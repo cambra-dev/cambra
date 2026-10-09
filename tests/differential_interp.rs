@@ -39,6 +39,86 @@ fn agree(source: &str) {
     );
 }
 
+/// A feed crossing `let`s between its target and itself: each is discharged on the edge
+/// into the target, so a row naming one compiles (`src/ccl/design/type-inference.md`, "A
+/// contribution crosses the binders after its target").
+#[rstest]
+#[case::a_let_before_the_feed(indoc! {r#"
+    out = test_sink()
+    xs = [1, 2, 3]
+    out << [v for v in xs if v > 1]
+"#})]
+#[case::a_constant_let_inside_a_loop(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        k = 1
+        out << [v for v in [1, 2, 3] if v > k]
+"#})]
+#[case::a_let_before_a_loop(indoc! {r#"
+    out = test_sink()
+    xs = [1, 2, 3]
+    for r in [1, 2]:
+        out << [v for v in xs if v > 1]
+"#})]
+fn a_feed_crossing_a_let(#[case] source: &str) {
+    agree(source);
+}
+
+/// A `def` feeding a handle declared outside it, called from the top level or a loop. The
+/// handle's element type stands at the level the handle is bound at, so the parameter
+/// written into it stays monomorphic and the channel receives what each call passes. Each
+/// call site feeds from its own place.
+#[rstest]
+#[case::called_once(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << y
+    f(1)
+"#})]
+#[case::called_in_a_loop(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << y
+    for r in [1, 2]:
+        f(r)
+"#})]
+#[case::a_row_constant_in_the_parameter(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << [v + y for v in [1, 2, 3]]
+    for r in [1, 2]:
+        f(r)
+"#})]
+// Each call site is its own place, as two `<<` statements are.
+#[case::called_twice(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << y
+    f(1)
+    f(2)
+"#})]
+#[case::called_once_and_from_a_loop(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << y
+    out << 0
+    f(0)
+    for r in [1, 2]:
+        f(r)
+"#})]
+#[case::called_through_another_def(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << y
+    def g(z):
+        f(z)
+        f(z + 10)
+    g(1)
+"#})]
+fn a_def_feeding_a_handle_declared_outside_it(#[case] source: &str) {
+    agree(source);
+}
+
 #[test]
 fn a_scalar_feed() {
     agree(indoc! {r#"

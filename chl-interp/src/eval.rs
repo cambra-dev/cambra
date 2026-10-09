@@ -104,11 +104,19 @@ struct TxnFrame {
     /// variable the block does not write is an as-of read.
     writes: BTreeSet<String>,
     /// Replies fed inside the block, held until the block commits and its commit time is known.
-    replies: Vec<(String, usize, Value)>,
+    replies: Vec<(String, Place, Value)>,
     /// Whether the block wrote or replied speculatively, which leaves whether it commits
     /// undecided.
     uncertain: bool,
 }
+
+/// Where a contribution to a channel comes from: the source positions of the user-function
+/// calls it runs under, outermost first, then the position of its `<<`.
+///
+/// A function feeding a channel declared outside it contributes once per call site, as each
+/// call site is its own instantiation of the function: `f(1)` and `f(2)` feed from two places,
+/// as two `<<` statements do.
+type Place = Vec<usize>;
 
 /// An open channel: what `defer()` or `test_sink()` made.
 ///
@@ -119,17 +127,17 @@ struct TxnFrame {
 /// under the key `x` was drawn from.
 #[derive(Default)]
 struct Channel {
-    /// Contributions: the feed site that made each, its key, and its value.
-    fed: Vec<(usize, Value, Value)>,
+    /// Contributions: the place that made each, its key, and its value.
+    fed: Vec<(Place, Value, Value)>,
     /// The value a `<<=` defined the channel as.
     defined: Option<Value>,
-    /// Every feed site naming this channel, in source order.
+    /// Every place feeding this channel, in the order the program text reaches them.
     ///
     /// A channel fed from more than one place is a union (`++`) of those places
     /// (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"), and its keys are
-    /// tagged by which one. The tagging is a property of the program text, so a site that
-    /// never fires still counts.
-    sites: Vec<usize>,
+    /// tagged by which one. The tagging is a property of the program text, so a place that
+    /// never fires still counts ([`collect_feed_sites`]).
+    sites: Vec<Place>,
 }
 
 impl Channel {
@@ -150,8 +158,11 @@ pub(crate) struct Interp {
     channels: BTreeMap<String, Channel>,
     /// The channels a `test_sink()` opened, which are what `run` answers with.
     observed: BTreeSet<String>,
-    /// Feed sites per channel name, collected from the program text before it runs.
-    feed_sites: BTreeMap<String, Vec<usize>>,
+    /// Feed places per channel name, collected from the program text before it runs.
+    feed_sites: BTreeMap<String, Vec<Place>>,
+    /// The source positions of the user-function calls running, outermost first: the call
+    /// part of a feed's [`Place`].
+    call_path: Vec<usize>,
     /// The values a generator has yielded, while one is running.
     yielded: Option<Vec<(Value, Value)>>,
     /// The commit times transaction blocks have taken. They are dense and 1-based: a block
@@ -197,12 +208,13 @@ struct OrderWatch {
 }
 
 impl Interp {
-    fn new(feed_sites: BTreeMap<String, Vec<usize>>, finals: BTreeMap<String, Value>) -> Self {
+    fn new(feed_sites: BTreeMap<String, Vec<Place>>, finals: BTreeMap<String, Value>) -> Self {
         Self {
             scopes: vec![Vec::new()],
             channels: BTreeMap::new(),
             observed: BTreeSet::new(),
             feed_sites,
+            call_path: Vec::new(),
             yielded: None,
             commit_time: 0,
             clock_known: true,
@@ -418,86 +430,193 @@ fn for_each_stmt<'a>(
 
 /// [`for_each_stmt`] over every block in expression position inside `e`.
 fn for_each_block<'a>(e: &'a Spanned<Expr>, bodies: Bodies, f: &mut dyn FnMut(&'a Spanned<Stmt>)) {
-    let mut sub = |c: &'a Spanned<Expr>| for_each_block(c, bodies, f);
     match &e.node {
         Expr::Block(stmt) => for_each_stmt(std::slice::from_ref(&**stmt), bodies, f),
-        Expr::Lambda { body, .. } => {
-            if bodies == Bodies::Enter {
-                sub(body);
-            }
-        }
+        Expr::Lambda { .. } if bodies == Bodies::Skip => {}
+        _ => for_each_child_expr(e, &mut |c| for_each_block(c, bodies, f)),
+    }
+}
+
+/// Call `f` on each expression directly inside `e`, a lambda's body included. A block in
+/// expression position holds a statement rather than an expression, so the caller decides how
+/// to enter one.
+fn for_each_child_expr<'a>(e: &'a Spanned<Expr>, f: &mut dyn FnMut(&'a Spanned<Expr>)) {
+    match &e.node {
+        Expr::Lambda { body, .. } => f(body),
         Expr::BinOp { left, right, .. } => {
-            sub(left);
-            sub(right);
+            f(left);
+            f(right);
         }
-        Expr::UnaryOp { operand, .. } => sub(operand),
-        Expr::BoolOp { operands, .. } => operands.iter().for_each(sub),
+        Expr::UnaryOp { operand, .. } => f(operand),
+        Expr::BoolOp { operands, .. } => operands.iter().for_each(f),
         Expr::Compare {
             left, comparators, ..
         } => {
-            sub(left);
-            comparators.iter().for_each(sub);
+            f(left);
+            comparators.iter().for_each(f);
         }
         Expr::Call { func, args } => {
-            sub(func);
-            args.iter().for_each(sub);
+            f(func);
+            args.iter().for_each(f);
         }
         Expr::List(items) | Expr::Tuple(items) | Expr::BraceGroup(items) => {
-            items.iter().for_each(sub)
+            items.iter().for_each(f)
         }
         Expr::Record(fields) | Expr::BraceRecord(fields) => {
-            fields.iter().for_each(|field| sub(&field.value))
+            fields.iter().for_each(|field| f(&field.value))
         }
         Expr::Subscript { target, index, .. } => {
-            sub(target);
-            sub(index);
+            f(target);
+            f(index);
         }
-        Expr::Attribute { target, .. } => sub(target),
+        Expr::Attribute { target, .. } => f(target),
         Expr::VariantCtor {
             payload: Some(VariantPayload::Term(inner)),
             ..
         }
-        | Expr::Yield(inner) => sub(inner),
+        | Expr::Yield(inner) => f(inner),
         Expr::IfExp {
             cond,
             then_expr,
             else_expr,
         } => {
-            sub(cond);
-            sub(then_expr);
-            sub(else_expr);
+            f(cond);
+            f(then_expr);
+            f(else_expr);
         }
         Expr::ListComp(comp) | Expr::GenExp(comp) => {
             for clause in &comp.clauses {
                 match clause {
-                    CompClause::For { iter, .. } => sub(iter),
-                    CompClause::If(guard) => sub(guard),
+                    CompClause::For { iter, .. } => f(iter),
+                    CompClause::If(guard) => f(guard),
                 }
             }
-            sub(&comp.element);
+            f(&comp.element);
         }
         Expr::Feed { target, value } => {
-            sub(target);
-            sub(value);
+            f(target);
+            f(value);
         }
-        // Literals, names and type syntax hold no statement.
+        // Literals, names, type syntax and a block hold no expression directly.
         _ => {}
     }
 }
 
-/// Every `<<` site in `body` into `feeds`, by the channel name each names, in source order.
-fn collect_feed_sites(body: &[Spanned<Stmt>], feeds: &mut BTreeMap<String, Vec<usize>>) {
-    for_each_stmt(body, Bodies::Enter, &mut |s| {
-        if let Stmt::Expr(e) = &s.node
-            && let Expr::Feed { target, value } = &e.node
-            && let Expr::Name(n) = &target.node
-        {
-            feeds
-                .entry(n.to_string())
-                .or_default()
-                .push(value.span.start);
+/// Every place feeding a channel, by the channel name each `<<` names, in the order the program
+/// text reaches them ([`Place`]).
+///
+/// A `def`'s body is reached once per call site naming it, where the call is, and not where it
+/// is defined: a function never called feeds from nowhere, and one called twice feeds from two
+/// places, which is what instantiating it at each call site gives.
+fn collect_feed_sites(body: &[Spanned<Stmt>], feeds: &mut BTreeMap<String, Vec<Place>>) {
+    PlaceWalk {
+        defs: vec![Vec::new()],
+        path: Vec::new(),
+        feeds,
+    }
+    .stmts(body);
+}
+
+/// The `def`s one scope of the program text declares, by name, in declaration order.
+type DefScope<'a> = Vec<(&'a str, &'a [Spanned<Stmt>])>;
+
+/// The walk [`collect_feed_sites`] runs: the program text in evaluation order, with each call
+/// to a `def` in scope expanded into the `def`'s body under the call's position.
+struct PlaceWalk<'a, 'f> {
+    /// The `def`s in scope by name, innermost scope last.
+    defs: Vec<DefScope<'a>>,
+    /// The positions of the calls being expanded, outermost first.
+    path: Vec<usize>,
+    feeds: &'f mut BTreeMap<String, Vec<Place>>,
+}
+
+impl<'a> PlaceWalk<'a, '_> {
+    fn stmts(&mut self, body: &'a [Spanned<Stmt>]) {
+        self.defs.push(Vec::new());
+        for s in body {
+            self.stmt(s);
         }
-    });
+        self.defs.pop();
+    }
+
+    fn stmt(&mut self, s: &'a Spanned<Stmt>) {
+        match &s.node {
+            Stmt::FunctionDef { name, body, .. } => self
+                .defs
+                .last_mut()
+                .expect("a scope is open")
+                .push((name.as_str(), body)),
+            Stmt::If {
+                branches,
+                else_body,
+            } => {
+                for b in branches {
+                    self.expr(&b.cond);
+                    self.stmts(&b.body);
+                }
+                if let Some(body) = else_body {
+                    self.stmts(body);
+                }
+            }
+            Stmt::Match { scrutinee, arms } => {
+                self.expr(scrutinee);
+                for a in arms {
+                    self.stmts(&a.body);
+                }
+            }
+            Stmt::For { iter, body, .. } => {
+                self.expr(iter);
+                self.stmts(body);
+            }
+            Stmt::With { body, .. } => self.stmts(body),
+            Stmt::Expr(e)
+            | Stmt::Return(Some(e))
+            | Stmt::Assign { value: e, .. }
+            | Stmt::AnnAssign { value: e, .. }
+            | Stmt::AugAssign { value: e, .. }
+            | Stmt::MutAssign { value: e, .. }
+            | Stmt::Define { value: e, .. } => self.expr(e),
+            _ => {}
+        }
+    }
+
+    fn expr(&mut self, e: &'a Spanned<Expr>) {
+        match &e.node {
+            Expr::Block(stmt) => self.stmt(stmt),
+            // The value is computed before it is fed.
+            Expr::Feed { target, value } => {
+                self.expr(value);
+                if let Expr::Name(n) = &target.node {
+                    let mut place = self.path.clone();
+                    place.push(value.span.start);
+                    self.feeds.entry(n.to_string()).or_default().push(place);
+                }
+            }
+            // The arguments are evaluated before the body runs.
+            Expr::Call { func, args } => {
+                args.iter().for_each(|a| self.expr(a));
+                let Expr::Name(name) = &func.node else {
+                    return self.expr(func);
+                };
+                let body = self
+                    .defs
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.iter().rev().find(|(n, _)| n == name));
+                if let Some(&(_, body)) = body
+                    // A call reaching itself through the calls being expanded is recursion,
+                    // whose places the walk cannot enumerate; the run refuses such a feed by
+                    // name when it fires.
+                    && !self.path.contains(&func.span.start)
+                {
+                    self.path.push(func.span.start);
+                    self.stmts(body);
+                    self.path.pop();
+                }
+            }
+            _ => for_each_child_expr(e, &mut |c| self.expr(c)),
+        }
+    }
 }
 
 /// The mutable variables `body` writes where it runs, by name.
@@ -1085,9 +1204,11 @@ impl Interp {
         } else {
             contributed
         };
-        // The feed's source position identifies the site: two `<<` in one program are two
-        // places whatever they write.
-        let site = value.span.start;
+        // The feed's source position under the calls running identifies the place: two `<<`
+        // in one program are two places whatever they write, and so is one `<<` in a
+        // function reached from two call sites.
+        let mut site = self.call_path.clone();
+        site.push(value.span.start);
         if let Some(frame) = self.txn.as_mut() {
             // A reply rides its block's commit, so it is indexed by commit time, not by
             // the iteration that produced it. The commit time is not known until the block
@@ -1102,7 +1223,7 @@ impl Interp {
     }
 
     /// The contributions of the open channel `name`.
-    fn contribute(&mut self, name: &str) -> &mut Vec<(usize, Value, Value)> {
+    fn contribute(&mut self, name: &str) -> &mut Vec<(Place, Value, Value)> {
         &mut self
             .channels
             .get_mut(name)
@@ -1266,7 +1387,7 @@ fn channel_value(channel: &Channel) -> Result<Value, Error> {
         let key = if channel.sites.len() > 1 {
             let Some(tag) = channel.sites.iter().position(|s| s == site) else {
                 return err(format!(
-                    "the feed at {site} fired but was not collected from the program text"
+                    "the feed at {site:?} fired but was not collected from the program text"
                 ));
             };
             Value::Variant {
@@ -1607,7 +1728,10 @@ impl Interp {
         // (`docs/chl-spec.md`, "3.2 Names").
         if let Some(Slot::Fn(function)) = self.slot(name) {
             let function = function.clone();
-            return self.call_user(name, &function, args);
+            self.call_path.push(func.span.start);
+            let returned = self.call_user(name, &function, args);
+            self.call_path.pop();
+            return returned;
         }
 
         // A call whose arity the table does not accept is not a builtin call, and reaches

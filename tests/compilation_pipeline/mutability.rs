@@ -2706,23 +2706,52 @@ x
     )
 }
 
-/// A loop's target binder is the gap the opaque-binder rule does not close. `p`
-/// is neither opaque nor discharged by the write's edge, so the contribution
-/// `{Int | __elem == __read ^+ p}` cannot be recorded on a value variable minted
-/// outside the loop. Annotating the mutable variable is the workaround: the
-/// contribution is then checked against the declared value type rather than
-/// joined into an inference variable
-/// (`refined_induction_variable_via_annotated_array_write_succeeds`).
+/// A write inside a loop crosses the loop's target binder, so the edge into the mutable
+/// variable joins over every value of `p` (`src/ccl/design/type-inference.md`, "A
+/// contribution crosses the binders after its target"): the refinement
+/// `{Int | __elem == __read ^+ p}` states a value per `p`, and the join drops it.
 #[test]
-fn snapshot_write_in_loop_to_unannotated_mut_var_leaves_an_open_bound() {
-    check_compile_error(
+fn a_write_in_a_loop_joins_over_the_loop_binder() {
+    check_scalar(
         indoc! {r#"
 x := 0
 for p in [1,2,3]:
     x := x ^+ p
 x
 "#},
-        "open bound recorded",
+        Value::Int(6),
+    )
+}
+
+/// A collection written to a mutable variable inside a loop, whose keys depend on the loop
+/// variable: the variable's type is the join of every value written to it, and collections
+/// over different keys have no join.
+#[test]
+fn a_write_of_rows_whose_keys_vary_with_the_loop_has_no_join() {
+    check_compile_error(
+        indoc! {r#"
+m := [1, 2, 3]
+for r in [1, 2]:
+    m := [v for v in [1, 2, 3] if v > r]
+sum(m)
+"#},
+        "depend on `r`",
+    )
+}
+
+/// The boxed version joins, as a sum over every subtype of the row's domain, and inference
+/// accepts it. A boxed collection written to a mutable variable does not compile in
+/// planning yet, loop or not. Pinned on that failure.
+#[test]
+fn a_boxed_write_whose_keys_vary_with_the_loop_reaches_a_planning_gap() {
+    check_compile_error(
+        indoc! {r#"
+m := box([1, 2, 3])
+for r in [1, 2]:
+    m := box([v for v in [1, 2, 3] if v > r])
+sum(m)
+"#},
+        "list literal reached op-conversion without an input",
     )
 }
 
@@ -2801,17 +2830,19 @@ x := x ^+ 1
     )
 }
 
-/// Here, `m` is unrefined because `-` is unrefined. So despite `^+`
-/// being refined, the outcome of `x ^+ m` is unknown to the solver.
+/// The write crosses `m`'s `let`, so the edge into `x` discharges `m ↦ 0 - 1`
+/// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its
+/// target"), and the solver decides `x ^+ (0 - 1) <= 5` from the annotation's `x <= 5`.
 #[test]
-fn checking_writes_fails_for_refined_addition_with_unrefined_additive() {
-    check_compile_error(
+fn a_write_discharges_a_let_it_crosses() {
+    check_scalar(
         indoc! {r#"
 x : Mut({Int where _ <= 5}) := 0;
 m = 0 - 1
 x := x ^+ m
+x
 "#},
-        "Type mismatch for write to mutable variable `x`: expected {Int | __elem <= 5}, found {Int | __elem == x ^+ m}",
+        Value::Int(-1),
     )
 }
 

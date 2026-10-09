@@ -1350,6 +1350,20 @@ impl CompactType {
 pub struct CompactGraph {
     pub term: CompactType,
     pub rec_vars: BTreeMap<InferVarId, CompactType>,
+    /// Refinements naming a binder the walk joins over in a position with no join: a
+    /// data domain ([`crate::ccl::subst::Mapping::Join`]). Non-empty is an error at
+    /// coalesce time, as `rec_vars` is.
+    pub join_violations: Vec<JoinViolation>,
+}
+
+/// A refinement naming joined binders where the join does not exist: a data function's
+/// domain, whose keys differ per value of the binders.
+#[derive(Debug, Clone)]
+pub struct JoinViolation {
+    /// The joined binders the refinement names.
+    pub binders: Vec<Name>,
+    /// The refinement, as written.
+    pub refinement: crate::ccl::Refinement,
 }
 
 /// Walk a `Type`, transitively expanding variable bounds at the
@@ -1386,6 +1400,9 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
         rec_vars: BTreeMap::new(),
         collapse,
         scope: RefinementScope::default(),
+        data_domain_depth: 0,
+        candidate_widened: None,
+        join_violations: Vec::new(),
     };
     let term = compact_go(ty, true, &Subst::id(), Position::default(), &mut st);
     debug_assert!(
@@ -1396,6 +1413,7 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
     CompactGraph {
         term,
         rec_vars: st.rec_vars,
+        join_violations: st.join_violations,
     }
 }
 
@@ -1587,6 +1605,15 @@ struct CompactState {
     /// function meeting at one variable spell one refinement one way. `key_go` threads
     /// the same type, so a key and a compacted type agree.
     scope: RefinementScope,
+    /// How many data-function domains enclose the walk, counting a function whose kind is
+    /// not yet known to be compute: a refinement there naming a joined binder has no join
+    /// ([`JoinViolation`]).
+    data_domain_depth: u32,
+    /// `Some` while a sum's candidate compacts, set to `true` when the walk drops a
+    /// refinement naming a joined binder from it: the candidate then widens to every
+    /// subtype of what remains ([`compact_type_kind`]).
+    candidate_widened: Option<bool>,
+    join_violations: Vec<JoinViolation>,
 }
 
 /// What the binder at `position` of a kind **variable** ranges over, derived here from the
@@ -1697,12 +1724,26 @@ fn compact_type_kind(
     // — is a position, so it compacts like one. A kind that carries no type has nothing to
     // decompose and crosses as itself.
     match type_kind {
-        TypeKind::Enumerated(domains) => CompactTypeKind::Enumerated(
-            domains
-                .iter()
-                .map(|d| compact_go(d, pol, subst_acc, Position::default(), st))
-                .collect(),
-        ),
+        // **A candidate naming a joined binder** is one domain per value of the binder, so
+        // the kind over every value is every subtype of the candidate without what it
+        // states about the binder (`src/ccl/design/type-inference.md`, "A contribution
+        // crosses the binders after its target"). The candidates' kinds then join.
+        TypeKind::Enumerated(domains) => domains
+            .iter()
+            .map(|d| {
+                let depth = std::mem::take(&mut st.data_domain_depth);
+                let outer = st.candidate_widened.replace(false);
+                let candidate = compact_go(d, pol, subst_acc, Position::default(), st);
+                let widened = std::mem::replace(&mut st.candidate_widened, outer);
+                st.data_domain_depth = depth;
+                if widened == Some(true) {
+                    CompactTypeKind::SubtypesOf(Box::new(candidate))
+                } else {
+                    CompactTypeKind::Enumerated(vec![candidate])
+                }
+            })
+            .reduce(|a, b| CompactTypeKind::merge(pol, a, b))
+            .unwrap_or(CompactTypeKind::Enumerated(Vec::new())),
         TypeKind::SubtypesOf(k) => CompactTypeKind::SubtypesOf(Box::new(compact_go(
             k,
             pol,
@@ -1898,6 +1939,23 @@ fn compact_go(
         Type::Refinement(inner, refinements) => {
             let mut ct = compact_go(inner, pol, subst_acc, pos, st);
             for r in refinements {
+                // **A refinement naming a joined binder** states something per value of the
+                // binder. In a sum's candidate the candidate widens; in a data domain there
+                // is no join, since each value has its own keys; anywhere else the join of
+                // the values drops it.
+                if subst_acc.joins_refinement(r) {
+                    match &mut st.candidate_widened {
+                        Some(widened) => *widened = true,
+                        None if st.data_domain_depth > 0 => {
+                            st.join_violations.push(JoinViolation {
+                                binders: subst_acc.joined_in(&r.predicate),
+                                refinement: r.clone(),
+                            })
+                        }
+                        None => {}
+                    }
+                    continue;
+                }
                 let r = subst_acc.force_refinement(r);
                 // References to the walk's enclosing binders become indices
                 // before the refinement is compared or stored.
@@ -1925,7 +1983,10 @@ fn compact_go(
             // position — which for the parent path mirrors Scala's `Set.empty`
             // argument, cycles spanning only one variable's bound chain and not
             // crossing a function boundary.
+            let data_domain = !matches!(fun_kind.resolved(), KindPin::Compute);
+            st.data_domain_depth += u32::from(data_domain);
             let dom = compact_go(d, !pol, subst_acc, Position::domain_of(fun_kind), st);
+            st.data_domain_depth -= u32::from(data_domain);
             // A Pi binder shadows the accumulated substitution inside the
             // codomain (it binds the name locally), so restrict it there.
             let cod_acc = match name {
@@ -2807,6 +2868,7 @@ mod tests {
         CompactGraph {
             term,
             rec_vars: BTreeMap::new(),
+            join_violations: Vec::new(),
         }
     }
 

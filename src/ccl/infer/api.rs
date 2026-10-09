@@ -369,6 +369,18 @@ pub enum InferError {
         /// source and once in CCL. A caller that has no span can still reach it.
         origin: String,
     },
+    /// A feed or a mutable variable receives a collection whose keys depend on a binder
+    /// bound between the target's declaration and the write, which the contribution's edge
+    /// joins over (`src/ccl/design/type-inference.md`, "A contribution crosses the binders
+    /// after its target"). The target's type is the join over every value written to it, and
+    /// collections over different keys have no join (`docs/chl-spec.md`, "Joining the types
+    /// of several values").
+    NoJoinOverBinder {
+        /// The binders the keys depend on.
+        binders: Vec<String>,
+        /// The predicate stating the keys, rendered symbolically.
+        keys: String,
+    },
     /// The expression kind is not yet handled by this inference pass.
     Unsupported(String),
     /// A [`crate::ccl::TypedExprNode::Case`] with no branches was encountered.
@@ -719,6 +731,7 @@ impl InferError {
             InferError::ScopeViolation { ty, .. } => each(ty),
             // No type to render: these carry a name, an id, or a rendered label.
             InferError::UnboundVariable(_)
+            | InferError::NoJoinOverBinder { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
             | InferError::UnresolvedHole { .. }
@@ -1266,6 +1279,19 @@ impl std::fmt::Debug for InferError {
                      A collection's domain is its data, so a join may not narrow it. Wrap each \
                      arm in `box` to keep them.",
                     listed.join(" vs ")
+                )
+            }
+            InferError::NoJoinOverBinder { binders, keys } => {
+                let binders: Vec<String> = binders.iter().map(|b| format!("`{b}`")).collect();
+                write!(
+                    f,
+                    "Type Inference Error: the keys of a collection written to a feed or mutable \
+                     variable depend on {}, bound between the target's declaration and the \
+                     write\n\
+                     Keys: {keys}\n\
+                     The target's type is the join of every value written to it, and collections \
+                     over different keys have no join.",
+                    binders.join(", ")
                 )
             }
             InferError::MutNotBareVariable { at } => {

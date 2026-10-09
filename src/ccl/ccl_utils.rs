@@ -1827,15 +1827,13 @@ fn count_free_in_type_with_visited(
     ty: &Type,
     visited: &mut HashSet<PredicateId>,
 ) -> usize {
-    // The only variable a type can bind is the refinement element binder
-    // ([`crate::ccl::REFINEMENT_BINDER`]): it occurs *only* inside refinement
-    // predicates, and each such occurrence is bound by its enclosing refinement —
-    // including under nesting, where each layer binds its own. So it is never free
-    // in a type: counting its (bound) occurrences reports a binder capture that
-    // cannot happen, and the caller that asks (lambda-elim's "value-dependent
-    // dependent function" guard) then rejects a perfectly ordinary term because
-    // some type inside it carried an `__elem` predicate. Every *other* name in a
-    // predicate is a free reference to the enclosing lexical scope and is counted.
+    // The refinement element binder ([`crate::ccl::REFINEMENT_BINDER`]) occurs *only*
+    // inside refinement predicates, and each such occurrence is bound by its enclosing
+    // refinement — including under nesting, where each layer binds its own. So it is
+    // never free in a type: counting its (bound) occurrences reports a binder capture
+    // that cannot happen, and the caller that asks (lambda-elim's "value-dependent
+    // dependent function" guard) then rejects a perfectly ordinary term because some
+    // type inside it carried an `__elem` predicate.
     //
     // The carve-out is type-level only: the *term* walk
     // ([`count_free_with_visited`]) deliberately keeps counting `__elem`, because a
@@ -1845,11 +1843,57 @@ fn count_free_in_type_with_visited(
     if name.is_elem() {
         return 0;
     }
-    let mut count = 0;
-    walk_refined_predicates(ty, visited, &mut |pred, vis| {
-        count += count_free_with_visited(name, pred, vis);
-    });
-    count
+    count_free_in_type_go(name, ty, visited)
+}
+
+/// [`count_free_in_type_with_visited`] past the element binder: the occurrences of
+/// `name` in `ty`'s refinement predicates that no binder inside `ty` binds.
+///
+/// A type binds a term name in two places, as [`crate::ccl::subst::type_free_vars`]
+/// reads them: a named function's Pi binder over its codomain, and a dependent tuple's
+/// named component over the components after it. A live codomain refers to its binder
+/// by name (`src/ccl/design/type-inference.md`, "A binder reference is stored in one of
+/// two forms"), so such a reference is bound, and counting it would report a capture
+/// that cannot happen.
+fn count_free_in_type_go(name: &Name, ty: &Type, visited: &mut HashSet<PredicateId>) -> usize {
+    match ty {
+        Type::Fun {
+            name: Some(binder),
+            fun_kind,
+            domain,
+            ..
+        } if binder == name => {
+            let mut count = 0;
+            for w in fun_kind.witnesses() {
+                for t in w.types() {
+                    count += count_free_in_type_go(name, t, visited);
+                }
+            }
+            count + count_free_in_type_go(name, domain, visited)
+        }
+        Type::DepTuple(components) => {
+            let mut count = 0;
+            for (component, component_ty) in components {
+                count += count_free_in_type_go(name, component_ty, visited);
+                if component.as_ref() == Some(name) {
+                    break;
+                }
+            }
+            count
+        }
+        _ => {
+            let mut count = 0;
+            if let Type::Refinement(_, refinements) = ty {
+                for refinement in refinements {
+                    if visited.insert(refinement.predicate_id()) {
+                        count += count_free_with_visited(name, &refinement.predicate, visited);
+                    }
+                }
+            }
+            ty.walk_children(|child| count += count_free_in_type_go(name, child, visited));
+            count
+        }
+    }
 }
 
 /// Walk every [`Type::Refinement`] reachable from `ty` and invoke `f`
@@ -1865,9 +1909,10 @@ fn count_free_in_type_with_visited(
 /// carry types that contain further refinements.
 ///
 /// This helper is the single source of truth for the
-/// type-walk + visited-set pattern used by
-/// [`count_free_in_type_with_visited`], [`crate::ccl::infer::check_fully_typed`],
-/// and [`crate::ccl::lambda_elim`]'s post-pass type-refinement walk.
+/// type-walk + visited-set pattern used by [`crate::ccl::infer::check_fully_typed`]
+/// and [`crate::ccl::lambda_elim`]'s post-pass type-refinement walk. It binds
+/// nothing, so a walk that must respect a Pi binder (`count_free_in_type_go`)
+/// walks the type itself.
 /// See [`walk_refined_predicates_mut`] for the rebuilding variant used by
 /// [`crate::ccl::inline`].
 pub fn walk_refined_predicates<F>(ty: &Type, visited: &mut HashSet<PredicateId>, f: &mut F)

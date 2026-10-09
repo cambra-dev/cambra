@@ -985,3 +985,66 @@ for i in [1, 2, 3]:
         Value::Unit,
     )
 }
+
+/// A feed's element type is the join of every contribution, and a feed inside a loop or a
+/// `def` contributes once per value of the binders between the target and the feed
+/// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its
+/// target"). Rows whose keys depend on such a binder have no join, so the program is refused
+/// naming it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::filtered_by_the_loop_variable(indoc! {r#"
+    o = defer()
+    for r in [1, 2]:
+        o << [v for v in [1, 2, 3] if v > r]
+    o
+"#}, "`r`")]
+#[case::grouped_by_the_loop_variable(indoc! {r#"
+    o = defer()
+    for i in [1, 2]:
+        o << [sum(g) for g in groupby([1, 2, 3, 4], \e -> e // i)]
+    o
+"#}, "`i`")]
+#[case::through_a_let_of_the_loop_variable(indoc! {r#"
+    o = defer()
+    for r in [1, 2]:
+        k = r
+        o << [v for v in [1, 2, 3] if v > k]
+    o
+"#}, "`k`")]
+#[case::filtered_by_a_parameter(indoc! {r#"
+    o = defer()
+    def f(y):
+        o << [v for v in [1, 2, 3] if v > y]
+    for r in [1, 2]:
+        f(r)
+    o
+"#}, "`y`")]
+// One call is refused as well: the `def` is inferred once, for every call.
+#[case::filtered_by_a_parameter_of_a_def_called_once(indoc! {r#"
+    o = defer()
+    def f(y):
+        o << [v for v in [1, 2, 3] if v > y]
+    f(1)
+    o
+"#}, "`y`")]
+fn rows_whose_keys_vary_with_a_binder_have_no_join(#[case] code: &str, #[case] binder: &str) {
+    check_compile_error(code, &format!("depend on {binder}"));
+}
+
+/// Boxed rows whose keys vary with the loop variable do join, as a sum over every subtype
+/// of the row's domain, and inference accepts them. Lambda elimination does not: the row's
+/// filter stays on its domain on one side of the channel and not on the other. Pinned on that
+/// failure.
+#[test]
+fn boxed_rows_whose_keys_vary_with_the_loop_reach_a_lowering_gap() {
+    check_compile_error(
+        indoc! {r#"
+            o = defer()
+            for r in [1, 2]:
+                o << box([v for v in [1, 2, 3] if v > r])
+            o
+        "#},
+        "post-lambda-elim produced an invalid tree",
+    );
+}

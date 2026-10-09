@@ -132,6 +132,13 @@ pub enum Mapping {
     /// map to a new `Rc` per payload instead. See the vault's
     /// `freshening-clone-report`.
     Discharge(Box<TypedExpr>),
+    /// `binder ↦` the join over every value the binder takes. A type leaving the
+    /// binder's scope this way keeps what holds for every value: a refinement naming the
+    /// binder is dropped where it states a value, and where it states a collection's
+    /// domain there is no join (`src/ccl/design/type-inference.md`, "A contribution
+    /// crosses the binders after its target"). It has no term, so the term walks leave
+    /// an occurrence in place and the decision is made per refinement.
+    Join,
 }
 
 /// What a substitution does to a **witness** binder — the witness-sort counterpart of
@@ -179,6 +186,7 @@ impl Clone for Mapping {
         match self {
             Mapping::Rename(b) => Mapping::Rename(b.clone()),
             Mapping::Discharge(t) => Mapping::Discharge(Box::new(t.clone_preserving_ids())),
+            Mapping::Join => Mapping::Join,
         }
     }
 }
@@ -225,6 +233,7 @@ impl Mapping {
             // the post-inference check.
             Mapping::Rename(to) => TypedExpr::var(to.clone()).with_ty(occurrence_ty.clone()),
             Mapping::Discharge(t) => (**t).clone(),
+            Mapping::Join => unreachable!("a joined binder has no term; its occurrence stays"),
         };
         assert_preserves_typedness(&out, occurrence_ty);
         out
@@ -247,6 +256,7 @@ impl Mapping {
             Mapping::Rename(to) => TypedExpr::preserve(node_id, TypedExprNode::Var(to.clone()))
                 .with_ty(occurrence_ty.clone()),
             Mapping::Discharge(t) => t.clone_at(node_id),
+            Mapping::Join => unreachable!("a joined binder has no term; its occurrence stays"),
         };
         assert_preserves_typedness(&out, occurrence_ty);
         out
@@ -449,6 +459,56 @@ impl Subst {
         Subst::of_binders(m)
     }
 
+    /// `[binder ↦ join]`: the type leaves `binder`'s scope as the join over every value
+    /// it takes ([`Mapping::Join`]).
+    pub fn join(binder: impl Into<Name>) -> Self {
+        let binder = binder.into();
+        debug_assert_no_pi_bound(&binder);
+        let mut m = BTreeMap::new();
+        m.insert(binder, Mapping::Join);
+        Subst::of_binders(m)
+    }
+
+    /// Whether a binder this substitution joins over occurs free in `e`.
+    pub fn joins_in(&self, e: &TypedExpr) -> bool {
+        self.binders
+            .iter()
+            .any(|(k, m)| matches!(m, Mapping::Join) && is_free(k, e))
+    }
+
+    /// The binders this substitution joins over that occur free in `e`.
+    pub fn joined_in(&self, e: &TypedExpr) -> Vec<Name> {
+        self.binders
+            .iter()
+            .filter(|(k, m)| matches!(m, Mapping::Join) && is_free(k, e))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Whether `r`'s predicate names a binder this substitution joins over, other than
+    /// the refinement's own element.
+    pub fn joins_refinement(&self, r: &crate::ccl::Refinement) -> bool {
+        self.shadow(&Name::elem()).joins_in(&r.predicate)
+    }
+
+    /// This substitution without its [`Mapping::Join`] entries: what applies inside a
+    /// position where a joined binder's refinement is kept for the caller to report
+    /// rather than dropped.
+    pub fn without_joins(&self) -> Cow<'_, Subst> {
+        if !self.binders.values().any(|m| matches!(m, Mapping::Join)) {
+            return Cow::Borrowed(self);
+        }
+        Cow::Owned(Subst {
+            binders: self
+                .binders
+                .iter()
+                .filter(|(_, m)| !matches!(m, Mapping::Join))
+                .map(|(k, m)| (k.clone(), m.clone()))
+                .collect(),
+            witnesses: self.witnesses.clone(),
+        })
+    }
+
     /// The binders this substitution acts on (its source domain).
     pub fn binders(&self) -> impl Iterator<Item = &Binder> {
         self.binders.keys()
@@ -515,6 +575,7 @@ impl Subst {
                             (Mapping::Discharge(a), Mapping::Discharge(b)) => {
                                 crate::ccl::eq_term_modulo_ty_slots(a, b)
                             }
+                            (Mapping::Join, Mapping::Join) => true,
                             _ => false,
                         }
                 })
@@ -526,6 +587,7 @@ impl Subst {
         self.binders.values().any(|m| match m {
             Mapping::Rename(to) => to == name,
             Mapping::Discharge(t) => is_free(name, t),
+            Mapping::Join => false,
         })
     }
 
@@ -569,7 +631,11 @@ impl Subst {
                     Some(mb) => mb.clone(),
                     None => Mapping::Rename(to.clone()),
                 },
+                // A definition naming a binder `b` joins over is itself joined over: it
+                // takes a value per value of that binder.
+                Some(Mapping::Discharge(t)) if b.joins_in(t) => Mapping::Join,
                 Some(Mapping::Discharge(t)) => Mapping::Discharge(Box::new(b.apply_expr(t))),
+                Some(Mapping::Join) => Mapping::Join,
                 None => match b.binders.get(&k) {
                     Some(mb) => mb.clone(),
                     None => continue,
@@ -580,6 +646,7 @@ impl Subst {
             let is_identity = match &composed {
                 Mapping::Rename(to) => *to == k,
                 Mapping::Discharge(t) => is_var_named(t, &k),
+                Mapping::Join => false,
             };
             if !is_identity {
                 m.insert(k, composed);
@@ -657,7 +724,7 @@ impl Subst {
                         TypedExprNode::Var(n) => Mapping::Rename(n.clone()),
                         _ => v.clone(),
                     },
-                    Mapping::Rename(_) => v.clone(),
+                    Mapping::Rename(_) | Mapping::Join => v.clone(),
                 };
                 (k.clone(), v)
             })
@@ -773,8 +840,8 @@ impl Subst {
             Var(n) => match self.binders.get(n) {
                 // The replacement carries its own type/annotation, so return it
                 // wholesale rather than rebuilding `e`.
-                Some(repl) => return repl.as_expr(&e.ty),
-                None => Var(n.clone()),
+                Some(repl) if !matches!(repl, Mapping::Join) => return repl.as_expr(&e.ty),
+                _ => Var(n.clone()),
             },
 
             // The cast target is a type slot `map_children` cannot reach;
@@ -961,6 +1028,7 @@ impl Subst {
                 TypedExprNode::Var(n) => Some(n.clone()),
                 _ => None,
             },
+            Mapping::Join => None,
         }
     }
 
@@ -1097,6 +1165,7 @@ impl Subst {
         // carry the substituted binder in a refinement predicate.
         if let TypedExprNode::Var(n) = &e.node
             && let Some(repl) = self.binders.get(n)
+            && !matches!(repl, Mapping::Join)
         {
             // Root-carry: the replacement ROOT is built at the occurrence's own
             // id — a *preserve*, so the root inherits the occurrence's
@@ -1392,7 +1461,9 @@ impl Subst {
         // and a predicate only ever references its *own* element through it. A
         // substitution whose terms read the element would capture here, which the
         // type walks refuse before reaching this ([`Self::assert_no_element_capture`]).
-        let restricted = self.shadow(&Name::elem());
+        // A joined binder has no term to put in the predicate: a caller that reaches here
+        // with a refinement naming one is keeping it ([`Mapping::Join`]).
+        let restricted = self.without_joins().shadow(&Name::elem());
         // Vacuous (no substituted binder occurs free anywhere in the
         // predicate — value or nested type slots): keep the original
         // refinement, *sharing its predicate `Rc`*. The shared `Rc` is what
@@ -1550,7 +1621,7 @@ impl Subst {
             } => Type::Fun {
                 name: None,
                 fun_kind: self.apply_fun_kind(fun_kind),
-                domain: Box::new(self.apply_type(domain)),
+                domain: Box::new(self.apply_domain(fun_kind, domain)),
                 codomain: Box::new(self.apply_type(codomain)),
             },
 
@@ -1560,7 +1631,7 @@ impl Subst {
                 domain,
                 codomain,
             } => {
-                let domain = Box::new(self.apply_type(domain));
+                let domain = Box::new(self.apply_domain(fun_kind, domain));
                 let (b2, inner) = self.under_binder_ty(b, codomain);
                 Type::Fun {
                     name: Some(b2),
@@ -1579,6 +1650,10 @@ impl Subst {
                     self.apply_type(base),
                     refinements
                         .iter()
+                        // A refinement naming a joined binder states a value here, so the
+                        // join drops it: a data domain or a kind's candidate applies
+                        // `without_joins` and never reaches this.
+                        .filter(|r| !self.joins_refinement(r))
                         .map(|r| {
                             self.assert_no_element_capture(r);
                             self.force_refinement(r)
@@ -1652,12 +1727,25 @@ impl Subst {
                             Some(WitnessMapping::Rename(to)) => w.renamed(*to),
                             _ => w.clone(),
                         };
-                        w.map_types(|t| self.apply_type(t))
+                        // A candidate is a domain the sum may take, so a joined binder's
+                        // refinement on it is kept, as in a data domain.
+                        w.map_types(|t| self.without_joins().apply_type(t))
                     })
                     .collect();
                 FunKind::Data((!kept.is_empty()).then(|| Rc::new(kept)))
             }
             other => other.clone(),
+        }
+    }
+
+    /// Apply this substitution to a function's `domain`. A data function's domain is its
+    /// data, so a refinement there naming a joined binder has no join: it is kept, naming
+    /// the binder, for compaction to report ([`Mapping::Join`]).
+    fn apply_domain(&self, fun_kind: &crate::ccl::ty::FunKind, domain: &Type) -> Type {
+        if fun_kind.resolved().is_data() {
+            self.without_joins().apply_type(domain)
+        } else {
+            self.apply_type(domain)
         }
     }
 
