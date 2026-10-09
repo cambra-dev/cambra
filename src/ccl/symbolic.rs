@@ -383,6 +383,16 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             )
         }
 
+        TypedExprNode::Run {
+            name, module, body, ..
+        } => {
+            let body_str = fmt(body, Precedence::Lowest, opts);
+            (
+                Precedence::Lowest,
+                format!("run {name} = {module}\nin {body_str}"),
+            )
+        }
+
         TypedExprNode::LetType { name, ty, body } => {
             let body_str = fmt(body, Precedence::Lowest, opts);
             (

@@ -506,7 +506,7 @@ fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
         }
         N::MutDecl { init, body, .. } => vec![init, body],
         N::For { iter, body, .. } => vec![iter, body],
-        N::Begin { body } | N::LetType { body, .. } => vec![body],
+        N::Begin { body } | N::LetType { body, .. } | N::Run { body, .. } => vec![body],
         N::ExprStmt { expr, body } => vec![expr, body],
         N::Feed { value, .. } | N::Define { value, .. } | N::MutWrite { value, .. } => vec![value],
     }

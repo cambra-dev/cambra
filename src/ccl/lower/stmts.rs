@@ -144,22 +144,45 @@ pub(super) fn lower_stmts_recovering(
             }
         });
 
-    if ctx.sink_bindings.is_empty() {
-        return Some(body);
-    }
-    errors.extend(sink_rebindings(stmts, ctx));
+    Some(body)
+}
 
-    // Build the outputs `Record` from the sink-bound names in sorted order (sort
-    // for determinism — HashMap iteration is unordered). The node, its output
-    // `Var`s, and the tail `ExprStmt` are program-owned plumbing with no owning
-    // statement; they carry the whole-program span.
+/// The program `body`, the root module's tree with every run it declares in
+/// place, with the sinks the root declares, `sinks`, registered and every
+/// program's sink read at its tail. `stmts` are the root's statements.
+///
+/// The final expression is wrapped so the program ends in
+/// `ExprStmt(<body>, Record{sink: Var(sink), …})`, built from the sink-bound
+/// names in sorted order for determinism. A run's sink is read through the
+/// binder its chain minted, since its key is qualified by the run path
+/// ([`LoweringContext::run_sink_names`]).
+pub(super) fn finish_program(
+    stmts: &[Spanned<ChlStmt>],
+    body: Expr,
+    sinks: &[DeclaredSink],
+    ctx: &mut LoweringContext,
+) -> (Expr, Vec<LoweringError>) {
+    let (registered, mut errors) = ctx.register_sinks(sinks, None);
+    if ctx.sink_bindings.is_empty() {
+        return (body, errors);
+    }
+    let own: HashSet<&str> = registered.iter().map(|(key, _)| key.as_str()).collect();
+    errors.extend(sink_rebindings(stmts, &own));
+
+    // The node, its output `Var`s, and the tail `ExprStmt` are program-owned
+    // plumbing with no owning statement; they carry the whole-program span.
     let program_span = stmts[0].span.join(stmts[stmts.len() - 1].span);
     let mut sink_names: Vec<String> = ctx.sink_bindings.keys().cloned().collect();
     sink_names.sort();
     let outs = sink_names
         .iter()
         .map(|n| {
-            let var = ctx.tag_machinery(Expr::var(n), program_span, "lower.sink_outputs");
+            let name = ctx
+                .run_sink_names
+                .get(n)
+                .cloned()
+                .unwrap_or_else(|| Name::raw(n.as_str()));
+            let var = ctx.tag_machinery(Expr::var(name), program_span, "lower.sink_outputs");
             (Label::new(n.as_str()), var)
         })
         .collect();
@@ -170,7 +193,8 @@ pub(super) fn lower_stmts_recovering(
     );
     // Place ExprStmt(body, outputs) at the innermost position of the Let* chain
     // so the outputs `Record` has the sink `Var` references in scope.
-    Some(append_outputs_at_tail(body, outputs, program_span, ctx))
+    let body = append_outputs_at_tail(body, outputs, program_span, ctx);
+    (body, errors)
 }
 
 /// Walk to the innermost continuation below the program's `Let`, `MutDecl`,
@@ -483,6 +507,17 @@ pub(super) fn lower_final_stmt(
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
             lower_standalone_transaction(last, unit, &scope, ctx)
+        }
+        // A run as the program's final statement: its chain around `Unit`, since
+        // a run has no value of its own.
+        ChlStmt::Run { path, alias, .. } => {
+            let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), last.span, "lower.run_unit");
+            Ok(
+                match (path.to_path(), modules::run_name(path, alias.as_ref())) {
+                    (Some(module), Some(name)) => ctx.take_run(&name, module, last.span, unit),
+                    _ => unit,
+                },
+            )
         }
         // Parse-recovery placeholder: silently substitute. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(Expr::error()),
@@ -894,6 +929,14 @@ pub(super) fn lower_middle_stmt(
             collect_stmt_names(preceding, &mut scope);
             lower_standalone_transaction(stmt, body, &scope, ctx)
         }
+        // A run stands at its statement: its chain around the rest of the module
+        // (`docs/chl-spec.md`, "9.3 Runs").
+        ChlStmt::Run { path, alias, .. } => Ok(
+            match (path.to_path(), modules::run_name(path, alias.as_ref())) {
+                (Some(module), Some(name)) => ctx.take_run(&name, module, stmt.span, body),
+                _ => body,
+            },
+        ),
         // Parse-recovery placeholder: silently drop the broken statement and
         // pass the continuation through. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(body),
@@ -2217,7 +2260,7 @@ pub(super) fn pre_declare_type_aliases(
 /// So a sink name has one binding statement, its declaration, and every other top-level
 /// binding of the name is refused at its own span. A second declaration is
 /// [`LoweringContext::register_sink_binding`]'s to refuse.
-fn sink_rebindings(stmts: &[Spanned<ChlStmt>], ctx: &LoweringContext) -> Vec<LoweringError> {
+fn sink_rebindings(stmts: &[Spanned<ChlStmt>], sinks: &HashSet<&str>) -> Vec<LoweringError> {
     fn target_names<'a>(t: &'a AssignTarget, out: &mut Vec<&'a str>) {
         match t {
             AssignTarget::Name(n) => out.push(n.as_str()),
@@ -2238,7 +2281,7 @@ fn sink_rebindings(stmts: &[Spanned<ChlStmt>], ctx: &LoweringContext) -> Vec<Low
             _ => {}
         }
         for name in bound {
-            if ctx.sink_bindings.contains_key(name) {
+            if sinks.contains(name) {
                 errors.push(LoweringError::unsupported(
                     stmt.span,
                     format!("`{name}` is a sink, so it cannot be bound again"),

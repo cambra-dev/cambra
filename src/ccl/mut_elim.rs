@@ -898,7 +898,7 @@ fn rewrite(mut expr: Expr) -> Expr {
 fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
     let value = rewrite(value);
     let vty = value.ty.clone();
-    let fresh = Name::fresh(name.base());
+    let fresh = Name::fresh_like(&name);
     let mut cont = cont;
     rename_uses(&mut cont, &name, &fresh);
     let cont = rewrite(cont);
@@ -1803,7 +1803,7 @@ pub(crate) fn fold_induction_loop(
         let mut read = Expr::apply(view, f);
         read.ty = vty.clone();
 
-        let x_final = Name::fresh(acc.name.base());
+        let x_final = Name::fresh_like(&acc.name);
         renames.push((acc.name.clone(), x_final.clone()));
         reads.push((binding(x_final, vty.clone()), read));
     }
@@ -2692,7 +2692,7 @@ fn freshen_bindings(mut e: Expr) -> Expr {
             unreachable!("guarded above")
         };
         let value = freshen_bindings(*bound_expr);
-        let fresh = Name::fresh(binding.name.base());
+        let fresh = Name::fresh_like(&binding.name);
         let old = std::mem::replace(&mut binding.name, fresh.clone());
         let renamed = Subst::discharge_env_in_place(
             *body,
@@ -2721,7 +2721,7 @@ fn freshen_chain(e: Expr, depth: usize) -> Expr {
     else {
         unreachable!("freshen_chain is given the chain `wrap_reads` just built");
     };
-    let fresh = Name::fresh(binding.name.base());
+    let fresh = Name::fresh_like(&binding.name);
     let old = std::mem::replace(&mut binding.name, fresh.clone());
     let renamed = Subst::discharge_env_in_place(
         *body,

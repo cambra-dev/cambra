@@ -1493,13 +1493,17 @@ where
             .map_with(|s, e| Spanned::new(e.span(), s))
             .delimited_by(just(Token::LParen), just(Token::RParen))
             .then_ignore(just(Token::Newline));
-        // A run takes `pub` at the head of its own line, as a loaded declaration
-        // does.
+        // `pub` is refused on a `run`, decorated or not; it is parsed here so the
+        // refusal names it.
         let renamed_from_tail = decorator_arg
             .clone()
             .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
             .then(run_stmt.clone())
-            .map(|((source, keyword), run)| {
+            .validate(|((source, keyword), run), _, emitter| {
+                if let Some(keyword) = keyword {
+                    let refused = pub_refusal(&run.node).expect("`pub` is refused on every `run`");
+                    emitter.emit(Rich::custom(keyword, refused));
+                }
                 let Stmt::Run {
                     path,
                     args,
@@ -1517,7 +1521,7 @@ where
                     uses,
                     renamed_from: Some(source),
                 };
-                (keyword, stmt)
+                (None, stmt)
             });
         let load_from_tail = decorator_arg
             // A loaded declaration is an ordinary declaration with no
@@ -1797,19 +1801,13 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
         | Stmt::AnnAssign { .. }
         | Stmt::MutAssign { .. }
         | Stmt::FunctionDef { .. }
-        | Stmt::Run {
-            renamed_from: None, ..
-        }
         | Stmt::Error => return None,
-        Stmt::Run {
-            renamed_from: Some(_),
-            ..
-        } => {
-            "`pub` on a renamed run stands at the head of the run's line, below the decorator: \
-             `@RenamedFrom(r)` above `pub run …`"
-        }
         Stmt::Import { .. } => {
             "`pub` is refused on an `import`: a module exports only what it declares"
+        }
+        Stmt::Run { .. } => {
+            "`pub` is refused on a `run`: a module exports only what it declares, and a run's \
+             members are reached through the values the module binds"
         }
         Stmt::Param { .. } => "`pub` is refused on a `param`",
         Stmt::Pub { .. } => "`pub` is written once",

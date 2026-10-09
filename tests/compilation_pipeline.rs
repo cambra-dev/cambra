@@ -48,6 +48,8 @@ mod nested_loops;
 mod probes;
 #[path = "compilation_pipeline/records.rs"]
 mod records;
+#[path = "compilation_pipeline/runs.rs"]
+mod runs;
 #[path = "compilation_pipeline/scalars_collections.rs"]
 mod scalars_collections;
 #[path = "compilation_pipeline/secondary_labels.rs"]

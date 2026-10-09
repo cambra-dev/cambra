@@ -83,7 +83,7 @@ use std::{
 
 use crate::{
     ccl::{
-        Branch, Expr, Lit, SharedHoleMint, Type, TypedExprNode,
+        Branch, Expr, Lit, Name, RunPath, SharedHoleMint, Type, TypedExprNode,
         provenance::{Nature, RewriteLabel},
     },
     chl_parser::ast::{
@@ -353,6 +353,12 @@ pub struct LoweringContext {
     /// re-lowering the same route in a later version is the reuse path.
     pub(super) http_routes_this_pass: HashSet<String>,
 
+    /// Where each route in [`http_routes_this_pass`](Self::http_routes_this_pass)
+    /// was lowered: its `http_serve` arguments, and the run whose module served
+    /// it, if a run's did. A route two runs serve is an error at the second run's
+    /// statement (`docs/chl-spec.md`, "9.9 Running").
+    pub(super) http_route_sites: HashMap<String, (Span, Option<(RunPath, Span)>)>,
+
     /// What this pass may do with an `http_serve` naming a route the registry does
     /// not already hold.
     pub(super) endpoints: Endpoints,
@@ -456,6 +462,29 @@ pub struct LoweringContext {
     /// Where the module being lowered performs IO, if it does: the first call to
     /// a registered source (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state").
     pub(super) io_site: Option<Span>,
+    /// The binder of each sink a run declares, by its key, which the program's
+    /// tail reads in place of the sink's spelling.
+    pub(super) run_sink_names: HashMap<String, Name>,
+    /// The sinks the module being lowered declares, in the order lowered, which
+    /// each run of it registers ([`Self::register_sinks`]).
+    declared_sinks: Vec<DeclaredSink>,
+}
+
+/// A sink a module declares: lowering binds its name, and each run of the
+/// module registers it ([`LoweringContext::register_sinks`]).
+#[derive(Debug, Clone)]
+enum DeclaredSink {
+    /// `requests, responses = http_serve(…)` at `span`, its arguments at
+    /// `args_span`: its route, and the binding its responses are read through.
+    Http {
+        route: HttpRoute,
+        responses: String,
+        span: Span,
+        args_span: Span,
+    },
+    /// `name = test_sink()` at `span`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    Test { name: String, span: Span },
 }
 
 /// A type name a block or a definition declares, and the type it names.
@@ -615,6 +644,57 @@ impl LoweringContext {
         }
     }
 
+    /// Register each sink in `sinks` for the run at `run`, declared by its
+    /// `run` statement, or for the root when `run` is `None`, and return each
+    /// one's key with the spelling of the binding it is read through.
+    ///
+    /// A sink is keyed by its binding's spelling, qualified in a run by the run
+    /// path, so two runs of one module bind two sinks (`docs/modules.md`,
+    /// "Registries keyed by spelling"). A test sink binds the sink registered
+    /// under its key, and a sink nothing registered is an error: writing to it
+    /// would drop the program's output without a trace.
+    fn register_sinks(
+        &mut self,
+        sinks: &[DeclaredSink],
+        run: Option<&(RunPath, Span)>,
+    ) -> (Vec<(String, String)>, Vec<LoweringError>) {
+        let key = |name: &str| match run {
+            Some((path, _)) => format!("{path}::{name}"),
+            None => name.to_string(),
+        };
+        let mut registered = Vec::new();
+        let mut errors = Vec::new();
+        for sink in sinks {
+            let (name, span, bound) = match sink {
+                DeclaredSink::Http {
+                    route,
+                    responses,
+                    span,
+                    args_span,
+                } => (
+                    responses,
+                    *span,
+                    self.register_route(route, *args_span, run),
+                ),
+                #[cfg(any(test, feature = "test-helpers"))]
+                DeclaredSink::Test { name, span } => {
+                    let found = self.test_sinks.get(&key(name)).cloned().ok_or_else(|| {
+                        LoweringError::unsupported(
+                            *span,
+                            format!("no test sink is registered under `{}`", key(name)),
+                        )
+                    });
+                    (name, *span, found.map(|sink| sink as Arc<dyn DataSink>))
+                }
+            };
+            match bound.and_then(|sink| self.register_sink_binding(key(name), sink, span)) {
+                Ok(()) => registered.push((key(name), name.clone())),
+                Err(error) => errors.push(error),
+            }
+        }
+        (registered, errors)
+    }
+
     /// Drain all sink bindings accumulated for this compilation.
     ///
     /// Returns every `(binding_name, DataSink)` pair discovered during lowering
@@ -622,6 +702,7 @@ impl LoweringContext {
     /// each entry to [`GlobalContext`](crate::ccl::context::GlobalContext) so
     /// it can extract the corresponding expressions and subscribe them.
     pub fn take_sink_bindings(&mut self) -> HashMap<String, Arc<dyn DataSink>> {
+        self.run_sink_names.clear();
         std::mem::take(&mut self.sink_bindings)
     }
 
@@ -1030,7 +1111,7 @@ fn lower_expr_inner(
             // subject — the value being refined — which is the reserved binder
             // `__elem` (`docs/chl-spec.md`, "6.4 Refinement syntax").
             if ctx.in_refinement_predicate && name == "_" {
-                return Ok(Expr::var(crate::ccl::Name::elem()));
+                return Ok(Expr::var(Name::elem()));
             }
             // A transactional mutable variable may be read only inside a `with begin():`
             // block, which pins a snapshot-consistent view (all txn reads in one
@@ -1301,18 +1382,46 @@ fn lower_expr_inner(
 /// `channelize` removes all `Feed` nodes and then collapses the `ExprStmt` to
 /// its body, leaving a clean `Let* Record{…}` shape for `compile_program`.
 pub fn lower_stmts(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
-    lower_module(module, ctx, false)
+    let lowered = lower_root(module, ctx);
+    let sinks = std::mem::take(&mut ctx.declared_sinks);
+    let mut errors = lowered.errors;
+    let value = lowered.value.map(|body| {
+        let (body, refused) = finish_program(&module.body, body, &sinks, ctx);
+        errors.extend(refused);
+        body
+    });
+    errors.sort_by_key(|e| {
+        let span = e.span();
+        (span.file, span.start, span.end)
+    });
+    LoweringResult { value, errors }
 }
 
-/// Lower `module`, an imported module, to the chain of its top-level bindings
-/// around [`modules::MODULE_BODY`], the placeholder for the code that imports it
-/// (`modules`).
-///
-/// An imported module has no value of its own (`docs/chl-spec.md`, "9.17 No
-/// trailing expressions"), and holds only value bindings, `def`s and type
-/// aliases until imported state is supported.
-pub fn lower_library(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
-    lower_module(module, ctx, true)
+/// Lower the root module `module`, whose last statement is the program's value,
+/// leaving its sinks declared ([`LoweringContext::declared_sinks`]) and its tail
+/// unread. [`lower_stmts`] finishes a program of one module; a program of
+/// several finishes once its runs are in place (`modules`).
+pub(super) fn lower_root(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
+    lower_module(module, ctx, Lowered::Root)
+}
+
+/// Lower `module`, a module other than the root, to the chain of its top-level
+/// statements around [`modules::MODULE_BODY`], the placeholder for the code below
+/// it wherever a run of it stands (`modules`). It has no value of its own
+/// (`docs/chl-spec.md`, "9.17 No trailing expressions"). A run performs its
+/// whole top level, and what an import may not hold is refused where the module
+/// is imported ([`library_statement_refusals`]).
+pub fn lower_module_body(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
+    lower_module(module, ctx, Lowered::Module)
+}
+
+/// What a module lowers as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lowered {
+    /// The root, whose last statement is the program's value.
+    Root,
+    /// Any other module, which is run or imported.
+    Module,
 }
 
 /// Where `module`, an imported module, binds a sink: the first statement that
@@ -1355,7 +1464,7 @@ pub fn state_site(module: &ChlModule) -> Option<Span> {
     })
 }
 
-fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, library: bool) -> LoweringResult {
+fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered) -> LoweringResult {
     // Module syntax that does not lower yet makes the module lower nothing, so no
     // lowering site has to account for it.
     let syntax = module_syntax::refuse_module_syntax(module);
@@ -1368,9 +1477,6 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, library: bool) ->
         &modules::top_level_aliases(&module.body),
         ctx,
     ));
-    if library {
-        errors.extend(library_statement_refusals(&module.body));
-    }
     let value = if errors.is_empty() {
         // `pub` decides what an importer reaches, which the interface records,
         // and an `import` binds a name lowering resolves through the module's
@@ -1387,10 +1493,9 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, library: bool) ->
                 })
                 .collect(),
         };
-        if library {
-            lower_library_recovering(&unmarked, ctx, &mut errors)
-        } else {
-            lower_stmts_recovering(&unmarked, ctx, &mut errors)
+        match lowered {
+            Lowered::Root => lower_stmts_recovering(&unmarked, ctx, &mut errors),
+            Lowered::Module => lower_library_recovering(&unmarked, ctx, &mut errors),
         }
     } else {
         None
@@ -1404,20 +1509,25 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, library: bool) ->
     LoweringResult { value, errors }
 }
 
-/// One error per binder spelled like an import name: `m::f` names a module, so a
-/// binder spelled `m` would give one spelling two meanings in one scope
-/// (`docs/chl-spec.md`, "9.6 Qualified references").
+/// One error per binder spelled like an import name or a run name: `m::f` names
+/// a module's member, so a binder spelled `m` would give one spelling two
+/// meanings in one scope (`docs/chl-spec.md`, "9.6 Qualified references").
 fn import_name_binders(binders: &[(SmolStr, Span)], ctx: &LoweringContext) -> Vec<LoweringError> {
     binders
         .iter()
         .filter_map(|(name, span)| {
-            let import = ctx.module.imports.get(name.as_str())?;
+            let qualifier = ctx.module.qualifiers.get(name.as_str())?;
+            let (what, note) = if qualifier.run {
+                ("a run name", "run here")
+            } else {
+                ("an import name", "imported here")
+            };
             Some(
                 LoweringError::unsupported(
                     *span,
-                    format!("`{name}` is an import name, so no binder in its module takes it"),
+                    format!("`{name}` is {what}, so no binder in its module takes it"),
                 )
-                .with_note(import.statement, "imported here"),
+                .with_note(qualifier.statement, note),
             )
         })
         .collect()
@@ -1452,7 +1562,7 @@ fn use_name_members(
 /// One error per top-level statement of an imported module that lowering does
 /// not support there: anything but a value binding, a `def`, a type alias, an
 /// `import`, or `pass`.
-fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<LoweringError> {
+pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<LoweringError> {
     stmts
         .iter()
         .filter_map(|stmt| {

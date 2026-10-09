@@ -48,7 +48,9 @@
 //! `uid` for [`Name::Unique`].
 
 use crate::chl_parser::ModulePath;
+use smol_str::SmolStr;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A globally-fresh binder identity. Minted only via [`Uid::fresh`]; nothing
@@ -214,6 +216,49 @@ impl std::hash::Hash for PiRef {
     }
 }
 
+/// Where a module's top-level member lives (`docs/modules.md`, "Names carry
+/// their home").
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Home {
+    /// The shared run of an imported module, by its module path.
+    Shared(ModulePath),
+    /// A run a `run` statement declares, by its run path.
+    Run(RunPath),
+}
+
+impl fmt::Display for Home {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Home::Shared(module) => write!(f, "{module}"),
+            Home::Run(run) => write!(f, "{run}"),
+        }
+    }
+}
+
+/// The run names from the root to a run, `eu` or `eu::inv`
+/// (`docs/chl-spec.md`, "9.1 Vocabulary"). The root's run path is empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RunPath(Arc<[SmolStr]>);
+
+impl RunPath {
+    /// The run path of the run `name` that the run at `self` declares.
+    pub fn child(&self, name: impl Into<SmolStr>) -> RunPath {
+        RunPath(self.0.iter().cloned().chain([name.into()]).collect())
+    }
+}
+
+impl fmt::Display for RunPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, name) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str("::")?;
+            }
+            f.write_str(name)?;
+        }
+        Ok(())
+    }
+}
+
 /// A binder or variable name. See the module docs for the five variants.
 ///
 /// Derived `Eq`/`Ord`/`Hash` compare the whole variant. For [`Name::Unique`]
@@ -228,15 +273,16 @@ pub enum Name {
     /// Lowering's output; identity is the string. See module docs.
     Raw(String),
     /// A uniquified source binder; identity is `uid`, `base` is the source
-    /// spelling kept as display metadata. `home` is the imported module whose
-    /// top-level member it binds, and `None` for any other binder: a local, or
-    /// a member of the root (`docs/modules.md`, "Names carry their home"). It
-    /// is display metadata too, and set where the name is minted, so a binder
-    /// and its uses carry the same one.
+    /// spelling kept as display metadata. `home` is the imported module or the
+    /// run whose top-level member it binds, and `None` for any other binder: a
+    /// local, or a member of the root (`docs/modules.md`, "Names carry their
+    /// home"). It is display metadata too, and set where the name is minted, so
+    /// a binder and its uses carry the same one. It is behind an `Arc` so it
+    /// costs `Name` one pointer.
     Unique {
         base: String,
         uid: Uid,
-        home: Option<ModulePath>,
+        home: Option<Arc<Home>>,
     },
     /// A compiler-introduced binder; identity is `uid`, `kind` is its
     /// provenance and whole display (no source spelling — that was noise).
@@ -280,8 +326,8 @@ impl Name {
     }
 
     /// [`Name::fresh`] for a binder whose home is `home`: the top-level member
-    /// `base` of an imported module.
-    pub fn fresh_in(base: impl Into<String>, home: Option<ModulePath>) -> Self {
+    /// `base` of an imported module or a run.
+    pub fn fresh_in(base: impl Into<String>, home: Option<Arc<Home>>) -> Self {
         Name::Unique {
             base: base.into(),
             uid: Uid::fresh(),
@@ -289,10 +335,21 @@ impl Name {
         }
     }
 
-    /// The imported module whose top-level member this binds, if it binds one.
-    pub fn home(&self) -> Option<&ModulePath> {
+    /// A fresh binder copying `name`'s spelling and home: what a pass that
+    /// re-mints a binder it copies or renames gives the copy, so the copy keeps
+    /// its display and its [`field_key`](Self::field_key).
+    pub fn fresh_like(name: &Name) -> Self {
+        match name {
+            Name::Unique { base, home, .. } => Self::fresh_in(base.clone(), home.clone()),
+            other => Self::fresh(other.base()),
+        }
+    }
+
+    /// The imported module or run whose top-level member this binds, if it
+    /// binds one.
+    pub fn home(&self) -> Option<&Home> {
         match self {
-            Name::Unique { home, .. } => home.as_ref(),
+            Name::Unique { home, .. } => home.as_deref(),
             _ => None,
         }
     }
@@ -462,7 +519,10 @@ impl Name {
             Name::PiBound(_) => {
                 unreachable!("a PiBound is a reference, not a binder; it labels no field")
             }
-            _ => crate::ccl::Label::new(self.base()),
+            // A member of a run is labeled by its run path, `eu::stock`, so the
+            // variables of two runs of one module keep distinct histories. A user
+            // identifier cannot contain `::`, so the label meets no local's.
+            _ => crate::ccl::Label::new(self.to_string()),
         }
     }
 
@@ -547,8 +607,8 @@ impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Name::PiBound(PiRef { index, hint: None }) => write!(f, "#{index}"),
-            // An imported module's member renders qualified, in every module's
-            // diagnostics alike.
+            // An imported module's or a run's member renders qualified, in every
+            // module's diagnostics alike.
             Name::Unique {
                 base,
                 home: Some(home),

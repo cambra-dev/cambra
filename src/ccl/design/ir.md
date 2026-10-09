@@ -34,7 +34,7 @@ inside dependent types (`ccl/names.rs`):
 | Variant | Identity and use |
 |---|---|
 | `Raw(String)` | Source spelling before uniquification; lexical scope distinguishes equal spellings. |
-| `Unique { base, uid, home }` | Source binder minted by `uniquify`; `uid` distinguishes binding sites, while `base` retains the source spelling and `home` the imported module whose top-level member it binds ([docs/modules.md, "Names carry their home"](../../../docs/modules.md#names-carry-their-home)). |
+| `Unique { base, uid, home }` | Source binder minted by `uniquify`; `uid` distinguishes binding sites, while `base` retains the source spelling and `home` the imported module or run whose top-level member it binds ([docs/modules.md, "Names carry their home"](../../../docs/modules.md#names-carry-their-home)). |
 | `Synthetic { kind, uid }` | Compiler binder with a fresh `uid`; `kind` identifies its origin (`Pair`, `Mono`, `FloatedDefer`, or `SolverArg`). |
 | `Reserved(ReservedName)` | Special name; the shared refinement-element binder is `__elem`. |
 | `PiBound(PiRef)` | Bound reference in a function type's codomain; its de Bruijn index determines equality, while its spelling hint is display metadata. It is never a term binder. |
@@ -205,6 +205,15 @@ lies in `body` ([chl-spec.md, "6.7 Type-alias
 statements"](../../../docs/chl-spec.md#67-type-alias-statements)), so uniquify reaches the
 `LetType` first and every use takes the resolution made there. Uniquify then replaces the node with
 `body`. No pass after it sees a `LetType`, and each has an unreachable arm for one.
+
+### `Run` — a `run` statement before linking
+
+`Run { name, module, statement, body }` is the `run` statement at `statement` that declares the run
+`name` of `module`, over `body`, the rest of the declaring module. A module lowers once, before any
+run of it exists, so the statement cannot stand for the run's chain yet. Linking creates the run
+and replaces the node with its chain around `body` ([docs/modules.md, "A module lowers
+once"](../../../docs/modules.md#a-module-lowers-once)). No pass after linking sees a `Run`, and
+each has an unreachable arm for one.
 
 ### `Cast` — explicit refinement acquisition
 

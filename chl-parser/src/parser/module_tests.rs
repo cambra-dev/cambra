@@ -269,10 +269,20 @@ fn pub_marks_each_statement_that_introduces_a_member() {
         pub_inner("pub stock: Mut(Map(String, Int), Txn) := []\n"),
         Stmt::MutAssign { .. }
     ));
-    assert!(matches!(
-        pub_inner("pub run inventory as inv\n"),
-        Stmt::Run { .. }
-    ));
+}
+
+/// A module exports only what it declares, so `pub` on a `run` is refused, as
+/// on an `import` (`docs/chl-spec.md`, "9.5 Visibility").
+#[test]
+fn pub_on_a_run_is_refused() {
+    assert_error("pub run inventory as inv\n", "`pub` is refused on a `run`");
+    assert_error(
+        indoc! {"
+            @RenamedFrom(eu)
+            pub run storefront as eu_west
+        "},
+        "`pub` is refused on a `run`",
+    );
 }
 
 /// The span of a `pub` statement starts at the keyword.
@@ -435,33 +445,6 @@ fn renamed_from_names_the_run_a_run_was() {
     assert_eq!(source.node, "eu");
     assert_eq!(alias.as_ref().map(|a| a.node.as_str()), Some("eu_west"));
     assert_eq!(src[m.body[0].span.as_range()].trim_end(), src.trim_end());
-}
-
-/// A renamed run takes `pub` where a loaded declaration does: at the head of
-/// its own line, below the decorator.
-#[test]
-fn a_renamed_run_takes_pub_on_its_own_line() {
-    let m = parse_m(indoc! {"
-        @RenamedFrom(eu)
-        pub run storefront as eu_west
-    "});
-    let Stmt::Pub { stmt, .. } = &m.body[0].node else {
-        panic!("expected a pub statement, got {:?}", m.body[0].node);
-    };
-    assert!(matches!(
-        stmt.node,
-        Stmt::Run {
-            renamed_from: Some(_),
-            ..
-        }
-    ));
-    assert_error(
-        indoc! {"
-            pub @RenamedFrom(eu)
-            run storefront as eu_west
-        "},
-        "`pub` on a renamed run stands at the head of the run's line",
-    );
 }
 
 /// Each decorator takes its own statement, and the wrong pairing names the right

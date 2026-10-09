@@ -1268,6 +1268,7 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")
         }
+        TypedExprNode::Run { .. } => unreachable!("linking expands every `Run`"),
         TypedExprNode::MutDecl { .. } => {
             unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
         }
@@ -1441,6 +1442,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")
         }
+        TypedExprNode::Run { .. } => unreachable!("linking expands every `Run`"),
         TypedExprNode::MutDecl { .. } => {
             unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
         }
@@ -2180,6 +2182,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             TypedExprNode::LetType { .. } => {
                 unreachable!("uniquify removes every `LetType`")
             }
+            TypedExprNode::Run { .. } => unreachable!("linking expands every `Run`"),
             TypedExprNode::MutDecl { .. } => {
                 unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
             }
@@ -2508,6 +2511,7 @@ fn extract_for_defer_impl(
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")
         }
+        TypedExprNode::Run { .. } => unreachable!("linking expands every `Run`"),
         TypedExprNode::MutDecl { .. } => {
             unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
         }

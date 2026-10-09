@@ -107,19 +107,6 @@ fn the_link_order_does_not_follow_statement_order() {
 }
 
 #[test]
-fn pub_run_names_a_module() {
-    let program = load(
-        "pub run shop as eu\n",
-        InMemory::default().with("shop", "x = 1\n"),
-    );
-    assert!(messages(&program).is_empty(), "{:?}", messages(&program));
-    assert_eq!(
-        names(&program, program.link_order().unwrap()),
-        ["shop", "main"]
-    );
-}
-
-#[test]
 fn each_statement_naming_a_missing_module_is_an_error_at_its_path() {
     let program = load(
         indoc! {"

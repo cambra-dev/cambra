@@ -78,8 +78,9 @@
 use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::PredMemo;
+use crate::ccl::names::Home;
 use crate::ccl::{Expr, Name, Type, TypedBinding, TypedExprNode};
-use crate::chl_parser::ModulePath;
+use std::sync::Arc;
 
 /// Every **distinct** refinement-predicate term reachable from `expr`, as a
 /// multiset of their id-sets, deduped by `Rc` pointer.
@@ -153,15 +154,11 @@ pub struct Uniquified {
 /// `scope` maps its spelling to. A module's `use` names enter its tree this way
 /// (`docs/modules.md`, "`use` names are environment entries, not bindings").
 ///
-/// `home` is the module path of an imported module, whose top-level binders are
-/// minted with it as their [`Name::home`]. A top-level binder is one on the
+/// `home` is the imported module or the run whose top-level binders are minted
+/// with it as their [`Name::home`]. A top-level binder is one on the
 /// chain of `let` and `LetType` bodies from the root of `expr`, and a
 /// top-level `LetType` declares one of the [`Uniquified::aliases`].
-pub fn run_in(
-    mut expr: Expr,
-    scope: &HashMap<String, Name>,
-    home: Option<&ModulePath>,
-) -> Uniquified {
+pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>, home: Option<Home>) -> Uniquified {
     debug_assert!(
         scope.values().all(|name| !name.is_raw()),
         "uniquify: a scope entry is a minted name"
@@ -180,7 +177,7 @@ pub fn run_in(
     let before_preds = distinct_predicate_terms(&expr);
 
     let mut u = Uniquifier {
-        home: home.cloned(),
+        home: home.map(Arc::new),
         top_level: true,
         aliases: Vec::new(),
         env: scope
@@ -233,13 +230,13 @@ pub fn run_in(
 }
 
 struct Uniquifier {
-    /// The module whose top-level binders this run mints, if it is an imported
-    /// one ([`run_in`]).
-    home: Option<ModulePath>,
-    /// Whether the node being entered is on the chain of `let` and `LetType`
-    /// bodies from the root, where a `let` binds a member of the module. Each
-    /// node clears it on entry, and a top-level `let` or `LetType` sets it again
-    /// for its body.
+    /// The imported module or run whose top-level binders this pass mints
+    /// ([`run_in`]).
+    home: Option<Arc<Home>>,
+    /// Whether the node being entered is on the module's spine, the chain of
+    /// `let`, `MutDecl`, statement, and `LetType` bodies from the root, where a
+    /// `let` or a `MutDecl` binds a member of the module. Each node clears it on
+    /// entry, and a top-level one of those sets it again for its body.
     top_level: bool,
     /// The top-level `LetType`s walked so far, by spelling, with their types
     /// resolved ([`Uniquified::aliases`]).
@@ -383,9 +380,19 @@ impl Uniquifier {
             } => {
                 self.expr(init);
                 self.binding_tys(binding);
-                let base = self.bind(binding);
+                let home = if top_level { self.home.clone() } else { None };
+                let base = self.bind_in(binding, home);
+                self.top_level = top_level;
                 self.expr(body);
                 self.unbind(base);
+            }
+
+            // A statement at a module's top level leaves the statements below it
+            // top-level.
+            TypedExprNode::ExprStmt { expr, body } => {
+                self.expr(expr);
+                self.top_level = top_level;
+                self.expr(body);
             }
 
             // Mutual recursion: mint *all* group binders before walking any
@@ -526,7 +533,7 @@ impl Uniquifier {
     }
 
     /// [`Self::bind`], minting the binder with `home` as its [`Name::home`].
-    fn bind_in(&mut self, b: &mut TypedBinding, home: Option<ModulePath>) -> Option<String> {
+    fn bind_in(&mut self, b: &mut TypedBinding, home: Option<Arc<Home>>) -> Option<String> {
         if !b.name.is_raw() {
             return None;
         }
@@ -649,6 +656,7 @@ mod tests {
     use super::*;
     use crate::ccl::lower::{LoweringContext, lower_stmts};
     use crate::ccl::{Expr, Lit, Refinement};
+    use crate::chl_parser::ModulePath;
 
     /// Parse and lower a CHL program, *without* uniquifying.
     fn lower_only(code: &str) -> Expr {
@@ -899,7 +907,7 @@ mod tests {
     /// minted with the module as their home, and every other binder without one.
     #[test]
     fn top_level_binders_are_minted_with_their_home() {
-        let catalog = ModulePath::new(["catalog".into()]);
+        let catalog = Home::Shared(ModulePath::new(["catalog".into()]));
         // let a = (let b = 1 in b) in let f = λ x → x in f
         let expr = run_in(
             Expr::let_bind(
@@ -912,11 +920,11 @@ mod tests {
                 ),
             ),
             &HashMap::new(),
-            Some(&catalog),
+            Some(catalog.clone()),
         )
         .expr;
         let mut homes = Vec::new();
-        fn collect(e: &Expr, out: &mut Vec<(String, Option<ModulePath>)>) {
+        fn collect(e: &Expr, out: &mut Vec<(String, Option<Home>)>) {
             e.walk_binders(|b| out.push((b.name.base().to_string(), b.name.home().cloned())));
             e.walk_children(|c| collect(c, out));
         }

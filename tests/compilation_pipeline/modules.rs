@@ -15,7 +15,7 @@ use crate::panic_message::panic_message;
 
 /// The program rooted at `root`, with `modules` as its other modules' files, by
 /// module path.
-fn program(root: &str, modules: &[(&str, &str)]) -> LoadedProgram {
+pub(crate) fn program(root: &str, modules: &[(&str, &str)]) -> LoadedProgram {
     let mut files = modules
         .iter()
         .fold(InMemory::default(), |files, (path, text)| {
@@ -30,7 +30,7 @@ fn program(root: &str, modules: &[(&str, &str)]) -> LoadedProgram {
 }
 
 /// The rendered errors of a program that does not compile.
-fn compile_errors(program: &LoadedProgram) -> String {
+pub(crate) fn compile_errors(program: &LoadedProgram) -> String {
     let result = panic::catch_unwind(AssertUnwindSafe(|| run_program(program)));
     let Err(payload) = result else {
         panic!("expected the program not to compile");
@@ -38,7 +38,7 @@ fn compile_errors(program: &LoadedProgram) -> String {
     panic_message(&*payload)
 }
 
-fn assert_refused(program: &LoadedProgram, needle: &str) {
+pub(crate) fn assert_refused(program: &LoadedProgram, needle: &str) {
     let errors = compile_errors(program);
     assert!(errors.contains(needle), "expected {needle:?} in:\n{errors}");
 }
@@ -223,7 +223,7 @@ plus(1)
 )]
 #[case::an_import_name(
     "import other\nimport catalog use limit as other\n",
-    "`other` is an import name, so no binder in its module takes it"
+    "`other` is an import name or a run name, so no binder in its module takes it"
 )]
 #[case::bound_twice(
     "import catalog use limit, double as limit\n",
@@ -518,7 +518,10 @@ fn an_imported_function_writes_the_callers_state(
     "import catalog\nx: catalog::limit = 1\nx\n",
     "`catalog::limit` is a value, not a type"
 )]
-#[case::unknown_qualifier("(nope::a=1).a\n", "`nope` is not an import name of this module")]
+#[case::unknown_qualifier(
+    "(nope::a=1).a\n",
+    "`nope` is not an import name or a run name of this module"
+)]
 #[case::value_qualified_by_this("this::a\n", "`this` qualifies a label or a tag")]
 #[case::member_of_a_run("shop::eu::stock\n", "names a member of a run")]
 #[case::second_import_of_a_name(

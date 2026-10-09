@@ -46,7 +46,7 @@ mod label;
 mod ops;
 mod ty;
 
-pub use names::{Name, PiRef};
+pub use names::{Home, Name, PiRef, RunPath};
 
 // `pub` re-exports — every public item of each submodule reappears at
 // `crate::ccl::`, the path the rest of the crate (and the interpreter, which
