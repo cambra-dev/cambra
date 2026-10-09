@@ -58,7 +58,10 @@ pub(super) fn lower_call(
                      is not one",
                 ));
             }
-            return lower_application(member, func.span, args, ctx);
+            if member.mut_param {
+                return lower_curried_call(member.name, func.span, args, ctx);
+            }
+            return lower_application(member.name, func.span, args, ctx);
         }
         _ => {
             return Err(LoweringError::unsupported(
@@ -334,20 +337,32 @@ pub(super) fn lower_call(
             // argument variable into the named parameter — the route by which a
             // `MutWrite` to a `Mut` parameter lands on the caller's mutable variable.
             if ctx.is_mut_param_fn(name) {
-                // The callee `Var` images the function name the user wrote;
-                // the intermediate curried `Apply`s are manufactured (the
-                // outermost `Apply` is the call's image, tagged by `lower_expr`,
-                // whose entry overwrites the interim machinery tag).
-                let mut acc = ctx.tag_image(Expr::var(name.to_string()), func.span);
-                for arg in args {
-                    let applied = Expr::apply(lower_call_arg(arg, ctx)?, acc);
-                    acc = ctx.tag_machinery(applied, func.span, "lower.curried_call");
-                }
-                return Ok(acc);
+                return lower_curried_call(Name::raw(name), func.span, args, ctx);
             }
             lower_application(Name::raw(name), func.span, args, ctx)
         }
     }
+}
+
+/// The function `callee` names, a `def` with a `Mut` parameter written at
+/// `func_span`, applied to `args` as a curried application, the shape the `def`
+/// lowers to.
+fn lower_curried_call(
+    callee: Name,
+    func_span: Span,
+    args: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    // The callee `Var` images the function name the user wrote; the intermediate
+    // curried `Apply`s are manufactured (the outermost `Apply` is the call's
+    // image, tagged by `lower_expr`, whose entry overwrites the interim machinery
+    // tag).
+    let mut acc = ctx.tag_image(Expr::var(callee), func_span);
+    for arg in args {
+        let applied = Expr::apply(lower_call_arg(arg, ctx)?, acc);
+        acc = ctx.tag_machinery(applied, func_span, "lower.curried_call");
+    }
+    Ok(acc)
 }
 
 /// The function `callee` names, written at `func_span`, applied to `args`, a

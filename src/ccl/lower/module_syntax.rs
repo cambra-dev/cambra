@@ -98,7 +98,6 @@ impl Refusals {
                 ChlStmt::Param { .. } => Some("param"),
                 ChlStmt::Pub { .. } => Some("pub"),
                 ChlStmt::Discard(DiscardHead::Run { .. }) => Some("@Discard run"),
-                ChlStmt::Discard(DiscardHead::Import { .. }) => Some("@Discard import"),
                 _ => None,
             };
             if let Some(keyword) = keyword {
@@ -641,8 +640,6 @@ mod tests {
                 @Discard
                 run audit as old
                 @Discard
-                import ledger
-                @Discard
                 stock
             1
         "});
@@ -673,10 +670,6 @@ mod tests {
                 (
                     "@Discard\n    run audit as old\n",
                     "`@Discard run` stands only at a module's top level"
-                ),
-                (
-                    "@Discard\n    import ledger\n",
-                    "`@Discard import` stands only at a module's top level"
                 ),
                 ("@Discard\n    stock\n", "`@Discard` is not supported yet"),
             ]

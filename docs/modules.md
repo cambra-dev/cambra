@@ -1,9 +1,8 @@
 # Modules
 
-> **Status: [Sketched].** A proposed implementation. The first three items of the [Implementation
-> stack](#implementation-stack) are implemented, the first three parts of the fourth, importing
-> values, `use` clauses, and type aliases ([Imports](#imports)), and a shared run's member's `home`
-> ([Names carry their home](#names-carry-their-home)).
+> **Status: [Sketched].** A proposed implementation. The first four items of the [Implementation
+> stack](#implementation-stack) are implemented, and a shared run's member's `home` ([Names carry
+> their home](#names-carry-their-home)).
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -161,8 +160,8 @@ root file
                free
   → check      once per module: inference over the module alone, as chl-spec.md's "9.14
                Checking a module on its own" requires
-  → run sites  each import against the IO its module performs; each run's arguments against its
-               module's parameter types
+  → run sites  each import against the IO its module performs and the state it declares; each
+               run's arguments against its module's parameter types
   → link       one shared run per imported module, in link order; then the run tree from the root.
                Per run, a copy of its module's chain with fresh uids and each parameter bound to its
                argument; every Member name rewritten to the binder it names
@@ -234,23 +233,24 @@ qualifier of labels and tags, and `m::T` as a type.
   name spelled like one would never reach its member.
 - **Linking** replaces each placeholder with the code below it: every imported module once, in
   link order, around the root, the first in link order outermost.
-- **IO.** A module that declares a sink lowers nothing, and lowering records a module's first read
-  of a registered source. Each `import` of a module that does either is an error, labeled at the IO
-  site.
+- **IO and state.** A module that declares a sink or mutable state lowers nothing (`sink_site`,
+  `state_site`), and lowering records a module's first read of a registered source. Each `import` of
+  a module that does any of these is an error, labeled at the site (`Unimportable`).
+- **`Mut` parameters.** A call to an imported `def` with a `Mut` parameter, qualified or through
+  `use`, takes the curried shape the `def` lowers to.
 - **Labels.** An unqualified label belongs to the module that writes it, `this::` spells the same
   label, and `m::` qualifies the label of the module `m` names. `some` and `none` are `Option`'s in
   every module ([Names carry their home](#names-carry-their-home)).
-- **Refused:** a module as a value, an imported module's mutable state and top-level loops and
-  expression statements, a call to an imported `def` with a `Mut` parameter, and a member of a run.
-  The last part of the Imports item, and the later items, lift these.
+- **Refused:** a module as a value, an imported module's top-level loops and expression
+  statements, and a member of a run. The later items lift these.
 
 A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
 into it adds no error.
 
 ### The module interface
 
-Checking a module records whether the module performs IO, with the site that does, and, for each
-public member:
+Checking a module records whether the module performs IO or declares mutable state, with the site
+that does, and, for each public member:
 
 | Member | Recorded |
 | --- | --- |
@@ -264,7 +264,8 @@ private and point at it.
 
 A `def` with a `Mut` parameter lowers as a curried chain, and its call sites must match
 (`LoweringContext::mut_param_fns`). The interface carries that shape so a user's call site lowers
-correctly.
+correctly: a qualified callee reads it from the member, and a `use` name of such a `def` is
+registered in `mut_param_fns` when its module begins lowering.
 
 Each module is lowered with fresh block state. Every spelling-keyed map in `LoweringContext`
 (`transactional_vars`, `type_aliases`, `mut_param_fns`, `shadow_depth`) covers one module. The
@@ -378,7 +379,8 @@ compiled from. The line and column of a span are computed from the map when a di
 source cache is keyed by `FileId`, so a single report can label several files. Several errors do:
 
 - a private or missing member: primary label at the reference, secondary at the declaration;
-- an import of a module that performs IO: primary label at the `import`, secondary at the IO site;
+- an import of a module that performs IO or declares mutable state: primary label at the `import`,
+  secondary at the IO site or the state;
 - a module-graph cycle: one label per statement in the cycle;
 - a public name bound twice, and a conflict between an import, run, or parameter name and a member:
   both sites;
@@ -401,17 +403,16 @@ An inference error's span resolves through the lowering projection, as it does t
 
 - **State belongs to runs.** A `VarPath` begins with the run path, then the enclosing binding chain,
   spelling, and index as today. The run-path segment has its own variant, so a run `cart` and a
-  binding named `cart` never produce the same address. Display: ``eu::`a`.`n` ``. A shared run's
-  segment is its module path, in a variant of its own, so the shared run of `cart` and a run named
-  `cart` never produce the same address either.
+  binding named `cart` never produce the same address. Display: ``eu::`a`.`n` ``. A shared run
+  holds no state, so no address names one.
 - **A reload carries every file.** `/diff` and `/reload` take a bundle mapping each module path to
   its source, including the root's. The single-source request form is removed. Reading files from
   disk at reload time is not offered: `/diff` answers about exactly the version it was sent. Until
   the bundle exists, a posted version is its root file alone, and one that names a module is refused
   ([program-evolution.md, "The control port"](../src/ccl/design/program-evolution.md#the-control-port)).
-- **The run tree is diffed by run path**, and shared runs by module path. A run marked
-  `@RenamedFrom(eu)` pairs with the predecessor's run `eu` instead of its own path.
-- **`@Discard` on a run or an import** covers every address below its run path.
+- **The run tree is diffed by run path.** A run marked `@RenamedFrom(eu)` pairs with the
+  predecessor's run `eu` instead of its own path.
+- **`@Discard` on a run** covers every address below its run path.
 - **Held addresses are recorded in the branch table** ([program-evolution.md, "The branch table"](../src/ccl/design/program-evolution.md#the-branch-table)). A tombstone resolves against every
   version in the branch's ancestry ([chl-spec.md, "8.9 `@Discard` [Decided]"](chl-spec.md#89-discard-decided)),
   so each branch's entry keeps the set of `VarPath`s every version in its ancestry held. A reload
@@ -555,7 +556,9 @@ One PR per item, each updating the spec and design docs it touches:
       imports, visibility, qualified callees, labels and tags that carry their module.
    2. **`use` clauses.**
    3. **Imported type aliases**, closed over their module.
-   4. **Imported mutable state** and `Mut`-parameter functions.
+   4. **`Mut`-parameter functions**, and the refusal of importing a module that declares state:
+      state belongs to runs ([chl-spec.md, "9.7 Importing asserts no IO and no
+      state"](chl-spec.md#97-importing-asserts-no-io-and-no-state)).
 5. **Per-module checking.** Inference over one module against the interfaces it uses, contracts in
    the interface, `cambra check`.
 6. **Runs and parameters.** `Name::Member`, a run's `Unique::home`, the run tree, per-run copies of
@@ -596,7 +599,7 @@ the [Implementation stack](#implementation-stack).
   `{String where _ in stock.keys()}` over `stock: Mut(Map(String, Int), Txn)`, names a key set that
   changes with each commit. The compiler cannot name a mutable map's key set in a type today, in one
   file or several. Needed for a per-run type such as `InStock` ([chl-spec.md, "9.7 Importing
-  asserts no IO"](chl-spec.md#97-importing-asserts-no-io)).
+  asserts no IO and no state"](chl-spec.md#97-importing-asserts-no-io-and-no-state)).
 - **Link-time constants.** A value fixed once linking binds a run's arguments, such as a route
   address passed as a parameter. A run argument may be any expression, so this needs its own
   definition of which expressions are link-time constants and when they are evaluated. Until it

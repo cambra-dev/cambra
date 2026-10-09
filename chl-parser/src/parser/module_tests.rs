@@ -363,7 +363,7 @@ fn a_loaded_declaration_takes_pub_on_its_own_line() {
 // ---- @Discard -------------------------------------------------------------
 
 #[test]
-fn discard_marks_a_variable_a_run_or_an_import() {
+fn discard_marks_a_variable_or_a_run() {
     let Stmt::Discard(DiscardHead::Name(name)) = only_stmt(indoc! {"
         @Discard
         stock
@@ -380,13 +380,19 @@ fn discard_marks_a_variable_a_run_or_an_import() {
     };
     assert_eq!(path_of(&path), ["storefront"]);
     assert_eq!(alias.map(|a| a.node), Some("us".into()));
-    let Stmt::Discard(DiscardHead::Import { path }) = only_stmt(indoc! {"
+}
+
+/// An imported module holds no state, so `@Discard` has nothing to mark gone on
+/// an `import` (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state").
+#[test]
+fn discard_does_not_mark_an_import() {
+    assert!(
+        !errors(indoc! {"
         @Discard
         import inventory
-    "}) else {
-        panic!("expected a discarded import");
-    };
-    assert_eq!(path_of(&path), ["inventory"]);
+    "})
+        .is_empty()
+    );
 }
 
 #[test]
