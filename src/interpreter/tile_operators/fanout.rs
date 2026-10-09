@@ -880,6 +880,7 @@ impl TileOperator for Memo {
             ),
             cached_tile: self.tiling().empty_tile(),
             upstream_drained: false,
+            drain_probed: false,
             consumer,
             wakeups: scheduler.wakeup_queue(),
         })
@@ -899,9 +900,14 @@ struct MemoProducer {
     ///
     /// Once everything the input will ever produce is cached, pulling it again
     /// is pointless work: a conforming input answers empty for a region it has
-    /// released, which merges to nothing. So skipping the pull is an
-    /// *optimization*, and only release builds take it — see [`Self::get_impl`].
+    /// released, which merges to nothing. So skipping the pull is an optimization: a
+    /// release build always takes it, and a debug build once it has probed the drained
+    /// input — see [`Self::get_impl`].
     upstream_drained: bool,
+    /// Whether the drained input has been pulled since it last notified, which only a debug
+    /// build reads. A probe asks whether the input still answers empty for what it released;
+    /// until the input notifies, the answer cannot have changed.
+    drain_probed: bool,
     /// This memo's consumer, woken through [`wakeups`](Self::wakeups) when a pull nothing
     /// notified finds data the cache did not hold.
     ///
@@ -926,20 +932,22 @@ impl TileProducer for MemoProducer {
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        // Everything the input will ever produce is already cached, so the pull
-        // below can only return what was released — which a conforming input
-        // answers empty, merging to nothing. Skipping it saves the work.
+        // Everything the input will ever produce is already cached, so the pull below can
+        // only return what was released — which a conforming input answers empty, merging to
+        // nothing. A release build skips it.
         //
-        // Debug builds deliberately do *not* skip it. A `Memo` sits above most
-        // scalar producers, so short-circuiting here would shield every one of
-        // them from ever being pulled after a universal release — the exact
-        // state the release-contract assertion in `TileProducer::get` exists to
-        // check. Keeping the pull in debug turns this cache from a shield into a
-        // probe: an input that answers with released data trips the assertion at
-        // the input, where the defect is, instead of corrupting the cache here.
+        // A debug build probes instead, once after the input drains and again after each
+        // notification. A `Memo` sits above most scalar producers, so never pulling a drained
+        // input would shield every one of them from the release-contract assertion in
+        // `TileProducer::get`; the probe makes an input that answers with released data trip
+        // that assertion at the input, where the defect is, instead of corrupting the cache
+        // here. Probing on every pull adds nothing, since until the input notifies a second
+        // probe asks what the first answered, and it re-reads a subgraph once per path to it,
+        // which grows with the nesting of the fan-outs over it.
         //
         // `cfg!` rather than `#[cfg]` so both configurations stay compiled.
-        if self.upstream_drained && !cfg!(debug_assertions) {
+        let notified = self.base.notified.take();
+        if self.upstream_drained && (!cfg!(debug_assertions) || (self.drain_probed && !notified)) {
             return self.cached_tile.clone();
         }
         // The cache is cumulative, so when nothing has notified since the last pull it is
@@ -952,7 +960,6 @@ impl TileProducer for MemoProducer {
         // input, which on a first lap is mostly empty. A drained input is left to the rule
         // above rather than gated here, which is what keeps that rule's debug probe: gating
         // a drained input would shield it in every build.
-        let notified = self.base.notified.take();
         if !notified && !self.upstream_drained {
             debug_assert!(
                 projection_guard.is_universal(),
@@ -983,6 +990,8 @@ impl TileProducer for MemoProducer {
             );
         }
         trace!("{} releasing {upstream_obsolete:?}", self.name());
+        // A pull of an input already drained is the probe.
+        self.drain_probed = self.upstream_drained;
         // Latch: once the input has handed over everything, a later pull answering
         // empty (as a conforming input does for a region it released) must not
         // read as "not drained after all".
@@ -1286,6 +1295,45 @@ mod tests {
         assert_eq!(pulls.get(), 2, "a notification re-enables the read");
     }
 
+    /// A debug build probes a drained input once, then answers from the cache until the input
+    /// notifies, which allows one more probe. A release build never pulls a drained input.
+    #[test]
+    fn a_drained_memo_probes_its_input_once_per_notification() {
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let complete = Tile::Scalar(ColumnValue::Ints(vec![7]));
+        let (input, pulls, notifier) = Scripted::new(vec![complete.clone()], &tiling);
+        let mut memo = Memo::new(Box::new(input));
+        let mut sched = Scheduler::new();
+        let mut producer = memo.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut sched);
+        let probes = |n: usize| if cfg!(debug_assertions) { 1 + n } else { 1 };
+
+        assert_eq!(producer.get(tiling.universal_guard()), complete);
+        assert_eq!(
+            pulls.get(),
+            1,
+            "the first pull reads the input, which drains"
+        );
+        assert_eq!(producer.get(tiling.universal_guard()), complete);
+        assert_eq!(
+            pulls.get(),
+            probes(1),
+            "a debug build probes the drained input once"
+        );
+        assert_eq!(producer.get(tiling.universal_guard()), complete);
+        assert_eq!(
+            pulls.get(),
+            probes(1),
+            "nothing notified, so the probe is not repeated"
+        );
+        notify(&notifier);
+        assert_eq!(producer.get(tiling.universal_guard()), complete);
+        assert_eq!(
+            pulls.get(),
+            probes(2),
+            "a notification allows one more probe"
+        );
+    }
+
     /// An **empty** cache is gated like any other once the input has been read: the first
     /// pull reads, because the flag starts set, and from then on the input's next change
     /// notifies. The input here yields nothing on the first pull and the row on the second.
@@ -1322,10 +1370,10 @@ mod tests {
     /// complete tile, and from then on the cache is the value: repeated pulls
     /// answer the same single scalar.
     ///
-    /// This has to hold in both build configurations, because only release builds
-    /// skip the upstream pull (see [`MemoProducer::get_impl`]). A debug build
-    /// re-pulls, and the input — honoring the release it was just handed — answers
-    /// empty, which merges to nothing. Were the input to answer with the released
+    /// This has to hold in both build configurations, because a debug build probes the
+    /// drained input (see [`MemoProducer::get_impl`]); this memo listens to no notification,
+    /// so it probes on every pull. The input — honoring the release it was just handed —
+    /// answers empty, which merges to nothing. Were the input to answer with the released
     /// value again, `merge` would append it: a `Tile::Scalar`'s positions are
     /// implicit, so it cannot tell "this position again" from "one more position",
     /// and one value would silently become two, then three.
@@ -1339,6 +1387,7 @@ mod tests {
             input: Box::new(upstream),
             cached_tile: tiling.empty_tile(),
             upstream_drained: false,
+            drain_probed: false,
             consumer: shared_consumer(Box::new(|| {})).0,
             wakeups: WakeupQueue::default(),
         };
