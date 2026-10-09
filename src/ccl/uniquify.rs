@@ -42,10 +42,12 @@
 //! `crate::ccl::scope`.)
 //!
 //! Type-borne refinement predicates are full terms and are walked under the
-//! environment of their syntactic origin (a `Cast` target or a user
-//! annotation — pre-inference, predicates exist nowhere else): their free
-//! variables resolve against that origin's lexical scope, and binders *inside*
-//! a predicate mint like any other. The reserved [`crate::ccl::REFINEMENT_BINDER`] is
+//! environment of their syntactic origin (a `Cast` target, a user annotation,
+//! or a type alias's [`LetType`](crate::ccl::TypedExprNode::LetType) —
+//! pre-inference, predicates exist nowhere else): their free variables resolve
+//! against that origin's lexical scope, and binders *inside* a predicate mint
+//! like any other. The pass removes each `LetType`, which has no job left once
+//! its predicates are resolved. The reserved [`crate::ccl::REFINEMENT_BINDER`] is
 //! bound by the refinement itself, never enters the environment, and stays
 //! raw — it is deliberately one shared name (see [`crate::ccl::Refinement`]).
 //! Predicates are immutable `Rc<TypedExpr>`, so uniquifying one **rebuilds**
@@ -77,6 +79,8 @@ use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::{Expr, Name, Type, TypedBinding, TypedExprNode};
+#[cfg(debug_assertions)]
+use crate::ccl::{PredicateId, Refinement};
 
 /// Every **distinct** refinement-predicate term reachable from `expr`, as a
 /// multiset of their id-sets, deduped by `Rc` pointer.
@@ -148,6 +152,8 @@ pub fn run(mut expr: Expr) -> Expr {
         // predicate it rebuilds, so no original survives beside its rebuild. The
         // tripwire below asserts that 1:1 correspondence on every compile.
         memo: PredMemo::replacing(),
+        #[cfg(debug_assertions)]
+        undeclared_aliases: alias_predicates(&expr),
     };
     u.expr(&mut expr);
     debug_assert!(
@@ -161,8 +167,8 @@ pub fn run(mut expr: Expr) -> Expr {
         let after_ids = collect_node_ids(&expr);
         debug_assert_eq!(
             before_ids, after_ids,
-            "uniquify must preserve every NodeId (1:1 in-place rename); \
-             provenance ids are stable across this pass"
+            "uniquify must preserve every NodeId but a removed `LetType`'s (1:1 in-place \
+             rename); provenance ids are stable across this pass"
         );
         let after_preds = distinct_predicate_terms(&expr);
         debug_assert_eq!(
@@ -204,11 +210,24 @@ struct Uniquifier {
     /// free variables against `env` — context the memo key does not name (see
     /// [`PredMemo`]'s note on key-determined transforms). Lowering shares a
     /// predicate `Rc` across slots only by *copying one refinement*, so every
-    /// occurrence sharing an `Rc` sits in one scope. Two occurrences that *should* uniquify
+    /// occurrence sharing an `Rc` sits in one scope, or is a use of a type alias.
+    /// A type alias's uses share its predicates across scopes, and its `LetType`
+    /// is walked before any of them, since every use lies in the `LetType`'s body
+    /// (`docs/chl-spec.md`, "6.7 Type-alias statements"); the entry made there is
+    /// the declaration's resolution. A use outside the body resolves each free
+    /// name as the `LetType` does ([`Self::undeclared_aliases`]). Two occurrences that *should* uniquify
     /// differently — the same predicate spelling under two different bindings —
     /// arrive as distinct `Rc`s, which is what the scope-blind-equality test at the
     /// bottom of this file pins.
     memo: PredMemo,
+    /// The predicates of the type aliases whose `LetType` the walk has not reached,
+    /// each with what its free names resolved to at the first use reached, if one
+    /// was. That use fills [`Self::memo`] with the resolution in its own scope, and
+    /// every later occurrence takes it, so the `LetType` asserts that it resolves
+    /// each name the same way. A nominal constructor's parameter type is such a use
+    /// (`src/ccl/design/ir.md`, "Type aliases resolve where they are declared").
+    #[cfg(debug_assertions)]
+    undeclared_aliases: HashMap<PredicateId, EarlyResolution>,
 }
 
 impl Uniquifier {
@@ -389,6 +408,17 @@ impl Uniquifier {
                 }
             }
 
+            // A type alias's predicates resolve here, in the scope its declaration
+            // sees. Every use of the alias shares these predicate terms, and a
+            // predicate is rebuilt once, so the uses get this resolution. The node
+            // then gives way to its body below.
+            TypedExprNode::LetType { ty, body, .. } => {
+                #[cfg(debug_assertions)]
+                for_each_predicate(ty, &mut |r| self.assert_resolved_as_declared(r));
+                self.ty(ty);
+                self.expr(body);
+            }
+
             // The cast target is a type slot `walk_children_mut` skips; its
             // refinement predicate is the main anchor lowering emits.
             TypedExprNode::Cast { value, target } => {
@@ -403,6 +433,9 @@ impl Uniquifier {
         if lambda {
             e.ty = e_ty;
         }
+        if let TypedExprNode::LetType { body, .. } = &mut e.node {
+            *e = std::mem::take(body.as_mut());
+        }
     }
 
     /// Walk a refinement-bearing type, uniquifying each predicate under the
@@ -415,6 +448,8 @@ impl Uniquifier {
             // which re-enters this same memo through `self.expr` → `self.ty`.
             let memo = self.memo.clone();
             refinements.rewrite_each(|_, r| {
+                #[cfg(debug_assertions)]
+                self.record_early_resolution(r);
                 memo.rebuild(r, &(), |pred| {
                     self.expr(pred);
                     true
@@ -422,6 +457,42 @@ impl Uniquifier {
             });
         }
         t.walk_children_mut(|c| self.ty(c));
+    }
+
+    /// Record what `r`'s free names resolve to here, when `r` is a type alias's
+    /// predicate that no use has reached before and whose `LetType` the walk has
+    /// not reached ([`Self::undeclared_aliases`]).
+    #[cfg(debug_assertions)]
+    fn record_early_resolution(&mut self, r: &Refinement) {
+        if let Some(None) = self.undeclared_aliases.get(&r.predicate_id()) {
+            let resolved = crate::ccl::subst::refinement_free_vars(r)
+                .into_iter()
+                .map(|raw| {
+                    let at_use = self.resolve(&raw);
+                    (raw, at_use)
+                })
+                .collect();
+            self.undeclared_aliases
+                .insert(r.predicate_id(), Some(resolved));
+        }
+    }
+
+    /// Assert, at `r`'s `LetType`, that a use of the alias reached before it
+    /// resolved each of `r`'s free names as this scope does
+    /// ([`Self::undeclared_aliases`]).
+    #[cfg(debug_assertions)]
+    fn assert_resolved_as_declared(&mut self, r: &Refinement) {
+        let Some(Some(resolved)) = self.undeclared_aliases.remove(&r.predicate_id()) else {
+            return;
+        };
+        for (raw, at_use) in resolved {
+            let declared = self.resolve(&raw);
+            assert_eq!(
+                at_use, declared,
+                "uniquify: a use of a type alias reached before the alias's `LetType` \
+                 resolves `{raw}` in its own scope, not as the declaration does"
+            );
+        }
     }
 
     /// Walk the type slots riding a binding site itself. These are in the
@@ -472,6 +543,37 @@ impl Uniquifier {
     }
 }
 
+/// What the free names of a type alias's predicate resolve to at the first use
+/// uniquify reaches above the alias's `LetType`, or `None` until one is reached
+/// ([`Uniquifier::undeclared_aliases`]).
+#[cfg(debug_assertions)]
+type EarlyResolution = Option<Vec<(Name, Option<Name>)>>;
+
+/// The predicates the `LetType`s in `expr` hold, none reached by a use yet
+/// ([`Uniquifier::undeclared_aliases`]).
+#[cfg(debug_assertions)]
+fn alias_predicates(expr: &Expr) -> HashMap<PredicateId, EarlyResolution> {
+    fn go(e: &Expr, out: &mut HashMap<PredicateId, EarlyResolution>) {
+        if let TypedExprNode::LetType { ty, .. } = &e.node {
+            for_each_predicate(ty, &mut |r| {
+                out.insert(r.predicate_id(), None);
+            });
+        }
+        e.walk_children(|c| go(c, out));
+    }
+    let mut out = HashMap::new();
+    go(expr, &mut out);
+    out
+}
+
+/// Call `f` on each refinement in `ty` and the types inside it, not descending into
+/// a predicate.
+#[cfg(debug_assertions)]
+fn for_each_predicate(ty: &Type, f: &mut impl FnMut(&Refinement)) {
+    ty.refinements().iter().for_each(&mut *f);
+    ty.walk_children(|c| for_each_predicate(c, f));
+}
+
 /// Collect the sorted multiset of every node's [`NodeId`] reachable from
 /// `expr`, mirroring the exact set of nodes [`Uniquifier::expr`] visits —
 /// the main expression tree *and* the [`TypedExpr`]s living inside type-borne
@@ -504,6 +606,12 @@ fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
     }
 
     fn from_expr(e: &Expr, out: &mut Vec<NodeId>) {
+        // Uniquify removes a `LetType`, so neither its id nor its type survives the
+        // pass. The predicates of that type ride the alias's uses too, and those
+        // occurrences are counted where they stand.
+        if let TypedExprNode::LetType { body, .. } = &e.node {
+            return from_expr(body, out);
+        }
         out.push(e.node_id());
         from_ty(&e.ty, out);
         if let Some(ann) = &e.user_annotation {
@@ -865,5 +973,31 @@ mod tests {
         assert_eq!(lambda_body.node, TypedExprNode::Var(f_rec.clone()));
         // The letrec body's f is the group's, shadowing the outer let.
         assert_eq!(rec_body.node, TypedExprNode::Var(f_rec.clone()));
+    }
+
+    /// A use of a type alias that uniquify reaches above the alias's `LetType`
+    /// resolves the alias's predicate in the use's scope, so a debug build refuses
+    /// one that resolves a name differently from the declaration.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "resolves `k` in its own scope, not as the declaration does")]
+    fn an_alias_use_above_its_let_type_resolving_a_name_differently_is_refused() {
+        let expr = lower_only(indoc::indoc! {"
+            k = 0
+            Pos = {Int where _ > k}
+            x: Pos = 1
+            x
+        "});
+        fn alias_type(e: &Expr) -> Option<Type> {
+            if let TypedExprNode::LetType { ty, .. } = &e.node {
+                return Some(ty.clone());
+            }
+            let mut found = None;
+            e.walk_children(|c| found = found.take().or_else(|| alias_type(c)));
+            found
+        }
+        let ty = alias_type(&expr).expect("the alias lowers to a `LetType`");
+        let above = TypedBinding::new_annotated("y", ty);
+        run(Expr::let_in(above, Expr::lit(Lit::Int(1)), expr));
     }
 }

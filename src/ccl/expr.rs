@@ -375,6 +375,23 @@ pub enum TypedExprNode {
         body: Box<TypedExpr>,
     },
 
+    /// A type alias declaration: `let type name = ty in body`.
+    ///
+    /// Binds no value. Lowering expands every use of the alias to `ty`, so the node
+    /// holds `ty` where the alias is declared, and nothing refers to `name`.
+    /// [`crate::ccl::uniquify`] resolves the free names of `ty`'s refinement
+    /// predicates in the scope the declaration sees, then replaces the node with
+    /// `body`, so no pass after it sees one (`src/ccl/design/ir.md`, "Type
+    /// aliases resolve where they are declared").
+    LetType {
+        /// The alias's spelling, for rendering.
+        name: String,
+        /// The type the alias names.
+        ty: Type,
+        /// The rest of the block the alias is declared in.
+        body: Box<TypedExpr>,
+    },
+
     /// A list literal: `[e0, e1, ...]`.
     ///
     /// Represents Python list syntax directly in the CCL tree. Elements may be
@@ -854,6 +871,7 @@ impl TypedExprNode {
             TypedExprNode::Lambda { .. } => "Lambda",
             TypedExprNode::Aggregate { .. } => "Aggregate",
             TypedExprNode::Let { .. } => "Let",
+            TypedExprNode::LetType { .. } => "LetType",
             TypedExprNode::MutDecl { .. } => "MutDecl",
             TypedExprNode::List(_) => "List",
             TypedExprNode::Case { .. } => "Case",
@@ -1433,6 +1451,16 @@ impl TypedExpr {
         .with_ty(ty)
     }
 
+    /// Construct a [`TypedExprNode::LetType`] — the type alias `name = ty`, declared
+    /// over `body`.
+    pub fn let_type(name: impl Into<String>, ty: Type, body: Self) -> Self {
+        Self::new(TypedExprNode::LetType {
+            name: name.into(),
+            ty,
+            body: Box::new(body),
+        })
+    }
+
     /// Construct a [`TypedExprNode::MutDecl`] — a mutable variable introduction `x := init`.
     ///
     /// `history` is the binder's `Mut(V, D)` type: `V` the declared value type (a
@@ -1736,6 +1764,7 @@ impl TypedExpr {
                 f(init.as_ref());
                 f(body.as_ref());
             }
+            TypedExprNode::LetType { body, .. } => f(body.as_ref()),
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
@@ -1942,6 +1971,7 @@ impl TypedExpr {
                 f(init.as_mut());
                 f(body.as_mut());
             }
+            TypedExprNode::LetType { body, .. } => f(body.as_mut()),
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
@@ -2075,6 +2105,7 @@ impl TypedExpr {
             | TypedExprNode::Feed { .. }
             | TypedExprNode::Define { .. }
             | TypedExprNode::MutWrite { .. }
+            | TypedExprNode::LetType { .. }
             | TypedExprNode::Transact { .. } => {}
         }
     }
@@ -2130,6 +2161,7 @@ impl TypedExpr {
             | TypedExprNode::Feed { .. }
             | TypedExprNode::Define { .. }
             | TypedExprNode::MutWrite { .. }
+            | TypedExprNode::LetType { .. }
             | TypedExprNode::Transact { .. } => {}
         }
     }
@@ -2182,7 +2214,9 @@ impl TypedExpr {
         if let Some(annotation) = &self.user_annotation {
             f(annotation);
         }
-        if let TypedExprNode::Cast { target, .. } = &self.node {
+        if let TypedExprNode::Cast { target, .. } | TypedExprNode::LetType { ty: target, .. } =
+            &self.node
+        {
             f(target);
         }
         if let TypedExprNode::Transact {
@@ -2210,7 +2244,9 @@ impl TypedExpr {
         if let Some(annotation) = &mut self.user_annotation {
             f(annotation);
         }
-        if let TypedExprNode::Cast { target, .. } = &mut self.node {
+        if let TypedExprNode::Cast { target, .. } | TypedExprNode::LetType { ty: target, .. } =
+            &mut self.node
+        {
             f(target);
         }
         if let TypedExprNode::Transact {
