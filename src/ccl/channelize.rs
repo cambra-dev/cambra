@@ -1431,7 +1431,6 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => {
             assert_no_defer_residue(value)
         }
-        TypedExprNode::Begin { body } => assert_no_defer_residue(body),
         TypedExprNode::BinOp { left, right, .. } => {
             assert_no_defer_residue(left)?;
             assert_no_defer_residue(right)
@@ -1473,17 +1472,15 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
                 .try_for_each(|(_, def)| assert_no_defer_residue(def))?;
             assert_no_defer_residue(body)
         }
-        // Pre-phase markers are not defer residue (v1 lowering guarantees no
-        // defer nodes inside them); check their subtrees structurally.
-        TypedExprNode::For { iter, body, .. } => {
-            assert_no_defer_residue(iter)?;
-            assert_no_defer_residue(body)
-        }
-        TypedExprNode::MutWrite { key, value, .. } => {
-            if let Some(key) = key {
-                assert_no_defer_residue(key)?;
-            }
-            assert_no_defer_residue(value)
+        // `mut_elim::run` eliminates every `For`/`MutWrite` marker and
+        // `transact_phase::run` every `Begin`, both before channelize.
+        TypedExprNode::For { .. }
+        | TypedExprNode::MutWrite { .. }
+        | TypedExprNode::Begin { .. } => {
+            unreachable!(
+                "a For/MutWrite/Begin reached channelize; mut_elim and transact_phase must have \
+                 eliminated it"
+            )
         }
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
