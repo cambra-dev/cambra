@@ -2,21 +2,11 @@
 
 use crate::interpreter::{FunctionGuard, TileGuard, Tiling};
 
-/// Which curried domain of a tiling an operator acts at, counted from the outside.
-///
-/// A collection tiling is a curried data function `K₀ ⤇ K₁ ⤇ … ⤇ V` — one `⤇` per
-/// level, which a tile stores Compressed-Sparse-Row-wise as one [`Tile::DataFunction`] per
-/// level. `CurryLevel(0)` is `K₀` and `CurryLevel(n)` is `Kₙ`, grouped by the `n` levels
-/// above it; `CurryLevel(levels)` is the values every level stands over, which is the
-/// level an operator that replaces a codomain acts at. An operator acts at one level and
-/// leaves the rest standing.
-///
-/// **The level is stated once, at construction, and read back from there.** The index is
-/// also the number of levels above, so a site could re-derive it as `levels() − k` for its own
-/// `k`; one that does reads a level its operator was not built with. See
-/// `src/interpreter/design-operators.md`, "Curry levels".
-///
-/// [`Tile::DataFunction`]: crate::interpreter::Tile::DataFunction
+/// Zero-based collection level, counted from the outermost domain.
+/// For `K₀ ⤇ … ⤇ Kₙ ⤇ V`, indices `0..=n` address collection levels and `n + 1`
+/// addresses `V`. Operators retain the level selected at construction rather than
+/// deriving it again from each input's depth.
+/// See `src/interpreter/design-operators.md`, "Curry levels".
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CurryLevel(usize);
 
@@ -47,13 +37,9 @@ impl CurryLevel {
         self.0.checked_sub(1).map(CurryLevel)
     }
 
-    /// This level counted from a **codomain** rather than from the whole tile, which is the
-    /// rebase a recursive accessor takes when it steps one level in.
-    ///
-    /// The same arithmetic as [`enclosing`](Self::enclosing) and a different level: that
-    /// one names the level above this, where this names *this* level from inside. Panics
-    /// at [`OUTERMOST`](Self::OUTERMOST), which is the accessors' base case and so never
-    /// stepped past.
+    /// Rebase this level after an accessor descends into a codomain.
+    /// Unlike [`enclosing`](Self::enclosing), this still addresses the same collection.
+    /// Panics at [`OUTERMOST`](Self::OUTERMOST), the accessors' base case.
     pub fn in_codomain(self) -> Self {
         CurryLevel(
             self.0
