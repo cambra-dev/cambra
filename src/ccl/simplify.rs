@@ -438,6 +438,31 @@ fn as_const(expr: &Expr) -> Option<&Expr> {
     None
 }
 
+/// Takes `zip_pair(f, g)` apart into `(f, g)`.
+///
+/// The by-value counterpart of [`as_zip`]: callers pass a term [`as_zip`] accepted, and any
+/// other term is unreachable.
+fn into_zip(expr: Expr) -> (Expr, Expr) {
+    let TypedExprNode::Tuple(elts) = into_applied(expr).node else {
+        unreachable!()
+    };
+    let Ok([f, g]) = <[Expr; 2]>::try_from(elts) else {
+        unreachable!()
+    };
+    (f, g)
+}
+
+/// Takes the argument `x` out of `curry(x)` or `const_(x)`.
+///
+/// The by-value counterpart of [`as_curry`] and [`as_const`]: callers pass a term one of them
+/// accepted, and any term other than an [`TypedExprNode::Apply`] is unreachable.
+fn into_applied(expr: Expr) -> Expr {
+    let TypedExprNode::Apply { argument, .. } = expr.node else {
+        unreachable!()
+    };
+    *argument
+}
+
 /// Returns `(left, right)` if `expr` is a two-element [`TypedExprNode::Compose`].
 ///
 /// Used for inner sub-composes that are always binary (e.g. `.0 ≫ curry(f)`).
@@ -852,21 +877,8 @@ fn try_product_beta_fst(expr: &mut Expr) -> bool {
         expr,
         |left, right| is_proj_idx(right, 0) && as_zip(left).is_some(),
         |left, _proj, _mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            vec![elts.swap_remove(0)]
+            let (f, _) = into_zip(left);
+            vec![f]
         },
     )
 }
@@ -924,21 +936,8 @@ fn try_product_beta_snd(expr: &mut Expr) -> bool {
         expr,
         |left, right| is_proj_idx(right, 1) && as_zip(left).is_some(),
         |left, _proj, _mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            vec![elts.swap_remove(1)]
+            let (_, g) = into_zip(left);
+            vec![g]
         },
     )
 }
@@ -956,21 +955,7 @@ fn try_ccc_universal(expr: &mut Expr) -> bool {
                 })
         },
         |left, _apply, _mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            let r = elts.swap_remove(1);
+            let (_, r) = into_zip(left);
             let TypedExpr {
                 node: TypedExprNode::Compose(mut r_elts),
                 ..
@@ -978,15 +963,7 @@ fn try_ccc_universal(expr: &mut Expr) -> bool {
             else {
                 unreachable!()
             };
-            let curry_f = r_elts.pop().unwrap();
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument: f, .. },
-                ..
-            } = curry_f
-            else {
-                unreachable!()
-            };
-            vec![*f]
+            vec![into_applied(r_elts.pop().unwrap())]
         },
     )
 }
@@ -1000,29 +977,8 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
                 && as_zip(left).is_some_and(|(_, r)| as_curry(r).is_some())
         },
         |left, _apply, mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            let curry_h = elts.swap_remove(1);
-            let g = elts.swap_remove(0);
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument: h, .. },
-                ..
-            } = curry_h
-            else {
-                unreachable!()
-            };
+            let (g, curry_h) = into_zip(left);
+            let h = into_applied(curry_h);
             // Type id: A → A where A = domain(g).  Type zip(id, g): A → (A, B)
             // where g: A → B.  Both fall back to Hole if g has no concrete type.
             //
@@ -1058,7 +1014,7 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
             };
             let id_node = id().with_ty(id_ty);
             let zip_node = zip_pair(id_node, g, mint_kind).with_ty(zip_ty);
-            vec![zip_node, *h]
+            vec![zip_node, h]
         },
     )
 }
@@ -1083,29 +1039,8 @@ fn try_partial_lookup(expr: &mut Expr) -> bool {
                 && as_zip(left).is_some_and(|(l, _)| as_const(l).is_some())
         },
         |left, lookup, mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            let keys = elts.swap_remove(1);
-            let const_c = elts.swap_remove(0);
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument: c, .. },
-                ..
-            } = const_c
-            else {
-                unreachable!()
-            };
+            let (const_c, keys) = into_zip(left);
+            let c = into_applied(const_c);
             // `curry(lookup?) : 𝐶 ⇒ (𝐾 ⇒ Option(𝑉))`, and applying it at `𝑐` leaves the
             // morphism the keys compose into. Both types are read off `lookup?`'s own
             // stamped pair type, which inference made concrete.
@@ -1127,7 +1062,7 @@ fn try_partial_lookup(expr: &mut Expr) -> bool {
                     .with_ty(Type::fun(lookup_ty.clone(), curry_ty.clone())),
             )
             .with_ty(curry_ty);
-            let partial = Expr::apply(*c, curry_of_lookup).with_ty(at_key);
+            let partial = Expr::apply(c, curry_of_lookup).with_ty(at_key);
             vec![keys, partial]
         },
     )
@@ -1212,30 +1147,8 @@ fn try_const_apply(expr: &mut Expr) -> bool {
                 && as_zip(left).is_some_and(|(_, r)| as_const(r).is_some())
         },
         |left, _apply, _mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            let const_g = elts.swap_remove(1);
-            let f = elts.swap_remove(0);
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument: g, .. },
-                ..
-            } = const_g
-            else {
-                unreachable!()
-            };
-            vec![f, *g]
+            let (f, const_g) = into_zip(left);
+            vec![f, into_applied(const_g)]
         },
     )
 }
@@ -1262,22 +1175,8 @@ fn try_product_eta(expr: &mut Expr) -> bool {
         })
     });
     if matched {
-        let TypedExpr {
-            node: TypedExprNode::Apply { argument, .. },
-            ty,
-            ..
-        } = take(expr)
-        else {
-            unreachable!()
-        };
-        let TypedExpr {
-            node: TypedExprNode::Tuple(mut elts),
-            ..
-        } = *argument
-        else {
-            unreachable!()
-        };
-        let left_compose = elts.swap_remove(0);
+        let ty = expr.ty.clone();
+        let (left_compose, _) = into_zip(take(expr));
         let TypedExpr {
             node: TypedExprNode::Compose(mut compose_elts),
             ..
@@ -1291,7 +1190,7 @@ fn try_product_eta(expr: &mut Expr) -> bool {
         } else {
             Expr::compose(compose_elts)
         };
-        *expr = f.with_ty(ty.clone());
+        *expr = f.with_ty(ty);
         return true;
     }
     false
@@ -1425,41 +1324,18 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
     if matched {
         let curry_ty = expr.ty.clone();
         let TypedExpr {
-            node: TypedExprNode::Apply {
-                argument: inner, ..
-            },
-            ..
-        } = take(expr)
-        else {
-            unreachable!()
-        };
-        let TypedExpr {
             node: TypedExprNode::Compose(mut inner_elts),
             ..
-        } = *inner
+        } = into_applied(take(expr))
         else {
             unreachable!()
         };
         // `𝑔`: everything the curried function's result flows through.
         let mut suffix = inner_elts.split_off(2);
         let _apply = inner_elts.pop().unwrap();
-        let zip_node = inner_elts.pop().unwrap();
-        let TypedExpr {
-            node: TypedExprNode::Apply { argument, .. },
-            ..
-        } = zip_node
-        else {
-            unreachable!()
-        };
-        let TypedExpr {
-            node: TypedExprNode::Tuple(mut elts),
-            ..
-        } = *argument
-        else {
-            unreachable!()
-        };
+        let (_, proj0f) = into_zip(inner_elts.pop().unwrap());
         // `𝑓`: the `.0` arm with its projection dropped, absent for a bare `.0`.
-        let f = match elts.swap_remove(1).node {
+        let f = match proj0f.node {
             TypedExprNode::Compose(mut compose_elts) => Some(compose_elts.pop().unwrap()),
             _ => None,
         };
