@@ -376,12 +376,18 @@ fn lower_for_body_stmts_scoped(
 
     // Each item carries its statement's span so the `Let` or `ExprStmt` folded around
     // the terminal below can be tagged as that statement's direct image.
-    let mut prefix: Vec<PrefixStmt> = Vec::new();
+    let mut prefix: Vec<PrefixStmt<'_>> = Vec::new();
 
     for (_, stmt) in contributing {
         match &stmt.node {
-            // A type alias binds nothing, so it contributes no `Let` to the frame.
-            ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {}
+            // A type alias binds no value, so it contributes no `Let` to the frame,
+            // only the `LetType` its predicates resolve at.
+            ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
+                prefix.push(PrefixStmt::Alias {
+                    target,
+                    span: stmt.span,
+                });
+            }
             ChlStmt::Assign {
                 target,
                 value,
@@ -567,14 +573,18 @@ fn lower_for_body_stmts_scoped(
                 span,
             } => (Expr::let_bind_with(name, value, body, transparency), span),
             PrefixStmt::Effect { effect, span } => (Expr::expr_stmt(effect, body), span),
+            // Imaged by `lower_type_alias_decl` itself.
+            PrefixStmt::Alias { target, span } => {
+                return lower_type_alias_decl(target, span, body, ctx);
+            }
         };
         ctx.tag_image(wrapped, span)
     }))
 }
 
 /// One statement of a for-loop body that is not its last: a binding the rest of the
-/// body reads, or an effect sequenced before it.
-enum PrefixStmt {
+/// body reads, an effect sequenced before it, or a type alias declared over it.
+enum PrefixStmt<'a> {
     Bind {
         name: String,
         value: Expr,
@@ -584,6 +594,10 @@ enum PrefixStmt {
     },
     Effect {
         effect: Expr,
+        span: Span,
+    },
+    Alias {
+        target: &'a Spanned<AssignTarget>,
         span: Span,
     },
 }
@@ -1227,14 +1241,13 @@ fn lower_loop_body_chain_scoped(
             .collect();
         let acc_names = in_scope.as_slice();
         chain = match &stmt.node {
+            ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
+                lower_type_alias_decl(target, stmt.span, chain, ctx)
+            }
             // `x = value` — a plain immutable binding. Inside a loop body it
             // is a per-iteration shadowing `let`, *never* a mutable write: `=`
             // is not a mutation operator (accumulators are written with `:=`
             // / `+=`). A loop-carried accumulator therefore never appears here.
-            // A type alias binds nothing, so the chain passes through unchanged.
-            ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
-                chain
-            }
             ChlStmt::Assign {
                 target,
                 value,

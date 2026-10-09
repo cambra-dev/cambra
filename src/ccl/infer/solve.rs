@@ -1324,6 +1324,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             let binding_name = binding.name.clone();
             with_shadows(ctx, [binding_name], |ctx| coalesce_node(body, level, ctx));
         }
+        TypedExprNode::LetType { .. } => {
+            unreachable!("uniquify removes every `LetType`")
+        }
         // A mutable variable introduction, resolved exactly like a monomorphic `let`: the
         // seed one level deeper, the binder slot resolved in place (it holds the
         // history `emit_mut_decl` bound it at), the body under the shadow. A

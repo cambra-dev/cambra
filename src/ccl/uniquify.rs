@@ -42,10 +42,12 @@
 //! `crate::ccl::scope`.)
 //!
 //! Type-borne refinement predicates are full terms and are walked under the
-//! environment of their syntactic origin (a `Cast` target or a user
-//! annotation — pre-inference, predicates exist nowhere else): their free
-//! variables resolve against that origin's lexical scope, and binders *inside*
-//! a predicate mint like any other. The reserved [`crate::ccl::REFINEMENT_BINDER`] is
+//! environment of their syntactic origin (a `Cast` target, a user annotation,
+//! or a type alias's [`LetType`](crate::ccl::TypedExprNode::LetType) —
+//! pre-inference, predicates exist nowhere else): their free variables resolve
+//! against that origin's lexical scope, and binders *inside* a predicate mint
+//! like any other. The pass removes each `LetType`, which has no job left once
+//! its predicates are resolved. The reserved [`crate::ccl::REFINEMENT_BINDER`] is
 //! bound by the refinement itself, never enters the environment, and stays
 //! raw — it is deliberately one shared name (see [`crate::ccl::Refinement`]).
 //! Predicates are immutable `Rc<TypedExpr>`, so uniquifying one **rebuilds**
@@ -161,8 +163,8 @@ pub fn run(mut expr: Expr) -> Expr {
         let after_ids = collect_node_ids(&expr);
         debug_assert_eq!(
             before_ids, after_ids,
-            "uniquify must preserve every NodeId (1:1 in-place rename); \
-             provenance ids are stable across this pass"
+            "uniquify must preserve every NodeId but a removed `LetType`'s (1:1 in-place \
+             rename); provenance ids are stable across this pass"
         );
         let after_preds = distinct_predicate_terms(&expr);
         debug_assert_eq!(
@@ -204,7 +206,11 @@ struct Uniquifier {
     /// free variables against `env` — context the memo key does not name (see
     /// [`PredMemo`]'s note on key-determined transforms). Lowering shares a
     /// predicate `Rc` across slots only by *copying one refinement*, so every
-    /// occurrence sharing an `Rc` sits in one scope. Two occurrences that *should* uniquify
+    /// occurrence sharing an `Rc` sits in one scope, or is a use of a type alias.
+    /// A type alias's uses share its predicates across scopes, and its `LetType`
+    /// is walked before any of them, since every use lies in the `LetType`'s body
+    /// (`docs/chl-spec.md`, "6.7 Type-alias statements"); the entry made there is
+    /// the declaration's resolution. Two occurrences that *should* uniquify
     /// differently — the same predicate spelling under two different bindings —
     /// arrive as distinct `Rc`s, which is what the scope-blind-equality test at the
     /// bottom of this file pins.
@@ -388,6 +394,15 @@ impl Uniquifier {
                 }
             }
 
+            // A type alias's predicates resolve here, in the scope its declaration
+            // sees. Every use of the alias shares these predicate terms, and a
+            // predicate is rebuilt once, so the uses get this resolution. The node
+            // then gives way to its body below.
+            TypedExprNode::LetType { ty, body, .. } => {
+                self.ty(ty);
+                self.expr(body);
+            }
+
             // The cast target is a type slot `walk_children_mut` skips; its
             // refinement predicate is the main anchor lowering emits.
             TypedExprNode::Cast { value, target } => {
@@ -401,6 +416,9 @@ impl Uniquifier {
         }
         if lambda {
             e.ty = e_ty;
+        }
+        if let TypedExprNode::LetType { body, .. } = &mut e.node {
+            *e = std::mem::take(body.as_mut());
         }
     }
 
@@ -503,6 +521,12 @@ fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
     }
 
     fn from_expr(e: &Expr, out: &mut Vec<NodeId>) {
+        // Uniquify removes a `LetType`, so neither its id nor its type survives the
+        // pass. The predicates of that type ride the alias's uses too, and those
+        // occurrences are counted where they stand.
+        if let TypedExprNode::LetType { body, .. } = &e.node {
+            return from_expr(body, out);
+        }
         out.push(e.node_id());
         from_ty(&e.ty, out);
         if let Some(ann) = &e.user_annotation {

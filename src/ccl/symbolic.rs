@@ -383,6 +383,14 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             )
         }
 
+        TypedExprNode::LetType { name, ty, body } => {
+            let body_str = fmt(body, Precedence::Lowest, opts);
+            (
+                Precedence::Lowest,
+                format!("let type {name} = {}\nin {body_str}", ty_at(ty, opts)),
+            )
+        }
+
         TypedExprNode::Let {
             binding,
             bound_expr: value,
