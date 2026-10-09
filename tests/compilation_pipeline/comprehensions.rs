@@ -99,6 +99,31 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
+/// A filter that **aggregates a collection**. The restrict evaluates the predicate per
+/// element, and the aggregate's operand is an iteration site inside it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// The predicate reads no element: `sum([1, 2]) > 2` holds, so every element stays.
+#[case::constant("sum([q for q in [1, 2, 3] if sum([1, 2]) > 2])", 6)]
+// `q > 2` keeps 3.
+#[case::beside_the_element("sum([q for q in [1, 2, 3] if q > max([1, 2])])", 3)]
+// A named collection: `q > 1` keeps 2 + 3.
+#[case::named_collection(
+    indoc! {r"
+        zs = [1, 2]
+        sum([q for q in [1, 2, 3] if q > sum(zs) - 2])
+    "},
+    5
+)]
+// A filtered collection: `sum([z for z in [1, 2] if z > 1])` is 2, so `q > 2` keeps 3.
+#[case::filtered_collection(
+    "sum([q for q in [1, 2, 3] if q > sum([z for z in [1, 2] if z > 1])])",
+    3
+)]
+fn a_filter_aggregates_a_collection(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
 // A *let-bound* (and therefore generalized) UDF referenced from inside a
 // filter predicate. The predicate's `f(x)` use lives inside the cast-target
 // refinement, not the main expression tree — exercising the coalesce walk's
