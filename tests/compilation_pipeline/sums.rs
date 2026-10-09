@@ -424,3 +424,21 @@ fn a_loop_over_a_sum_is_unsupported(#[case] code: &str) {
         "a `for` loop over a collection whose type is a sum is not supported yet",
     );
 }
+
+/// Not yet compiled: jagged rows summed inside a `def`. The same expression at top level
+/// compiles (`a_jagged_nested_collection_is_consumed_at_each_rows_own_domain`), so the witness listing that comes out empty
+/// is lost generalizing over the `def`, not in the comprehension. The generated grid's
+/// `function_body/rows_sum` and `generator_yield/rows_sum` cells are this program.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "post-inference produced an invalid tree")]
+fn a_def_body_summing_jagged_rows_does_not_compile() {
+    check_scalar(
+        indoc! {r"
+            def f(n):
+                sum([sum(r2) for r2 in [box([1, 2]), box([3])]])
+            f(3)
+        "},
+        Value::Int(6),
+    );
+}
