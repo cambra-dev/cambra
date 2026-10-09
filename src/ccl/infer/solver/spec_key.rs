@@ -352,6 +352,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Param(_)
+        | Type::DepTuple(_)
         | Type::Txn => KeyView::from_atom(
             AtomKey::from_type(ty).expect("every atomic type classifies as an AtomKey"),
         ),

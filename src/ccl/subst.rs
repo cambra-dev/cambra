@@ -1293,6 +1293,18 @@ impl Subst {
             }
 
             Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.rewrite_type_go(t, memo)),
+            // A component's name binds the components after it, as a `Fun`'s binds
+            // its codomain.
+            Type::DepTuple(cs) => {
+                let mut restricted = self.clone();
+                for (name, t) in cs.iter_mut() {
+                    restricted.rewrite_type_go(t, memo);
+                    if let Some(b) = name {
+                        restricted = restricted.shadow(b);
+                        restricted.assert_no_capture(b);
+                    }
+                }
+            }
             Type::Record(fs) => fs
                 .iter_mut()
                 .for_each(|(_, t)| self.rewrite_type_go(t, memo)),
@@ -1538,6 +1550,18 @@ impl Subst {
             }
 
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| self.apply_type(t)).collect()),
+            Type::DepTuple(cs) => {
+                let mut restricted = self.clone();
+                let mut out = Vec::with_capacity(cs.len());
+                for (name, t) in cs {
+                    out.push((name.clone(), restricted.apply_type(t)));
+                    if let Some(b) = name {
+                        restricted = restricted.shadow(b);
+                        restricted.assert_no_capture(b);
+                    }
+                }
+                Type::DepTuple(out)
+            }
             Type::Record(fs) => Type::Record(
                 fs.iter()
                     .map(|(n, t)| (n.clone(), self.apply_type(t)))
@@ -1688,6 +1712,7 @@ pub fn type_contains_infer(ty: &Type) -> bool {
             type_contains_infer(value) || type_contains_infer(domain)
         }
         Type::Tuple(ts) => ts.iter().any(type_contains_infer),
+        Type::DepTuple(cs) => cs.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Record(fs) => fs.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Variant(tags, _) => tags.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Refinement(base, _) => type_contains_infer(base),
@@ -1782,6 +1807,22 @@ fn collect_type_fv(
         Type::Tuple(ts) => ts
             .iter()
             .for_each(|t| collect_type_fv(t, bound, visited, out)),
+        // A component's name is bound in the components after it.
+        Type::DepTuple(cs) => {
+            fn rest(
+                cs: &[(Option<Name>, Type)],
+                bound: &mut BTreeSet<Binder>,
+                visited: &mut BTreeSet<PredicateId>,
+                out: &mut BTreeSet<Binder>,
+            ) {
+                let Some(((name, t), later)) = cs.split_first() else {
+                    return;
+                };
+                collect_type_fv(t, bound, visited, out);
+                with_binders(bound, name.clone(), |bnd| rest(later, bnd, visited, out));
+            }
+            rest(cs, bound, visited, out)
+        }
         Type::Record(fs) => fs
             .iter()
             .for_each(|(_, t)| collect_type_fv(t, bound, visited, out)),
@@ -1953,6 +1994,53 @@ pub fn open_pi_binder(target: &Mapping, ty: &Type) -> Type {
     out
 }
 
+/// Close each dependent-tuple component's references to the names of the
+/// components before it into indices: component `𝑘` reaches component `𝑗` at
+/// `𝑘 − 1 − 𝑗` (`src/ccl/design/type-inference.md`, "Representation"). Indices
+/// already present are left alone, so closing is the identity on components
+/// copied from a closed Pi chain.
+pub fn close_tuple_components(components: &mut [(Option<Name>, Type)]) {
+    for k in 1..components.len() {
+        let (earlier, later) = components.split_at_mut(k);
+        let enclosing: Vec<Option<Name>> = earlier.iter().map(|(n, _)| n.clone()).collect();
+        let ty = &mut later[0].1;
+        if !enclosing.iter().flatten().any(|n| is_free_in_type(n, ty)) {
+            continue;
+        }
+        PiWalk::new(PiMode::Close(&enclosing)).ty(ty, 0);
+    }
+}
+
+/// Open the binder `depth` crossings out of `ty` at `target`: the
+/// [`open_pi_binder`] walk started `depth` crossings deep. A projection out of
+/// a dependent tuple opens component `𝑘`'s earlier components outermost first,
+/// component `𝑗` at depth `𝑘 − 1 − 𝑗`; opening the outermost remaining binder
+/// changes no distance to the ones inside it, so no index shifts.
+pub fn open_pi_binder_at(target: &Mapping, ty: &Type, depth: u32) -> Type {
+    let mut out = ty.clone();
+    PiWalk::new(PiMode::Open(target)).ty(&mut out, depth);
+    out
+}
+
+/// A dependent tuple's components, each opened at the ones before it: component `𝑘`'s
+/// reference to component `𝑗` becomes what `at(𝑗, opened_𝑗)` maps it to, outermost first,
+/// where `opened_𝑗` is component `𝑗` already opened (`src/ccl/design/type-inference.md`,
+/// "Projection").
+pub fn open_tuple_components(
+    components: &[(Option<Name>, Type)],
+    mut at: impl FnMut(usize, &Type) -> Mapping,
+) -> Vec<Type> {
+    let mut opened: Vec<Type> = Vec::with_capacity(components.len());
+    for (k, (_, component)) in components.iter().enumerate() {
+        let mut ty = component.clone();
+        for (j, earlier) in opened.iter().enumerate() {
+            ty = open_pi_binder_at(&at(j, earlier), &ty, (k - 1 - j) as u32);
+        }
+        opened.push(ty);
+    }
+    opened
+}
+
 /// A morphism's `codomain` in the form its *consumer* speaks: descent
 /// under a dependent morphism's binder, where its own reference to that binder
 /// is the free name rather than an index
@@ -2057,6 +2145,12 @@ impl<'a> PiWalk<'a> {
                 refinements.rewrite_each(|_, r| self.refinement(r, depth));
             }
             Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
+            // Component `𝑘` sits inside the scopes of the `𝑘` components before it.
+            Type::DepTuple(cs) => {
+                for (k, (_, t)) in cs.iter_mut().enumerate() {
+                    self.ty(t, depth + k as u32);
+                }
+            }
             Type::Record(fs) => fs.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
             Type::Variant(tags, _) => tags.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
             Type::History { value, domain, .. } => {
@@ -2189,7 +2283,21 @@ impl<'a> PiWalk<'a> {
 /// whether to *keep* a function's binder wants [`codomain_depends_on`], which
 /// also admits a name-spelled codomain.
 pub fn references_enclosing_function(ty: &Type) -> bool {
-    fn ty_scan(ty: &Type, depth: u32, visited: &mut BTreeSet<(PredicateId, u32)>) -> bool {
+    references_binder_within(ty, 1)
+}
+
+/// Does `ty` reference any of the `within` binders immediately around it — a
+/// [`Name::PiBound`] whose index, less the crossings walked to reach it, is
+/// below `within`? `within = 1` is [`references_enclosing_function`]; a
+/// dependent tuple's component `𝑘` depends on an earlier component exactly
+/// when this holds at `within = 𝑘`.
+pub fn references_binder_within(ty: &Type, within: u32) -> bool {
+    fn ty_scan(
+        ty: &Type,
+        depth: u32,
+        within: u32,
+        visited: &mut BTreeSet<(PredicateId, u32)>,
+    ) -> bool {
         match ty {
             Type::Base(_)
             | Type::UIntRange(_)
@@ -2200,11 +2308,14 @@ pub fn references_enclosing_function(ty: &Type) -> bool {
             | Type::SharedHole(_)
             | Type::Param(_)
             | Type::Infer(_) => false,
-            Type::Poly(poly) => poly.types().any(|t| ty_scan(t, depth, visited)),
-            Type::BoundedHole(t) => ty_scan(t, depth, visited),
+            Type::Poly(poly) => poly.types().any(|t| ty_scan(t, depth, within, visited)),
+            Type::BoundedHole(t) => ty_scan(t, depth, within, visited),
             Type::Fun {
                 domain, codomain, ..
-            } => ty_scan(domain, depth, visited) || ty_scan(codomain, depth + 1, visited),
+            } => {
+                ty_scan(domain, depth, within, visited)
+                    || ty_scan(codomain, depth + 1, within, visited)
+            }
             // Keyed by depth as well as by predicate: the answer depends on
             // the crossings walked to reach the refinement, so one shared predicate
             // reached at two depths is two questions. Keying on identity alone
@@ -2213,32 +2324,43 @@ pub fn references_enclosing_function(ty: &Type) -> bool {
             Type::Refinement(base, refinements) => {
                 refinements.iter().any(|r| {
                     visited.insert((r.predicate_id(), depth))
-                        && expr_scan(&r.predicate, depth, visited)
-                }) || ty_scan(base, depth, visited)
+                        && expr_scan(&r.predicate, depth, within, visited)
+                }) || ty_scan(base, depth, within, visited)
             }
-            Type::Tuple(ts) => ts.iter().any(|t| ty_scan(t, depth, visited)),
-            Type::Record(fs) => fs.iter().any(|(_, t)| ty_scan(t, depth, visited)),
-            Type::Variant(tags, _) => tags.iter().any(|(_, t)| ty_scan(t, depth, visited)),
+            Type::Tuple(ts) => ts.iter().any(|t| ty_scan(t, depth, within, visited)),
+            Type::DepTuple(cs) => cs
+                .iter()
+                .enumerate()
+                .any(|(k, (_, t))| ty_scan(t, depth + k as u32, within, visited)),
+            Type::Record(fs) => fs.iter().any(|(_, t)| ty_scan(t, depth, within, visited)),
+            Type::Variant(tags, _) => tags.iter().any(|(_, t)| ty_scan(t, depth, within, visited)),
             Type::History { value, domain, .. } => {
-                ty_scan(value, depth, visited) || ty_scan(domain, depth, visited)
+                ty_scan(value, depth, within, visited) || ty_scan(domain, depth, within, visited)
             }
             // A witness reference is a leaf in its own namespace: it neither is
             // nor crosses a Pi index.
             Type::WitnessRef(_) => false,
         }
     }
-    fn expr_scan(e: &TypedExpr, depth: u32, visited: &mut BTreeSet<(PredicateId, u32)>) -> bool {
-        if matches!(&e.node, TypedExprNode::Var(n) if n.pi_bound_index() == Some(depth)) {
+    fn expr_scan(
+        e: &TypedExpr,
+        depth: u32,
+        within: u32,
+        visited: &mut BTreeSet<(PredicateId, u32)>,
+    ) -> bool {
+        if matches!(&e.node, TypedExprNode::Var(n)
+            if n.pi_bound_index().is_some_and(|i| i >= depth && i - depth < within))
+        {
             return true;
         }
         let mut found = false;
-        e.walk_type_slots(|t| found = found || ty_scan(t, depth, visited));
+        e.walk_type_slots(|t| found = found || ty_scan(t, depth, within, visited));
         if found {
             return true;
         }
-        e.fold_children(false, |acc, c| acc || expr_scan(c, depth, visited))
+        e.fold_children(false, |acc, c| acc || expr_scan(c, depth, within, visited))
     }
-    ty_scan(ty, 0, &mut BTreeSet::new())
+    ty_scan(ty, 0, within, &mut BTreeSet::new())
 }
 
 /// Does `codomain`, just extracted from a function binding `binder`, depend on
@@ -3148,6 +3270,103 @@ mod locally_nameless_tests {
         };
         assert!(is_pi_bound(predicate_of(domain), 0));
         assert!(is_pi_bound(predicate_of(codomain), 1));
+    }
+
+    /// The components of a dependent tuple, for the tests below: `(i : Int) × (j : {Int |
+    /// i}) × {Int | (i, j)}`, each predicate a bare reference so the index it closes to is
+    /// what the test reads.
+    fn telescope() -> (Name, Name, Vec<(Option<Name>, Type)>) {
+        let (i, j) = (Name::fresh("i"), Name::fresh("j"));
+        let both = TypedExpr::tuple(vec![TypedExpr::var(i.clone()), TypedExpr::var(j.clone())]);
+        let components = vec![
+            (Some(i.clone()), int()),
+            (Some(j.clone()), refined(TypedExpr::var(i.clone()))),
+            (None, refined(both)),
+        ];
+        (i, j, components)
+    }
+
+    /// Component `𝑘` reaches component `𝑗` at `𝑘 − 1 − 𝑗`: `j`'s reference to `i` is `#0`,
+    /// and the last component reaches `i` at `#1` and `j` at `#0`
+    /// (`src/ccl/design/type-inference.md`, "Representation").
+    #[test]
+    fn a_component_reaches_an_earlier_one_by_the_components_between() {
+        let (_, _, components) = telescope();
+        let Type::DepTuple(closed) = Type::dep_tuple(components) else {
+            panic!("a component reading an earlier one makes a dependent tuple");
+        };
+        assert!(is_pi_bound(predicate_of(&closed[1].1), 0));
+        let TypedExprNode::Tuple(both) = &predicate_of(&closed[2].1).node else {
+            panic!("the last component's predicate is the pair it was built with");
+        };
+        assert!(is_pi_bound(&both[0], 1));
+        assert!(is_pi_bound(&both[1], 0));
+    }
+
+    /// A tuple whose components read no earlier one is the plain `Tuple`: one spelling per
+    /// tuple.
+    #[test]
+    fn a_tuple_of_independent_components_is_the_plain_tuple() {
+        let components = vec![
+            (Some(Name::fresh("i")), int()),
+            (Some(Name::fresh("j")), int()),
+        ];
+        assert_eq!(Type::dep_tuple(components), Type::Tuple(vec![int(), int()]));
+    }
+
+    /// A reference to a function around the tuple from component `𝑘` adds `𝑘`: the
+    /// components before it are crossings too.
+    #[test]
+    fn a_reference_out_of_the_tuple_crosses_the_components_before_it() {
+        let x = Name::fresh("x");
+        let tuple = Type::DepTuple(vec![
+            (Some(Name::fresh("i")), int()),
+            (None, refined(TypedExpr::var(x.clone()))),
+        ]);
+        let Type::DepTuple(closed) = close_pi_binder(&x, &tuple) else {
+            panic!("closing preserves the tuple");
+        };
+        assert!(is_pi_bound(predicate_of(&closed[1].1), 1));
+    }
+
+    /// A projection's type is the component opened at the earlier components' projections,
+    /// outermost first: `p.2` reads `(p.0, p.1)`.
+    #[test]
+    fn a_projection_opens_the_earlier_components_at_the_tuple() {
+        let (_, _, components) = telescope();
+        let tuple = Type::dep_tuple(components);
+        let p = Name::fresh("p");
+        let project = |j: usize, ty: &Type| {
+            TypedExpr::apply(
+                TypedExpr::var(p.clone()).with_ty(tuple.clone()),
+                TypedExpr::proj_index(j).with_ty(Type::fun(tuple.clone(), ty.clone())),
+            )
+            .with_ty(ty.clone())
+        };
+        let last = tuple.component_type(2, project).expect("three components");
+        let TypedExprNode::Tuple(both) = &predicate_of(&last).node else {
+            panic!("the last component's predicate is the pair it was built with");
+        };
+        for (k, read) in both.iter().enumerate() {
+            let TypedExprNode::Apply { argument, function } = &read.node else {
+                panic!("component {k} reads a projection, got {read:?}");
+            };
+            assert!(matches!(&argument.node, TypedExprNode::Var(n) if n == &p));
+            assert!(
+                matches!(function.node, TypedExprNode::Proj(crate::ccl::ProjKey::Index(j)) if j == k)
+            );
+        }
+    }
+
+    /// Each component renders inside the binders of the components before it, so a
+    /// reference prints as the binder's name.
+    #[test]
+    fn a_dependent_tuple_renders_its_binders() {
+        let (_, _, components) = telescope();
+        assert_eq!(
+            Type::dep_tuple(components).to_string(),
+            "(i : Int) × (j : {Int | i}) × {Int | (i, j)}",
+        );
     }
 
     /// Two α-variant codomains close to structurally identical types — the

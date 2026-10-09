@@ -500,8 +500,12 @@ fn atom_json(a: &AtomKey) -> Option<String> {
         // A witness reference is a name for whichever domain a Σ picked, and the model
         // has no witness — outside the fragment for the same reason `ChanDom` is. Nor
         // does it have type parameters, which exist only inside a polymorphic
-        // definition's body.
-        AtomKey::ChanDom(..) | AtomKey::Witness(..) | AtomKey::Param(..) => return None,
+        // definition's body. A dependent tuple's components read one another by
+        // index, and the model has no binders.
+        AtomKey::ChanDom(..)
+        | AtomKey::Witness(..)
+        | AtomKey::Param(..)
+        | AtomKey::DepTuple(..) => return None,
     })
 }
 

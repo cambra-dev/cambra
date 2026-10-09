@@ -1129,6 +1129,18 @@ pub enum Type {
     },
     /// An ordered product type with unnamed fields (tuple).
     Tuple(Vec<Type>),
+    /// A **dependent tuple**: a telescope whose component `𝑘` may reference
+    /// every earlier component, `(𝑖 : 𝐴) × (𝑗 : 𝐵(𝑖)) × 𝐶(𝑖, 𝑗)`. Each component
+    /// is a binder in the shape of a `Fun`'s, scoping over the components after
+    /// it; a reference is a [`Name::PiBound`](crate::ccl::Name::PiBound) whose
+    /// index counts crossings into a binder's scope, so component `𝑘` reaches
+    /// component `𝑗` at `𝑘 − 1 − 𝑗`. The name slot is an opening address and a
+    /// display spelling, as `Fun::name` is.
+    ///
+    /// Built only by [`Type::dep_tuple`], which returns the `Tuple` of the same
+    /// components when none references an earlier one, so a tuple has one
+    /// spelling. See `src/ccl/design/type-inference.md`, "4.8 Dependent tuples".
+    DepTuple(Vec<(Option<crate::ccl::Name>, Type)>),
     /// A named product type (record).
     Record(Vec<(String, Type)>),
     /// A tagged sum type — each tag has its own payload type.
@@ -2348,6 +2360,34 @@ fn fmt_type(
             let parts: Vec<_> = ts.iter().map(|t| at(t, binders).to_string()).collect();
             write!(f, "({})", parts.join(", "))
         }
+        // `(𝑖 : 𝐴) × (𝑗 : 𝐵(𝑖)) × 𝐶(𝑖, 𝑗)`: each component renders inside the
+        // binders of the components before it. A component that is itself a
+        // dependent tuple renders in parentheses, since it is a different type
+        // from the flat telescope.
+        Type::DepTuple(components) => {
+            fn rest(
+                f: &mut fmt::Formatter<'_>,
+                components: &[(Option<crate::ccl::Name>, Type)],
+                binders: Option<&symbolic::PiBinderEnv<'_>>,
+            ) -> fmt::Result {
+                let Some(((name, ty), later)) = components.split_first() else {
+                    return Ok(());
+                };
+                let shown = at(ty, binders);
+                match (name, ty) {
+                    (Some(x), _) => write!(f, "({x} : {shown})")?,
+                    (None, Type::DepTuple(_)) => write!(f, "({shown})")?,
+                    (None, _) => write!(f, "{shown}")?,
+                }
+                if later.is_empty() {
+                    return Ok(());
+                }
+                write!(f, " × ")?;
+                let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
+                rest(f, later, Some(&inner))
+            }
+            rest(f, components, binders)
+        }
         Type::Record(fields) => {
             let parts: Vec<_> = fields
                 .iter()
@@ -2541,6 +2581,47 @@ impl Type {
             return Type::Base(BaseType::Unit);
         }
         Type::Tuple(elems)
+    }
+
+    /// The dependent tuple of `components`, each a binder name and its type.
+    /// A component's references to earlier components may be spelled by name or
+    /// already be indices; names are closed here. When no component references
+    /// an earlier one the result is the [`Type::tuple`] of the same types, so a
+    /// tuple has one spelling (`src/ccl/design/type-inference.md`,
+    /// "Representation").
+    pub fn dep_tuple(mut components: Vec<(Option<crate::ccl::Name>, Self)>) -> Self {
+        crate::ccl::subst::close_tuple_components(&mut components);
+        let dependent = components
+            .iter()
+            .enumerate()
+            .any(|(k, (_, t))| crate::ccl::subst::references_binder_within(t, k as u32));
+        if dependent {
+            Type::DepTuple(components)
+        } else {
+            Type::tuple(components.into_iter().map(|(_, t)| t).collect())
+        }
+    }
+
+    /// The type of component `index` of a value `tuple` of type `self`, for a
+    /// product type: a `Tuple`'s element, or a dependent tuple's component opened
+    /// at `tuple.0 … tuple.(index − 1)`, outermost first. `project` builds the
+    /// projection term `tuple.𝑗` with the type it is given, for the opening.
+    pub fn component_type(
+        &self,
+        index: usize,
+        project: impl Fn(usize, &Type) -> TypedExpr,
+    ) -> Option<Type> {
+        match self.peel_refinements() {
+            Type::Tuple(ts) => ts.get(index).cloned(),
+            Type::DepTuple(cs) => {
+                cs.get(index)?;
+                crate::ccl::subst::open_tuple_components(&cs[..=index], |j, earlier| {
+                    crate::ccl::subst::Mapping::Discharge(Box::new(project(j, earlier)))
+                })
+                .pop()
+            }
+            _ => None,
+        }
     }
 
     /// The named product of `fields` — a [`Type::Record`], or
@@ -3386,6 +3467,11 @@ impl Type {
             },
             Type::BoundedHole(t) => Type::BoundedHole(Box::new(t.without_pi_names())),
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| t.without_pi_names()).collect()),
+            Type::DepTuple(cs) => Type::DepTuple(
+                cs.iter()
+                    .map(|(_, t)| (None, t.without_pi_names()))
+                    .collect(),
+            ),
             Type::Record(fs) => Type::Record(
                 fs.iter()
                     .map(|(n, t)| (n.clone(), t.without_pi_names()))
@@ -3540,6 +3626,11 @@ impl Type {
                     f(t);
                 }
             }
+            Type::DepTuple(cs) => {
+                for (_, t) in cs {
+                    f(t);
+                }
+            }
             Type::Record(fields) => {
                 for (_, t) in fields {
                     f(t);
@@ -3594,6 +3685,11 @@ impl Type {
             }
             Type::Tuple(ts) => {
                 for t in ts {
+                    f(t);
+                }
+            }
+            Type::DepTuple(cs) => {
+                for (_, t) in cs {
                     f(t);
                 }
             }

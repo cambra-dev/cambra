@@ -1825,6 +1825,15 @@ fn coalesce_type_predicates_go(
         Type::Tuple(ts) => ts
             .iter_mut()
             .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
+        // Component `𝑘` is inside the scopes of the `𝑘` components before it.
+        Type::DepTuple(cs) => {
+            let n = cs.len();
+            for (name, t) in cs.iter_mut() {
+                coalesce_type_predicates_go(t, level, ctx, scope);
+                scope.enter(name.clone());
+            }
+            (0..n).for_each(|_| scope.exit());
+        }
         Type::Record(fs) => fs
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates_go(t, level, ctx, scope)),

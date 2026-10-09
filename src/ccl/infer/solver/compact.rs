@@ -74,6 +74,62 @@ pub enum AtomKey {
     /// `String` do (`src/ccl/design/type-parameters.md`, "Subtyping with a type
     /// parameter").
     Param(Rc<crate::ccl::ty::TypeParam>),
+    /// A dependent tuple, which matches only a tuple equal to it up to binder
+    /// names ([`DepTupleAtom`]). The lattice's product slot keys fields with
+    /// nothing in scope between them, so a telescope rides as a whole; comparing
+    /// its components under subtyping is not represented here.
+    DepTuple(DepTupleAtom),
+}
+
+/// A [`Type::DepTuple`] as an [`AtomKey`]: equal to another exactly when the two are equal up
+/// to binder names, which [`Type::without_pi_names`] strips (references are indices, so
+/// nothing else names a binder). The α-invariant content hash orders and buckets the atoms; it
+/// decides nothing alone, since two different tuples can share it.
+#[derive(Debug, Clone)]
+pub struct DepTupleAtom {
+    hash: u64,
+    ty: Rc<Type>,
+    unnamed: Rc<Type>,
+}
+
+impl DepTupleAtom {
+    fn new(ty: &Type) -> Self {
+        DepTupleAtom {
+            hash: crate::ccl::content_hash::type_content_hash(ty),
+            ty: Rc::new(ty.clone()),
+            unnamed: Rc::new(ty.without_pi_names()),
+        }
+    }
+}
+
+impl PartialEq for DepTupleAtom {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.unnamed == other.unnamed
+    }
+}
+impl Eq for DepTupleAtom {}
+impl PartialOrd for DepTupleAtom {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for DepTupleAtom {
+    /// By hash, then, for two unequal tuples sharing one, by their structure as printed —
+    /// a total order consistent with [`PartialEq`].
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.hash.cmp(&other.hash).then_with(|| {
+            if self == other {
+                std::cmp::Ordering::Equal
+            } else {
+                format!("{:?}", self.unnamed).cmp(&format!("{:?}", other.unnamed))
+            }
+        })
+    }
+}
+impl std::hash::Hash for DepTupleAtom {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.hash.hash(state)
+    }
 }
 
 impl AtomKey {
@@ -89,6 +145,7 @@ impl AtomKey {
             Type::WitnessRef(b) => Some(AtomKey::Witness(*b)),
             Type::ChanDom(n, l) => Some(AtomKey::ChanDom(n.clone(), *l)),
             Type::Param(p) => Some(AtomKey::Param(Rc::clone(p))),
+            Type::DepTuple(_) => Some(AtomKey::DepTuple(DepTupleAtom::new(ty))),
             _ => None,
         }
     }
@@ -102,6 +159,7 @@ impl AtomKey {
             AtomKey::Witness(b) => Type::WitnessRef(*b),
             AtomKey::ChanDom(n, l) => Type::ChanDom(n.clone(), *l),
             AtomKey::Param(p) => Type::Param(Rc::clone(p)),
+            AtomKey::DepTuple(a) => (*a.ty).clone(),
         }
     }
 }
@@ -1809,6 +1867,7 @@ fn compact_go(
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Param(_)
+        | Type::DepTuple(_)
         | Type::Txn => CompactType::from_atom(AtomKey::from_type(ty).unwrap()),
         // `emit_let` opens a `Poly` and binds at its body; none reaches the solver.
         Type::Poly(_) => unreachable!("a polymorphic type reached `compact`"),

@@ -436,6 +436,8 @@ pub fn freshen_above(
         | Type::DataSource(_)
         | Type::Txn
         | Type::Hole
+        // Born after inference, outside every generalized `let`: nothing in it is quantified.
+        | Type::DepTuple(_)
         | Type::SharedHole(_) => ty.clone(),
         // A channel domain minted inside the generalized definition
         // (level > lim) is *quantified* exactly like a variable — each
