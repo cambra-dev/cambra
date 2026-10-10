@@ -63,7 +63,7 @@ impl BaseType {
 ///
 /// Named `Lit` to avoid shadowing `crate::interpreter::Literal`, which is
 /// an unrelated operator struct.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Lit {
     /// An integer constant.
     Int(i64),

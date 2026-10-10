@@ -292,11 +292,6 @@ fn a_parameter_without_an_argument_takes_its_default(
     "param n: Int\nn\n",
     "the root module's parameter `n` has no default"
 )]
-#[case::imported_without_a_default("import stepper\n1\n", "module `stepper` is imported")]
-#[case::an_import_argument(
-    "import stepper(base=1)\n1\n",
-    "an argument to an import is not supported yet"
-)]
 #[case::bound_by_a_member(
     "run clash(base=1)\n1\n",
     "`base` is a parameter, so no member of its module takes it"

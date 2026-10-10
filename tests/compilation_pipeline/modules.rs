@@ -2,10 +2,14 @@
 //! through its import name, and labels that belong to a module
 //! (`docs/chl-spec.md`, "9. Modules [Decided]").
 
+use std::collections::BTreeSet;
 use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
+use cambra::ccl::context::GlobalContext;
 use cambra::ccl::load::{InMemory, LoadedProgram, RootFile};
+use cambra::ccl::lower::modules::lower_program;
+use cambra::ccl::{Home, TypedExprNode};
 use cambra::interpreter::Value;
 use indoc::indoc;
 use rstest_log::rstest;
@@ -430,6 +434,141 @@ fn options_tags_are_every_modules() {
         ),
         Value::Int(10),
     );
+}
+
+/// A module whose parameters an import passes: `scale` has no default.
+const SCALED: &str = indoc! {"
+    param scale: Int
+    param offset: Int = 0
+    pub def by(x):
+        x * scale + offset
+"};
+
+/// An import passes its arguments to the module's parameters, and a parameter
+/// without one takes its default (`docs/chl-spec.md`, "9.2 Imports").
+#[rstest]
+#[case::an_argument("import scaled(scale=3)\nscaled::by(2)\n", 6)]
+#[case::overriding_a_default("import scaled(scale=3, offset=1)\nscaled::by(2)\n", 7)]
+#[case::a_negative_literal("import scaled(scale=-3)\nscaled::by(2)\n", -6)]
+#[case::a_boolean("import flag(on=True)\nflag::n\n", 1)]
+#[case::through_use("import scaled(scale=3) use by\nby(2)\n", 6)]
+#[case::two_sets_of_arguments("import scaled(scale=2)\nimport nine\nscaled::by(1) + nine::v\n", 11)]
+#[timeout(Duration::from_secs(10))]
+fn an_imports_arguments_reach_its_modules_parameters(#[case] root: &str, #[case] expected: i64) {
+    check_program_scalar(
+        &program(
+            root,
+            &[
+                ("scaled", SCALED),
+                ("flag", "param on: Bool\npub n = 1 if on else 0\n"),
+                ("nine", "import scaled(scale=3)\npub v = scaled::by(3)\n"),
+            ],
+        ),
+        Value::Int(expected),
+    );
+}
+
+/// The shared runs `program` lowers, by their homes: each `let` its chains bind
+/// stands on the spine above the root's.
+fn shared_runs(program: &LoadedProgram) -> BTreeSet<String> {
+    let mut ctx = GlobalContext::default();
+    let lowered = lower_program(program, ctx.lowering_ctx());
+    assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
+    let tree = lowered.value.expect("the program lowers");
+    let mut homes = BTreeSet::new();
+    let mut at = &tree;
+    loop {
+        match &at.node {
+            TypedExprNode::Let { binding, body, .. } => {
+                if let Some(Home::Shared(run)) = binding.name.home() {
+                    homes.insert(run.to_string());
+                }
+                at = body;
+            }
+            TypedExprNode::MutDecl { body, .. } | TypedExprNode::ExprStmt { body, .. } => {
+                at = body;
+            }
+            _ => return homes,
+        }
+    }
+}
+
+/// Imports of one module with equal arguments reach one shared run, whichever
+/// order they write them in, and imports with different arguments reach two
+/// (`docs/chl-spec.md`, "9.2 Imports").
+#[rstest]
+#[case::equal_arguments("import scaled(scale=3)", "import scaled(scale=3)", &["scaled(scale=3)"])]
+#[case::in_another_order(
+    "import scaled(offset=1, scale=3)",
+    "import scaled(scale=3, offset=1)",
+    &["scaled(offset=1, scale=3)"]
+)]
+#[case::different_arguments(
+    "import scaled(scale=2)",
+    "import scaled(scale=3)",
+    &["scaled(scale=2)", "scaled(scale=3)"]
+)]
+#[timeout(Duration::from_secs(10))]
+fn an_import_reaches_one_shared_run_per_set_of_arguments(
+    #[case] root: &str,
+    #[case] other: &str,
+    #[case] expected: &[&str],
+) {
+    assert_shared_runs(root, other, expected);
+}
+
+/// An omitted argument is its parameter's default, so an import that omits it
+/// and one that passes the default reach one shared run (`docs/chl-spec.md`,
+/// "9.2 Imports").
+#[rstest]
+#[ignore = "arguments are compared as written (docs/modules.md, \"Imports\")"]
+#[timeout(Duration::from_secs(10))]
+fn an_omitted_argument_is_its_default() {
+    assert_shared_runs(
+        "import scaled(scale=3)",
+        "import scaled(scale=3, offset=0)",
+        &["scaled(scale=3)"],
+    );
+}
+
+/// Assert that a program whose root imports `scaled` with the statement `root`,
+/// and imports `nine`, which imports it with `other`, lowers the shared runs of
+/// `scaled` in `expected`.
+fn assert_shared_runs(root: &str, other: &str, expected: &[&str]) {
+    let program = program(
+        &format!("{root}\nimport nine\nscaled::by(1) + nine::v\n"),
+        &[
+            ("scaled", SCALED),
+            ("nine", &format!("{other}\npub v = scaled::by(3)\n")),
+        ],
+    );
+    let expected: BTreeSet<String> = expected.iter().map(|s| s.to_string()).collect();
+    let mut runs = shared_runs(&program);
+    runs.remove("nine");
+    assert_eq!(runs, expected);
+}
+
+#[rstest]
+#[case::missing(
+    "import scaled\n1\n",
+    "this import passes no argument for the parameter `scale`, which has no default"
+)]
+#[case::unknown(
+    "import scaled(scale=1, nope=2)\n1\n",
+    "module `scaled` has no parameter `nope`"
+)]
+#[case::twice(
+    "import scaled(scale=1, scale=2)\n1\n",
+    "the parameter `scale` already has an argument"
+)]
+#[case::not_a_literal(
+    "import scaled(scale=1 + 2)\n1\n",
+    "an argument to an import is supported only as a literal for now"
+)]
+#[case::mistyped("import scaled(scale=\"x\")\nscaled::by(1)\n", "annotated as Int")]
+#[timeout(Duration::from_secs(10))]
+fn a_misused_import_argument_is_refused(#[case] root: &str, #[case] needle: &str) {
+    assert_refused(&program(root, &[("scaled", SCALED)]), needle);
 }
 
 /// Importing a module that performs IO is an error at the `import`, pointing at
