@@ -556,16 +556,9 @@ fn cty_json(ct: &CompactType) -> Option<String> {
                 KindPin::Unpinned => "unknown",
                 KindPin::Sum(_) => return None,
             };
-            // **One domain, because that is all the slot now states.** The model keeps the
-            // alternatives as a list; this solver joins them into one position and keeps
-            // only `combined`, the pair that *first* had no common answer — inherited
-            // across later merges, so it is a diagnostic snapshot and not the current
-            // alternatives. There is nothing here to reconstruct the list from.
-            //
-            // `domains_disagree` is not the model's `conflict` either: it says the arms are
-            // over data with no common answer, which coalesce decides, and
-            // `differential_coalesce_vs_lean_model` is what compares that decision.
-            //
+            // Encode the one domain but omit the disagreement flag and diagnostic pair.
+            // The model cannot reconstruct every conflict from this output alone.
+            // See `formal/design.md`, "The fn slot holds one domain".
             format!(
                 r#"{{"kind":"{kind}","dom":{},"cod":{}}}"#,
                 cty_json(&cf.domain)?,

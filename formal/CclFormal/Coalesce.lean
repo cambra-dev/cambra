@@ -3,56 +3,19 @@ import CclFormal.Merge
 /-!
 # `coalesce`: materializing a compact type back out as a `Ty`
 
-The Lean mirror of `src/ccl/infer/solver/coalesce.rs`'s `coalesce_compact_go` — the partial function
-from a merged bound to the type the solver reports. A position **materializes** when `coalesce`
-gives it a type: the operation carries the name `coalesce` and the Rust spells what it does to each
-position the same way (`materialize_record`, `materialize_variant`). `merge` says how bounds
-combine; this says what the combination *is*, and it is the half that decides whether a join has an
-answer at all.
+The result distinguishes a concrete type, an unresolved position and rejection.
+Slot rules and comparison exclusions are specified in `formal/design.md`,
+"Materialization: the merge is a bound, and the least one".
 
-`coalesce` is partial in two different ways, and they are distinct outcomes:
-
-- **Refused** (`CoalesceError`): the position has no type. Two or more concrete
-  contributions at once, a `Data` slot whose alternatives do not reconcile, a conflicted slot, or a
-  record with mixed key kinds.
-- **Unresolved** (`ok none`): nothing concrete reached the position, so
-  `coalesce_compact_go` emits a fresh `Type::Infer`. The model has no `Infer` node — the same
-  exclusion `Ty` makes for the subtype relation — so it reports the fact and not the variable. A
-  position that materializes to an inference variable is therefore compared only as "unresolved",
-  refinements included: the Rust attaches the position's refinements to the variable and the model
-  cannot carry them.
-
-## What it drops, beyond `CompactTy`'s own adjudications
-
-- **The Pi binder.** `coalesce_compact_go` keeps `cf.name` when the codomain
-  references it (`kept_name`). `CompactTy` has no binder slot, so the model always emits `none` and
-  the differential compares modulo the binder.
-- **`Openness`.** `CompactTy`'s variant slot is a bare tag map, so a materialized
-  variant carries no arm-set completeness. Every generated arm set is closed.
-- **Which error.** A conflicted `fn` slot is `KindConflict` or
-  `DomainJoinConflict` in the Rust depending on how many alternatives survive, and the model drops a
-  conflicted slot's alternatives (see `Merge.lean`), so it reports one `conflictedSlot` for both.
-
-## Why it terminates
-
-By `depth`, not by any subterm ordering. One recursive call is the reason: a `Compute` slot's
-alternatives are folded with `merge` (`meetAll`) and the *result* is materialized, and that result
-is not a subterm of the position. The bound is `merge_depth_le` — **`merge` does not deepen a
-position**, since it unions atoms, merges map payloads pointwise, and recurses into a function
-slot's domain and codomain — so the folded domain is no deeper than the alternatives it came from,
-which are children of the position. `compact.rs` makes no such argument anywhere, and its own
-recursion rests on it.
-
-Everything else recurses on a child, and each call's bound is named beside it (`depth_cod_lt`,
-`depth_dom_lt`, `depth_recordPayload_lt`, `depth_variantPayload_lt`, `depth_fold_lt`). The keyed
-maps are walked with `List.attach`, so each payload's recursive call carries the membership proof
-its bound needs.
+Recursion decreases `(depth t, phase)`: `coalesce` has phase 1, and same-position shape
+helpers have phase 0. Calls back into `coalesce` use shallower children.
+The function slot has one domain; no folded-domain recursion occurs.
 -/
 
 namespace CclFormal
 namespace CompactTy
 
-/-- Why a position has no type. -/
+/-- Rejections of the modeled materializer, not semantic nonexistence proofs. -/
 inductive CoalesceError where
   /-- Bounds with no common shape at one position (`IncompatibleBounds`). Two or
   more concrete contributions is one way; a product with no fields is the same thing read one level
@@ -104,11 +67,11 @@ def nameKeys : List (FieldKey × CompactTy) → Option (List String)
   | (.name s, _) :: rest => (nameKeys rest).map (s :: ·)
   | (.idx _, _) :: _ => none
 
-/-! ### The depth bounds `coalesce`'s recursion decreases by
+/-! ### Depth bounds for recursive child materialization
 
-Every recursive call is on something strictly shallower than the position, which is what makes one
-measure — `depth` — enough. The folded `Compute` domain is the call
-that needs `merge_depth_le`; the rest are children. -/
+Shape helpers use these strict child-depth bounds. Same-position helper calls instead
+decrease the second component of the lexicographic termination measure.
+-/
 
 theorem depth_cod_lt {a : List Atom} {r v : Option (List (FieldKey × CompactTy))}
     {c : Option (List Predicate)} {k : KindMerge} {ds cod : CompactTy} :
@@ -180,12 +143,9 @@ def funTy (kind : FunKind) : Option Ty → Option Ty → Option Ty
   | some d, some c => some (.fn none kind d c)
   | _, _ => none
 
-/-- The shapes a position contributed, combined: none is unresolved, one is the
-type with the position's refinements re-attached, and two or more is a position with no type at all.
-
-Named, and not a `match` inside [`coalesce`], because it is what every shape argument reads:
-materializing at all means exactly one contribution is non-empty.
--/
+/-- Combine occupied-shape entries: zero is unresolved, one retains that entry,
+and multiple entries are incompatible. An occupied but unresolved shape still counts.
+Successful results retain the position's predicates. -/
 def combine (shapes : List (Option Ty)) (refinements : Option (List Predicate)) :
     Except CoalesceError (Option Ty) :=
   match shapes with
@@ -195,13 +155,9 @@ def combine (shapes : List (Option Ty)) (refinements : Option (List Predicate)) 
 
 mutual
 
-/-- Mirror of `coalesce_compact_go`. `ok none` is an unresolved position.
-
-The four contributions are *named* functions rather than sub-expressions of one `do` block, because
-a proof has to speak about one of them on its own: the shape argument every case of the monotonicity
-lemma rests on is that materializing means exactly one contribution is non-empty, and that is
-unstatable about an inline expression. Each takes the whole position, which is also what the `depth`
-lemmas below are stated against. -/
+/-- Materialize occupied shapes and attach refinements.
+Named helpers expose individual contributions to proofs. Passing the whole position
+retains the termination measure across same-position calls. -/
 def coalesce (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
   | t => do
     -- The position is passed whole to each contribution and destructured only
@@ -223,12 +179,9 @@ def coalesce (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
 termination_by t => (depth t, 1)
 decreasing_by all_goals (apply Prod.Lex.right; omega)
 
-/-- The record slot's contribution: the empty product is unit, dense index keys
-are a tuple, sparse ones are unresolved, name keys are a record, and a mix has no type. The payloads
-materialize either way, so a nested refusal wins over a discarded shape — what the `?` in
-`materialize_record` does. The key kinds are checked *before* any payload is materialized: a
-mixed-key map has no type and
-`materialize_record` returns without touching the payloads. -/
+/-- Empty or mixed-key records are rejected before payload traversal.
+Dense index keys produce a tuple; sparse keys remain unresolved; names produce a record.
+Payload failures propagate before the sparse-key result is selected. -/
 def recordShapes (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
   | .mk _ none _ _ _ => pure none
   | .mk _ (some m) _ _ _ =>
@@ -267,20 +220,9 @@ def denotesSeveralDomains : CompactTy → Bool
   | .mk atoms none none none _ => atoms.eraseDups.length > 1
   | _ => false
 
-/-- The function slot's contribution. The domain is one position, materialized like any other;
-the resolved kind decides only what the function *is*.
-`coalesce_compact_go` (`compact.rs`) is the counterpart.
-
-**A `data` position's atoms are alternatives**, one candidate domain each, so several of them is
-the domain join rejected by name rather than the incompatible-bounds a compute position's would
-give. `denoted_domains` reads them the same way, and on the same shape: bare atoms, nothing else in
-the position.
-
-The Rust also reaches that rejection through `domains_disagree`, a flag `CompactFun::merge` sets
-from the *operands* because the meet erases the evidence — two domains that had no common answer
-leave as one position. There is no slot for it here, so a disagreement whose merged position is not
-several atoms is a verdict this model does not state (`formal/design.md`, "Σ types and `FunKind`
-inference"). -/
+/-- Materialize the codomain, check the kind, then materialize the domain.
+Data functions reject bare domains with multiple distinct atoms. Rust's operand-level
+disagreement flag is omitted; see `formal/design.md`, "The fn slot holds one domain". -/
 def funShapes (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
   | .mk _ _ _ none _ => pure none
   | .mk _ _ _ (some (k, d, cod)) _ => do
@@ -479,14 +421,10 @@ def coalesceAgrees (want : Except CoalesceError (Option Ty)) (got : CoalesceOutc
       match e with
       | .incompatible => kind == "IncompatibleBounds"
       | .domainJoin => kind == "DomainJoinConflict"
-      -- A conflicted slot's error *identity* is not predicted, because the
-      -- alternatives the model drops are what decides it. `coalesce_compact_go`
-      -- materializes the slot's domain before it reads the kind, so a domain
-      -- that has no type at all — two records intersecting to no field, say —
-      -- reports `IncompatibleBounds` and the kind conflict is never reached;
-      -- with one surviving alternative it is `KindConflict` and with more,
-      -- `DomainJoinConflict`. Predicting which needs the domains, and carrying
-      -- them means mirroring `widest`'s arrival-order tie-break.
+      -- The comparison admits these Rust error categories for a conflicted model slot.
+      -- Rust materializes the domain before selecting its final kind error; the model's
+      -- conflict branch runs before domain materialization. This is not exact diagnostic
+      -- equivalence, and no domain-list payload is omitted by the current representation.
       | .conflictedSlot =>
           kind == "KindConflict" || kind == "DomainJoinConflict"
             || kind == "IncompatibleBounds"

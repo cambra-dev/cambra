@@ -4,26 +4,19 @@ import CclFormal.SubtypeCheckDecidesSubtyping
 /-!
 # The materialized merge is a bound of both operands
 
-`Merge.lean` proves `merge pol` is the least upper bound of the order it induces
-(`merge_is_least_absorber`), and that order is defined *by* the merge. This module states the
-theorem that names the order independently: the merged position materializes to the
-`Subtyping`-least upper bound of what its operands materialize to, and dually at a negative
-position.
+`merge_is_a_bound` connects successful materialization to `Subtyping`.
+It requires concrete operands and merge, plus each operand's `DataAgree` relation to the merge.
+`merge_is_least_position` is a separate conditional statement over representation bounds.
 
-The statements are `Bool`-valued on purpose. `subtypeCheck` decides `Subtyping`
-(`subtypeCheck_iff_subtyping`) and `coalesce` is total, so each is measurable over a bounded sample
-before it is proved, and the sample is what caught the shapes recorded in `formal/design.md`, "The
-lattice is a semantic statement".
+The Boolean sample predicates do not quantify over every possible subtype bound.
+See `formal/design.md`, "Bound and leastness hypotheses" and "Checked samples and their limits".
 -/
 
 namespace CclFormal
 namespace CompactTy
 
-/-- The soundness half at one pair: where all three positions materialize, a
-positive merge lands above both operands and a negative one below both.
-
-Conditional on materializing, which is the honest form — `coalesce` is partial,
-and its failures are exactly the joins no `Ty` names. -/
+/-- If all three positions materialize, check that the merge bounds both operand types
+in the polarity's direction. Otherwise return true without asserting materialization. -/
 def MergeIsBoundAt (pol : Bool) (a b : CompactTy) : Bool :=
   match coalesce pol a, coalesce pol b, coalesce pol (merge pol a b) with
   | .ok (some ta), .ok (some tb), .ok (some tm) =>
@@ -33,12 +26,10 @@ def MergeIsBoundAt (pol : Bool) (a b : CompactTy) : Bool :=
 
 /-! ## Concrete positions
 
-`wellFormed` excludes `KindMerge.conflict`. `KindMerge.unknown` is the other non-concrete kind — a
-kind variable nothing has pinned — and it is not a subject for a subtyping statement: `coalesce`
-materializes it by applying the capability default, a merge that pins the slot to `data` overrides
-that default, and so the operand's own materialization is not what the merge combined.
-`kindResolved` is what "concrete"
-means for the kind slot, and `merge_is_a_bound` assumes it. -/
+`concrete` combines `wellFormed` and recursive kind resolution. An `unknown` kind defaults
+to compute but can merge to data, so separately defaulted operand types need not describe
+the combined position.
+-/
 
 mutual
 
@@ -102,10 +93,9 @@ theorem kindResolvedKeys_iff {m : List (FieldKey × CompactTy)} {ks : List Field
       · rfl
       · exact h k (by simp) v hv
 
-/-- The lemma both halves factor through: `coalesce pol` carries `absorbedBy pol` to
-`Subtyping` at a positive position and to its converse at a negative one. Soundness is this applied
-to `absorbedBy_merge_left`/`absorbedBy_merge_right`; leastness is `merge_absorbedBy`
-transported back through an embedding of `Ty` into `CompactTy`. -/
+/-- Conditional monotonicity from absorption to materialized subtyping.
+The proof requires concrete positions and domain agreement. Type-level leastness is
+proved separately, not by reflecting subtyping into absorption. -/
 def CoalesceMonotoneAt (pol : Bool) (a b : CompactTy) : Bool :=
   if equiv (merge pol a b) b then
     match coalesce pol a, coalesce pol b with
@@ -456,13 +446,10 @@ theorem coalesce_shape (pol : Bool) {as : List Atom}
 
 /-! ## Where the merge had to move a data domain
 
-The function case needs one thing `absorbedBy` does not give it: at a negative position a `data`
-slot's two domains agree. This is not a restriction on which types a data domain may be — a data
-domain is refined whenever a filter narrows a collection, which is most of them. It is a condition
-on the *pair*, saying the merge did not have to move a data domain, and that is exactly when a bound
-exists: `subtypeCheck` reads a data domain invariantly, as `constrain_go` does when it reports
-`ConstrainError::DataDomainMismatch`, so two collections over different domains have nothing below
-both. Their join is the Σ over both candidates, which the Σ work adds.
+`DataAgree` requires equivalent domains when the left function is data, at either polarity.
+It recurses into shared keyed payloads, both directions of domain pairs, and codomains.
+This is a proof hypothesis, not a characterization of arbitrary bound existence.
+See `formal/design.md`, "Bound and leastness hypotheses".
 -/
 
 mutual
@@ -1703,34 +1690,20 @@ private def provedCovered : List (Bool × CompactTy × CompactTy) :=
     concrete (merge pol a b) && DataAgree pol a (merge pol a b)
       && DataAgree pol b (merge pol a b)
 
--- What `merge_is_a_bound` proves, against what the sample checks: of the kind-resolved
--- pairs, these are the ones whose merge stays concrete and whose data domains did
--- not move, so the theorem applies to them. The rest are a data domain the merge moved.
---
--- 1844 of 2048, up from 1814 when a slot held a list of domain alternatives: the class
--- excluded then — a `compute` slot carrying two alternatives, which materialized by
--- meeting them — cannot arise over one domain.
+-- These cases satisfy the theorem's concrete-merge and operand-to-merge
+-- domain-agreement hypotheses. The remaining cases are outside that theorem.
 #guard (provedCovered).length == 1844
 #guard (provedCovered.filter fun (pol, a, b) => !MergeIsBoundAt pol a b).isEmpty
 
 #guard (cases wellFormed).length == 2888
 #guard (cases concrete).length == 2048
 
--- In general, over kind-resolved positions: the merge is a bound wherever one
--- exists. That it is below every bound of both operands is `leastness_failures_eq_nil`
--- (`MaterializedMergeIsTheLeastBound.lean`) — a theorem over the same sample, not a measurement.
+-- Finite-pool guarded soundness, not an unrestricted existence theorem.
+-- The sample's leastness assertion is proved separately by `leastness_failures_eq_nil`.
 #guard guardedFailures.isEmpty
 
--- Unguarded, one phenomenon survives, on two surfaces, in both orders and at **both
--- polarities**: a merge of two `data` slots whose domains disagree. Both polarities because
--- the domain merges contravariantly at both — a positive merge meets the domains rather
--- than accumulating them, which is what doubled these counts from 4 and 2. A disagreement is
--- caught loudly exactly when the domains' join is undefined — two distinct atoms
--- give a two-atom position `coalesce` rejects, so nothing materializes and the
--- statement is vacuous — and silently whenever the join exists: record keys
--- intersect, variant tags unite, refinement sets intersect. So the boundary is the
--- domains' agreement, which is what `coalesce_monotone_fun` assumes, and not the shape of a
--- domain.
+-- Unguarded data-domain disagreement fails at both polarities.
+-- The guards below pin the sample's counts; they do not measure Rust reachability.
 #guard (failures concrete).length == 8
 #guard (monotoneFailures concrete).length == 4
 #guard !MergeIsBoundAt false
@@ -1765,9 +1738,8 @@ private def provedCovered : List (Bool × CompactTy × CompactTy) :=
   (.mk [] none none (some (.data, intPosition, intPosition)) (some []))
   (.mk [] none none (some (.unknown, intPosition, intPosition)) (some []))
 
--- The guard is what excludes the shape `Ty` gives no bound: a data function's
--- domain is invariant, so nothing is below both of these, and no merge result
--- could be. The Σ over both domains is the type that would be, which the Σ work adds.
+-- These invariant data domains have no shared lower bound in the candidate pool.
+-- The model does not introduce a dependent sum to reconcile them.
 #guard !MergeIsBoundAt false
   (.mk [] none none
     (some (.data, .mk [] (some [(.name "a", intPosition)]) none none (some []), intPosition))
