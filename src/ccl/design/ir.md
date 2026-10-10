@@ -439,15 +439,16 @@ generalized definition while retaining a captured outer channel. See
 
 ### `Aggregate` — first-class aggregation node
 
-`Aggregate { input, kind }` identifies a fold independently of a function name. CHL `sum(xs)` and
-`max(xs)` lower to this node. `OperatorSchemes::aggregate` supplies the whole input-to-output
-type; `emit_aggregate` applies that scheme to the inferred input. A collection input has data
-function type `𝐷 ⤇ 𝑉`. `Sum` requires `Int` elements and yields `Int`. `Max` yields the element
-type and also requires `Orderable` of two elements. `Drain` consumes any element type and yields
-`Unit`; `Sole` yields the element type and requires at most one input element at runtime.
-Operator conversion dispatches by `AggregateKind`, without inspecting a call-site variable name.
+`Aggregate { input, kind }` identifies a fold independently of a function name. CHL `sum(xs)`,
+`max(xs)`, and `min(xs)` lower to this node. `OperatorSchemes::aggregate` supplies the whole
+input-to-output type; `emit_aggregate` applies that scheme to the inferred input. A collection input
+has data function type `𝐷 ⤇ 𝑉`. `Sum` requires `Int` elements and yields `Int`. `Max` and `Min`
+yield the element type and also require `Orderable` of two elements. `Drain` consumes any element
+type and yields `Unit`; `Sole` yields the element type and requires at most one input element at
+runtime. Operator conversion dispatches by `AggregateKind`, without inspecting a call-site variable
+name.
 
-`AggregateKind` also defines the output extent, seed, fold, and partiality. `Sum`, `Max`, and
+`AggregateKind` also defines the output extent, seed, fold, and partiality. `Sum`, `Max`, `Min`, and
 `Drain` use total folds with an in-band identity. `Sole` has an `Option(𝐴)`-like accumulator:
 empty is represented by an empty column, one element by a length-one column, and adding another
 element faults. `is_partial` states that distinction, and `initial_accumulator` checks that the

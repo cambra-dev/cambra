@@ -1740,12 +1740,12 @@ pub(super) fn emit_aggregate<C: Typing>(
     let input_ty = emit_value_read(input, ctx)?;
     let at = || "Aggregate".to_string();
     let result = apply_unary_scheme(ctx, scheme, &input_ty, &at)?;
-    // `max` returns an element of what it consumes, so the scheme already gives it a
+    // `max` and `min` return an element of what they consume, so the scheme already gives it a
     // type; what the scheme cannot say is that the elements must be *orderable*
     // against each other, `Orderable(γ, γ)` (`docs/chl-spec.md`, "Trait
     // requirements"). That is a pure requirement: `Orderable` associates nothing, and
     // the result type stays the scheme's.
-    if kind == AggregateKind::Max {
+    if kind == AggregateKind::Max || kind == AggregateKind::Min {
         ctx.require_trait(
             Trait::Orderable,
             operator_node_id,

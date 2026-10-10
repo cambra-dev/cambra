@@ -212,7 +212,7 @@ The connections between the layers above and the capabilities Cambra claims:
 | Generator functions | Implemented (single-`for` bodies; general shapes **[Planned]**) |
 | `:=` mutation and loop accumulators (induction histories) | Implemented |
 | Transactions: `with begin():` over `Mut(V, Txn)` variables | Implemented (single deny-guard conditionals only; handle form and `abort()` still landing) |
-| Aggregates | `sum`, `max` implemented; `min`/`count`/`avg`/`len` **[Planned]** |
+| Aggregates | `sum`, `max`, `min` implemented; `count`/`avg`/`len` **[Planned]** |
 | Refinement typing | Machinery implemented (internal); surface syntax **[Decided]** |
 | Feed channels | Via `defer()` / `http_serve` implemented; `Feed(_)` declarations designed, not yet |
 | Contextual parameters (`requires` / `given` / `summon`) | **[Decided]** |

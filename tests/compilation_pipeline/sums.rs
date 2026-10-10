@@ -130,6 +130,8 @@ f(box([1, 2, 3]))",
 // A consumer other than `sum`. The predicate discriminates: unfiltered `max` is
 // 3, so a dropped filter is visible.
 #[case("x = box([1, 2, 3])\nmax([y for y in x if y < 3])", Value::Int(2))]
+// `min` under the same filter: unfiltered `min` is 1, so only a filter that drops 1 is visible.
+#[case("x = box([1, 2, 3])\nmin([y for y in x if y > 1])", Value::Int(2))]
 // Two consumers of one box, each with its own filter — the restrictions belong
 // to the sites, not to the boxed value they share.
 #[case(

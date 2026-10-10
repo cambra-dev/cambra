@@ -1672,6 +1672,24 @@ impl Interp {
                     .ok_or_else(|| Error("`max` of an empty collection is not defined".into()))
             }
 
+            // `min` of an empty collection is not defined, as for `max`.
+            Some(SurfaceBuiltin::Min) => {
+                let c = match self.eval(&args[0])? {
+                    Value::Collection(c) => c,
+                    Value::Pending => return Ok(Value::Pending),
+                    _ => return err("`min` takes a collection"),
+                };
+                let mut best: Option<i64> = None;
+                for (_, v) in c.entries() {
+                    let Value::Int(i) = v else {
+                        return err("`min` takes a collection of integers");
+                    };
+                    best = Some(best.map_or(*i, |b: i64| b.min(*i)));
+                }
+                best.map(Value::Int)
+                    .ok_or_else(|| Error("`min` of an empty collection is not defined".into()))
+            }
+
             Some(SurfaceBuiltin::Sum) => {
                 let c = match self.eval(&args[0])? {
                     Value::Collection(c) => c,

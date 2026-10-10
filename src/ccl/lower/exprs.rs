@@ -157,7 +157,7 @@ pub(super) fn lower_call(
                 ctx,
             ))
         }
-        Some(b @ (SurfaceBuiltin::Sum | SurfaceBuiltin::Max)) => {
+        Some(b @ (SurfaceBuiltin::Sum | SurfaceBuiltin::Max | SurfaceBuiltin::Min)) => {
             if !b.arity().accepts(args.len()) {
                 return Err(LoweringError::unsupported(
                     func.span,
@@ -167,7 +167,8 @@ pub(super) fn lower_call(
             let kind = match b {
                 SurfaceBuiltin::Sum => AggregateKind::Sum,
                 SurfaceBuiltin::Max => AggregateKind::Max,
-                _ => unreachable!("the arm matched sum or max"),
+                SurfaceBuiltin::Min => AggregateKind::Min,
+                _ => unreachable!("the arm matched sum, max, or min"),
             };
             let input = lower_expr(&args[0], ctx)?;
             Ok(Expr::aggregate(input, kind))

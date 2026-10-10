@@ -159,7 +159,7 @@ aggregate(op) : (I ⇀ Agg) ⇒ Agg
 
 Each new input mapping independently updates the running aggregate via `⊕`. `aggregate` can be a
 **homomorphism to the aggregate tiling**, in which case it streams. The aggregate tiling type (`Count×Sum`,
-`Count×Max`, etc.) is determined by the combining operation. In the current implementation the monoid is fixed per aggregate kind rather than user-supplied — `sum` (`⊕ = +`) and `max` (`Builtin::Sum`/`Builtin::Max`); `aggregate(op)` is the general primitive these instantiate.
+`Count×Max`, etc.) is determined by the combining operation. In the current implementation the monoid is fixed per aggregate kind rather than user-supplied — `sum` (`⊕ = +`), `max`, and `min` (`Builtin::Sum`/`Builtin::Max`/`Builtin::Min`); `aggregate(op)` is the general primitive these instantiate.
 
 NOTE: Even if an aggregation streams, the projection that _extracts_ the aggregate may not be a 
 homomorphism, and therefore not stream. For example, `sum(nums) > 100` streams into the `Count×Sum`

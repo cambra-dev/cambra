@@ -56,7 +56,7 @@ determined in a single step: from `⊥` to its terminal value.
 Function tiles can be determined incrementally, with each new tile covering a disjoint portion
 of the domain. Partial function tiles are terminal when they are total.
 
-**Aggregate terms** (e.g. `sum(f)`, `max(f)`, where `f: I ⇒ T`):
+**Aggregate terms** (e.g. `sum(f)`, `max(f)`, `min(f)`, where `f: I ⇒ T`):
 An aggregate operator takes a function tiling (`I ⇀ T`) as input and produces tiles in a
 tiling specific to the aggregation. For `sum`, the tiling is `Count × Sum`; for `max`,
 `Count × Max` (see Section 2, Unsplittable Tilings). Each increment of the input function
@@ -554,10 +554,10 @@ its future output must be a function of that seed and its remaining input alone.
 That is compaction's semantic sufficiency (Section 3) with the seed standing where
 `compact(obsolete)` stands. For an aggregate the seed is the retired operator's tile unchanged, so
 the compact map is the identity and the condition reduces to the operator being a homomorphism over
-its input, which `sum` and `max` are. The compact-map requirements otherwise transfer unaltered: a
-seed is a homomorphic image of what it summarizes, it is `⊥` only for `⊥`, and it is terminal
-exactly when the summarized tile was. A tile of a different tiling satisfies none of them, which is
-why a reload that changes a stateful term's type is refused rather than reseeded.
+its input, which `sum`, `max`, and `min` are. The compact-map requirements otherwise transfer
+unaltered: a seed is a homomorphic image of what it summarizes, it is `⊥` only for `⊥`, and it is
+terminal exactly when the summarized tile was. A tile of a different tiling satisfies none of them,
+which is why a reload that changes a stateful term's type is refused rather than reseeded.
 
 **4. Input availability.** An operator rebuilt from `⊥` computes `inject(f₂)` only where the input
 it reads is still the whole of what it reads. A term built from `P₂`'s own literals and terms

@@ -20,6 +20,7 @@
 pub enum SurfaceBuiltin {
     Sum,
     Max,
+    Min,
     Groupby,
     Set,
     Map,
@@ -121,6 +122,7 @@ pub const SURFACE_BUILTINS: &[SurfaceBuiltinEntry] = {
     &[
         entry("sum", B::Sum, Exact(1), Function),
         entry("max", B::Max, Exact(1), Function),
+        entry("min", B::Min, Exact(1), Function),
         entry("groupby", B::Groupby, Exact(2), Function),
         entry("set", B::Set, Exact(1), Function),
         entry("map", B::Map, Exact(1), Function),
@@ -182,6 +184,7 @@ mod tests {
         let every = |b: B| match b {
             B::Sum
             | B::Max
+            | B::Min
             | B::Groupby
             | B::Set
             | B::Map
@@ -197,6 +200,7 @@ mod tests {
         [
             B::Sum,
             B::Max,
+            B::Min,
             B::Groupby,
             B::Set,
             B::Map,
@@ -235,7 +239,7 @@ mod tests {
             assert_eq!(SurfaceBuiltin::from_name(e.spelling), Some(e.builtin));
             assert_eq!(e.builtin.spelling(), e.spelling);
         }
-        assert_eq!(SurfaceBuiltin::from_name("min"), None);
+        assert_eq!(SurfaceBuiltin::from_name("count"), None);
         assert_eq!(SurfaceBuiltin::from_name("Sum"), None);
     }
 
