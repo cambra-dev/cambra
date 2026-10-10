@@ -318,9 +318,9 @@ a `let` at the `run` statement. A `use` name for a type is an alias, in scope th
 for an import and from the statement down for a run. A `run` statement lowers to a
 [`Run`](ir.md#run--a-run-statement-before-linking) node over the rest of the module, below a `let`
 per argument. A value `param` lowers to a `let` at the head of its module's chain, of its default,
-which creating a run or a shared run replaces with its argument ([docs/modules.md,
-"Runs"](../../../docs/modules.md#runs)). A shared run's arguments are bound at the head of its
-chain, one shared run per module and distinct set of arguments ([docs/modules.md,
+which creating a run or a shared import replaces with its argument ([docs/modules.md,
+"Runs"](../../../docs/modules.md#runs)). A shared import's arguments are bound at the head of its
+chain, one shared import per module and distinct set of arguments ([docs/modules.md,
 "Imports"](../../../docs/modules.md#imports)). A Module-typed `param` lowers to a `let` per entry of
 its Module type, which creating a run binds to the argument's members, and a top-level binding of a
 module to nothing ([docs/modules.md, "A Module type is not a
@@ -328,11 +328,11 @@ module to nothing ([docs/modules.md, "A Module type is not a
 by each run of the module.
 
 The rest of the module syntax parses ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules") and
-does not lower yet: a type parameter, `@RenamedFrom`, `@Discard`, `pub` on a mutable variable, and
-a write to another module's member. `refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the
-whole module, every block and every expression, and reports one `LoweringError::Unsupported` per
-construct, and the module lowers nothing when it reports. A path with a capitalized qualifier
-segment, `Price::discounted`, is refused as a method reference rather than as module syntax
+does not lower yet: `@RenamedFrom`, `@Discard`, `pub` on a mutable variable, and a write to another
+module's member. `refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the whole module,
+every block and every expression, and reports one `LoweringError::Unsupported` per construct, and
+the module lowers nothing when it reports. A path with a capitalized qualifier segment,
+`Price::discounted`, is refused as a method reference rather than as module syntax
 ([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and methods [Decided]"). A module that
 uses refused syntax therefore reports only those refusals, and none of the lowering errors its
 other statements would raise.

@@ -50,9 +50,9 @@ pub struct Qualifier {
     pub module: ModulePath,
     /// The module's file, or `None` when loading found none.
     pub file: Option<FileId>,
-    /// For an import name, the shared run it reaches, or `None` when its
+    /// For an import name, the shared import it reaches, or `None` when its
     /// arguments are in error.
-    pub shared: Option<SharedRun>,
+    pub shared: Option<SharedImport>,
     /// The statement that binds the name.
     pub statement: Span,
     /// What the module declares. `None` when the module has no file or has
@@ -69,6 +69,10 @@ pub struct Qualifier {
     /// The spelling the view's spellings are under: empty for this module's own
     /// parameter, and `shop` for one `shop`'s module declares.
     pub view_base: QualifiedName,
+    /// The types the run or shared import it reaches gives its module's type
+    /// parameters, as this module writes them, which a type member reached
+    /// through it takes ([`Qualifier::reach_type`]).
+    pub types: TypeArguments,
 }
 
 /// How a [`Qualifier`]'s name is bound.
@@ -117,6 +121,7 @@ impl LoweringContext {
         self.mut_param_fns.clear();
         self.declared_sinks.clear();
         self.parameters.clear();
+        self.run_type_arguments.clear();
         // A `use` type name is in scope throughout its module. One whose module
         // has errors of its own names no type, and stands for any. A `use` name
         // for a function with a `Mut` parameter takes the curried call shape the
@@ -587,7 +592,9 @@ impl Qualifier {
             )
             .with_related(found.declared, "declared here without `pub`"));
         }
-        Ok(Some(reroot_alias(&found.ty, &self.name)))
+        let mut ty = reroot_alias(&found.ty, &self.name);
+        ty.walk_types_mut(&mut |ty| substitute(ty, &self.types));
+        Ok(Some(ty))
     }
 
     /// Whether `member` is a member of this module bound to a module.
@@ -623,6 +630,7 @@ impl Qualifier {
             return Ok(Qualifier {
                 name: self.name.child(member),
                 view: Some(Rc::clone(inner)),
+                types: TypeArguments::default(),
                 ..self.clone()
             });
         }
@@ -646,12 +654,22 @@ impl Qualifier {
             )
             .with_related(found.declared, "declared here without `pub`"));
         }
+        let types = found
+            .types
+            .iter()
+            .map(|(param, ty)| {
+                let mut ty = reroot(ty, &self.name);
+                substitute(&mut ty, &self.types);
+                (*param, ty)
+            })
+            .collect();
         Ok(Qualifier {
             module: found.module.clone(),
             interface: found.interface.clone(),
             name: self.name.then(&found.name),
             view: found.view.clone(),
             view_base: self.name.clone(),
+            types: Rc::new(types),
             ..self.clone()
         })
     }
@@ -743,6 +761,8 @@ pub(super) fn bound_name(module: &ModulePath, alias: Option<&Spanned<SmolStr>>) 
 /// The scope `module` lowers in: `labels` as the module of its unqualified
 /// labels, a [`Qualifier`] per `import` and per `run`, each reaching the
 /// interface `interfaces` holds for its statement, and a [`Use`] per `use` item.
+/// An import name reaches what `imports` holds for its statement. A run's type
+/// arguments are lowered with the module ([`LoweringContext::declare_run_types`]).
 ///
 /// An import of a module that performs IO or declares state is an error at the
 /// statement, and so is a second import or run binding one name. A `use` item
@@ -754,7 +774,7 @@ pub(super) fn module_scope(
     labels: Option<ModulePath>,
     program: &LoadedProgram,
     interfaces: &HashMap<Span, Option<Rc<Interface>>>,
-    shared: &HashMap<Span, SharedRun>,
+    imports: &HashMap<Span, Imported>,
     ctx: &LoweringContext,
     errors: &mut Vec<LoweringError>,
 ) -> ModuleScope {
@@ -793,13 +813,19 @@ pub(super) fn module_scope(
                 let qualifier = Qualifier {
                     module,
                     file,
-                    shared: shared.get(&stmt.span).cloned(),
+                    shared: imports
+                        .get(&stmt.span)
+                        .map(|imported| imported.shared.clone()),
                     statement: stmt.span,
                     interface,
                     kind: QualifierKind::Import,
                     name: QualifiedName::new(name.clone()),
                     view: None,
                     view_base: QualifiedName::default(),
+                    types: imports
+                        .get(&stmt.span)
+                        .map(|reaches| Rc::clone(&reaches.types))
+                        .unwrap_or_default(),
                 };
                 (name, qualifier, uses)
             }
@@ -833,6 +859,7 @@ pub(super) fn module_scope(
                     name: QualifiedName::new(name.clone()),
                     view: None,
                     view_base: QualifiedName::default(),
+                    types: TypeArguments::default(),
                 };
                 (name, qualifier, uses)
             }

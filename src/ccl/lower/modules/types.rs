@@ -1,4 +1,5 @@
-//! A type as another module writes it: spelled through a qualifier.
+//! A type as another module writes it: spelled through a qualifier, and with type
+//! parameters replaced by their arguments.
 
 use super::*;
 
@@ -55,4 +56,73 @@ pub(super) fn reroot(ty: &Type, qualifier: &QualifiedName) -> Type {
         true
     });
     ty
+}
+
+/// `ty` with each type parameter `arguments` maps replaced by its type.
+pub(in crate::ccl::lower) fn substitute(ty: &mut Type, arguments: &HashMap<TypeParamId, Type>) {
+    if arguments.is_empty() {
+        return;
+    }
+    if let Type::Param(param) = ty
+        && let Some(argument) = arguments.get(&param.id)
+    {
+        *ty = argument.clone();
+        return;
+    }
+    ty.walk_children_mut(|child| substitute(child, arguments));
+}
+
+/// [`substitute`] in every type slot of `expr`.
+pub(super) fn substitute_in(expr: &mut Expr, arguments: &HashMap<TypeParamId, Type>) {
+    if arguments.is_empty() {
+        return;
+    }
+    expr.walk_type_slots_mut(|ty| substitute(ty, arguments));
+    expr.walk_children_mut(|child| substitute_in(child, arguments));
+}
+
+/// The types a run or a shared import of the module `interface` declares gives its
+/// type parameters, as the module reaching it through the qualifier `spelling`
+/// writes them: the argument `given` has for one, and otherwise its default,
+/// spelled through the qualifier ([`reroot`]). A parameter with neither takes
+/// a hole, its run being an error ([`ProgramLowering::create`]).
+pub(super) fn reached_types(
+    interface: &Interface,
+    spelling: &QualifiedName,
+    given: &HashMap<SmolStr, Type>,
+) -> TypeArguments {
+    let mut arguments = HashMap::new();
+    for parameter in &interface.parameters {
+        let ParameterKind::Type { param, default, .. } = &parameter.kind else {
+            continue;
+        };
+        let ty = match (given.get(&parameter.name), default) {
+            (Some(argument), _) => argument.clone(),
+            (None, Some(default)) => {
+                let mut ty = reroot(default, spelling);
+                substitute(&mut ty, &arguments);
+                ty
+            }
+            (None, None) => Type::Hole,
+        };
+        arguments.insert(param.id, ty);
+    }
+    Rc::new(arguments)
+}
+
+/// A name a refinement in `ty` reads other than its element, if one does.
+pub(super) fn value_named(ty: &Type) -> Option<Name> {
+    fn walk(ty: &Type, visited: &mut HashSet<crate::ccl::PredicateId>, found: &mut Option<Name>) {
+        crate::ccl::ccl_utils::walk_refined_predicates(ty, visited, &mut |predicate, _| {
+            if found.is_none() {
+                *found = crate::ccl::ccl_utils::free_names(predicate)
+                    .into_iter()
+                    .find(|name| !name.is_elem());
+            }
+        });
+        ty.walk_children(|child| walk(child, visited, found));
+    }
+    let mut found = None;
+    walk(ty, &mut HashSet::new(), &mut found);
+    found
 }

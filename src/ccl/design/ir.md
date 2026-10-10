@@ -213,25 +213,35 @@ reads `k`, and those names resolve in the declaration's scope, not at a use unde
 Every use shares `ty`'s predicate terms, and uniquify rebuilds a shared predicate once. A use in a
 statement lies in `body` ([chl-spec.md, "6.7 Type-alias
 statements"](../../../docs/chl-spec.md#67-type-alias-statements)), so uniquify reaches the
-`LetType` first and the use takes the resolution made there. A nominal constructor's parameter type
-is the one use outside `body`: `nominal::bind_constructors` binds each constructor around the whole
-module, so uniquify reaches the constructor first. Lowering refuses a constructor parameter type
-whose refinement names a binding (`lower_parameter_type`), so every predicate reached there is
-closed and resolves the same in both scopes. A debug build asserts that a use uniquify reaches
-before its alias's `LetType` resolves each free name as the `LetType` does. Uniquify then replaces
-the node with `body`. No pass after it sees a `LetType`, and each has an unreachable arm for one.
+`LetType` first and the use takes the resolution made there. Two uses lie outside `body`:
+
+- `nominal::bind_constructors` binds each constructor around the whole module, so uniquify reaches a
+  constructor's parameter type first. Lowering refuses a constructor parameter type whose refinement
+  names a binding (`lower_parameter_type`), so every predicate reached there is closed and resolves
+  the same in both scopes.
+- A run's value argument is bound in a `let` above its `Run` node, annotated with the parameter's
+  type with the type arguments substituted, and linking puts each type argument's `LetType` where
+  that node stood, so uniquify reaches the annotation first. Only the run's other arguments are
+  bound between the two, spelled `__run::…` (`argument_name`), which no source writes, so each
+  free name resolves the same at both.
+
+A debug build asserts that a use uniquify reaches before its alias's `LetType` resolves each free
+name as the `LetType` does. Uniquify then replaces the node with `body`. No pass after it sees a
+`LetType`, and each has an unreachable arm for one.
 
 ### `Run` — a `run` statement before linking
 
-`Run { name, module, statement, arguments, modules, body }` is the `run` statement at `statement`
-that declares the run `name` of `module`, over `body`, the rest of the declaring module.
+`Run { name, module, statement, arguments, modules, types, body }` is the `run` statement at
+`statement` that declares the run `name` of `module`, over `body`, the rest of the declaring module.
 `arguments` names the parameters it passes value arguments for, each bound in a `let` above the
 node, and `modules` holds each module argument: its parameter, the module as the declaring module
-spells it, and the argument's span. A module lowers once, before any run of it exists, so the
-statement cannot stand for the run's chain yet. Linking creates the run and replaces the node with
-its chain around `body` ([docs/modules.md, "A module lowers
-once"](../../../docs/modules.md#a-module-lowers-once)). No pass after linking sees a `Run`, and
-each has an unreachable arm for one.
+spells it, and the argument's span. `types` holds each type argument with its parameter and span,
+and linking puts a `LetType` of each where the node stood, so uniquification resolves its
+refinements in the declaring module's scope. A module lowers once, before any run of it exists, so
+the statement cannot stand for the run's chain yet. Linking creates the run and replaces the node
+with its chain around `body` ([docs/modules.md, "A module lowers
+once"](../../../docs/modules.md#a-module-lowers-once)). No pass after linking sees a `Run`, and each
+has an unreachable arm for one.
 
 ### `Abstract` — a value known only by its type
 

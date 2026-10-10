@@ -306,7 +306,7 @@ exactly like any nested block (§4). (The parser's root AST node is
 named `Module`, after Python's `ast.Module`.)
 
 > **Direction [Decided].** A source file is a **module**. Importing one
-> asserts that it performs no IO and reaches the shared run of its arguments;
+> asserts that it performs no IO and reaches the shared import of its arguments;
 > running one creates a run of its own. The engine runs one root module. Modules are
 > specified in [9. Modules](#9-modules), whose statements (`import`, `run`, `param`,
 > and `pub` on a member) extend this grammar ([2.2 Statements](#22-statements)).
@@ -4112,9 +4112,9 @@ members ([9.8 Module types](#98-module-types)).
 - **Run.** One running of a module, declared by a `run` statement. A run has a **run name** in the
   module that declares it and a **run path** from the root: `eu`, or `eu::inv` for a run `eu`
   declares.
-- **Shared run.** The one evaluation of an imported module's top level at one set of arguments,
-  whose members every import passing those arguments reaches. Its run path is the module path with
-  those arguments
+- **Shared import.** The one evaluation of an imported module's top level at one set of arguments,
+  whose members every import passing those arguments reaches. It holds no state, and its run path
+  is the module path with those arguments
   ([9.7 Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)).
 - **Member.** A binding at a module's top level. Bindings inside a `def`, a loop, or a block are
   **locals**.
@@ -4145,18 +4145,18 @@ module_path ::= ident ("::" ident)*
   ([9.15 Module files](#915-module-files)). A `use` alias keeps the case of the member it names,
   `T as U` or `f as g`. Both rules follow from a capitalized name being a type
   ([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)).
-- An import reaches every public member of the module's shared run. Importing a module that
+- An import reaches every public member of the module's shared import. Importing a module that
   performs IO or declares mutable state is an error ([9.7 Importing asserts no IO and no
   state](#97-importing-asserts-no-io-and-no-state)).
 - An import passes arguments to the module's parameters as a run does
   ([9.4 Parameters](#94-parameters)): keyword-only, one for each parameter without a default. Every
-  argument is a constant, so two imports of one module with equal arguments reach one shared run,
+  argument is a constant, so two imports of one module with equal arguments reach one shared import,
   and its type members are one type in both: `import sorted_map(K=String)` in two modules gives
   both one `sorted_map::Map`. An omitted argument is the parameter's default, so `import m` and
-  `import m(x=1)` reach one shared run when `x` defaults to `1` (**[Planned]**). An argument may be
-  any constant ([9.19 Open questions](#919-open-questions)): a literal, a type (**[Planned]**), or
+  `import m(x=1)` reach one shared import when `x` defaults to `1` (**[Planned]**). An argument may
+  be any constant ([9.19 Open questions](#919-open-questions)): a literal, a type, or
   an import name passed as a value of its Module type ([9.8 Module types](#98-module-types)). A run
-  name may not: a shared run stands outside every run, and an import reaches no state ([9.7
+  name may not: a shared import stands outside every run, and an import reaches no state ([9.7
   Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)).
 - An `import` stands at a module's top level. One inside a `def`, a loop, or a block is an error.
 - There is no wildcard `use`. Adding a public member to a module never changes what an importer's
@@ -4205,8 +4205,8 @@ run inventory as inv use stock                        # binds `inv`, and `stock`
   only runs above its own, so runs cannot depend on each other in a cycle: `run svc(peer=y) as x`
   above `run svc(peer=x) as y` names `y` before it is bound.
 - A run needs no `import`. A run name and an import name in one module may not coincide. Importing a
-  module and running it are two runs: the import reaches the shared run, and the `run` statement
-  declares another.
+  module and running it reach two copies of it: the import reaches the shared import, and the `run`
+  statement declares a run.
 - A module returns a run it declares the way it returns any value: by binding it to a public member.
   `pub audit = a`, below `run audit_api as a`, is a member of the run's Module type ([9.8 Module
   types](#98-module-types)), and a module running `shop` reaches the run's members through it,
@@ -4229,12 +4229,16 @@ param Receipt <: {id: String}
 param payments: Module{charge: {amount: Int} => Receipt}
 ```
 
-- **[Planned]** A **type parameter** is a capitalized parameter, since `Caps` means type ([6.1
-  Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)). It
-  names a type that varies with the run. The module is checked with it as an opaque type, known only
-  through its bound: `Receipt` above has an `id` and nothing else checking can rely on. A run or an
-  import supplies it as an argument, `Receipt=stripe::Receipt`, as it does any parameter without a
-  default. **[Planned]** An argument left out is inferred from the types of the other arguments.
+- A **type parameter** is a capitalized parameter, since `Caps` means type
+  ([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)).
+  It names a type that varies with the run, and takes a bound written as a `def`'s type parameter's
+  is ([Kinds and bounds](#kinds-and-bounds)). A run or an import supplies it as an argument,
+  `Receipt=stripe::Receipt`, as it does any parameter without a default, and the module's uses of it
+  are checked at each argument. **[Planned]** Checked on its own, the module knows a bounded type
+  parameter only through its bound: `Receipt` above has an `id` and nothing else checking can rely
+  on ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). A default is a type
+  over the module's import names and the type parameters declared above it. **[Planned]** An
+  argument left out is inferred from the types of the other arguments.
 - **A structural bound is met by structural types only.** A nominal type relates to no structural
   type ([A nominal type is opaque](#a-nominal-type-is-opaque)), and a record meets `{id: String}`
   only through the labels the bound names, which belong to the bounding module
@@ -4328,12 +4332,12 @@ access](#39-subscript-and-attribute-access)). With `import shop::cart`, `run sho
 
 | Written | Position | Means |
 | --- | --- | --- |
-| `cart::total` | value | the public member `total` of `shop::cart`'s shared run |
+| `cart::total` | value | the public member `total` of `shop::cart`'s shared import |
 | `cart::Item` | type | the public type member `Item` of `shop::cart`, an alias, or a nominal type (**[Planned]**) |
 | `c::count` | value, write target | **[Planned]** the public member `count` of the run `c` |
 | `c::total` | value | the public member `total` of the run `c`, a copy distinct from `cart::total` |
 | `p::count` | value, write target | **[Planned]** the member `count` of the run passed as `p` |
-| `cart` | value | `shop::cart`'s shared run, as a value of its Module type ([9.8 Module types](#98-module-types)) |
+| `cart` | value | `shop::cart`'s shared import, as a value of its Module type ([9.8 Module types](#98-module-types)) |
 | `c` | value | the run `c`, as a value of its Module type |
 | `cart::hidden` | any | error: `hidden` is private to `shop::cart`, with a secondary label at its declaration |
 | `cart::missing` | any | error: `shop::cart` has no member `missing` |
@@ -4374,7 +4378,7 @@ runs another is itself run.
 
 An imported module's top level is evaluated once for each distinct set of arguments, however many
 modules import it with those arguments, because its members are values it computes. That evaluation
-is the module's **shared run** at those arguments. Every import passing them reaches the same
+is the module's **shared import** at those arguments. Every import passing them reaches the same
 members. Its run path is the module path with its arguments, so it never collides with a run a
 `run` statement names.
 
@@ -4445,7 +4449,7 @@ Each run performs its module's top level, with its parameters bound to its argum
 - Its own runs run with it, and their run paths extend its own.
 
 Runs share state only by being passed: a module passes one run to others as an argument. A shared
-run holds no state ([9.7 Importing asserts no IO and no
+import holds no state ([9.7 Importing asserts no IO and no
 state](#97-importing-asserts-no-io-and-no-state)):
 
 ```python
@@ -4630,8 +4634,8 @@ a type through its run name, and two spellings name one type exactly when those 
   records and variants but not for refinements.
 - **A module is checked once against every argument.** Inside `shop`, `Receipt` is opaque, so the
   functions of `Order` hold for each run's `Receipt`
-  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). A shared run takes its
-  module's default arguments, and a `run` passing the same arguments reaches the same types.
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). A shared import takes
+  its module's default arguments, and a `run` passing the same arguments reaches the same types.
 
 ### 9.13 Private-in-public
 
@@ -4678,7 +4682,7 @@ called functions or the full set of runs: the mutable-variable and transaction r
 dataflow shapes the compiler can emit, and route uniqueness across runs. One of these can refuse
 code inside a module that checked. The error is reported at the code it names, with the run whose
 copy failed, and with a secondary label at the `run` statement that created that run, or at each
-`import` that reaches a shared run.
+`import` that reaches a shared import.
 
 **[Planned]** — the guarantee needs every inferred type to state each requirement its body imposes.
 A trait requirement on a generic parameter is the exception today: it is enforced only when a
@@ -4710,7 +4714,7 @@ prints. An annotation is how an author fixes the contract.
   file's name. `import cart` does not load `Cart.cambra`, and naming `deploy.cambra` as the root
   does not read `Deploy.cambra`.
 - Two module paths resolving to one file, through a symlink for example, are refused. The file would
-  have two identities, and two shared runs.
+  have two identities, and two shared imports.
 
 ### 9.16 The std root
 
@@ -4755,7 +4759,7 @@ script-shaped root therefore needs an output sink, which [10. Sinks](#10-sinks) 
 A reload replaces the source of every module, the root's included, and the running program carries
 its state across ([8.8 `@LoadFrom`](#88-loadfrom)):
 
-- **State belongs to runs.** Each run's state is its own, and a shared run holds none
+- **State belongs to runs.** Each run's state is its own, and a shared import holds none
   ([9.7 Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)). A reload
   pairs the runs of the two versions by run path. A run the new version adds starts from its
   declared initial values. A run present in both takes over its state, whether its module's source,

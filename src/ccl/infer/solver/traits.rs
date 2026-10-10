@@ -1010,7 +1010,7 @@ impl TraitObligation {
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
         let peeled = peel_components(product);
-        let mut stated = canonical_type(&peeled);
+        let mut stated = peeled.canonical();
         let mut assumed = self
             .assumptions
             .borrow()
@@ -1090,7 +1090,7 @@ impl TraitObligation {
         let components = product_components(stated);
         let assumptions = self.assumptions.borrow();
         let mut fitting = assumptions.iter().filter_map(|a| {
-            let arg = canonical_type(a.args.get(pos as usize)?);
+            let arg = a.args.get(pos as usize)?.canonical();
             let fits = matches!(arg, Type::Tuple(_) | Type::Record(_))
                 && product_shape(&arg) == fields
                 && components
@@ -2029,21 +2029,6 @@ pub(crate) fn product_fields(product: &Type) -> Vec<FieldKey> {
             .collect(),
         other => unreachable!("`product_fields` is reached only for a product, got {other:?}"),
     }
-}
-
-/// `ty` with every record's fields in a canonical order, recursively: the form two
-/// spellings of one type share, which an assumption is matched in
-/// ([`TraitObligation::narrow_product`]).
-pub(crate) fn canonical_type(ty: &Type) -> Type {
-    let mut out = ty.clone();
-    fn go(ty: &mut Type) {
-        if let Type::Record(fields) = ty {
-            fields.sort_by(|(a, _), (b, _)| a.cmp(b));
-        }
-        ty.walk_children_mut(go);
-    }
-    go(&mut out);
-    out
 }
 
 /// A product's fields in a canonical order, for deciding whether two products are the same
