@@ -315,8 +315,8 @@ impl OperatorSchemes {
         let iota = fresh_var(BODY_LEVEL);
         let nu = fresh_var(BODY_LEVEL);
         let commit_record = Type::Record(vec![
-            ("time".to_string(), Type::Txn),
-            ("write".to_string(), nu.clone()),
+            ("time".into(), Type::Txn),
+            ("write".into(), nu.clone()),
         ]);
         let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
         // The commit stream (field 0) is a collection — a data function.

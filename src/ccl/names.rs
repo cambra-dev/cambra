@@ -50,7 +50,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 
 /// A globally-fresh binder identity. Minted only via [`Uid::fresh`]; nothing
 /// observes its numeric value (only `uid` *equality*), so non-determinism
@@ -400,8 +400,8 @@ impl Name {
     /// double-underscore name ([`source_spelling`](Self::source_spelling)), so
     /// minting into that namespace rules the collision out rather than checking
     /// for it.
-    pub fn defer_tap_field(&self, index: usize) -> String {
-        format!("__to_{}_{}", self.base(), index)
+    pub fn defer_tap_field(&self, index: usize) -> SmolStr {
+        format_smolstr!("__to_{}_{}", self.base(), index)
     }
 
     /// The spelling this binder has in the source, or `None` for one the
@@ -433,14 +433,14 @@ impl Name {
     /// Hashing cannot normalize a uid after it becomes string content. See
     /// `src/ccl/design/diffing.md`,
     /// "A name rendered into a string is past the point uid-robustness applies".
-    pub fn field_key(&self) -> String {
+    pub fn field_key(&self) -> SmolStr {
         match self {
             // Not a binder, so no mutable variable is ever declared at one and
             // no record field is ever labeled by one.
             Name::PiBound(_) => {
                 unreachable!("a PiBound is a reference, not a binder; it labels no field")
             }
-            _ => self.base().to_string(),
+            _ => SmolStr::from(self.base()),
         }
     }
 

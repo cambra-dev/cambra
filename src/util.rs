@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use log::{debug, trace};
+use smol_str::SmolStr;
 
 use crate::interpreter::tuple_field;
 
@@ -12,7 +13,7 @@ use crate::interpreter::tuple_field;
 /// emits `{name: value, …}` with fields sorted alphabetically.
 pub fn fmt_record<V: std::fmt::Display>(
     f: &mut std::fmt::Formatter<'_>,
-    fields: &HashMap<String, V>,
+    fields: &HashMap<SmolStr, V>,
 ) -> std::fmt::Result {
     let is_tuple = (0..fields.len()).all(|i| fields.contains_key(&tuple_field(i)));
     if is_tuple {

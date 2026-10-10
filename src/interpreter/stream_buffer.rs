@@ -405,7 +405,7 @@ mod tests {
         buf.release(
             "p",
             Predicate::Record(HashMap::from([(
-                "k".to_string(),
+                "k".into(),
                 Predicate::at_or_below(Value::UInt(4)),
             )])),
         );

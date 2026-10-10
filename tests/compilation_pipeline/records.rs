@@ -175,12 +175,12 @@ fn test_hash_join_record_body() {
 fn test_datasource_named_record_join() {
     let mut ctx = GlobalContext::default();
     let record_type = Type::Record(vec![
-        ("id".to_string(), Type::Base(BaseType::Int)),
-        ("label".to_string(), Type::Base(BaseType::String)),
+        ("id".into(), Type::Base(BaseType::Int)),
+        ("label".into(), Type::Base(BaseType::String)),
     ]);
     let record_extent = Extent::Record(HashMap::from([
-        ("id".to_string(), Extent::Base(BaseType::Int)),
-        ("label".to_string(), Extent::Base(BaseType::String)),
+        ("id".into(), Extent::Base(BaseType::Int)),
+        ("label".into(), Extent::Base(BaseType::String)),
     ]));
     let src1 = Rc::new(RefCell::new(TestDataSource::new(
         "src1",
@@ -199,15 +199,15 @@ fn test_datasource_named_record_join() {
         (
             Value::UInt(0),
             Value::Record(HashMap::from([
-                ("id".to_string(), Value::Int(1)),
-                ("label".to_string(), Value::String("a".into())),
+                ("id".into(), Value::Int(1)),
+                ("label".into(), Value::String("a".into())),
             ])),
         ),
         (
             Value::UInt(1),
             Value::Record(HashMap::from([
-                ("id".to_string(), Value::Int(2)),
-                ("label".to_string(), Value::String("b".into())),
+                ("id".into(), Value::Int(2)),
+                ("label".into(), Value::String("b".into())),
             ])),
         ),
     ]);
@@ -218,15 +218,15 @@ fn test_datasource_named_record_join() {
         (
             Value::UInt(0),
             Value::Record(HashMap::from([
-                ("id".to_string(), Value::Int(1)),
-                ("label".to_string(), Value::String("x".into())),
+                ("id".into(), Value::Int(1)),
+                ("label".into(), Value::String("x".into())),
             ])),
         ),
         (
             Value::UInt(1),
             Value::Record(HashMap::from([
-                ("id".to_string(), Value::Int(3)),
-                ("label".to_string(), Value::String("y".into())),
+                ("id".into(), Value::Int(3)),
+                ("label".into(), Value::String("y".into())),
             ])),
         ),
     ]);
@@ -342,8 +342,8 @@ fn test_product_of_collections_is_a_record_of_tables() {
         "r = (a=[1, 2], b=[4, 5, 6]); r",
         Tile::record(
             [
-                ("a".to_string(), make_int_list(&[1, 2])),
-                ("b".to_string(), make_int_list(&[4, 5, 6])),
+                ("a".into(), make_int_list(&[1, 2])),
+                ("b".into(), make_int_list(&[4, 5, 6])),
             ]
             .into_iter()
             .collect(),
@@ -365,9 +365,9 @@ fn test_list_of_records_holding_collections() {
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::record(
                 [
-                    ("a".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1, 3]))),
+                    ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 3]))),
                     (
-                        "b".to_string(),
+                        "b".into(),
                         Tile::grouped(
                             ColumnValue::UInts(vec![0, 2]),
                             ColumnValue::UInts(vec![0, 1, 0, 1]),
@@ -451,9 +451,9 @@ fn test_a_filtered_component_keeps_the_domain_it_binds() {
         "r = (n=1, xs=[y for y in [1, 2, 3] if y > 2]); r",
         Tile::record(
             [
-                ("n".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                ("n".into(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
                 (
-                    "xs".to_string(),
+                    "xs".into(),
                     Tile::data_function(
                         ColumnValue::UInts(vec![2]),
                         Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),

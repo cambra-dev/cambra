@@ -1,5 +1,6 @@
 use bit_set::BitSet;
 use log::trace;
+use smol_str::SmolStr;
 
 use crate::{
     ccl::{
@@ -116,7 +117,7 @@ pub fn convert_to_operators(
 }
 
 /// One compiled operator per program output.
-pub type OutputOperators = Vec<(String, Box<dyn TileOperator>)>;
+pub type OutputOperators = Vec<(SmolStr, Box<dyn TileOperator>)>;
 
 /// Compile a `Let`'s bound expression into the innermost scope, shared by both
 /// conversion entry points, and return the input its body is converted with.
@@ -364,7 +365,7 @@ struct StoreReadInfo {
     /// read is a branch of this one fan.
     fan: Rc<FanOut>,
     /// Per-variable read info, keyed by the variable's [`Name::field_key`].
-    keys: HashMap<String, KeyReadInfo>,
+    keys: HashMap<SmolStr, KeyReadInfo>,
     /// Which engine backs the store (selects the read projection).
     kind: StoreReadKind,
 }
@@ -1577,7 +1578,7 @@ identities is not distinguishing them",
                 .ok_or_else(|| ConversionError::TypeError(format!("Unknown data source: {name}"))),
             // Recurse through compound types so nested refinements are stripped.
             Type::Tuple(ts) => {
-                let fields: Result<HashMap<String, Extent>, _> = ts
+                let fields: Result<HashMap<SmolStr, Extent>, _> = ts
                     .iter()
                     .enumerate()
                     .map(|(i, t)| Ok((tuple_field(i), self.extent_of(t)?)))
@@ -1585,7 +1586,7 @@ identities is not distinguishing them",
                 Ok(Extent::record(fields?))
             }
             Type::Record(named) => {
-                let fields: Result<HashMap<String, Extent>, _> = named
+                let fields: Result<HashMap<SmolStr, Extent>, _> = named
                     .iter()
                     .map(|(name, t)| Ok((name.clone(), self.extent_of(t)?)))
                     .collect();
@@ -3138,7 +3139,7 @@ fn extent_shapes_agree(got: &Extent, want: &Extent) -> bool {
 /// [`ConversionError::TypeError`]. Function-tiled components under a record extent would
 /// otherwise build a record of collections where the consumer reads a collection of records.
 fn build_product(
-    components: Vec<(String, Box<dyn TileOperator>)>,
+    components: Vec<(SmolStr, Box<dyn TileOperator>)>,
     expr: &Expr,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
@@ -3186,12 +3187,12 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
     match &expr.node {
         TypedExprNode::Lit(lit) => Ok(match lit {
             Lit::Int(n) => Value::Int(*n),
-            Lit::String(s) => Value::String(s.into()),
+            Lit::String(s) => Value::String(s.clone()),
             Lit::Bool(b) => Value::Bool(*b),
             Lit::Unit => Value::Unit,
         }),
         TypedExprNode::Tuple(elts) => {
-            let fields: Result<HashMap<String, Value>, _> = elts
+            let fields: Result<HashMap<SmolStr, Value>, _> = elts
                 .iter()
                 .enumerate()
                 .map(|(i, e)| Ok((tuple_field(i), expr_to_value(e)?)))
@@ -3199,7 +3200,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
             Ok(Value::Record(fields?))
         }
         TypedExprNode::Record(fields) => {
-            let map: Result<HashMap<String, Value>, _> = fields
+            let map: Result<HashMap<SmolStr, Value>, _> = fields
                 .iter()
                 .map(|(name, e)| Ok((name.clone(), expr_to_value(e)?)))
                 .collect();
@@ -3251,10 +3252,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
 fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, ConversionError> {
     let (value, extent) = match lit {
         Lit::Int(n) => (Value::Int(*n), Extent::Base(BaseType::Int)),
-        Lit::String(s) => (
-            Value::String(s.clone().into()),
-            Extent::Base(BaseType::String),
-        ),
+        Lit::String(s) => (Value::String(s.clone()), Extent::Base(BaseType::String)),
         Lit::Bool(b) => (Value::Bool(*b), Extent::Base(BaseType::Bool)),
         Lit::Unit => (Value::Unit, Extent::Base(BaseType::Unit)),
     };
@@ -3298,7 +3296,7 @@ fn build_transact_store(
 /// ``variant_project(`fired)`` on the read eliminates it — so the *stream's*
 /// restriction to fired positions is a typed step rather than a decode the type
 /// cannot see.
-fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
+fn body_tap_fields(body_ty: &Type) -> Vec<(SmolStr, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
     };
@@ -3355,10 +3353,10 @@ pub(crate) fn store_key_name(key: &Value) -> Option<&str> {
 /// v` into the whole-value write `m := insert(m, k, v)`, so a mutable variable holds its whole
 /// collection at the single key `` `reg(unit) `` and the data key never reaches this key
 /// space. The tag is what would keep two mutable variables' keys disjoint if one ever did.
-fn store_key_extent(arms: Vec<(String, Extent)>) -> Extent {
+fn store_key_extent(arms: Vec<(SmolStr, Extent)>) -> Extent {
     Extent::Union(TagMap::from_arms(
         arms.into_iter()
-            .map(|(f, e)| (FieldKey::Name(f.into()), e))
+            .map(|(f, e)| (FieldKey::Name(f), e))
             .collect(),
     ))
 }
@@ -3385,11 +3383,11 @@ fn build_commit_store(
     // The reply taps join that key space, so their arms are collected before the
     // operator is built — the extent it carries has to describe every key the
     // store will hold, and a tap key is written from the first commit on.
-    let per_writer_taps: Vec<Vec<(String, Type)>> = writers
+    let per_writer_taps: Vec<Vec<(SmolStr, Type)>> = writers
         .iter()
         .map(|w| body_tap_fields(&w.body.ty))
         .collect();
-    let mut key_arms: Vec<(String, Extent)> = keys
+    let mut key_arms: Vec<(SmolStr, Extent)> = keys
         .iter()
         .map(|k| (k.name.field_key(), Extent::Base(BaseType::Unit)))
         .collect();
@@ -3399,7 +3397,7 @@ fn build_commit_store(
         }
     }
     let key_extent = store_key_extent(key_arms);
-    let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
+    let mut keys_map: HashMap<SmolStr, KeyReadInfo> = HashMap::with_capacity(keys.len());
     // Per scalar key, the stream giving its seed, the value it holds before any commit (a
     // literal init is a constant; a computed init streams to its value).
     let mut seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
@@ -3502,7 +3500,7 @@ fn build_commit_store(
     // (`TODO(store-key-levels)` on `Tile::Store`). The taps are read from the writers'
     // bodies rather than from `keys_map`, which does not hold them until each writer is
     // converted below — after the store they read back.
-    let mut store_values: HashMap<String, Tiling> = keys_map
+    let mut store_values: HashMap<SmolStr, Tiling> = keys_map
         .iter()
         .map(|(field, info)| (field.clone(), Tiling::Scalar(info.value_extent.clone())))
         .collect();
@@ -3582,7 +3580,7 @@ fn build_commit_store(
         // `Fun(Txn, V)` value-stream off the shared log. A tap takes no seed op —
         // it has no seed, so its stream starts at the first reply.
         let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
-        let mut tap_fields: Vec<String> = Vec::with_capacity(taps.len());
+        let mut tap_fields: Vec<SmolStr> = Vec::with_capacity(taps.len());
         for (field, tap_ty) in taps {
             let tap_value_extent = ctx.extent_of(&tap_ty)?;
             write_keys.push(store_key(&field));
@@ -4006,7 +4004,7 @@ fn state_identities(expr: &Expr) -> StateIdentities<'_> {
             // is the node, not the key.
             let site = content_hash(e);
             for k in keys {
-                let name = k.name.field_key();
+                let name = k.name.field_key().to_string();
                 let index = w.counts.entry((w.chain.clone(), name.clone())).or_insert(0);
                 w.out.variables.push(MutableVariable {
                     path: VarPath {
@@ -4382,8 +4380,8 @@ fn build_induction_store(
 /// arrives holding the accumulators and leaves holding the taps beside them.
 fn store_parts(
     w: &WriterSite,
-    taps: Vec<(String, Type)>,
-    keys_map: &mut HashMap<String, KeyReadInfo>,
+    taps: Vec<(SmolStr, Type)>,
+    keys_map: &mut HashMap<SmolStr, KeyReadInfo>,
     ctx: &mut OpConversionContext,
 ) -> Result<StoreParts, ConversionError> {
     let read_extents: Vec<Extent> = w
@@ -4403,7 +4401,7 @@ fn store_parts(
         .iter()
         .map(|n| store_key(&n.field_key()))
         .collect();
-    let mut tap_fields: Vec<String> = Vec::new();
+    let mut tap_fields: Vec<SmolStr> = Vec::new();
     for (field, tap_ty) in taps {
         let value_extent = ctx.extent_of(&tap_ty)?;
         let runtime_key = store_key(&field);
@@ -4446,9 +4444,9 @@ struct StoreParts {
     /// Keys written, in decision-`writes` order: the accumulators, then the tap keys.
     write_keys: Vec<Value>,
     /// The reply-tap fields, appended to each write set.
-    tap_fields: Vec<String>,
+    tap_fields: Vec<SmolStr>,
     /// The store's state, one field per key.
-    store_values: HashMap<String, Tiling>,
+    store_values: HashMap<SmolStr, Tiling>,
 }
 
 /// A nested `Transact`'s curried source, split into the levels it leaves standing and the two
@@ -4568,7 +4566,7 @@ fn build_nested_induction_store(
         (tuple_field(1), inner_domain),
     ]));
 
-    let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
+    let mut keys_map: HashMap<SmolStr, KeyReadInfo> = HashMap::with_capacity(keys.len());
     let mut seed_ops: Vec<Box<dyn TileOperator>> = Vec::new();
     let mut store_seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     // A seed is a morphism of the enclosing parameter, one per enclosing position, so it is
@@ -4731,7 +4729,7 @@ fn build_induction_store_single(
     // Each accumulator becomes a mutable variable key: its seed op (its value before any
     // position, read per pull until it settles) plus a dense-read entry carrying that
     // value as the leading-carry fold default.
-    let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
+    let mut keys_map: HashMap<SmolStr, KeyReadInfo> = HashMap::with_capacity(keys.len());
     let mut seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
@@ -4935,7 +4933,7 @@ fn as_of_snapshot_fields(
 /// The `(store, field)` of a `__hist.field` read on a registered store, if `e` is one.
 /// The same shape the generic `Apply`/`Proj` arm matches, factored out so the
 /// `FinalRead` arm can recognise its own operand.
-fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, String)> {
+fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, SmolStr)> {
     let TypedExprNode::Apply { argument, function } = &e.node else {
         return None;
     };
@@ -5181,7 +5179,7 @@ fn proj_named_field(
     }
     let record_extent = value_extent_at(input.tiling(), level);
     let field_extent = field_extent_of(&record_extent, name)?;
-    let fn_value = Value::ComputableFunction(FunctionDef::RecordField(name.to_string()));
+    let fn_value = Value::ComputableFunction(FunctionDef::RecordField(SmolStr::new(name)));
     let fn_extent = Extent::Function {
         domain: Box::new(record_extent),
         codomain: Box::new(field_extent),
@@ -5476,7 +5474,7 @@ fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
 /// A read of key `field` of a nested induction store, and the steps after it.
 struct NestedStoreRead<'a> {
     store: Name,
-    field: String,
+    field: SmolStr,
     steps: Vec<&'a Expr>,
 }
 
@@ -6000,9 +5998,9 @@ mod variant_ctor_tests {
         // stream is not expressible as pure CCL without planning (`VariantCtor`
         // op-conversion is scalar-only), so we inject the stream as the fed input.
         let stream_extent = Extent::Record(HashMap::from([
-            ("time".to_string(), Extent::Base(BaseType::Int)),
+            ("time".into(), Extent::Base(BaseType::Int)),
             (
-                "decision".to_string(),
+                "decision".into(),
                 // Keyed by the tag the `decision_ty` above declares: a named sum's
                 // extent carries its names, and the projection looks `commit` up by
                 // name.
@@ -6015,9 +6013,9 @@ mod variant_ctor_tests {
         let stream_tile = Tile::data_function(
             ColumnValue::from_uints(vec![0, 1]),
             Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
-                ("time".to_string(), ColumnValue::Ints(vec![10, 20])),
+                ("time".into(), ColumnValue::Ints(vec![10, 20])),
                 (
-                    "decision".to_string(),
+                    "decision".into(),
                     // Both rows carry `commit`, so the arm owns rows 0 and 1.
                     ColumnValue::Union(TagMap::from_arms(vec![(
                         FieldKey::Name("commit".into()),

@@ -7,6 +7,7 @@
 //! because it is part of the crate-public surface re-exported from
 //! `tile_operators`.
 
+use smol_str::SmolStr;
 use std::collections::HashMap;
 
 use super::{Predicate, Tile, TilePathStep, Tiling};
@@ -140,7 +141,7 @@ pub(crate) fn repeat_tile(tile: Tile, len: usize) -> Tile {
 /// A column reader takes a record's fields one value per row, which a field holding no cell
 /// at some rows does not give; reaching one is a reader this representation has not been
 /// taught.
-pub(crate) fn assert_no_absent_cells(absent: &HashMap<String, bit_set::BitSet>) {
+pub(crate) fn assert_no_absent_cells(absent: &HashMap<SmolStr, bit_set::BitSet>) {
     assert!(
         absent.is_empty(),
         "a record holding no cell of a field at some rows reached a reader taking one value \
@@ -485,16 +486,16 @@ mod tests {
     #[test]
     fn open_collections_opens_a_record_field() {
         let extent = Extent::Record(HashMap::from([
-            ("a".to_string(), Extent::Base(BaseType::Int)),
+            ("a".into(), Extent::Base(BaseType::Int)),
             (
-                "b".to_string(),
+                "b".into(),
                 function(Extent::Base(BaseType::String), Extent::Base(BaseType::Int)),
             ),
         ]));
         let cells = ColumnValue::Records(HashMap::from([
-            ("a".to_string(), ColumnValue::Ints(vec![5, 6])),
+            ("a".into(), ColumnValue::Ints(vec![5, 6])),
             (
-                "b".to_string(),
+                "b".into(),
                 ColumnValue::Variants(vec![
                     map_value(vec![(Value::String("x".into()), Value::Int(1))]),
                     map_value(vec![

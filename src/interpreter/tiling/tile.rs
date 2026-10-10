@@ -1,6 +1,7 @@
 //! The [`Tile`] type: the materialized data exchanged between operators, plus
 //! [`validate_tile`] for dev-build structural checks.
 
+use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 
 use bit_set::BitSet;
@@ -35,8 +36,8 @@ pub enum Tile {
     /// top-level scalar (`src/interpreter/design-operators.md`, "The release contract"). A
     /// field with no entry holds a cell at every row, or, before it has arrived, at none.
     Record {
-        fields: HashMap<String, Tile>,
-        absent: HashMap<String, BitSet>,
+        fields: HashMap<SmolStr, Tile>,
+        absent: HashMap<SmolStr, BitSet>,
     },
     /// A collection, `keys ⤇ values` — one new dimension over the rows it sits in.
     ///
@@ -217,7 +218,7 @@ impl Tile {
     }
 
     /// A record holding a cell of every field at every row it stands over.
-    pub fn record(fields: HashMap<String, Tile>) -> Tile {
+    pub fn record(fields: HashMap<SmolStr, Tile>) -> Tile {
         Tile::Record {
             fields,
             absent: HashMap::new(),
@@ -1670,12 +1671,12 @@ impl Tile {
 
     /// A store's key space — the mutable variables and reply taps it holds, which is
     /// static and so complete whether or not a key has been written.
-    pub fn store_keys(&self) -> impl Iterator<Item = &String> {
+    pub fn store_keys(&self) -> impl Iterator<Item = &SmolStr> {
         self.store_state().keys()
     }
 
     /// The per-key changelogs of a store.
-    fn store_state(&self) -> &HashMap<String, Tile> {
+    fn store_state(&self) -> &HashMap<SmolStr, Tile> {
         let Tile::Store { state, .. } = self else {
             panic!("a store's state is read off a store: {self:?}")
         };
@@ -2224,7 +2225,7 @@ impl Tile {
             // Only a scalar field holds no cell at a row, and a scalar holds no deleted row, so
             // every field that names one stands at every row the record does.
             Tile::Record { fields, .. } => {
-                let named: HashMap<&String, TileGuard> = fields
+                let named: HashMap<&SmolStr, TileGuard> = fields
                     .iter()
                     .filter_map(|(name, field)| Some((name, field.deleted_guard_under(row_paths)?)))
                     .collect();
@@ -2463,7 +2464,7 @@ enum RowSource {
 
 /// The rows a record stands over: each field's own, counting the rows a scalar field holds
 /// no cell at.
-fn record_rows(fields: &HashMap<String, Tile>, absent: &HashMap<String, BitSet>) -> usize {
+fn record_rows(fields: &HashMap<SmolStr, Tile>, absent: &HashMap<SmolStr, BitSet>) -> usize {
     fields
         .iter()
         .map(|(name, field)| field.rows() + absent.get(name).map_or(0, BitSet::len))
@@ -3881,12 +3882,12 @@ mod tests {
             ColumnValue::from_uints(groups.iter().map(|(k, _, _)| *k).collect()),
             Box::new(Tile::record(HashMap::from([
                 (
-                    "n".to_string(),
+                    "n".into(),
                     Tile::Scalar(ColumnValue::Ints(
                         groups.iter().filter_map(|(_, n, _)| *n).collect(),
                     )),
                 ),
-                ("xs".to_string(), b),
+                ("xs".into(), b),
             ]))),
             outer_pred,
             BitSet::new(),
@@ -3923,9 +3924,9 @@ mod tests {
             Predicate::qualified(Predicate::at_or_below(Value::UInt(0)), Predicate::True);
         tile.remove_guarded(TileGuard::Function(FunctionGuard::Codomain(Box::new(
             TileGuard::Record(HashMap::from([
-                ("n".to_string(), TileGuard::Scalar(under_row0)),
+                ("n".into(), TileGuard::Scalar(under_row0)),
                 (
-                    "xs".to_string(),
+                    "xs".into(),
                     TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
                 ),
             ])),
@@ -4027,10 +4028,10 @@ mod tests {
             domain: ColumnValue::from_uints(vec![0, 1]),
             codomain: Box::new(Tile::Record {
                 fields: HashMap::from([
-                    ("n".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
-                    ("xs".to_string(), fields["xs"].clone()),
+                    ("n".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
+                    ("xs".into(), fields["xs"].clone()),
                 ]),
-                absent: HashMap::from([("n".to_string(), BitSet::from_iter([0]))]),
+                absent: HashMap::from([("n".into(), BitSet::from_iter([0]))]),
             }),
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
@@ -4055,9 +4056,9 @@ mod tests {
         );
         let n_alone = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(
             HashMap::from([
-                ("n".to_string(), TileGuard::Scalar(under_row0.clone())),
+                ("n".into(), TileGuard::Scalar(under_row0.clone())),
                 (
-                    "xs".to_string(),
+                    "xs".into(),
                     TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
                 ),
             ]),
@@ -4077,9 +4078,9 @@ mod tests {
 
         let xs_too = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(
             HashMap::from([
-                ("n".to_string(), TileGuard::Scalar(Predicate::False)),
+                ("n".into(), TileGuard::Scalar(Predicate::False)),
                 (
-                    "xs".to_string(),
+                    "xs".into(),
                     TileGuard::Function(FunctionGuard::Domain(under_row0)),
                 ),
             ]),
@@ -4243,9 +4244,9 @@ mod tests {
                 ColumnValue::from_uints(vec![0]),
                 ColumnValue::from_uints(vec![0]),
                 Box::new(Tile::record(HashMap::from([
-                    ("_0".to_string(), Tile::Scalar(ColumnValue::Ints(vec![0]))),
+                    ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![0]))),
                     (
-                        "_1".to_string(),
+                        "_1".into(),
                         Tile::grouped(
                             ColumnValue::from_uints(vec![0]),
                             ColumnValue::from_uints(vec![0, 1]),
@@ -4291,9 +4292,9 @@ mod tests {
         );
         tile.remove_guarded(TileGuard::Function(FunctionGuard::Codomain(Box::new(
             TileGuard::Record(HashMap::from([
-                ("n".to_string(), TileGuard::Scalar(Predicate::False)),
+                ("n".into(), TileGuard::Scalar(Predicate::False)),
                 (
-                    "xs".to_string(),
+                    "xs".into(),
                     TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
                         Value::UInt(100),
                     ))),
@@ -4356,15 +4357,15 @@ mod tests {
         );
         assert!(
             Tile::record(HashMap::from([
-                ("a".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
-                ("b".to_string(), collection.clone()),
+                ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                ("b".into(), collection.clone()),
             ]))
             .holds_a_level(),
             "a collection in a record's field is a level under the record"
         );
         assert!(
             !Tile::record(HashMap::from([(
-                "a".to_string(),
+                "a".into(),
                 Tile::Scalar(ColumnValue::Ints(vec![1]))
             )]))
             .holds_a_level(),
@@ -4421,7 +4422,7 @@ mod tests {
         field.remove_guarded(TileGuard::Function(FunctionGuard::Domain(
             Predicate::at_or_below(Value::UInt(0)),
         )));
-        let mut tile = Tile::record(HashMap::from([("a".to_string(), field)]));
+        let mut tile = Tile::record(HashMap::from([("a".into(), field)]));
         tile.compact();
 
         let Tile::Record { fields, .. } = &tile else {
@@ -5309,7 +5310,7 @@ mod tests {
     fn merge_rejects_a_repeated_commit_tick() {
         let store = || Tile::Store {
             state: Box::new(Tile::record(HashMap::from([(
-                "acc".to_string(),
+                "acc".into(),
                 Tile::data_function(
                     ColumnValue::UInts(vec![0]),
                     Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))),
@@ -5318,7 +5319,7 @@ mod tests {
                 ),
             )]))),
             seed: Box::new(Tile::record(HashMap::from([(
-                "acc".to_string(),
+                "acc".into(),
                 Tile::Scalar(ColumnValue::Ints(vec![0])),
             )]))),
             decided: Box::new(one_row_decided(ColumnValue::UInts(vec![0]))),
@@ -5364,22 +5365,22 @@ mod tests {
     fn merge_record_recurses_per_field() {
         let make_record = |_: i64| {
             Tile::record(HashMap::from([(
-                "x".to_string(),
+                "x".into(),
                 Tile::Scalar(ColumnValue::Ints(vec![])),
             )]))
         };
         let mut tile = Tile::record(HashMap::from([(
-            "x".to_string(),
+            "x".into(),
             Tile::Scalar(ColumnValue::Ints(vec![])),
         )]));
         tile.merge(Tile::record(HashMap::from([(
-            "x".to_string(),
+            "x".into(),
             Tile::Scalar(ColumnValue::Ints(vec![7])),
         )])));
         assert_eq!(
             tile,
             Tile::record(HashMap::from([(
-                "x".to_string(),
+                "x".into(),
                 Tile::Scalar(ColumnValue::Ints(vec![7])),
             )]))
         );
@@ -5554,8 +5555,8 @@ mod tests {
     #[test]
     fn to_guard_record_recurses() {
         let tile = Tile::record(HashMap::from([
-            ("a".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
-            ("b".to_string(), Tile::Scalar(ColumnValue::Ints(vec![]))),
+            ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+            ("b".into(), Tile::Scalar(ColumnValue::Ints(vec![]))),
         ]));
         let TileGuard::Record(guards) = tile.to_guard() else {
             panic!("expected Record guard");
@@ -5744,12 +5745,12 @@ mod tests {
     #[test]
     fn remove_guarded_record_recurses() {
         let mut tile = Tile::record(HashMap::from([
-            ("a".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
-            ("b".to_string(), Tile::Scalar(ColumnValue::Ints(vec![2]))),
+            ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+            ("b".into(), Tile::Scalar(ColumnValue::Ints(vec![2]))),
         ]));
         tile.remove_guarded(TileGuard::Record(HashMap::from([
-            ("a".to_string(), TileGuard::Scalar(Predicate::True)),
-            ("b".to_string(), TileGuard::Scalar(Predicate::False)),
+            ("a".into(), TileGuard::Scalar(Predicate::True)),
+            ("b".into(), TileGuard::Scalar(Predicate::False)),
         ])));
         let Tile::Record { fields, .. } = &tile else {
             panic!()
@@ -6040,9 +6041,9 @@ mod tests {
             Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1]),
                 Box::new(Tile::record(HashMap::from([
-                    ("agg".to_string(), sums(acc)),
+                    ("agg".into(), sums(acc)),
                     (
-                        "xs".to_string(),
+                        "xs".into(),
                         Tile::grouped(
                             ColumnValue::UInts(vec![0, 1]),
                             ColumnValue::from_uints(vec![xs, xs]),

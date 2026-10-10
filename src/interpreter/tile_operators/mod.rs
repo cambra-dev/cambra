@@ -14,6 +14,7 @@
 //! `impl_*_base` macros, and [`TilePathStep`]) and re-exports every cluster so
 //! consumers continue to reach items as `tile_operators::X`.
 
+use smol_str::SmolStr;
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -345,14 +346,14 @@ enum EntryValue {
     Row(Tile),
 }
 
-type NodeKey = (Vec<String>, usize);
-type EntryKey = (Vec<String>, Vec<Value>);
+type NodeKey = (Vec<SmolStr>, usize);
+type EntryKey = (Vec<SmolStr>, Vec<Value>);
 
 /// Flatten `tile` into its collection levels and the entries it holds.
 fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<EntryKey, Entry>) {
     fn walk(
         tile: &Tile,
-        label: &[String],
+        label: &[SmolStr],
         level: usize,
         rows: &[Option<Vec<Value>>],
         above: &Predicate,
@@ -446,7 +447,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                     let entry = |value: EntryValue| Entry { value, complete };
                     let at_label = |name: &str| {
                         let mut l = label.to_vec();
-                        l.push(name.to_string());
+                        l.push(SmolStr::new(name));
                         l
                     };
                     entries.insert(
@@ -460,7 +461,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                         unreachable!("a store's rows are stores")
                     };
                     let positions = store_decided_positions(decided, 0);
-                    let names: Vec<String> = one.store_keys().cloned().collect();
+                    let names: Vec<SmolStr> = one.store_keys().cloned().collect();
                     for name in names {
                         let key = store_key(&name);
                         // A store waiting for its seed has none yet; once it has one it
@@ -501,7 +502,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 };
                 let part = |name: &str| {
                     let mut l = label.to_vec();
-                    l.push(name.to_string());
+                    l.push(SmolStr::new(name));
                     l
                 };
                 for (name, log) in logs {
@@ -558,7 +559,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
 }
 
 /// Whether `guard` releases the root value under record fields `label` whole.
-fn released_whole(guard: &TileGuard, label: &[String]) -> bool {
+fn released_whole(guard: &TileGuard, label: &[SmolStr]) -> bool {
     match guard {
         g if g.is_universal() => true,
         TileGuard::Or(arms) => arms.iter().any(|arm| released_whole(arm, label)),
@@ -573,8 +574,8 @@ fn released_whole(guard: &TileGuard, label: &[String]) -> bool {
 /// The paths reaching collection level `level` under record fields `label` that `guard`
 /// releases: a domain guard `d` codomain steps in names keys of level `d` and everything
 /// beneath them.
-fn released_at(guard: &TileGuard, label: &[String], level: usize) -> Predicate {
-    fn walk(guard: &TileGuard, label: &[String], depth: usize, level: usize) -> Predicate {
+fn released_at(guard: &TileGuard, label: &[SmolStr], level: usize) -> Predicate {
+    fn walk(guard: &TileGuard, label: &[SmolStr], depth: usize, level: usize) -> Predicate {
         match guard {
             TileGuard::Or(arms) => arms
                 .iter()
@@ -604,7 +605,7 @@ fn released_at(guard: &TileGuard, label: &[String], level: usize) -> Predicate {
 }
 
 /// The paths whose value under record fields `label` `guard` names: a keyless leaf's rows.
-fn released_cells_at(guard: &TileGuard, label: &[String]) -> Predicate {
+fn released_cells_at(guard: &TileGuard, label: &[SmolStr]) -> Predicate {
     match guard {
         TileGuard::Or(arms) => arms
             .iter()
@@ -653,7 +654,7 @@ fn completeness_violation(
     }
     // A root value is released by a release naming it whole, through the record fields that
     // reach it; a path beneath the root by one naming it.
-    let is_released = |label: &Vec<String>, path: &Vec<Value>| match path.len() {
+    let is_released = |label: &Vec<SmolStr>, path: &Vec<Value>| match path.len() {
         0 => released_whole(released, label),
         n => released_at(released, label, n - 1).contains_path(path),
     };
@@ -1071,7 +1072,7 @@ pub(crate) trait CyclicSequencingProducer: TileProducer {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TilePathStep {
     /// A step into a specific field of a Record
-    Record(String),
+    Record(SmolStr),
     /// A step into the codomain of a function
     Codomain,
 }
@@ -1145,10 +1146,7 @@ pub(crate) mod test_helpers {
         use std::collections::HashMap;
         let tiling = full_store_tiling(
             Extent::Base(BaseType::UInt),
-            HashMap::from([(
-                "acc".to_string(),
-                Tiling::Scalar(Extent::Base(BaseType::Int)),
-            )]),
+            HashMap::from([("acc".into(), Tiling::Scalar(Extent::Base(BaseType::Int)))]),
         );
         let mut engine = CommitEngine::unopened();
         let step = |engine: &mut CommitEngine, p: usize| {
@@ -1202,9 +1200,9 @@ pub(crate) mod test_helpers {
                 row_starts: ColumnValue::UInts(vec![0]),
                 domain: ColumnValue::UInts(vec![0]),
                 codomain: Box::new(Tile::record(HashMap::from([
-                    ("n".to_string(), Tile::Scalar(n)),
+                    ("n".into(), Tile::Scalar(n)),
                     (
-                        "xs".to_string(),
+                        "xs".into(),
                         Tile::grouped(
                             ColumnValue::UInts(vec![0]),
                             ColumnValue::UInts(vec![]),

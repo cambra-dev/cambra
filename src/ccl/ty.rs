@@ -1130,7 +1130,7 @@ pub enum Type {
     /// An ordered product type with unnamed fields (tuple).
     Tuple(Vec<Type>),
     /// A named product type (record).
-    Record(Vec<(String, Type)>),
+    Record(Vec<(SmolStr, Type)>),
     /// A tagged sum type — each tag has its own payload type.
     ///
     /// Tags are [`FieldKey`]s, the dual of `Record`/`Tuple` keys: `Name`
@@ -2546,7 +2546,7 @@ impl Type {
     /// The named product of `fields` — a [`Type::Record`], or
     /// [`BaseType::Unit`] when there are none. See [`Type::tuple`] for why the
     /// empty case collapses.
-    pub fn record(fields: Vec<(String, Self)>) -> Self {
+    pub fn record(fields: Vec<(SmolStr, Self)>) -> Self {
         if fields.is_empty() {
             return Type::Base(BaseType::Unit);
         }
@@ -5686,8 +5686,8 @@ mod tests {
 
         // A record payload's braces are the arm's braces.
         let record = Type::Record(vec![
-            ("a".to_string(), Type::Base(BaseType::Int)),
-            ("b".to_string(), Type::Base(BaseType::Int)),
+            ("a".into(), Type::Base(BaseType::Int)),
+            ("b".into(), Type::Base(BaseType::Int)),
         ]);
         assert_eq!(
             Type::variant(vec![(FieldKey::Name("pair".into()), record)]).to_string(),

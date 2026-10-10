@@ -2302,7 +2302,7 @@ mod tests {
     #[test]
     fn a_negative_position_meets_both_sides() {
         let int = || Type::Base(BaseType::Int);
-        let field = |n: &str| (n.to_string(), int());
+        let field = |n: &str| (n.into(), int());
         // `demand` is what the body asks of the variable; `value` is what reaches it.
         // `negative` places it at a function's domain rather than its codomain.
         let read_at = |value: Type, demand: Type, negative: bool| {
@@ -2386,7 +2386,7 @@ mod tests {
     fn a_settled_negative_position_closes_an_open_child_demand() {
         let int = || Type::Base(BaseType::Int);
         let arm = |n: &str, t: Type| (FieldKey::Name(SmolStr::from(n)), t);
-        let rec = |t: Type| Type::Record(vec![("f".to_string(), t)]);
+        let rec = |t: Type| Type::Record(vec![("f".into(), t)]);
         let dom = fresh_var(0);
         let mut cache = ConstrainCache::new();
         let value = Type::Variant(
@@ -2815,8 +2815,8 @@ mod tests {
         assert_eq!(
             *domain,
             Box::new(Type::Record(vec![
-                ("a".to_string(), Type::Base(BaseType::Int)),
-                ("b".to_string(), Type::Base(BaseType::Int)),
+                ("a".into(), Type::Base(BaseType::Int)),
+                ("b".into(), Type::Base(BaseType::Int)),
             ])),
             "the met domain is the union of the two records' fields"
         );

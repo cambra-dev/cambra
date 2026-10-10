@@ -49,6 +49,7 @@
 //! semantics are validated deterministically.
 
 use bit_set::BitSet;
+use smol_str::SmolStr;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
 
@@ -1418,7 +1419,7 @@ fn map_extent(key_extent: &Extent, value_extent: &Extent) -> Extent {
 /// key's [`store_key`] name. Carrying each key's tiling is what lets the keys differ: a
 /// single shared codomain could only describe a heterogeneous store as the union of its
 /// keys' extents, which names what any key might hold rather than what each one does.
-pub fn full_store_tiling(domain: Extent, values: HashMap<String, Tiling>) -> Tiling {
+pub fn full_store_tiling(domain: Extent, values: HashMap<SmolStr, Tiling>) -> Tiling {
     Tiling::Store {
         domain,
         codomain: Box::new(Tiling::Record(values)),
@@ -1435,7 +1436,7 @@ pub fn full_store_tiling(domain: Extent, values: HashMap<String, Tiling>) -> Til
 pub fn nested_store_tiling(
     enclosing: Extent,
     inner: Extent,
-    values: HashMap<String, Tiling>,
+    values: HashMap<SmolStr, Tiling>,
 ) -> Tiling {
     Tiling::data_function(enclosing, full_store_tiling(inner, values))
 }
@@ -1693,11 +1694,11 @@ pub fn proposal_stream_tiling(key_extent: &Extent, value_extent: &Extent) -> Til
         Extent::Base(BaseType::UInt),
         Tiling::Record(HashMap::from([
             (
-                F_SNAP.to_string(),
+                SmolStr::from(F_SNAP),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
-            (F_READS.to_string(), Tiling::Scalar(map.clone())),
-            (F_WRITES.to_string(), Tiling::Scalar(map)),
+            (SmolStr::from(F_READS), Tiling::Scalar(map.clone())),
+            (SmolStr::from(F_WRITES), Tiling::Scalar(map)),
         ])),
     )
 }
@@ -1749,7 +1750,7 @@ impl CommitOperator {
     /// Its length is the writer count. See [`Self::writer_write_keys`].
     pub fn new(
         init: HashMap<Value, Value>,
-        values: HashMap<String, Tiling>,
+        values: HashMap<SmolStr, Tiling>,
         writer_write_keys: Vec<Vec<Value>>,
     ) -> Self {
         let output_tiling = full_store_tiling(commit_clock_domain(), values);
@@ -1771,7 +1772,7 @@ impl CommitOperator {
     /// concrete-map constructor used by engine-level tests.)
     pub fn with_seed_ops(
         seed_ops: Vec<(Value, Box<dyn TileOperator>)>,
-        values: HashMap<String, Tiling>,
+        values: HashMap<SmolStr, Tiling>,
         writer_write_keys: Vec<Vec<Value>>,
     ) -> Self {
         let output_tiling = full_store_tiling(commit_clock_domain(), values);
@@ -1933,7 +1934,7 @@ struct CommitProducer {
 /// column, `reads`/`writes` `Variants` map columns) — inference's
 /// `emit_transact_writer` types it so, so a missing or non-`Scalar` field is
 /// impossible.
-fn record_field<'a>(fields: &'a HashMap<String, Tile>, name: &str) -> &'a ColumnValue {
+fn record_field<'a>(fields: &'a HashMap<SmolStr, Tile>, name: &str) -> &'a ColumnValue {
     match fields.get(name) {
         Some(Tile::Scalar(cv)) => cv,
         other => unreachable!(
@@ -2359,7 +2360,7 @@ pub fn nested_engines_tiling(
     standing: &Tiling,
     depth: usize,
     pair_domain: &Extent,
-    values: HashMap<String, Tiling>,
+    values: HashMap<SmolStr, Tiling>,
 ) -> Tiling {
     let (enclosing, inner) = split_pair_domain(pair_domain).unwrap_or_else(|| {
         panic!("a nested store sequences its positions as pairs, got {pair_domain}")
@@ -2405,7 +2406,7 @@ pub struct InductionStore {
     resumed_after: Option<Position>,
     /// Reply-tap decision fields, appended to each write set (see
     /// [`body_decision_at`]). Empty for a store with no feed.
-    tap_fields: Vec<String>,
+    tap_fields: Vec<SmolStr>,
     /// Per accumulator key, the stream giving each row's value **before** any of its
     /// positions.
     ///
@@ -2430,7 +2431,7 @@ impl InductionStore {
     pub fn new(
         seed_ops: Vec<(Value, Box<dyn TileOperator>)>,
         write_keys: Vec<Value>,
-        tap_fields: Vec<String>,
+        tap_fields: Vec<SmolStr>,
         output_tiling: Tiling,
         resumed_after: Option<Position>,
     ) -> Self {
@@ -2597,7 +2598,7 @@ struct InductionStoreProducer {
     resumed_after: Option<Position>,
     body_producer: Box<dyn TileProducer>,
     write_keys: Vec<Value>,
-    tap_fields: Vec<String>,
+    tap_fields: Vec<SmolStr>,
     /// The full-store output tiling — for a debug-time shape check on the rendered
     /// store tile.
     output_tiling: Tiling,
@@ -3951,7 +3952,7 @@ impl TileProducer for StoreDenseReadProducer {
 /// extent.
 #[derive(Clone)]
 pub struct AsOfField {
-    pub field: String,
+    pub field: SmolStr,
     pub key: Value,
     pub value_extent: Extent,
 }
@@ -6126,8 +6127,8 @@ fn body_input_fields<T>(
     read_extents: &[Extent],
     item: T,
     read: impl Fn(usize, &Extent) -> T,
-) -> HashMap<String, T> {
-    let mut fields: HashMap<String, T> = HashMap::with_capacity(read_extents.len() + 1);
+) -> HashMap<SmolStr, T> {
+    let mut fields: HashMap<SmolStr, T> = HashMap::with_capacity(read_extents.len() + 1);
     for (i, ext) in read_extents.iter().enumerate() {
         fields.insert(tuple_field(i), read(i, ext));
     }
@@ -6271,7 +6272,7 @@ fn body_decision_at(
     tile: &Tile,
     pos: &Position,
     write_keys: &[Value],
-    tap_fields: &[String],
+    tap_fields: &[SmolStr],
 ) -> Option<(bool, Vec<Value>, Vec<bool>)> {
     let Tile::DataFunction {
         domain, codomain, ..
@@ -6296,7 +6297,7 @@ fn decision_at_index(
     union_col: &ColumnValue,
     row: usize,
     write_keys: &[Value],
-    tap_fields: &[String],
+    tap_fields: &[SmolStr],
 ) -> Option<(bool, Vec<Value>, Vec<bool>)> {
     let Value::Union { tag, inner } = union_col.index_at(row) else {
         return None;
@@ -6410,7 +6411,7 @@ pub struct TransactWriter {
     /// Decision-record field names of the reply taps, in `write_keys` tail order.
     /// Their values are appended to each committed write set (a tap commits iff
     /// its transaction does, so a denied request replies nothing).
-    tap_fields: Vec<String>,
+    tap_fields: Vec<SmolStr>,
 }
 
 impl TransactWriter {
@@ -6421,7 +6422,7 @@ impl TransactWriter {
         driver_op: Box<dyn TileOperator>,
         read_keys: Vec<Value>,
         write_keys: Vec<Value>,
-        tap_fields: Vec<String>,
+        tap_fields: Vec<SmolStr>,
         key_extent: Extent,
         value_extent: Extent,
     ) -> Self {
@@ -6533,7 +6534,7 @@ struct TransactWriterProducer {
     write_keys: Vec<Value>,
     /// Reply-tap decision fields, appended to each write set (see
     /// [`TransactWriter::tap_fields`]).
-    tap_fields: Vec<String>,
+    tap_fields: Vec<SmolStr>,
     /// The driver position whose decision this writer has already acted on, so a
     /// re-pull re-reads a *not-ready* decision without re-deciding a settled one.
     last_decided_pos: Option<Position>,
@@ -6579,7 +6580,7 @@ impl TransactWriterProducer {
             ColumnValue::from_uints((self.committed_base..self.committed_base + n).collect()),
             Box::new(Tile::record(HashMap::from([
                 (
-                    F_SNAP.to_string(),
+                    SmolStr::from(F_SNAP),
                     Tile::Scalar(ColumnValue::from_values(
                         self.emitted
                             .iter()
@@ -6589,11 +6590,11 @@ impl TransactWriterProducer {
                     )),
                 ),
                 (
-                    F_READS.to_string(),
+                    SmolStr::from(F_READS),
                     Tile::Scalar(ColumnValue::Variants(reads)),
                 ),
                 (
-                    F_WRITES.to_string(),
+                    SmolStr::from(F_WRITES),
                     Tile::Scalar(ColumnValue::Variants(writes)),
                 ),
             ]))),
@@ -7112,10 +7113,10 @@ mod tests {
             commit_clock_domain(),
             HashMap::from([
                 (
-                    "name".to_string(),
+                    "name".into(),
                     Tiling::Scalar(Extent::Base(BaseType::String)),
                 ),
-                ("count".to_string(), Tiling::Scalar(value_extent())),
+                ("count".into(), Tiling::Scalar(value_extent())),
             ]),
         );
         let tile = e.render_full_store_tile(&tiling);
@@ -7414,8 +7415,8 @@ mod tests {
     /// the key the same way the CCL side does.
     fn commit_payload_extent(key: &str) -> Extent {
         Extent::Record(HashMap::from([(
-            F_WRITES.to_string(),
-            Extent::Record(HashMap::from([(key.to_string(), value_extent())])),
+            SmolStr::from(F_WRITES),
+            Extent::Record(HashMap::from([(SmolStr::from(key), value_extent())])),
         )]))
     }
 
@@ -7433,11 +7434,11 @@ mod tests {
     /// keyed by the variable written, so a fixture names its key the same way
     /// the writer consuming the decision does.
     fn commit_value(key: &str, write: Value) -> Value {
-        let writes_rec = Value::Record(HashMap::from([(key.to_string(), write)]));
+        let writes_rec = Value::Record(HashMap::from([(SmolStr::from(key), write)]));
         Value::Union {
             tag: FieldKey::Name(V_COMMIT.into()),
             inner: Box::new(Value::Record(HashMap::from([(
-                F_WRITES.to_string(),
+                SmolStr::from(F_WRITES),
                 writes_rec,
             )]))),
         }
@@ -8319,10 +8320,10 @@ mod tests {
     }
 
     /// A store's per-key value tilings over `accounts`: one key each, holding a balance.
-    fn store_values(accounts: &[&str]) -> HashMap<String, Tiling> {
+    fn store_values(accounts: &[&str]) -> HashMap<SmolStr, Tiling> {
         accounts
             .iter()
-            .map(|a| ((*a).to_string(), Tiling::Scalar(value_extent())))
+            .map(|a| ((*a).into(), Tiling::Scalar(value_extent())))
             .collect()
     }
 
@@ -8332,11 +8333,11 @@ mod tests {
     }
 
     /// The store's per-key value tilings for exactly the keys `init` seeds.
-    fn keyed_like(init: &HashMap<Value, Value>) -> HashMap<String, Tiling> {
+    fn keyed_like(init: &HashMap<Value, Value>) -> HashMap<SmolStr, Tiling> {
         init.keys()
             .map(|k| {
                 let name = store_key_name(k).expect("an initial state is keyed by store keys");
-                (name.to_string(), Tiling::Scalar(value_extent()))
+                (SmolStr::from(name), Tiling::Scalar(value_extent()))
             })
             .collect()
     }
@@ -8915,20 +8916,20 @@ mod tests {
             ColumnValue::from_uints((base..base + emitted.len()).collect()),
             Box::new(Tile::record(HashMap::from([
                 (
-                    F_SNAP.to_string(),
+                    SmolStr::from(F_SNAP),
                     Tile::Scalar(ColumnValue::from_values(
                         emitted.iter().map(|p| p.0.value().clone()).collect(),
                         &Extent::Base(BaseType::UInt),
                     )),
                 ),
                 (
-                    F_READS.to_string(),
+                    SmolStr::from(F_READS),
                     Tile::Scalar(ColumnValue::Variants(
                         emitted.iter().map(|p| map_to_value(&p.1)).collect(),
                     )),
                 ),
                 (
-                    F_WRITES.to_string(),
+                    SmolStr::from(F_WRITES),
                     Tile::Scalar(ColumnValue::Variants(
                         emitted.iter().map(|p| map_to_value(&p.2)).collect(),
                     )),
@@ -9734,8 +9735,8 @@ mod tests {
             value
         };
 
-        fn field<T>(t: T) -> HashMap<String, T> {
-            HashMap::from([("units".to_string(), t)])
+        fn field<T>(t: T) -> HashMap<SmolStr, T> {
+            HashMap::from([("units".into(), t)])
         }
         // A column of record values, and a record of columns over the fields.
         let units = ColumnValue::from_ints(vec![2, 1]);
@@ -9760,7 +9761,7 @@ mod tests {
             out.sort();
             out
         };
-        let expected = vec![("btc".to_string(), 2), ("eth".to_string(), 1)];
+        let expected = vec![("btc".into(), 2), ("eth".into(), 1)];
         assert_eq!(entries(boxed), expected);
         assert_eq!(entries(struct_of_arrays), expected);
     }
@@ -9803,7 +9804,7 @@ mod tests {
                     frontier.clone(),
                     BitSet::new(),
                 );
-                (account.to_string(), tile)
+                (account.into(), tile)
             })
             .collect();
         let seed_record = accounts
@@ -9813,7 +9814,7 @@ mod tests {
                     Some((_, v)) => ColumnValue::from_ints(vec![*v]),
                     None => ColumnValue::from_ints(vec![]),
                 };
-                ((*a).to_string(), Tile::Scalar(column))
+                ((*a).into(), Tile::Scalar(column))
             })
             .collect();
         let tile = Tile::Store {
@@ -10043,7 +10044,7 @@ mod tests {
             terminal: false,
             closed_keys: Vec::new(),
         };
-        let one_key = |log: Tile| store(Tile::record(HashMap::from([("a".to_string(), log)])));
+        let one_key = |log: Tile| store(Tile::record(HashMap::from([("a".into(), log)])));
         // Non-ascending change ticks.
         assert!(!validate_tile(&one_key(log(vec![2, 1], vec![1, 2]))));
         // More values than ticks to hold them.

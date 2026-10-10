@@ -183,7 +183,7 @@ fn int_lit(n: i64) -> Type {
 
 /// The type of the string literal `s` — see [`int_lit`].
 fn str_lit(s: &str) -> Type {
-    lit_singleton(&Lit::String(s.to_string()))
+    lit_singleton(&Lit::String(s.into()))
 }
 
 /// The type of the boolean literal `b` — see [`int_lit`].

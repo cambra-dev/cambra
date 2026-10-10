@@ -4136,8 +4136,8 @@ mod tests {
         // whole, singleton included.
         let mut expr = Expr::apply(
             Expr::new(TypedExprNode::Record(vec![
-                ("x".to_string(), Expr::lit(Lit::Int(42))),
-                ("y".to_string(), Expr::lit(Lit::String("hi".into()))),
+                ("x".into(), Expr::lit(Lit::Int(42))),
+                ("y".into(), Expr::lit(Lit::String("hi".into()))),
             ])),
             Expr::proj_field("x"),
         );

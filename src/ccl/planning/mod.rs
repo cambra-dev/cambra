@@ -755,14 +755,14 @@ mod tests {
         let int = int_ty();
         let out_ty = data_fun_ty(Type::UIntRange(3), int.clone());
         let mut expr = Expr::new(TypedExprNode::Record(vec![
-            ("out_a".to_string(), list_123()),
-            ("out_b".to_string(), list_123()),
-            ("n".to_string(), Expr::lit(Lit::Int(0)).with_ty(int.clone())),
+            ("out_a".into(), list_123()),
+            ("out_b".into(), list_123()),
+            ("n".into(), Expr::lit(Lit::Int(0)).with_ty(int.clone())),
         ]))
         .with_ty(Type::Record(vec![
-            ("out_a".to_string(), out_ty.clone()),
-            ("out_b".to_string(), out_ty),
-            ("n".to_string(), int),
+            ("out_a".into(), out_ty.clone()),
+            ("out_b".into(), out_ty),
+            ("n".into(), int),
         ]));
 
         insert_iterate_markers(&mut expr, &Default::default());

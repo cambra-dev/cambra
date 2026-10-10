@@ -1,6 +1,7 @@
 //! The [`Predicate`] type: subset-of-an-extent descriptions used by guards, plus
 //! the column-value conversions and the function domain-sort helper.
 
+use smol_str::SmolStr;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -36,7 +37,7 @@ fn same_region(a: &Predicate, b: &Predicate) -> bool {
 /// too, which is exact for products: a nonempty componentwise predicate lies inside another exactly
 /// when each of its components does.
 enum Componentwise {
-    Record(Vec<String>),
+    Record(Vec<SmolStr>),
     Qualified,
 }
 
@@ -57,7 +58,7 @@ impl Componentwise {
                     m1.len() == m2.len() && m2.keys().all(|k| m1.contains_key(k)),
                     "records over one domain have one schema: {a:?} and {b:?}"
                 );
-                let mut names: Vec<String> = m1.keys().cloned().collect();
+                let mut names: Vec<SmolStr> = m1.keys().cloned().collect();
                 names.sort();
                 let first = names.iter().map(|n| &m1[n]).collect();
                 let second = names.iter().map(|n| &m2[n]).collect();
@@ -171,7 +172,7 @@ pub enum Predicate {
     /// described field by field, as a [`Record`](Self::Record) or a union of them.
     Intervals(IntervalSet<Value>),
     /// A componentwise predicate over a record key: the AND of each field's predicate.
-    Record(HashMap<String, Predicate>),
+    Record(HashMap<SmolStr, Predicate>),
     /// The union of multiple predicates — admits any value accepted by any arm.
     ///
     /// A union of componentwise predicates as [`Predicate::flatten_or`] leaves it: no two arms join
@@ -351,8 +352,8 @@ impl Predicate {
 
     /// A [`Record`](Self::Record) componentwise predicate over `fields`, in canonical form: a field
     /// admitting nothing makes the componentwise predicate admit nothing ([`Componentwise`]).
-    pub(crate) fn record(fields: HashMap<String, Predicate>) -> Predicate {
-        let mut names: Vec<String> = fields.keys().cloned().collect();
+    pub(crate) fn record(fields: HashMap<SmolStr, Predicate>) -> Predicate {
+        let mut names: Vec<SmolStr> = fields.keys().cloned().collect();
         names.sort();
         let mut fields = fields;
         let components = names.iter().map(|n| fields.remove(n).unwrap()).collect();
@@ -554,7 +555,7 @@ impl Predicate {
         !self.as_bool().unwrap_or(true)
     }
 
-    pub fn split_record<V>(&self, fields: &HashMap<String, V>) -> HashMap<String, Predicate> {
+    pub fn split_record<V>(&self, fields: &HashMap<SmolStr, V>) -> HashMap<SmolStr, Predicate> {
         match self {
             p if p.as_bool().is_some() => fields
                 .keys()
@@ -934,8 +935,8 @@ impl Predicate {
                 Predicate::qualified(
                     above.clone(),
                     Predicate::record(HashMap::from([
-                        (fields.0.to_string(), outer.clone()),
-                        (fields.1.to_string(), here.clone()),
+                        (SmolStr::from(fields.0), outer.clone()),
+                        (SmolStr::from(fields.1), here.clone()),
                     ])),
                 )
             }
@@ -972,7 +973,7 @@ impl Predicate {
                 // one componentwise predicate at a time, since unpairing is one-to-one.
                 let (enclosing, here) = self.split_qualification();
                 let halves =
-                    HashMap::from([(fields.0.to_string(), ()), (fields.1.to_string(), ())]);
+                    HashMap::from([(SmolStr::from(fields.0), ()), (SmolStr::from(fields.1), ())]);
                 let arms = match here {
                     Predicate::Or(arms) => arms.clone(),
                     one => vec![one.clone()],
@@ -1158,7 +1159,7 @@ impl Predicate {
             };
             return Predicate::intervals(IntervalSet::new(vec![bound]));
         };
-        let mut names: Vec<&String> = fields.keys().collect();
+        let mut names: Vec<&SmolStr> = fields.keys().collect();
         names.sort();
         // Step `i` agrees with `v` on the fields before `i`, lies below it on field `i`,
         // and admits anything after. The last step's field takes `v`'s own value too where
@@ -1535,7 +1536,7 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
         )
     }
 
-    fn record_cv_to_extent(fields: &HashMap<String, ColumnValue>) -> Extent {
+    fn record_cv_to_extent(fields: &HashMap<SmolStr, ColumnValue>) -> Extent {
         Extent::Record(transform_hashmap_values(fields, |cv| match cv {
             ColumnValue::UInts(_) => Extent::Base(BaseType::UInt),
             ColumnValue::Records(inner) => record_cv_to_extent(inner),
@@ -1624,7 +1625,7 @@ mod tests {
         Predicate::Record(
             fields
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
+                .map(|(k, v)| (SmolStr::from(*k), v.clone()))
                 .collect(),
         )
     }
@@ -2265,8 +2266,8 @@ mod tests {
 
     fn pair(a: usize, b: usize) -> Value {
         Value::Record(HashMap::from([
-            ("_0".to_string(), Value::UInt(a)),
-            ("_1".to_string(), Value::UInt(b)),
+            ("_0".into(), Value::UInt(a)),
+            ("_1".into(), Value::UInt(b)),
         ]))
     }
 
@@ -2290,8 +2291,8 @@ mod tests {
         assert!(!prefix.contains(&pair(1, 1)));
         assert!(!Predicate::below(pair(1, 0)).contains(&pair(1, 0)));
         let extent = Extent::Record(HashMap::from([
-            ("_0".to_string(), Extent::Base(BaseType::UInt)),
-            ("_1".to_string(), Extent::Base(BaseType::UInt)),
+            ("_0".into(), Extent::Base(BaseType::UInt)),
+            ("_1".into(), Extent::Base(BaseType::UInt)),
         ]));
         assert!(prefix.is_applicable_to(&extent));
     }
@@ -2321,8 +2322,8 @@ mod tests {
     #[test]
     fn an_interval_over_record_values_is_not_applicable() {
         let extent = Extent::Record(HashMap::from([
-            ("_0".to_string(), Extent::Base(BaseType::UInt)),
-            ("_1".to_string(), Extent::Base(BaseType::UInt)),
+            ("_0".into(), Extent::Base(BaseType::UInt)),
+            ("_1".into(), Extent::Base(BaseType::UInt)),
         ]));
         let over_records =
             Predicate::Intervals(IntervalSet::new(vec![Interval::unbound_closed(pair(1, 0))]));
@@ -2404,8 +2405,8 @@ mod tests {
 
     fn pairs(outer: &[usize], inner: &[usize]) -> ColumnValue {
         ColumnValue::Records(HashMap::from([
-            ("_0".to_string(), ColumnValue::UInts(outer.to_vec())),
-            ("_1".to_string(), ColumnValue::UInts(inner.to_vec())),
+            ("_0".into(), ColumnValue::UInts(outer.to_vec())),
+            ("_1".into(), ColumnValue::UInts(inner.to_vec())),
         ]))
     }
 
@@ -2430,8 +2431,8 @@ mod tests {
         assert_eq!(one_by_one, whole);
         for (a, b) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
             assert!(whole.contains(&Value::Record(HashMap::from([
-                ("_0".to_string(), Value::UInt(a)),
-                ("_1".to_string(), Value::UInt(b)),
+                ("_0".into(), Value::UInt(a)),
+                ("_1".into(), Value::UInt(b)),
             ]))));
         }
     }
@@ -2446,8 +2447,8 @@ mod tests {
         assert!(arm_count(&p) <= 3, "one arm per row at most: {p:?}");
         let pair = |a: usize, b: usize| {
             Value::Record(HashMap::from([
-                ("_0".to_string(), Value::UInt(a)),
-                ("_1".to_string(), Value::UInt(b)),
+                ("_0".into(), Value::UInt(a)),
+                ("_1".into(), Value::UInt(b)),
             ]))
         };
         for (a, b) in [(0, 0), (0, 1), (1, 0), (2, 0), (2, 1)] {
@@ -2460,9 +2461,9 @@ mod tests {
 
     #[test]
     fn split_record_true_broadcasts() {
-        let fields: HashMap<String, ()> = [("x", ()), ("y", ())]
+        let fields: HashMap<SmolStr, ()> = [("x", ()), ("y", ())]
             .iter()
-            .map(|(k, v)| (k.to_string(), *v))
+            .map(|(k, v)| (SmolStr::from(*k), *v))
             .collect();
         let result = Predicate::True.split_record(&fields);
         assert_eq!(result["x"], Predicate::True);
@@ -2471,9 +2472,9 @@ mod tests {
 
     #[test]
     fn split_record_false_broadcasts() {
-        let fields: HashMap<String, ()> = [("a", ())]
+        let fields: HashMap<SmolStr, ()> = [("a", ())]
             .iter()
-            .map(|(k, v)| (k.to_string(), *v))
+            .map(|(k, v)| (SmolStr::from(*k), *v))
             .collect();
         let result = Predicate::False.split_record(&fields);
         assert_eq!(result["a"], Predicate::False);
@@ -2481,9 +2482,9 @@ mod tests {
 
     #[test]
     fn split_record_record_returns_its_own_fields() {
-        let fields: HashMap<String, ()> = [("a", ()), ("b", ())]
+        let fields: HashMap<SmolStr, ()> = [("a", ()), ("b", ())]
             .iter()
-            .map(|(k, v)| (k.to_string(), *v))
+            .map(|(k, v)| (SmolStr::from(*k), *v))
             .collect();
         let p = record_pred(&[
             ("a", Predicate::True),
@@ -2498,9 +2499,9 @@ mod tests {
     /// them a share of a row it never held.
     #[test]
     fn split_record_of_an_empty_record_gives_every_field_nothing() {
-        let fields: HashMap<String, ()> = [("a", ()), ("b", ())]
+        let fields: HashMap<SmolStr, ()> = [("a", ()), ("b", ())]
             .iter()
-            .map(|(k, v)| (k.to_string(), *v))
+            .map(|(k, v)| (SmolStr::from(*k), *v))
             .collect();
         let p = record_pred(&[("a", Predicate::True), ("b", Predicate::False)]);
         let result = p.split_record(&fields);
@@ -2723,16 +2724,16 @@ mod tests {
         ]);
 
         let only_first = Value::Record(HashMap::from([
-            ("_0".to_string(), Value::UInt(5)),
-            ("_1".to_string(), Value::UInt(20)),
+            ("_0".into(), Value::UInt(5)),
+            ("_1".into(), Value::UInt(20)),
         ]));
         let only_second = Value::Record(HashMap::from([
-            ("_0".to_string(), Value::UInt(20)),
-            ("_1".to_string(), Value::UInt(5)),
+            ("_0".into(), Value::UInt(20)),
+            ("_1".into(), Value::UInt(5)),
         ]));
         let neither = Value::Record(HashMap::from([
-            ("_0".to_string(), Value::UInt(20)),
-            ("_1".to_string(), Value::UInt(20)),
+            ("_0".into(), Value::UInt(20)),
+            ("_1".into(), Value::UInt(20)),
         ]));
 
         assert!(
@@ -3118,12 +3119,9 @@ mod tests {
         let pt = |k: usize| Predicate::from_column_value(&ColumnValue::UInts(vec![k]));
         let pair = |x: usize, y: usize| {
             Value::Record(
-                [
-                    ("a".to_string(), Value::UInt(x)),
-                    ("b".to_string(), Value::UInt(y)),
-                ]
-                .into_iter()
-                .collect(),
+                [("a".into(), Value::UInt(x)), ("b".into(), Value::UInt(y))]
+                    .into_iter()
+                    .collect(),
             )
         };
         let all = record_pred(&[("a", pt(0).union(&pt(1))), ("b", pt(0).union(&pt(1)))]);
@@ -3197,7 +3195,7 @@ mod tests {
         Extent::Record(
             fields
                 .iter()
-                .map(|(k, e)| (k.to_string(), e.clone()))
+                .map(|(k, e)| (SmolStr::from(*k), e.clone()))
                 .collect(),
         )
     }
@@ -3306,8 +3304,8 @@ mod tests {
     fn applicable_record_predicate_to_matching_record_extent() {
         let pred = Predicate::Record(
             [
-                ("x".to_string(), Predicate::True),
-                ("y".to_string(), Predicate::False),
+                ("x".into(), Predicate::True),
+                ("y".into(), Predicate::False),
             ]
             .into(),
         );
@@ -3316,13 +3314,13 @@ mod tests {
 
     #[test]
     fn applicable_record_predicate_with_typed_fields() {
-        let pred = Predicate::Record([("n".to_string(), int_intervals(&[1, 2]))].into());
+        let pred = Predicate::Record([("n".into(), int_intervals(&[1, 2]))].into());
         assert!(pred.is_applicable_to(&record_ext(&[("n", int())])));
     }
 
     #[test]
     fn applicable_record_predicate_rejects_missing_key() {
-        let pred = Predicate::Record([("x".to_string(), Predicate::True)].into());
+        let pred = Predicate::Record([("x".into(), Predicate::True)].into());
         // Record extent has "x" and "y" but the predicate only covers "x".
         assert!(!pred.is_applicable_to(&record_ext(&[("x", int()), ("y", int())])));
     }
@@ -3330,13 +3328,13 @@ mod tests {
     #[test]
     fn applicable_record_predicate_rejects_wrong_field_type() {
         // "x" field predicate is an Int interval but the extent says Bool.
-        let pred = Predicate::Record([("x".to_string(), int_intervals(&[1]))].into());
+        let pred = Predicate::Record([("x".into(), int_intervals(&[1]))].into());
         assert!(!pred.is_applicable_to(&record_ext(&[("x", bool_ext())])));
     }
 
     #[test]
     fn applicable_record_predicate_rejects_scalar_extent() {
-        let pred = Predicate::Record([("x".to_string(), Predicate::True)].into());
+        let pred = Predicate::Record([("x".into(), Predicate::True)].into());
         assert!(!pred.is_applicable_to(&int()));
     }
 

@@ -22,7 +22,7 @@ pub enum FunctionDef {
     BinOp(BinOpKind),
     /// Unary arithmetic or boolean operation applied element-wise to a single column.
     UnaryOp(UnaryOpKind),
-    RecordField(String),
+    RecordField(SmolStr),
     /// `insert(m, k, v)` — the collection with one key's value replaced, inserting the key
     /// where it was absent. Applied to a `Records` column of the tupled argument
     /// ([`crate::ccl::Builtin::Insert`]), pointwise: one map in, one map out.
@@ -189,7 +189,7 @@ pub enum Value {
     /// A function value (collection of bindings)
     Function(Vec<FuncBinding>),
     /// A record value
-    Record(HashMap<String, Value>),
+    Record(HashMap<SmolStr, Value>),
     ComputableFunction(FunctionDef),
     /// A tagged union value: `tag` names which arm, `inner` is the payload.
     ///
@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn test_value_display_record() {
         let mut fields = HashMap::new();
-        fields.insert("x".to_string(), Value::Int(1));
+        fields.insert("x".into(), Value::Int(1));
         let r = Value::Record(fields);
         assert_eq!(r.to_string(), "{x: 1}");
     }

@@ -27,6 +27,7 @@
 //! answer: empty readings outnumber row-carrying ones by orders of magnitude.
 //! Each probe therefore holds its last row-carrying reading beside its newest.
 
+use smol_str::SmolStr;
 use std::{
     cell::RefCell,
     collections::{HashMap, hash_map::Entry},
@@ -488,7 +489,7 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
             }
         }
         Tile::Record { fields, .. } => {
-            let mut names: Vec<&String> = fields.keys().collect();
+            let mut names: Vec<&SmolStr> = fields.keys().collect();
             // `Tile::Record` is a `HashMap`, whose iteration order varies
             // between runs of one program. Sorting is what makes a rendering
             // reproducible.
@@ -502,7 +503,7 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
                     .into_iter()
                     .skip(total.saturating_sub(limit))
                     .map(|name| ReadingRow {
-                        key: Some(name.clone()),
+                        key: Some(name.to_string()),
                         value: bounded(|out| write_field(tile, name, 0, out)),
                         deleted: false,
                     })
@@ -570,7 +571,7 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
                     .into_iter()
                     .skip(total.saturating_sub(limit))
                     .map(|name| ReadingRow {
-                        key: Some(name.clone()),
+                        key: Some(name.to_string()),
                         value: bounded(|out| write_changelog(tile, name, out)),
                         deleted: false,
                     })
@@ -669,7 +670,7 @@ fn write_position(tile: &Tile, i: usize, out: &mut Bounded) -> fmt::Result {
     match tile {
         Tile::Scalar(column) => write_cell(column, i, out),
         Tile::Record { fields, .. } => {
-            let mut names: Vec<&String> = fields.keys().collect();
+            let mut names: Vec<&SmolStr> = fields.keys().collect();
             names.sort();
             write_fields(names, out, |name, out| write_field(tile, name, i, out))
         }
@@ -704,7 +705,7 @@ fn write_position(tile: &Tile, i: usize, out: &mut Bounded) -> fmt::Result {
 
 /// `(name: …, …)` over `names`, each value written by `write_value`.
 fn write_fields(
-    names: Vec<&String>,
+    names: Vec<&SmolStr>,
     out: &mut Bounded,
     mut write_value: impl FnMut(&str, &mut Bounded) -> fmt::Result,
 ) -> fmt::Result {
@@ -736,8 +737,8 @@ fn write_field(record: &Tile, name: &str, i: usize, out: &mut Bounded) -> fmt::R
 
 /// A store's keys, sorted: its state is a `HashMap`, whose iteration order
 /// varies between runs.
-fn sorted_store_keys(store: &Tile) -> Vec<&String> {
-    let mut names: Vec<&String> = store.store_keys().collect();
+fn sorted_store_keys(store: &Tile) -> Vec<&SmolStr> {
+    let mut names: Vec<&SmolStr> = store.store_keys().collect();
     names.sort();
     names
 }
@@ -798,7 +799,7 @@ pub(crate) fn one_key_store(
     let decided = positions.clone();
     Tile::Store {
         state: Box::new(Tile::record(HashMap::from([(
-            key.to_string(),
+            SmolStr::from(key),
             Tile::data_function(
                 ColumnValue::UInts(positions),
                 Box::new(Tile::Scalar(values)),
@@ -807,7 +808,7 @@ pub(crate) fn one_key_store(
             ),
         )]))),
         seed: Box::new(Tile::record(HashMap::from([(
-            key.to_string(),
+            SmolStr::from(key),
             Tile::Scalar(ColumnValue::Units(0)),
         )]))),
         decided: Box::new(one_row_decided(ColumnValue::UInts(decided))),
@@ -1073,8 +1074,8 @@ mod tests {
     #[test]
     fn a_record_codomain_renders_its_fields_in_sorted_order() {
         let mut fields = HashMap::new();
-        fields.insert("text".to_string(), Tile::Scalar(strings(&["a"])));
-        fields.insert("tagged".to_string(), Tile::Scalar(strings(&["> a"])));
+        fields.insert("text".into(), Tile::Scalar(strings(&["a"])));
+        fields.insert("tagged".into(), Tile::Scalar(strings(&["> a"])));
         let tile = Tile::data_function(
             uints(&[0]),
             Box::new(Tile::record(fields)),

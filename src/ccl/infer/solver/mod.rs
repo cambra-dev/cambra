@@ -187,7 +187,7 @@ pub(crate) mod test_helpers {
                 fields
                     .iter()
                     .map(|(k, t)| match k {
-                        FieldKey::Name(n) => (n.to_string(), t.clone()),
+                        FieldKey::Name(n) => (n.clone(), t.clone()),
                         _ => unreachable!(),
                     })
                     .collect(),

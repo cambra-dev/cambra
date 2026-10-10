@@ -253,9 +253,7 @@ fn apply_one(op: crate::scalar_ops::BinOpKind, left: &Lit, right: &Lit) -> Optio
             Some(Lit::Int(rt::zip_arithmetic(a, vec![*l], &[*r]).pop()?))
         }
         (rt::BinOpKind::Concat, Lit::String(l), Lit::String(r)) => Some(Lit::String(
-            rt::zip_concat(vec![l.as_str().into()], &[r.as_str().into()])
-                .pop()?
-                .to_string(),
+            rt::zip_concat(vec![l.as_str().into()], &[r.as_str().into()]).pop()?,
         )),
         (rt::BinOpKind::Compare(c), Lit::Int(l), Lit::Int(r)) => {
             Some(Lit::Bool(rt::zip_compare(c, vec![*l], &[*r]).get(0)?))

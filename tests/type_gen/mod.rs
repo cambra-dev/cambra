@@ -77,7 +77,7 @@ fn gen_pred_at(rng: &mut Rng, depth: u32) -> Rc<TypedExpr> {
         1 => Rc::new(TypedExpr::lit(Lit::Bool(true))),
         2 => Rc::new(TypedExpr::lit(Lit::Int(rng.below(3) as i64))),
         3 => Rc::new(TypedExpr::lit(Lit::String(
-            if rng.chance(1, 2) { "p" } else { "q" }.to_string(),
+            if rng.chance(1, 2) { "p" } else { "q" }.into(),
         ))),
         4 => Rc::new(TypedExpr::lit(Lit::Unit)),
         5 => Rc::new(TypedExpr::unary(
@@ -305,7 +305,7 @@ pub fn gen_ty(rng: &mut Rng, depth: u32, fragment: Fragment) -> Type {
             let mut fields = Vec::new();
             for key in ["a", "b", "c"] {
                 if rng.chance(1, 2) {
-                    fields.push((key.to_string(), gen_ty(rng, depth - 1, fragment)));
+                    fields.push((key.into(), gen_ty(rng, depth - 1, fragment)));
                 }
             }
             Type::Record(fields)

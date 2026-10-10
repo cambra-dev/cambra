@@ -914,7 +914,7 @@ impl Expr {
 pub enum Lit {
     Int(i64),
     /// String literal with escapes already processed.
-    String(String),
+    String(SmolStr),
     Bool(bool),
 }
 

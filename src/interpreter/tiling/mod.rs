@@ -27,6 +27,8 @@ pub(crate) fn transform_hashmap_values<K: Clone + Eq + Hash, InputV, V, F: Fn(&I
 
 #[cfg(test)]
 pub(super) mod tests {
+    use smol_str::SmolStr;
+
     use crate::ccl::BaseType;
     use crate::interpreter::{Extent, Tiling};
 
@@ -61,7 +63,7 @@ pub(super) mod tests {
         Tiling::Record(
             fields
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
+                .map(|(k, v)| (SmolStr::from(*k), v.clone()))
                 .collect(),
         )
     }
