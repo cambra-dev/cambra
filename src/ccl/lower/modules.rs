@@ -24,11 +24,13 @@ use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates_mut};
 use crate::ccl::load::LoadedProgram;
 use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType};
 use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
+use crate::ccl::ty::{TypeParam, TypeParamId};
 use crate::ccl::uniquify;
 use crate::ccl::{Argument, Expr, Home, Label, Lit, Name, RunPath, SharedRun, Type, TypedExprNode};
 use crate::chl_parser::ast::{
     AssignTarget, Expr as ChlExpr, Lit as ChlLit, Module as ChlModule, ModuleArg,
-    ModulePath as AstModulePath, QualifiedName, Span, Spanned, Stmt as ChlStmt, UnaryOp,
+    ModulePath as AstModulePath, QualifiedName, Span, Spanned, Stmt as ChlStmt, UnaryOp, UseItem,
+    VariantPayload,
 };
 use crate::chl_parser::{FileId, ModulePath, SurfaceBuiltin};
 use smol_str::SmolStr;
@@ -75,7 +77,24 @@ pub struct Parameter {
     /// A Module-typed parameter's default, the module it names as its module
     /// spells it.
     pub module_default: Option<String>,
+    /// For a type parameter, what it declares.
+    pub type_param: Option<TypeParameter>,
 }
+
+/// A type parameter of a module, `param T <: B = D` (`docs/chl-spec.md`, "9.4
+/// Parameters"): the [`Type::Param`] its module lowers `T` to, and its bound and
+/// default as its module lowered them.
+#[derive(Debug, Clone)]
+pub struct TypeParameter {
+    pub param: Rc<TypeParam>,
+    /// The bound, recorded for checking a module on its own: nothing compares an
+    /// argument with it yet (`docs/modules.md`, "Runs").
+    pub bound: Option<Type>,
+    pub default: Option<Type>,
+}
+
+/// The type each type parameter of a run or a shared run takes, by parameter.
+pub type TypeArguments = Rc<HashMap<TypeParamId, Type>>;
 
 /// A top-level binding of a module, `pub audit = a`: a member that is a module
 /// (`docs/chl-spec.md`, "9.3 Runs").
@@ -94,6 +113,9 @@ pub struct ModuleMember {
     /// What it reaches when it is bound to a Module-typed parameter, spelled
     /// in its declaring module.
     pub view: Option<Rc<ModuleView>>,
+    /// The types the run it is bound to gives its module's type parameters, as
+    /// its declaring module writes them.
+    pub types: TypeArguments,
 }
 
 /// What a Module-typed parameter reaches of the module it takes: each member
@@ -233,6 +255,11 @@ impl Interface {
                         module,
                         default: default.is_some(),
                         module_default: ctx.module_parameter_defaults.get(&name.node).cloned(),
+                        type_param: ctx
+                            .module_type_parameters
+                            .iter()
+                            .find(|(declared, _)| *declared == name.node)
+                            .map(|(_, declared)| declared.clone()),
                     })
                 }
                 _ => None,
@@ -256,6 +283,7 @@ impl Interface {
                         interface: bound.interface.clone(),
                         spelling: bound.spelling.clone(),
                         view: bound.view.clone(),
+                        types: Rc::clone(&bound.types),
                     },
                 );
                 continue;
@@ -389,6 +417,58 @@ fn reroot(ty: &Type, qualifier: &str) -> Type {
         rename(predicate, qualifier, &mut Vec::new())
     });
     ty
+}
+
+/// `ty` with each type parameter `arguments` maps replaced by its type.
+pub(super) fn substitute(ty: &mut Type, arguments: &HashMap<TypeParamId, Type>) {
+    if arguments.is_empty() {
+        return;
+    }
+    if let Type::Param(param) = ty
+        && let Some(argument) = arguments.get(&param.id)
+    {
+        *ty = argument.clone();
+        return;
+    }
+    ty.walk_children_mut(|child| substitute(child, arguments));
+}
+
+/// [`substitute`] in every type slot of `expr`.
+fn substitute_in(expr: &mut Expr, arguments: &HashMap<TypeParamId, Type>) {
+    if arguments.is_empty() {
+        return;
+    }
+    expr.walk_type_slots_mut(|ty| substitute(ty, arguments));
+    expr.walk_children_mut(|child| substitute_in(child, arguments));
+}
+
+/// The types a run or a shared run of the module `interface` declares gives its
+/// type parameters, as the module reaching it through the qualifier `spelling`
+/// writes them: the argument `given` has for one, and otherwise its default,
+/// spelled through the qualifier ([`reroot`]). A parameter with neither takes
+/// a hole, its run being an error ([`ProgramLowering::create`]).
+fn reached_types(
+    interface: &Interface,
+    spelling: &str,
+    given: &HashMap<SmolStr, Type>,
+) -> TypeArguments {
+    let mut arguments = HashMap::new();
+    for parameter in &interface.parameters {
+        let Some(declared) = &parameter.type_param else {
+            continue;
+        };
+        let ty = match (given.get(&parameter.name), &declared.default) {
+            (Some(argument), _) => argument.clone(),
+            (None, Some(default)) => {
+                let mut ty = reroot(default, spelling);
+                substitute(&mut ty, &arguments);
+                ty
+            }
+            (None, None) => Type::Hole,
+        };
+        arguments.insert(declared.param.id, ty);
+    }
+    Rc::new(arguments)
 }
 
 /// The placeholder [`MODULE_BODY`] as an expression.
@@ -608,6 +688,10 @@ pub struct Qualifier {
     /// The spelling the view's spellings are under: empty for this module's own
     /// parameter, and `shop::` for one `shop`'s module declares.
     pub view_base: String,
+    /// The types the run or shared run it reaches gives its module's type
+    /// parameters, as this module writes them, which a type member reached
+    /// through it takes ([`Qualifier::reach_type`]).
+    pub types: TypeArguments,
 }
 
 /// How a [`Qualifier`]'s name is bound.
@@ -662,6 +746,8 @@ impl LoweringContext {
         self.module_parameters.clear();
         self.module_parameter_types.clear();
         self.module_parameter_defaults.clear();
+        self.module_type_parameters.clear();
+        self.run_type_arguments.clear();
         // A `use` type name is in scope throughout its module. One whose module
         // has errors of its own names no type, and stands for any. A `use` name
         // for a function with a `Mut` parameter takes the curried call shape the
@@ -763,6 +849,7 @@ impl LoweringContext {
                     spelling: name.node.to_string(),
                     view: Some(Rc::new(view)),
                     view_base: String::new(),
+                    types: TypeArguments::default(),
                 },
             );
             self.module_parameters.insert(name.node.clone(), lets);
@@ -1027,6 +1114,11 @@ impl LoweringContext {
         for arg in args {
             let span = arg.name.span.join(arg.value.span);
             let parameter = parameters.iter().find(|p| p.name == arg.name.node);
+            // A type argument is lowered with the module's type aliases
+            // (`Self::declare_run_types`).
+            if parameter.is_some_and(|p| p.type_param.is_some()) {
+                continue;
+            }
             match (
                 parameter.and_then(|p| p.module.as_ref()),
                 self.module_named(&arg.value),
@@ -1131,19 +1223,23 @@ impl LoweringContext {
             .module
             .qualifiers
             .get(name)
-            .and_then(|qualifier| qualifier.interface.as_ref())
-            .map(|interface| {
+            .and_then(|qualifier| Some((qualifier.interface.as_ref()?, &qualifier.types)))
+            .map(|(interface, types)| {
                 interface
                     .parameters
                     .iter()
                     .map(|parameter| {
-                        let ty = parameter.annotation.as_ref().map(|ty| reroot(ty, name));
+                        let ty = parameter.annotation.as_ref().map(|ty| {
+                            let mut ty = reroot(ty, name);
+                            substitute(&mut ty, types);
+                            ty
+                        });
                         (parameter.name.clone(), ty)
                     })
                     .collect()
             })
             .unwrap_or_default();
-        arguments
+        let run = arguments
             .values
             .into_iter()
             .rev()
@@ -1154,7 +1250,154 @@ impl LoweringContext {
                     None => Expr::let_bind(bound, value, body),
                 };
                 self.tag_image(bound, span)
+            });
+        // Each type argument is a `let type` above the run, which resolves its
+        // refinements here, and which linking hands the run
+        // ([`ProgramLowering::expand_runs`]).
+        let types = self.run_type_arguments.remove(name).unwrap_or_default();
+        types
+            .into_iter()
+            .rev()
+            .fold(run, |body, (parameter, span, ty)| {
+                let bound = argument_name(name, &parameter);
+                let bound = Expr::let_type(bound.base(), AliasType::Type(ty), body);
+                self.tag_image(bound, span)
             })
+    }
+
+    /// Declare the type parameter `name` of the module being lowered, which
+    /// `statement` declares with the bound `bound` and the default `default`:
+    /// an alias of a declared [`Type::Param`] from its statement down, as a
+    /// type alias is (`docs/chl-spec.md`, "9.4 Parameters"). Each run of the
+    /// module replaces the parameter by its argument or its default
+    /// ([`ProgramLowering::create`]).
+    pub(super) fn declare_type_parameter(
+        &mut self,
+        name: &Spanned<SmolStr>,
+        statement: Span,
+        bound: Option<&Spanned<ChlExpr>>,
+        default: Option<&Spanned<ChlExpr>>,
+    ) -> Result<(), LoweringError> {
+        if super::is_builtin_type_name(&name.node) {
+            return Err(LoweringError::unsupported(
+                name.span,
+                format!(
+                    "`{}` is a built-in type and cannot name a type parameter",
+                    name.node
+                ),
+            ));
+        }
+        // A bound or a default in error is a hole, and the parameter is still
+        // declared, so its uses report nothing more.
+        let mut error = None;
+        let mut lower = |ty: &Spanned<ChlExpr>, ctx: &mut Self| {
+            super::stmts::lower_type_expr(ty, ctx).unwrap_or_else(|e| {
+                error.get_or_insert(e);
+                Type::Hole
+            })
+        };
+        let bound = bound.map(|bound| lower(bound, self));
+        let default = default.map(|default| lower(default, self));
+        let param = TypeParam::declared(name.node.as_str());
+        let alias = AliasType::Type(Type::Param(Rc::clone(&param)));
+        self.declare_type_alias(name.node.as_str(), statement, alias);
+        self.module_type_parameters.push((
+            name.node.clone(),
+            TypeParameter {
+                param,
+                bound,
+                default,
+            },
+        ));
+        error.map_or(Ok(()), Err)
+    }
+
+    /// Lower the type arguments `args` of the `run` statement declaring the run
+    /// `run`, with the `use` clause `uses`, where the statement stands: in the
+    /// module's scope, with the type aliases above it. The run's qualifier
+    /// takes the types they give its module's type parameters, so a type member
+    /// reached through it does, and so does each of its `use` names.
+    ///
+    /// Lowering runs from the last statement to the first, so this runs ahead
+    /// of it, with the type aliases, for the statements below the run that
+    /// reach its type members.
+    pub(super) fn declare_run_types(
+        &mut self,
+        run: &SmolStr,
+        args: &[ModuleArg],
+        uses: &[UseItem],
+    ) -> Vec<LoweringError> {
+        let Some(interface) = self
+            .module
+            .qualifiers
+            .get(run)
+            .and_then(|q| q.interface.clone())
+        else {
+            return Vec::new();
+        };
+        let mut errors = Vec::new();
+        let mut given = HashMap::new();
+        let mut lowered = Vec::new();
+        for arg in args {
+            let declared = interface
+                .parameters
+                .iter()
+                .any(|p| p.name == arg.name.node && p.type_param.is_some());
+            if !declared {
+                continue;
+            }
+            // An argument in error is a hole, so the run reports nothing more
+            // for it.
+            let ty = super::stmts::lower_type_expr(&arg.value, self).unwrap_or_else(|error| {
+                errors.push(error);
+                Type::Hole
+            });
+            given.insert(arg.name.node.clone(), ty.clone());
+            let span = arg.name.span.join(arg.value.span);
+            lowered.push((arg.name.node.clone(), span, ty));
+        }
+        if !interface.parameters.iter().any(|p| p.type_param.is_some()) {
+            return errors;
+        }
+        let types = reached_types(&interface, run, &given);
+        let qualifier = self
+            .module
+            .qualifiers
+            .get_mut(run)
+            .expect("the run's qualifier was read above");
+        qualifier.types = types;
+        let qualifier = qualifier.clone();
+        for item in uses {
+            let bound = item.alias.as_ref().unwrap_or(&item.name);
+            if super::stmts::is_type_name(&item.name.node) {
+                // A refused `use` item has no `use` name.
+                if !self.module.uses.contains_key(&bound.node) {
+                    continue;
+                }
+                let reached = qualifier.reach_type(run, &item.name.node, item.name.span);
+                if let Ok(ty) = &reached {
+                    let ty = ty.clone().unwrap_or(AliasType::Type(Type::Hole));
+                    self.declare_type_alias(bound.node.as_str(), bound.span, ty);
+                }
+                if let (Ok(reached), Some(used)) = (reached, self.module.uses.get_mut(&bound.node))
+                {
+                    used.reached = Reached::Type(reached);
+                }
+            } else if let Some(Ok(module)) = qualifier.used_module(&item.name.node)
+                && self.module.qualifiers.contains_key(&bound.node)
+            {
+                self.module.qualifiers.insert(
+                    bound.node.clone(),
+                    Qualifier {
+                        statement: bound.span,
+                        kind: QualifierKind::Use { run: true },
+                        ..module
+                    },
+                );
+            }
+        }
+        self.run_type_arguments.insert(run.clone(), lowered);
+        errors
     }
 }
 
@@ -1379,7 +1622,9 @@ impl Qualifier {
             )
             .with_note(found.declared, "declared here without `pub`"));
         }
-        Ok(Some(reroot_alias(&found.ty, &self.spelling)))
+        let mut ty = reroot_alias(&found.ty, &self.spelling);
+        ty.walk_types_mut(&mut |ty| substitute(ty, &self.types));
+        Ok(Some(ty))
     }
 
     /// Whether `member` is a member of this module bound to a module.
@@ -1415,6 +1660,7 @@ impl Qualifier {
             return Ok(Qualifier {
                 spelling: format!("{}::{member}", self.spelling),
                 view: Some(Rc::clone(inner)),
+                types: TypeArguments::default(),
                 ..self.clone()
             });
         }
@@ -1438,12 +1684,22 @@ impl Qualifier {
             )
             .with_note(found.declared, "declared here without `pub`"));
         }
+        let types = found
+            .types
+            .iter()
+            .map(|(param, ty)| {
+                let mut ty = reroot(ty, &self.spelling);
+                substitute(&mut ty, &self.types);
+                (*param, ty)
+            })
+            .collect();
         Ok(Qualifier {
             module: found.module.clone(),
             interface: found.interface.clone(),
             spelling: format!("{}::{}", self.spelling, found.spelling),
             view: found.view.clone(),
             view_base: format!("{}::", self.spelling),
+            types: Rc::new(types),
             ..self.clone()
         })
     }
@@ -1473,8 +1729,11 @@ impl Qualifier {
 /// and `::` separates the run name from the parameter, so no two arguments in
 /// one module share one.
 fn argument_name(run: &str, parameter: &str) -> Name {
-    Name::raw(format!("__run::{run}::{parameter}"))
+    Name::raw(format!("{ARGUMENT}{run}::{parameter}"))
 }
+
+/// The prefix of every [`argument_name`].
+const ARGUMENT: &str = "__run::";
 
 /// The module `segments` names, whose first segment names `first`: each later
 /// segment is a public member of the module before it that is bound to a module.
@@ -1529,6 +1788,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         program,
         lowered: HashMap::new(),
         imports: HashMap::new(),
+        type_keys: HashMap::new(),
         shared: HashMap::new(),
         import_refusals: HashSet::new(),
         errors: Vec::new(),
@@ -1536,13 +1796,18 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     // With a cycle there is no link order, and the root lowers with no module to
     // reach: loading has reported the cycle.
     let order = program.link_order().unwrap_or_default();
-    // Each import's shared run is decided by what it writes, before any module
-    // lowers, so each lowers knowing the shared run its imports reach.
-    let sites = lowering.shared_runs();
+    // Each import's shared run is decided once the module it imports has
+    // lowered, and before its importer lowers, so the importer reaches the
+    // types its arguments give.
+    let mut sites = HashMap::new();
     for &file in order {
+        lowering.import_keys(file, &mut sites, ctx);
         if file != root {
             lowering.lower(file, ctx);
         }
+    }
+    if !order.contains(&root) {
+        lowering.import_keys(root, &mut sites, ctx);
     }
     let mut chains = Vec::new();
     // A shared run is created after the shared runs it reaches, and a run's
@@ -1602,7 +1867,17 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             Some((name.node.clone(), stmt.span, Rc::clone(ty), default.clone()))
         })
         .collect();
+    // The root's type parameters take their defaults.
+    let mut defaults = HashMap::new();
+    for (_, declared) in &ctx.module_type_parameters {
+        if let Some(default) = &declared.default {
+            let mut default = default.clone();
+            substitute(&mut default, &defaults);
+            defaults.insert(declared.param.id, default);
+        }
+    }
     let value = lowered.value.map(|mut chain| {
+        substitute_in(&mut chain, &defaults);
         let mut qualified = lowering.shared_names(&scope);
         // The root's Module-typed parameters take their defaults.
         let mut modules = HashMap::new();
@@ -1612,7 +1887,14 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             chain = lowering.bind_module_parameter(chain, &name, &ty, &names, at, ctx);
             modules.insert(name, names);
         }
-        let chain = lowering.expand_runs(chain, &RunPath::default(), &mut qualified, &modules, ctx);
+        let chain = lowering.expand_runs(
+            chain,
+            &RunPath::default(),
+            &mut qualified,
+            &modules,
+            &mut HashMap::new(),
+            ctx,
+        );
         let (chain, refused) = finish_program(&ast.body, chain, &sinks, ctx);
         lowering.errors.extend(refused);
         let scope = use_names(&scope, qualified);
@@ -1638,9 +1920,12 @@ struct ProgramLowering<'a> {
     /// Each module other than the root, lowered, by file, or `None` when it has
     /// no syntax tree or has errors of its own.
     lowered: HashMap<FileId, Option<Rc<LoweredModule>>>,
-    /// The shared run each `import` statement reaches, by the statement. An
-    /// import whose arguments are in error reaches none.
-    imports: HashMap<Span, SharedRun>,
+    /// What each `import` statement reaches, by the statement. An import whose
+    /// arguments are in error reaches nothing.
+    imports: HashMap<Span, Imported>,
+    /// Each type argument to an import, by the spelling its shared run's key
+    /// holds ([`Argument::Type`]).
+    type_keys: HashMap<String, Type>,
     /// The names each shared run reaches ([`Created::names`]), or `None` when it
     /// has none.
     shared: HashMap<SharedRun, Option<Rc<HashMap<String, Name>>>>,
@@ -1657,14 +1942,34 @@ struct ImportSite {
     statement: Span,
     /// Each argument, by its parameter: its span and its value.
     arguments: HashMap<SmolStr, (Span, Argument)>,
+    /// Each type argument, by its parameter, as the importer lowered it.
+    types: HashMap<SmolStr, Type>,
+}
+
+/// What an `import` statement reaches: its shared run, and the types that gives
+/// its module's type parameters, as the importer writes them.
+struct Imported {
+    run: SharedRun,
+    types: TypeArguments,
+}
+
+/// An argument to an `import` as written, before its shared run is decided
+/// ([`ProgramLowering::import_keys`]).
+enum ImportArgument<'a> {
+    Lit(Lit),
+    /// An import name, by the statement that binds it.
+    Import(Span),
+    /// A type, with the statements of the imports whose names it writes.
+    Type(&'a Spanned<ChlExpr>, Vec<Span>),
 }
 
 /// The arguments a run is created with ([`ProgramLowering::create`]).
 enum Supplied<'a> {
     /// A run's: the parameters its `run` statement passes value arguments for,
-    /// each bound above the run under its run name, and its module arguments,
-    /// each the names its module reaches, with the argument's span.
-    Run(&'a [SmolStr], Vec<ModuleArgument>),
+    /// each bound above the run under its run name, its module arguments, each
+    /// the names its module reaches, with the argument's span, and its type
+    /// arguments, by parameter, as its declaring module's chain holds them.
+    Run(&'a [SmolStr], Vec<ModuleArgument>, HashMap<SmolStr, Type>),
     /// A shared run's: its import's constants, a literal bound at the head of
     /// its chain under its spelling, `scaled(scale=3)`, and an import name
     /// reaching its shared run.
@@ -1790,69 +2095,130 @@ impl ProgramLowering<'_> {
         self.importable(file).then(|| Rc::clone(&lowered.interface))
     }
 
-    fn shared_runs(&mut self) -> HashMap<SharedRun, (FileId, ImportSite)> {
-        let mut runs: HashMap<SharedRun, (FileId, ImportSite)> = HashMap::new();
-        for importer in self.program.sources().files() {
-            let Some(ast) = self.program.ast(importer) else {
+    /// Decide the shared run each `import` of the module in `importer` reaches,
+    /// once the modules it imports have lowered and before it lowers: record it
+    /// by the statement, with the types it gives its module's type parameters
+    /// as `importer` writes them, and add it to `sites` with the first import
+    /// that reaches it.
+    ///
+    /// An import passing an import name reaches its shared run once that
+    /// import's is decided, and a type argument is lowered against the imports
+    /// decided so far, so the imports resolve in rounds. A type argument is
+    /// built from built-in types and imported type members: one naming a type
+    /// the importer declares, or a value, waits on link-time constants
+    /// (`docs/modules.md`, "Dependencies").
+    fn import_keys(
+        &mut self,
+        importer: FileId,
+        sites: &mut HashMap<SharedRun, (FileId, ImportSite)>,
+        ctx: &mut LoweringContext,
+    ) {
+        let program = self.program;
+        let Some(ast) = program.ast(importer) else {
+            return;
+        };
+        let import_names: HashMap<SmolStr, Span> = ast
+            .body
+            .iter()
+            .filter_map(|stmt| import_name(stmt).map(|name| (name, stmt.span)))
+            .collect();
+        // A `use` type name of an import reaches its type through that import.
+        let used_types: HashMap<SmolStr, Span> = ast
+            .body
+            .iter()
+            .filter_map(|stmt| match &stmt.node {
+                ChlStmt::Import { uses, .. } => Some((stmt.span, uses)),
+                _ => None,
+            })
+            .flat_map(|(statement, uses)| {
+                uses.iter()
+                    .map(move |item| (item.alias.as_ref().unwrap_or(&item.name), statement))
+            })
+            .filter(|(bound, _)| super::stmts::is_type_name(&bound.node))
+            .map(|(bound, statement)| (bound.node.clone(), statement))
+            .collect();
+        let declared_types: HashSet<SmolStr> = top_level_aliases(&ast.body)
+            .into_iter()
+            .map(|alias| alias.name)
+            .chain(ast.body.iter().filter_map(|stmt| match &stmt.node {
+                ChlStmt::Param { name, .. } if super::stmts::is_type_name(&name.node) => {
+                    Some(name.node.clone())
+                }
+                _ => None,
+            }))
+            .collect();
+        let run_names: HashSet<SmolStr> = ast
+            .body
+            .iter()
+            .filter_map(|stmt| match &stmt.node {
+                ChlStmt::Run { path, alias, .. } => run_name(path, alias.as_ref()),
+                _ => None,
+            })
+            .collect();
+        // Each import whose arguments are well formed. One whose arguments are
+        // not reaches no shared run.
+        let mut pending = Vec::new();
+        for stmt in &ast.body {
+            let ChlStmt::Import { path, args, .. } = &stmt.node else {
                 continue;
             };
-            let import_names: HashMap<SmolStr, Span> = ast
-                .body
-                .iter()
-                .filter_map(|stmt| import_name(stmt).map(|name| (name, stmt.span)))
-                .collect();
-            let run_names: HashSet<SmolStr> = ast
+            // A segment the parser refused names no module, and loading has
+            // reported a module with no file.
+            let (Some(module), Some(name)) = (path.to_path(), import_name(stmt)) else {
+                continue;
+            };
+            let Some((file, target)) = program
+                .file_of(&module)
+                .and_then(|file| Some((file, program.ast(file)?)))
+            else {
+                continue;
+            };
+            let errors = self.errors.len();
+            let parameters: HashSet<&str> = target
                 .body
                 .iter()
                 .filter_map(|stmt| match &stmt.node {
-                    ChlStmt::Run { path, alias, .. } => run_name(path, alias.as_ref()),
+                    ChlStmt::Param { name, .. } => Some(name.node.as_str()),
                     _ => None,
                 })
                 .collect();
-            // Each import whose arguments are well formed, with each import name
-            // it passes, by the statement that binds the name. One whose
-            // arguments are not reaches no shared run.
-            let mut pending = Vec::new();
-            for stmt in &ast.body {
-                let ChlStmt::Import { path, args, .. } = &stmt.node else {
-                    continue;
-                };
-                // A segment the parser refused names no module, and loading has
-                // reported a module with no file.
-                let Some(module) = path.to_path() else {
-                    continue;
-                };
-                let Some((file, target)) = self
-                    .program
-                    .file_of(&module)
-                    .and_then(|file| Some((file, self.program.ast(file)?)))
-                else {
-                    continue;
-                };
-                let errors = self.errors.len();
-                let parameters: HashSet<&str> = target
-                    .body
-                    .iter()
-                    .filter_map(|stmt| match &stmt.node {
-                        ChlStmt::Param { name, .. } => Some(name.node.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                self.errors
-                    .extend(misused_arguments(args, &module, &parameters));
-                let mut arguments = Vec::new();
-                for arg in args {
-                    let value = match (&arg.value.node, constant(&arg.value.node)) {
-                        (_, Some(value)) => Ok(value),
+            self.errors
+                .extend(misused_arguments(args, &module, &parameters));
+            let mut arguments = Vec::new();
+            for arg in args {
+                let value = if super::stmts::is_type_name(&arg.name.node) {
+                    let mut names = HashSet::new();
+                    mentioned_names(&arg.value.node, &mut names);
+                    if let Some(declared) = names.iter().find(|name| declared_types.contains(*name))
+                    {
+                        self.errors.push(LoweringError::unsupported(
+                            arg.value.span,
+                            format!(
+                                "`{declared}` is a type this module declares, and an argument to \
+                                 an import is built from built-in types and imported type \
+                                 members for now"
+                            ),
+                        ));
+                        continue;
+                    }
+                    let reached = names
+                        .iter()
+                        .filter_map(|name| import_names.get(name).or_else(|| used_types.get(name)))
+                        .copied()
+                        .collect();
+                    ImportArgument::Type(&arg.value, reached)
+                } else {
+                    match (&arg.value.node, constant(&arg.value.node)) {
+                        (_, Some(value)) => ImportArgument::Lit(value),
                         (ChlExpr::Name(name), None) if import_names.contains_key(name) => {
-                            Err(import_names[name])
+                            ImportArgument::Import(import_names[name])
                         }
                         (ChlExpr::Name(name), None) if run_names.contains(name) => {
                             self.errors.push(LoweringError::unsupported(
                                 arg.value.span,
                                 format!(
-                                    "`{name}` is a run name, and a run is not an argument to \
-                                     an import: a shared run stands outside every run"
+                                    "`{name}` is a run name, and a run is not an argument to an \
+                                     import: a shared run stands outside every run"
                                 ),
                             ));
                             continue;
@@ -1860,74 +2226,157 @@ impl ProgramLowering<'_> {
                         _ => {
                             self.errors.push(LoweringError::unsupported(
                                 arg.value.span,
-                                "an argument to an import is supported only as a literal or \
-                                 an import name for now",
+                                "an argument to an import is supported only as a literal, a \
+                                 type, or an import name for now",
                             ));
                             continue;
                         }
-                    };
-                    arguments.push((arg.name.node.clone(), arg.value.span, value));
-                }
-                if self.errors.len() == errors {
-                    pending.push((stmt.span, file, module, arguments));
-                }
+                    }
+                };
+                arguments.push((arg.name.node.clone(), arg.value.span, value));
             }
-            // An import that passes an import name reaches its shared run once
-            // that import's is known, so the imports resolve in rounds. One left
-            // when a round resolves none passes an import whose arguments are in
-            // error, or is in a cycle of imports passing each other.
-            let mut resolved: HashMap<Span, Option<SharedRun>> = import_names
-                .values()
-                .filter(|import| !pending.iter().any(|(statement, ..)| statement == *import))
-                .map(|import| (*import, None))
-                .collect();
-            while !pending.is_empty() {
-                let before = pending.len();
-                pending.retain(|(statement, file, module, arguments)| {
-                    let mut key = Vec::new();
-                    let mut site = HashMap::new();
-                    for (parameter, span, value) in arguments {
-                        let argument = match value {
-                            Ok(value) => Argument::Lit(value.clone()),
-                            Err(import) => match resolved.get(import) {
-                                Some(Some(run)) => Argument::Module(run.clone()),
-                                Some(None) => {
+            if self.errors.len() == errors {
+                pending.push((stmt.span, file, module, name, arguments));
+            }
+        }
+        let mut resolved: HashMap<Span, Option<SharedRun>> = import_names
+            .values()
+            .filter(|import| !pending.iter().any(|(statement, ..)| statement == *import))
+            .map(|import| (*import, None))
+            .collect();
+        let typed = pending.iter().any(|(.., arguments)| {
+            arguments
+                .iter()
+                .any(|(.., value)| matches!(value, ImportArgument::Type(..)))
+        });
+        let interfaces = if typed {
+            self.interfaces(ast)
+        } else {
+            HashMap::new()
+        };
+        while !pending.is_empty() {
+            let before = pending.len();
+            // A type argument lowers against the imports decided in the rounds
+            // before. The scope's own errors are reported when the module lowers.
+            // A type argument lowers against the scope built here, so one whose
+            // imports are decided in this round waits for the next.
+            let decided: HashSet<Span> = resolved.keys().copied().collect();
+            if typed {
+                let scope = module_scope(
+                    ast,
+                    None,
+                    program,
+                    &interfaces,
+                    &self.imports,
+                    ctx,
+                    &mut Vec::new(),
+                );
+                ctx.begin_module(scope);
+            }
+            pending.retain(|(statement, file, module, name, arguments)| {
+                let mut key = Vec::new();
+                let mut site = HashMap::new();
+                let mut types = HashMap::new();
+                for (parameter, span, value) in arguments {
+                    let argument = match value {
+                        ImportArgument::Lit(value) => Argument::Lit(value.clone()),
+                        ImportArgument::Import(import) => match resolved.get(import) {
+                            Some(Some(run)) => Argument::Module(run.clone()),
+                            Some(None) => {
+                                resolved.insert(*statement, None);
+                                return false;
+                            }
+                            None => return true,
+                        },
+                        ImportArgument::Type(written, reached) => {
+                            for import in reached {
+                                match resolved.get(import) {
+                                    Some(Some(_)) if decided.contains(import) => {}
+                                    Some(None) => {
+                                        resolved.insert(*statement, None);
+                                        return false;
+                                    }
+                                    _ => return true,
+                                }
+                            }
+                            let ty = match super::stmts::lower_type_expr(written, ctx) {
+                                Ok(ty) => ty,
+                                Err(error) => {
+                                    self.errors.push(error);
                                     resolved.insert(*statement, None);
                                     return false;
                                 }
-                                None => return true,
-                            },
-                        };
-                        key.push((parameter.clone(), argument.clone()));
-                        site.insert(parameter.clone(), (*span, argument));
-                    }
-                    key.sort();
-                    let run = SharedRun {
-                        module: module.clone(),
-                        arguments: key.into(),
+                            };
+                            if let Some(value) = value_named(&ty) {
+                                self.errors.push(LoweringError::unsupported(
+                                    *span,
+                                    format!(
+                                        "this type's refinement reads `{value}`, and an argument \
+                                         to an import is a type whose refinements read no value \
+                                         for now"
+                                    ),
+                                ));
+                                resolved.insert(*statement, None);
+                                return false;
+                            }
+                            let written = ty.to_string();
+                            if let Some(earlier) =
+                                self.type_keys.insert(written.clone(), ty.clone())
+                            {
+                                assert!(
+                                    earlier == ty,
+                                    "two type arguments to imports are written `{written}` and \
+                                     are different types, so they would reach one shared run"
+                                );
+                            }
+                            types.insert(parameter.clone(), ty);
+                            Argument::Type(written)
+                        }
                     };
-                    resolved.insert(*statement, Some(run.clone()));
-                    self.imports.insert(*statement, run.clone());
-                    runs.entry(run).or_insert((
-                        *file,
-                        ImportSite {
-                            statement: *statement,
-                            arguments: site,
-                        },
+                    key.push((parameter.clone(), argument.clone()));
+                    site.insert(parameter.clone(), (*span, argument));
+                }
+                key.sort();
+                let run = SharedRun {
+                    module: module.clone(),
+                    arguments: key.into(),
+                };
+                let reached = self
+                    .lowered
+                    .get(file)
+                    .cloned()
+                    .flatten()
+                    .map_or_else(TypeArguments::default, |lowered| {
+                        reached_types(&lowered.interface, name, &types)
+                    });
+                resolved.insert(*statement, Some(run.clone()));
+                self.imports.insert(
+                    *statement,
+                    Imported {
+                        run: run.clone(),
+                        types: reached,
+                    },
+                );
+                sites.entry(run).or_insert((
+                    *file,
+                    ImportSite {
+                        statement: *statement,
+                        arguments: site,
+                        types,
+                    },
+                ));
+                false
+            });
+            if pending.len() == before {
+                for (statement, ..) in pending.drain(..) {
+                    self.errors.push(LoweringError::unsupported(
+                        statement,
+                        "this import's arguments name imports whose arguments name it, in a \
+                         cycle",
                     ));
-                    false
-                });
-                if pending.len() == before {
-                    for (statement, ..) in pending.drain(..) {
-                        self.errors.push(LoweringError::unsupported(
-                            statement,
-                            "this import's arguments pass imports that pass it, in a cycle",
-                        ));
-                    }
                 }
             }
         }
-        runs
     }
 
     /// Lower the shared run `run`, of those in `sites`, if it is not lowered
@@ -1953,14 +2402,14 @@ impl ProgramLowering<'_> {
             .iter()
             .filter_map(|(_, argument)| match argument {
                 Argument::Module(run) => Some(run.clone()),
-                Argument::Lit(_) => None,
+                Argument::Lit(_) | Argument::Type(_) => None,
             })
             .collect();
         if let Some(ast) = self.program.ast(*file) {
             reached.extend(
                 ast.body
                     .iter()
-                    .filter_map(|stmt| self.imports.get(&stmt.span).cloned()),
+                    .filter_map(|stmt| Some(self.imports.get(&stmt.span)?.run.clone())),
             );
         }
         for reached in &reached {
@@ -2037,10 +2486,31 @@ impl ProgramLowering<'_> {
         };
         let own = self.shared_names(&lowered.scope);
         let mut modules: HashMap<SmolStr, Rc<HashMap<String, Name>>> = HashMap::new();
+        // A type parameter's default is its module's own type, so it takes the
+        // run's names. An argument is its declaring module's, so it replaces the
+        // parameter once the run is uniquified, and the declaring module's
+        // `let type` of it resolves its refinements where it is written.
+        let given = match &supplied {
+            Supplied::Run(.., types) => types,
+            Supplied::Import(_, site) => &site.types,
+        };
+        let mut defaults = HashMap::new();
+        let mut arguments = HashMap::new();
         for parameter in &lowered.interface.parameters {
-            if let Some(ty) = &parameter.module {
+            if let Some(declared) = &parameter.type_param {
+                if let Some(argument) = given.get(&parameter.name) {
+                    arguments.insert(declared.param.id, argument.clone());
+                    continue;
+                }
+                if let Some(default) = &declared.default {
+                    let mut default = default.clone();
+                    substitute(&mut default, &defaults);
+                    defaults.insert(declared.param.id, default);
+                    continue;
+                }
+            } else if let Some(ty) = &parameter.module {
                 let argument = match &supplied {
-                    Supplied::Run(_, arguments) => arguments
+                    Supplied::Run(_, arguments, _) => arguments
                         .iter()
                         .find(|argument| argument.parameter == parameter.name)
                         .map(|argument| (Rc::clone(&argument.names), argument.span)),
@@ -2063,6 +2533,9 @@ impl ProgramLowering<'_> {
                             );
                             continue;
                         }
+                        Some((_, Argument::Type(_))) => {
+                            unreachable!("a type argument is for a capitalized parameter")
+                        }
                         None => None,
                     },
                 }
@@ -2078,9 +2551,12 @@ impl ProgramLowering<'_> {
                 }
             } else {
                 let given = match &supplied {
-                    Supplied::Run(arguments, _) => arguments.contains(&parameter.name),
+                    Supplied::Run(arguments, ..) => arguments.contains(&parameter.name),
                     Supplied::Import(_, site) => match site.arguments.get(&parameter.name) {
                         Some((_, Argument::Lit(_))) => true,
+                        Some((_, Argument::Type(_))) => {
+                            unreachable!("a type argument is for a capitalized parameter")
+                        }
                         Some((span, Argument::Module(_))) => {
                             self.errors.push(
                                 LoweringError::unsupported(
@@ -2138,7 +2614,7 @@ impl ProgramLowering<'_> {
                 .iter()
                 .filter_map(|(parameter, (span, argument))| match argument {
                     Argument::Lit(value) => Some((parameter, (span, value))),
-                    Argument::Module(_) => None,
+                    Argument::Module(_) | Argument::Type(_) => None,
                 })
                 .collect();
             arguments.sort_by(|l, r| l.0.cmp(r.0));
@@ -2158,15 +2634,24 @@ impl ProgramLowering<'_> {
                 chain = ctx.tag_image(bound, *span);
             }
         }
+        substitute_in(&mut chain, &defaults);
         let mut qualified = own;
-        let chain = self.expand_runs(chain, &path, &mut qualified, &modules, ctx);
+        let chain = self.expand_runs(
+            chain,
+            &path,
+            &mut qualified,
+            &modules,
+            &mut HashMap::new(),
+            ctx,
+        );
         let (sinks, refused) = match &place {
             Some(place) => ctx.register_sinks(&lowered.sinks, Some(place)),
             None => (Vec::new(), Vec::new()),
         };
         self.errors.extend(refused);
         let scope = use_names(&lowered.scope, qualified);
-        let uniquified = uniquify::run_in(chain, &scope, home.clone());
+        let mut uniquified = uniquify::run_in(chain, &scope, home.clone());
+        substitute_in(&mut uniquified.expr, &arguments);
         let mut names = scope;
         let (spine, _) = spine(&uniquified.expr);
         for name in spine {
@@ -2237,13 +2722,16 @@ impl ProgramLowering<'_> {
     /// `expr`, a module's chain, with each [`TypedExprNode::Run`] on its spine
     /// replaced by the run it declares, at a run path under `path`, around the
     /// rest of the module. Each name a created run reaches is recorded in
-    /// `qualified`, spelled through its run name.
+    /// `qualified`, spelled through its run name. Each `let type` of a run's
+    /// type argument above it ([`LoweringContext::take_run`]) is recorded in
+    /// `types` on the way down, and the run takes it.
     fn expand_runs(
         &mut self,
         expr: Expr,
         path: &RunPath,
         qualified: &mut HashMap<String, Name>,
         modules: &HashMap<SmolStr, Rc<HashMap<String, Name>>>,
+        types: &mut HashMap<String, Type>,
         ctx: &mut LoweringContext,
     ) -> Expr {
         if matches!(expr.node, TypedExprNode::Run { .. }) {
@@ -2266,6 +2754,13 @@ impl ProgramLowering<'_> {
                     span,
                 })
                 .collect();
+            let prefix = format!("{ARGUMENT}{name}::");
+            let given = types
+                .iter()
+                .filter_map(|(spelling, ty)| {
+                    Some((SmolStr::from(spelling.strip_prefix(&prefix)?), ty.clone()))
+                })
+                .collect();
             let run_path = path.child(name.clone());
             let created = self.program.file_of(&module).and_then(|file| {
                 let home = Home::Run(run_path.clone());
@@ -2274,21 +2769,32 @@ impl ProgramLowering<'_> {
                     file,
                     Some(home),
                     place,
-                    Supplied::Run(&arguments, passed),
+                    Supplied::Run(&arguments, passed, given),
                     ctx,
                 )
             });
             let Some(created) = created else {
-                return self.expand_runs(*body, path, qualified, modules, ctx);
+                return self.expand_runs(*body, path, qualified, modules, types, ctx);
             };
             // The rest of the module, below the run, reaches it.
             for (spelling, binder) in created.names {
                 qualified.insert(format!("{name}::{spelling}"), binder);
             }
-            let body = self.expand_runs(*body, path, qualified, modules, ctx);
+            let body = self.expand_runs(*body, path, qualified, modules, types, ctx);
             return link(created.chain, body);
         }
+        if let TypedExprNode::LetType { name, ty, .. } = &expr.node
+            && name.starts_with(ARGUMENT)
+        {
+            let AliasType::Type(ty) = ty else {
+                unreachable!("a type argument is a value's type");
+            };
+            types.insert(name.clone(), ty.clone());
+        }
         // The rest of the spine is moved out and back, so no node is minted.
+        let mut descend = |body: Box<Expr>| {
+            Box::new(self.expand_runs(*body, path, qualified, modules, types, ctx))
+        };
         match expr.node {
             TypedExprNode::Let {
                 binding,
@@ -2298,7 +2804,7 @@ impl ProgramLowering<'_> {
                 node: TypedExprNode::Let {
                     binding,
                     bound_expr,
-                    body: Box::new(self.expand_runs(*body, path, qualified, modules, ctx)),
+                    body: descend(body),
                 },
                 ..expr
             },
@@ -2310,14 +2816,14 @@ impl ProgramLowering<'_> {
                 node: TypedExprNode::MutDecl {
                     binding,
                     init,
-                    body: Box::new(self.expand_runs(*body, path, qualified, modules, ctx)),
+                    body: descend(body),
                 },
                 ..expr
             },
             TypedExprNode::ExprStmt { expr: effect, body } => Expr {
                 node: TypedExprNode::ExprStmt {
                     expr: effect,
-                    body: Box::new(self.expand_runs(*body, path, qualified, modules, ctx)),
+                    body: descend(body),
                 },
                 ..expr
             },
@@ -2325,7 +2831,7 @@ impl ProgramLowering<'_> {
                 node: TypedExprNode::LetType {
                     name,
                     ty,
-                    body: Box::new(self.expand_runs(*body, path, qualified, modules, ctx)),
+                    body: descend(body),
                 },
                 ..expr
             },
@@ -2349,13 +2855,9 @@ impl ProgramLowering<'_> {
         qualified
     }
 
-    /// The scope `module` lowers in ([`module_scope`]).
-    fn scope(
-        &mut self,
-        module: &ChlModule,
-        labels: Option<ModulePath>,
-        ctx: &LoweringContext,
-    ) -> ModuleScope {
+    /// The interface each `import` and `run` statement of `module` reaches, by
+    /// the statement, or `None` where there is none.
+    fn interfaces(&mut self, module: &ChlModule) -> HashMap<Span, Option<Rc<Interface>>> {
         let mut interfaces = HashMap::new();
         for stmt in &module.body {
             let path = match &stmt.node {
@@ -2376,6 +2878,17 @@ impl ProgramLowering<'_> {
             };
             interfaces.insert(stmt.span, interface);
         }
+        interfaces
+    }
+
+    /// The scope `module` lowers in ([`module_scope`]).
+    fn scope(
+        &mut self,
+        module: &ChlModule,
+        labels: Option<ModulePath>,
+        ctx: &LoweringContext,
+    ) -> ModuleScope {
+        let interfaces = self.interfaces(module);
         module_scope(
             module,
             labels,
@@ -2418,6 +2931,84 @@ fn constant(expr: &ChlExpr) -> Option<Lit> {
         },
         _ => None,
     }
+}
+
+/// Each name `expr` writes that could name a type or a module: a bare name, and
+/// the first segment of a qualified one.
+fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
+    let mut each = |exprs: &mut dyn Iterator<Item = &Spanned<ChlExpr>>| {
+        for expr in exprs {
+            mentioned_names(&expr.node, names);
+        }
+    };
+    match expr {
+        ChlExpr::Name(name) => {
+            names.insert(name.clone());
+        }
+        ChlExpr::Qualified(q) => {
+            let first = q
+                .qualifier
+                .first()
+                .expect("a qualified name has a qualifier");
+            names.insert(first.node.clone());
+        }
+        ChlExpr::Call { func, args } => each(&mut std::iter::once(&**func).chain(args)),
+        ChlExpr::List(elts) | ChlExpr::Tuple(elts) | ChlExpr::BraceGroup(elts) => {
+            each(&mut elts.iter())
+        }
+        ChlExpr::Record(fields) | ChlExpr::BraceRecord(fields) => {
+            each(&mut fields.iter().map(|field| &field.value))
+        }
+        ChlExpr::ModuleType(entries) => each(&mut entries.iter().map(|entry| &entry.value)),
+        ChlExpr::BraceRefinement { base, predicate } => {
+            each(&mut [&**base, &**predicate].into_iter())
+        }
+        ChlExpr::FunctionType { domain, codomain } => {
+            each(&mut [&**domain, &**codomain].into_iter())
+        }
+        ChlExpr::Subscript { target, index, .. } => each(&mut [&**target, &**index].into_iter()),
+        ChlExpr::BinOp { left, right, .. } => each(&mut [&**left, &**right].into_iter()),
+        ChlExpr::UnaryOp { operand, .. } => each(&mut std::iter::once(&**operand)),
+        ChlExpr::BoolOp { operands, .. } => each(&mut operands.iter()),
+        ChlExpr::Compare {
+            left, comparators, ..
+        } => each(&mut std::iter::once(&**left).chain(comparators)),
+        ChlExpr::Attribute { target, .. } => each(&mut std::iter::once(&**target)),
+        ChlExpr::VariantCtor { payload, .. } => match payload {
+            Some(VariantPayload::Term(p) | VariantPayload::Fields(p)) => {
+                each(&mut std::iter::once(&**p))
+            }
+            None => {}
+        },
+        // None of these is a type. Lowering the argument as one refuses it.
+        ChlExpr::Lit(_)
+        | ChlExpr::Error
+        | ChlExpr::Forall { .. }
+        | ChlExpr::Lambda { .. }
+        | ChlExpr::IfExp { .. }
+        | ChlExpr::ListComp(_)
+        | ChlExpr::GenExp(_)
+        | ChlExpr::Yield(_)
+        | ChlExpr::Feed { .. }
+        | ChlExpr::Block(_) => {}
+    }
+}
+
+/// A name a refinement in `ty` reads other than its element, if one does.
+fn value_named(ty: &Type) -> Option<Name> {
+    fn walk(ty: &Type, visited: &mut HashSet<crate::ccl::PredicateId>, found: &mut Option<Name>) {
+        crate::ccl::ccl_utils::walk_refined_predicates(ty, visited, &mut |predicate, _| {
+            if found.is_none() {
+                *found = crate::ccl::ccl_utils::free_names(predicate)
+                    .into_iter()
+                    .find(|name| !name.is_elem());
+            }
+        });
+        ty.walk_children(|child| walk(child, visited, found));
+    }
+    let mut found = None;
+    walk(ty, &mut HashSet::new(), &mut found);
+    found
 }
 
 /// What the view `view` reaches among `names`, a run's names: each value under
@@ -2589,6 +3180,8 @@ fn last_segment(path: &ModulePath) -> SmolStr {
 /// The scope `module` lowers in: `labels` as the module of its unqualified
 /// labels, a [`Qualifier`] per `import` and per `run`, each reaching the
 /// interface `interfaces` holds for its statement, and a [`Use`] per `use` item.
+/// An import name reaches what `imports` holds for its statement. A run's type
+/// arguments are lowered with the module ([`LoweringContext::declare_run_types`]).
 ///
 /// An import of a module that performs IO or declares state is an error at the
 /// statement, and so is a second import or run binding one name. A `use` item
@@ -2600,7 +3193,7 @@ fn module_scope(
     labels: Option<ModulePath>,
     program: &LoadedProgram,
     interfaces: &HashMap<Span, Option<Rc<Interface>>>,
-    shared: &HashMap<Span, SharedRun>,
+    imports: &HashMap<Span, Imported>,
     ctx: &LoweringContext,
     errors: &mut Vec<LoweringError>,
 ) -> ModuleScope {
@@ -2641,13 +3234,17 @@ fn module_scope(
                 let qualifier = Qualifier {
                     module,
                     file,
-                    shared: shared.get(&stmt.span).cloned(),
+                    shared: imports.get(&stmt.span).map(|imported| imported.run.clone()),
                     statement: stmt.span,
                     interface,
                     kind: QualifierKind::Import,
                     spelling: name.to_string(),
                     view: None,
                     view_base: String::new(),
+                    types: imports
+                        .get(&stmt.span)
+                        .map(|reaches| Rc::clone(&reaches.types))
+                        .unwrap_or_default(),
                 };
                 (name, qualifier, uses)
             }
@@ -2683,6 +3280,7 @@ fn module_scope(
                     spelling: name.to_string(),
                     view: None,
                     view_base: String::new(),
+                    types: TypeArguments::default(),
                 };
                 (name, qualifier, uses)
             }

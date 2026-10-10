@@ -480,6 +480,13 @@ pub struct LoweringContext {
     /// The module each Module-typed parameter's default names, as the module
     /// being lowered spells it.
     pub(super) module_parameter_defaults: HashMap<SmolStr, String>,
+    /// Each type parameter of the module being lowered, by name, in the order
+    /// declared ([`Self::declare_type_parameter`]).
+    pub(super) module_type_parameters: Vec<(SmolStr, modules::TypeParameter)>,
+    /// The type arguments of each `run` statement of the module being lowered,
+    /// by run name: each one's parameter, its span, and the type, lowered where
+    /// the statement stands ([`Self::declare_run_types`]).
+    pub(super) run_type_arguments: HashMap<SmolStr, Vec<(SmolStr, Span, Type)>>,
     /// Every binder the module being lowered writes, with its span, for the rule
     /// that none takes a name that denotes a module ([`import_name_binders`]).
     pub(super) module_binders: Vec<(SmolStr, Span)>,
@@ -1510,8 +1517,10 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
         // `pub` decides what an importer reaches, which the interface records,
         // and an `import` binds a name lowering resolves through the module's
         // scope. Neither leaves anything in the lowered tree.
-        // A parameter is in scope throughout its module, so its `let` heads the
-        // module's chain (`docs/chl-spec.md`, "9.4 Parameters").
+        // A value parameter is in scope throughout its module, so its `let`
+        // heads the module's chain (`docs/chl-spec.md`, "9.4 Parameters"). A type
+        // parameter stays at its statement, from which it is in scope, as a
+        // type alias is.
         let (parameters, rest): (Vec<_>, Vec<_>) = module
             .body
             .iter()
@@ -1520,7 +1529,10 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
                 ChlStmt::Pub { stmt, .. } => (**stmt).clone(),
                 _ => stmt.clone(),
             })
-            .partition(|stmt| matches!(stmt.node, ChlStmt::Param { .. }));
+            .partition(|stmt| {
+                matches!(&stmt.node, ChlStmt::Param { name, .. }
+                    if !is_type_name(&name.node))
+            });
         let unmarked = ChlModule {
             file: module.file,
             body: parameters.into_iter().chain(rest).collect(),
