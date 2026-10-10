@@ -231,7 +231,7 @@ impl DataSourceDomainExtentImpl for UnopenedRoute {
         )
     }
 
-    fn first_position_for_a_new_producer(&self) -> usize {
+    fn first_position_for_a_new_producer(&self) -> u64 {
         unreachable!("`{}` was never opened, so it offers no position", self.id)
     }
 
@@ -372,7 +372,7 @@ pub struct HttpServerSharedState {
     // design. It holds the *socket* a request arrived on, not a value the program
     // computed: the request's data reaches the sink as a tile like anything else,
     // and this is what the reply is finally written to.
-    pending: Mutex<HashMap<usize, tiny_http::Request>>,
+    pending: Mutex<HashMap<u64, tiny_http::Request>>,
 }
 
 impl HttpServerSharedState {
@@ -383,7 +383,7 @@ impl HttpServerSharedState {
     }
 
     /// Store a new pending request at `idx`.
-    fn insert(&self, idx: usize, request: tiny_http::Request) {
+    fn insert(&self, idx: u64, request: tiny_http::Request) {
         self.pending.lock().unwrap().insert(idx, request);
     }
 
@@ -589,7 +589,7 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
 
     /// The requests still in flight, which is what the inspector renders as the
     /// route's live tail.
-    fn retained_window(&self) -> Option<std::ops::Range<usize>> {
+    fn retained_window(&self) -> Option<std::ops::Range<u64>> {
         Some(self.buf.retained_window())
     }
 
@@ -609,7 +609,7 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
         self.buf.carry_release_to_new_producers();
     }
 
-    fn first_position_for_a_new_producer(&self) -> usize {
+    fn first_position_for_a_new_producer(&self) -> u64 {
         self.buf.first_index_for_a_new_producer()
     }
 

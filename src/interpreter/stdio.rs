@@ -72,7 +72,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         "stdin"
     }
 
-    fn retained_window(&self) -> Option<std::ops::Range<usize>> {
+    fn retained_window(&self) -> Option<std::ops::Range<u64>> {
         Some(self.buf.retained_window())
     }
 
@@ -137,7 +137,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         self.buf.carry_release_to_new_producers();
     }
 
-    fn first_position_for_a_new_producer(&self) -> usize {
+    fn first_position_for_a_new_producer(&self) -> u64 {
         self.buf.first_index_for_a_new_producer()
     }
 

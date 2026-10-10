@@ -14,7 +14,7 @@ use crate::interpreter::{
 use crate::pretty_graph::fmt_binop;
 use crate::util::fmt_record;
 
-use super::{ColumnValue, FuncBinding, bindings_are_list};
+use super::{ColumnValue, FuncBinding, RowIndex, bindings_are_list, uint_of_row};
 use crate::interpreter::tile_operators::{materialize_collections, open_collections};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -140,7 +140,7 @@ impl FunctionDef {
         let mut values = (**codomain).clone();
         values.merge_rows(new_values);
         Tile::grouped(
-            ColumnValue::UInts(starts),
+            starts,
             keys.select_indices(key_entries.iter().copied(), key_entries.len()),
             Box::new(values.select_rows(&value_entries)),
             domain_predicate.clone(),
@@ -182,7 +182,7 @@ impl std::fmt::Display for FunctionDef {
 #[derive(Clone, PartialEq, Eq)]
 pub enum Value {
     Int(i64),
-    UInt(usize),
+    UInt(u64),
     String(SmolStr),
     Bool(bool),
     Unit,
@@ -516,8 +516,8 @@ impl From<i64> for Value {
     }
 }
 
-impl From<usize> for Value {
-    fn from(v: usize) -> Self {
+impl From<u64> for Value {
+    fn from(v: u64) -> Self {
         Value::UInt(v)
     }
 }
@@ -549,7 +549,13 @@ impl Value {
         }
     }
 
-    pub fn as_uint(&self) -> usize {
+    /// The `UInt` carrying the same number as `row`. Lossless: `usize` is at most 64 bits on
+    /// every supported host.
+    pub fn uint_from_row(row: RowIndex) -> Self {
+        Value::UInt(uint_of_row(row))
+    }
+
+    pub fn as_uint(&self) -> u64 {
         match self {
             Value::UInt(i) => *i,
             _ => panic!("Not uint: {self:?}"),
@@ -693,11 +699,11 @@ mod tests {
         let mut elements = Vec::new();
         for group in groups {
             starts.push(positions.len());
-            positions.extend(0..group.len());
+            positions.extend(0..uint_of_row(group.len()));
             elements.extend(group.iter().copied());
         }
         Tile::grouped(
-            ColumnValue::UInts(starts),
+            starts,
             ColumnValue::UInts(positions),
             Box::new(Tile::Scalar(ColumnValue::Ints(elements))),
             crate::interpreter::Predicate::True,
@@ -712,7 +718,7 @@ mod tests {
     fn apply_tile_writes_a_collection_valued_key() {
         // Row 0 is `{a: [1, 2]}`, row 1 is `{a: [3]}`.
         let level = Tile::grouped(
-            ColumnValue::from_uints(vec![0, 1]),
+            vec![0, 1],
             ColumnValue::Strings(vec!["a".into(), "a".into()]),
             Box::new(int_lists(&[&[1, 2], &[3]])),
             crate::interpreter::Predicate::True,
@@ -741,7 +747,7 @@ mod tests {
         else {
             panic!("insert over a level yields a level")
         };
-        assert_eq!(row_starts, ColumnValue::from_uints(vec![0, 1]));
+        assert_eq!(row_starts, vec![0, 1]);
         assert_eq!(
             domain,
             ColumnValue::Strings(vec!["a".into(), "a".into(), "b".into()])
@@ -755,7 +761,7 @@ mod tests {
     #[test]
     fn apply_tile_writes_its_key_in_every_row() {
         let level = Tile::grouped(
-            ColumnValue::from_uints(vec![0, 2]),
+            vec![0, 2],
             ColumnValue::Strings(vec!["a".into(), "b".into(), "a".into()]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
             crate::interpreter::Predicate::True,
@@ -782,7 +788,7 @@ mod tests {
         else {
             panic!("insert over a level yields a level")
         };
-        assert_eq!(row_starts, ColumnValue::from_uints(vec![0, 2]));
+        assert_eq!(row_starts, vec![0, 2]);
         assert_eq!(
             domain,
             ColumnValue::Strings(vec!["a".into(), "b".into(), "a".into(), "c".into()])

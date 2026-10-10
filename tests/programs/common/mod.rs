@@ -342,7 +342,7 @@ pub fn tile_to_canonical(tile: Tile) -> String {
                     .into_iter()
                     .enumerate()
                     .map(|(i, b)| FuncBinding {
-                        input: Value::UInt(i),
+                        input: Value::uint_from_row(i),
                         output: b.output,
                     })
                     .collect();

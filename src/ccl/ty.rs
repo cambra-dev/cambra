@@ -1090,7 +1090,7 @@ pub enum Type {
     /// Emitted by `lower_list_comp` to annotate the outer lambda's parameter
     /// with the exact length of the source list. `compile_ccl::extent_of` maps
     /// it directly to `Extent::UIntRange { start: 0, end: n }`.
-    UIntRange(usize),
+    UIntRange(u64),
     /// A function type. When `name` is `None` it is the ordinary
     /// non-dependent function type `domain ⇒ codomain`. When `name` is `Some(x)` it
     /// is a **Pi type** `(x: domain) ⇒ codomain`: the binder `x` is in scope
@@ -2518,6 +2518,11 @@ fn singleton_value(ty: &Type) -> Option<&TypedExpr> {
 }
 
 impl Type {
+    /// The index range `[0, len)` of an in-memory sequence of `len` rows.
+    pub fn index_range(len: usize) -> Self {
+        Type::UIntRange(crate::interpreter::uint_of_row(len))
+    }
+
     /// The product of `elems` — a [`Type::Tuple`], or [`BaseType::Unit`] when
     /// there are none.
     ///
@@ -5404,7 +5409,7 @@ mod tests {
         );
     }
 
-    fn rng(n: usize) -> Type {
+    fn rng(n: u64) -> Type {
         Type::UIntRange(n)
     }
 
@@ -5950,7 +5955,7 @@ mod witness_identity_tests {
 mod witness_subst_tests {
     use super::*;
 
-    fn range(n: usize) -> Type {
+    fn range(n: u64) -> Type {
         Type::UIntRange(n)
     }
 

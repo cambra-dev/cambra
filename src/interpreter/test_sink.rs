@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn a_nested_collection_reads_each_row_s_run() {
         let inner = Tile::grouped(
-            ColumnValue::UInts(vec![0, 2]),
+            vec![0, 2],
             ColumnValue::from_uints(vec![0, 1, 0]),
             ints(vec![10, 11, 20]),
             Predicate::True,
@@ -273,7 +273,7 @@ mod tests {
     fn a_column_longer_than_its_rows_is_malformed() {
         // Built as the literal: the checked constructors refuse this tile.
         let tile = Tile::DataFunction {
-            row_starts: ColumnValue::UInts(vec![0]),
+            row_starts: vec![0],
             domain: ColumnValue::from_uints(vec![0]),
             codomain: ints(vec![1, 2]),
             domain_predicate: Predicate::True,

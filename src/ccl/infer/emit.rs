@@ -2358,7 +2358,7 @@ pub(super) fn emit_list<C: Typing>(
     // appears in the list type. A list literal is a **data** function — its
     // domain is the index set, so a join with another collection may not narrow
     // it — see `src/ccl/design/type-inference.md`, "The domain join needs `box`".
-    Ok(fun_ty(Type::UIntRange(n), read_through(&elem_ty)))
+    Ok(fun_ty(Type::index_range(n), read_through(&elem_ty)))
 }
 
 /// Emit constraints for a [`TypedExprNode::Case`] — the unified

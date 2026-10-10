@@ -1196,7 +1196,7 @@ mod tests {
 
     /// One row at `key`, under a domain predicate that claims only the prefix up to
     /// it — so the tile is not the whole function and the input is not drained.
-    fn one_row(key: usize, value: i64) -> Tile {
+    fn one_row(key: u64, value: i64) -> Tile {
         Tile::data_function(
             ColumnValue::UInts(vec![key]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![value]))),

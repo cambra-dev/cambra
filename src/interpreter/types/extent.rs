@@ -31,7 +31,7 @@ pub enum Extent {
     ///
     /// Created from a CCL `UIntRange(n)` type as the full set `[0, n)`, and
     /// shrunk directly as individual elements or sub-intervals are released.
-    UIntRange(IntervalSet<usize>),
+    UIntRange(IntervalSet<u64>),
     DataSourceDomain(Rc<RefCell<dyn DataSourceDomainExtentImpl>>),
     /// A restricted extent: wraps another extent with a restriction predicate.
     Restricted {
@@ -353,7 +353,7 @@ pub trait DataSourceDomainExtentImpl {
     /// has none: a source that answered `0` when it had advanced would base an
     /// induction drive below every position it will offer, and the drive would
     /// wait for an element that is not coming.
-    fn first_position_for_a_new_producer(&self) -> usize;
+    fn first_position_for_a_new_producer(&self) -> u64;
 
     /// Answer whatever this source left in flight, because it will never be read
     /// again.
@@ -407,7 +407,7 @@ pub trait DataSourceDomainExtentImpl {
     /// which is a consumer taking delivery. `None` and `Some(empty)` are
     /// different answers: the first says this kind of source has no window, the
     /// second that its window is currently empty.
-    fn retained_window(&self) -> Option<std::ops::Range<usize>> {
+    fn retained_window(&self) -> Option<std::ops::Range<u64>> {
         None
     }
 }
@@ -465,16 +465,16 @@ impl Extent {
     ///
     /// The resulting interval set contains every unsigned integer in `[0, n)`.
     /// For `n == 0`, the set is empty.
-    pub fn uint_range(n: usize) -> Self {
+    pub fn uint_range(n: u64) -> Self {
         Self::uint_range_interval(0, n)
     }
 
     /// Construct a `UIntRange` extent covering `[start, end)`.
     ///
     /// Returns an empty set when `start >= end`.
-    pub fn uint_range_interval(start: usize, end: usize) -> Self {
+    pub fn uint_range_interval(start: u64, end: u64) -> Self {
         if start >= end {
-            Extent::UIntRange(IntervalSet::from(Interval::<usize>::empty()))
+            Extent::UIntRange(IntervalSet::from(Interval::<u64>::empty()))
         } else {
             Extent::UIntRange(IntervalSet::from(Interval::closed_open(start, end)))
         }
@@ -484,7 +484,7 @@ impl Extent {
     /// range starting at `0` (i.e. `[0, n)`), return `n`.
     ///
     /// Used to convert a compile-time extent back to a CCL `Type::UIntRange(n)`.
-    pub fn as_uint_range_size(&self) -> Option<usize> {
+    pub fn as_uint_range_size(&self) -> Option<u64> {
         if let Extent::UIntRange(set) = self {
             if set.is_empty() {
                 return Some(0);

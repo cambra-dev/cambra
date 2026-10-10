@@ -151,7 +151,7 @@ fn converse_group_by_key<K: PartialOrd>(
     Tile::data_function(
         domain1_col,
         Box::new(Tile::grouped(
-            ColumnValue::UInts(group_starts),
+            group_starts,
             domain2_col.clone(),
             Box::new(Tile::Scalar(domain2_col)),
             domain_predicate,
@@ -622,9 +622,7 @@ fn pair_two_levels(tile: Tile) -> Tile {
     // Everything beneath the inner level named its paths by outer and inner key apart, and
     // the pair level names them together.
     codomain.map_level_predicates(&mut |depth, pred| pred.with_levels_paired(depth + 2, 0, fields));
-    let ColumnValue::UInts(offsets_vec) = &row_starts else {
-        panic!("row starts are UInts")
-    };
+    let offsets_vec = &row_starts;
 
     // One copy of a group's key per key inside it, so the pair column lines up with the
     // flattened codomain.
@@ -1189,7 +1187,7 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling, second: Paired) -> 
             at += b - a;
         }
         Tile::grouped(
-            ColumnValue::UInts(starts),
+            starts,
             keys.clone(),
             Box::new(pair_tile(outer_values, second, pair)),
             Predicate::False,
@@ -1601,14 +1599,14 @@ mod tests {
         );
     }
 
-    fn uints(values: &[usize]) -> ColumnValue {
+    fn uints(values: &[u64]) -> ColumnValue {
         ColumnValue::UInts(values.to_vec())
     }
 
     /// One level of `keys` grouped by `starts`, over `codomain`.
-    fn level(starts: &[usize], keys: &[usize], codomain: Tile) -> Tile {
+    fn level(starts: &[usize], keys: &[u64], codomain: Tile) -> Tile {
         Tile::grouped(
-            uints(starts),
+            starts.to_vec(),
             uints(keys),
             Box::new(codomain),
             Predicate::False,
@@ -1763,7 +1761,7 @@ mod tests {
         let two_level_tile = Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 2]),
+                vec![0, 2],
                 ColumnValue::UInts(vec![10, 20, 30]),
                 Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200, 300]))),
                 Predicate::False,
@@ -1883,7 +1881,7 @@ mod tests {
         let two_level_tile = Tile::data_function(
             ColumnValue::UInts(vec![100, 200, 300]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 1, 2]),
+                vec![0, 1, 2],
                 ColumnValue::UInts(vec![10, 20, 30]),
                 Box::new(Tile::Scalar(ColumnValue::UInts(vec![1, 2, 3]))),
                 Predicate::False,
@@ -1972,7 +1970,7 @@ mod tests {
         let two_level_tile = Tile::data_function(
             ColumnValue::UInts(vec![1, 2, 3]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 1, 2]),
+                vec![0, 1, 2],
                 ColumnValue::UInts(vec![10, 20, 30]),
                 Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200, 300]))),
                 Predicate::False,
@@ -2043,7 +2041,7 @@ mod tests {
         let two_level_tile = Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 1]),
+                vec![0, 1],
                 ColumnValue::UInts(vec![10, 20]),
                 Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200]))),
                 Predicate::False,
@@ -2199,7 +2197,7 @@ mod tests {
             panic!("expected a collection of collections");
         };
         // Group for 10 starts at 0 (rows 0 and 2 map to 10); group for 20 starts at 2.
-        assert_eq!(*row_starts, ColumnValue::UInts(vec![0, 2]));
+        assert_eq!(*row_starts, vec![0, 2]);
         // The inner level is sorted by codomain key: [0, 2] for key 10, then [1] for 20.
         assert_eq!(*inner_keys, ColumnValue::Ints(vec![0, 2, 1]));
         assert_eq!(domain_predicate, Predicate::True);
@@ -2320,7 +2318,7 @@ mod tests {
         let inner = Tile::data_function(
             ColumnValue::from_uints(vec![0, 1]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0, 2]),
+                vec![0, 2],
                 ColumnValue::from_uints(vec![0, 1, 0, 1, 2]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8, 9, 10, 11]))),
                 Predicate::True,
@@ -2367,7 +2365,7 @@ mod tests {
         };
         assert_eq!(
             row_starts,
-            &ColumnValue::from_uints(vec![0, 2]),
+            &vec![0, 2],
             "the groups are the rows' own, two keys then three"
         );
         assert_eq!(domain, &ColumnValue::from_uints(vec![0, 1, 0, 1, 2]));
@@ -2404,7 +2402,7 @@ mod tests {
         let inner = Tile::data_function(
             ColumnValue::from_uints(vec![0, 1]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0, 2]),
+                vec![0, 2],
                 ColumnValue::from_uints(vec![0, 1, 0, 1, 2]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8, 9, 10, 11]))),
                 Predicate::True,
@@ -2445,7 +2443,7 @@ mod tests {
         else {
             panic!("the paired level is a collection")
         };
-        assert_eq!(row_starts, &ColumnValue::from_uints(vec![0, 2]));
+        assert_eq!(row_starts, &vec![0, 2]);
         assert_eq!(
             domain,
             &ColumnValue::from_uints(vec![0, 1, 0, 1, 2]),
@@ -2482,7 +2480,7 @@ mod tests {
         let inner = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(vec![0, 1]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
                 Predicate::True,
@@ -2533,7 +2531,7 @@ mod tests {
         let int = || Extent::Base(BaseType::Int);
         let single = |codomain: Tile, stated: Predicate| {
             Tile::grouped(
-                ColumnValue::from_uints(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(vec![0]),
                 Box::new(codomain),
                 stated,
@@ -2616,7 +2614,7 @@ mod tests {
         let inner = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(vec![0]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
                 Predicate::False,
@@ -2678,7 +2676,7 @@ mod tests {
         let inner = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(vec![0]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
                 Predicate::qualified(

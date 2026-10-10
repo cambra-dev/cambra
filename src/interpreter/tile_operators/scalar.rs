@@ -784,7 +784,7 @@ impl VariantProjectProducer {
             // Explicit stream domain: gather the actual keys at the kept positions.
             Some(d) => d.select_indices(key_positions.iter().copied(), key_positions.len()),
             // Implicit `Scalar(Union)` domain: the kept positions *are* the keys.
-            None => ColumnValue::from_uints(key_positions),
+            None => ColumnValue::uints_from_rows(key_positions),
         };
         let out_codomain = match arms.get(&self.tag) {
             Some(arm) => arm
@@ -955,7 +955,7 @@ impl TileProducer for VariantIsProducer {
         let answers: bit_vec::BitVec = positions.iter().map(|p| carried.contains(*p)).collect();
         let out_domain = match domain_col {
             Some(d) => d.select_indices(positions.iter().copied(), positions.len()),
-            None => ColumnValue::from_uints(positions),
+            None => ColumnValue::uints_from_rows(positions),
         };
         Tile::data_function(
             out_domain,

@@ -40,7 +40,7 @@ pub(super) mod tests {
         Extent::Base(BaseType::Bool)
     }
 
-    pub(crate) fn range(end: usize) -> Extent {
+    pub(crate) fn range(end: u64) -> Extent {
         Extent::uint_range(end)
     }
 

@@ -422,8 +422,11 @@ impl SourceWindow {
 /// The last `limit` indices of a source's retained `window`: the keys a
 /// sample fetches, so its cost is bounded by `limit` rather than by how much
 /// the source retains.
-pub fn window_tail(window: std::ops::Range<usize>, limit: usize) -> std::ops::Range<usize> {
-    window.end.saturating_sub(limit).max(window.start)..window.end
+pub fn window_tail(window: std::ops::Range<u64>, limit: usize) -> std::ops::Range<u64> {
+    window
+        .end
+        .saturating_sub(super::uint_of_row(limit))
+        .max(window.start)..window.end
 }
 
 /// Render the tail of a source's retained window.
@@ -784,9 +787,9 @@ fn write_entries(
 #[cfg(test)]
 pub(crate) fn one_key_store(
     key: &str,
-    positions: Vec<usize>,
+    positions: Vec<u64>,
     values: ColumnValue,
-    watermark: Option<usize>,
+    watermark: Option<u64>,
     terminal: bool,
 ) -> Tile {
     use std::collections::HashMap;
@@ -833,11 +836,11 @@ mod tests {
         ColumnValue::Strings(values.iter().map(|s| (*s).into()).collect())
     }
 
-    fn uints(values: &[usize]) -> ColumnValue {
+    fn uints(values: &[u64]) -> ColumnValue {
         ColumnValue::UInts(values.to_vec())
     }
 
-    fn collection(domain: &[usize], values: &[&str], deleted: &[usize]) -> Tile {
+    fn collection(domain: &[u64], values: &[&str], deleted: &[usize]) -> Tile {
         Tile::data_function(
             uints(domain),
             Box::new(Tile::Scalar(strings(values))),
@@ -1093,7 +1096,7 @@ mod tests {
     #[test]
     fn a_nested_collection_renders_its_entries() {
         let inner = Tile::grouped(
-            uints(&[0, 2]),
+            vec![0, 2],
             uints(&[0, 1, 0]),
             Box::new(Tile::Scalar(strings(&["a", "b", "c"]))),
             Predicate::True,
@@ -1142,8 +1145,8 @@ mod tests {
     fn a_cut_inside_a_nested_collection_counts_what_it_passed_over() {
         let entries = CHARS_PER_CELL;
         let inner = Tile::grouped(
-            uints(&[0]),
-            uints(&(0..entries).collect::<Vec<_>>()),
+            vec![0],
+            ColumnValue::uints_from_rows(0..entries),
             Box::new(Tile::Scalar(strings(&vec!["v"; entries]))),
             Predicate::True,
             BitSet::new(),

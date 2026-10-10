@@ -5,7 +5,9 @@ use bit_set::BitSet;
 use super::*;
 use crate::interpreter::operator_graph::{value, value_at};
 use crate::{
-    interpreter::{Consumer, Scheduler, Value, forwarding_consumer, shared_consumer, tuple_field},
+    interpreter::{
+        Consumer, RowIndex, Scheduler, Value, forwarding_consumer, shared_consumer, tuple_field,
+    },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -401,11 +403,11 @@ impl TileProducer for ZipProducer {
                          two arms gave back separately have no skeleton to stand on"
                     );
                 }
-                let skeleton_levels: Vec<(ColumnValue, ColumnValue)> = filtered_tiles[skeleton_at]
-                    .key_levels()[..self.level.index()]
-                    .iter()
-                    .map(|(starts, keys)| ((*starts).clone(), (*keys).clone()))
-                    .collect();
+                let skeleton_levels: Vec<(Vec<RowIndex>, ColumnValue)> =
+                    filtered_tiles[skeleton_at].key_levels()[..self.level.index()]
+                        .iter()
+                        .map(|(starts, keys)| (starts.to_vec(), (*keys).clone()))
+                        .collect();
                 let mut codomains: Vec<Tile> = Vec::with_capacity(filtered_tiles.len());
                 let mut absent: HashMap<String, BitSet> = HashMap::new();
                 for (arm, filtered) in filtered_tiles.iter_mut().enumerate() {
@@ -423,7 +425,7 @@ impl TileProducer for ZipProducer {
                         assert!(
                             filtered.key_levels()[..self.level.index()]
                                 .iter()
-                                .map(|(starts, keys)| ((*starts).clone(), (*keys).clone()))
+                                .map(|(starts, keys)| (starts.to_vec(), (*keys).clone()))
                                 .eq(skeleton_levels.iter().cloned()),
                             "Zip: inputs disagree on the {} levels above the pair, after \
                              aligning them: {skeleton_levels:?} against {filtered:?}",
@@ -1151,7 +1153,7 @@ mod tests {
     }
 
     /// Whether `guard` names key `key` of a collection and not key `kept`.
-    fn names_key(guard: &TileGuard, key: usize, kept: usize) -> bool {
+    fn names_key(guard: &TileGuard, key: u64, kept: u64) -> bool {
         matches!(guard, TileGuard::Function(FunctionGuard::Domain(p))
             if p.contains(&Value::UInt(key)) && !p.contains(&Value::UInt(kept)))
     }
@@ -1222,7 +1224,7 @@ mod tests {
                     (
                         "b".to_string(),
                         Tile::grouped(
-                            ColumnValue::UInts(vec![0, 1]),
+                            vec![0, 1],
                             ColumnValue::UInts(vec![0, 0]),
                             Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
                             Predicate::False,
@@ -1402,7 +1404,7 @@ mod tests {
         let arm1 = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(vec![3]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![30]))),
                 Predicate::False,

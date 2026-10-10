@@ -353,12 +353,12 @@ mod tests {
     /// exercises `ExtractFinal`'s incremental (pre-terminal) release path.
     struct PartialSource {
         tiling: Tiling,
-        releases: Rc<RefCell<Vec<usize>>>,
+        releases: Rc<RefCell<Vec<u64>>>,
     }
 
     struct PartialSourceProducer {
         base: ProducerBase,
-        releases: Rc<RefCell<Vec<usize>>>,
+        releases: Rc<RefCell<Vec<u64>>>,
     }
 
     impl TileOperator for PartialSource {
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn extract_final_releases_below_the_running_max() {
         let value_tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
-        let releases = Rc::new(RefCell::new(Vec::<usize>::new()));
+        let releases = Rc::new(RefCell::new(Vec::<u64>::new()));
         let source = PartialSource {
             tiling: Tiling::data_function(Extent::Base(BaseType::UInt), value_tiling.clone()),
             releases: releases.clone(),

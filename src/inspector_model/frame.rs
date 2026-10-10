@@ -209,7 +209,7 @@ mod tests {
 
     /// The obsolete guard of a collection producer whose consumer has released
     /// the keys up to `through`, or nothing.
-    fn released(through: Option<usize>) -> TileGuard {
+    fn released(through: Option<u64>) -> TileGuard {
         TileGuard::Function(FunctionGuard::Domain(match through {
             Some(key) => Predicate::at_or_below(CellValue::UInt(key)),
             None => Predicate::False,
@@ -226,7 +226,7 @@ mod tests {
 
     fn collection(values: &[&str], deleted: &[usize]) -> Tile {
         Tile::data_function(
-            ColumnValue::UInts((0..values.len()).collect()),
+            ColumnValue::uints_from_rows(0..values.len()),
             Box::new(Tile::Scalar(strings(values))),
             Predicate::True,
             deleted.iter().copied().collect::<BitSet>(),

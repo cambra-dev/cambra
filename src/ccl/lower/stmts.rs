@@ -2289,7 +2289,7 @@ fn lower_type_application(
                     "`Array(n, T)` needs an integer-literal length `n`",
                 ));
             };
-            let n = usize::try_from(*n).map_err(|_| {
+            let n = u64::try_from(*n).map_err(|_| {
                 LoweringError::unsupported(n_arg.span, "`Array` length must be non-negative")
             })?;
             Ok(Type::data_fun(

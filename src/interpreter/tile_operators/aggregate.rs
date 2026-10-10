@@ -486,12 +486,7 @@ fn build_levels_from_paths(
             BitSet::new(),
         );
     }
-    nest_levels(
-        domains,
-        starts.into_iter().map(ColumnValue::UInts).collect(),
-        Box::new(codomain),
-        domain_predicate,
-    )
+    nest_levels(domains, starts, codomain, domain_predicate)
 }
 
 /// Collapses the **innermost** collection of a nested tile into an aggregation, leaving the
@@ -823,7 +818,7 @@ mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{QuietSpy, ReleaseSpy};
     use crate::interpreter::{BaseType, Extent, Predicate, Tile};
-    fn int_function(domain: Vec<usize>, values: Vec<i64>) -> Tile {
+    fn int_function(domain: Vec<u64>, values: Vec<i64>) -> Tile {
         Tile::data_function(
             ColumnValue::from_uints(domain),
             Box::new(Tile::Scalar(ColumnValue::Ints(values))),
@@ -918,7 +913,7 @@ mod tests {
         let tile = Tile::data_function(
             ColumnValue::Ints(vec![1, 2]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0, 2]),
+                vec![0, 2],
                 ColumnValue::Ints(vec![0, 1, 0, 1]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))),
                 Predicate::False,
@@ -1002,7 +997,7 @@ mod tests {
         let tile = Tile::data_function(
             ColumnValue::Ints(vec![1, 2]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0, 2]),
+                vec![0, 2],
                 ColumnValue::Ints(vec![0, 1, 0]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
                 Predicate::False,
@@ -1059,7 +1054,7 @@ mod tests {
         let tile = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(vec![0, 2, 1]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 120, 110]))),
                 Predicate::False,
@@ -1110,10 +1105,10 @@ mod tests {
         let tile = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(vec![0]),
                 Box::new(Tile::grouped(
-                    ColumnValue::from_uints(vec![0]),
+                    vec![0],
                     ColumnValue::from_uints(vec![0, 1]),
                     Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
                     Predicate::False,

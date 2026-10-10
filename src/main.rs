@@ -370,7 +370,7 @@ impl Inspection {
                 Some(render_source_window(
                     self.source_node_ids.get(name).cloned().unwrap_or_default(),
                     name,
-                    window.len(),
+                    cambra::interpreter::row_index(window.end - window.start),
                     &keys,
                     &values,
                 ))

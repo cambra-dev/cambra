@@ -212,7 +212,7 @@ fn test_datasource_named_record_join() {
         ),
     ]);
     src1.borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(1usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
 
     src2.borrow_mut().add_data(&[
         (
@@ -231,7 +231,7 @@ fn test_datasource_named_record_join() {
         ),
     ]);
     src2.borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(1usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -369,7 +369,7 @@ fn test_list_of_records_holding_collections() {
                     (
                         "b".to_string(),
                         Tile::grouped(
-                            ColumnValue::UInts(vec![0, 2]),
+                            vec![0, 2],
                             ColumnValue::UInts(vec![0, 1, 0, 1]),
                             Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4, 5]))),
                             Predicate::True,

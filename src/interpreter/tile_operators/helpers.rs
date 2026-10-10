@@ -47,7 +47,7 @@ pub(crate) fn open_collections(cells: &ColumnValue, extent: &Extent) -> Tile {
                 }
             }
             Tile::grouped(
-                ColumnValue::UInts(starts),
+                starts,
                 ColumnValue::from_values(keys, domain),
                 Box::new(open_collections(
                     &ColumnValue::from_values(values, codomain),
@@ -421,7 +421,7 @@ mod tests {
             elements
                 .iter()
                 .enumerate()
-                .map(|(i, e)| (Value::UInt(i), Value::Int(*e)))
+                .map(|(i, e)| (Value::uint_from_row(i), Value::Int(*e)))
                 .collect(),
         )
     }
@@ -467,7 +467,7 @@ mod tests {
         else {
             panic!("a collection opens to a level")
         };
-        assert_eq!(row_starts, ColumnValue::UInts(vec![0, 2]));
+        assert_eq!(row_starts, vec![0, 2]);
         let Tile::DataFunction {
             row_starts,
             codomain,
@@ -476,7 +476,7 @@ mod tests {
         else {
             panic!("a collection's collection values open to a level")
         };
-        assert_eq!(row_starts, ColumnValue::UInts(vec![0, 2, 3]));
+        assert_eq!(row_starts, vec![0, 2, 3]);
         assert_eq!(*codomain, Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4])));
     }
 

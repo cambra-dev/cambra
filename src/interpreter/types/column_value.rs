@@ -8,7 +8,7 @@ use std::mem::take;
 use bit_vec::BitVec;
 use smol_str::SmolStr;
 
-use super::{BaseType, Extent, Value};
+use super::{BaseType, Extent, RowIndex, Value, row_index, uint_of_row};
 use crate::ccl::{FieldKey, TagMap};
 
 /// Returns whether the given FuncBindings represent a logical list.
@@ -16,7 +16,7 @@ pub fn bindings_are_list(bindings: &[FuncBinding]) -> bool {
     bindings
         .iter()
         .enumerate()
-        .all(|(i, b)| b.input == Value::UInt(i))
+        .all(|(i, b)| b.input == Value::uint_from_row(i))
 }
 
 /// A function binding represents a single input-output pair for a function
@@ -62,7 +62,7 @@ fn retain_vec<T>(v: &mut Vec<T>, mask: &BitVec) {
 pub enum ColumnValue {
     Units(usize),
     Ints(Vec<i64>),
-    UInts(Vec<usize>),
+    UInts(Vec<u64>),
     Strings(Vec<SmolStr>),
     Bools(BitVec),
     Variants(Vec<Value>),
@@ -662,9 +662,14 @@ impl ColumnValue {
         ColumnValue::Ints(values)
     }
 
-    /// Create a `ColumnValue` from a `Vec<usize>`.
-    pub fn from_uints(values: Vec<usize>) -> Self {
+    /// Create a `ColumnValue` from a `Vec<u64>`.
+    pub fn from_uints(values: Vec<u64>) -> Self {
         ColumnValue::UInts(values)
+    }
+
+    /// Create a `UInts` column carrying the numbers of `rows` (see [`Value::uint_from_row`]).
+    pub fn uints_from_rows(rows: impl IntoIterator<Item = RowIndex>) -> Self {
+        ColumnValue::UInts(rows.into_iter().map(uint_of_row).collect())
     }
 
     /// Compute the cartesian product of a map of named column values.
@@ -928,7 +933,7 @@ impl ColumnValue {
     ) -> ColumnValue {
         let indices: Vec<usize> = match (self, map_keys) {
             (ColumnValue::UInts(v), ColumnValue::UInts(mk)) => {
-                let pos: HashMap<usize, usize> =
+                let pos: HashMap<u64, usize> =
                     mk.into_iter().enumerate().map(|(i, k)| (k, i)).collect();
                 take(v).into_iter().map(|k| pos[&k]).collect()
             }
@@ -972,10 +977,10 @@ impl ColumnValue {
         };
         let indices = take(v);
         let n = indices.len();
-        map.select_indices(indices.into_iter(), n)
+        map.select_indices(indices.into_iter().map(row_index), n)
     }
 
-    pub fn for_each_uint(&mut self, f: impl Fn(&mut usize)) {
+    pub fn for_each_uint(&mut self, f: impl Fn(&mut u64)) {
         match self {
             ColumnValue::UInts(v) => v.iter_mut().for_each(f),
             _ => panic!("Not UInts"),

@@ -1064,7 +1064,7 @@ fn a_tuple_of_a_collection_and_a_fold_over_each_group() {
                 (
                     "_0".into(),
                     Tile::grouped(
-                        ColumnValue::UInts(vec![0, 1]),
+                        vec![0, 1],
                         ColumnValue::from_uints(vec![1, 0, 2]),
                         Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4]))),
                         Predicate::True,

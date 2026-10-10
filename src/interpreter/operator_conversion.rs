@@ -44,6 +44,7 @@ use crate::{
             zip_arms_at, zip_arms_named_at,
         },
         tuple_field,
+        uint_of_row,
     },
     util::ScopeStack,
 };
@@ -2956,10 +2957,10 @@ fn compile_list_fn(
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let elts: Vec<&Expr> = elts.iter().collect();
     let (values, values_tiling) = list_levels(&elts, &elt_extent)?;
-    let domain = Extent::uint_range(elts.len());
+    let domain = Extent::uint_range(uint_of_row(elts.len()));
     let tiling = Tiling::data_function(domain.clone(), values_tiling);
     let tile = Tile::data_function(
-        ColumnValue::from_values((0..elts.len()).map(Value::UInt).collect(), &domain),
+        ColumnValue::from_values((0..elts.len()).map(Value::uint_from_row).collect(), &domain),
         Box::new(values),
         // Every key a literal writes down is present, and no more are coming.
         Predicate::True,
@@ -3018,13 +3019,13 @@ fn list_levels(elts: &[&Expr], elt_extent: &Extent) -> Result<(Tile, Tiling), Co
                     )));
                 };
                 row_starts.push(level.len());
-                level.extend((0..part.len()).map(Value::UInt));
+                level.extend((0..part.len()).map(Value::uint_from_row));
                 inner.extend(part.iter());
             }
             let (values_tile, values_tiling) = list_levels(&inner, values)?;
             Ok((
                 Tile::grouped(
-                    ColumnValue::from_uints(row_starts),
+                    row_starts,
                     ColumnValue::from_values(level, keys),
                     Box::new(values_tile),
                     // Every key a literal writes down is present, and no more are coming.
@@ -3224,7 +3225,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
                 .enumerate()
                 .map(|(i, e)| {
                     Ok(FuncBinding {
-                        input: Value::UInt(i),
+                        input: Value::uint_from_row(i),
                         output: expr_to_value(e)?,
                     })
                 })
@@ -4259,7 +4260,7 @@ pub struct UnreadablePrefix {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MissingPrefix {
     /// The first `n` elements of a stream indexed from `0`.
-    Elements(usize),
+    Elements(u64),
     /// Every position through this one, of a domain whose positions are not counted.
     Through(Value),
 }

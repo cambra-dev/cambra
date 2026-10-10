@@ -483,11 +483,11 @@ fn a_comprehension_reads_a_feed_channel_fed_outside_a_transaction() {
 /// induction writes (partially implemented)").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::match_good("good", &[0usize], &[2i64])]
+#[case::match_good("good", &[0u64], &[2i64])]
 #[case::match_bad("bad", &[1], &[3])]
 fn two_defers_fed_from_complementary_match_arms(
     #[case] read: &str,
-    #[case] domain: &[usize],
+    #[case] domain: &[u64],
     #[case] codomain: &[i64],
 ) {
     let code = format!(
@@ -518,11 +518,11 @@ fn two_defers_fed_from_complementary_match_arms(
 /// The `if`/`else` spelling of [`two_defers_fed_from_complementary_match_arms`].
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::if_good("good", &[1usize], &[2i64])]
+#[case::if_good("good", &[1u64], &[2i64])]
 #[case::if_bad("bad", &[0], &[1])]
 fn two_defers_fed_from_complementary_if_arms(
     #[case] read: &str,
-    #[case] domain: &[usize],
+    #[case] domain: &[u64],
     #[case] codomain: &[i64],
 ) {
     let code = format!(
@@ -555,11 +555,11 @@ fn two_defers_fed_from_complementary_if_arms(
 /// residual keeps the default arm for the named arm's pass to leave alone.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::named_arm("a", &[0usize], &[1i64])]
+#[case::named_arm("a", &[0u64], &[1i64])]
 #[case::default_arm("b", &[1, 2], &[7, 7])]
 fn a_default_arm_feeds_its_own_defer(
     #[case] read: &str,
-    #[case] domain: &[usize],
+    #[case] domain: &[u64],
     #[case] codomain: &[i64],
 ) {
     let code = format!(
