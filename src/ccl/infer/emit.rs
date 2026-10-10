@@ -2376,7 +2376,7 @@ pub(super) fn emit_list<C: Typing>(
 /// branch carries the literal-`true` guard), and every branch body flows
 /// one-way into one shared variable, so the node's type is the arms' **join**.
 pub(super) fn emit_case<C: Typing>(
-    scrutinee: Option<&mut Expr>,
+    mut scrutinee: Option<&mut Expr>,
     branches: &mut [Branch],
     label: &str,
     ctx: &mut C,
@@ -2390,7 +2390,12 @@ pub(super) fn emit_case<C: Typing>(
     // Structural dispatch: constrain the scrutinee to the Variant of the
     // branch pattern tags, minting one payload var αᵢ per pattern branch and
     // writing it into the branch's binding slot (coalesce resolves it later).
-    if let Some(scrut) = scrutinee {
+    let nominal = branches
+        .iter()
+        .find_map(|b| b.pattern.as_ref().and_then(|p| p.nominal.clone()));
+    if let (Some(scrut), Some(decl)) = (scrutinee.as_deref_mut(), nominal) {
+        emit_nominal_scrutinee(scrut, &decl, branches, ctx)?;
+    } else if let Some(scrut) = scrutinee {
         let scrut_ty = emit_value_read(scrut, ctx)?;
         let mut expected_tags: BTreeMap<FieldKey, Type> = BTreeMap::new();
         for b in branches.iter_mut() {
@@ -2464,6 +2469,49 @@ pub(super) fn emit_case<C: Typing>(
         ctx.require_sub(&body_ty, &result_ty, &|| "Case arm".to_string())?;
     }
     Ok(result_ty)
+}
+
+/// The scrutinee of a `Case` whose patterns name constructors of the nominal type `decl`.
+///
+/// The scrutinee is below `decl` at fresh arguments, and each arm binds its constructor's
+/// payload at those arguments. The payload keeps the declaration's refinements: every
+/// value of the type was built by a constructor, whose function discharged them. Lowering
+/// has checked that the arms name constructors of `decl` alone and cover it
+/// (`lower::nominal::constructor_arms_type`).
+fn emit_nominal_scrutinee<C: Typing>(
+    scrut: &mut Expr,
+    decl: &std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+    branches: &mut [Branch],
+    ctx: &mut C,
+) -> Result<(), LocatedInferError> {
+    let scrut_ty = emit_value_read(scrut, ctx)?;
+    let args: Vec<Type> = decl.params.iter().map(|_| ctx.fresh()).collect();
+    let expected = Type::Nominal(decl.clone(), args.clone());
+    ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
+    for b in branches.iter_mut() {
+        let Some(p) = &mut b.pattern else {
+            continue;
+        };
+        debug_assert!(
+            p.nominal.as_ref() == Some(decl),
+            "the patterns of one `Case` name constructors of one nominal type"
+        );
+        let ctor = decl.ctor(&p.tag).unwrap_or_else(|| {
+            panic!(
+                "`{}` declares no constructor `{}`; lowering checks a pattern's constructor",
+                decl.name, p.tag
+            )
+        });
+        let mut payload = decl.instantiate(&ctor.payload(), &args);
+        ctx.type_annotation_predicates(&mut payload)?;
+        let payload = ctx.normalize(&payload);
+        let slot = ctx.binding_slot(&mut p.binding.ty);
+        let (ty, tag) = (decl.name.clone(), p.tag.clone());
+        ctx.require_sub(&payload, &slot, &|| {
+            format!("the parameters of `{ty}::{tag}`")
+        })?;
+    }
+    Ok(())
 }
 
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the

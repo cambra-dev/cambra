@@ -28,8 +28,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use chl_parser::ast::{
-    AssignTarget, AugOp, BinOp, BoolOp, CmpOp, CompClause, Expr, IfBranch, Lit, PayloadPattern,
-    QualifiedName, Spanned, Stmt, TypeAnnotation, TypeDeclBody, UnaryOp, VariantPayload,
+    ArmPattern, AssignTarget, AugOp, BinOp, BoolOp, CmpOp, CompClause, ConstructorPattern, Expr,
+    IfBranch, Lit, PayloadPattern, QualifiedName, Spanned, Stmt, TypeAnnotation, TypeDeclBody,
+    UnaryOp, VariantPayload,
 };
 
 use crate::value::{Collection, Value};
@@ -181,10 +182,10 @@ pub(crate) struct Interp {
     cells_made: u64,
     /// One watch per running loop over a collection not keyed by position, innermost last.
     order_watches: Vec<OrderWatch>,
-    /// The number of parameters of each constructor the module's `type` declarations
-    /// declare, by its qualified name `Shape::circle`. Collected before the program runs,
-    /// since a declaration is in scope throughout its module.
-    constructors: Rc<BTreeMap<String, usize>>,
+    /// The members the module's `type` declarations declare, by qualified name
+    /// `Shape::circle`. Collected before the program runs, since a declaration is in scope
+    /// throughout its module.
+    constructors: Rc<BTreeMap<String, Member>>,
 }
 
 /// A loop over a collection not keyed by position, whose iteration order is not defined
@@ -492,9 +493,17 @@ fn for_each_block<'a>(e: &'a Spanned<Expr>, bodies: Bodies, f: &mut dyn FnMut(&'
     }
 }
 
-/// The number of parameters of each constructor `body`'s `type` declarations declare, by its
-/// qualified name `Shape::circle`.
-fn collect_constructors(body: &[Spanned<Stmt>]) -> BTreeMap<String, usize> {
+/// A member a `type` declaration declares.
+#[derive(Clone, Copy)]
+enum Member {
+    /// A constructor, with its number of parameters.
+    Constructor(usize),
+    /// The `extract` of the single-constructor form.
+    Extract,
+}
+
+/// The members `body`'s `type` declarations declare, by qualified name `Shape::circle`.
+fn collect_constructors(body: &[Spanned<Stmt>]) -> BTreeMap<String, Member> {
     let mut out = BTreeMap::new();
     for stmt in body {
         let Stmt::TypeDecl(decl) = &stmt.node else {
@@ -502,13 +511,14 @@ fn collect_constructors(body: &[Spanned<Stmt>]) -> BTreeMap<String, usize> {
         };
         match &decl.body {
             TypeDeclBody::Single(_) => {
-                out.insert(format!("{}::new", decl.name.node), 1);
+                out.insert(format!("{}::new", decl.name.node), Member::Constructor(1));
+                out.insert(format!("{}::extract", decl.name.node), Member::Extract);
             }
             TypeDeclBody::Constructors(ctors) => {
                 for ctor in ctors {
                     out.insert(
                         format!("{}::{}", decl.name.node, ctor.name.node),
-                        ctor.params.len(),
+                        Member::Constructor(ctor.params.len()),
                     );
                 }
             }
@@ -608,6 +618,37 @@ impl Interp {
         match &stmt.node {
             // `out = test_sink()` declares a sink; any other assignment binds a value. An
             // opaque binding (`^=`) binds the same value, since its opacity only affects typing.
+            // `Price::new(r) = p` binds the parameters of the one constructor `p`'s type
+            // declares.
+            Stmt::Assign {
+                target:
+                    Spanned {
+                        node: AssignTarget::Constructor(pattern),
+                        ..
+                    },
+                value,
+                ..
+            } => {
+                let v = self.eval(value)?;
+                let bound = match v {
+                    Value::Pending => pattern
+                        .binders
+                        .iter()
+                        .flatten()
+                        .filter_map(|b| b.node.as_ref().map(|n| (n.to_string(), Value::Pending)))
+                        .collect(),
+                    Value::Variant { tag, payload } if tag == pattern.ctor.node.as_str() => {
+                        constructor_binds(pattern, &payload)?
+                    }
+                    other => {
+                        return err(format!("`{}` does not match {other}", pattern.ctor.node));
+                    }
+                };
+                for (n, v) in bound {
+                    self.bind(n, Slot::Val(v));
+                }
+                Ok(None)
+            }
             Stmt::Assign { target, value, .. } => {
                 let name = name_of(target)?;
                 let is_sink = is_zero_arg_call(&value.node, SurfaceBuiltin::TestSink);
@@ -772,7 +813,7 @@ impl Interp {
             // Tag dispatch: the first arm whose tag matches, or a wildcard arm.
             Stmt::Match { scrutinee, arms } => match self.match_arm(scrutinee, arms)? {
                 Chosen::Arm(bound, body) => self.scoped(|me| {
-                    if let Some((n, v)) = bound {
+                    for (n, v) in bound {
                         me.bind(n, Slot::Val(v));
                     }
                     me.exec_block(body)
@@ -780,7 +821,7 @@ impl Interp {
                 Chosen::Undecided(arms) => self.speculate(|me| {
                     for (bound, body) in arms {
                         me.scoped(|me| {
-                            if let Some(n) = bound {
+                            for n in bound {
                                 me.bind(n, Slot::Val(Value::Pending));
                             }
                             me.exec_block(body)
@@ -977,8 +1018,8 @@ impl Interp {
         }
     }
 
-    /// The number of parameters of the constructor `q` names.
-    fn constructor_arity(&self, q: &QualifiedName) -> Result<usize, Error> {
+    /// The member `q` names.
+    fn member(&self, q: &QualifiedName) -> Result<Member, Error> {
         let [ty] = q.qualifier.as_slice() else {
             return err(format!("unsupported qualified name: {q:?}"));
         };
@@ -986,13 +1027,35 @@ impl Interp {
         self.constructors
             .get(&key)
             .copied()
-            .ok_or_else(|| Error(format!("`{key}` is not a declared constructor")))
+            .ok_or_else(|| Error(format!("`{key}` is not a declared member")))
+    }
+
+    /// The number of parameters of the constructor `q` names.
+    fn constructor_arity(&self, q: &QualifiedName) -> Result<usize, Error> {
+        match self.member(q)? {
+            Member::Constructor(arity) => Ok(arity),
+            Member::Extract => err(format!(
+                "`{}` as a function value is not supported",
+                q.name.node
+            )),
+        }
     }
 
     /// A constructor applied to its arguments: the value named by the constructor, holding
     /// the argument, or the tuple of several (`docs/chl-spec.md`, "Declaring a nominal
     /// type").
     fn construct(&mut self, q: &QualifiedName, args: &[Spanned<Expr>]) -> Result<Value, Error> {
+        // `N::extract(n)` is the payload of `n`'s one constructor `new`.
+        if let Member::Extract = self.member(q)? {
+            let [arg] = args else {
+                return err("`extract` takes one argument");
+            };
+            return match self.eval(arg)? {
+                Value::Pending => Ok(Value::Pending),
+                Value::Variant { payload, .. } => Ok(*payload),
+                other => err(format!("`extract` takes a nominal value, got {other}")),
+            };
+        }
         let arity = self.constructor_arity(q)?;
         if arity == 0 || arity != args.len() {
             return err(format!(
@@ -1245,7 +1308,7 @@ impl Interp {
         match &stmt.node {
             Stmt::Match { scrutinee, arms } => match self.match_arm(scrutinee, arms)? {
                 Chosen::Arm(bound, body) => self.scoped(|me| {
-                    if let Some((n, v)) = bound {
+                    for (n, v) in bound {
                         me.bind(n, Slot::Val(v));
                     }
                     me.block_value(body, effects_denote_unit)
@@ -1253,7 +1316,7 @@ impl Interp {
                 Chosen::Undecided(arms) => self.speculate(|me| {
                     for (bound, body) in arms {
                         me.scoped(|me| {
-                            if let Some(n) = bound {
+                            for n in bound {
                                 me.bind(n, Slot::Val(Value::Pending));
                             }
                             me.block_value(body, effects_denote_unit)
@@ -1287,33 +1350,47 @@ impl Interp {
         arms: &'a [chl_parser::ast::MatchArm],
     ) -> Result<Chosen<'a>, Error> {
         for pattern in arms.iter().filter_map(|arm| arm.pattern.as_ref()) {
-            unqualified(&pattern.tag_qualifier, "tag")?;
+            match pattern {
+                ArmPattern::Tag(p) => unqualified(&p.tag_qualifier, "tag")?,
+                ArmPattern::Constructor(p) => {
+                    unqualified(&p.type_path[..p.type_path.len() - 1], "type")?
+                }
+            }
         }
-        let binder = |arm: &chl_parser::ast::MatchArm| match &arm.pattern {
-            Some(pattern) => match &pattern.payload {
-                PayloadPattern::Named(n) => Some(n.to_string()),
-                PayloadPattern::Ignored | PayloadPattern::Absent => None,
-            },
-            None => None,
+        let names = |arm: &chl_parser::ast::MatchArm| -> Vec<String> {
+            match &arm.pattern {
+                Some(ArmPattern::Tag(p)) => match &p.payload {
+                    PayloadPattern::Named(n) => vec![n.to_string()],
+                    PayloadPattern::Ignored | PayloadPattern::Absent => Vec::new(),
+                },
+                Some(ArmPattern::Constructor(p)) => p
+                    .binders
+                    .iter()
+                    .flatten()
+                    .filter_map(|b| b.node.as_ref().map(|n| n.to_string()))
+                    .collect(),
+                None => Vec::new(),
+            }
         };
         let v = self.eval(scrutinee)?;
         if matches!(v, Value::Pending) {
             return Ok(Chosen::Undecided(
-                arms.iter()
-                    .map(|arm| (binder(arm), &arm.body[..]))
-                    .collect(),
+                arms.iter().map(|arm| (names(arm), &arm.body[..])).collect(),
             ));
         }
         let Value::Variant { tag, payload } = v else {
             return err("`match` dispatches on a variant");
         };
         for arm in arms {
-            if let Some(pattern) = &arm.pattern
-                && pattern.tag.as_str() != tag
-            {
-                continue;
-            }
-            let bound = binder(arm).map(|n| (n, (*payload).clone()));
+            let bound = match &arm.pattern {
+                Some(ArmPattern::Tag(p)) if p.tag.as_str() != tag => continue,
+                Some(ArmPattern::Constructor(p)) if p.ctor.node.as_str() != tag => continue,
+                Some(ArmPattern::Constructor(p)) => constructor_binds(p, &payload)?,
+                Some(ArmPattern::Tag(_)) | None => names(arm)
+                    .into_iter()
+                    .map(|n| (n, (*payload).clone()))
+                    .collect(),
+            };
             return Ok(Chosen::Arm(bound, &arm.body));
         }
         err(format!("no `match` arm for tag `{tag}"))
@@ -1363,10 +1440,42 @@ fn channel_value(channel: &Channel) -> Result<Value, Error> {
 
 /// What a `match` selects.
 enum Chosen<'a> {
-    /// The arm that runs: the payload it binds, if any, and its body.
-    Arm(Option<(String, Value)>, &'a [Spanned<Stmt>]),
-    /// The scrutinee is pending, so any arm may run: each arm's binder, if any, and body.
-    Undecided(Vec<(Option<String>, &'a [Spanned<Stmt>])>),
+    /// The arm that runs: the names it binds, and its body.
+    Arm(Vec<(String, Value)>, &'a [Spanned<Stmt>]),
+    /// The scrutinee is pending, so any arm may run: each arm's binders and body.
+    Undecided(Vec<(Vec<String>, &'a [Spanned<Stmt>])>),
+}
+
+/// The names a constructor pattern binds from a value's payload: the payload itself for
+/// one parameter, and its positions for several.
+fn constructor_binds(
+    pattern: &ConstructorPattern,
+    payload: &Value,
+) -> Result<Vec<(String, Value)>, Error> {
+    let binders = pattern.binders.as_deref().unwrap_or(&[]);
+    if let [only] = binders {
+        return Ok(only
+            .node
+            .iter()
+            .map(|n| (n.to_string(), payload.clone()))
+            .collect());
+    }
+    let Value::Record(fields) = payload else {
+        return err("a constructor of several parameters holds their tuple");
+    };
+    let mut out = Vec::new();
+    for (i, b) in binders.iter().enumerate() {
+        if let Some(n) = &b.node {
+            let key = format!("_{i}");
+            let v = fields
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+                .ok_or_else(|| Error(format!("no position {i} in a constructor's tuple")))?;
+            out.push((n.to_string(), v));
+        }
+    }
+    Ok(out)
 }
 
 /// The single name an assignment target binds.

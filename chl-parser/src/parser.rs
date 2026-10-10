@@ -10,11 +10,12 @@ use chumsky::prelude::*;
 use smol_str::SmolStr;
 
 use crate::ast::{
-    AnnotationMode, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp, CmpOp,
-    CompClause, Comprehension, Constructor, ConstructorParam, DiscardHead, Expr, FileId, IfBranch,
-    KindAnnotation, Lit, MatchArm, MatchPattern, Module, ModulePath, Param, PayloadPattern,
-    QualifiedName, RecordField, Requirement, RunArg, Span, Spanned, Stmt, TypeAnnotation, TypeDecl,
-    TypeDeclBody, TypeParam, UnaryOp, UseItem, VariantPayload,
+    AnnotationMode, ArmPattern, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp,
+    CmpOp, CompClause, Comprehension, Constructor, ConstructorParam, ConstructorPattern,
+    DiscardHead, Expr, FileId, IfBranch, KindAnnotation, Lit, MatchArm, MatchPattern, Module,
+    ModulePath, Param, PayloadPattern, QualifiedName, RecordField, Requirement, RunArg, Span,
+    Spanned, Stmt, TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem,
+    VariantPayload,
 };
 use crate::lexer::{self, Token};
 
@@ -2214,6 +2215,44 @@ fn assign_stmt<'src>(
     Ok(Spanned::new(span, stmt))
 }
 
+/// A constructor pattern, `Shape::rect(w, h)` or `Option::none`: a path whose last
+/// segment is the constructor, after the type, and one binder or `_` per parenthesised
+/// position (`docs/chl-spec.md`, "4.3.1 Destructuring patterns").
+fn constructor_pattern<'src, I>() -> impl Parser<'src, I, ConstructorPattern, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+{
+    let binder = select! { Token::Ident(s) => s }.map_with(|s, e| {
+        let name = (s.as_str() != "_").then_some(s);
+        Spanned::new(e.span(), name)
+    });
+    qualified_name()
+        .try_map(|(qualifier, ctor), span| {
+            if qualifier.is_empty() {
+                Err(Rich::custom(
+                    span,
+                    "a constructor pattern names its type: `Type::ctor`",
+                ))
+            } else {
+                Ok((qualifier, ctor))
+            }
+        })
+        .then(
+            binder
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LParen), just(Token::RParen))
+                .or_not(),
+        )
+        .map(|((type_path, ctor), binders)| ConstructorPattern {
+            type_path,
+            ctor,
+            binders,
+        })
+}
+
 /// The `case` arms of a `match`, over a parser for how an arm's body is spelled.
 ///
 /// Two spellings reach this: an indented block (the statement form) and a
@@ -2240,55 +2279,54 @@ where
     B: Parser<'src, I, Vec<Spanned<Stmt>>, PErr<'src>> + Clone,
 {
     let match_ident = select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span()));
-    let case_pattern = choice((
-        tag_name(),
-        select! { Token::Ident(s) if s.as_str() == "_" => s }
-            .map_with(|s, e| (Vec::new(), (s, e.span()))),
-    ));
     let case_binder = choice((
         select! { Token::Ident(s) if s.as_str() == "_" => s }.map(|_| None),
         match_ident.map(|(name, _)| Some(name)),
     ));
-    just(Token::Case)
-        .ignore_then(case_pattern)
+    let tag_arm = tag_name()
         .then(
             case_binder
                 .delimited_by(just(Token::LParen), just(Token::RParen))
                 .or_not(),
         )
+        .map(|((tag_qualifier, (tag, tag_span)), binder)| {
+            let payload = match binder {
+                Some(Some(name)) => PayloadPattern::Named(name),
+                Some(None) => PayloadPattern::Ignored,
+                None => PayloadPattern::Absent,
+            };
+            Some(ArmPattern::Tag(MatchPattern {
+                tag,
+                tag_span,
+                tag_qualifier,
+                payload,
+            }))
+        });
+    // A constructor arm names its type, so its path has a qualifier; a bare name is
+    // neither a tag nor a constructor.
+    let constructor_arm = constructor_pattern().map(|p| Some(ArmPattern::Constructor(p)));
+    let default_arm = select! { Token::Ident(s) if s.as_str() == "_" => s }
+        .map_with(|_, e| e.span())
+        .then(
+            case_binder
+                .delimited_by(just(Token::LParen), just(Token::RParen))
+                .or_not(),
+        )
+        .validate(|(_, binder), e, emitter| {
+            if binder.is_some() {
+                emitter.emit(Rich::custom(
+                    e.span(),
+                    "the default arm `case _:` binds no payload: the tags it \
+                     covers have different payload types",
+                ));
+            }
+            None
+        });
+    just(Token::Case)
+        .ignore_then(choice((tag_arm, constructor_arm, default_arm)))
         .then_ignore(just(Token::Colon))
         .then(body)
-        .validate(
-            |(((tag_qualifier, (tag, tag_span)), binder), body), e, emitter| {
-                if tag.as_str() == "_" {
-                    if binder.is_some() {
-                        emitter.emit(Rich::custom(
-                            e.span(),
-                            "the default arm `case _:` binds no payload: the tags it \
-                         covers have different payload types",
-                        ));
-                    }
-                    return MatchArm {
-                        pattern: None,
-                        body,
-                    };
-                }
-                let payload = match binder {
-                    Some(Some(name)) => PayloadPattern::Named(name),
-                    Some(None) => PayloadPattern::Ignored,
-                    None => PayloadPattern::Absent,
-                };
-                MatchArm {
-                    pattern: Some(MatchPattern {
-                        tag,
-                        tag_span,
-                        tag_qualifier,
-                        payload,
-                    }),
-                    body,
-                }
-            },
-        )
+        .map(|(pattern, body)| MatchArm { pattern, body })
         .repeated()
         .at_least(1)
         .collect::<Vec<_>>()
@@ -2322,6 +2360,28 @@ fn expr_to_assign_target(spanned: Spanned<Expr>) -> Result<Spanned<AssignTarget>
             checked: false,
         } => AssignTarget::Subscript { target, index },
         Expr::Qualified(q) => AssignTarget::Qualified(q),
+        // `Price::new(r)`: a call of a name qualified by a type, whose arguments are the
+        // binders a constructor pattern takes.
+        Expr::Call { func, args } => {
+            let Expr::Qualified(QualifiedName { qualifier, name }) = func.node else {
+                return Err(span);
+            };
+            if qualifier.is_empty() || args.is_empty() {
+                return Err(span);
+            }
+            let mut binders = Vec::with_capacity(args.len());
+            for arg in args {
+                let Expr::Name(n) = arg.node else {
+                    return Err(arg.span);
+                };
+                binders.push(Spanned::new(arg.span, (n.as_str() != "_").then_some(n)));
+            }
+            AssignTarget::Constructor(ConstructorPattern {
+                type_path: qualifier,
+                ctor: name,
+                binders: Some(binders),
+            })
+        }
         _ => return Err(span),
     };
     Ok(Spanned::new(span, node))
@@ -2497,6 +2557,59 @@ mod tests {
                 ("empty", vec![]),
             ]
         );
+    }
+
+    /// A constructor arm names its type and binds one name or `_` per parameter; one
+    /// without parentheses matches a constructor that declares none.
+    #[test]
+    fn match_arms_name_constructors() {
+        let m = parse_m(indoc! {"
+            match s:
+                case Shape::rect(w, _):
+                    w
+                case shop::Shape::empty:
+                    0
+                case _:
+                    1
+        "});
+        let Stmt::Match { arms, .. } = &m.body[0].node else {
+            panic!("expected a match, got {:?}", m.body[0].node)
+        };
+        let Some(ArmPattern::Constructor(rect)) = &arms[0].pattern else {
+            panic!("expected a constructor arm, got {:?}", arms[0].pattern)
+        };
+        let path: Vec<_> = rect.type_path.iter().map(|s| s.node.as_str()).collect();
+        assert_eq!(
+            (path.as_slice(), rect.ctor.node.as_str()),
+            (&["Shape"][..], "rect")
+        );
+        let binders: Vec<_> = rect
+            .binders
+            .as_ref()
+            .expect("parenthesised")
+            .iter()
+            .map(|b| b.node.as_deref())
+            .collect();
+        assert_eq!(binders, [Some("w"), None]);
+        let Some(ArmPattern::Constructor(empty)) = &arms[1].pattern else {
+            panic!("expected a constructor arm, got {:?}", arms[1].pattern)
+        };
+        assert_eq!(empty.type_path.len(), 2);
+        assert!(empty.binders.is_none());
+        assert!(arms[2].pattern.is_none());
+    }
+
+    /// A constructor call in target position is a constructor pattern.
+    #[test]
+    fn a_constructor_pattern_is_an_assignment_target() {
+        let m = parse_m("Price::new(r) = p\n");
+        let Stmt::Assign { target, .. } = &m.body[0].node else {
+            panic!("expected an assignment, got {:?}", m.body[0].node)
+        };
+        let AssignTarget::Constructor(p) = &target.node else {
+            panic!("expected a constructor target, got {:?}", target.node)
+        };
+        assert_eq!(p.ctor.node, "new");
     }
 
     /// A constructor that declares no parameters is written without parentheses, since
@@ -3423,10 +3536,18 @@ mod tests {
             Stmt::Match { scrutinee, arms } => {
                 assert!(matches!(scrutinee.node, Expr::Name(_)));
                 assert_eq!(arms.len(), 2);
-                let p0 = arms[0].pattern.as_ref().expect("tagged arm");
+                let p0 = arms[0]
+                    .pattern
+                    .as_ref()
+                    .and_then(ArmPattern::as_tag)
+                    .expect("tagged arm");
                 assert_eq!(p0.tag.as_str(), "some");
                 assert_eq!(p0.payload, PayloadPattern::Named("v".into()));
-                let p1 = arms[1].pattern.as_ref().expect("tagged arm");
+                let p1 = arms[1]
+                    .pattern
+                    .as_ref()
+                    .and_then(ArmPattern::as_tag)
+                    .expect("tagged arm");
                 assert_eq!(p1.tag.as_str(), "none");
                 assert_eq!(p1.payload, PayloadPattern::Absent);
             }
@@ -3462,11 +3583,21 @@ mod tests {
         assert!(matches!(scrutinee.node, Expr::Name(_)));
         assert_eq!(arms.len(), 2);
         assert_eq!(
-            arms[0].pattern.as_ref().expect("tagged arm").payload,
+            arms[0]
+                .pattern
+                .as_ref()
+                .and_then(ArmPattern::as_tag)
+                .expect("tagged arm")
+                .payload,
             PayloadPattern::Named("n".into())
         );
         assert_eq!(
-            arms[1].pattern.as_ref().expect("tagged arm").payload,
+            arms[1]
+                .pattern
+                .as_ref()
+                .and_then(ArmPattern::as_tag)
+                .expect("tagged arm")
+                .payload,
             PayloadPattern::Absent
         );
         // Each arm body is its single expression, held as a one-statement block.

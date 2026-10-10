@@ -86,6 +86,24 @@ declaration through every pass. The tag is the
 constructor's name, which is how a value identifies its constructor
 ([chl-spec.md, "A nominal type is opaque"](../../../docs/chl-spec.md#a-nominal-type-is-opaque)).
 
+### Taking a value apart
+
+A `match` arm names a constructor, `case Shape::rect(w, h):`. `constructor_arms_type` checks the
+arms before anything lowers: they name constructors of one declaration, each binds one name or
+`_` per declared parameter, and without a `case _:` every constructor has an arm. A `match` that
+mixes tag arms and constructor arms is refused. Each arm lowers to a `Pattern` whose `nominal`
+names the declaration, binding the constructor's payload. For a constructor of one parameter
+that binding is the user's name. For several it is a minted name, and each named parameter is
+substituted by its projection of the payload tuple (`bind_parameters`), as a multi-parameter
+function's parameters are, so an arm whose body is a feed keeps the bare feed the loop fan-out
+reads.
+
+An assignment `Price::new(c) = p` is a one-arm `Case` over `p` whose body is the rest of the
+block. It is accepted only for a declaration with one constructor, where the match cannot fail.
+
+The single-constructor form also binds `N::extract`, the function `λ 𝑛 : N(𝑃…) → match 𝑛:
+case N::new(𝑟): 𝑟`, around the module beside its constructor (`bind_extract`).
+
 ---
 
 ## Inference
@@ -97,6 +115,15 @@ parameter, and constrains `𝑒` below the constructor's payload at `𝛼…`. T
 with its refinements stripped. The node is only ever the body of the constructor's function, whose
 parameter annotation already discharged them, and the declaration's own predicates were never
 typed.
+
+### The constructor-pattern rule
+
+`emit_case` hands a `Case` whose patterns name a declaration to `emit_nominal_scrutinee`. The
+scrutinee is constrained below the declaration at fresh arguments, and each arm's binder takes its
+constructor's payload at those arguments. The payload keeps the declaration's refinements, typed
+as an annotation's predicates are: every value of the type was built by a constructor, whose
+function discharged them. So `Price::new(c) = p` gives `c` the type `{Int where _ >= 0}` for
+`type Price = {Int where _ >= 0}`.
 
 ### Subtyping
 
@@ -133,7 +160,8 @@ shape is read where a value is built or taken apart, through `Type::structure`, 
 nominal type's **representation** and every other type itself:
 
 - `lambda_elim`, where a constructor becomes `variant_wrap` and a `Case` becomes
-  `variant_project`.
+  `variant_project`. A nominal scrutinee's projections take the nominal type itself as their
+  domain (`arms_variant`), since the arms name constructors of that type.
 - Operator conversion, where `extent_of` builds a value's extent and the `VariantCtor` and
   `variant_wrap` arms build a union column.
 

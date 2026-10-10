@@ -440,8 +440,42 @@ pub struct MatchArm {
     ///
     /// Mirrors `cambra::ccl::Branch`'s `pattern: Option<Pattern>`, which is
     /// the shape this lowers to: a tag-less branch in a scrutinee-`Case`.
-    pub pattern: Option<MatchPattern>,
+    pub pattern: Option<ArmPattern>,
     pub body: Vec<Spanned<Stmt>>,
+}
+
+/// What a tagged [`MatchArm`] matches: a variant's tag, or a nominal type's constructor.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArmPattern {
+    /// `` case `tag(v): ``.
+    Tag(MatchPattern),
+    /// `case Shape::rect(w, h):` (`docs/chl-spec.md`, "4.10 `match` — tag dispatch").
+    Constructor(ConstructorPattern),
+}
+
+impl ArmPattern {
+    /// The tag a variant arm matches, or `None` for a constructor arm.
+    pub fn as_tag(&self) -> Option<&MatchPattern> {
+        match self {
+            ArmPattern::Tag(p) => Some(p),
+            ArmPattern::Constructor(_) => None,
+        }
+    }
+}
+
+/// A nominal type's constructor applied to one binder per declared parameter:
+/// `Shape::rect(w, h)`, or `Option::none` for a constructor that declares none
+/// (`docs/chl-spec.md`, "4.3.1 Destructuring patterns").
+///
+/// The binders are names or `_`. A pattern in a binder's place is not supported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstructorPattern {
+    /// The type's path: its module qualifier, then the type's name.
+    pub type_path: Vec<Spanned<SmolStr>>,
+    pub ctor: Spanned<SmolStr>,
+    /// One per parenthesised position, `None` for `_`. `None` for the whole when the
+    /// pattern has no parentheses.
+    pub binders: Option<Vec<Spanned<Option<SmolStr>>>>,
 }
 
 /// The tag a [`MatchArm`] matches, and what it says about that tag's payload.
@@ -638,6 +672,9 @@ pub enum AssignTarget {
     /// A variable of another module or run, `c::count := v`
     /// (`docs/chl-spec.md`, "9.6 Qualified references").
     Qualified(QualifiedName),
+    /// A nominal value taken apart by its constructor, `Price::new(r) = p`
+    /// (`docs/chl-spec.md`, "4.3.1 Destructuring patterns").
+    Constructor(ConstructorPattern),
 }
 
 // ---------------------------------------------------------------------------

@@ -135,7 +135,7 @@ Self-referential *collection* definitions solve an equation as a least fixpoint 
 
 ### Pattern matching and conditionals
 
-`if`/`elif`/`else` (statement) and `e₁ if cond else e₂` (ternary) are implemented, with semantic non-strictness: a non-taken branch contributes nothing and need not be defined. `match`/`case` tag dispatch over a variant is implemented too, and is the *same* first-match rule over the same IR node — an arm carries a tag pattern where an `if` carries a guard, which is why a tag test and a boolean guard will eventually sit on one arm with no new structure. Patterns are shallow: one tag per arm, no nesting, no literal patterns, no per-arm guard, and no expression form. Mechanism: [src/ccl/design/lowering.md](../src/ccl/design/lowering.md), "Variants and match".
+`if`/`elif`/`else` (statement) and `e₁ if cond else e₂` (ternary) are implemented, with semantic non-strictness: a non-taken branch contributes nothing and need not be defined. `match`/`case` tag dispatch over a variant, or over a nominal type's constructors, is implemented too, and is the *same* first-match rule over the same IR node — an arm carries a tag pattern where an `if` carries a guard, which is why a tag test and a boolean guard will eventually sit on one arm with no new structure. Patterns are shallow: one tag per arm, no nesting, no literal patterns, no per-arm guard, and no expression form. Mechanism: [src/ccl/design/lowering.md](../src/ccl/design/lowering.md), "Variants and match".
 
 ### Currently omitted
 

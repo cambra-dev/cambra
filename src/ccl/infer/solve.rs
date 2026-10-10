@@ -3193,6 +3193,7 @@ mod tests {
                     transparency: BindingTransparency::Transparent,
                 },
                 empty_payload: false,
+                nominal: None,
             }),
             guard: TypedExpr::lit(Lit::Bool(true)),
             body: TypedExpr::var(b),

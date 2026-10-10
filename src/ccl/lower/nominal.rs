@@ -22,9 +22,10 @@ use super::stmts::{is_builtin_type_name, lower_type_expr};
 use super::{LoweringContext, LoweringError};
 use crate::ccl::nominal::{NominalCtor, NominalDecl};
 use crate::ccl::ty::{PolyParam, PolyType, TypeKind, TypeParam};
-use crate::ccl::{Expr, Lit, Type, TypedExprNode};
+use crate::ccl::{Expr, Lit, Pattern, Type, TypedBinding, TypedExprNode};
 use crate::chl_parser::ast::{
-    Expr as ChlExpr, QualifiedName, Span, Spanned, Stmt as ChlStmt, TypeDecl, TypeDeclBody,
+    ArmPattern, ConstructorPattern, Expr as ChlExpr, MatchArm, QualifiedName, Span, Spanned,
+    Stmt as ChlStmt, TypeDecl, TypeDeclBody,
 };
 
 /// The name the constructor function of `ctor` is bound to.
@@ -86,8 +87,12 @@ pub(super) fn declare_nominal_types(
                 params.push(TypeParam::declared(param.node.clone()));
             }
         }
-        ctx.nominal_types
-            .push(NominalDecl::declared(name.node.clone(), params, name.span));
+        ctx.nominal_types.push(NominalDecl::declared(
+            name.node.clone(),
+            params,
+            name.span,
+            matches!(decl.body, TypeDeclBody::Single(_)),
+        ));
     }
     errors
 }
@@ -317,11 +322,15 @@ fn lower_parameter_type(
     Ok(lowered)
 }
 
-/// Wrap `body` in the binding of each constructor function the module declares.
+/// Wrap `body` in the binding of each function the module's declarations declare: each
+/// constructor that declares parameters, and the `extract` of a single-constructor form.
 pub(super) fn bind_constructors(body: Expr, ctx: &mut LoweringContext) -> Expr {
     let decls = ctx.nominal_types.clone();
     let mut acc = body;
     for decl in decls.iter().rev() {
+        if decl.declares_extract {
+            acc = bind_extract(decl, acc, ctx);
+        }
         for ctor in decl.body().ctors.iter().rev() {
             if ctor.params.is_empty() {
                 continue;
@@ -334,34 +343,90 @@ pub(super) fn bind_constructors(body: Expr, ctx: &mut LoweringContext) -> Expr {
                 ctor.span,
                 label,
             );
-            let mut function = Expr::lambda(arg, Type::Hole, value);
-            if let TypedExprNode::Lambda { param, .. } = &mut function.node {
-                param.declare(ctor.payload());
-            }
-            let function = ctx.tag_machinery(function, ctor.span, label);
             let name = constructor_binding(decl, &ctor.name);
-            let binding = if decl.params.is_empty() {
-                Expr::let_bind(name, function, acc)
-            } else {
-                let poly = Type::Poly(Rc::new(PolyType {
-                    params: decl
-                        .params
-                        .iter()
-                        .map(|p| PolyParam {
-                            param: Rc::clone(p),
-                            kind: TypeKind::Type,
-                            bound_at: None,
-                        })
-                        .collect(),
-                    requires: Vec::new(),
-                    body: Type::Hole,
-                }));
-                Expr::let_bind_annotated(name, function, acc, poly)
-            };
-            acc = ctx.tag_machinery(binding, ctor.span, label);
+            acc = bind_function(
+                decl,
+                name,
+                arg,
+                ctor.payload(),
+                value,
+                acc,
+                ctor.span,
+                label,
+                ctx,
+            );
         }
     }
     acc
+}
+
+/// `N::extract`, the function `λ n → match n: case N::new(r): r` that the
+/// single-constructor form declares (`docs/chl-spec.md`, "The single-constructor form").
+fn bind_extract(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
+    let label = "lower.nominal_extract";
+    let span = decl.span;
+    let arg = "__extract_arg";
+    let payload = ctx.fresh_ignored_payload();
+    let scrutinee = ctx.tag_machinery(Expr::var(arg), span, label);
+    let read = ctx.tag_machinery(Expr::var(payload.as_str()), span, label);
+    let guard = ctx.tag_machinery(Expr::lit(Lit::Bool(true)), span, label);
+    let case = Expr::match_expr(
+        scrutinee,
+        vec![crate::ccl::Branch {
+            pattern: Some(Pattern {
+                tag: "new".to_string(),
+                binding: TypedBinding::new_unannotated(payload),
+                empty_payload: false,
+                nominal: Some(Rc::clone(decl)),
+            }),
+            guard,
+            body: read,
+        }],
+    );
+    let case = ctx.tag_machinery(case, span, label);
+    let name = constructor_binding(decl, "extract");
+    let self_ty = decl.applied_to_params();
+    bind_function(decl, name, arg, self_ty, case, acc, span, label, ctx)
+}
+
+/// `let name = λ arg : param_ty → value in acc`, polymorphic over the declaration's type
+/// parameters when it has any, as a `def` with type parameters is.
+#[allow(clippy::too_many_arguments)]
+fn bind_function(
+    decl: &NominalDecl,
+    name: String,
+    arg: &str,
+    param_ty: Type,
+    value: Expr,
+    acc: Expr,
+    span: Span,
+    label: crate::ccl::provenance::RewriteLabel,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    let mut function = Expr::lambda(arg, Type::Hole, value);
+    if let TypedExprNode::Lambda { param, .. } = &mut function.node {
+        param.declare(param_ty);
+    }
+    let function = ctx.tag_machinery(function, span, label);
+    let binding = if decl.params.is_empty() {
+        Expr::let_bind(name, function, acc)
+    } else {
+        let poly = Type::Poly(Rc::new(PolyType {
+            params: decl
+                .params
+                .iter()
+                .map(|p| PolyParam {
+                    param: Rc::clone(p),
+                    kind: TypeKind::Type,
+                    bound_at: None,
+                })
+                .collect(),
+            requires: Vec::new(),
+            body: Type::Hole,
+        }));
+        Expr::let_bind_annotated(name, function, acc, poly)
+    };
+    ctx.tag_machinery(binding, span, label)
 }
 
 /// The declaration whose constructor `q` names, `Shape::circle`.
@@ -384,6 +449,7 @@ fn resolve_constructor(
     };
     match decl.ctor(&q.name.node) {
         Some(_) => Ok(Rc::clone(decl)),
+        None if is_extract(decl, &q.name.node) => Ok(Rc::clone(decl)),
         None => Err(LoweringError::unsupported(
             span,
             format!("`{}` declares no constructor `{}`", decl.name, q.name.node),
@@ -391,14 +457,22 @@ fn resolve_constructor(
     }
 }
 
-/// Lower a name qualified by a type, `Shape::circle`: the constructor function, or the
-/// value a constructor without parameters builds.
+/// Whether `name` is the `extract` a declaration declares.
+fn is_extract(decl: &NominalDecl, name: &str) -> bool {
+    decl.declares_extract && name == "extract"
+}
+
+/// Lower a name qualified by a type, `Shape::circle`: the constructor function, the
+/// value a constructor without parameters builds, or `extract`.
 pub(super) fn lower_member(
     q: &QualifiedName,
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let decl = resolve_constructor(q, span, ctx)?;
+    if is_extract(&decl, &q.name.node) {
+        return Ok(Expr::var(constructor_binding(&decl, "extract")));
+    }
     let ctor = decl.ctor(&q.name.node).expect("resolved above");
     if !ctor.params.is_empty() {
         return Ok(Expr::var(constructor_binding(&decl, &ctor.name)));
@@ -416,31 +490,35 @@ pub(super) fn lower_member_call(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let decl = resolve_constructor(q, span, ctx)?;
-    let ctor = decl.ctor(&q.name.node).expect("resolved above");
-    if ctor.params.is_empty() {
+    let arity = match decl.ctor(&q.name.node) {
+        Some(ctor) => ctor.params.len(),
+        None => 1,
+    };
+    let ctor_name = q.name.node.clone();
+    if arity == 0 {
         return Err(LoweringError::unsupported(
             span,
             format!(
                 "`{0}::{1}` declares no parameters, so it is a value and not a function: \
                  write `{0}::{1}`",
-                decl.name, ctor.name
+                decl.name, ctor_name
             ),
         ));
     }
-    if args.len() != ctor.params.len() {
+    if args.len() != arity {
         return Err(LoweringError::unsupported(
             span,
             format!(
                 "`{}::{}` takes {} argument{}, got {}",
                 decl.name,
-                ctor.name,
-                ctor.params.len(),
-                if ctor.params.len() == 1 { "" } else { "s" },
+                ctor_name,
+                arity,
+                if arity == 1 { "" } else { "s" },
                 args.len()
             ),
         ));
     }
-    let name = constructor_binding(&decl, &ctor.name);
+    let name = constructor_binding(&decl, &ctor_name);
     super::exprs::apply_named(&name, span, args, ctx)
 }
 
@@ -454,4 +532,269 @@ pub(super) fn refuse_nested(span: Span, decl: &TypeDecl) -> LoweringError {
             decl.name.node
         ),
     )
+}
+
+/// The nominal type a `match`'s constructor arms name, once each arm is checked against
+/// it: every arm names a constructor of that one type and binds one name per declared
+/// parameter, and without a `case _:` every constructor has an arm
+/// (`docs/chl-spec.md`, "4.10 `match` — tag dispatch").
+pub(super) fn constructor_arms_type(
+    match_span: Span,
+    arms: &[MatchArm],
+    has_default: bool,
+    ctx: &LoweringContext,
+) -> Result<Rc<NominalDecl>, LoweringError> {
+    let mut found: Option<Rc<NominalDecl>> = None;
+    for arm in arms {
+        let Some(ArmPattern::Constructor(pattern)) = &arm.pattern else {
+            continue;
+        };
+        let decl = resolve_pattern_type(pattern, ctx)?;
+        match &found {
+            Some(first) if *first != decl => {
+                return Err(LoweringError::unsupported(
+                    pattern.type_path[0].span.join(pattern.ctor.span),
+                    format!(
+                        "`match` names constructors of `{}` and of `{}`; the arms of one `match` \
+                         name constructors of one type",
+                        first.name, decl.name
+                    ),
+                ));
+            }
+            Some(_) => {}
+            None => found = Some(Rc::clone(&decl)),
+        }
+        check_binders(&decl, pattern)?;
+    }
+    let decl = found.expect("`constructor_arms_type` is called with a constructor arm");
+    if !has_default {
+        let named: HashSet<&str> = arms
+            .iter()
+            .filter_map(|a| match &a.pattern {
+                Some(ArmPattern::Constructor(p)) => Some(p.ctor.node.as_str()),
+                _ => None,
+            })
+            .collect();
+        let missing: Vec<String> = decl
+            .body()
+            .ctors
+            .iter()
+            .filter(|c| !named.contains(c.name.as_str()))
+            .map(|c| format!("`{}::{}`", decl.name, c.name))
+            .collect();
+        if !missing.is_empty() {
+            return Err(LoweringError::unsupported(
+                match_span,
+                format!(
+                    "`match` over `{}` has no arm for {}; each constructor is handled by an \
+                     arm, or `case _:` covers the rest",
+                    decl.name,
+                    missing.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(decl)
+}
+
+/// The declaration a constructor pattern's type path names, with the constructor it
+/// names checked to exist.
+fn resolve_pattern_type(
+    pattern: &ConstructorPattern,
+    ctx: &LoweringContext,
+) -> Result<Rc<NominalDecl>, LoweringError> {
+    let [ty] = pattern.type_path.as_slice() else {
+        unreachable!("`refuse_module_syntax` refuses a constructor pattern qualified by a module")
+    };
+    let Some(decl) = ctx.nominal_type(&ty.node) else {
+        return Err(LoweringError::unsupported(
+            ty.span,
+            format!("`{}` is not a nominal type this module declares", ty.node),
+        ));
+    };
+    if decl.ctor(&pattern.ctor.node).is_none() {
+        return Err(LoweringError::unsupported(
+            ty.span.join(pattern.ctor.span),
+            format!(
+                "`{}` declares no constructor `{}`",
+                decl.name, pattern.ctor.node
+            ),
+        ));
+    }
+    Ok(decl)
+}
+
+/// A constructor pattern binds one name or `_` per declared parameter, and takes no
+/// parentheses for a constructor that declares none.
+fn check_binders(decl: &NominalDecl, pattern: &ConstructorPattern) -> Result<(), LoweringError> {
+    let ctor = decl
+        .ctor(&pattern.ctor.node)
+        .expect("resolved by `resolve_pattern_type`");
+    let span = pattern.type_path[0].span.join(pattern.ctor.span);
+    match (&pattern.binders, ctor.params.len()) {
+        (None, 0) => Ok(()),
+        (Some(_), 0) => Err(LoweringError::unsupported(
+            span,
+            format!(
+                "`{0}::{1}` declares no parameters, so its pattern takes no parentheses: \
+                 `{0}::{1}`",
+                decl.name, ctor.name
+            ),
+        )),
+        (Some(binders), n) if binders.len() == n => Ok(()),
+        (binders, n) => Err(LoweringError::unsupported(
+            span,
+            format!(
+                "`{}::{}` declares {n} parameter{}, so its pattern binds {n}; this one binds {}",
+                decl.name,
+                ctor.name,
+                if n == 1 { "" } else { "s" },
+                binders.as_ref().map_or(0, Vec::len)
+            ),
+        )),
+    }
+}
+
+/// The [`Pattern`] a checked constructor pattern lowers to, and the parameters to bind
+/// from its payload by position.
+///
+/// The pattern binds the constructor's payload ([`NominalCtor::payload`]). For one
+/// parameter that is the parameter, so the pattern binds it under the user's name. For
+/// several it is their tuple, which the pattern binds under a minted name, and each named
+/// parameter is projected out of it ([`bind_parameters`]).
+pub(super) fn constructor_arm_pattern(
+    decl: &Rc<NominalDecl>,
+    pattern: &ConstructorPattern,
+    ctx: &mut LoweringContext,
+) -> (Pattern, Vec<(String, usize)>) {
+    let binders = pattern.binders.as_deref().unwrap_or(&[]);
+    let (payload, binds) = match binders {
+        [] => (ctx.fresh_ignored_payload(), Vec::new()),
+        [only] => match &only.node {
+            Some(name) => (name.to_string(), Vec::new()),
+            None => (ctx.fresh_ignored_payload(), Vec::new()),
+        },
+        many => {
+            let binds = many
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| b.node.as_ref().map(|n| (n.to_string(), i)))
+                .collect();
+            (ctx.fresh_ignored_payload(), binds)
+        }
+    };
+    let pattern = Pattern {
+        tag: pattern.ctor.node.to_string(),
+        binding: TypedBinding::new_unannotated(payload),
+        empty_payload: binders.is_empty(),
+        nominal: Some(Rc::clone(decl)),
+    };
+    (pattern, binds)
+}
+
+/// `body` with each of `binds` replaced by its position of the tuple `payload` names.
+///
+/// Substituted rather than bound, as a multi-parameter function's parameters are
+/// (`functions::uncurry_params`): an arm whose body is a bare feed keeps that shape, which
+/// the feed fan-out over a loop's `match` reads (`channelize`'s
+/// `try_extract_fanout_feed`). The payload's name is minted, so no binder in `body` can
+/// capture it.
+pub(super) fn bind_parameters(
+    payload: &crate::ccl::Name,
+    binds: Vec<(String, usize)>,
+    body: Expr,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    let label = "lower.constructor_pattern";
+    binds.into_iter().fold(body, |acc, (name, i)| {
+        let read = ctx.tag_machinery(Expr::var(payload.clone()), span, label);
+        let proj = ctx.tag_machinery(Expr::proj_index(i), span, label);
+        let field = ctx.tag_machinery(Expr::apply(read, proj), span, label);
+        super::functions::substitute_param_in_body(
+            acc,
+            &crate::ccl::Name::raw(name.as_str()),
+            &field,
+            label,
+        )
+    })
+}
+
+/// `pattern = value` followed by `body`: a `Case` over `value` with the pattern's one arm.
+///
+/// A constructor pattern can fail to match, so an assignment takes apart only a type that
+/// declares one constructor, where the match is exhaustive (`docs/chl-spec.md`, "4.3.1
+/// Destructuring patterns").
+pub(super) fn lower_constructor_assignment(
+    pattern: &ConstructorPattern,
+    value: Expr,
+    body: Expr,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let checked = check_constructor_assignment(pattern, span, ctx)?;
+    Ok(checked.wrap(value, body, span, ctx))
+}
+
+/// A constructor pattern checked for an assignment, ready to take a value apart.
+pub(super) struct ConstructorAssignment {
+    pattern: Pattern,
+    binds: Vec<(String, usize)>,
+}
+
+impl ConstructorAssignment {
+    /// The names the assignment binds.
+    pub(super) fn names(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.binds.iter().map(|(n, _)| n.clone()).collect();
+        if self.binds.is_empty() {
+            out.push(self.pattern.binding.name.base().to_string());
+        }
+        out
+    }
+
+    /// `body` with the assignment's names bound from `value`.
+    pub(super) fn wrap(
+        self,
+        value: Expr,
+        body: Expr,
+        span: Span,
+        ctx: &mut LoweringContext,
+    ) -> Expr {
+        let body = bind_parameters(&self.pattern.binding.name, self.binds, body, span, ctx);
+        let guard = ctx.tag_machinery(Expr::lit(Lit::Bool(true)), span, "lower.match_guard");
+        ctx.tag_image(
+            Expr::match_expr(
+                value,
+                vec![crate::ccl::Branch {
+                    pattern: Some(self.pattern),
+                    guard,
+                    body,
+                }],
+            ),
+            span,
+        )
+    }
+}
+
+/// Check that `pattern` can stand on the left of `=`: its type declares one constructor.
+pub(super) fn check_constructor_assignment(
+    pattern: &ConstructorPattern,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<ConstructorAssignment, LoweringError> {
+    let decl = resolve_pattern_type(pattern, ctx)?;
+    check_binders(&decl, pattern)?;
+    let ctors = decl.body().ctors.len();
+    if ctors != 1 {
+        return Err(LoweringError::unsupported(
+            span,
+            format!(
+                "`{}` declares {ctors} constructors, so a pattern naming one of them can fail \
+                 to match; take it apart with `match`",
+                decl.name
+            ),
+        ));
+    }
+    let (pattern, binds) = constructor_arm_pattern(&decl, pattern, ctx);
+    Ok(ConstructorAssignment { pattern, binds })
 }
