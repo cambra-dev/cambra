@@ -42,6 +42,9 @@
 //! | Exponential beta | `⟨g, curry(h)⟩ ≫ apply` | `⟨id, g⟩ ≫ h` | ✗ (restructures) |
 //! | Exponential eta | `curry(⟨.1, .0 ≫ f⟩ ≫ apply ≫ g)` | `f ≫ map(g)` | ✗ (drops structure) |
 //! | Const-apply | `⟨f, const(g)⟩ ≫ apply` | `f ≫ g` | ✗ (drops `const` wrap) |
+//! | Apply-compose | `⟨x, ⟨F, G⟩ ≫ compose⟩ ≫ apply` | `⟨⟨x, F⟩ ≫ apply, G⟩ ≫ apply` | ✗ (restructures) |
+//! | Apply-zip | `⟨x, ⟨F, G⟩ ≫ zip⟩ ≫ apply` | `⟨⟨x, F⟩ ≫ apply, ⟨x, G⟩ ≫ apply⟩` | ✗ (duplicates `x`) |
+//! | Apply-constant-valued | `⟨x, h ≫ const⟩ ≫ apply` | `h` | ✗ (drops `x`) |
 //! | Product eta | `⟨f ≫ .0, f ≫ .1⟩` | `f` | ✗ (collapses) |
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` | ✓ |
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
@@ -337,6 +340,13 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
         changed |= ruled("simplify.exponential_beta", expr, try_exponential_beta);
         changed |= ruled("simplify.exponential_eta", expr, try_exponential_eta);
         changed |= ruled("simplify.const_apply", expr, try_const_apply);
+        changed |= ruled("simplify.apply_compose", expr, try_apply_compose);
+        changed |= ruled("simplify.apply_zip", expr, try_apply_zip);
+        changed |= ruled(
+            "simplify.apply_constant_valued",
+            expr,
+            try_apply_constant_valued,
+        );
         changed |= ruled("simplify.product_eta", expr, try_product_eta);
         changed |= ruled(
             "simplify.zip_distribute_compose",
@@ -388,80 +398,6 @@ fn ruled(
 // ---------------------------------------------------------------------------
 // Flatten-compose helpers
 // ---------------------------------------------------------------------------
-
-/// Expand `expr` into its flat compose constituents.
-///
-/// If `expr` is an n-ary [`TypedExprNode::Compose`], return its elements;
-/// otherwise return a single-element `vec![expr]`.  Used by
-/// [`try_flatten_compose`] to merge already-flattened child compose nodes.
-///
-/// A nested chain whose type is dependent, `(𝑏: 𝐷) ⇒ 𝐶[𝑏]`, ends in the dependent morphism
-/// its codomain is read off (`infer::emit`'s `emit_compose`: the prefix before it preserves
-/// the value). The steps after the nested chain speak `𝑏`, and once spliced they follow that
-/// last morphism directly, whose codomain the checker opens at its own binder. So the last
-/// morphism takes `𝑏` as its binder's name: its codomain is closed, so the name is all that
-/// changes, and it says what the nested chain's type said.
-///
-/// A nested chain whose type names a binder its codomain does not read, `(𝑏: 𝐷) ⇒ 𝐶`, binds
-/// `𝑏` only for the steps that follow the chain, and matters only where one of them reads it
-/// (`read_after`): a dependent tuple's key family, whose keys are stated at the enclosing value
-/// (`planning::correlated`'s `keys_family`). The chain's input is its first morphism's, so
-/// that morphism takes the binder, and the steps after still follow a morphism binding it.
-fn flatten_compose_arm(expr: Expr, read_after: impl Fn(&Name) -> bool) -> Vec<Expr> {
-    match expr.node {
-        TypedExprNode::Compose(mut elts) => {
-            if let Type::Fun {
-                name: Some(b),
-                codomain: chain_codomain,
-                ..
-            } = expr.ty.peel_refinements()
-            {
-                if crate::ccl::subst::references_enclosing_function(chain_codomain) {
-                    if let Some(last) = elts.last_mut()
-                        && let Type::Fun {
-                            name: Some(k),
-                            codomain,
-                            ..
-                        } = &mut last.ty
-                        && k != b
-                        && crate::ccl::subst::references_enclosing_function(codomain)
-                    {
-                        debug_assert!(
-                            !crate::ccl::subst::type_free_vars(codomain).contains(k),
-                            "a codomain closed over its binder `{k}` also names it, which the \
-                             rename would leave unbound"
-                        );
-                        *k = b.clone();
-                    }
-                } else if read_after(b)
-                    && let Some(first) = elts.first_mut()
-                {
-                    let mut first_ty = &mut first.ty;
-                    while let Type::Refinement(inner, _) = first_ty {
-                        first_ty = inner;
-                    }
-                    let Type::Fun { name, .. } = first_ty else {
-                        panic!(
-                            "a chain's first morphism takes the chain's binder `{b}`, but its \
-                             type is not a function: {}",
-                            first.ty
-                        )
-                    };
-                    match name {
-                        None => *name = Some(b.clone()),
-                        Some(k) => assert!(
-                            k == b,
-                            "a chain binding `{b}` starts with a morphism binding `{k}`, so the \
-                             steps after it would read `{b}` unbound"
-                        ),
-                    }
-                }
-            }
-            elts
-        }
-        _ => vec![expr],
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Pattern-matching helpers for zip / curry / const
@@ -545,13 +481,19 @@ fn collapse_compose(mut elts: Vec<Expr>) -> Expr {
     if elts.len() == 1 {
         return elts.pop().unwrap();
     }
+    // The chain's type by the one rule for chains ([`crate::ccl::ccl_utils::chain_type`]): a
+    // last morphism whose codomain reads its own binder is read at each position.
     let ty = match (
         elts.first().map(|e| e.ty.clone()),
         elts.last().and_then(|e| e.ty.codomain()),
     ) {
-        (Some(head), Some(codomain)) => match head.domain() {
-            Some(domain) => Type::fun_like_or_hole(&head, &domain, &codomain),
-            None => Type::Hole,
+        (Some(head), Some(codomain)) => match (head.domain(), head.fun_kind()) {
+            (Some(domain), Some(fun_kind))
+                if !domain.is_unresolved() && !codomain.is_unresolved() =>
+            {
+                crate::ccl::ccl_utils::chain_type(&elts, fun_kind.clone())
+            }
+            _ => Type::Hole,
         },
         _ => Type::Hole,
     };
@@ -624,10 +566,34 @@ fn try_pairwise_in_compose(
     } else {
         fun_kind_of(&left.ty)
     };
+    // The steps after the pair are typed inside the binders the pair entered (`infer::emit`'s
+    // `compose_chain`), so the pair's binders are read there as positions: `left`'s is the
+    // input, `right`'s is `left` applied to it.
+    let entered = [binder_of(&left.ty), binder_of(&right.ty)];
+    let positions = [left.ty.domain(), right.ty.domain()];
+    let read_after = |b: &Option<Name>| {
+        b.as_ref().is_some_and(|b| {
+            elts[i..]
+                .iter()
+                .any(|e| crate::ccl::ccl_utils::is_free(b, e))
+        })
+    };
+    let reads_right = read_after(&entered[1]).then(|| left.clone_preserving_ids());
+    let reads = [read_after(&entered[0]), reads_right.is_some()];
     let mut replacements = apply(left, right, &mint_kind);
+    let replaced = replacements.len();
     for (j, r) in replacements.drain(..).enumerate() {
         elts.insert(i + j, r);
     }
+    restate_entered_binders(
+        &mut elts,
+        i,
+        replaced,
+        entered,
+        positions,
+        reads,
+        reads_right,
+    );
     let collapsed = elts.len() == 1;
     *expr = if collapsed {
         elts.pop().unwrap()
@@ -683,6 +649,105 @@ fn try_pairwise_in_compose(
     }
     expr.user_annotation = user_annotation;
     true
+}
+
+/// The name a function type binds its input under, if it names one.
+fn binder_of(ty: &Type) -> Option<Name> {
+    match ty.peel_refinements() {
+        Type::Fun { name, .. } => name.clone(),
+        _ => None,
+    }
+}
+
+/// Restate, in the steps after a rewritten pair, the binders the pair entered and its
+/// replacement no longer does.
+///
+/// The `replaced` morphisms at `elts[at..]` stand for `left ≫ right`, so they start at
+/// `left`'s input. That input is the first replacement's binder, named here if it is not yet
+/// (where none replaced the pair, the next step's input is `left`'s): `left`'s binder reads as
+/// it, and `right`'s as `left` applied to it.
+fn restate_entered_binders(
+    elts: &mut [Expr],
+    at: usize,
+    replaced: usize,
+    entered: [Option<Name>; 2],
+    positions: [Option<Type>; 2],
+    reads: [bool; 2],
+    left: Option<Expr>,
+) {
+    let after = at + replaced;
+    let stale = |b: &Name, elts: &[Expr]| {
+        !elts[at..after]
+            .iter()
+            .any(|e| binder_of(&e.ty).as_ref() == Some(b))
+    };
+    let restated: Vec<(Name, usize)> = entered
+        .iter()
+        .zip(reads)
+        .enumerate()
+        .filter_map(|(side, (b, read))| {
+            let b = b.as_ref().filter(|_| read)?;
+            (stale(b, elts)
+                && elts[after..]
+                    .iter()
+                    .any(|e| crate::ccl::ccl_utils::is_free(b, e)))
+            .then(|| (b.clone(), side))
+        })
+        .collect();
+    if restated.is_empty() {
+        return;
+    }
+    let head = &mut elts[at];
+    let mut head_ty = &mut head.ty;
+    while let Type::Refinement(inner, _) = head_ty {
+        head_ty = inner;
+    }
+    let Type::Fun { name, .. } = head_ty else {
+        panic!(
+            "a step after a rewritten pair reads the pair's binder, but the morphism standing at \
+             its input is not a function: {}",
+            head.ty
+        )
+    };
+    let k = name.get_or_insert_with(|| Name::fresh("__at")).clone();
+    // The reads are minted for the morphism standing at the input, which they name.
+    let _g = crate::ccl::provenance::enter(
+        head.node_id(),
+        "simplify.restate_entered_binder",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    for (b, side) in restated {
+        let input = positions[0]
+            .clone()
+            .expect("a pair that binds a name types its input");
+        let position = Expr::var(&k).with_ty(input);
+        let term = match side {
+            0 => position,
+            _ => {
+                let left = left
+                    .as_ref()
+                    .expect("`right`'s binder is read, so `left` was kept")
+                    .clone_preserving_ids();
+                // Typed as the application it is: `left`'s codomain at the input, which is
+                // the type a reader re-derives for it.
+                let applied = match left.ty.peel_refinements() {
+                    Type::Fun {
+                        name: Some(x),
+                        codomain,
+                        ..
+                    } => crate::ccl::subst::discharge_codomain(x, &position, codomain),
+                    Type::Fun { codomain, .. } => (**codomain).clone(),
+                    _ => positions[1]
+                        .clone()
+                        .expect("a pair that binds a name types its input"),
+                };
+                Expr::apply(position, left).with_ty(applied)
+            }
+        };
+        for e in &mut elts[after..] {
+            crate::ccl::subst::Subst::discharge_in_place(e, &b, &term);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,6 +1440,117 @@ fn try_const_apply(expr: &mut Expr) -> bool {
     )
 }
 
+/// `⟨𝑥, 𝑓⟩ ≫ apply`, typed: `𝑓`'s value is a function, and the chain is its codomain.
+fn applied(x: Expr, f: Expr, kind: &FunKind) -> Expr {
+    let result =
+        f.ty.codomain()
+            .and_then(|value| value.peel_refinements().codomain())
+            .unwrap_or(Type::Hole);
+    let pair = zip_pair(x, f, kind);
+    let apply_ty = match pair.ty.codomain() {
+        Some(arguments) => Type::compute_fun_or_hole(&arguments, &result),
+        None => Type::Hole,
+    };
+    let elts = vec![pair, Expr::builtin(Builtin::Apply).with_ty(apply_ty)];
+    let ty = crate::ccl::ccl_utils::chain_type(&elts, kind.clone());
+    Expr::compose(elts).with_ty(ty)
+}
+
+/// `(𝐹, 𝐺)` if `m` is `⟨𝐹, 𝐺⟩ ≫ 𝑏` for the builtin `𝑏` taking a pair of functions to one.
+fn as_paired_functions(m: &Expr, b: Builtin) -> Option<(&Expr, &Expr)> {
+    as_compose(m).and_then(|(pair, combine)| as_zip(pair).filter(|_| is_builtin(combine, b)))
+}
+
+/// Apply of a composed function: `⟨𝑥, ⟨𝐹, 𝐺⟩ ≫ compose⟩ ≫ apply  ⟹  ⟨⟨𝑥, 𝐹⟩ ≫ apply, 𝐺⟩ ≫ apply`
+///
+/// With [`try_apply_zip`], [`try_apply_constant_valued`] and [`try_const_apply`], these are
+/// the exponential's β-laws for the combinators lambda elimination writes where an
+/// application's function reads the parameter. Together they return such an application to
+/// first order wherever its source was first order.
+fn try_apply_compose(expr: &mut Expr) -> bool {
+    try_pairwise_in_compose(
+        expr,
+        |left, right| {
+            is_builtin(right, Builtin::Apply)
+                && as_zip(left)
+                    .is_some_and(|(_, m)| as_paired_functions(m, Builtin::Compose).is_some())
+        },
+        |left, _apply, mint_kind| {
+            let (x, m) = take_zip(left);
+            let (f, g) = take_zip(take_compose_head(m));
+            vec![applied(applied(x, f, mint_kind), g, mint_kind)]
+        },
+    )
+}
+
+/// Apply of a paired function: `⟨𝑥, ⟨𝐹, 𝐺⟩ ≫ zip⟩ ≫ apply  ⟹  ⟨⟨𝑥, 𝐹⟩ ≫ apply, ⟨𝑥, 𝐺⟩ ≫ apply⟩`
+fn try_apply_zip(expr: &mut Expr) -> bool {
+    try_pairwise_in_compose(
+        expr,
+        |left, right| {
+            is_builtin(right, Builtin::Apply)
+                && as_zip(left).is_some_and(|(_, m)| as_paired_functions(m, Builtin::Zip).is_some())
+        },
+        |left, _apply, mint_kind| {
+            let (x, m) = take_zip(left);
+            let (f, g) = take_zip(take_compose_head(m));
+            // Both legs read `𝑥`, so the second takes a copy of its own.
+            let x_again = x.clone();
+            vec![zip_pair(
+                applied(x, f, mint_kind),
+                applied(x_again, g, mint_kind),
+                mint_kind,
+            )]
+        },
+    )
+}
+
+/// Apply of a constant-valued function: `⟨𝑥, ℎ ≫ const⟩ ≫ apply  ⟹  ℎ`
+///
+/// `ℎ ≫ const` sends each input to the function constantly `ℎ`'s value there, so applying it
+/// to anything gives that value.
+fn try_apply_constant_valued(expr: &mut Expr) -> bool {
+    try_pairwise_in_compose(
+        expr,
+        |left, right| {
+            is_builtin(right, Builtin::Apply)
+                && as_zip(left).is_some_and(|(_, m)| {
+                    matches!(&m.node, TypedExprNode::Compose(elts)
+                        if elts.len() >= 2 && elts.last().is_some_and(|c| is_builtin(c, Builtin::Const)))
+                })
+        },
+        |left, _apply, _mint_kind| {
+            let (_, m) = take_zip(left);
+            let TypedExprNode::Compose(mut elts) = m.node else {
+                unreachable!("matched a compose")
+            };
+            elts.pop();
+            elts
+        },
+    )
+}
+
+/// `(𝑓, 𝑔)` out of `⟨𝑓, 𝑔⟩`, which the caller matched with [`as_zip`].
+fn take_zip(pair: Expr) -> (Expr, Expr) {
+    let TypedExprNode::Apply { argument, .. } = pair.node else {
+        unreachable!("matched a zip")
+    };
+    let TypedExprNode::Tuple(mut elts) = argument.node else {
+        unreachable!("matched a zip")
+    };
+    let g = elts.pop().expect("a zip pairs two");
+    let f = elts.pop().expect("a zip pairs two");
+    (f, g)
+}
+
+/// The head of a two-element compose, which the caller matched with [`as_compose`].
+fn take_compose_head(m: Expr) -> Expr {
+    let TypedExprNode::Compose(mut elts) = m.node else {
+        unreachable!("matched a compose")
+    };
+    elts.swap_remove(0)
+}
+
 /// Product eta: `⟨f ≫ .0, f ≫ .1⟩  ⟹  f`
 ///
 /// Works for n-ary compose arms: matches when both arms end in `.0`/`.1`
@@ -1495,31 +1671,23 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
                 unreachable!()
             };
 
-            // Each distributed arm is `left ≫ arm`, taking `left`'s domain (see
-            // `try_pairwise_in_compose` for which kind that makes it).
-            let arm_ty = |arm: &Expr| match (&left.ty, &arm.ty) {
-                (
-                    Type::Fun { domain: dom, .. },
-                    Type::Fun {
-                        domain: _,
-                        codomain: cod,
-                        ..
-                    },
-                ) => Type::Fun {
-                    name: None,
-                    fun_kind: mint_kind.clone(),
-                    domain: Box::new(dom.as_ref().clone()),
-                    codomain: Box::new(cod.as_ref().clone()),
-                },
-                _ => Type::Hole,
+            // Each distributed arm is the chain `left ≫ arm`, typed by the rule for chains
+            // ([`crate::ccl::ccl_utils::chain_type`]) at the kind a minted morphism takes (see
+            // `try_pairwise_in_compose`).
+            let arm_chain = |left: Expr, arm: &Expr| {
+                let elts = vec![left, arm.clone()];
+                let ty = match (&elts[0].ty, &arm.ty) {
+                    (Type::Fun { .. }, Type::Fun { .. }) => {
+                        crate::ccl::ccl_utils::chain_type(&elts, mint_kind.clone())
+                    }
+                    _ => Type::Hole,
+                };
+                Expr::compose(elts).with_ty(ty)
             };
-            let g_ty = arm_ty(g);
-            let h_ty = arm_ty(h);
-
             // Distribution places `left` on both legs of the zip.
             let h_left = left.clone();
-            let g_compose = Expr::compose(vec![left, g.clone()]).with_ty(g_ty);
-            let h_compose = Expr::compose(vec![h_left, h.clone()]).with_ty(h_ty);
+            let g_compose = arm_chain(left, g);
+            let h_compose = arm_chain(h_left, h);
             vec![zip_pair(g_compose, h_compose, mint_kind)]
         },
     )
@@ -1655,6 +1823,13 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
 /// rules produce new two-element `Compose` nodes via [`compose`]; if any of
 /// their arguments were already `Compose` nodes, the result is a nested
 /// `Compose` that this function normalizes.
+///
+/// A chain names each position it passes through by its morphisms' binders, and a nested
+/// chain's binder names its input, its head's position (`src/ccl/design/type-inference.md`,
+/// "A chain names each position"). Spliced in, the nested chain's head takes that binder,
+/// so the morphisms that read the position by it still do. At the outer chain's head the
+/// position is the outer chain's input, so the outer chain's binder names it, where it has
+/// one. The other names for that position, the head's own binder say, are renamed to it.
 fn try_flatten_compose(expr: &mut Expr) -> bool {
     let TypedExprNode::Compose(elts) = &expr.node else {
         return false;
@@ -1674,13 +1849,56 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
     else {
         unreachable!()
     };
+    let outer = binder_of(&ty);
+    let mut renames: Vec<(Name, Name, Type)> = Vec::new();
     let mut flat: Vec<Expr> = Vec::new();
     let mut rest = elts.into_iter();
     while let Some(arm) = rest.next() {
         let after = rest.as_slice();
-        flat.extend(flatten_compose_arm(arm, |b| {
-            after.iter().any(|e| crate::ccl::ccl_utils::is_free(b, e))
-        }));
+        let inner_binder = binder_of(&arm.ty);
+        let input = arm.ty.domain().unwrap_or(Type::Hole);
+        let TypedExprNode::Compose(mut inner) = arm.node else {
+            flat.push(arm);
+            continue;
+        };
+        let target = if flat.is_empty() {
+            outer.clone().or_else(|| inner_binder.clone())
+        } else {
+            inner_binder.clone()
+        };
+        let head_binder = binder_of(&inner[0].ty);
+        let read = |n: &Name| {
+            inner
+                .iter()
+                .chain(after)
+                .any(|e| crate::ccl::ccl_utils::is_free(n, e))
+        };
+        let named_read = [&target, &inner_binder, &head_binder]
+            .into_iter()
+            .flatten()
+            .any(read);
+        if let Some(t) = target.filter(|_| named_read) {
+            let head = &mut inner[0];
+            let mut slot = &mut head.ty;
+            while let Type::Refinement(inner_ty, _) = slot {
+                slot = inner_ty;
+            }
+            if let Type::Fun { name, .. } = slot {
+                for old in [inner_binder.clone(), name.clone()].into_iter().flatten() {
+                    if old != t {
+                        renames.push((old, t.clone(), input.clone()));
+                    }
+                }
+                *name = Some(t);
+            }
+        }
+        flat.extend(inner);
+    }
+    for (old, new, input) in renames {
+        let at = Expr::var(&new).with_ty(input);
+        for e in &mut flat {
+            crate::ccl::subst::Subst::discharge_in_place(e, &old, &at);
+        }
     }
     *expr = Expr::compose(flat);
     expr.ty = ty;
@@ -2106,6 +2324,88 @@ mod tests {
         let expected = typed_compose2(f, g);
 
         assert_eq!(simplify(expr), expected);
+    }
+
+    /// `⟨x, 𝑀⟩ ≫ apply` for a function-valued `𝑀` over `Int`.
+    fn apply_to(x: Expr, m: Expr, result: Type) -> Expr {
+        let function = m.ty.codomain().expect("a morphism");
+        let apply_ty = fun_ty(Type::Tuple(vec![int_ty(), function]), result);
+        typed_compose2(
+            zip_pair(x, m, &FunKind::Compute),
+            Expr::builtin(Builtin::Apply).with_ty(apply_ty),
+        )
+    }
+
+    /// `⟨𝐹, 𝐺⟩ ≫ 𝑏` for a builtin `𝑏` taking two `Int ⇒ Int` functions to `combined`.
+    fn paired_functions(f: Expr, g: Expr, b: Builtin, combined: Type) -> Expr {
+        let int_fn = fun_ty(int_ty(), int_ty());
+        let combine =
+            Expr::builtin(b).with_ty(fun_ty(Type::Tuple(vec![int_fn.clone(), int_fn]), combined));
+        typed_compose2(zip_pair(f, g, &FunKind::Compute), combine)
+    }
+
+    /// Apply of a composed function returns to first order:
+    /// `⟨x, ⟨const(f), const(g)⟩ ≫ compose⟩ ≫ apply  ⟹  x ≫ f ≫ g`.
+    #[test]
+    fn simplify_apply_compose() {
+        let int_fn = fun_ty(int_ty(), int_ty());
+        let x = var("x").with_ty(int_fn.clone());
+        let f = var("f").with_ty(int_fn.clone());
+        let g = var("g").with_ty(int_fn.clone());
+        let m = paired_functions(
+            typed_const(f.clone(), int_ty()),
+            typed_const(g.clone(), int_ty()),
+            Builtin::Compose,
+            int_fn,
+        );
+        let simplified = simplify(apply_to(x.clone(), m, int_ty()));
+        assert_eq!(
+            crate::ccl::symbolic::symbolic(&simplified),
+            crate::ccl::symbolic::symbolic(&typed_compose(vec![x, f, g])),
+        );
+    }
+
+    /// Apply of a paired function distributes into the pair:
+    /// `⟨x, ⟨const(f), const(g)⟩ ≫ zip⟩ ≫ apply  ⟹  ⟨x ≫ f, x ≫ g⟩`.
+    #[test]
+    fn simplify_apply_zip() {
+        let int_fn = fun_ty(int_ty(), int_ty());
+        let pair = Type::Tuple(vec![int_ty(), int_ty()]);
+        let x = var("x").with_ty(int_fn.clone());
+        let f = var("f").with_ty(int_fn.clone());
+        let g = var("g").with_ty(int_fn);
+        let m = paired_functions(
+            typed_const(f.clone(), int_ty()),
+            typed_const(g.clone(), int_ty()),
+            Builtin::Zip,
+            fun_ty(int_ty(), pair.clone()),
+        );
+        let simplified = simplify(apply_to(x.clone(), m, pair));
+        let expected = zip_pair(
+            typed_compose2(x.clone(), f),
+            typed_compose2(x, g),
+            &FunKind::Compute,
+        );
+        assert_eq!(
+            crate::ccl::symbolic::symbolic(&simplified),
+            crate::ccl::symbolic::symbolic(&expected),
+        );
+    }
+
+    /// Apply of a constant-valued function is the value: `⟨x, h ≫ const⟩ ≫ apply  ⟹  h`.
+    #[test]
+    fn simplify_apply_constant_valued() {
+        let int_fn = fun_ty(int_ty(), int_ty());
+        let x = var("x").with_ty(int_fn.clone());
+        let h = var("h").with_ty(int_fn.clone());
+        let constant =
+            Expr::builtin(Builtin::Const).with_ty(fun_ty(int_ty(), fun_ty(int_ty(), int_ty())));
+        let m = typed_compose2(h.clone(), constant);
+        let simplified = simplify(apply_to(x, m, int_ty()));
+        assert_eq!(
+            crate::ccl::symbolic::symbolic(&simplified),
+            crate::ccl::symbolic::symbolic(&h),
+        );
     }
 
     /// Const-apply inside a longer compose: a ≫ ⟨f, const(g)⟩ ≫ apply ≫ b  ⟹  a ≫ f ≫ g ≫ b

@@ -2,7 +2,7 @@
 //! collection's domain as `map(filter_values(𝑞))`.
 
 use super::{join::combine_predicates, *};
-use crate::ccl::{Refinement, application_order, subst::open_codomain};
+use crate::ccl::{Name, Refinement, application_order, subst::Subst, subst::open_codomain};
 
 /// Insert a per-group filter wherever a morphism's codomain refines the collection its
 /// domain carries.
@@ -35,10 +35,10 @@ use crate::ccl::{Refinement, application_order, subst::open_codomain};
 /// [`application_order`], so the emitted term is a function of which refinements the
 /// difference holds rather than of the order they accumulated in.
 ///
-/// The rewrite retires the site's Pi binder, and the predicates it bound name 𝑔 free in
-/// every type emitted here. One spelling has to serve both the filter's codomain and
-/// the site's domain, and a domain is a position no binder scopes over: an index there
-/// resolves against the enclosing function rather than the collection.
+/// The predicates the site's Pi binder `𝑔` bound read the site's input. The filter inserted
+/// before the site takes that input, so it takes `𝑔` as its binder, and the site's new
+/// domain reads it by that name (`src/ccl/design/type-inference.md`, "A chain names each
+/// position").
 ///
 /// A site whose added refinements do not all dereference 𝑔 is left alone: nothing here
 /// knows what stream to evaluate such a predicate against, and materializing the rest
@@ -76,9 +76,10 @@ pub(super) fn insert_per_group_filters(expr: &mut Expr) {
     let TypedExprNode::Compose(elts) = &mut expr.node else {
         unreachable!("matched a Compose above")
     };
-    let Some((site_codomain, value_predicate)) = per_group_filter_site(&elts[site]) else {
+    let Some((binder, site_codomain, value_predicate)) = per_group_filter_site(&elts[site]) else {
         unreachable!("position found it")
     };
+
     let narrowed = site_codomain
         .domain()
         .expect("a per-group filter site returns a collection");
@@ -102,9 +103,9 @@ pub(super) fn insert_per_group_filters(expr: &mut Expr) {
     let filter = apply_primitive(
         filter_values,
         Builtin::Map,
-        Type::fun(upstream_codomain, filtered.clone()),
+        Type::pi(binder, upstream_codomain, filtered.clone()),
     );
-    // The site now takes the narrowed collection, and its Pi binder retires. An
+    // The site now takes the narrowed collection, and its Pi binder is the filter's. An
     // `Apply`'s function slot carries the same function type, so it is re-typed with the node:
     // leaving it behind makes the node disagree with itself.
     let retyped = Type::fun(filtered, site_codomain);
@@ -117,7 +118,7 @@ pub(super) fn insert_per_group_filters(expr: &mut Expr) {
 
 /// The site's codomain and the value predicate to filter by, if `expr` is a per-group
 /// filter site. See [`insert_per_group_filters`] for the shape.
-fn per_group_filter_site(expr: &Expr) -> Option<(Type, Expr)> {
+fn per_group_filter_site(expr: &Expr) -> Option<(Name, Type, Expr)> {
     let Narrowing {
         binder,
         opened,
@@ -131,7 +132,7 @@ fn per_group_filter_site(expr: &Expr) -> Option<(Type, Expr)> {
     for (r, _) in application_order(&added, &consumed) {
         conjoined = combine_predicates(conjoined, Some(value_predicate(&r.predicate, &binder)?));
     }
-    Some((opened, conjoined?))
+    Some((binder, opened, conjoined?))
 }
 
 /// A morphism whose codomain refines the collection its domain carries, before asking
@@ -170,7 +171,7 @@ fn narrowing(expr: &Expr) -> Option<Narrowing> {
         // A substitution rather than `Type::rename_witnesses`, because the refinement's
         // predicate types its `__elem` at the witness and only a substitution reaches it.
         (Some([row, ..]), Some([narrowed, ..])) if row.type_kind() == narrowed.type_kind() => {
-            crate::ccl::subst::Subst::rename_witness(narrowed.id(), row.id()).apply_type(&opened)
+            Subst::rename_witness(narrowed.id(), row.id()).apply_type(&opened)
         }
         _ => opened,
     };
@@ -202,6 +203,15 @@ fn narrowing(expr: &Expr) -> Option<Narrowing> {
     })
 }
 
+/// Whether `e` is the filter [`insert_per_group_filters`] emits, `map(filter_values(𝑞))`: the
+/// operator that performs the narrowing its type states, so it is no narrowing left standing.
+fn is_per_group_filter(e: &Expr) -> bool {
+    matches!(&e.node, TypedExprNode::Apply { argument, function }
+        if is_builtin(function, Builtin::Map)
+            && matches!(&argument.node, TypedExprNode::Apply { function, .. }
+                if is_builtin(function, Builtin::FilterValues)))
+}
+
 /// Reject a narrowing [`insert_per_group_filters`] left standing.
 ///
 /// The site keeps claiming a narrowing no operator performs, and op-conversion reads a
@@ -210,7 +220,10 @@ fn narrowing(expr: &Expr) -> Option<Narrowing> {
 /// positions it inspects: the elements of a composition after the first.
 pub(super) fn reject_unmaterialized_narrowings(expr: &Expr) -> Result<(), String> {
     if let TypedExprNode::Compose(elts) = &expr.node
-        && let Some(site) = elts.iter().skip(1).find(|e| narrowing(e).is_some())
+        && let Some(site) = elts
+            .iter()
+            .skip(1)
+            .find(|e| narrowing(e).is_some() && !is_per_group_filter(e))
     {
         return Err(format!(
             "a filter on an inner collection that planning cannot materialize is not \
@@ -257,7 +270,7 @@ fn value_predicate(predicate: &Expr, binder: &Name) -> Option<Expr> {
                 (Some(d), Some(c)) => Type::fun(d, c),
                 _ => Type::Hole,
             };
-            Some(Expr::compose(many.to_vec()).with_ty(ty))
+            Some(ccl_utils::chain_typed(many.to_vec(), ty))
         }
     }
 }
@@ -336,8 +349,10 @@ mod tests {
             "((q1, q2) ▷ zip ≫ and) ▷ filter_values ▷ map"
         );
         // The filter delivers exactly what the site now takes: one type, so the
-        // post-planning `typecheck` chains them.
+        // post-planning `typecheck` chains them. The filter binds the site's former binder,
+        // which the site's domain reads, so its codomain is read opened at it.
         let filtered = filter.ty.codomain().expect("the filter is a function");
+        let filtered = open_codomain(&filter.ty, &filtered);
         assert_eq!(site_ty.domain(), Some(filtered));
     }
 

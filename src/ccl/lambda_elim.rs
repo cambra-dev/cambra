@@ -127,7 +127,13 @@ impl std::fmt::Display for LambdaElimError {
 /// (as produced by [`crate::ccl::infer::infer`]).
 ///
 /// Returns `Ok(point_free_expr)` where the result contains no `Lambda` nodes.
-pub fn run(mut expr: Expr) -> Result<Expr, LambdaElimError> {
+pub fn run(expr: Expr) -> Result<Expr, LambdaElimError> {
+    // Elimination builds a type per node, each closing or opening the binders it crosses,
+    // so one memo serves every conversion of a shared predicate.
+    crate::ccl::subst::with_conversion_memo(|| run_memoized(expr))
+}
+
+fn run_memoized(mut expr: Expr) -> Result<Expr, LambdaElimError> {
     let mut ctx = ElimContext::new();
     compose_sum_generators(&mut expr);
     let point_free = elim_lambdas(&mut ctx, expr)?;
@@ -282,6 +288,58 @@ pub(crate) fn compose(f: Expr, g: Expr) -> Expr {
     Expr::compose(vec![f, g])
 }
 
+/// The type of an operation applied to `operands` with result type `result`, stated over
+/// the operation's own input (`src/ccl/design/type-inference.md`, "A chain names each
+/// position").
+///
+/// `result` was written over the operand terms, `{Int | __elem == 𝑙 ^+ 𝑟}` say. The
+/// operation's input `𝑞` is the operands, so each occurrence of an operand term reads as
+/// `𝑞`'s component, `(𝑞 : (Int, Int)) ⇒ {Int | __elem == 𝑞.0 ^+ 𝑞.1}`: wherever the
+/// operation runs, the component and the operand are one value. A single operand is `𝑞`
+/// itself. A result that reads no operand is the plain function from the operands' type.
+fn operation_type(operands: &[&Expr], input: &Type, result: &Type) -> Type {
+    let q = Name::fresh("__args");
+    let at = |i: usize, ty: &Type| -> Expr {
+        let whole = Expr::var(&q).with_ty(input.clone());
+        if operands.len() == 1 {
+            return whole;
+        }
+        Expr::apply(
+            whole,
+            Expr::proj_index(i).with_ty(Type::fun(input.clone(), ty.clone())),
+        )
+        .with_ty(ty.clone())
+    };
+    fn abstract_operands(
+        e: &mut Expr,
+        operands: &[&Expr],
+        at: &dyn Fn(usize, &Type) -> Expr,
+    ) -> bool {
+        if let Some(i) = operands
+            .iter()
+            .position(|o| crate::ccl::ty::eq_term_modulo_ty_slots(o, e))
+        {
+            *e = at(i, &e.ty);
+            return true;
+        }
+        let mut changed = false;
+        e.walk_children_mut(|c| changed |= abstract_operands(c, operands, at));
+        changed
+    }
+    let mut stated = result.clone();
+    let changed = crate::ccl::ccl_utils::walk_refined_predicates_mut(
+        &mut stated,
+        &crate::ccl::ccl_utils::PredMemo::default(),
+        &(),
+        &mut |pred, _| abstract_operands(pred, operands, &at),
+    );
+    if changed {
+        Type::pi(q, input.clone(), stated)
+    } else {
+        Type::compute_fun_or_hole(input, result)
+    }
+}
+
 /// Build a [`TypedExprNode::Tuple`] whose type is inferred from its elements.
 ///
 /// Sets the node's type to the product of the element types, using
@@ -312,7 +370,7 @@ pub(crate) fn zip_pair(f: Expr, g: Expr, fun_kind: &FunKind) -> Expr {
 ///
 /// Lifting the predicate onto a pair rewrites `param` to `__elem.0`, and a refinement that
 /// reads `param` inside a subterm's type binds `__elem` again, so the rewrite would capture
-/// (`subst::Subst`, `assert_no_element_capture`). A restated component fact loses nothing
+/// (`subst::Mapping::Unspellable`). A restated component fact loses nothing
 /// when removed: the pair's first component is `param`, whose type states it. Only a
 /// refinement equal as a term to one the tuple's type states is removed; any other that
 /// would capture still reaches the substitution and fails there.
@@ -395,20 +453,7 @@ pub(crate) fn pairing_components(element: &Expr) -> Option<Vec<Expr>> {
     let input = Expr::var(a).with_ty((**domain).clone());
     Some(
         fs.iter()
-            .map(|f| match &f.node {
-                TypedExprNode::Builtin(Builtin::Id) => input.clone(),
-                _ => {
-                    let cod = match f.ty.peel_refinements() {
-                        Type::Fun {
-                            name: Some(b),
-                            codomain,
-                            ..
-                        } => crate::ccl::subst::discharge_codomain(b, &input, codomain),
-                        _ => f.ty.codomain().unwrap_or(Type::Hole),
-                    };
-                    Expr::apply(input.clone(), f.clone()).with_ty(cod)
-                }
-            })
+            .map(|f| crate::ccl::ccl_utils::read_at(&input, f))
             .collect(),
     )
 }
@@ -473,7 +518,7 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 
 /// Compute the type of `zip(f, g): A → (B, C)` from `f: A → B` and `g: A → C`.
 ///
-/// Returns [`Type::Hole`] unless both arguments match a bare [`Type::Fun`]; inference
+/// Returns [`Type::Hole`] unless both arguments are functions, refined or not; inference
 /// fills in the gap in that case.
 ///
 /// The domain is `f`'s, but the **kind is declared** rather than read off `f`: a zip of
@@ -493,8 +538,9 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 /// has to ride it. A caller holds a name and not that dependence, so declaring the binder
 /// the way `fun_kind` is declared would make a Pi of every pair an elimination builds,
 /// including the `⟨id, scrut ≫ variant_project(cᵢ)⟩` the outer-binder `Case` arm mints
-/// from [`Type::fun`]. Where both operands name a binder they name the same one, each
-/// being this elimination's own `param`, which the first assertion below states.
+/// from [`Type::fun`]. Where both operands name a binder, the names may differ: a chain
+/// typed by [`crate::ccl::ccl_utils::chain_type`] binds a fresh position. Each codomain reads
+/// its binder by index rather than by name, so the pair binds both under the first name.
 ///
 /// Reading the binder off the first operand alone leaves an unnamed function whose codomain
 /// references a binder, and [`crate::ccl::subst::open_codomain`] then has no binder to open
@@ -503,7 +549,8 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 /// beside a correlated body produces that shape; the `debug_assert!` below rejects it where
 /// the type is built rather than where it is read.
 pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
-    match (&f.ty, &g.ty) {
+    // A refinement on an operand states a fact about that operand, not about the pair.
+    match (f.ty.peel_refinements(), g.ty.peel_refinements()) {
         (
             Type::Fun {
                 name,
@@ -517,11 +564,34 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
                 ..
             },
         ) => {
-            assert!(
-                !matches!((name, g_name), (Some(x), Some(y)) if x != y),
-                "a zip's operands are morphisms over one domain, so a binder either operand \
-                 names is that domain's binder; these name two: {name:?} and {g_name:?}",
+            // Each codomain reads its own binder by index, so two operands naming different
+            // binders bind the one domain under two spellings, and the pair takes either.
+            debug_assert!(
+                [(name, b), (g_name, c)].iter().all(|(n, cod)| n
+                    .as_ref()
+                    .is_none_or(|n| !crate::ccl::subst::type_free_vars(cod).contains(n))),
+                "a codomain closed over its binder also names it: {name:?} in {b}, {g_name:?} \
+                 in {c}",
             );
+            // **`⟨id, 𝑔⟩` with `𝑔` reading its input is a dependent pair.** Its first
+            // component is the input, so `𝑔`'s codomain reads the first component:
+            // `𝐴 ⇒ (𝑥 : 𝐴) × 𝐶(𝑥)`, the type of the pair a lambda over it is eliminated at
+            // (`src/ccl/design/type-inference.md`, "4.8 Dependent tuples").
+            if crate::ccl::ccl_utils::is_builtin(f, Builtin::Id)
+                && let Some(x) = g_name
+                && crate::ccl::subst::references_enclosing_function(c)
+            {
+                let second = crate::ccl::subst::open_codomain(&g.ty, c);
+                return Type::Fun {
+                    name: None,
+                    fun_kind: fun_kind.clone(),
+                    domain: a.clone(),
+                    codomain: Box::new(Type::dep_tuple(vec![
+                        (Some(x.clone()), *b.clone()),
+                        (None, second),
+                    ])),
+                };
+            }
             let codomain = Type::Tuple(vec![*b.clone(), *c.clone()]);
             debug_assert!(
                 name.is_some()
@@ -933,7 +1003,7 @@ fn elim_lambda(
     param_ty: &Type,
     body: Expr,
 ) -> Result<Expr, LambdaElimError> {
-    elim_lambda_kinded(ctx, param, param_ty, body, FunKind::Compute)
+    elim_lambda_at(ctx, param, param_ty, body, FunKind::Compute)
 }
 
 /// [`elim_lambda`] at a declared [`FunKind`] — see its note on why the default
@@ -950,21 +1020,198 @@ fn elim_lambda_kinded(
     })
 }
 
-/// Whether `ty` is a collection whose own domain reads `param`. A refinement there decides
-/// which entries the collection has, a comprehension's filter or a group-by key's membership
-/// say, so a body of that type varies with `param` and is not constant in it
-/// (`src/ccl/design/type-inference.md`, "A refinement on a collection's domain is data"). Only
-/// the body's own domain counts: a collection it holds, such as a group whose domain reads a
-/// key, is the family a Pi-constant type encodes, and a function's domain is what it takes.
+/// [`elim_lambda_kinded`] where `λ param → body` itself is eliminated, rather than a subterm
+/// of its body: the morphism it returns is the one over `param`, so a chain it is binds
+/// `param` ([`bind_chain_input`]). A chain inside it, a zip's operand say, reads `param` as
+/// the enclosing input, and a rewrite can move it after another step, so it does not
+/// rebind the name.
+fn elim_lambda_at(
+    ctx: &mut ElimContext,
+    param: &Name,
+    param_ty: &Type,
+    body: Expr,
+    fun_kind: FunKind,
+) -> Result<Expr, LambdaElimError> {
+    let mut out = elim_lambda_kinded(ctx, param, param_ty, body, fun_kind)?;
+    bind_chain_input(&mut out, param);
+    Ok(out)
+}
+
+/// Make the chain `morphism` name its input `param`, where its morphisms' types read it.
+///
+/// Eliminating `λ param → …` gives a morphism over `param`, so a chain it is has `param` as
+/// its input, its head's position, and a chain names each position by the binder of the
+/// morphism there (`src/ccl/design/type-inference.md`, "A chain names each position"). The
+/// head takes `param`, or, binding a name of its own already, the reads of `param` take
+/// that name. A chain whose own binder names the input under another name, one
+/// [`crate::ccl::ccl_utils::chain_type`] minted for a dependent last morphism, has the reads
+/// of that name restated the same way.
+fn bind_chain_input(morphism: &mut Expr, param: &Name) {
+    let chain_binder = match morphism.ty.peel_refinements() {
+        Type::Fun { name, .. } => name.clone(),
+        _ => None,
+    };
+    let TypedExprNode::Compose(elts) = &mut morphism.node else {
+        return;
+    };
+    let input = elts[0].ty.domain().unwrap_or(Type::Hole);
+    let names = [Some(param.clone()), chain_binder].into_iter().flatten();
+    let read: Vec<Name> = names
+        .filter(|n| elts[1..].iter().any(|e| is_free(n, e)))
+        .collect();
+    let Some(first) = read.first() else {
+        return;
+    };
+    let mut slot = &mut elts[0].ty;
+    while let Type::Refinement(inner, _) = slot {
+        slot = inner;
+    }
+    let Type::Fun { name: head, .. } = slot else {
+        return;
+    };
+    let position = head.get_or_insert_with(|| first.clone()).clone();
+    let at = Expr::var(&position).with_ty(input);
+    for n in read.iter().filter(|n| **n != position) {
+        for e in elts[1..].iter_mut() {
+            crate::ccl::subst::Subst::discharge_in_place(e, n, &at);
+        }
+    }
+}
+
+/// Whether a value of type `ty` holds a collection whose domain reads `param`. A refinement
+/// on a collection's domain decides which entries the collection has, a comprehension's
+/// filter or a group-by key's membership say, so a body of that type varies with `param` and
+/// is not constant in it (`src/ccl/design/type-inference.md`, "A refinement on a collection's
+/// domain is data").
+///
+/// The walk reaches every collection the value holds: the rows of a collection, the
+/// components of a tuple, record or variant, and a history's function. A compute function's
+/// type does not say whether a collection in its result is one it builds, so the walk stops
+/// there and [`builds_domain_reading`] reads its term. A refinement on a value is a fact about
+/// it, so its predicate is not read. A
+/// binder of `ty` that shadows `param` ends the walk below it. A group-by family stays
+/// Pi-constant because a group's domain reads the group's key, a binder of the type, rather
+/// than `param`.
 fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
-    matches!(
-        ty.peel_refinements(),
+    match ty {
+        Type::Refinement(inner, _) | Type::BoundedHole(inner) => {
+            reads_in_collection_domain(param, inner)
+        }
         Type::Fun {
-            fun_kind: FunKind::Data(..),
+            name,
+            fun_kind,
             domain,
-            ..
-        } if crate::ccl::subst::type_free_vars(domain).contains(param)
-    )
+            codomain,
+        } => {
+            let data = match fun_kind {
+                FunKind::Data(..) => true,
+                FunKind::Compute => false,
+                FunKind::Var(v) => v.resolved().is_data(),
+            };
+            data && (crate::ccl::subst::type_free_vars(domain).contains(param)
+                || (name.as_ref() != Some(param) && reads_in_collection_domain(param, codomain)))
+        }
+        Type::Tuple(ts) => ts.iter().any(|t| reads_in_collection_domain(param, t)),
+        Type::DepTuple(components) => {
+            for (name, t) in components {
+                if reads_in_collection_domain(param, t) {
+                    return true;
+                }
+                if name.as_ref() == Some(param) {
+                    return false;
+                }
+            }
+            false
+        }
+        Type::Record(fields) => fields
+            .iter()
+            .any(|(_, t)| reads_in_collection_domain(param, t)),
+        Type::Variant(arms, _) => arms
+            .iter()
+            .any(|(_, t)| reads_in_collection_domain(param, t)),
+        Type::History { function, .. } => reads_in_collection_domain(param, function),
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::Hole
+        | Type::SharedHole(_)
+        | Type::Infer(_)
+        | Type::DataSource(_)
+        | Type::ChanDom(..)
+        | Type::Txn
+        | Type::WitnessRef(_)
+        | Type::Param(_)
+        | Type::Poly(_) => false,
+    }
+}
+
+/// Whether `expr` builds a collection whose domain reads `param`: a cast strictly inside it
+/// whose target narrows by `param`, or a data lambda whose binder's type does. These are where a
+/// term defines a collection's domain, so a body holding one varies with `param` whatever its
+/// own type says (`src/ccl/design/type-inference.md`, "A refinement on a collection's domain is
+/// data"). A compute function that builds such a collection is one: its type cannot tell the
+/// collection from one it takes as its argument and returns, but its term can. A filter's cast
+/// is a refined lambda here once an enclosing elimination has rewritten it
+/// (`refine_filtering_casts`), which is why a binder counts as well as a cast.
+///
+/// A comprehension's binder ranges over the keys of the source it iterates, so the refinements
+/// that source's domain carries are restated rather than built ([`source_refinements`]); only
+/// the ones beyond them, its own filters, count. A compute lambda's binder type is what it
+/// takes, so it does not count, and neither does a cast that is `expr` itself, which is a
+/// lambda's result and has its own arm. A predicate reads `param` where its terms do: the types
+/// its subterms carry restate the domain they range over.
+fn builds_domain_reading(param: &Name, expr: &Expr) -> bool {
+    // The refinements on `domain` that narrow by `param`, less those `restated` carries.
+    fn narrows_by(param: &Name, domain: &Type, restated: &[Refinement]) -> bool {
+        let Type::Refinement(_, refinements) = domain else {
+            return false;
+        };
+        refinements
+            .iter()
+            .any(|r| is_free_in_value(param, &r.predicate) && !restated.contains(r))
+    }
+    fn inside(param: &Name, e: &Expr) -> bool {
+        let here = match &e.node {
+            TypedExprNode::Cast { target, .. } => {
+                target.domain().is_some_and(|d| narrows_by(param, &d, &[]))
+            }
+            TypedExprNode::Lambda {
+                param: binding,
+                body,
+            } => {
+                matches!(
+                    e.ty.peel_refinements(),
+                    Type::Fun {
+                        fun_kind: FunKind::Data(..),
+                        ..
+                    }
+                ) && narrows_by(param, &binding.ty, &source_refinements(&binding.name, body))
+            }
+            _ => false,
+        };
+        let mut below = false;
+        e.walk_children(|c| below |= inside(param, c));
+        here || below
+    }
+    let mut below = false;
+    expr.walk_children(|c| below |= inside(param, c));
+    below
+}
+
+/// The refinements on the domains of the collections `body` reads at `binder`: the sources a
+/// comprehension over `binder` iterates, `binder ▷ source`.
+fn source_refinements(binder: &Name, body: &Expr) -> Vec<Refinement> {
+    fn go(binder: &Name, e: &Expr, out: &mut Vec<Refinement>) {
+        if let TypedExprNode::Apply { argument, function } = &e.node
+            && matches!(&argument.node, TypedExprNode::Var(n) if n == binder)
+            && let Some(Type::Refinement(_, refinements)) = function.ty.domain()
+        {
+            out.extend(refinements.iter().cloned());
+        }
+        e.walk_children(|c| go(binder, c, out));
+    }
+    let mut out = Vec::new();
+    go(binder, body, &mut out);
+    out
 }
 
 /// Rewrite each cast-wrapped lambda under `expr` whose narrowing reads `param` to the
@@ -1156,8 +1403,8 @@ fn elim_lambda_impl(
     // has its binder free only in that refinement.
     //
     // A refinement in `e`'s type is a fact about a value, which a Pi binder can carry, except
-    // on a collection's own domain, where it decides which entries the collection has: there
-    // `x` is data, and `e` is not constant in it ([`reads_in_collection_domain`]). A filter
+    // on the domain of a collection `e` holds, where it decides which entries the collection
+    // has: there `x` is data, and `e` is not constant in it ([`reads_in_collection_domain`]). A filter
     // on a comprehension's elements is such a refinement, which the nested-lambda rule lifts
     // onto the pair. A cast-wrapped lambda has its own arm, which also point-frees the cast's
     // inner lambda.
@@ -1165,6 +1412,7 @@ fn elim_lambda_impl(
         && !in_value
         && in_body_type
         && !reads_in_collection_domain(param, &body.ty)
+        && !builds_domain_reading(param, &body)
     {
         let result_pi = Type::pi_kinded(param, param_ty.clone(), body.ty.clone(), fun_kind.clone());
         let const_fn =
@@ -1221,15 +1469,38 @@ fn elim_lambda_impl(
             // (`emit_pair_filter` in `src/ccl/planning/correlated.rs`), and nothing applies a
             // component refinement. So the two copies serve different readers: the
             // component states what `y` is, the pair states what to narrow.
+            //
+            // **A filter reading `param` stays where the pair is otherwise not dependent.** The
+            // component is then `{𝐾 | 𝑝(param, ·)}`, a type chosen by the first component's
+            // value, so the pair is the dependent tuple `(param : 𝐴) × {𝐾 | 𝑝(param, ·)}` and
+            // `.1` out of it carries the filter its readers need. Nothing lifts: on the pair,
+            // the filter's `.1` would have to read the refinement's own `__elem.0` inside a
+            // nested refinement, which has no spelling. Planning applies it from the
+            // component instead (`emit_pair_filter` in `src/ccl/planning/correlated.rs`).
             let refinements = y_ty.refinements().to_vec();
-            let lifting: Vec<Refinement> = refinements
+            let membership_dependent = refinements
                 .iter()
-                .filter(|r| !r.is_collection_membership())
-                .cloned()
-                .collect();
+                .any(|r| r.is_collection_membership() && is_free_in_value(param, &r.predicate));
+            let filter_dependent = !membership_dependent
+                && refinements.iter().any(|r| {
+                    !r.is_collection_membership() && is_free_in_value(param, &r.predicate)
+                });
+            let lifting: Vec<Refinement> = if filter_dependent {
+                Vec::new()
+            } else {
+                refinements
+                    .iter()
+                    .filter(|r| !r.is_collection_membership())
+                    .cloned()
+                    .collect()
+            };
             let staying: Vec<Refinement> = refinements
                 .iter()
-                .filter(|r| r.is_collection_membership() || !is_free_in_value(param, &r.predicate))
+                .filter(|r| {
+                    filter_dependent
+                        || r.is_collection_membership()
+                        || !is_free_in_value(param, &r.predicate)
+                })
                 .cloned()
                 .collect();
             let y_ty = {
@@ -1332,10 +1603,12 @@ fn elim_lambda_impl(
                     .with_ty(param_ty.clone());
                     crate::ccl::subst::Subst::discharge(param.clone(), first).apply_type(&y_ty)
                 };
-                // The projection's binder is `pair`, as every morphism eliminated from
-                // `λ pair → …` binds it: what follows in a chain reads it by that name.
+                // The projection's own binder is for its own codomain alone, so no name binds
+                // two positions of a chain (`src/ccl/design/type-inference.md`, "A chain names
+                // each position").
                 let y_at_pair = at(&pair);
-                let proj1_ty = Type::pi(pair.clone(), pair_ty.clone(), y_at_pair.clone());
+                let own = Name::fresh("__pair");
+                let proj1_ty = Type::pi(own.clone(), pair_ty.clone(), at(&own));
                 (y_at_pair, proj1_ty)
             } else {
                 (y_ty.clone(), Type::fun(pair_ty.clone(), y_ty.clone()))
@@ -1350,7 +1623,7 @@ fn elim_lambda_impl(
             // The merged pair morphism is the uncurried form of the same nested
             // abstraction, so it carries the enclosing function's kind: currying a
             // collection does not make it a capability.
-            let inner_elim = elim_lambda_kinded(ctx, &pair, &pair_ty, merged, fun_kind.clone())?;
+            let inner_elim = elim_lambda_at(ctx, &pair, &pair_ty, merged, fun_kind.clone())?;
             Ok(curry_at(inner_elim, result_ty))
         }
 
@@ -1366,8 +1639,11 @@ fn elim_lambda_impl(
         // it. The binder must ride the type for the refinement's `param` to stay
         // bound once the term binder is gone, and it is what planning's pointful
         // group-by recognizer reads the key off.
+        //
+        // A closed value that is not a lambda, a filtered collection read under the loop
+        // around it, takes the second path: the value lifts under `const` whatever it is.
         TypedExprNode::Cast { value, target }
-            if matches!(value.node, TypedExprNode::Lambda { .. }) =>
+            if matches!(value.node, TypedExprNode::Lambda { .. }) || !is_free(param, &value) =>
         {
             debug_assert!(
                 cast_target_refinement(&target).is_some(),
@@ -1395,7 +1671,9 @@ fn elim_lambda_impl(
             // the loop's binder — no one bucketing serves every `param`, and the
             // refinement is a filter on the inner binder that reads the outer one, which
             // the nested-lambda rule lifts onto the pair.
-            if is_free(param, &value) || key_reads(param, &target) {
+            if matches!(value.node, TypedExprNode::Lambda { .. })
+                && (is_free(param, &value) || key_reads(param, &target))
+            {
                 let refined = refined_lambda(*value, &target, body_ty.clone());
                 return elim_lambda_kinded(ctx, param, param_ty, refined, fun_kind);
             }
@@ -1535,8 +1813,12 @@ fn elim_lambda_impl(
         TypedExprNode::BinOp { left, op, right } => {
             let left = *left;
             let right = *right;
+            let fn_ty = operation_type(
+                &[&left, &right],
+                &Type::tuple(vec![left.ty.clone(), right.ty.clone()]),
+                &body_ty,
+            );
             let tuple = typed_tuple(vec![left, right]);
-            let fn_ty = Type::compute_fun_or_hole(&tuple.ty, &body_ty);
             let fn_var = Expr::builtin(Builtin::BinOp(op)).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
             // Desugaring rewrites the *same* lambda's body, so the type it ends up
@@ -1554,7 +1836,10 @@ fn elim_lambda_impl(
         // keeps the N-ary value-form intact.
         TypedExprNode::Copair(ops) => {
             let tuple = typed_tuple(ops);
-            let fn_ty = Type::compute_fun_or_hole(&tuple.ty, &body_ty);
+            let TypedExprNode::Tuple(operands) = &tuple.node else {
+                unreachable!("built a tuple")
+            };
+            let fn_ty = operation_type(&operands.iter().collect::<Vec<_>>(), &tuple.ty, &body_ty);
             let fn_var = Expr::builtin(Builtin::Copair).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
             // Desugaring rewrites the *same* lambda's body, so the type it ends up
@@ -1567,7 +1852,7 @@ fn elim_lambda_impl(
         TypedExprNode::UnaryOp(op, inner) => {
             let op_builtin = Builtin::for_unaryop(op);
             let inner = *inner;
-            let fn_ty = Type::compute_fun_or_hole(&inner.ty, &body_ty);
+            let fn_ty = operation_type(&[&inner], &inner.ty, &body_ty);
             let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
             let desugared = Expr::apply(inner, fn_var).with_ty(body_ty);
             // Desugaring rewrites the *same* lambda's body, so the type it ends up
@@ -1634,20 +1919,21 @@ fn elim_lambda_impl(
             // (i.e. the renamed function v applied to the current argument x).
             // Type `call_v` using the types already computed for `new_def` and
             // `param_ty`, so that `elim_lambda` on the substituted body can
-            // propagate types into the combinator arguments it builds.
+            // propagate types into the combinator arguments it builds. A `def` whose type
+            // reads `x` makes `v` dependent, and the application's type is its codomain
+            // opened at `x`.
+            let x = Expr::var(param).with_ty(param_ty.clone());
             let call_v_result_ty = match &new_def.ty {
                 Type::Fun {
-                    domain: _,
-                    codomain: cod,
+                    name: Some(b),
+                    codomain,
                     ..
-                } => *cod.clone(),
+                } => crate::ccl::subst::discharge_codomain(b, &x, codomain),
+                Type::Fun { codomain, .. } => (**codomain).clone(),
                 _ => Type::Hole,
             };
-            let call_v = Expr::apply(
-                Expr::var(param).with_ty(param_ty.clone()),
-                Expr::var(&v).with_ty(new_def.ty.clone()),
-            )
-            .with_ty(call_v_result_ty);
+            let call_v =
+                Expr::apply(x, Expr::var(&v).with_ty(new_def.ty.clone())).with_ty(call_v_result_ty);
             let substituted_body = substitute(*let_body, &v, &call_v);
             let new_body =
                 elim_lambda_kinded(ctx, param, param_ty, substituted_body, fun_kind.clone())?;
@@ -1656,8 +1942,14 @@ fn elim_lambda_impl(
             // to the bound expression (design §6.2 move-site rule) — the same
             // substitution inference's let-closing and `emit_let` apply, so
             // the post-elim check's reconstruction reconciles structurally.
+            // It is the eliminated body's type that is discharged, not
+            // `result_ty`: there `v` is still the scalar the let bound, while
+            // `new_def` is a function of the position, so `v ↦ new_def` would
+            // put an unapplied function where a value stood. The eliminated
+            // body reads `v` at the position (`x ▷ v`), which the discharge
+            // turns into `x ▷ new_def`.
             let let_ty = crate::ccl::subst::Subst::discharge(&v, new_def.clone_preserving_ids())
-                .apply_type(&result_ty);
+                .apply_type(&new_body.ty);
             Ok(Expr::let_bind(v, new_def, new_body).with_ty(let_ty))
         }
 
@@ -1672,24 +1964,19 @@ fn elim_lambda_impl(
         // applied — including the references inside the definitions, the group being
         // recursive, which is the one way this differs from `Let`.
         //
-        // Each reference, inside the definitions and in the body, is typed
-        // `𝑃 ⇒ 𝑇` from the binding's own type `𝑇`, before elimination. That is the
-        // eliminated definition's type wherever the history's type does not depend on the
-        // enclosing parameter; a history whose type does would be a dependent function,
-        // which these references would not say.
+        // Each reference, inside the definitions and in the body, is typed from the
+        // binding's own type `𝑇`, before elimination: `𝑃 ⇒ 𝑇`, or `(param : 𝑃) ⇒ 𝑇` where
+        // the history's type depends on the enclosing parameter, a fed row filtered by the
+        // enclosing loop's variable say. Applied at `param` itself, either is `𝑇`.
         TypedExprNode::LetRec { bindings, body } => {
             let calls: Vec<(Name, Expr)> = bindings
                 .iter()
                 .map(|(b, _)| {
-                    assert!(
-                        !crate::ccl::ccl_utils::is_free_in_type(param, &b.ty),
-                        "a nested recurrence's history type does not depend on the enclosing \
-                         parameter `{param}`, so each reference to it is typed `𝑃 ⇒ 𝑇`: `{}` \
-                         has type {}",
-                        b.name,
-                        b.ty
-                    );
-                    let hist_ty = Type::fun(param_ty.clone(), b.ty.clone());
+                    let hist_ty = if crate::ccl::ccl_utils::is_free_in_type(param, &b.ty) {
+                        Type::pi_kinded(param, param_ty.clone(), b.ty.clone(), fun_kind.clone())
+                    } else {
+                        Type::fun(param_ty.clone(), b.ty.clone())
+                    };
                     let call = Expr::apply(
                         Expr::var(param).with_ty(param_ty.clone()),
                         Expr::var(&b.name).with_ty(hist_ty),
@@ -1847,10 +2134,12 @@ fn elim_lambda_impl(
                     Builtin::FilterValues,
                     Type::fun(param_ty.clone(), param_ty.clone()),
                 );
-                arms.push(
-                    typed_compose(vec![filter, value_fn])
-                        .with_ty(Type::fun(param_ty.clone(), value_ty.clone())),
-                );
+                // `filter_values` maps each position to itself, so an arm whose value reads
+                // `param` keeps `eᵢ`'s binder ([`crate::ccl::ccl_utils::chain_type_of`]).
+                arms.push(crate::ccl::ccl_utils::chain_typed(
+                    vec![filter, value_fn],
+                    Type::fun(param_ty.clone(), value_ty.clone()),
+                ));
             }
             match arms.len() {
                 0 => unreachable!("a value-selecting Case has at least one branch"),
@@ -1858,15 +2147,11 @@ fn elim_lambda_impl(
                 // A **disjoint join**, not a copairing: these arms restrict the
                 // *same* fed domain — by first-match, or by tag — so the result
                 // lands back on it rather than on a coproduct of per-arm domains.
-                // It carries the eliminated lambda's kind for the same reason
-                // every other rebuild here does: the join is that lambda's
-                // point-free form, not a new decision about what the value is.
-                _ => Ok(Expr::disjoint_join(arms).with_ty(Type::Fun {
-                    name: None,
-                    fun_kind: fun_kind.clone(),
-                    domain: Box::new(param_ty.clone()),
-                    codomain: Box::new(value_ty),
-                })),
+                // It is typed as the eliminated lambda, kind and binder alike, for the
+                // same reason every other rebuild here is: the join is that lambda's
+                // point-free form, not a new decision about what the value is. A value
+                // whose type reads `param` keeps the binder over it.
+                _ => Ok(Expr::disjoint_join(arms).with_ty(result_ty.clone())),
             }
         }
 
@@ -2097,15 +2382,11 @@ fn elim_lambda_impl(
                 // A **disjoint join**, not a copairing: these arms restrict the
                 // *same* fed domain — by first-match, or by tag — so the result
                 // lands back on it rather than on a coproduct of per-arm domains.
-                // It carries the eliminated lambda's kind for the same reason
-                // every other rebuild here does: the join is that lambda's
-                // point-free form, not a new decision about what the value is.
-                _ => Ok(Expr::disjoint_join(arms).with_ty(Type::Fun {
-                    name: None,
-                    fun_kind: fun_kind.clone(),
-                    domain: Box::new(param_ty.clone()),
-                    codomain: Box::new(value_ty),
-                })),
+                // It is typed as the eliminated lambda, kind and binder alike, for the
+                // same reason every other rebuild here is: the join is that lambda's
+                // point-free form, not a new decision about what the value is. A value
+                // whose type reads `param` keeps the binder over it.
+                _ => Ok(Expr::disjoint_join(arms).with_ty(result_ty.clone())),
             }
         }
 
@@ -2221,7 +2502,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                 param: param.clone(),
                 body: Box::new(body.clone_preserving_ids()),
             }));
-            let mut result = elim_lambda_kinded(
+            let mut result = elim_lambda_at(
                 ctx,
                 &param.name,
                 &param.ty,
@@ -2603,16 +2884,10 @@ mod tests {
         );
     }
 
-    /// A **refined** function operand drops the pair to [`Type::Hole`].
-    ///
-    /// The match is on the bare [`Type::Fun`], so `{(k: Int) ⇒ B | p}` takes the fallback
-    /// arm and the pair loses the domain, the codomain and the binder that operand still
-    /// carries — the hazard [`Type::fun_kind`] peels refinements to avoid. Pinned on the
-    /// gap: an `#[ignore]` reports the same green whether it closed, regressed, or went
-    /// away, and the failure is silent otherwise, a `Hole` being what an operand of no
-    /// known shape yields too.
+    /// A **refined** function operand is still a function: `{(k: Int) ⇒ B | p}` gives the
+    /// pair its domain, its codomain and the binder it names, as [`Type::fun_kind`] reads
+    /// through refinements.
     #[test]
-    #[should_panic(expected = "a refined operand is still a function")]
     fn a_zip_reads_through_a_refined_operand() {
         let binder = Name::raw("k");
         let refined = Type::refined_one(
@@ -3244,5 +3519,55 @@ mod tests {
             "(.time, .decision ≫ variant_project(`commit)) ▷ zip \
              ⊔ .decision ≫ variant_project(`abort) ≫ (0, 0) ▷ const"
         );
+    }
+
+    /// `{[0, 3] | 𝑛}`: a key domain whose refinement reads `𝑛`.
+    fn keys_reading(n: &Name) -> Type {
+        Type::refined(
+            Type::UIntRange(3),
+            RefinementSet::one(Refinement::born(Rc::new(
+                Expr::var(n.clone()).with_ty(Type::Base(BaseType::Bool)),
+            ))),
+        )
+    }
+
+    /// Under `λ 𝑖`, rows whose domains read `𝑖` differ for each `𝑖` though the outer domain
+    /// does not read it, so the body varies, as it does when it holds such rows in a tuple.
+    #[test]
+    fn a_held_collection_whose_domain_reads_the_parameter_varies() {
+        let i = Name::raw("i");
+        let rows = Type::data_fun(
+            Type::UIntRange(1),
+            Type::data_fun(keys_reading(&i), Type::Base(BaseType::Int)),
+        );
+        assert!(reads_in_collection_domain(&i, &rows));
+        let held = Type::Tuple(vec![
+            Type::Base(BaseType::Int),
+            Type::data_fun(keys_reading(&i), Type::Base(BaseType::Int)),
+        ]);
+        assert!(reads_in_collection_domain(&i, &held));
+    }
+
+    /// A group's domain reads the group's key, a binder of the type, so the group-by family
+    /// is Pi-constant in `𝑖`. The type walk stops at a compute function, whose term
+    /// [`builds_domain_reading`] reads instead: the group `λ 𝑔 → (𝑔, 1)` takes and returns
+    /// comes from its argument.
+    #[test]
+    fn a_group_family_and_a_function_do_not_vary() {
+        let i = Name::raw("i");
+        let k = Name::raw("k");
+        let family = Type::pi_kinded(
+            &k,
+            Type::UIntRange(1),
+            Type::data_fun(keys_reading(&k), Type::Base(BaseType::Int)),
+            FunKind::Data(None),
+        );
+        assert!(!reads_in_collection_domain(&i, &family));
+        let group = Type::data_fun(keys_reading(&i), Type::Base(BaseType::Int));
+        let passes_it_on = Type::fun(
+            group.clone(),
+            Type::Tuple(vec![group, Type::Base(BaseType::Int)]),
+        );
+        assert!(!reads_in_collection_domain(&i, &passes_it_on));
     }
 }

@@ -191,9 +191,9 @@ pub fn refuse_param_joined_with_outer_variable(graph: &CompactGraph) -> Result<(
             go(&fun.domain, !polarity)?;
             go(&fun.codomain, polarity)?;
         }
-        if let Some((value, domain, _)) = &ct.history_slot {
-            go(value, polarity)?;
-            go(domain, polarity)?;
+        if let Some(history) = &ct.history_slot {
+            go(&history.value, polarity)?;
+            go(&history.domain, polarity)?;
         }
         Ok(())
     }
@@ -637,15 +637,24 @@ fn coalesce_compact_go(
             }
         }
     }
-    if let Some((value, domain, history_kind)) = &ct.history_slot {
+    if let Some(history) = &ct.history_slot {
         // Both children materialize at the same polarity (invariant — both
         // directions were resolved at constraint time). The `kind` rides through
         // from compaction so a feed rebuilds as a feed, a mutable variable as a mutable variable.
-        shapes.push(Type::history(
-            coalesce_compact_go(domain, polarity, scope)?,
-            coalesce_compact_go(value, polarity, scope)?,
-            *history_kind,
-        ));
+        // The value compacted under the function's binder, so it is already in the closed form
+        // the function stores. The binder stays only where the value reads it, as a
+        // function's does.
+        let value = coalesce_compact_go(&history.value, polarity, scope)?;
+        let function = Type::Fun {
+            name: history
+                .name
+                .clone()
+                .filter(|b| crate::ccl::subst::codomain_depends_on(b, &value)),
+            fun_kind: crate::ccl::ty::FunKind::Data(None),
+            domain: Box::new(coalesce_compact_go(&history.domain, polarity, scope)?),
+            codomain: Box::new(value),
+        };
+        shapes.push(Type::history_over(function, history.kind));
     }
     let mut all = Vec::new();
     all.append(&mut atoms);
@@ -742,19 +751,25 @@ fn coalesce_compact_go(
 /// feed with no other content, is left intact. The `while` form is a defensive
 /// fixpoint; the body never re-arms `history_slot`.
 fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
-    while let Some((value, domain, kind)) = ct.history_slot.take() {
+    while let Some(history) = ct.history_slot.take() {
         // Only a *feed channel* dissolves into a read view; a mutable variable is read as
         // its scalar value, never merged into the surrounding type.
-        if kind != HistoryKind::Append {
-            ct.history_slot = Some((value, domain, kind));
+        if history.kind != HistoryKind::Append {
+            ct.history_slot = Some(history);
             break;
         }
         let has_other =
             !ct.atoms.is_empty() || ct.rec.is_some() || ct.var.is_some() || ct.fun.is_some();
         if !has_other {
-            ct.history_slot = Some((value, domain, kind));
+            ct.history_slot = Some(history);
             break;
         }
+        let super::compact::CompactHistory {
+            name,
+            value,
+            domain,
+            ..
+        } = history;
         // The channel is the `domain ⤇ value` function; reconstruct it as a
         // `fun`-slot CompactType (exactly what the old single-payload slot held)
         // and merge it into the read view.
@@ -766,7 +781,8 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
         // polarity (see `CompactType::refinements`).
         let chan = CompactType {
             fun: Some(super::compact::CompactFun {
-                name: None,
+                // The function's binder: the row at `𝑘` may read `𝑘`.
+                name,
                 binders: Vec::new(),
                 // A feed's read view is a collection: a data function.
                 kind: super::compact::KindPin::Data,

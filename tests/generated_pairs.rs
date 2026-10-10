@@ -52,15 +52,12 @@ use panic_message::panic_message;
 /// `skeleton/filler[binders]`. `grid_agrees` holds every cell outside this list and [`UNDEFINED`]
 /// to agreement and every cell here to disagreement, so a fix that makes one agree removes it.
 const BROKEN: &[(&str, &str)] = &[
-    ("comp_source_in_loop", "binder_cond_coll[i]"),
     ("function_body", "rows_sum"),
     ("generator_yield", "rows_sum"),
     ("groupby_tuple_key", "rec_comp"),
     ("groupby_tuple_key", "rec_filtered"),
     ("groupby_tuple_key", "rec_list"),
     ("loop_source_in_loop", "binder_cond_boxed[i]"),
-    ("loop_source_in_loop", "binder_cond_coll[i]"),
-    ("loop_source_in_loop", "binder_filtered_comp[i]"),
     ("loop_source_in_loop", "cond_boxed"),
     ("loop_source_in_loop", "cond_coll"),
     ("loop_source_in_loop", "dup_union"),
@@ -68,8 +65,6 @@ const BROKEN: &[(&str, &str)] = &[
     ("loop_source_in_loop", "map_lit"),
     ("loop_source_in_loop", "union"),
     ("nested_mut_source", "binder_cond_boxed[i]"),
-    ("nested_mut_source", "binder_cond_coll[i]"),
-    ("nested_mut_source", "binder_filtered_comp[i]"),
     ("nested_mut_source", "cond_boxed"),
     ("nested_mut_source", "cond_coll"),
     ("nested_mut_source", "dup_union"),
@@ -89,8 +84,6 @@ const BROKEN: &[(&str, &str)] = &[
     ("record_in_list", "sum_of_empty"),
     ("record_in_list", "ternary"),
     ("record_in_list", "union_sum"),
-    ("rows_comp_source", "rows_filtered"),
-    ("rows_inner_filter", "rows_filtered"),
     ("rows_loop_feed", "rows_filtered"),
     ("rows_nested_mut", "rows_cond"),
     ("rows_nested_mut", "rows_filtered"),

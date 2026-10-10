@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use crate::ccl::ccl_utils::discharge_transparent_lets;
+use crate::ccl::ccl_utils::normal_refinement;
 use crate::ccl::infer_var::Origin;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, KindPin, TypeKind};
@@ -527,6 +527,17 @@ fn witness_instantiation(
     out
 }
 
+/// The substitution a kind edge is recorded under, at the end whose function is read under
+/// `own` across an edge to `far` read under `far_subst`: what the type bound recorded at that
+/// end renders, `Bound::edge(own, far, far_subst)`, so a sum's candidates read across the edge
+/// are read as the bound's content is ([`FunKindVar::record_under`]).
+fn kind_edge_subst(own: &Subst, far: &Type, far_subst: &Subst) -> Subst {
+    if own.is_id() && far_subst.is_id() {
+        return Subst::id();
+    }
+    Bound::edge(own.clone(), far.clone(), far_subst.clone()).render_subst()
+}
+
 /// Relate two function kinds by **recording the edge**, and nothing else.
 ///
 /// Whether the two are compatible, how many binders each is over, and what those binders
@@ -542,6 +553,8 @@ fn constrain_fun_kind(
     k1: &FunKind,
     lhs: &Type,
     rhs: &Type,
+    sl: &Subst,
+    sr: &Subst,
 ) -> Result<(), ConstrainError> {
     let mismatch = || ConstrainError::KindMismatch {
         lhs: lhs.clone(),
@@ -555,11 +568,14 @@ fn constrain_fun_kind(
         // kind"). Recording one side leaves the other reading nothing, so a pin that
         // reaches either end after the edge is drawn never crosses it.
         (FunKind::Var(v0), FunKind::Var(v1)) => {
-            v0.record(k1.clone(), false);
-            v1.record(k0.clone(), true);
+            v0.record_under(k1.clone(), false, kind_edge_subst(sl, rhs, sr));
+            v1.record_under(k0.clone(), true, kind_edge_subst(sr, lhs, sl));
         }
-        (FunKind::Var(v), other) | (other, FunKind::Var(v)) => {
-            v.record(other.clone(), matches!(k1, FunKind::Var(_)));
+        (FunKind::Var(v), other) if matches!(k0, FunKind::Var(_)) => {
+            v.record_under(other.clone(), false, kind_edge_subst(sl, rhs, sr));
+        }
+        (other, FunKind::Var(v)) => {
+            v.record_under(other.clone(), true, kind_edge_subst(sr, lhs, sl));
         }
         // Both concrete: a capability is not a collection, a plain collection is not a sum —
         // entering one is a term — and two sums of different width are two types. Nothing
@@ -910,7 +926,16 @@ fn candidate_in_kind(
 ) -> Result<(), ConstrainError> {
     match sup {
         TypeKind::SubtypesOf(b) => constrain_go(d, b, sl, sr, cache, scope),
-        TypeKind::Enumerated(sups) if sups.contains(d) => Ok(()),
+        // Each side is read in its own frame, through the edge's substitutions: two
+        // candidates spelling a binder each side names differently are one candidate.
+        TypeKind::Enumerated(sups)
+            if {
+                let d = sl.apply_type(d);
+                sups.iter().any(|s| sr.apply_type(s) == d)
+            } =>
+        {
+            Ok(())
+        }
         TypeKind::Enumerated(_) => Err(ConstrainError::Mismatch {
             lhs: lhs.clone(),
             rhs: rhs.clone(),
@@ -1038,7 +1063,7 @@ fn constrain_go_impl(
             // The kind edge (see [`constrain_fun_kind`]): recorded, not answered. What the two
             // kinds turn out to be, and how their binders correspond, is read once the kind
             // graph is closed.
-            constrain_fun_kind(k0, k1, lhs, rhs)?;
+            constrain_fun_kind(k0, k1, lhs, rhs, sl, sr)?;
             // **Binders correspond by position across this edge.** A sum's binders are its
             // kind's positions, so position `i` of one side is position `i` of the other,
             // and the edge carries that correspondence in its own substitution — the Σ
@@ -1288,6 +1313,17 @@ fn constrain_go_impl(
             Ok(())
         }
 
+        // Dependent tuple: component by component. A component reads the ones before it by
+        // index, the way a codomain reads its function's binder, so the component names are
+        // spellings and take no part (`src/ccl/design/type-inference.md`, "4.8 Dependent
+        // tuples").
+        (Type::DepTuple(a), Type::DepTuple(b)) if a.len() == b.len() => {
+            for ((_, t0), (_, t1)) in a.iter().zip(b) {
+                constrain_go(t0, t1, sl, sr, cache, scope)?;
+            }
+            Ok(())
+        }
+
         // Record: named width-subtyping. rhs's fields must all appear in lhs.
         (Type::Record(a), Type::Record(b)) => {
             for (name, t1) in b {
@@ -1435,22 +1471,21 @@ fn constrain_go_impl(
         // which accepts any left-hand shape, so a mutable variable demanded as a feed
         // lands in `NotAFeed` — the type-level guardrail that `<<` targets a `defer`
         // channel, not a `:=` mutable variable.
+        //
+        // The functions relate in both directions, which is invariance in both the domain and
+        // the value, and the function rule aligns their binders.
         (
             Type::History {
-                value: v0,
-                domain: d0,
+                function: w0,
                 history_kind: k0,
             },
             Type::History {
-                value: v1,
-                domain: d1,
+                function: w1,
                 history_kind: k1,
             },
         ) if k0 == k1 => {
-            constrain_go(v0, v1, &Subst::id(), &Subst::id(), cache, scope)?;
-            constrain_go(v1, v0, &Subst::id(), &Subst::id(), cache, scope)?;
-            constrain_go(d0, d1, &Subst::id(), &Subst::id(), cache, scope)?;
-            constrain_go(d1, d0, &Subst::id(), &Subst::id(), cache, scope)
+            constrain_go(w0, w1, &Subst::id(), &Subst::id(), cache, scope)?;
+            constrain_go(w1, w0, &Subst::id(), &Subst::id(), cache, scope)
         }
         // There is deliberately **no deref arm here.** A mutable variable mention that denotes
         // its value is dereffed by the rule that emits it (`emit::emit_value_read`), so a
@@ -1488,11 +1523,17 @@ fn constrain_go_impl(
                     // this one is reachable from either side or from neither: recording only
                     // here leaves a walk that arrives at the far end unable to get back, and
                     // two kinds at one position then rename onto their own binders with
-                    // nothing composing the two.
+                    // nothing composing the two. Each end reads the other under this edge's
+                    // substitutions, as the bound each would hold does.
                     if let FunKind::Var(other) = &k {
-                        other.record(FunKind::Var(Rc::clone(&lv.fun_kind)), true);
+                        other.record_under(
+                            FunKind::Var(Rc::clone(&lv.fun_kind)),
+                            true,
+                            kind_edge_subst(sr, lhs, sl),
+                        );
                     }
-                    lv.fun_kind.record(k, false);
+                    lv.fun_kind
+                        .record_under(k, false, kind_edge_subst(sl, rhs, sr));
                 }
                 lows
             };
@@ -1556,9 +1597,14 @@ fn constrain_go_impl(
                 if let Some(k) = lhs.fun_kind_of() {
                     // Both ends, as above.
                     if let FunKind::Var(other) = &k {
-                        other.record(FunKind::Var(Rc::clone(&rv.fun_kind)), false);
+                        other.record_under(
+                            FunKind::Var(Rc::clone(&rv.fun_kind)),
+                            false,
+                            kind_edge_subst(sl, rhs, sr),
+                        );
                     }
-                    rv.fun_kind.record(k, true);
+                    rv.fun_kind
+                        .record_under(k, true, kind_edge_subst(sr, lhs, sl));
                 }
                 ups
             };
@@ -1661,21 +1707,11 @@ fn constrain_go_impl(
         // `value` above), a feed reads as the reconstructed channel function.
         (
             Type::History {
-                value,
-                domain,
+                function,
                 history_kind: HistoryKind::Append,
             },
             _,
-        ) => {
-            let chan = Type::Fun {
-                name: None,
-                // A feed's read view is a collection: a data function.
-                fun_kind: FunKind::Data(None),
-                domain: domain.clone(),
-                codomain: value.clone(),
-            };
-            constrain_go(&chan, rhs, sl, sr, cache, scope)
-        }
+        ) => constrain_go(function, rhs, sl, sr, cache, scope),
         // A *channel-shaped* lhs meeting a feed requirement is the read view of
         // that handle: a use position that both held the handle and was read
         // coalesces to the bare channel, and monomorphization's two-way pin then
@@ -1685,20 +1721,10 @@ fn constrain_go_impl(
         (
             Type::Fun { .. },
             Type::History {
-                value,
-                domain,
+                function,
                 history_kind: HistoryKind::Append,
             },
-        ) => {
-            let chan = Type::Fun {
-                name: None,
-                // A feed's read view is a collection: a data function.
-                fun_kind: FunKind::Data(None),
-                domain: domain.clone(),
-                codomain: value.clone(),
-            };
-            constrain_go(lhs, &chan, sl, sr, cache, scope)
-        }
+        ) => constrain_go(lhs, function, sl, sr, cache, scope),
         // Any other plain value can never satisfy a feed requirement: reading is
         // transparent, but the write capability cannot be conjured (`g(5)` where
         // `g` feeds its parameter). A `<<` targeting a `:=` mutable variable lands here
@@ -1726,9 +1752,11 @@ fn constrain_go_impl(
         //     names — the reflexive same-name arm short-circuits above);
         //   - a refined-source contribution: `ChanDom(d)` vs `{D | p}`;
         //   - a source-domained contribution: `ChanDom(d)` vs a
-        //     `DataSource`/`Variant` (union-of-sources) domain.
+        //     `DataSource`/`Variant` (union-of-sources) domain;
+        //   - a feed under nested loops, keyed by the tuple of their positions: a
+        //     projection out of the channel's key, `𝑘 ▷ .𝑖`, against a tuple.
         // A structurally non-domain meet — a channel domain against a scalar,
-        // function, product, or history — is a genuine type error and falls
+        // function, record, or history — is a genuine type error and falls
         // through to the mismatch arm, so an ill-domained feed program gets
         // an inference diagnostic rather than a post-channelize wall panic.
         (
@@ -1737,6 +1765,8 @@ fn constrain_go_impl(
             | Type::DataSource(_)
             | Type::Variant(..)
             | Type::Refinement(..)
+            | Type::Tuple(_)
+            | Type::DepTuple(_)
             | Type::ChanDom(..)
             | Type::Hole,
         )
@@ -1745,6 +1775,8 @@ fn constrain_go_impl(
             | Type::DataSource(_)
             | Type::Variant(..)
             | Type::Refinement(..)
+            | Type::Tuple(_)
+            | Type::DepTuple(_)
             | Type::Hole,
             Type::ChanDom(..),
         ) => Ok(()),
@@ -1792,16 +1824,12 @@ fn constrain_go_impl(
             // *untransported* rhs refinements, since the recursive constraint below
             // carries `sr` for them.
             //
-            // Each transported predicate has its transparent `let` bindings
-            // discharged first ([`discharge_transparent_lets`]). A `let` in a
-            // predicate names a sub-term rather than stating which values the
-            // refinement admits, so one predicate arrives under two spellings —
-            // one carrying A-normalization's bindings, one whose bindings inlining
-            // already collapsed — and structural equality reads them as a deficit
-            // that is not one.
+            // Each transported predicate is taken in its normal form ([`normal_refinement`]),
+            // which is what refinement equality compares, and what the SMT encoder below can
+            // read: it has no `let` or eliminated combinator.
             let lrefs_in_ambient: Vec<Refinement> = lrefs
                 .iter()
-                .map(|l| discharge_transparent_lets(&sl.force_refinement(l)))
+                .map(|l| normal_refinement(&sl.force_refinement(l)))
                 .collect();
             // Transported, unlike `deficit`'s members: `smt_sub` below reads both
             // sides' predicates as terms of one formula, so a name has to mean the
@@ -1810,7 +1838,7 @@ fn constrain_go_impl(
             // discharge edge on `sl` replaces with the bound term.
             let rrefs_in_ambient: Vec<Refinement> = rrefs
                 .iter()
-                .map(|r| discharge_transparent_lets(&sr.force_refinement(r)))
+                .map(|r| normal_refinement(&sr.force_refinement(r)))
                 .collect();
             let deficit: RefinementSet = rrefs
                 .iter()
@@ -1994,15 +2022,26 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         // Invariant payload: polarity is meaningless under invariance, so
         // both children are extruded with two-way proxies (a history is read
         // *and* written) instead of the polar one-way approximation below.
-        Type::History {
-            value,
-            domain,
-            history_kind,
-        } => Type::history(
-            extrude_invariant(domain, target_level, cache),
-            extrude_invariant(value, target_level, cache),
-            *history_kind,
-        ),
+        Type::History { function, history_kind } => {
+            let Type::Fun {
+                name,
+                fun_kind,
+                domain,
+                codomain,
+            } = function.as_ref()
+            else {
+                unreachable!("a history's function is an unrefined function, got {function}")
+            };
+            Type::history_over(
+                Type::Fun {
+                    name: name.clone(),
+                    fun_kind: fun_kind.clone(),
+                    domain: Box::new(extrude_invariant(domain, target_level, cache)),
+                    codomain: Box::new(extrude_invariant(codomain, target_level, cache)),
+                },
+                *history_kind,
+            )
+        }
         Type::Infer(tv) => {
             if let Some(existing) = cache.get(&(tv.uid, pol)) {
                 return Type::Infer(Rc::clone(existing));
@@ -2493,6 +2532,7 @@ mod tests {
                 Type::UIntRange(3),
                 Refinement {
                     predicate: Rc::new(TypedExpr::lit(Lit::Bool(true))),
+                    normal: Default::default(),
                 },
             )
         };
@@ -3001,10 +3041,10 @@ mod tests {
         assert_eq!(type_level(&h), 1);
         let inst = freshen_above(0, &h, FreshenLevel::At(0), &mut FreshenCache::new());
         assert_eq!(type_level(&inst), 0);
-        let Type::History { value, .. } = &inst else {
+        let Some((_, value, _)) = inst.history_parts() else {
             panic!("freshen changed the constructor: {inst}");
         };
-        let (Type::Infer(orig), Type::Infer(minted)) = (&v1, value.as_ref()) else {
+        let (Type::Infer(orig), Type::Infer(minted)) = (&v1, value) else {
             unreachable!("fresh_var yields Type::Infer");
         };
         assert_ne!(
@@ -3022,10 +3062,10 @@ mod tests {
         let v1 = fresh_var(1);
         let h = feed_ty(Type::UIntRange(3), v1.clone());
         let out = extrude(&h, true, 0, &mut ExtrudeCache::new());
-        let Type::History { value, .. } = &out else {
+        let Some((_, value, _)) = out.history_parts() else {
             panic!("extrude changed the constructor: {out}");
         };
-        let Type::Infer(proxy) = value.as_ref() else {
+        let Type::Infer(proxy) = value else {
             panic!("extruded value should be the proxy var, got {value}");
         };
         assert_eq!(proxy.level(), 0);
@@ -3071,10 +3111,10 @@ mod tests {
                 elems[0]
             );
         };
-        let Type::History { value, .. } = &elems[1] else {
+        let Some((_, value, _)) = elems[1].history_parts() else {
             panic!("second element should stay a Feed, got {}", elems[1]);
         };
-        let Type::Infer(feed_proxy) = value.as_ref() else {
+        let Type::Infer(feed_proxy) = value else {
             panic!("feed value should extrude to a proxy var, got {value}");
         };
         // The invariant position must reuse the polar proxy — same original

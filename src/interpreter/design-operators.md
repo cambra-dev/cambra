@@ -895,7 +895,10 @@ by Var-lookup time.
 
 Which iteration a binding is aligned to is `LetBinding::depth`. A reference made in a deeper
 iteration reads a tile keyed by one it is not running over, so it is spread over the keys beneath
-each of the binding's rows first (`lift_into_iteration`).
+each of the binding's rows first (`lift_into_iteration`). A reference converted at a deeper curry
+level than the binding's (`LetBinding::level`), inside a `strength` or `curry_over` its loop body
+runs beneath, is spread the same way, over the keys of the reference's input, one level at a time
+(`lift_into_level`).
 
 ### Fan-out and sharing
 
@@ -1037,6 +1040,24 @@ lambda it denotes, whose binder carries the filter as a refinement. The nested-l
 lifts it onto the pair as it does any other filter
 ([type-inference.md, "Dependent application and
 reconstruction"](../ccl/design/type-inference.md#dependent-application-and-reconstruction)).
+
+### Applying a collection at a key
+
+`apply` over `(key, collection)` rows converts to [`Lookup`], which reads each row's key in that
+row's own collection. A collection is a data function, and `apply`'s type keeps the key inside
+its domain, so the answer is the value at the key, not an option. A read of a dependent loop's
+element has this shape: the element's value is its position read in the collection the loop's
+source builds from the enclosing positions, `⟨𝑥.1, 𝑥.0 ▷ 𝐷⟩ ≫ apply`. Applying a compute
+function stays unsupported, since a compute function has no compiled form as a value.
+
+The rows stand at the level the node is converted at, and each row's collection is a level
+beneath it, one run of keys per row. A row is answered as soon as its key arrives in its run,
+because a value at a key never changes and no row waits for an absence to be decided, which
+[`CheckedLookup`] does. A row whose key has not arrived is left out, and every level states the
+input's completeness less that row's path, the rule `CheckedLookup` applies to a key it has not
+decided. An input that is complete answers every row, and `Lookup` fails loudly where one does
+not. The answer keeps the input's keys at every level above the rows, so a release passes
+through to the input, each row's collection going with its row.
 
 ### Where a collection is materialized
 

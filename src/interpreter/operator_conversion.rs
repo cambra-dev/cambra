@@ -37,7 +37,7 @@ use crate::{
         operator_graph::{record_kept_operators, record_sink},
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
-            Filter, FlattenTupleDomain, IterateExtent, MakeRecord, MapAggregate, MapDomain,
+            Filter, FlattenTupleDomain, IterateExtent, Lookup, MakeRecord, MapAggregate, MapDomain,
             MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
             MapResultWithSource, Memo, PermuteRecordDomain, Product, Restrict, SelectField,
             TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap,
@@ -650,6 +650,10 @@ pub(crate) struct LetBinding {
     /// than this reads a tile keyed by an iteration it is not running over, so it is
     /// lifted rather than read through ([`BindingKind`]).
     pub(crate) depth: usize,
+    /// The curry level the binding's values stand at, where it is [`BindingKind::Aligned`].
+    /// A reference converted further in reads a tile with fewer levels than its input, so
+    /// it is lifted over the keys beneath each row ([`lift_into_level`]).
+    pub(crate) level: Option<CurryLevel>,
 }
 
 /// RAII scope guard for [`TileCompileContext`].
@@ -955,9 +959,16 @@ records one and the only site a `Transact` reaches"
             self.keep_region(bound_expr, entry.fan());
             let fan = entry.fan().clone();
             self.record(node, entry);
-            let depth = self.iterations.len();
-            self.scopes
-                .bind(name.clone(), LetBinding { fan, kind, depth });
+            let (depth, level) = (self.iterations.len(), self.level);
+            self.scopes.bind(
+                name.clone(),
+                LetBinding {
+                    fan,
+                    kind,
+                    depth,
+                    level,
+                },
+            );
             return Ok(());
         }
 
@@ -979,9 +990,16 @@ records one and the only site a `Transact` reaches"
         // will not be kept: the offer is keyed by the node, and declining is the
         // reader's decision, made where the operator would be taken.
         self.record(node, Recorded::Operator(fan.clone()));
-        let depth = self.iterations.len();
-        self.scopes
-            .bind(name.clone(), LetBinding { fan, kind, depth });
+        let (depth, level) = (self.iterations.len(), self.level);
+        self.scopes.bind(
+            name.clone(),
+            LetBinding {
+                fan,
+                kind,
+                depth,
+                level,
+            },
+        );
         Ok(())
     }
 
@@ -2563,13 +2581,23 @@ fn convert_impl_inner(
 
         TypedExprNode::Var(name) => {
             if let Some(binding) = ctx.lookup(name) {
-                let (kind, depth) = (binding.kind, binding.depth);
+                let (kind, depth, bound_at) = (binding.kind, binding.depth, binding.level);
                 let op = binding.fan.branch();
                 // Aligned bindings already vary in lockstep with the
                 // surrounding iteration — return the FanOut branch directly.
                 // Free bindings are standalone functions; under an
                 // iteration we apply them pointwise via `MapResult`.
                 match (kind, input) {
+                    // Read from further in than it was bound, inside a `strength` or
+                    // `curry_over` the binding's body runs beneath: the input is the binding's
+                    // own input carried down those levels, so only its keys are taken.
+                    (BindingKind::Aligned, Some(input))
+                        if depth == ctx.iterations.len()
+                            && bound_at.is_some_and(|b| b < ctx.level()) =>
+                    {
+                        let bound_at = bound_at.expect("checked by the guard");
+                        lift_into_level(op, input, bound_at, ctx.level())
+                    }
                     // An aligned use reads its binding directly, so the branch
                     // the enclosing `Let` fanned for this position is surplus.
                     // Dropping it here is all it takes: the graph is walked from
@@ -2804,6 +2832,13 @@ fn convert_impl_inner(
                     "final_or_default composed over {} — only its applied form is a reduction",
                     input.tiling()
                 ))),
+                // `apply` over `(key, collection)` rows reads each key in its row's collection.
+                // A collection is a data function, so applying one at a key its type keeps in
+                // the domain is the total lookup. A compute function has no compiled form as a
+                // value, so applying one stays unsupported.
+                Builtin::Apply if applies_a_collection(&expr.ty) => Ok(Box::new(
+                    Lookup::new_at(input, ctx.level()).map_err(ConversionError::Unsupported)?,
+                )),
                 _ => Err(ConversionError::Unsupported(format!(
                     "unsupported Builtin({}) in λ-free CCL",
                     b.name()
@@ -2994,6 +3029,21 @@ fn expect_input(
     name: &str,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     input.ok_or_else(|| ConversionError::Unsupported(format!("{name} requires an input operator")))
+}
+
+/// Whether `apply_ty`, the type of an `apply` node, applies a data function: its domain is
+/// the `(key, function)` pair, and the function is a collection.
+fn applies_a_collection(apply_ty: &Type) -> bool {
+    let Some(Type::Tuple(pair)) = apply_ty.domain().map(|d| d.peel_refinements().clone()) else {
+        return false;
+    };
+    matches!(
+        pair.get(1).map(Type::peel_refinements),
+        Some(Type::Fun {
+            fun_kind: crate::ccl::FunKind::Data(..),
+            ..
+        })
+    )
 }
 
 fn expect_no_input(
@@ -5242,6 +5292,23 @@ fn lift_into_iteration(
         &tuple_field(0),
         CurryLevel::new(open.paired.index() + 1),
     )
+}
+
+/// Lift `op`, holding one value per row at `bound_at`, to the rows of `input` at `level`,
+/// a level further in: each value is paired with the keys beneath its row in `input`, one
+/// level at a time, and read back off the pair — the construction [`lift_into_iteration`]
+/// makes for an iteration a nested `Transact` opens.
+fn lift_into_level(
+    op: Box<dyn TileOperator>,
+    input: Box<dyn TileOperator>,
+    bound_at: CurryLevel,
+    level: CurryLevel,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let keys = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+    (bound_at.index()..level.index()).try_fold(op, |op, row| {
+        let paired = Box::new(Product::per_row_at(op, keys.branch(), CurryLevel::new(row)));
+        proj_named_field(paired, &tuple_field(0), CurryLevel::new(row + 1))
+    })
 }
 
 /// Build an operator that extracts a named field from the record codomain of `input`.

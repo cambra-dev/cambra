@@ -121,7 +121,7 @@ struct ConverseProducer {
 ///
 /// A guard naming anything beneath those levels names input rows only through what the
 /// operator rebuilt there, and fails loudly as `operator` cannot release it yet.
-fn release_kept_keys(guard: TileGuard, kept: usize, operator: &str) -> TileGuard {
+pub(super) fn release_kept_keys(guard: TileGuard, kept: usize, operator: &str) -> TileGuard {
     match guard {
         g @ TileGuard::Function(FunctionGuard::Domain(_)) => g,
         TileGuard::Function(FunctionGuard::Codomain(inner)) if kept > 1 => TileGuard::Function(

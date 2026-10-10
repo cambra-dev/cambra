@@ -3119,11 +3119,7 @@ else:
 /// no separate scalar payload to peel — scalar `<<=` is rejected by typing).
 fn feed_value(ty: &Type) -> &Type {
     match ty {
-        Type::History {
-            value,
-            history_kind: HistoryKind::Append,
-            ..
-        } => value,
+        Type::History { .. } => ty.as_feed().expect("a feed handle").1,
         _ => panic!("expected a feed handle, got {ty}"),
     }
 }

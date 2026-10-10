@@ -102,7 +102,7 @@ pub fn type_level(ty: &Type) -> Level {
         // increment's per-call-site domain generalization depends on the
         // `domain`'s level surfacing here, so a fresh domain var pins the
         // level of the enclosing `Mut`.
-        Type::History { value, domain, .. } => type_level(value).max(type_level(domain)),
+        Type::History { function, .. } => type_level(function),
         // A channel domain stores its introduction level, but deliberately
         // reports 0 here: `type_level` drives extrusion and bound-recording
         // level scoping, and a rigid atom must flow through bounds to

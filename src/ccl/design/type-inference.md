@@ -530,6 +530,9 @@ what should be one domain.
 A mutable map seeded with one entry exercises this case. Its key has a singleton type, and the
 `box` scheme shares a variable between its domain and its sole sum candidate. Following the
 resulting chain must retain the same key-domain information as entering the position directly.
+A sum's candidate is a data domain, so compaction enters it as an invariant position, as it
+does a data function's domain. Entered as a variant position, the shared variable reads one way
+as `box`'s argument domain and another as its candidate.
 The regression cases include `a_one_entry_seed_reads_as_a_map` and the related keyed-write tests.
 
 The exception does not enable negative merging along every bound chain. An unrestricted read
@@ -983,8 +986,8 @@ must precede the parent's materialization in this implementation.
 #### Refinement representation during specialization
 
 A `Refinement` contains an immutable `Rc<TypedExpr>` predicate. Its equality is type-blind
-structural term equality (`eq_term_modulo_ty_slots`); the predicate's embedded type slots are
-inference metadata, not part of that comparison.
+equality of normal forms ([Predicates are compared by normal form](#predicates-are-compared-by-normal-form));
+the predicate's embedded type slots are inference metadata, not part of that comparison.
 
 The predicate is bare: the reserved `REFINEMENT_BINDER` name, `__elem`, denotes the value of
 the refined base type. A refinement binds that name, and a nested refinement shadows it.
@@ -1008,6 +1011,36 @@ When allocation identity is needed, `PredicateId` uses the predicate's address. 
 equality and allocation identity serve different purposes: equal terms are not necessarily one
 allocation, and a rewritten term is not identified merely by its predecessor's structural type.
 
+#### Predicates are compared by normal form
+
+Two refinements are equal when their predicates' normal forms are equal as terms
+(`eq_term_modulo_ty_slots`, which pairs interior binders), and a refinement hashes by its normal
+form. `ccl_utils::normal_form` computes it, and `Refinement` caches it beside the predicate it was
+computed for.
+
+A type quotes terms, and passes respell the terms it quotes. A-normalization names operands,
+inlining moves a definition into place, and lambda elimination rewrites a definition point-free
+while a type's copy keeps its lambdas. The normal form is the spelling every such copy reaches:
+
+- a transparent `let` is discharged, and an applied lambda is β-reduced;
+- an applied `cast` reads its value, since a cast re-views a collection's domain and leaves what
+  it holds at a key unchanged;
+- an applied eliminated combinator reads back to the term it stands for: `id`, `const`, a `zip`
+  pairing, `apply`, an operator, a chain, `curry` and `uncurry`;
+- an applied staged form reads as what it stages. Planning writes `curry(𝑔)` over a dependent
+  domain as `(𝐹, 𝑔) ▷ curry_over`, which reads as `curry(𝑔)`, and a filter as `𝑚 ▷ filter_values`,
+  the identity restricted to what `𝑚` keeps, which reads as `id`. A correlated site's keys and
+  pairing read the same way: `𝑝 ▷ iterate` and `𝑐 ▷ map_domain` map each key to itself,
+  `𝑥 ▷ ((𝑣, 𝑐) ▷ strength)` is `(𝑣, 𝑥 ▷ 𝑐)`, and `𝑥 ▷ (𝑐 ▷ map(𝑔))` is `(𝑥 ▷ 𝑐) ▷ 𝑔`. An
+  application reaches only keys in its function's domain, so no restriction changes the value
+  read, and a type that reads a definition planning restaged still compares equal to the copy
+  that reads it unplanned;
+- a projection out of a tuple or record former reads the component.
+
+Normalizing is term-level: it leaves type slots as they are and mints no node identity, so an
+equality can run it. A consumer that reads a predicate as a term rather than comparing it, the SMT
+encoder, takes the normal form as well (`ccl_utils::normal_refinement`).
+
 #### Cast targets and inferred views
 
 A `Cast` has two distinct type-bearing roles. Its target contains the refinements supplied by
@@ -1027,7 +1060,9 @@ bases before coalescing its target predicates.
 Predicate-rebuilding passes preserve sharing among occurrences of the same original allocation
 when they run under the same rewrite conditions. Lowering establishes shared filter predicates
 with `Refinement::sharing`. A pass-scoped memo maps an original allocation and its context to one
-rebuilt allocation; a vacuous rewrite retains the original.
+rebuilt allocation; a vacuous rewrite retains the original. A substitution applied by building a
+new term (`Subst::apply_type`, `apply_expr`) is such a pass for the length of one application, its
+context the active substitution. A walk that only reads predicates visits each allocation once.
 
 This is not a global interning rule for every structurally equal predicate. Different contexts can
 require different results, and [generic instantiation](#one-known-exception-scoped-and-unfixed-generic-instantiation)
@@ -1969,7 +2004,8 @@ lexical scope at the write.
 | A transparent `let` | Discharge `[𝑥 ↦ definition]`, as `close_let_type` does |
 | A `:=` binder | None: the name stays, as in `close_let_type` |
 | An opaque binder outside every lambda of the crossing | None: it is one value |
-| A lambda's, loop's or pattern's binder, or an opaque binder under one | `Mapping::Join` |
+| A loop's binder, where the feed is keyed by the loop's position | `Mapping::Join` with the binder's term at the key |
+| Any other lambda's, loop's or pattern's binder, or an opaque binder under one | `Mapping::Join` |
 
 A history's type is the join of every value written to it (`docs/chl-spec.md`, "Joining the types
 of several values"). The contribution is joined over the values of each binder in the last row.
@@ -1987,7 +2023,7 @@ binder is decided by its position:
   `NoJoinOverBinder`.
 
 A discharge whose definition names a joined binder composes into a join (`Subst::then`), so `k = r`
-inside a loop over `r` is joined over as `r` is. The decision is syntactic: a domain naming a joined
+inside a loop over `r` is joined over as `r` is, with `r`'s term at the key where `r` has one. The decision is syntactic: a domain naming a joined
 binder has no join even where its keys are the same for every value. Check mode trusts the types
 recorded at a feed or a write, so only emission records the edge.
 
@@ -1995,17 +2031,81 @@ A `def`'s parameter is joined over however many calls reach the `def`. Inference
 before any call site supplies an argument, so `def f(y): out << [v for v in xs if v > y]` is refused
 with `NoJoinOverBinder` when `f` is called once as well.
 
-**[Planned]** A binder that the target's key or a term in scope determines is discharged rather
-than joined over. A loop variable crossed by a feed is the loop's source read at the channel key's
-position, and a pattern binder is the scrutinee's payload. Until then both are joined over, and a
-collection whose keys read one is refused with `NoJoinOverBinder`.
-
 A `def` whose body writes to a handle declared outside it is generalized like any other `def`, so a
 variable its contribution carries must not be quantified. A `let` of a `Defer` binds
 monomorphically, and `emit_let` mints the channel's element variable at the binding's level rather
 than the right-hand side's. The edge from `def f(y): out << y` into `out` then lowers `y`'s variable
 to that level, `f` is monomorphic in `y`, and the channel receives what each call passes rather
 than the generic variable.
+
+#### A history's value may depend on its position
+
+A history's type holds a data function, `Type::History { function, .. }` with `function` the
+`(𝑘 : 𝐷) ⤇ 𝑉` its reads see. The binder names the position, and `𝑉` may read it: a feed of
+`[v for v in xs if v > r]` inside a loop over `r` holds, at each position, the row filtered by that
+position's `r`. Coalescing keeps the binder only where the value reads it, as it does a function's.
+
+`InferCtx::require_feed` keys a feed's contribution when the target is fed from one place
+(one `<<` naming it, no `<<=`, and no call it is passed to), outside a transaction, and every binder
+the feed crosses is a `let` or a loop variable, none of the loops writing a mutable variable
+declared outside it. The key is the position of the loop around the feed, or the tuple of positions
+of the loops around it, outermost first. A loop variable `𝑥` over the source `𝑠` exits as
+`Mapping::Join` with the term `𝑘.𝑖 ▷ 𝑠` at the key, `𝑘` itself for a single loop. A dependent
+source's binder, which the chain scopes over the loop's body as the position, exits with `𝑘.𝑖`.
+The term reads the source's values: a filter's `cast` states which positions exist, which the key's
+type carries, so the term reads through it.
+
+A refinement naming a keyed binder is decided by position, as for any joined binder, except that a
+collection's domain reads the term instead of having no join. The value at `𝑘` is then a collection
+whose keys depend on `𝑘`, which is what lets a loop feed rows filtered by its variable.
+
+Channelize builds the same key (`flatten_nested_contribution`). Where an inner loop's keys depend on
+an outer loop's value, through its source or its filter, the key is the dependent tuple of the
+positions ([4.8](#48-dependent-tuples)), and each projection out of it binds the key, as the
+key terms inference builds do.
+
+A chain `𝑠 ≫ 𝑓` with `𝑓 : (𝑥 : 𝑋) ⇒ 𝐶` is the loop that binds `𝑥`, and its type reads `𝑥` at each
+position, `(𝑘 : 𝐷) ⇒ 𝐶[𝑥 ↦ 𝑘 ▷ 𝑠]`, by the rule in
+[A chain names each position](#a-chain-names-each-position).
+
+A contribution that is not keyed is joined over as before: a `def` parameter, a target fed from
+several places, a loop that writes a mutable variable, and a pattern binder. **[Planned]** Several
+places feeding one target are keyed by the place, whose payload is that place's positions, and a
+pattern binder exits as the scrutinee's payload. Both need a term that reads a variant's payload.
+
+#### A chain names each position
+
+A chain `𝑒₀ ≫ 𝑒₁ ≫ … ≫ 𝑒ₙ` names each position it passes through by the binder of the morphism
+there: `𝑒ᵢ`'s binder `𝑥ᵢ` is its input, and `𝑥₀` is the chain's. A type after `𝑒ᵢ` reads that
+position as `𝑥ᵢ`. No name binds two positions. A chain's own binder, where its type names one, is
+its head's input under a second name. `compose_chain` types each morphism under the binders before
+it and opens each codomain at its own binder for the adjacency with the next.
+
+A type that names a position does not depend on how the position is computed. Planning rewrites a
+morphism's implementation by equivalences normal form does not identify, a group-by into
+`converse` and `map` or a join into its plan, and the types naming the position stay valid. A pass
+that removes or merges the morphism binding a position restates the types that read it:
+
+- Flattening gives a nested chain's head the nested chain's binder, the name its position was read
+  by in the outer chain, or the outer chain's binder at the outer head.
+- Simplify's pairwise rewrite reads a binder its replacement no longer binds as the replacement's
+  input carried through the morphism it replaced (`restate_entered_binders`).
+- A per-group filter takes the binder of the site it is inserted before, whose input it now takes.
+
+A chain's own type is a function of its input alone. Each position its codomain reads is written
+as the input carried there: `(𝑥₀ : 𝐷) ⇒ 𝐶[𝑥ᵢ ↦ 𝑥₀ ▷ 𝑒₀ ≫ … ≫ 𝑒ᵢ₋₁]`, where leading morphisms that map
+each position to itself (`id`, an iteration source, `filter_values`) drop out of the read.
+Emission discharges a codomain not resolved yet by suspension
+([A substitution reaching a variable suspends on it](#a-substitution-reaching-a-variable-suspends-on-it)).
+After inference every pass that builds or rebuilds a chain types it by the same rule
+(`ccl_utils::chain_type_of`). The chain binds its input only where its codomain reads it, or a
+morphism after its head reads it under a name the head does not bind.
+
+Lambda elimination keeps the names apart. Eliminating `λ 𝑝 → body` gives a morphism over `𝑝`, so a
+chain it returns names `𝑝` at its head (`bind_chain_input`). Every other morphism it builds takes a
+binder of its own, which only its own codomain reads. An operation's dependent result is stated
+over the operation's own input, `(𝑞 : (Int, Int)) ⇒ {Int | __elem == 𝑞.0 ^+ 𝑞.1}`, rather than over
+the eliminated parameter its operands were written with (`operation_type`).
 
 #### Discharge is application
 
@@ -2017,6 +2117,39 @@ Pi indices do not eliminate every name-based transport operation. Live bounds st
 telescope entries, and the closure bridge still uses `Subst::aligned` and the restricted
 `licensed_correspondence_view` where appropriate. The cases and failure mode are specified under
 [Native bound edges and closure](#native-bound-edges-and-closure).
+
+#### A substitution reaching a variable suspends on it
+
+A substitution `σ` applied to an inference variable `𝛼` denotes `𝛼[σ]`: whatever `𝛼` resolves to,
+with `σ` applied. `Subst::apply_type` cannot compute that while `𝛼` is unresolved, so it returns a
+variable standing for it. The variable `𝛽` carries `𝛼` under `σ` as both its lower and its upper
+bound (`Bound::suspended_on`), so compaction applies `σ` to `𝛼`'s content as it walks to it, the
+way it applies an edge's substitution. `𝛽`'s telescope is `𝛼`'s with `σ`'s domain removed and the
+names `σ`'s range reads added, and it shares `𝛼`'s kind.
+
+A substitution whose binder half names no binder in `𝛼`'s telescope, and which has no witness half,
+leaves `𝛼` unchanged. `𝛼` resolves to types naming its telescope's binders and nothing else
+([The invariant](#the-invariant)), so the binder half acts on none of them. A telescope does not
+list witnesses, so a witness half always suspends. The bound keeps `σ` whole: other bounds have
+their witness half applied when they are stored (`Bound::with_subst`), and here that application is
+`𝛼[σ]` again.
+
+A substitution crossing into a refinement's predicate passes under the refinement's element binder,
+`__elem`. An entry whose term reads `__elem` names the enclosing element, which has no spelling
+there, so `Subst::under_element` makes it `Mapping::Unspellable`. Acting on an occurrence of its
+binder fails. A variable whose telescope holds the binder suspends on the entry like any other, so
+the failure happens when the variable resolves to content reading the binder, and content that does
+not read it is unchanged. Whether a variable reads a binder its telescope holds is unknown until it
+resolves, so this is the earliest point the outcome is decided.
+
+Compaction already applies a substitution to a variable met in a type's structure, by walking the
+variable's bounds under it. A variable met in a type slot of a term the type quotes is different.
+The slot is part of a refinement's predicate, which compaction forces whole
+(`Subst::force_refinement`), and coalescing resolves the slot later, on its own
+(`coalesce_type_predicates`). Without the suspension, `σ` misses what the slot resolves to. A
+dependent type quotes terms whose slots are such variables: a loop's source read at a position, a
+`let`'s definition, a key's projection. Discharging a loop variable into one leaves its slots
+naming the variable once they resolve.
 
 #### Where the conversions run
 
@@ -2410,6 +2543,13 @@ an edge. `var_binder_kind` first follows the collection's source positions where
 otherwise it joins lower contributions, falling back to a meet of upper contributions.
 The choice of lower versus upper list determines the operation at either occurrence
 polarity. An upper demand reaches concrete values through ordinary bound closure.
+
+A kind edge carries the substitution of the type edge it was recorded at, rendered as the
+bound recorded beside it renders (`FunKindVar::record_under`). A candidate read across the
+edge is read under it, composed before the walk's own, as that bound's content is. A
+contribution leaving a scope relates its kind to the channel's under its exits, so a boxed row
+whose candidate names a loop variable is read with that variable joined over, as its domain
+would be.
 
 The post-inference check uses the same rule. Settled kinds can be compared without recording
 new bounds, and omitting the kind premise would accept incompatible collection annotations
@@ -2959,12 +3099,13 @@ refinement: a group-by under a loop whose key reads the loop's binder has keys
 `{𝐾 | 𝑘 ∈ 𝑀(𝑎)}`. A pair whose second component reads nothing of the first is the `Tuple` it
 always was.
 
-Inference introduces no dependent tuple, and a program cannot write one. Two further births are
-[Planned]: `channelize` keying a feed by the positions of every loop around it
-(`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"), and a source value whose
-domain depends on an outer element, such as `[x for xs in xss for x in xs]`, typed during
-inference as a sum `Σ (σ : SubtypesOf((UInt, UInt))). σ ⤇ 𝑉` whose witness at the term that
-builds it is a dependent tuple.
+Inference introduces no dependent tuple, and a program cannot write one. `channelize` keys a feed
+under nested loops by one when an inner loop's keys depend on an outer loop's value
+([A history's value may depend on its position](#a-historys-value-may-depend-on-its-position)).
+One further birth is [Planned]: a source value whose domain depends on an outer element, such as
+`[x for xs in xss for x in xs]`, typed during inference as a sum
+`Σ (σ : SubtypesOf((UInt, UInt))). σ ⤇ 𝑉` whose witness at the term that builds it is a dependent
+tuple.
 
 ### Representation
 
@@ -3009,13 +3150,14 @@ pair's own binder as the projection's, as every morphism eliminated from `λ �
 projection applied to `𝑝` discharges `𝑝` at itself, which `subst::discharge_codomain` answers by
 opening the codomain at the name.
 
-### Flattening [Planned]
+### Flattening
 
 `flatten_domain` reshapes keys, `((𝑖, 𝑗), 𝑘)` into `(𝑖, 𝑗, 𝑘)`, and channelize uses it to give a
 feed under three loops its flat key (`docs/chl-spec.md`, "8.4 Feeds are the second form of
 mutability"). Its type rule takes `(𝑝 : (𝑎 : 𝐴) × 𝐵(𝑎)) × 𝐶(𝑝.0, 𝑝.1)` to
 `(𝑎 : 𝐴) × (𝑏 : 𝐵(𝑎)) × 𝐶(𝑎, 𝑏)`, rewriting `𝐶`'s reads of `𝑝.0` and `𝑝.1` into references to
-the new components. The reshaping is an operation in the types as at run time.
+the new components (`channelize::spliced`). The reshaping is an operation in the types as at run
+time.
 
 ### Subtyping
 
@@ -3028,17 +3170,32 @@ nowhere else. As a collection's domain it is invariant, like every domain.
 ### A refinement on a collection's domain is data
 
 A refinement on a value records a fact about a value already fixed. A refinement on a
-collection's domain decides which entries exist. A body that is a collection whose own domain
-reads a lambda's parameter varies with the parameter, so the body is not constant in it, and the
-lambda belongs to the nested-lambda rule rather than to the Pi-constant form of
+collection's domain decides which entries exist. A body that holds a collection whose domain reads
+a lambda's parameter varies with the parameter, so the body is not constant in it, and the lambda
+belongs to the nested-lambda rule rather than to the Pi-constant form of
 [4.5](#dependent-application-and-reconstruction). `λ 𝑖 → λ 𝑘 : {Int | 𝑘 ∈ keys(𝑖)} → …`, a
 group-by whose key reads `𝑖`, has such a parameter, as does a comprehension filtered by the
 enclosing binder, `λ 𝑟 → λ 𝑣 : {Int | 𝑣 > 𝑟} → …`.
 
-Only the body's own domain counts. A collection the body holds, such as a group whose domain reads
-its key, is the family a Pi-constant type encodes, which the group-by recognizer plans. A
-collection the body takes as an argument does not vary the body: `sum` over a collection whose
-domain reads the parameter is the same `sum` for every value of it.
+The collection may sit below the body's own domain. Under `λ 𝑖`, the rows of
+`(𝑗 : 𝐽) ⤇ ({𝐾 | 𝑝(𝑖, 𝑗)} ⤇ 𝑉)` have domains that read `𝑖`, so the rows' entries differ for each
+`𝑖` while the outer domain `𝐽` does not read it. The collections a body holds are its rows, the
+components of a tuple, record or variant, and a history's function.
+
+A compute function's type cannot say whether a collection in its result is one it builds or one
+it takes and returns: the group `λ 𝑔 : 𝐺(𝑘) → (𝑔, 1)` returns its argument, and a loop's writer
+builds the row it feeds. Its term can. A filter defines a collection's domain, as a cast's target
+or, once an enclosing elimination has rewritten the cast, as a refinement on a comprehension's
+binder, so a body that holds one reading the parameter varies with it, inside a compute function
+as anywhere else. A comprehension's binder ranges over the keys of the source it applies it to,
+so the refinements that source's domain carries are restated there rather than built, and only
+the ones beyond them count. A compute lambda's binder type is what it takes, and does not count.
+
+A domain that reads a binder of the body's own type does not vary the body. A group's domain reads
+the group's key, `(𝑘 : 𝐾) ⤇ ({𝐼 | key(𝑒) == 𝑘} ⤇ 𝑉)`, and that family is the Pi-constant
+type the group-by recognizer plans. A collection the body takes as an argument does not vary the
+body either: `sum` over a collection whose domain reads the parameter is the same `sum` for every
+value of it.
 
 ### A group-by whose key reads an enclosing binder
 
@@ -3075,8 +3232,8 @@ A subterm whose type restates the pair's own dependent tuple, the key
 first; the pair's first component has the tuple's type, which states them. Where a nested
 refinement still reads `𝑎`, a filter in the key function reading the loop binder, the rule binds `𝑎`
 instead of substituting it: the lifted filter is `__elem.0 ▷ (λ 𝑎 → 𝑝)`, and the nested refinement
-reads a binder of the filter's own term. A substitution that would capture still fails
-(`Subst::assert_no_element_capture`).
+reads a binder of the filter's own term. A substitution that would capture still fails, where
+it reaches an occurrence (`Mapping::Unspellable`).
 
 ### Iterating a dependent tuple
 

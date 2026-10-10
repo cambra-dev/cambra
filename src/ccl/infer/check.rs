@@ -215,6 +215,10 @@ impl Typing for CheckCtx {
         0
     }
 
+    fn recoveries(&self) -> usize {
+        0
+    }
+
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
         // Recurse to collect the child's own errors, then hand back its
         // *recorded* type (not the rule-derived, throwaway-laden one) so the
@@ -529,8 +533,11 @@ impl Typing for CheckCtx {
             // template is not a tree node — it is cloned again at every read, and
             // that read is where the sibling is minted. (Not because predicates
             // are out of the id domain; they are in it.)
-            crate::ccl::subst::Subst::discharge(name, bound_expr.clone_preserving_ids())
-                .apply_type(&body_ty)
+            crate::ccl::subst::Subst::discharge(
+                name,
+                crate::ccl::ccl_utils::predicate_term(bound_expr),
+            )
+            .apply_type(&body_ty)
         } else {
             body_ty
         }
@@ -880,7 +887,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::VariantCtor { tag, payload } => emit_variant_ctor(tag, payload, ctx)?,
 
-        TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, ctx)?,
+        TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, node_id, ctx)?,
 
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 
@@ -892,7 +899,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             writers,
             domain,
             parameter,
-        } => emit_transact(keys, writers, domain, parameter.as_ref(), ctx)?,
+        } => emit_transact(keys, writers, domain, parameter.as_ref(), node_id, ctx)?,
 
         TypedExprNode::LetRec { bindings, body } => emit_letrec(bindings, body, ctx)?,
 
@@ -1118,6 +1125,13 @@ pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
 
 /// [`check`], keeping the node each error was raised at.
 pub(crate) fn check_located(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
+    // The walk opens a type's binders to reach the predicates beneath them, once per node
+    // that carries the type, so one memo keeps each opened predicate one allocation and
+    // `checked_predicates` checks it once.
+    crate::ccl::subst::with_conversion_memo(|| check_located_memoized(expr))
+}
+
+fn check_located_memoized(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     let mut cloned = expr.clone_preserving_ids();
     let mut ctx = CheckCtx::new(cloned.node_id());
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps

@@ -1314,11 +1314,7 @@ fn lower_loop_body_chain_scoped(
                     // `D = Hole`: the domain is whatever writes it — an inner `for`, or
                     // the rest of this body — which the unified phase resolves exactly as
                     // it does for one declared before a top-level loop.
-                    let mut_ty = Type::History {
-                        value: Box::new(value_ty),
-                        domain: Box::new(Type::Hole),
-                        history_kind: crate::ccl::HistoryKind::Overwrite,
-                    };
+                    let mut_ty = Type::mutable(Type::Hole, value_ty);
                     let init = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                     ctx.tag_image(Expr::mut_decl(name, mut_ty, init, chain), stmt.span)
                 } else {

@@ -487,12 +487,12 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             ..Default::default()
         },
         // A history's children are invariant, so they recurse at the reference's
-        // own polarity — no flip, matching `compact_go`.
-        Type::History {
-            value,
-            domain,
-            history_kind,
-        } => {
+        // own polarity — no flip, matching `compact_go`. The function is taken apart rather
+        // than keyed as the function it is, whose domain would flip; its binder is an
+        // α-name, which a key leaves out as it does a function's.
+        history @ Type::History { .. } => {
+            let (domain, value, history_kind) = history.history_parts().expect("matched a history");
+            let history_kind = &history_kind;
             let value = key_go(value, pol, subst_acc, ctx);
             let domain = key_go(domain, pol, subst_acc, ctx);
             KeyView {

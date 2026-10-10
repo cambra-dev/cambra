@@ -678,8 +678,9 @@ struct FunKindBounds {
     /// plain collection. So it is a stamp rather than a bound: a fact about how the variable
     /// was made, folded in beside what the edges recorded.
     stamped: KindPin,
-    /// Kinds recorded **below** this variable — what has flowed into it.
-    lower: Vec<FunKind>,
+    /// Kinds recorded **below** this variable — what has flowed into it — each with the
+    /// substitution its edge was recorded under ([`FunKindVar::record_under`]).
+    lower: Vec<(FunKind, crate::ccl::subst::Subst)>,
     /// The kinds this one is a collection **built over**, in generator order.
     ///
     /// A different relation from the bounds, because it states something different. A
@@ -690,8 +691,9 @@ struct FunKindBounds {
     /// a bound would claim a subtyping that does not hold and pair positions that are not
     /// the same position.
     built_over: Vec<FunKind>,
-    /// Kinds recorded **above** it — what it must satisfy.
-    upper: Vec<FunKind>,
+    /// Kinds recorded **above** it — what it must satisfy — each with the substitution its
+    /// edge was recorded under.
+    upper: Vec<(FunKind, crate::ccl::subst::Subst)>,
     /// The kind this one is a **copy of**, where it was made by instantiating a scheme.
     ///
     /// Not a bound, and not a pair of them. Mutual bounds would say the two kinds are equal,
@@ -770,9 +772,18 @@ impl FunKindVar {
         v
     }
 
-    /// Record `k` below (or above) this variable. Deduplicated by the point it denotes, so
-    /// one edge drawn twice records once.
+    /// Record `k` below (or above) this variable, with no substitution between the two.
     pub fn record(&self, k: FunKind, lower: bool) {
+        self.record_under(k, lower, crate::ccl::subst::Subst::id());
+    }
+
+    /// Record `k` below (or above) this variable across an edge whose far side is read under
+    /// `subst`: the substitution that takes `k`'s function, as the edge relates it, into this
+    /// variable's frame — what the type bound recorded at the same edge renders
+    /// (`Bound::render_subst`). A sum's candidates read across the edge are read under it, as
+    /// the bound's content is ([`Self::lower_edges`]). Deduplicated by the point it denotes
+    /// and the substitution, so one edge drawn twice records once.
+    pub fn record_under(&self, k: FunKind, lower: bool, subst: crate::ccl::subst::Subst) {
         // A variable against itself says nothing, and recording it makes every reader walk
         // a cycle to find that out.
         if matches!(&k, FunKind::Var(v) if v.uid == self.uid) {
@@ -780,8 +791,11 @@ impl FunKindVar {
         }
         let mut b = self.bounds.borrow_mut();
         let side = if lower { &mut b.lower } else { &mut b.upper };
-        if !side.iter().any(|x| same_fun_kind(x, &k)) {
-            side.push(k);
+        if !side
+            .iter()
+            .any(|(x, s)| same_fun_kind(x, &k) && *s == subst)
+        {
+            side.push((k, subst));
             kind_fact_written();
         }
     }
@@ -830,16 +844,16 @@ impl FunKindVar {
                 Some(n) => KindPin::Sum(n),
                 None => KindPin::Unpinned,
             };
-            b.lower
-                .iter()
-                .chain(b.upper.iter())
-                .fold(b.stamped.clone().join(over), |acc, k| {
+            b.lower.iter().chain(b.upper.iter()).map(|(k, _)| k).fold(
+                b.stamped.clone().join(over),
+                |acc, k| {
                     let point = match k {
                         FunKind::Var(x) => go(x, now, seen),
                         other => other.resolved(),
                     };
                     acc.join(point)
-                })
+                },
+            )
         }
         if let Some(pin) = cached(self, now) {
             return pin;
@@ -913,8 +927,8 @@ impl FunKindVar {
             let b = self.bounds.borrow();
             (
                 b.stamped.clone(),
-                b.lower.clone(),
-                b.upper.clone(),
+                b.lower.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+                b.upper.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
                 b.built_over.clone(),
             )
         };
@@ -961,11 +975,32 @@ impl FunKindVar {
     /// The kinds recorded **below** this variable, for a reader deriving the correspondences
     /// between its binders and theirs.
     pub fn lower(&self) -> Vec<FunKind> {
-        self.bounds.borrow().lower.clone()
+        self.bounds
+            .borrow()
+            .lower
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     /// The kinds recorded **above** this one.
     pub fn upper(&self) -> Vec<FunKind> {
+        self.bounds
+            .borrow()
+            .upper
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// [`Self::lower`] with each edge's substitution ([`Self::record_under`]), for a reader of
+    /// what a kind below states — a sum's candidates — which is read under it.
+    pub fn lower_edges(&self) -> Vec<(FunKind, crate::ccl::subst::Subst)> {
+        self.bounds.borrow().lower.clone()
+    }
+
+    /// [`Self::upper`] with each edge's substitution.
+    pub fn upper_edges(&self) -> Vec<(FunKind, crate::ccl::subst::Subst)> {
         self.bounds.borrow().upper.clone()
     }
 
@@ -1320,16 +1355,18 @@ pub enum Type {
     /// for `Feed` ones. Both erase it to a bare `Type::Fun`; no pass downstream
     /// may observe a `History` (a survivor at the strict `typecheck` is a compiler bug —
     /// see `collect_type_errors`). See src/ccl/design/mutability.md.
-    /// Built by [`Type::feed`], [`Type::mutable`] and [`Type::history`] rather than
-    /// written directly: a history denotes the arrow `domain ⤇ value`, and an arrow's
-    /// binding discipline needs one owner (see [`Type::history`]).
+    /// Built by [`Type::feed`], [`Type::mutable`], [`Type::history`] and
+    /// [`Type::history_keyed`] rather than written directly (see [`Type::history_over`]).
     History {
-        /// The type of the history's value (a position's cell / element). Read
-        /// through by the deref coercion for a [`HistoryKind::Overwrite`] reference.
-        value: Box<Type>,
-        /// The index the history's positions are tracked over (loop index,
-        /// transaction time, or a feed channel's collection domain).
-        domain: Box<Type>,
+        /// The data function `domain ⤇ value` the history denotes, always an unrefined
+        /// [`Type::Fun`]. Its domain is the index the history's positions are tracked over
+        /// (loop index, transaction time, or a feed channel's collection domain), and its
+        /// codomain the type of one position's value, which the deref coercion reads
+        /// through for a [`HistoryKind::Overwrite`] reference. A function's binder is named
+        /// only where the value depends on the position: a feed in a loop holds a row per
+        /// position, and the row at `𝑘` may read `𝑘` (`src/ccl/design/type-inference.md`,
+        /// "A history's value may depend on its position").
+        function: Box<Type>,
         /// Whether this is a mutable variable or a feed channel — selects the read
         /// mode (scalar-final vs whole-collection) and, in the unified phase, whether
         /// off-path positions carry forward.
@@ -2506,15 +2543,26 @@ fn fmt_type(
         }
         Type::Txn => write!(f, "Txn"),
         Type::History {
-            value,
-            domain,
+            function,
             history_kind,
         } => {
-            let (value, domain) = (at(value, binders), at(domain, binders));
-            if *history_kind == HistoryKind::Overwrite {
-                write!(f, "Mut({value}, {domain})")
-            } else {
-                write!(f, "feed({domain} ⤇ {value})")
+            let Type::Fun {
+                name,
+                domain,
+                codomain,
+                ..
+            } = function.peel_refinements()
+            else {
+                unreachable!("a history's function is a function, got {function:?}")
+            };
+            // The value renders inside the function's binder, as a function's codomain does.
+            let inner = symbolic::PiBinderEnv::crossing(binders, name.as_ref());
+            let (value, domain) = (at(codomain, Some(&inner)), at(domain, binders));
+            match (history_kind, name) {
+                (HistoryKind::Overwrite, None) => write!(f, "Mut({value}, {domain})"),
+                (HistoryKind::Overwrite, Some(k)) => write!(f, "Mut({value}, {k}: {domain})"),
+                (HistoryKind::Append, None) => write!(f, "feed({domain} ⤇ {value})"),
+                (HistoryKind::Append, Some(k)) => write!(f, "feed(({k}: {domain}) ⤇ {value})"),
             }
         }
         Type::WitnessRef(b) => {
@@ -2754,19 +2802,58 @@ impl Type {
     /// A history at an explicit [`HistoryKind`], for a rebuild carrying the kind it
     /// replaces.
     ///
-    /// **The one place a history is built.** A history denotes the arrow `domain ⤇ value`,
-    /// and an arrow's binding is a discipline: a `Type::Fun` binds its domain over its
-    /// codomain, and [`Type::pi_kinded`] owns that closing so no caller can leave a free
-    /// name for a binder the type itself provides. A history spells the same arrow across
-    /// two independent fields, so nothing holds that discipline for it — which is exactly
-    /// why a feed's value cannot depend on its own position today. Routing every
-    /// construction through here gives the discipline one owner to move to.
+    /// The function is unnamed: no value reads its position. A history holds its data
+    /// function as a [`Type::Fun`], so the function's binding rules, closing included
+    /// ([`Type::pi_kinded`]), are the history's too.
     pub fn history(domain: Self, value: Self, history_kind: HistoryKind) -> Self {
+        Self::history_over(Type::data_fun(domain, value), history_kind)
+    }
+
+    /// A history whose value at position `key` may read `key`: the function
+    /// `(key : domain) ⤇ value`, closed over `key` as [`Type::pi_kinded`] closes.
+    pub fn history_keyed(
+        key: impl Into<crate::ccl::Name>,
+        domain: Self,
+        value: Self,
+        history_kind: HistoryKind,
+    ) -> Self {
+        Self::history_over(
+            Type::pi_kinded(key, domain, value, FunKind::Data(None)),
+            history_kind,
+        )
+    }
+
+    /// The history denoting `function`, an unrefined data function. The one place a history
+    /// is built: a rebuild that maps a history's function comes through here with the
+    /// function it built.
+    pub fn history_over(function: Self, history_kind: HistoryKind) -> Self {
+        debug_assert!(
+            matches!(function, Type::Fun { .. }),
+            "a history denotes an unrefined data function `domain ⤇ value`, got {function}"
+        );
         Type::History {
-            value: Box::new(value),
-            domain: Box::new(domain),
+            function: Box::new(function),
             history_kind,
         }
+    }
+
+    /// The `(domain, value)` of this history's function, the value in its stored form: closed
+    /// over the function's binder where the function names one. `None` if this is not a history.
+    pub fn history_parts(&self) -> Option<(&Type, &Type, HistoryKind)> {
+        let Type::History {
+            function,
+            history_kind,
+        } = self.peel_refinements()
+        else {
+            return None;
+        };
+        let Type::Fun {
+            domain, codomain, ..
+        } = function.as_ref()
+        else {
+            unreachable!("a history denotes an unrefined function, got {function}")
+        };
+        Some((domain, codomain, *history_kind))
     }
 
     /// This type's [`FunKind`] if it is a function, looking through refinements.
@@ -3084,12 +3171,8 @@ impl Type {
     /// *not* one ([`Type::as_feed`]): it reads as its whole collection, so the two are
     /// never interchangeable at a read.
     pub fn mut_value_type(&self) -> Option<&Type> {
-        match self.peel_refinements() {
-            Type::History {
-                value,
-                history_kind: HistoryKind::Overwrite,
-                ..
-            } => Some(value),
+        match self.history_parts() {
+            Some((_, value, HistoryKind::Overwrite)) => Some(value),
             _ => None,
         }
     }
@@ -3099,14 +3182,12 @@ impl Type {
     ///
     /// A channel is a [`HistoryKind::Append`] history, and what a read of it yields
     /// is the whole read view `domain ⤇ value` — hence the pair, where
-    /// [`Type::mut_value_type`] returns a single value type.
+    /// [`Type::mut_value_type`] returns a single value type. The value is in its stored
+    /// form, closed over the function's binder where the value depends on its key; the read
+    /// function itself is [`Type::read_view`].
     pub fn as_feed(&self) -> Option<(&Type, &Type)> {
-        match self.peel_refinements() {
-            Type::History {
-                domain,
-                value,
-                history_kind: HistoryKind::Append,
-            } => Some((domain, value)),
+        match self.history_parts() {
+            Some((domain, value, HistoryKind::Append)) => Some((domain, value)),
             _ => None,
         }
     }
@@ -3122,21 +3203,20 @@ impl Type {
     /// reads through instead; this is the post-inference counterpart, with no solver left
     /// to defer to.
     ///
-    /// **No read view carries a Σ.** [`Type::History`] has no binder slot, so the channel
-    /// case builds its function with [`Type::data_fun`] and a consumer reading binders off
-    /// that view finds none — because a handle holds none, not because the view dropped
-    /// them.
+    /// **No read view carries a Σ.** A history's function is `Data(None)`, with no witness
+    /// binders, so a consumer reading witness binders off a channel's read view finds none —
+    /// because a handle holds none, not because the view dropped them.
     pub fn read_view(&self) -> Cow<'_, Type> {
         let mut peeled = self.peel_refinements();
         while let Some(value) = peeled.mut_value_type() {
             peeled = value.peel_refinements();
         }
         match peeled {
+            // The function is the read view, its binder included: the row at `𝑘` reads `𝑘`.
             Type::History {
-                domain,
-                value,
+                function,
                 history_kind: HistoryKind::Append,
-            } => Cow::Owned(Type::data_fun((**domain).clone(), (**value).clone())),
+            } => Cow::Borrowed(function),
             other => Cow::Borrowed(other),
         }
     }
@@ -3487,14 +3567,9 @@ impl Type {
                 Type::refined(base.without_pi_names(), refinements.clone())
             }
             Type::History {
-                value,
-                domain,
+                function,
                 history_kind,
-            } => Type::history(
-                domain.without_pi_names(),
-                value.without_pi_names(),
-                *history_kind,
-            ),
+            } => Type::history_over(function.without_pi_names(), *history_kind),
             Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(Type::without_pi_names))),
             Type::Base(_)
             | Type::UIntRange(_)
@@ -3637,10 +3712,7 @@ impl Type {
                 }
             }
             Type::Refinement(base, _) => f(base),
-            Type::History { value, domain, .. } => {
-                f(value);
-                f(domain);
-            }
+            Type::History { function, .. } => f(function),
             Type::Variant(tags, _) => {
                 for (_, t) in tags {
                     f(t);
@@ -3699,10 +3771,7 @@ impl Type {
                 }
             }
             Type::Refinement(base, _) => f(base),
-            Type::History { value, domain, .. } => {
-                f(value);
-                f(domain);
-            }
+            Type::History { function, .. } => f(function),
             Type::Variant(tags, _) => {
                 for (_, t) in tags {
                     f(t);
@@ -3738,7 +3807,7 @@ impl Type {
 /// equality of the bare predicate — no α-renaming needed.
 ///
 /// [`predicate`]: Refinement::predicate
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Refinement {
     /// A **bare**, *immutable* boolean expression (not a lambda) in which
     /// [`REFINEMENT_BINDER`] is free. Compiled as an element-wise loop join
@@ -3759,6 +3828,37 @@ pub struct Refinement {
     /// pass. Use [`Refinement::born`] only for a genuinely *new* predicate.
     /// Guarded by `tests/predicate_sharing.rs`.
     pub predicate: Rc<TypedExpr>,
+    /// The predicate's normal form, what equality and hashing compare
+    /// ([`crate::ccl::ccl_utils::normal_form`]), kept with the predicate it was computed for.
+    pub normal: NormalFormCache,
+}
+
+/// A [`Refinement`]'s normal form, computed the first time the refinement is compared or
+/// hashed. It holds the predicate `Rc` it was computed for, and a refinement whose predicate
+/// was re-pointed since computes it again.
+#[derive(Clone, Default)]
+pub struct NormalFormCache(RefCell<Option<(Rc<TypedExpr>, Rc<TypedExpr>)>>);
+
+impl fmt::Debug for Refinement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Refinement")
+            .field("predicate", &self.predicate)
+            .finish()
+    }
+}
+
+impl Refinement {
+    /// The predicate's normal form ([`crate::ccl::ccl_utils::normal_form`]).
+    pub(crate) fn normal(&self) -> Rc<TypedExpr> {
+        if let Some((for_predicate, normal)) = &*self.normal.0.borrow()
+            && Rc::ptr_eq(for_predicate, &self.predicate)
+        {
+            return Rc::clone(normal);
+        }
+        let normal = Rc::new(ccl_utils::normal_form(&self.predicate));
+        *self.normal.0.borrow_mut() = Some((Rc::clone(&self.predicate), Rc::clone(&normal)));
+        normal
+    }
 }
 
 /// Pointer identity of a refinement's predicate term.
@@ -3887,7 +3987,10 @@ impl Refinement {
     /// `Rc` sharing one `Rc` (see the note on [`Refinement::predicate`]).
     pub fn born(predicate: Rc<TypedExpr>) -> Self {
         debug_assert_predicate_shape(&predicate);
-        Refinement { predicate }
+        Refinement {
+            predicate,
+            normal: NormalFormCache::default(),
+        }
     }
 
     /// Construct a refinement by applying a template function to a
@@ -3945,8 +4048,7 @@ impl PartialEq for Refinement {
         if Rc::ptr_eq(&self.predicate, &other.predicate) {
             return true;
         }
-
-        eq_term_modulo_ty_slots(&self.predicate, &other.predicate)
+        eq_term_modulo_ty_slots(&self.normal(), &other.normal())
     }
 }
 
@@ -4067,13 +4169,14 @@ fn eq_cast_target_predicates(
         // containment is mutual containment — the same argument that impl
         // makes. The mutual recursion terminates on tree shape: predicates are
         // acyclic `Rc<TypedExpr>`s, so a cast target cannot contain the term
-        // comparing it.
+        // comparing it. Members compare by normal form, as every predicate does
+        // (`src/ccl/design/type-inference.md`, "Predicates are compared by normal form").
         (Some(s1), Some(s2)) => {
             s1.len() == s2.len()
                 && s1.iter().all(|r1| {
                     s2.iter().any(|r2| {
                         Rc::ptr_eq(&r1.predicate, &r2.predicate)
-                            || eq_term_modulo_ty_slots_go(&r1.predicate, &r2.predicate, pairs)
+                            || eq_term_modulo_ty_slots_go(&r1.normal(), &r2.normal(), pairs)
                     })
                 })
         }
@@ -4641,7 +4744,7 @@ impl std::hash::Hash for Refinement {
     /// which keeps the `Eq`/`Hash` contract. The predicate is immutable, so a
     /// `Type` used as a `ConstrainCache` key never re-hashes differently.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        hash_term_modulo_ty_slots(&self.predicate, state, &mut Vec::new());
+        hash_term_modulo_ty_slots(&self.normal(), state, &mut Vec::new());
     }
 }
 
@@ -5336,6 +5439,7 @@ mod tests {
                 Type::Hole,
                 Refinement {
                     predicate: offending,
+                    normal: NormalFormCache::default(),
                 },
             )),
             codomain: Box::new(Type::Hole),
@@ -5606,6 +5710,39 @@ mod tests {
             gt, lt,
             "casts differing only in the target's nested filter are distinct refinements"
         );
+    }
+
+    /// A predicate reading a definition planning restaged equals one reading it unplanned.
+    /// `𝑦 ▷ (𝑥 ▷ ((𝐹, 𝑔) ▷ curry_over))` reads as `𝑦 ▷ (𝑥 ▷ (𝑔 ▷ curry))`, and
+    /// `𝑥 ▷ (𝑚 ▷ filter_values)` as `𝑥`: an application reaches only keys in its function's
+    /// domain, so the restriction a staged form adds changes no value read.
+    #[test]
+    fn a_staged_form_compares_as_what_it_stages() {
+        let apply = |argument: TypedExpr, function: TypedExpr| TypedExpr::apply(argument, function);
+        use crate::ccl::Builtin;
+        let builtin = |b: Builtin| TypedExpr::builtin(b);
+        let compare = |lhs: TypedExpr| {
+            Refinement::born(Rc::new(TypedExpr::binop(
+                TypedExpr::var(Name::elem()),
+                BinOpKind::Compare(CompareKind::Greater),
+                lhs,
+            )))
+        };
+        let read =
+            |curried: TypedExpr| apply(TypedExpr::var("y"), apply(TypedExpr::var("x"), curried));
+
+        let curried = read(apply(TypedExpr::var("g"), builtin(Builtin::Curry)));
+        let staged = read(apply(
+            TypedExpr::tuple(vec![TypedExpr::var("F"), TypedExpr::var("g")]),
+            builtin(Builtin::CurryOver),
+        ));
+        assert_eq!(compare(curried), compare(staged));
+
+        let filtered = apply(
+            TypedExpr::var("x"),
+            apply(TypedExpr::var("m"), builtin(Builtin::FilterValues)),
+        );
+        assert_eq!(compare(filtered), compare(TypedExpr::var("x")));
     }
 
     /// A rewrite that makes two refinements equal leaves a *set*, not a bag.

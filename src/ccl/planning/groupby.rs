@@ -123,7 +123,7 @@ fn emit_groupby(
     );
     let grouped_values_ty = partition(group_of(value_ty));
     typecheck(&values_fn).expect("Bad values_fn expr");
-    let grouped_values = compose(grouped, values_fn).with_ty(grouped_values_ty);
+    let grouped_values = ccl_utils::chain_typed(vec![grouped, values_fn], grouped_values_ty);
     typecheck(&grouped_values).expect("Bad grouped_values expr");
     grouped_values
 }
@@ -379,11 +379,14 @@ fn rewrite_groupby_source(head: &Expr, witnesses: &mut Witnesses) -> Result<Opti
     // collection too, and it carries the kind of the source it is a read of. Its domain
     // keeps every refinement except the consumed grouping equation — dropping them here
     // would silently discard a filter.
-    let keys = compose(site.collection.clone(), key_pf).with_ty(Type::fun_like(
-        &site.collection.ty,
-        site.value_idx_ty.clone(),
-        site.key_ty.clone(),
-    ));
+    let keys = ccl_utils::chain_typed(
+        vec![site.collection.clone(), key_pf],
+        Type::fun_like(
+            &site.collection.ty,
+            site.value_idx_ty.clone(),
+            site.key_ty.clone(),
+        ),
+    );
     Ok(Some(emit_groupby(
         keys,
         site.collection.clone(),

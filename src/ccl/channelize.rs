@@ -632,28 +632,20 @@ struct Contribution {
 /// is flattened.
 pub(crate) fn flatten_nested_contribution(mut value: Expr, levels: usize) -> Expr {
     for level in 0..levels.saturating_sub(1) {
-        let (outer, keys, elem) = {
-            let Type::Fun {
-                fun_kind: FunKind::Data(_),
-                domain: outer,
-                codomain: inner,
-                ..
-            } = value.ty.peel_refinements()
-            else {
-                unreachable!("a contribution has a collection level per loop it was fed under")
-            };
-            let Type::Fun {
-                fun_kind: FunKind::Data(_),
-                domain: keys,
-                codomain: elem,
-                ..
-            } = inner.peel_refinements()
-            else {
-                unreachable!("a contribution has a collection level per loop it was fed under")
-            };
-            ((**outer).clone(), (**keys).clone(), (**elem).clone())
-        };
-        let paired = Type::data_fun(Type::Tuple(vec![outer.clone(), keys.clone()]), elem.clone());
+        let Levels {
+            outer_name,
+            outer,
+            inner_name,
+            keys,
+            elem,
+        } = outer_levels(&value.ty);
+        let paired = keyed_by(
+            vec![
+                (outer_name.clone(), outer.clone()),
+                (inner_name.clone(), keys.clone()),
+            ],
+            elem.clone(),
+        );
         value = apply_primitive(value, Builtin::Uncurry, paired.clone());
         // Past the first level the outer key is the tuple this loop built, and it is spliced
         // open: a feed under three loops is keyed by the three positions, not by a pair of a
@@ -661,13 +653,7 @@ pub(crate) fn flatten_nested_contribution(mut value: Expr, levels: usize) -> Exp
         // mutability"). A loop's own key that is a tuple stays one; only the position this
         // flattening paired is spliced.
         if level > 0 {
-            let Type::Tuple(prefix) = outer else {
-                unreachable!("the level above was flattened to a tuple")
-            };
-            let flat = Type::data_fun(
-                Type::Tuple(prefix.into_iter().chain([keys]).collect()),
-                elem,
-            );
+            let flat = spliced(outer_name.as_ref(), &outer, inner_name, keys, elem);
             let positions = Expr::list(vec![
                 Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int)),
             ])
@@ -686,6 +672,137 @@ pub(crate) fn flatten_nested_contribution(mut value: Expr, levels: usize) -> Exp
     value
 }
 
+/// The two outer collection levels of a contribution, `(𝑘₀ : 𝐴) ⤇ (𝑘₁ : 𝐾) ⤇ 𝐸`, opened
+/// by name: `keys` (`𝐾`) may read `outer_name`, and `elem` (`𝐸`) both names. An inner loop
+/// whose positions depend on the outer loop's value is the case where `𝐾` reads `𝑘₀`.
+struct Levels {
+    outer_name: Option<Name>,
+    outer: Type,
+    inner_name: Option<Name>,
+    keys: Type,
+    elem: Type,
+}
+
+fn outer_levels(ty: &Type) -> Levels {
+    let Type::Fun {
+        fun_kind: FunKind::Data(_),
+        name: outer_name,
+        domain: outer,
+        codomain: inner,
+    } = ty.peel_refinements()
+    else {
+        unreachable!("a contribution has a collection level per loop it was fed under")
+    };
+    let inner = crate::ccl::subst::open_codomain(ty, inner);
+    let Type::Fun {
+        fun_kind: FunKind::Data(_),
+        name: inner_name,
+        domain: keys,
+        codomain: elem,
+    } = inner.peel_refinements()
+    else {
+        unreachable!("a contribution has a collection level per loop it was fed under")
+    };
+    Levels {
+        outer_name: outer_name.clone(),
+        outer: (**outer).clone(),
+        inner_name: inner_name.clone(),
+        keys: (**keys).clone(),
+        elem: crate::ccl::subst::open_codomain(inner.peel_refinements(), elem),
+    }
+}
+
+/// The collection `(key : (𝑐₀ : 𝐶₀) × … × 𝐶ₙ) ⤇ 𝐸` over the telescope `components`, with
+/// `elem`'s reads of each component name `𝑐ᵢ` read as `key.𝑖`. Where no component reads an
+/// earlier one the key is the plain tuple ([`Type::dep_tuple`]), and where `elem` reads none
+/// the function is unnamed.
+fn keyed_by(components: Vec<(Option<Name>, Type)>, elem: Type) -> Type {
+    let tuple = Type::dep_tuple(components.clone());
+    let key = Name::fresh("__key");
+    // A projection binds the key, which its component can read.
+    let project = |index: usize, component: &Type| {
+        Expr::apply(
+            Expr::var(&key).with_ty(tuple.clone()),
+            Expr::proj_index(index).with_ty(Type::pi(
+                key.clone(),
+                tuple.clone(),
+                component.clone(),
+            )),
+        )
+        .with_ty(component.clone())
+    };
+    let elem = components
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (name, _))| Some((index, name.clone()?)))
+        .fold(elem, |elem, (index, name)| {
+            let component = tuple
+                .component_type(index, project)
+                .expect("a telescope has a component per name");
+            crate::ccl::subst::Subst::discharge(name, project(index, &component)).apply_type(&elem)
+        });
+    if crate::ccl::subst::codomain_depends_on(&key, &elem) {
+        Type::pi_kinded(key, tuple, elem, FunKind::Data(None))
+    } else {
+        Type::data_fun(tuple, elem)
+    }
+}
+
+/// The collection over `outer`'s components followed by `keys`, where `outer` is the tuple of
+/// positions an earlier level built and `outer_name` the binder `keys` and `elem` read it
+/// through: each read `outer_name.𝑗` becomes the spliced key's component `𝑗`
+/// (`src/ccl/design/type-inference.md`, "Flattening").
+fn spliced(
+    outer_name: Option<&Name>,
+    outer: &Type,
+    inner_name: Option<Name>,
+    mut keys: Type,
+    mut elem: Type,
+) -> Type {
+    let prefix: Vec<(Option<Name>, Type)> = match outer {
+        Type::Tuple(ts) => ts.iter().map(|t| (None, t.clone())).collect(),
+        Type::DepTuple(cs) => cs.clone(),
+        other => unreachable!("the level above was flattened to a tuple, got {other}"),
+    };
+    let names = crate::ccl::subst::tuple_component_names(&prefix);
+    let opened = crate::ccl::subst::open_tuple_components(&prefix, |j, _| {
+        crate::ccl::subst::Mapping::Rename(names[j].clone())
+    });
+    if let Some(outer_name) = outer_name {
+        let components: Vec<Expr> = names
+            .iter()
+            .zip(&opened)
+            .map(|(name, ty)| Expr::var(name).with_ty(ty.clone()))
+            .collect();
+        let memo = PredMemo::new();
+        crate::ccl::subst::rewrite_pairing_projections_memo(
+            outer_name,
+            &components,
+            &mut keys,
+            &memo,
+        );
+        crate::ccl::subst::rewrite_pairing_projections_memo(
+            outer_name,
+            &components,
+            &mut elem,
+            &memo,
+        );
+        assert!(
+            !crate::ccl::subst::type_free_vars(&keys).contains(outer_name)
+                && !crate::ccl::subst::type_free_vars(&elem).contains(outer_name),
+            "a nested feed's keys and rows read an earlier level's key only through its \
+             components"
+        );
+    }
+    let components = names
+        .into_iter()
+        .map(Some)
+        .zip(opened)
+        .chain([(inner_name, keys)])
+        .collect();
+    keyed_by(components, elem)
+}
+
 /// A feed's contribution from under nested loops, rebuilt over the product of the loops'
 /// positions: `𝐴 ≫ (λ 𝑥 → 𝐵 ≫ (λ 𝑦 → 𝑣))` becomes
 /// `λ 𝑝 : (𝐷𝐴, 𝐷𝐵) → (𝑝.0 ▷ 𝐴) ▷ (λ 𝑥 → (𝑝.1 ▷ 𝐵) ▷ (λ 𝑦 → 𝑣))`, at any depth. A feed is keyed
@@ -697,9 +814,8 @@ pub(crate) fn flatten_nested_contribution(mut value: Expr, levels: usize) -> Exp
 /// The tuple's refinement carries the loops' filters, read at their components, which is
 /// where planning applies them. A loop's filter is the refinement its source's cast adds
 /// ([`refine_source_domain`]); the cast is dropped from the loop's read, as a comprehension's
-/// source carries none. A filter that reads an enclosing loop's binder reads it through that
-/// loop's source at its own component: `𝑦 > 𝑥` under `𝑥` in `𝐴` and `𝑦` in `𝐵` becomes
-/// `__elem.0 ▷ 𝐴 ▷ (λ 𝑥 → __elem.1 ▷ 𝐵 ▷ (λ 𝑦 → 𝑦 > 𝑥))`. A source's own domain refinement
+/// source carries none. No filter reads an enclosing loop's variable: that nest's keys depend
+/// on the enclosing position, and [`indexed_nest`] builds it. A source's own domain refinement
 /// stays on its component and is lifted as well; a present-key refinement is not a filter and
 /// is not lifted.
 ///
@@ -735,19 +851,14 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
             }
         }
         for r in refinements.iter().filter(|r| !r.is_collection_membership()) {
-            let mut predicate = crate::ccl::subst::Subst::discharge(Name::elem(), at(index))
+            let predicate = crate::ccl::subst::Subst::discharge(Name::elem(), at(index))
                 .apply_expr(&r.predicate);
-            for enclosing in (0..index).rev() {
-                let g = &generators[enclosing];
-                if count_free(&g.param.name, &predicate) > 0 {
-                    predicate = read_level(
-                        at(enclosing),
-                        g.source().clone(),
-                        g.param.clone(),
-                        predicate,
-                    );
-                }
-            }
+            debug_assert!(
+                generators[..index]
+                    .iter()
+                    .all(|g| count_free(&g.param.name, &predicate) == 0),
+                "a product nest's filter reads no enclosing loop's variable ([`generator_nest`])"
+            );
             lifted.push(Refinement::born(Rc::new(predicate)));
         }
     }
@@ -759,6 +870,7 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
         Type::Refinement(Box::new(bare), set)
     };
     let record = Name::fresh("__iter_record");
+    let nest_params: Vec<Name> = generators.iter().map(|g| g.param.name.clone()).collect();
     around_lets(contribution, &mut |nest| {
         let body = rebuild_nest(nest, 0, levels, &mut |depth, _, param, inner| {
             let position = Expr::apply(
@@ -766,10 +878,15 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
                 Expr::proj_index(depth).with_ty(Type::fun(keys.clone(), domains[depth].clone())),
             )
             .with_ty(domains[depth].clone());
-            read_level(position, generators[depth].source().clone(), param, inner)
+            read_level(
+                position,
+                generators[depth].source().clone(),
+                param,
+                inner,
+                &nest_params,
+            )
         });
-        let value = body.ty.clone();
-        Expr::lambda(&record, keys.clone(), body).with_ty(Type::data_fun(keys.clone(), value))
+        collection_over(&record, keys.clone(), body)
     })
 }
 
@@ -843,7 +960,7 @@ fn rebuild_let(
     body: Expr,
 ) -> Expr {
     TypedExpr {
-        ty: body.ty.clone(),
+        ty: lifted_past(&binding, &bound_expr, &body.ty),
         node: TypedExprNode::Let {
             binding,
             bound_expr,
@@ -853,6 +970,22 @@ fn rebuild_let(
         // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
         node_id,
     }
+}
+
+/// `ty`, written under the binder `binding` of a `let` defining it as `bound_expr`, as it reads
+/// outside it: a transparent binder discharged to its definition, as inference's
+/// `close_let_type` lifts a `let`'s type. An opaque binder's name stays.
+fn lifted_past(binding: &TypedBinding, bound_expr: &Expr, ty: &Type) -> Type {
+    if binding.transparency == BindingTransparency::Opaque
+        || !crate::ccl::subst::type_free_vars(ty).contains(&binding.name)
+    {
+        return ty.clone();
+    }
+    crate::ccl::subst::Subst::discharge(
+        &binding.name,
+        crate::ccl::ccl_utils::predicate_term(bound_expr),
+    )
+    .apply_type(ty)
 }
 
 /// One generator of a nest, as [`generator_nest`] reads it: the term the loop iterates and
@@ -884,10 +1017,9 @@ struct NestScope {
 }
 
 /// Whether `nest` is `levels` generators, each a source composed with a lambda over its
-/// elements, and if so whether it is **independent**: no generator's source reads an enclosing
-/// generator's binder or a name bound inside one, and no filter reads a name bound inside one.
-/// A filter may read an enclosing binder. Collects each generator into `generators`, outermost
-/// first. `None` where a level is not a loop generator but a collection indexed by position or
+/// elements, and if so whether it is **independent**: no generator's source or filter reads an
+/// enclosing generator's binder or a name bound inside one. Collects each generator into
+/// `generators`, outermost first. `None` where a level is not a loop generator but a collection indexed by position or
 /// a gated unit, which [`flatten_nested_contribution`] takes as it is.
 ///
 /// Decided by the nest's shape and the names its terms read alone: no type is consulted.
@@ -923,10 +1055,11 @@ fn generator_nest(
                 iterated,
                 param: param.clone(),
             };
-            // The source may read no enclosing binder; its filter may. Neither may read a name
-            // bound between the loops, which the product's keys could not reach.
+            // Neither the source nor its filter may read an enclosing binder or a name bound
+            // between the loops: the loop's keys would then depend on the enclosing position,
+            // and the keys of the nest are a dependent tuple rather than a product.
             let reads = |names: &[Name], e: &Expr| names.iter().any(|n| count_free(n, e) > 0);
-            let independent = !reads(&scope.binders, generator.source())
+            let independent = !reads(&scope.binders, &generator.iterated)
                 && !reads(&scope.lets, &generator.iterated);
             generators.push(generator);
             scope.binders.push(param.name.clone());
@@ -1004,13 +1137,41 @@ fn rebuild_nest(
 
 /// `(position ▷ source) ▷ (λ param → inner)`: one generator's step at `position`. The lambda's
 /// type is dependent: a deeper generator's domain may name `param`, in a filter that reads it.
-fn read_level(position: Expr, source: Expr, param: TypedBinding, inner: Expr) -> Expr {
+///
+/// Where `inner`'s type reads a variable of the nest's loops (`nest_params`), as a row filtered
+/// by one does, the step is `inner` with the read substituted for `param` in terms and types
+/// alike, at every level, rather than a redex. The row's filter then reads the position, which
+/// lambda elimination lifts onto the key as it lifts any filter reading a lambda's parameter.
+/// Behind a redex, the variable the filter reads would be gone from the term by the time the
+/// key's lambda is eliminated.
+fn read_level(
+    position: Expr,
+    source: Expr,
+    param: TypedBinding,
+    inner: Expr,
+    nest_params: &[Name],
+) -> Expr {
     let item = source_item(&source.ty);
     let read = Expr::apply(position, source).with_ty(item);
+    let row_reads = crate::ccl::subst::type_free_vars(&inner.ty);
+    if nest_params.iter().any(|p| row_reads.contains(p)) {
+        return crate::ccl::subst::Subst::discharge(param.name, read).apply_expr(&inner);
+    }
     let ty = inner.ty.clone();
-    let lambda_ty = Type::pi(param.name.clone(), param.ty.clone(), ty.clone());
-    let lambda = Expr::lambda(&param.name, param.ty, inner).with_ty(lambda_ty);
+    let lambda = contribution_lambda(&param, inner, None);
     Expr::apply(read, lambda).with_ty(ty)
+}
+
+/// `λ position : domain → body`, a collection over `domain`, keyed where `body`'s type reads
+/// `position`.
+fn collection_over(position: &Name, domain: Type, body: Expr) -> Expr {
+    let value = body.ty.clone();
+    let ty = if crate::ccl::subst::type_free_vars(&value).contains(position) {
+        Type::pi_kinded(position.clone(), domain.clone(), value, FunKind::Data(None))
+    } else {
+        Type::data_fun(domain.clone(), value)
+    };
+    Expr::lambda(position, domain, body).with_ty(ty)
 }
 
 /// A feed's contribution from under `levels` loops, each level indexed by its own position:
@@ -1023,6 +1184,7 @@ fn read_level(position: Expr, source: Expr, param: TypedBinding, inner: Expr) ->
 /// A `let` between two levels is bound inside the inner level's position lambda, next to the
 /// read of that level's source, as it is in [`nest_as_product`]'s form.
 fn indexed_nest(nest: Expr, levels: usize) -> Expr {
+    let nest_params = loop_params(&nest, levels);
     rebuild_nest(nest, 0, levels, &mut |_, source, param, inner| {
         let inner = lets_into_position(inner);
         let domain = source_domain(&source.ty).expect("a loop's source is a collection");
@@ -1032,10 +1194,31 @@ fn indexed_nest(nest: Expr, levels: usize) -> Expr {
             source,
             param,
             inner,
+            &nest_params,
         );
-        let value = step.ty.clone();
-        Expr::lambda(&position, domain.clone(), step).with_ty(Type::data_fun(domain, value))
+        collection_over(&position, domain, step)
     })
+}
+
+/// The variables of the `levels` loops of `nest`, outermost first: each `𝑠 ≫ (λ 𝑥 → body)`'s
+/// `𝑥`, through the `let`s between them.
+fn loop_params(nest: &Expr, levels: usize) -> Vec<Name> {
+    let mut params = Vec::with_capacity(levels);
+    let mut at = nest;
+    while params.len() < levels {
+        match &at.node {
+            TypedExprNode::Let { body, .. } => at = body,
+            TypedExprNode::Compose(elts) => match elts.last().map(|e| &e.node) {
+                Some(TypedExprNode::Lambda { param, body }) => {
+                    params.push(param.name.clone());
+                    at = body;
+                }
+                _ => break,
+            },
+            _ => break,
+        }
+    }
+    params
 }
 
 /// `expr` with the `let`s that open it moved inside the position lambda they open onto, if
@@ -1059,6 +1242,9 @@ fn lets_into_position(expr: Expr) -> Expr {
         unreachable!("matched as a `let`")
     };
     let body = lets_into_position(*body);
+    // The position lambda moves out from under the `let`, so its type reads the binding as the
+    // `let`'s own type would.
+    let lambda_ty = lifted_past(&binding, &bound_expr, &body.ty);
     let rebind = |body: Expr| rebuild_let(binding, bound_expr, user_annotation, node_id, body);
     match body.node {
         TypedExprNode::Lambda { param, body: step } => TypedExpr {
@@ -1066,6 +1252,7 @@ fn lets_into_position(expr: Expr) -> Expr {
                 param,
                 body: Box::new(rebind(*step)),
             },
+            ty: lambda_ty,
             ..body
         },
         node => rebind(TypedExpr { node, ..body }),
@@ -1234,6 +1421,12 @@ impl ChannelizeCtx {
 /// (rather than leaving it for `simplify`) means no later pass needs to
 /// pattern-match `ExprStmt`.
 pub fn run(expr: Expr) -> Result<Expr, Located<DeferError>> {
+    // Keying a contribution builds a function type per level over the same predicates, so one
+    // memo serves every binder conversion of a predicate shared across them.
+    crate::ccl::subst::with_conversion_memo(|| run_memoized(expr))
+}
+
+fn run_memoized(expr: Expr) -> Result<Expr, Located<DeferError>> {
     let mut ctx = ChannelizeCtx::new();
     // Cluster channelization.  Walks the tree, processes `let d = Defer in …`
     // clusters, extracting feeds and building each defer's channel.
@@ -1274,15 +1467,8 @@ pub fn run(expr: Expr) -> Result<Expr, Located<DeferError>> {
 /// per-instantiation, freshened at `specialize_use`), so channel recording
 /// and lift-alias entries key on it, never on the term name.
 fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
-    match ty.peel_refinements() {
-        Type::History {
-            domain,
-            history_kind: HistoryKind::Append,
-            ..
-        } => match domain.peel_refinements() {
-            Type::ChanDom(n, l) => Some((n.clone(), *l)),
-            _ => None,
-        },
+    match ty.as_feed()?.0.peel_refinements() {
+        Type::ChanDom(n, l) => Some((n.clone(), *l)),
         _ => None,
     }
 }
@@ -1294,12 +1480,7 @@ fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
 fn channel_domain_of(ty: &Type) -> Option<Type> {
     match ty.peel_refinements() {
         Type::Fun { domain, .. } => Some((**domain).clone()),
-        Type::History {
-            domain,
-            history_kind: HistoryKind::Append,
-            ..
-        } => Some((**domain).clone()),
-        _ => None,
+        _ => ty.as_feed().map(|(domain, _)| domain.clone()),
     }
 }
 
@@ -1370,26 +1551,33 @@ fn erase_chan_domains_in_type(
     kinds: &HashMap<Name, FunKind>,
 ) -> bool {
     if let Type::History {
-        value,
-        domain,
+        function,
         history_kind: HistoryKind::Append,
     } = ty
     {
         // The handle names its channel, and the channel's assembled type is what says
         // whether the read view binds a witness. Read it before the domain is substituted:
         // afterwards the domain is a bare reference, and a reference carries no kind.
+        let Type::Fun {
+            name,
+            domain,
+            codomain: value,
+            ..
+        } = std::mem::replace(function.as_mut(), Type::Hole)
+        else {
+            unreachable!("a history's function is an unrefined function")
+        };
         let fun_kind = match domain.peel_refinements() {
             Type::ChanDom(n, _) => kinds.get(n).cloned(),
             _ => None,
         };
-        let domain = std::mem::replace(domain.as_mut(), Type::Hole);
-        let value = std::mem::replace(value.as_mut(), Type::Hole);
+        // A feed channel reads as a collection: erase History to its function, a data function
+        // keeping the function's binder.
         *ty = Type::Fun {
-            name: None,
-            // A feed channel reads as a collection: erase History → a data function.
+            name,
             fun_kind: fun_kind.unwrap_or(FunKind::Data(None)),
-            domain: Box::new(domain),
-            codomain: Box::new(value),
+            domain,
+            codomain: value,
         };
         erase_chan_domains_in_type(ty, map, kinds);
         return true;
@@ -1578,8 +1766,13 @@ fn erase_chan_domains(
         // read, and that read is where the sibling is minted.
         let discharge =
             crate::ccl::subst::Subst::discharge(&binding.name, bound_expr.clone_preserving_ids());
+        // Only a domain naming the binder is rewritten. A `let` under a loop's position
+        // lambda can read the position, and a domain built from that loop names a binder
+        // after it, which a discharge passing under it would report as a capture.
         for dom in map.values_mut() {
-            *dom = discharge.apply_type(dom);
+            if crate::ccl::subst::type_free_vars(dom).contains(&binding.name) {
+                *dom = discharge.apply_type(dom);
+            }
         }
     } else {
         expr.walk_children_mut(|c| erase_chan_domains(c, map, kinds, predicates));
@@ -1600,12 +1793,7 @@ fn erase_chan_domains(
 fn fun_codomain(ty: &Type) -> Option<Type> {
     match ty.peel_refinements() {
         Type::Fun { codomain, .. } => Some((**codomain).clone()),
-        Type::History {
-            value,
-            history_kind: HistoryKind::Append,
-            ..
-        } => Some((**value).clone()),
-        _ => None,
+        _ => ty.as_feed().map(|(_, value)| value.clone()),
     }
 }
 
@@ -1614,12 +1802,7 @@ fn fun_codomain(ty: &Type) -> Option<Type> {
 fn fun_domain(ty: &Type) -> Option<Type> {
     match ty.peel_refinements() {
         Type::Fun { domain, .. } => Some((**domain).clone()),
-        Type::History {
-            domain,
-            history_kind: HistoryKind::Append,
-            ..
-        } => Some((**domain).clone()),
-        _ => None,
+        _ => ty.as_feed().map(|(domain, _)| domain.clone()),
     }
 }
 
@@ -2392,12 +2575,13 @@ fn channelize_cluster(
 /// mis-scoping a channel.
 #[cfg(debug_assertions)]
 fn assert_no_shadowed_captures(body: &Expr, channels: &HashMap<Name, Expr>) {
-    let mut channel_fvs: HashSet<Name> = HashSet::new();
-    for c in channels.values() {
-        collect_free_vars(c, &mut channel_fvs);
-    }
-    let mut body_fvs: HashSet<Name> = HashSet::new();
-    collect_free_vars(body, &mut body_fvs);
+    // Scope-aware in types too: a node's type stands where the node does, so a dependent
+    // type under a `let` names the `let`'s binder without capturing it.
+    let channel_fvs: HashSet<Name> = channels
+        .values()
+        .flat_map(crate::ccl::ccl_utils::free_names)
+        .collect();
+    let body_fvs = crate::ccl::ccl_utils::free_names(body);
     let protected: HashSet<Name> = channel_fvs.intersection(&body_fvs).cloned().collect();
     fn walk(e: &Expr, protected: &HashSet<Name>) {
         if let TypedExprNode::Let { binding, .. } = &e.node {
@@ -2898,11 +3082,40 @@ fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
     // collection exactly when the head is. The head here is routinely a feed handle that
     // `erase_chan_domains` has not yet turned into a `Type::Fun`, which `fun_like` reads as
     // the read view it states.
-    let ty = match (d, c) {
-        (Some(d), Some(c)) => Type::fun_like(&elts[0].ty, d, c),
-        _ => Type::Hole,
+    match (d, c) {
+        (Some(d), Some(c)) => {
+            let stated = Type::fun_like(&elts[0].ty, d, c);
+            crate::ccl::ccl_utils::chain_typed(elts, stated)
+        }
+        _ => Expr::compose(elts).with_ty(Type::Hole),
+    }
+}
+
+/// `λ param → body`, a channel contribution built around a fed value, with the kind of
+/// `exemplar`'s function (`Compute` where there is none) and dependent where `body`'s type
+/// reads `param`: a row fed in a loop may read the loop's variable
+/// (`src/ccl/design/type-inference.md`, "A history's value may depend on its position").
+fn contribution_lambda(param: &TypedBinding, body: Expr, exemplar: Option<&Type>) -> Expr {
+    let codomain = body.ty.clone();
+    let fun_kind = exemplar
+        .and_then(
+            |t| match Type::fun_like(t, param.ty.clone(), codomain.clone()) {
+                Type::Fun { fun_kind, .. } => Some(fun_kind),
+                _ => None,
+            },
+        )
+        .unwrap_or(FunKind::Compute);
+    let ty = if crate::ccl::subst::type_free_vars(&codomain).contains(&param.name) {
+        Type::pi_kinded(param.name.clone(), param.ty.clone(), codomain, fun_kind)
+    } else {
+        Type::Fun {
+            name: None,
+            fun_kind,
+            domain: Box::new(param.ty.clone()),
+            codomain: Box::new(codomain),
+        }
     };
-    Expr::compose(elts).with_ty(ty)
+    Expr::lambda(&param.name, param.ty.clone(), body).with_ty(ty)
 }
 
 /// Walk `expr` collecting `Feed`/`Define` nodes for `defer_name`.
@@ -3203,8 +3416,10 @@ fn extract_for_defer_impl(
                     // companion channel's type is the lambda's codomain `v.ty`
                     // (the argument matches `param.ty`). Typed at construction.
                     // It binds one element, so it adds no position.
-                    let v_ty = v.ty.clone();
-                    let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
+                    // A value reading the element reads the argument.
+                    let v_ty =
+                        crate::ccl::subst::discharge_codomain(&param.name, &new_argument, &v.ty);
+                    let channel_lambda = contribution_lambda(&param, v, None);
                     let channel = Expr::apply(new_argument.clone(), channel_lambda).with_ty(v_ty);
                     feeds.push(Contribution {
                         value: channel,
@@ -3440,8 +3655,7 @@ fn extract_for_defer_impl(
                                         Refinement::born(Rc::new(pred_on_source));
                                     let mut refined_prefix = source_prefix.clone();
                                     refine_source_domain(&mut refined_prefix, refinement_struct);
-                                    let channel_lambda =
-                                        Expr::lambda(&param.name, param.ty.clone(), value);
+                                    let channel_lambda = contribution_lambda(&param, value, None);
                                     // stamp the channel at
                                     // construction — `Fun(refined-domain,
                                     // value)` off the two elements' concrete
@@ -3509,7 +3723,7 @@ fn extract_for_defer_impl(
                             // a prefix that is itself a defer read carries its
                             // handle's rigid `ChanDom` domain, closed by the
                             // final `erase_chan_domains` substitution.
-                            let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
+                            let channel_lambda = contribution_lambda(&param, v, None);
                             let mut channel_elts = new_elts.clone();
                             channel_elts.push(channel_lambda);
                             // A single-element "compose" is just that
@@ -3604,14 +3818,9 @@ fn extract_for_defer_impl(
                 // it is the same collection-or-capability the lambda was — `Expr::lambda`
                 // stamps `Compute`, so the incoming kind is carried back on. Its binder is
                 // one more position the contribution is keyed by.
-                let wrapped = Expr::lambda(&param.name, param.ty.clone(), v);
-                let wrapped_ty = Type::fun_like(
-                    &ty,
-                    param.ty.clone(),
-                    wrapped.ty.codomain().expect("a lambda is a function"),
-                );
+                let wrapped = contribution_lambda(&param, v, Some(&ty));
                 feeds.push(Contribution {
-                    value: wrapped.with_ty(wrapped_ty),
+                    value: wrapped,
                     levels: levels + 1,
                     feed,
                 });

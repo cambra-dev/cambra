@@ -511,11 +511,10 @@ fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
     {
         return false;
     }
-    let (value, domain, kind, other) = match (read, now) {
+    let (function, kind, other) = match (read, now) {
         (
             Type::History {
-                value,
-                domain,
+                function,
                 history_kind,
             },
             other,
@@ -523,21 +522,21 @@ fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
         | (
             other,
             Type::History {
-                value,
-                domain,
+                function,
                 history_kind,
             },
-        ) => (value, domain, history_kind, other),
+        ) => (function, history_kind, other),
         _ => unreachable!("called only when at least one side peels to a History"),
     };
     match kind {
-        // A feed's read view is a collection: a data function.
-        HistoryKind::Append => types_agree_modulo_unread(
-            &Type::data_fun((**domain).clone(), (**value).clone()),
-            other,
-            refinements,
-        ),
-        HistoryKind::Overwrite => types_agree_modulo_unread(value, other, refinements),
+        // A feed reads as its whole collection, the history's data function.
+        HistoryKind::Append => types_agree_modulo_unread(function, other, refinements),
+        HistoryKind::Overwrite => {
+            let Type::Fun { codomain, .. } = function.peel_refinements() else {
+                unreachable!("a history's function is a function")
+            };
+            types_agree_modulo_unread(codomain, other, refinements)
+        }
     }
 }
 
@@ -1347,14 +1346,23 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // Reading resolved inputs remains applicable after specialization has
             // freshened the emit-time variables. Peel outer refinements to expose
             // the preceding function without removing codomain refinements.
+            //
+            // The preceding codomain is opened at its own binder, the name the morphisms
+            // after it read its position by (`src/ccl/design/type-inference.md`, "A chain
+            // names each position").
+            let position = match (expr.ty.peel_refinements(), elts.first()) {
+                (Type::Fun { name: Some(k), .. }, _) => Some(k.clone()),
+                (_, Some(head)) => match head.ty.peel_refinements() {
+                    Type::Fun { name, .. } => name.clone(),
+                    _ => None,
+                },
+                _ => None,
+            };
             for i in 1..elts.len() {
-                let Type::Fun {
-                    codomain: prev_cod, ..
-                } = elts[i - 1].ty.peel_refinements()
-                else {
+                let Some(prev_cod) = elts[i - 1].ty.peel_refinements().codomain() else {
                     continue;
                 };
-                let prev_cod = prev_cod.as_ref().clone();
+                let prev_cod = crate::ccl::subst::open_codomain(&elts[i - 1].ty, &prev_cod);
                 specialize_projection_domain(&mut elts[i], &prev_cod);
             }
             if let (Some(first), Some(last)) = (elts.first(), elts.last())
@@ -1365,26 +1373,34 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                         ..
                     },
                     Type::Fun {
-                        name: last_name,
+                        name: _last_name,
                         codomain: last_cod,
                         ..
                     },
                 ) = (first.ty.peel_refinements(), last.ty.peel_refinements())
             {
-                // Keep a dependent *final* morphism's Pi binder on the rebuilt
-                // chain type, mirroring `emit_compose`: the chain's codomain is
-                // the final codomain, which may reference that binder, and the
-                // dependent-application discharge dispatches on the name —
-                // rebuilding with a bare function type would silently drop the
-                // dependence.
-                expr.ty = Type::Fun {
-                    name: last_name.clone(),
-                    // FunKind is the first morphism's (mirrors `emit_compose`): a
-                    // chain over a data source is a data collection.
-                    fun_kind: first_kind.clone(),
-                    domain: Box::new((**first_dom).clone()),
-                    codomain: Box::new((**last_cod).clone()),
-                };
+                // The chain's type by the rule for chains, as `emit_compose` types it
+                // ([`crate::ccl::ccl_utils::chain_type_of`]): a last morphism whose codomain
+                // reads its own binder is read at each position, or keeps its binder where the
+                // prefix maps each position to itself. Rebuilt with a bare function type, the
+                // codomain's reference to that binder would be left with none.
+                expr.ty = crate::ccl::ccl_utils::chain_type_of(
+                    elts,
+                    Type::Fun {
+                        // The chain's own input binder where a morphism's type reads it,
+                        // which keeps the name those types were written with; otherwise
+                        // none, and the rule names the input
+                        // (`ccl_utils::chain_input_binder`).
+                        name: position
+                            .clone()
+                            .filter(|k| elts.iter().any(|e| crate::ccl::ccl_utils::is_free(k, e))),
+                        // FunKind is the first morphism's (mirrors `emit_compose`): a
+                        // chain over a data source is a data collection.
+                        fun_kind: first_kind.clone(),
+                        domain: Box::new((**first_dom).clone()),
+                        codomain: Box::new((**last_cod).clone()),
+                    },
+                );
             }
         }
         TypedExprNode::Record(fs) => {
@@ -1615,7 +1631,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             {
                 let sigma = crate::ccl::subst::Subst::discharge(
                     &binding.name,
-                    bound_expr.clone_preserving_ids(),
+                    crate::ccl::ccl_utils::predicate_term(bound_expr),
                 );
                 Some(sigma.apply_type(&body.ty))
             } else {
@@ -1840,10 +1856,7 @@ fn coalesce_type_predicates_go(
         Type::Variant(tags, _) => tags
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates_go(t, level, ctx, scope)),
-        Type::History { value, domain, .. } => {
-            coalesce_type_predicates_go(value, level, ctx, scope);
-            coalesce_type_predicates_go(domain, level, ctx, scope);
-        }
+        Type::History { function, .. } => coalesce_type_predicates_go(function, level, ctx, scope),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
@@ -2570,10 +2583,17 @@ fn recovered_input(input: &Type) -> Type {
 /// too.
 pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
     if matches!(morphism.node, TypedExprNode::Proj(_))
-        && let Some(cod) = morphism.ty.codomain()
+        && let Type::Fun { name, codomain, .. } = morphism.ty.peel_refinements()
     {
-        // A projection is non-dependent, so the rebuilt function type keeps `name: None`.
-        morphism.ty = Type::fun(recovered_input(input), cod);
+        // Only the domain is recovered. A projection out of a dependent tuple binds the
+        // tuple, and its codomain reads it (`src/ccl/design/type-inference.md`,
+        // "Projection"), so the binder and the stored codomain stay as they are.
+        morphism.ty = Type::Fun {
+            name: name.clone(),
+            fun_kind: crate::ccl::FunKind::Compute,
+            domain: Box::new(recovered_input(input)),
+            codomain: codomain.clone(),
+        };
     }
 }
 

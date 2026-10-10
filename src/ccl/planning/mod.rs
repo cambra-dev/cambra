@@ -103,7 +103,11 @@ pub fn run(expr: Expr) -> Result<Expr, String> {
     // Live cross-endpoint reads are recognized earlier, in
     // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
     // such read is already an `as_of` join — nothing to do at planning time.
-    plan_term(expr, Root::Program, &mut Witnesses::default())
+    // Planning compiles the predicates it reaches by eliminating their lambdas, so one memo
+    // serves every binder conversion of a predicate shared across sites.
+    crate::ccl::subst::with_conversion_memo(|| {
+        plan_term(expr, Root::Program, &mut Witnesses::default())
+    })
 }
 
 /// What a term [`plan_term`] plans is: the program, or a term lifted out of a refinement.
@@ -126,9 +130,12 @@ pub(super) enum Root {
 /// them leaves a term it already ran on unchanged.
 pub(super) fn plan_term(term: Expr, root: Root, witnesses: &mut Witnesses) -> Result<Expr, String> {
     let mut term = plan_before_iteration(term, witnesses)?;
+    // One memo for the iteration walk and the predicate compilation after it, so a
+    // predicate shared across sites compiles once ([`PredMemo`], "One memo per pass").
+    let memo = PredMemo::new();
     match root {
-        Root::Program => insert_iterate_markers(&mut term, witnesses)?,
-        Root::Lifted => iterate::insert_iterate_recurse(&mut term, witnesses)?,
+        Root::Program => insert_iterate_markers(&mut term, witnesses, &memo)?,
+        Root::Lifted => iterate::insert_iterate_recurse(&mut term, witnesses, &memo)?,
     }
     // Normalize every remaining bare predicate to point-free form.
     // `wrap_with_iterate` compiles each iteration *site*'s predicate, but a
@@ -141,7 +148,7 @@ pub(super) fn plan_term(term: Expr, root: Root, witnesses: &mut Witnesses) -> Re
     // post-planning typecheck's structural refinement match holds. It runs
     // after the recognizers (which already consumed the bare shapes they
     // match) and is idempotent on already-compiled predicates.
-    compile_refinement_predicates(&mut term, &PredMemo::new());
+    compile_refinement_predicates(&mut term, &memo);
     // A refinement on an inner collection's domain is materialized here rather than
     // by the iteration walk above: `wrap_with_iterate` reads a node's own domain,
     // and this one is a codomain in. It runs after predicate compilation because it
@@ -729,7 +736,7 @@ mod tests {
 
         let mut expr = Expr::let_bind("xs".to_string(), list_123(), body_chain).with_ty(list_ty);
 
-        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
+        insert_iterate_markers(&mut expr, &mut Default::default(), &PredMemo::new()).unwrap();
 
         let TypedExprNode::Let {
             bound_expr, body, ..
@@ -764,7 +771,7 @@ mod tests {
             fun_ty(fun_ty(Type::UIntRange(3), int.clone()), int.clone()),
             int,
         );
-        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
+        insert_iterate_markers(&mut expr, &mut Default::default(), &PredMemo::new()).unwrap();
         let TypedExprNode::Apply { argument, function } = &expr.node else {
             panic!("expected Apply, got: {}", symbolic(&expr));
         };
@@ -800,7 +807,7 @@ mod tests {
             ("n".to_string(), int),
         ]));
 
-        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
+        insert_iterate_markers(&mut expr, &mut Default::default(), &PredMemo::new()).unwrap();
 
         let TypedExprNode::Record(outs) = &expr.node else {
             panic!("expected a record, got: {}", symbolic(&expr));

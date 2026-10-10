@@ -1297,10 +1297,13 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
                 let mut s = HashSet::new();
                 ids_of(&r.predicate, &mut s);
                 slot.insert(s);
+                // A predicate is an expression, so its own type slots are an
+                // expression walk's business rather than the type descent's. Once per
+                // term, like its ids: a term shared across type slots holds the same
+                // predicates in its own, and descending at every occurrence would walk
+                // the sharing out into a tree.
+                from_expr_ty(&r.predicate, acc);
             }
-            // A predicate is an expression, so its own type slots are an
-            // expression walk's business rather than the type descent's.
-            from_expr_ty(&r.predicate, acc);
         });
     }
     fn from_expr_ty(e: &Expr, acc: &mut HashMap<usize, HashSet<NodeId>>) {
@@ -1694,7 +1697,7 @@ fn pre_channelize_wall(
             blame.infer(errs, expr)
         } else {
             let errs: Vec<&InferError> = errs.iter().map(|e| &e.error).collect();
-            panic!("{boundary} produced an invalid tree: {errs:?}")
+            invalid_tree(expr, boundary, &errs)
         }
     })
 }
