@@ -874,6 +874,12 @@ impl QualifiedName {
         Some((first, QualifiedName(rest.to_vec())))
     }
 
+    /// Whether it has no segment: the prefix of a spelling a module writes
+    /// alone.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// `rest` spelled through this one.
     pub fn then(&self, rest: &QualifiedName) -> Self {
         QualifiedName(self.0.iter().chain(&rest.0).cloned().collect())

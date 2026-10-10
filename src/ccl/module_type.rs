@@ -9,15 +9,47 @@
 
 use crate::ccl::Type;
 use crate::ccl::chl_print::chl_type;
+use crate::ccl::ty::TypeParam;
 use smol_str::SmolStr;
 use std::fmt;
 use std::rc::Rc;
 
-/// The public members a Module type names, each with its type, in the order
-/// written.
+/// The public members a Module type names: its type members, and its other
+/// members with their types, each in the order written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleType {
+    pub types: Vec<TypeEntry>,
     pub entries: Vec<ModuleEntry>,
+}
+
+/// A type member a [`ModuleType`] names.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeEntry {
+    pub name: SmolStr,
+    pub form: TypeEntryForm,
+}
+
+/// What a [`TypeEntry`] states of its member.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeEntryForm {
+    /// `Name = T`: the member is `T`, and the entries after it write `T`.
+    Exact(Type),
+    /// `Name <: T`, or `Name: Type` with no bound: the member is some type of
+    /// that kind, and the entries after it write `param` for it.
+    Abstract {
+        param: Rc<TypeParam>,
+        bound: Option<Type>,
+    },
+}
+
+impl TypeEntry {
+    /// The type the entries after this one write for its member.
+    pub fn written(&self) -> Type {
+        match &self.form {
+            TypeEntryForm::Exact(ty) => ty.clone(),
+            TypeEntryForm::Abstract { param, .. } => Type::Param(Rc::clone(param)),
+        }
+    }
 }
 
 /// One member a [`ModuleType`] names.
@@ -42,6 +74,16 @@ impl AliasType {
         match self {
             AliasType::Type(ty) => f(ty),
             AliasType::Module(module) => {
+                for entry in &module.types {
+                    match &entry.form {
+                        TypeEntryForm::Exact(ty) => f(ty),
+                        TypeEntryForm::Abstract { bound, .. } => {
+                            if let Some(bound) = bound {
+                                f(bound);
+                            }
+                        }
+                    }
+                }
                 for entry in &module.entries {
                     entry.ty.walk_types(f);
                 }
@@ -54,7 +96,18 @@ impl AliasType {
         match self {
             AliasType::Type(ty) => f(ty),
             AliasType::Module(module) => {
-                for entry in &mut Rc::make_mut(module).entries {
+                let module = Rc::make_mut(module);
+                for entry in &mut module.types {
+                    match &mut entry.form {
+                        TypeEntryForm::Exact(ty) => f(ty),
+                        TypeEntryForm::Abstract { bound, .. } => {
+                            if let Some(bound) = bound {
+                                f(bound);
+                            }
+                        }
+                    }
+                }
+                for entry in &mut module.entries {
                     entry.ty.walk_types_mut(f);
                 }
             }
@@ -67,16 +120,35 @@ impl ModuleType {
     pub fn entry(&self, name: &str) -> Option<&ModuleEntry> {
         self.entries.iter().find(|entry| entry.name == name)
     }
+
+    /// The type member named `name`, if the Module type has one.
+    pub fn type_entry(&self, name: &str) -> Option<&TypeEntry> {
+        self.types.iter().find(|entry| entry.name == name)
+    }
 }
 
-/// `Module{events: Feed(Event), charge: Int => Receipt}`.
+/// `Module{Receipt <: {id: String}, charge: Int => Receipt}`, the type members
+/// first.
 impl fmt::Display for ModuleType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Module{")?;
-        for (i, entry) in self.entries.iter().enumerate() {
-            if i > 0 {
-                f.write_str(", ")?;
+        let mut separator = "";
+        for entry in &self.types {
+            f.write_str(separator)?;
+            separator = ", ";
+            match &entry.form {
+                TypeEntryForm::Exact(ty) => write!(f, "{} = {}", entry.name, chl_type(ty))?,
+                TypeEntryForm::Abstract {
+                    bound: Some(bound), ..
+                } => write!(f, "{} <: {}", entry.name, chl_type(bound))?,
+                TypeEntryForm::Abstract { bound: None, .. } => {
+                    write!(f, "{}: Type", entry.name)?;
+                }
             }
+        }
+        for entry in &self.entries {
+            f.write_str(separator)?;
+            separator = ", ";
             write!(f, "{}: {}", entry.name, entry.ty)?;
         }
         f.write_str("}")

@@ -566,14 +566,20 @@ impl Qualifier {
                 format!("`{name}::{member}` is a value, not a type"),
             ));
         }
-        if self.view.is_some() {
-            return Err(LoweringError::unsupported(
-                span,
-                format!(
-                    "`{name}::{member}` is a type member through a parameter, which is not \
-                     supported yet"
-                ),
-            ));
+        if let Some(view) = &self.view {
+            let Some(ty) = view.types.get(member) else {
+                return Err(LoweringError::unsupported(
+                    span,
+                    format!("the Module type of `{name}` has no type member `{member}`"),
+                )
+                .with_related(self.statement, "declared here"));
+            };
+            let mut ty = match self.view_base.is_empty() {
+                true => ty.clone(),
+                false => reroot(ty, &self.view_base),
+            };
+            substitute(&mut ty, &self.types);
+            return Ok(Some(AliasType::Type(ty)));
         }
         let Some(interface) = self.reachable() else {
             return Ok(None);
@@ -595,6 +601,53 @@ impl Qualifier {
         let mut ty = reroot_alias(&found.ty, &self.name);
         ty.walk_types_mut(&mut |ty| substitute(ty, &self.types));
         Ok(Some(ty))
+    }
+
+    /// The type this module, passed at `span` as the argument for `parameter`,
+    /// gives `member`, an abstract type member of the parameter's Module type
+    /// spelled under it: `payments::Receipt` takes this module's `Receipt`.
+    /// `None` when this module has errors of its own. A member this module
+    /// lacks, or has as a Module type, is an error.
+    pub(super) fn argument_type_member(
+        &self,
+        parameter: &QualifiedName,
+        member: &QualifiedName,
+        span: Span,
+    ) -> Result<Option<Type>, LoweringError> {
+        let path = member
+            .strip_prefix(parameter)
+            .expect("a member is spelled under its parameter");
+        match self.reach_type_path(&self.name, &path, span)? {
+            Some(AliasType::Type(ty)) => Ok(Some(ty)),
+            Some(AliasType::Module(_)) => Err(LoweringError::unsupported(
+                span,
+                format!(
+                    "`{}::{path}` is a Module type, and the parameter's Module type names a type \
+                     member `{path}`",
+                    self.name
+                ),
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// The type member at `path` below the module this reaches, through the
+    /// qualifier `name`: `Receipt`, or `audit::Event` through a member bound to
+    /// a module.
+    pub(super) fn reach_type_path(
+        &self,
+        name: &QualifiedName,
+        path: &QualifiedName,
+        span: Span,
+    ) -> Result<Option<AliasType>, LoweringError> {
+        let (last, init) = path.segments().split_last().expect("a path has a segment");
+        let mut at = self.clone();
+        let mut spelled = name.clone();
+        for segment in init {
+            at = at.module_member(&spelled, &Spanned::new(span, segment.clone()))?;
+            spelled = spelled.child(segment.clone());
+        }
+        at.reach_type(&spelled, last, span)
     }
 
     /// Whether `member` is a member of this module bound to a module.
@@ -630,7 +683,6 @@ impl Qualifier {
             return Ok(Qualifier {
                 name: self.name.child(member),
                 view: Some(Rc::clone(inner)),
-                types: TypeArguments::default(),
                 ..self.clone()
             });
         }

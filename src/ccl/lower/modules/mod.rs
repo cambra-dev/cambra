@@ -37,7 +37,7 @@ use super::{
 };
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates_mut};
 use crate::ccl::load::LoadedProgram;
-use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType};
+use crate::ccl::module_type::{AliasType, ModuleType, TypeEntryForm};
 use crate::ccl::names::QualifiedName;
 use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
 use crate::ccl::ty::{TypeParam, TypeParamId};
