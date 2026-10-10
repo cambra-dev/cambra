@@ -227,19 +227,17 @@ impl AggregateKind {
 }
 
 fn accumulate_max<T: Ord + Clone>(acc: &mut [T], values: &[T]) {
-    let max = values.iter().max().cloned();
-    if let Some(max) = max
-        && max > acc[0]
+    if let Some(max) = values.iter().max()
+        && max > &acc[0]
     {
-        acc[0] = max;
+        acc[0].clone_from(max);
     }
 }
 
 fn accumulate_min<T: Ord + Clone>(acc: &mut [T], values: &[T]) {
-    let min = values.iter().min().cloned();
-    if let Some(min) = min
-        && min < acc[0]
+    if let Some(min) = values.iter().min()
+        && min < &acc[0]
     {
-        acc[0] = min;
+        acc[0].clone_from(min);
     }
 }
