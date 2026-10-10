@@ -563,7 +563,7 @@ fn assert_shared_runs(root: &str, other: &str, expected: &[&str]) {
 )]
 #[case::not_a_literal(
     "import scaled(scale=1 + 2)\n1\n",
-    "an argument to an import is supported only as a literal or an import name for now"
+    "an argument to an import is supported only as a literal, a type, or an import name for now"
 )]
 #[case::mistyped("import scaled(scale=\"x\")\nscaled::by(1)\n", "annotated as Int")]
 #[timeout(Duration::from_secs(10))]

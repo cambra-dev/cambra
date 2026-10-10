@@ -28,7 +28,7 @@ pub(super) fn lower_library_recovering(
 ) -> Option<Expr> {
     let stmts = &module.body[..];
     let outer_bindings = HashSet::new();
-    errors.extend(pre_declare_type_aliases(stmts, ctx));
+    errors.extend(pre_declare_module_types(stmts, ctx));
     errors.extend(ctx.declare_module_parameters(stmts));
     pre_register_txn_decls(stmts, ctx);
     let span = match (stmts.first(), stmts.last()) {
@@ -90,7 +90,7 @@ pub(super) fn lower_stmts_recovering(
     // reason: an annotation below an alias is lowered before it. They go first
     // because `pre_register_txn_decls` lowers the `Mut(V, Txn)` annotations it
     // scans — see [`with_block_type_aliases`] for the constraint.
-    errors.extend(pre_declare_type_aliases(stmts, ctx));
+    errors.extend(pre_declare_module_types(stmts, ctx));
     errors.extend(ctx.declare_module_parameters(stmts));
     pre_register_txn_decls(stmts, ctx);
     // This block's value is its last *contributing* statement ([`contributing_stmts`]),
@@ -961,6 +961,11 @@ pub(super) fn lower_middle_stmt(
             // A Module-typed parameter binds a `let` per value its Module type
             // names, each run binding it to the argument's member
             // (`LoweringContext::declare_module_parameters`).
+            // A type parameter binds no value: it is an alias of its parameter
+            // (`pre_declare_module_types`).
+            if is_type_name(&name.node) {
+                return Ok(body);
+            }
             if let Some(lets) = ctx.module_parameters.get(&name.node).cloned() {
                 return Ok(lets.into_iter().rev().fold(body, |body, (binder, ty)| {
                     let placeholder = ctx.tag_image(Expr::error(), stmt.span);
@@ -2361,53 +2366,111 @@ pub(super) fn pre_declare_type_aliases(
     let mut errors = Vec::new();
     let mut declared: HashSet<&str> = HashSet::new();
     for stmt in stmts {
-        let ChlStmt::Assign { target, value, .. } = &stmt.node else {
-            continue;
-        };
-        let Some((name, rhs)) = type_alias_decl(target, value) else {
-            continue;
-        };
-        if is_builtin_type_name(name) {
-            errors.push(LoweringError::unsupported(
-                stmt.span,
-                format!("`{name}` is a built-in type and cannot be given another meaning"),
-            ));
-            continue;
-        }
-        if ctx.is_type_param(name) {
-            errors.push(LoweringError::unsupported(
-                stmt.span,
-                format!(
-                    "`{name}` is a type parameter of the enclosing definition, and an alias \
-                     of the same name in its body would hide it"
-                ),
-            ));
-            continue;
-        }
-        if !declared.insert(name) {
-            errors.push(LoweringError::unsupported(
-                stmt.span,
-                format!(
-                    "`{name}` is declared twice in this block; a type alias names \
-                     one type for the whole block"
-                ),
-            ));
-            continue;
-        }
-        match lower_alias_type(rhs, ctx) {
-            Ok(ty) => ctx.declare_type_alias(name, stmt.span, ty),
-            // The inner error names the form in surface words
-            // ([`describe_type_form`]), so it composes into one sentence.
-            Err(inner) => errors.push(LoweringError::unsupported(
-                stmt.span,
-                format!(
-                    "`{name}` is capitalized, so `{name} = …` declares a type alias \
-                     and its right-hand side must be a type: {inner}"
-                ),
-            )),
+        errors.extend(pre_declare_type_alias(stmt, &mut declared, ctx));
+    }
+    errors
+}
+
+/// [`pre_declare_type_aliases`] for a module's top level, which also declares
+/// its type parameters ([`LoweringContext::declare_type_parameter`]) and lowers
+/// its runs' type arguments ([`LoweringContext::declare_run_types`]), each in
+/// source order with the aliases: a type parameter is in scope from its
+/// statement down, as an alias is, and a run's type arguments see the aliases
+/// above it.
+pub(super) fn pre_declare_module_types(
+    stmts: &[Spanned<ChlStmt>],
+    ctx: &mut LoweringContext,
+) -> Vec<LoweringError> {
+    let mut errors = Vec::new();
+    let mut declared: HashSet<&str> = HashSet::new();
+    for stmt in stmts {
+        match &stmt.node {
+            ChlStmt::Param {
+                name,
+                annotation,
+                default,
+            } if is_type_name(&name.node) => {
+                if !declared.insert(name.node.as_str()) {
+                    errors.push(LoweringError::unsupported(
+                        stmt.span,
+                        format!("`{}` is already a type this module declares", name.node),
+                    ));
+                    continue;
+                }
+                let bound = annotation.as_ref().map(|annotation| &annotation.ty);
+                if let Err(error) =
+                    ctx.declare_type_parameter(name, stmt.span, bound, default.as_ref())
+                {
+                    errors.push(error);
+                }
+            }
+            ChlStmt::Run {
+                path,
+                alias,
+                args,
+                uses,
+                ..
+            } => {
+                if let Some(name) = modules::run_name(path, alias.as_ref()) {
+                    errors.extend(ctx.declare_run_types(&name, args, uses));
+                }
+            }
+            _ => errors.extend(pre_declare_type_alias(stmt, &mut declared, ctx)),
         }
     }
     errors
+}
+
+/// Declare the type alias `stmt` declares, if it declares one, adding its name
+/// to `declared`, the names its block declares a type under so far.
+fn pre_declare_type_alias<'a>(
+    stmt: &'a Spanned<ChlStmt>,
+    declared: &mut HashSet<&'a str>,
+    ctx: &mut LoweringContext,
+) -> Option<LoweringError> {
+    let ChlStmt::Assign { target, value, .. } = &stmt.node else {
+        return None;
+    };
+    let (name, rhs) = type_alias_decl(target, value)?;
+    if is_builtin_type_name(name) {
+        return Some(LoweringError::unsupported(
+            stmt.span,
+            format!("`{name}` is a built-in type and cannot be given another meaning"),
+        ));
+    }
+    if ctx.is_type_param(name) {
+        return Some(LoweringError::unsupported(
+            stmt.span,
+            format!(
+                "`{name}` is a type parameter of the enclosing definition, and an alias \
+                 of the same name in its body would hide it"
+            ),
+        ));
+    }
+    if !declared.insert(name) {
+        return Some(LoweringError::unsupported(
+            stmt.span,
+            format!(
+                "`{name}` is declared twice in this block; a type alias names \
+                 one type for the whole block"
+            ),
+        ));
+    }
+    match lower_alias_type(rhs, ctx) {
+        Ok(ty) => {
+            ctx.declare_type_alias(name, stmt.span, ty);
+            None
+        }
+        // The inner error names the form in surface words
+        // ([`describe_type_form`]), so it composes into one sentence.
+        Err(inner) => Some(LoweringError::unsupported(
+            stmt.span,
+            format!(
+                "`{name}` is capitalized, so `{name} = …` declares a type alias \
+                 and its right-hand side must be a type: {inner}"
+            ),
+        )),
+    }
 }
 
 /// Every top-level statement that binds a sink's name other than the one declaring it.

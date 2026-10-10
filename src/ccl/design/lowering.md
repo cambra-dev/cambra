@@ -327,8 +327,8 @@ types"](../../../docs/modules.md#module-types-are-not-value-types)). A sink is d
 registered by each run of the module.
 
 The rest of the module syntax parses ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules
-[Decided]") and does not lower yet: a type parameter, `@RenamedFrom`, `@Discard`, `pub` on a
-mutable variable, and a write to another module's member.
+[Decided]") and does not lower yet: `@RenamedFrom`, `@Discard`, `pub` on a mutable variable, and
+a write to another module's member.
 `refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the whole module, every block and
 every expression, and reports one `LoweringError::Unsupported` per construct, and the module lowers
 nothing when it reports. A path with a capitalized qualifier segment, `Price::discounted`, is

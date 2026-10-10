@@ -38,6 +38,8 @@ mod generators_udf_poly;
 mod joins_aggregates_groupby;
 #[path = "compilation_pipeline/misc.rs"]
 mod misc;
+#[path = "compilation_pipeline/module_type_parameters.rs"]
+mod module_type_parameters;
 #[path = "compilation_pipeline/module_types.rs"]
 mod module_types;
 #[path = "compilation_pipeline/modules.rs"]

@@ -2878,16 +2878,19 @@ first("a", "b")   # T = String
   annotation, or it is the associated type of a requirement whose other positions are determined
   ([Trait requirements](#trait-requirements)). Any other type parameter is an
   error at the definition.
-- **A type parameter is opaque in the body.** A value of type `T` supports what `T`'s bound and the
-  `requires` clause state, and nothing else. `def inc(T, x: T) => T: x + 1` is an error at `+`,
-  because no requirement states that `T` and `Int` are `Addable`.
-- **Two type parameters have no common type but what their bounds give them.** With `a: T` and
-  `b: U`, `a if c else b` is an error: no type the program can write covers both. With bounds it
+- **A type parameter with a written kind is opaque in the body.** A value of type `T` supports what
+  `T`'s kind and the `requires` clause state, and nothing else. `def inc(T: Type, x: T) => T: x + 1`
+  is an error at `+`, because no requirement states that `T` and `Int` are `Addable`. With `T`
+  alone, the same body infers that requirement into `inc`'s type, and each call is checked against
+  it ([Kinds and bounds](#kinds-and-bounds)).
+- **Two type parameters with written kinds have no common type but what their bounds give
+  them.** With `a: T` and `b: U`, `a if c else b` is an error: no type the program can write covers both. With bounds it
   is the least type their bounds place above both: `T` under `U <: T`, and `Int` under `T <: Int`
   and `U <: Int`. The definition is rejected whether or not anything calls it.
-- **A type parameter does not leave its definition.** A value of type `T` flowing into something
-  declared outside the `def`, as in `outer << x` with `x: T`, is an error naming `T`: outside the
-  definition `T` names no type.
+- **A type parameter with a written kind does not leave its definition.** A value of type `T`
+  flowing into something declared outside the `def`, as in `outer << x` with `x: T`, is an error
+  naming `T`: outside the definition `T` names no type. With `T` alone, the flow infers `T`'s kind
+  below `outer`'s element type instead.
 - **A type parameter is scoped like an alias declared in the function's block**
   ([6.7 Type-alias statements](#67-type-alias-statements)). It shadows an outer alias of the same
   name. An alias of the same name declared in the body is an error naming both.
@@ -2897,9 +2900,13 @@ first("a", "b")   # T = String
 A type parameter ranges over a **kind**, a set of types. `T: K` states that `T` is one of the types
 in the kind `K`:
 
-- `Type` is every type. `T` alone is `T: Type`.
+- `Type` is every type.
 - `SubtypesOf(U)` is every subtype of `U`, `U` included. `T <: U`, the **bound** form, is
   `T: SubtypesOf(U)`.
+
+`T` alone writes no kind. Its kind is inferred from the uses in its definition, as an unannotated
+value parameter's type is: a contract is inferred unless it is written
+([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
 
 Any other kind, such as a listing `T: [Int, String]`, is **[Open]** and an error. A type written as
 a kind, as in `T: Int`, is an error.
@@ -2920,7 +2927,9 @@ With `a: {at: Int}` and a `{Int, {at: Int}}` result instead, `pair.1` is `{at: I
 
 - A kind names only the type parameters before it. A bound naming its own parameter is a recursive
   type, which [6.7 Type-alias statements](#67-type-alias-statements) leaves unwritable.
-- No kind gives a type parameter a lower bound.
+- No kind gives a type parameter a lower bound. A body that requires one of a `T` with no kind
+  written, as `x if c else 1` with `x: T` does, is **[Open]**: its inferred kind has no written
+  form.
 
 #### Trait requirements
 
@@ -3865,10 +3874,12 @@ param payments: Module{charge: {amount: Int} => Receipt}
 
 - A **type parameter** is a capitalized parameter, since `Caps` means type
   ([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)).
-  It names a type that varies with the run. The module is checked with it as an opaque type, known
-  only through its bound: `Receipt` above has an `id` and nothing else checking can rely on. A run
-  or an import supplies it as an argument, `Receipt=stripe::Receipt`, as it does any parameter
-  without a default. **[Planned]** An argument left out is inferred from the types of the other
+  It names a type that varies with the run, and follows a `def`'s type parameter
+  ([Kinds and bounds](#kinds-and-bounds)). With a bound it is opaque apart from it: `Receipt` above
+  has an `id` and nothing else checking can rely on. With none, its kind is inferred from the
+  module's uses. A run or an import supplies it as an argument, `Receipt=stripe::Receipt`, as it
+  does any parameter without a default. A default is a type over the module's import names and the
+  type parameters declared above it. **[Planned]** An argument left out is inferred from the types of the other
   arguments.
 - A value parameter is an immutable value. Its type is its annotation, or inferred from the module's
   uses the way a function parameter's is.
@@ -4179,7 +4190,8 @@ A module is checked once, alone, with no root and nothing that uses it. `cambra 
 runs that check and prints the module's interface.
 
 - **Parameters are typed binders.** A value parameter has its annotated type or the type its uses
-  infer. A type parameter is opaque apart from its bound.
+  infer. A type parameter is opaque apart from its bound, and one with no bound has the kind its
+  uses infer.
 - **Imports are read through interfaces.** A module sees another module's public contracts and
   whether it performs IO, never its bodies.
 - **A public member's contract is its type.** An annotated member's contract is the annotation,

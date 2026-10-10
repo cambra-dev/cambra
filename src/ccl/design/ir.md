@@ -214,7 +214,8 @@ statements"](../../../docs/chl-spec.md#67-type-alias-statements)), so uniquify r
 that declares the run `name` of `module`, over `body`, the rest of the declaring module.
 `arguments` names the parameters it passes value arguments for, each bound in a `let` above the
 node, and `modules` holds each module argument: its parameter, the module as the declaring module
-spells it, and the argument's span. A module lowers once, before any run of it exists, so the
+spells it, and the argument's span. Each type argument is a `LetType` above the node, named as a
+value argument's `let` is. A module lowers once, before any run of it exists, so the
 statement cannot stand for the run's chain yet. Linking creates the run and replaces the node with
 its chain around `body` ([docs/modules.md, "A module lowers
 once"](../../../docs/modules.md#a-module-lowers-once)). No pass after linking sees a `Run`, and
