@@ -102,6 +102,7 @@ mod functions;
 mod http;
 mod loops;
 mod module_syntax;
+mod nominal;
 mod sinks;
 mod stmts;
 #[cfg(any(test, feature = "test-helpers"))]
@@ -383,6 +384,12 @@ pub struct LoweringContext {
     /// same-named alias in the body is an error rather than a shadow
     /// (`docs/chl-spec.md`, "Type parameters"), which is what this answers.
     pub(super) type_params_in_scope: Vec<String>,
+
+    /// The nominal types the module declares, by name (`docs/chl-spec.md`, "Declaring a
+    /// nominal type"). Unlike an alias, a nominal type survives lowering as a
+    /// [`Type::Nominal`] naming its declaration. Declared only at the top level, so never
+    /// snapshotted.
+    pub(super) nominal_types: Vec<Rc<crate::ccl::nominal::NominalDecl>>,
 
     /// Shadow-depth counter keyed by surface spelling: how many enclosing local
     /// binders — loop targets, comprehension generators, lambda/`def` params —
@@ -778,6 +785,11 @@ impl LoweringContext {
         self.type_aliases.get(name)
     }
 
+    /// The nominal type the module declares under `name`.
+    pub(super) fn nominal_type(&self, name: &str) -> Option<Rc<crate::ccl::nominal::NominalDecl>> {
+        self.nominal_types.iter().find(|d| d.name == name).cloned()
+    }
+
     /// Whether `name` is a type parameter of a definition being lowered.
     pub(super) fn is_type_param(&self, name: &str) -> bool {
         self.type_params_in_scope.iter().any(|n| n == name)
@@ -955,9 +967,7 @@ fn lower_expr_inner(
             }
             Ok(Expr::var(name.to_string()))
         }
-        ChlExpr::Qualified(_) => {
-            unreachable!("a qualified name is refused before lowering (`refuse_module_syntax`)")
-        }
+        ChlExpr::Qualified(q) => nominal::lower_member(q, expr.span, ctx),
         ChlExpr::BinOp { left, op, right } => lower_binop(left, *op, right, ctx),
         ChlExpr::Compare {
             left,

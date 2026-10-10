@@ -795,7 +795,7 @@ visibly.
 
 ### A nominal type is compared by declaration
 
-> **Status: [Prescribed].** Nominal types are not implemented.
+> **Status: [Prescribed].**
 
 The second refusal compares types after inference, and a nominal type survives inference, so the
 comparison sees the nominal type and not only its constructors' parameter types. The rules a stored

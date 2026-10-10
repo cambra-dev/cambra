@@ -492,9 +492,26 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // and the `Unit`-valued expression sitting there is a real node — unlike
         // an arm's *type*, where "stores nothing" is the whole content and the
         // surface spells it `` `tag ``.
-        TypedExprNode::VariantCtor { tag, payload } => (
+        TypedExprNode::VariantCtor {
+            tag,
+            payload,
+            nominal: None,
+        } => (
             Precedence::Atom,
             format!("`{tag}({})", fmt(payload, Precedence::Lowest, opts)),
+        ),
+        // A nominal constructor keeps its type's name, as the source spells it.
+        TypedExprNode::VariantCtor {
+            tag,
+            payload,
+            nominal: Some(decl),
+        } => (
+            Precedence::Atom,
+            format!(
+                "{}::{tag}({})",
+                decl.name,
+                fmt(payload, Precedence::Lowest, opts)
+            ),
         ),
 
         // `transact (k = init, …) { [reads]⇒[writes] over <source> do <body>;

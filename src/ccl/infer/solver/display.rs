@@ -359,6 +359,12 @@ fn for_each_child(
         f(value, pol)?;
         f(domain, pol)?;
     }
+    for (decl, args) in ct.nominal.values_mut() {
+        for (arg, v) in args.iter_mut().zip(&decl.body().variances) {
+            let pol = v.polarity(pol);
+            f(arg, pol)?;
+        }
+    }
     Some(())
 }
 
@@ -400,7 +406,8 @@ impl Parametrize<'_> {
             || ct.rec.is_some()
             || ct.var.is_some()
             || ct.fun.is_some()
-            || ct.history_slot.is_some();
+            || ct.history_slot.is_some()
+            || !ct.nominal.is_empty();
         if quantified.is_empty() {
             // Nothing reached this position: it is unconstrained, which a parameter
             // of its own states.

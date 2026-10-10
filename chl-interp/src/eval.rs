@@ -29,7 +29,7 @@ use std::rc::Rc;
 
 use chl_parser::ast::{
     AssignTarget, AugOp, BinOp, BoolOp, CmpOp, CompClause, Expr, IfBranch, Lit, PayloadPattern,
-    Spanned, Stmt, TypeAnnotation, UnaryOp, VariantPayload,
+    QualifiedName, Spanned, Stmt, TypeAnnotation, TypeDeclBody, UnaryOp, VariantPayload,
 };
 
 use crate::value::{Collection, Value};
@@ -181,6 +181,10 @@ pub(crate) struct Interp {
     cells_made: u64,
     /// One watch per running loop over a collection not keyed by position, innermost last.
     order_watches: Vec<OrderWatch>,
+    /// The number of parameters of each constructor the module's `type` declarations
+    /// declare, by its qualified name `Shape::circle`. Collected before the program runs,
+    /// since a declaration is in scope throughout its module.
+    constructors: Rc<BTreeMap<String, usize>>,
 }
 
 /// A loop over a collection not keyed by position, whose iteration order is not defined
@@ -213,6 +217,7 @@ impl Interp {
             lost: None,
             txn: None,
             loop_keys: Vec::new(),
+            constructors: Rc::default(),
             cells_made: 0,
             order_watches: Vec::new(),
         }
@@ -302,12 +307,14 @@ pub fn run(source: &str) -> Result<Observations, Error> {
         .map_err(|errors| Error(format!("parse error: {errors:?}")))?;
     let mut feed_sites = BTreeMap::new();
     collect_feed_sites(&module.body, &mut feed_sites);
+    let constructors = Rc::new(collect_constructors(&module.body));
 
     // Each pass completes at least one channel or ends the run, so there is at most one pass per
     // channel, plus the last.
     let mut finals: BTreeMap<String, Value> = BTreeMap::new();
     loop {
         let mut interp = Interp::new(feed_sites.clone(), finals.clone());
+        interp.constructors = Rc::clone(&constructors);
         // A failure outside speculation is on the path the program takes, whatever a later
         // pass would read, so it is the program's.
         interp.exec_block(&module.body)?;
@@ -483,6 +490,31 @@ fn for_each_block<'a>(e: &'a Spanned<Expr>, bodies: Bodies, f: &mut dyn FnMut(&'
         // Literals, names and type syntax hold no statement.
         _ => {}
     }
+}
+
+/// The number of parameters of each constructor `body`'s `type` declarations declare, by its
+/// qualified name `Shape::circle`.
+fn collect_constructors(body: &[Spanned<Stmt>]) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for stmt in body {
+        let Stmt::TypeDecl(decl) = &stmt.node else {
+            continue;
+        };
+        match &decl.body {
+            TypeDeclBody::Single(_) => {
+                out.insert(format!("{}::new", decl.name.node), 1);
+            }
+            TypeDeclBody::Constructors(ctors) => {
+                for ctor in ctors {
+                    out.insert(
+                        format!("{}::{}", decl.name.node, ctor.name.node),
+                        ctor.params.len(),
+                    );
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Every `<<` site in `body` into `feeds`, by the channel name each names, in source order.
@@ -939,9 +971,57 @@ impl Interp {
                 Ok(None)
             }
 
-            Stmt::Pass => Ok(None),
+            // A declaration binds no value; its constructors were collected before the run.
+            Stmt::Pass | Stmt::TypeDecl(_) => Ok(None),
             other => err(format!("unsupported statement: {other:?}")),
         }
+    }
+
+    /// The number of parameters of the constructor `q` names.
+    fn constructor_arity(&self, q: &QualifiedName) -> Result<usize, Error> {
+        let [ty] = q.qualifier.as_slice() else {
+            return err(format!("unsupported qualified name: {q:?}"));
+        };
+        let key = format!("{}::{}", ty.node, q.name.node);
+        self.constructors
+            .get(&key)
+            .copied()
+            .ok_or_else(|| Error(format!("`{key}` is not a declared constructor")))
+    }
+
+    /// A constructor applied to its arguments: the value named by the constructor, holding
+    /// the argument, or the tuple of several (`docs/chl-spec.md`, "Declaring a nominal
+    /// type").
+    fn construct(&mut self, q: &QualifiedName, args: &[Spanned<Expr>]) -> Result<Value, Error> {
+        let arity = self.constructor_arity(q)?;
+        if arity == 0 || arity != args.len() {
+            return err(format!(
+                "`{}` takes {arity} arguments, got {}",
+                q.name.node,
+                args.len()
+            ));
+        }
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.eval(arg)?);
+        }
+        if any_pending(values.iter()) {
+            return Ok(Value::Pending);
+        }
+        let payload = match <[Value; 1]>::try_from(values) {
+            Ok([only]) => only,
+            Err(values) => Value::Record(
+                values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| (format!("_{i}"), v))
+                    .collect(),
+            ),
+        };
+        Ok(Value::Variant {
+            tag: q.name.node.to_string(),
+            payload: Box::new(payload),
+        })
     }
 
     /// The scopes a function defined here closes over: every value as it stands now
@@ -1330,6 +1410,21 @@ impl Interp {
             Expr::Lit(Lit::String(s)) => Ok(Value::Str(s.clone())),
             Expr::Lit(Lit::Bool(b)) => Ok(Value::Bool(*b)),
 
+            // A constructor that declares no parameters is a value, held as its name.
+            Expr::Qualified(q) => {
+                let arity = self.constructor_arity(q)?;
+                if arity != 0 {
+                    return err(format!(
+                        "the constructor `{}` as a function value is not supported",
+                        q.name.node
+                    ));
+                }
+                Ok(Value::Variant {
+                    tag: q.name.node.to_string(),
+                    payload: Box::new(Value::Unit),
+                })
+            }
+
             Expr::Name(n) => match self.slot(n) {
                 Some(Slot::Val(v)) => Ok(v.clone()),
                 Some(Slot::Mut(cell)) => {
@@ -1600,6 +1695,9 @@ impl Interp {
     /// A lambda is applied where it is written rather than becoming a value: nothing in
     /// CHL observes a function, so the comparison domain has no reason to carry one.
     fn call(&mut self, func: &Spanned<Expr>, args: &[Spanned<Expr>]) -> Result<Value, Error> {
+        if let Expr::Qualified(q) = &func.node {
+            return self.construct(q, args);
+        }
         let Expr::Name(name) = &func.node else {
             return err("only a named function can be called");
         };

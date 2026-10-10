@@ -1704,6 +1704,9 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                 | Type::ChanDom(_, _)
                 | Type::Param(_)
                 | Type::Txn => {}
+                // A nominal value is opaque: no operation reaches a component of it, so
+                // its arguments name no place inside it.
+                Type::Nominal(..) => {}
                 Type::Poly(_) => unreachable!("a polymorphic type is never a recorded bound"),
                 // `peel_refinements` returns a non-refinement by construction.
                 Type::Refinement(_, _) => unreachable!("refinements are peeled above"),
@@ -2085,8 +2088,9 @@ pub fn offered(ty: &Type) -> Offered<'_> {
         // structural trait can be asked of ([`Trait::is_structural`]).
         Type::Tuple(_) | Type::Record(_) => Offered::Product(cur),
         // Sums and functions are fully determined and are not bases. A collection
-        // compared or added is the same mistake as a variant.
-        Type::Variant(_, _) | Type::Fun { .. } => Offered::NotABase,
+        // compared or added is the same mistake as a variant. A declared nominal type
+        // satisfies no trait (`docs/chl-spec.md`, "A nominal type is opaque").
+        Type::Variant(_, _) | Type::Fun { .. } | Type::Nominal(..) => Offered::NotABase,
         Type::Param(param) => Offered::Param(param),
         // Everything else is either a variable, a placeholder, or a carrier whose
         // payload reaches the watch by another route.

@@ -186,6 +186,11 @@ pub fn refuse_param_joined_with_outer_variable(graph: &CompactGraph) -> Result<(
             go(value, polarity)?;
             go(domain, polarity)?;
         }
+        for (decl, args) in ct.nominal.values() {
+            for (arg, v) in args.iter().zip(&decl.body().variances) {
+                go(arg, v.polarity(polarity))?;
+            }
+        }
         Ok(())
     }
     go(&graph.term, true)
@@ -631,6 +636,15 @@ fn coalesce_compact_go(
             coalesce_compact_go(value, polarity, scope)?,
             *history_kind,
         ));
+    }
+    // Each declaration is one shape, so two at one position fall to the conflict below.
+    for (decl, args) in ct.nominal.values() {
+        let args = args
+            .iter()
+            .zip(&decl.body().variances)
+            .map(|(arg, v)| coalesce_compact_go(arg, v.polarity(polarity), scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        shapes.push(Type::Nominal(decl.clone(), args));
     }
     let mut all = Vec::new();
     all.append(&mut atoms);

@@ -11,10 +11,10 @@ use smol_str::SmolStr;
 
 use crate::ast::{
     AnnotationMode, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp, CmpOp,
-    CompClause, Comprehension, DiscardHead, Expr, FileId, IfBranch, KindAnnotation, Lit, MatchArm,
-    MatchPattern, Module, ModulePath, Param, PayloadPattern, QualifiedName, RecordField,
-    Requirement, RunArg, Span, Spanned, Stmt, TypeAnnotation, TypeParam, UnaryOp, UseItem,
-    VariantPayload,
+    CompClause, Comprehension, Constructor, ConstructorParam, DiscardHead, Expr, FileId, IfBranch,
+    KindAnnotation, Lit, MatchArm, MatchPattern, Module, ModulePath, Param, PayloadPattern,
+    QualifiedName, RecordField, Requirement, RunArg, Span, Spanned, Stmt, TypeAnnotation, TypeDecl,
+    TypeDeclBody, TypeParam, UnaryOp, UseItem, VariantPayload,
 };
 use crate::lexer::{self, Token};
 
@@ -1593,6 +1593,92 @@ where
                 Err(Rich::custom(name_span, message))
             });
 
+        // ---- type N(P…): constructors | type N(P…) = R ---------------
+        // (`docs/chl-spec.md`, "Declaring a nominal type")
+        //
+        // A constructor parameter's `name:` prefix is optional, and a parameter type
+        // can itself begin with an identifier, so the prefix is tried and rewound.
+        let ctor_param = binder
+            .then_ignore(just(Token::Colon))
+            .or_not()
+            .then(expr.clone())
+            .map(|(name, ty)| ConstructorParam { name, ty });
+        // Parentheses hold at least one parameter: a constructor that declares none is a
+        // value, written without them.
+        let ctor_line = binder
+            .then(
+                ctor_param
+                    .separated_by(just(Token::Comma))
+                    .at_least(1)
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .or_not()
+                    .map(Option::unwrap_or_default),
+            )
+            .then_ignore(just(Token::Newline))
+            .validate(|(name, params), _, emitter| {
+                if starts_capitalized(&name.node) {
+                    emitter.emit(Rich::custom(
+                        name.span,
+                        format!(
+                            "constructor `{}` is capitalized, which names a type; a \
+                             constructor begins with a lowercase letter",
+                            name.node
+                        ),
+                    ));
+                }
+                Constructor { name, params }
+            });
+        let type_body = choice((
+            just(Token::Eq)
+                .ignore_then(expr.clone())
+                .then_ignore(just(Token::Newline))
+                .map(TypeDeclBody::Single),
+            just(Token::Colon)
+                .ignore_then(just(Token::Newline))
+                .ignore_then(just(Token::Indent).labelled("indented constructor lines"))
+                .ignore_then(
+                    ctor_line
+                        .then_ignore(just(Token::Newline).repeated())
+                        .repeated()
+                        .at_least(1)
+                        .collect::<Vec<_>>(),
+                )
+                .then_ignore(just(Token::Dedent))
+                .map(TypeDeclBody::Constructors),
+        ));
+        let type_stmt = just(Token::Type)
+            .ignore_then(binder)
+            .then(
+                binder
+                    .separated_by(just(Token::Comma))
+                    .at_least(1)
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .or_not()
+                    .map(Option::unwrap_or_default),
+            )
+            .then(type_body)
+            .validate(|((name, params), body), e, emitter| {
+                let heads = std::iter::once((&name, "type name"))
+                    .chain(params.iter().map(|p| (p, "type parameter")));
+                for (head, what) in heads {
+                    if !starts_capitalized(&head.node) {
+                        emitter.emit(Rich::custom(
+                            head.span,
+                            format!(
+                                "{what} `{}` begins with a lowercase letter; a type's name \
+                                 is capitalized",
+                                head.node
+                            ),
+                        ));
+                    }
+                }
+                Spanned::new(e.span(), Stmt::TypeDecl(TypeDecl { name, params, body }))
+            });
+
         let def_stmt = just(Token::Def)
             .ignore_then(select! { Token::Ident(s) => s }.labelled("function name"))
             .then(
@@ -1748,6 +1834,7 @@ where
             for_stmt,
             with_stmt,
             def_stmt,
+            type_stmt,
             decorated_stmt,
             pub_stmt,
             block_assign,
@@ -1815,6 +1902,7 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
         | Stmt::AnnAssign { .. }
         | Stmt::MutAssign { .. }
         | Stmt::FunctionDef { .. }
+        | Stmt::TypeDecl(_)
         | Stmt::Run {
             renamed_from: None, ..
         }
@@ -1849,7 +1937,8 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
         | Stmt::With { .. }
         | Stmt::Return(_)
         | Stmt::Pass => {
-            "`pub` marks a statement that introduces a member: an assignment, a `def`, or a `run`"
+            "`pub` marks a statement that introduces a member: an assignment, a `def`, a `type`, or a \
+             `run`"
         }
     };
     Some(what)
@@ -2368,6 +2457,89 @@ mod tests {
         parse_mod(src)
             .into_result()
             .unwrap_or_else(|errs| panic!("parse errors: {errs:#?}"))
+    }
+
+    /// The constructor-list form keeps each line's name and parameters in source order, with
+    /// a parameter's documenting name where one is written.
+    #[test]
+    fn type_declaration_lists_its_constructors() {
+        let m = parse_m(indoc! {"
+            type Shape(T):
+                circle(radius: Int)
+                rect(T, h: Int)
+                empty
+        "});
+        let Stmt::TypeDecl(decl) = &m.body[0].node else {
+            panic!("expected a type declaration, got {:?}", m.body[0].node)
+        };
+        assert_eq!(decl.name.node, "Shape");
+        let params: Vec<_> = decl.params.iter().map(|p| p.node.as_str()).collect();
+        assert_eq!(params, ["T"]);
+        let TypeDeclBody::Constructors(ctors) = &decl.body else {
+            panic!("expected constructor lines, got {:?}", decl.body)
+        };
+        let shape: Vec<(&str, Vec<Option<&str>>)> = ctors
+            .iter()
+            .map(|c| {
+                let names = c
+                    .params
+                    .iter()
+                    .map(|p| p.name.as_ref().map(|n| n.node.as_str()))
+                    .collect();
+                (c.name.node.as_str(), names)
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("circle", vec![Some("radius")]),
+                ("rect", vec![None, Some("h")]),
+                ("empty", vec![]),
+            ]
+        );
+    }
+
+    /// A constructor that declares no parameters is written without parentheses, since
+    /// it is a value: `none()` does not parse.
+    #[test]
+    fn a_constructor_line_takes_no_empty_parentheses() {
+        assert!(
+            !parse_mod("type Option(T):\n    some(T)\n    none()\n")
+                .errors
+                .is_empty()
+        );
+    }
+
+    /// `type N = R` is the single-constructor form, and `pub` exports it.
+    #[test]
+    fn single_constructor_type_declaration() {
+        let m = parse_m("pub type Price = {Int where _ >= 0}\n");
+        let Stmt::Pub { stmt, .. } = &m.body[0].node else {
+            panic!("expected `pub`, got {:?}", m.body[0].node)
+        };
+        let Stmt::TypeDecl(decl) = &stmt.node else {
+            panic!("expected a type declaration, got {:?}", stmt.node)
+        };
+        assert_eq!(decl.name.node, "Price");
+        assert!(matches!(decl.body, TypeDeclBody::Single(_)));
+    }
+
+    /// A type's name and parameters are capitalized and its constructors are not, and each
+    /// case error names the offending identifier.
+    #[test]
+    fn type_declaration_case_errors_name_the_identifier() {
+        for (src, needle) in [
+            ("type price = Int\n", "type name `price`"),
+            ("type Box(t) = t\n", "type parameter `t`"),
+            ("type Shape:\n    Circle(Int)\n", "constructor `Circle`"),
+        ] {
+            let result = parse_mod(src);
+            assert!(
+                result.errors.iter().any(|e| e.to_string().contains(needle)),
+                "{src:?}: expected an error naming {needle}, got {:#?}",
+                result.errors
+            );
+        }
     }
 
     #[test]

@@ -393,6 +393,13 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         // bookkeeping, not identity - see `ChanLevel`).
         (Type::ChanDom(a, _), Type::ChanDom(b, _)) => a == b,
         (Type::Param(a), Type::Param(b)) => a == b,
+        (Type::Nominal(d1, a1), Type::Nominal(d2, a2)) => {
+            d1 == d2
+                && a1
+                    .iter()
+                    .zip(a2)
+                    .all(|(x, y)| types_agree_modulo_unread(x, y, refinements))
+        }
         (
             Type::Fun {
                 name: n1,
@@ -1855,7 +1862,7 @@ fn coalesce_type_predicates_go(
             coalesce_type_predicates_go(c, level, ctx, scope);
             scope.exit();
         }
-        Type::Tuple(ts) => ts
+        Type::Tuple(ts) | Type::Nominal(_, ts) => ts
             .iter_mut()
             .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
         Type::Record(fs) => fs

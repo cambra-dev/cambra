@@ -14,6 +14,7 @@
 // hazard therefore doesn't apply here.
 #![allow(clippy::mutable_key_type)]
 
+use crate::ccl::nominal::Variance;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -1013,6 +1014,30 @@ fn constrain_go_impl(
         // to every other type (the catch-all `Mismatch` below).
         (Type::Txn, Type::Txn) => Ok(()),
 
+        // Two applications of one nominal type relate argument by argument, as each
+        // parameter's variance requires. A contravariant argument flips the way a
+        // function's domain does, swapping the two sides' morphisms. An invariant one
+        // equates in both directions under no morphism, as a history's children do: both
+        // directions carrying the sides' morphisms would meet two non-invertible
+        // morphisms at one variable. A nominal type relates to no other type, so every
+        // other pairing falls to the catch-all `Mismatch` below (`docs/chl-spec.md`, "A
+        // nominal type is opaque").
+        (Type::Nominal(d0, a0), Type::Nominal(d1, a1)) if d0 == d1 => {
+            for ((x, y), v) in a0.iter().zip(a1).zip(&d0.body().variances) {
+                match v {
+                    Variance::Covariant => constrain_go(x, y, sl, sr, cache, scope)?,
+                    Variance::Contravariant => {
+                        cache.swapped(|cache| constrain_go(y, x, sr, sl, cache, scope))?
+                    }
+                    Variance::Invariant => {
+                        constrain_go(x, y, &Subst::id(), &Subst::id(), cache, scope)?;
+                        constrain_go(y, x, &Subst::id(), &Subst::id(), cache, scope)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
         // Function: contravariant on domain, covariant on codomain. The
         // codomain edge *derives* the binder correspondence — aligning the two
         // Pi binders `k ↦ x` — and carries it onward (design §3.6); the domain
@@ -1970,6 +1995,19 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         Type::Tuple(ts) => Type::Tuple(
             ts.iter()
                 .map(|t| extrude(t, pol, target_level, cache))
+                .collect(),
+        ),
+        // Each argument extrudes at the polarity its variance gives it, and an invariant
+        // one through two-way proxies, as a history's payload does.
+        Type::Nominal(decl, args) => Type::Nominal(
+            decl.clone(),
+            args.iter()
+                .zip(&decl.body().variances)
+                .map(|(t, v)| match v {
+                    Variance::Covariant => extrude(t, pol, target_level, cache),
+                    Variance::Contravariant => extrude(t, !pol, target_level, cache),
+                    Variance::Invariant => extrude_invariant(t, target_level, cache),
+                })
                 .collect(),
         ),
         Type::Record(fs) => Type::Record(

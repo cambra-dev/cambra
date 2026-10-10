@@ -1763,6 +1763,13 @@ fn collect_type_errors(
         Type::Poly(_) => errors.push(InferError::Unsupported(format!(
             "polymorphic type `{ty}` survived inference at `{context_sym}`"
         ))),
+        // A nominal type is concrete, and stays to operator conversion
+        // (`src/ccl/design/nominal-types.md`, "After inference").
+        Type::Nominal(_, args) => {
+            for arg in args {
+                collect_type_errors(arg, context_sym, strictness, errors, seen_refinements);
+            }
+        }
         Type::Fun {
             domain,
             codomain,

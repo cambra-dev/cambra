@@ -421,11 +421,19 @@ pub enum TypedExprNode {
     /// Produces a [`Type::Variant`] containing a single tag whose payload type
     /// is inferred from `payload`. Width-subtyping then lets the resulting
     /// singleton variant flow into any consumer expecting a superset of tags.
+    ///
+    /// With `nominal`, the tag is a constructor of that nominal type, and the value is a
+    /// [`Type::Nominal`] applied to arguments read off the payload's type
+    /// (`docs/chl-spec.md`, "6.8 Nominal types and methods \[Decided\]"). Lowering builds
+    /// one only as the body of the function a constructor declares, so the function's
+    /// annotation states the constructor's parameter type, refinements included.
     VariantCtor {
         /// Tag name; arbitrary identifier.
         tag: String,
         /// Payload expression.
         payload: Box<TypedExpr>,
+        /// The nominal type whose constructor `tag` is, if any.
+        nominal: Option<std::rc::Rc<crate::ccl::nominal::NominalDecl>>,
     },
 
     /// A transactional mutable variable: a set of scalar-variable **keys** sharing one
@@ -1566,6 +1574,21 @@ impl TypedExpr {
         Self::new(TypedExprNode::VariantCtor {
             tag: tag.into(),
             payload: Box::new(payload),
+            nominal: None,
+        })
+    }
+
+    /// Construct a [`TypedExprNode::VariantCtor`] building a value of the nominal type
+    /// `decl` with its constructor `tag`.
+    pub fn nominal_ctor(
+        decl: std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+        tag: impl Into<String>,
+        payload: TypedExpr,
+    ) -> Self {
+        Self::new(TypedExprNode::VariantCtor {
+            tag: tag.into(),
+            payload: Box::new(payload),
+            nominal: Some(decl),
         })
     }
 

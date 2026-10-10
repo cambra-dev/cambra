@@ -1293,6 +1293,7 @@ impl Subst {
             }
 
             Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.rewrite_type_go(t, memo)),
+            Type::Nominal(_, ts) => ts.iter_mut().for_each(|t| self.rewrite_type_go(t, memo)),
             Type::Record(fs) => fs
                 .iter_mut()
                 .for_each(|(_, t)| self.rewrite_type_go(t, memo)),
@@ -1538,6 +1539,9 @@ impl Subst {
             }
 
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| self.apply_type(t)).collect()),
+            Type::Nominal(d, ts) => {
+                Type::Nominal(d.clone(), ts.iter().map(|t| self.apply_type(t)).collect())
+            }
             Type::Record(fs) => Type::Record(
                 fs.iter()
                     .map(|(n, t)| (n.clone(), self.apply_type(t)))
@@ -1688,6 +1692,7 @@ pub fn type_contains_infer(ty: &Type) -> bool {
             type_contains_infer(value) || type_contains_infer(domain)
         }
         Type::Tuple(ts) => ts.iter().any(type_contains_infer),
+        Type::Nominal(_, ts) => ts.iter().any(type_contains_infer),
         Type::Record(fs) => fs.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Variant(tags, _) => tags.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Refinement(base, _) => type_contains_infer(base),
@@ -1780,6 +1785,9 @@ fn collect_type_fv(
             collect_type_fv(base, bound, visited, out);
         }
         Type::Tuple(ts) => ts
+            .iter()
+            .for_each(|t| collect_type_fv(t, bound, visited, out)),
+        Type::Nominal(_, ts) => ts
             .iter()
             .for_each(|t| collect_type_fv(t, bound, visited, out)),
         Type::Record(fs) => fs
@@ -2057,6 +2065,7 @@ impl<'a> PiWalk<'a> {
                 refinements.rewrite_each(|_, r| self.refinement(r, depth));
             }
             Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
+            Type::Nominal(_, ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
             Type::Record(fs) => fs.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
             Type::Variant(tags, _) => tags.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
             Type::History { value, domain, .. } => {
@@ -2217,6 +2226,7 @@ pub fn references_enclosing_function(ty: &Type) -> bool {
                 }) || ty_scan(base, depth, visited)
             }
             Type::Tuple(ts) => ts.iter().any(|t| ty_scan(t, depth, visited)),
+            Type::Nominal(_, ts) => ts.iter().any(|t| ty_scan(t, depth, visited)),
             Type::Record(fs) => fs.iter().any(|(_, t)| ty_scan(t, depth, visited)),
             Type::Variant(tags, _) => tags.iter().any(|(_, t)| ty_scan(t, depth, visited)),
             Type::History { value, domain, .. } => {

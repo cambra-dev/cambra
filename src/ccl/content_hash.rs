@@ -208,6 +208,15 @@ fn hash_type<'a>(
         // its spelling is what is folded. None survives inference, so this is
         // reached only by a hash of a pre-inference tree.
         T::Param(param) => param.spelling.hash(state),
+        // A declaration's identity is per-compilation, so its name is what is folded. None
+        // survives inference, so this is reached only by a hash of a pre-inference tree.
+        T::Nominal(decl, args) => {
+            decl.name.hash(state);
+            args.len().hash(state);
+            for t in args {
+                hash_type(t, env, wenv, free, state);
+            }
+        }
         T::Poly(poly) => {
             for p in &poly.params {
                 p.param.spelling.hash(state);

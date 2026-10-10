@@ -1396,9 +1396,14 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         TypedExprNode::Error => crate::unexpected_error_node!(),
         // A tagged-variant value carries no ExprStmt of its own; recurse into
         // the payload so a nested one is dropped.
-        TypedExprNode::VariantCtor { tag, payload } => TypedExprNode::VariantCtor {
+        TypedExprNode::VariantCtor {
+            tag,
+            payload,
+            nominal,
+        } => TypedExprNode::VariantCtor {
             tag,
             payload: Box::new(drop_expr_stmts(*payload)),
+            nominal,
         },
     };
     TypedExpr {
@@ -3241,8 +3246,13 @@ fn extract_for_defer_impl(
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Defer) => node,
         TypedExprNode::Error => crate::unexpected_error_node!(),
-        TypedExprNode::VariantCtor { tag, payload } => TypedExprNode::VariantCtor {
+        TypedExprNode::VariantCtor {
             tag,
+            payload,
+            nominal,
+        } => TypedExprNode::VariantCtor {
+            tag,
+            nominal,
             payload: Box::new(extract_for_defer(
                 *payload,
                 defer_name,

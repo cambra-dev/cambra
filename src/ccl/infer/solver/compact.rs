@@ -6,6 +6,7 @@
 //! [`CompactType`] / [`CompactGraph`] are the shared currency consumed by the
 //! sibling [`mod@super::simplify_type`] and [`super::coalesce`] modules.
 
+use crate::ccl::nominal::{NominalDecl, NominalId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -503,6 +504,7 @@ impl CompactType {
             fun,
             refinements,
             history_slot,
+            nominal,
         } = self;
         Occupied {
             atoms: atoms.len(),
@@ -510,7 +512,8 @@ impl CompactType {
             others: rec.is_some()
                 || var.is_some()
                 || refinements.as_ref().is_some_and(|r| !r.is_empty())
-                || history_slot.is_some(),
+                || history_slot.is_some()
+                || !nominal.is_empty(),
         }
     }
 }
@@ -775,6 +778,13 @@ pub struct CompactType {
     /// onto each child's variables, and compaction only needs a deterministic
     /// materialization, not a second polarity analysis.
     pub history_slot: Option<(Box<CompactType>, Box<CompactType>, HistoryKind)>,
+    /// Nominal contributions, keyed by declaration: each declaration with its arguments,
+    /// one position per argument. Two declarations at one position are two shapes, which
+    /// [`shapes`](Self::shapes) counts and coalesce reports: a join of two nominal types is
+    /// an error (`docs/chl-spec.md`, "A nominal type is opaque"). Each argument compacts
+    /// at the polarity [`Variance::polarity`](crate::ccl::nominal::Variance::polarity)
+    /// gives it.
+    pub nominal: BTreeMap<NominalId, (Rc<NominalDecl>, Vec<CompactType>)>,
     /// **Kinding** constraints gathered from the variables contributing here —
     /// `α :: 𝐾` for each, conjunctively. Folded in by the variable walk exactly as
     /// its bounds are, and discharged by
@@ -906,6 +916,7 @@ impl CompactType {
             fun,
             refinements: _,
             history_slot,
+            nominal,
         } = self;
         let is_witness = |a: &&AtomKey| matches!(a, AtomKey::Witness(_));
         atoms.iter().filter(|a| !is_witness(a)).count()
@@ -914,6 +925,7 @@ impl CompactType {
             + usize::from(var.is_some())
             + usize::from(fun.is_some())
             + usize::from(history_slot.is_some())
+            + nominal.len()
     }
 
     /// Does this position, or any below it, name two shapes where coalesce admits one?
@@ -933,6 +945,10 @@ impl CompactType {
                 .history_slot
                 .as_ref()
                 .is_some_and(|(v, d, _)| v.conflicted() || d.conflicted())
+            || self
+                .nominal
+                .values()
+                .any(|(_, args)| args.iter().any(Self::conflicted))
     }
 
     /// Does this position name a type? Exactly one shape here, and no conflict below.
@@ -1004,6 +1020,7 @@ impl CompactType {
             fun,
             refinements,
             history_slot,
+            nominal,
         } = self;
         // `atoms` and `refinements` hold no position, so structural equality on those is
         // already denotational — the first is a `BTreeSet` and the second a set of terms.
@@ -1029,6 +1046,13 @@ impl CompactType {
                 (Some((v, d, k)), Some((v2, d2, k2))) => k == k2 && v.equiv(v2) && d.equiv(d2),
                 _ => false,
             }
+            && nominal.len() == other.nominal.len()
+            && nominal.iter().all(|(id, (_, args))| {
+                other
+                    .nominal
+                    .get(id)
+                    .is_some_and(|(_, args2)| args.iter().zip(args2).all(|(a, b)| a.equiv(b)))
+            })
             && match (fun, &other.fun) {
                 (None, None) => true,
                 (Some(a), Some(b)) => {
@@ -1120,6 +1144,25 @@ impl CompactType {
                 ))
             }
         };
+        // Arguments of one declaration merge position by position, each at the polarity
+        // its variance gives it. Two declarations stay apart, as two shapes.
+        let mut nominal = lhs.nominal;
+        for (id, (decl, args)) in rhs.nominal {
+            match nominal.remove(&id) {
+                None => {
+                    nominal.insert(id, (decl, args));
+                }
+                Some((_, mine)) => {
+                    let merged = mine
+                        .into_iter()
+                        .zip(args)
+                        .zip(&decl.body().variances)
+                        .map(|((a, b), v)| Self::merge(v.polarity(pol), a, b))
+                        .collect();
+                    nominal.insert(id, (decl, merged));
+                }
+            }
+        }
         CompactType {
             vars,
             atoms,
@@ -1129,6 +1172,7 @@ impl CompactType {
             fun,
             refinements,
             history_slot,
+            nominal,
         }
     }
 
@@ -1153,6 +1197,7 @@ impl CompactType {
             refinements,
             history_slot,
             kinds,
+            nominal,
         } = self;
         atoms.is_empty()
             && rec.is_none()
@@ -1160,6 +1205,7 @@ impl CompactType {
             && fun.is_none()
             && refinements.is_none()
             && history_slot.is_none()
+            && nominal.is_empty()
             && kinds.is_empty()
     }
 
@@ -1362,7 +1408,8 @@ fn refinement_slot_present(ct: &CompactType) -> bool {
         || ct.rec.is_some()
         || ct.var.is_some()
         || ct.fun.is_some()
-        || ct.history_slot.is_some();
+        || ct.history_slot.is_some()
+        || !ct.nominal.is_empty();
     if carries_content && ct.refinements.is_none() {
         return false;
     }
@@ -1382,6 +1429,10 @@ fn refinement_slot_present(ct: &CompactType) -> bool {
         && ct.history_slot.iter().all(|(value, domain, _)| {
             refinement_slot_present(value) && refinement_slot_present(domain)
         })
+        && ct
+            .nominal
+            .values()
+            .all(|(_, args)| args.iter().all(refinement_slot_present))
 }
 
 /// The variables whose bounds the current path is walking, as a chain of stack
@@ -2028,6 +2079,22 @@ fn compact_go(
                 ..CompactType::value()
             }
         }
+        // Each argument is a new position, compacted at the polarity its variance gives
+        // it, and an invariant one at this polarity, as a history's children are.
+        Type::Nominal(decl, args) => {
+            let args = args
+                .iter()
+                .zip(&decl.body().variances)
+                .map(|(t, v)| {
+                    let pol = v.polarity(pol);
+                    compact_go(t, pol, subst_acc, Position::default(), st)
+                })
+                .collect();
+            CompactType {
+                nominal: BTreeMap::from([(decl.id, (decl.clone(), args))]),
+                ..CompactType::value()
+            }
+        }
         Type::Infer(state) => {
             let uid = state.uid;
             let key = (uid, pol);
@@ -2152,6 +2219,7 @@ fn compact_go(
                     rec,
                     fun,
                     history_slot,
+                    nominal,
                     var,
                     // A sum is a shape: it is what the position *is*, and it
                     // determines the position as much as an atom does.
@@ -2177,6 +2245,7 @@ fn compact_go(
                     && rec.is_none()
                     && fun.is_none()
                     && history_slot.is_none()
+                    && nominal.is_empty()
                     && !var_is_shape
             };
             // The two rules that read the opposite side, and they are not the same rule.

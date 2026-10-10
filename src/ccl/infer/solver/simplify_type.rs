@@ -282,6 +282,21 @@ fn simplify_analyze(
             co_occurrences,
         );
     }
+    // A nominal type's arguments recurse at the polarity their variance gives them
+    // (`CompactType::nominal`).
+    for (decl, args) in ct.nominal.values() {
+        for (arg, v) in args.iter().zip(&decl.body().variances) {
+            let pol = v.polarity(pol);
+            simplify_analyze(
+                arg,
+                pol,
+                input_rec_vars,
+                all_vars,
+                rec_processed,
+                co_occurrences,
+            );
+        }
+    }
 }
 
 /// Apply `var_subst` to a binder's kind — variant for variant, since every type a kind
@@ -370,6 +385,18 @@ fn simplify_reconstruct(
         )
     });
 
+    let new_nominal = ct
+        .nominal
+        .into_iter()
+        .map(|(id, (decl, args))| {
+            let args = args
+                .into_iter()
+                .map(|a| simplify_reconstruct(a, var_subst))
+                .collect();
+            (id, (decl, args))
+        })
+        .collect();
+
     CompactType {
         vars: new_vars,
         atoms: ct.atoms,
@@ -381,6 +408,7 @@ fn simplify_reconstruct(
         fun: new_fun,
         refinements: ct.refinements,
         history_slot: new_history_slot,
+        nominal: new_nominal,
     }
 }
 

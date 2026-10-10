@@ -52,7 +52,22 @@ pub(super) fn lower_stmts_recovering(
     // reason: an annotation below an alias is lowered before it. They go first
     // because `pre_register_txn_decls` lowers the `Mut(V, Txn)` annotations it
     // scans — see [`with_block_type_aliases`] for the constraint.
+    //
+    // A nominal type's head is declared before the aliases, which may name it, and its
+    // constructors after them, since a constructor's parameter type may name an alias.
+    // A declaration error leaves the module unlowered, as a module-syntax refusal does:
+    // every use of the type would otherwise report again.
+    let declared = nominal::declare_nominal_types(stmts, ctx);
+    if !declared.is_empty() {
+        errors.extend(declared);
+        return None;
+    }
     errors.extend(pre_declare_type_aliases(stmts, ctx));
+    let defined = nominal::define_nominal_types(stmts, ctx);
+    if !defined.is_empty() {
+        errors.extend(defined);
+        return None;
+    }
     pre_register_txn_decls(stmts, ctx);
     // This block's value is its last *contributing* statement ([`contributing_stmts`]),
     // and the statements above that one are its prefix.
@@ -107,6 +122,7 @@ pub(super) fn lower_stmts_recovering(
                 }
             }
         });
+    let body = nominal::bind_constructors(body, ctx);
 
     if ctx.sink_bindings.is_empty() {
         return Some(body);
@@ -532,6 +548,11 @@ pub(super) fn lower_middle_stmt(
         ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
             Ok(body)
         }
+        // A nominal type binds no value either: `declare_nominal_types` declared it for
+        // the whole module, and its constructors are bound around the whole module
+        // (`nominal::bind_constructors`).
+        ChlStmt::TypeDecl(_) if is_top_level => Ok(body),
+        ChlStmt::TypeDecl(decl) => Err(nominal::refuse_nested(stmt.span, decl)),
         ChlStmt::Assign {
             target,
             value,
@@ -1725,19 +1746,27 @@ pub(super) fn lower_type_expr_or_poly(
         // never a variant: a tag is written with its backtick wherever it appears.
         // An alias is substituted by the type it names, so no alias survives this
         // function and nothing downstream of lowering knows the name.
-        ChlExpr::Name(id) => name_type(id.as_str())
-            .or_else(|| ctx.type_alias(id.as_str()).cloned())
-            .ok_or_else(|| {
-                LoweringError::unsupported(
-                    annotation.span,
-                    format!("unknown type annotation: {id}"),
-                )
-            }),
+        ChlExpr::Name(id) => {
+            match name_type(id.as_str()).or_else(|| ctx.type_alias(id.as_str()).cloned()) {
+                Some(ty) => Ok(ty),
+                None => match ctx.nominal_type(id.as_str()) {
+                    Some(decl) => nominal_application(annotation.span, decl, &[], ctx),
+                    None => Err(LoweringError::unsupported(
+                        annotation.span,
+                        format!("unknown type annotation: {id}"),
+                    )),
+                },
+            }
+        }
         // Type application `List(T)`: a type constructor applied to argument
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).
         ChlExpr::Call { func, args } => {
-            lower_type_application(annotation.span, type_ctor_head(func)?, args, ctx)
+            let head = type_ctor_head(func)?;
+            match ctx.nominal_type(head) {
+                Some(decl) => nominal_application(annotation.span, decl, args, ctx),
+                None => lower_type_application(annotation.span, head, args, ctx),
+            }
         }
         // Record type `{name: T, …}`.
         ChlExpr::BraceRecord(fields) => {
@@ -1897,10 +1926,8 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         // `Error` is a parser recovery placeholder, which the caller surfaces
         // through `ParseResult::errors` before this message is ever read.
         ChlExpr::Error => "a malformed expression",
+        ChlExpr::Qualified(_) => "a qualified name",
         // The forms with their own arms in `lower_type_expr` never reach here.
-        ChlExpr::Qualified(_) => {
-            unreachable!("a qualified name is refused before lowering (`refuse_module_syntax`)")
-        }
         ChlExpr::Name(_)
         | ChlExpr::BraceRecord(_)
         | ChlExpr::BraceGroup(_)
@@ -2093,6 +2120,16 @@ pub(super) fn pre_declare_type_aliases(
             ));
             continue;
         }
+        if ctx.nominal_type(name).is_some() {
+            errors.push(LoweringError::unsupported(
+                stmt.span,
+                format!(
+                    "`{name}` is declared by a `type` in this module, which binds its name \
+                     once"
+                ),
+            ));
+            continue;
+        }
         if !declared.insert(name) {
             errors.push(LoweringError::unsupported(
                 stmt.span,
@@ -2249,6 +2286,32 @@ fn name_type(id: &str) -> Option<Type> {
         "_" => Some(Type::Hole),
         _ => None,
     }
+}
+
+/// A nominal type applied to its arguments, one per type parameter.
+fn nominal_application(
+    span: Span,
+    decl: Rc<crate::ccl::nominal::NominalDecl>,
+    args: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    if args.len() != decl.params.len() {
+        return Err(LoweringError::unsupported(
+            span,
+            format!(
+                "`{}` takes {} type argument{}, got {}",
+                decl.name,
+                decl.params.len(),
+                if decl.params.len() == 1 { "" } else { "s" },
+                args.len()
+            ),
+        ));
+    }
+    let args = args
+        .iter()
+        .map(|a| lower_type_expr(a, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Type::Nominal(decl, args))
 }
 
 /// Extract the simple-name head of a type application (`List` in `List(T)`).

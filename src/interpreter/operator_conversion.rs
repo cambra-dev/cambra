@@ -1569,6 +1569,8 @@ identities is not distinguishing them",
         match ty {
             // Strip refinements at every level — Filter handles them instead.
             Type::Refinement(inner, _) => self.extent_of(inner),
+            // A nominal value is held as its representation (`Type::structure`).
+            Type::Nominal(..) => self.extent_of(&ty.structure()),
             // Look up the runtime impl and wrap it in DataSourceDomain.
             Type::DataSource(name) => self
                 .sources
@@ -2684,11 +2686,8 @@ fn convert_impl_inner(
                             expr.ty
                         ))
                     })?;
-                    let mut union_ty = &codomain;
-                    while let Type::Refinement(inner, _) = union_ty {
-                        union_ty = inner;
-                    }
-                    let Type::Variant(variants, _) = union_ty else {
+                    let union_ty = codomain.peel_refinements().structure();
+                    let Type::Variant(variants, _) = &*union_ty else {
                         return Err(ConversionError::TypeError(format!(
                             "variant_wrap({tag}) codomain must be a Variant, got {codomain}"
                         )));
@@ -2808,13 +2807,10 @@ fn convert_impl_inner(
         // Compiles to a `Scalar(Union)` tile via `VariantWrap` — the net-new
         // runtime construct that mirrors `ColumnValue::Union`, reusing the union
         // column machinery already built for `iterate`/`++`.
-        TypedExprNode::VariantCtor { tag, payload } => {
+        TypedExprNode::VariantCtor { tag, payload, .. } => {
             expect_no_input(input, "variant constructor")?;
-            let mut ty = &expr.ty;
-            while let Type::Refinement(inner, _) = ty {
-                ty = inner;
-            }
-            let Type::Variant(variants, _) = ty else {
+            let ty = expr.ty.peel_refinements().structure();
+            let Type::Variant(variants, _) = &*ty else {
                 return Err(ConversionError::TypeError(format!(
                     "VariantCtor `{tag}` has non-variant type {}; inference should have \
                      width-subtyped it to a Type::Variant before op-conversion",
@@ -3210,7 +3206,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
         // Without it, a list literal of variants (``[`a(1), `b(2)]``) is rejected even
         // though `ColumnValue::from_values` builds a union column from a `Union`
         // extent perfectly well.
-        TypedExprNode::VariantCtor { tag, payload } => Ok(Value::Union {
+        TypedExprNode::VariantCtor { tag, payload, .. } => Ok(Value::Union {
             tag: FieldKey::Name(tag.as_str().into()),
             inner: Box::new(expr_to_value(payload)?),
         }),
@@ -5748,6 +5744,7 @@ mod variant_ctor_tests {
             TypedExprNode::VariantCtor {
                 tag: "commit".into(),
                 payload: Box::new(payload),
+                nominal: None,
             },
             commit_abort_ty(Type::Base(CclBase::Int)),
         );
@@ -5778,6 +5775,7 @@ mod variant_ctor_tests {
             TypedExprNode::VariantCtor {
                 tag: "abort".into(),
                 payload: Box::new(payload),
+                nominal: None,
             },
             commit_abort_ty(Type::Base(CclBase::Int)),
         );
@@ -5808,6 +5806,7 @@ mod variant_ctor_tests {
             TypedExprNode::VariantCtor {
                 tag: "commit".into(),
                 payload: Box::new(payload),
+                nominal: None,
             },
             commit_abort_ty(Type::Base(CclBase::Int)),
         );
@@ -6096,6 +6095,7 @@ mod variant_ctor_tests {
             TypedExprNode::VariantCtor {
                 tag: "commit".into(),
                 payload: Box::new(p_plus_1),
+                nominal: None,
             },
             variant_ty.clone(),
         );
@@ -6106,6 +6106,7 @@ mod variant_ctor_tests {
                     TypedExprNode::Lit(Lit::Unit),
                     Type::Base(CclBase::Unit),
                 )),
+                nominal: None,
             },
             variant_ty.clone(),
         );

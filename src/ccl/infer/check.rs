@@ -865,7 +865,11 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             branches,
         } => emit_case(scrutinee.as_deref_mut(), branches, &label, ctx)?,
 
-        TypedExprNode::VariantCtor { tag, payload } => emit_variant_ctor(tag, payload, ctx)?,
+        TypedExprNode::VariantCtor {
+            tag,
+            payload,
+            nominal,
+        } => emit_variant_ctor(tag, payload, nominal.as_ref(), ctx)?,
 
         TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, ctx)?,
 

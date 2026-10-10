@@ -4,15 +4,17 @@
 //! "Implementation stack"). [`refuse_module_syntax`] finds every module construct
 //! in a module, at any depth, and [`super::lower_stmts`] lowers nothing when it
 //! finds one. No other lowering site therefore sees an [`ChlStmt::Import`],
-//! [`ChlStmt::Run`], [`ChlStmt::Param`], [`ChlStmt::Discard`], [`ChlStmt::Pub`],
-//! [`ChlExpr::Qualified`], a qualified label, or a qualified tag.
+//! [`ChlStmt::Run`], [`ChlStmt::Param`], [`ChlStmt::Discard`], [`ChlStmt::Pub`], a
+//! qualified label, a qualified tag, or a [`ChlExpr::Qualified`] other than a name
+//! qualified by one type, `Shape::circle`, which lowering resolves among the module's
+//! nominal types.
 
 use super::LoweringError;
 use super::stmts::is_type_name;
 use crate::chl_parser::ast::{
     AssignTarget, CompClause, Comprehension, Expr as ChlExpr, IfBranch, KindAnnotation, MatchArm,
     Module as ChlModule, Param, QualifiedName, RecordField, Requirement, Span, Spanned,
-    Stmt as ChlStmt, TypeAnnotation, TypeParam, VariantPayload,
+    Stmt as ChlStmt, TypeAnnotation, TypeDeclBody, TypeParam, VariantPayload,
 };
 use smol_str::SmolStr;
 
@@ -181,6 +183,16 @@ impl Refusals {
                 self.expr(context);
                 self.stmts(body);
             }
+            ChlStmt::TypeDecl(decl) => match &decl.body {
+                TypeDeclBody::Constructors(ctors) => {
+                    for ctor in ctors {
+                        for param in &ctor.params {
+                            self.expr(&param.ty);
+                        }
+                    }
+                }
+                TypeDeclBody::Single(ty) => self.expr(ty),
+            },
             ChlStmt::Return(None) | ChlStmt::Pass | ChlStmt::Error => {}
         }
     }
@@ -308,6 +320,10 @@ impl Refusals {
 
     fn expr(&mut self, expr: &Spanned<ChlExpr>) {
         match &expr.node {
+            // A name qualified by one type is a member of that type, which lowering
+            // resolves (`lower::nominal`).
+            ChlExpr::Qualified(q) if matches!(q.qualifier.as_slice(), [ty] if is_type_name(&ty.node)) =>
+                {}
             ChlExpr::Qualified(q) => self.qualified(q, expr.span),
             ChlExpr::Attribute {
                 target,
@@ -522,11 +538,14 @@ mod tests {
     }
 
     /// A capitalized qualifier segment is a type, so the path names one of its
-    /// methods rather than a module member.
+    /// methods rather than a module member. A name qualified by one type alone, as
+    /// `Price::discounted`, is left to lowering, which resolves it among the module's
+    /// nominal types.
     #[test]
     fn a_capitalized_qualifier_is_refused_as_a_method_reference() {
         let refused = refusals(indoc! {"
-            f = Price::discounted
+            e = Price::discounted
+            f = mod::Price::discounted
             g = x.mod::Price::discounted(10)
             h = mod::Price
             f
@@ -539,8 +558,8 @@ mod tests {
             refused,
             [
                 (
-                    "Price::discounted",
-                    "the method reference `Price::discounted` is not supported yet"
+                    "mod::Price::discounted",
+                    "the method reference `mod::Price::discounted` is not supported yet"
                 ),
                 (
                     "mod::Price::discounted",

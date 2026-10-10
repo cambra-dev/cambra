@@ -98,6 +98,9 @@ struct KeyView {
     /// handle at one position stay distinguishable rather than one shadowing the
     /// other. Each maps to `(value, domain)`.
     history: BTreeMap<HistoryKind, (Box<KeyView>, Box<KeyView>)>,
+    /// Nominal contributions, keyed by declaration so two nominal types at one
+    /// position stay distinguishable. Each maps to its arguments in order.
+    nominal: BTreeMap<crate::ccl::nominal::NominalId, Vec<KeyView>>,
 }
 
 /// Structural equality, with `refinements` compared as a set.
@@ -123,6 +126,7 @@ impl PartialEq for KeyView {
             && self.rec == other.rec
             && self.var == other.var
             && self.history == other.history
+            && self.nominal == other.nominal
     }
 }
 
@@ -168,6 +172,18 @@ impl KeyView {
                     let (v0, d0) = e.get_mut();
                     v0.union(*value);
                     d0.union(*domain);
+                }
+            }
+        }
+        for (decl, args) in other.nominal {
+            match self.nominal.entry(decl) {
+                Entry::Vacant(e) => {
+                    e.insert(args);
+                }
+                Entry::Occupied(mut e) => {
+                    for (a0, a) in e.get_mut().iter_mut().zip(args) {
+                        a0.union(a);
+                    }
                 }
             }
         }
@@ -496,6 +512,22 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             let domain = key_go(domain, pol, subst_acc, ctx);
             KeyView {
                 history: BTreeMap::from([(*history_kind, (Box::new(value), Box::new(domain)))]),
+                ..Default::default()
+            }
+        }
+        // A contravariant argument flips, as a function's domain does; an invariant one
+        // keys at this polarity, as a history's children do.
+        Type::Nominal(decl, args) => {
+            let args = args
+                .iter()
+                .zip(&decl.body().variances)
+                .map(|(t, v)| {
+                    let pol = v.polarity(pol);
+                    key_go(t, pol, subst_acc, ctx)
+                })
+                .collect();
+            KeyView {
+                nominal: BTreeMap::from([(decl.id, args)]),
                 ..Default::default()
             }
         }
