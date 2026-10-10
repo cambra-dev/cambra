@@ -335,6 +335,37 @@ report is the gap rather than the program. Check mode shares the rules and does 
 statements: its rules record a failed constraint and continue, and an error a rule returns ends the
 walk.
 
+#### A lambda applied where it stands binds its parameter first
+
+An application `𝑎 ▷ (λ 𝑥 → body)` whose parameter has no annotation relates `𝑎` to the
+parameter's slot before the body is emitted, as `let 𝑥 = 𝑎 in body` binds `𝑥` to `𝑎`. The
+application edge drawn afterwards states the same relation again. So the body reads `𝑥`'s type from
+the argument as it is emitted, which is what a method call on `𝑥` in the body needs to resolve
+(`nominal-types.md`, "Method calls"). Every comprehension's generator is such an application, so
+its element reads each binder's type from the source.
+
+The edge being drawn earlier also changes which rule a conflict is reported at: a comprehension
+whose element misuses its binder fails at the binder's slot rather than at the application.
+
+#### A definition group is emitted in the order its references need
+
+A `DefGroup`, an `impl` block's functions, means the `let`s that bind each function after the
+functions it calls, and which those are is decided as the calls are emitted: a method call names
+its function only once its receiver is typed. So `emit_def_group` binds each member as a `let`'s
+definition, at the group's position, in a scope it opens for the group, and a reference to a member
+not yet bound emits that member first (`emit_group_member_for`, from the `Var` rule), wherever the
+reference stands. That emission runs as if the enclosing member's had not begun
+(`InferCtx::at_group`): the scopes it opened are set aside, and the level, telescope, open `Poly`
+parameters and assumptions are the group's. Each member is then bound before the members that name
+it, is generalized as a `let` is, and its uses instantiate its scheme, so the members are
+polymorphic to each other.
+
+A reference to a member still under emission is a cycle, an error naming the members from that one
+to the reference (`InferError::DefinitionCycle`). Once the body is emitted, the group is rewritten
+into nested `Let`s in the order the members' emission finished, each closed over its binder as a
+`let`'s body type is, so no pass after emission meets a group. The telescope has every member's
+name entered over the whole group, since each is in lexical scope there.
+
 #### Apply is one-way
 
 The ordinary application rule emits a function-shape constraint and an argument constraint:

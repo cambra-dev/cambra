@@ -208,6 +208,42 @@ impl<K: Eq + std::hash::Hash + std::fmt::Debug, V> ScopeStack<K, V> {
         scope.insert(name, value);
     }
 
+    /// How many scopes are open.
+    pub(crate) fn depth(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// Bind `name` to `value` in the scope at `depth`, counted from the outermost: a binding
+    /// that belongs to an enclosing scope while inner ones are open.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no scope is open at `depth`. In debug builds, also panics if `name` is
+    /// already bound there.
+    pub(crate) fn bind_at(&mut self, depth: usize, name: impl Into<K>, value: V) {
+        let name = name.into();
+        let scope = self
+            .scopes
+            .get_mut(depth)
+            .expect("ScopeStack::bind_at called with no scope at that depth");
+        debug_assert!(
+            !scope.contains_key(&name),
+            "ScopeStack::bind_at: '{name:?}' already bound in that scope"
+        );
+        scope.insert(name, value);
+    }
+
+    /// Set aside every scope deeper than `depth`, innermost last, for [`resume`](Self::resume)
+    /// to reopen: the scope at `depth` is then the innermost.
+    pub(crate) fn suspend_above(&mut self, depth: usize) -> Vec<HashMap<K, V>> {
+        self.scopes.split_off(depth)
+    }
+
+    /// Reopen the scopes [`suspend_above`](Self::suspend_above) set aside.
+    pub(crate) fn resume(&mut self, suspended: Vec<HashMap<K, V>>) {
+        self.scopes.extend(suspended);
+    }
+
     /// Look up `name` from innermost scope outward, returning the first match.
     pub fn lookup<Q>(&self, name: &Q) -> Option<&V>
     where

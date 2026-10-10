@@ -78,10 +78,12 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         Case { .. } => "Case".to_string(),
         VariantCtor { tag, .. } => format!("VariantCtor(.{tag})"),
         NominalCtor { decl, ctor, .. } => format!("NominalCtor({}::{ctor})", decl.name),
+        Method { name, .. } => format!("Method({name})"),
         LoadFrom(n) => format!("LoadFrom({n})"),
         Realize(_) => "Realize".to_string(),
         Transact { .. } => "Transact".to_string(),
         LetRec { .. } => "LetRec".to_string(),
+        DefGroup { .. } => "DefGroup".to_string(),
         For { .. } => "For".to_string(),
         MutWrite { name, .. } => format!("MutWrite({name})"),
         // The declaring half of `:=`, named after its binder as `MutWrite` is

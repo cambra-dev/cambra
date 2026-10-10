@@ -4216,6 +4216,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         // A refinement predicate is assembled from already-lowered terms, so a
         // comprehension never reaches one as a `Comprehension` node.
         N::Comprehension { .. } => unreachable!("a Comprehension reached a refinement predicate"),
+        N::DefGroup { .. } => unreachable!("a DefGroup reached a refinement predicate"),
         N::Lit(_)
         | N::Var(_)
         | N::Builtin(_)
@@ -4231,6 +4232,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Case { .. }
         | N::VariantCtor { .. }
         | N::NominalCtor { .. }
+        | N::Method { .. }
         | N::For { .. }
         | N::MutDecl { .. }
         | N::MutWrite { .. }
@@ -4486,6 +4488,27 @@ fn eq_term_modulo_ty_slots_go(
                 payload: p2,
             },
         ) => d1 == d2 && c1 == c2 && eq_term_modulo_ty_slots_go(p1, p2, pairs),
+        (
+            N::Method {
+                name: m1,
+                args: a1,
+                candidates: c1,
+            },
+            N::Method {
+                name: m2,
+                args: a2,
+                candidates: c2,
+            },
+        ) => {
+            m1 == m2
+                && a1 == a2
+                && c1.len() == c2.len()
+                && c1.iter().zip(c2).all(|(x, y)| {
+                    x.decl == y.decl
+                        && x.params == y.params
+                        && eq_term_modulo_ty_slots_go(&x.function, &y.function, pairs)
+                })
+        }
         (N::Record(f1), N::Record(f2)) => {
             f1.len() == f2.len()
                 && f1.iter().zip(f2).all(|((n1, e1), (n2, e2))| {
@@ -4595,6 +4618,13 @@ fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
         TypedExprNode::NominalCtor { decl, ctor, .. } => {
             decl.hash(state);
             ctor.hash(state);
+        }
+        // The candidates' functions are children, hashed below. Their declarations and
+        // parameter counts, which `eq` also compares, are left out: candidates that differ only
+        // there hash alike, which a hash may do.
+        TypedExprNode::Method { name, args, .. } => {
+            name.hash(state);
+            args.hash(state);
         }
         TypedExprNode::Proj(ProjKey::Index(i)) => i.hash(state),
         TypedExprNode::Proj(ProjKey::Field(f)) => f.hash(state),

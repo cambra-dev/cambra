@@ -407,6 +407,39 @@ pub enum InferError {
         /// The binding's name.
         name: String,
     },
+    /// A method call `x.m(…)` whose receiver's type names no type declaring `m`
+    /// (`docs/chl-spec.md`, "Associated functions and methods").
+    UnresolvedMethod {
+        /// The method's name.
+        method: String,
+        /// The receiver's type, or `None` where nothing before the call determines it.
+        receiver: Option<Type>,
+    },
+    /// Functions of an `impl` block that reach themselves through the calls their
+    /// definitions make: each calls the next, and the last the first (`docs/chl-spec.md`,
+    /// "Associated functions and methods").
+    DefinitionCycle {
+        /// The functions, each calling the next.
+        names: Vec<String>,
+    },
+    /// A method call `x.m(𝑎…)` passing a number of arguments after its receiver other than
+    /// the parameters the receiver type's method declares after `self`.
+    MethodArity {
+        /// The method, qualified by its type: `Price::cents`.
+        method: String,
+        /// The parameters it declares after `self`.
+        params: usize,
+        /// The arguments the call passes after the receiver.
+        args: usize,
+    },
+    /// A method call `x.m(…)` whose receiver is stated to be two nominal types at once,
+    /// which have no join.
+    AmbiguousReceiver {
+        /// The method's name.
+        method: String,
+        /// The two types the receiver is stated to be.
+        types: (String, String),
+    },
     /// A type parameter would reach something declared outside the definition
     /// that declares it, whose type is fixed before the parameter is chosen.
     TypeParamEscapes {
@@ -663,6 +696,7 @@ impl InferError {
             }
             InferError::MutInCompositeType { ty, .. } => each(ty),
             InferError::ScopeViolation { ty, .. } => each(ty),
+            InferError::UnresolvedMethod { receiver, .. } => receiver.iter_mut().for_each(each),
             // No type to render: these carry a name, an id, or a rendered label.
             InferError::UnboundVariable(_)
             | InferError::Unsupported(_)
@@ -675,6 +709,9 @@ impl InferError {
             | InferError::MutNotBareVariable { .. }
             | InferError::MutArgNotMutable { .. }
             | InferError::TypeParamEscapes { .. }
+            | InferError::AmbiguousReceiver { .. }
+            | InferError::MethodArity { .. }
+            | InferError::DefinitionCycle { .. }
             | InferError::MissingRequirement { .. }
             | InferError::MonomorphicPolyBinding { .. }
             | InferError::MutWriteToNonMutable { .. } => {}
@@ -1028,6 +1065,56 @@ impl std::fmt::Debug for InferError {
                 "`{name}` is annotated with a polymorphic type, but its right-hand side is \
                  monomorphic: only a function definition or a name of a polymorphic binding \
                  can be polymorphic"
+            ),
+            InferError::DefinitionCycle { names } => match names.as_slice() {
+                [one] => write!(f, "`{one}` calls itself; a function does not reach itself"),
+                _ => write!(
+                    f,
+                    "the functions {} call each other in a cycle; a function does not reach \
+                     itself",
+                    names
+                        .iter()
+                        .map(|n| format!("`{n}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
+            InferError::MethodArity {
+                method,
+                params,
+                args,
+            } => write!(
+                f,
+                "`{method}` takes {params} argument{} after `self`, got {args}",
+                if *params == 1 { "" } else { "s" }
+            ),
+            InferError::AmbiguousReceiver {
+                method,
+                types: (a, b),
+            } => write!(
+                f,
+                "`.{method}(…)` is called on a value stated to be both `{a}` and `{b}`, two \
+                 nominal types with no join"
+            ),
+            InferError::UnresolvedMethod {
+                method,
+                receiver: None,
+            } => write!(
+                f,
+                "`.{method}(…)` calls a method of its receiver's type, and nothing before the \
+                 call determines that type; annotate the receiver with a nominal type"
+            ),
+            InferError::UnresolvedMethod {
+                method,
+                receiver: Some(ty @ Type::Nominal(..)),
+            } => write!(f, "`{ty}` has no method `{method}`"),
+            InferError::UnresolvedMethod {
+                method,
+                receiver: Some(ty),
+            } => write!(
+                f,
+                "`.{method}(…)` calls a method, and `{ty}` is not a nominal type, so it has no \
+                 methods; the function a field holds is called as `(r.{method})(…)`"
             ),
             InferError::TypeParamEscapes { param, target, at } => match target {
                 Some(EscapeTarget::Argument { function }) => write!(

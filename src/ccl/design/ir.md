@@ -78,7 +78,7 @@ are:
 |---|---|
 | `Lambda` | `param` binds in `body`. |
 | `Let`, `MutDecl` | `binding` binds in `body`; `bound_expr` or `init` is outside its scope. |
-| `LetRec` | Every group binder binds in every definition and in `body`. |
+| `LetRec`, `DefGroup` | Every group binder binds in every definition and in `body`. |
 | `For` | `target` binds in `body`; `iter` is outside its scope. |
 | `Case` | A branch pattern's payload binder binds in that branch's `guard` and `body` only. |
 | `Comprehension` | A generator's `target` binds in its own `guards`, in every later generator, and in `element`; its own `iter` is outside its scope. |
@@ -247,6 +247,8 @@ The remaining nodes supply values or mark source structure for a later phase:
 | `Tuple`, `Record`, `List` | Positional product, named product, and source list construction. Elements may be expressions. |
 | `VariantCtor` | Tag and payload construction, dual to a `Case` pattern. |
 | `NominalCtor` | A nominal type's constructor applied to its payload, typed by the declaration rather than as a variant ([nominal-types.md](nominal-types.md#constructors)). |
+| `Method` | A method call's unresolved function, with a reference to each candidate; inference replaces it with the one its receiver's type names ([nominal-types.md](nominal-types.md#method-calls)). |
+| `DefGroup` | An `impl` block's functions, which reach each other in any order; inference rewrites the group into the `Let`s that bind each after the functions it calls ([type-inference.md](type-inference.md#a-definition-group-is-emitted-in-the-order-its-references-need)). |
 | `Proj` | First-class tuple or record projection; applying it to a value gives field access. |
 | `Compose` | Function composition in application order, built by lowering and lambda elimination. |
 | `ExprStmt` | Statement expression followed by its continuation. |

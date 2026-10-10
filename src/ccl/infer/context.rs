@@ -224,6 +224,40 @@ pub(super) struct InferCtx {
     /// How many uses of a poisoned binding emission has resolved
     /// ([`Self::note_use`]).
     poisoned_reads: usize,
+    /// The [`DefGroup`](crate::ccl::TypedExprNode::DefGroup)s whose emission encloses the
+    /// current position, innermost last.
+    pub(super) groups: Vec<OpenGroup>,
+}
+
+/// A [`DefGroup`](crate::ccl::TypedExprNode::DefGroup) under emission: what its members are
+/// emitted at, wherever a reference first needs one (`src/ccl/design/nominal-types.md`,
+/// "Associated functions").
+pub(super) struct OpenGroup {
+    /// The scope the group's members are bound in.
+    pub(super) depth: usize,
+    /// The emission position the group stands at: its level, its telescope, which has every
+    /// member's name entered, the `Poly` parameters open there, and its assumptions.
+    level: Level,
+    telescope: Telescope,
+    opened_params: usize,
+    assumptions: Vec<Rc<TraitRequirement>>,
+    /// The members, in source order.
+    pub(super) members: Vec<GroupMember>,
+    /// The members under emission, outermost first: a reference to one is a cycle.
+    pub(super) in_progress: Vec<usize>,
+    /// The members emitted, in the order their emission finished, which is the order of the
+    /// `Let`s the group becomes.
+    pub(super) done: Vec<usize>,
+}
+
+/// One member of an [`OpenGroup`].
+pub(super) struct GroupMember {
+    pub(super) binding: TypedBinding,
+    /// The definition, `None` while it is under emission.
+    pub(super) def: Option<Expr>,
+    /// Whether its definition typed, once emitted ([`Typing::close_let_type`] closes only
+    /// over one that did).
+    pub(super) defined: bool,
 }
 
 /// The environment a solver query runs in: the lexical scope at the query,
@@ -272,6 +306,133 @@ impl InferCtx {
             bound_at_annotation: HashSet::new(),
             errors: Vec::new(),
             poisoned_reads: 0,
+            groups: Vec::new(),
+        }
+    }
+
+    /// Open a scope for the members of a group about to be emitted, standing at the current
+    /// position, and enter every member's name into the telescope: each is in lexical scope
+    /// throughout the group. [`close_group`](Self::close_group) restores the telescope.
+    pub(super) fn open_group(&mut self, members: Vec<GroupMember>) -> Telescope {
+        let entry = self.telescope.clone();
+        for m in &members {
+            self.telescope = self.telescope.extended(m.binding.name.clone());
+        }
+        self.scopes.push_scope();
+        self.groups.push(OpenGroup {
+            depth: self.scopes.depth() - 1,
+            level: self.level,
+            telescope: self.telescope.clone(),
+            opened_params: self.opened_params.len(),
+            assumptions: self.assumptions.clone(),
+            members,
+            in_progress: Vec::new(),
+            done: Vec::new(),
+        });
+        entry
+    }
+
+    /// Close the innermost group [`open_group`](Self::open_group) opened, restoring the
+    /// telescope it returned.
+    pub(super) fn close_group(&mut self, entry: Telescope) -> OpenGroup {
+        let group = self.groups.pop().expect("a group is open");
+        self.scopes.pop_scope();
+        self.telescope = entry;
+        group
+    }
+
+    /// Run `f` at the position group `g` stands at, as if the emission under way inside it
+    /// had not begun: the scopes it opened are set aside, and the level, telescope, open
+    /// `Poly` parameters and assumptions are the group's. Everything is restored after.
+    pub(super) fn at_group<R>(&mut self, g: usize, f: impl FnOnce(&mut Self) -> R) -> R {
+        let group = &self.groups[g];
+        let suspended = self.scopes.suspend_above(group.depth + 1);
+        let level = std::mem::replace(&mut self.level, group.level);
+        let telescope = std::mem::replace(&mut self.telescope, group.telescope.clone());
+        let params = self.opened_params.split_off(group.opened_params);
+        let assumptions = std::mem::replace(&mut self.assumptions, group.assumptions.clone());
+        let demand_at = self.demand_at.take();
+        let r = f(self);
+        self.scopes.resume(suspended);
+        self.level = level;
+        self.telescope = telescope;
+        self.opened_params.extend(params);
+        self.assumptions = assumptions;
+        self.demand_at = demand_at;
+        r
+    }
+
+    /// Bind a member of group `g` in the group's scope, as [`Typing::scoped_let`] binds a
+    /// `let`. Run [`at_group`](Self::at_group), at the group's level.
+    pub(super) fn bind_group_member(
+        &mut self,
+        g: usize,
+        binding: &TypedBinding,
+        let_scheme: LetScheme,
+    ) {
+        let entry = self.let_scope_binding(binding, let_scheme);
+        let depth = self.groups[g].depth;
+        self.scopes.bind_at(depth, binding.name.clone(), entry);
+    }
+
+    /// The scope entry a `let` binding is bound at under `let_scheme`, at the current level,
+    /// recording what the binding states past its scope. Shared by [`Typing::scoped_let`]
+    /// and [`bind_group_member`](Self::bind_group_member).
+    fn let_scope_binding(&mut self, binding: &TypedBinding, let_scheme: LetScheme) -> Binding {
+        let (name, bound_ty) = (&binding.name, &binding.ty);
+        // An opaque binder carries no definiens, so a type lifted past it keeps
+        // the name (`close_let_type`) and what the name means there is the type
+        // it is bound at — a fact with no scope, recorded once here. Recorded on
+        // entry rather than on exit because a bound naming it is recorded
+        // *inside* the scope, on a variable that may have been minted outside
+        // (see [`Telescope`]).
+        if binding.transparency == BindingTransparency::Opaque {
+            self.telescope.enter_opaque(name);
+            self.opaque_binders.insert(name.clone(), bound_ty.clone());
+        }
+        // Generalize at the current (outer) level: any variable in `bound_ty`
+        // whose level exceeds `self.level` was minted inside the RHS and is
+        // universally quantified; `instantiate` freshens it per use site.
+        // Variables that escaped to an outer scope were already lowered to
+        // `self.level` (or below) by `extrude` during constraint solving, so
+        // they stay fixed. (Sound to generalize unconditionally because CCL is
+        // a pure value language — no value-restriction hazard.)
+        let generalize = let_scheme != LetScheme::Monomorphic;
+        if let_scheme
+            == (LetScheme::Generalized {
+                at_annotation: true,
+            })
+        {
+            self.bound_at_annotation.insert(name.clone());
+        }
+        let scheme = if generalize {
+            // Polymorphic: generalize at the outer level. Each `Var` use
+            // instantiates a fresh copy; the coalesce walk then specializes
+            // the definition per distinct use instantiation
+            // (`specialize_use`). A binding annotated with a polymorphic type, which
+            // `emit_let` has opened in place, also states its `requires` clause, which
+            // each use instantiates.
+            let requires = match &binding.user_annotation {
+                Some(Type::Poly(poly)) => poly.requires.clone(),
+                _ => Vec::new(),
+            };
+            PolyScheme::poly(self.level, bound_ty.clone()).with_requires(requires)
+        } else {
+            // Monomorphic: one type, shared by every use, so `instantiate` freshens
+            // nothing — uses stay as `Var` references and share the binding's
+            // variables. Those sit one level up, where the right-hand side was
+            // emitted, and a generalized sibling would quantify them there, giving each
+            // of its uses a disconnected copy; they move down to the binding's level.
+            PolyScheme::poly(
+                self.level + 1,
+                crate::ccl::infer::solver::constrain::lower_levels(bound_ty, self.level),
+            )
+        };
+        Binding {
+            scheme,
+            generalized: generalize,
+            defined_at: self.current_node(),
+            poisoned: let_scheme == LetScheme::Poisoned,
         }
     }
 
@@ -951,66 +1112,10 @@ impl Typing for InferCtx {
         let_scheme: LetScheme,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let (name, bound_ty) = (&binding.name, &binding.ty);
-        // An opaque binder carries no definiens, so a type lifted past it keeps
-        // the name (`close_let_type`) and what the name means there is the type
-        // it is bound at — a fact with no scope, recorded once here. Recorded on
-        // entry rather than on exit because a bound naming it is recorded
-        // *inside* the scope, on a variable that may have been minted outside
-        // (see [`Telescope`]).
-        if binding.transparency == BindingTransparency::Opaque {
-            self.telescope.enter_opaque(name);
-            self.opaque_binders.insert(name.clone(), bound_ty.clone());
-        }
-        // Generalize at the current (outer) level: any variable in `bound_ty`
-        // whose level exceeds `self.level` was minted inside the RHS and is
-        // universally quantified; `instantiate` freshens it per use site.
-        // Variables that escaped to an outer scope were already lowered to
-        // `self.level` (or below) by `extrude` during constraint solving, so
-        // they stay fixed. (Sound to generalize unconditionally because CCL is
-        // a pure value language — no value-restriction hazard.)
-        let generalize = let_scheme != LetScheme::Monomorphic;
-        if let_scheme
-            == (LetScheme::Generalized {
-                at_annotation: true,
-            })
-        {
-            self.bound_at_annotation.insert(name.clone());
-        }
-        let scheme = if generalize {
-            // Polymorphic: generalize at the outer level. Each `Var` use
-            // instantiates a fresh copy; the coalesce walk then specializes
-            // the definition per distinct use instantiation
-            // (`specialize_use`). A binding annotated with a polymorphic type, which
-            // `emit_let` has opened in place, also states its `requires` clause, which
-            // each use instantiates.
-            let requires = match &binding.user_annotation {
-                Some(Type::Poly(poly)) => poly.requires.clone(),
-                _ => Vec::new(),
-            };
-            PolyScheme::poly(self.level, bound_ty.clone()).with_requires(requires)
-        } else {
-            // Monomorphic: one type, shared by every use, so `instantiate` freshens
-            // nothing — uses stay as `Var` references and share the binding's
-            // variables. Those sit one level up, where the right-hand side was
-            // emitted, and a generalized sibling would quantify them there, giving each
-            // of its uses a disconnected copy; they move down to the binding's level.
-            PolyScheme::poly(
-                self.level + 1,
-                crate::ccl::infer::solver::constrain::lower_levels(bound_ty, self.level),
-            )
-        };
+        let entry = self.let_scope_binding(binding, let_scheme);
         self.scopes.push_scope();
-        self.scopes.bind(
-            name,
-            Binding {
-                scheme,
-                generalized: generalize,
-                defined_at: self.current_node(),
-                poisoned: let_scheme == LetScheme::Poisoned,
-            },
-        );
-        let r = self.under_binder(name, f);
+        self.scopes.bind(binding.name.clone(), entry);
+        let r = self.under_binder(&binding.name, f);
         self.scopes.pop_scope();
         r
     }

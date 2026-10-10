@@ -566,7 +566,10 @@ fn bug_comprehension_exponent_loses_its_bound() {
 /// A negative element is rejected as a type error, not an internal invariant failure.
 #[test]
 fn a_negative_comprehension_element_is_rejected_as_an_exponent() {
-    check_compile_error("sum([2 ** x for x in [1, 2, -3]])", "__elem >= 0");
+    check_compile_error(
+        "sum([2 ** x for x in [1, 2, -3]])",
+        "annotated as {Int where _ >= 0}",
+    );
 }
 
 /// BUG: exponentiation silently wraps an unrepresentable result in every profile.

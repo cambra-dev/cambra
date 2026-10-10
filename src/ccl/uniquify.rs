@@ -325,7 +325,8 @@ impl Uniquifier {
             // Mutual recursion: mint *all* group binders before walking any
             // binding body, so a reference to any group name — in any body or
             // in the letrec body — resolves to its group binder.
-            TypedExprNode::LetRec { bindings, body } => {
+            TypedExprNode::LetRec { bindings, body }
+            | TypedExprNode::DefGroup { bindings, body } => {
                 let bases: Vec<Option<String>> = bindings
                     .iter_mut()
                     .map(|(b, _)| {

@@ -70,6 +70,11 @@ pub(super) fn lower_stmts_recovering(
         errors.extend(defined);
         return None;
     }
+    let associated = nominal::declare_associated_functions(stmts, ctx);
+    if !associated.is_empty() {
+        errors.extend(associated);
+        return None;
+    }
     pre_register_txn_decls(stmts, ctx);
     // This block's value is its last *contributing* statement ([`contributing_stmts`]),
     // and the statements above that one are its prefix.
@@ -155,7 +160,8 @@ pub(super) fn lower_stmts_recovering(
     Some(append_outputs_at_tail(body, outputs, program_span, ctx))
 }
 
-/// Walk to the innermost non-`Let`/`ExprStmt` continuation and wrap it with
+/// Walk to the innermost continuation of the statements' `Let`s, `DefGroup`s and `ExprStmt`s
+/// and wrap it with
 /// `ExprStmt(current_tail, outputs)`.
 ///
 /// Recurses through both `Let` and `ExprStmt` nodes: a for-loop in the middle
@@ -200,6 +206,16 @@ fn append_outputs_at_tail(
                 node: TypedExprNode::MutDecl {
                     binding,
                     init,
+                    body: Box::new(new_body),
+                },
+                ..expr
+            }
+        }
+        TypedExprNode::DefGroup { bindings, body } => {
+            let new_body = append_outputs_at_tail(*body, outputs, program_span, ctx);
+            Expr {
+                node: TypedExprNode::DefGroup {
+                    bindings,
                     body: Box::new(new_body),
                 },
                 ..expr
@@ -772,8 +788,46 @@ pub(super) fn lower_middle_stmt(
             let define = ctx.tag_image(lowered, stmt.span);
             Ok(ctx.tag_image(Expr::expr_stmt(define, body), stmt.span))
         }
+        // An associated function, `def N::f`, or an `impl` block of them: bindings at the
+        // statement's position, as a module function's is (`nominal::lower_associated_def`).
+        ChlStmt::FunctionDef { owner: Some(_), .. } | ChlStmt::Impl(_) if !is_top_level => {
+            Err(LoweringError::unsupported(
+                stmt.span,
+                "an associated function is declared at a module's top level",
+            ))
+        }
+        ChlStmt::FunctionDef { owner: Some(_), .. } | ChlStmt::Impl(_) => {
+            let mut lowered = Vec::new();
+            for def in nominal::associated_defs(stmt) {
+                let decl = ctx
+                    .nominal_type(&def.owner.node)
+                    .expect("`declare_associated_functions` checked the owner");
+                let (name, func_expr, annotation) =
+                    nominal::lower_associated_def(&decl, &def, ctx)?;
+                let binding = match annotation {
+                    Some(poly) => TypedBinding::new_annotated(name, poly),
+                    None => TypedBinding::new_unannotated(name),
+                };
+                lowered.push((binding, func_expr));
+            }
+            let lowered = match (&stmt.node, <[_; 1]>::try_from(lowered)) {
+                (ChlStmt::FunctionDef { .. }, Ok([(binding, func_expr)])) => {
+                    Expr::new(TypedExprNode::Let {
+                        binding,
+                        bound_expr: Box::new(func_expr),
+                        body: Box::new(body),
+                    })
+                }
+                // The block's functions reach each other in any order: inference binds each
+                // after the functions it calls (`TypedExprNode::DefGroup`).
+                (_, Ok(one)) => Expr::def_group(Vec::from(one), body),
+                (_, Err(lowered)) => Expr::def_group(lowered, body),
+            };
+            Ok(ctx.tag_image(lowered, stmt.span))
+        }
         // Function definition → Let binding with curried lambda body.
         ChlStmt::FunctionDef {
+            owner: None,
             name,
             type_params,
             params,
@@ -1260,17 +1314,12 @@ pub(super) fn mut_annotation_parts(
     annotation: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Option<Result<(Type, bool), LoweringError>> {
-    // `Mut(…)` is type application — a call with a bare-name head (application
-    // is parenthesised at both levels; see `lower_type_annotation`).
-    let ChlExpr::Call { func, args } = &annotation.node else {
-        return None;
-    };
-    let ChlExpr::Name(head) = &func.node else {
-        return None;
-    };
-    if head.as_str() != "Mut" {
+    if !is_mut_type(annotation) {
         return None;
     }
+    let ChlExpr::Call { args, .. } = &annotation.node else {
+        unreachable!("`is_mut_type` matched a call")
+    };
     match args.as_slice() {
         [value] => Some(lower_type_expr(value, ctx).map(|t| (t, false))),
         [value, domain] => {
@@ -1347,11 +1396,9 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
             // name in the block wins (a non-`Mut` redefinition clears an earlier
             // `Mut` one, so its calls lower tupled).
             ChlStmt::FunctionDef { name, params, .. } => {
-                let has_mut_param = params.iter().any(|p| {
-                    p.annotation
-                        .as_ref()
-                        .is_some_and(|a| is_mut_annotation(a, ctx))
-                });
+                let has_mut_param = params
+                    .iter()
+                    .any(|p| p.annotation.as_ref().is_some_and(is_mut_annotation));
                 if has_mut_param {
                     ctx.register_mut_param_fn(name.node.as_str());
                 } else {
@@ -1370,8 +1417,16 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
 /// rejected where the parameter is lowered
 /// (`lower::functions::mut_param_history_type`) — registering it either way is
 /// harmless, since the rejection is what the program sees.
-fn is_mut_annotation(annotation: &TypeAnnotation, ctx: &mut LoweringContext) -> bool {
-    mut_annotation_parts(&annotation.ty, ctx).is_some()
+pub(super) fn is_mut_annotation(annotation: &TypeAnnotation) -> bool {
+    is_mut_type(&annotation.ty)
+}
+
+/// Whether `ty` is a `Mut(…)` type. `Mut(…)` is type application, a call with a bare-name head
+/// (application is parenthesised at both levels; see `lower_type_annotation`), and no alias
+/// can name it.
+fn is_mut_type(ty: &Spanned<ChlExpr>) -> bool {
+    matches!(&ty.node, ChlExpr::Call { func, .. }
+        if matches!(&func.node, ChlExpr::Name(head) if head.as_str() == "Mut"))
 }
 
 /// Lower a binder's type annotation, applying its [`AnnotationMode`].
@@ -2030,6 +2085,7 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         // through `ParseResult::errors` before this message is ever read.
         ChlExpr::Error => "a malformed expression",
         ChlExpr::Qualified(_) => "a qualified name",
+        ChlExpr::MethodCall { .. } => "a method call",
         // The forms with their own arms in `lower_type_expr` never reach here.
         ChlExpr::Name(_)
         | ChlExpr::BraceRecord(_)

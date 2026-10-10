@@ -182,10 +182,9 @@ pub(crate) struct Interp {
     cells_made: u64,
     /// One watch per running loop over a collection not keyed by position, innermost last.
     order_watches: Vec<OrderWatch>,
-    /// The members the module's `type` declarations declare, by qualified name
-    /// `Shape::circle`. Collected before the program runs, since a declaration is in scope
-    /// throughout its module.
-    members: Rc<BTreeMap<String, Member>>,
+    /// What the module declares of each nominal type, by the type's name. Collected before
+    /// the program runs, since a declaration is in scope throughout its module.
+    types: Rc<BTreeMap<String, TypeMembers>>,
 }
 
 /// A loop over a collection not keyed by position, whose iteration order is not defined
@@ -218,7 +217,7 @@ impl Interp {
             lost: None,
             txn: None,
             loop_keys: Vec::new(),
-            members: Rc::default(),
+            types: Rc::default(),
             cells_made: 0,
             order_watches: Vec::new(),
         }
@@ -308,14 +307,14 @@ pub fn run(source: &str) -> Result<Observations, Error> {
         .map_err(|errors| Error(format!("parse error: {errors:?}")))?;
     let mut feed_sites = BTreeMap::new();
     collect_feed_sites(&module.body, &mut feed_sites);
-    let members = Rc::new(collect_members(&module.body));
+    let types = Rc::new(collect_types(&module.body));
 
     // Each pass completes at least one channel or ends the run, so there is at most one pass per
     // channel, plus the last.
     let mut finals: BTreeMap<String, Value> = BTreeMap::new();
     loop {
         let mut interp = Interp::new(feed_sites.clone(), finals.clone());
-        interp.members = Rc::clone(&members);
+        interp.types = Rc::clone(&types);
         // A failure outside speculation is on the path the program takes, whatever a later
         // pass would read, so it is the program's.
         interp.exec_block(&module.body)?;
@@ -502,22 +501,60 @@ enum Member {
     Extract,
 }
 
-/// The members `body`'s `type` declarations declare, by qualified name `Shape::circle`.
-fn collect_members(body: &[Spanned<Stmt>]) -> BTreeMap<String, Member> {
-    let mut out = BTreeMap::new();
+/// What the module declares of one nominal type.
+#[derive(Default)]
+struct TypeMembers {
+    /// Its constructors, and the single-constructor form's `extract`, by name.
+    members: BTreeMap<String, Member>,
+    /// Its methods: the associated functions whose first parameter is `self`, and `extract`.
+    methods: BTreeSet<String>,
+}
+
+/// What `body` declares of each nominal type, by the type's name: each `type` declaration's
+/// members, and the methods the associated functions of the type declare.
+fn collect_types(body: &[Spanned<Stmt>]) -> BTreeMap<String, TypeMembers> {
+    let mut out: BTreeMap<String, TypeMembers> = BTreeMap::new();
+    let mut add_function = |ty: &str, name: &str, params: &[chl_parser::ast::Param]| {
+        if params.first().is_some_and(|p| p.name == "self") {
+            out.entry(ty.to_string())
+                .or_default()
+                .methods
+                .insert(name.to_string());
+        }
+    };
+    for stmt in body {
+        match &stmt.node {
+            Stmt::FunctionDef {
+                owner: Some(owner),
+                name,
+                params,
+                ..
+            } => add_function(&owner.node, &name.node, params),
+            Stmt::Impl(block) => {
+                for def in &block.defs {
+                    if let Stmt::FunctionDef { name, params, .. } = &unwrap_pub(def).node {
+                        add_function(&block.ty.node, &name.node, params);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     for stmt in body {
         let Stmt::TypeDecl(decl) = &stmt.node else {
             continue;
         };
+        let ty = out.entry(decl.name.node.to_string()).or_default();
         match &decl.body {
             TypeDeclBody::Single(_) => {
-                out.insert(format!("{}::new", decl.name.node), Member::Constructor(1));
-                out.insert(format!("{}::extract", decl.name.node), Member::Extract);
+                ty.members.insert("new".into(), Member::Constructor(1));
+                ty.members.insert("extract".into(), Member::Extract);
+                ty.methods.insert("extract".into());
             }
             TypeDeclBody::Constructors(ctors) => {
                 for ctor in ctors {
-                    out.insert(
-                        format!("{}::{}", decl.name.node, ctor.name.node),
+                    ty.members.insert(
+                        ctor.name.node.to_string(),
                         Member::Constructor(ctor.params.len()),
                     );
                 }
@@ -525,6 +562,14 @@ fn collect_members(body: &[Spanned<Stmt>]) -> BTreeMap<String, Member> {
         }
     }
     out
+}
+
+/// The statement a `pub` marks, or `stmt` itself.
+fn unwrap_pub(stmt: &Spanned<Stmt>) -> &Spanned<Stmt> {
+    match &stmt.node {
+        Stmt::Pub { stmt, .. } => stmt,
+        _ => stmt,
+    }
 }
 
 /// Every `<<` site in `body` into `feeds`, by the channel name each names, in source order.
@@ -831,9 +876,39 @@ impl Interp {
                 }),
             },
 
+            // `impl N:` binds each `def` as `def N::f` does.
+            Stmt::Impl(block) => {
+                for def in &block.defs {
+                    let Stmt::FunctionDef {
+                        name, params, body, ..
+                    } = &unwrap_pub(def).node
+                    else {
+                        return err("an `impl` block holds `def`s");
+                    };
+                    self.bind_associated(&block.ty.node, &name.node, params, body)?;
+                }
+                Ok(None)
+            }
+
             Stmt::FunctionDef {
-                name, params, body, ..
+                owner: Some(owner),
+                name,
+                params,
+                body,
+                ..
             } => {
+                self.bind_associated(&owner.node, &name.node, params, body)?;
+                Ok(None)
+            }
+
+            Stmt::FunctionDef {
+                owner: None,
+                name,
+                params,
+                body,
+                ..
+            } => {
+                let name = name.node.to_string();
                 let function = Function {
                     params: params
                         .iter()
@@ -845,7 +920,7 @@ impl Interp {
                     body: body.clone(),
                     env: self.captured_scopes(),
                 };
-                self.bind(name.node.to_string(), Slot::Fn(Rc::new(function)));
+                self.bind(name, Slot::Fn(Rc::new(function)));
                 Ok(None)
             }
 
@@ -1018,16 +1093,92 @@ impl Interp {
         }
     }
 
+    /// Bind the associated function `ty::name`. It takes no `Mut` parameter, which the
+    /// compiler does not support yet either.
+    fn bind_associated(
+        &mut self,
+        ty: &str,
+        name: &str,
+        params: &[chl_parser::ast::Param],
+        body: &[Spanned<Stmt>],
+    ) -> Result<(), Error> {
+        if let Some(p) = params
+            .iter()
+            .find(|p| p.annotation.as_ref().is_some_and(is_mut_annotation))
+        {
+            return err(format!(
+                "`{ty}::{name}` takes a `Mut` parameter `{}`, which an associated function \
+                 does not",
+                p.name
+            ));
+        }
+        let function = Function {
+            params: params.iter().map(|p| (p.name.to_string(), false)).collect(),
+            body: body.to_vec(),
+            env: self.captured_scopes(),
+        };
+        self.bind(format!("{ty}::{name}"), Slot::Fn(Rc::new(function)));
+        Ok(())
+    }
+
+    /// `receiver.method(args)`: the method of the one type that declares it and has the
+    /// receiver's constructor, called with the receiver as `self`.
+    fn call_method(
+        &mut self,
+        receiver: &Spanned<Expr>,
+        method: &str,
+        args: &[Spanned<Expr>],
+    ) -> Result<Value, Error> {
+        let v = self.eval(receiver)?;
+        let Value::Nominal { ty, payload, .. } = &v else {
+            return match v {
+                Value::Pending => Ok(Value::Pending),
+                other => err(format!(
+                    "`.{method}(…)` on {other}, which is not a nominal value"
+                )),
+            };
+        };
+        // A nominal value names its type, which is the one whose method this is.
+        let declares = self
+            .types
+            .get(ty.as_str())
+            .is_some_and(|t| t.methods.contains(method));
+        if !declares {
+            return err(format!("`{ty}` declares no method `{method}`"));
+        }
+        let bound = format!("{ty}::{method}");
+        if method == "extract" && self.slot(&bound).is_none() {
+            return Ok((**payload).clone());
+        }
+        let Some(Slot::Fn(function)) = self.slot(&bound) else {
+            return err(format!("`{bound}` is not bound"));
+        };
+        let function = function.clone();
+        let mut values = vec![v.clone()];
+        for a in args {
+            values.push(self.eval(a)?);
+        }
+        if any_pending(values.iter()) {
+            return Ok(Value::Pending);
+        }
+        self.call_with_values(&bound, &function, values)
+    }
+
     /// The member `q` names.
     fn member(&self, q: &QualifiedName) -> Result<Member, Error> {
         let [ty] = q.qualifier.as_slice() else {
             return err(format!("unsupported qualified name: {q:?}"));
         };
-        let key = format!("{}::{}", ty.node, q.name.node);
-        self.members
-            .get(&key)
+        self.types
+            .get(ty.node.as_str())
+            .and_then(|t| t.members.get(q.name.node.as_str()))
             .copied()
-            .ok_or_else(|| Error(format!("`{key}` is not a declared member")))
+            .ok_or_else(|| {
+                Error(format!(
+                    "`{}::{}` is not a declared member",
+                    ty.node, q.name.node
+                ))
+            })
     }
 
     /// The number of parameters of the constructor `q` names.
@@ -1045,6 +1196,14 @@ impl Interp {
     /// the argument, or the tuple of several (`docs/chl-spec.md`, "Declaring a nominal
     /// type").
     fn construct(&mut self, q: &QualifiedName, args: &[Spanned<Expr>]) -> Result<Value, Error> {
+        // An associated function, `N::f(args)`, is bound under its qualified name.
+        if let [ty] = q.qualifier.as_slice() {
+            let bound = format!("{}::{}", ty.node, q.name.node);
+            if let Some(Slot::Fn(function)) = self.slot(&bound) {
+                let function = function.clone();
+                return self.call_user(&bound, &function, args);
+            }
+        }
         // `N::extract(n)` is the payload of `n`'s one constructor `new`.
         if let Member::Extract = self.member(q)? {
             let [arg] = args else {
@@ -1550,6 +1709,12 @@ impl Interp {
             Expr::Lit(Lit::String(s)) => Ok(Value::Str(s.to_string())),
             Expr::Lit(Lit::Bool(b)) => Ok(Value::Bool(*b)),
 
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+            } => self.call_method(receiver, &method.node, args),
+
             // A constructor that declares no parameters is a value, held as its name.
             Expr::Qualified(q) => {
                 let arity = self.constructor_arity(q)?;
@@ -2025,7 +2190,35 @@ impl Interp {
             };
             params.push((param.clone(), slot));
         }
+        self.run_call(function, params)
+    }
 
+    /// Call `function` with `values` for its parameters, none of them by reference: an
+    /// associated function called as a method, its receiver already evaluated.
+    fn call_with_values(
+        &mut self,
+        name: &str,
+        function: &Function,
+        values: Vec<Value>,
+    ) -> Result<Value, Error> {
+        if function.params.len() != values.len() {
+            return err(format!(
+                "`{name}` takes {} argument(s), given {}",
+                function.params.len(),
+                values.len()
+            ));
+        }
+        let params = function
+            .params
+            .iter()
+            .zip(values)
+            .map(|((param, _), v)| (param.clone(), Slot::Val(v)))
+            .collect();
+        self.run_call(function, params)
+    }
+
+    /// Run `function`'s body with `params` bound.
+    fn run_call(&mut self, function: &Function, params: Scope) -> Result<Value, Error> {
         let mut env = function.env.clone();
         env.push(params);
         let caller = std::mem::replace(&mut self.scopes, env);
@@ -2772,6 +2965,21 @@ mod tests {
                     out << pool
         "#});
         assert!(e.contains("not judgeable"), "{e}");
+    }
+
+    /// An associated function takes no `Mut` parameter, in a block or not, as the compiler
+    /// refuses one.
+    #[test]
+    fn an_associated_function_with_a_mut_parameter_is_refused() {
+        for decl in [
+            "def Price::add(self, total: Mut(Int)) => Int:\n    1",
+            "impl Price:\n    def add(self, total: Mut(Int)) => Int:\n        1",
+        ] {
+            let e = refused(&format!(
+                "type Price = Int\n{decl}\nout = test_sink()\nout << 1\n"
+            ));
+            assert!(e.contains("takes a `Mut` parameter `total`"), "{e}");
+        }
     }
 
     #[test]

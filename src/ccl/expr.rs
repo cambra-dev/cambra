@@ -417,6 +417,20 @@ pub enum TypedExprNode {
         branches: Vec<Branch>,
     },
 
+    /// A method not yet resolved: the function of the application
+    /// `(𝑥, 𝑎…) ▷ method(m; N₁::m, …)` that a method call `𝑥.m(𝑎…)` lowers to
+    /// (`src/ccl/design/nominal-types.md`, "Method calls"). Each candidate is a nominal type
+    /// declaring a method `name`. Inference replaces the node with the candidate the
+    /// receiver's type names, so none survives inference.
+    Method {
+        name: String,
+        /// The number of arguments the call passes after the receiver. With any, the
+        /// application's argument is the tuple of the receiver and those, and the receiver
+        /// is its first component; otherwise the argument is the receiver.
+        args: usize,
+        candidates: Vec<MethodCandidate>,
+    },
+
     /// Tagged variant constructor: `` `Tag(payload) ``.
     ///
     /// Produces a [`Type::Variant`] containing a single tag whose payload type
@@ -541,6 +555,23 @@ pub enum TypedExprNode {
         /// The mutually recursive definition group. Every binding's name is
         /// in scope in every binding's body (and in `body`). Each binding
         /// carries its full type (generated concretely by the unified phase).
+        bindings: Vec<(TypedBinding, TypedExpr)>,
+        /// The continuation, with the whole group in scope.
+        body: Box<TypedExpr>,
+    },
+
+    /// The functions an `impl` block declares, which reach each other in any order
+    /// (`docs/chl-spec.md`, "Associated functions and methods").
+    ///
+    /// Every binding's name is in scope in every binding's body and in `body`, as in a
+    /// [`LetRec`](Self::LetRec), but no binding reaches itself: the group means the `Let`s
+    /// that bind each function after the functions it calls. Which those are is decided
+    /// by inference, which resolves the block's method calls, so lowering builds the group
+    /// in source order and inference rewrites it into those `Let`s
+    /// (`src/ccl/design/nominal-types.md`, "Associated functions"). No pass after
+    /// inference meets one.
+    DefGroup {
+        /// The block's functions, in source order, each bound as a `Let` would bind it.
         bindings: Vec<(TypedBinding, TypedExpr)>,
         /// The continuation, with the whole group in scope.
         body: Box<TypedExpr>,
@@ -828,8 +859,10 @@ impl TypedExprNode {
             TypedExprNode::Case { .. } => "Case",
             TypedExprNode::VariantCtor { .. } => "VariantCtor",
             TypedExprNode::NominalCtor { .. } => "NominalCtor",
+            TypedExprNode::Method { .. } => "Method",
             TypedExprNode::Transact { .. } => "Transact",
             TypedExprNode::LetRec { .. } => "LetRec",
+            TypedExprNode::DefGroup { .. } => "DefGroup",
             TypedExprNode::For { .. } => "For",
             TypedExprNode::MutWrite { .. } => "MutWrite",
             TypedExprNode::Tuple(_) => "Tuple",
@@ -1449,6 +1482,14 @@ impl TypedExpr {
         })
     }
 
+    /// Construct a [`TypedExprNode::DefGroup`] of an `impl` block's functions.
+    pub fn def_group(bindings: Vec<(TypedBinding, Self)>, body: Self) -> Self {
+        Self::new(TypedExprNode::DefGroup {
+            bindings,
+            body: Box::new(body),
+        })
+    }
+
     /// Construct a tuple expression.
     pub fn tuple(elts: Vec<Self>) -> Self {
         Self::new(TypedExprNode::Tuple(elts))
@@ -1717,6 +1758,9 @@ impl TypedExpr {
             }
             TypedExprNode::VariantCtor { payload, .. }
             | TypedExprNode::NominalCtor { payload, .. } => f(payload.as_ref()),
+            TypedExprNode::Method { candidates, .. } => {
+                candidates.iter().for_each(|c| f(&c.function));
+            }
             TypedExprNode::Record(fields) => fields.iter().for_each(|(_, e)| f(e)),
             // `domain` is a `Type`, not an `Expr` child, so the expr-walker
             // skips it (its type residue is reached via `expr.ty` walks). Child
@@ -1731,7 +1775,8 @@ impl TypedExpr {
                     f(&w.body);
                 }
             }
-            TypedExprNode::LetRec { bindings, body } => {
+            TypedExprNode::LetRec { bindings, body }
+            | TypedExprNode::DefGroup { bindings, body } => {
                 for (_, def) in bindings {
                     f(def);
                 }
@@ -1919,6 +1964,9 @@ impl TypedExpr {
             }
             TypedExprNode::VariantCtor { payload, .. }
             | TypedExprNode::NominalCtor { payload, .. } => f(payload.as_mut()),
+            TypedExprNode::Method { candidates, .. } => {
+                candidates.iter_mut().for_each(|c| f(&mut c.function));
+            }
             TypedExprNode::Record(fields) => fields.iter_mut().for_each(|(_, e)| f(e)),
             // `domain` is a `Type`, not an `Expr` child (see `walk_children`).
             // Child order mirrors `walk_transact`.
@@ -1931,7 +1979,8 @@ impl TypedExpr {
                     f(&mut w.body);
                 }
             }
-            TypedExprNode::LetRec { bindings, body } => {
+            TypedExprNode::LetRec { bindings, body }
+            | TypedExprNode::DefGroup { bindings, body } => {
                 for (_, def) in bindings {
                     f(def);
                 }
@@ -1986,7 +2035,7 @@ impl TypedExpr {
             | TypedExprNode::Let { binding: param, .. }
             | TypedExprNode::MutDecl { binding: param, .. }
             | TypedExprNode::For { target: param, .. } => f(param),
-            TypedExprNode::LetRec { bindings, .. } => {
+            TypedExprNode::LetRec { bindings, .. } | TypedExprNode::DefGroup { bindings, .. } => {
                 bindings.iter().for_each(|(b, _)| f(b));
             }
             TypedExprNode::Case { branches, .. } => {
@@ -2011,6 +2060,7 @@ impl TypedExpr {
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
+            | TypedExprNode::Method { .. }
             | TypedExprNode::VariantCtor { .. }
             | TypedExprNode::NominalCtor { .. }
             | TypedExprNode::List(_)
@@ -2039,7 +2089,7 @@ impl TypedExpr {
             | TypedExprNode::Let { binding: param, .. }
             | TypedExprNode::MutDecl { binding: param, .. }
             | TypedExprNode::For { target: param, .. } => f(param),
-            TypedExprNode::LetRec { bindings, .. } => {
+            TypedExprNode::LetRec { bindings, .. } | TypedExprNode::DefGroup { bindings, .. } => {
                 bindings.iter_mut().for_each(|(b, _)| f(b));
             }
             TypedExprNode::Case { branches, .. } => {
@@ -2065,6 +2115,7 @@ impl TypedExpr {
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
+            | TypedExprNode::Method { .. }
             | TypedExprNode::VariantCtor { .. }
             | TypedExprNode::NominalCtor { .. }
             | TypedExprNode::List(_)
@@ -2337,6 +2388,17 @@ pub struct Branch {
     pub guard: TypedExpr,
     /// Value expression; evaluated when the branch wins.
     pub body: TypedExpr,
+}
+
+/// One type's method a [`TypedExprNode::Method`] may resolve to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MethodCandidate {
+    /// The nominal type declaring the method.
+    pub decl: std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+    /// The number of value parameters the method declares after `self`.
+    pub params: usize,
+    /// A reference to the method's binding.
+    pub function: TypedExpr,
 }
 
 /// What a [`Pattern`] matches: a structural variant's tag, or a nominal type's
