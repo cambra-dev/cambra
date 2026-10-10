@@ -72,7 +72,10 @@ fn uses_of(uses: &[UseItem]) -> Vec<(&str, Option<&str>)> {
 
 #[test]
 fn an_import_names_a_module_path() {
-    let Stmt::Import { path, alias, uses } = only_stmt("import shop::cart\n") else {
+    let Stmt::Import {
+        path, alias, uses, ..
+    } = only_stmt("import shop::cart\n")
+    else {
         panic!("expected an import");
     };
     assert_eq!(path_of(&path), ["shop", "cart"]);
@@ -82,7 +85,10 @@ fn an_import_names_a_module_path() {
 
 #[test]
 fn an_import_takes_an_alias_and_a_use_clause() {
-    let Stmt::Import { path, alias, uses } = only_stmt("import a::b as c use f, T as U\n") else {
+    let Stmt::Import {
+        path, alias, uses, ..
+    } = only_stmt("import a::b as c use f, T as U\n")
+    else {
         panic!("expected an import");
     };
     assert_eq!(path_of(&path), ["a", "b"]);
@@ -273,6 +279,19 @@ fn pub_marks_each_statement_that_introduces_a_member() {
 
 /// A module exports only what it declares, so `pub` on a `run` is refused, as
 /// on an `import` (`docs/chl-spec.md`, "9.5 Visibility").
+/// An import passes keyword arguments as a run does (`docs/chl-spec.md`, "9.2
+/// Imports").
+#[test]
+fn an_import_takes_keyword_arguments() {
+    let Stmt::Import { args, alias, .. } = only_stmt("import sorted_map(K=String, cap=8) as m\n")
+    else {
+        panic!("expected an import");
+    };
+    let names: Vec<&str> = args.iter().map(|a| a.name.node.as_str()).collect();
+    assert_eq!(names, ["K", "cap"]);
+    assert_eq!(alias.map(|a| a.node), Some("m".into()));
+}
+
 #[test]
 fn pub_on_a_run_is_refused() {
     assert_error("pub run inventory as inv\n", "`pub` is refused on a `run`");

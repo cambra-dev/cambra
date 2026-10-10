@@ -26,8 +26,8 @@ use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
 use crate::ccl::uniquify;
 use crate::ccl::{Expr, Home, Label, Name, RunPath, Type, TypedExprNode};
 use crate::chl_parser::ast::{
-    AssignTarget, Module as ChlModule, ModulePath as AstModulePath, QualifiedName, Span, Spanned,
-    Stmt as ChlStmt,
+    AssignTarget, Module as ChlModule, ModuleArg, ModulePath as AstModulePath, QualifiedName, Span,
+    Spanned, Stmt as ChlStmt,
 };
 use crate::chl_parser::{FileId, ModulePath, SurfaceBuiltin};
 use smol_str::SmolStr;
@@ -49,8 +49,22 @@ pub struct Interface {
     members: HashMap<SmolStr, Member>,
     /// Every top-level type alias, by spelling, public and private alike.
     types: HashMap<SmolStr, TypeMember>,
+    /// Each value parameter, in the order declared.
+    parameters: Vec<Parameter>,
     /// Why importing the module is an error, if it is.
     pub unimportable: Option<Unimportable>,
+}
+
+/// One value parameter of a module.
+#[derive(Debug, Clone)]
+pub struct Parameter {
+    pub name: SmolStr,
+    /// The `param` statement.
+    pub declared: Span,
+    /// Its annotated type, as its module lowered it, if it has one.
+    pub annotation: Option<Type>,
+    /// Whether it has a default, which a run that passes no argument takes.
+    pub default: bool,
 }
 
 /// What makes a module one that is run and not imported (`docs/chl-spec.md`,
@@ -102,6 +116,7 @@ impl Interface {
             module,
             members: HashMap::new(),
             types: HashMap::new(),
+            parameters: Vec::new(),
             unimportable: Some(why),
         }
     }
@@ -111,12 +126,27 @@ impl Interface {
     /// imported for `unimportable`, if it has a reason.
     fn of_lowered(
         module: ModulePath,
+        ast: &ChlModule,
         chain: &Expr,
-        bindings: &[TopLevelBinding],
-        aliases: &[TopLevelBinding],
         mut_param_fns: impl Fn(&str) -> bool,
         unimportable: Option<Unimportable>,
     ) -> Self {
+        let bindings = &top_level_bindings(&ast.body);
+        let aliases = &top_level_aliases(&ast.body);
+        let annotations = parameter_annotations(chain);
+        let parameters = ast
+            .body
+            .iter()
+            .filter_map(|stmt| match &stmt.node {
+                ChlStmt::Param { name, default, .. } => Some(Parameter {
+                    name: name.node.clone(),
+                    declared: stmt.span,
+                    annotation: annotations.get(name.node.as_str()).cloned().flatten(),
+                    default: default.is_some(),
+                }),
+                _ => None,
+            })
+            .collect();
         let members = bindings
             .iter()
             .map(|binding| {
@@ -154,9 +184,26 @@ impl Interface {
             module,
             members,
             types,
+            parameters,
             unimportable,
         }
     }
+}
+
+/// The annotation of each `let` at the head of `chain` that binds a raw name,
+/// by spelling: a module's parameters, which head its chain.
+fn parameter_annotations(chain: &Expr) -> HashMap<&str, Option<Type>> {
+    let mut annotations = HashMap::new();
+    let mut at = chain;
+    while let TypedExprNode::Let { binding, body, .. } = &at.node {
+        if let Name::Raw(spelling) = &binding.name {
+            annotations
+                .entry(spelling.as_str())
+                .or_insert_with(|| binding.user_annotation.clone());
+        }
+        at = body;
+    }
+    annotations
 }
 
 /// The type each top-level `LetType` on `chain`'s spine declares, by spelling.
@@ -572,15 +619,21 @@ impl LoweringContext {
     }
 
     /// The rest of the module, `body`, below the `run` statement at `statement`
-    /// that declares the run `name` of `module`: a [`TypedExprNode::Run`] over a
-    /// `let` per value its `use` clause binds. The `let` keeps a generic member
+    /// that declares the run `name` of `module` with `arguments`: a
+    /// [`TypedExprNode::Run`] over a `let` per value its `use` clause binds,
+    /// below a `let` per argument. The `use` name's `let` keeps a generic member
     /// generic (`src/ccl/design/type-inference.md`, "A name of a generalized
     /// binding").
+    ///
+    /// Each argument is bound under the name its parameter reads
+    /// ([`argument_name`]), at the parameter's type spelled through the run name
+    /// ([`reroot`]), so a mismatch is the argument's error.
     pub(super) fn take_run(
         &mut self,
         name: &str,
         module: ModulePath,
         statement: Span,
+        arguments: Vec<(SmolStr, Span, Expr)>,
         body: Expr,
     ) -> Expr {
         let mut used: Vec<(SmolStr, Name, Span)> = self
@@ -610,9 +663,40 @@ impl LoweringContext {
             name: name.into(),
             module,
             statement,
+            arguments: arguments
+                .iter()
+                .map(|(parameter, ..)| parameter.clone())
+                .collect(),
             body: Box::new(body),
         });
-        self.tag_image(run, statement)
+        let run = self.tag_image(run, statement);
+        let parameters: HashMap<SmolStr, Option<Type>> = self
+            .module
+            .qualifiers
+            .get(name)
+            .and_then(|qualifier| qualifier.interface.as_ref())
+            .map(|interface| {
+                interface
+                    .parameters
+                    .iter()
+                    .map(|parameter| {
+                        let ty = parameter.annotation.as_ref().map(|ty| reroot(ty, name));
+                        (parameter.name.clone(), ty)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        arguments
+            .into_iter()
+            .rev()
+            .fold(run, |body, (parameter, span, value)| {
+                let bound = argument_name(name, &parameter);
+                let bound = match parameters.get(&parameter).cloned().flatten() {
+                    Some(ty) => Expr::let_bind_annotated(bound, value, body, ty),
+                    None => Expr::let_bind(bound, value, body),
+                };
+                self.tag_image(bound, span)
+            })
     }
 }
 
@@ -707,6 +791,15 @@ impl Qualifier {
     }
 }
 
+/// The name the argument for the parameter `parameter` of the run `run` is
+/// bound under, above the run, and read under by the parameter's `let`. No user
+/// binder takes a double-underscore name, run names are unique in their module,
+/// and `::` separates the run name from the parameter, so no two arguments in
+/// one module share one.
+fn argument_name(run: &str, parameter: &str) -> Name {
+    Name::raw(format!("__run::{run}::{parameter}"))
+}
+
 /// `q` as written: `cart::total`.
 fn spell(q: &QualifiedName) -> String {
     let mut out = String::new();
@@ -774,6 +867,24 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     let scope = lowering.scope(ast, None, ctx);
     ctx.begin_module(scope.clone());
     let lowered = lower_root(ast, ctx);
+    // The root has one run, which no `run` statement supplies arguments.
+    for stmt in &ast.body {
+        if let ChlStmt::Param {
+            name,
+            default: None,
+            ..
+        } = &stmt.node
+        {
+            lowering.errors.push(LoweringError::unsupported(
+                stmt.span,
+                format!(
+                    "the root module's parameter `{}` has no default, and no `run` statement \
+                     supplies the root's arguments: run this module from a root instead",
+                    name.node
+                ),
+            ));
+        }
+    }
     let sinks = std::mem::take(&mut ctx.declared_sinks);
     let mut errors = std::mem::take(&mut lowering.errors);
     errors.extend(lowered.errors);
@@ -866,9 +977,8 @@ impl ProgramLowering<'_> {
         let chain = lowered.value.filter(|_| clean)?;
         let interface = Interface::of_lowered(
             module,
+            ast,
             &chain,
-            &top_level_bindings(&ast.body),
-            &top_level_aliases(&ast.body),
             |name| ctx.is_mut_param_fn(name),
             unimportable,
         );
@@ -938,7 +1048,7 @@ impl ProgramLowering<'_> {
             .filter(|interface| interface.unimportable.is_none())
             .and_then(|interface| {
                 let home = Home::Shared(interface.module.clone());
-                self.create(file, Some(home), None, ctx)
+                self.create(file, Some(home), None, &[], ctx)
             });
         let (chain, names) = match created {
             Some(created) => (Some(created.chain), Some(Rc::new(created.names))),
@@ -950,22 +1060,26 @@ impl ProgramLowering<'_> {
 
     /// Create a run of the module in `file` with `home` as its members' home:
     /// the shared run, with no `run` statement, or the run at the run path and
-    /// `run` statement `place`. `None` when the module has no lowering.
+    /// `run` statement `place`, which passes arguments for the parameters
+    /// `arguments`. `None` when the module has no lowering.
     ///
-    /// Its chain is a copy of the module's, with each run it declares created in
-    /// turn and put in place ([`Self::expand_runs`]). It is uniquified with a
-    /// scope that maps each name spelled through a qualifier to the binder in the
-    /// qualifier's run, and each `use` name of an import to its member's binder.
-    /// A run registers the sinks its module declares, under its run path.
+    /// Its chain is a copy of the module's. Each parameter with an argument reads
+    /// it ([`argument_name`]), and one with neither an argument nor a default is
+    /// an error. Each run it declares is created in turn and put in place
+    /// ([`Self::expand_runs`]). It is uniquified with a scope that maps each name
+    /// spelled through a qualifier to the binder in the qualifier's run, and each
+    /// `use` name of an import to its member's binder. A run registers the sinks
+    /// its module declares, under its run path.
     fn create(
         &mut self,
         file: FileId,
         home: Option<Home>,
         place: Option<(RunPath, Span)>,
+        arguments: &[SmolStr],
         ctx: &mut LoweringContext,
     ) -> Option<Created> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
-        let chain = {
+        let mut chain = {
             let _copy = crate::ccl::provenance::copy_frame("link.run");
             lowered.chain.clone()
         };
@@ -973,6 +1087,40 @@ impl ProgramLowering<'_> {
             .as_ref()
             .map(|(path, _)| path.clone())
             .unwrap_or_default();
+        for parameter in &lowered.interface.parameters {
+            if arguments.contains(&parameter.name) {
+                let run = place
+                    .as_ref()
+                    .and_then(|(path, _)| path.last())
+                    .expect("only a run passes arguments");
+                let argument = ctx.tag_image(
+                    Expr::var(argument_name(run, &parameter.name)),
+                    parameter.declared,
+                );
+                read_argument(&mut chain, &parameter.name, argument);
+            } else if !parameter.default {
+                let error = match (&place, &home) {
+                    (Some((path, statement)), _) => LoweringError::unsupported(
+                        *statement,
+                        format!(
+                            "the run `{path}` passes no argument for the parameter `{}`, which \
+                             has no default",
+                            parameter.name
+                        ),
+                    )
+                    .with_note(parameter.declared, "the parameter"),
+                    (None, _) => LoweringError::unsupported(
+                        parameter.declared,
+                        format!(
+                            "module `{}` is imported, and an argument to an import is not \
+                             supported yet, so its parameter `{}` needs a default",
+                            lowered.interface.module, parameter.name
+                        ),
+                    ),
+                };
+                self.errors.push(error);
+            }
+        }
         let mut qualified = self.shared_names(&lowered.scope);
         let chain = self.expand_runs(chain, &path, &mut qualified, ctx);
         let (sinks, refused) = match &place {
@@ -1020,6 +1168,7 @@ impl ProgramLowering<'_> {
                     name,
                     module,
                     statement,
+                    arguments,
                     body,
                 } = expr.node
                 else {
@@ -1028,7 +1177,8 @@ impl ProgramLowering<'_> {
                 let run_path = path.child(name.clone());
                 let created = self.program.file_of(&module).and_then(|file| {
                     let home = Home::Run(run_path.clone());
-                    self.create(file, Some(home), Some((run_path, statement)), ctx)
+                    let place = Some((run_path, statement));
+                    self.create(file, Some(home), place, &arguments, ctx)
                 });
                 let body = self.expand_runs(*body, path, qualified, ctx);
                 return match created {
@@ -1143,6 +1293,50 @@ impl ProgramLowering<'_> {
     }
 }
 
+/// `chain`, a copy of a module's chain, with the `let` of its parameter
+/// `parameter`, which heads it, bound to `argument` in place of its default.
+fn read_argument(chain: &mut Expr, parameter: &str, argument: Expr) {
+    let mut at = chain;
+    loop {
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = &mut at.node
+        else {
+            unreachable!("a module's parameters head its chain, and `{parameter}` is one");
+        };
+        if matches!(&binding.name, Name::Raw(spelling) if spelling == parameter) {
+            **bound_expr = argument;
+            return;
+        }
+        at = body;
+    }
+}
+
+/// One error per argument in `args`, of a `run` of the module `interface`
+/// describes, that names no parameter of it or one an earlier argument already
+/// gives a value, each at the argument.
+fn misused_arguments(args: &[ModuleArg], interface: &Interface) -> Vec<LoweringError> {
+    let mut errors = Vec::new();
+    let mut supplied = HashSet::new();
+    for arg in args {
+        let name = &arg.name.node;
+        if !interface.parameters.iter().any(|p| &p.name == name) {
+            errors.push(LoweringError::unsupported(
+                arg.name.span,
+                format!("module `{}` has no parameter `{name}`", interface.module),
+            ));
+        } else if !supplied.insert(name) {
+            errors.push(LoweringError::unsupported(
+                arg.name.span,
+                format!("the parameter `{name}` already has an argument"),
+            ));
+        }
+    }
+    errors
+}
+
 /// The scope a run of the module that lowered in `scope` is uniquified in:
 /// `qualified`, each name spelled through a qualifier, and each `use` name of an
 /// import, mapped to its member's binder. A run's `use` names are `let`s at its
@@ -1192,7 +1386,9 @@ fn module_scope(
     let mut use_items = Vec::new();
     for stmt in &module.body {
         let (name, qualifier, uses) = match &stmt.node {
-            ChlStmt::Import { path, alias, uses } => {
+            ChlStmt::Import {
+                path, alias, uses, ..
+            } => {
                 // A segment the parser refused names no module.
                 let Some(module) = path.to_path() else {
                     continue;
@@ -1230,12 +1426,19 @@ fn module_scope(
                 (name, qualifier, uses)
             }
             ChlStmt::Run {
-                path, alias, uses, ..
+                path,
+                alias,
+                uses,
+                args,
+                ..
             } => {
                 // A segment the parser refused names no module.
                 let Some(module) = path.to_path() else {
                     continue;
                 };
+                if let Some(Some(interface)) = interfaces.get(&stmt.span) {
+                    errors.extend(misused_arguments(args, interface));
+                }
                 let name = alias
                     .as_ref()
                     .map_or_else(|| last_segment(&module), |alias| alias.node.clone());

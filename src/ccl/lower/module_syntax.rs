@@ -3,13 +3,13 @@
 //!
 //! [`refuse_module_syntax`] finds every such construct in a module, at any
 //! depth, and the module lowers nothing when it finds one. It refuses an
-//! argument to `run`, `param`, `@RenamedFrom`, `@Discard`, `pub` on anything but
-//! a value binding, a `def` or a type alias, a write to another module's member,
-//! and a method reference. A qualified value, type, label, or tag reaches
+//! argument to an import, a type parameter, `@RenamedFrom`, `@Discard`, `pub` on anything but a value binding,
+//! a `def` or a type alias, a write to another module's member, and a method
+//! reference. A qualified value, type, label, or tag reaches
 //! lowering, which resolves it against the module's import names and run names
 //! (`super::modules`). Lowering therefore sees a top-level [`ChlStmt::Import`],
-//! a top-level [`ChlStmt::Run`] without arguments, and a top-level
-//! [`ChlStmt::Pub`] on a binding, and no other module statement.
+//! [`ChlStmt::Run`], value [`ChlStmt::Param`], and [`ChlStmt::Pub`] on a binding,
+//! and no other module statement.
 //!
 //! The walk also collects every binder the module writes, for the rule that no
 //! binder takes an import name's or a run name's spelling (`docs/chl-spec.md`,
@@ -119,26 +119,18 @@ impl Refusals {
                 if let Some(renamed_from) = renamed_from {
                     self.refuse(renamed_from.span, "`@RenamedFrom` is not supported yet");
                 }
-                if let (Some(first), Some(last)) = (args.first(), args.last()) {
-                    self.refuse(
-                        first.name.span.join(last.value.span),
-                        "an argument to `run` is not supported yet: a module has no parameters",
-                    );
-                }
                 for arg in args {
                     self.expr(&arg.value);
                 }
             }
             ChlStmt::Param {
+                name,
                 annotation,
                 default,
-                ..
             } => {
-                self.refuse(
-                    stmt.span,
-                    "`param` is not supported yet: a program is a single module, and only a \
-                     `run` supplies a parameter",
-                );
+                if is_type_name(&name.node) {
+                    self.refuse(stmt.span, "a type parameter is not supported yet");
+                }
                 self.annotation(annotation.as_ref());
                 if let Some(default) = default {
                     self.expr(default);
@@ -243,7 +235,18 @@ impl Refusals {
             }
             // An import's module and `use` items resolve against the program
             // (`super::modules`).
-            ChlStmt::Import { .. } | ChlStmt::Return(None) | ChlStmt::Pass | ChlStmt::Error => {}
+            ChlStmt::Import { args, .. } => {
+                if let (Some(first), Some(last)) = (args.first(), args.last()) {
+                    self.refuse(
+                        first.name.span.join(last.value.span),
+                        "an argument to an import is not supported yet",
+                    );
+                }
+                for arg in args {
+                    self.expr(&arg.value);
+                }
+            }
+            ChlStmt::Return(None) | ChlStmt::Pass | ChlStmt::Error => {}
         }
     }
 
@@ -480,18 +483,22 @@ mod tests {
     #[test]
     fn each_module_statement_is_refused_at_its_span() {
         let refused = refusals(indoc! {r#"
+            @RenamedFrom(old)
             run audit(log=1)
-            param port: String
+            param Receipt <: {id: String}
             @Discard
             stock
             1
         "#});
         let messages: Vec<&str> = refused.iter().map(|(_, m)| m.as_str()).collect();
-        assert!(messages[0].starts_with("an argument to `run` is not supported yet"));
-        assert!(messages[1].starts_with("`param` is not supported yet"));
+        assert_eq!(messages[0], "`@RenamedFrom` is not supported yet");
+        assert_eq!(messages[1], "a type parameter is not supported yet");
         assert_eq!(messages[2], "`@Discard` is not supported yet");
         let spans: Vec<&str> = refused.iter().map(|(s, _)| s.trim_end()).collect();
-        assert_eq!(spans, ["log=1", "param port: String", "@Discard\nstock"]);
+        assert_eq!(
+            spans,
+            ["old", "param Receipt <: {id: String}", "@Discard\nstock"]
+        );
     }
 
     /// `pub` on a mutable variable is refused at the keyword, and the
@@ -665,11 +672,13 @@ mod tests {
         );
     }
 
+    /// A run's arguments are expressions of the module that runs it, checked as
+    /// any other.
     #[test]
-    fn a_run_argument_is_refused() {
+    fn a_run_argument_is_checked() {
         assert_eq!(
-            refused_spans("run storefront(audit=audit_api::log, port=1)\n"),
-            ["audit=audit_api::log, port=1"]
+            refused_spans("run storefront(audit=Price::discounted)\n"),
+            ["Price::discounted"]
         );
     }
 }

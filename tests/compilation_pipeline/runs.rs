@@ -167,7 +167,6 @@ fn a_run_name_is_in_scope_below_its_statement(#[case] root: &str, #[case] needle
     "import counter\nrun counter\n1\n",
     "`counter` is already an import name"
 )]
-#[case::an_argument("run counter(x=1)\n1\n", "an argument to `run` is not supported yet")]
 #[case::public("pub run counter\n1\n", "`pub` is refused on a `run`")]
 #[case::a_binder_named_like_a_run(
     "run counter as eu\neu = 1\neu\n",
@@ -217,4 +216,101 @@ fn two_runs_serving_one_route_are_refused() {
         "{errors}"
     );
     assert!(errors.contains("the run that serves it first"), "{errors}");
+}
+
+/// A module of value parameters: `base` without a default, `step` with one.
+const STEPPER: &str = indoc! {"
+    param base: Int
+    param step: Int = 1
+    pub total = base + step
+"};
+
+/// A run's parameters take its arguments, and a parameter without one takes
+/// its default (`docs/chl-spec.md`, "9.4 Parameters"). An argument is any
+/// expression over the names above the run: the module's own members, and
+/// another run's members, so one run's result can be passed into another.
+#[rstest]
+#[case::default("run stepper(base=10) as a\na::total\n", 11)]
+#[case::overriding_a_default("run stepper(base=10, step=5) as a\na::total\n", 15)]
+#[case::two_runs_two_arguments(
+    "run stepper(base=1) as a\nrun stepper(base=100) as b\na::total + b::total\n",
+    103
+)]
+#[case::another_runs_member(
+    "run stepper(base=1) as a\nrun stepper(base=a::total) as b\nb::total\n",
+    3
+)]
+#[case::the_modules_own_member("x = 41\nrun stepper(base=x) as a\na::total\n", 42)]
+#[case::through_a_run_that_passes_its_own("run relay(start=7) as r\nr::out\n", 8)]
+#[timeout(Duration::from_secs(10))]
+fn a_runs_parameters_take_its_arguments(#[case] root: &str, #[case] expected: i64) {
+    let relay = "param start: Int\nrun stepper(base=start) as s\npub out = s::total\n";
+    check_program_scalar(
+        &program(root, &[("stepper", STEPPER), ("relay", relay)]),
+        Value::Int(expected),
+    );
+}
+
+/// The root and an imported module are run by no `run` statement, so their
+/// parameters take their defaults.
+#[rstest]
+#[case::root("param n: Int = 5\nn + 1\n", &[], 6)]
+#[case::imported(
+    "import scaled\nscaled::by(3)\n",
+    &[("scaled", "param scale: Int = 2\npub def by(x):\n    x * scale\n")],
+    6
+)]
+#[case::unannotated(
+    "run bump(k=3) as b\nb::v\n",
+    &[("bump", "param k\npub v = k + 1\n")],
+    4
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_parameter_without_an_argument_takes_its_default(
+    #[case] root: &str,
+    #[case] modules: &[(&str, &str)],
+    #[case] expected: i64,
+) {
+    check_program_scalar(&program(root, modules), Value::Int(expected));
+}
+
+#[rstest]
+#[case::missing(
+    "run stepper as a\n1\n",
+    "the run `a` passes no argument for the parameter `base`"
+)]
+#[case::unknown(
+    "run stepper(base=1, nope=2) as a\n1\n",
+    "module `stepper` has no parameter `nope`"
+)]
+#[case::mistyped("run stepper(base=\"x\") as a\na::total\n", "annotated as Int")]
+#[case::twice(
+    "run stepper(base=1, base=2) as a\n1\n",
+    "the parameter `base` already has an argument"
+)]
+#[case::root_without_a_default(
+    "param n: Int\nn\n",
+    "the root module's parameter `n` has no default"
+)]
+#[case::imported_without_a_default("import stepper\n1\n", "module `stepper` is imported")]
+#[case::an_import_argument(
+    "import stepper(base=1)\n1\n",
+    "an argument to an import is not supported yet"
+)]
+#[case::bound_by_a_member(
+    "run clash(base=1)\n1\n",
+    "`base` is a parameter, so no member of its module takes it"
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_misused_parameter_is_refused(#[case] root: &str, #[case] needle: &str) {
+    assert_refused(
+        &program(
+            root,
+            &[
+                ("stepper", STEPPER),
+                ("clash", "param base: Int\nbase = 2\n"),
+            ],
+        ),
+        needle,
+    );
 }

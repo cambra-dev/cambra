@@ -380,6 +380,8 @@ pub enum TypedExprNode {
     /// A `run` statement in a module being lowered: the run `name` of `module`,
     /// declared by the statement at `statement`, with the rest of the declaring
     /// module in `body` (`docs/modules.md`, "A module lowers once").
+    /// `arguments` are the parameters the statement passes arguments for, each
+    /// bound above the node.
     ///
     /// Exists only between lowering and linking. Linking replaces it with the
     /// run's chain around `body`, so no pass after it sees one, and each has an
@@ -388,6 +390,7 @@ pub enum TypedExprNode {
         name: SmolStr,
         module: ModulePath,
         statement: Span,
+        arguments: Vec<SmolStr>,
         body: Box<TypedExpr>,
     },
 

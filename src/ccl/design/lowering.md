@@ -314,12 +314,15 @@ to the type its alias names, spelled through `m`, and a label to a `Label` of th
 An import's `use` name for a value lowers as a raw name, which the same scope resolves. A run's is
 a `let` at the `run` statement. A `use` name for a type is an alias, in scope throughout the module
 for an import and from the statement down for a run. A `run` statement lowers to a
-[`Run`](ir.md#run--a-run-statement-before-linking) node over the rest of the module. A sink is
-declared, and registered by each run of the module.
+[`Run`](ir.md#run--a-run-statement-before-linking) node over the rest of the module, below a `let`
+per argument. A value `param` lowers to a `let` at the head of its module's chain, of its default,
+which creating a run replaces with the run's argument ([docs/modules.md,
+"Runs"](../../../docs/modules.md#runs)). A sink is declared, and registered by each run of the
+module.
 
 The rest of the module syntax parses ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules
-[Decided]") and does not lower yet: an argument to `run`, `param`, `@RenamedFrom`,
-`@Discard`, `pub` on a mutable variable, and a write to another module's member.
+[Decided]") and does not lower yet: a type parameter, `@RenamedFrom`, `@Discard`, `pub` on a
+mutable variable, and a write to another module's member.
 `refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the whole module, every block and
 every expression, and reports one `LoweringError::Unsupported` per construct, and the module lowers
 nothing when it reports. A path with a capitalized qualifier segment, `Price::discounted`, is

@@ -1,8 +1,8 @@
 # Modules
 
 > **Status: [Sketched].** A proposed implementation. The first four items of the [Implementation
-> stack](#implementation-stack) are implemented, and the first part of the sixth, runs without
-> parameters ([Runs](#runs)).
+> stack](#implementation-stack) are implemented, and the sixth, runs and value parameters
+> ([Runs](#runs)).
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -272,16 +272,17 @@ qualifier of labels and tags, and `m::T` as a type.
 - **Labels.** An unqualified label belongs to the module that writes it, `this::` spells the same
   label, and `m::` qualifies the label of the module `m` names. `some` and `none` are `Option`'s in
   every module ([Names carry their home](#names-carry-their-home)).
-- **Refused:** a module as a value, and a member of a run another module declares. The later items
-  lift these.
+- **Refused:** an argument to an import, a module as a value, and a member of a run another module
+  declares. The later items lift these. With no import arguments, a shared run takes every
+  parameter's default, and a parameter without one is an error at the parameter.
 
 A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
 into it adds no error.
 
 ### Runs
 
-Running modules without parameters is implemented: `run m` and `run a::b as n`, a run's members
-reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
+Running modules is implemented: `run m(x=e)` and `run a::b as n`, value parameters, a run's
+members reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
 
 - **A run is created from its module's lowering.** A `run` statement lowers to a `Run` node over
   the rest of the declaring module (`LoweringContext::take_run`), and creating the declaring
@@ -298,10 +299,19 @@ reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
 - **Routes are unique across runs.** Creating a run registers its routes. A route two runs serve is
   an error at the second `run` statement, with a note at the first. A route address is a literal,
   so two runs of one module that serves a route always conflict.
-- **Refused:** an argument to `run`, `@RenamedFrom`, and a `run` in an imported module. `pub` on a
-  `run` is a parse error: a module returns a run by binding it to a public member, which waits on
-  Module types.
-  `pub` on `:=` is refused, so no module reaches another run's mutable variable.
+- **A parameter is a `let` at the head of its module's chain**, of its default, or of a placeholder
+  when it has none. The interface records each parameter's annotation and whether it has a default.
+  A `run` statement binds each argument above its `Run` node under `argument_name`'s
+  double-underscore name, `__run::eu::port`, at the parameter's annotated type spelled through the
+  run name, so a mismatch is reported at the argument. Creating the run points each parameter with
+  an argument at that name, and refuses one with neither an argument nor a default at the `run`
+  statement. An unannotated parameter's type is inferred from the module's uses, so a bad argument
+  for one is reported where the module uses it, until a module is checked alone. The root and a
+  shared run take every parameter's default, and a parameter without one is an error there.
+- **Refused:** a type parameter and a parameter of Module type (item 7), `@RenamedFrom`, and a `run`
+  in an imported module. `pub` on a `run` is a parse error: a module returns a run by binding it to
+  a public member, which waits on Module types. `pub` on `:=` is refused, so no module reaches
+  another run's mutable variable.
 
 ### The module interface
 
@@ -632,7 +642,9 @@ One PR per item, each updating the spec and design docs it touches:
       path, route uniqueness across runs.
    2. **Value parameters.** `param`, keyword arguments, defaults, run-site checks.
 7. **Module types and type parameters.** `Module{…}` and its subtyping, Module-typed parameters
-   and the qualified references through them, type parameters.
+   and the qualified references through them, type parameters, and arguments to an import: one
+   shared run per module and distinct set of constant arguments ([chl-spec.md, "9.2
+   Imports"](chl-spec.md#92-imports)).
 8. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
    removed, route uniqueness across runs.
 9. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
@@ -669,10 +681,12 @@ the [Implementation stack](#implementation-stack).
   file or several. Needed for a per-run type such as `InStock` ([chl-spec.md, "9.7 Importing
   asserts no IO and no state"](chl-spec.md#97-importing-asserts-no-io-and-no-state)).
 - **Link-time constants.** A value fixed once linking binds a run's arguments, such as a route
-  address passed as a parameter. A run argument may be any expression, so this needs its own
-  definition of which expressions are link-time constants and when they are evaluated. Until it
-  exists a route address is a literal ([Intrinsics resolve by
-  identity](#intrinsics-resolve-by-identity)).
+  address passed as a parameter, and every argument to an import, which keys its shared run. A run
+  argument may be any expression, so this needs its own definition of which expressions are
+  link-time constants and when they are evaluated ([chl-spec.md, "9.19 Open
+  questions"](chl-spec.md#919-open-questions)). Until it exists a route address is a literal
+  ([Intrinsics resolve by identity](#intrinsics-resolve-by-identity)), and an import argument is a
+  literal, a type, or an import name or run name.
 - **`Feed(…)` declarations** ([chl-spec.md, "8.4 Feeds are the second form of
   mutability"](chl-spec.md#84-feeds-are-the-second-form-of-mutability)), for a public feed with no
   initializer.
