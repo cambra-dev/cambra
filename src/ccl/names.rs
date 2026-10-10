@@ -254,6 +254,10 @@ pub enum KeyArgument {
     /// An import name, passed as a value of its Module type: the shared run it
     /// reaches.
     Module(SharedRun),
+    /// A type, as `Display for Type` writes it. Two type arguments that write
+    /// alike are equal types, which keying a shared run checks
+    /// (`ProgramLowering::import_keys`).
+    Type(String),
 }
 
 impl SharedRun {
@@ -288,6 +292,7 @@ impl fmt::Display for SharedRun {
                     unreachable!("no import argument is the unit constant")
                 }
                 KeyArgument::Module(run) => write!(f, "{parameter}={run}")?,
+                KeyArgument::Type(ty) => write!(f, "{parameter}={ty}")?,
             }
         }
         f.write_str(")")

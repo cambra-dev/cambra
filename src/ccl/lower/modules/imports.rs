@@ -10,83 +10,154 @@ pub(super) struct ImportSite {
     pub(super) statement: Span,
     /// Each argument, by its parameter: its span and its value.
     pub(super) arguments: HashMap<SmolStr, (Span, KeyArgument)>,
+    /// Each type argument, by its parameter, as the importer lowered it.
+    pub(super) types: HashMap<SmolStr, Type>,
+}
+
+/// What an `import` statement reaches: its shared run, and the types that gives
+/// its module's type parameters, as the importer writes them.
+pub(super) struct Imported {
+    pub(super) run: SharedRun,
+    pub(super) types: TypeArguments,
+}
+
+/// An argument to an `import` as written, before its shared run is decided
+/// ([`ProgramLowering::import_keys`]).
+pub(super) enum ImportArgument<'a> {
+    Lit(Lit),
+    /// An import name, by the statement that binds it.
+    Import(Span),
+    /// A type, with the statements of the imports whose names it writes.
+    Type(&'a Spanned<ChlExpr>, Vec<Span>),
 }
 
 impl ProgramLowering<'_> {
-    /// The shared run each of the program's `import` statements reaches, by its
-    /// key, with its module's file and the first statement that reaches it:
-    /// one per module and distinct set of arguments. Records the shared run
-    /// each statement reaches.
+    /// Decide the shared run each `import` of the module in `importer` reaches,
+    /// once the modules it imports have lowered and before it lowers: record it
+    /// by the statement, with the types it gives its module's type parameters
+    /// as `importer` writes them, and add it to `sites` with the first import
+    /// that reaches it.
     ///
-    /// An argument is a literal or an import name for now (`docs/modules.md`,
-    /// "Dependencies"). One that is neither, or that names no parameter or one
-    /// already given an argument, is an error at the argument, and its import
-    /// reaches no shared run. An import passing an import name waits for that
-    /// import's shared run, so the imports resolve in rounds, and those left
-    /// when a round resolves none are in a cycle.
-    pub(super) fn shared_runs(&mut self) -> HashMap<SharedRun, (FileId, ImportSite)> {
-        let mut runs: HashMap<SharedRun, (FileId, ImportSite)> = HashMap::new();
-        for importer in self.program.sources().files() {
-            let Some(ast) = self.program.ast(importer) else {
+    /// An import passing an import name reaches its shared run once that
+    /// import's is decided, and a type argument is lowered against the imports
+    /// decided so far, so the imports resolve in rounds. A type argument is
+    /// built from built-in types and imported type members: one naming a type
+    /// the importer declares, or a value, waits on link-time constants
+    /// (`docs/modules.md`, "Dependencies").
+    pub(super) fn import_keys(
+        &mut self,
+        importer: FileId,
+        sites: &mut HashMap<SharedRun, (FileId, ImportSite)>,
+        ctx: &mut LoweringContext,
+    ) {
+        let program = self.program;
+        let Some(ast) = program.ast(importer) else {
+            return;
+        };
+        let import_names: HashMap<SmolStr, Span> = ast
+            .body
+            .iter()
+            .filter_map(|stmt| import_name(stmt).map(|name| (name, stmt.span)))
+            .collect();
+        // A `use` type name of an import reaches its type through that import.
+        let used_types: HashMap<SmolStr, Span> = ast
+            .body
+            .iter()
+            .filter_map(|stmt| match &stmt.node {
+                ChlStmt::Import { uses, .. } => Some((stmt.span, uses)),
+                _ => None,
+            })
+            .flat_map(|(statement, uses)| {
+                uses.iter()
+                    .map(move |item| (item.alias.as_ref().unwrap_or(&item.name), statement))
+            })
+            .filter(|(bound, _)| crate::ccl::lower::stmts::is_type_name(&bound.node))
+            .map(|(bound, statement)| (bound.node.clone(), statement))
+            .collect();
+        let declared_types: HashSet<SmolStr> = top_level_aliases(&ast.body)
+            .into_iter()
+            .map(|alias| alias.name)
+            .chain(ast.body.iter().filter_map(|stmt| match &stmt.node {
+                ChlStmt::Param { name, .. }
+                    if crate::ccl::lower::stmts::is_type_name(&name.node) =>
+                {
+                    Some(name.node.clone())
+                }
+                _ => None,
+            }))
+            .collect();
+        let run_names: HashSet<SmolStr> = ast
+            .body
+            .iter()
+            .filter_map(|stmt| match &stmt.node {
+                ChlStmt::Run { path, alias, .. } => run_name(path, alias.as_ref()),
+                _ => None,
+            })
+            .collect();
+        // Each import whose arguments are well formed. One whose arguments are
+        // not reaches no shared run.
+        let mut pending = Vec::new();
+        for stmt in &ast.body {
+            let ChlStmt::Import { path, args, .. } = &stmt.node else {
                 continue;
             };
-            let import_names: HashMap<SmolStr, Span> = ast
-                .body
-                .iter()
-                .filter_map(|stmt| import_name(stmt).map(|name| (name, stmt.span)))
-                .collect();
-            let run_names: HashSet<SmolStr> = ast
+            // A segment the parser refused names no module, and loading has
+            // reported a module with no file.
+            let (Some(module), Some(name)) = (path.to_path(), import_name(stmt)) else {
+                continue;
+            };
+            let Some((file, target)) = program
+                .file_of(&module)
+                .and_then(|file| Some((file, program.ast(file)?)))
+            else {
+                continue;
+            };
+            let errors = self.errors.len();
+            let parameters: HashSet<&str> = target
                 .body
                 .iter()
                 .filter_map(|stmt| match &stmt.node {
-                    ChlStmt::Run { path, alias, .. } => run_name(path, alias.as_ref()),
+                    ChlStmt::Param { name, .. } => Some(name.node.as_str()),
                     _ => None,
                 })
                 .collect();
-            // Each import whose arguments are well formed, with each import name
-            // it passes, by the statement that binds the name. One whose
-            // arguments are not reaches no shared run.
-            let mut pending = Vec::new();
-            for stmt in &ast.body {
-                let ChlStmt::Import { path, args, .. } = &stmt.node else {
-                    continue;
-                };
-                // A segment the parser refused names no module, and loading has
-                // reported a module with no file.
-                let Some(module) = path.to_path() else {
-                    continue;
-                };
-                let Some((file, target)) = self
-                    .program
-                    .file_of(&module)
-                    .and_then(|file| Some((file, self.program.ast(file)?)))
-                else {
-                    continue;
-                };
-                let errors = self.errors.len();
-                let parameters: HashSet<&str> = target
-                    .body
-                    .iter()
-                    .filter_map(|stmt| match &stmt.node {
-                        ChlStmt::Param { name, .. } => Some(name.node.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                self.errors
-                    .extend(misused_arguments(args, &module, &parameters));
-                let mut arguments = Vec::new();
-                for arg in args {
-                    let value = match (&arg.value.node, constant(&arg.value.node)) {
-                        (_, Some(value)) => Ok(value),
+            self.errors
+                .extend(misused_arguments(args, &module, &parameters));
+            let mut arguments = Vec::new();
+            for arg in args {
+                let value = if crate::ccl::lower::stmts::is_type_name(&arg.name.node) {
+                    let mut names = HashSet::new();
+                    mentioned_names(&arg.value.node, &mut names);
+                    if let Some(declared) = names.iter().find(|name| declared_types.contains(*name))
+                    {
+                        self.errors.push(LoweringError::unsupported(
+                            arg.value.span,
+                            format!(
+                                "`{declared}` is a type this module declares, and an argument to \
+                                 an import is built from built-in types and imported type \
+                                 members for now"
+                            ),
+                        ));
+                        continue;
+                    }
+                    let reached = names
+                        .iter()
+                        .filter_map(|name| import_names.get(name).or_else(|| used_types.get(name)))
+                        .copied()
+                        .collect();
+                    ImportArgument::Type(&arg.value, reached)
+                } else {
+                    match (&arg.value.node, constant(&arg.value.node)) {
+                        (_, Some(value)) => ImportArgument::Lit(value),
                         (ChlExpr::Name(name), None) if import_names.contains_key(name) => {
-                            Err(import_names[name])
+                            ImportArgument::Import(import_names[name])
                         }
                         (ChlExpr::Name(name), None) if run_names.contains(name) => {
                             self.errors.push(LoweringError::unsupported(
                                 arg.value.span,
                                 format!(
-                                    "`{name}` is a run name, and a run is not an argument to \
-                                     an import: a shared run stands outside every run"
+                                    "`{name}` is a run name, and a run is not an argument to an \
+                                     import: a shared run stands outside every run"
                                 ),
                             ));
                             continue;
@@ -94,74 +165,159 @@ impl ProgramLowering<'_> {
                         _ => {
                             self.errors.push(LoweringError::unsupported(
                                 arg.value.span,
-                                "an argument to an import is supported only as a literal or \
-                                 an import name for now",
+                                "an argument to an import is supported only as a literal, a \
+                                 type, or an import name for now",
                             ));
                             continue;
                         }
-                    };
-                    arguments.push((arg.name.node.clone(), arg.value.span, value));
-                }
-                if self.errors.len() == errors {
-                    pending.push((stmt.span, file, module, arguments));
-                }
+                    }
+                };
+                arguments.push((arg.name.node.clone(), arg.value.span, value));
             }
-            // An import that passes an import name reaches its shared run once
-            // that import's is known, so the imports resolve in rounds. One left
-            // when a round resolves none passes an import whose arguments are in
-            // error, or is in a cycle of imports passing each other.
-            let mut resolved: HashMap<Span, Option<SharedRun>> = import_names
-                .values()
-                .filter(|import| !pending.iter().any(|(statement, ..)| statement == *import))
-                .map(|import| (*import, None))
-                .collect();
-            while !pending.is_empty() {
-                let before = pending.len();
-                pending.retain(|(statement, file, module, arguments)| {
-                    let mut key = Vec::new();
-                    let mut site = HashMap::new();
-                    for (parameter, span, value) in arguments {
-                        let argument = match value {
-                            Ok(value) => KeyArgument::Lit(value.clone()),
-                            Err(import) => match resolved.get(import) {
-                                Some(Some(run)) => KeyArgument::Module(run.clone()),
-                                Some(None) => {
+            if self.errors.len() == errors {
+                pending.push((stmt.span, file, module, name, arguments));
+            }
+        }
+        let mut resolved: HashMap<Span, Option<SharedRun>> = import_names
+            .values()
+            .filter(|import| !pending.iter().any(|(statement, ..)| statement == *import))
+            .map(|import| (*import, None))
+            .collect();
+        let typed = pending.iter().any(|(.., arguments)| {
+            arguments
+                .iter()
+                .any(|(.., value)| matches!(value, ImportArgument::Type(..)))
+        });
+        let interfaces = if typed {
+            self.interfaces(ast)
+        } else {
+            HashMap::new()
+        };
+        while !pending.is_empty() {
+            let before = pending.len();
+            // A type argument lowers against the imports decided in the rounds
+            // before. The scope's own errors are reported when the module lowers.
+            // A type argument lowers against the scope built here, so one whose
+            // imports are decided in this round waits for the next.
+            let decided: HashSet<Span> = resolved.keys().copied().collect();
+            if typed {
+                let scope = module_scope(
+                    ast,
+                    None,
+                    program,
+                    &interfaces,
+                    &self.imports,
+                    ctx,
+                    &mut Vec::new(),
+                );
+                ctx.begin_module(scope);
+            }
+            pending.retain(|(statement, file, module, name, arguments)| {
+                let mut key = Vec::new();
+                let mut site = HashMap::new();
+                let mut types = HashMap::new();
+                for (parameter, span, value) in arguments {
+                    let argument = match value {
+                        ImportArgument::Lit(value) => KeyArgument::Lit(value.clone()),
+                        ImportArgument::Import(import) => match resolved.get(import) {
+                            Some(Some(run)) => KeyArgument::Module(run.clone()),
+                            Some(None) => {
+                                resolved.insert(*statement, None);
+                                return false;
+                            }
+                            None => return true,
+                        },
+                        ImportArgument::Type(written, reached) => {
+                            for import in reached {
+                                match resolved.get(import) {
+                                    Some(Some(_)) if decided.contains(import) => {}
+                                    Some(None) => {
+                                        resolved.insert(*statement, None);
+                                        return false;
+                                    }
+                                    _ => return true,
+                                }
+                            }
+                            let ty = match crate::ccl::lower::stmts::lower_type_expr(written, ctx) {
+                                Ok(ty) => ty,
+                                Err(error) => {
+                                    self.errors.push(error);
                                     resolved.insert(*statement, None);
                                     return false;
                                 }
-                                None => return true,
-                            },
-                        };
-                        key.push((parameter.clone(), argument.clone()));
-                        site.insert(parameter.clone(), (*span, argument));
-                    }
-                    key.sort();
-                    let run = SharedRun {
-                        module: module.clone(),
-                        arguments: key.into(),
+                            };
+                            if let Some(value) = value_named(&ty) {
+                                self.errors.push(LoweringError::unsupported(
+                                    *span,
+                                    format!(
+                                        "this type's refinement reads `{value}`, and an argument \
+                                         to an import is a type whose refinements read no value \
+                                         for now"
+                                    ),
+                                ));
+                                resolved.insert(*statement, None);
+                                return false;
+                            }
+                            let written = ty.to_string();
+                            if let Some(earlier) =
+                                self.type_keys.insert(written.clone(), ty.clone())
+                            {
+                                assert!(
+                                    earlier == ty,
+                                    "two type arguments to imports are written `{written}` and \
+                                     are different types, so they would reach one shared run"
+                                );
+                            }
+                            types.insert(parameter.clone(), ty);
+                            KeyArgument::Type(written)
+                        }
                     };
-                    resolved.insert(*statement, Some(run.clone()));
-                    self.imports.insert(*statement, run.clone());
-                    runs.entry(run).or_insert((
-                        *file,
-                        ImportSite {
-                            statement: *statement,
-                            arguments: site,
-                        },
+                    key.push((parameter.clone(), argument.clone()));
+                    site.insert(parameter.clone(), (*span, argument));
+                }
+                key.sort();
+                let run = SharedRun {
+                    module: module.clone(),
+                    arguments: key.into(),
+                };
+                let reached = self.lowered.get(file).cloned().flatten().map_or_else(
+                    TypeArguments::default,
+                    |lowered| {
+                        reached_types(
+                            &lowered.interface,
+                            &QualifiedName::new(name.clone()),
+                            &types,
+                        )
+                    },
+                );
+                resolved.insert(*statement, Some(run.clone()));
+                self.imports.insert(
+                    *statement,
+                    Imported {
+                        run: run.clone(),
+                        types: reached,
+                    },
+                );
+                sites.entry(run).or_insert((
+                    *file,
+                    ImportSite {
+                        statement: *statement,
+                        arguments: site,
+                        types,
+                    },
+                ));
+                false
+            });
+            if pending.len() == before {
+                for (statement, ..) in pending.drain(..) {
+                    self.errors.push(LoweringError::unsupported(
+                        statement,
+                        "this import's arguments name imports whose arguments name it, in a \
+                         cycle",
                     ));
-                    false
-                });
-                if pending.len() == before {
-                    for (statement, ..) in pending.drain(..) {
-                        self.errors.push(LoweringError::unsupported(
-                            statement,
-                            "this import's arguments pass imports that pass it, in a cycle",
-                        ));
-                    }
                 }
             }
         }
-        runs
     }
 }
 
@@ -180,5 +336,66 @@ pub(super) fn constant(expr: &ChlExpr) -> Option<Lit> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Each name `expr` writes that could name a type or a module: a bare name, and
+/// the first segment of a qualified one.
+pub(super) fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
+    let mut each = |exprs: &mut dyn Iterator<Item = &Spanned<ChlExpr>>| {
+        for expr in exprs {
+            mentioned_names(&expr.node, names);
+        }
+    };
+    match expr {
+        ChlExpr::Name(name) => {
+            names.insert(name.clone());
+        }
+        ChlExpr::Qualified(q) => {
+            let first = q
+                .qualifier
+                .first()
+                .expect("a qualified name has a qualifier");
+            names.insert(first.node.clone());
+        }
+        ChlExpr::Call { func, args } => each(&mut std::iter::once(&**func).chain(args)),
+        ChlExpr::List(elts) | ChlExpr::Tuple(elts) | ChlExpr::BraceGroup(elts) => {
+            each(&mut elts.iter())
+        }
+        ChlExpr::Record(fields) | ChlExpr::BraceRecord(fields) => {
+            each(&mut fields.iter().map(|field| &field.value))
+        }
+        ChlExpr::ModuleType(entries) => each(&mut entries.iter().map(|entry| &entry.value)),
+        ChlExpr::BraceRefinement { base, predicate } => {
+            each(&mut [&**base, &**predicate].into_iter())
+        }
+        ChlExpr::FunctionType { domain, codomain } => {
+            each(&mut [&**domain, &**codomain].into_iter())
+        }
+        ChlExpr::Subscript { target, index, .. } => each(&mut [&**target, &**index].into_iter()),
+        ChlExpr::BinOp { left, right, .. } => each(&mut [&**left, &**right].into_iter()),
+        ChlExpr::UnaryOp { operand, .. } => each(&mut std::iter::once(&**operand)),
+        ChlExpr::BoolOp { operands, .. } => each(&mut operands.iter()),
+        ChlExpr::Compare {
+            left, comparators, ..
+        } => each(&mut std::iter::once(&**left).chain(comparators)),
+        ChlExpr::Attribute { target, .. } => each(&mut std::iter::once(&**target)),
+        ChlExpr::VariantCtor { payload, .. } => match payload {
+            Some(VariantPayload::Term(p) | VariantPayload::Fields(p)) => {
+                each(&mut std::iter::once(&**p))
+            }
+            None => {}
+        },
+        // None of these is a type. Lowering the argument as one refuses it.
+        ChlExpr::Lit(_)
+        | ChlExpr::Error
+        | ChlExpr::Forall { .. }
+        | ChlExpr::Lambda { .. }
+        | ChlExpr::IfExp { .. }
+        | ChlExpr::ListComp(_)
+        | ChlExpr::GenExp(_)
+        | ChlExpr::Yield(_)
+        | ChlExpr::Feed { .. }
+        | ChlExpr::Block(_) => {}
     }
 }

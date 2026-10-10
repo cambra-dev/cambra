@@ -327,11 +327,11 @@ module to nothing ([docs/modules.md, "A Module type is not a
 by each run of the module.
 
 The rest of the module syntax parses ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules") and
-does not lower yet: a type parameter, `@RenamedFrom`, `@Discard`, `pub` on a mutable variable, and
-a write to another module's member. `refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the
-whole module, every block and every expression, and reports one `LoweringError::Unsupported` per
-construct, and the module lowers nothing when it reports. A path with a capitalized qualifier
-segment, `Price::discounted`, is refused as a method reference rather than as module syntax
+does not lower yet: `@RenamedFrom`, `@Discard`, `pub` on a mutable variable, and a write to another
+module's member. `refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the whole module,
+every block and every expression, and reports one `LoweringError::Unsupported` per construct, and
+the module lowers nothing when it reports. A path with a capitalized qualifier segment,
+`Price::discounted`, is refused as a method reference rather than as module syntax
 ([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and methods [Decided]"). A module that
 uses refused syntax therefore reports only those refusals, and none of the lowering errors its
 other statements would raise.

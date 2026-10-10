@@ -44,14 +44,31 @@ pub enum ParameterKind {
         /// Its default, the module it names as its module spells it.
         default: Option<QualifiedName>,
     },
+    /// A type, `param T <: B = D`: the [`Type::Param`] its module lowers `T`
+    /// to, and its bound and default as its module lowered them.
+    Type {
+        param: Rc<TypeParam>,
+        /// The bound, recorded for checking a module on its own: nothing
+        /// compares an argument with it yet (`docs/modules.md`, "Runs").
+        bound: Option<Type>,
+        default: Option<Type>,
+    },
 }
 
+/// The type each type parameter of a run or a shared run takes, by parameter.
+pub type TypeArguments = Rc<HashMap<TypeParamId, Type>>;
+
 impl Parameter {
+    /// Whether it takes a type.
+    pub fn is_type(&self) -> bool {
+        matches!(self.kind, ParameterKind::Type { .. })
+    }
+
     /// Its annotated type, if it takes a value and has one.
     pub fn annotation(&self) -> Option<&Type> {
         match &self.kind {
             ParameterKind::Value(annotation) => annotation.as_ref(),
-            ParameterKind::Module { .. } => None,
+            ParameterKind::Module { .. } | ParameterKind::Type { .. } => None,
         }
     }
 
@@ -59,7 +76,7 @@ impl Parameter {
     pub fn module(&self) -> Option<&Rc<ModuleType>> {
         match &self.kind {
             ParameterKind::Module { ty, .. } => Some(ty),
-            ParameterKind::Value(_) => None,
+            ParameterKind::Value(_) | ParameterKind::Type { .. } => None,
         }
     }
 
@@ -68,7 +85,7 @@ impl Parameter {
     pub fn module_default(&self) -> Option<&QualifiedName> {
         match &self.kind {
             ParameterKind::Module { default, .. } => default.as_ref(),
-            ParameterKind::Value(_) => None,
+            ParameterKind::Value(_) | ParameterKind::Type { .. } => None,
         }
     }
 
@@ -127,6 +144,9 @@ pub struct ModuleBinding {
     /// What it reaches when it is bound to a Module-typed parameter, spelled
     /// in its declaring module.
     pub view: Option<Rc<ModuleView>>,
+    /// The types the run it is bound to gives its module's type parameters, as
+    /// its declaring module writes them.
+    pub types: TypeArguments,
 }
 
 /// What a Module-typed parameter reaches of the module it takes: each member
@@ -278,6 +298,7 @@ impl Interface {
                         interface: bound.interface.clone(),
                         name: bound.name.clone(),
                         view: bound.view.clone(),
+                        types: Rc::clone(&bound.types),
                     },
                 );
                 continue;
