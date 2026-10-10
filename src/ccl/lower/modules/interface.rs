@@ -43,6 +43,10 @@ pub enum ParameterKind {
         ty: Rc<ModuleType>,
         /// Its default, the module it names as its module spells it.
         default: Option<QualifiedName>,
+        /// With a default, the type each abstract type member of its Module
+        /// type takes from the default, as its module writes it, by the
+        /// member's spelling, `payments::Receipt`.
+        default_types: HashMap<QualifiedName, Type>,
     },
     /// A type, `param T <: B = D`: the [`Type::Param`] its module lowers `T`
     /// to, and its bound and default as its module lowered them.
@@ -59,6 +63,15 @@ pub enum ParameterKind {
 pub type TypeArguments = Rc<HashMap<TypeParamId, Type>>;
 
 impl Parameter {
+    /// The type the abstract type member `member` of its Module type takes
+    /// from its default, by the member's spelling, if it has one.
+    pub fn default_type(&self, member: &QualifiedName) -> Option<&Type> {
+        match &self.kind {
+            ParameterKind::Module { default_types, .. } => default_types.get(member),
+            ParameterKind::Value(_) | ParameterKind::Type { .. } => None,
+        }
+    }
+
     /// Whether it takes a type.
     pub fn is_type(&self) -> bool {
         matches!(self.kind, ParameterKind::Type { .. })
@@ -151,11 +164,13 @@ pub struct ModuleBinding {
 
 /// What a Module-typed parameter reaches of the module it takes: each member
 /// its Module type names, a value as the spelling of the `let` the parameter
-/// binds for it, `audit::count`, and a module as its own view.
+/// binds for it, `audit::count`, a module as its own view, and a type member as
+/// the type its module writes for it.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleView {
     pub values: HashMap<SmolStr, QualifiedName>,
     pub modules: HashMap<SmolStr, Rc<ModuleView>>,
+    pub types: HashMap<SmolStr, Type>,
 }
 
 impl ModuleView {
@@ -169,6 +184,9 @@ impl ModuleView {
         lets: &mut Vec<(QualifiedName, Type)>,
     ) -> ModuleView {
         let mut view = ModuleView::default();
+        for entry in &ty.types {
+            view.types.insert(entry.name.clone(), entry.written());
+        }
         for entry in &ty.entries {
             let spelling = prefix.child(entry.name.clone());
             match &entry.ty {
@@ -188,7 +206,12 @@ impl ModuleView {
     /// Each member `ty` names that this view does not reach, at any depth,
     /// spelled under `prefix`.
     pub(super) fn missing(&self, prefix: &QualifiedName, ty: &ModuleType) -> Vec<QualifiedName> {
-        let mut missing = Vec::new();
+        let mut missing: Vec<QualifiedName> = ty
+            .types
+            .iter()
+            .filter(|entry| !self.types.contains_key(&entry.name))
+            .map(|entry| prefix.child(entry.name.clone()))
+            .collect();
         for entry in &ty.entries {
             let spelled = prefix.child(entry.name.clone());
             match (&entry.ty, self.modules.get(&entry.name)) {
@@ -489,6 +512,22 @@ impl Interface {
     pub(super) fn missing(&self, ty: &ModuleType) -> Vec<String> {
         let module = &self.module;
         let mut missing = Vec::new();
+        for entry in &ty.types {
+            let name = &entry.name;
+            match self.types.get(name) {
+                Some(member) if !member.public => {
+                    missing.push(format!("`{name}` is private to module `{module}`"));
+                }
+                Some(TypeMember {
+                    ty: AliasType::Type(_),
+                    ..
+                }) => {}
+                Some(_) => missing.push(format!(
+                    "`{name}` is a Module type in module `{module}`, and the entry names a type"
+                )),
+                None => missing.push(format!("module `{module}` has no type member `{name}`")),
+            }
+        }
         for entry in &ty.entries {
             let name = &entry.name;
             match &entry.ty {

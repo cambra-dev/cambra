@@ -530,7 +530,8 @@ pub struct LoweringContext {
     /// The type arguments of each `run` statement of the module being lowered,
     /// by run name: each one's parameter, its span, and the type, lowered where
     /// the statement stands ([`Self::declare_run_types`]).
-    pub(super) run_type_arguments: HashMap<SmolStr, Vec<(SmolStr, Span, Type)>>,
+    pub(super) run_type_arguments:
+        HashMap<SmolStr, Vec<(crate::ccl::names::QualifiedName, Span, Type)>>,
     /// Every binder the module being lowered writes, with its span, for the rule
     /// that none takes a name that denotes a module ([`module_name_binders`]).
     pub(super) module_binders: Vec<(SmolStr, Span)>,
@@ -1618,25 +1619,17 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
         // `pub` decides what an importer reaches, which the interface records,
         // and an `import` binds a name lowering resolves through the module's
         // scope. Neither leaves anything in the lowered tree.
-        // A value parameter is in scope throughout its module, so its `let`
-        // heads the module's chain (`docs/chl-spec.md`, "9.4 Parameters"). A type
-        // parameter stays at its statement, from which it is in scope, as a
-        // type alias is.
-        let (parameters, rest): (Vec<_>, Vec<_>) = module
-            .body
-            .iter()
-            .filter(|stmt| !matches!(stmt.node, ChlStmt::Import { .. }))
-            .map(|stmt| match &stmt.node {
-                ChlStmt::Pub { stmt, .. } => (**stmt).clone(),
-                _ => stmt.clone(),
-            })
-            .partition(|stmt| {
-                matches!(&stmt.node, ChlStmt::Param { name, .. }
-                    if !chl_parser::ast::is_type_name(&name.node))
-            });
         let unmarked = ChlModule {
             file: module.file,
-            body: parameters.into_iter().chain(rest).collect(),
+            body: module
+                .body
+                .iter()
+                .filter(|stmt| !matches!(stmt.node, ChlStmt::Import { .. }))
+                .map(|stmt| match &stmt.node {
+                    ChlStmt::Pub { stmt, .. } => (**stmt).clone(),
+                    _ => stmt.clone(),
+                })
+                .collect(),
         };
         match lowered {
             Lowered::Root => lower_stmts_recovering(&unmarked, ctx, &mut errors),
@@ -1664,7 +1657,7 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
 ///
 /// `kinds` selects the names checked: an import's, a run's, and a `use` name's
 /// are in scope before the module lowers, and a parameter's and a binding's once
-/// they are declared ([`LoweringContext::declare_module_parameters`]). Each
+/// they are declared ([`LoweringContext::declare_module_parameter`]). Each
 /// error comes with the name its binder takes.
 pub(super) fn module_name_binders(
     binders: &[(SmolStr, Span)],

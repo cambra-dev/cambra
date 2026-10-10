@@ -398,7 +398,7 @@ pub enum TypedExprNode {
         statement: Span,
         arguments: Vec<SmolStr>,
         modules: Vec<(SmolStr, Option<crate::ccl::names::QualifiedName>, Span)>,
-        types: Vec<(SmolStr, Span, Type)>,
+        types: Vec<(crate::ccl::names::QualifiedName, Span, Type)>,
         body: Box<TypedExpr>,
     },
 
