@@ -324,7 +324,7 @@ where
         N::Begin { body } => open(f, body),
         // A type alias binds no value; its type is a type slot, reached by the
         // caller's type walk.
-        N::LetType { body, .. } => open(f, body),
+        N::LetType { body, .. } | N::Run { body, .. } => open(f, body),
 
         // The write target is a *use* of the binder that introduced the defer
         // handle / mutable variable, so it resolves like any variable.
@@ -584,6 +584,7 @@ where
         | N::Lambda { .. }
         | N::Let { .. }
         | N::LetType { .. }
+        | N::Run { .. }
         | N::MutDecl { .. }
         | N::LetRec { .. }
         | N::For { .. }
@@ -642,6 +643,12 @@ mod tests {
             }),
             TypedExpr::let_bind("l", var("bound"), var("l")),
             TypedExpr::let_type("Alias", Type::Hole, var("aliased")),
+            node(N::Run {
+                name: "eu".into(),
+                module: chl_parser::ModulePath::new(["shop".into()]),
+                statement: chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
+                body: Box::new(var("rest")),
+            }),
             TypedExpr::mut_decl(
                 "md",
                 Type::mutable(Type::Hole, Type::Hole),
@@ -781,6 +788,7 @@ mod tests {
         N::Aggregate { .. } => "Aggregate",
         N::Let { .. } => "Let",
         N::LetType { .. } => "LetType",
+        N::Run { .. } => "Run",
         N::MutDecl { .. } => "MutDecl",
         N::List(_) => "List",
         N::Case { .. } => "Case",

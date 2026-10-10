@@ -453,7 +453,7 @@ pub fn freshen_above(
             let fresh = cache
                 .chan_doms
                 .entry(name.clone())
-                .or_insert_with(|| crate::ccl::Name::fresh(name.base()))
+                .or_insert_with(|| crate::ccl::Name::fresh_like(name))
                 .clone();
             Type::ChanDom(fresh, crate::ccl::ChanLevel(target.level_of(lvl.0)))
         }

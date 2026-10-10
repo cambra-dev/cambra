@@ -481,6 +481,11 @@ fn hash_payload<'a>(
             name.hash(h);
             hash_type(ty, env, wenv, free, h);
         }
+        // A run's content is its name and its module; its body is its one child.
+        N::Run { name, module, .. } => {
+            name.hash(h);
+            module.hash(h);
+        }
         N::BinOp { op, .. } => op.hash(h),
         N::UnaryOp(kind, _) => kind.hash(h),
         N::Aggregate { kind, .. } => kind.hash(h),

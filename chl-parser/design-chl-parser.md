@@ -148,9 +148,9 @@ Key shape choices:
   [docs/chl-spec.md](../docs/chl-spec.md), "9. Modules [Decided]". `Stmt::Pub`
   wraps the statement `pub` marks rather than being a field of each statement
   that can introduce a member, so one rule (`pub_refusal`) refuses `pub` on every
-  statement that introduces none. It carries the keyword's span, because on a
-  `@LoadFrom` declaration or a `@RenamedFrom` run `pub` stands on the line below
-  the decorator, where the statement does not start. A renamed run is a
+  statement that introduces none, `import` and `run` among them. It carries the
+  keyword's span, because on a `@LoadFrom` declaration `pub` stands on the line
+  below the decorator, where the statement does not start. A renamed run is a
   `Stmt::Run` whose `renamed_from` names the predecessor's run, since the
   decorator changes only which run it pairs with.
 - **A module path has two types.** `ast::ModulePath` is a path as written, each

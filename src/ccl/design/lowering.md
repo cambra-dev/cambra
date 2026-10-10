@@ -302,20 +302,28 @@ not intended `pass` semantics.
 
 ## Module syntax
 
-A top-level `import` with its `use` clause, `pub` on a value binding, a `def`, or a type alias, and
-a qualified value, type, label, or tag lower ([docs/modules.md,
-"Imports"](../../../docs/modules.md#imports)). Lowering resolves each qualified form against the
-module's import names (`ccl/lower/modules.rs`): a value to the binder the imported module's chain
-minted, a type to the type its alias names there, and a label to a `Label` of the module it names. A
-`use` name for a value lowers as a raw name, and uniquifying the module resolves it to the member's
-binder. A `use` name for a type is an alias in scope throughout the module.
+A top-level `import` or `run` with its `use` clause, `pub` on a value binding, a `def`, or a type
+alias, and a qualified value, type, label, or tag lower ([docs/modules.md,
+"Imports"](../../../docs/modules.md#imports), [docs/modules.md,
+"Runs"](../../../docs/modules.md#runs)).
+A module lowers once, and linking creates each run of it from that lowering ([docs/modules.md, "A
+module lowers once"](../../../docs/modules.md#a-module-lowers-once)). Lowering resolves each
+qualified form against the module's import names and run names (`ccl/lower/modules.rs`): a value
+to the raw name `m::f`, which creating the module's run resolves to the binder in `m`'s run, a type
+to the type its alias names, spelled through `m`, and a label to a `Label` of the module it names.
+An import's `use` name for a value lowers as a raw name, which the same scope resolves. A run's is
+a `let` at the `run` statement. A `use` name for a type is an alias, in scope throughout the module
+for an import and from the statement down for a run. A `run` statement lowers to a
+[`Run`](ir.md#run--a-run-statement-before-linking) node over the rest of the module. A sink is
+declared, and registered by each run of the module.
 
 The rest of the module syntax parses ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules
-[Decided]") and does not lower yet: `run`, `param`, `@RenamedFrom`, `@Discard`, `pub` on a mutable
-variable, and a write to another module's member. `refuse_module_syntax`
-(`ccl/lower/module_syntax.rs`) walks the whole module, every block and every expression, and reports
-one `LoweringError::Unsupported` per construct, and the module lowers nothing when it reports. A
-path with a capitalized qualifier segment, `Price::discounted`, is refused as a method reference
-rather than as module syntax ([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and
-methods [Decided]"). A module that uses refused syntax therefore reports only those refusals, and
-none of the lowering errors its other statements would raise.
+[Decided]") and does not lower yet: an argument to `run`, `param`, `@RenamedFrom`,
+`@Discard`, `pub` on a mutable variable, and a write to another module's member.
+`refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the whole module, every block and
+every expression, and reports one `LoweringError::Unsupported` per construct, and the module lowers
+nothing when it reports. A path with a capitalized qualifier segment, `Price::discounted`, is
+refused as a method reference rather than as module syntax
+([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and methods [Decided]"). A module that
+uses refused syntax therefore reports only those refusals, and none of the lowering errors its
+other statements would raise.

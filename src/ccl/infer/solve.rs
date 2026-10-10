@@ -1354,6 +1354,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")
         }
+        TypedExprNode::Run { .. } => unreachable!("linking expands every `Run`"),
         TypedExprNode::MutDecl {
             binding,
             init,

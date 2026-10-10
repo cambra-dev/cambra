@@ -33,7 +33,7 @@ pub use super::source_map::FileId;
 // index and byte offsets, exactly what the `/api/snapshot` schema specifies.
 // The field names are already lowercase single words, so no `rename_all` is
 // needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct Span {
     pub file: FileId,
     pub start: usize,
@@ -336,13 +336,12 @@ pub enum Stmt {
     /// "9.5 Visibility").
     ///
     /// `keyword` is the span of `pub` itself. It is where the statement starts,
-    /// except on a decorated statement, whose `pub` stands on the line below the
-    /// decorator: `@LoadFrom(qty)` above `pub held: Int`, and `@RenamedFrom(eu)`
-    /// above `pub run storefront as eu_west`.
+    /// except on a loaded declaration, whose `pub` stands on the line below the
+    /// decorator: `@LoadFrom(qty)` above `pub held: Int`.
     ///
     /// **Invariant:** in a parse with no errors, the inner statement is a
     /// [`Stmt::Assign`], [`Stmt::AnnAssign`], [`Stmt::MutAssign`],
-    /// [`Stmt::LoadFrom`], [`Stmt::FunctionDef`] or [`Stmt::Run`]. The parser
+    /// [`Stmt::LoadFrom`] or [`Stmt::FunctionDef`]. The parser
     /// reports `pub` on any other statement as a parse error. Whether a `:=`
     /// introduces a mutable variable, and whether the statement stands at a
     /// module's top level, are left to lowering.
