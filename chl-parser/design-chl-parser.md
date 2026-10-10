@@ -121,6 +121,9 @@ Key shape choices:
   [Atoms](../docs/chl-spec.md#24-atoms) and
   [Refinement syntax](../docs/chl-spec.md#64-refinement-syntax).
   Bracketed predicates also use `bracketed_expr`.
+- `Expr::ModuleType` is `Module{name: T, …}`. `Module` is not a keyword: an identifier
+  spelled `Module` followed by a brace group is this form, and the group must be a record
+  type or empty ([Module types](../docs/chl-spec.md#98-module-types)).
 - `Expr::FunctionType` represents right-associative `=>` below feed precedence.
   Its operands are expressions; lowering validates their use as types.
   A `def` return annotation consumes its delimiter before this production runs, so its

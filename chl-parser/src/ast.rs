@@ -712,6 +712,12 @@ pub enum Expr {
     /// value position (a record *value* is `(x=1, y=2)`, [`Expr::Record`]).
     BraceRecord(Vec<RecordField>),
 
+    /// A Module type: `Module{name: T, …}`, the type of a module's public
+    /// members (`docs/chl-spec.md`, "9.8 Module types"). Each entry is a
+    /// member's name and its type. `Module` is not a keyword: followed by
+    /// braces, it writes this form.
+    ModuleType(Vec<RecordField>),
+
     /// A colon-free brace group: `{T, U}` (no `key: value` entries).
     ///
     /// Term-level braces are reserved for structural **type** syntax (see

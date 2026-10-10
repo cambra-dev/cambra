@@ -369,6 +369,11 @@ impl Refusals {
                 }
             }
             ChlExpr::Record(fields) | ChlExpr::BraceRecord(fields) => self.fields(fields),
+            ChlExpr::ModuleType(entries) => {
+                for entry in entries {
+                    self.expr(&entry.value);
+                }
+            }
             ChlExpr::Lit(_) | ChlExpr::Name(_) | ChlExpr::Error => {}
             ChlExpr::BinOp { left, right, .. } => {
                 self.expr(left);

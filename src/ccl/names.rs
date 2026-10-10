@@ -242,7 +242,17 @@ impl fmt::Display for Home {
 pub struct SharedRun {
     pub module: ModulePath,
     /// Each argument, by its parameter, in parameter-name order.
-    pub arguments: Arc<[(SmolStr, Lit)]>,
+    pub arguments: Arc<[(SmolStr, Argument)]>,
+}
+
+/// An argument an import passes: a constant (`docs/chl-spec.md`, "9.2
+/// Imports").
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Argument {
+    Lit(Lit),
+    /// An import name, passed as a value of its Module type: the shared run it
+    /// reaches.
+    Module(SharedRun),
 }
 
 impl SharedRun {
@@ -268,11 +278,14 @@ impl fmt::Display for SharedRun {
                 f.write_str(", ")?;
             }
             match value {
-                Lit::Int(n) => write!(f, "{parameter}={n}")?,
-                Lit::String(s) => write!(f, "{parameter}={s:?}")?,
-                Lit::Bool(true) => write!(f, "{parameter}=True")?,
-                Lit::Bool(false) => write!(f, "{parameter}=False")?,
-                Lit::Unit => unreachable!("no import argument is the unit constant"),
+                Argument::Lit(Lit::Int(n)) => write!(f, "{parameter}={n}")?,
+                Argument::Lit(Lit::String(s)) => write!(f, "{parameter}={s:?}")?,
+                Argument::Lit(Lit::Bool(true)) => write!(f, "{parameter}=True")?,
+                Argument::Lit(Lit::Bool(false)) => write!(f, "{parameter}=False")?,
+                Argument::Lit(Lit::Unit) => {
+                    unreachable!("no import argument is the unit constant")
+                }
+                Argument::Module(run) => write!(f, "{parameter}={run}")?,
             }
         }
         f.write_str(")")

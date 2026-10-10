@@ -20,6 +20,7 @@ pub mod lambda_elim;
 pub mod letrec;
 pub mod load;
 pub mod lower;
+pub mod module_type;
 pub mod mut_elim;
 pub mod mut_read;
 pub mod mut_scope;
@@ -46,7 +47,7 @@ mod label;
 mod ops;
 mod ty;
 
-pub use names::{Home, Name, PiRef, RunPath, SharedRun};
+pub use names::{Argument, Home, Name, PiRef, RunPath, SharedRun};
 
 // `pub` re-exports — every public item of each submodule reappears at
 // `crate::ccl::`, the path the rest of the crate (and the interpreter, which

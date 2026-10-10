@@ -309,3 +309,14 @@ fn a_misused_parameter_is_refused(#[case] root: &str, #[case] needle: &str) {
         needle,
     );
 }
+
+/// A module feeds a run's public feed through its run name, in a loop or once
+/// (`docs/chl-spec.md`, "9.9 Running").
+#[rstest]
+#[case::in_a_loop("run audit as a\nfor x in [1, 2]:\n    a::events << x\na::total\n", 3)]
+#[case::once("run audit as a\na::events << 5\na::total\n", 5)]
+#[timeout(Duration::from_secs(10))]
+fn a_module_feeds_a_runs_feed(#[case] root: &str, #[case] expected: i64) {
+    let audit = "pub events = defer()\npub total = sum([e for e in events])\n";
+    check_program_scalar(&program(root, &[("audit", audit)]), Value::Int(expected));
+}

@@ -3787,8 +3787,10 @@ module_path ::= ident ("::" ident)*
   and its type members are one type in both: `import sorted_map(K=String)` in two modules gives
   both one `sorted_map::Map`. An omitted argument is the parameter's default, so `import m` and
   `import m(x=1)` reach one shared run when `x` defaults to `1`. An argument may be any constant
-  ([9.19 Open questions](#919-open-questions)): a literal, a type, or an import name or run name
-  passed as a value of its Module type ([9.8 Module types](#98-module-types)).
+  ([9.19 Open questions](#919-open-questions)): a literal, a type, or an import name passed as a
+  value of its Module type ([9.8 Module types](#98-module-types)). A run name may not: a shared run
+  stands outside every run, and an import reaches no state ([9.7 Importing asserts no IO and no
+  state](#97-importing-asserts-no-io-and-no-state)).
 - An `import` stands at a module's top level. One inside a `def`, a loop, or a block is an error.
 - There is no wildcard `use`. Adding a public member to a module never changes what an importer's
   names mean.
@@ -4030,8 +4032,9 @@ run audit
 run storefront(audit=audit) as eu    # the run `audit` has `events` and may have more
 ```
 
-An import name or run name denotes its run as a Module value in one position only: a run argument.
-A Module value stored in data or returned from a function is **[Open]**
+An import name or run name denotes its run as a Module value in two positions only: an argument,
+and a binding, `pub audit = a` ([9.3 Runs](#93-runs)). A Module value stored in data or returned
+from a function is **[Open]**
 ([9.19 Open questions](#919-open-questions)). A Module-typed parameter therefore names exactly one
 run in each run of its module. A `Txn` member reached through it is a bare variable reference, as
 through a run name.

@@ -642,12 +642,17 @@ mod tests {
                 kind: crate::ccl::AggregateKind::Sum,
             }),
             TypedExpr::let_bind("l", var("bound"), var("l")),
-            TypedExpr::let_type("Alias", Type::Hole, var("aliased")),
+            TypedExpr::let_type(
+                "Alias",
+                crate::ccl::module_type::AliasType::Type(Type::Hole),
+                var("aliased"),
+            ),
             node(N::Run {
                 name: "eu".into(),
                 module: chl_parser::ModulePath::new(["shop".into()]),
                 statement: chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
                 arguments: Vec::new(),
+                modules: Vec::new(),
                 body: Box::new(var("rest")),
             }),
             TypedExpr::mut_decl(

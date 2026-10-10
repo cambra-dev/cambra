@@ -709,19 +709,30 @@ pub(super) fn lower_feed(
     value: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    // `x << v` is an expression form, so the LHS is parsed as an `Expr`
-    // rather than an `AssignTarget`. Semantically we still require a bare
-    // identifier here.
-    let name = match &target.node {
-        ChlExpr::Name(id) => id.as_str().to_string(),
-        _ => {
-            return Err(LoweringError::unsupported(
-                target.span,
-                "handle binding: only simple name targets are supported",
-            ));
-        }
+    let Some(name) = feed_target(target, "handle binding", ctx)? else {
+        return Ok(Expr::error());
     };
     Ok(Expr::feed(name, lower_expr(value, ctx)?))
+}
+
+/// The feed `target` names: a name, or another module's member, `a::events`
+/// (`docs/chl-spec.md`, "9.9 Running"), or `None` when that module has errors of
+/// its own. `x << v` is an expression form, so the target is parsed as an
+/// `Expr` rather than an `AssignTarget`; `context` names the position in the
+/// error for any other form.
+pub(super) fn feed_target(
+    target: &Spanned<ChlExpr>,
+    context: &str,
+    ctx: &LoweringContext,
+) -> Result<Option<Name>, LoweringError> {
+    match &target.node {
+        ChlExpr::Name(id) => Ok(Some(Name::from(id.as_str()))),
+        ChlExpr::Qualified(q) => Ok(ctx.member(q, target.span)?.map(|member| member.name)),
+        _ => Err(LoweringError::unsupported(
+            target.span,
+            format!("{context}: only a name or a qualified name is a feed target"),
+        )),
+    }
 }
 
 pub(super) fn lower_define(

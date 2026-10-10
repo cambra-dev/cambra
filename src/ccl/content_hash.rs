@@ -15,6 +15,7 @@
 //! "Standalone hashing is the matcher's precondition".
 
 use crate::ccl::Label;
+use crate::ccl::module_type::AliasType;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -309,6 +310,28 @@ fn hash_type<'a>(
 /// Fold named/tagged type fields into `state` order-insensitively: each
 /// `(key, type)` is finalized to its own hash, then the set is sorted before
 /// folding, so field declaration order does not matter.
+/// [`hash_type`] over what a type alias names: its type, or each entry of its
+/// Module type with the entry's name.
+fn hash_alias_type<'a>(
+    ty: &'a AliasType,
+    env: &mut Vec<&'a Name>,
+    wenv: &mut Vec<crate::ccl::ty::WitnessId>,
+    free: FreeVars<'_>,
+    state: &mut DefaultHasher,
+) {
+    std::mem::discriminant(ty).hash(state);
+    match ty {
+        AliasType::Type(ty) => hash_type(ty, env, wenv, free, state),
+        AliasType::Module(module) => {
+            module.entries.len().hash(state);
+            for entry in &module.entries {
+                entry.name.hash(state);
+                hash_alias_type(&entry.ty, env, wenv, free, state);
+            }
+        }
+    }
+}
+
 fn hash_type_fields<'a, K: Hash>(
     fields: &'a [(K, Type)],
     env: &mut Vec<&'a Name>,
@@ -479,7 +502,7 @@ fn hash_payload<'a>(
         // its one child.
         N::LetType { name, ty, .. } => {
             name.hash(h);
-            hash_type(ty, env, wenv, free, h);
+            hash_alias_type(ty, env, wenv, free, h);
         }
         // A run's content is its name and its module; its body is its one child.
         N::Run { name, module, .. } => {

@@ -477,6 +477,27 @@ where
         //     comma-free item, `{T}`) is what says the braces are the *tag's*
         //     rather than the payload type's. That is the one form a standalone
         //     type rejects, which is why it is free to mean this here.
+        // `Module{name: T, …}` — a Module type (§9.8). Its braces hold a
+        // member per entry, so they parse as a record type does; `Module{}` is
+        // the Module type with no members.
+        let module_type = select! { Token::Ident(s) if s == "Module" => () }
+            .ignore_then(brace_group.clone())
+            .validate(|(group, _), e, emitter| match group.node {
+                Expr::BraceRecord(fields) => Spanned::new(e.span(), Expr::ModuleType(fields)),
+                Expr::BraceGroup(elts) if elts.is_empty() => {
+                    Spanned::new(e.span(), Expr::ModuleType(Vec::new()))
+                }
+                Expr::Error => Spanned::new(e.span(), Expr::Error),
+                _ => {
+                    emitter.emit(Rich::custom(
+                        e.span(),
+                        "a Module type lists its members as `name: T`",
+                    ));
+                    Spanned::new(e.span(), Expr::Error)
+                }
+            })
+            .boxed();
+
         let variant_ctor = tag_name()
             .then(
                 choice((
@@ -557,6 +578,7 @@ where
             list_or_listcomp,
             paren_group,
             brace_type,
+            module_type,
             name,
         ))
         .labelled("expression")

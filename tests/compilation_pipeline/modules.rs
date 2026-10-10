@@ -227,7 +227,7 @@ plus(1)
 )]
 #[case::an_import_name(
     "import other\nimport catalog use limit as other\n",
-    "`other` is an import name or a run name, so no binder in its module takes it"
+    "`other` is an import name, so no binder in its module takes it"
 )]
 #[case::bound_twice(
     "import catalog use limit, double as limit\n",
@@ -470,7 +470,7 @@ fn an_imports_arguments_reach_its_modules_parameters(#[case] root: &str, #[case]
 
 /// The shared runs `program` lowers, by their homes: each `let` its chains bind
 /// stands on the spine above the root's.
-fn shared_runs(program: &LoadedProgram) -> BTreeSet<String> {
+pub(crate) fn shared_runs(program: &LoadedProgram) -> BTreeSet<String> {
     let mut ctx = GlobalContext::default();
     let lowered = lower_program(program, ctx.lowering_ctx());
     assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
@@ -563,7 +563,7 @@ fn assert_shared_runs(root: &str, other: &str, expected: &[&str]) {
 )]
 #[case::not_a_literal(
     "import scaled(scale=1 + 2)\n1\n",
-    "an argument to an import is supported only as a literal for now"
+    "an argument to an import is supported only as a literal or an import name for now"
 )]
 #[case::mistyped("import scaled(scale=\"x\")\nscaled::by(1)\n", "annotated as Int")]
 #[timeout(Duration::from_secs(10))]
@@ -657,12 +657,12 @@ fn an_imported_function_writes_the_callers_state(
     "import catalog\nx: catalog::limit = 1\nx\n",
     "`catalog::limit` is a value, not a type"
 )]
-#[case::unknown_qualifier(
-    "(nope::a=1).a\n",
-    "`nope` is not an import name or a run name of this module"
-)]
+#[case::unknown_qualifier("(nope::a=1).a\n", "`nope` does not name a module here")]
 #[case::value_qualified_by_this("this::a\n", "`this` qualifies a label or a tag")]
-#[case::member_of_a_run("shop::eu::stock\n", "names a member of a run")]
+#[case::through_a_value_member(
+    "import catalog\ncatalog::limit::x\n",
+    "module `catalog` has no member `limit` bound to a module"
+)]
 #[case::second_import_of_a_name(
     "import catalog\nimport other as catalog\n1\n",
     "`catalog` is already an import name"
