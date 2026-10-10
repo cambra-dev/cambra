@@ -487,6 +487,19 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             }
         }
 
+        // `method(m; Shape::m, Box::m)`: the name, then each candidate.
+        TypedExprNode::Method {
+            name, candidates, ..
+        } => {
+            let cs: Vec<String> = candidates
+                .iter()
+                .map(|(_, c)| fmt(c, Precedence::Lowest, opts))
+                .collect();
+            (
+                Precedence::Atom,
+                format!("method({name}; {})", cs.join(", ")),
+            )
+        }
         // Construction is CHL's `` `tag(payload) ``. The payload is always
         // rendered, including the nullary constructor's `unit`: this is a term,
         // and the `Unit`-valued expression sitting there is a real node — unlike

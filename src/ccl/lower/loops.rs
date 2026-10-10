@@ -473,7 +473,14 @@ fn lower_for_body_stmts_scoped(
                      is not supported",
                 ));
             }
+            ChlStmt::FunctionDef { owner: Some(_), .. } | ChlStmt::Impl(_) => {
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    "an associated function is declared at a module's top level",
+                ));
+            }
             ChlStmt::FunctionDef {
+                owner: None,
                 name,
                 type_params,
                 params,

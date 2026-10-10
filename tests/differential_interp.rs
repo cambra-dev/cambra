@@ -218,6 +218,40 @@ fn a_match_over_nominal_values_feeds_per_arm() {
     "#});
 }
 
+/// Associated functions, methods called on their receivers, an `impl` block, and
+/// `extract` as a method.
+#[test]
+fn methods_of_nominal_values() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+
+        type Price = Int
+
+        def Shape::size(self) => Int:
+            match self:
+                case Shape::circle(r):
+                    r
+                case Shape::rect(w, h):
+                    w * h
+
+        impl Price:
+            def cents(self) => Int:
+                self.extract()
+
+            def plus(self, n: Int) => Price:
+                Price::new(self.cents() + n)
+
+        def Price::of_cents(c: Int) => Price:
+            Price::new(c)
+
+        out = test_sink()
+        for n in [1, 2, 3]:
+            out << (Shape::rect(n, 2).size(), Price::of_cents(n).plus(10).cents())
+    "#});
+}
+
 /// A collection fed at a site that does not iterate nests under that site's one key. The
 /// compiler splices it into the channel instead: channelize takes the channel's domain from
 /// the contribution's own domain. Pinned at both answers.

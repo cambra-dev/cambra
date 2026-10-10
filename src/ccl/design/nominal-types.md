@@ -104,6 +104,47 @@ block. It is accepted only for a declaration with one constructor, where the mat
 The single-constructor form also binds `N::extract`, the function `λ 𝑛 : N(𝑃…) → match 𝑛:
 case N::new(𝑟): 𝑟`, around the module beside its constructor (`bind_extract`).
 
+### Associated functions
+
+`def N::f(…)` lowers as a `def` named `N::f`, bound where the statement stands, as a module
+function is. An `impl N(𝑃…):` block binds its `def`s there, each taking the block's type parameters
+before its own (`lower_associated_def`), and each after the block's functions it names
+(`order_by_reference`), so they reach each other in any order. A method's `self` without an annotation is
+annotated `N(𝑃…)`, the declaration at the block's parameters. Outside a block a parameterised
+type's method annotates its `self`. `N::f` in an expression names the binding, and `N::f(𝑎…)`
+applies it.
+
+`declare_associated_functions` records every associated function before anything lowers, so a
+method call anywhere in the module names every type declaring its method. It checks each against
+its type: the type is declared in the module, the name is free in the type's namespace, which the
+constructors and `extract` share, and the function declares a value parameter. An associated
+function stands at a module's top level, and one with a `Mut` parameter is refused.
+
+### Method calls
+
+A method call `𝑥.m(𝑎…)` is the call `N::m(𝑥, 𝑎…)` for the `N` that `𝑥`'s type names, which
+lowering does not know. The parser keeps the call apart from a call of a field, `(𝑟.f)(𝑎…)`, as
+`Expr::MethodCall`. Lowering builds the application with a placeholder for the function:
+
+```
+(𝑥, 𝑎…) ▷ method(m; N₁::m, N₂::m, …)
+```
+
+The placeholder, `TypedExprNode::Method`, holds the method's name, whether the call passes
+arguments after the receiver, and, as its children, a reference to each `N::m` the module declares,
+so `uniquify` resolves the candidates as it resolves any reference. ANF treats it as an atom, so it
+stays the application's function. No type declaring `m` is a lowering error.
+
+Inference resolves the placeholder where it emits the application (`resolve_method`, called from
+`emit_apply`). The argument is emitted first, as for every application, so the receiver is typed by
+everything the program states before the call. The receiver is the argument, or the first
+component of its tuple type when the call passes arguments. That type names a nominal head,
+directly or through the bounds its variable has gathered, or the call is an error asking for an
+annotation on the receiver: no later use decides it (`docs/chl-spec.md`, "Associated functions and
+methods"). The head's candidate replaces the placeholder, and the application is emitted as any
+call of a `def`. A head with no candidate is an error naming the type and the method, and a type
+that is not nominal is an error saying it has no methods. No `Method` node survives inference.
+
 ---
 
 ## Inference
@@ -179,6 +220,7 @@ The reload guard compares extents, so it sees the representation as well.
 
 - A recursive declaration, one whose constructors' parameter types reach the declaration itself.
   Its representation would be an infinite type. Lowering refuses it at the declaration.
+- An associated function with a `Mut` parameter. Lowering refuses it at the parameter.
 - A refinement in a constructor's parameter type that names a module binding. The constructor
   functions are bound outside the whole module, where no module binding is in scope, so lowering
   refuses a parameter type with a free name.

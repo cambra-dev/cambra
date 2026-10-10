@@ -69,6 +69,11 @@ pub(super) fn lower_stmts_recovering(
         errors.extend(defined);
         return None;
     }
+    let associated = nominal::declare_associated_functions(stmts, ctx);
+    if !associated.is_empty() {
+        errors.extend(associated);
+        return None;
+    }
     pre_register_txn_decls(stmts, ctx);
     // This block's value is its last *contributing* statement ([`contributing_stmts`]),
     // and the statements above that one are its prefix.
@@ -770,8 +775,101 @@ pub(super) fn lower_middle_stmt(
             let define = ctx.tag_image(lowered, stmt.span);
             Ok(ctx.tag_image(Expr::expr_stmt(define, body), stmt.span))
         }
+        // An associated function, `def N::f`, or an `impl` block of them: bindings at the
+        // statement's position, as a module function's is (`nominal::lower_associated_def`).
+        ChlStmt::FunctionDef { owner: Some(_), .. } | ChlStmt::Impl(_) if !is_top_level => {
+            Err(LoweringError::unsupported(
+                stmt.span,
+                "an associated function is declared at a module's top level",
+            ))
+        }
+        ChlStmt::FunctionDef {
+            owner: Some(owner),
+            name,
+            type_params,
+            params,
+            output,
+            requires,
+            body: fn_body,
+        } => {
+            let decl = ctx
+                .nominal_type(&owner.node)
+                .expect("`declare_associated_functions` checked the owner");
+            let (name, func_expr, annotation) = nominal::lower_associated_def(
+                &decl,
+                &[],
+                name,
+                type_params,
+                params,
+                output.as_ref(),
+                requires,
+                fn_body,
+                stmt.span,
+                ctx,
+            )?;
+            Ok(ctx.tag_image(
+                match annotation {
+                    Some(poly) => Expr::let_bind_annotated(name, func_expr, body, poly),
+                    None => Expr::let_bind(name, func_expr, body),
+                },
+                stmt.span,
+            ))
+        }
+        ChlStmt::Impl(block) => {
+            let decl = ctx
+                .nominal_type(&block.ty.node)
+                .expect("`declare_associated_functions` checked the owner");
+            let mut lowered = Vec::with_capacity(block.defs.len());
+            for def in &block.defs {
+                let ChlStmt::FunctionDef {
+                    name,
+                    type_params,
+                    params,
+                    output,
+                    requires,
+                    body: fn_body,
+                    ..
+                } = &def.node
+                else {
+                    unreachable!("the parser builds an `impl` block of `def`s")
+                };
+                let (name, func_expr, annotation) = nominal::lower_associated_def(
+                    &decl,
+                    &block.params,
+                    name,
+                    type_params,
+                    params,
+                    output.as_ref(),
+                    requires,
+                    fn_body,
+                    def.span,
+                    ctx,
+                )?;
+                lowered.push(nominal::LoweredDef {
+                    name,
+                    func: func_expr,
+                    annotation,
+                    span: def.span,
+                });
+            }
+            let mut acc = body;
+            for def in nominal::order_by_reference(lowered, block.ty.span)?
+                .into_iter()
+                .rev()
+            {
+                acc = ctx.tag_image(
+                    match def.annotation {
+                        Some(poly) => Expr::let_bind_annotated(def.name, def.func, acc, poly),
+                        None => Expr::let_bind(def.name, def.func, acc),
+                    },
+                    def.span,
+                );
+            }
+            Ok(acc)
+        }
         // Function definition → Let binding with curried lambda body.
         ChlStmt::FunctionDef {
+            owner: None,
             name,
             type_params,
             params,
@@ -1949,6 +2047,7 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         // through `ParseResult::errors` before this message is ever read.
         ChlExpr::Error => "a malformed expression",
         ChlExpr::Qualified(_) => "a qualified name",
+        ChlExpr::MethodCall { .. } => "a method call",
         // The forms with their own arms in `lower_type_expr` never reach here.
         ChlExpr::Name(_)
         | ChlExpr::BraceRecord(_)

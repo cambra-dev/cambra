@@ -770,6 +770,9 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Comprehension { .. } => {
             unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
         }
+        TypedExprNode::Method { .. } => {
+            unreachable!("a Method reached the check; inference resolves every method")
+        }
         // Verify the **base**, trust the refinement. A literal's singleton predicate
         // (`{Int | __elem == 5}`) is a resolved predicate like any other, and by the
         // time this mode runs post-planning it has been compiled to point-free form.

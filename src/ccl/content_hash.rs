@@ -487,6 +487,12 @@ fn hash_payload<'a>(
         N::UnaryOp(kind, _) => kind.hash(h),
         N::Aggregate { kind, .. } => kind.hash(h),
         N::VariantCtor { tag, .. } => tag.hash(h),
+        N::Method {
+            name, with_args, ..
+        } => {
+            name.hash(h);
+            with_args.hash(h);
+        }
         // Field *names* are folded together with their values in `hash_rel`,
         // which is what keeps `(a: 1, b: 2)` distinct from `(a: 2, b: 1)` under
         // the order-insensitive fold. An [`Fold::Own`] fold has no children to

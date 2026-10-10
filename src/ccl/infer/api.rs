@@ -407,6 +407,22 @@ pub enum InferError {
         /// The binding's name.
         name: String,
     },
+    /// A method call `x.m(…)` whose receiver's type names no type declaring `m`
+    /// (`docs/chl-spec.md`, "Associated functions and methods").
+    UnresolvedMethod {
+        /// The method's name.
+        method: String,
+        /// The receiver's type, or `None` where nothing before the call determines it.
+        receiver: Option<Type>,
+    },
+    /// A method call `x.m(…)` whose receiver is stated to be two nominal types at once,
+    /// which have no join.
+    AmbiguousReceiver {
+        /// The method's name.
+        method: String,
+        /// The two types the receiver is stated to be.
+        types: (String, String),
+    },
     /// A type parameter would reach something declared outside the definition
     /// that declares it, whose type is fixed before the parameter is chosen.
     TypeParamEscapes {
@@ -717,6 +733,7 @@ impl InferError {
             InferError::MutableInRefinedType { ty, .. }
             | InferError::MutInCompositeType { ty, .. } => each(ty),
             InferError::ScopeViolation { ty, .. } => each(ty),
+            InferError::UnresolvedMethod { receiver, .. } => receiver.iter_mut().for_each(each),
             // No type to render: these carry a name, an id, or a rendered label.
             InferError::UnboundVariable(_)
             | InferError::Unsupported(_)
@@ -729,6 +746,7 @@ impl InferError {
             | InferError::MutNotBareVariable { .. }
             | InferError::MutArgNotMutable { .. }
             | InferError::TypeParamEscapes { .. }
+            | InferError::AmbiguousReceiver { .. }
             | InferError::MissingRequirement { .. }
             | InferError::MonomorphicPolyBinding { .. }
             | InferError::MutWriteToNonMutable { .. } => {}
@@ -1082,6 +1100,34 @@ impl std::fmt::Debug for InferError {
                 "`{name}` is annotated with a polymorphic type, but its right-hand side is \
                  monomorphic: only a function definition or a name of a polymorphic binding \
                  can be polymorphic"
+            ),
+            InferError::AmbiguousReceiver {
+                method,
+                types: (a, b),
+            } => write!(
+                f,
+                "`.{method}(…)` is called on a value stated to be both `{a}` and `{b}`, two \
+                 nominal types with no join"
+            ),
+            InferError::UnresolvedMethod {
+                method,
+                receiver: None,
+            } => write!(
+                f,
+                "`.{method}(…)` calls a method of its receiver's type, and nothing before the \
+                 call determines that type; annotate the receiver with a nominal type"
+            ),
+            InferError::UnresolvedMethod {
+                method,
+                receiver: Some(ty @ Type::Nominal(..)),
+            } => write!(f, "`{ty}` has no method `{method}`"),
+            InferError::UnresolvedMethod {
+                method,
+                receiver: Some(ty),
+            } => write!(
+                f,
+                "`.{method}(…)` calls a method, and `{ty}` is not a nominal type, so it has no \
+                 methods; the function a field holds is called as `(r.{method})(…)`"
             ),
             InferError::TypeParamEscapes { param, target, at } => match target {
                 Some(EscapeTarget::Argument { function }) => write!(

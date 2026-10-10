@@ -72,6 +72,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Comprehension { .. } => {
             unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
         }
+        // Lowering builds a `Method` only as an application's function, which
+        // `emit_apply` resolves before emitting it.
+        TypedExprNode::Method { name, .. } => {
+            unreachable!("method `{name}` reached emission outside the application it resolves in")
+        }
         TypedExprNode::Lit(lit) => {
             // A literal's type is its singleton, `{Int | __elem == n}`, and the
             // three nodes of that `__elem == n` term are minted *here* — the
@@ -1028,6 +1033,11 @@ pub(super) fn emit_apply<C: Typing>(
         return emit_lookup_checked(function, &collection, &key, &key_ty, ctx);
     }
     let raw_arg_ty = ctx.subexpr(argument)?;
+    // A method call's function is resolved here, the argument now typed: the receiver's
+    // type picks the candidate that replaces the placeholder.
+    if matches!(function.node, TypedExprNode::Method { .. }) {
+        resolve_method(function, &raw_arg_ty, ctx)?;
+    }
     // A function position is a value position, so a mutable variable mention there reads
     // (`src/ccl/design/mutability.md`, "A mutable variable read is an explicit operation").
     // Undereffed it meets the demand `fn_ty <: (x: d) ⇒ result` as a mismatch, the relation
@@ -2512,6 +2522,128 @@ fn emit_nominal_scrutinee<C: Typing>(
         })?;
     }
     Ok(())
+}
+
+/// Replace the `Method` placeholder `function` with the candidate its receiver's type names
+/// (`src/ccl/design/nominal-types.md`, "Method calls").
+///
+/// The receiver is the argument, or the first component of the argument's tuple type. Its type is
+/// what the program has stated before the call: the type itself, or the bounds its
+/// variable has gathered so far. A later use does not decide it.
+fn resolve_method<C: Typing>(
+    function: &mut Expr,
+    arg_ty: &Type,
+    ctx: &mut C,
+) -> Result<(), LocatedInferError> {
+    let TypedExprNode::Method {
+        name,
+        with_args,
+        candidates,
+    } = &mut function.node
+    else {
+        unreachable!("`resolve_method` is called on a `Method`")
+    };
+    let receiver_ty = if *with_args {
+        first_component(arg_ty).unwrap_or(Type::Hole)
+    } else {
+        arg_ty.clone()
+    };
+    let receiver_ty = read_through(&receiver_ty);
+    let unresolved = |receiver| InferError::UnresolvedMethod {
+        method: name.clone(),
+        receiver,
+    };
+    let decl = match nominal_head(&receiver_ty) {
+        Head::Nominal(decl) => decl,
+        Head::Unknown => return Err(ctx.raise(unresolved(None))),
+        Head::Other(ty) => return Err(ctx.raise(unresolved(Some(ty)))),
+        Head::Two(a, b) => {
+            return Err(ctx.raise(InferError::AmbiguousReceiver {
+                method: name.clone(),
+                types: (a.name.to_string(), b.name.to_string()),
+            }));
+        }
+    };
+    let Some(at) = candidates.iter().position(|(d, _)| *d == decl) else {
+        return Err(ctx.raise(unresolved(Some(decl.applied_to_params()))));
+    };
+    let (_, chosen) = candidates.swap_remove(at);
+    *function = chosen;
+    Ok(())
+}
+
+/// The first component of the tuple `ty` is: directly, or through the bounds its variable
+/// has gathered, as when the argument tuple is named by a binding. `None` where nothing
+/// states a tuple yet.
+fn first_component(ty: &Type) -> Option<Type> {
+    match ty.peel_refinements() {
+        Type::Tuple(elts) => elts.first().cloned(),
+        Type::Infer(var) => {
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = vec![std::rc::Rc::clone(var)];
+            while let Some(v) = stack.pop() {
+                if !seen.insert(v.uid) {
+                    continue;
+                }
+                let bounds = v.bounds.borrow();
+                for b in bounds.lower().iter().chain(bounds.upper().iter()) {
+                    match b.ty.peel_refinements() {
+                        Type::Tuple(elts) => return elts.first().cloned(),
+                        Type::Infer(next) => stack.push(std::rc::Rc::clone(next)),
+                        _ => {}
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// What a receiver's type says about the nominal type it is.
+enum Head {
+    Nominal(std::rc::Rc<crate::ccl::nominal::NominalDecl>),
+    /// Nothing stated yet: a variable without a bound naming a type.
+    Unknown,
+    /// A type that is not nominal.
+    Other(Type),
+    /// Two nominal types, which have no join.
+    Two(
+        std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+        std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+    ),
+}
+
+/// The nominal type `ty` names: directly, or through the bounds its variable has
+/// gathered, following variable-to-variable bounds.
+fn nominal_head(ty: &Type) -> Head {
+    match ty.peel_refinements() {
+        Type::Nominal(decl, _) => Head::Nominal(decl.clone()),
+        Type::Infer(var) => {
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = vec![std::rc::Rc::clone(var)];
+            let mut found: Option<std::rc::Rc<crate::ccl::nominal::NominalDecl>> = None;
+            while let Some(v) = stack.pop() {
+                if !seen.insert(v.uid) {
+                    continue;
+                }
+                let bounds = v.bounds.borrow();
+                for b in bounds.lower().iter().chain(bounds.upper().iter()) {
+                    match b.ty.peel_refinements() {
+                        Type::Nominal(decl, _) => match &found {
+                            Some(f) if f != decl => return Head::Two(f.clone(), decl.clone()),
+                            _ => found = Some(decl.clone()),
+                        },
+                        Type::Infer(next) => stack.push(std::rc::Rc::clone(next)),
+                        _ => {}
+                    }
+                }
+            }
+            found.map_or(Head::Unknown, Head::Nominal)
+        }
+        Type::Hole | Type::SharedHole(_) => Head::Unknown,
+        other => Head::Other(other.clone()),
+    }
 }
 
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the

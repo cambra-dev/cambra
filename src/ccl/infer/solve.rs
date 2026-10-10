@@ -1489,6 +1489,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::VariantCtor { payload, .. } => {
             coalesce_node(payload, level, ctx);
         }
+        TypedExprNode::Method { .. } => {
+            unreachable!("emission resolves every method; none reaches coalesce")
+        }
         TypedExprNode::ExprStmt { expr: e, body } => {
             coalesce_node(e, level, ctx);
             coalesce_node(body, level, ctx);
