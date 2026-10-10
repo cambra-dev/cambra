@@ -567,7 +567,7 @@ fn hash_payload<'a>(
                 match &br.pattern {
                     Some(p) => {
                         1u8.hash(h);
-                        p.tag.hash(h);
+                        p.head.hash(h);
                         hash_binding(&p.binding, env, wenv, free, fold, h);
                     }
                     None => 0u8.hash(h),
@@ -697,7 +697,7 @@ mod tests {
         use crate::ccl::nominal::{NominalCtor, NominalDecl};
         let span = chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0);
         let light = |tags: &[&str]| {
-            let decl = NominalDecl::declared("Light".into(), Vec::new(), span);
+            let decl = NominalDecl::declared("Light".into(), Vec::new(), span, false);
             decl.define(
                 tags.iter()
                     .map(|t| NominalCtor {

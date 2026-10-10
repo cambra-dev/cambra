@@ -776,6 +776,520 @@ fn constructor_use_errors_name_what_is_wrong() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Taking a value apart: `match` arms and constructor patterns
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_match_dispatches_on_the_constructor() {
+    check_scalar(
+        indoc! {r#"
+            type Shape:
+                circle(radius: Int)
+                rect(w: Int, h: Int)
+
+            def area(s: Shape) => Int:
+                match s:
+                    case Shape::circle(r):
+                        r * r * 3
+                    case Shape::rect(w, h):
+                        w * h
+
+            area(Shape::rect(3, 4)) + area(Shape::circle(2))
+        "#},
+        Value::Int(24),
+    );
+}
+
+/// The arms name the scrutinee's type, so the scrutinee needs no annotation.
+#[test]
+fn a_constructor_arm_determines_the_scrutinee_type() {
+    check_scalar(
+        indoc! {r#"
+            type Light:
+                on
+                off
+
+            def lit(l):
+                match l:
+                    case Light::on:
+                        1
+                    case Light::off:
+                        0
+
+            lit(Light::on)
+        "#},
+        Value::Int(1),
+    );
+}
+
+/// `case _:` covers the constructors no arm names, and `_` declines a parameter.
+#[test]
+fn a_default_arm_and_an_ignored_parameter() {
+    check_scalar(
+        indoc! {r#"
+            type Shape:
+                circle(radius: Int)
+                rect(w: Int, h: Int)
+                empty
+
+            def width(s: Shape) => Int:
+                match s:
+                    case Shape::rect(w, _):
+                        w
+                    case _:
+                        0
+
+            width(Shape::rect(5, 9)) + width(Shape::empty)
+        "#},
+        Value::Int(5),
+    );
+}
+
+/// A parameterised type's arm binds its parameter at the scrutinee's argument.
+#[test]
+fn a_parameterised_arm_binds_at_the_argument() {
+    check_scalar(
+        indoc! {r#"
+            type Maybe(T):
+                just(T)
+                nothing
+
+            def or_zero(m: Maybe(Int)) => Int:
+                match m:
+                    case Maybe::just(v):
+                        v
+                    case Maybe::nothing:
+                        0
+
+            or_zero(Maybe::just(7)) + or_zero(Maybe::nothing)
+        "#},
+        Value::Int(7),
+    );
+}
+
+/// A type with one constructor is taken apart by assignment, and the binder keeps the
+/// constructor's refinement.
+#[test]
+fn a_single_constructor_type_destructures_by_assignment() {
+    check_scalar(
+        indoc! {r#"
+            type Price = {Int where _ >= 0}
+
+            def half(n: {Int where _ >= 0}) => Int:
+                n // 2
+
+            p = Price::new(10)
+            Price::new(c) = p
+            half(c)
+        "#},
+        Value::Int(5),
+    );
+}
+
+/// A constructor of several parameters destructures by assignment into one name per
+/// parameter, `_` declining one, at the top level and in a `def`.
+#[test]
+fn a_constructor_of_several_parameters_destructures_by_assignment() {
+    check_scalar(
+        indoc! {r#"
+            type Pair:
+                pair(Int, Int)
+
+            def diff(p: Pair) => Int:
+                Pair::pair(a, b) = p
+                a - b
+
+            Pair::pair(x, y) = Pair::pair(3, 4)
+            Pair::pair(_, z) = Pair::pair(5, 6)
+            x * y + z + diff(Pair::pair(9, 4))
+        "#},
+        Value::Int(23),
+    );
+}
+
+/// A destructuring assignment in a loop body that writes a mutable variable binds its
+/// A destructuring assignment inside a transaction block binds per-transaction locals, as
+/// `x = 𝑣` does there.
+#[test]
+fn a_destructuring_assignment_in_a_transaction() {
+    check_scalar(
+        indoc! {r#"
+            type Price = Int
+
+            c: Mut(Int, Txn) := 0
+            with begin():
+                Price::new(x) = Price::new(3)
+                c := c + x
+            await_final(c)
+        "#},
+        Value::Int(3),
+    );
+}
+
+/// names for the rest of the iteration, as `x = e` does.
+#[test]
+fn a_destructuring_assignment_in_a_loop_that_accumulates() {
+    check_scalar(
+        indoc! {r#"
+            type Price = Int
+
+            type Pair:
+                pair(Int, Int)
+
+            total := 0
+            for p in [Pair::pair(1, 2), Pair::pair(3, 4)]:
+                Pair::pair(a, b) = p
+                Price::new(c) = Price::new(a * b)
+                total := total + c
+            total
+        "#},
+        Value::Int(14),
+    );
+}
+
+#[test]
+fn a_record_payload_destructures_and_projects() {
+    check_scalar(
+        indoc! {r#"
+            type Price = {amount: Int}
+
+            Price::new(r) = Price::new((amount=3))
+            r.amount
+        "#},
+        Value::Int(3),
+    );
+}
+
+#[test]
+fn match_errors_name_what_is_wrong() {
+    for (src, needle) in [
+        (
+            indoc! {r#"
+                type Pair:
+                    pair(Int, Int)
+
+                match Pair::pair(1, 2):
+                    case Pair::pair(a, a):
+                        a
+            "#},
+            "`a` is bound twice in the pattern `Pair::pair(…)`",
+        ),
+        (
+            indoc! {r#"
+                type Pair:
+                    pair(Int, Int)
+
+                Pair::pair(a, a) = Pair::pair(1, 2)
+                a
+            "#},
+            "`a` is bound twice in the pattern `Pair::pair(…)`",
+        ),
+        // A nominal value is not a variant, and a variant is not a nominal value, though
+        // the one is represented as the other.
+        (
+            indoc! {r#"
+                type Light:
+                    on
+                    off
+
+                match Light::on:
+                    case `on:
+                        1
+                    case `off:
+                        0
+            "#},
+            "Type mismatch for Case scrutinee: expected {`off{",
+        ),
+        (
+            indoc! {r#"
+                type Light:
+                    on
+                    off
+
+                match `on(()):
+                    case Light::on:
+                        1
+                    case Light::off:
+                        0
+            "#},
+            "expected Light, found {`on}",
+        ),
+        (
+            indoc! {r#"
+                type Shape:
+                    circle(radius: Int)
+                    rect(w: Int, h: Int)
+
+                def area(s: Shape) => Int:
+                    match s:
+                        case Shape::circle(r):
+                            r
+
+                area(Shape::circle(1))
+            "#},
+            "`match` over `Shape` has no arm for `Shape::rect`",
+        ),
+        (
+            indoc! {r#"
+                type Shape:
+                    circle(radius: Int)
+                    rect(w: Int, h: Int)
+
+                def area(s: Shape) => Int:
+                    match s:
+                        case Shape::rect(w):
+                            w
+                        case _:
+                            0
+
+                area(Shape::circle(1))
+            "#},
+            "declares 2 parameters, so its pattern binds 2; this one binds 1",
+        ),
+        (
+            indoc! {r#"
+                type Light:
+                    on
+                    off
+
+                def lit(l: Light) => Int:
+                    match l:
+                        case Light::on(x):
+                            1
+                        case _:
+                            0
+
+                lit(Light::on)
+            "#},
+            "`Light::on` declares no parameters, so its pattern takes no parentheses",
+        ),
+        (
+            indoc! {r#"
+                type Light:
+                    on
+                    off
+
+                def lit(l: Light) => Int:
+                    match l:
+                        case Light::on:
+                            1
+                        case `off:
+                            0
+
+                lit(Light::on)
+            "#},
+            "mixes variant tags and constructors",
+        ),
+        (
+            indoc! {r#"
+                type Light:
+                    on
+                    off
+                type Door:
+                    open
+                    shut
+
+                def lit(l: Light) => Int:
+                    match l:
+                        case Light::on:
+                            1
+                        case Door::open:
+                            0
+
+                lit(Light::on)
+            "#},
+            "names constructors of `Light` and of `Door`",
+        ),
+        (
+            indoc! {r#"
+                type Shape:
+                    circle(radius: Int)
+                    rect(w: Int, h: Int)
+
+                Shape::circle(r) = Shape::circle(1)
+                r
+            "#},
+            "`Shape` declares 2 constructors, so a pattern naming one of them can fail",
+        ),
+        (
+            indoc! {r#"
+                type Light:
+                    on
+                    off
+                type Door:
+                    open
+                    shut
+
+                def lit(l: Light) => Int:
+                    match l:
+                        case Door::open:
+                            1
+                        case _:
+                            0
+
+                lit(Light::on)
+            "#},
+            "Type mismatch for Case scrutinee: expected Door, found Light",
+        ),
+        (
+            indoc! {r#"
+                type Light:
+                    on
+                    off
+
+                def lit(l: Light) => Int:
+                    match l:
+                        case Light::on:
+                            1
+                        case Light::on:
+                            2
+                        case _:
+                            0
+
+                lit(Light::on)
+            "#},
+            "`match` has two `case Light::on` arms",
+        ),
+        (
+            indoc! {r#"
+                type Light:
+                    on
+                    off
+                type Door:
+                    on
+                    shut
+
+                def lit(l: Light) => Int:
+                    match l:
+                        case Light::on:
+                            1
+                        case Door::on:
+                            2
+                        case _:
+                            0
+
+                lit(Light::on)
+            "#},
+            "names constructors of `Light` and of `Door`",
+        ),
+        (
+            indoc! {r#"
+                def lit(l):
+                    match l:
+                        case Lamp::on:
+                            1
+                        case _:
+                            0
+
+                lit(1)
+            "#},
+            "`Lamp` is not a nominal type this module declares",
+        ),
+        (
+            indoc! {r#"
+                type Light:
+                    on
+                    off
+
+                def lit(l: Light) => Int:
+                    match l:
+                        case Light::dim:
+                            1
+                        case _:
+                            0
+
+                lit(Light::on)
+            "#},
+            "`Light` declares no constructor `dim`",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+
+                for Price::new(c) in [Price::new(1)]:
+                    c
+                1
+            "#},
+            "a constructor pattern takes a value apart only in a plain `=` assignment",
+        ),
+        (
+            indoc! {r#"
+                def f(x):
+                    match x:
+                        case shop::Shape::circle(r):
+                            r
+                        case _:
+                            0
+
+                f(1)
+            "#},
+            "the qualified type `shop::Shape` is not supported yet",
+        ),
+    ] {
+        check_compile_error(src, needle);
+    }
+}
+
+/// The single-constructor form declares `extract`, which answers the constructor's
+/// argument, and is a function value too.
+#[test]
+fn extract_answers_the_single_constructors_argument() {
+    check_scalar(
+        indoc! {r#"
+            type Price = {amount: Int}
+
+            p = Price::new((amount=3))
+            get = Price::extract
+            Price::extract(p).amount + get(p).amount
+        "#},
+        Value::Int(6),
+    );
+    check_scalar(
+        indoc! {r#"
+            type Wrap(T) = T
+
+            Wrap::extract(Wrap::new(4)) + 1
+        "#},
+        Value::Int(5),
+    );
+}
+
+/// Only the single-constructor form declares `extract`.
+#[test]
+fn a_constructor_list_declares_no_extract() {
+    check_compile_error(
+        indoc! {r#"
+            type Shape:
+                circle(radius: Int)
+
+            Shape::extract(Shape::circle(1))
+        "#},
+        "`Shape` declares no constructor `extract`",
+    );
+}
+
+/// An arm's binder shadows an outer binding of the same name, a transactional mutable
+/// variable included, whose read outside a `with begin():` block would otherwise be refused.
+#[test]
+fn a_constructor_arms_binder_shadows_an_outer_name() {
+    check_scalar(
+        indoc! {r#"
+            type Shape:
+                circle(radius: Int)
+
+            r: Mut(Int, Txn) := 0
+            def radius(s: Shape) => Int:
+                match s:
+                    case Shape::circle(r):
+                        r
+
+            radius(Shape::circle(4))
+        "#},
+        Value::Int(4),
+    );
+}
+
 /// A nullary constructor's type argument is determined by the use, and a join with a
 /// sibling of the same type is one: `Opt::none` joined with `Opt::some(1)` is an `Opt(Int)`,
 /// whichever arm it is (`docs/chl-spec.md`, "6.8 Nominal types and methods \[Decided\]").
@@ -822,5 +1336,17 @@ fn a_collection_payload_compiles() {
             7
         "},
         Value::Int(7),
+    );
+}
+
+/// A boxed payload is the collection it boxes when it is taken back out.
+#[test]
+fn a_boxed_payload_reads_back_as_its_collection() {
+    check_scalar(
+        indoc! {"
+            type Bag(T) = List(T)
+            sum(Bag::extract(Bag::new(box([1, 2, 3]))))
+        "},
+        Value::Int(6),
     );
 }

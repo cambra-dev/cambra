@@ -456,10 +456,11 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
                                 } else {
                                     format!(" if {}", fmt(guard, Precedence::Lowest, opts))
                                 };
-                                // Destructuring mirrors construction: `` `tag(binder) ``.
+                                // Destructuring mirrors construction: `` `tag(binder) ``,
+                                // or `N::c(binder)` for a nominal constructor.
                                 format!(
-                                    "`{}({}){} → {}",
-                                    p.tag,
+                                    "{}({}){} → {}",
+                                    p.head,
                                     p.binding.name,
                                     guard_str,
                                     fmt(body, Precedence::Lowest, opts)

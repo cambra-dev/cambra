@@ -781,8 +781,8 @@ fn pin_unobservable_arm_payload(p: &Pattern, ctx: &mut CoalesceCtx) -> bool {
         pinned.is_ok(),
         "pinning an unreachable payload variable cannot fail: its only bounds are \
          the requirements its own body stated, and `{chosen}` is a type they all \
-         still accept (arm `` `{} ``)",
-        p.tag,
+         still accept (arm `{}`)",
+        p.head,
     );
     true
 }
@@ -1922,7 +1922,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 .iter()
                 .filter_map(|b| b.pattern.as_ref())
                 .filter(|p| pin && pin_unobservable_arm_payload(p, ctx))
-                .map(|p| p.tag.clone())
+                .map(|p| p.tag().to_string())
                 .collect();
             if let Some(s) = scrutinee {
                 coalesce_node(s, level, ctx);
@@ -1941,7 +1941,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 // `Pattern::binding.ty`; run it through the same pipeline used
                 // for `expr.ty` so it ends up concrete.
                 if let Some(p) = &mut b.pattern {
-                    let tag = p.tag.clone();
+                    let tag = p.tag().to_string();
                     resolve_binder_slot(
                         &mut p.binding.ty,
                         || format!("Case pattern `.{tag}` payload"),
@@ -3696,7 +3696,7 @@ mod tests {
         use crate::ccl::{Branch, Pattern, TypedBinding};
         let arm = |tag: &str, b: &str| Branch {
             pattern: Some(Pattern {
-                tag: tag.to_string(),
+                head: crate::ccl::PatternHead::Tag(tag.to_string()),
                 binding: TypedBinding {
                     name: b.into(),
                     ty: Type::Hole,

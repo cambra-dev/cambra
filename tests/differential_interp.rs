@@ -170,6 +170,25 @@ fn two_types_share_a_constructor_name() {
     "#});
 }
 
+/// A `match` and a destructuring assignment take apart values of two types whose
+/// constructors share a name.
+#[test]
+fn two_types_sharing_a_constructor_name_taken_apart() {
+    agree(indoc! {r#"
+        type Money = Int
+        type Price = Int
+
+        out = test_sink()
+        for n in [1, 2]:
+            Price::new(p) = Price::new(n * 10)
+            out << p
+        for n in [3, 4]:
+            match Money::new(n):
+                case Money::new(m):
+                    out << m
+    "#});
+}
+
 /// A mutable variable holding a nominal value: its history's value type is the nominal
 /// type, through `mut_elim` and the store.
 #[test]
@@ -184,6 +203,72 @@ fn a_mutable_variable_of_a_nominal_type() {
             s := Shape::circle(r)
         out = test_sink()
         out << s
+    "#});
+}
+
+/// A `match` over constructors, a destructuring assignment and `extract`, per loop
+/// iteration.
+#[test]
+fn nominal_values_taken_apart() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+            empty
+
+        type Price = Int
+
+        def area(s: Shape) => Int:
+            match s:
+                case Shape::circle(r):
+                    r * r * 3
+                case Shape::rect(w, h):
+                    w * h
+                case Shape::empty:
+                    0
+
+        out = test_sink()
+        for n in [1, 2, 3]:
+            Price::new(c) = Price::new(n * 10)
+            out << (area(Shape::rect(n, n + 1)) + area(Shape::circle(n)), c + Price::extract(Price::new(n)))
+    "#});
+}
+
+/// Destructuring assignments of a constructor of several parameters in loop bodies, one
+/// feeding and one accumulating into a mutable variable.
+#[test]
+fn nominal_values_destructured_in_loops() {
+    agree(indoc! {r#"
+        type Pair:
+            pair(Int, Int)
+
+        out = test_sink()
+        total := 0
+        for p in [Pair::pair(1, 2), Pair::pair(3, 4)]:
+            Pair::pair(a, _) = p
+            out << a
+        for p in [Pair::pair(5, 6), Pair::pair(7, 8)]:
+            Pair::pair(a, b) = p
+            total := total + a * b
+        out << total
+    "#});
+}
+
+/// A loop over nominal values whose body is a `match`, each arm feeding.
+#[test]
+fn a_match_over_nominal_values_feeds_per_arm() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+
+        out = test_sink()
+        for s in [Shape::circle(1), Shape::rect(2, 3), Shape::circle(4)]:
+            match s:
+                case Shape::circle(r):
+                    out << r
+                case Shape::rect(w, h):
+                    out << w * h
     "#});
 }
 

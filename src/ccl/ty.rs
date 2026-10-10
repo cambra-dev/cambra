@@ -4449,7 +4449,7 @@ fn eq_term_modulo_ty_slots_go(
                         // A payload binder scopes over the guard and the body
                         // both, so both compare under the pairing.
                         (Some(p), Some(q)) => {
-                            p.tag == q.tag
+                            p.head == q.head
                                 && eq_under_binder(
                                     pairs,
                                     &p.binding.name,
@@ -5235,7 +5235,7 @@ mod tests {
                     TypedExpr::lit(Lit::Unit),
                     vec![crate::ccl::Branch {
                         pattern: Some(crate::ccl::Pattern {
-                            tag: "some".into(),
+                            head: crate::ccl::PatternHead::Tag("some".into()),
                             binding: crate::ccl::TypedBinding::new_annotated(
                                 b,
                                 Type::Base(BaseType::Int),

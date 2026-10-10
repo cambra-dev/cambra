@@ -12,9 +12,10 @@
 use super::LoweringError;
 use super::stmts::is_type_name;
 use crate::chl_parser::ast::{
-    AssignTarget, CompClause, Comprehension, Expr as ChlExpr, IfBranch, KindAnnotation, MatchArm,
-    Module as ChlModule, Param, QualifiedName, RecordField, Requirement, Span, Spanned,
-    Stmt as ChlStmt, TypeAnnotation, TypeDeclBody, TypeParam, VariantPayload,
+    ArmPattern, AssignTarget, CompClause, Comprehension, ConstructorPattern, Expr as ChlExpr,
+    IfBranch, KindAnnotation, MatchArm, Module as ChlModule, Param, QualifiedName, RecordField,
+    Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeDeclBody, TypeParam,
+    VariantPayload,
 };
 use smol_str::SmolStr;
 
@@ -199,8 +200,12 @@ impl Refusals {
 
     fn arms(&mut self, arms: &[MatchArm]) {
         for arm in arms {
-            if let Some(pattern) = &arm.pattern {
-                self.tag(&pattern.tag_qualifier, &pattern.tag, pattern.tag_span);
+            match &arm.pattern {
+                Some(ArmPattern::Tag(pattern)) => {
+                    self.tag(&pattern.tag_qualifier, &pattern.tag, pattern.tag_span)
+                }
+                Some(ArmPattern::Constructor(pattern)) => self.constructor_pattern(pattern),
+                None => {}
             }
             self.stmts(&arm.body);
         }
@@ -263,6 +268,23 @@ impl Refusals {
                 self.expr(index);
             }
             AssignTarget::Qualified(q) => self.qualified(q, target.span),
+            AssignTarget::Constructor(pattern) => self.constructor_pattern(pattern),
+        }
+    }
+
+    /// A constructor pattern's type qualified by a module, `shop::Shape::circle(r)`.
+    fn constructor_pattern(&mut self, pattern: &ConstructorPattern) {
+        if let [first, .., last] = pattern.type_path.as_slice() {
+            self.refuse(
+                first.span.join(last.span),
+                format!(
+                    "the qualified type `{}` is not supported yet: a program is a single module",
+                    spell(
+                        &pattern.type_path[..pattern.type_path.len() - 1],
+                        &last.node
+                    )
+                ),
+            );
         }
     }
 

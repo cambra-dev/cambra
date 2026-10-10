@@ -808,11 +808,20 @@ fn arm_compose(
 /// its `` `b ``. Deriving the domain from the arms makes "contains the projected tag" true
 /// by construction, and adjacency still holds, because `scrut_ty <: arms_variant` is
 /// exactly what inference required (`emit_case`'s `require_sub`).
+///
+/// A nominal scrutinee's arms name constructors of its type, so the projections consume
+/// that type, which the scrutinee already is (`src/ccl/design/nominal-types.md`, "After
+/// inference"). Only its own refinement is peeled: one inside a type argument is what the
+/// arms' binders read.
 fn arms_variant(branches: &[Branch], scrut_ty: &Type) -> Type {
+    if let nominal @ Type::Nominal(..) = scrut_ty.peel_refinements() {
+        return nominal.clone();
+    }
+    let scrut_head = strip_refinements(scrut_ty);
     let mut tags: Vec<(FieldKey, Type)> = branches
         .iter()
         .filter_map(|b| b.pattern.as_ref())
-        .map(|p| (FieldKey::Name(p.tag.as_str().into()), p.binding.ty.clone()))
+        .map(|p| (FieldKey::Name(p.tag().into()), p.binding.ty.clone()))
         .collect();
     // Join in the scrutinee's own tags. Without a default arm this adds nothing —
     // the scrutinee's tags are a subset of the arms' (`emit_case`'s `require_sub`).
@@ -820,7 +829,7 @@ fn arms_variant(branches: &[Branch], scrut_ty: &Type) -> Type {
     // still have to accept it, so what they consume is the join of the arms' demand
     // and the scrutinee's type — exactly what the open variable `emit_case` relates
     // them both to coalesces to.
-    if let Type::Variant(scrut_tags, _) = strip_refinements(scrut_ty) {
+    if let Type::Variant(scrut_tags, _) = scrut_head {
         for (k, t) in scrut_tags {
             if !tags.iter().any(|(existing, _)| *existing == k) {
                 tags.push((k, t));
@@ -899,10 +908,8 @@ fn build_scrutinee_case_cform(
             .pattern
             .expect("guarded: scrutinee-Case branches all bind a pattern");
         let payload_ty = pat.binding.ty.clone();
-        let vp = Expr::builtin(Builtin::VariantProject(FieldKey::Name(
-            pat.tag.as_str().into(),
-        )))
-        .with_ty(Type::fun(consumed.clone(), payload_ty.clone()));
+        let vp = Expr::builtin(Builtin::VariantProject(FieldKey::Name(pat.tag().into())))
+            .with_ty(Type::fun(consumed.clone(), payload_ty.clone()));
         // eᵢ as a point-free morphism `Pᵢ ⇒ Vᵢ`, reading the projected payload.
         // `elim_lambda` abstracts the binder and leaves the walk to its caller.
         // An arm not mentioning its payload binder takes a `const` rule, which
@@ -2056,7 +2063,7 @@ fn elim_lambda_impl(
                 // empty restriction for a tag the value never carries, which is
                 // exactly what width subtyping means. Nothing to resolve, nothing
                 // to reject.
-                let tag_key = FieldKey::Name(pat.tag.as_str().into());
+                let tag_key = FieldKey::Name(pat.tag().into());
                 seen_tags.push(tag_key.clone());
                 let payload_ty = pat.binding.ty.clone();
                 let payload_name = pat.binding.name.clone();
@@ -2620,6 +2627,33 @@ mod tests {
         )
     }
 
+    /// A nominal scrutinee's projections consume its type with only its own refinement
+    /// peeled: a refinement inside a type argument is part of what the arms' binders read.
+    #[test]
+    fn a_nominal_scrutinee_keeps_its_arguments_refinements() {
+        use crate::ccl::nominal::{NominalCtor, NominalDecl};
+        use crate::ccl::ty::TypeParam;
+        let span = chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0);
+        let t = TypeParam::declared("T");
+        let decl = NominalDecl::declared("Box".into(), vec![Rc::clone(&t)], span, false);
+        decl.define(vec![NominalCtor {
+            name: "boxed".into(),
+            span,
+            params: vec![(None, Type::Param(t))],
+        }])
+        .expect("`boxed` names `T`");
+        let refine = |base: Type, by: &str| {
+            let bool_ty = Type::Base(BaseType::Bool);
+            Type::refined(
+                base,
+                RefinementSet::one(Refinement::born(Rc::new(var(by).with_ty(bool_ty)))),
+            )
+        };
+        let argument = refine(Type::Base(BaseType::Int), "p");
+        let boxed = Type::Nominal(decl, vec![argument]);
+        assert_eq!(arms_variant(&[], &refine(boxed.clone(), "q")), boxed);
+    }
+
     /// `Int ⇒ Int` — a morphism over the same domain, depending on nothing.
     fn plain_morphism() -> Expr {
         let int = Type::Base(BaseType::Int);
@@ -3171,7 +3205,7 @@ mod tests {
         use crate::ccl::{Pattern, TypedBinding};
         Branch {
             pattern: Some(Pattern {
-                tag: tag.into(),
+                head: crate::ccl::PatternHead::Tag(tag.into()),
                 binding: TypedBinding {
                     name: binder.into(),
                     ty: binder_ty,

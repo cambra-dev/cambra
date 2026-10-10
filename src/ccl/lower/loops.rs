@@ -388,20 +388,23 @@ fn lower_for_body_stmts_scoped(
                 transparency,
             } => {
                 refuse_nested_sink(target, value, stmt.span)?;
-                let name = extract_name_target(target, "assignment")?;
-                if mutation_scope.contains(&name) {
-                    return Err(outer_binding_write_error(stmt.span, &name));
+                let assignment = AssignmentBindings::of(target, *transparency, stmt.span, ctx)?;
+                let names = assignment.names();
+                if let Some(name) = names.iter().find(|name| mutation_scope.contains(*name)) {
+                    return Err(outer_binding_write_error(stmt.span, name));
                 }
                 let scope = body_scope(mutation_scope, &frame_introduced);
                 let val = lower_assigned_value(value, &[], &scope, ctx)?;
-                frame_introduced.insert(name.clone());
-                prefix.push(PrefixStmt::Bind {
-                    name,
-                    value: val,
-                    annotation: None,
-                    transparency: binding_transparency(*transparency),
-                    span: stmt.span,
-                });
+                frame_introduced.extend(names);
+                for (name, value, transparency) in assignment.bindings(val, stmt.span, ctx) {
+                    prefix.push(PrefixStmt::Bind {
+                        name,
+                        value,
+                        annotation: None,
+                        transparency,
+                        span: stmt.span,
+                    });
+                }
             }
             ChlStmt::AnnAssign {
                 target,
@@ -1403,13 +1406,12 @@ fn lower_loop_body_chain_scoped(
                 transparency,
             } => {
                 refuse_nested_sink(target, value, stmt.span)?;
-                let name = extract_name_target(target, "assignment")?;
-                check_mut_write_context(&name, stmt.span, ctx)?;
+                let assignment = AssignmentBindings::of(target, *transparency, stmt.span, ctx)?;
+                for name in assignment.names() {
+                    check_mut_write_context(&name, stmt.span, ctx)?;
+                }
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
-                ctx.tag_image(
-                    Expr::let_bind_with(name, val, chain, binding_transparency(*transparency)),
-                    stmt.span,
-                )
+                assignment.wrap(val, chain, stmt.span, ctx)
             }
             // `x op= value` — a mutable write, always. A write to an accumulator
             // declared before the loop is the `MutWrite` the phase threads as the

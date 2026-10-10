@@ -111,6 +111,33 @@ operator conversion lower both the same way. The constructor's name is the tag, 
 value identifies its constructor
 ([chl-spec.md, "A nominal type is opaque"](../../../docs/chl-spec.md#a-nominal-type-is-opaque)).
 
+### Taking a value apart
+
+A `match` arm names a constructor, `case Shape::rect(w, h):`. `constructor_arms_type` checks the
+arms before anything lowers: they name constructors of one declaration, each binds one name or `_`
+per declared parameter, and without a `case _:` every constructor has an arm. A `match` that mixes
+tag arms and constructor arms is refused.
+
+Each arm lowers to a `Pattern` whose head is `PatternHead::Constructor`, naming the declaration and
+the constructor, where a tag arm's head is `PatternHead::Tag`. Both match a runtime row by the same
+tag, which is all a pass that only dispatches reads (`Pattern::tag`). The pattern binds the
+constructor's payload: under the parameter's own name for a constructor of one parameter, and under
+a minted name for several. Each named parameter of several is then substituted by its projection of
+the payload tuple (`bind_parameters`), as a multi-parameter function's parameters are, so an arm
+whose body is a feed keeps the bare feed the loop fan-out reads.
+
+An assignment `N::c(𝑎…) = 𝑣` is accepted only for a declaration with one constructor, where the
+match cannot fail. It lowers to the plain bindings it means (`ConstructorAssignment`), each
+lowered as `𝑥 = 𝑒` is at that statement's position. The payload binds to the one-arm `Case`
+`match 𝑣 { N::c(𝑝) → 𝑝 }`, under the parameter's own name for a constructor of one parameter and a
+minted name `𝑝` otherwise. Each named parameter of several then binds to its projection `𝑝.𝑖`.
+The rest of the block is the body of those bindings and not of the `Case`, so a loop body keeps
+the statement sequence the mutability-elimination phases read.
+
+The single-constructor form also binds `N::extract`, the function
+`λ 𝑛 : N(𝑃…) → match 𝑛 { N::new(𝑟) → 𝑟 }`, around the module beside its constructor
+(`bind_extract`).
+
 ---
 
 ## Inference
@@ -122,6 +149,15 @@ parameter, and constrains `𝑒` below the constructor's payload at `𝛼…`. T
 with its refinements stripped. The node is only ever the body of the constructor's function, whose
 parameter annotation already discharged them, or a constructor without parameters, whose payload
 is `unit`; the declaration's own predicates were never typed.
+
+### The constructor-pattern rule
+
+`emit_case` hands a `Case` whose heads are constructors to `emit_nominal_scrutinee`. The
+scrutinee is constrained below the declaration at fresh arguments, and each arm's binder takes its
+constructor's payload at those arguments. The payload keeps the declaration's refinements, typed
+as an annotation's predicates are: every value of the type was built by a constructor, whose
+function discharged them. So `Price::new(c) = p` gives `c` the type `{Int where _ >= 0}` for
+`type Price = {Int where _ >= 0}`.
 
 ### Subtyping
 
@@ -166,7 +202,8 @@ shape is read where a value is built or taken apart, through `Type::structure`, 
 nominal type's **representation** and every other type itself:
 
 - `lambda_elim`, where a constructor becomes `variant_wrap` and a `Case` becomes
-  `variant_project`.
+  `variant_project`. A nominal scrutinee's projections take the nominal type itself as their
+  domain (`arms_variant`), since the arms name constructors of that type.
 - Operator conversion, where `extent_of` builds a value's extent and the `NominalCtor` and
   `variant_wrap` arms build a union column.
 

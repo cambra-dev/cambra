@@ -46,6 +46,9 @@ pub struct NominalDecl {
     pub params: Vec<Rc<TypeParam>>,
     /// The declaration's name, for diagnostics naming it.
     pub span: Span,
+    /// Whether the declaration is the single-constructor form `type N = R`, the one form
+    /// that declares `N::extract` (`docs/chl-spec.md`, "The single-constructor form").
+    pub declares_extract: bool,
     body: OnceCell<NominalBody>,
 }
 
@@ -157,8 +160,13 @@ pub fn split(input: Type, output: Type) -> Type {
 
 impl NominalDecl {
     /// The declaration of `name`, with no constructors yet.
-    pub fn declared(name: SmolStr, params: Vec<Rc<TypeParam>>, span: Span) -> Rc<NominalDecl> {
-        Self::declared_in(Vec::new(), name, params, span)
+    pub fn declared(
+        name: SmolStr,
+        params: Vec<Rc<TypeParam>>,
+        span: Span,
+        declares_extract: bool,
+    ) -> Rc<NominalDecl> {
+        Self::declared_in(Vec::new(), name, params, span, declares_extract)
     }
 
     /// The declaration of `name` in the module at `module`, with no constructors yet.
@@ -167,14 +175,27 @@ impl NominalDecl {
         name: SmolStr,
         params: Vec<Rc<TypeParam>>,
         span: Span,
+        declares_extract: bool,
     ) -> Rc<NominalDecl> {
         Rc::new(NominalDecl {
             module,
             name,
             params,
             span,
+            declares_extract,
             body: OnceCell::new(),
         })
+    }
+
+    /// `self` applied to its own type parameters: the type of `self` inside a function
+    /// the declaration declares, such as `extract`.
+    pub fn applied_to_params(self: &Rc<Self>) -> Type {
+        let args = self
+            .params
+            .iter()
+            .map(|p| Type::Param(Rc::clone(p)))
+            .collect();
+        Type::Nominal(Rc::clone(self), args)
     }
 
     /// Define the constructors, computing each parameter's variance.
@@ -454,8 +475,12 @@ mod tests {
     /// `shape` builds from the declaration's one type parameter.
     fn variance_of(shape: impl Fn(Type) -> Type) -> Result<Variance, String> {
         let t = TypeParam::declared("T");
-        let decl =
-            NominalDecl::declared("N".into(), vec![t.clone()], Span::new(FileId::ROOT, 0, 0));
+        let decl = NominalDecl::declared(
+            "N".into(),
+            vec![t.clone()],
+            Span::new(FileId::ROOT, 0, 0),
+            false,
+        );
         let ctor = NominalCtor {
             name: "c".into(),
             span: Span::new(FileId::ROOT, 0, 0),
@@ -522,6 +547,7 @@ mod tests {
             "Cell".into(),
             vec![t.clone()],
             Span::new(FileId::ROOT, 0, 0),
+            false,
         );
         decl.define(vec![NominalCtor {
             name: "c".into(),
@@ -542,8 +568,12 @@ mod tests {
     fn a_nested_nominal_type_composes_its_variance() {
         let inner = |variance_shape: fn(Type) -> Type| {
             let u = TypeParam::declared("U");
-            let decl =
-                NominalDecl::declared("In".into(), vec![u.clone()], Span::new(FileId::ROOT, 0, 0));
+            let decl = NominalDecl::declared(
+                "In".into(),
+                vec![u.clone()],
+                Span::new(FileId::ROOT, 0, 0),
+                false,
+            );
             decl.define(vec![NominalCtor {
                 name: "c".into(),
                 span: Span::new(FileId::ROOT, 0, 0),
@@ -573,7 +603,7 @@ mod tests {
         };
         let span = Span::new(FileId::ROOT, 0, 0);
         let t = TypeParam::declared("T");
-        let decl = NominalDecl::declared("N".into(), vec![t.clone()], span);
+        let decl = NominalDecl::declared("N".into(), vec![t.clone()], span, false);
         decl.define(vec![NominalCtor {
             name: "c".into(),
             span,
