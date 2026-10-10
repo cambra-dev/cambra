@@ -40,6 +40,7 @@
 //! | `add`/`sub`/… (and compares / logic) | `Builtin(BinOp(op))` for `op: BinOpKind` | binary scalar ops |
 //! | `neg`, `not_fn` | `Builtin(Neg)`, `Builtin(NotFn)` | unary scalar ops |
 
+use smol_str::SmolStr;
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{
@@ -1407,7 +1408,7 @@ fn elim_lambda_impl(
         // This keeps the same structural invariant: the Record node always has type
         // Record([..., Fun(D, Ti), ...]) and the Fun wrapper lives on the Apply/Zip node.
         TypedExprNode::Record(fields) => {
-            let elim_fields: Vec<(String, Expr)> = fields
+            let elim_fields: Vec<(SmolStr, Expr)> = fields
                 .into_iter()
                 .map(|(k, e)| {
                     elim_lambda_kinded(ctx, param, param_ty, e, fun_kind.clone()).map(|r| (k, r))
@@ -3015,8 +3016,8 @@ mod tests {
     fn outer_binder_arm_zips_the_element_beside_the_projection() {
         let decision_ty = commit_abort_ty();
         let c_ty = Type::Record(vec![
-            ("decision".to_string(), decision_ty.clone()),
-            ("time".to_string(), int_ty()),
+            ("decision".into(), decision_ty.clone()),
+            ("time".into(), int_ty()),
         ]);
         let c_decision = Expr::apply(
             var("c").with_ty(c_ty.clone()),

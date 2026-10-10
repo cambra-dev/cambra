@@ -35,6 +35,7 @@ pub use tiling::*;
 pub use types::*;
 pub use unary_op::*;
 
+use smol_str::{SmolStr, format_smolstr};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -73,6 +74,6 @@ where
 ///
 /// Returns `"_0"`, `"_1"`, etc., used throughout the interpreter to represent
 /// positional tuple fields as named record fields.
-pub fn tuple_field(i: usize) -> String {
-    format!("_{i}")
+pub fn tuple_field(i: usize) -> SmolStr {
+    format_smolstr!("_{i}")
 }

@@ -568,10 +568,7 @@ mod tests {
                 Expr::lambda(
                     "r",
                     Type::Hole,
-                    Expr::new(TypedExprNode::Record(vec![(
-                        "time".to_string(),
-                        Expr::var("r"),
-                    )])),
+                    Expr::new(TypedExprNode::Record(vec![("time".into(), Expr::var("r"))])),
                 ),
             ])
         };

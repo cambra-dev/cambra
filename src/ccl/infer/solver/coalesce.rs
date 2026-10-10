@@ -855,7 +855,7 @@ fn materialize_record(
         let mut out = Vec::with_capacity(rec.len());
         for (k, v) in rec {
             let name = match k {
-                FieldKey::Name(s) => s.to_string(),
+                FieldKey::Name(s) => s.clone(),
                 _ => unreachable!(),
             };
             out.push((name, coalesce_compact_go(v, polarity, scope)?));
@@ -1061,8 +1061,8 @@ mod tests {
         assert_eq!(
             t,
             Type::Record(vec![
-                ("x".to_string(), Type::Base(BaseType::Int)),
-                ("y".to_string(), Type::Base(BaseType::Bool))
+                ("x".into(), Type::Base(BaseType::Int)),
+                ("y".into(), Type::Base(BaseType::Bool))
             ])
         );
     }
@@ -1186,8 +1186,8 @@ mod tests {
         // variable identity, so co-occurrence analysis cannot merge them).
         let (p, q) = (1, 2);
         let ty = Type::Record(vec![
-            ("a".to_string(), refined(prim(BaseType::Int), p)),
-            ("b".to_string(), refined(prim(BaseType::Int), q)),
+            ("a".into(), refined(prim(BaseType::Int), p)),
+            ("b".into(), refined(prim(BaseType::Int), q)),
         ]);
         let out = coalesce_compact(&simplify_type(compact_type(&ty))).unwrap();
         assert_eq!(out, ty);

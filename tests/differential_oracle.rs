@@ -131,10 +131,10 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
                 let in_r = if rng.chance(1, 6) { !in_l } else { in_l };
                 let (l, r) = gen_pair(rng, depth - 1);
                 if in_l {
-                    ls.push((key.to_string(), l));
+                    ls.push((key.into(), l));
                 }
                 if in_r {
-                    rs.push((key.to_string(), r));
+                    rs.push((key.into(), r));
                 }
             }
             (Type::Record(ls), Type::Record(rs))
@@ -198,7 +198,7 @@ fn name_identity(n: &Name) -> String {
     match n {
         Name::Unique { base, uid } => format!("u{uid:?}:{base}"),
         Name::Synthetic { kind, uid } => format!("s{uid:?}:{}", kind.stem()),
-        _ => n.field_key(),
+        _ => n.field_key().to_string(),
     }
 }
 

@@ -73,6 +73,7 @@
 //! inlined to their call site (see `src/ccl/design/mutability.md`, "`Mut` is a
 //! CCL type").
 
+use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
@@ -235,7 +236,7 @@ fn first_unpaired_as_of_read(e: &Expr) -> Option<Name> {
 struct BoundRead {
     name: Name,
     hist_read: Expr,
-    field: String,
+    field: SmolStr,
     value_ty: Type,
 }
 
@@ -405,7 +406,7 @@ fn proj_pair(p: &Name, pair_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
 /// `Fun(Txn, V)` by construction. An induction accumulator never reaches here at all —
 /// its trailing read is a `final_or_default` `mut_elim` mints and `ExtractFinal`
 /// reduces, a different term from this one.
-fn as_of_read_source(bound_expr: &Expr) -> Option<(&Expr, String)> {
+fn as_of_read_source(bound_expr: &Expr) -> Option<(&Expr, SmolStr)> {
     let TypedExprNode::Apply {
         function: sample_fn,
         argument: hist_read,
@@ -624,7 +625,7 @@ struct RawSite {
 /// the engine appends nothing for an aborted decision).
 struct FeedSite {
     defer: Name,
-    field: String,
+    field: SmolStr,
     value_ty: Type,
 }
 
@@ -2303,7 +2304,7 @@ fn build_writer(
     // In-block `<<` feeds, each resolved to its read-your-writes value at its
     // position in the block. Collected as `(defer, __to_<defer>_k field, value,
     // path)` — the control-flow path is the tap's fire condition.
-    let mut collected_feeds: Vec<(Name, String, Expr, Expr)> = Vec::new();
+    let mut collected_feeds: Vec<(Name, SmolStr, Expr, Expr)> = Vec::new();
     // The legal `MutWrite` targets inside this block: exactly the site's write
     // keys (transactional mutable variables `collect_footprint` recorded). `walk_block`
     // asserts every write it sees is one of these — see its `MutWrite` arm.
@@ -2323,7 +2324,7 @@ fn build_writer(
     // `emit_transact_writer`. A write key never assigned in the block keeps its
     // snapshot (unchanged).
     let write_tys: Vec<Type> = site.write_keys.iter().map(value_ty).collect();
-    let write_fields: Vec<(String, Expr)> = site
+    let write_fields: Vec<(SmolStr, Expr)> = site
         .write_keys
         .iter()
         .map(|wk| {
@@ -2356,7 +2357,7 @@ fn build_writer(
             value_ty: val.ty.clone(),
         })
         .collect();
-    let feeds: Vec<(String, Expr, Expr)> = collected_feeds
+    let feeds: Vec<(SmolStr, Expr, Expr)> = collected_feeds
         .into_iter()
         .map(|(_, field, val, fpath)| (field, val, fpath))
         .collect();
@@ -2446,7 +2447,7 @@ fn walk_block(
     env: &mut HashMap<Name, Expr>,
     path: &Expr,
     commit_paths: &mut Vec<Expr>,
-    feeds: &mut Vec<(Name, String, Expr, Expr)>,
+    feeds: &mut Vec<(Name, SmolStr, Expr, Expr)>,
     feed_counter: &mut usize,
     allowed_writes: &HashSet<Name>,
 ) {
@@ -2576,7 +2577,7 @@ fn walk_case(
     env: &mut HashMap<Name, Expr>,
     path: &Expr,
     commit_paths: &mut Vec<Expr>,
-    feeds: &mut Vec<(Name, String, Expr, Expr)>,
+    feeds: &mut Vec<(Name, SmolStr, Expr, Expr)>,
     feed_counter: &mut usize,
     allowed_writes: &HashSet<Name>,
 ) {
@@ -2882,12 +2883,12 @@ fn per_key_view(
     // ⟨time, write⟩ ▷ zip : dom ⇒ {time, write} — the zip inner-joins, so the
     // total `time` leg is narrowed to the committing positions of the `write` leg.
     let views_rec_ty = Type::Record(vec![
-        (F_TIME.to_string(), time_view.ty.clone()),
-        (F_WRITE.to_string(), write_view.ty.clone()),
+        (SmolStr::from(F_TIME), time_view.ty.clone()),
+        (SmolStr::from(F_WRITE), write_view.ty.clone()),
     ]);
     let mut views = Expr::new(TypedExprNode::Record(vec![
-        (F_TIME.to_string(), time_view),
-        (F_WRITE.to_string(), write_view),
+        (SmolStr::from(F_TIME), time_view),
+        (SmolStr::from(F_WRITE), write_view),
     ]));
     views.ty = views_rec_ty.clone();
     let tap_ty = Type::fun_like(&commits_ty, dom.clone(), view_rec_ty.clone());
@@ -3062,14 +3063,14 @@ fn plan_store(
         wt_tuple.ty = Type::Tuple(wt_tys);
 
         let rec_ty = Type::Record(vec![
-            (F_TIME.to_string(), Type::Txn),
-            (F_WRITE_TARGETS.to_string(), wt_tuple.ty.clone()),
-            (F_DECISION.to_string(), decision_ty.clone()),
+            (SmolStr::from(F_TIME), Type::Txn),
+            (SmolStr::from(F_WRITE_TARGETS), wt_tuple.ty.clone()),
+            (SmolStr::from(F_DECISION), decision_ty.clone()),
         ]);
         let mut rec = Expr::new(TypedExprNode::Record(vec![
-            (F_TIME.to_string(), tvar(&t, Type::Txn)),
-            (F_WRITE_TARGETS.to_string(), wt_tuple),
-            (F_DECISION.to_string(), decision),
+            (SmolStr::from(F_TIME), tvar(&t, Type::Txn)),
+            (SmolStr::from(F_WRITE_TARGETS), wt_tuple),
+            (SmolStr::from(F_DECISION), decision),
         ]));
         rec.ty = rec_ty.clone();
         commit_rec_ty.push(rec_ty.clone());
@@ -3178,8 +3179,8 @@ fn plan_store(
         // position, never which positions the accessor consults), so the
         // `hist_k ↔ commits_j` cycles still cross the guard.
         let view_rec_ty = Type::Record(vec![
-            (F_TIME.to_string(), Type::Txn),
-            (F_WRITE.to_string(), v.clone()),
+            (SmolStr::from(F_TIME), Type::Txn),
+            (SmolStr::from(F_WRITE), v.clone()),
         ]);
         let (view, view_ty) = match writers_of.get(k) {
             Some(sites) => {

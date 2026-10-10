@@ -31,7 +31,7 @@ fn int_lit(n: i64) -> Type {
 }
 /// The type of the string literal `s` — see [`int_lit`].
 fn str_lit_ty_local(s: &str) -> Type {
-    cambra::ccl::infer::lit_singleton(&Lit::String(s.to_string()))
+    cambra::ccl::infer::lit_singleton(&Lit::String(s.into()))
 }
 fn string() -> Type {
     Type::Base(BaseType::String)

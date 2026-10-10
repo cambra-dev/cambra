@@ -787,7 +787,7 @@ mod tests {
             Extent::record(
                 fields
                     .iter()
-                    .map(|(n, e)| ((*n).to_string(), e.clone()))
+                    .map(|(n, e)| ((*n).into(), e.clone()))
                     .collect(),
             )
         };

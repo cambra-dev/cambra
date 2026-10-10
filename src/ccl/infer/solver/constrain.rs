@@ -690,7 +690,7 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
 /// would then depend on whether the two sides happened to be structurally
 /// identical.
 ///
-/// Nothing in `Type` enforces uniqueness — `Record(Vec<(String, Type)>)` admits
+/// Nothing in `Type` enforces uniqueness — `Record(Vec<(SmolStr, Type)>)` admits
 /// duplicates and the builders merely happen not to produce them — so this is a
 /// real invariant that is not type-enforced, which is where a `debug_assert`
 /// earns its keep. `dup_key_record_trips_the_uniquely_keyed_invariant` pins that
@@ -2359,8 +2359,8 @@ mod tests {
     #[should_panic(expected = "duplicate record key")]
     fn dup_key_record_trips_the_uniquely_keyed_invariant() {
         let dup = Type::Record(vec![
-            ("a".to_string(), Type::Base(BaseType::Int)),
-            ("a".to_string(), Type::Base(BaseType::Bool)),
+            ("a".into(), Type::Base(BaseType::Int)),
+            ("a".into(), Type::Base(BaseType::Bool)),
         ]);
         let mut cache = ConstrainCache::new();
         let _ = constrain_subtype(&dup, &dup.clone(), &mut cache);

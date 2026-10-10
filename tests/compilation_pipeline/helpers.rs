@@ -27,6 +27,7 @@
 //! Most tests get 10s; the three heaviest compiles get 30s.
 
 use cambra::chl_parser::SourceMap;
+use smol_str::SmolStr;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
@@ -271,7 +272,7 @@ pub(crate) fn make_record(fields: &[(&str, Value)]) -> Value {
     Value::Record(
         fields
             .iter()
-            .map(|(k, v)| (k.to_string(), v.clone()))
+            .map(|(k, v)| (SmolStr::from(*k), v.clone()))
             .collect(),
     )
 }

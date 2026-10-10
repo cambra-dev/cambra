@@ -1,6 +1,7 @@
 //! Statement-block lowering: `Let` chains, `if`/`else`, sink-declaration dispatch, and
 //! mutation-loop dispatch.
 
+use smol_str::SmolStr;
 use std::{collections::HashSet, rc::Rc};
 
 use super::*;
@@ -124,7 +125,7 @@ pub(super) fn lower_stmts_recovering(
         .iter()
         .map(|n| {
             let var = ctx.tag_machinery(Expr::var(n), program_span, "lower.sink_outputs");
-            (n.clone(), var)
+            (SmolStr::from(n), var)
         })
         .collect();
     let outputs = ctx.tag_machinery(
@@ -1744,7 +1745,7 @@ pub(super) fn lower_type_expr_or_poly(
             let mut out = Vec::with_capacity(fields.len());
             for field in fields {
                 out.push((
-                    field.name.as_str().to_string(),
+                    SmolStr::from(field.name.as_str()),
                     lower_type_expr(&field.value, ctx)?,
                 ));
             }

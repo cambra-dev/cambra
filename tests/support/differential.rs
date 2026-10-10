@@ -112,7 +112,7 @@ pub fn convert(v: TileValue, ty: &Type) -> Value {
                 .into_iter()
                 .map(|(n, v)| {
                     let t = tys.iter().find(|(f, _)| *f == n).map(|(_, t)| t.clone());
-                    (n, convert(v, &t.unwrap_or(Type::Hole)))
+                    (n.to_string(), convert(v, &t.unwrap_or(Type::Hole)))
                 })
                 .collect(),
         ),
@@ -131,7 +131,7 @@ fn convert_untyped(v: TileValue) -> Value {
         TileValue::Record(fields) => Value::Record(
             fields
                 .into_iter()
-                .map(|(n, v)| (n, convert_untyped(v)))
+                .map(|(n, v)| (n.to_string(), convert_untyped(v)))
                 .collect(),
         ),
         TileValue::Union { tag, inner } => Value::Variant {

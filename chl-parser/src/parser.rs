@@ -108,7 +108,7 @@ where
         // ---- Atoms ---------------------------------------------------
         let lit = select! {
             Token::Int(n) => Expr::Lit(Lit::Int(n)),
-            Token::String(s) => Expr::Lit(Lit::String(s)),
+            Token::String(s) => Expr::Lit(Lit::String(s.into())),
             Token::True => Expr::Lit(Lit::Bool(true)),
             Token::False => Expr::Lit(Lit::Bool(false)),
         }
