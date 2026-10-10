@@ -391,6 +391,10 @@ pub struct LoweringContext {
     /// snapshotted.
     pub(super) nominal_types: Vec<Rc<crate::ccl::nominal::NominalDecl>>,
 
+    /// The associated functions the module declares, recorded before anything lowers so a
+    /// method call anywhere names every type declaring its method.
+    pub(super) associated_functions: Vec<nominal::AssociatedFunction>,
+
     /// Shadow-depth counter keyed by surface spelling: how many enclosing local
     /// binders — loop targets, comprehension generators, lambda/`def` params —
     /// currently bind each name. The `transactional_vars` set is keyed by base
@@ -968,6 +972,11 @@ fn lower_expr_inner(
             Ok(Expr::var(name.to_string()))
         }
         ChlExpr::Qualified(q) => nominal::lower_member(q, expr.span, ctx),
+        ChlExpr::MethodCall {
+            receiver,
+            method,
+            args,
+        } => nominal::lower_method_call(receiver, method, args, expr.span, ctx),
         ChlExpr::BinOp { left, op, right } => lower_binop(left, *op, right, ctx),
         ChlExpr::Compare {
             left,

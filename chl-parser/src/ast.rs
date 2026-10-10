@@ -271,6 +271,10 @@ pub enum Stmt {
     /// The type parameters are the capitalized leading parameters, kept apart from
     /// `params` because they are not arguments: `params` alone is the arity.
     FunctionDef {
+        /// The nominal type an associated function belongs to, `Price` in
+        /// `def Price::discounted(…)` (`docs/chl-spec.md`, "Associated functions and
+        /// methods"). `None` for a module function.
+        owner: Option<Spanned<SmolStr>>,
         name: SmolStr,
         type_params: Vec<TypeParam>,
         params: Vec<Param>,
@@ -282,6 +286,10 @@ pub enum Stmt {
     /// `type N(P…):` over constructor lines, or `type N(P…) = R` (`docs/chl-spec.md`,
     /// "Declaring a nominal type").
     TypeDecl(TypeDecl),
+
+    /// `impl N(P…):` over `def`s, each an associated function of `N`
+    /// (`docs/chl-spec.md`, "Associated functions and methods").
+    Impl(ImplBlock),
 
     /// `with <binding> = <context>: body` — a transaction block. The context
     /// is `begin()` (the transaction marker); `binding`, when present, names
@@ -517,6 +525,17 @@ pub struct TypeDecl {
     /// The type parameters, `T` in `type Option(T):`.
     pub params: Vec<Spanned<SmolStr>>,
     pub body: TypeDeclBody,
+}
+
+/// An `impl` block ([`Stmt::Impl`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImplBlock {
+    /// The type whose associated functions the block declares.
+    pub ty: Spanned<SmolStr>,
+    /// The type's parameters, bound once for every `def` in the block.
+    pub params: Vec<Spanned<SmolStr>>,
+    /// The block's `def`s, each a [`Stmt::FunctionDef`], or one under [`Stmt::Pub`].
+    pub defs: Vec<Spanned<Stmt>>,
 }
 
 /// What a [`TypeDecl`] declares after its head.
@@ -755,6 +774,16 @@ pub enum Expr {
     /// Function call: `func(args)`. CHL does not support keyword arguments.
     Call {
         func: Box<Spanned<Expr>>,
+        args: Vec<Spanned<Expr>>,
+    },
+
+    /// Method call: `receiver.method(args)`, the method of the receiver's nominal type
+    /// with the receiver as `self` (`docs/chl-spec.md`, "Associated functions and
+    /// methods"). Apart from [`Expr::Call`] of an [`Expr::Attribute`], which is a call of
+    /// the function a field holds.
+    MethodCall {
+        receiver: Box<Spanned<Expr>>,
+        method: Spanned<SmolStr>,
         args: Vec<Spanned<Expr>>,
     },
 

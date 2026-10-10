@@ -12,9 +12,9 @@ use smol_str::SmolStr;
 use crate::ast::{
     AnnotationMode, ArmPattern, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp,
     CmpOp, CompClause, Comprehension, Constructor, ConstructorParam, ConstructorPattern,
-    DiscardHead, Expr, FileId, IfBranch, KindAnnotation, Lit, MatchArm, MatchPattern, Module,
-    ModulePath, Param, PayloadPattern, QualifiedName, RecordField, Requirement, RunArg, Span,
-    Spanned, Stmt, TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem,
+    DiscardHead, Expr, FileId, IfBranch, ImplBlock, KindAnnotation, Lit, MatchArm, MatchPattern,
+    Module, ModulePath, Param, PayloadPattern, QualifiedName, RecordField, Requirement, RunArg,
+    Span, Spanned, Stmt, TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem,
     VariantPayload,
 };
 use crate::lexer::{self, Token};
@@ -591,13 +591,13 @@ where
         .boxed();
 
         // ---- Postfix: call, subscript, attribute ---------------------
-        let call_args = bracketed_expr
+        let call_arg_list = bracketed_expr
             .clone()
             .separated_by(just(Token::Comma))
             .allow_trailing()
             .collect::<Vec<_>>()
-            .delimited_by(just(Token::LParen), just(Token::RParen))
-            .map(PostfixOp::Call);
+            .delimited_by(just(Token::LParen), just(Token::RParen));
+        let call_args = call_arg_list.clone().map(PostfixOp::Call);
         // A subscript index is a comma-separated list: a single element is
         // the index itself (`xs[0]`); several become a tuple (`Mut(Int, Txn)`
         // — the multi-argument type-annotation form), matching Python's
@@ -637,6 +637,13 @@ where
             }),
         ))
         .labelled("field name or index");
+        // `.m(args)` is a method call, one postfix rather than an attribute then a call, so
+        // it stays apart from calling the function a field holds, `(r.f)(args)`
+        // (`docs/chl-spec.md`, "Associated functions and methods").
+        let method_call = just(Token::Dot)
+            .ignore_then(attr_key.clone())
+            .then(call_arg_list)
+            .map(|((qualifier, name), args)| PostfixOp::MethodCall(name, qualifier, args));
         let attribute = just(Token::Dot)
             .ignore_then(attr_key)
             .map(|(qualifier, name)| PostfixOp::Attribute(name, qualifier));
@@ -644,7 +651,7 @@ where
         let postfix = atom
             .clone()
             .foldl_with(
-                choice((call_args, subscript, attribute)).repeated(),
+                choice((call_args, subscript, method_call, attribute)).repeated(),
                 |target, op, e| {
                     let span = e.span();
                     let node = match op {
@@ -663,6 +670,28 @@ where
                             attr_span: attr.span,
                             attr_qualifier,
                         },
+                        PostfixOp::MethodCall(method, qualifier, args) if qualifier.is_empty() => {
+                            Expr::MethodCall {
+                                receiver: Box::new(target),
+                                method,
+                                args,
+                            }
+                        }
+                        // A qualified method path, `x.mod::Price::discounted(10)`, keeps the
+                        // shape of a call of an attribute, which module syntax refuses.
+                        PostfixOp::MethodCall(attr, attr_qualifier, args) => {
+                            let attr_span = attr.span;
+                            let func = Expr::Attribute {
+                                target: Box::new(target),
+                                attr: attr.node,
+                                attr_span,
+                                attr_qualifier,
+                            };
+                            Expr::Call {
+                                func: Box::new(Spanned::new(span, func)),
+                                args,
+                            }
+                        }
                     };
                     Spanned::new(span, node)
                 },
@@ -1119,6 +1148,8 @@ enum PostfixOp {
     Subscript(Box<Spanned<Expr>>, bool),
     /// A field key and the qualifier of its label.
     Attribute(Spanned<SmolStr>, Vec<Spanned<SmolStr>>),
+    /// `.m(args)`: the method's name, its path's qualifier, and the arguments.
+    MethodCall(Spanned<SmolStr>, Vec<Spanned<SmolStr>>, Vec<Spanned<Expr>>),
 }
 
 /// A variant tag and the `::` qualifier before its backtick: `` `some `` is
@@ -1680,8 +1711,14 @@ where
                 Spanned::new(e.span(), Stmt::TypeDecl(TypeDecl { name, params, body }))
             });
 
+        // `def f` or `def Price::f`: a qualifying type makes the function an associated
+        // function of that type.
+        let def_name = binder
+            .then_ignore(just(Token::ColonColon))
+            .or_not()
+            .then(select! { Token::Ident(s) => s }.labelled("function name"));
         let def_stmt = just(Token::Def)
-            .ignore_then(select! { Token::Ident(s) => s }.labelled("function name"))
+            .ignore_then(def_name)
             .then(
                 param
                     .separated_by(just(Token::Comma))
@@ -1695,10 +1732,11 @@ where
             .then_ignore(just(Token::Colon))
             .then(block.clone())
             .map_with(
-                |((((name, (type_params, params)), output), requires), body), e| {
+                |(((((owner, name), (type_params, params)), output), requires), body), e| {
                     Spanned::new(
                         e.span(),
                         Stmt::FunctionDef {
+                            owner,
                             name,
                             type_params,
                             params,
@@ -1709,6 +1747,49 @@ where
                     )
                 },
             );
+
+        // ---- impl N(P…): ( [pub] def … )+ -------------------------------
+        // (`docs/chl-spec.md`, "Associated functions and methods")
+        let impl_item = just(Token::Pub)
+            .map_with(|_, e| e.span())
+            .or_not()
+            .then(def_stmt.clone())
+            .map_with(|(keyword, def), e| match keyword {
+                None => def,
+                Some(keyword) => Spanned::new(
+                    e.span(),
+                    Stmt::Pub {
+                        keyword,
+                        stmt: Box::new(def),
+                    },
+                ),
+            });
+        let impl_stmt = just(Token::Impl)
+            .ignore_then(binder)
+            .then(
+                binder
+                    .separated_by(just(Token::Comma))
+                    .at_least(1)
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .or_not()
+                    .map(Option::unwrap_or_default),
+            )
+            .then_ignore(just(Token::Colon))
+            .then_ignore(just(Token::Newline))
+            .then_ignore(just(Token::Indent).labelled("indented `def`s"))
+            .then(
+                impl_item
+                    .then_ignore(just(Token::Newline).repeated())
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(Token::Dedent))
+            .map_with(|((ty, params), defs), e| {
+                Spanned::new(e.span(), Stmt::Impl(ImplBlock { ty, params, defs }))
+            });
 
         // ---- simple statements (must end at NEWLINE) ----------------
         let return_stmt = just(Token::Return)
@@ -1836,6 +1917,7 @@ where
             with_stmt,
             def_stmt,
             type_stmt,
+            impl_stmt,
             decorated_stmt,
             pub_stmt,
             block_assign,
@@ -1919,6 +2001,7 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
             "`pub` is refused on an `import`: a module exports only what it declares"
         }
         Stmt::Param { .. } => "`pub` is refused on a `param`",
+        Stmt::Impl(_) => "`pub` stands on each `def` in an `impl` block, not on the block",
         Stmt::Pub { .. } => "`pub` is written once",
         Stmt::AugAssign { .. } => {
             "`pub` is refused on a compound assignment, which writes a variable another statement introduced"
@@ -2597,6 +2680,66 @@ mod tests {
         assert_eq!(empty.type_path.len(), 2);
         assert!(empty.binders.is_none());
         assert!(arms[2].pattern.is_none());
+    }
+
+    /// `def Price::f` names its owner; an `impl` block holds `def`s, `pub` on each.
+    #[test]
+    fn associated_functions_name_their_type() {
+        let m = parse_m(indoc! {"
+            def Price::double(self) => Price:
+                self
+            impl Option(T):
+                def or_else(self, d: T) => T:
+                    d
+                pub def is_none(self) => Bool:
+                    True
+            1
+        "});
+        let Stmt::FunctionDef { owner, name, .. } = &m.body[0].node else {
+            panic!("expected a def, got {:?}", m.body[0].node)
+        };
+        assert_eq!(
+            (owner.as_ref().map(|o| o.node.as_str()), name.as_str()),
+            (Some("Price"), "double")
+        );
+        let Stmt::Impl(block) = &m.body[1].node else {
+            panic!("expected an impl block, got {:?}", m.body[1].node)
+        };
+        assert_eq!(block.ty.node, "Option");
+        assert_eq!(block.params.len(), 1);
+        assert_eq!(block.defs.len(), 2);
+        assert!(matches!(block.defs[1].node, Stmt::Pub { .. }));
+    }
+
+    /// `pub` stands on each `def` in an `impl` block, not on the block.
+    #[test]
+    fn pub_on_an_impl_block_is_refused() {
+        let result = parse_mod("pub impl Price:\n    def f(self) => Int:\n        1\n");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.to_string().contains("`pub` stands on each `def`")),
+            "got {:#?}",
+            result.errors
+        );
+    }
+
+    /// `x.m(a)` is a method call; `(r.f)(a)` calls the function a field holds.
+    #[test]
+    fn a_method_call_is_apart_from_a_field_call() {
+        let Expr::MethodCall { method, args, .. } = parse_e("p.discounted(10)").node else {
+            panic!("expected a method call")
+        };
+        assert_eq!((method.node.as_str(), args.len()), ("discounted", 1));
+        assert!(matches!(
+            parse_e("(r.f)(1)").node,
+            Expr::Call { func, .. } if matches!(func.node, Expr::Attribute { .. })
+        ));
+        assert!(matches!(
+            parse_e("p.extract()").node,
+            Expr::MethodCall { .. }
+        ));
     }
 
     /// A constructor call in target position is a constructor pattern.

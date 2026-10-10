@@ -186,7 +186,13 @@ pub(crate) struct Interp {
     /// `Shape::circle`. Collected before the program runs, since a declaration is in scope
     /// throughout its module.
     constructors: Rc<BTreeMap<String, Member>>,
+    /// Each method's name, with every type declaring it and that type's constructor tags:
+    /// a method call picks its type by the receiver's constructor.
+    methods: Rc<BTreeMap<String, Vec<MethodOwner>>>,
 }
+
+/// A type declaring a method, with its constructor tags.
+type MethodOwner = (String, Vec<String>);
 
 /// A loop over a collection not keyed by position, whose iteration order is not defined
 /// (`docs/chl-spec.md`, "Accumulator iteration order is not yet defined [Open]").
@@ -219,6 +225,7 @@ impl Interp {
             txn: None,
             loop_keys: Vec::new(),
             constructors: Rc::default(),
+            methods: Rc::default(),
             cells_made: 0,
             order_watches: Vec::new(),
         }
@@ -309,6 +316,7 @@ pub fn run(source: &str) -> Result<Observations, Error> {
     let mut feed_sites = BTreeMap::new();
     collect_feed_sites(&module.body, &mut feed_sites);
     let constructors = Rc::new(collect_constructors(&module.body));
+    let methods = Rc::new(collect_methods(&module.body));
 
     // Each pass completes at least one channel or ends the run, so there is at most one pass per
     // channel, plus the last.
@@ -316,6 +324,7 @@ pub fn run(source: &str) -> Result<Observations, Error> {
     loop {
         let mut interp = Interp::new(feed_sites.clone(), finals.clone());
         interp.constructors = Rc::clone(&constructors);
+        interp.methods = Rc::clone(&methods);
         // A failure outside speculation is on the path the program takes, whatever a later
         // pass would read, so it is the program's.
         interp.exec_block(&module.body)?;
@@ -491,6 +500,62 @@ fn for_each_block<'a>(e: &'a Spanned<Expr>, bodies: Bodies, f: &mut dyn FnMut(&'
         // Literals, names and type syntax hold no statement.
         _ => {}
     }
+}
+
+/// Each method `body` declares, by name, with every type declaring it and that type's
+/// constructor tags. A method is an associated function whose first parameter is `self`,
+/// and the single-constructor form's `extract`.
+fn collect_methods(body: &[Spanned<Stmt>]) -> BTreeMap<String, Vec<MethodOwner>> {
+    let mut tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut out: BTreeMap<String, Vec<MethodOwner>> = BTreeMap::new();
+    for stmt in body {
+        if let Stmt::TypeDecl(decl) = &stmt.node {
+            let ty = decl.name.node.to_string();
+            let ctor_tags = match &decl.body {
+                TypeDeclBody::Single(_) => {
+                    out.entry("extract".into())
+                        .or_default()
+                        .push((ty.clone(), vec!["new".into()]));
+                    vec!["new".to_string()]
+                }
+                TypeDeclBody::Constructors(ctors) => {
+                    ctors.iter().map(|c| c.name.node.to_string()).collect()
+                }
+            };
+            tags.insert(ty, ctor_tags);
+        }
+    }
+    let mut add = |ty: &str, name: &str, params: &[chl_parser::ast::Param]| {
+        if params.first().is_some_and(|p| p.name == "self") {
+            let ctor_tags = tags.get(ty).cloned().unwrap_or_default();
+            out.entry(name.to_string())
+                .or_default()
+                .push((ty.to_string(), ctor_tags));
+        }
+    };
+    for stmt in body {
+        match &stmt.node {
+            Stmt::FunctionDef {
+                owner: Some(owner),
+                name,
+                params,
+                ..
+            } => add(&owner.node, name, params),
+            Stmt::Impl(block) => {
+                for def in &block.defs {
+                    let def = match &def.node {
+                        Stmt::Pub { stmt, .. } => stmt,
+                        _ => def,
+                    };
+                    if let Stmt::FunctionDef { name, params, .. } = &def.node {
+                        add(&block.ty.node, name, params);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A member a `type` declaration declares.
@@ -831,9 +896,41 @@ impl Interp {
                 }),
             },
 
+            // `impl N:` binds each `def` as `def N::f` does.
+            Stmt::Impl(block) => {
+                for def in &block.defs {
+                    let def = match &def.node {
+                        Stmt::Pub { stmt, .. } => stmt,
+                        _ => def,
+                    };
+                    let Stmt::FunctionDef {
+                        name, params, body, ..
+                    } = &def.node
+                    else {
+                        return err("an `impl` block holds `def`s");
+                    };
+                    let function = Function {
+                        params: params.iter().map(|p| (p.name.to_string(), false)).collect(),
+                        body: body.clone(),
+                        env: self.captured_scopes(),
+                    };
+                    let bound = format!("{}::{name}", block.ty.node);
+                    self.bind(bound, Slot::Fn(Rc::new(function)));
+                }
+                Ok(None)
+            }
+
             Stmt::FunctionDef {
-                name, params, body, ..
+                owner,
+                name,
+                params,
+                body,
+                ..
             } => {
+                let name = match owner {
+                    Some(owner) => format!("{}::{name}", owner.node),
+                    None => name.to_string(),
+                };
                 let function = Function {
                     params: params
                         .iter()
@@ -845,7 +942,7 @@ impl Interp {
                     body: body.clone(),
                     env: self.captured_scopes(),
                 };
-                self.bind(name.to_string(), Slot::Fn(Rc::new(function)));
+                self.bind(name, Slot::Fn(Rc::new(function)));
                 Ok(None)
             }
 
@@ -1018,6 +1115,56 @@ impl Interp {
         }
     }
 
+    /// `receiver.method(args)`: the method of the one type that declares it and has the
+    /// receiver's constructor, called with the receiver as `self`.
+    fn call_method(
+        &mut self,
+        receiver: &Spanned<Expr>,
+        method: &str,
+        args: &[Spanned<Expr>],
+    ) -> Result<Value, Error> {
+        let v = self.eval(receiver)?;
+        let Value::Variant { tag, payload } = &v else {
+            return match v {
+                Value::Pending => Ok(Value::Pending),
+                other => err(format!(
+                    "`.{method}(…)` on {other}, which is not a nominal value"
+                )),
+            };
+        };
+        let owners: Vec<String> = self
+            .methods
+            .get(method)
+            .into_iter()
+            .flatten()
+            .filter(|(_, tags)| tags.iter().any(|t| t == tag))
+            .map(|(ty, _)| ty.clone())
+            .collect();
+        let [owner] = owners.as_slice() else {
+            return err(format!(
+                "`.{method}(…)` on `{tag}` names {} types; the interpreter tells types apart by \
+                 constructor",
+                owners.len()
+            ));
+        };
+        let bound = format!("{owner}::{method}");
+        if method == "extract" && self.slot(&bound).is_none() {
+            return Ok((**payload).clone());
+        }
+        let Some(Slot::Fn(function)) = self.slot(&bound) else {
+            return err(format!("`{bound}` is not bound"));
+        };
+        let function = function.clone();
+        let mut values = vec![v.clone()];
+        for a in args {
+            values.push(self.eval(a)?);
+        }
+        if any_pending(values.iter()) {
+            return Ok(Value::Pending);
+        }
+        self.call_with_values(&bound, &function, values)
+    }
+
     /// The member `q` names.
     fn member(&self, q: &QualifiedName) -> Result<Member, Error> {
         let [ty] = q.qualifier.as_slice() else {
@@ -1045,6 +1192,14 @@ impl Interp {
     /// the argument, or the tuple of several (`docs/chl-spec.md`, "Declaring a nominal
     /// type").
     fn construct(&mut self, q: &QualifiedName, args: &[Spanned<Expr>]) -> Result<Value, Error> {
+        // An associated function, `N::f(args)`, is bound under its qualified name.
+        if let [ty] = q.qualifier.as_slice() {
+            let bound = format!("{}::{}", ty.node, q.name.node);
+            if let Some(Slot::Fn(function)) = self.slot(&bound) {
+                let function = function.clone();
+                return self.call_user(&bound, &function, args);
+            }
+        }
         // `N::extract(n)` is the payload of `n`'s one constructor `new`.
         if let Member::Extract = self.member(q)? {
             let [arg] = args else {
@@ -1519,6 +1674,12 @@ impl Interp {
             Expr::Lit(Lit::String(s)) => Ok(Value::Str(s.clone())),
             Expr::Lit(Lit::Bool(b)) => Ok(Value::Bool(*b)),
 
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+            } => self.call_method(receiver, &method.node, args),
+
             // A constructor that declares no parameters is a value, held as its name.
             Expr::Qualified(q) => {
                 let arity = self.constructor_arity(q)?;
@@ -1975,7 +2136,35 @@ impl Interp {
             };
             params.push((param.clone(), slot));
         }
+        self.run_call(function, params)
+    }
 
+    /// Call `function` with `values` for its parameters, none of them by reference: an
+    /// associated function called as a method, its receiver already evaluated.
+    fn call_with_values(
+        &mut self,
+        name: &str,
+        function: &Function,
+        values: Vec<Value>,
+    ) -> Result<Value, Error> {
+        if function.params.len() != values.len() {
+            return err(format!(
+                "`{name}` takes {} argument(s), given {}",
+                function.params.len(),
+                values.len()
+            ));
+        }
+        let params = function
+            .params
+            .iter()
+            .zip(values)
+            .map(|((param, _), v)| (param.clone(), Slot::Val(v)))
+            .collect();
+        self.run_call(function, params)
+    }
+
+    /// Run `function`'s body with `params` bound.
+    fn run_call(&mut self, function: &Function, params: Scope) -> Result<Value, Error> {
         let mut env = function.env.clone();
         env.push(params);
         let caller = std::mem::replace(&mut self.scopes, env);

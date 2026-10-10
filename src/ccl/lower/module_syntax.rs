@@ -184,6 +184,7 @@ impl Refusals {
                 self.expr(context);
                 self.stmts(body);
             }
+            ChlStmt::Impl(block) => self.stmts(&block.defs),
             ChlStmt::TypeDecl(decl) => match &decl.body {
                 TypeDeclBody::Constructors(ctors) => {
                     for ctor in ctors {
@@ -346,6 +347,12 @@ impl Refusals {
             // resolves (`lower::nominal`).
             ChlExpr::Qualified(q) if matches!(q.qualifier.as_slice(), [ty] if is_type_name(&ty.node)) =>
                 {}
+            ChlExpr::MethodCall { receiver, args, .. } => {
+                self.expr(receiver);
+                for a in args {
+                    self.expr(a);
+                }
+            }
             ChlExpr::Qualified(q) => self.qualified(q, expr.span),
             ChlExpr::Attribute {
                 target,

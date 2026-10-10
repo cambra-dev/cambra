@@ -434,7 +434,7 @@ fn constructor_use_errors_name_what_is_wrong() {
 
                 Shape::square(1)
             "#},
-            "`Shape` declares no constructor `square`",
+            "`Shape` declares no constructor or function `square`",
         ),
         (
             indoc! {r#"
@@ -828,7 +828,7 @@ fn a_constructor_list_declares_no_extract() {
 
             Shape::extract(Shape::circle(1))
         "#},
-        "`Shape` declares no constructor `extract`",
+        "`Shape` declares no constructor or function `extract`",
     );
 }
 
@@ -850,5 +850,335 @@ fn a_constructor_arms_binder_shadows_an_outer_name() {
             radius(Shape::circle(4))
         "#},
         Value::Int(4),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Associated functions and methods
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_associated_function_is_reached_through_its_type() {
+    check_scalar(
+        indoc! {r#"
+            type Price = Int
+
+            def Price::of_cents(c: Int) => Price:
+                Price::new(c)
+
+            make = Price::of_cents
+            Price::extract(Price::of_cents(250)) + Price::extract(make(5))
+        "#},
+        Value::Int(255),
+    );
+}
+
+/// A method is an associated function whose first parameter is `self`, called on a
+/// value of its type or through the type.
+#[test]
+fn a_method_is_called_on_its_receiver() {
+    check_scalar(
+        indoc! {r#"
+            type Price = Int
+
+            def Price::cents(self) => Int:
+                Price::extract(self)
+
+            def Price::discounted(self, pct: Int) => Price:
+                Price::new(self.cents() - self.cents() * pct // 100)
+
+            p = Price::new(200)
+            p.discounted(10).cents() + Price::cents(p)
+        "#},
+        Value::Int(380),
+    );
+}
+
+#[test]
+fn extract_is_a_method() {
+    check_scalar(
+        indoc! {r#"
+            type Price = {amount: Int}
+
+            Price::new((amount=3)).extract().amount
+        "#},
+        Value::Int(3),
+    );
+}
+
+/// Two types may each declare a method of one name; the receiver's type picks.
+#[test]
+fn the_receiver_picks_among_same_named_methods() {
+    check_scalar(
+        indoc! {r#"
+            type Shape:
+                circle(radius: Int)
+                rect(w: Int, h: Int)
+
+            type Price = Int
+
+            def Shape::size(self) => Int:
+                match self:
+                    case Shape::circle(r):
+                        r
+                    case Shape::rect(w, h):
+                        w * h
+
+            def Price::size(self) => Int:
+                self.extract()
+
+            Shape::rect(2, 3).size() + Price::new(10).size()
+        "#},
+        Value::Int(16),
+    );
+}
+
+/// An `impl` block declares a parameterised type's methods with its parameters bound once,
+/// and one method calls another through `self`.
+#[test]
+fn an_impl_block_binds_the_types_parameters() {
+    check_scalar(
+        indoc! {r#"
+            type Maybe(T):
+                just(T)
+                nothing
+
+            impl Maybe(T):
+                def or_else(self, d: T) => T:
+                    match self:
+                        case Maybe::just(v):
+                            v
+                        case Maybe::nothing:
+                            d
+
+                def unwrap_or(self, d: T) => T:
+                    self.or_else(d)
+
+            m: Maybe(Int) = Maybe::just(7)
+            n: Maybe(Int) = Maybe::nothing
+            m.or_else(0) + n.unwrap_or(5)
+        "#},
+        Value::Int(12),
+    );
+}
+
+#[test]
+fn method_errors_name_what_is_wrong() {
+    for (src, needle) in [
+        (
+            indoc! {r#"
+                type Price = Int
+
+                def Price::cents(self) => Int:
+                    self.extract()
+
+                def total(p):
+                    p.cents()
+
+                total(Price::new(1))
+            "#},
+            "nothing before the call determines that type; annotate the receiver",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+
+                def Price::cents(self) => Int:
+                    self.extract()
+
+                r = (cents=1)
+                r.cents()
+            "#},
+            "is not a nominal type, so it has no methods",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+                type Cost = Int
+
+                def Price::cents(self) => Int:
+                    self.extract()
+
+                Cost::new(1).cents()
+            "#},
+            "`Cost` has no method `cents`",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+
+                Price::new(1).cents()
+            "#},
+            "no type this module declares has a method `cents`",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+
+                def Price::new(c: Int) => Price:
+                    Price::new(c)
+
+                1
+            "#},
+            "`Price::new` is already declared",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+
+                def Price::zero() => Price:
+                    Price::new(0)
+
+                1
+            "#},
+            "`Price::zero` declares no parameters",
+        ),
+        (
+            indoc! {r#"
+                type Box(T):
+                    boxed(T)
+
+                def Box::get(self) => Int:
+                    1
+
+                1
+            "#},
+            "`self` of `Box::get` needs its type",
+        ),
+        (
+            indoc! {r#"
+                def Lamp::on(self) => Int:
+                    1
+
+                1
+            "#},
+            "`Lamp` is not a nominal type this module declares",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+
+                def f(x):
+                    def Price::g(self) => Int:
+                        1
+                    x
+
+                f(1)
+            "#},
+            "an associated function is declared at a module's top level",
+        ),
+        (
+            indoc! {r#"
+                type A = Int
+                type B = Int
+
+                def A::size(self) => Int:
+                    1
+                def B::size(self) => Int:
+                    2
+
+                def pick(c: Bool):
+                    if c:
+                        A::new(1)
+                    else:
+                        B::new(1)
+
+                pick(True).size()
+            "#},
+            "is called on a value stated to be both",
+        ),
+        (
+            indoc! {r#"
+                type Box(T):
+                    boxed(T)
+
+                impl Box:
+                    def get(self) => Int:
+                        1
+
+                1
+            "#},
+            "`Box` takes 1 type parameter, and `impl Box` names 0",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+                type Cost = Int
+
+                impl Price:
+                    def Cost::f(self) => Int:
+                        1
+
+                1
+            "#},
+            "a `def` in `impl Price:` belongs to `Price`",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+
+                def Price::add(self, total: Mut(Int)) => Int:
+                    1
+
+                1
+            "#},
+            "an associated function with a pass-by-reference parameter is not supported yet",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+
+                impl Price:
+                    def a(self) => Int:
+                        self.b()
+                    def b(self) => Int:
+                        self.a()
+
+                1
+            "#},
+            "call each other in a cycle",
+        ),
+    ] {
+        check_compile_error(src, needle);
+    }
+}
+
+/// The functions of an `impl` block reach each other in any order.
+#[test]
+fn an_impl_blocks_functions_reach_each_other() {
+    check_scalar(
+        indoc! {r#"
+            type Price = Int
+
+            impl Price:
+                def doubled(self) => Int:
+                    self.cents() * 2
+                def cents(self) => Int:
+                    self.extract()
+
+            Price::new(21).doubled()
+        "#},
+        Value::Int(42),
+    );
+}
+
+/// A method may call the same-named method of another type.
+#[test]
+fn a_method_delegates_to_another_types_same_named_method() {
+    check_scalar(
+        indoc! {r#"
+            type Price = Int
+            type Order = Price
+
+            def Price::size(self) => Int:
+                self.extract()
+
+            impl Order:
+                def size(self) => Int:
+                    self.extract().size() + 1
+
+            Order::new(Price::new(4)).size()
+        "#},
+        Value::Int(5),
     );
 }

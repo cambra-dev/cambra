@@ -416,6 +416,21 @@ pub enum TypedExprNode {
         branches: Vec<Branch>,
     },
 
+    /// A method not yet resolved: the function of the application
+    /// `(𝑥, 𝑎…) ▷ method(m; N₁::m, …)` that a method call `𝑥.m(𝑎…)` lowers to
+    /// (`src/ccl/design/nominal-types.md`, "Method calls"). Each candidate is a nominal type
+    /// declaring a method `name`, with a reference to that method's binding. Inference
+    /// replaces the node with the candidate the receiver's type names, so none survives
+    /// inference.
+    Method {
+        name: String,
+        /// Whether the call passes arguments after the receiver. The application's
+        /// argument is then the tuple of the receiver and those, and the receiver is its
+        /// first component; otherwise the argument is the receiver.
+        with_args: bool,
+        candidates: Vec<(std::rc::Rc<crate::ccl::nominal::NominalDecl>, TypedExpr)>,
+    },
+
     /// Tagged variant constructor: `` `Tag(payload) ``.
     ///
     /// Produces a [`Type::Variant`] containing a single tag whose payload type
@@ -815,6 +830,7 @@ impl TypedExprNode {
             TypedExprNode::List(_) => "List",
             TypedExprNode::Case { .. } => "Case",
             TypedExprNode::VariantCtor { .. } => "VariantCtor",
+            TypedExprNode::Method { .. } => "Method",
             TypedExprNode::Transact { .. } => "Transact",
             TypedExprNode::LetRec { .. } => "LetRec",
             TypedExprNode::For { .. } => "For",
@@ -1704,6 +1720,9 @@ impl TypedExpr {
                 }
             }
             TypedExprNode::VariantCtor { payload, .. } => f(payload.as_ref()),
+            TypedExprNode::Method { candidates, .. } => {
+                candidates.iter().for_each(|(_, c)| f(c));
+            }
             TypedExprNode::Record(fields) => fields.iter().for_each(|(_, e)| f(e)),
             // `domain` is a `Type`, not an `Expr` child, so the expr-walker
             // skips it (its type residue is reached via `expr.ty` walks). Child
@@ -1905,6 +1924,9 @@ impl TypedExpr {
                 }
             }
             TypedExprNode::VariantCtor { payload, .. } => f(payload.as_mut()),
+            TypedExprNode::Method { candidates, .. } => {
+                candidates.iter_mut().for_each(|(_, c)| f(c));
+            }
             TypedExprNode::Record(fields) => fields.iter_mut().for_each(|(_, e)| f(e)),
             // `domain` is a `Type`, not an `Expr` child (see `walk_children`).
             // Child order mirrors `walk_transact`.
@@ -1997,6 +2019,7 @@ impl TypedExpr {
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
+            | TypedExprNode::Method { .. }
             | TypedExprNode::VariantCtor { .. }
             | TypedExprNode::List(_)
             | TypedExprNode::Tuple(_)
@@ -2050,6 +2073,7 @@ impl TypedExpr {
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
+            | TypedExprNode::Method { .. }
             | TypedExprNode::VariantCtor { .. }
             | TypedExprNode::List(_)
             | TypedExprNode::Tuple(_)

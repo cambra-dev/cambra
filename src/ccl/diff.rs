@@ -490,6 +490,7 @@ fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
             v
         }
         N::VariantCtor { payload, .. } => vec![payload],
+        N::Method { candidates, .. } => candidates.iter().map(|(_, c)| c).collect(),
         N::Record(fields) => fields.iter().map(|(_, e)| e).collect(),
         N::Transact { keys, writers, .. } => {
             let mut v: Vec<&TypedExpr> = keys.iter().map(|k| &k.init).collect();

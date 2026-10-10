@@ -77,6 +77,10 @@ pub enum Token {
     /// Opens a nominal type declaration (`docs/chl-spec.md`, "Declaring a nominal type").
     #[token("type", priority = 3)]
     Type,
+    /// Opens a block of a nominal type's associated functions (`docs/chl-spec.md`,
+    /// "Associated functions and methods").
+    #[token("impl", priority = 3)]
+    Impl,
     // The module keywords (`docs/chl-spec.md`, "9. Modules [Decided]").
     #[token("import", priority = 3)]
     Import,
@@ -276,6 +280,7 @@ impl fmt::Display for Token {
             Token::Forall => "forall",
             Token::Requires => "requires",
             Token::Type => "type",
+            Token::Impl => "impl",
             Token::And => "and",
             Token::Or => "or",
             Token::Not => "not",
@@ -530,6 +535,7 @@ fn opens_block_at_line_start(tok: &Token) -> bool {
             | Token::For
             | Token::Def
             | Token::Type
+            | Token::Impl
             | Token::With
             | Token::Match
             | Token::Case

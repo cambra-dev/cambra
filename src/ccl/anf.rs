@@ -204,6 +204,9 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
         | TypedExprNode::Defer
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Lambda { .. } => true,
+        // An unresolved method stands for one of its candidate references, each an atom,
+        // and inference resolves it only where it is an application's function.
+        TypedExprNode::Method { .. } => true,
         // A comprehension is atomic when the term it encodes to is — which is
         // the unfiltered shape, one `Lambda`
         // ([`crate::ccl::comprehension::encodes_to_lambda`]). Deciding it on the
@@ -405,6 +408,9 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             }
             let_chain(binds, rebuild(TypedExprNode::Record(out)))
         }
+
+        // The candidates are references, already atoms.
+        node @ TypedExprNode::Method { .. } => rebuild(node),
 
         TypedExprNode::VariantCtor {
             tag,

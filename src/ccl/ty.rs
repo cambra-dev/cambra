@@ -4141,6 +4141,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::List(_)
         | N::Case { .. }
         | N::VariantCtor { .. }
+        | N::Method { .. }
         | N::For { .. }
         | N::MutDecl { .. }
         | N::MutWrite { .. }
@@ -4386,6 +4387,25 @@ fn eq_term_modulo_ty_slots_go(
                 nominal: n2,
             },
         ) => t1 == t2 && n1 == n2 && eq_term_modulo_ty_slots_go(p1, p2, pairs),
+        (
+            N::Method {
+                name: m1,
+                with_args: a1,
+                candidates: c1,
+            },
+            N::Method {
+                name: m2,
+                with_args: a2,
+                candidates: c2,
+            },
+        ) => {
+            m1 == m2
+                && a1 == a2
+                && c1.len() == c2.len()
+                && c1.iter().zip(c2).all(|((d1, e1), (d2, e2))| {
+                    d1 == d2 && eq_term_modulo_ty_slots_go(e1, e2, pairs)
+                })
+        }
         (N::Record(f1), N::Record(f2)) => {
             f1.len() == f2.len()
                 && f1.iter().zip(f2).all(|((n1, e1), (n2, e2))| {
@@ -4492,6 +4512,12 @@ fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
         TypedExprNode::UnaryOp(kind, _) => kind.hash(state),
         TypedExprNode::Aggregate { kind, .. } => kind.hash(state),
         TypedExprNode::VariantCtor { tag, .. } => tag.hash(state),
+        TypedExprNode::Method {
+            name, with_args, ..
+        } => {
+            name.hash(state);
+            with_args.hash(state);
+        }
         TypedExprNode::Proj(ProjKey::Index(i)) => i.hash(state),
         TypedExprNode::Proj(ProjKey::Field(f)) => f.hash(state),
         _ => {}
