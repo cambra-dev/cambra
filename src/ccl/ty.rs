@@ -3690,7 +3690,7 @@ pub type RefinementTemplate = fn(&[TypedExpr]) -> TypedExpr;
 
 /// A refinement predicate is a **boolean expression over
 /// [`crate::ccl::REFINEMENT_BINDER`]**: it holds no `MutDecl`, `MutWrite`, `For`,
-/// `Begin`, `LetRec` or `Transact`.
+/// `Begin`, `LetRec`, `Transact` or `LetType`.
 ///
 /// Asserted at every site that installs a predicate ([`Refinement::born`], and the
 /// rewrite path's `point_at`) rather than at a later wall, because the
@@ -3710,6 +3710,7 @@ pub(crate) fn debug_assert_predicate_shape(predicate: &TypedExpr) {
                 N::Begin { .. } => Some("Begin"),
                 N::LetRec { .. } => Some("LetRec"),
                 N::Transact { .. } => Some("Transact"),
+                N::LetType { .. } => Some("LetType"),
                 _ => None,
             };
             if here.is_some() {
@@ -4121,7 +4122,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::LoadFrom(_)
         | N::Error => true,
         // The two shapes a term this walk compares never holds; the catch-all says why.
-        N::LetRec { .. } | N::Transact { .. } => false,
+        N::LetRec { .. } | N::Transact { .. } | N::LetType { .. } => false,
     }
 }
 

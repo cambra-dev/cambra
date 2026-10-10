@@ -1350,6 +1350,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // seed one level deeper, the binder slot resolved in place (it holds the
         // history `emit_mut_decl` bound it at), the body under the shadow. A
         // mutable variable is never generalized, so there is no specialization arm.
+        TypedExprNode::LetType { .. } => {
+            unreachable!("uniquify removes every `LetType`")
+        }
         TypedExprNode::MutDecl {
             binding,
             init,

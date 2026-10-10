@@ -471,6 +471,9 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             body: Box::new(normalize(*body, muts)),
         }),
 
+        TypedExprNode::LetType { .. } => {
+            unreachable!("uniquify removes every `LetType`")
+        }
         TypedExprNode::MutDecl {
             binding,
             init,

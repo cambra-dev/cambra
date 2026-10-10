@@ -474,6 +474,12 @@ fn hash_payload<'a>(
                 hash_type(target, env, wenv, free, h);
             }
         }
+        // A type alias's content is its spelling and the type it names; its body is
+        // its one child.
+        N::LetType { name, ty, .. } => {
+            name.hash(h);
+            hash_type(ty, env, wenv, free, h);
+        }
         N::BinOp { op, .. } => op.hash(h),
         N::UnaryOp(kind, _) => kind.hash(h),
         N::Aggregate { kind, .. } => kind.hash(h),
