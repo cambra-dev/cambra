@@ -638,20 +638,29 @@ fn an_imports_arguments_reach_its_modules_parameters(#[case] root: &str, #[case]
     );
 }
 
-/// The shared runs `program` lowers, by their homes: each `let` its chains bind
+/// The shared imports `program` lowers, by their homes: each `let` its chains bind
 /// stands on the spine above the root's.
-pub(crate) fn shared_runs(program: &LoadedProgram) -> BTreeSet<String> {
+pub(crate) fn shared_imports(program: &LoadedProgram) -> BTreeSet<String> {
+    shared_import_order(program).into_iter().collect()
+}
+
+/// The shared imports `program` lowers, by their homes, in the order their chains
+/// stand on the spine, outermost first.
+pub(crate) fn shared_import_order(program: &LoadedProgram) -> Vec<String> {
     let mut ctx = GlobalContext::default();
     let lowered = lower_program(program, ctx.lowering_ctx());
     assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
     let tree = lowered.value.expect("the program lowers");
-    let mut homes = BTreeSet::new();
+    let mut homes: Vec<String> = Vec::new();
     let mut at = &tree;
     loop {
         match &at.node {
             TypedExprNode::Let { binding, body, .. } => {
-                if let Some(Home::Shared(run)) = binding.name.home() {
-                    homes.insert(run.to_string());
+                if let Some(Home::Import(shared)) = binding.name.home() {
+                    let home = shared.to_string();
+                    if homes.last() != Some(&home) {
+                        homes.push(home);
+                    }
                 }
                 at = body;
             }
@@ -663,7 +672,7 @@ pub(crate) fn shared_runs(program: &LoadedProgram) -> BTreeSet<String> {
     }
 }
 
-/// Imports of one module with equal arguments reach one shared run, whichever
+/// Imports of one module with equal arguments reach one shared import, whichever
 /// order they write them in, and imports with different arguments reach two
 /// (`docs/chl-spec.md`, "9.2 Imports").
 #[rstest]
@@ -679,23 +688,23 @@ pub(crate) fn shared_runs(program: &LoadedProgram) -> BTreeSet<String> {
     &["scaled(scale=2)", "scaled(scale=3)"]
 )]
 #[timeout(Duration::from_secs(10))]
-fn an_import_reaches_one_shared_run_per_set_of_arguments(
+fn an_import_reaches_one_shared_import_per_set_of_arguments(
     #[case] root: &str,
     #[case] other: &str,
     #[case] expected: &[&str],
 ) {
-    assert_shared_runs(root, other, expected);
+    assert_shared_imports(root, other, expected);
 }
 
 /// An omitted argument is its parameter's default, so an import that omits it
-/// and one that passes the default reach one shared run (`docs/chl-spec.md`,
+/// and one that passes the default reach one shared import (`docs/chl-spec.md`,
 /// "9.2 Imports", **[Planned]**). Until link-time constants exist, arguments
-/// are compared as written, and the two reach two shared runs (`docs/modules.md`,
+/// are compared as written, and the two reach two shared imports (`docs/modules.md`,
 /// "Imports"). This pins that gap.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn an_omitted_argument_and_its_default_reach_two_shared_runs() {
-    assert_shared_runs(
+fn an_omitted_argument_and_its_default_reach_two_shared_imports() {
+    assert_shared_imports(
         "import scaled(scale=3)",
         "import scaled(scale=3, offset=0)",
         &["scaled(scale=3)", "scaled(offset=0, scale=3)"],
@@ -703,9 +712,9 @@ fn an_omitted_argument_and_its_default_reach_two_shared_runs() {
 }
 
 /// Assert that a program whose root imports `scaled` with the statement `root`,
-/// and imports `nine`, which imports it with `other`, lowers the shared runs of
+/// and imports `nine`, which imports it with `other`, lowers the shared imports of
 /// `scaled` in `expected`.
-fn assert_shared_runs(root: &str, other: &str, expected: &[&str]) {
+fn assert_shared_imports(root: &str, other: &str, expected: &[&str]) {
     let program = program(
         &formatdoc! {"
             {root}
@@ -724,9 +733,9 @@ fn assert_shared_runs(root: &str, other: &str, expected: &[&str]) {
         ],
     );
     let expected: BTreeSet<String> = expected.iter().map(|s| s.to_string()).collect();
-    let mut runs = shared_runs(&program);
-    runs.remove("nine");
-    assert_eq!(runs, expected);
+    let mut shared = shared_imports(&program);
+    shared.remove("nine");
+    assert_eq!(shared, expected);
 }
 
 #[rstest]
@@ -756,14 +765,23 @@ fn assert_shared_runs(root: &str, other: &str, expected: &[&str]) {
         import scaled(scale=1 + 2)
         1
     "},
-    "an argument to an import is supported only as a literal or an import name for now"
+    "an argument to an import's value parameter is supported only as a literal or an import name \
+     for now"
+)]
+#[case::a_type_for_a_value(
+    indoc! {"
+        import scaled(scale=Int)
+        1
+    "},
+    "`scale` takes a value, and a type is an argument only to a type parameter, whose name is \
+     capitalized"
 )]
 #[case::not_a_literal_with_a_use_name(
     indoc! {"
         import scaled(scale=1 + 2) use by
         by(1)
     "},
-    "an argument to an import is supported only as a literal"
+    "an argument to an import's value parameter is supported only as a literal"
 )]
 #[case::mistyped(indoc! {r#"
     import scaled(scale="x")

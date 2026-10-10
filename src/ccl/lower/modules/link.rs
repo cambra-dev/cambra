@@ -1,5 +1,5 @@
 //! Linking: each run of a module created from the module's one lowering, and the
-//! shared runs around the root (`docs/modules.md`, "Linking").
+//! shared imports around the root (`docs/modules.md`, "Linking").
 
 use super::*;
 
@@ -83,13 +83,13 @@ pub(super) fn raw_scope(names: &HashMap<QualifiedName, Name>) -> HashMap<String,
 ///
 /// Each module lowers in link order, so the modules it imports and runs lower
 /// before it, and the root lowers last. Linking then creates each imported
-/// module's shared run, in link order, and the root's run, which creates each
-/// run it declares in turn. The shared runs' chains wrap the root's, the first
+/// module's shared import, in link order, and the root's run, which creates each
+/// run it declares in turn. The shared imports' chains wrap the root's, the first
 /// in link order outermost. A module whose own errors stop it from lowering has
 /// no interface, and a reference into it lowers to an error placeholder without
 /// an error of its own.
 ///
-/// An imported module that performs IO or declares state has no shared run,
+/// An imported module that performs IO or declares state has no shared import,
 /// and each `import` of it is the error.
 pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> LoweringResult {
     let sources = program.sources();
@@ -98,6 +98,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         program,
         lowered: HashMap::new(),
         imports: HashMap::new(),
+        type_keys: TypeKeys::default(),
         shared: HashMap::new(),
         import_refusals: HashSet::new(),
         errors: Vec::new(),
@@ -105,27 +106,32 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     // With a cycle there is no link order, and the root lowers with no module to
     // reach: loading has reported the cycle.
     let order = program.link_order().unwrap_or_default();
-    // Each import's shared run is decided by what it writes, before any module
-    // lowers, so each lowers knowing the shared run its imports reach.
-    let sites = lowering.shared_runs();
+    // Each import's shared import is decided once the module it imports has
+    // lowered, and before its importer lowers, so the importer reaches the
+    // types its arguments give.
+    let mut sites = HashMap::new();
     for &file in order {
+        lowering.import_keys(file, &mut sites, ctx);
         if file != root {
             lowering.lower(file, ctx);
         }
     }
+    if !order.contains(&root) {
+        lowering.import_keys(root, &mut sites, ctx);
+    }
     let mut chains = Vec::new();
-    // A shared run is created after the shared runs it reaches, and a run's
+    // A shared import is created after the shared imports it reaches, and a run's
     // key holds the keys of the imports it passes, so the order is well founded.
     let position: HashMap<FileId, usize> = order
         .iter()
         .enumerate()
         .map(|(i, file)| (*file, i))
         .collect();
-    let mut in_order: Vec<&SharedRun> = sites.keys().collect();
-    in_order.sort_by_key(|run| (position.get(&sites[*run].0).copied(), (*run).clone()));
-    for run in in_order {
-        if sites[run].0 != root {
-            lowering.ensure_shared_run(run, &sites, &mut chains, ctx);
+    let mut in_order: Vec<&SharedImport> = sites.keys().collect();
+    in_order.sort_by_key(|shared| (position.get(&sites[*shared].0).copied(), (*shared).clone()));
+    for shared in in_order {
+        if sites[shared].0 != root {
+            lowering.ensure_shared_import(shared, &sites, &mut chains, ctx);
         }
     }
 
@@ -171,7 +177,25 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             ))
         })
         .collect();
+    // The root's type parameters take their defaults, each after the ones
+    // declared above it, which its default may name.
+    let mut defaults = HashMap::new();
+    let mut declared: Vec<&Parameter> = ctx.parameters.iter().collect();
+    declared.sort_by_key(|parameter| parameter.declared.start);
+    for parameter in declared {
+        if let ParameterKind::Type {
+            param,
+            default: Some(default),
+            ..
+        } = &parameter.kind
+        {
+            let mut default = default.clone();
+            substitute(&mut default, &defaults);
+            defaults.insert(param.id, default);
+        }
+    }
     let value = lowered.value.map(|mut chain| {
+        substitute_in(&mut chain, &defaults);
         let mut qualified = lowering.shared_names(&scope);
         // The root's Module-typed parameters take their defaults.
         let mut modules = HashMap::new();
@@ -200,19 +224,21 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
 }
 
 /// The lowering of a program's modules: each module lowered once, the shared
-/// run each `import` reaches, the names each shared run reaches, and the errors
+/// import each `import` reaches, the names each shared import reaches, and the errors
 /// found.
 pub(super) struct ProgramLowering<'a> {
     pub(super) program: &'a LoadedProgram,
     /// Each module other than the root, lowered, by file, or `None` when it has
     /// no syntax tree or has errors of its own.
     pub(super) lowered: HashMap<FileId, Option<Rc<LoweredModule>>>,
-    /// The shared run each `import` statement reaches, by the statement. An
-    /// import whose arguments are in error reaches none.
-    pub(super) imports: HashMap<Span, SharedRun>,
-    /// The names each shared run reaches ([`Created::names`]), or `None` when it
+    /// What each `import` statement reaches, by the statement. An import whose
+    /// arguments are in error reaches nothing.
+    pub(super) imports: HashMap<Span, Imported>,
+    /// The key of each type an import passes as an argument.
+    pub(super) type_keys: TypeKeys,
+    /// The names each shared import reaches ([`Created::names`]), or `None` when it
     /// has none.
-    pub(super) shared: HashMap<SharedRun, Option<Rc<HashMap<QualifiedName, Name>>>>,
+    pub(super) shared: HashMap<SharedImport, Option<Rc<HashMap<QualifiedName, Name>>>>,
     /// The imported modules whose statements an import may not hold have been
     /// reported ([`ProgramLowering::importable`]).
     pub(super) import_refusals: HashSet<FileId>,
@@ -222,13 +248,14 @@ pub(super) struct ProgramLowering<'a> {
 /// The arguments a run is created with ([`ProgramLowering::create`]).
 pub(super) enum Supplied<'a> {
     /// A run's: the parameters its `run` statement passes value arguments for,
-    /// each bound above the run under its run name, and its module arguments,
-    /// each the names its module reaches, with the argument's span.
-    Run(&'a [SmolStr], Vec<PassedModule>),
-    /// A shared run's: its import's constants, a literal bound at the head of
+    /// each bound above the run under its run name, its module arguments, each
+    /// the names its module reaches, with the argument's span, and its type
+    /// arguments, by parameter, as its declaring module's chain holds them.
+    Run(&'a [SmolStr], Vec<PassedModule>, HashMap<SmolStr, Type>),
+    /// A shared import's: its import's constants, a literal bound at the head of
     /// its chain under its spelling, `scaled(scale=3)`, and an import name
-    /// reaching its shared run.
-    Import(&'a SharedRun, &'a ImportSite),
+    /// reaching its shared import.
+    Import(&'a SharedImport, &'a ImportSite),
 }
 
 /// A module passed to a Module-typed parameter, at `span`: the names its run
@@ -351,55 +378,55 @@ impl ProgramLowering<'_> {
         self.importable(file).then(|| Rc::clone(&lowered.interface))
     }
 
-    /// Create the shared run `run`, of those in `sites`, if it is not created
-    /// yet, after each shared run it reaches: those its module imports and those
+    /// Create the shared import `shared`, of those in `sites`, if it is not created
+    /// yet, after each shared import it reaches: those its module imports and those
     /// its arguments name. Each chain is pushed onto `chains` once its own
-    /// shared runs' are.
-    pub(super) fn ensure_shared_run(
+    /// shared imports' are.
+    pub(super) fn ensure_shared_import(
         &mut self,
-        run: &SharedRun,
-        sites: &HashMap<SharedRun, (FileId, ImportSite)>,
+        shared: &SharedImport,
+        sites: &HashMap<SharedImport, (FileId, ImportSite)>,
         chains: &mut Vec<Expr>,
         ctx: &mut LoweringContext,
     ) {
-        if self.shared.contains_key(run) {
+        if self.shared.contains_key(shared) {
             return;
         }
-        // Each shared run is created once, and a cycle among imports is refused
+        // Each shared import is created once, and a cycle among imports is refused
         // by loading, so the entry made here ends the recursion.
-        self.shared.insert(run.clone(), None);
-        let (file, site) = &sites[run];
-        let mut reached: Vec<SharedRun> = run
+        self.shared.insert(shared.clone(), None);
+        let (file, site) = &sites[shared];
+        let mut reached: Vec<SharedImport> = shared
             .arguments
             .iter()
             .filter_map(|(_, argument)| match argument {
-                KeyArgument::Module(run) => Some(run.clone()),
-                KeyArgument::Lit(_) => None,
+                KeyArgument::Module(passed) => Some(passed.clone()),
+                KeyArgument::Lit(_) | KeyArgument::Type(_) => None,
             })
             .collect();
         if let Some(ast) = self.program.ast(*file) {
             reached.extend(
                 ast.body
                     .iter()
-                    .filter_map(|stmt| self.imports.get(&stmt.span).cloned()),
+                    .filter_map(|stmt| Some(self.imports.get(&stmt.span)?.shared.clone())),
             );
         }
         for reached in &reached {
             if sites.contains_key(reached) {
-                self.ensure_shared_run(reached, sites, chains, ctx);
+                self.ensure_shared_import(reached, sites, chains, ctx);
             }
         }
-        if let Some(chain) = self.shared_run(*file, run.clone(), site, ctx) {
+        if let Some(chain) = self.shared_import(*file, shared.clone(), site, ctx) {
             chains.push(chain);
         }
     }
 
-    /// Create the shared run `run` of the imported module in `file`, for the
+    /// Create the shared import `shared` of the imported module in `file`, for the
     /// import `site`, recording the names it reaches, and return its chain.
-    pub(super) fn shared_run(
+    pub(super) fn shared_import(
         &mut self,
         file: FileId,
-        run: SharedRun,
+        shared: SharedImport,
         site: &ImportSite,
         ctx: &mut LoweringContext,
     ) -> Option<Expr> {
@@ -407,25 +434,25 @@ impl ProgramLowering<'_> {
         let created = interface
             .filter(|interface| interface.unimportable.is_none())
             .and_then(|_| {
-                let home = Home::Shared(run.clone());
-                self.create(file, Some(home), None, Supplied::Import(&run, site), ctx)
+                let home = Home::Import(shared.clone());
+                self.create(file, Some(home), None, Supplied::Import(&shared, site), ctx)
             });
         let (chain, names) = match created {
             Some(created) => (Some(created.chain), Some(Rc::new(created.names))),
             None => (None, None),
         };
-        self.shared.insert(run, names);
+        self.shared.insert(shared, names);
         chain
     }
 
     /// Create a run of the module in `file` with `home` as its members' home:
-    /// a shared run, with no `run` statement, or the run at the run path and
+    /// a shared import, with no `run` statement, or the run at the run path and
     /// `run` statement `place`, with the arguments `supplied`. `None` when the
     /// module has no lowering.
     ///
     /// Its chain is a copy of the module's. Each parameter with an argument
     /// reads it ([`argument_name`]), and one with neither an argument nor a
-    /// default is an error. A shared run's arguments are constants, bound at
+    /// default is an error. A shared import's arguments are constants, bound at
     /// the head of its chain at their parameters' types, so a mismatch is the
     /// argument's error. Each run it declares is created in turn and put in
     /// place ([`Self::expand_runs`]). It is uniquified with a scope that maps
@@ -455,26 +482,50 @@ impl ProgramLowering<'_> {
                 .and_then(|(path, _)| path.last())
                 .expect("a run has a name")
                 .to_string(),
-            Supplied::Import(run, _) => run.to_string(),
+            Supplied::Import(shared, _) => shared.to_string(),
         };
         let own = self.shared_names(&lowered.scope);
         let mut modules: HashMap<SmolStr, Rc<HashMap<QualifiedName, Name>>> = HashMap::new();
+        // A type parameter's default is its module's own type, so it takes the
+        // run's names. An argument is its declaring module's, so it replaces the
+        // parameter once the run is uniquified, and the declaring module's
+        // `let type` of it resolves its refinements where it is written.
+        let given = match &supplied {
+            Supplied::Run(.., types) => types,
+            Supplied::Import(_, site) => &site.types,
+        };
+        let mut defaults = HashMap::new();
+        let mut arguments = HashMap::new();
         for parameter in &lowered.interface.parameters {
-            if let Some(ty) = parameter.module() {
+            if let ParameterKind::Type { param, default, .. } = &parameter.kind {
+                if let Some(argument) = given.get(&parameter.name) {
+                    arguments.insert(param.id, argument.clone());
+                    continue;
+                }
+                if let Some(default) = default {
+                    let mut default = default.clone();
+                    substitute(&mut default, &defaults);
+                    defaults.insert(param.id, default);
+                    continue;
+                }
+            } else if let Some(ty) = parameter.module() {
                 let argument = match &supplied {
-                    Supplied::Run(_, arguments) => arguments
+                    Supplied::Run(_, arguments, _) => arguments
                         .iter()
                         .find(|argument| argument.parameter == parameter.name)
                         .map(|argument| (argument.names.clone(), argument.span)),
-                    // A shared run that failed to be created has no names.
+                    // A shared import that failed to be created has no names.
                     Supplied::Import(_, site) => match site.arguments.get(&parameter.name) {
-                        Some((span, KeyArgument::Module(run))) => {
-                            Some((self.shared.get(run).cloned().flatten(), *span))
+                        Some((span, KeyArgument::Module(passed))) => {
+                            Some((self.shared.get(passed).cloned().flatten(), *span))
                         }
                         Some((span, KeyArgument::Lit(_))) => {
                             self.errors
                                 .extend(parameter.mismatched(false, *span, IMPORT_MODULE));
                             continue;
+                        }
+                        Some((_, KeyArgument::Type(_))) => {
+                            unreachable!("a type argument is for a capitalized parameter")
                         }
                         None => None,
                     },
@@ -500,9 +551,12 @@ impl ProgramLowering<'_> {
                 }
             } else {
                 let given = match &supplied {
-                    Supplied::Run(arguments, _) => arguments.contains(&parameter.name),
+                    Supplied::Run(arguments, ..) => arguments.contains(&parameter.name),
                     Supplied::Import(_, site) => match site.arguments.get(&parameter.name) {
                         Some((_, KeyArgument::Lit(_))) => true,
+                        Some((_, KeyArgument::Type(_))) => {
+                            unreachable!("a type argument is for a capitalized parameter")
+                        }
                         Some((span, KeyArgument::Module(_))) => {
                             self.errors
                                 .extend(parameter.mismatched(true, *span, IMPORT_MODULE));
@@ -551,7 +605,7 @@ impl ProgramLowering<'_> {
                 .iter()
                 .filter_map(|(parameter, (span, argument))| match argument {
                     KeyArgument::Lit(value) => Some((parameter, (span, value))),
-                    KeyArgument::Module(_) => None,
+                    KeyArgument::Module(_) | KeyArgument::Type(_) => None,
                 })
                 .collect();
             arguments.sort_by(|l, r| l.0.cmp(r.0));
@@ -571,6 +625,7 @@ impl ProgramLowering<'_> {
                 chain = ctx.tag_image(bound, *span);
             }
         }
+        substitute_in(&mut chain, &defaults);
         let mut qualified = own;
         let chain = self.expand_runs(chain, &path, &mut qualified, &modules, ctx);
         let (sinks, refused) = match &place {
@@ -579,7 +634,8 @@ impl ProgramLowering<'_> {
         };
         self.errors.extend(refused);
         let scope = use_names(&lowered.scope, qualified);
-        let uniquified = uniquify::run_in(chain, &raw_scope(&scope), home.clone());
+        let mut uniquified = uniquify::run_in(chain, &raw_scope(&scope), home.clone());
+        substitute_in(&mut uniquified, &arguments);
         let mut names = scope;
         let (spine, _) = spine(&uniquified);
         for name in spine {
@@ -655,7 +711,9 @@ impl ProgramLowering<'_> {
     /// `expr`, a module's chain, with each [`TypedExprNode::Run`] on its spine
     /// replaced by the run it declares, at a run path under `path`, around the
     /// rest of the module. Each name a created run reaches is recorded in
-    /// `qualified`, spelled through its run name.
+    /// `qualified`, spelled through its run name. Each type argument the run
+    /// takes is a `let type` where the `Run` stood, which resolves the
+    /// argument's refinements in the declaring module's scope.
     pub(super) fn expand_runs(
         &mut self,
         mut expr: Expr,
@@ -671,6 +729,7 @@ impl ProgramLowering<'_> {
                 statement,
                 arguments,
                 modules: passed,
+                types,
                 body,
             } = expr.node
             else {
@@ -685,6 +744,10 @@ impl ProgramLowering<'_> {
                     span,
                 })
                 .collect();
+            let given = types
+                .iter()
+                .map(|(parameter, _, ty)| (parameter.clone(), ty.clone()))
+                .collect();
             let run_path = path.child(name.clone());
             let created = self.program.file_of(&module).and_then(|file| {
                 let home = Home::Run(run_path.clone());
@@ -693,19 +756,29 @@ impl ProgramLowering<'_> {
                     file,
                     Some(home),
                     place,
-                    Supplied::Run(&arguments, passed),
+                    Supplied::Run(&arguments, passed, given),
                     ctx,
                 )
             });
-            let Some(created) = created else {
-                return self.expand_runs(*body, path, qualified, modules, ctx);
+            let run = match created {
+                Some(created) => {
+                    // The rest of the module, below the run, reaches it.
+                    for (spelling, binder) in created.names {
+                        qualified.insert(QualifiedName::new(name.clone()).then(&spelling), binder);
+                    }
+                    let body = self.expand_runs(*body, path, qualified, modules, ctx);
+                    fill_module_body(created.chain, body)
+                }
+                None => self.expand_runs(*body, path, qualified, modules, ctx),
             };
-            // The rest of the module, below the run, reaches it.
-            for (spelling, binder) in created.names {
-                qualified.insert(QualifiedName::new(name.clone()).then(&spelling), binder);
-            }
-            let body = self.expand_runs(*body, path, qualified, modules, ctx);
-            return fill_module_body(created.chain, body);
+            return types
+                .into_iter()
+                .rev()
+                .fold(run, |body, (parameter, span, ty)| {
+                    let bound = argument_name(&name, &parameter);
+                    let bound = Expr::let_type(bound.base(), AliasType::Type(ty), body);
+                    ctx.tag_image(bound, span)
+                });
         }
         // The rest of the spine stays in place, so no node is minted.
         if let Some(body) = spine_body_mut(&mut expr) {
@@ -715,12 +788,15 @@ impl ProgramLowering<'_> {
         expr
     }
 
-    /// Each name the shared runs of `scope`'s import names reach, spelled
+    /// Each name the shared imports of `scope`'s import names reach, spelled
     /// through the import name.
     pub(super) fn shared_names(&self, scope: &ModuleScope) -> HashMap<QualifiedName, Name> {
         let mut qualified = HashMap::new();
         for (qualifier, reached) in &scope.qualifiers {
-            let Some(Some(names)) = reached.shared.as_ref().and_then(|run| self.shared.get(run))
+            let Some(Some(names)) = reached
+                .shared
+                .as_ref()
+                .and_then(|shared| self.shared.get(shared))
             else {
                 continue;
             };
@@ -734,13 +810,12 @@ impl ProgramLowering<'_> {
         qualified
     }
 
-    /// The scope `module` lowers in ([`module_scope`]).
-    pub(super) fn scope(
+    /// The interface each `import` and `run` statement of `module` reaches, by
+    /// the statement, or `None` where there is none.
+    pub(super) fn interfaces(
         &mut self,
         module: &ChlModule,
-        labels: Option<ModulePath>,
-        ctx: &LoweringContext,
-    ) -> ModuleScope {
+    ) -> HashMap<Span, Option<Rc<Interface>>> {
         let mut interfaces = HashMap::new();
         for stmt in &module.body {
             let path = match &stmt.node {
@@ -761,6 +836,17 @@ impl ProgramLowering<'_> {
             };
             interfaces.insert(stmt.span, interface);
         }
+        interfaces
+    }
+
+    /// The scope `module` lowers in ([`module_scope`]).
+    pub(super) fn scope(
+        &mut self,
+        module: &ChlModule,
+        labels: Option<ModulePath>,
+        ctx: &LoweringContext,
+    ) -> ModuleScope {
+        let interfaces = self.interfaces(module);
         module_scope(
             module,
             labels,
@@ -840,7 +926,7 @@ pub(super) fn use_names(
         let Reached::Value(Some(reference)) = &used.reached else {
             continue;
         };
-        // An import whose arguments are in error reaches no shared run, and its `use` names
+        // An import whose arguments are in error reaches no shared import, and its `use` names
         // reach nothing: the error at the import accounts for them.
         let qualifier = reference.name.segments().first();
         if !names

@@ -47,6 +47,7 @@
 //! the spelling is unambiguous in almost every rendering. `Debug` surfaces the
 //! `uid` for [`Name::Unique`].
 
+use crate::ccl::Type;
 use crate::ccl::ops::Lit;
 use crate::chl_parser::ModulePath;
 use crate::chl_parser::ast::{QualifiedName as ParserQualifiedName, Spanned};
@@ -226,8 +227,8 @@ impl std::hash::Hash for PiRef {
 /// their home").
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Home {
-    /// The shared run of an imported module.
-    Shared(SharedRun),
+    /// The shared import of an imported module.
+    Import(SharedImport),
     /// A run a `run` statement declares, by its run path.
     Run(RunPath),
 }
@@ -235,44 +236,115 @@ pub enum Home {
 impl fmt::Display for Home {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Home::Shared(run) => write!(f, "{run}"),
+            Home::Import(shared) => write!(f, "{shared}"),
             Home::Run(run) => write!(f, "{run}"),
         }
     }
 }
 
-/// The shared run of an imported module: one per module and distinct set of
+/// The shared import of an imported module: one per module and distinct set of
 /// arguments its imports pass (`docs/chl-spec.md`, "9.2 Imports").
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SharedRun {
+pub struct SharedImport {
     pub module: ModulePath,
     /// Each argument, by its parameter, in parameter-name order.
     pub arguments: Arc<[(SmolStr, KeyArgument)]>,
 }
 
-/// An argument an import passes, as its shared run's key holds it: a constant
+/// An argument an import passes, as its shared import's key holds it: a constant
 /// (`docs/chl-spec.md`, "9.2 Imports").
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KeyArgument {
     Lit(Lit),
-    /// An import name, passed as a value of its Module type: the shared run it
+    /// An import name, passed as a value of its Module type: the shared import it
     /// reaches.
-    Module(SharedRun),
+    Module(SharedImport),
+    /// A type, made canonical.
+    Type(TypeKey),
 }
 
-impl SharedRun {
-    /// The shared run an import of `module` with no arguments reaches.
+/// A type argument in a shared import's key: the id [`TypeKeys`] gives every equal
+/// canonical type ([`Type::canonical`]), and that type as `Display for Type` writes it.
+/// Two type arguments reach one shared import exactly when their canonical types are
+/// equal, so the key compares and hashes by the id, and two written alike still reach
+/// two. It orders by its spelling, then by the id, so the order of a module's shared
+/// imports follows their types rather than which `import` was decided first
+/// (`docs/modules.md`, "Linking"). An id means something only among the keys one
+/// [`TypeKeys`] gives, which is one compilation's. The type itself stays out of the key,
+/// since a [`Name`]'s home holds the key and a type is neither `Send` nor `Sync`.
+#[derive(Clone, Debug)]
+pub struct TypeKey {
+    id: u32,
+    written: SmolStr,
+}
+
+impl fmt::Display for TypeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.written)
+    }
+}
+
+impl PartialEq for TypeKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for TypeKey {}
+
+impl std::hash::Hash for TypeKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.id, state);
+    }
+}
+
+impl PartialOrd for TypeKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Consistent with equality: keys of one id are of one canonical type, so they share a
+/// spelling.
+impl Ord for TypeKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&self.written, self.id).cmp(&(&other.written, other.id))
+    }
+}
+
+/// The keys of the type arguments one compilation's imports pass, one per canonical type
+/// ([`TypeKey`]).
+#[derive(Default)]
+pub struct TypeKeys(std::collections::HashMap<Type, TypeKey>);
+
+impl TypeKeys {
+    /// The key of the type argument `ty`, which equal types written differently share.
+    pub fn key(&mut self, ty: &Type) -> TypeKey {
+        let canonical = ty.canonical();
+        let id = u32::try_from(self.0.len()).expect("fewer than 2^32 type arguments");
+        self.0
+            .entry(canonical)
+            .or_insert_with_key(|canonical| TypeKey {
+                id,
+                written: canonical.to_string().into(),
+            })
+            .clone()
+    }
+}
+
+impl SharedImport {
+    /// The shared import an import of `module` with no arguments reaches.
     #[cfg(test)]
     pub fn of(module: ModulePath) -> Self {
-        SharedRun {
+        SharedImport {
             module,
             arguments: Arc::new([]),
         }
     }
 }
 
-/// `m`, or `m(port=8080, region="eu")` for a shared run with arguments.
-impl fmt::Display for SharedRun {
+/// `m`, or `m(port=8080, region="eu")` for a shared import with arguments.
+impl fmt::Display for SharedImport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.module)?;
         if self.arguments.is_empty() {
@@ -291,7 +363,8 @@ impl fmt::Display for SharedRun {
                 KeyArgument::Lit(Lit::Unit) => {
                     unreachable!("no import argument is the unit constant")
                 }
-                KeyArgument::Module(run) => write!(f, "{parameter}={run}")?,
+                KeyArgument::Module(shared) => write!(f, "{parameter}={shared}")?,
+                KeyArgument::Type(key) => write!(f, "{parameter}={key}")?,
             }
         }
         f.write_str(")")
@@ -631,8 +704,8 @@ impl Name {
                 ..
             } => match &**home {
                 Home::Run(run) => crate::ccl::Label::in_run(run.clone(), base.clone()),
-                Home::Shared(run) => unreachable!(
-                    "`{base}` of the shared run `{run}` is no mutable variable: an import of \
+                Home::Import(shared) => unreachable!(
+                    "`{base}` of the shared import `{shared}` is no mutable variable: an import of \
                      a module that declares state is refused"
                 ),
             },

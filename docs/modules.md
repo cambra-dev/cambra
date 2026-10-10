@@ -7,7 +7,7 @@
 > questions](#open-questions) what it leaves undecided.
 
 The language rules for modules are [chl-spec.md, "9. Modules"](chl-spec.md#9-modules):
-imports, runs, parameters, visibility, qualified references, Module types, shared runs, and how a
+imports, runs, parameters, visibility, qualified references, Module types, shared imports, and how a
 reload treats runs. This document is how the compiler implements them, and uses that section's
 vocabulary ([chl-spec.md, "9.1 Vocabulary"](chl-spec.md#91-vocabulary)).
 
@@ -56,7 +56,7 @@ The order does not affect meaning, since members of different modules never shar
 deterministic because two compilations of one root must produce one tree: program diffing compares
 trees structurally ([src/ccl/design/diffing.md](../src/ccl/design/diffing.md)).
 
-Linking puts one shared run per imported module and distinct set of arguments, in link order,
+Linking puts one shared import per imported module and distinct set of arguments, in link order,
 around the root, and each run at its `run` statement in the module that declares it
 ([Runs](#runs)). Each is created from its module's lowering, which happens once ([A module lowers
 once](#a-module-lowers-once)).
@@ -116,9 +116,9 @@ join them with `::` only in the raw name a reference lowers to and in the scope 
 in (`raw_scope`).
 
 One change to `Name` (`src/ccl/names.rs`): **`Name::Unique { base, uid, home }`**, where `home` is
-the run a member belongs to: `Shared(SharedRun)` for a shared run's member, its module path and its
-arguments, `Run(run_path)` for a member of a run a `run` statement declares, and absent for a
-local. Identity remains the `uid`.
+the run a member belongs to: `Import(SharedImport)` for a shared import's member, its module path
+and its arguments, `Run(run_path)` for a member of a run a `run` statement declares, and absent for
+a local. Identity remains the `uid`.
 `home` is metadata of the kind `base` already is. It is implemented as `home: Option<Arc<Home>>`.
 `uniquify::run_in` mints a run's top-level binders with it, and every other binder, the root's
 members included, without one. A pass that re-mints a copy of a binder keeps its home
@@ -175,7 +175,7 @@ Linking creates each run from its module's lowering (`ProgramLowering::create`):
 2. **Create each run it declares**, at its `Run` node, and put its chain there around the rest of
    the module (`ProgramLowering::expand_runs`).
 3. **Uniquify** the copy with the run's home, in a scope that maps each spelling through a
-   qualifier to the binder of the run the qualifier reaches: `m::f` to the shared run's member,
+   qualifier to the binder of the run the qualifier reaches: `m::f` to the shared import's member,
    `eu::f` to the member of the run `eu` created in step 2. Each `use` name of an import maps to its
    member's binder.
 4. **Register** the sinks the module declares, keyed by the run path.
@@ -203,7 +203,7 @@ root file
                Checking a module on its own" requires
   → run sites  each import against the IO its module performs and the state it declares; each
                run's arguments against its module's parameter types
-  → link       create each shared run, one per imported module and distinct set of arguments, in
+  → link       create each shared import, one per imported module and distinct set of arguments, in
                link order, and the root's run, which creates each run it declares at its `run`
                statement; each run a uniquified copy of its module's chain
   → infer …    over the linked tree: specialization and refinement propagation
@@ -254,7 +254,7 @@ Importing values and type aliases is implemented: `import m`, `import a::b as c`
 `import m(x=1)`, `use` clauses on an `import`, `pub` on value bindings, `def`s and type aliases,
 `m::f` as a value, a callee, and a qualifier of labels and tags, and `m::T` as a type.
 
-- **An imported module has a shared run per distinct set of arguments its imports pass**, created
+- **An imported module has a shared import per distinct set of arguments its imports pass**, created
   from its lowering in link order and linked around the root ([A module lowers
   once](#a-module-lowers-once)).
 - **An interface records declarations.** `Interface` (`src/ccl/lower/modules/interface.rs`) records each
@@ -270,10 +270,10 @@ Importing values and type aliases is implemented: `import m`, `import a::b as c`
   an error, and so is a `use` name spelled like an import name, another `use` name, a builtin, or a
   built-in type. A builtin call resolves by its spelling before scope (`lower_call`), so a `use`
   name spelled like one would never reach its member.
-- **Linking** puts each shared run's chain around the root, once, in link order, the first in link
-  order outermost ([A module lowers once](#a-module-lowers-once)).
+- **Linking** puts each shared import's chain around the root, once, in link order, the first in
+  link order outermost ([A module lowers once](#a-module-lowers-once)).
 - **IO and state.** A module that declares a sink or mutable state (`sink_site`, `state_site`), or
-  reads a registered source, which lowering records, has no shared run. Each `import` of it is an
+  reads a registered source, which lowering records, has no shared import. Each `import` of it is an
   error, labeled at the site (`Unimportable`). Lowering declares a sink without opening anything, so
   lowering such a module is harmless; a run of it registers the sink.
 - **What an import may hold.** A `run` and an expression statement in an imported module are
@@ -285,17 +285,30 @@ Importing values and type aliases is implemented: `import m`, `import a::b as c`
   label, and `m::` qualifies the label of the module `m` names. A nominal type's constructor is not
   a label, so `Option::some` is the same in every module
   ([Names carry their home](#names-carry-their-home)).
-- **Arguments.** Each import's shared run is decided by what it writes, before any module lowers
-  (`ProgramLowering::shared_runs`): its module and its arguments, `Home::Shared`'s `SharedRun`. Each
-  import qualifier records the shared run it reaches. A shared run is created for the first
-  statement that reaches it. Two sets are compared as written, so an omitted argument and one equal
-  to its default reach two shared runs, where chl-spec.md's "9.2 Imports" has them reach one.
-  Comparing them needs a default evaluated at link time ([Link-time constants](#dependencies)). An
-  argument is a literal or an import name; anything else is an error at the argument
-  ([Dependencies](#dependencies)). An import name's shared run is part of the key,
-  `shop(counter=counter)`, and is created first (`ProgramLowering::ensure_shared_run`). Each literal
-  is bound at the head of the shared run's chain, at its parameter's type, and a parameter with
-  neither an argument nor a default is an error at the `import`.
+- **Arguments.** Each import's shared import is decided by what it writes, once the modules its
+  importer imports have lowered and before the importer does (`ProgramLowering::import_keys`): its
+  module and its arguments, `Home::Import`'s `SharedImport`. Each import qualifier records the
+  shared import it reaches and the types that gives its module's type parameters. A shared import is
+  created for the first statement that reaches it. Two sets are compared as written, so an omitted
+  argument and one equal to its default reach two shared imports, where chl-spec.md's "9.2 Imports"
+  has them reach one. Comparing them needs a default evaluated at link time ([Link-time
+  constants](#dependencies)). An argument is a literal, a type, or an import name; anything else is
+  an error at the argument ([Dependencies](#dependencies)). An import name's shared import is part
+  of the key, `shop(counter=counter)`, and is created first
+  (`ProgramLowering::ensure_shared_import`). Each literal is bound at the head of the shared
+  import's chain, at its parameter's type, and a parameter with neither an argument nor a default is
+  an error at the `import`.
+- **Type arguments.** A type argument is lowered against the importer's other imports, so the
+  importer's imports are decided in rounds: one waits until the imports whose names its arguments
+  write are decided. Its key is the type made canonical, each record's fields and each sum's arms in
+  label order (`Type::canonical`), so `holder(T={a: Int, b: String})` and
+  `holder(T={b: String, a: Int})` are one key. Keys are interned per compilation (`TypeKeys`) and
+  ordered by their spelling, so the order of a module's shared imports does not depend on statement
+  order. A type argument is built from built-in types and imported type
+  members: one naming a type the importer declares, or with a refinement that reads a value, is an
+  error at the argument. This restriction is temporary: link-time constants lift it ([Link-time
+  constants](#dependencies)). The module's copy for the import takes each type argument as a run's
+  copy does ([Runs](#runs)).
 - **Refused:** an imported module's nominal `type` declarations and top-level `if`, `match` and
   `with` statements.
 
@@ -340,11 +353,26 @@ members reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
   for one is reported where the module uses it, until a module is checked alone. A value parameter
   without an annotation is refused (`refuse_module_syntax`). The root takes every parameter's
   default, and a parameter without one is an error there.
-- **Refused:** a type parameter (item 7), `@RenamedFrom`, a `run` in an imported module, and a
-  nominal `type` declaration, an associated function or an `impl` block in any module but the root
-  (`module_nominal_refusals`). `pub` on a `run` is a parse error, since a module returns a run by
-  binding it to a public member ([A Module type is not a `Type`](#a-module-type-is-not-a-type)).
-  `pub` on `:=` is refused, so no module reaches another run's mutable variable.
+- **A type parameter is an alias of a declared `Type::Param`** from its statement down, as a `def`'s
+  is, and binds no `let` (`LoweringContext::declare_type_parameter`). The interface records its
+  bound and its default. A `run` statement's type arguments are lowered ahead of the module's
+  statements, with its type aliases, where the statement stands
+  (`LoweringContext::declare_run_types`). The run name's qualifier records the types they give, so
+  `n::Pair` and a `use` type name of the run take them, and so does each value argument's
+  annotation. The `Run` node holds the type arguments. Creating the run substitutes each default
+  before the run is uniquified, since a default is the run's own type, and each argument after.
+  Linking puts a `let type` of each argument, `__run::n::T`, where the `Run` node stood, so the
+  declaring module's uniquification resolves the argument's refinements where they are written, and
+  the run's copy shares the resolved predicates. Nothing compares an argument with its parameter's
+  bound, and each use of `T` is checked against each argument, so a body relying on more than its
+  bound is accepted while every argument provides it. Both wait on checking a module on its own, at
+  the `Run` node. A type member of a Module type, and a type member reached through a Module-typed
+  parameter, are refused.
+- **Refused:** `@RenamedFrom`, a `run` in an imported module, and a nominal `type` declaration,
+  an associated function or an `impl` block in any module but the root (`module_nominal_refusals`).
+  `pub` on a `run` is a parse error, since a module returns a run by binding it to a public member
+  ([A Module type is not a `Type`](#a-module-type-is-not-a-type)). `pub` on `:=` is refused, so no
+  module reaches another run's mutable variable.
 
 ### The module interface
 
@@ -427,7 +455,7 @@ with a Module type must be passed a module, and a module must be passed to one. 
 binds each entry's `let` to the argument's member, imaged at the argument, so a member whose type
 does not fit is the argument's error (`ProgramLowering::bind_module_parameter`). An argument whose
 module has errors of its own binds nothing and adds no error, as a reference into it adds none. The
-argument's members are those of the run or shared run it names, or, for a parameter passed on,
+argument's members are those of the run or shared import it names, or, for a parameter passed on,
 those of that parameter's argument (`module_names`). A default names an import, checked while the
 module lowers and taken by a run that passes no argument.
 
@@ -443,7 +471,7 @@ is not known where the module lowers.
 ### `use` names are environment entries, not bindings
 
 `import n use f` in module `m` does not lower to a `let`. Each run of `m` is uniquified with `f`
-mapped to the binder of `n`'s member `f` in `n`'s shared run, beneath every binder of the tree
+mapped to the binder of `n`'s member `f` in `n`'s shared import, beneath every binder of the tree
 (`uniquify::run_in`). An unshadowed use of `f` resolves to that binder, and a local `f` shadows it
 by ordinary lexical scope. The scope has no position, so a `use` name is in scope throughout its
 module, above its `import` too. A `use` clause on a run binds `f` instead with a `let` of `r::f` at
@@ -561,7 +589,7 @@ own"](chl-spec.md#914-checking-a-module-on-its-own)), is not implemented.
 
 - **State belongs to runs.** A `VarPath` begins with the run path, then the enclosing binding chain,
   spelling, and index as today. The run-path segment has its own variant, so a run `cart` and a
-  binding named `cart` never produce the same address. Display: ``eu::`a`.`n` ``. A shared run
+  binding named `cart` never produce the same address. Display: ``eu::`a`.`n` ``. A shared import
   holds no state, so no address names one.
 - **A reload carries every file.** `/diff` and `/reload` take a bundle mapping each module path to
   its source, including the root's. The single-source request form is removed. Reading files from
@@ -678,7 +706,7 @@ run storefront(port="8081", region="us", audit=audit) as us
 What each rule contributes:
 
 - `catalog` performs no IO, so `storefront` imports it, and both storefront runs reach its one
-  shared run.
+  shared import.
 - `storefront` checks alone: its parameters are typed by their annotations. Each `run` checks its
   arguments: the run `audit` has an `events` member of type `Feed(audit_api::Event)`, so its Module
   type is a subtype of `AuditLog` by width.
@@ -710,8 +738,8 @@ One PR per item, each updating the spec and design docs it touches:
 3. **Loading and the module graph.** Path resolution, per-file parsing, module paths in the
    `SourceMap`, cycle refusal, link order.
 4. **Imports**, in four parts:
-   1. **Values.** Per-module lowering and uniquification, interfaces, shared runs, the IO check on
-      imports, visibility, qualified callees, labels and tags that carry their module.
+   1. **Values.** Per-module lowering and uniquification, interfaces, shared imports, the IO check
+      on imports, visibility, qualified callees, labels and tags that carry their module.
    2. **`use` clauses.**
    3. **Imported type aliases**, closed over their module.
    4. **`Mut`-parameter functions**, and the refusal of importing a module that declares state:
@@ -724,13 +752,18 @@ One PR per item, each updating the spec and design docs it touches:
       `Unique::home`, run members, state and IO in runs, sink and history keys qualified by run
       path, route uniqueness across runs.
    2. **Value parameters.** `param`, keyword arguments, defaults, run-site checks.
-7. **Module types and type parameters**, in three parts:
-   1. **Arguments to an import.** One shared run per module and distinct set of constant arguments
-      ([chl-spec.md, "9.2 Imports"](chl-spec.md#92-imports)), with a literal as the constant.
+7. **Module types and type parameters**, in five parts:
+   1. **Arguments to an import.** One shared import per module and distinct set of constant
+      arguments ([chl-spec.md, "9.2 Imports"](chl-spec.md#92-imports)), with a literal as the
+      constant.
    2. **Module types.** `Module{…}`, Module-typed parameters and the qualified references through
       them, an import name or run name as an argument, a member bound to a run, and feeding another
       run's feed.
-   3. **Type parameters**, and a type as an argument.
+   3. **Type parameters**, and a type as an argument to a run or an import.
+   4. **Type members of Module types**, `Module{Receipt <: {id: String}}`, and a type member reached
+      through a Module-typed parameter, `payments::Receipt`.
+   5. **Inferred type arguments.** A type parameter a `run` or an `import` leaves out, inferred from
+      the types of its other arguments ([chl-spec.md, "9.4 Parameters"](chl-spec.md#94-parameters)).
 8. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
    removed.
 9. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
@@ -767,12 +800,13 @@ the [Implementation stack](#implementation-stack).
   file or several. Needed for a per-run type such as `InStock` ([chl-spec.md, "9.7 Importing
   asserts no IO and no state"](chl-spec.md#97-importing-asserts-no-io-and-no-state)).
 - **Link-time constants.** A value fixed once linking binds a run's arguments, such as a route
-  address passed as a parameter, and every argument to an import, which keys its shared run. A run
-  argument may be any expression, so this needs its own definition of which expressions are
+  address passed as a parameter, and every argument to an import, which keys its shared import. A
+  run argument may be any expression, so this needs its own definition of which expressions are
   link-time constants and when they are evaluated ([chl-spec.md, "9.19 Open
   questions"](chl-spec.md#919-open-questions)). Until it exists a route address is a literal
   ([Intrinsics resolve by identity](#intrinsics-resolve-by-identity)), and an import argument is a
-  literal or an import name.
+  literal, an import name, or a type built from built-in types and imported type members whose
+  refinements read no value.
 - **`Feed(…)` declarations** ([chl-spec.md, "8.4 Feeds are the second form of
   mutability"](chl-spec.md#84-feeds-are-the-second-form-of-mutability)), for a public feed with no
   initializer.
