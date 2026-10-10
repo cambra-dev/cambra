@@ -35,7 +35,7 @@ inside dependent types (`ccl/names.rs`):
 |---|---|
 | `Raw(String)` | Source spelling before uniquification; lexical scope distinguishes equal spellings. |
 | `Unique { base, uid }` | Source binder minted by `uniquify`; `uid` distinguishes binding sites, while `base` retains the source spelling. |
-| `Synthetic { kind, uid }` | Compiler binder with a fresh `uid`; `kind` identifies its origin (`Pair`, `Mono`, `FloatedDefer`, or `SolverArg`). |
+| `Synthetic { kind, uid }` | Compiler binder with a fresh `uid`; `kind` identifies its origin (`Pair`, `Mono`, `FloatedDefer`, `SolverArg`, or `Component`). |
 | `Reserved(ReservedName)` | Special name; the shared refinement-element binder is `__elem`. |
 | `PiBound(PiRef)` | Bound reference in a function type's codomain; its de Bruijn index determines equality, while its spelling hint is display metadata. It is never a term binder. |
 

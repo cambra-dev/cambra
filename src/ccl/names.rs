@@ -20,7 +20,7 @@
 //!   identity (like [`Name::Unique`], from the same fresh-id space) plus a
 //!   provenance [`SyntheticKind`] (the tupled binder lambda elimination mints,
 //!   a monomorphization specialization, the defer-plumbing names, the solver's
-//!   dependent-application binder). It shares everything operational with
+//!   dependent-application binder, a split product's component). It shares everything operational with
 //!   `Unique` — globally distinct, capture-free, uid-identity — and differs
 //!   only in *provenance*: minted by a pass, not written by the user, so it
 //!   carries **no source spelling** (the old mangled string was noise; the
@@ -123,6 +123,10 @@ pub enum SyntheticKind {
     /// ([`crate::ccl::comprehension`]): the index position the element map is
     /// read at, which the generator sources are then indexed by.
     IterRecord,
+    /// One component of a let-bound tuple or record that holds a function,
+    /// bound on its own by the inliner so the function reaches its calls
+    /// (`src/ccl/inline.rs`, "Functions held in products").
+    Component,
 }
 
 impl SyntheticKind {
@@ -138,6 +142,7 @@ impl SyntheticKind {
             SyntheticKind::AnfTemp => "__anf",
             SyntheticKind::MutRead => "__read",
             SyntheticKind::IterRecord => "__iter_record",
+            SyntheticKind::Component => "__component",
         }
     }
 }
@@ -356,6 +361,12 @@ impl Name {
                 ..
             }
         )
+    }
+
+    /// A binder for one component of a split product (the inliner's
+    /// `SyntheticKind::Component`).
+    pub fn component() -> Self {
+        Self::synthetic(SyntheticKind::Component)
     }
 
     /// The display spelling. Total over every variant; never use it for an

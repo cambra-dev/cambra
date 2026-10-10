@@ -38,20 +38,19 @@ pub(super) fn lower_constant(constant: &ChlLit) -> Result<Expr, LoweringError> {
 /// `Function`-kind builtin nor a registered source returns [`LoweringError::Unsupported`]; this
 /// includes `begin()`, `test_sink()`, and `http_serve()` outside the statement that recognizes
 /// them.
+///
+/// A callee that is an expression rather than a name — `r.f(x)`, a field of a
+/// record — is ordinary application of the function value it evaluates to
+/// ([`lower_expression_call`]).
 pub(super) fn lower_call(
     func: &Spanned<ChlExpr>,
     args: &[Spanned<ChlExpr>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let name = match &func.node {
-        ChlExpr::Name(id) => id.as_str(),
-        _ => {
-            return Err(LoweringError::unsupported(
-                func.span,
-                "only named function calls are supported",
-            ));
-        }
+    let ChlExpr::Name(id) = &func.node else {
+        return lower_expression_call(func, args, ctx);
     };
+    let name = id.as_str();
 
     let builtin = SurfaceBuiltin::from_name(name);
     match builtin {
@@ -326,31 +325,93 @@ pub(super) fn lower_call(
                 }
                 return Ok(acc);
             }
-            // Single-arg call: direct application `f(a)` → `Apply(a, f)`. The
-            // argument is an ordinary value, so it lowers through `lower_expr` —
-            // where the out-of-block transactional read gate applies. (Only a
-            // `Mut`-param callee, handled above, accepts a bare mutable variable pass and
-            // bypasses the gate.)
-            if args.len() == 1 {
-                let arg = lower_expr(&args[0], ctx)?;
-                let callee = ctx.tag_image(Expr::var(name.to_string()), func.span);
-                return Ok(Expr::apply(arg, callee));
-            }
-            // Multi-arg call: tuple the arguments and apply once,
-            // `f(a, b, ...)` → `Apply(Tuple([a, b, ...]), f)`. This pairs with
-            // the uncurried multi-arg lambda lowering in [`lower_lambda`] so
-            // that syntactic multi-arg functions compile without any `curry`
-            // combinator appearing in the tree. Arguments lower through the gated
-            // `lower_expr` for the same reason as the single-arg case.
-            let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
-            // The tuple is manufactured packing (there is no tuple in the
-            // source call); the callee `Var` images the function name.
-            let args_span = args[0].span.join(args[args.len() - 1].span);
-            let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
-            let callee = ctx.tag_image(Expr::var(name.to_string()), func.span);
-            Ok(Expr::apply(arg_tuple, callee))
+            apply_to_args(args, ctx, |ctx| {
+                Ok(ctx.tag_image(Expr::var(name.to_string()), func.span))
+            })
         }
     }
+}
+
+/// Lower a call whose callee is an expression rather than a name.
+///
+/// Three callee forms name their function statically, and they are the ones
+/// accepted: a field of a product (`r.f(x)`), the result of a call (`add(1)(2)`),
+/// and a lambda (`(\x -> x + 1)(41)`). The inliner resolves each to the function it
+/// names (`src/ccl/design/optimization.md`, "Functions held in products"). Any other
+/// callee, such as `(f if c else g)(x)` or `fs[i](x)`, chooses its function at run
+/// time and is refused.
+///
+/// Builtins, sources, and the curried call shape of a `Mut`-parameter `def` are
+/// all decided by the callee's spelling, so none of them applies here: the
+/// arguments are tupled as a named call's are. A `Mut`-parameter function reached
+/// through a field is therefore called with a tuple its curried type does not
+/// accept, and inference refuses the call.
+fn lower_expression_call(
+    func: &Spanned<ChlExpr>,
+    args: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    match &func.node {
+        ChlExpr::Attribute { .. } | ChlExpr::Call { .. } | ChlExpr::Lambda { .. } => {}
+        _ => {
+            return Err(LoweringError::unsupported(
+                func.span,
+                "a called expression must be a name, a field (`r.f(x)`), a call \
+                 (`f(x)(y)`), or a lambda",
+            ));
+        }
+    }
+    if args.is_empty() {
+        return Err(LoweringError::unsupported(
+            func.span,
+            "a function takes at least one argument, so a call needs one",
+        ));
+    }
+    if matches!(func.node, ChlExpr::Lambda { .. }) {
+        // `(\x -> e)(a)` is `f = \x -> e; f(a)`: binding the lambda makes it a
+        // let-bound capability, which the inliner substitutes and beta-reduces.
+        // Left in call position, the lambda would reach `lambda_elim` unreduced.
+        let callee_name = ctx.fresh_callee_name();
+        let lambda = lower_expr(func, ctx)?;
+        let call = apply_to_args(args, ctx, |ctx| {
+            Ok(ctx.tag_machinery(
+                Expr::var(callee_name.clone()),
+                func.span,
+                "lower.lambda_call",
+            ))
+        })?;
+        // The call is no longer the expression's root, which `lower_expr` tags, so
+        // it is recorded here.
+        let call = ctx.tag_machinery(call, func.span, "lower.lambda_call");
+        let bound = Expr::let_bind(callee_name, lambda, call);
+        return Ok(ctx.tag_machinery(bound, func.span, "lower.lambda_call"));
+    }
+    apply_to_args(args, ctx, |ctx| lower_expr(func, ctx))
+}
+
+/// Apply the callee `callee` builds to a call's arguments: `f(a)` → `a ▷ f`, and
+/// `f(a, b, …)` → `(a, b, …) ▷ f`. The arguments lower first.
+///
+/// The tupled form pairs with the uncurried multi-arg lambda lowering in
+/// [`lower_lambda`], so syntactic multi-arg functions compile without any
+/// `curry` combinator appearing in the tree. Every argument is an ordinary
+/// value, so it lowers through `lower_expr`, where the out-of-block
+/// transactional read gate applies. (Only a `Mut`-param callee, handled in
+/// [`lower_call`], accepts a bare mutable variable and bypasses the gate.)
+fn apply_to_args(
+    args: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
+    callee: impl FnOnce(&mut LoweringContext) -> Result<Expr, LoweringError>,
+) -> Result<Expr, LoweringError> {
+    if let [arg] = args {
+        let arg = lower_expr(arg, ctx)?;
+        return Ok(Expr::apply(arg, callee(ctx)?));
+    }
+    let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
+    // The tuple is manufactured packing: there is no tuple in the source call.
+    let args_span = args[0].span.join(args[args.len() - 1].span);
+    let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
+    Ok(Expr::apply(arg_tuple, callee(ctx)?))
 }
 
 /// Lower group-by and return its present-key domain for re-keying callers.

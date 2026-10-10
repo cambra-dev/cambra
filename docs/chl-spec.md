@@ -964,6 +964,18 @@ parameters consumes all `n` arguments together. There is no implicit
 currying — `f(a)` for an `n>1`-arity `f` is a compile-time error, not
 a partial application.
 
+The callee is a name, a field of a product (`r.f(x)`), a call
+(`add(1)(2)`), or a lambda (`(\x -> x + 1)(41)`). Any other callee
+expression, such as `(f if c else g)(x)`, is a compile-time error.
+
+A function is a value: it may be bound, passed as an argument, and held
+in a tuple or record field. Every call must resolve to one function at
+compile time. A program in which the function a call reaches depends on
+run-time data is a compile-time error, whatever spelling reaches it:
+`pick(c)(x)` where `pick` returns `inc if c else dbl`, or `g = inc if c
+else dbl` followed by `g(x)`. So is a function value that no call
+consumes, such as a program whose result is a function.
+
 **No keyword arguments**, **no default values**, **no `*args`/`**kwargs`**,
 **no positional-only / keyword-only markers**. The function-call grammar
 is exactly a parenthesised, comma-separated list of expressions.
@@ -4395,7 +4407,10 @@ with parser-level support that lowering rejects:
   `yield`s, multiple sequential `for` loops, nested `for`s where the
   inner loop yields, and post-loop statements are all rejected
   pending support.
-- **First-class functions in arbitrary positions** — see the
+- **First-class functions in arbitrary positions** — a function may be
+  bound, passed, and held in a product field, and each call must resolve
+  to it statically ([3.8 Function calls](#38-function-calls)). A function
+  chosen at run time or stored in a collection is not supported. See the
   2026-03-05 first-class-functions design notes.
 - **Recursion** — self-reference in `def` is not yet wired through;
   self-referential *value* bindings get the explicit `rec` form
