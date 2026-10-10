@@ -11,7 +11,7 @@ pub(super) struct ImportSite {
     /// Each argument, by its parameter: its span and its value.
     pub(super) arguments: HashMap<SmolStr, (Span, KeyArgument)>,
     /// Each type argument, by its parameter, as the importer lowered it.
-    pub(super) types: HashMap<SmolStr, Type>,
+    pub(super) types: HashMap<QualifiedName, Type>,
 }
 
 /// What an `import` statement reaches: its shared run, and the types that gives
@@ -25,8 +25,9 @@ pub(super) struct Imported {
 /// ([`ProgramLowering::import_keys`]).
 pub(super) enum ImportArgument<'a> {
     Lit(Lit),
-    /// An import name, by the statement that binds it.
-    Import(Span),
+    /// An import name, by the statement that binds it, with the abstract type
+    /// members of the parameter's Module type, which it gives.
+    Import(Span, SmolStr, Vec<QualifiedName>),
     /// A type, with the statements of the imports whose names it writes.
     Type(&'a Spanned<ChlExpr>, Vec<Span>),
 }
@@ -150,7 +151,29 @@ impl ProgramLowering<'_> {
                     match (&arg.value.node, constant(&arg.value.node)) {
                         (_, Some(value)) => ImportArgument::Lit(value),
                         (ChlExpr::Name(name), None) if import_names.contains_key(name) => {
-                            ImportArgument::Import(import_names[name])
+                            let members = self
+                                .lowered
+                                .get(&file)
+                                .cloned()
+                                .flatten()
+                                .and_then(|lowered| {
+                                    let parameter = lowered
+                                        .interface
+                                        .parameters
+                                        .iter()
+                                        .find(|p| p.name == arg.name.node)?
+                                        .clone();
+                                    let ty = parameter.module()?;
+                                    Some(abstract_members(
+                                        &QualifiedName::new(parameter.name.clone()),
+                                        ty,
+                                    ))
+                                })
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|(member, _)| member)
+                                .collect();
+                            ImportArgument::Import(import_names[name], name.clone(), members)
                         }
                         (ChlExpr::Name(name), None) if run_names.contains(name) => {
                             self.errors.push(LoweringError::unsupported(
@@ -184,9 +207,11 @@ impl ProgramLowering<'_> {
             .map(|import| (*import, None))
             .collect();
         let typed = pending.iter().any(|(.., arguments)| {
-            arguments
-                .iter()
-                .any(|(.., value)| matches!(value, ImportArgument::Type(..)))
+            arguments.iter().any(|(.., value)| match value {
+                ImportArgument::Type(..) => true,
+                ImportArgument::Import(_, _, members) => !members.is_empty(),
+                ImportArgument::Lit(_) => false,
+            })
         });
         let interfaces = if typed {
             self.interfaces(ast)
@@ -219,14 +244,55 @@ impl ProgramLowering<'_> {
                 for (parameter, span, value) in arguments {
                     let argument = match value {
                         ImportArgument::Lit(value) => KeyArgument::Lit(value.clone()),
-                        ImportArgument::Import(import) => match resolved.get(import) {
-                            Some(Some(run)) => KeyArgument::Module(run.clone()),
-                            Some(None) => {
-                                resolved.insert(*statement, None);
-                                return false;
+                        ImportArgument::Import(import, passed, members) => {
+                            let run = match resolved.get(import) {
+                                Some(Some(run))
+                                    if members.is_empty() || decided.contains(import) =>
+                                {
+                                    run.clone()
+                                }
+                                Some(None) => {
+                                    resolved.insert(*statement, None);
+                                    return false;
+                                }
+                                _ => return true,
+                            };
+                            // Each abstract type member is the passed module's,
+                            // as the importer writes it, and one it lacks is an
+                            // error at the argument.
+                            let qualifier = ctx.module.qualifiers.get(passed).cloned();
+                            let under = QualifiedName::new(parameter.clone());
+                            let passed = QualifiedName::new(passed.clone());
+                            for member in members {
+                                let path = member
+                                    .strip_prefix(&under)
+                                    .expect("a member is spelled under its parameter");
+                                let found = qualifier.as_ref().map(|qualifier| {
+                                    qualifier.reach_type_path(&passed, &path, *span)
+                                });
+                                let ty = match found {
+                                    Some(Ok(Some(AliasType::Type(ty)))) => ty,
+                                    Some(Ok(Some(AliasType::Module(_)))) => {
+                                        self.errors.push(LoweringError::unsupported(
+                                            *span,
+                                            format!(
+                                                "`{passed}::{path}` is a Module type, and the \
+                                                 parameter's Module type names a type member \
+                                                 `{path}`"
+                                            ),
+                                        ));
+                                        Type::Hole
+                                    }
+                                    Some(Err(error)) => {
+                                        self.errors.push(error);
+                                        Type::Hole
+                                    }
+                                    Some(Ok(None)) | None => Type::Hole,
+                                };
+                                types.insert(member.clone(), ty);
                             }
-                            None => return true,
-                        },
+                            KeyArgument::Module(run)
+                        }
                         ImportArgument::Type(written, reached) => {
                             for import in reached {
                                 match resolved.get(import) {
@@ -268,7 +334,7 @@ impl ProgramLowering<'_> {
                                      are different types, so they would reach one shared run"
                                 );
                             }
-                            types.insert(parameter.clone(), ty);
+                            types.insert(QualifiedName::new(parameter.clone()), ty);
                             KeyArgument::Type(written)
                         }
                     };

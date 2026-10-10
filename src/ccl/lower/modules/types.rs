@@ -13,19 +13,9 @@ use super::*;
 /// lowered, renamed or not: the module's own run holds that one, so the two
 /// trees share no node.
 pub(super) fn reroot_alias(ty: &AliasType, qualifier: &QualifiedName) -> AliasType {
-    match ty {
-        AliasType::Type(ty) => AliasType::Type(reroot(ty, qualifier)),
-        AliasType::Module(module) => AliasType::Module(Rc::new(ModuleType {
-            entries: module
-                .entries
-                .iter()
-                .map(|entry| ModuleEntry {
-                    name: entry.name.clone(),
-                    ty: reroot_alias(&entry.ty, qualifier),
-                })
-                .collect(),
-        })),
-    }
+    let mut ty = ty.clone();
+    ty.walk_types_mut(&mut |ty| *ty = reroot(ty, qualifier));
+    ty
 }
 
 /// [`reroot_alias`] on a type.
@@ -81,22 +71,87 @@ pub(super) fn substitute_in(expr: &mut Expr, arguments: &HashMap<TypeParamId, Ty
     expr.walk_children_mut(|child| substitute_in(child, arguments));
 }
 
+/// `ty` with a fresh type parameter for each of its abstract type members, at
+/// every depth: each Module-typed parameter's, so two parameters of one Module
+/// type take two arguments.
+pub(super) fn instantiate(ty: &Rc<ModuleType>) -> Rc<ModuleType> {
+    fn fresh(ty: &mut ModuleType, map: &mut HashMap<TypeParamId, Type>) {
+        for entry in &mut ty.types {
+            if let TypeEntryForm::Abstract { param, .. } = &mut entry.form {
+                let renamed = TypeParam::declared(param.spelling.clone());
+                map.insert(param.id, Type::Param(Rc::clone(&renamed)));
+                *param = renamed;
+            }
+        }
+        for entry in &mut ty.entries {
+            if let AliasType::Module(inner) = &mut entry.ty {
+                fresh(Rc::make_mut(inner), map);
+            }
+        }
+    }
+    let mut instance = (**ty).clone();
+    let mut map = HashMap::new();
+    fresh(&mut instance, &mut map);
+    let mut instance = AliasType::Module(Rc::new(instance));
+    instance.walk_types_mut(&mut |ty| substitute(ty, &map));
+    let AliasType::Module(instance) = instance else {
+        unreachable!("instantiated a Module type above");
+    };
+    instance
+}
+
+/// Each abstract type member `ty` names, at every depth, spelled under
+/// `prefix`, `payments::Receipt`, with its type parameter.
+pub(super) fn abstract_members(
+    prefix: &QualifiedName,
+    ty: &ModuleType,
+) -> Vec<(QualifiedName, Rc<TypeParam>)> {
+    let mut members = Vec::new();
+    for entry in &ty.types {
+        if let TypeEntryForm::Abstract { param, .. } = &entry.form {
+            members.push((prefix.child(entry.name.clone()), Rc::clone(param)));
+        }
+    }
+    for entry in &ty.entries {
+        if let AliasType::Module(inner) = &entry.ty {
+            members.extend(abstract_members(&prefix.child(entry.name.clone()), inner));
+        }
+    }
+    members
+}
+
 /// The types a run or a shared run of the module `interface` declares gives its
-/// type parameters, as the module reaching it through the qualifier `spelling`
-/// writes them: the argument `given` has for one, and otherwise its default,
-/// spelled through the qualifier ([`reroot`]). A parameter with neither takes
-/// a hole, its run being an error ([`ProgramLowering::create`]).
+/// type parameters, and the abstract type members of its Module-typed
+/// parameters, as the module reaching it through the qualifier `spelling`
+/// writes them: the argument `given` has for one, by its spelling, and
+/// otherwise its default, spelled through the qualifier ([`reroot`]). One with
+/// neither takes a hole, its run being an error ([`ProgramLowering::create`]).
 pub(super) fn reached_types(
     interface: &Interface,
     spelling: &QualifiedName,
-    given: &HashMap<SmolStr, Type>,
+    given: &HashMap<QualifiedName, Type>,
 ) -> TypeArguments {
     let mut arguments = HashMap::new();
     for parameter in &interface.parameters {
+        if let Some(ty) = parameter.module() {
+            for (member, param) in abstract_members(&QualifiedName::new(parameter.name.clone()), ty)
+            {
+                let ty = match (given.get(&member), parameter.default_type(&member)) {
+                    (Some(argument), _) => argument.clone(),
+                    (None, Some(default)) => reroot(default, spelling),
+                    (None, None) => Type::Hole,
+                };
+                arguments.insert(param.id, ty);
+            }
+            continue;
+        }
         let ParameterKind::Type { param, default, .. } = &parameter.kind else {
             continue;
         };
-        let ty = match (given.get(&parameter.name), default) {
+        let ty = match (
+            given.get(&QualifiedName::new(parameter.name.clone())),
+            default,
+        ) {
             (Some(argument), _) => argument.clone(),
             (None, Some(default)) => {
                 let mut ty = reroot(default, spelling);

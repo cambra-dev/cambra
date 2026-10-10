@@ -11,10 +11,10 @@ use smol_str::SmolStr;
 
 use crate::ast::{
     AnnotationMode, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp, CmpOp,
-    CompClause, Comprehension, DiscardHead, Expr, FileId, IfBranch, KeywordArg, KindAnnotation,
-    Lit, MatchArm, MatchPattern, Module, Param, PayloadPattern, QualifiedName, RecordField,
-    Requirement, Span, Spanned, Stmt, TypeAnnotation, TypeParam, UnaryOp, UseItem, VariantPayload,
-    WrittenPath,
+    CompClause, Comprehension, DiscardHead, EntryForm, Expr, FileId, IfBranch, KeywordArg,
+    KindAnnotation, Lit, MatchArm, MatchPattern, Module, ModuleTypeEntry, Param, PayloadPattern,
+    QualifiedName, RecordField, Requirement, Span, Spanned, Stmt, TypeAnnotation, TypeParam,
+    UnaryOp, UseItem, VariantPayload, WrittenPath,
 };
 use crate::lexer::{self, Token};
 use crate::module_path::segment_error;
@@ -478,25 +478,47 @@ where
         //     comma-free item, `{T}`) is what says the braces are the *tag's*
         //     rather than the payload type's. That is the one form a standalone
         //     type rejects, which is why it is free to mean this here.
-        // `Module{name: T, …}` — a Module type (§9.8). Its braces hold a
-        // member per entry, so they parse as a record type does; `Module{}` is
-        // the Module type with no members.
+        // `Module{name: T, Name = T, Name <: T, Name: K, …}` — a Module type
+        // (§9.8), an entry per member; `Module{}` has no members. Braces that
+        // hold anything else parse as a brace literal, refused here.
+        let module_entry = qualified_name()
+            .then(choice((
+                just(Token::Colon).to(EntryForm::Annotated),
+                just(Token::Eq).to(EntryForm::Exact),
+                just(Token::LtColon).to(EntryForm::Bounded),
+            )))
+            .then(bracketed_expr.clone())
+            .map(|(((qualifier, name), form), value)| ModuleTypeEntry {
+                name: name.node,
+                name_span: name.span,
+                qualifier,
+                form,
+                value,
+            });
+        let module_entries = just(Token::LBrace)
+            .ignore_then(
+                module_entry
+                    .separated_by(just(Token::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(Token::RBrace))
+            .map_with(|entries, e| Spanned::new(e.span(), Expr::ModuleType(entries)));
         let module_type = select! { Token::Ident(s) if s == "Module" => () }
-            .ignore_then(brace_group.clone())
-            .validate(|(group, _), e, emitter| match group.node {
-                Expr::BraceRecord(fields) => Spanned::new(e.span(), Expr::ModuleType(fields)),
-                Expr::BraceGroup(elts) if elts.is_empty() => {
-                    Spanned::new(e.span(), Expr::ModuleType(Vec::new()))
-                }
-                Expr::Error => Spanned::new(e.span(), Expr::Error),
-                _ => {
-                    emitter.emit(Rich::custom(
-                        e.span(),
-                        "a Module type lists its members as `name: T`",
-                    ));
+            .ignore_then(choice((
+                module_entries,
+                brace_group.clone().validate(|(group, _), e, emitter| {
+                    if !matches!(group.node, Expr::Error) {
+                        emitter.emit(Rich::custom(
+                            e.span(),
+                            "a Module type lists its members as `name: T`, `Name = T`, \
+                             `Name <: T`, or `Name: K`",
+                        ));
+                    }
                     Spanned::new(e.span(), Expr::Error)
-                }
-            })
+                }),
+            )))
+            .map_with(|ty, e| Spanned::new(e.span(), ty.node))
             .boxed();
 
         let variant_ctor = tag_name()

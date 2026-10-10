@@ -686,6 +686,29 @@ fn a_module_type_lists_its_members() {
     assert!(matches!(parse_e("Module{}"), Expr::ModuleType(entries) if entries.is_empty()));
 }
 
+/// A type member is written `Name = T`, `Name <: T`, or `Name: K`, each entry
+/// recording its form.
+#[test]
+fn a_module_type_states_each_type_member_by_its_form() {
+    let Expr::ModuleType(entries) = parse_e("Module{A = Int, B <: {id: Int}, C: Type, d: A}")
+    else {
+        panic!("expected a Module type");
+    };
+    let forms: Vec<(&str, EntryForm)> = entries
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.form))
+        .collect();
+    assert_eq!(
+        forms,
+        [
+            ("A", EntryForm::Exact),
+            ("B", EntryForm::Bounded),
+            ("C", EntryForm::Annotated),
+            ("d", EntryForm::Annotated),
+        ]
+    );
+}
+
 #[test]
 fn a_module_types_braces_hold_members() {
     assert_error(
