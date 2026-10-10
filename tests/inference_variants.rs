@@ -61,6 +61,7 @@ fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> B
                 transparency: BindingTransparency::Transparent,
             },
             empty_payload: false,
+            nominal: None,
         }),
         guard: guard.unwrap_or_else(|| TypedExpr::lit(Lit::Bool(true))),
         body,

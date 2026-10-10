@@ -657,7 +657,11 @@ fn a_case_pattern_takes_a_qualified_tag() {
     let patterns: Vec<(Vec<&str>, &str)> = arms
         .iter()
         .map(|arm| {
-            let pattern = arm.pattern.as_ref().expect("a tagged arm");
+            let pattern = arm
+                .pattern
+                .as_ref()
+                .and_then(ArmPattern::as_tag)
+                .expect("a tagged arm");
             (names(&pattern.tag_qualifier), pattern.tag.as_str())
         })
         .collect();

@@ -2349,6 +2349,10 @@ pub struct Pattern {
     /// payload does not match the first. `emit_case` records it as `payload <: Unit` on
     /// that arm alone, which lets the rejection name the arm.
     pub empty_payload: bool,
+    /// The nominal type whose constructor `tag` is, if any. Every pattern of one `Case`
+    /// names the same one, or none does (`docs/chl-spec.md`, "4.10 `match` — tag
+    /// dispatch").
+    pub nominal: Option<std::rc::Rc<crate::ccl::nominal::NominalDecl>>,
 }
 
 #[cfg(test)]

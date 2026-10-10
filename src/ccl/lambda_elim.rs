@@ -647,7 +647,15 @@ fn arm_compose(
 /// its `` `b ``. Deriving the domain from the arms makes "contains the projected tag" true
 /// by construction, and adjacency still holds, because `scrut_ty <: arms_variant` is
 /// exactly what inference required (`emit_case`'s `require_sub`).
+///
+/// A nominal scrutinee's arms name constructors of its type, so the projections consume
+/// that type, which the scrutinee already is (`src/ccl/design/nominal-types.md`, "After
+/// inference").
 fn arms_variant(branches: &[Branch], scrut_ty: &Type) -> Type {
+    let scrut_head = strip_refinements(scrut_ty);
+    if matches!(scrut_head, Type::Nominal(..)) {
+        return scrut_head;
+    }
     let mut tags: Vec<(FieldKey, Type)> = branches
         .iter()
         .filter_map(|b| b.pattern.as_ref())
@@ -2941,6 +2949,7 @@ mod tests {
                     transparency: BindingTransparency::Transparent,
                 },
                 empty_payload: false,
+                nominal: None,
             }),
             guard: Expr::lit(Lit::Bool(true)).with_ty(bool_ty()),
             body,

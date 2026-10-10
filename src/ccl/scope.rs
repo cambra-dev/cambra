@@ -712,6 +712,7 @@ mod tests {
                         tag: "T".into(),
                         binding: bind("payload"),
                         empty_payload: false,
+                        nominal: None,
                     }),
                     guard: var("g0"),
                     body: var("payload"),

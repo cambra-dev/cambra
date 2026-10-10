@@ -10,8 +10,9 @@ use crate::{
         TypedExprNode,
     },
     chl_parser::ast::{
-        AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, KindAnnotation, MatchArm,
-        PayloadPattern, Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeParam,
+        AnnotationMode, ArmPattern, AssignTarget, BinOp as ChlBinOp, IfBranch, KindAnnotation,
+        MatchArm, PayloadPattern, Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation,
+        TypeParam,
     },
 };
 
@@ -548,6 +549,20 @@ pub(super) fn lower_middle_stmt(
         ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
             Ok(body)
         }
+        // `Price::new(r) = p`: a one-arm `match` over `p` whose body is the rest of the
+        // block (`docs/chl-spec.md`, "4.3.1 Destructuring patterns").
+        ChlStmt::Assign {
+            target:
+                Spanned {
+                    node: AssignTarget::Constructor(pattern),
+                    ..
+                },
+            value,
+            ..
+        } => {
+            let rhs = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
+            nominal::lower_constructor_assignment(pattern, rhs, body, stmt.span, ctx)
+        }
         // A nominal type binds no value either: `declare_nominal_types` declared it for
         // the whole module, and its constructors are bound around the whole module
         // (`nominal::bind_constructors`).
@@ -946,6 +961,13 @@ pub(super) fn extract_name_target(
         AssignTarget::Qualified(_) => {
             unreachable!("a qualified target is refused before lowering (`refuse_module_syntax`)")
         }
+        AssignTarget::Constructor(_) => Err(LoweringError::unsupported(
+            target.span,
+            format!(
+                "{context}: a constructor pattern takes a value apart only in a plain `=` \
+                 assignment or a `match` arm"
+            ),
+        )),
     }
 }
 
@@ -962,7 +984,7 @@ pub(super) fn write_target_name(target: &Spanned<AssignTarget>) -> Option<&str> 
             ChlExpr::Name(id) => Some(id.as_str()),
             _ => None,
         },
-        AssignTarget::Tuple(_) => None,
+        AssignTarget::Tuple(_) | AssignTarget::Constructor(_) => None,
         AssignTarget::Qualified(_) => {
             unreachable!("a qualified target is refused before lowering (`refuse_module_syntax`)")
         }
@@ -2505,13 +2527,19 @@ pub(super) fn lower_match_over(
         !arms.is_empty(),
         "lower_match: `match` with no `case` arms (parser invariant violated)"
     );
-    if let Some(dup) = first_duplicate_tag(arms) {
+    let constructor_arms = arms
+        .iter()
+        .filter(|a| matches!(a.pattern, Some(ArmPattern::Constructor(_))))
+        .count();
+    let tag_arms = arms
+        .iter()
+        .filter(|a| matches!(a.pattern, Some(ArmPattern::Tag(_))))
+        .count();
+    if constructor_arms > 0 && tag_arms > 0 {
         return Err(LoweringError::unsupported(
             match_span,
-            format!(
-                "`match` has two `case {dup}` arms; each tag is handled by exactly \
-                 one arm (the arms partition the scrutinee's tags)"
-            ),
+            "`match` mixes variant tags and constructors of a nominal type; the arms of one \
+             `match` name constructors of one type, or tags of one variant",
         ));
     }
     // The default arm must be last and unique. It matches whatever the tagged arms
@@ -2532,6 +2560,28 @@ pub(super) fn lower_match_over(
              did not, so an arm after it could never be selected",
         ));
     }
+    // The type constructor arms name, checked against the arms before anything lowers.
+    let nominal = if constructor_arms > 0 {
+        Some(nominal::constructor_arms_type(
+            match_span,
+            arms,
+            defaults == 1,
+            ctx,
+        )?)
+    } else {
+        None
+    };
+    // After the one-type check, so two arms naming same-spelled constructors of two types
+    // are reported as two types rather than as a repeated constructor.
+    if let Some(dup) = first_duplicate_tag(arms) {
+        return Err(LoweringError::unsupported(
+            match_span,
+            format!(
+                "`match` has two `case {dup}` arms; each tag is handled by exactly \
+                 one arm (the arms partition the scrutinee's tags)"
+            ),
+        ));
+    }
     let scrutinee_expr = lower_expr(scrutinee, ctx)?;
     // Only a default arm: nothing is dispatched on, so there is no `Case` to
     // build — a tag-less `Branch` is a *fallback*, and with no tagged arm to fall
@@ -2543,7 +2593,30 @@ pub(super) fn lower_match_over(
     }
     let mut branches = Vec::with_capacity(arms.len());
     for arm in arms {
-        let Some(pat) = &arm.pattern else {
+        if let (Some(ArmPattern::Constructor(pattern)), Some(decl)) = (&arm.pattern, &nominal) {
+            let (pattern, binds) = nominal::constructor_arm_pattern(decl, pattern, ctx);
+            // Every name the arm binds shadows an outer one in its body, as a tag arm's
+            // binder does: the payload's, which is the parameter's own name for a
+            // constructor of one parameter, and each projected parameter's.
+            let mut names: Vec<String> = binds.iter().map(|(name, _)| name.clone()).collect();
+            names.push(pattern.binding.name.base().to_string());
+            let mut arm_scope = outer_bindings.clone();
+            arm_scope.extend(names.iter().cloned());
+            let body = ctx.with_shadowed(names, |ctx| lower_body(&arm.body, &arm_scope, ctx))?;
+            let body =
+                nominal::bind_parameters(&pattern.binding.name, binds, body, match_span, ctx);
+            branches.push(Branch {
+                pattern: Some(pattern),
+                guard: ctx.tag_machinery(
+                    Expr::lit(Lit::Bool(true)),
+                    match_span,
+                    "lower.match_guard",
+                ),
+                body,
+            });
+            continue;
+        }
+        let Some(ArmPattern::Tag(pat)) = &arm.pattern else {
             // The default arm binds nothing — the tags it covers have different
             // payload types, so there is no single thing to bind — and lowers to a
             // tag-less `Branch`, which is what makes it the fallback.
@@ -2591,6 +2664,7 @@ pub(super) fn lower_match_over(
                     transparency: BindingTransparency::Transparent,
                 },
                 empty_payload,
+                nominal: None,
             }),
             guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), match_span, "lower.match_guard"),
             body,
@@ -2608,13 +2682,22 @@ pub(super) fn lower_match_over(
     ))
 }
 
-/// The first tag appearing on more than one arm, if any.
-fn first_duplicate_tag(arms: &[MatchArm]) -> Option<&str> {
+/// The first tag or constructor appearing on more than one arm, if any: a tag by its
+/// name, a constructor qualified by its type.
+fn first_duplicate_tag(arms: &[MatchArm]) -> Option<String> {
     let mut seen = HashSet::new();
     arms.iter()
-        .filter_map(|arm| arm.pattern.as_ref())
-        .find(|pat| !seen.insert(pat.tag.as_str()))
-        .map(|pat| pat.tag.as_str())
+        .filter_map(|arm| match arm.pattern.as_ref()? {
+            ArmPattern::Tag(pat) => Some(pat.tag.to_string()),
+            ArmPattern::Constructor(pat) => {
+                let ty = pat
+                    .type_path
+                    .last()
+                    .expect("a constructor pattern names its type");
+                Some(format!("{}::{}", ty.node, pat.ctor.node))
+            }
+        })
+        .find(|name| !seen.insert(name.clone()))
 }
 
 /// Lower a [`ChlStmt::If`] (a flattened `if`/`elif`/`else` chain) to a

@@ -383,6 +383,30 @@ fn lower_for_body_stmts_scoped(
             // A type alias binds nothing, so it contributes no `Let` to the frame.
             ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {}
             ChlStmt::Assign {
+                target:
+                    Spanned {
+                        node: AssignTarget::Constructor(pattern),
+                        ..
+                    },
+                value,
+                ..
+            } => {
+                let assignment = nominal::check_constructor_assignment(pattern, stmt.span, ctx)?;
+                for name in assignment.names() {
+                    if mutation_scope.contains(&name) {
+                        return Err(outer_binding_write_error(stmt.span, &name));
+                    }
+                }
+                let scope = body_scope(mutation_scope, &frame_introduced);
+                let val = lower_assigned_value(value, &[], &scope, ctx)?;
+                frame_introduced.extend(assignment.names());
+                prefix.push(PrefixStmt::Destructure {
+                    assignment,
+                    value: val,
+                    span: stmt.span,
+                });
+            }
+            ChlStmt::Assign {
                 target,
                 value,
                 transparency,
@@ -567,6 +591,11 @@ fn lower_for_body_stmts_scoped(
                 span,
             } => (Expr::let_bind_with(name, value, body, transparency), span),
             PrefixStmt::Effect { effect, span } => (Expr::expr_stmt(effect, body), span),
+            PrefixStmt::Destructure {
+                assignment,
+                value,
+                span,
+            } => return assignment.wrap(value, body, span, ctx),
         };
         ctx.tag_image(wrapped, span)
     }))
@@ -575,6 +604,12 @@ fn lower_for_body_stmts_scoped(
 /// One statement of a for-loop body that is not its last: a binding the rest of the
 /// body reads, or an effect sequenced before it.
 enum PrefixStmt {
+    /// `Price::new(r) = p`: the value taken apart, binding the pattern's names.
+    Destructure {
+        assignment: nominal::ConstructorAssignment,
+        value: Expr,
+        span: Span,
+    },
     Bind {
         name: String,
         value: Expr,
@@ -1234,6 +1269,23 @@ fn lower_loop_body_chain_scoped(
             // A type alias binds nothing, so the chain passes through unchanged.
             ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
                 chain
+            }
+            ChlStmt::Assign {
+                target:
+                    Spanned {
+                        node: AssignTarget::Constructor(pattern),
+                        ..
+                    },
+                value,
+                ..
+            } => {
+                // Each bound name is checked as a plain binding's is below.
+                let assignment = nominal::check_constructor_assignment(pattern, stmt.span, ctx)?;
+                for name in assignment.names() {
+                    check_mut_write_context(&name, stmt.span, ctx)?;
+                }
+                let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
+                assignment.wrap(val, chain, stmt.span, ctx)
             }
             ChlStmt::Assign {
                 target,

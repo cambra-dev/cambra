@@ -3023,6 +3023,7 @@ mod rewrite_tests {
                 tag: tag.into(),
                 binding: TypedBinding::new_unannotated(payload),
                 empty_payload: false,
+                nominal: None,
             }),
             guard: int(1),
             body: int(2),

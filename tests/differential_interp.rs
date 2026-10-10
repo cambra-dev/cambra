@@ -172,6 +172,52 @@ fn a_mutable_variable_of_a_nominal_type() {
     "#});
 }
 
+/// A `match` over constructors, a destructuring assignment and `extract`, per loop
+/// iteration.
+#[test]
+fn nominal_values_taken_apart() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+            empty
+
+        type Price = Int
+
+        def area(s: Shape) => Int:
+            match s:
+                case Shape::circle(r):
+                    r * r * 3
+                case Shape::rect(w, h):
+                    w * h
+                case Shape::empty:
+                    0
+
+        out = test_sink()
+        for n in [1, 2, 3]:
+            Price::new(c) = Price::new(n * 10)
+            out << (area(Shape::rect(n, n + 1)) + area(Shape::circle(n)), c + Price::extract(Price::new(n)))
+    "#});
+}
+
+/// A loop over nominal values whose body is a `match`, each arm feeding.
+#[test]
+fn a_match_over_nominal_values_feeds_per_arm() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+
+        out = test_sink()
+        for s in [Shape::circle(1), Shape::rect(2, 3), Shape::circle(4)]:
+            match s:
+                case Shape::circle(r):
+                    out << r
+                case Shape::rect(w, h):
+                    out << w * h
+    "#});
+}
+
 /// A collection fed at a site that does not iterate nests under that site's one key. The
 /// compiler splices it into the channel instead: channelize takes the channel's domain from
 /// the contribution's own domain. Pinned at both answers.

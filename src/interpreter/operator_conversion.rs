@@ -5975,6 +5975,7 @@ mod variant_ctor_tests {
                         tag: "commit".into(),
                         binding: binding("w", int_ty.clone()),
                         empty_payload: false,
+                        nominal: None,
                     }),
                     guard: bool_true(),
                     body: arm_body,

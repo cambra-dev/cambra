@@ -5137,6 +5137,7 @@ mod tests {
                                 Type::Base(BaseType::Int),
                             ),
                             empty_payload: false,
+                            nominal: None,
                         }),
                         guard: TypedExpr::lit(Lit::Bool(true)),
                         body: cmp,
