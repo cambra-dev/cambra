@@ -551,13 +551,13 @@ for i in [1, 2]:
 o"#,
     Tile::data_function(
         ColumnValue::Records(HashMap::from([
-            ("_0".to_string(), ColumnValue::from_uints(vec![0, 0, 1, 1])),
-            ("_1".to_string(), ColumnValue::from_uints(vec![0, 1, 0, 1])),
+            ("_0".into(), ColumnValue::from_uints(vec![0, 0, 1, 1])),
+            ("_1".into(), ColumnValue::from_uints(vec![0, 1, 0, 1])),
         ])),
         Box::new(Tile::Scalar(ColumnValue::Ints(vec![11, 32, 44, 66]))),
         Predicate::Record(HashMap::from([
-            ("_0".to_string(), Predicate::True),
-            ("_1".to_string(), Predicate::True),
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
         ])),
         BitSet::new(),
     )

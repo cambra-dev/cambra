@@ -70,7 +70,7 @@ pub enum ColumnValue {
         inputs: Box<ColumnValue>,
         outputs: Box<ColumnValue>,
     },
-    Records(HashMap<String, ColumnValue>),
+    Records(HashMap<SmolStr, ColumnValue>),
     /// A tagged union column: a partition of the row space into tag-keyed arms.
     ///
     /// Each [`UnionArm`] records *which* rows carry its tag and their payloads, so
@@ -314,7 +314,7 @@ impl ColumnValue {
             }
             Extent::Record(m) => {
                 // Pivot the list of Records into a Record of ColumnValues
-                let keys: Vec<String> = m.keys().cloned().collect();
+                let keys: Vec<SmolStr> = m.keys().cloned().collect();
                 let fields = keys
                     .into_iter()
                     .map(|key| {
@@ -676,12 +676,12 @@ impl ColumnValue {
     /// # Example
     /// Given `{"a": [1, 2], "b": [3, 4]}`, returns
     /// `Records {"a": [1, 1, 2, 2], "b": [3, 4, 3, 4]}`.
-    pub fn cartesian_product(data: HashMap<String, ColumnValue>) -> ColumnValue {
+    pub fn cartesian_product(data: HashMap<SmolStr, ColumnValue>) -> ColumnValue {
         if data.is_empty() {
             return ColumnValue::Records(HashMap::new());
         }
         // Sort keys for a deterministic column order when computing strides.
-        let mut keys: Vec<String> = data.keys().cloned().collect();
+        let mut keys: Vec<SmolStr> = data.keys().cloned().collect();
         keys.sort();
         let lengths: Vec<usize> = keys.iter().map(|k| data[k].len()).collect();
         let total: usize = lengths.iter().product();
@@ -1137,15 +1137,15 @@ mod tests {
         // Row 0: a[0]=1, b[0]=3 | Row 1: a[0]=1, b[1]=4
         // Row 2: a[1]=2, b[0]=3 | Row 3: a[1]=2, b[1]=4
         let data = HashMap::from([
-            ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
-            ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
+            ("a".into(), ColumnValue::Ints(vec![1, 2])),
+            ("b".into(), ColumnValue::Ints(vec![3, 4])),
         ]);
         let result = ColumnValue::cartesian_product(data);
         assert_eq!(
             result,
             ColumnValue::Records(HashMap::from([
-                ("a".to_string(), ColumnValue::Ints(vec![1, 1, 2, 2])),
-                ("b".to_string(), ColumnValue::Ints(vec![3, 4, 3, 4])),
+                ("a".into(), ColumnValue::Ints(vec![1, 1, 2, 2])),
+                ("b".into(), ColumnValue::Ints(vec![3, 4, 3, 4])),
             ]))
         );
     }

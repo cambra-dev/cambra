@@ -1428,7 +1428,7 @@ pub(super) fn emit_tuple<C: Typing>(
 
 /// Record literal: each field value type becomes a named product field.
 pub(super) fn emit_record<C: Typing>(
-    fs: &mut [(String, Expr)],
+    fs: &mut [(SmolStr, Expr)],
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let mut fields = BTreeMap::new();
@@ -2281,7 +2281,7 @@ fn proj_requirement<C: Typing>(key: &ProjKey, field_ty: Type, ctx: &mut C) -> Ty
             positions.push(field_ty);
             Type::Tuple(positions)
         }
-        ProjKey::Field(name) => Type::Record(vec![(name.to_string(), field_ty)]),
+        ProjKey::Field(name) => Type::Record(vec![(name.clone(), field_ty)]),
     }
 }
 
@@ -2658,7 +2658,7 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 /// per-position feed output stream). The decision codomain is the variant
 /// `` {`commit{𝑃} | `abort} ``; the taps live inside the (dense) `commit` payload
 /// record `𝑃`, so peel `commit` and drop the `writes` field.
-pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
+pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(SmolStr, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
     };
@@ -2796,7 +2796,7 @@ pub(super) fn emit_transact<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     use std::collections::HashMap;
-    let mut fields: Vec<(String, Type)> = Vec::with_capacity(keys.len());
+    let mut fields: Vec<(SmolStr, Type)> = Vec::with_capacity(keys.len());
     // key Name → the type of one committed value (a writer's snapshot / write
     // bound) — the codomain of the key's history.
     let mut key_types: HashMap<Name, Type> = HashMap::with_capacity(keys.len());

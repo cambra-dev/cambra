@@ -48,6 +48,7 @@
 //! the node entirely would mean teaching planning's iteration staging to find
 //! writer sources inside letrec bindings — deferred until something needs it.)
 
+use smol_str::SmolStr;
 use std::collections::HashMap;
 
 use crate::ccl::{
@@ -1248,7 +1249,7 @@ pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
 /// routes it as an ordinary channel contribution.
 struct FeedSite {
     defer: Name,
-    field: String,
+    field: SmolStr,
     value: Expr,
     /// The feed statement this tap is recorded against, so the view resolves to
     /// the `<<` the user wrote rather than to the enclosing loop.
@@ -1720,7 +1721,7 @@ pub(crate) fn fold_induction_loop(
     // are the accumulators' pre-loop bindings, under the same labels as the write
     // set they default.
     let writes_view = hist_field_view(&h, &hist_ty, &domain_ty, F_WRITES, &writes_ty, &decision_ty);
-    let seeds: Vec<(String, Expr)> = accs
+    let seeds: Vec<(SmolStr, Expr)> = accs
         .iter()
         .map(|a| {
             let _g = a.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
@@ -2962,12 +2963,12 @@ fn decision_record(commit: Expr, write_elts: Vec<Expr>, writes_ty: &Type) -> Exp
     ));
     writes.ty = writes_ty.clone();
     let mut rec = Expr::new(TypedExprNode::Record(vec![
-        (COMMIT_SELECTOR.to_string(), commit),
-        (F_WRITES.to_string(), writes),
+        (SmolStr::from(COMMIT_SELECTOR), commit),
+        (SmolStr::from(F_WRITES), writes),
     ]));
     rec.ty = Type::Record(vec![
-        (COMMIT_SELECTOR.to_string(), Type::Base(BaseType::Bool)),
-        (F_WRITES.to_string(), writes_ty.clone()),
+        (SmolStr::from(COMMIT_SELECTOR), Type::Base(BaseType::Bool)),
+        (SmolStr::from(F_WRITES), writes_ty.clone()),
     ]);
     rec
 }
@@ -3065,7 +3066,7 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
                 false,
                 &bool_ty,
             );
-            let feed_tuples: Vec<(String, Expr, Expr)> = feeds
+            let feed_tuples: Vec<(SmolStr, Expr, Expr)> = feeds
                 .iter()
                 .map(|f| (f.field.clone(), f.value.clone(), f.fire.clone()))
                 .collect();

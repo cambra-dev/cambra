@@ -55,7 +55,7 @@ pub(super) fn http_serve_decl(
         return None;
     };
     let string = |a: &Spanned<ChlExpr>| match &a.node {
-        ChlExpr::Lit(ChlLit::String(s)) => Some(s.clone()),
+        ChlExpr::Lit(ChlLit::String(s)) => Some(s.to_string()),
         _ => None,
     };
     Some(HttpServeDecl {

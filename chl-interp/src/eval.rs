@@ -1327,7 +1327,7 @@ impl Interp {
     fn eval_expr(&mut self, e: &Spanned<Expr>) -> Result<Value, Error> {
         match &e.node {
             Expr::Lit(Lit::Int(i)) => Ok(Value::Int(*i)),
-            Expr::Lit(Lit::String(s)) => Ok(Value::Str(s.clone())),
+            Expr::Lit(Lit::String(s)) => Ok(Value::Str(s.to_string())),
             Expr::Lit(Lit::Bool(b)) => Ok(Value::Bool(*b)),
 
             Expr::Name(n) => match self.slot(n) {

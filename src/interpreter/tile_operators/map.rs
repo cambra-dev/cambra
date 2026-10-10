@@ -1581,9 +1581,9 @@ mod tests {
         use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
         let uint = || Extent::Base(BaseType::UInt);
         let value_tiling = Tiling::Record(HashMap::from([
-            ("n".to_string(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+            ("n".into(), Tiling::Scalar(Extent::Base(BaseType::Int))),
             (
-                "xs".to_string(),
+                "xs".into(),
                 Tiling::data_function(uint(), Tiling::Scalar(uint())),
             ),
         ]));
@@ -1594,9 +1594,9 @@ mod tests {
         let f = Tile::data_function(
             ColumnValue::UInts(vec![5]),
             Box::new(Tile::record(HashMap::from([
-                ("n".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                ("n".into(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
                 (
-                    "xs".to_string(),
+                    "xs".into(),
                     Tile::grouped(
                         ColumnValue::UInts(vec![0]),
                         ColumnValue::UInts(vec![7]),
@@ -1789,9 +1789,9 @@ mod tests {
         let uint = || Extent::Base(BaseType::UInt);
         let int = || Extent::Base(BaseType::Int);
         let row = Tiling::Record(HashMap::from([
-            ("a".to_string(), Tiling::Scalar(int())),
+            ("a".into(), Tiling::Scalar(int())),
             (
-                "b".to_string(),
+                "b".into(),
                 Tiling::data_function(uint(), Tiling::Scalar(int())),
             ),
         ]));

@@ -3202,7 +3202,7 @@ fn drive_main_record_map(
                 let mut fields: Vec<(String, i64)> = fields
                     .iter()
                     .map(|(name, value)| match value {
-                        Value::Int(n) => (name.clone(), *n),
+                        Value::Int(n) => (name.to_string(), *n),
                         other => panic!("expected an Int field, got {other:?}"),
                     })
                     .collect();

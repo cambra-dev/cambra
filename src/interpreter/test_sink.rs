@@ -5,6 +5,7 @@
 //! position; the sink's field in the compiled program's type (`CompiledProgram::ast`) tells the
 //! two apart.
 
+use smol_str::SmolStr;
 use std::sync::Mutex;
 
 use crate::interpreter::{DataSink, FuncBinding, Tile, Value, validate_tile};
@@ -107,7 +108,7 @@ fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
             if absent.values().any(|rows| !rows.is_empty()) {
                 return Err(SinkReadError::Incomplete);
             }
-            let mut columns: Vec<(&String, Vec<Value>)> = Vec::with_capacity(fields.len());
+            let mut columns: Vec<(&SmolStr, Vec<Value>)> = Vec::with_capacity(fields.len());
             for (name, sub) in fields {
                 columns.push((name, tile_rows(sub, rows)?));
             }

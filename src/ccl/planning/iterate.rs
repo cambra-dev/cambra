@@ -852,8 +852,8 @@ mod tests {
         // `Record` arm under `input=None`; wrapping the chain would
         // feed an unwanted upstream stream in.
         let int = int_ty();
-        let record = Expr::new(TypedExprNode::Record(vec![("f".to_string(), list_123())])).with_ty(
-            Type::Record(vec![("f".to_string(), fun_ty(Type::UIntRange(3), int))]),
+        let record = Expr::new(TypedExprNode::Record(vec![("f".into(), list_123())])).with_ty(
+            Type::Record(vec![("f".into(), fun_ty(Type::UIntRange(3), int))]),
         );
         assert!(is_iteration_bearing(&record));
     }
@@ -865,11 +865,8 @@ mod tests {
         // non-builtin function position as iteration-bearing avoids the
         // wrap-then-fail trap.
         let int = int_ty();
-        let record_ty = Type::Record(vec![(
-            "f".to_string(),
-            fun_ty(Type::UIntRange(3), int.clone()),
-        )]);
-        let record = Expr::new(TypedExprNode::Record(vec![("f".to_string(), list_123())]))
+        let record_ty = Type::Record(vec![("f".into(), fun_ty(Type::UIntRange(3), int.clone()))]);
+        let record = Expr::new(TypedExprNode::Record(vec![("f".into(), list_123())]))
             .with_ty(record_ty.clone());
         let proj = Expr::proj_field("f")
             .with_ty(fun_ty(record_ty, fun_ty(Type::UIntRange(3), int.clone())));
@@ -1090,15 +1087,15 @@ mod tests {
         let int = int_ty();
         let field_ty = fun_ty(Type::UIntRange(3), int.clone());
         let mut expr = Expr::new(TypedExprNode::Record(vec![
-            ("xs".to_string(), list_123()),
+            ("xs".into(), list_123()),
             (
-                "constant".to_string(),
+                "constant".into(),
                 Expr::lit(Lit::Int(42)).with_ty(int.clone()),
             ),
         ]))
         .with_ty(Type::Record(vec![
-            ("xs".to_string(), field_ty),
-            ("constant".to_string(), int),
+            ("xs".into(), field_ty),
+            ("constant".into(), int),
         ]));
 
         let before = symbolic(&expr);
@@ -1283,7 +1280,7 @@ mod tests {
         // this test — we only check the writer `source` gets iterate-wrapped.
         let body = Expr::var("acc").with_ty(int.clone());
         let hist_ty = Type::Record(vec![(
-            "acc".to_string(),
+            "acc".into(),
             ccl_utils::history_ty(&Type::UIntRange(3), &int),
         )]);
         let mut expr = Expr::new(TypedExprNode::Transact {
@@ -1327,10 +1324,8 @@ mod tests {
         #[case] expect_site: bool,
     ) {
         let component = list_123().with_ty(component_ty.clone());
-        let mut expr =
-            Expr::new(TypedExprNode::Record(vec![("out".to_string(), component)])).with_ty(
-                Type::Record(vec![("out".to_string(), component_ty.clone())]),
-            );
+        let mut expr = Expr::new(TypedExprNode::Record(vec![("out".into(), component)]))
+            .with_ty(Type::Record(vec![("out".into(), component_ty.clone())]));
         insert_iterate_recurse(&mut expr, &Default::default());
         let TypedExprNode::Record(fields) = &expr.node else {
             panic!("still a record: {}", symbolic(&expr));
@@ -1348,12 +1343,12 @@ mod tests {
     fn test_insert_iterate_recurse_wraps_a_collection_record_field() {
         let int = int_ty();
         let mut expr = Expr::new(TypedExprNode::Record(vec![
-            ("xs".to_string(), list_123()),
-            ("n".to_string(), Expr::lit(Lit::Int(0)).with_ty(int.clone())),
+            ("xs".into(), list_123()),
+            ("n".into(), Expr::lit(Lit::Int(0)).with_ty(int.clone())),
         ]))
         .with_ty(Type::Record(vec![
-            ("xs".to_string(), fun_ty(Type::UIntRange(3), int.clone())),
-            ("n".to_string(), int),
+            ("xs".into(), fun_ty(Type::UIntRange(3), int.clone())),
+            ("n".into(), int),
         ]));
         insert_iterate_recurse(&mut expr, &Default::default());
         let TypedExprNode::Record(fields) = &expr.node else {

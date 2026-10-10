@@ -1,6 +1,7 @@
 //! BinOp operator: the column dispatch over the scalar kernel in
 //! [`crate::scalar_ops`], which owns the operator enums and the element-wise semantics.
 
+use smol_str::SmolStr;
 use std::collections::HashMap;
 
 use bit_vec::BitVec;
@@ -69,8 +70,8 @@ pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue)
 /// `type-checker-inlining-drops-a-narrowing-annotation`.
 fn compare_records(
     op: CompareKind,
-    left: HashMap<String, ColumnValue>,
-    right: &HashMap<String, ColumnValue>,
+    left: HashMap<SmolStr, ColumnValue>,
+    right: &HashMap<SmolStr, ColumnValue>,
 ) -> BitVec {
     let rows = left
         .iter()
@@ -166,7 +167,6 @@ mod tests {
     #[test]
     fn binop_unequal_lengths_combine_common_prefix_only() {
         use bit_vec::BitVec;
-        use smol_str::SmolStr;
 
         // String concat: `l` longer than `r` → result is the 2-element prefix.
         let l = ColumnValue::Strings(

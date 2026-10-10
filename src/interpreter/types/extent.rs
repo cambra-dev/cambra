@@ -1,6 +1,7 @@
 //! Extent (the runtime type of an operator) and the data-source/sink traits
 //! that an [`Extent::DataSourceDomain`] is built around.
 
+use smol_str::SmolStr;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use intervalsets::ops::Difference;
@@ -24,7 +25,7 @@ pub enum Extent {
         codomain: Box<Extent>,
     },
     /// A record type: map of field names to their extents
-    Record(HashMap<String, Extent>),
+    Record(HashMap<SmolStr, Extent>),
     /// A union type: one of several possible extents
     Union(TagMap<Extent>),
     /// A finite set of unsigned integer indices, represented as an interval set.
@@ -511,12 +512,12 @@ impl Extent {
     }
 
     /// Create a record extent from field extents
-    pub fn record(fields: HashMap<String, Extent>) -> Self {
+    pub fn record(fields: HashMap<SmolStr, Extent>) -> Self {
         Extent::Record(fields)
     }
 
     /// Create a restricted record extent: an [`Extent::Restricted`] wrapping an [`Extent::Record`].
-    pub fn restricted_record(fields: HashMap<String, Extent>) -> Self {
+    pub fn restricted_record(fields: HashMap<SmolStr, Extent>) -> Self {
         Extent::restricted(Extent::Record(fields))
     }
 
@@ -538,7 +539,7 @@ impl Extent {
     }
 
     /// Return the field map if this extent is an [`Extent::Record`], or an [`Extent::Restricted`] wrapping one.
-    pub fn record_fields(&self) -> Option<&HashMap<String, Extent>> {
+    pub fn record_fields(&self) -> Option<&HashMap<SmolStr, Extent>> {
         match self {
             Extent::Record(fields) => Some(fields),
             Extent::Restricted { base, .. } => base.record_fields(),
@@ -616,8 +617,8 @@ mod tests {
     fn test_extent_display_union_collapses_a_braced_payload() {
         let record = Extent::Record(
             [
-                ("a".to_string(), Extent::Base(BaseType::Int)),
-                ("b".to_string(), Extent::Base(BaseType::Int)),
+                ("a".into(), Extent::Base(BaseType::Int)),
+                ("b".into(), Extent::Base(BaseType::Int)),
             ]
             .into_iter()
             .collect(),
@@ -697,8 +698,8 @@ mod tests {
     #[test]
     fn test_includes_record_same() {
         let r = Extent::Record(HashMap::from([
-            ("a".to_string(), Extent::Base(BaseType::Int)),
-            ("b".to_string(), Extent::Base(BaseType::Bool)),
+            ("a".into(), Extent::Base(BaseType::Int)),
+            ("b".into(), Extent::Base(BaseType::Bool)),
         ]));
         assert!(r.includes(&r));
     }
@@ -706,9 +707,9 @@ mod tests {
     #[test]
     fn test_includes_record_covariant_field() {
         // Wide has field "a" = Int; narrow has field "a" = Int and "b" = Bool (different size).
-        let wide = Extent::Record(HashMap::from([("a".to_string(), Extent::uint_range(10))]));
+        let wide = Extent::Record(HashMap::from([("a".into(), Extent::uint_range(10))]));
         let narrow = Extent::Record(HashMap::from([(
-            "a".to_string(),
+            "a".into(),
             Extent::uint_range_interval(2, 5),
         )]));
         assert!(wide.includes(&narrow));

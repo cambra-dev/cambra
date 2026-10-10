@@ -1,5 +1,6 @@
 //! Miscellaneous utilities for working with CCL.
 
+use smol_str::SmolStr;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -224,10 +225,10 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
 /// feed's fire path, so a feed-only committing position appends a change carrying
 /// the tap (the caller folds fires into `commit` before calling; see
 /// `transact_phase`'s `commit_paths` and `letrec_phase`'s widen).
-pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(String, Expr, Expr)]) -> Expr {
-    let mut fields: Vec<(String, Expr)> = Vec::with_capacity(2 + feeds.len() * 2);
-    fields.push((COMMIT_SELECTOR.to_string(), commit.clone()));
-    fields.push((F_WRITES.to_string(), writes));
+pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(SmolStr, Expr, Expr)]) -> Expr {
+    let mut fields: Vec<(SmolStr, Expr)> = Vec::with_capacity(2 + feeds.len() * 2);
+    fields.push((SmolStr::from(COMMIT_SELECTOR), commit.clone()));
+    fields.push((SmolStr::from(F_WRITES), writes));
     for (field, value, fire) in feeds {
         // Wrap unconditionally iff the fire path *is* the commit — a structural
         // test (no Boolean simplification). Such a tap fires at every position the
@@ -468,7 +469,7 @@ pub fn wrap_decision_variant(decision: Expr) -> Expr {
             // Split the `commit` selector out from the payload fields (everything
             // else — `writes` and the `__to_<defer>*` taps, in order).
             let mut commit: Option<Expr> = None;
-            let mut payload_fields: Vec<(String, Expr)> = Vec::with_capacity(fields.len());
+            let mut payload_fields: Vec<(SmolStr, Expr)> = Vec::with_capacity(fields.len());
             for (k, v) in fields {
                 if k == COMMIT_SELECTOR {
                     commit = Some(v);

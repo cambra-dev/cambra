@@ -3,6 +3,7 @@
 // builtins
 // ---------------------------------------------------------------------------
 
+use smol_str::SmolStr;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::{cell::RefCell, rc::Rc};
@@ -2564,7 +2565,7 @@ fn compile_version(
     let per_field_ops = recorded(provenance_capture_enabled(), Phase::Convert, || {
         if sink_bindings_registry.is_empty() {
             convert_to_operators(&join_planned, ctx.conversion_ctx())
-                .map(|op| vec![("main".to_string(), op)])
+                .map(|op| vec![(SmolStr::new_inline("main"), op)])
         } else {
             convert_outputs_to_operators(&join_planned, ctx.conversion_ctx())
         }
@@ -2590,6 +2591,7 @@ fn compile_version(
     let mut main_consumer = Some(main_consumer);
     let mut outputs = Vec::with_capacity(per_field_ops.len());
     for (name, mut op) in per_field_ops {
+        let name = name.to_string();
         let universal = op.tiling().universal_guard();
         if name == "main" {
             // Subscribe the user-supplied consumer to drive the main output.

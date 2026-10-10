@@ -1,5 +1,6 @@
 use bit_set::BitSet;
 use intervalsets::{Bounding, Interval, IntervalSet, ops::Difference};
+use smol_str::SmolStr;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use super::*;
@@ -320,8 +321,8 @@ fn iterate_union(ext_arms: &TagMap<Extent>, producer: &str) -> ColumnValue {
     cv
 }
 
-fn iterate_record(fields: &HashMap<String, Extent>, producer: &str) -> ColumnValue {
-    let data: HashMap<String, ColumnValue> = fields
+fn iterate_record(fields: &HashMap<SmolStr, Extent>, producer: &str) -> ColumnValue {
+    let data: HashMap<SmolStr, ColumnValue> = fields
         .iter()
         .map(|(field, field_extent)| (field.clone(), iterate_extent(field_extent, producer)))
         .collect();

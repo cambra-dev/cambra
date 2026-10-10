@@ -78,7 +78,7 @@ pub(super) fn product(fields: BTreeMap<FieldKey, Type>) -> Type {
             fields
                 .into_iter()
                 .map(|(k, t)| match k {
-                    FieldKey::Name(n) => (n.to_string(), t),
+                    FieldKey::Name(n) => (n.clone(), t),
                     _ => unreachable!(),
                 })
                 .collect(),
@@ -493,7 +493,7 @@ pub(crate) fn int_lit_ty(n: i64) -> Type {
 /// Test shorthand for a string literal's type — see [`int_lit_ty`].
 #[cfg(test)]
 pub(crate) fn str_lit_ty(s: &str) -> Type {
-    lit_singleton(&Lit::String(s.to_string()))
+    lit_singleton(&Lit::String(s.into()))
 }
 
 /// Test shorthand for a boolean literal's type — see [`int_lit_ty`].
@@ -791,15 +791,15 @@ mod tests {
     #[test]
     fn smoke_record_literal() {
         let mut e = TypedExpr::new(TypedExprNode::Record(vec![
-            ("a".to_string(), lit_int(1)),
-            ("b".to_string(), lit_string("x")),
+            ("a".into(), lit_int(1)),
+            ("b".into(), lit_string("x")),
         ]));
         let ty = run_inference(&mut e).expect("inference succeeds");
         assert_eq!(
             ty,
             Type::Record(vec![
-                ("a".to_string(), int_lit_ty(1)),
-                ("b".to_string(), str_lit_ty("x")),
+                ("a".into(), int_lit_ty(1)),
+                ("b".into(), str_lit_ty("x")),
             ])
         );
     }

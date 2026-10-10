@@ -5,6 +5,7 @@
 
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{AggregateKind, BinOpKind, Builtin, Lit, Name, ProjKey, Type, UnaryOpKind};
+use smol_str::SmolStr;
 
 /// The `commit` tag of a writer **decision variant** —
 /// `` {`commit{𝑃} | `abort} ``. `𝑃` is the (dense) write/reply payload record
@@ -627,7 +628,7 @@ pub enum TypedExprNode {
     ///
     /// Lowered from Python dict literals with bare identifier keys.
     /// Field access `r.field` lowers to `Apply(r, Proj(ProjKey::Field("field")))`.
-    Record(Vec<(String, TypedExpr)>),
+    Record(Vec<(SmolStr, TypedExpr)>),
 
     /// A reference to an externally-registered data source, identified by name.
     ///
@@ -1436,7 +1437,7 @@ impl TypedExpr {
     /// Construct a first-class projection morphism node.
     ///
     /// `Proj(Field(f))` acts as the function `λ t → t.f`.
-    pub fn proj_field(field: impl Into<String>) -> Self {
+    pub fn proj_field(field: impl Into<SmolStr>) -> Self {
         Self::new(TypedExprNode::Proj(ProjKey::Field(field.into())))
     }
 
