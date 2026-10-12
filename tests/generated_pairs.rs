@@ -54,6 +54,7 @@ use panic_message::panic_message;
 /// (`a_def_body_summing_jagged_rows_does_not_compile`, in `tests/compilation_pipeline/sums.rs`).
 const LIVE: &[&str] = &[
     "aggregate_arg",
+    "arg_beside_fn",
     "binop_operand",
     "body_mut_intro",
     "bool_feed",
@@ -63,6 +64,9 @@ const LIVE: &[&str] = &[
     "defer_feed",
     "feed",
     "feed_in_loop",
+    "fn_param_applied",
+    "fn_param_in_loop",
+    "fn_param_on_match_payload",
     "function_arg",
     "groupby_source",
     "keyed_write_value",
@@ -85,6 +89,7 @@ const LIVE: &[&str] = &[
     "record_feed_in_loop",
     "record_field",
     "record_projected",
+    "scrutinee_beside_fn",
     "str_coll_source",
     "str_loop_feed",
     "string_feed",
@@ -131,6 +136,8 @@ enum Ty {
     RecWithColl,
     /// A collection of integer collections, whose rows may differ in domain.
     Rows,
+    /// A function from an integer to an integer.
+    IntFn,
     /// A transactional mutable variable. Nothing evaluates to one, so it names what a binder
     /// denotes and never what a hole wants or a filler produces; `no_hole_wants_a_store`
     /// holds that.
@@ -661,6 +668,54 @@ fn skeletons() -> Vec<Skeleton> {
             out << acc
         "#}},
 
+        // A function passed to a `def` and applied there. A-normalization names a compound
+        // argument beside it, so the call's argument tuple arrives at inlining wrapped in a `let`.
+        Skeleton { name: "fn_param_applied", hole: Ty::IntFn, scope: &[], body: indoc! {r#"
+            def ap(f, n):
+                f(n)
+
+            out = test_sink()
+            out << ap({}, 2 + 3)
+        "#}},
+        Skeleton { name: "fn_param_on_match_payload", hole: Ty::IntFn, scope: &[], body: indoc! {r#"
+            def ap(f, b):
+                match b:
+                    case `some(v):
+                        f(v)
+                    case `none:
+                        0
+
+            out = test_sink()
+            out << ap({}, `some(2))
+        "#}},
+        Skeleton { name: "fn_param_in_loop", hole: Ty::IntFn, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            def ap(f, n):
+                f(n)
+
+            out = test_sink()
+            for i in [1, 2]:
+                out << ap({}, i)
+        "#}},
+        // The argument beside a function, as a value and as a `match` scrutinee.
+        Skeleton { name: "arg_beside_fn", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            def ap(f, n):
+                f(n)
+
+            out = test_sink()
+            out << ap(\x -> x * 10, {})
+        "#}},
+        Skeleton { name: "scrutinee_beside_fn", hole: Ty::Variant, scope: &[], body: indoc! {r#"
+            def ap(f, b):
+                match b:
+                    case `some(v):
+                        f(v)
+                    case `none:
+                        0
+
+            out = test_sink()
+            out << ap(\x -> x * 10, {})
+        "#}},
+
         // A product key: a tuple names each group (`Equatable` on a product).
         Skeleton { name: "groupby_tuple_key", hole: Ty::RecColl, scope: &[], body: indoc! {r#"
             out = test_sink()
@@ -816,6 +871,18 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "rows_jagged", ty: Ty::Rows, needs: &[], decls: "", expr: "[box([1, 2]), box([3, 4, 5])]" },
         Filler { name: "rows_comp", ty: Ty::Rows, needs: &[], decls: "", expr: "[[z3 * z2 for z3 in [1, 2]] for z2 in [1, 2]]" },
         Filler { name: "rows_filtered", ty: Ty::Rows, needs: &[], decls: "", expr: "[[z3 for z3 in [1, 2, 3] if z3 > z2] for z2 in [1, 2]]" },
+
+        // --- functions from integers to integers: a lambda, a named `def`, a name bound to a
+        // lambda, and a lambda capturing the binder in scope
+        Filler { name: "lambda", ty: Ty::IntFn, needs: &[], decls: "", expr: "\\fx -> fx * 10" },
+        Filler { name: "def_name", ty: Ty::IntFn, needs: &[], decls: indoc! {r#"
+            def helper_tens(hn):
+                hn * 10
+        "#}, expr: "helper_tens" },
+        Filler { name: "lambda_name", ty: Ty::IntFn, needs: &[], decls: indoc! {r#"
+            helper_lam = \hx -> hx + 3
+        "#}, expr: "helper_lam" },
+        Filler { name: "lambda_capturing", ty: Ty::IntFn, needs: &[Ty::Int], decls: "", expr: "\\fx -> fx + {b}" },
     ]
 }
 

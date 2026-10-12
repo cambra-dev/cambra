@@ -68,8 +68,8 @@
 use crate::ccl::{
     BindingTransparency, Expr, Lit, Name, Refinement, Type, TypedExprNode,
     ccl_utils::{
-        PredMemo, count_free, discharge_transparent_lets, free_names_in_value, is_free,
-        spelled_in_a_type, walk_refined_predicates_mut,
+        PredMemo, closed_let_type, count_free, discharge_transparent_lets, free_names_in_value,
+        is_free, spelled_in_a_type, walk_refined_predicates_mut,
     },
     lambda_elim::substitute,
     names::SyntheticKind,
@@ -858,7 +858,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
                 // the substituted argument's copies arrive through `on_copy` as
                 // copies of the argument's own interior, which is what they are.
                 let _g = provenance::enter(node_id, "inline.beta", provenance::Nature::Expansion);
-                return substitute(*body, &param.name, &argument);
+                return beta_reduce(*body, &param.name, argument);
             }
             // Not a Lambda (e.g. the bound expression is Var("id") rather
             // than a literal lambda) — skip beta-reduction and reconstruct
@@ -973,6 +973,51 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
         ty,
         user_annotation,
     }
+}
+
+/// `body[param := argument]`, with the `Let` chain wrapping `argument` floated out around
+/// the result: `(let 𝑥 = 𝑒 in 𝑣) ▷ (λ param → body)` reduces to `let 𝑥 = 𝑒 in
+/// body[param := 𝑣]`.
+///
+/// A-normalization names each compound component of a multi-arg call's argument tuple,
+/// so the tuple arrives as `let __anf = 𝑒 in (𝑎, __anf)`. Substituted whole, every read of
+/// the parameter becomes `(let __anf = 𝑒 in (𝑎, __anf)).𝑖`, which `simplify`'s literal-tuple
+/// projection does not fold. A function component then stays inside a value tuple, and
+/// op-conversion compiles it as a tuple element with no input. Floating the chain leaves
+/// each read a projection of the bare tuple, and binds `𝑒` once rather than once per read.
+fn beta_reduce(body: Expr, param: &Name, argument: Expr) -> Expr {
+    let mut lets = Vec::new();
+    let mut value = argument;
+    while let TypedExprNode::Let { .. } = value.node {
+        let Expr {
+            node_id,
+            node:
+                TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body: let_body,
+                },
+            ..
+        } = value
+        else {
+            unreachable!("matched a Let")
+        };
+        debug_assert!(
+            !is_free(&binding.name, &body),
+            "beta_reduce: the argument's binder `{}` is free in the callee body; binders are \
+             unique after uniquify, so floating it out of the argument cannot capture",
+            binding.name
+        );
+        lets.push((node_id, binding, *bound_expr));
+        value = *let_body;
+    }
+    let reduced = substitute(body, param, &value);
+    lets.into_iter()
+        .rev()
+        .fold(reduced, |body, (node_id, binding, bound_expr)| {
+            let ty = closed_let_type(&binding, &bound_expr, body.ty.clone());
+            Expr::let_in_preserving(node_id, binding, bound_expr, body).with_ty(ty)
+        })
 }
 
 /// Run [`inline_and_beta_reduce`] on every refinement predicate embedded in

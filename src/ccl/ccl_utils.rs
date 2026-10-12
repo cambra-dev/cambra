@@ -8,8 +8,8 @@ use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
 use crate::ccl::subst::Subst;
 use crate::ccl::{
     BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, F_WRITES, FieldKey, Lit,
-    LogicKind, Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedExprNode,
-    UnaryOpKind, V_ABORT, V_COMMIT, V_FIRED, V_IDLE,
+    LogicKind, Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedBinding,
+    TypedExprNode, UnaryOpKind, V_ABORT, V_COMMIT, V_FIRED, V_IDLE,
 };
 
 /// The `commit` selector field of the **intermediate** decision record the two
@@ -662,6 +662,24 @@ fn discharge_transparent_lets_in_term(e: &Expr) -> Expr {
         return body;
     }
     out
+}
+
+/// The type of `let binding = bound_expr in body`, from `body_ty`: the body's type lifted out
+/// of the binder's scope by discharging `[binding ↦ bound_expr]`
+/// (`src/ccl/design/type-inference.md`, "`let` binders and scope exit"). An opaque binder
+/// carries no definiens to discharge, so its name stays in the lifted type.
+///
+/// The post-pass check reconstructs a `let`'s type with this, so a pass building a `let` stamps
+/// the same type.
+pub(crate) fn closed_let_type(binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type {
+    if binding.transparency == BindingTransparency::Opaque
+        || !crate::ccl::subst::type_free_vars(&body_ty).contains(&binding.name)
+    {
+        return body_ty;
+    }
+    // A type-level discharge. The template keeps its ids because a template is not a tree
+    // node — it is cloned again at every read, and that read is where the sibling is minted.
+    Subst::discharge(&binding.name, bound_expr.clone_preserving_ids()).apply_type(&body_ty)
 }
 
 /// Debug-only invariant: no refinement predicate embedded in `ty` contains an
