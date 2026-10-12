@@ -286,6 +286,42 @@ impl ScopeEnv for SolverScope<'_> {
 }
 
 impl InferCtx {
+    /// Open the type parameters `params` of a module checked on its own, in
+    /// declaration order, for the whole check (`docs/modules.md`, "Checking a
+    /// module on its own"). An opaque one is an opened parameter, its bound
+    /// normalized with the ones before it open. One with no kind written is a
+    /// variable at the module's level, which its uses bound.
+    pub(super) fn open_module_params(
+        &mut self,
+        params: &[super::ModuleCheckParam],
+    ) -> Result<(), LocatedInferError> {
+        for p in params {
+            let opened = match p {
+                super::ModuleCheckParam::Inferred(_) => {
+                    Type::Infer(InferVar::fresh_in(self.level, &self.telescope))
+                }
+                super::ModuleCheckParam::Opaque { param, bound } => {
+                    let bound = match bound {
+                        Some(bound) => {
+                            let mut bound = bound.clone();
+                            self.type_annotation_predicates(&mut bound)?;
+                            Some(self.normalize_annotation(&bound))
+                        }
+                        None => None,
+                    };
+                    Type::Param(crate::ccl::ty::TypeParam::opened(
+                        param.spelling.clone(),
+                        self.level,
+                        bound,
+                        None,
+                    ))
+                }
+            };
+            self.opened_params.push((p.param().id, opened));
+        }
+        Ok(())
+    }
+
     /// `root` seeds [`current_node_id`](Self::current_node_id) so the context is
     /// never in a state where an error has no node to blame.
     pub(super) fn new(sources: HashMap<String, Type>, root: NodeId) -> Self {

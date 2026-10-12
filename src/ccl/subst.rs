@@ -1741,7 +1741,7 @@ pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
 /// [`InferError::UnresolvedBoundedHole`](crate::ccl::infer::InferError::UnresolvedBoundedHole),
 /// not by this test.
 pub fn type_contains_infer(ty: &Type) -> bool {
-    matches!(ty, Type::Infer(_) | Type::BarrierVar(_)) || ty.any_child(type_contains_infer)
+    ty.holds_type(&|ty| matches!(ty, Type::Infer(_) | Type::BarrierVar(_)))
 }
 
 /// Insert each of `names` into `bound` for the duration of `f`, restoring the

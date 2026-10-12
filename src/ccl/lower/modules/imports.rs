@@ -25,9 +25,9 @@ pub(super) struct Imported {
 /// ([`ProgramLowering::import_keys`]).
 pub(super) enum ImportArgument<'a> {
     Lit(Lit),
-    /// An import name, by the statement that binds it, with the abstract type
-    /// members of the parameter's Module type, which it gives.
-    Import(Span, SmolStr, Vec<QualifiedName>),
+    /// An import name, by the statement that binds it, with the type members
+    /// of the parameter's Module type, each with what its entry states.
+    Import(Span, SmolStr, Vec<(QualifiedName, TypeEntryForm)>),
     /// A type, with the statements of the imports whose names it writes.
     Type(&'a Spanned<ChlExpr>, Vec<Span>),
 }
@@ -163,15 +163,12 @@ impl ProgramLowering<'_> {
                                         .find(|p| p.name == arg.name.node)?
                                         .clone();
                                     let ty = parameter.module()?;
-                                    Some(abstract_members(
+                                    Some(type_members(
                                         &QualifiedName::new(parameter.name.clone()),
                                         ty,
                                     ))
                                 })
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|(member, _)| member)
-                                .collect();
+                                .unwrap_or_default();
                             ImportArgument::Import(import_names[name], name.clone(), members)
                         }
                         (ChlExpr::Name(name), None) if run_names.contains(name) => {
@@ -232,6 +229,7 @@ impl ProgramLowering<'_> {
             let before = pending.len();
             // A type argument lowers against the imports decided in the rounds
             // before. The scope's own errors are reported when the module lowers.
+            // Each import's arguments are checked by the importer's check.
             // A type argument lowers against the scope built here, so one whose
             // imports are decided in this round waits for the next.
             let decided: HashSet<Span> = resolved.keys().copied().collect();
@@ -251,6 +249,7 @@ impl ProgramLowering<'_> {
                 let mut key = Vec::new();
                 let mut site = HashMap::new();
                 let mut types = HashMap::new();
+                let mut checked: Vec<(Span, Type, TypeEntryForm)> = Vec::new();
                 for (parameter, span, value) in arguments {
                     let argument = match value {
                         ImportArgument::Lit(value) => KeyArgument::Lit(value.clone()),
@@ -272,7 +271,7 @@ impl ProgramLowering<'_> {
                             // error at the argument.
                             let qualifier = ctx.module.qualifiers.get(passed).cloned();
                             let under = QualifiedName::new(parameter.clone());
-                            for member in members {
+                            for (member, form) in members {
                                 let found = qualifier.as_ref().map(|qualifier| {
                                     qualifier.argument_type_member(&under, member, *span)
                                 });
@@ -284,7 +283,10 @@ impl ProgramLowering<'_> {
                                     }
                                     Some(Ok(None)) | None => Type::Hole,
                                 };
-                                types.insert(member.clone(), ty);
+                                checked.push((*span, ty.clone(), form.clone()));
+                                if matches!(form, TypeEntryForm::Abstract { .. }) {
+                                    types.insert(member.clone(), ty);
+                                }
                             }
                             KeyArgument::Module(shared)
                         }
@@ -320,6 +322,34 @@ impl ProgramLowering<'_> {
                                 return false;
                             }
                             let key = self.type_keys.key(&ty);
+                            let bound =
+                                self.lowered
+                                    .get(file)
+                                    .cloned()
+                                    .flatten()
+                                    .and_then(|lowered| {
+                                        let found = lowered
+                                            .interface
+                                            .parameters
+                                            .iter()
+                                            .find(|p| &p.name == parameter)?;
+                                        let ParameterKind::Type {
+                                            param,
+                                            bound: Some(bound),
+                                            ..
+                                        } = &found.kind
+                                        else {
+                                            return None;
+                                        };
+                                        Some((Rc::clone(param), bound.clone()))
+                                    });
+                            if let Some((param, bound)) = bound {
+                                let form = TypeEntryForm::Abstract {
+                                    param,
+                                    bound: Some(bound),
+                                };
+                                checked.push((*span, ty.clone(), form));
+                            }
                             types.insert(QualifiedName::new(parameter.clone()), ty);
                             KeyArgument::Type(key)
                         }
@@ -332,16 +362,20 @@ impl ProgramLowering<'_> {
                     module: module.clone(),
                     arguments: key.into(),
                 };
-                let reached = self.lowered.get(file).cloned().flatten().map_or_else(
-                    TypeArguments::default,
-                    |lowered| {
-                        reached_types(
-                            &lowered.interface,
-                            &QualifiedName::new(name.clone()),
-                            &types,
-                        )
-                    },
-                );
+                let qualifier = QualifiedName::new(name.clone());
+                let reached = self
+                    .lowered
+                    .get(file)
+                    .cloned()
+                    .flatten()
+                    .map_or_else(TypeArguments::default, |lowered| {
+                        reached_types(&lowered.interface, &qualifier, &types)
+                    });
+                let checks = type_checks(std::mem::take(&mut checked), &qualifier, &reached);
+                self.import_checks
+                    .entry(importer)
+                    .or_default()
+                    .extend(checks);
                 resolved.insert(*statement, Some(shared.clone()));
                 self.imports.insert(
                     *statement,
