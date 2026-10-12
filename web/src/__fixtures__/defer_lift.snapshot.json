@@ -5249,7 +5249,7 @@
           ]
         },
         {
-          "label": "FanOutBranch",
+          "label": "FanOutSlot",
           "nodeId": 817,
           "role": "operator",
           "tiling": "Fn({[0, 3]} → Int)",
@@ -5374,7 +5374,7 @@
           ]
         },
         {
-          "label": "FanOutBranch",
+          "label": "FanOutSlot",
           "nodeId": 821,
           "role": "operator",
           "tiling": "Fn({[0, 3]} → Int)",
@@ -5470,7 +5470,7 @@
           ]
         },
         {
-          "label": "FanOutBranch",
+          "label": "FanOutSlot",
           "nodeId": 824,
           "role": "operator",
           "tiling": "Fn({`0 | `1{[0, 3]}} → Int)",

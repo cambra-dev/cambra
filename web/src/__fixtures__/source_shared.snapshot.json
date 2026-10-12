@@ -4674,7 +4674,7 @@
           ]
         },
         {
-          "label": "FanOutBranch",
+          "label": "FanOutSlot",
           "nodeId": 683,
           "role": "operator",
           "tiling": "Fn(Source(stdin) → String)",
@@ -4894,7 +4894,7 @@
           ]
         },
         {
-          "label": "FanOutBranch",
+          "label": "FanOutSlot",
           "nodeId": 684,
           "role": "operator",
           "tiling": "Fn(Source(stdin) → String)",

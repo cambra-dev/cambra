@@ -113,7 +113,7 @@ pub(super) fn insert_iterate_recurse(
     }
     // A zipped product pairs its components beneath the levels they were applied over:
     // op-conversion's `Zip` arm fans the outer input out to each component, so each is
-    // compiled with `input=Some(fan_out_branch)`. The value-position arms below would mark a
+    // compiled with `input=Some(fan_out_slot)`. The value-position arms below would mark a
     // collection-valued component as an iteration site ([`mark_component_source`]),
     // and an `iterate` chain takes no input — the same shape the `Copair` arm's
     // `Data`-kind test keeps a fanned-out `Case` arm away from. Recurse into each
@@ -1175,7 +1175,7 @@ mod tests {
     #[test]
     fn test_insert_iterate_recurse_zip_arg_tuple_left_alone() {
         // `Apply(Tuple(fields), Zip)` — Zip's arm runs the tuple under
-        // `input=Some(fan_out_branch)`, so each field receives the
+        // `input=Some(fan_out_slot)`, so each field receives the
         // surrounding iteration via fan-out and must *not* be wrapped.
         // The catch-all `Apply` walk would otherwise wrap the inner
         // Record/Tuple fields and introduce redundant operators.

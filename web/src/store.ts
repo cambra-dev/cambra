@@ -37,7 +37,7 @@ export type Selection =
    *
    * It exists because an operator's span is not its own. Conversion attributes
    * a whole recurrence to the statement that produced it, so
-   * `FanOutBranch`'s span is the entire `for`. A `node` selection on it
+   * `FanOutSlot`'s span is the entire `for`. A `node` selection on it
    * therefore derives a region covering the loop, seeds every node inside that
    * region as a trace, and lights up the pane — while its transitive closure
    * walks back to the statement and forward to all 46 siblings. Neither is

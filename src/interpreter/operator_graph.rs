@@ -14,7 +14,7 @@
 //! An edge is a **subscription**: the consumer holds the operator the edge names
 //! and calls `get` on it. `notify` runs the other way along the same edges, so an
 //! edge is the pull direction rather than dataflow as a whole. One edge is held
-//! without being subscribed: a fan branch that lost `should_subscribe` while its
+//! without being subscribed: a fan slot that lost `should_subscribe` while its
 //! sibling drove the subscribe for all of them.
 //!
 //! Degrees are counted in dataflow direction — an operator holding no input has
@@ -59,7 +59,7 @@ pub enum EdgeKind {
     ///
     /// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
     Value { deferred: bool },
-    /// An edge to a node more than one consumer may reach: a `FanOutBranch`'s
+    /// An edge to a node more than one consumer may reach: a `FanOutSlot`'s
     /// edge to its fan input.
     ///
     /// What separates this from [`Value`](Self::Value) is exclusivity, not
@@ -155,11 +155,11 @@ pub(crate) fn value_late<'a>(role: EdgeRole, op: &'a dyn TileOperator) -> InputE
     }
 }
 
-/// A branch's edge to its fan input.
+/// A slot's edge to its fan input.
 ///
 /// Whether the fan closes a cycle is not this edge's business. Every cycle in
 /// the graph runs through an input wired late — see [`EdgeKind::Value`]'s
-/// `deferred` — and a store's remaining branches serve its downstream reads.
+/// `deferred` — and a store's remaining slots serve its downstream reads.
 pub(crate) fn share<'a>(fan_input: &'a dyn TileOperator) -> InputEdgeSpec<'a> {
     InputEdgeSpec {
         role: EdgeRole::Named("fan"),
@@ -215,8 +215,8 @@ impl OperatorGraph {
     ///
     /// Two kinds of node qualify. A **sink**: nothing subscribes it. A **fan
     /// input**: the `Rc<FanOut>` holding it is dropped when conversion ends, so
-    /// only its branches survive, and each names it with a `Share` — and a
-    /// binding whose variable is never used has a fan with no branches at all,
+    /// only its slots survive, and each names it with a `Share` — and a
+    /// binding whose variable is never used has a fan with no slots at all,
     /// so nothing names it.
     ///
     /// Every node of the graph is reachable from here along `Value` edges alone,

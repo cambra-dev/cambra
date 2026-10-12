@@ -129,7 +129,7 @@ describe("the values pane", () => {
     expect(after?.textContent).toContain('"changed"');
   });
 
-  // One operator builds one producer per `FanOut` branch, and two of them
+  // One operator builds one producer per `FanOut` slot, and two of them
   // holding a row at the same domain key are two rows. Keyed on the key alone,
   // the second overwrote the first: one was drawn and both were counted.
   it("keeps two probes' rows at one key apart", async () => {

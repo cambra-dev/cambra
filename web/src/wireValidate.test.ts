@@ -342,7 +342,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     pane.nodes = [
       {
         ...minimalOperatorNode(),
-        label: "FanOutBranch",
+        label: "FanOutSlot",
         role: "operator",
         tiling: "String",
         inputs: [{ role: { kind: "named", name: "fan" }, kind: "share", deferred: false, subscribed: 1 }],

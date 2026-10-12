@@ -646,7 +646,7 @@ pub enum TypedExprNode {
     /// tree computes, and
     /// [`crate::interpreter::operator_conversion`] supplies the value. Here that
     /// is the retired program's state
-    /// ([`Inheritance::mutable_state`](crate::interpreter::operator_conversion::Inheritance)),
+    /// ([`Offer::mutable_state`](crate::interpreter::operator_conversion::Offer)),
     /// which is why a version containing one is an upgrade of a specific
     /// predecessor and cannot be started from nothing.
     ///

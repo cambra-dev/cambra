@@ -13,7 +13,7 @@ use cambra::chl_parser::SourceMap;
 use cambra::interpreter::{
     BaseType, Consumer, Extent, Predicate, SinkReadError, TestDataSource, Value,
 };
-use cambra::live_program::LiveProgram;
+use cambra::live_program::{LiveProgram, MAIN_BRANCH};
 use indoc::{formatdoc, indoc};
 
 /// Run `source` to completion and answer what it wrote to each named sink.
@@ -557,6 +557,7 @@ fn a_sink_accumulates_across_a_reload() {
 
     live.reload(
         &mut ctx,
+        MAIN_BRANCH,
         &SourceMap::single("<test>", version(100)),
         &consumer,
     )
@@ -569,7 +570,7 @@ fn a_sink_accumulates_across_a_reload() {
     let mut completed = false;
     for _ in 0..200 {
         ctx.scheduler().check_for_notifications();
-        if live.done().try_recv().is_ok() {
+        if live.poll_finished() {
             completed = true;
             break;
         }

@@ -307,25 +307,28 @@ pub trait DataSourceDomainExtentImpl {
     /// Release the region described by `obsolete` for the given producer — those domain values no longer
     /// need to be retained by the source.
     fn release(&mut self, producer: &str, obsolete: Predicate);
-    /// Record what every current producer has released, so a producer
+    /// Record where `predecessor`'s producers stopped, so a producer
     /// registering with this source from now on starts there rather than at the
-    /// oldest value it still holds.
+    /// oldest value the source still holds.
     ///
-    /// Called when a running program is replaced
-    /// ([`LiveProgram::reload`](crate::live_program::LiveProgram::reload)). The
-    /// operators the replacement rebuilds register as new producers, and a source
-    /// hands a newly-registered one everything it has retained, so without this
-    /// the replacement recomputes the program's history instead of continuing it
+    /// Called when a branch's version is replaced or a branch is created
+    /// ([`LiveProgram`](crate::live_program::LiveProgram)), with the names of
+    /// the producers the version being replaced holds. The operators the
+    /// replacement rebuilds register as new producers, and a source hands a
+    /// newly-registered one everything it has retained, so without this the
+    /// replacement recomputes the program's history instead of continuing it
     /// and re-emits an output for every input the replaced version answered.
     ///
-    /// What is carried is the *agreed* release — the part every producer is
-    /// finished with — so an element that arrived but went unhandled is still
-    /// delivered to whoever takes over.
+    /// What is carried is the intersection of the predecessor's producers'
+    /// releases, so an element that arrived but went unhandled is still
+    /// delivered to whoever takes over, and another branch's lagging producer
+    /// does not pull the start below what the predecessor handled — see
+    /// [`ProducerReleases::carry_to_new_producers`](crate::interpreter::producer_releases::ProducerReleases::carry_to_new_producers).
     ///
     /// There is no default: a source that silently did not carry would replay its
     /// history into the replacement, which reads as the program answering every
     /// request it had already answered.
-    fn carry_release_to_new_producers(&mut self);
+    fn carry_release_to_new_producers(&mut self, predecessor: &std::collections::HashSet<String>);
 
     /// The first position a producer registering with this source from now on
     /// will be offered.

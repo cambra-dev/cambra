@@ -460,7 +460,7 @@ fn operator_nodes(example: &str) -> Vec<Value> {
 
 /// The `IterateExtent`s upstream of `id`, following every input edge.
 ///
-/// Share edges are followed too: a fan branch reaches its fan input through
+/// Share edges are followed too: a fan slot reaches its fan input through
 /// one, and a source read downstream of a shared iteration crosses it.
 fn iterations_upstream(nodes: &[Value], id: u64) -> Vec<&Value> {
     let by_id: std::collections::HashMap<u64, &Value> = nodes

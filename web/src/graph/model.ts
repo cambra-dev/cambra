@@ -3,7 +3,7 @@
 // The wire ships every operator the conversion built. Two of those kinds carry
 // no step of the computation and cost the reader more than they tell:
 //
-// - **A `FanOutBranch` never has more than one consumer.** The fan-out happens
+// - **A `FanOutSlot` never has more than one consumer.** The fan-out happens
 //   at the shared producer every branch points at, and `FanOut` is not a
 //   `TileOperator`, so no node records it. Drawing the branches puts the name
 //   "fan" on the one node in the star that does not fan. Suppressing a branch
@@ -74,7 +74,7 @@ export class DrawGraph {
 }
 
 const isConstant = (n: OperatorNode) => n.label === "Constant";
-const isBranch = (n: OperatorNode) => n.label === "FanOutBranch";
+const isFanSlot = (n: OperatorNode) => n.label === "FanOutSlot";
 
 /** A constant's type, which is all its node carried. */
 function constantText(node: OperatorNode): string {
@@ -103,7 +103,7 @@ export function drawGraphOf(pane: OperatorPane): DrawGraph {
   const suppressed = new Set<number>();
   const chipOf = new Map<number, number>();
   for (const n of pane.nodes) {
-    if (isBranch(n) && n.inputs.some((e) => isNamedRole(e.role, "fan")) && outDegree(n.nodeId) === 1) {
+    if (isFanSlot(n) && n.inputs.some((e) => isNamedRole(e.role, "fan")) && outDegree(n.nodeId) === 1) {
       suppressed.add(n.nodeId);
     }
   }

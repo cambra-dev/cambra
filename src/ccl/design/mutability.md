@@ -1203,7 +1203,7 @@ loop completion — a **completeness** edge on the `Txn` domain.
 
 **A sample, not a reduction.** A `Txn` read takes the key's carried value at some commit
 position, and this read's position is where `𝑥`'s writers finish. `await_final(𝑥)` becomes
-`final_read(𝑥.history)`, which op-conversion compiles to `StoreFinalRead` over the store branch.
+`final_read(𝑥.history)`, which op-conversion compiles to `StoreFinalRead` over the store slot.
 That operator takes the same sample the fed-out as-of read does, through the same `store_current`;
 the two differ in what fixes the position — a trigger's arrival there, the store's own closure here.
 Neither term carries a seed operand, because every store carries its keys' seeds.
