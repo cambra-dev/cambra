@@ -536,7 +536,6 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
             }
         }
         Tile::Aggregation {
-            kind,
             accumulator,
             terminal,
         } => Rendered {
@@ -544,8 +543,8 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
             completeness: Some(format!("terminal: {}", cell(terminal, 0))),
             note: None,
             rows: vec![ReadingRow {
-                key: Some(format!("{kind:?}")),
-                value: position(accumulator, 0),
+                key: Some(format!("{:?}", accumulator.kind())),
+                value: position(&accumulator.to_tile(), 0),
                 deleted: false,
             }],
             total: 1,
@@ -694,7 +693,7 @@ fn write_position(tile: &Tile, i: usize, out: &mut Bounded) -> fmt::Result {
             })
         }
         Tile::DataFunction { .. } => out.write_str("<absent>"),
-        Tile::Aggregation { accumulator, .. } => write_position(accumulator, i, out),
+        Tile::Aggregation { accumulator, .. } => write_position(&accumulator.to_tile(), i, out),
         // A store is a whole value, so it stands at one row.
         Tile::Store { .. } if i < tile.rows() => {
             write_fields(sorted_store_keys(tile), out, |name, out| {

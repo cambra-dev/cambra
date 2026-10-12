@@ -448,11 +448,17 @@ type and yields `Unit`; `Sole` yields the element type and requires at most one 
 runtime. Operator conversion dispatches by `AggregateKind`, without inspecting a call-site variable
 name.
 
-`AggregateKind` also defines the output extent, seed, fold, and partiality. `Sum`, `Max`, `Min`, and
-`Drain` use total folds with an in-band identity. `Sole` has an `Option(𝐴)`-like accumulator:
-empty is represented by an empty column, one element by a length-one column, and adding another
-element faults. `is_partial` states that distinction, and `initial_accumulator` checks that the
-seed representation agrees. The duplicate-key check for map construction uses this `Sole` law
+`AggregateKind` also defines the output extent and partiality, and selects the fold: each aggregate
+implements `Aggregation` over its element type (`ccl/aggregate/aggregation.rs`), stating
+`accumulate`, `combine`, and `finalize` over typed state. `AggregateKind::accumulator` builds the
+`Accumulator`, the aggregate with one typed partial aggregation per row, which `Tile::Aggregation`
+holds directly and which a tile selects, filters, and merges without converting it to a column. Only
+the accumulator seeds, and it seeds the typed state, never a tile. `Sum` seeds `0` and `Drain` its
+`unit`, so a fold of no rows still leaves one row. `Max` and `Min` have no identity and are empty
+until the first element arrives. A `whole` `Accumulator::merge` combines two partial aggregations of
+one group, and one with no rows contributes nothing. `Sole` has an `Option(𝐴)`-like accumulator, as
+`Max` and `Min` do: empty is represented by an empty column and one element by a length-one column.
+Adding a second element to `Sole` faults. The duplicate-key check for map construction uses this `Sole` law
 (`ccl/aggregate.rs`).
 
 ---

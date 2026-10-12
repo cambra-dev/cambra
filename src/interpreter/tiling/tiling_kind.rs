@@ -221,9 +221,8 @@ impl Tiling {
                 BitSet::new(),
             ),
             Tiling::Aggregation { kind, accumulator } => Tile::Aggregation {
-                kind: *kind,
                 terminal: ColumnValue::Bools(BitVec::new()),
-                accumulator: Box::new(accumulator.empty_at_no_rows()),
+                accumulator: kind.accumulator(accumulator),
             },
             // An empty store: every key's changelog empty, frontier undecided, live,
             // and no key closed — a writer that has not been pulled yet may still

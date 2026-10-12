@@ -8,7 +8,7 @@ use super::*;
 use crate::interpreter::nest_levels;
 use crate::interpreter::operator_graph::value;
 use crate::{
-    ccl::AggregateKind,
+    ccl::{Accumulator, AggregateKind},
     interpreter::{ColumnValue, Consumer, Scheduler, Value},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -77,10 +77,8 @@ struct AggregateProducer {
     base: ProducerBase,
     /// The subscribed input producer.
     input: Box<dyn TileProducer>,
-    /// The aggregation operation.
-    kind: AggregateKind,
-    /// Running accumulation state; updated in place on each `get`.
-    accumulator: Tile,
+    /// The aggregate and its running state; updated in place on each `get`.
+    accumulator: Box<dyn Accumulator>,
     /// Set once the consumer has released this output universally, after which
     /// the accumulator must never be handed back — it *is* the whole output, so
     /// re-emitting it returns released data.
@@ -88,26 +86,15 @@ struct AggregateProducer {
 }
 
 impl AggregateProducer {
-    /// Construct an `AggregateProducer`, seeding the accumulator with the identity element.
+    /// Construct an `AggregateProducer` with an unseeded accumulator, which the first fold seeds.
     fn new(base: ProducerBase, input: Box<dyn TileProducer>) -> Self {
-        let (kind, accumulator) = match &base.tiling {
-            Tiling::Aggregation {
-                kind,
-                accumulator: acc_tiling,
-            } => (
-                *kind,
-                Tile::Aggregation {
-                    kind: *kind,
-                    accumulator: Box::new(kind.initial_accumulator(acc_tiling)),
-                    terminal: ColumnValue::Bools(BitVec::from_elem(1, false)),
-                },
-            ),
+        let accumulator = match &base.tiling {
+            Tiling::Aggregation { kind, accumulator } => kind.accumulator(accumulator),
             other => panic!("AggregateProducer created with non-Aggregation tiling: {other:?}"),
         };
         Self {
             base,
             input,
-            kind,
             accumulator,
             released: false,
         }
@@ -144,17 +131,11 @@ impl TileProducer for AggregateProducer {
             "Aggregate input is_terminal: {is_terminal} from guard {:?}",
             self.input.obsolete_guard()
         );
-        let Tile::Aggregation {
-            kind: _,
-            ref mut accumulator,
-            terminal: ColumnValue::Bools(ref mut terminal),
-        } = self.accumulator
-        else {
-            panic!("Accumulator must be Aggregation tile")
-        };
-        self.kind.accumulate(accumulator, &values, 0, values.rows());
-        terminal.set(0, is_terminal);
-        self.accumulator.clone()
+        self.accumulator.accumulate_tile(&values, 0, values.rows());
+        Tile::Aggregation {
+            accumulator: self.accumulator.clone(),
+            terminal: ColumnValue::Bools(BitVec::from_elem(1, is_terminal)),
+        }
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -174,12 +155,11 @@ impl TileProducer for AggregateProducer {
 pub struct ExtractAggregate {
     input: Box<dyn TileOperator>,
     base: OperatorBase,
-    kind: AggregateKind,
     only_terminal: bool,
 }
 
 impl ExtractAggregate {
-    pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind, only_terminal: bool) -> Self {
+    pub fn new(input: Box<dyn TileOperator>, only_terminal: bool) -> Self {
         let tiling = if only_terminal {
             Tiling::Scalar(input.extent())
         } else {
@@ -188,7 +168,6 @@ impl ExtractAggregate {
         Self {
             base: OperatorBase::new(tiling),
             input,
-            kind,
             only_terminal,
         }
     }
@@ -217,7 +196,6 @@ impl TileOperator for ExtractAggregate {
             input: self
                 .input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
-            kind: self.kind,
             only_terminal: self.only_terminal,
         })
     }
@@ -226,7 +204,6 @@ impl TileOperator for ExtractAggregate {
 struct ExtractAggregateProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
-    kind: AggregateKind,
     only_terminal: bool,
 }
 
@@ -240,7 +217,6 @@ impl TileProducer for ExtractAggregateProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_result = self.input.get(self.input.tiling().universal_guard());
         let Tile::Aggregation {
-            kind: _,
             accumulator,
             terminal,
         } = input_result
@@ -258,7 +234,7 @@ impl TileProducer for ExtractAggregateProducer {
         }
         if self.only_terminal {
             if terminal.index_at(0).as_bool() {
-                self.kind.extract(*accumulator)
+                accumulator.finalize()
             } else {
                 self.tiling().empty_tile()
             }
@@ -284,8 +260,6 @@ impl TileProducer for ExtractAggregateProducer {
 pub struct MapExtractAggregate {
     /// The `DataFunction(D, Aggregation)`-typed input.
     input: Box<dyn TileOperator>,
-    /// The aggregation operation used to extract final values from accumulators.
-    kind: AggregateKind,
     /// Output tiling: `DataFunction { domain: input.domain, codomain: Scalar(output_extent) }`.
     base: OperatorBase,
 }
@@ -295,7 +269,7 @@ impl MapExtractAggregate {
     ///
     /// `input` must be a collection chain ending in `Aggregation { accumulator: A }`, at
     /// whatever depth. The output replaces that aggregation with what it extracts to.
-    pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
+    pub fn new(input: Box<dyn TileOperator>) -> Self {
         assert!(
             input.tiling().is_data_function(),
             "MapExtractAggregate expected a collection input, got {}",
@@ -305,7 +279,6 @@ impl MapExtractAggregate {
         Self {
             base: OperatorBase::new(tiling),
             input,
-            kind,
         }
     }
 }
@@ -346,7 +319,6 @@ impl TileOperator for MapExtractAggregate {
                 scheduler,
             ),
             input: input_producer,
-            kind: self.kind,
         })
     }
 }
@@ -356,8 +328,6 @@ struct MapExtractAggregateProducer {
     base: ProducerBase,
     /// The subscribed input producer.
     input: Box<dyn TileProducer>,
-    /// The aggregation operation used to extract final values.
-    kind: AggregateKind,
 }
 
 impl TileProducer for MapExtractAggregateProducer {
@@ -377,7 +347,6 @@ impl TileProducer for MapExtractAggregateProducer {
         let Tile::Aggregation {
             accumulator,
             terminal,
-            ..
         } = folded
         else {
             panic!("MapExtractAggregate expected an aggregation under the keys, got {folded:?}")
@@ -386,7 +355,7 @@ impl TileProducer for MapExtractAggregateProducer {
         let mask = terminal
             .as_bitvec()
             .unwrap_or_else(|| panic!("Expected bools"));
-        *slot = self.kind.extract(*accumulator);
+        *slot = accumulator.finalize();
         // One bool per accumulator, so the mask is over the innermost collection's keys.
         output
             .innermost_level_mut()
@@ -618,7 +587,7 @@ struct MapAggregateProducer {
     /// The aggregation operation.
     kind: AggregateKind,
     /// Running per-key accumulators, grown as new keys arrive across `get` calls.
-    accumulators: HashMap<Vec<Value>, Tile>,
+    accumulators: HashMap<Vec<Value>, Box<dyn Accumulator>>,
     /// Keys above the accumulators whose every accumulator was released without the key
     /// itself: a key is there only through what it maps to, and a release naming part of
     /// what lies beneath leaves it in place, holding nothing unreleased
@@ -698,8 +667,8 @@ impl TileProducer for MapAggregateProducer {
             let (start, end) = folded.row_run(row);
             let acc = accumulators
                 .entry(path.clone())
-                .or_insert_with(|| kind.initial_accumulator(&output_tiling));
-            kind.accumulate(acc, &values, start, end);
+                .or_insert_with(|| kind.accumulator(&output_tiling));
+            acc.accumulate_tile(&values, start, end);
         }
 
         // Release received values
@@ -718,7 +687,7 @@ impl TileProducer for MapAggregateProducer {
         // level is the same mistake one level up: under a nested store the enclosing
         // positions stay open while the one being run is decided, so an aggregate inside the
         // nest would never settle either.
-        let mut entries: Vec<(Vec<Value>, Tile)> = self
+        let mut entries: Vec<(Vec<Value>, Box<dyn Accumulator>)> = self
             .accumulators
             .iter()
             .map(|(path, acc)| (path.clone(), acc.clone()))
@@ -733,13 +702,12 @@ impl TileProducer for MapAggregateProducer {
             .collect();
         // One accumulator per key, run together in path order: a scalar fold's rows are a
         // column, and `Sole`'s are the elements' own levels.
-        let mut accumulator = output_tiling.empty_at_no_rows();
+        let mut accumulator = self.kind.accumulator(&output_tiling);
         for (_, acc) in &entries {
-            accumulator.merge_rows(acc.clone());
+            accumulator.merge(acc.clone(), false);
         }
         let aggregation = Tile::Aggregation {
-            kind: self.kind,
-            accumulator: Box::new(accumulator),
+            accumulator,
             terminal: ColumnValue::Bools(terminal),
         };
         let mut paths: Vec<&[Value]> = entries.iter().map(|(path, _)| path.as_slice()).collect();
@@ -851,8 +819,8 @@ mod tests {
             panic!("expected an Aggregation tile, got {first:?}");
         };
         assert_eq!(
-            *accumulator,
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![30])))
+            accumulator.to_tile(),
+            Tile::Scalar(ColumnValue::Ints(vec![30]))
         );
 
         producer.release(tiling.universal_guard());
@@ -1084,7 +1052,7 @@ mod tests {
             panic!("the fold sits beneath one level, got {second:?}")
         };
         assert_eq!(
-            **accumulator,
+            accumulator.to_tile(),
             Tile::Scalar(ColumnValue::Ints(vec![330])),
             "each element counted once"
         );

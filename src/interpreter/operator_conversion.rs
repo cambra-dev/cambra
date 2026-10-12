@@ -2823,7 +2823,6 @@ fn convert_impl_inner(
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
                 b if let Some(kind) = b.as_aggregate() => Ok(Box::new(MapExtractAggregate::new(
                     Box::new(MapAggregate::new(input, kind)),
-                    kind,
                 ))),
                 // Composed rather than applied would be a reduction per enclosing position, which
                 // nothing mints: a loop's trailing read is `final_read`, and a guard-`Case`
@@ -5454,7 +5453,6 @@ fn apply_aggregate(
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     Ok(Box::new(ExtractAggregate::new(
         Box::new(Aggregate::new(input, op)),
-        op,
         true,
     )))
 }

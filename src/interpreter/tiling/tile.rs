@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use super::curry_level::CurryLevel;
 use super::guard::domain_prefix;
 use crate::{
-    ccl::AggregateKind,
+    ccl::Accumulator,
     interpreter::{
         BinOpKind, ColumnValue, Extent, FunctionGuard, LogicKind, Position, Predicate, RowIndex,
         TileGuard, Tiling, Value, apply_binop_column, tuple_field,
@@ -76,12 +76,10 @@ pub enum Tile {
     },
     /// A Tile representing the state of a scalar aggregation.
     Aggregation {
-        /// The type of aggregate
-        kind: AggregateKind,
-        /// The accumulator state of the specific aggregate, one value per row. A tile
-        /// rather than a column because a fold may yield an *element*: `Sole` holds
-        /// whatever shape the element has, levels included.
-        accumulator: Box<Tile>,
+        /// The aggregate with its partial aggregation, one per row. Not a column of values
+        /// because a fold may yield an *element*: `Sole` holds whatever shape the element
+        /// has, levels included.
+        accumulator: Box<dyn Accumulator>,
         /// Boolean representing whether the aggregate is complete
         terminal: ColumnValue,
     },
@@ -296,14 +294,20 @@ impl Tile {
                     && value_tile.check_from_over(codomain, &levels)
             }
             (
-                Tile::Aggregation {
-                    kind, accumulator, ..
-                },
+                Tile::Aggregation { accumulator, .. },
                 Tiling::Aggregation {
                     kind: tiled,
                     accumulator: accumulator_tiling,
                 },
-            ) => kind == tiled && accumulator.check_from_over(accumulator_tiling, levels),
+            ) => {
+                accumulator.kind() == *tiled
+                    && match accumulator.as_tile() {
+                        Some(state) => state.check_from_over(accumulator_tiling, levels),
+                        None => accumulator
+                            .to_tile()
+                            .check_from_over(accumulator_tiling, levels),
+                    }
+            }
             // The state is a changelog per key, which is what the tiling's own
             // `store_state` spells out; checking against that checks each key's change
             // ticks against the commit domain and its values against that key's tiling.
@@ -523,27 +527,24 @@ impl Tile {
             (Tile::Scalar(s), Tile::Scalar(o)) => s.append(o),
             (
                 Tile::Aggregation {
-                    kind: s_kind,
                     accumulator: s_acc,
                     terminal: s_term,
                 },
                 Tile::Aggregation {
-                    kind: o_kind,
                     accumulator: o_acc,
                     terminal: o_term,
                 },
             ) => {
-                assert_eq!(*s_kind, o_kind);
+                assert_eq!(s_acc.kind(), o_acc.kind());
                 // A whole aggregation is one row, and `other` is a later contribution to it,
                 // folded in by the aggregate's own law. Under a collection the two sides are
                 // different rows, each its own accumulator, so they follow one another.
+                s_acc.merge(o_acc, whole);
                 if whole {
-                    s_kind.accumulate(s_acc, &o_acc, 0, o_acc.rows());
                     let taken = std::mem::replace(s_term, ColumnValue::Units(0));
                     *s_term =
                         apply_binop_column(BinOpKind::BoolLogic(LogicKind::Or), taken, &o_term);
                 } else {
-                    s_acc.merge_part(*o_acc, false);
                     s_term.append(o_term);
                 }
             }
@@ -762,12 +763,10 @@ impl Tile {
                 self.regroup_rows(&rows.iter().map(|r| vec![*r]).collect::<Vec<_>>())
             }
             Tile::Aggregation {
-                kind,
                 accumulator,
                 terminal,
             } => Tile::Aggregation {
-                kind: *kind,
-                accumulator: Box::new(accumulator.select_rows(rows)),
+                accumulator: accumulator.select_rows(rows),
                 terminal: terminal.select_indices(rows.iter().copied(), rows.len()),
             },
             // A store is vectorized over rows like anything else — one changelog, seed,
@@ -922,7 +921,11 @@ impl Tile {
             // it keeps the row count: a collection's rows are its `row_starts`, which
             // dropping keys rebuilds at the same length, so `accumulator.rows()` still
             // matches `terminal`.
-            Tile::Aggregation { accumulator, .. } => accumulator.compact(),
+            Tile::Aggregation { accumulator, .. } => {
+                if let Some(elements) = accumulator.as_tile_mut() {
+                    elements.compact();
+                }
+            }
             Tile::Scalar(_) | Tile::Store { .. } => {}
         }
     }
@@ -978,7 +981,7 @@ impl Tile {
                 },
                 TileGuard::Aggregation(pred),
             ) if pred.is_true() => {
-                **accumulator = accumulator.select_rows(&[]);
+                *accumulator = accumulator.select_rows(&[]);
                 *terminal = terminal.select_indices(std::iter::empty(), 0);
             }
             // Record: recurse per field.
@@ -2231,7 +2234,7 @@ impl Tile {
             }
             Tile::Aggregation { accumulator, .. } => {
                 assert!(
-                    !accumulator.holds_deleted_rows(),
+                    !accumulator.as_tile().is_some_and(Tile::holds_deleted_rows),
                     "compacting drops a row deleted inside an aggregate's accumulator, which \
                      the aggregate's guard has no spelling for: {self:?}"
                 );
@@ -2248,7 +2251,9 @@ impl Tile {
                 codomain, deleted, ..
             } => !deleted.is_empty() || codomain.holds_deleted_rows(),
             Tile::Record { fields, .. } => fields.values().any(Tile::holds_deleted_rows),
-            Tile::Aggregation { accumulator, .. } => accumulator.holds_deleted_rows(),
+            Tile::Aggregation { accumulator, .. } => {
+                accumulator.as_tile().is_some_and(Tile::holds_deleted_rows)
+            }
             Tile::Scalar(_) | Tile::Store { .. } => false,
         }
     }
@@ -3121,6 +3126,7 @@ mod tests {
     use bit_vec::BitVec;
 
     use super::*;
+    use crate::ccl::AggregateKind;
     use crate::interpreter::{ColumnValue, FunctionGuard, Predicate, TileGuard, Value};
 
     // ── The keys compaction removes ───────────────────────────────────────────
@@ -4349,8 +4355,7 @@ mod tests {
         );
         assert!(
             !Tile::Aggregation {
-                kind: AggregateKind::Sole,
-                accumulator: Box::new(collection),
+                accumulator: AggregateKind::Sole.accumulator_of(collection),
                 terminal: ColumnValue::Bools(BitVec::from_elem(1, false)),
             }
             .holds_a_level(),
@@ -4434,8 +4439,7 @@ mod tests {
             Predicate::at_or_below(Value::UInt(100)),
         )));
         let mut tile = Tile::Aggregation {
-            kind: AggregateKind::Sole,
-            accumulator: Box::new(accumulator),
+            accumulator: AggregateKind::Sole.accumulator_of(accumulator),
             terminal: ColumnValue::Bools(BitVec::from_elem(2, false)),
         };
         tile.compact();
@@ -4448,7 +4452,9 @@ mod tests {
             domain,
             deleted,
             ..
-        } = accumulator.as_ref()
+        } = accumulator
+            .as_tile()
+            .expect("a `Sole` accumulator holds its elements as a tile")
         else {
             panic!("expected a collection in the accumulator, got {accumulator:?}");
         };
@@ -5933,8 +5939,7 @@ mod tests {
     fn sums(acc: Vec<i64>) -> Tile {
         let rows = acc.len();
         Tile::Aggregation {
-            kind: AggregateKind::Sum,
-            accumulator: Box::new(Tile::Scalar(ColumnValue::Ints(acc))),
+            accumulator: AggregateKind::Sum.accumulator_of(Tile::Scalar(ColumnValue::Ints(acc))),
             terminal: ColumnValue::Bools(BitVec::from_elem(rows, true)),
         }
     }
@@ -5944,10 +5949,11 @@ mod tests {
         let Tile::Aggregation { accumulator, .. } = tile.values_at(CurryLevel::new(level)) else {
             panic!("expected an aggregation at level {level}: {tile:?}");
         };
-        let Tile::Scalar(column) = accumulator.as_ref() else {
+        let state = accumulator.to_tile();
+        let Tile::Scalar(column) = state else {
             panic!("expected a column accumulator: {accumulator:?}");
         };
-        column.clone()
+        column
     }
 
     /// A delivery of new keys over aggregations appends one accumulator per key, and
@@ -6041,8 +6047,8 @@ mod tests {
             panic!("expected an aggregation: {fields:?}");
         };
         assert_eq!(
-            accumulator.as_ref(),
-            &Tile::Scalar(ColumnValue::Ints(vec![3, 30]))
+            accumulator.to_tile(),
+            Tile::Scalar(ColumnValue::Ints(vec![3, 30]))
         );
     }
 

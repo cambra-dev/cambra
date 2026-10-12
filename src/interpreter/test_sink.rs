@@ -240,8 +240,7 @@ mod tests {
     #[test]
     fn a_fold_or_a_store_is_not_a_sink_tiling() {
         let aggregation = || Tile::Aggregation {
-            kind: crate::ccl::AggregateKind::Sum,
-            accumulator: ints(vec![6]),
+            accumulator: crate::ccl::AggregateKind::Sum.accumulator_of(*ints(vec![6])),
             terminal: ColumnValue::Bools(bit_vec::BitVec::from_elem(1, true)),
         };
         let store = crate::interpreter::commit_operator::full_store_tiling(
