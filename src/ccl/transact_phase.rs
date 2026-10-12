@@ -3966,10 +3966,17 @@ mod tests {
     fn and_path_collapses_true_side() {
         let bool_ty = Type::Base(BaseType::Bool);
         let t = Expr::lit(Lit::Bool(true)).with_ty(bool_ty.clone());
-        let g = tvar(&Name::fresh("g"), bool_ty);
-        let is_var = |e: &Expr| matches!(e.node, TypedExprNode::Var(_));
-        assert!(is_var(&and_path(&t, &g)));
-        assert!(is_var(&and_path(&g, &t)));
-        assert!(!is_var(&and_path(&g, &g)));
+        let (g_name, h_name) = (Name::fresh("g"), Name::fresh("h"));
+        let g = tvar(&g_name, bool_ty.clone());
+        let h = tvar(&h_name, bool_ty);
+        let is_var = |e: &Expr, name: &Name| matches!(&e.node, TypedExprNode::Var(n) if n == name);
+        assert!(is_var(&and_path(&t, &g), &g_name));
+        assert!(is_var(&and_path(&h, &t), &h_name));
+        let both = and_path(&g, &h);
+        assert!(matches!(
+            &both.node,
+            TypedExprNode::BinOp { left, op: BinOpKind::BoolLogic(crate::ccl::LogicKind::And), right }
+                if is_var(left, &g_name) && is_var(right, &h_name)
+        ));
     }
 }
