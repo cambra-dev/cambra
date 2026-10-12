@@ -1268,8 +1268,8 @@ struct FeedSite {
 }
 
 /// `p ▷ .i : elt_ty` — projection of a tuple-typed variable (a writer-body
-/// snapshot slot). Mirrors `transact_phase`'s `proj_tuple`.
-fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
+/// snapshot slot).
+pub(crate) fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
     let mut proj = Expr::proj_index(i);
     proj.ty = Type::fun(tuple_ty.clone(), elt_ty.clone());
     let mut app = Expr::apply(tvar(p, tuple_ty.clone()), proj);
@@ -1302,7 +1302,7 @@ fn writes_key_view(
     comp
 }
 
-/// A `Var(name) : ty`.
+/// A [`TypedBinding`] with `name : ty` and no user annotation.
 pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
     TypedBinding {
         name,
@@ -3065,7 +3065,8 @@ fn conjoin_path(path: &Expr, pi: &Expr) -> Expr {
     o
 }
 
-fn is_true_lit(e: &Expr) -> bool {
+/// Whether `e` is the literal `true`.
+pub(crate) fn is_true_lit(e: &Expr) -> bool {
     matches!(&e.node, TypedExprNode::Lit(Lit::Bool(true)))
 }
 
