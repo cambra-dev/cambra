@@ -2666,8 +2666,7 @@ fn compile_version(
                 pretty_tile_producer_with(
                     producer.as_ref(),
                     &VizOptions {
-                        max_depth: Some(30),
-                        ..Default::default()
+                        max_depth: Some(30)
                     }
                 )
             );
@@ -2693,8 +2692,7 @@ fn compile_version(
                 pretty_tile_producer_with(
                     sink_producer.as_ref(),
                     &VizOptions {
-                        max_depth: Some(30),
-                        ..Default::default()
+                        max_depth: Some(30)
                     }
                 )
             );

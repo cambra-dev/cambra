@@ -34,12 +34,6 @@ pub struct InspectNode {
     /// Stored separately from `annotations` so renderers can display it
     /// with dedicated styling (e.g. as a subtitle in the web inspector).
     pub tiling: Option<String>,
-    /// Formatted yield guard; always displayed when present.
-    pub yield_guard: Option<String>,
-    /// Formatted obsolete/release guard; shown in verbose mode.
-    pub obsolete_guard: Option<String>,
-    /// Formatted intent guard; shown in verbose mode.
-    pub intent_guard: Option<String>,
     /// Children with edge labels, e.g. `("left", child_desc)`. An empty label
     /// renders the child with no `edge: ` prefix.
     pub children: Vec<(String, InspectNode)>,
@@ -55,9 +49,6 @@ impl InspectNode {
             label: label.into(),
             annotations: Vec::new(),
             tiling: None,
-            yield_guard: None,
-            obsolete_guard: None,
-            intent_guard: None,
             children: Vec::new(),
             held_values: None,
         }
@@ -83,24 +74,6 @@ impl InspectNode {
     /// Set the tiling / output shape (shown as a subtitle in graphical renderers).
     pub fn with_tiling(mut self, tiling: impl Into<String>) -> Self {
         self.tiling = Some(tiling.into());
-        self
-    }
-
-    /// Set the yield guard (always shown when present).
-    pub fn with_yield_guard(mut self, guard: impl Into<String>) -> Self {
-        self.yield_guard = Some(guard.into());
-        self
-    }
-
-    /// Set the obsolete/release guard (shown in verbose mode).
-    pub fn with_obsolete_guard(mut self, guard: impl Into<String>) -> Self {
-        self.obsolete_guard = Some(guard.into());
-        self
-    }
-
-    /// Set the intent guard (shown in verbose mode).
-    pub fn with_intent_guard(mut self, guard: impl Into<String>) -> Self {
-        self.intent_guard = Some(guard.into());
         self
     }
 
@@ -162,16 +135,6 @@ fn render_node(
     if let Some(ref t) = node.tiling {
         out.push(' ');
         out.push_str(t);
-    }
-    // Append structured guard fields after annotations.
-    if let Some(ref g) = node.yield_guard {
-        out.push_str(&format!(" [yield: {g}]"));
-    }
-    if let Some(ref g) = node.obsolete_guard {
-        out.push_str(&format!(" [obsolete: {g}]"));
-    }
-    if let Some(ref g) = node.intent_guard {
-        out.push_str(&format!(" [intent: {g}]"));
     }
 
     // Check depth limit before rendering children.

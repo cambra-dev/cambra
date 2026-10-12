@@ -16,10 +16,6 @@ use crate::interpreter::{
 };
 pub use crate::pretty_tree::{InspectNode, render, render_with_max_depth};
 
-/// Mode labels for variable subscription display.
-pub const MODE_ITERATION: &str = "iteration";
-pub const MODE_ARGUMENT: &str = "argument";
-
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
@@ -31,11 +27,6 @@ pub const MODE_ARGUMENT: &str = "argument";
 /// a debugging tool should itself be debuggable.
 #[derive(Debug, Clone)]
 pub struct VizOptions {
-    /// Include non-yield guard values (release, predicate, intent — can be verbose).
-    /// Yield guards are always shown since they are the primary progress signal.
-    pub show_guards: bool,
-    /// Include extent/type annotations
-    pub show_extents: bool,
     /// Maximum tree depth to render. Nodes beyond this depth are replaced
     /// with a truncation indicator. `None` means unlimited.
     pub max_depth: Option<usize>,
@@ -44,29 +35,7 @@ pub struct VizOptions {
 impl Default for VizOptions {
     fn default() -> Self {
         VizOptions {
-            show_guards: false,
-            show_extents: true,
             max_depth: Some(15),
-        }
-    }
-}
-
-impl VizOptions {
-    /// All details hidden (minimal output).
-    pub fn minimal() -> Self {
-        VizOptions {
-            show_guards: false,
-            show_extents: false,
-            max_depth: Some(15),
-        }
-    }
-
-    /// All details shown (maximum verbosity).
-    pub fn verbose() -> Self {
-        VizOptions {
-            show_guards: true,
-            show_extents: true,
-            max_depth: None,
         }
     }
 }
@@ -146,11 +115,6 @@ pub fn pretty_tile_operator(op: &dyn TileOperator) -> String {
 /// Pretty-print an operator tree with custom options.
 pub fn pretty_tile_operator_with(op: &dyn TileOperator, opts: &VizOptions) -> String {
     render_with_max_depth(&op.inspect(opts), opts.max_depth)
-}
-
-/// Pretty-print a tile producer tree with default options.
-pub fn pretty_tile_producer(producer: &dyn TileProducer) -> String {
-    pretty_tile_producer_with(producer, &VizOptions::default())
 }
 
 /// Pretty-print a tile producer tree with custom options.
