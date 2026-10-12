@@ -63,7 +63,8 @@ end
 -- The indent for line `lnum` (default `v:lnum`), from the logical line before
 -- it:
 --
--- - inside an unclosed bracket, the previous line's indent;
+-- - after a line ending in an open bracket, one level past that line;
+-- - otherwise inside an unclosed bracket, the previous line's indent;
 -- - after a header ending in `:`, one level past the header's first line; two
 --   levels when the header is an `if` on the right of an assignment, whose
 --   `elif`/`else` chain sits one level in and whose bodies sit one further
@@ -81,6 +82,9 @@ function _G.cambra_indent(lnum)
     open = open + bracket_balance(vim.fn.getline(l))
   end
   if open > 0 then
+    if code_of(vim.fn.getline(prev)):match("[%(%[{]%s*$") then
+      return vim.fn.indent(prev) + vim.fn.shiftwidth()
+    end
     return vim.fn.indent(prev)
   end
   local base = vim.fn.indent(start)

@@ -884,103 +884,26 @@ mod tests {
         }
     }
 
-    /// Whether `token` is a keyword: an identifier-shaped spelling that lexes
-    /// as something other than [`Token::Ident`]. The match has no wildcard arm,
-    /// so a new variant does not compile until it is classified here.
-    fn is_keyword(token: &Token) -> bool {
-        match token {
-            Token::True
-            | Token::False
-            | Token::Where
-            | Token::And
-            | Token::Or
-            | Token::Not
-            | Token::If
-            | Token::Elif
-            | Token::Else
-            | Token::For
-            | Token::In
-            | Token::Def
-            | Token::Return
-            | Token::Yield
-            | Token::Pass
-            | Token::With
-            | Token::Match
-            | Token::Case
-            | Token::Forall
-            | Token::Requires
-            | Token::Import
-            | Token::Use
-            | Token::As
-            | Token::Pub
-            | Token::Run
-            | Token::Param
-            | Token::This => true,
-            Token::Newline
-            | Token::Indent
-            | Token::Dedent
-            | Token::LShiftEq
-            | Token::LShift
-            | Token::EqEq
-            | Token::NotEq
-            | Token::LtE
-            | Token::LtColon
-            | Token::GtE
-            | Token::PlusPlus
-            | Token::PlusEq
-            | Token::CaretPlus
-            | Token::CaretEq
-            | Token::MinusEq
-            | Token::Arrow
-            | Token::DoubleArrow
-            | Token::StarStar
-            | Token::StarEq
-            | Token::DoubleSlashEq
-            | Token::DoubleSlash
-            | Token::Plus
-            | Token::Minus
-            | Token::Star
-            | Token::Amp
-            | Token::Pipe
-            | Token::Caret
-            | Token::Eq
-            | Token::Lt
-            | Token::Gt
-            | Token::LParen
-            | Token::RParen
-            | Token::LBracket
-            | Token::RBracket
-            | Token::Question
-            | Token::LBrace
-            | Token::RBrace
-            | Token::Comma
-            | Token::Colon
-            | Token::ColonEq
-            | Token::Dot
-            | Token::Backtick
-            | Token::Semi
-            | Token::Backslash
-            | Token::At
-            | Token::Int(_)
-            | Token::String(_)
-            | Token::Ident(_) => false,
-        }
-    }
-
-    /// `KEYWORDS` lists a variant exactly when [`is_keyword`] classifies it as
-    /// one, each variant once.
+    /// `KEYWORDS` lists exactly the keyword variants, in declaration order. A
+    /// keyword is a variant whose `Display` spelling is identifier-shaped and
+    /// lexes back to that variant rather than to [`Token::Ident`]. `Display for
+    /// Token` has no wildcard arm, so a new variant does not compile until it
+    /// has a spelling, and the spelling decides whether it is a keyword. Layout
+    /// and literal tokens drop out because their spellings (`indent`,
+    /// `identifier`, …) lex as `Ident`.
     #[test]
     fn keywords_lists_exactly_the_keyword_variants() {
         use strum::IntoEnumIterator;
-        for token in Token::iter() {
-            let rows = KEYWORDS.iter().filter(|(_, t)| *t == token).count();
-            assert_eq!(
-                rows,
-                usize::from(is_keyword(&token)),
-                "{token:?}: {rows} KEYWORDS rows, is_keyword = {}",
-                is_keyword(&token)
-            );
-        }
+        let derived: Vec<Token> = Token::iter()
+            .filter(|t| {
+                let s = t.to_string();
+                s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && tokens(&s) == vec![t.clone(), Token::Newline]
+            })
+            .collect();
+        let listed: Vec<Token> = KEYWORDS.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(derived, listed);
     }
 
     /// `where` separates a refinement's base type from its predicate

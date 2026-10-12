@@ -13,8 +13,10 @@
 //! `\<\%(a\|b\|…\)\>` pattern. Each must equal the spellings in
 //! `chl_parser::builtins::SURFACE_BUILTINS`.
 //!
-//! The test reads only these rules. Whether a grammar applies them, and whether
-//! any other rule colors a keyword or a builtin, is not checked here.
+//! Each of these rules is applied: the TextMate grammar includes its entry in
+//! the top-level `patterns`, and the Vim syntax file links its group to a
+//! highlight group. Whether an earlier rule shadows one of them, or another
+//! rule colors a keyword or a builtin, is not checked here.
 
 use chl_parser::builtins::SURFACE_BUILTINS;
 use chl_parser::lexer::KEYWORDS;
@@ -139,4 +141,41 @@ fn builtin_rules_list_exactly_the_surface_builtins() {
         builtins,
         "Vim `cambraBuiltin` differs from SURFACE_BUILTINS"
     );
+}
+
+/// Each keyword class and the builtin rule is applied: the TextMate grammar's
+/// top-level `patterns` includes its entry, and the Vim syntax file has a `hi
+/// def link` line for its group. A rule that is listed but never applied
+/// colors nothing.
+#[test]
+fn keyword_and_builtin_rules_are_applied() {
+    let grammar: serde_json::Value =
+        serde_json::from_str(&read("editors/vscode/syntaxes/cambra.tmLanguage.json"))
+            .expect("the TextMate grammar is valid JSON");
+    let syntax = read("editors/nvim/syntax/cambra.vim");
+    let included: BTreeSet<&str> = grammar["patterns"]
+        .as_array()
+        .expect("the TextMate grammar has a top-level `patterns` array")
+        .iter()
+        .filter_map(|p| p["include"].as_str())
+        .collect();
+    let linked: BTreeSet<&str> = syntax
+        .lines()
+        .filter_map(|line| line.strip_prefix("hi def link "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
+    let rules = CLASSES
+        .iter()
+        .copied()
+        .chain([("builtin", "cambraBuiltin")]);
+    for (entry, group) in rules {
+        assert!(
+            included.contains(format!("#{entry}").as_str()),
+            "TextMate `patterns` does not include `#{entry}`"
+        );
+        assert!(
+            linked.contains(group),
+            "Vim syntax has no `hi def link {group}` line"
+        );
+    }
 }

@@ -81,6 +81,8 @@ record value's are. A refinement's predicate after `where` is a term, and is hig
 Both editors indent a new line from the line above it:
 
 - After a line ending in `:`, ignoring a trailing comment, one level in.
+- After a line ending in an open bracket (`(`, `[` or `{`), ignoring a trailing comment, one level
+  in.
 - After a header whose `if` is the right-hand side of an assignment (`label = if c:`), two levels
   in. The `elif` and `else` chain sits one level in from the statement and the bodies one level
   further ([4.3 Assignment forms](../docs/chl-spec.md#43-assignment-forms)); a body one level in
