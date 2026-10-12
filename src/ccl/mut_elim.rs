@@ -213,21 +213,25 @@ fn contains_marker(expr: &Expr) -> bool {
     found
 }
 
-/// Whether any type slot still carries a mutable `Type::History` — the
-/// post-condition [`erase_mut`] establishes, checked over the *same*
-/// [`Expr::walk_type_slots`] set the erasure uses so the two cannot disagree about
-/// which slots exist. A `Feed` history is *not* the phase's concern (it is erased
-/// later by `channelize`), so only [`HistoryKind::Overwrite`] counts here.
-fn contains_mut_type(expr: &Expr) -> bool {
-    fn ty_has_mut(ty: &Type) -> bool {
+/// Whether `ty` holds an overwrite-law history, the type of a mutable variable.
+fn ty_has_mut(ty: &Type) -> bool {
+    ty.holds_type(&|ty| {
         matches!(
             ty,
             Type::History {
                 history_kind: HistoryKind::Overwrite,
                 ..
             }
-        ) || ty.any_child(ty_has_mut)
-    }
+        )
+    })
+}
+
+/// Whether any type slot still carries a mutable `Type::History` — the
+/// post-condition [`erase_mut`] establishes, checked over the *same*
+/// [`Expr::walk_type_slots`] set the erasure uses so the two cannot disagree about
+/// which slots exist. A `Feed` history is *not* the phase's concern (it is erased
+/// later by `channelize`), so only [`HistoryKind::Overwrite`] counts here.
+fn contains_mut_type(expr: &Expr) -> bool {
     let mut here = false;
     expr.walk_type_slots(|t| here |= ty_has_mut(t));
     here || expr.any_child(contains_mut_type)
@@ -3170,15 +3174,6 @@ mod tests {
     /// post-condition cannot report. A guard has to enumerate the slot itself or
     /// it inherits the same blind spot.
     fn binder_ty_has_mut(expr: &Expr) -> bool {
-        fn ty_has_mut(ty: &Type) -> bool {
-            matches!(
-                ty,
-                Type::History {
-                    history_kind: HistoryKind::Overwrite,
-                    ..
-                }
-            ) || ty.any_child(ty_has_mut)
-        }
         let mut found = false;
         expr.walk_binders(|b| found |= ty_has_mut(&b.ty));
         found || expr.any_child(binder_ty_has_mut)

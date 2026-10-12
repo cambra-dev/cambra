@@ -637,11 +637,9 @@ impl<'a> Naming<'a> {
     /// included.
     fn mentions_param(&self, ty: &Type) -> bool {
         let params = self.params.borrow();
-        let mut found = false;
-        visit_params(ty, &mut |p| {
-            found |= params.values().any(|mine| mine.id == p.id);
-        });
-        found
+        ty.holds_type(
+            &|ty| matches!(ty, Type::Param(p) if params.values().any(|mine| mine.id == p.id)),
+        )
     }
 }
 

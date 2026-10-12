@@ -1436,6 +1436,20 @@ pub fn infer(
     Ok(ty)
 }
 
+/// Check `expr`, the check tree of a module checked on its own, with the
+/// module's type parameters `params` open throughout it (`docs/modules.md`,
+/// "Checking a module on its own"). Only its errors are read: the tree is
+/// discarded, and no pass after inference runs on it.
+pub fn check_module(
+    expr: &mut Expr,
+    ctx: &mut TypeInferenceContext,
+    params: &[super::ModuleCheckParam],
+) -> Result<(), Vec<LocatedInferError>> {
+    // The arena tears down every variable the check mints, as for `infer`.
+    let _arena = InferArena::new();
+    super::run_with_params(expr, &ctx.source_types, params).map(|_| ())
+}
+
 /// Drop every `user_annotation` in the tree — inference has consumed them.
 ///
 /// An annotation is a **pre-inference input**: the type the user declared, which
@@ -2078,7 +2092,7 @@ fn unlocated(located: Vec<LocatedInferError>) -> Vec<InferError> {
 /// that minted it — and the walk reaches the slot either way.
 fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
     fn ty_has_transient(ty: &Type) -> bool {
-        matches!(ty, Type::History { .. }) || ty.any_child(ty_has_transient)
+        ty.holds_type(&|ty| matches!(ty, Type::History { .. }))
     }
     fn binder_has_transient(expr: &Expr) -> bool {
         let mut found = false;

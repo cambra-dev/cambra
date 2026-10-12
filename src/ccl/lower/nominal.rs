@@ -387,10 +387,7 @@ fn lower_parameter_type(
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
     let lowered = lower_type_expr(ty, ctx)?;
-    fn has_hole(ty: &Type) -> bool {
-        matches!(ty, Type::Hole | Type::BoundedHole(_)) || ty.any_child(has_hole)
-    }
-    if has_hole(&lowered) {
+    if lowered.holds_type(&|ty| matches!(ty, Type::Hole | Type::BoundedHole(_))) {
         return Err(LoweringError::unsupported(
             ty.span,
             "a constructor's parameter type is written in full; `_` leaves part of it to \
