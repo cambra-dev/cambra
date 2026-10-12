@@ -438,6 +438,37 @@ fn as_const(expr: &Expr) -> Option<&Expr> {
     None
 }
 
+/// Takes `zip_pair(f, g)` apart into `(f, g)`.
+///
+/// The by-value counterpart of [`as_zip`]: callers pass a term [`as_zip`] accepted, and any
+/// other term is unreachable.
+fn into_zip(expr: Expr) -> (Expr, Expr) {
+    debug_assert!(
+        as_zip(&expr).is_some(),
+        "into_zip takes a term as_zip accepted"
+    );
+    let TypedExprNode::Tuple(elts) = into_argument(expr).node else {
+        unreachable!("as_zip accepted the term, so the zip's argument is a tuple")
+    };
+    let Ok([f, g]) = <[Expr; 2]>::try_from(elts) else {
+        unreachable!("as_zip accepted the term, so the zip's tuple has two elements")
+    };
+    (f, g)
+}
+
+/// Takes the argument `x` out of an application such as `curry(x)`, `const_(x)` or
+/// `zip_pair(f, g)`.
+///
+/// The by-value counterpart of [`as_curry`] and [`as_const`]: callers pass a term one of them
+/// accepted, and any term other than an [`TypedExprNode::Apply`] is unreachable. The builtin
+/// applied is the caller's matcher's to check.
+fn into_argument(expr: Expr) -> Expr {
+    let TypedExprNode::Apply { argument, .. } = expr.node else {
+        unreachable!("the caller's matcher accepted an application")
+    };
+    *argument
+}
+
 /// Returns `(left, right)` if `expr` is a two-element [`TypedExprNode::Compose`].
 ///
 /// Used for inner sub-composes that are always binary (e.g. `.0 ≫ curry(f)`).
@@ -449,6 +480,17 @@ fn as_compose(expr: &Expr) -> Option<(&Expr, &Expr)> {
         return Some((left, right));
     }
     None
+}
+
+/// Takes the elements out of an n-ary [`TypedExprNode::Compose`].
+///
+/// The by-value counterpart of [`as_compose`] and [`compose_split_last`]: callers pass a term
+/// their matcher accepted as a compose, and any other term is unreachable.
+fn into_compose(expr: Expr) -> Vec<Expr> {
+    let TypedExprNode::Compose(elts) = expr.node else {
+        unreachable!("the caller's matcher accepted a compose")
+    };
+    elts
 }
 
 /// Returns `true` if `expr` is the `id` built-in.
@@ -644,18 +686,7 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
 /// other `𝑆` alone.
 fn try_compose_constant_function(expr: &mut Expr) -> bool {
     fn constant_function(left: &Expr) -> Option<(&Expr, &Expr)> {
-        let TypedExprNode::Apply { argument, function } = &left.node else {
-            return None;
-        };
-        if !is_builtin(function, Builtin::Zip) {
-            return None;
-        }
-        let TypedExprNode::Tuple(parts) = &argument.node else {
-            return None;
-        };
-        let [source, lifted] = parts.as_slice() else {
-            return None;
-        };
+        let (source, lifted) = as_zip(left)?;
         if !source.ty.codomain().is_some_and(|c| c.sum().is_some()) {
             return None;
         }
@@ -665,17 +696,8 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
         expr,
         |left, right| is_builtin(right, Builtin::Compose) && constant_function(left).is_some(),
         |left, _right, _mint_kind| {
-            let TypedExprNode::Apply { argument, .. } = left.node else {
-                unreachable!("matched as a zip above")
-            };
-            let TypedExprNode::Tuple(mut parts) = argument.node else {
-                unreachable!("matched as a pair above")
-            };
-            let lifted = parts.pop().expect("matched as a pair above");
-            let source = parts.pop().expect("matched as a pair above");
-            let TypedExprNode::Apply { argument: f, .. } = lifted.node else {
-                unreachable!("matched as a constant above")
-            };
+            let (source, lifted) = into_zip(left);
+            let f = into_argument(lifted);
             if is_id(&f) {
                 return vec![source];
             }
@@ -689,7 +711,7 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
                 },
                 None => Type::Hole,
             };
-            vec![source, apply_primitive(*f, Builtin::Map, mapped_ty)]
+            vec![source, apply_primitive(f, Builtin::Map, mapped_ty)]
         },
     )
 }
@@ -708,29 +730,11 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
 /// Scoped as [`try_compose_constant_function`] is, to an `𝑆` whose values are a sum.
 fn try_compose_with_strength(expr: &mut Expr) -> bool {
     fn curried_function(left: &Expr) -> Option<(&Expr, &Expr)> {
-        let TypedExprNode::Apply { argument, function } = &left.node else {
-            return None;
-        };
-        if !is_builtin(function, Builtin::Zip) {
-            return None;
-        }
-        let TypedExprNode::Tuple(parts) = &argument.node else {
-            return None;
-        };
-        let [source, curried] = parts.as_slice() else {
-            return None;
-        };
+        let (source, curried) = as_zip(left)?;
         if !source.ty.codomain().is_some_and(|c| c.sum().is_some()) {
             return None;
         }
-        let TypedExprNode::Apply {
-            argument: g,
-            function: curry,
-        } = &curried.node
-        else {
-            return None;
-        };
-        is_builtin(curry, Builtin::Curry).then_some((source, g.as_ref()))
+        Some((source, as_curry(curried)?))
     }
     try_pairwise_in_compose(
         expr,
@@ -745,17 +749,8 @@ fn try_compose_with_strength(expr: &mut Expr) -> bool {
                 unreachable!("a zip of two functions is a function")
             };
             let (fun_kind, enclosing) = (fun_kind.clone(), (**enclosing).clone());
-            let TypedExprNode::Apply { argument, .. } = left.node else {
-                unreachable!("matched as a zip above")
-            };
-            let TypedExprNode::Tuple(mut parts) = argument.node else {
-                unreachable!("matched as a pair above")
-            };
-            let curried = parts.pop().expect("matched as a pair above");
-            let source = parts.pop().expect("matched as a pair above");
-            let TypedExprNode::Apply { argument: g, .. } = curried.node else {
-                unreachable!("matched as a curry above")
-            };
+            let (source, curried) = into_zip(left);
+            let g = into_argument(curried);
             let collection = source
                 .ty
                 .codomain()
@@ -773,7 +768,7 @@ fn try_compose_with_strength(expr: &mut Expr) -> bool {
             let with_row = zip_pair(id, source, &fun_kind);
             let strength = Expr::builtin(Builtin::Strength)
                 .with_ty(Type::fun(row_and_collection, strengthened.clone()));
-            let map = apply_primitive(*g, Builtin::Map, Type::fun(strengthened, mapped));
+            let map = apply_primitive(g, Builtin::Map, Type::fun(strengthened, mapped));
             vec![with_row, strength, map]
         },
     )
@@ -824,9 +819,6 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
         // `narrows_domain_irrecoverably` rules out.
         |left, right| as_const(right).is_some() && !narrows_domain_irrecoverably(left),
         |left, right, mint_kind| {
-            let Some(g) = as_const(&right) else {
-                unreachable!()
-            };
             // The collapsed constant takes `left`'s domain (see
             // `try_pairwise_in_compose` for which kind that makes it).
             let new_const_ty = match (left.ty.domain(), right.ty.codomain()) {
@@ -838,9 +830,10 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
                 },
                 _ => Type::Hole,
             };
+            let g = into_argument(right);
             let const_var_ty = Type::compute_fun_or_hole(&g.ty, &new_const_ty);
             let const_var = Expr::builtin(Builtin::Const).with_ty(const_var_ty);
-            let new_const = Expr::apply(g.clone(), const_var).with_ty(new_const_ty);
+            let new_const = Expr::apply(g, const_var).with_ty(new_const_ty);
             vec![new_const]
         },
     )
@@ -852,21 +845,8 @@ fn try_product_beta_fst(expr: &mut Expr) -> bool {
         expr,
         |left, right| is_proj_idx(right, 0) && as_zip(left).is_some(),
         |left, _proj, _mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            vec![elts.swap_remove(0)]
+            let (f, _) = into_zip(left);
+            vec![f]
         },
     )
 }
@@ -924,21 +904,8 @@ fn try_product_beta_snd(expr: &mut Expr) -> bool {
         expr,
         |left, right| is_proj_idx(right, 1) && as_zip(left).is_some(),
         |left, _proj, _mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            vec![elts.swap_remove(1)]
+            let (_, g) = into_zip(left);
+            vec![g]
         },
     )
 }
@@ -956,37 +923,9 @@ fn try_ccc_universal(expr: &mut Expr) -> bool {
                 })
         },
         |left, _apply, _mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            let r = elts.swap_remove(1);
-            let TypedExpr {
-                node: TypedExprNode::Compose(mut r_elts),
-                ..
-            } = r
-            else {
-                unreachable!()
-            };
-            let curry_f = r_elts.pop().unwrap();
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument: f, .. },
-                ..
-            } = curry_f
-            else {
-                unreachable!()
-            };
-            vec![*f]
+            let (_, r) = into_zip(left);
+            let mut r_elts = into_compose(r);
+            vec![into_argument(r_elts.pop().unwrap())]
         },
     )
 }
@@ -1000,29 +939,8 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
                 && as_zip(left).is_some_and(|(_, r)| as_curry(r).is_some())
         },
         |left, _apply, mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            let curry_h = elts.swap_remove(1);
-            let g = elts.swap_remove(0);
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument: h, .. },
-                ..
-            } = curry_h
-            else {
-                unreachable!()
-            };
+            let (g, curry_h) = into_zip(left);
+            let h = into_argument(curry_h);
             // Type id: A → A where A = domain(g).  Type zip(id, g): A → (A, B)
             // where g: A → B.  Both fall back to Hole if g has no concrete type.
             //
@@ -1058,7 +976,7 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
             };
             let id_node = id().with_ty(id_ty);
             let zip_node = zip_pair(id_node, g, mint_kind).with_ty(zip_ty);
-            vec![zip_node, *h]
+            vec![zip_node, h]
         },
     )
 }
@@ -1083,29 +1001,8 @@ fn try_partial_lookup(expr: &mut Expr) -> bool {
                 && as_zip(left).is_some_and(|(l, _)| as_const(l).is_some())
         },
         |left, lookup, mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            let keys = elts.swap_remove(1);
-            let const_c = elts.swap_remove(0);
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument: c, .. },
-                ..
-            } = const_c
-            else {
-                unreachable!()
-            };
+            let (const_c, keys) = into_zip(left);
+            let c = into_argument(const_c);
             // `curry(lookup?) : 𝐶 ⇒ (𝐾 ⇒ Option(𝑉))`, and applying it at `𝑐` leaves the
             // morphism the keys compose into. Both types are read off `lookup?`'s own
             // stamped pair type, which inference made concrete.
@@ -1127,7 +1024,7 @@ fn try_partial_lookup(expr: &mut Expr) -> bool {
                     .with_ty(Type::fun(lookup_ty.clone(), curry_ty.clone())),
             )
             .with_ty(curry_ty);
-            let partial = Expr::apply(*c, curry_of_lookup).with_ty(at_key);
+            let partial = Expr::apply(c, curry_of_lookup).with_ty(at_key);
             vec![keys, partial]
         },
     )
@@ -1212,30 +1109,8 @@ fn try_const_apply(expr: &mut Expr) -> bool {
                 && as_zip(left).is_some_and(|(_, r)| as_const(r).is_some())
         },
         |left, _apply, _mint_kind| {
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
-                unreachable!()
-            };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            let const_g = elts.swap_remove(1);
-            let f = elts.swap_remove(0);
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument: g, .. },
-                ..
-            } = const_g
-            else {
-                unreachable!()
-            };
-            vec![f, *g]
+            let (f, const_g) = into_zip(left);
+            vec![f, into_argument(const_g)]
         },
     )
 }
@@ -1262,36 +1137,16 @@ fn try_product_eta(expr: &mut Expr) -> bool {
         })
     });
     if matched {
-        let TypedExpr {
-            node: TypedExprNode::Apply { argument, .. },
-            ty,
-            ..
-        } = take(expr)
-        else {
-            unreachable!()
-        };
-        let TypedExpr {
-            node: TypedExprNode::Tuple(mut elts),
-            ..
-        } = *argument
-        else {
-            unreachable!()
-        };
-        let left_compose = elts.swap_remove(0);
-        let TypedExpr {
-            node: TypedExprNode::Compose(mut compose_elts),
-            ..
-        } = left_compose
-        else {
-            unreachable!()
-        };
+        let ty = expr.ty.clone();
+        let (left_compose, _) = into_zip(take(expr));
+        let mut compose_elts = into_compose(left_compose);
         let _proj = compose_elts.pop().unwrap();
         let f = if compose_elts.len() == 1 {
             compose_elts.pop().unwrap()
         } else {
             Expr::compose(compose_elts)
         };
-        *expr = f.with_ty(ty.clone());
+        *expr = f.with_ty(ty);
         return true;
     }
     false
@@ -1356,9 +1211,7 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
             as_zip(left).is_some() && is_simplifying_zip(right)
         },
         |left, right, mint_kind| {
-            let Some((g, h)) = as_zip(&right) else {
-                unreachable!()
-            };
+            let (g, h) = into_zip(right);
 
             // Each distributed arm is `left ≫ arm`, taking `left`'s domain (see
             // `try_pairwise_in_compose` for which kind that makes it).
@@ -1378,13 +1231,13 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
                 },
                 _ => Type::Hole,
             };
-            let g_ty = arm_ty(g);
-            let h_ty = arm_ty(h);
+            let g_ty = arm_ty(&g);
+            let h_ty = arm_ty(&h);
 
             // Distribution places `left` on both legs of the zip.
             let h_left = left.clone();
-            let g_compose = Expr::compose(vec![left, g.clone()]).with_ty(g_ty);
-            let h_compose = Expr::compose(vec![h_left, h.clone()]).with_ty(h_ty);
+            let g_compose = Expr::compose(vec![left, g]).with_ty(g_ty);
+            let h_compose = Expr::compose(vec![h_left, h]).with_ty(h_ty);
             vec![zip_pair(g_compose, h_compose, mint_kind)]
         },
     )
@@ -1424,42 +1277,13 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
     });
     if matched {
         let curry_ty = expr.ty.clone();
-        let TypedExpr {
-            node: TypedExprNode::Apply {
-                argument: inner, ..
-            },
-            ..
-        } = take(expr)
-        else {
-            unreachable!()
-        };
-        let TypedExpr {
-            node: TypedExprNode::Compose(mut inner_elts),
-            ..
-        } = *inner
-        else {
-            unreachable!()
-        };
+        let mut inner_elts = into_compose(into_argument(take(expr)));
         // `𝑔`: everything the curried function's result flows through.
         let mut suffix = inner_elts.split_off(2);
         let _apply = inner_elts.pop().unwrap();
-        let zip_node = inner_elts.pop().unwrap();
-        let TypedExpr {
-            node: TypedExprNode::Apply { argument, .. },
-            ..
-        } = zip_node
-        else {
-            unreachable!()
-        };
-        let TypedExpr {
-            node: TypedExprNode::Tuple(mut elts),
-            ..
-        } = *argument
-        else {
-            unreachable!()
-        };
+        let (_, proj0f) = into_zip(inner_elts.pop().unwrap());
         // `𝑓`: the `.0` arm with its projection dropped, absent for a bare `.0`.
-        let f = match elts.swap_remove(1).node {
+        let f = match proj0f.node {
             TypedExprNode::Compose(mut compose_elts) => Some(compose_elts.pop().unwrap()),
             _ => None,
         };
