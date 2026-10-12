@@ -27,7 +27,7 @@ impl LoweringContext {
             return Vec::new();
         };
         let ty = match self.module_annotation(&annotation.ty) {
-            Ok(Some(ty)) => instantiate(&ty),
+            Ok(Some(ty)) => instantiate(&QualifiedName::new(name.node.clone()), &ty),
             Ok(None) => return Vec::new(),
             Err(error) => return vec![error],
         };
@@ -371,6 +371,9 @@ impl LoweringContext {
         let mut errors = Vec::new();
         let mut given = HashMap::new();
         let mut lowered = Vec::new();
+        // Each argument a module's check compares with its parameter: its span,
+        // its type, and what its parameter states.
+        let mut checked: Vec<(Span, Type, TypeEntryForm)> = Vec::new();
         for arg in args {
             let span = arg.name.span.join(arg.value.span);
             let Some(parameter) = interface
@@ -386,6 +389,20 @@ impl LoweringContext {
             if let Some(ty) = parameter.module() {
                 let module = self.module_named(&arg.value).and_then(Result::ok);
                 let under = QualifiedName::new(parameter.name.clone());
+                for (member, form) in type_members(&under, ty) {
+                    let path = member
+                        .strip_prefix(&under)
+                        .expect("a member is spelled under its parameter");
+                    let found = module.as_ref().and_then(|module| {
+                        module
+                            .reach_type_path(&module.name, &path, arg.value.span)
+                            .ok()
+                            .flatten()
+                    });
+                    if let Some(AliasType::Type(found)) = found {
+                        checked.push((span, found, form));
+                    }
+                }
                 for (member, _) in abstract_members(&under, ty) {
                     let path = member
                         .strip_prefix(&under)
@@ -421,6 +438,21 @@ impl LoweringContext {
                     Type::Hole
                 },
             );
+            if let ParameterKind::Type {
+                param,
+                bound: Some(bound),
+                ..
+            } = &parameter.kind
+            {
+                checked.push((
+                    span,
+                    ty.clone(),
+                    TypeEntryForm::Abstract {
+                        param: Rc::clone(param),
+                        bound: Some(bound.clone()),
+                    },
+                ));
+            }
             given.insert(QualifiedName::new(arg.name.node.clone()), ty.clone());
             lowered.push((QualifiedName::new(arg.name.node.clone()), span, ty));
         }
@@ -430,10 +462,13 @@ impl LoweringContext {
                     !abstract_members(&QualifiedName::new(p.name.clone()), ty).is_empty()
                 })
         });
-        if !typed {
+        if !typed && checked.is_empty() {
             return errors;
         }
-        let types = reached_types(&interface, &QualifiedName::new(run.clone()), &given);
+        let run_spelling = QualifiedName::new(run.clone());
+        let types = reached_types(&interface, &run_spelling, &given);
+        let checks = type_checks(checked, &run_spelling, &types);
+        self.run_type_checks.insert(run.clone(), checks);
         let qualifier = self
             .module
             .qualifiers
@@ -543,8 +578,21 @@ pub(super) fn parameter_let<'a>(chain: &'a mut Expr, parameter: &str) -> &'a mut
 /// `chain`, a copy of a module's chain, with the `let` of its parameter
 /// `parameter`, which heads it, bound to `argument` in place of its default.
 pub(super) fn read_argument(chain: &mut Expr, parameter: &str, argument: Expr) {
+    take_argument(chain, parameter, argument);
+}
+
+/// [`read_argument`], returning the value the parameter's `let` held.
+pub(super) fn take_argument(chain: &mut Expr, parameter: &str, argument: Expr) -> Expr {
     let TypedExprNode::Let { bound_expr, .. } = &mut parameter_let(chain, parameter).node else {
         unreachable!("a parameter's `let` is a `let`");
     };
-    **bound_expr = argument;
+    std::mem::replace(bound_expr.as_mut(), argument)
+}
+
+/// `chain`, a copy of a module's chain, with the `let` of its parameter
+/// `parameter`, which heads it, replaced by what `wrap` makes of it.
+pub(super) fn wrap_parameter(chain: &mut Expr, parameter: &str, wrap: impl FnOnce(Expr) -> Expr) {
+    let at = parameter_let(chain, parameter);
+    let this = std::mem::take(at);
+    *at = wrap(this);
 }

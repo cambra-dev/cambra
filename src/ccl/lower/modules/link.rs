@@ -101,6 +101,10 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         type_keys: HashMap::new(),
         shared: HashMap::new(),
         import_refusals: HashSet::new(),
+        shared_chains: Vec::new(),
+        shared_reached: HashMap::new(),
+        checking: false,
+        import_checks: HashMap::new(),
         errors: Vec::new(),
     };
     // With a cycle there is no link order, and the root lowers with no module to
@@ -205,6 +209,32 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             defaults.insert(param.id, default);
         }
     }
+    // The root's lowering, for its check: a copy no tree holds.
+    let run_checks = std::mem::take(&mut ctx.run_type_checks);
+    let root_lowered = lowered
+        .value
+        .as_ref()
+        .filter(|_| errors.is_empty())
+        .map(|chain| {
+            let module = sources
+                .module(root)
+                .cloned()
+                .unwrap_or_else(|| ModulePath::new([SmolStr::from("main")]));
+            LoweredModule {
+                chain: chain.clone_preserving_ids(),
+                interface: Rc::new(Interface::of_lowered(
+                    module,
+                    ast,
+                    chain,
+                    ctx.parameters.clone(),
+                    ctx,
+                    None,
+                )),
+                scope: scope.clone(),
+                sinks: Vec::new(),
+                run_checks,
+            }
+        });
     let value = lowered.value.map(|mut chain| {
         substitute_in(&mut chain, &defaults);
         let mut qualified = lowering.shared_names(&scope);
@@ -226,7 +256,33 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             .rev()
             .fold(root, |body, chain| fill_module_body(chain, body))
     });
-    errors.extend(lowering.errors);
+    errors.extend(std::mem::take(&mut lowering.errors));
+    // Each module is checked on its own, once linking has found nothing wrong.
+    // The root's check is the linked program's inference, unless its parameters
+    // or the arguments its own runs and imports pass need one of their own.
+    if errors.is_empty() && value.is_some() {
+        if let Some(root_lowered) = root_lowered
+            && (!root_lowered.interface.parameters.is_empty()
+                || !lowering
+                    .inferred_arguments(root, &root_lowered.chain)
+                    .is_empty()
+                || root_lowered
+                    .run_checks
+                    .values()
+                    .any(|checks| !checks.is_empty())
+                || lowering
+                    .import_checks
+                    .get(&root)
+                    .is_some_and(|checks| !checks.is_empty()))
+        {
+            lowering.lowered.insert(root, Some(Rc::new(root_lowered)));
+        }
+        for &file in order {
+            if let Some(check) = lowering.check(file, ctx) {
+                ctx.module_checks.push(check);
+            }
+        }
+    }
     errors.sort_by_key(|e| {
         let span = e.span();
         (span.file, span.start, span.end)
@@ -254,6 +310,18 @@ pub(super) struct ProgramLowering<'a> {
     /// The imported modules whose statements an import may not hold have been
     /// reported ([`ProgramLowering::importable`]).
     pub(super) import_refusals: HashSet<FileId>,
+    /// Each shared run's chain, as linking created it, in the order created,
+    /// which a module's check copies ([`ProgramLowering::check`]).
+    pub(super) shared_chains: Vec<(SharedRun, Expr)>,
+    /// The shared runs each shared run reaches: its arguments' and its
+    /// module's imports'.
+    pub(super) shared_reached: HashMap<SharedRun, Vec<SharedRun>>,
+    /// Whether runs are being created for a module's check, which registers no
+    /// sink or route.
+    pub(super) checking: bool,
+    /// The checks of each module's imports' type arguments, by the importer
+    /// ([`ProgramLowering::import_keys`]).
+    pub(super) import_checks: HashMap<FileId, Vec<TypeCheck>>,
     pub(super) errors: Vec<LoweringError>,
 }
 
@@ -294,6 +362,9 @@ pub(super) struct LoweredModule {
     pub(super) scope: ModuleScope,
     /// The sinks it declares, which each run of it registers.
     pub(super) sinks: Vec<DeclaredSink>,
+    /// The checks of each `run` statement's type arguments, by run name, which
+    /// the module's check makes ([`LoweringContext::declare_run_types`]).
+    pub(super) run_checks: HashMap<SmolStr, Vec<TypeCheck>>,
 }
 
 /// One run of a module, created ([`ProgramLowering::create`]).
@@ -332,6 +403,7 @@ impl ProgramLowering<'_> {
         ctx.begin_module(scope.clone());
         let lowered = lower_module_body(ast, ctx);
         let sinks = std::mem::take(&mut ctx.declared_sinks);
+        let run_checks = std::mem::take(&mut ctx.run_type_checks);
         let unimportable = sink_site(ast)
             .map(Unimportable::Io)
             .or_else(|| state_site(ast).map(Unimportable::State))
@@ -352,6 +424,7 @@ impl ProgramLowering<'_> {
             interface: Rc::new(interface),
             scope,
             sinks,
+            run_checks,
         })
     }
 
@@ -432,7 +505,12 @@ impl ProgramLowering<'_> {
                 self.ensure_shared_run(reached, sites, chains, ctx);
             }
         }
+        self.shared_reached.insert(run.clone(), reached);
         if let Some(chain) = self.shared_run(*file, run.clone(), site, ctx) {
+            // A copy no tree holds, which each check that reaches the shared run
+            // copies again.
+            let kept = chain.clone_preserving_ids();
+            self.shared_chains.push((run.clone(), kept));
             chains.push(chain);
         }
     }
@@ -678,8 +756,8 @@ impl ProgramLowering<'_> {
         let mut qualified = own;
         let chain = self.expand_runs(chain, &path, &mut qualified, &modules, ctx);
         let (sinks, refused) = match &place {
-            Some(place) => ctx.register_sinks(&lowered.sinks, Some(place)),
-            None => (Vec::new(), Vec::new()),
+            Some(place) if !self.checking => ctx.register_sinks(&lowered.sinks, Some(place)),
+            _ => (Vec::new(), Vec::new()),
         };
         self.errors.extend(refused);
         let scope = use_names(&lowered.scope, qualified);

@@ -343,12 +343,81 @@ fn imports_at_equal_types_reach_one_shared_run() {
     param Int = String
     1
 "}, "`Int` is a built-in type")]
+#[case::an_argument_outside_its_bound(
+    indoc! {r#"
+        run below(T=String, x="a") as b
+        1
+    "#},
+    "annotated as Int, but inferred as String"
+)]
+#[case::an_imports_argument_outside_its_bound(
+    indoc! {"
+        import capped(T=String)
+        1
+    "},
+    "annotated as Int, but inferred as String"
+)]
+#[case::a_use_beyond_the_bound(indoc! {"
+    run beyond(T=Int, x=3) as b
+    b::v
+"}, "No Addable instance")]
 #[timeout(Duration::from_secs(10))]
 fn a_misused_type_parameter_is_refused(#[case] root: &str, #[case] needle: &str) {
     assert_refused(
-        &program(root, &[("box", BOX), ("holder", HOLDER), ("adder", ADDER)]),
+        &program(
+            root,
+            &[
+                ("box", BOX),
+                ("holder", HOLDER),
+                ("adder", ADDER),
+                (
+                    "below",
+                    indoc! {"
+                        param T <: Int
+                        param x: T
+                        pub v = x
+                    "},
+                ),
+                (
+                    "capped",
+                    indoc! {"
+                        param T <: Int
+                        pub Pair = {T, T}
+                    "},
+                ),
+                (
+                    "beyond",
+                    indoc! {r#"
+                        param T <: {Int where _ > 0}
+                        param x: T
+                        pub v = x + "a"
+                    "#},
+                ),
+            ],
+        ),
         needle,
     );
+}
+
+/// A type argument outside its parameter's bound is reported at the argument.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_bound_is_checked_at_the_argument() {
+    let errors = compile_errors(&program(
+        indoc! {r#"
+            run below(T=String, x="a") as b
+            1
+        "#},
+        &[(
+            "below",
+            indoc! {"
+                param T <: Int
+                param x: T
+                pub v = x
+            "},
+        )],
+    ));
+    assert!(errors.contains("main.cambra:1:11"), "{errors}");
 }
 
 /// A type argument that does not lower is its one error: the run reports no

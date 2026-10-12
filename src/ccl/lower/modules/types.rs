@@ -18,6 +18,14 @@ pub(super) fn reroot_alias(ty: &AliasType, qualifier: &QualifiedName) -> AliasTy
     ty
 }
 
+/// `ty` with each refinement predicate rebuilt as a new term derived from its
+/// own, for a tree other than the one holding it.
+pub(super) fn derived(ty: &Type) -> Type {
+    let mut ty = ty.clone();
+    walk_refined_predicates_mut(&mut ty, &PredMemo::new(), &(), &mut |_, _| true);
+    ty
+}
+
 /// [`reroot_alias`] on a type.
 pub(super) fn reroot(ty: &Type, qualifier: &QualifiedName) -> Type {
     fn rename(expr: &mut Expr, qualifier: &QualifiedName, bound: &mut Vec<Name>) {
@@ -71,33 +79,53 @@ pub(super) fn substitute_in(expr: &mut Expr, arguments: &HashMap<TypeParamId, Ty
     expr.walk_children_mut(|child| substitute_in(child, arguments));
 }
 
-/// `ty` with a fresh type parameter for each of its abstract type members, at
-/// every depth: each Module-typed parameter's, so two parameters of one Module
-/// type take two arguments.
-pub(super) fn instantiate(ty: &Rc<ModuleType>) -> Rc<ModuleType> {
-    fn fresh(ty: &mut ModuleType, map: &mut HashMap<TypeParamId, Type>) {
+/// `ty`, the Module type of the parameter `prefix`, with a fresh type parameter
+/// for each of its abstract type members, at every depth, spelled as the module
+/// writes it, `payments::Receipt`: each Module-typed parameter's, so two
+/// parameters of one Module type take two arguments.
+pub(super) fn instantiate(prefix: &QualifiedName, ty: &Rc<ModuleType>) -> Rc<ModuleType> {
+    fn fresh(prefix: &QualifiedName, ty: &mut ModuleType, map: &mut HashMap<TypeParamId, Type>) {
         for entry in &mut ty.types {
             if let TypeEntryForm::Abstract { param, .. } = &mut entry.form {
-                let renamed = TypeParam::declared(param.spelling.clone());
+                let spelled = prefix.child(entry.name.clone());
+                let renamed = TypeParam::declared(spelled.to_string());
                 map.insert(param.id, Type::Param(Rc::clone(&renamed)));
                 *param = renamed;
             }
         }
         for entry in &mut ty.entries {
             if let AliasType::Module(inner) = &mut entry.ty {
-                fresh(Rc::make_mut(inner), map);
+                fresh(&prefix.child(entry.name.clone()), Rc::make_mut(inner), map);
             }
         }
     }
     let mut instance = (**ty).clone();
     let mut map = HashMap::new();
-    fresh(&mut instance, &mut map);
+    fresh(prefix, &mut instance, &mut map);
     let mut instance = AliasType::Module(Rc::new(instance));
     instance.walk_types_mut(&mut |ty| substitute(ty, &map));
     let AliasType::Module(instance) = instance else {
         unreachable!("instantiated a Module type above");
     };
     instance
+}
+
+/// Each type member `ty` names, at every depth, spelled under `prefix`,
+/// `payments::Receipt`, with what its entry states.
+pub(super) fn type_members(
+    prefix: &QualifiedName,
+    ty: &ModuleType,
+) -> Vec<(QualifiedName, TypeEntryForm)> {
+    let mut members = Vec::new();
+    for entry in &ty.types {
+        members.push((prefix.child(entry.name.clone()), entry.form.clone()));
+    }
+    for entry in &ty.entries {
+        if let AliasType::Module(inner) = &entry.ty {
+            members.extend(type_members(&prefix.child(entry.name.clone()), inner));
+        }
+    }
+    members
 }
 
 /// Each abstract type member `ty` names, at every depth, spelled under

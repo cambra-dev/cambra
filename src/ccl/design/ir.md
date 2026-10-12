@@ -228,8 +228,15 @@ has an unreachable arm for one.
 `Abstract` is a leaf with no definiens. In a module's chain it is bound by the `let` of a parameter
 with no default, or of a member a Module-typed parameter's Module type names ([docs/modules.md,
 "Runs"](../../../docs/modules.md#runs)). Each run binds the parameter to its argument, and refuses a
-run that passes none, so the linked program holds no `Abstract`, and inference and every pass after
-it have an unreachable arm for one.
+run that passes none, so the linked program holds no `Abstract`.
+
+In a module's check tree it stands for any parameter, or for a member a parameter's Module type
+names ([docs/modules.md, "Checking a module on its
+own"](../../../docs/modules.md#checking-a-module-on-its-own)). Inference gives it a fresh type, so
+the `let` that binds it states its type: an exact annotation binds it at the annotation, and with
+none its uses settle it. Under a polymorphic annotation it is generalized as a function definition
+is, and each use's copy takes that use's instance. Inference is the last pass a check tree reaches,
+so every pass after inference has an unreachable arm for an `Abstract`.
 
 ### `Cast` — explicit refinement acquisition
 

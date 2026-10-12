@@ -653,24 +653,38 @@ fn an_import_passing_a_module_reaches_one_shared_run_per_argument() {
     );
 }
 
-/// A module whose type member is a refinement, and a function over it.
+/// A module whose type member is a refinement, a value of it, and a function
+/// over it.
 const POSITIVE: &str = indoc! {"
     pub Count = {Int where _ > 0}
+    pub start: Count = 3
     pub def keep(c: Count) => Count:
         c
 "};
 
-/// A module whose type member is `Int`, and a function over it.
+/// A module whose type member is `Int`, a value of it, and a function over it.
 const INTS: &str = indoc! {"
     pub Count = Int
+    pub start: Count = 0
     pub def keep(c: Count) => Count:
         c
 "};
 
-/// A module that knows its parameter's `Count` only through a bound.
+/// A module that knows its parameter's `Count` only through a bound, so it
+/// takes its values from the parameter.
 const BOUNDED: &str = indoc! {"
-    param n: Module{Count <: Int, keep: Count => Count}
-    pub v: n::Count = n::keep(3)
+    param n: Module{Count <: Int, start: Count, keep: Count => Count}
+    pub v: Int = n::keep(n::start)
+"};
+
+/// A module that takes two modules of one Module type, whose `Count`s are two
+/// types.
+const PAIR: &str = indoc! {"
+    Num = Module{Count <: Int, start: Count, keep: Count => Count}
+    param a: Num
+    param b: Num
+    pub w: a::Count = a::keep(a::start)
+    pub v: b::Count = b::keep(b::start)
 "};
 
 /// Each Module-typed parameter takes its argument's type members: `Name <: T`
@@ -710,11 +724,11 @@ const BOUNDED: &str = indoc! {"
 #[case::the_roots_default(
     indoc! {"
         import positive
-        param n: Module{Count <: Int, keep: Count => Count} = positive
-        x: n::Count = n::keep(2)
+        param n: Module{Count <: Int, start: Count, keep: Count => Count} = positive
+        x: n::Count = n::keep(n::start)
         x
     "},
-    2
+    3
 )]
 #[case::two_parameters_of_one_module_type(
     indoc! {"
@@ -740,15 +754,15 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
                 (
                     "kinded",
                     indoc! {"
-                        param n: Module{Count: Type, keep: Count => Count}
-                        pub v = n::keep(3)
+                        param n: Module{Count: Type, start: Count, keep: Count => Count}
+                        pub v = n::keep(n::start)
                     "},
                 ),
                 (
                     "subtyped",
                     indoc! {"
-                        param n: Module{Count: SubtypesOf(Int), keep: Count => Count}
-                        pub v = n::keep(3)
+                        param n: Module{Count: SubtypesOf(Int), start: Count, keep: Count => Count}
+                        pub v: Int = n::keep(n::start)
                     "},
                 ),
                 (
@@ -761,21 +775,12 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
                 (
                     "relay",
                     indoc! {"
-                        param n: Module{Count <: Int, keep: Count => Count}
+                        param n: Module{Count <: Int, start: Count, keep: Count => Count}
                         run bounded(n=n) as b
                         pub v = b::v
                     "},
                 ),
-                (
-                    "pair",
-                    indoc! {"
-                        Num = Module{Count <: Int, keep: Count => Count}
-                        param a: Num
-                        param b: Num
-                        pub w: a::Count = 0
-                        pub v: b::Count = 1
-                    "},
-                ),
+                ("pair", PAIR),
             ],
         ),
         Value::Int(expected),
@@ -783,13 +788,37 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
 }
 
 #[rstest]
-#[case::a_value_outside_the_arguments_member(
+#[case::a_value_of_an_abstract_member(
     indoc! {"
         run positive as p
         run zero(n=p) as z
         1
     "},
-    "annotated as {Int where _ > 0}, but inferred as {Int where _ == 0}"
+    "annotated as n::Count, but inferred as {Int where _ == 0}"
+)]
+#[case::an_exact_member_the_arguments_is_not(
+    indoc! {"
+        run positive as p
+        run exact_only(n=p) as e
+        1
+    "},
+    "annotated as {Int where _ > 0}, but inferred as Int"
+)]
+#[case::a_member_outside_its_bound(
+    indoc! {"
+        run worded as w
+        run bounded(n=w) as b
+        1
+    "},
+    "annotated as Int, but inferred as String"
+)]
+#[case::two_parameters_members(
+    indoc! {"
+        run positive as p
+        run crossed(a=p, b=p) as c
+        1
+    "},
+    "annotated as a::Count, but inferred as b::Count"
 )]
 #[case::an_exact_member_the_argument_does_not_fit(
     indoc! {"
@@ -834,7 +863,7 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
     indoc! {"
         import positive
         run bounded(n=m) as b
-        param m: Module{Count <: Int, keep: Count => Count} = positive
+        param m: Module{Count <: Int, start: Count, keep: Count => Count} = positive
         b::v
     "},
     "the argument for `n` is declared below this statement"
@@ -859,6 +888,31 @@ fn a_misused_type_member_is_refused(#[case] root: &str, #[case] needle: &str) {
                     indoc! {"
                         param n: Module{Count <: Int, keep: Count => Count}
                         pub w: n::Count = 0
+                    "},
+                ),
+                (
+                    "exact_only",
+                    indoc! {"
+                        param n: Module{Count = Int}
+                        pub w: n::Count = 0
+                    "},
+                ),
+                (
+                    "worded",
+                    indoc! {r#"
+                        pub Count = String
+                        pub start: Count = "a"
+                        pub def keep(c: Count) => Count:
+                            c
+                    "#},
+                ),
+                (
+                    "crossed",
+                    indoc! {"
+                        Num = Module{Count <: Int, start: Count}
+                        param a: Num
+                        param b: Num
+                        pub w: a::Count = b::start
                     "},
                 ),
                 (
