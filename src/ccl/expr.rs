@@ -2329,6 +2329,30 @@ impl TypedExpr {
         binds
     }
 
+    /// The binder of each statement of the chain this node heads, in order: each
+    /// `Let`'s, `MutDecl`'s and `DefGroup`'s, through each `ExprStmt` to the
+    /// statement after it, down to the chain's last expression. A module's top
+    /// level is such a chain.
+    pub fn chain_binders(&self) -> Vec<&TypedBinding> {
+        let mut binders = Vec::new();
+        let mut at = self;
+        loop {
+            at = match &at.node {
+                TypedExprNode::Let { binding, body, .. }
+                | TypedExprNode::MutDecl { binding, body, .. } => {
+                    binders.push(binding);
+                    body
+                }
+                TypedExprNode::DefGroup { bindings, body } => {
+                    binders.extend(bindings.iter().map(|(binding, _)| binding));
+                    body
+                }
+                TypedExprNode::ExprStmt { body, .. } => body,
+                _ => return binders,
+            };
+        }
+    }
+
     /// Mutable analog of [`fold_children`](Self::fold_children).
     ///
     /// Threads `init` through `f` while visiting each direct child by mutable

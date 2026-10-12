@@ -548,7 +548,7 @@ impl Qualifier {
         }
         Ok(Some(Reference {
             name: self.name.child(member),
-            mut_param: found.mut_param,
+            mut_param: found.mut_param.is_some(),
         }))
     }
 

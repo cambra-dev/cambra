@@ -2,6 +2,7 @@
 //! its members, and its parameters (`docs/modules.md`, "The module interface").
 
 use super::*;
+use crate::ccl::infer::Contract;
 
 /// What a module declares, for the modules that reach it (`docs/modules.md`,
 /// "The module interface").
@@ -249,9 +250,9 @@ pub struct Member {
     pub public: bool,
     /// The statement that binds it.
     pub declared: Span,
-    /// Whether it is a `def` with a `Mut` parameter, whose calls take a curried
-    /// shape.
-    pub mut_param: bool,
+    /// For a `def` with a `Mut` parameter, whose calls take a curried shape, its
+    /// number of parameters.
+    pub mut_param: Option<usize>,
 }
 
 /// One top-level type alias of a module.
@@ -292,6 +293,77 @@ impl Interface {
     /// Whether `parameter` is one of [`Self::inferred_parameters`].
     pub(super) fn infers(&self, parameter: &str) -> bool {
         self.inferred_parameters().any(|p| p == parameter)
+    }
+
+    /// Whether `name` is a public value member.
+    pub fn is_public(&self, name: &str) -> bool {
+        self.members.get(name).is_some_and(|member| member.public)
+    }
+
+    /// The interface as `cambra check` prints it (`docs/chl-spec.md`, "9.14
+    /// Checking a module on its own"): each parameter, then each public member
+    /// in the order declared, a value with its contract from `contracts`, by
+    /// spelling, and then whether the module performs IO or declares state.
+    ///
+    /// # Panics
+    ///
+    /// If `contracts` lacks a public value member's: every one is a binder of the
+    /// module's check tree.
+    pub fn written(&self, contracts: &HashMap<SmolStr, Contract>) -> String {
+        let mut lines = vec![format!("module {}", self.module)];
+        for parameter in &self.parameters {
+            let stated = match &parameter.kind {
+                ParameterKind::Module { ty, .. } => format!(": {ty}"),
+                ParameterKind::Type {
+                    bound: Some(bound), ..
+                } => format!(" <: {}", crate::ccl::chl_print::chl_type(bound)),
+                ParameterKind::Value(Some(ty)) => {
+                    format!(": {}", crate::ccl::chl_print::chl_type(ty))
+                }
+                ParameterKind::Type { bound: None, .. } | ParameterKind::Value(None) => {
+                    String::new()
+                }
+            };
+            let default = if parameter.default { " = …" } else { "" };
+            lines.push(format!("param {}{stated}{default}", parameter.name));
+        }
+        let mut members: Vec<(Span, String)> = Vec::new();
+        for (name, member) in &self.members {
+            if member.public {
+                let contract = contracts.get(name).unwrap_or_else(|| {
+                    panic!(
+                        "module `{}`'s check found the public member `{name}`",
+                        self.module
+                    )
+                });
+                // A caller writes a curried `def`'s arguments as one call's.
+                let contract = match member.mut_param {
+                    Some(arity) => contract.uncurried(arity),
+                    None => contract.clone(),
+                };
+                let line = format!("pub {name}: {}", contract.written());
+                members.push((member.declared, line));
+            }
+        }
+        for (name, member) in &self.types {
+            if member.public {
+                members.push((member.declared, format!("pub {name} = {}", member.ty)));
+            }
+        }
+        for (name, member) in &self.modules {
+            if member.public {
+                let line = format!("pub {name} = {}", member.module);
+                members.push((member.declared, line));
+            }
+        }
+        members.sort_by_key(|(span, _)| span.start);
+        lines.extend(members.into_iter().map(|(_, line)| line));
+        match self.unimportable {
+            Some(Unimportable::Io(_)) => lines.push("performs IO".to_string()),
+            Some(Unimportable::State(_)) => lines.push("declares mutable state".to_string()),
+            None => {}
+        }
+        lines.join("\n") + "\n"
     }
 
     /// The interface of a module that importing is an error for. Each import of
@@ -350,7 +422,9 @@ impl Interface {
                 Member {
                     public: binding.public,
                     declared: binding.span,
-                    mut_param: ctx.is_mut_param_fn(&binding.name),
+                    mut_param: ctx
+                        .is_mut_param_fn(&binding.name)
+                        .then(|| def_arity(&ast.body, binding.span)),
                 },
             );
         }
@@ -404,6 +478,22 @@ pub struct TopLevelBinding {
     pub name: SmolStr,
     pub span: Span,
     pub public: bool,
+}
+
+/// The number of parameters of the `def` at `span`, a statement of `stmts`.
+fn def_arity(stmts: &[Spanned<ChlStmt>], span: Span) -> usize {
+    let stmt = stmts
+        .iter()
+        .find(|stmt| stmt.span == span)
+        .unwrap_or_else(|| panic!("a top-level binding's statement stands at {span:?}"));
+    let inner = match &stmt.node {
+        ChlStmt::Pub { stmt, .. } => &stmt.node,
+        other => other,
+    };
+    let ChlStmt::FunctionDef { params, .. } = inner else {
+        panic!("a member with a `Mut` parameter is a `def`");
+    };
+    params.len()
 }
 
 /// The value bindings of `stmts`, a module's top level, in order. A type alias
@@ -554,7 +644,7 @@ impl Interface {
                     Some(member) if !member.public => {
                         missing.push(format!("`{name}` is private to module `{module}`"));
                     }
-                    Some(member) if member.mut_param => missing.push(format!(
+                    Some(member) if member.mut_param.is_some() => missing.push(format!(
                         "`{name}` takes a `Mut` parameter, and a parameter's Module type does \
                          not reach one yet"
                     )),

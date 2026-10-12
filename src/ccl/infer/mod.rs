@@ -68,7 +68,7 @@ impl ModuleCheckParam {
     }
 }
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ccl::FieldKey;
@@ -552,15 +552,26 @@ pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
 ) -> Result<Type, Vec<LocatedInferError>> {
-    run_with_params(expr, sources, &[])
+    run_with_params(expr, sources, &[], &HashSet::new()).map(|(ty, _, _)| ty)
 }
 
-/// [`run`] with a module's type parameters `params` open throughout `expr`.
+/// The scheme each generalized binding a module check reports was bound at.
+pub(crate) type NotedSchemes = Vec<(Name, solver::display::InferredPoly)>;
+
+/// The variable each [`ModuleCheckParam::Inferred`] parameter is opened as, with the
+/// parameter.
+pub(crate) type OpenedVars = HashMap<crate::ccl::InferVarId, Rc<crate::ccl::ty::TypeParam>>;
+
+/// [`run`] with a module's type parameters `params` open throughout `expr`,
+/// also returning the scheme each generalized binding in `reported` is bound at
+/// ([`typing::Typing::note_scheme`]), and the variable each parameter with no kind
+/// written is opened as.
 pub(crate) fn run_with_params(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
     params: &[ModuleCheckParam],
-) -> Result<Type, Vec<LocatedInferError>> {
+    reported: &HashSet<Name>,
+) -> Result<(Type, NotedSchemes, OpenedVars), Vec<LocatedInferError>> {
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
         let pre = InferCtx::new(HashMap::new(), expr.node_id());
@@ -572,7 +583,8 @@ pub(crate) fn run_with_params(
         // node whose rule raised it, and the root is the outermost such node.
         InferCtx::new(translated, expr.node_id())
     };
-    sub_ctx.open_module_params(params).map_err(|e| vec![e])?;
+    let opened = sub_ctx.open_module_params(params).map_err(|e| vec![e])?;
+    sub_ctx.reported = reported.clone();
 
     // Pass 1: emit constraints. The high-value variants
     // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.
@@ -716,7 +728,7 @@ pub(crate) fn run_with_params(
     // validator does not traverse for witness references. This additional walk is debug-only.
     #[cfg(debug_assertions)]
     debug_assert_no_free_witness(expr, "post-inference");
-    Ok(expr.ty.clone())
+    Ok((expr.ty.clone(), sub_ctx.schemes_noted, opened))
 }
 
 use crate::ccl::Expr;

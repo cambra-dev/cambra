@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use cambra::ccl::context::{GlobalContext, check_program};
 use indoc::indoc;
 use rstest_log::rstest;
 
@@ -228,4 +229,252 @@ fn a_link_time_error_names_its_run(
         assert!(!errors.contains(label), "{errors}");
     }
     assert_eq!(report_count(&errors), 1, "{errors}");
+}
+
+/// `cambra check` checks a file on its own, with its parameters abstract, and
+/// prints its interface: each parameter, then each public member with its
+/// contract, its annotation or the type it infers.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_prints_its_interface() {
+    let program = program(
+        indoc! {"
+            import nums
+            param scale: Int = 2
+            param T <: Int
+            pub Count = {Int where _ > 0}
+            pub base: Count = 3
+            pub def double(x):
+                x * scale
+            pub def first(U, a: U, b: U) => U:
+                a
+            pub def keep(c: T) => T:
+                c
+            hidden = 1
+            pub total = nums::limit + base
+        "},
+        &[("nums", "pub limit = 10\n")],
+    );
+    let interface = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(
+        interface,
+        indoc! {"
+            module main
+            param scale: Int = …
+            param T <: Int
+            pub Count = {Int where _ > 0}
+            pub base: {Int where _ > 0}
+            pub double: forall (A) A => Int requires Multipliable(A, Int, Output=Int)
+            pub first: forall (U) {U, U} => U
+            pub keep: T => T
+            pub total: Int
+        "}
+    );
+}
+
+/// A type parameter with no kind written is one variable for the whole check, and a
+/// contract writes it as the parameter, in a member's type and in a generalized one's
+/// scheme alike.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_contract_writes_a_parameter_with_no_kind_by_name() {
+    let program = program(
+        indoc! {"
+            param T
+            def id(x: T) => T:
+                x
+            pub def wrap(x):
+                id(x)
+            pub def pick(a: T, b):
+                b
+        "},
+        &[],
+    );
+    let interface = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(
+        interface,
+        indoc! {"
+            module main
+            param T
+            pub wrap: T => T
+            pub pick: forall (A) {T, A} => A
+        "}
+    );
+}
+
+/// A member declared after a statement that binds nothing, a loop or a feed, has
+/// its contract.
+#[rstest]
+#[case::a_loop(indoc! {"
+    total := 0
+    for x in [1, 2]:
+        total := total + x
+    pub n = 1
+"})]
+#[case::a_feed(indoc! {"
+    events = defer()
+    events << 1
+    pub n = 1
+"})]
+#[timeout(Duration::from_secs(10))]
+fn a_member_after_a_statement_has_its_contract(#[case] file: &str) {
+    let interface = check_program(&mut GlobalContext::default(), &program(file, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(
+        interface.contains("pub n: {Int where _ == 1}"),
+        "{interface}"
+    );
+}
+
+/// A `def` with a `Mut` parameter lowers curried, and its contract is written in
+/// the shape its callers apply it in: one function of its parameters.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_def_with_a_mut_parameter_is_written_uncurried() {
+    let program = program(
+        indoc! {"
+            pub def draw(p: Mut(Int, Txn), amt: Int):
+                with begin():
+                    p := p - amt
+            pub def reset(p: Mut(Int, Txn)):
+                with begin():
+                    p := 0
+        "},
+        &[],
+    );
+    let interface = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(
+        interface,
+        indoc! {"
+            module main
+            pub draw: {Mut(Int, Txn), Int} => {}
+            pub reset: Mut(Int, Txn) => {}
+        "}
+    );
+}
+
+/// A file whose check fails reports its errors, and prints no interface.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_reports_its_errors() {
+    let program = program(
+        indoc! {"
+            param n: Int
+            pub v: String = n
+        "},
+        &[],
+    );
+    let errors = check_program(&mut GlobalContext::default(), &program).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+/// `cambra check` creates a file's runs as linking does, so an error in creating
+/// one is reported, once, however many modules' checks create the run: here a
+/// run that passes no argument for a parameter without one.
+#[rstest]
+#[case::run_by_the_file(indoc! {"
+    run counter
+    pub m = counter::v
+"})]
+#[case::run_by_a_run_of_the_file(indoc! {"
+    run outer
+    pub m = outer::w
+"})]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_reports_a_runs_missing_argument(#[case] file: &str) {
+    let counter = indoc! {"
+        param n: Int
+        pub v = n + 1
+    "};
+    let outer = indoc! {"
+        run counter
+        pub w = counter::v
+    "};
+    let program = program(file, &[("counter", counter), ("outer", outer)]);
+    let errors = check_program(&mut GlobalContext::default(), &program).unwrap_err();
+    let messages: Vec<String> = errors.iter().map(|e| e.message()).collect();
+    assert_eq!(
+        messages,
+        ["the run `counter` passes no argument for the parameter `n`, which has no default"]
+    );
+}
+
+/// A linked compile reports an error in a module's `run` statement once, from the
+/// module's own check, however many runs of the module copy the statement.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_runs_missing_argument_is_reported_once_however_often_it_is_copied() {
+    let counter = indoc! {"
+        param n: Int
+        pub v = n + 1
+    "};
+    let outer = indoc! {"
+        run counter
+        pub w = counter::v
+    "};
+    let errors = compile_errors(&program(
+        indoc! {"
+            run outer as a
+            run outer as b
+            a::w + b::w
+        "},
+        &[("counter", counter), ("outer", outer)],
+    ));
+    assert!(
+        errors.contains("the run `counter` passes no argument"),
+        "{errors}"
+    );
+    assert!(errors.contains("outer.cambra:1:1"), "{errors}");
+    assert_eq!(report_count(&errors), 1, "{errors}");
+}
+
+/// The `cambra check` subcommand reads the file and the modules it reaches from
+/// disk, prints the file's interface and exits 0, prints a failing check's
+/// errors and exits 1, and refuses a missing file argument.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+fn cambra_check_prints_an_interface_or_errors() {
+    let dir = std::env::temp_dir().join(format!("cambra-check-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("creating the directory");
+    std::fs::write(dir.join("nums.cambra"), "pub limit = 10\n").expect("writing nums");
+    std::fs::write(
+        dir.join("lib.cambra"),
+        indoc! {"
+            import nums
+            pub total = nums::limit + 1
+        "},
+    )
+    .expect("writing lib");
+    std::fs::write(dir.join("bad.cambra"), "pub v: String = 1\n").expect("writing bad");
+    let check = |args: &[&std::path::Path]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_cambra"))
+            .arg("check")
+            .args(args)
+            .output()
+            .expect("the cambra binary spawns")
+    };
+
+    let checked = check(&[&dir.join("lib.cambra")]);
+    let stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(checked.status.success(), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&checked.stdout),
+        indoc! {"
+            module lib
+            pub total: Int
+        "}
+    );
+
+    let failed = check(&[&dir.join("bad.cambra")]);
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert_eq!(failed.status.code(), Some(1), "{stderr}");
+    assert!(failed.stdout.is_empty());
+    assert!(stderr.contains("bad.cambra:1:"), "{stderr}");
+
+    let usage = check(&[]);
+    assert_eq!(usage.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&usage.stderr).contains("Usage: cambra check"));
 }

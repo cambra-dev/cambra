@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
+use crate::ccl::infer::solver::display::InferredPoly;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
@@ -368,7 +369,7 @@ pub enum InferError {
         /// The polymorphic type the user wrote.
         annotation: Box<Type>,
         /// The right-hand side's type.
-        inferred: Box<crate::ccl::infer::solver::display::InferredPoly>,
+        inferred: Box<InferredPoly>,
     },
     /// Collections over domains with no common answer met at one position.
     ///
@@ -1444,16 +1445,104 @@ pub fn infer(
 
 /// Check `expr`, the check tree of a module checked on its own, with the
 /// module's type parameters `params` open throughout it (`docs/modules.md`,
-/// "Checking a module on its own"). Only its errors are read: the tree is
-/// discarded, and no pass after inference runs on it.
+/// "Checking a module on its own"), and return the contract of each binding in
+/// `reported`. The tree is discarded, and no pass after inference runs on it.
 pub fn check_module(
     expr: &mut Expr,
     ctx: &mut TypeInferenceContext,
     params: &[super::ModuleCheckParam],
-) -> Result<(), Vec<LocatedInferError>> {
+    reported: &HashSet<Name>,
+) -> Result<HashMap<Name, Contract>, Vec<LocatedInferError>> {
     // The arena tears down every variable the check mints, as for `infer`.
     let _arena = InferArena::new();
-    super::run_with_params(expr, &ctx.source_types, params).map(|_| ())
+    let (_, schemes, opened) = super::run_with_params(expr, &ctx.source_types, params, reported)?;
+    let mut contracts: HashMap<Name, Contract> = schemes
+        .into_iter()
+        .map(|(name, mut scheme)| {
+            scheme.map_types(&mut |ty| write_opened(ty, &opened));
+            (name, Contract::Scheme(scheme))
+        })
+        .collect();
+    // A monomorphic binding's type is the one its uses settled.
+    for binding in expr.chain_binders() {
+        if reported.contains(&binding.name) && !contracts.contains_key(&binding.name) {
+            let mut ty = binding.ty.clone();
+            write_opened(&mut ty, &opened);
+            contracts.insert(binding.name.clone(), Contract::Type(ty));
+        }
+    }
+    Ok(contracts)
+}
+
+/// The contract a module's check infers for one of its public members
+/// (`docs/chl-spec.md`, "9.14 Checking a module on its own").
+#[derive(Debug, Clone)]
+pub enum Contract {
+    /// A generalized member's scheme.
+    Scheme(InferredPoly),
+    /// Another member's type.
+    Type(Type),
+}
+
+impl Contract {
+    /// The contract written in CHL.
+    pub fn written(&self) -> String {
+        match self {
+            Contract::Scheme(scheme) => crate::ccl::chl_print::chl_inferred_poly(scheme),
+            Contract::Type(ty) => crate::ccl::chl_print::chl_type(ty),
+        }
+    }
+
+    /// The contract of a `def` of `arity` parameters that lowers curried, one
+    /// function per parameter (`uncurry_params` in `src/ccl/lower/functions.rs`),
+    /// as its callers apply it: one function of the tuple of its parameters. A
+    /// `def` of one parameter takes it alone either way.
+    pub fn uncurried(&self, arity: usize) -> Contract {
+        let uncurry = |ty: &Type| {
+            let mut domains = Vec::new();
+            let mut at = ty;
+            for _ in 0..arity {
+                let Type::Fun {
+                    name,
+                    domain,
+                    codomain,
+                    ..
+                } = at
+                else {
+                    panic!("a curried `def` of {arity} parameters has {arity} arrows: `{ty}`");
+                };
+                assert!(
+                    name.as_ref()
+                        .is_none_or(|n| !crate::ccl::subst::codomain_depends_on(n, codomain)),
+                    "a curried `def`'s later parameters do not read an earlier one: `{ty}`"
+                );
+                domains.push((**domain).clone());
+                at = codomain;
+            }
+            Type::fun(Type::tuple(domains), at.clone())
+        };
+        match self {
+            _ if arity < 2 => self.clone(),
+            Contract::Scheme(scheme) => {
+                let mut scheme = scheme.clone();
+                scheme.poly.body = uncurry(&scheme.poly.body);
+                Contract::Scheme(scheme)
+            }
+            Contract::Type(ty) => Contract::Type(uncurry(ty)),
+        }
+    }
+}
+
+/// `ty` with each variable a module type parameter with no kind written is opened as
+/// replaced by the parameter, so a contract writes `T` where the module does.
+fn write_opened(ty: &mut Type, opened: &super::OpenedVars) {
+    if let Type::Infer(var) = ty
+        && let Some(param) = opened.get(&var.uid)
+    {
+        *ty = Type::Param(std::rc::Rc::clone(param));
+        return;
+    }
+    ty.walk_children_mut(|child| write_opened(child, opened));
 }
 
 /// Drop every `user_annotation` in the tree — inference has consumed them.

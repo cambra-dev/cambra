@@ -145,6 +145,25 @@ pub(super) struct HttpRoute {
 }
 
 impl LoweringContext {
+    /// Give each route `sinks` declares a source that opens nothing, unless a
+    /// source already answers to its name: a module checked alone reads its
+    /// requests' type off it, and runs nothing.
+    pub(super) fn declare_unopened_routes(&mut self, sinks: &[DeclaredSink]) {
+        for sink in sinks {
+            match sink {
+                DeclaredSink::Http { route, .. } => {
+                    let name = &route.source_name;
+                    if !self.sources.contains_key(name) {
+                        let source = Rc::new(RefCell::new(UnopenedRoute::new(name.clone())));
+                        self.sources.insert(name.clone(), source);
+                    }
+                }
+                #[cfg(any(test, feature = "test-helpers"))]
+                DeclaredSink::Test { .. } => {}
+            }
+        }
+    }
+
     /// Register the route `route`, declared with its arguments at `args_span`, for the run at
     /// `run`, or for the root when `run` is `None`: open it, or bind the open one this context
     /// inherited, and return the sink its responses go to. A route is unique across all runs,
