@@ -1838,6 +1838,13 @@ pub(super) fn emit_let<C: Typing>(
     } else {
         LetScheme::Monomorphic
     };
+    if defined && generalize {
+        let scheme = match &binding.user_annotation {
+            Some(poly @ Type::Poly(_)) => poly,
+            _ => &scheme_ty,
+        };
+        ctx.note_scheme(&binding.name, scheme);
+    }
     let body_ty = ctx.scoped_let(binding, scheme, |ctx| ctx.subexpr(body))?;
     // A failed definition has no definiens to discharge: the program is already
     // rejected, and the RHS it would substitute did not type.

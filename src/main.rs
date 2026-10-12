@@ -356,6 +356,27 @@ fn main() {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
 
+    // `cambra check <file>` checks the file on its own and prints its interface
+    // (`docs/chl-spec.md`, "9.14 Checking a module on its own").
+    if args.get(1).map(String::as_str) == Some("check") {
+        let [_, _, file] = args.as_slice() else {
+            eprintln!("Usage: cambra check <input_file>");
+            std::process::exit(1);
+        };
+        let loaded = LoadedProgram::read(Path::new(file)).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        });
+        match cambra::ccl::context::check_program(&mut GlobalContext::default(), &loaded) {
+            Ok(interface) => print!("{interface}"),
+            Err(errors) => {
+                eprint_errors(&errors, loaded.sources());
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let mut input_file = None;
     let mut inspect_port: Option<u16> = None;
     let mut control_port: Option<u16> = None;
@@ -383,7 +404,7 @@ fn main() {
     }
 
     let usage = "Usage: cambra [[--inspect[=PORT]] [--control[=PORT]] \
-| --inspect-only[=PORT] | --dump-snapshot] <input_file>";
+| --inspect-only[=PORT] | --dump-snapshot] <input_file>\n       cambra check <input_file>";
     let mode = match (inspect_port, control_port, inspect_only_port, dump_snapshot) {
         (None, None, Some(port), false) => Mode::InspectOnly { port },
         (None, None, None, true) => Mode::DumpSnapshot,
