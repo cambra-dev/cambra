@@ -327,6 +327,26 @@ fn methods_of_nominal_values() {
     "#});
 }
 
+/// The compiler-provided `Option`: a checked lookup's answer, its constructors, a `match`
+/// over them, and `is_none`.
+#[test]
+fn option_values() {
+    agree(indoc! {r#"
+        def or_zero(o: Option(Int)) => Int:
+            match o:
+                case Option::some(v):
+                    v
+                case Option::none:
+                    0
+
+        m = map([(1, 10), (2, 20)])
+        out = test_sink()
+        for k in [1, 2, 3]:
+            out << (or_zero(m[k]?), m[k]?.is_none(), or_zero(Option::some(k)))
+        out << (or_zero(Option::none), True, 0)
+    "#});
+}
+
 /// A collection fed at a site that does not iterate is one element, under that site's one key
 /// (`docs/chl-spec.md`, "3.7 Feed operator `<<`").
 #[test]

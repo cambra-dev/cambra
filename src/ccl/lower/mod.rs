@@ -77,7 +77,7 @@
 use smol_str::SmolStr;
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     rc::Rc,
     sync::Arc,
 };
@@ -85,6 +85,7 @@ use std::{
 use crate::{
     ccl::{
         Branch, Expr, Lit, SharedHoleMint, Type, TypedExprNode,
+        nominal::NominalDecl,
         provenance::{Nature, RewriteLabel},
     },
     chl_parser::ast::{
@@ -432,11 +433,18 @@ pub struct LoweringContext {
     /// nominal type"). Unlike an alias, a nominal type survives lowering as a
     /// [`Type::Nominal`] naming its declaration. Declared only at the top level, so never
     /// snapshotted.
-    pub(super) nominal_types: Vec<Rc<crate::ccl::nominal::NominalDecl>>,
+    pub(super) nominal_types: Vec<Rc<NominalDecl>>,
 
     /// The associated functions the module declares, recorded before anything lowers so a
     /// method call anywhere names every type declaring its method.
     pub(super) associated_functions: Vec<nominal::AssociatedFunction>,
+
+    /// The members of compiler-provided declarations the module names, by binding name: the
+    /// ones a qualified reference names, and the candidates of a method call of their name
+    /// (`src/ccl/design/nominal-types.md`, "The compiler-provided `Option`").
+    /// `nominal::bind_constructors` binds only these, so a module that names no member of
+    /// `Option` lowers as it would without it.
+    pub(super) builtin_members_used: BTreeMap<String, (Rc<NominalDecl>, SmolStr)>,
 
     /// Shadow-depth counter keyed by surface spelling: how many enclosing local
     /// binders — loop targets, comprehension generators, lambda/`def` params —
@@ -832,9 +840,13 @@ impl LoweringContext {
         self.type_aliases.get(name)
     }
 
-    /// The nominal type the module declares under `name`.
-    pub(super) fn nominal_type(&self, name: &str) -> Option<Rc<crate::ccl::nominal::NominalDecl>> {
-        self.nominal_types.iter().find(|d| d.name == name).cloned()
+    /// The nominal type `name` names: one the module declares, or a compiler-provided one.
+    pub(super) fn nominal_type(&self, name: &str) -> Option<Rc<NominalDecl>> {
+        self.nominal_types
+            .iter()
+            .find(|d| d.name == name)
+            .cloned()
+            .or_else(|| crate::ccl::nominal::builtin(name))
     }
 
     /// Whether `name` is a type parameter of a definition being lowered.
@@ -1397,6 +1409,37 @@ mod tests {
                 format!("{errs:?}").contains("keyed write"),
                 "expected the keyed-write diagnostic for:\n{code}\ngot {errs:?}"
             );
+        }
+    }
+
+    /// A module binds only the members of the compiler-provided `Option` it names
+    /// (`src/ccl/design/nominal-types.md`, "The compiler-provided `Option`"), so one that names
+    /// none lowers as it would without the declaration.
+    #[test]
+    fn a_module_binds_only_the_option_members_it_names() {
+        fn option_bindings(e: &crate::ccl::Expr, out: &mut Vec<String>) {
+            if let super::TypedExprNode::Let { binding, .. } = &e.node
+                && binding.name.base().starts_with("Option::")
+            {
+                out.push(binding.name.base().to_string());
+            }
+            e.fold_children((), |(), c| option_bindings(c, out));
+        }
+        for (code, bound) in [
+            ("m = map([(1, 10)])\nm[1]?", &[][..]),
+            ("Option::some(1)", &["Option::some"][..]),
+            (
+                "m = map([(1, 10)])\nm[1]?.is_none()",
+                &["Option::is_none"][..],
+            ),
+        ] {
+            let module = super::test_helpers::parse_module(code);
+            let lowered = super::lower_stmts(&module, &mut super::LoweringContext::default())
+                .into_result()
+                .unwrap_or_else(|e| panic!("`{code}` lowers: {e:?}"));
+            let mut found = Vec::new();
+            option_bindings(&lowered, &mut found);
+            assert_eq!(found, bound, "the `Option` members `{code}` binds");
         }
     }
 }

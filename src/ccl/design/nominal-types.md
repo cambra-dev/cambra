@@ -205,6 +205,25 @@ the method, and a type that is not nominal is an error saying it has no methods.
 survives inference. A method no type declares is a lowering error pointing at `(r.f)(…)`, the call
 of a field's function, and a position, `t.0(…)`, names no method.
 
+### The compiler-provided `Option`
+
+`Option(T)` is a `NominalDecl` the compiler provides (`nominal::option`) at the path `std::Option`,
+with the constructors `none` and `some(T)`, the method `is_none`, and no source. Its constructor
+names are the tags the runtime builds when it answers a checked lookup (`V_NONE`, `V_SOME`), so a
+lookup's answer is a value of it. `LoweringContext::nominal_type` answers it for the name `Option`
+after the module's own declarations, and `Type::option_of` builds an application of it.
+
+A member of `Option` is bound only where the module names it: a reference records it
+(`member_reference`), and `bind_constructors` binds the recorded ones, `is_none` as
+`λ 𝑜 : Option(𝑇) → match 𝑜 { Option::some(_) → false; Option::none → true }` (`bind_is_none`). A
+method call names every type that declares its method, because inference picks the candidate
+from the receiver's type, so any `.is_none()` call binds `Option::is_none`, even one whose
+receiver is a type declaring its own `is_none`. A module that names no member lowers as it would
+without the declaration. Its
+identity is its path, so every compilation, and every version of a reloaded program, names the
+same type. Its spans are empty, and lowering refuses the programs that would point a diagnostic at
+one: a declaration named `Option`, and an associated function of it.
+
 ---
 
 ## Inference

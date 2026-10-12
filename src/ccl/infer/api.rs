@@ -947,6 +947,18 @@ fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
     ))
 }
 
+/// The hint for a variant meeting `Option`, such as a `` case `some(v): `` arm on a checked
+/// lookup: `Option` is nominal, so a backtick tag neither builds nor matches one
+/// (`docs/chl-spec.md`, "3.15 Variant constructors").
+fn option_variant_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
+    let is_option = |t: &Type| t.peel_refinements().option_payload().is_some();
+    let is_variant = |t: &Type| matches!(t.peel_refinements(), Type::Variant(..));
+    (is_option(type_a) && is_variant(type_b) || is_variant(type_a) && is_option(type_b)).then_some(
+        "hint: `Option` is a nominal type, not a variant: build one with `Option::some(v)` or \
+         `Option::none`, and match one with `case Option::some(v):` and `case Option::none:`",
+    )
+}
+
 fn product_keying_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
     match (type_a, type_b) {
         (Type::Record(_), Type::Tuple(_)) | (Type::Tuple(_), Type::Record(_)) => Some(
@@ -1025,6 +1037,9 @@ impl std::fmt::Debug for InferError {
                         "Type mismatch for {ctx}: expected {expected}, found {found}"
                     )?;
                     if let Some(hint) = product_keying_hint(expected, found) {
+                        write!(f, "\n  {hint}")?;
+                    }
+                    if let Some(hint) = option_variant_hint(expected, found) {
                         write!(f, "\n  {hint}")?;
                     }
                     if let Some(hint) = undischarged_index_hint(found, expected) {
@@ -1215,7 +1230,11 @@ impl std::fmt::Debug for InferError {
                     "Annotation mismatch: annotated as {}, but inferred as {}",
                     crate::ccl::chl_print::chl_type(annotation),
                     crate::ccl::chl_print::chl_type(inferred)
-                )
+                )?;
+                if let Some(hint) = option_variant_hint(annotation, inferred) {
+                    write!(f, "\n  {hint}")?;
+                }
+                Ok(())
             }
             InferError::PolyAnnotationMismatch {
                 annotation,
