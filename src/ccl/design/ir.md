@@ -57,6 +57,13 @@ use. Within this mint-once, copy-preserving representation, structural compariso
 α-equivalence checks without another scope analysis. It does not identify independently minted
 α-equivalent trees.
 
+Copies keep their binders' identities, so two copies of one binding site can meet in one scope:
+a specialization clone's argument and the body of another clone of the same definition, or two
+copies of one value under one writer. A rewrite that moves a `let` binder into a scope it did not
+occupy therefore renames it first (`refresh_let_binder` in `ccl_utils.rs`): the binder gets a fresh
+`uid` of the same kind (`Name::refreshed`), and its reads follow, in terms and in type slots. The
+kind stays because later rules read it, such as `Name::is_anf_temp`.
+
 At the post-`uniquify` checkpoint, every binding site must be `Name::Unique`, not merely a minted
 name. A surviving `Synthetic` binder there indicates that a pass minted it too early. The check
 does not require globally distinct uids, since copied binding sites retain their original identity

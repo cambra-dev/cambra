@@ -275,6 +275,20 @@ impl Name {
         }
     }
 
+    /// The same kind of binder as `self`, with a globally fresh `uid`: for a rewrite that moves
+    /// a binder to where a copy of it may already be bound. A synthetic binder keeps its kind,
+    /// which later rules read ([`Self::is_anf_temp`]), and a raw one becomes a uniquified
+    /// binder of its spelling.
+    pub fn refreshed(&self) -> Self {
+        match self {
+            Name::Raw(base) | Name::Unique { base, .. } => Name::fresh(base.clone()),
+            Name::Synthetic { kind, .. } => Self::synthetic(kind.clone()),
+            Name::Reserved(_) | Name::PiBound(_) => {
+                unreachable!("`{self}` is never a `let` binder, so nothing renames it")
+            }
+        }
+    }
+
     /// The refinement element binder `__elem`.
     pub fn elem() -> Self {
         Name::Reserved(ReservedName::Elem)
