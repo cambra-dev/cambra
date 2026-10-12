@@ -2101,11 +2101,9 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
 /// Lower a variant type — **one arm, or a `|`-chain of them** — into a
 /// [`Type::Variant`].
 ///
-/// Arms are canonicalized into **name order**, matching [`Type::option_of`] and the
-/// order the solver materializes a coalesced variant in. Without that, a
-/// hand-written `` `some{T} | `none `` would be a distinct type from `Option(T)`
-/// that merely happens to carry the same arms, and an annotation written in the
-/// other order would not compare equal to what inference produced.
+/// Arms are canonicalized into **name order**, the order the solver materializes a
+/// coalesced variant in. Without that, an annotation written in another order would not
+/// compare equal to what inference produced.
 fn lower_variant_type(
     ann: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
@@ -2175,7 +2173,8 @@ fn collect_variant_arms(
 /// The capitalized names the type language spells that are not base types: the
 /// constructors [`lower_type_application`] dispatches on, the two heads resolved
 /// ahead of it (`Mut` in [`mut_annotation_parts`], `Feed` on a `def` parameter),
-/// and `Mut`'s sequencing domain `Txn`.
+/// `Mut`'s sequencing domain `Txn`, and the compiler-provided nominal type `Option`
+/// ([`crate::ccl::nominal::builtin`]).
 ///
 /// A new type constructor is added here in the same change that teaches
 /// [`lower_type_application`] its head. `builtin_type_names_are_refused` iterates
@@ -2574,18 +2573,6 @@ fn lower_type_application(
                 return Err(arity_err("one element type"));
             };
             Ok(Type::collection_of(lower_type_expr(elem, ctx)?))
-        }
-        // `Option(T)` abbreviates the two-tag variant `{some: T, none: Unit}` —
-        // a peer of `List(T)` here, not a distinguished type. Its constructors
-        // are the ordinary `` `some(e) `` / `` `none ``, which no pass special-cases.
-        "Option" => {
-            let [payload] = args else {
-                return Err(LoweringError::unsupported(
-                    span,
-                    "`Option` takes one type argument: `Option(T)`",
-                ));
-            };
-            Ok(Type::option_of(lower_type_expr(payload, ctx)?))
         }
         // `Mut(…)` in a nested position is handled by `mut_annotation_parts`
         // before this function is reached; seeing it here means a `Mut` inside

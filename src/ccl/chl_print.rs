@@ -171,10 +171,6 @@ impl Printer {
                     .collect();
                 format!("{{{}}}", parts.join(", "))
             }
-            Type::Variant(..) if ty.option_payload().is_some() => {
-                let payload = ty.option_payload().expect("matched above");
-                format!("Option({})", self.ty(payload))
-            }
             Type::Variant(tags, openness) => {
                 let named = tags.iter().all(|(k, _)| matches!(k, FieldKey::Name(_)));
                 if !named || openness.permits_extra_tags() {

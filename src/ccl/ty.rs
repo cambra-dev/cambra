@@ -1807,13 +1807,13 @@ pub enum TypeKind {
     Type,
 }
 
-/// The `` `some `` tag of an `Option` — a value that is present.
+/// The name of `Option`'s constructor of a present value, `Option::some`.
 ///
-/// Named here, beside [`Type::option_of`], because the runtime builds the same tag when it
-/// answers a checked lookup (`some_of` in `src/interpreter/tile_operators/lookup.rs`). One
-/// spelling, two builders.
+/// Named here because the runtime builds the same tag when it answers a checked lookup
+/// (`some_of` in `src/interpreter/tile_operators/lookup.rs`), and the compiler-provided
+/// declaration ([`crate::ccl::nominal::option`]) declares it. One spelling, two builders.
 pub const V_SOME: &str = "some";
-/// The `` `none `` tag of an `Option` — a value that is absent. See [`V_SOME`].
+/// The name of `Option`'s constructor of an absent value, `Option::none`. See [`V_SOME`].
 pub const V_NONE: &str = "none";
 
 /// The kind part of a `Σ… ⤇ V` rendering — candidates in brackets, every other kind by
@@ -2627,27 +2627,10 @@ impl Type {
         }
     }
 
-    /// `Option(𝑇)` — the two-tag variant `{some: 𝑇, none: Unit}`.
-    ///
-    /// A built-in type *abbreviation*, in the same category as `List(T)` — see
-    /// `docs/chl-spec.md`, "3.15 Variant constructors".
-    /// It is **not** a distinguished kind of type: the result is an ordinary
-    /// structural [`Type::Variant`], and the constructors `` `some(𝑒) `` / `` `none ``
-    /// are ordinary variant constructors that no pass gives special treatment.
-    /// The spellings live in [`V_SOME`]/[`V_NONE`] rather than here, because the runtime
-    /// builds the same tags when it answers a checked lookup; when type aliases land this
-    /// is replaced by a prelude `` Option(T) = {`some{T} | `none} `` and deleted.
-    ///
-    /// Tags are listed in **name order** (`none` before `some`) on purpose: the
-    /// solver materializes a coalesced variant from a `BTreeMap`, so an inferred
-    /// variant's tags always come out name-ordered. Writing the abbreviation in
-    /// that same order is what lets an `Option(T)` *annotation* compare equal to
-    /// the inferred type structurally instead of differing only by tag order.
+    /// `Option(payload)`, the compiler-provided nominal type
+    /// ([`crate::ccl::nominal::option`]) that a checked lookup answers.
     pub fn option_of(payload: Self) -> Self {
-        Type::variant(vec![
-            (FieldKey::Name(V_NONE.into()), Type::Base(BaseType::Unit)),
-            (FieldKey::Name(V_SOME.into()), payload),
-        ])
+        Type::Nominal(crate::ccl::nominal::option(), vec![payload])
     }
 
     /// The payload of an [`option_of`](Self::option_of), or `None` for any other type.
@@ -2655,14 +2638,10 @@ impl Type {
     /// The constructor's inverse, for a rule that recovers an answer it recorded earlier
     /// rather than recomputing it.
     pub fn option_payload(&self) -> Option<&Self> {
-        let Type::Variant(arms, Openness::Closed) = self else {
-            return None;
-        };
-        let [(none, _), (some, payload)] = arms.as_slice() else {
-            return None;
-        };
-        (*none == FieldKey::Name(V_NONE.into()) && *some == FieldKey::Name(V_SOME.into()))
-            .then_some(payload)
+        match self {
+            Type::Nominal(decl, args) if **decl == *crate::ccl::nominal::option() => args.first(),
+            _ => None,
+        }
     }
 
     /// A **closed** tagged sum: these arms and no others.

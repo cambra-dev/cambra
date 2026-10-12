@@ -185,8 +185,9 @@ branch.
 
 A variant constructor becomes `VariantCtor(tag, payload)`. A bare `` `tag `` and `` `tag() ``
 both supply a `unit` payload. The payload can be a tuple or record, using ordinary term syntax.
-`Option(T)` expands to the two-tag variant ``{`some{T} | `none}`` in type position; constructor
-terms receive no special handling for those names.
+`Option(T)` names the compiler-provided nominal type, built by `Option::some` and `Option::none`
+([nominal-types.md](nominal-types.md#the-compiler-provided-option)); the backtick tags `` `some ``
+and `` `none `` are ordinary tags that build a structural variant.
 
 `match 𝑠` becomes a `Case` with a scrutinee and one `Branch` per arm. Tagged branches carry a
 `Pattern(tag, binding, empty_payload)` and a literal `true` guard. A named payload binds its name.

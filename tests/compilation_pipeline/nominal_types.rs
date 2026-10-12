@@ -2001,6 +2001,99 @@ fn a_method_delegates_to_another_types_same_named_method() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The compiler-provided `Option`
+// ---------------------------------------------------------------------------
+
+/// `Option(T)` is a nominal type the compiler provides, built by `Option::some` and
+/// `Option::none` and taken apart by arms naming them.
+#[test]
+fn option_is_built_and_matched_by_its_constructors() {
+    check_scalar(
+        indoc! {r#"
+            def or_zero(o: Option(Int)) => Int:
+                match o:
+                    case Option::some(v):
+                        v
+                    case Option::none:
+                        0
+
+            wrap = Option::some
+            or_zero(Option::some(4)) + or_zero(Option::none) + or_zero(wrap(3))
+        "#},
+        Value::Int(7),
+    );
+}
+
+/// A checked lookup answers an `Option` of the value type.
+#[test]
+fn a_checked_lookup_answers_an_option() {
+    check_scalar(
+        indoc! {r#"
+            m = map([(1, 10), (2, 20)])
+            a: Option(Int) = m[1]?
+            match a:
+                case Option::some(v):
+                    v
+                case Option::none:
+                    0
+        "#},
+        Value::Int(10),
+    );
+}
+
+/// `Option::is_none` is a method the compiler provides with `Option`.
+#[test]
+fn option_declares_is_none() {
+    check_scalar(
+        indoc! {r#"
+            m = map([(1, 10)])
+            (m[2]?.is_none(), Option::is_none(m[1]?))
+        "#},
+        make_tuple(&[Value::Bool(true), Value::Bool(false)]),
+    );
+}
+
+#[test]
+fn option_errors_name_what_is_wrong() {
+    for (src, needle) in [
+        (
+            indoc! {r#"
+                x: Option(Int) = `some(1)
+                x
+            "#},
+            "annotated as Option(Int), but inferred as {`some{Int where _ == 1}}",
+        ),
+        (
+            indoc! {r#"
+                type Option(T):
+                    some(T)
+
+                1
+            "#},
+            "`Option` is a built-in type and cannot be given another meaning",
+        ),
+        (
+            indoc! {r#"
+                def Option::get(T, self: Option(T), d: T) => T:
+                    d
+
+                1
+            "#},
+            "`Option` is a built-in type, so this module declares no associated function of it",
+        ),
+        (
+            indoc! {r#"
+                x: Option = Option::none
+                x
+            "#},
+            "`Option` takes 1 type argument, got 0",
+        ),
+    ] {
+        check_compile_error(src, needle);
+    }
+}
+
 /// A nullary constructor's type argument is determined by the use, and a join with a
 /// sibling of the same type is one: `Opt::none` joined with `Opt::some(1)` is an `Opt(Int)`,
 /// whichever arm it is (`docs/chl-spec.md`, "6.8 Nominal types and methods \[Decided\]").
