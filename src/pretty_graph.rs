@@ -20,7 +20,7 @@ pub use crate::pretty_tree::{InspectNode, render, render_with_max_depth};
 // Options
 // ---------------------------------------------------------------------------
 
-/// Options controlling visualization verbosity.
+/// Options for rendering an operator or producer tree.
 ///
 /// Derives Debug and Clone so that callers can inspect options during
 /// troubleshooting and clone-then-modify for per-subtree overrides —
