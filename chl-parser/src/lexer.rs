@@ -18,6 +18,8 @@ use std::fmt;
 /// directly by logos. `Indent`/`Dedent` are synthesised by the layout pass in
 /// [`tokenize`].
 #[derive(Logos, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// The tests enumerate every variant. A data field holds its `Default` value.
+#[cfg_attr(test, derive(strum::EnumIter))]
 #[logos(skip r"[ \t]+")] // horizontal whitespace inside a line
 #[logos(skip r"#[^\n]*")] // comments (excluding the terminating newline)
 pub enum Token {
@@ -250,6 +252,44 @@ pub enum Token {
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| SmolStr::from(lex.slice()), priority = 2)]
     Ident(SmolStr),
 }
+
+/// Every keyword spelling and the token it lexes to: the identifier-shaped
+/// spellings that lex as something other than [`Token::Ident`].
+///
+/// The editor grammars under `editors/` list the same spellings, and
+/// `tests/editor_grammars.rs` fails when either grammar differs from this
+/// table. `True` and `False` are listed here although the grammars highlight
+/// them as constants rather than as keywords. It is public for the planned
+/// language server (`editors/README.md`).
+pub const KEYWORDS: &[(&str, Token)] = &[
+    ("True", Token::True),
+    ("False", Token::False),
+    ("where", Token::Where),
+    ("and", Token::And),
+    ("or", Token::Or),
+    ("not", Token::Not),
+    ("if", Token::If),
+    ("elif", Token::Elif),
+    ("else", Token::Else),
+    ("for", Token::For),
+    ("in", Token::In),
+    ("def", Token::Def),
+    ("return", Token::Return),
+    ("yield", Token::Yield),
+    ("pass", Token::Pass),
+    ("with", Token::With),
+    ("match", Token::Match),
+    ("case", Token::Case),
+    ("forall", Token::Forall),
+    ("requires", Token::Requires),
+    ("import", Token::Import),
+    ("use", Token::Use),
+    ("as", Token::As),
+    ("pub", Token::Pub),
+    ("run", Token::Run),
+    ("param", Token::Param),
+    ("this", Token::This),
+];
 
 /// User-facing rendering of a token, used by the parser's `Rich` error
 /// formatter. Returns the bare symbol or literal text — chumsky's error
@@ -830,6 +870,40 @@ mod tests {
                 Token::Newline,
             ]
         );
+    }
+
+    #[test]
+    fn every_keyword_spelling_lexes_to_its_token() {
+        for (spelling, token) in KEYWORDS {
+            assert_eq!(
+                tokens(spelling),
+                vec![token.clone(), Token::Newline],
+                "`{spelling}` does not lex to its KEYWORDS token"
+            );
+            assert_eq!(token.to_string(), *spelling);
+        }
+    }
+
+    /// `KEYWORDS` lists exactly the keyword variants, in declaration order. A
+    /// keyword is a variant whose `Display` spelling is identifier-shaped and
+    /// lexes back to that variant rather than to [`Token::Ident`]. `Display for
+    /// Token` has no wildcard arm, so a new variant does not compile until it
+    /// has a spelling, and the spelling decides whether it is a keyword. Layout
+    /// and literal tokens drop out because their spellings (`indent`,
+    /// `identifier`, …) lex as `Ident`.
+    #[test]
+    fn keywords_lists_exactly_the_keyword_variants() {
+        use strum::IntoEnumIterator;
+        let derived: Vec<Token> = Token::iter()
+            .filter(|t| {
+                let s = t.to_string();
+                s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && tokens(&s) == vec![t.clone(), Token::Newline]
+            })
+            .collect();
+        let listed: Vec<Token> = KEYWORDS.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(derived, listed);
     }
 
     /// `where` separates a refinement's base type from its predicate
