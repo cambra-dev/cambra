@@ -26,7 +26,7 @@ use crate::{
         inline, lambda_elim,
         lower::{
             LoweredRoute, LoweringContext, LoweringError,
-            modules::{InferredArgument, ModuleCheck, RunSites, lower_program},
+            modules::{InferredArgument, ModuleCheck, RunSites, lower_for_check, lower_program},
         },
         mut_elim, mut_read, opaque_output,
         panes::gate_leaks,
@@ -2282,6 +2282,8 @@ fn check_modules(
     ctx: &mut GlobalContext,
     checks: Vec<ModuleCheck>,
     blame: &Blame<'_>,
+    contracts_of: Option<FileId>,
+    contracts: &mut HashMap<SmolStr, String>,
 ) -> Vec<CompileError> {
     let mut own: HashMap<FileId, HashSet<(Span, String)>> = HashMap::new();
     let mut seen: HashSet<(Span, String)> = HashSet::new();
@@ -2294,12 +2296,26 @@ fn check_modules(
         let mut blame = blame.fresh();
         let mut tree = uniquify::run(check.tree);
         annotate_arguments(&mut tree, &check.arguments, &inferred);
+        // The module's own public members head its check tree with no home,
+        // below the shared imports it reaches.
+        let mut wanted = HashSet::new();
+        if contracts_of == Some(check.file) {
+            let mut at = &tree;
+            while let TypedExprNode::Let { binding, body, .. }
+            | TypedExprNode::MutDecl { binding, body, .. } = &at.node
+            {
+                if binding.name.home().is_none() && check.interface.is_public(binding.name.base()) {
+                    wanted.insert(binding.name.clone());
+                }
+                at = body;
+            }
+        }
         tree = anf::run(tree);
         tree = mut_read::run(tree);
         let derivation = DerivationSession::install();
         tree = comprehension::run(tree, ctx.lowering_ctx().shared_holes());
         blame.derive(&derivation.into_log(), Phase::Comprehension);
-        let checked = check_module(&mut tree, ctx.inference_ctx(), &check.params);
+        let checked = check_module(&mut tree, ctx.inference_ctx(), &check.params, &wanted);
         if checked.is_ok() {
             note_parameter_types(
                 &tree,
@@ -2308,8 +2324,16 @@ fn check_modules(
                 &mut inferred,
             );
         }
-        let Err(errors) = checked else {
-            continue;
+        let errors = match checked {
+            Ok(found) => {
+                contracts.extend(
+                    found
+                        .into_iter()
+                        .map(|(name, written)| (SmolStr::from(name.base()), written)),
+                );
+                continue;
+            }
+            Err(errors) => errors,
         };
         let respelling = mut_read::read_respelling(&tree);
         let errors = errors
@@ -2440,6 +2464,56 @@ fn annotate_arguments(
     tree.walk_children_mut(|child| annotate_arguments(child, arguments, inferred));
 }
 
+/// Check `program`'s root file on its own, as `cambra check` does
+/// (`docs/chl-spec.md`, "9.14 Checking a module on its own"): as a module with
+/// its parameters abstract, after each module it imports and runs. Return its
+/// interface as [`Interface::written`](crate::ccl::lower::modules::Interface::written)
+/// writes it, or every error found.
+pub fn check_program(
+    ctx: &mut GlobalContext,
+    program: &LoadedProgram,
+) -> Result<String, Vec<CompileError>> {
+    let mut errors: Vec<CompileError> = program.compile_errors();
+    if program.root().is_none() {
+        return Err(errors);
+    }
+    let lowering_session = LoweringSession::install();
+    let lowered = lower_for_check(program, ctx.lowering_ctx());
+    errors.extend(lowered.into_iter().map(CompileError::Lower));
+    let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let mut output_ids = HashSet::new();
+    for check in &checks {
+        assert_unique_node_ids(&check.tree, "post-lowering module check");
+        output_ids.extend(collect_tree_ids(&check.tree));
+    }
+    let projection = {
+        let (projection, leaks) = fold_lowering(&lowering_session.into_log(), &output_ids);
+        gate_leaks(&leaks, "lowering");
+        projection
+    };
+    for (_name, source) in ctx.lowering_ctx().take_sources() {
+        let name = source.borrow().get_id().to_string();
+        let output_type = source.borrow().output_type();
+        ctx.inference_ctx().register_source_type(&name, output_type);
+    }
+    let root = program.sources().root();
+    let interface = checks
+        .iter()
+        .find(|check| check.file == root)
+        .map(|check| Rc::clone(&check.interface));
+    let blame = Blame::new(&projection, program.sources());
+    let mut contracts = HashMap::new();
+    let errors = check_modules(ctx, checks, &blame, Some(root), &mut contracts);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let interface = interface.expect("a program that checks has its root's file checked");
+    Ok(interface.written(&contracts))
+}
+
 /// The phase sequence, from the α-uniquified tree to `stop`'s output.
 ///
 /// Split out of [`run_frontend`] only so each phase boundary can `return` the
@@ -2540,7 +2614,7 @@ fn run_passes(
 
     // Each module is checked on its own before the linked program is inferred,
     // and a module whose check fails stops the compile with its errors.
-    let check_errors = check_modules(ctx, checks, &blame);
+    let check_errors = check_modules(ctx, checks, &blame, None, &mut HashMap::new());
     if !check_errors.is_empty() {
         return Err(check_errors);
     }

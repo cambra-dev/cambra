@@ -192,6 +192,11 @@ pub(super) struct InferCtx {
     /// [`Typing::close_poly`], so a `Poly` an alias names, opened by each binding it
     /// annotates, maps to that binding's parameters alone.
     opened_params: Vec<(crate::ccl::ty::TypeParamId, Type)>,
+    /// The generalized bindings whose schemes a module check reports, and the
+    /// scheme each was bound at, written as an annotation would state it
+    /// ([`Typing::note_scheme`]).
+    pub(super) reported: HashSet<Name>,
+    pub(super) schemes_noted: Vec<(Name, crate::ccl::infer::solver::display::InferredPoly)>,
     /// Where the demand of the edges being drawn was stated, when it is not the node
     /// under emission: a type parameter's bound or a requirement, written in a `Poly`
     /// and checked at a use ([`Typing::with_demand_at`]).
@@ -336,6 +341,8 @@ impl InferCtx {
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
             opened_params: Vec::new(),
+            reported: HashSet::new(),
+            schemes_noted: Vec::new(),
             demand_at: None,
             assumptions: Vec::new(),
             telescope: Telescope::empty(),
@@ -1166,6 +1173,31 @@ impl Typing for InferCtx {
         should_generalize(def, self.level, |name| {
             self.scopes.lookup(name).is_some_and(|b| b.generalized)
         })
+    }
+
+    fn note_scheme(&mut self, name: &Name, ty: &Type) {
+        if !self.reported.contains(name) {
+            return;
+        }
+        // A polymorphic annotation's parameters and requirements are the
+        // scheme's own, over the body the binding settled.
+        let written = match ty {
+            Type::Poly(annotated) => {
+                poly_for_display(&annotated.body, self.level).map(|mut written| {
+                    let mut params = annotated.params.clone();
+                    params.append(&mut written.poly.params);
+                    written.poly.params = params;
+                    let mut requires = annotated.requires.clone();
+                    requires.append(&mut written.poly.requires);
+                    written.poly.requires = requires;
+                    written
+                })
+            }
+            ty => poly_for_display(ty, self.level),
+        };
+        if let Some(written) = written {
+            self.schemes_noted.push((name.clone(), written));
+        }
     }
 
     fn scoped_let<R>(

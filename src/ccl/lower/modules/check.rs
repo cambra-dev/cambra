@@ -91,6 +91,30 @@ pub(super) fn checked_by(
     body
 }
 
+/// Lower `program` for `cambra check` on its root file (`docs/chl-spec.md`,
+/// "9.14 Checking a module on its own"): every module lowered once, the root's
+/// file as a module rather than a root, the shared imports its modules reach
+/// created, and a check of each module, the root's file's included, pushed onto
+/// `ctx`'s module checks. Nothing is linked, and each route a module declares
+/// is a source that opens nothing. Returns the errors found.
+pub fn lower_for_check(program: &LoadedProgram, ctx: &mut LoweringContext) -> Vec<LoweringError> {
+    let mut lowering = ProgramLowering::new(program);
+    let order = program.link_order().unwrap_or_default();
+    let mut sites = HashMap::new();
+    for &file in order {
+        lowering.import_keys(file, &mut sites, ctx);
+        lowering.lower(file, ctx);
+    }
+    lowering.shared_imports(order, &sites, ctx);
+    for lowered in lowering.lowered.values().flatten() {
+        ctx.declare_unopened_routes(&lowered.sinks);
+    }
+    if lowering.errors.is_empty() {
+        lowering.check_all(order, ctx);
+    }
+    in_source_order(lowering.errors)
+}
+
 /// A module's check tree, which inference checks it on its own with
 /// (`docs/modules.md`, "Checking a module on its own").
 pub struct ModuleCheck {
@@ -112,6 +136,8 @@ pub struct ModuleCheck {
     /// parameter of another module, which the check compares with the type that
     /// module's own check infers for it.
     pub arguments: Vec<InferredArgument>,
+    /// What the module declares.
+    pub interface: Rc<Interface>,
 }
 
 /// A value argument for a parameter its module leaves unannotated
@@ -128,7 +154,31 @@ pub struct InferredArgument {
     pub parameter: SmolStr,
 }
 
-impl ProgramLowering<'_> {
+impl<'a> ProgramLowering<'a> {
+    /// Push the check of each module in `order`, the link order, onto `ctx`'s
+    /// module checks, keeping the errors creating their runs raises. An error in
+    /// another module's code is that module's own when its own check raised it,
+    /// as an inference error is (`check_modules` in `src/ccl/context.rs`), and the
+    /// link order checks a module before every module that reaches it.
+    pub(super) fn check_all(&mut self, order: &[FileId], ctx: &mut LoweringContext) {
+        let mut own: HashSet<Span> = HashSet::new();
+        for &file in order {
+            let before = self.errors.len();
+            if let Some(check) = self.check(file, ctx) {
+                ctx.module_checks.push(check);
+            }
+            for error in self.errors.split_off(before) {
+                let span = error.span();
+                if span.file == file {
+                    own.insert(span);
+                } else if own.contains(&span) {
+                    continue;
+                }
+                self.errors.push(error);
+            }
+        }
+    }
+
     /// The check tree of the module in `file`, which inference checks it on its
     /// own with (`docs/modules.md`, "Checking a module on its own"), or `None`
     /// when it has no lowering.
@@ -139,8 +189,9 @@ impl ProgramLowering<'_> {
     /// and its type parameters are opened by the check ([`ModuleCheck::params`]).
     /// A default with an annotation is checked against it. Each run it declares
     /// is created as linking creates it, registering nothing, and the shared
-    /// imports it reaches are copies of linking's. Errors raised while creating
-    /// its runs are linking's too, which reports them.
+    /// imports it reaches are copies of linking's. An error raised while creating
+    /// its runs is an error of the program: `cambra check` links nothing, so
+    /// creating them here is the only place it is raised ([`lower_for_check`]).
     pub(super) fn check(&mut self, file: FileId, ctx: &mut LoweringContext) -> Option<ModuleCheck> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
         let mut chain = {
@@ -202,15 +253,13 @@ impl ProgramLowering<'_> {
         let chain = checked_by(chain, &QualifiedName::new("import"), &imports, ctx);
         let mut qualified = self.shared_names(&lowered.scope);
         self.checking = true;
-        let errors = self.errors.len();
         let chain = self.expand_runs(chain, &RunPath::default(), &mut qualified, &modules, ctx);
-        self.errors.truncate(errors);
         self.checking = false;
         let scope = use_names(&lowered.scope, qualified);
         let chain = uniquify::run_in(chain, &raw_scope(&scope), None);
         // A module's chain ends at its placeholder, and the root's at its last
         // statement.
-        let mut tree = if file == self.program.sources().root() {
+        let mut tree = if lowered.as_root {
             chain
         } else {
             let span = Span::new(file, 0, self.program.sources().text(file).len());
@@ -249,6 +298,7 @@ impl ProgramLowering<'_> {
             reached_by: self.reached_by(file),
             inferred_parameters: lowered.interface.inferred_parameters().cloned().collect(),
             arguments: self.inferred_arguments(file, &lowered.chain),
+            interface: Rc::clone(&lowered.interface),
         })
     }
 
