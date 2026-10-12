@@ -808,17 +808,17 @@ fn with_src() -> (GlobalContext, Rc<RefCell<TestDataSource>>) {
     (ctx, src)
 }
 
-fn add(src: &Rc<RefCell<TestDataSource>>, from: usize, values: &[i64]) {
-    let rows: Vec<(Value, Value)> = values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (Value::UInt(from + i), Value::Int(*v)))
+fn add(src: &Rc<RefCell<TestDataSource>>, from: u64, values: &[i64]) {
+    let rows: Vec<(Value, Value)> = (from..)
+        .zip(values)
+        .map(|(i, v)| (Value::UInt(i), Value::Int(*v)))
         .collect();
+    let last = from + u64::try_from(values.len()).expect("fits in u64") - 1;
     let mut src = src.borrow_mut();
     src.add_data(&rows);
     // Every position up to the last added is complete, which is what lets a
     // drive release the position it last decided.
-    src.set_yield_predicate(Predicate::at_or_below(Value::UInt(from + values.len() - 1)));
+    src.set_yield_predicate(Predicate::at_or_below(Value::UInt(last)));
 }
 
 /// Deliver and pull branch `name`'s `main` output until its fold settles.
