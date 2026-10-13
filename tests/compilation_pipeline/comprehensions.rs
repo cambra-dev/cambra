@@ -99,6 +99,72 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
+/// A filter that **aggregates a collection**. The restrict evaluates the predicate per
+/// element, and the aggregate's operand is an iteration site inside it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// The predicate reads no element: `sum([1, 2]) > 2` holds, so every element stays.
+#[case::constant("sum([q for q in [1, 2, 3] if sum([1, 2]) > 2])", 6)]
+// `q > 2` keeps 3.
+#[case::beside_the_element("sum([q for q in [1, 2, 3] if q > max([1, 2])])", 3)]
+// A named collection, the control: a `let`-bound collection is an iteration site at its
+// binding, so it needs none of the filter's planning. `q > 1` keeps 2 + 3.
+#[case::named_collection(
+    indoc! {r"
+        zs = [1, 2]
+        sum([q for q in [1, 2, 3] if q > sum(zs) - 2])
+    "},
+    5
+)]
+// A filtered collection: `sum([z for z in [1, 2] if z > 1])` is 2, so `q > 2` keeps 3.
+#[case::filtered_collection(
+    "sum([q for q in [1, 2, 3] if q > sum([z for z in [1, 2] if z > 1])])",
+    3
+)]
+// A boxed source: `q > 2` keeps 3.
+#[case::boxed_source("sum([q for q in box([1, 2, 3]) if q > sum([1, 1])])", 3)]
+// A conditional collection: the first leg is taken, and `q > 2` keeps 3.
+#[case::conditional_source(
+    indoc! {r"
+        c: Bool = True
+        sum([q for q in (box([1, 2, 3]) if c else box([4])) if q > sum([1, 1])])
+    "},
+    3
+)]
+// Two generators, the filter on the first: `q > 2` keeps the pairs (3, 10) and (3, 20).
+#[case::two_generators(
+    "sum([q + r for q in [1, 2, 3] for r in [10, 20] if q > sum([1, 1])])",
+    36
+)]
+// A per-group filter: groups [1], [2, 3] and [4], and `x > 1` keeps 2, 3 and 4.
+#[case::per_group(
+    r"sum([sum([x for x in g if x > sum([0, 1])]) for g in groupby([1, 2, 3, 4], \v -> v // 2)])",
+    9
+)]
+// An equi-join whose key side aggregates: `a == b + 1` keeps (2, 1) and (3, 2).
+#[case::join_key(
+    "sum([a for a in [1, 2, 3] for b in [1, 2, 3] if a == b + max([0, 1])])",
+    5
+)]
+// The same, the aggregate on the other side.
+#[case::join_key_left(
+    "sum([a for a in [1, 2, 3] for b in [1, 2, 3] if a - sum([1, 0]) == b])",
+    5
+)]
+fn a_filter_aggregates_a_collection(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// A filter whose aggregate reads the element it filters: planning does not rewrite the
+/// correlated aggregate through `strength` yet, so the program is refused.
+#[test]
+fn a_filter_aggregating_over_its_own_element_is_refused() {
+    check_compile_error(
+        "sum([q for q in [1, 2, 3] if q > sum([z for z in [1, 2] if z < q])])",
+        "a curried morphism planning did not rewrite through `strength`",
+    );
+}
+
 // A *let-bound* (and therefore generalized) UDF referenced from inside a
 // filter predicate. The predicate's `f(x)` use lives inside the cast-target
 // refinement, not the main expression tree — exercising the coalesce walk's
