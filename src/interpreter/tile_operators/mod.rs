@@ -31,7 +31,7 @@ use crate::{
     ccl::provenance::NodeId,
     interpreter::operator_graph::{EdgeKind, InputEdgeSpec},
     interpreter::value_probe::ProbeSlot,
-    interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value, validate_tile},
+    interpreter::{ColumnValue, Consumer, Extent, Gate, Scheduler, Value, validate_tile},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -274,6 +274,12 @@ pub(crate) use impl_operator_base;
 /// [`FanOut`](crate::interpreter::tile_operators::FanOut), whose slots are separate
 /// producers with separate flags — so "since the consumer last pulled" and "since anyone
 /// last pulled" are the same statement.
+///
+/// The same bit gates the consumer an operator shares between its inputs
+/// ([`shared_consumer`](crate::interpreter::shared_consumer)): a notification that finds it
+/// set has nothing to add to the one that set it, so it is not passed on. That flag starts
+/// clear ([`Self::clear`]), so a notification an operator sends as it subscribes passes, and
+/// every pull clears it ([`ProducerBase::sharing`]).
 #[derive(Clone)]
 pub enum Notified {
     /// The input's notification does not reach this producer, so every pull reads —
@@ -289,6 +295,29 @@ impl Notified {
     /// everything to read.
     pub fn flag() -> Self {
         Self::Flag(Rc::new(Cell::new(true)))
+    }
+
+    /// A live [`Flag`](Self::Flag), starting clear: the gate on an operator's shared consumer,
+    /// or on a fan-out's branches, which has passed nothing on yet.
+    pub fn clear() -> Self {
+        Self::Flag(Rc::new(Cell::new(false)))
+    }
+
+    /// Record that the input has new data, and say whether that is news: the flag was clear.
+    /// `Always` is always news.
+    pub fn mark_news(&self) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Flag(c) => !c.replace(true),
+        }
+    }
+
+    /// Whether the flag is set, without clearing it. `Always` reads set.
+    pub fn is_set(&self) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Flag(c) => c.get(),
+        }
     }
 
     /// Record that the input has new data.
@@ -735,6 +764,13 @@ pub struct ProducerBase {
     /// Obsolete region of the tiling
     pub obsolete_guard: TileGuard,
     pub(crate) notified: Notified,
+    /// The gate on the consumer this producer's operator shares between its inputs
+    /// ([`shared_consumer`](crate::interpreter::scheduler::shared_consumer)), cleared by
+    /// every pull. `None` for an operator that shares none.
+    pub(crate) gate: Option<Notified>,
+    /// How many times this producer has been pulled, for the debug check that a woken
+    /// consumer pulls (`scheduler::pull_laps`).
+    pub(crate) pulls: u64,
     /// The last tile `get` returned, for the debug check that the complete region never
     /// changes ([`completeness_violation`]). Debug builds only; `None` in release.
     pub(crate) last_output: Option<Tile>,
@@ -769,8 +805,18 @@ impl ProducerBase {
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
             notified,
+            gate: None,
+            pulls: 0,
             last_output: None,
         }
+    }
+
+    /// This producer's operator shares one consumer between its inputs
+    /// ([`shared_consumer`](crate::interpreter::shared_consumer)), whose `gate` every pull
+    /// clears. `None` for an operator that, in this subscription, shares none.
+    pub(crate) fn sharing(mut self, gate: impl Into<Option<Gate>>) -> Self {
+        self.gate = gate.into().map(|Gate(notified)| notified);
+        self
     }
 
     /// A producer no operator built, for a test double constructing one
@@ -784,6 +830,8 @@ impl ProducerBase {
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
             notified: Notified::Always,
+            gate: None,
+            pulls: 0,
             last_output: None,
         }
     }
@@ -889,6 +937,12 @@ pub trait TileProducer {
 
     /// Fetch the current tile value.  Contains generic logic for all producers
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
+        // Cleared before the pull, so a notification arriving while it runs passes: the
+        // pull may already have read past the input that sent it.
+        if let Some(gate) = &self.base().gate {
+            gate.take();
+        }
+        self.base_mut().pulls += 1;
         let mut result = self.get_impl(projection_guard);
         // A scalar field's cell released while its row stays open is left out here rather
         // than by each producer: a producer rebuilds a row from inputs released by whole key,
@@ -1007,9 +1061,22 @@ pub trait TileProducer {
         self.add_inspect_children(node, opts)
     }
 
-    /// Hook for adding any children to the InspectNode.
-    fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
-        node
+    /// Hand `visit` each producer this one pulls, with the role it plays. It is what
+    /// [`add_inspect_children`](Self::add_inspect_children) lists by default, and what
+    /// `scheduler::pull_laps`'s debug check that a woken
+    /// consumer pulls walks. A producer that pulls nothing visits nothing.
+    fn visit_input_producers(&self, _visit: &mut dyn FnMut(&str, &dyn TileProducer)) {}
+
+    /// Hook for adding any children to the InspectNode: by default, each producer
+    /// [`visit_input_producers`](Self::visit_input_producers) visits, under its role.
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        let mut children = Vec::new();
+        self.visit_input_producers(&mut |role, input| {
+            children.push((role.to_string(), input.inspect(opts)));
+        });
+        children
+            .into_iter()
+            .fold(node, |node, (role, child)| node.child(role, child))
     }
 }
 

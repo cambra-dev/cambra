@@ -10,8 +10,6 @@ use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::AggregateKind,
     interpreter::{ColumnValue, Consumer, Scheduler, Value},
-    pretty_graph::VizOptions,
-    pretty_tree::InspectNode,
 };
 
 /// Reduces a `DataFunction` input to a single scalar via an aggregation operation.
@@ -121,8 +119,8 @@ impl TileProducer for AggregateProducer {
 
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -233,8 +231,8 @@ struct ExtractAggregateProducer {
 impl TileProducer for ExtractAggregateProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -363,8 +361,8 @@ struct MapExtractAggregateProducer {
 impl TileProducer for MapExtractAggregateProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -638,8 +636,8 @@ impl TileProducer for MapAggregateProducer {
 
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {

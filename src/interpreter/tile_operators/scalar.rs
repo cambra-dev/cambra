@@ -396,8 +396,8 @@ struct VariantWrapProducer {
 impl TileProducer for VariantWrapProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("payload", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("payload", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -669,8 +669,8 @@ impl VariantProjectProducer {
 impl TileProducer for VariantProjectProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("scrutinee", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("scrutinee", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -904,8 +904,8 @@ struct VariantIsProducer {
 impl TileProducer for VariantIsProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("scrutinee", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("scrutinee", &*self.input);
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
@@ -983,8 +983,8 @@ struct ToScalarProducer {
 impl TileProducer for ToScalarProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {

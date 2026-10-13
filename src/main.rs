@@ -145,7 +145,7 @@ fn run_program(
             Some(inspection) => inspection.before_pull(ctx.scheduler()),
             None => Vec::new(),
         };
-        ctx.scheduler().deliver(delivery);
+        let delivered = ctx.scheduler().deliver(delivery);
         live.pull_mains(pull_main);
         if let Some(inspection) = inspection.as_mut() {
             inspection.publish(&sources);
@@ -154,8 +154,10 @@ fn run_program(
             break;
         }
         // A `main` output is pulled as soon as it is notified, so while one is
-        // running the loop spins; a sink program is woken by its sources.
-        if !live.any_main_running() {
+        // running the loop spins; a sink program is woken by its sources. A pass that
+        // delivered something may have queued more, since a sink pulls once per pass, so
+        // the next pass runs at once.
+        if !delivered && !live.any_main_running() {
             // TODO we shouldn't need to sleep here; we should come up with a better interface
             // for check_for_notifications
             thread::sleep(Duration::from_millis(10));
