@@ -36,6 +36,8 @@ mod feeds_cases;
 mod generators_udf_poly;
 #[path = "compilation_pipeline/joins_aggregates_groupby.rs"]
 mod joins_aggregates_groupby;
+#[path = "compilation_pipeline/key_collections.rs"]
+mod key_collections;
 #[path = "compilation_pipeline/misc.rs"]
 mod misc;
 #[path = "compilation_pipeline/mutability.rs"]
