@@ -71,6 +71,8 @@ const LIVE: &[&str] = &[
     "match_scrutinee",
     "max_arg",
     "mut_init",
+    "mut_reads_itself",
+    "mut_write_rhs",
     "nested_mut_over_row",
     "rec_comp_element",
     "rec_comp_in_loop",

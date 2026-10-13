@@ -486,59 +486,6 @@ pub enum InferError {
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
-    /// A **type refinement depends on a mutable variable**, where nothing can close
-    /// it over the mutable variable's scope.
-    ///
-    /// A `let` binder can be discharged into the type it is lifted out of, because the
-    /// binder *is* its bound expression. A mutable variable has no such term **at this point in
-    /// compilation**, which is the precise obstacle: closure is demanded during
-    /// coalesce, and the term that would discharge it does not exist until `mut_elim`
-    /// several passes later. That pass compiles a write-free mutable variable straight into a
-    /// `let`, and a written one into a history plus trailing
-    /// `let x_final = final_or_default(…)` bindings — either of which a predicate could
-    /// name. Nothing about a mutable variable makes it unnameable; the naming just happens too
-    /// late.
-    ///
-    /// So this is a **staging limitation reported as a rejection**, not a compiler bug
-    /// and not an impossibility. Lifting it would mean letting a predicate reference a
-    /// mutable variable through inference (mutable variables are enumerable — `MutDecl` binders and
-    /// pass-by-reference params), staging the scope invariant across `mut_elim`, and
-    /// having that pass rewrite reads inside predicate terms as it already does in the
-    /// term tree.
-    ///
-    /// One sub-case is harder and would stay rejected: a comprehension *inside* the loop
-    /// that writes the mutable variable. There "the value of `x`" is per-iteration, so the
-    /// refinement would have to depend on the sequencing position rather than on a
-    /// single binding — and a predicate rides a type, which carries no position.
-    ///
-    /// Worth asking first whether the filter belongs in a type at all. It is there as a
-    /// *planning channel* (planning reifies it off `expr.ty.domain()`), not as a proof
-    /// obligation the way an index-in-range refinement is; a filter that reached
-    /// planning as a term would never raise this.
-    ///
-    /// Reading the mutable variable into a binding first is the surface workaround.
-    /// [`crate::ccl::mut_read`] names the reads it reaches with an opaque binder, and an
-    /// opaque binder is what a type lifted out of its scope keeps, so the predicate
-    /// mentions the binder and never the variable — `k = x` ahead of the comprehension
-    /// compiles.
-    ///
-    /// What reaches here is the read that pass leaves in place
-    /// (`src/ccl/design/mutability.md`, "A read is named while inference runs"): a
-    /// refined cast's value, whose target holds a copy of the term below it, which
-    /// inference dedups against by structural equality. Rewriting the term alone leaves
-    /// the two unequal, so a filter written on the variable itself is rejected.
-    ///
-    /// Reported here so the program is rejected with its source position instead of
-    /// tripping the debug-only scope net (and, in release, surviving to panic at the
-    /// pre-channelize wall).
-    MutableInRefinedType {
-        /// The mutable variable's name.
-        name: String,
-        /// The refinement-bearing type that mentions it. Carries the offending
-        /// predicate, which is the informative part — the blame span already points
-        /// at the introduction, so the node is not rendered as well.
-        ty: Type,
-    },
     /// A node's coalesced type references a term binder that is not in scope
     /// at that node — a violation of the scope-validity invariant (design
     /// §6.2). Like [`InferError::UnresolvedHole`], treat as a compiler bug
@@ -714,8 +661,7 @@ impl InferError {
                 each(required);
                 each(found);
             }
-            InferError::MutableInRefinedType { ty, .. }
-            | InferError::MutInCompositeType { ty, .. } => each(ty),
+            InferError::MutInCompositeType { ty, .. } => each(ty),
             InferError::ScopeViolation { ty, .. } => each(ty),
             // No type to render: these carry a name, an id, or a rendered label.
             InferError::UnboundVariable(_)
@@ -1210,15 +1156,6 @@ impl std::fmt::Debug for InferError {
             }
             InferError::UnresolvedPartial { kind, at } => {
                 write!(f, "Unresolved partial {kind} in expression: {at}")
-            }
-            InferError::MutableInRefinedType { name, ty } => {
-                write!(
-                    f,
-                    "a type refinement here depends on the mutable variable `{name}`: \
-                     {ty}. A mutable variable has no single value for a type to refer \
-                     to, so a type cannot depend on one — a limitation, not a mistake \
-                     in the program."
-                )
             }
             InferError::ScopeViolation { at, ty, unbound } => {
                 write!(

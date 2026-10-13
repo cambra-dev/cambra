@@ -80,7 +80,7 @@ use crate::ccl::{
     BaseType, BindingTransparency, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS,
     F_WRITES, FieldKey, HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode,
     WriterSite,
-    ccl_utils::{free_names_in_value, is_free_in_value, synthesize_arm_predicate},
+    ccl_utils::{free_names_in_value, is_free, is_free_in_value, synthesize_arm_predicate},
     mut_elim::{close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys},
     provenance,
     provenance::{Located, NodeId},
@@ -1439,8 +1439,10 @@ fn partition_spine(
             let body = partition_spine(*body, txn_mut_vars, lifted, env);
             // A binding the remainder does not name is one the lift took the last
             // consumer of. Dropping it is what keeps the remainder's reads the
-            // block's reads.
-            if !is_free_in_value(&binding.name, &body) {
+            // block's reads. A type naming it counts: a filter reading a mutable
+            // variable puts the read's binder in the type of the collection it
+            // filters, and dropping the binding would leave that type naming nothing.
+            if !is_free(&binding.name, &body) {
                 return body;
             }
             Expr {

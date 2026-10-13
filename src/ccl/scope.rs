@@ -1,13 +1,13 @@
 //! CCL's binding structure, in one place.
 //!
 //! Every scope-aware pass — free-variable counting, capture-avoiding
-//! substitution, α-uniquification — needs the same answer to one question:
-//! *which binders scope over which of a node's children?* [`for_each_scoped_item`]
-//! is the single place that answers it. Its `match` is **exhaustive with no
-//! wildcard arm**, deliberately: a new [`TypedExprNode`] variant must declare
-//! its scope here before the crate compiles, instead of falling into a
-//! `_ => walk_children(..)` catch-all in five separate passes and silently
-//! getting the wrong one.
+//! substitution, α-uniquification, inference's scope check — needs the same
+//! answer to one question: *which binders scope over which of a node's
+//! children?* [`for_each_scoped_item`] is the single place that answers it. Its
+//! `match` is **exhaustive with no wildcard arm**, deliberately: a new
+//! [`TypedExprNode`] variant must declare its scope here before the crate
+//! compiles, instead of falling into a `_ => walk_children(..)` catch-all in
+//! five separate passes and silently getting the wrong one.
 //!
 //! Design of record: `src/ccl/design/ir.md`, "Binding structure lives in one
 //! place".
@@ -167,7 +167,7 @@ impl<'a> Binders<'a> {
     /// environment frame for the other would be right only by accident.
     /// Consecutive children under one scope compare equal here, which is what
     /// lets [`for_each_scoped_item_mut`] group them into runs.
-    fn is_same_scope(self, other: Binders<'_>) -> bool {
+    pub fn is_same_scope(self, other: Binders<'_>) -> bool {
         match (self, other) {
             (Binders::Ambient, Binders::Ambient) => true,
             (Binders::One(a), Binders::One(b)) => std::ptr::eq(a, b),

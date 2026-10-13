@@ -16,6 +16,7 @@ use crate::ccl::infer::solver::{
 };
 use crate::ccl::infer_var::InferVarId;
 use crate::ccl::provenance::NodeId;
+use crate::ccl::scope::{Binders, ScopedItem, for_each_scoped_item};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::ty::{TraitRequirement, TypeParamId};
 use crate::ccl::{
@@ -1048,56 +1049,33 @@ fn check_scope_valid_go(
             related: RelatedPositions::default(),
         });
     }
-    match &expr.node {
-        TypedExprNode::Lambda { param, body, .. } => {
+    // The binders are the ones `for_each_scoped_item` states for every node, so a node that
+    // introduces one is checked under it without this walk restating which nodes bind. A
+    // scope's children are consecutive, so one extended set serves the whole run.
+    let mut opened: Option<(Binders<'_>, std::collections::BTreeSet<Name>)> = None;
+    for_each_scoped_item(expr, &mut |item| {
+        let ScopedItem::Child {
+            expr: child,
+            binders,
+        } = item
+        else {
+            return;
+        };
+        if binders.is_empty() {
+            check_scope_valid_go(child, scope, witnesses, errors);
+            return;
+        }
+        if !opened
+            .as_ref()
+            .is_some_and(|(open, _)| open.is_same_scope(binders))
+        {
             let mut s = scope.clone();
-            s.insert(param.name.clone());
-            check_scope_valid_go(body, &s, witnesses, errors);
+            s.extend(binders.iter().map(|b| b.name.clone()));
+            opened = Some((binders, s));
         }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            check_scope_valid_go(bound_expr, scope, witnesses, errors);
-            let mut s = scope.clone();
-            s.insert(binding.name.clone());
-            check_scope_valid_go(body, &s, witnesses, errors);
-        }
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            if let Some(sc) = scrutinee {
-                check_scope_valid_go(sc, scope, witnesses, errors);
-            }
-            for b in branches {
-                let mut s = scope.clone();
-                if let Some(p) = &b.pattern {
-                    s.insert(p.binding.name.clone());
-                }
-                check_scope_valid_go(&b.guard, &s, witnesses, errors);
-                check_scope_valid_go(&b.body, &s, witnesses, errors);
-            }
-        }
-        // Mutual recursion: the whole group is in scope in every binding
-        // body and in the letrec body.
-        TypedExprNode::LetRec { bindings, body } => {
-            let mut s = scope.clone();
-            s.extend(bindings.iter().map(|(b, _)| b.name.clone()));
-            for (_, def) in bindings {
-                check_scope_valid_go(def, &s, witnesses, errors);
-            }
-            check_scope_valid_go(body, &s, witnesses, errors);
-        }
-        TypedExprNode::For { target, iter, body } => {
-            check_scope_valid_go(iter, scope, witnesses, errors);
-            let mut s = scope.clone();
-            s.insert(target.name.clone());
-            check_scope_valid_go(body, &s, witnesses, errors);
-        }
-        _ => expr.walk_children(|c| check_scope_valid_go(c, scope, witnesses, errors)),
-    }
+        let (_, s) = opened.as_ref().expect("opened above");
+        check_scope_valid_go(child, s, witnesses, errors);
+    });
 }
 
 /// Resolve a type that may contain inference variables into a concrete
@@ -1671,21 +1649,11 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // value against a handle. A `Let` needs no deref here because it does not
         // deref either (`emit_let` passes its body along; it cannot bind a mutable variable).
         TypedExprNode::ExprStmt { body, .. } => Some(read_through(&body.ty)),
-        // A mutable introduction has no discharge term until `mut_elim`. Reject a result
-        // refinement that still names its binder here, with the source position, before
-        // the general scope check sees it. See `InferError::MutableInRefinedType` for the
-        // staging restriction and the requirements for supporting this shape.
-        TypedExprNode::MutDecl { binding, body, .. } => {
-            if crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name) {
-                let label = format!("mutable `{}`", binding.name);
-                ctx.push_error(
-                    InferError::MutableInRefinedType {
-                        name: binding.name.base().to_string(),
-                        ty: body.ty.clone(),
-                    },
-                    label,
-                );
-            }
+        // A mutable introduction's result type cannot name its binder: every read that
+        // reaches a type is named first (`src/ccl/design/mutability.md`, "A read is named
+        // while inference runs"), so one that did would be a compiler bug, which the scope
+        // check reports.
+        TypedExprNode::MutDecl { body, .. } => {
             // Dereffed for the same reason as `ExprStmt`: `emit_mut_decl` reports its
             // body in a value position, so `x := 0; …; x` denotes `x`'s value.
             Some(read_through(&body.ty))
@@ -2703,8 +2671,8 @@ fn collect_param_spelling(
         }
     }
     let mut shadowed = false;
-    crate::ccl::scope::for_each_scoped_item(expr, &mut |item| {
-        if let crate::ccl::scope::ScopedItem::Child {
+    for_each_scoped_item(expr, &mut |item| {
+        if let ScopedItem::Child {
             expr: child,
             binders,
         } = item
@@ -2896,6 +2864,28 @@ mod tests {
         let mut errors = Vec::new();
         check_scope_valid(&lam, &std::collections::BTreeSet::new(), &mut errors);
         assert_eq!(errors, vec![]);
+    }
+
+    // A mutable variable introduction scopes like a `let`: its binder is in scope over the
+    // body, where a filter reading the variable puts it in a refinement, and not over the
+    // seed.
+    #[test]
+    fn scope_check_scopes_a_mutable_variable_over_its_body_only() {
+        use super::check_scope_valid;
+        use crate::ccl::infer::InferError;
+        let mut body = lit_int(1);
+        body.ty = refined_int(TypedExpr::var("x"));
+        let mut init = lit_int(0);
+        init.ty = refined_int(TypedExpr::var("x"));
+        let init_id = init.node_id();
+        let decl = TypedExpr::mut_decl("x", Type::Hole, init, body);
+        let mut errors = Vec::new();
+        check_scope_valid(&decl, &std::collections::BTreeSet::new(), &mut errors);
+        let [located] = errors.as_slice() else {
+            panic!("expected one ScopeViolation, on the seed; got {errors:?}");
+        };
+        assert!(matches!(located.error, InferError::ScopeViolation { .. }));
+        assert_eq!(located.node_id, init_id, "the seed is outside the binder");
     }
 
     // Appendix case L: a predicate whose only free variable is the

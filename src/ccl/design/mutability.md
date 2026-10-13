@@ -227,8 +227,9 @@ position can stand after the write that ended the segment — and the binding is
 at its source position. `inline`'s read-once rule drops the ones read exactly once whose definiens
 no write in the body disturbs, and `mut_elim` inlines the ones standing on a writer's spine; one
 read twice, spelled in a type, or blocked by a write reaches planning as an opaque `let`. A
-diagnostic raised past inference — `lambda_elim`'s, or op-conversion's — spells such a read `__anf`,
-the rename below reaching inference errors alone.
+transparent binding of a read, `k = x`, stays where a type spells `k` for the same reason: `inline`
+substituting it would put `x` in that type. A diagnostic raised past inference — `lambda_elim`'s,
+or op-conversion's — spells such a read `__anf`, the rename below reaching inference errors alone.
 
 A diagnostic spells the binder as the variable it reads. `mut_read::read_respelling` builds that
 rename and `compile_program` applies it to an inference error's types, so a message reports
@@ -248,12 +249,18 @@ mutable variable written more than once carries no refinement.
 A write inside a `for` body is the case still refused. Its contribution names the loop target, which
 carries neither a definiens to discharge nor a fact that outlives its scope.
 
-Five positions keep the read as lowering built it, in both passes, each because a later pass reads
-the term there:
-an application's function and argument (the three handle positions above), a block's terminal
-expression (the tail rules, and rule 2's escape check), the value of a feed
-(`rewrite_as_of_reads`), and a refined cast's value (whose target holds a copy of the term). The
-module docs carry the per-position detail.
+A read that reaches a refinement predicate before inference is named by A-normalization ahead of
+the term carrying it, one binding per variable, and renamed in every copy at once. Two terms do: a
+comprehension's guards and sources, which `ccl/comprehension.rs` places in its cast's predicate, and
+a refined cast's value, whose target holds a copy of the term. Neither performs a write, so every
+read in one denotes the value at the term's position, the handle positions inside it included.
+A-normalization does not descend into a type, and this rename is what keeps such a predicate off the
+variable: `[z for z in xs if z > acc]` types over `{… | z > __anf}`.
+
+Outside those terms, four positions keep the read as lowering built it, in both passes, each because
+a later pass reads the term there: an application's function and argument (the three handle
+positions above), a block's terminal expression (the tail rules, and rule 2's escape check), and the
+value of a feed (`rewrite_as_of_reads`). The module docs carry the per-position detail.
 
 ## Surface language
 

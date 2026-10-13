@@ -1112,53 +1112,33 @@ fn an_equal_width_mut_parameter_still_accepts_a_mut_var() {
     );
 }
 
-/// A type refinement cannot depend on a mutable variable — a **staging** limitation,
-/// deliberately reported rather than worked around.
+/// A comprehension filtering on a mutable variable compiles, and the filter reads the
+/// value the variable holds where the comprehension stands.
 ///
-/// A comprehension filter's predicate rides the domain type as a refinement, so
-/// filtering on a mutable variable produces a type mentioning it. A `let` binder can be
-/// discharged into the type it is lifted out of, because the binder *is* its bound
-/// expression; a mutable variable has no such term *at the point closure is demanded*. That is
-/// the whole obstacle: closure is required during coalesce, and `mut_elim` — several
-/// passes later — is what compiles a write-free mutable variable into a `let` and a written one
-/// into trailing `let x_final = final_or_default(…)` bindings. The naming exists; it
-/// just arrives too late to discharge with.
-///
-/// Lifting it is scoped rather than impossible (see
-/// [`InferError::MutableInRefinedType`](cambra::ccl::infer::InferError)), with one
-/// genuinely hard sub-case left over: a comprehension inside the loop that writes the
-/// mutable variable, where the value is per-iteration and a predicate — riding a type — has no
-/// position to depend on.
-///
-/// This is the case the read naming cannot reach: the predicate rides the cast
-/// target, which holds a copy of the term below it, so `crate::ccl::mut_read`
-/// leaves the position alone (the two copies would otherwise stop being equal).
-/// A read named *outside* the comprehension is the case below, which compiles.
-///
-/// Before this was reported here it tripped `check_scope_valid`, a debug-only
-/// regression net documented as never firing on a well-typed program — so a *release*
-/// build had no check at all and reached the pre-channelize wall with a surviving mutable
-/// type.
-#[test]
-fn a_refinement_cannot_depend_on_a_mutable() {
-    expect_compile_error(
-        indoc! {r#"
-            x := 2
-            ys = [i for i in [1, 2, 3] if i < x]
-            ys
-        "#},
-        "depends on the mutable variable",
-    );
-}
-
-/// A comprehension filtering on a mutable variable **read into a binding first**
-/// compiles, and the filter reads the value at the binding's position.
-///
-/// `crate::ccl::mut_read` names the read with an opaque binder, so the predicate
-/// mentions that binder rather than the mutable variable — and an opaque binder
-/// is not discharged when the type leaves its scope, which is what keeps the
-/// mutable variable's name out of it.
+/// The predicate rides the cast's domain type. A-normalization renames the filter's
+/// read to a binding ahead of the comprehension, and `crate::ccl::mut_read` seals it
+/// opaque, so the predicate mentions that binder rather than the mutable variable — and
+/// an opaque binder is not discharged when the type leaves its scope. A read the
+/// program names first (`k = x`) keeps `k` in the type: `inline` does not substitute a
+/// read into a type.
 #[rstest]
+#[case::on_the_variable(
+    indoc! {r#"
+        x := 2
+        ys = [i for i in [1, 2, 3] if i < x]
+        ys
+    "#},
+    vec![1]
+)]
+#[case::before_a_write(
+    indoc! {r#"
+        x := 2
+        ys = [i for i in [1, 2, 3] if i < x]
+        x := 9
+        ys
+    "#},
+    vec![1]
+)]
 #[case::through_a_copy(
     indoc! {r#"
         x := 2
@@ -1179,7 +1159,7 @@ fn a_refinement_cannot_depend_on_a_mutable() {
     "#},
     vec![1, 2]
 )]
-fn a_refinement_may_depend_on_a_named_read(#[case] code: &str, #[case] expected: Vec<i64>) {
+fn a_refinement_may_depend_on_a_read(#[case] code: &str, #[case] expected: Vec<i64>) {
     check_tile(
         code,
         Tile::data_function(
@@ -1197,9 +1177,8 @@ fn a_refinement_may_depend_on_a_named_read(#[case] code: &str, #[case] expected:
 /// The binder exists for inference, so a message carrying one names something the
 /// reader cannot look up (`src/ccl/design/mutability.md`, "A read is named while
 /// inference runs"). Two messages carry one: a write the declaration's refinement
-/// refuses, whose found type is the write's own contribution, and the
-/// mutable-in-a-refinement rejection, whose type is the predicate the
-/// comprehension filters on.
+/// refuses, whose found type is the write's own contribution, and a mismatch over a
+/// collection filtered on the variable, whose type carries the filter's predicate.
 #[rstest]
 #[case::a_write_the_declaration_refines(
     indoc! {r#"
@@ -1210,15 +1189,14 @@ fn a_refinement_may_depend_on_a_named_read(#[case] code: &str, #[case] expected:
     "#},
     "found {Int | __elem == x ^+ n}"
 )]
-#[case::a_refinement_over_a_second_mutable(
+#[case::a_filter_on_the_variable(
     indoc! {r#"
         x := 2
-        y := 3
-        k = y
-        ys = [i for i in [1, 2, 3] if i < x and i < k]
-        ys
+        ys = [i for i in [1, 2, 3] if i < x]
+        n: Int = ys
+        n
     "#},
-    "i < x and i < y"
+    "[1, 2, 3][_] < x}"
 )]
 fn a_diagnostic_spells_a_read_as_its_variable(#[case] code: &str, #[case] expected: &str) {
     let rendered = compile_errors(code);

@@ -908,3 +908,147 @@ fn a_constant_whole_map_write_through_a_mut_parameter() {
         out << sum(m)
     "#});
 }
+
+// A filter becomes a refinement on the comprehension's domain, so a filter that reads a
+// binding puts it in a type. These hold the passes after inference to the binding the type
+// names (`src/ccl/design/mutability.md`, "A read is named while inference runs").
+
+/// A filter reading a `let` binding, which every channel the binding reaches carries in its
+/// type.
+#[test]
+fn a_filter_reads_a_let_binding() {
+    agree(indoc! {r#"
+        out = test_sink()
+        k = 1
+        ys = [z for z in [1, 2, 3] if z > k]
+        out << sum(ys)
+    "#});
+}
+
+#[test]
+fn a_filter_reads_a_mutable_variable() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 1
+        ys = [z for z in [1, 2, 3] if z > acc]
+        out << sum(ys)
+    "#});
+}
+
+/// Two filters read one mutable variable on either side of a write, so the two types they
+/// put it in denote different values.
+#[test]
+fn filters_read_a_mutable_variable_on_either_side_of_a_write() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 1
+        ys = [z for z in [1, 2, 3] if z > acc]
+        acc := 2
+        out << sum([w for w in ys if w > acc])
+    "#});
+}
+
+/// A filter reading a copy of a mutable variable, which the types spell as the copy.
+#[test]
+fn a_filter_reads_a_copy_of_a_mutable_variable() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 1
+        k = acc
+        ys = [z for z in [1, 2, 3] if z > k]
+        out << sum(ys)
+    "#});
+}
+
+/// A filter reading a mutable variable the same loop body then writes.
+#[test]
+fn a_filter_reads_a_mutable_variable_its_loop_writes() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 1
+        for i in [1, 2]:
+            ys = [z for z in [1, 2, 3] if z > acc]
+            acc := acc + sum(ys)
+        out << acc
+    "#});
+}
+
+/// A filter passing a mutable variable to a function, which inlining puts in the type.
+#[test]
+fn a_filter_passes_a_mutable_variable_to_a_function() {
+    agree(indoc! {r#"
+        def twice(n):
+            n * 2
+
+        out = test_sink()
+        acc := 1
+        ys = [z for z in [1, 2, 3] if z > twice(acc)]
+        out << sum(ys)
+    "#});
+}
+
+/// A group-by key reading a mutable variable: the key rides the group-by's own refinement.
+#[test]
+fn a_groupby_key_reads_a_mutable_variable() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 2
+        out << sum([sum(g) for g in groupby([1, 2, 3, 4], \v -> v // acc)])
+    "#});
+}
+
+/// A function returning a filtered collection, called with a mutable variable, which the
+/// call reads at its position.
+#[test]
+fn a_filter_reads_a_mutable_argument() {
+    agree(indoc! {r#"
+        def above(xs, t):
+            [x for x in xs if x > t]
+
+        out = test_sink()
+        acc := 1
+        ys = above([1, 2, 3], acc)
+        acc := 5
+        out << sum(ys) + acc
+    "#});
+}
+
+/// A filter reading a transactional mutable variable the same transaction then writes.
+#[test]
+fn a_filter_reads_a_mutable_variable_its_transaction_writes() {
+    agree(indoc! {r#"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [1, 2]:
+            with begin():
+                pool := sum([z2 for z2 in [1, 2, 3] if z2 > pool])
+                out << pool
+    "#});
+}
+
+/// Rows filtered on a mutable variable, fed right after the loop that writes it. The filter
+/// reads the variable's final value through a binder of its own, which the channel's type keeps
+/// rather than discharging: discharged, it would put the loop's history in the type. A
+/// collection fed outside any loop lands flat (`a_collection_feed_lands_flat`), so both answers
+/// are pinned.
+#[test]
+fn a_filter_reads_a_mutable_variable_after_the_loop_that_writes_it() {
+    let source = indoc! {r#"
+        out = test_sink()
+        acc := 0
+        for r in [1, 2]:
+            acc += r
+        out << [z for z in [1, 2, 3, 4] if z > acc]
+    "#};
+    let kept = || {
+        Value::Collection(Collection::from_entries(vec![(
+            Value::Int(3),
+            Value::Int(4),
+        )]))
+    };
+    assert_eq!(compiled(source), kept());
+    assert_eq!(
+        interpreted(source),
+        Value::Collection(Collection::from_entries(vec![(Value::Unit, kept())]))
+    );
+}
