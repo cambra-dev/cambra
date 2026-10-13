@@ -245,6 +245,22 @@ fn test_empty_list_read_inside_a_generalized_definition(
     check_scalar(&format!("{code}{tail}"), expected);
 }
 
+// A lambda whose parameter nothing reads takes the parameter type of the function it is
+// joined with: the other branch's `+` requires `Int` of `y`. `f` is not called, which
+// is what leaves `x` with no value either.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_unread_lambda_parameter_takes_its_type_from_the_join() {
+    check_scalar(
+        indoc! {r"
+            c = True
+            f = (\x -> 1) if c else (\y -> y + 2)
+            3
+        "},
+        Value::Int(3),
+    );
+}
+
 // A definition sound alone whose body a use's types fail: `a if c else "s"` joins
 // `a` with `String`, which has a type until a use makes `a` an `Int`. The pin
 // succeeds, since `x` is not in the signature, so the error the specialization

@@ -204,8 +204,8 @@ types join to determine the `Case` result.
 
 The scrutinee may have fewer tags than the arms cover. Such arms stay in the tree. Their
 `variant_project` produces an empty restriction, so they contribute no value at runtime.
-Inference pins an otherwise unobservable payload type to a concrete required upper bound, then
-to a type accepted by its uses, or to `Unit` if neither applies. Exhaustiveness applies from
+Inference pins an otherwise unobservable payload type to the type of its position, then to a type
+accepted by its uses, or to `Unit` if neither applies. Exhaustiveness applies from
 scrutinee tags to arm tags; surplus arm tags are valid. The fan-out for a `match` inside a lambda
 combines restrictions on the same domain with
 `DisjointJoin`, as distinguished from `Copair` in

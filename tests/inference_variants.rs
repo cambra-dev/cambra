@@ -653,8 +653,8 @@ fn read_arm_payload_is_pinned_to_where_it_flows() {
 /// upper bound. Here the read states its requirement as a trait obligation
 /// instead — so `Unit` would contradict it, and the pin takes a type the
 /// requirements still accept. The upper bounds an operand records are the
-/// operator's own requirement variables, which resolve to nothing concrete, which
-/// is why the flow case does not claim these payloads first.
+/// operator's own requirement variables, which have no concrete position of their
+/// own, which is why the payload's position does not claim these payloads first.
 ///
 /// The cases below are chosen to separate the two halves of that choice:
 ///
