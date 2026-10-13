@@ -487,6 +487,9 @@ pub struct LoweringContext {
     /// The check tree of each module other than the root, which the compile
     /// infers before the linked program ([`modules::ModuleCheck`]).
     pub(crate) module_checks: Vec<modules::ModuleCheck>,
+    /// Where each run of the linked program is brought in
+    /// ([`modules::RunSites`]).
+    pub(crate) run_sites: modules::RunSites,
     /// Every binder the module being lowered writes, with its span, for the rule
     /// that none takes a name that denotes a module ([`module_name_binders`]).
     pub(super) module_binders: Vec<(SmolStr, Span)>,
