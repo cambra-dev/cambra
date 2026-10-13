@@ -19,7 +19,7 @@ use rstest_log::rstest;
 /// Compile `code`, expect one located inference error, and return the source text its
 /// primary label underlines with the source text and wording of each secondary label.
 /// Each case asserts both exactly.
-fn labels(code: &str) -> (String, Vec<(String, &'static str)>) {
+fn labels(code: &str) -> (String, Vec<(String, String)>) {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let program = LoadedProgram::test(code);
@@ -34,7 +34,7 @@ fn labels(code: &str) -> (String, Vec<(String, &'static str)>) {
         text(span),
         related
             .iter()
-            .map(|(at, label)| (text(at), *label))
+            .map(|(at, label)| (text(at), label.clone()))
             .collect(),
     )
 }
@@ -148,7 +148,10 @@ fn an_error_labels_the_positions_its_edge_involves(
 ) {
     let (got_primary, got_related) = labels(code);
     assert_eq!(got_primary, primary, "the error's primary span");
-    let got: Vec<(&str, &str)> = got_related.iter().map(|(t, l)| (t.as_str(), *l)).collect();
+    let got: Vec<(&str, &str)> = got_related
+        .iter()
+        .map(|(t, l)| (t.as_str(), l.as_str()))
+        .collect();
     assert_eq!(got, related);
 }
 

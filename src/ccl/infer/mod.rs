@@ -670,6 +670,7 @@ pub(crate) fn run_with_params(
             return Err(vec![LocatedInferError {
                 error,
                 node_id,
+                also: Box::default(),
                 related: RelatedPositions::default(),
             }]);
         }

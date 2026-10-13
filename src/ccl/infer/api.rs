@@ -766,6 +766,11 @@ pub struct LocatedInferError {
     pub error: InferError,
     /// The node whose typing rule raised the error.
     pub node_id: NodeId,
+    /// The nodes of the errors merged into this one, each raising it too: a bounds
+    /// conflict met in two copies of one run's code is one error, raised at each
+    /// (`push_coalesce_err`). Boxed, rarely non-empty, to keep every
+    /// `Result<_, LocatedInferError>` under `clippy::result_large_err`'s threshold.
+    pub also: Box<[NodeId]>,
     /// The other source positions the error involves, each a secondary label: where the
     /// failing edge's value came from and what demanded it, when either is elsewhere
     /// (`src/ccl/design/diagnostics.md`, "Secondary labels").
@@ -829,6 +834,7 @@ impl LocatedInferError {
         LocatedInferError {
             error,
             node_id,
+            also: Box::default(),
             related: RelatedPositions::default(),
         }
     }

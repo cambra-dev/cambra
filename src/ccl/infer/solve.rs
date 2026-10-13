@@ -65,10 +65,12 @@ fn is_significant_context(label: &str) -> bool {
 /// `blame` is the node whose rule raised `new_err`. A merged
 /// `IncompatibleBounds` keeps the *first* contributing node: a bounds conflict
 /// has no single site by nature — the same variable was constrained in several
-/// places — so the blame is the site where the conflict was first detected and
-/// the later sites land in `context`. (Turning that context into node ids, so a
-/// report can underline every contributing site, is the follow-up the
-/// `is_significant_context` note above describes.)
+/// places — so the blame is the site where the conflict was first detected, the
+/// later sites' labels land in `context`, and their nodes in
+/// [`LocatedInferError::also`], so each copy of a run's code that raised it is
+/// labelled at its run. (Turning `context` itself into node ids, so a report can
+/// underline every contributing site, is the follow-up the `is_significant_context`
+/// note above describes.)
 fn push_coalesce_err(
     errors: &mut Vec<LocatedInferError>,
     new_err: InferError,
@@ -99,18 +101,22 @@ fn push_coalesce_err(
                 && *polarity == key.0
                 && conflicting == &key.1
             {
-                return Some(context);
+                return Some((context, e.node_id, &mut e.also));
             }
             None
         });
-        if let Some(ctx_vec) = existing {
+        if let Some((ctx_vec, first, also)) = existing {
             if is_significant_context(&label) {
                 ctx_vec.push(label);
+            }
+            if blame != first && !also.contains(&blame) {
+                *also = also.iter().copied().chain([blame]).collect();
             }
         } else {
             errors.push(LocatedInferError {
                 error: new_err,
                 node_id: blame,
+                also: Box::default(),
                 related: RelatedPositions::default(),
             });
         }
@@ -118,6 +124,7 @@ fn push_coalesce_err(
         errors.push(LocatedInferError {
             error: new_err,
             node_id: blame,
+            also: Box::default(),
             related: RelatedPositions::default(),
         });
     }
@@ -1435,6 +1442,7 @@ pub(super) fn push_barrier_failures(
                     LocatedInferError {
                         error,
                         node_id: node,
+                        also: Box::default(),
                         related: RelatedPositions::default(),
                     }
                     .with_failure(failure),
@@ -1574,6 +1582,7 @@ fn check_scope_valid_go(
                 unbound: vec!["a witness reference free in its node's type".to_string()],
             },
             node_id: expr.node_id(),
+            also: Box::default(),
             related: RelatedPositions::default(),
         });
     }
@@ -1590,6 +1599,7 @@ fn check_scope_valid_go(
                 unbound: unbound.iter().map(|n| n.to_string()).collect(),
             },
             node_id: expr.node_id(),
+            also: Box::default(),
             related: RelatedPositions::default(),
         });
     }
@@ -2756,6 +2766,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
             LocatedInferError {
                 error: map_constrain_err(e, PIN_LABEL),
                 node_id: use_expr.node_id(),
+                also: Box::default(),
                 related: RelatedPositions::default(),
             }
             .with_failure(cache.take_failure()),
@@ -2996,6 +3007,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             LocatedInferError {
                 error: h.error.error.clone(),
                 node_id: at_use,
+                also: Box::default(),
                 related: h.error.related.clone(),
             }
             .with_failure((None, Some(in_body))),
