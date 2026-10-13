@@ -22,7 +22,9 @@ rendering live in `parser/error.rs`.
 
 ### Stage 1 — Lexer (`lexer.rs`)
 
-`tokenize` runs Logos, validates tag adjacency with `check_tags`, then resolves layout.
+`tokenize` runs Logos, validates tag adjacency with `check_tags`, then resolves layout. It never
+fails: [Lexer recovery](#lexer-recovery) specifies the stream and errors it returns for a source
+with lexical errors. This section describes a source with none.
 Logos produces span-bearing keywords, identifiers, literals, punctuation and physical newlines.
 It skips comments and horizontal whitespace. The source-level layout rules are owned by
 [Indentation](../docs/chl-spec.md#13-indentation-off-side-rule); the implementation uses two
@@ -42,21 +44,20 @@ line ends in `:` but did not start with a block-opening keyword. The floor comes
 logical statement's first line, not a later physical line containing the colon. Blank and
 comment-only lines do not consume the pending request or change the stack.
 
-Bracket depth suppresses physical newlines and indentation processing while nonzero. The
-counter does not match opening and closing bracket kinds; the parser checks the required
-closing token. A closer at depth zero gives `UnmatchedClose`; nonzero depth at EOF gives
-`UnclosedBracket`.
+A stack of open brackets suppresses physical newlines and indentation processing while it is
+nonempty. Each entry records the bracket's kind, its span, and the indentation of the line its
+statement began on; a close bracket must match the innermost entry's kind.
 
-The successful token stream ends with a `Newline` and enough `Dedent`s to close the stack.
+The token stream ends with a `Newline` and enough `Dedent`s to close the stack.
 Ordinary blocks balance `Indent` and `Dedent`; each pending assignment-side level contributes
 one extra `Dedent`. Tests include `block_right_hand_side_opens_a_level_of_its_own`,
 `a_wrapped_header_floors_the_level_at_the_statement`,
 `the_chain_column_is_fixed_by_its_first_line` and
 `a_match_right_hand_side_closes_its_level_unpinned`.
 
-An unescaped physical newline before a string's closing quote gives `UnterminatedString`
-at the opening quote. A backtick not immediately followed by an identifier gives
-`DetachedBacktick` at the backtick. Both failures precede layout processing.
+A string literal ends at its closing quote on the same line. A backtick is immediately followed
+by an identifier. `raw_tokens` runs Logos and these two checks once for both `tokenize` and
+`highlight`.
 
 `KEYWORDS` lists every keyword spelling with its token. The editor grammars under `editors/` list
 the same spellings, and `tests/editor_grammars.rs` fails when they differ
@@ -64,8 +65,9 @@ the same spellings, and `tests/editor_grammars.rs` fails when they differ
 
 `highlight` maps source to highlight spans: each logos token's `HighlightClass` from
 `highlight_class`, with string escapes, comments and the `TODO_WORDS` inside comments as spans of
-their own. An identifier that `SurfaceBuiltin::from_name` resolves is a `Builtin`. `./ci.sh editors`
-checks both editor grammars against it
+their own. An identifier that `SurfaceBuiltin::from_name` resolves is a `Builtin`. A `Token::Error`
+gets no span. It never fails, and returns the errors `raw_tokens` found beside the spans.
+`./ci.sh editors` checks both editor grammars against it
 ([editors/README.md](../editors/README.md#editor-highlight-check)).
 
 A statement opens a block either from its head keyword (`if`, `def`, …) or from
@@ -100,7 +102,7 @@ expression positions do not admit that form. The surface rule is
 
 The grammar does not accept every token in operator position. For example, `in` is a keyword
 consumed by iteration clauses, not an implemented membership operator. `>>` is two `Gt`
-tokens, and `is` is an identifier. `/`, `%` and `~` fail tokenization.
+tokens, and `is` is an identifier. `/`, `%` and `~` start no token and lex as `Token::Error`.
 `operators_absent_from_chl` covers the lexical cases.
 Experimental `^+` and `^=` tokens are accepted but omitted from the language reference.
 
@@ -244,7 +246,8 @@ A recovered region becomes `Expr::Error`. In `x = (1 +) + 2`, recovery replaces 
 parenthesized subexpression and allows parsing the enclosing assignment.
 
 This mechanism requires a recoverable delimiter region. It does not handle every expression
-failure or repair an unclosed bracket rejected by the lexer.
+failure. It relies on the lexer's stream having balanced brackets
+([Lexer recovery](#lexer-recovery)).
 
 ### Statement-level recovery
 
@@ -263,12 +266,171 @@ A semicolon terminates a valid simple statement, but is not a synchronization to
 recovery parser. Recovery can therefore discard later semicolon-separated text on the same
 logical line. It does not promise one error per source-level mistake.
 
-### Lexer-level: unclosed brackets at EOF
+### Lexer recovery
 
-Bracket depth suppresses layout newlines until the bracketed region closes. At EOF with nonzero
-depth, tokenization returns `LexError::UnclosedBracket`; parsing does not begin. Without that
-check, a following physical line could have no token marking a statement boundary.
-The layout mechanism is specified under [Stage 1](#stage-1--lexer-lexerrs).
+`tokenize` accepts every input. It returns `Lexed { tokens, errors }`: a token stream the grammar
+can parse, and every lexical error found, in source order. A source with no lexical error yields
+no errors and the token stream described under [Stage 1](#stage-1--lexer-lexerrs). The rules
+below decide what the stream holds where the source is wrong.
+
+Two invariants hold for every input:
+
+- **Brackets in the stream balance.** Every `(`, `[` and `{` has a closer of its own kind, nested
+  correctly. Bracket-level recovery seeks the matching closer, so an unbalanced stream would send
+  it to the wrong token or to the end of the file. The lexer drops a closer that matches nothing
+  and inserts a zero-width closer, a closer whose span is empty and covers no source text, for an
+  opener the source never closes.
+- **Layout has its usual shape.** The stream ends with a `Newline` and the `Dedent`s that close
+  the indentation stack, as on valid input.
+
+#### Characters no token matches
+
+A maximal run of characters that start no token becomes one `Token::Error` and one
+`InvalidToken`. No grammar rule accepts `Token::Error`, so statement-level recovery skips the
+rest of the line.
+
+```text
+x = a $$ b        →  x = a <Error> b       InvalidToken at `$$`
+```
+
+#### Unterminated strings
+
+A string literal ends at its line's end when it has no closing quote. Its token is a `String`
+holding the text after the quote, and `UnterminatedString` points at the opening quote. The
+newline after it remains a token, so the next line starts a statement.
+
+```text
+x = "abc          →  x = String("abc")     UnterminatedString at `"`
+y = 1                y = 1
+```
+
+#### Detached backticks
+
+A backtick not immediately followed by an identifier is dropped from the stream, with
+`DetachedBacktick` at the backtick.
+
+#### Close brackets
+
+A close bracket is compared with the open brackets on the stack:
+
+- **It matches the innermost.** The pair closes.
+- **It matches an outer one.** Each open bracket inside that one gets a zero-width closer just
+  before the close bracket and an `UnclosedBracket` at its opener. The close bracket then closes
+  the outer one.
+
+  ```text
+  xs = [f(a]      →  xs = [ f ( a ) ]       UnclosedBracket at `(`
+  ```
+
+- **It matches none.** It is dropped, and the innermost open bracket, if any, keeps going. Which
+  error it reports waits until that open bracket closes, because either bracket can be the
+  mistake: a `]` typed for `)`, or a stray `]`. If the open bracket closes later, the close
+  bracket was stray and gets `UnmatchedClose`. If it never closes, one `MismatchedClose` at the
+  close bracket names both, and the open bracket gets no `UnclosedBracket` of its own.
+
+  ```text
+  x = f(a))       →  x = f ( a )            UnmatchedClose at the second `)`
+
+  x = f(a]        →  x = f ( a )            UnmatchedClose at `]`
+      + b)               + b )
+
+  x = f(a]        →  x = f ( a )            MismatchedClose: `]` does not match `(`
+  y = 2              y = 2
+  ```
+
+  Neither error commits to one reading, and neither does the token stream: the open bracket
+  closes where layout says it does. CPython reports the third case the same way ("closing
+  parenthesis ']' does not match opening parenthesis '('"), and stops. rustc labels both brackets
+  in the third case. In the second, it reports the enclosing function's final `}` as an unexpected
+  closing delimiter, and labels both `]` and `)` as missing an open bracket.
+
+#### Unclosed brackets
+
+Inside brackets the layout pass drops physical newlines and skips indentation, so an open
+bracket that is never closed turns every later line into part of one logical line. At the end of
+input each open bracket gets a zero-width closer and an `UnclosedBracket` at its opener.
+
+That alone leaves the rest of the file inside the bracket. When the layout pass ends with open
+brackets, `tokenize` runs it a second time, in which those brackets close early. Each one closes
+before the first later line that starts at or left of the indentation of the line where its
+opener's statement began.
+
+```text
+x = f(a, b        →  x = f ( a , b )        UnclosedBracket at `(`
+y = 2                y = 2
+```
+
+The second pass applies only to the brackets the first pass left open. A bracket the first pass
+closed keeps its tokens, such as the `[` of a closing bracket on its own line:
+
+```text
+xs = [
+    1,
+]
+```
+
+A source with no unclosed bracket never reaches the second pass, so the second pass cannot change
+the tokens of a source with no lexical error.
+
+The rule closes too early where an unclosed bracket's own continuation lines start at the
+statement's indentation. `b,` and `c` become statements of their own rather than elements:
+
+```text
+ys = (a,          →  ys = ( a , )           UnclosedBracket at `(`
+b,                   b ,
+c                    c
+```
+
+The rule does not test the line's first token for a statement keyword. Most statements start
+with a name (`y = 2`, `out = stdout()`), so a keyword condition would leave every such line
+inside the bracket.
+
+#### Inconsistent indentation
+
+A line whose indentation matches no enclosing level gets `InconsistentIndent` at its first token
+and belongs to the deepest enclosing level left of it. No `Indent` is emitted for it.
+
+```text
+if c:
+    x = 1
+  y = 2           →  y = 2 is a statement after the `if`      InconsistentIndent at `y`
+```
+
+#### One diagnostic per lexical error
+
+`parse_module` and `parse_expression` report the lexer's errors first, then parse the stream. A
+grammar error whose found token is a `Token::Error` or a zero-width closer is dropped from the
+result, because the lexical error at that place already reports it.
+
+#### Later: parser-driven recovery for unclosed brackets
+
+The second layout pass decides where a bracket should have closed from indentation alone. An
+indented line after the opener stays inside the bracket, so here the bracket closes before
+`def g` and the grammar reports `return` as well:
+
+```text
+def f(x:          →  def f ( x : return x )      UnclosedBracket at `(`
+    return x                                     grammar error at `return`
+def g():             def g ( ) : …
+```
+
+The parser knows more: the point at which a bracketed list cannot continue, here `return`. Ruff's
+Python parser uses that point. It pulls tokens from its lexer one at a time, and when a bracketed
+list fails it asks the lexer to re-read the last newline inside the bracket as a statement boundary
+and lex onward from there.
+
+Chumsky parses a token slice built before parsing begins (`parse_module`), and it backtracks, so
+the grammar has no point at which to ask the lexer for different tokens. Two designs keep the
+idea without that:
+
+- **Re-parse.** Parse; when the first grammar error falls inside a bracket the lexer reported
+  unclosed, lex again with that bracket closed before the error's line, and parse again. At most
+  one round per unclosed bracket.
+- **A pull parser.** Replace the Chumsky grammar with a hand-written parser that pulls tokens, as
+  Ruff's does.
+
+Neither is implemented. A recovery corpus case where the second layout pass closes a bracket at
+the wrong line is the evidence for either.
 
 ### Recovery API
 
@@ -281,9 +443,9 @@ pub struct ParseResult<T> {
 }
 ```
 
-`value` and `errors` are independent outputs. A lexical failure returns no AST and one error.
-An unrecovered grammar failure can also return no AST. Recovery can return an AST containing
-`Expr::Error` or `Stmt::Error`. A `validate` rule can instead report a custom error while
+`value` and `errors` are independent outputs. Lexical errors come first in `errors`, and parsing
+runs after them. An unrecovered grammar failure returns no AST. Recovery can return an AST
+containing `Expr::Error` or `Stmt::Error`. A `validate` rule can instead report a custom error while
 retaining an ordinary node; a nonempty error list does not imply that the AST contains a hole.
 
 For example, `parse_expression(file, "1 +")` has no AST, whereas
@@ -404,6 +566,14 @@ The grammar does not specify a portable maximum nesting depth.
 - **Unit tests** in `lexer.rs` and `parser.rs` cover individual grammar
   productions and the layout pass; `parser/module_tests.rs` covers the module
   syntax.
+- **Lexer recovery** has three suites in `chl-parser/tests/lexer_recovery.rs`:
+  - Each source with lexical errors under `chl-parser/tests/lexer_recovery/` has a `.tokens`
+    golden holding its tokens, its lexical errors, the errors `parse_module` reports, and its
+    statements' kinds. `CAMBRA_BLESS=1` rewrites the goldens.
+  - Every `.cambra` file under the repository's `tests/` and `editors/` lexes with no error.
+  - A seeded mutation fuzzer (`CAMBRA_FUZZ_SEED`, `CAMBRA_FUZZ_N`) checks the invariants under
+    [Lexer recovery](#lexer-recovery) on mutated sources, and that `parse_module` reports the
+    lexer's errors first.
 - **Integration tests** in `tests/chl_parser_roundtrip.rs` parse
   representative CHL programs (joined comprehensions, defer/feed patterns,
   function definitions with `yield`, multi-line bracketed expressions, …) and

@@ -65,7 +65,7 @@ pub enum Expected {
     /// A named label attached with `.labelled(...)`, e.g. `"expression"`,
     /// `"identifier"`, `"function name"`.
     Label(String),
-    /// A category produced by [`collect_errors`]'s collapsing pass when
+    /// A category produced by [`lex_then_grammar_errors`]'s collapsing pass when
     /// every member of the category appeared in the expected set. Static
     /// strings: `"binary operator"`, `"comparison operator"`,
     /// `"postfix operation"`, `"augmented-assignment operator"`.
@@ -234,15 +234,22 @@ impl ParseError {
             ParseError::Lex(e) => {
                 let span = e.span();
                 let msg = e.to_string();
-                Report::build(ReportKind::Error, span.file, span.start)
+                let mut report = Report::build(ReportKind::Error, span.file, span.start)
                     .with_config(config)
                     .with_message("lex error")
                     .with_label(
                         Label::new(label_span(span))
                             .with_message(msg)
                             .with_color(Color::Red),
-                    )
-                    .finish()
+                    );
+                if let Some((related, what)) = e.related() {
+                    report = report.with_label(
+                        Label::new(label_span(related))
+                            .with_message(what)
+                            .with_color(Color::Yellow),
+                    );
+                }
+                report.finish()
             }
             ParseError::Parse(info) => {
                 let mut report = Report::build(ReportKind::Error, info.span.file, info.span.start)
@@ -421,11 +428,31 @@ fn rich_to_info(err: Rich<'_, Token, Span>) -> ParseErrorInfo {
     }
 }
 
-/// Convert a batch of chumsky errors (as returned by `into_output_errors`)
-/// into the public [`ParseError`] form, applying category collapsing.
-pub(super) fn collect_errors(errs: Vec<Rich<'_, Token, Span>>) -> Vec<ParseError> {
-    errs.into_iter()
-        .map(rich_to_info)
-        .map(ParseError::Parse)
+/// A parse's errors in the public [`ParseError`] form: the lexer's errors, then
+/// the grammar's (as returned by `into_output_errors`) with category
+/// collapsing applied.
+///
+/// A grammar error found at a [`Token::Error`] or at a zero-width closer is
+/// dropped: the lexer synthesised that token and reported the lexical error at
+/// that place (`chl-parser/design-chl-parser.md`, "One diagnostic per lexical
+/// error"). No source text lexes to a zero-width closer.
+pub(super) fn lex_then_grammar_errors(
+    lex: Vec<LexError>,
+    grammar: Vec<Rich<'_, Token, Span>>,
+) -> Vec<ParseError> {
+    let explained_by_lexer = |err: &Rich<'_, Token, Span>| match err.found() {
+        Some(Token::Error) => true,
+        Some(Token::RParen | Token::RBracket | Token::RBrace) => err.span().start == err.span().end,
+        _ => false,
+    };
+    lex.into_iter()
+        .map(ParseError::Lex)
+        .chain(
+            grammar
+                .into_iter()
+                .filter(|err| !explained_by_lexer(err))
+                .map(rich_to_info)
+                .map(ParseError::Parse),
+        )
         .collect()
 }

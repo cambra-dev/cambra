@@ -36,21 +36,13 @@ pub use error::*;
 /// the list of all parser errors. See [`ParseResult`] for the recovery
 /// semantics.
 pub fn parse_module(file: FileId, source: &str) -> ParseResult<Module> {
-    let tokens = match lexer::tokenize(file, source) {
-        Ok(t) => t,
-        Err(e) => {
-            return ParseResult {
-                value: None,
-                errors: vec![ParseError::from(e)],
-            };
-        }
-    };
+    let lexer::Lexed { tokens, errors } = lexer::tokenize(file, source);
     let eof = Span::new(file, source.len(), source.len());
     let input = tokens.as_slice().map(eof, |(t, s)| (t, s));
     let (out, errs) = module_parser().parse(input).into_output_errors();
     ParseResult {
         value: out.map(|body| Module { file, body }),
-        errors: collect_errors(errs),
+        errors: lex_then_grammar_errors(errors, errs),
     }
 }
 
@@ -62,15 +54,7 @@ pub fn parse_module(file: FileId, source: &str) -> ParseResult<Module> {
 /// error produces an [`Expr::Error`] node rather than aborting the whole
 /// parse.
 pub fn parse_expression(file: FileId, source: &str) -> ParseResult<Spanned<Expr>> {
-    let tokens = match lexer::tokenize(file, source) {
-        Ok(t) => t,
-        Err(e) => {
-            return ParseResult {
-                value: None,
-                errors: vec![ParseError::from(e)],
-            };
-        }
-    };
+    let lexer::Lexed { tokens, errors } = lexer::tokenize(file, source);
     let eof = Span::new(file, source.len(), source.len());
     let input = tokens.as_slice().map(eof, |(t, s)| (t, s));
     let parser = expression()
@@ -79,7 +63,7 @@ pub fn parse_expression(file: FileId, source: &str) -> ParseResult<Spanned<Expr>
     let (out, errs) = parser.parse(input).into_output_errors();
     ParseResult {
         value: out,
-        errors: collect_errors(errs),
+        errors: lex_then_grammar_errors(errors, errs),
     }
 }
 

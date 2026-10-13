@@ -190,6 +190,20 @@ fn custom_grammar_errors_render_with_source_context() {
     );
 }
 
+/// A close bracket of the wrong kind renders with both brackets labelled,
+/// since either one can be the mistake.
+#[test]
+fn a_mismatched_close_renders_both_brackets() {
+    let src = "x = f(a]";
+    let sources = SourceMap::single("<test>", src);
+    let rendered = parse_module(sources.root(), src).render_errors(&sources);
+    assert!(
+        rendered.contains("`]` does not match `(`")
+            && rendered.contains("this bracket is never closed"),
+        "{rendered}"
+    );
+}
+
 #[test]
 fn tuples_and_subscript() {
     let _ = must_parse_expr(r#"('a', 1)"#);
@@ -494,16 +508,29 @@ fn bad_def_header_does_not_swallow_following_top_level_stmts() {
 }
 
 #[test]
-fn unclosed_bracket_is_reported_at_eof() {
-    // Without the lexer's EOF check, `(1 + 2\n` would silently eat every
-    // following newline (bracket depth > 0 suppresses them) and produce
-    // a confusing parse error far from the actual problem. With it, we
-    // get a clean `UnclosedBracket` from the lexer.
-    use cambra::chl_parser::lexer::{LexError, tokenize};
-    assert!(matches!(
-        tokenize(FileId::ROOT, "(1 + 2\n"),
-        Err(LexError::UnclosedBracket { .. })
-    ));
+fn unclosed_bracket_is_reported_at_its_opener() {
+    // An unclosed `(` would otherwise swallow every following newline. The
+    // lexer reports it at the bracket, closes it before the next statement's
+    // line, and the statements after it parse.
+    use cambra::chl_parser::ParseError;
+    use cambra::chl_parser::ast::Span;
+    use cambra::chl_parser::lexer::LexError;
+    let src = indoc! {"
+        x = (1 + 2
+        y = 3
+    "};
+    let result = parse_module(FileId::ROOT, src);
+    assert_eq!(
+        result.errors,
+        vec![ParseError::Lex(LexError::UnclosedBracket {
+            span: Span::new(FileId::ROOT, 4, 5)
+        })]
+    );
+    let m = result
+        .value
+        .expect("the statements around the bracket parse");
+    assert_eq!(m.body.len(), 2);
+    assert!(matches!(m.body[1].node, Stmt::Assign { .. }));
 }
 
 #[test]

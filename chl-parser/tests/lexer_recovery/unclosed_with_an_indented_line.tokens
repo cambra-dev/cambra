@@ -1,0 +1,26 @@
+tokens:
+  1:1-1:4 Def
+  1:5-1:6 Ident("f")
+  1:6-1:7 LParen
+  1:7-1:8 Ident("x")
+  1:8-1:9 Colon
+  2:5-2:11 Return
+  2:12-2:13 Ident("x")
+  2:13-2:13 RParen
+  2:13-3:1 Newline
+  3:1-3:4 Def
+  3:5-3:6 Ident("g")
+  3:6-3:7 LParen
+  3:7-3:8 RParen
+  3:8-3:9 Colon
+  3:9-4:1 Newline
+  4:1-4:5 Indent
+  4:5-4:9 Pass
+  4:9-5:1 Newline
+  5:1-5:1 Dedent
+lex errors:
+  1:6-1:7 bracket is never closed
+parse errors:
+  1:6-1:7 lex error: bracket is never closed
+  2:5-2:11 found 'return', expected expression (in statement at 0..8)
+statements: Error, FunctionDef
