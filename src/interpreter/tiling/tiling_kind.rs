@@ -1,6 +1,7 @@
 //! The [`Tiling`] type: the static shape descriptor for what a
 //! [`TileOperator`](crate::interpreter::tile_operators::TileOperator) produces.
 
+use smol_str::SmolStr;
 use std::{collections::HashMap, fmt};
 
 use bit_set::BitSet;
@@ -23,7 +24,7 @@ pub enum Tiling {
     /// A single value, which may or may not be known.
     Scalar(Extent),
     /// A record of tilings.
-    Record(HashMap<String, Tiling>),
+    Record(HashMap<SmolStr, Tiling>),
     /// A collection level: the static shape of a
     /// [`Tile::DataFunction`](crate::interpreter::tiling::Tile).
     DataFunction {

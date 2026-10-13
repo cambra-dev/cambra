@@ -74,6 +74,7 @@
 //!   top-level block.
 //! - [`http`] — `http_serve` recognition and lowering.
 
+use smol_str::SmolStr;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -1004,7 +1005,7 @@ fn lower_expr_inner(
                     qualifier.is_empty(),
                     "a qualified label is refused before lowering (`refuse_module_syntax`)"
                 );
-                let field_name = name.as_str().to_string();
+                let field_name = SmolStr::from(name.as_str());
                 if out.iter().any(|(k, _)| k == &field_name) {
                     return Err(LoweringError::unsupported(
                         *name_span,

@@ -1,3 +1,4 @@
+use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 
 use bit_set::BitSet;
@@ -25,7 +26,7 @@ pub struct Zip {
     /// Output tiling: the standing levels, with a `Record` where the operands' values sat.
     base: OperatorBase,
     /// Field names in input order, used when producing the output Record tile.
-    names: Vec<String>,
+    names: Vec<SmolStr>,
     /// The input collections to pair.
     inputs: Vec<Box<dyn TileOperator>>,
     /// The level the record sits at — the values every standing level is over.
@@ -53,7 +54,7 @@ impl Zip {
     /// are the ones the operands were applied over. Two arms that agree beneath them (two
     /// projections of one grouped row, say) look pairable all the way down, and two that
     /// differ there are the collection-valued component case.
-    pub fn new_at(names: Vec<String>, ops: Vec<Box<dyn TileOperator>>, level: CurryLevel) -> Self {
+    pub fn new_at(names: Vec<SmolStr>, ops: Vec<Box<dyn TileOperator>>, level: CurryLevel) -> Self {
         assert!(!ops.is_empty(), "Zip requires at least one input");
         assert!(
             level != CurryLevel::OUTERMOST,
@@ -120,7 +121,7 @@ pub fn zip_arms_at(inputs: Vec<Box<dyn TileOperator>>, level: CurryLevel) -> Box
 
 /// Named-field variant of [`zip_arms_at`], for record literals.
 pub fn zip_arms_named_at(
-    inputs: Vec<(String, Box<dyn TileOperator>)>,
+    inputs: Vec<(SmolStr, Box<dyn TileOperator>)>,
     level: CurryLevel,
 ) -> Box<dyn TileOperator> {
     if inputs.iter().all(|(_, op)| op.tiling().is_scalar()) {
@@ -174,7 +175,7 @@ impl TileOperator for Zip {
 struct ZipProducer {
     base: ProducerBase,
     /// Field names in input order, used when producing the output Record tile.
-    names: Vec<String>,
+    names: Vec<SmolStr>,
     /// Live input producers, in field order.
     inputs: Vec<Box<dyn TileProducer>>,
     /// The level the record sits at ([`Zip`]).
@@ -409,7 +410,7 @@ impl TileProducer for ZipProducer {
                         .map(|(starts, keys)| (starts.to_vec(), (*keys).clone()))
                         .collect();
                 let mut codomains: Vec<Tile> = Vec::with_capacity(filtered_tiles.len());
-                let mut absent: HashMap<String, BitSet> = HashMap::new();
+                let mut absent: HashMap<SmolStr, BitSet> = HashMap::new();
                 for (arm, filtered) in filtered_tiles.iter_mut().enumerate() {
                     let held = filtered.paths_at(rows_level);
                     // Lift the values out, leaving the chain of keys behind: what stays is
@@ -563,7 +564,7 @@ fn align_keyless(values: Tile, cells: &[Option<usize>]) -> (Tile, Option<BitSet>
 pub struct MakeRecord {
     base: OperatorBase,
     /// Field names in input order, used when producing `Tile::Record` tiles.
-    names: Vec<String>,
+    names: Vec<SmolStr>,
     inputs: Vec<Box<dyn TileOperator>>,
 }
 
@@ -581,13 +582,13 @@ impl MakeRecord {
     ///
     /// Like [`Self::new`] but uses the caller-supplied field names instead of
     /// the synthetic `_0`, `_1`, … names used for tuples.
-    pub fn new_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Self {
+    pub fn new_named(inputs: Vec<(SmolStr, Box<dyn TileOperator>)>) -> Self {
         assert!(!inputs.is_empty(), "MakeRecord requires at least one input");
         let (names, ops) = inputs.into_iter().unzip();
         Self::new_impl(names, ops)
     }
 
-    fn new_impl(names: Vec<String>, inputs: Vec<Box<dyn TileOperator>>) -> Self {
+    fn new_impl(names: Vec<SmolStr>, inputs: Vec<Box<dyn TileOperator>>) -> Self {
         let tiling = Tiling::Record(
             names
                 .iter()
@@ -646,7 +647,7 @@ impl TileOperator for MakeRecord {
 /// tiles.
 struct MakeRecordProducer {
     base: ProducerBase,
-    names: Vec<String>,
+    names: Vec<SmolStr>,
     inputs: Vec<Box<dyn TileProducer>>,
 }
 
@@ -664,7 +665,7 @@ impl TileProducer for MakeRecordProducer {
         // Every operand is pulled whole ([`SelectFieldProducer`] says why a narrowed pull
         // is unsound). An operand withholds what [`Self::release_impl`] told it a consumer
         // finished with, so a field that settled early is not re-delivered.
-        let fields: HashMap<String, Tile> = self
+        let fields: HashMap<SmolStr, Tile> = self
             .names
             .iter()
             .zip(self.inputs.iter_mut())
@@ -712,7 +713,7 @@ pub struct SelectField {
     /// The product whose field this selects.
     input: Box<dyn TileOperator>,
     /// The field's name — `_0`, `_1`, … for a tuple.
-    name: String,
+    name: SmolStr,
 }
 
 /// What a selector of field `name` releases of the product `tiling`, given its consumer's
@@ -789,7 +790,7 @@ impl SelectField {
     /// # Panics
     ///
     /// Panics unless `input`'s deepest values are a `Tiling::Record` holding `name`.
-    pub fn new(input: Box<dyn TileOperator>, name: impl Into<String>) -> Self {
+    pub fn new(input: Box<dyn TileOperator>, name: impl Into<SmolStr>) -> Self {
         let name = name.into();
         let tiling = select_field_tiling(input.tiling(), &name);
         Self {
@@ -851,7 +852,7 @@ impl TileOperator for SelectField {
 struct SelectFieldProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
-    name: String,
+    name: SmolStr,
     /// The product's tiling, for naming this field in a guard travelling upward.
     input_tiling: Tiling,
 }
@@ -999,7 +1000,7 @@ mod tests {
             logs.push(log);
             inputs.push(Box::new(spy));
         }
-        let names: Vec<String> = (0..2).map(tuple_field).collect();
+        let names: Vec<SmolStr> = (0..2).map(tuple_field).collect();
         let out_tiling =
             Tiling::Record(names.iter().map(|n| (n.clone(), tiling.clone())).collect());
         let mut producer = MakeRecordProducer {
@@ -1036,9 +1037,9 @@ mod tests {
         Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Record(HashMap::from([
-                ("a".to_string(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+                ("a".into(), Tiling::Scalar(Extent::Base(BaseType::Int))),
                 (
-                    "xs".to_string(),
+                    "xs".into(),
                     Tiling::data_function(
                         Extent::Base(BaseType::UInt),
                         Tiling::Scalar(Extent::Base(BaseType::Int)),
@@ -1090,7 +1091,7 @@ mod tests {
             select.result_correlation(),
             Some(vec![
                 TilePathStep::Codomain,
-                TilePathStep::Record("a".to_string())
+                TilePathStep::Record("a".into())
             ]),
         );
     }
@@ -1108,7 +1109,7 @@ mod tests {
         let mut producer = SelectFieldProducer {
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &output_tiling),
             input: Box::new(spy),
-            name: "a".to_string(),
+            name: "a".into(),
             input_tiling: input_tiling.clone(),
         };
         let rows = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
@@ -1124,8 +1125,8 @@ mod tests {
         };
         let other_fields = TileGuard::Function(FunctionGuard::Codomain(Box::new(
             TileGuard::Record(HashMap::from([
-                ("a".to_string(), TileGuard::Scalar(Predicate::False)),
-                ("xs".to_string(), fields["xs"].universal_guard()),
+                ("a".into(), TileGuard::Scalar(Predicate::False)),
+                ("xs".into(), fields["xs"].universal_guard()),
             ])),
         )));
         assert_eq!(
@@ -1140,14 +1141,14 @@ mod tests {
     fn select_field_over_a_bare_product_releases_every_other_field() {
         let int = Tiling::Scalar(Extent::Base(BaseType::Int));
         let product = Tiling::Record(HashMap::from([
-            ("a".to_string(), int.clone()),
-            ("b".to_string(), int.clone()),
+            ("a".into(), int.clone()),
+            ("b".into(), int.clone()),
         ]));
         assert_eq!(
             guard_at_field(&product, "a", TileGuard::Scalar(Predicate::False)),
             TileGuard::Record(HashMap::from([
-                ("a".to_string(), TileGuard::Scalar(Predicate::False)),
-                ("b".to_string(), TileGuard::Scalar(Predicate::True)),
+                ("a".into(), TileGuard::Scalar(Predicate::False)),
+                ("b".into(), TileGuard::Scalar(Predicate::True)),
             ])),
         );
     }
@@ -1177,16 +1178,15 @@ mod tests {
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
-        let input_tiling =
-            Tiling::Record(HashMap::from([("xs".to_string(), field_tiling.clone())]));
+        let input_tiling = Tiling::Record(HashMap::from([("xs".into(), field_tiling.clone())]));
         let (spy, log) = ReleaseSpy::new(
-            Tile::record(HashMap::from([("xs".to_string(), filtered_collection())])),
+            Tile::record(HashMap::from([("xs".into(), filtered_collection())])),
             input_tiling.clone(),
         );
         let mut producer = SelectFieldProducer {
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
             input: Box::new(spy),
-            name: "xs".to_string(),
+            name: "xs".into(),
             input_tiling,
         };
         producer.get(producer.tiling().universal_guard());
@@ -1208,9 +1208,9 @@ mod tests {
         let uint = || Extent::Base(BaseType::UInt);
         let int = || Extent::Base(BaseType::Int);
         let row_tiling = Tiling::Record(HashMap::from([
-            ("a".to_string(), Tiling::Scalar(int())),
+            ("a".into(), Tiling::Scalar(int())),
             (
-                "b".to_string(),
+                "b".into(),
                 Tiling::data_function(uint(), Tiling::Scalar(int())),
             ),
         ]));
@@ -1220,9 +1220,9 @@ mod tests {
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::Record {
                 fields: HashMap::from([
-                    ("a".to_string(), Tile::Scalar(ColumnValue::Ints(vec![5]))),
+                    ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![5]))),
                     (
-                        "b".to_string(),
+                        "b".into(),
                         Tile::grouped(
                             vec![0, 1],
                             ColumnValue::UInts(vec![0, 0]),
@@ -1232,7 +1232,7 @@ mod tests {
                         ),
                     ),
                 ]),
-                absent: HashMap::from([("a".to_string(), BitSet::from_iter([0]))]),
+                absent: HashMap::from([("a".into(), BitSet::from_iter([0]))]),
             }),
             Predicate::False,
             BitSet::new(),
@@ -1240,7 +1240,7 @@ mod tests {
         let mut producer = SelectFieldProducer {
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
             input: Box::new(TestTileProducer::new(input, input_tiling.clone())),
-            name: "a".to_string(),
+            name: "a".into(),
             input_tiling,
         };
         let out = producer.get(producer.tiling().universal_guard());
@@ -1265,8 +1265,8 @@ mod tests {
         let output_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Record(HashMap::from([
-                ("a".to_string(), Tiling::Scalar(Extent::Base(BaseType::Int))),
-                ("b".to_string(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+                ("a".into(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+                ("b".into(), Tiling::Scalar(Extent::Base(BaseType::Int))),
             ])),
         );
         let (spy_a, log_a) = ReleaseSpy::new(filtered_collection(), input_tiling.clone());
@@ -1274,7 +1274,7 @@ mod tests {
         let mut zip = ZipProducer {
             level: CurryLevel::new(1),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
-            names: vec!["a".to_string(), "b".to_string()],
+            names: vec!["a".into(), "b".into()],
             inputs: vec![Box::new(spy_a), Box::new(spy_b)],
         };
         zip.get(zip.tiling().universal_guard());
@@ -1329,20 +1329,14 @@ mod tests {
         let output_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Record(HashMap::from([
-                (
-                    "a".to_string(),
-                    Tiling::Scalar(Extent::Base(BaseType::UInt)),
-                ),
-                (
-                    "b".to_string(),
-                    Tiling::Scalar(Extent::Base(BaseType::UInt)),
-                ),
+                ("a".into(), Tiling::Scalar(Extent::Base(BaseType::UInt))),
+                ("b".into(), Tiling::Scalar(Extent::Base(BaseType::UInt))),
             ])),
         );
         let mut zip = ZipProducer {
             level: CurryLevel::new(1),
             base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
-            names: vec!["a".to_string(), "b".to_string()],
+            names: vec!["a".into(), "b".into()],
             inputs: vec![
                 Box::new(TestTileProducer::new(tile_a, input_tiling.clone())),
                 Box::new(TestTileProducer::new(tile_b, input_tiling)),

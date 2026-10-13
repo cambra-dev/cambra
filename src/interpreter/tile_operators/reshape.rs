@@ -1,3 +1,4 @@
+use smol_str::SmolStr;
 use std::collections::HashMap;
 
 use super::*;
@@ -19,7 +20,7 @@ pub struct PermuteRecordDomain {
     permutation: Vec<usize>,
 }
 
-fn permute_record<T>(mut input: HashMap<String, T>, permutation: &[usize]) -> HashMap<String, T> {
+fn permute_record<T>(mut input: HashMap<SmolStr, T>, permutation: &[usize]) -> HashMap<SmolStr, T> {
     HashMap::from_iter(permutation.iter().enumerate().map(|(idx, target)| {
         (
             tuple_field(idx),
@@ -205,7 +206,7 @@ fn tuple_field_index(field: &str) -> usize {
 /// `field_map = [("a", Some("x")), ("a", Some("y")), ("b", None)]`.
 /// A predicate `{a: {x: P1, y: P2}, b: P3}` on the nested domain becomes
 /// `{_0: P1, _1: P2, _2: P3}` on the flat domain.
-fn flatten_predicate(pred: &Predicate, field_map: &[(String, Option<String>)]) -> Predicate {
+fn flatten_predicate(pred: &Predicate, field_map: &[(SmolStr, Option<SmolStr>)]) -> Predicate {
     match pred {
         Predicate::True | Predicate::False => pred.clone(),
         Predicate::Record(outer_preds) => Predicate::Record(
@@ -247,12 +248,12 @@ fn flatten_predicate(pred: &Predicate, field_map: &[(String, Option<String>)]) -
 /// Converts a flat-domain `Predicate` back into a nested-tuple `Predicate`.
 ///
 /// Inverse of [`flatten_predicate`]; used when propagating release guards upstream.
-fn unflatten_predicate(pred: &Predicate, field_map: &[(String, Option<String>)]) -> Predicate {
+fn unflatten_predicate(pred: &Predicate, field_map: &[(SmolStr, Option<SmolStr>)]) -> Predicate {
     match pred {
         Predicate::True | Predicate::False => pred.clone(),
         Predicate::Record(flat_preds) => {
-            let mut outer_groups: HashMap<String, HashMap<String, Predicate>> = HashMap::new();
-            let mut pass_through: HashMap<String, Predicate> = HashMap::new();
+            let mut outer_groups: HashMap<SmolStr, HashMap<SmolStr, Predicate>> = HashMap::new();
+            let mut pass_through: HashMap<SmolStr, Predicate> = HashMap::new();
             for (out_idx, (outer_k, inner_k_opt)) in field_map.iter().enumerate() {
                 let flat_pred = flat_preds
                     .get(&tuple_field(out_idx))
@@ -270,7 +271,7 @@ fn unflatten_predicate(pred: &Predicate, field_map: &[(String, Option<String>)])
                     }
                 }
             }
-            let mut result: HashMap<String, Predicate> = pass_through;
+            let mut result: HashMap<SmolStr, Predicate> = pass_through;
             for (outer_k, inner_preds) in outer_groups {
                 result.insert(outer_k, Predicate::Record(inner_preds));
             }
@@ -297,7 +298,7 @@ fn unflatten_predicate(pred: &Predicate, field_map: &[(String, Option<String>)])
 /// identity) is also not preservable after flattening and returns `None`.
 fn flatten_result_correlation(
     corr: Vec<TilePathStep>,
-    field_map: &[(String, Option<String>)],
+    field_map: &[(SmolStr, Option<SmolStr>)],
 ) -> Option<Vec<TilePathStep>> {
     let Some(first) = corr.first() else {
         return None; // empty path: flat domain ≠ nested codomain
@@ -348,7 +349,7 @@ pub struct FlattenTupleDomain {
     /// Maps output field index `i` to `(outer_field_key, inner_field_key_opt)`.
     ///
     /// `inner_field_key_opt = Some(k)` for flattened fields; `None` for pass-through fields.
-    field_map: Vec<(String, Option<String>)>,
+    field_map: Vec<(SmolStr, Option<SmolStr>)>,
 }
 
 impl FlattenTupleDomain {
@@ -372,11 +373,11 @@ impl FlattenTupleDomain {
             )
         };
 
-        let mut sorted_outer: Vec<(&String, &Extent)> = outer_fields.iter().collect();
+        let mut sorted_outer: Vec<(&SmolStr, &Extent)> = outer_fields.iter().collect();
         sorted_outer.sort_by_key(|(k, _)| tuple_field_index(k));
 
-        let mut field_map: Vec<(String, Option<String>)> = Vec::new();
-        let mut flat_extent: HashMap<String, Extent> = HashMap::new();
+        let mut field_map: Vec<(SmolStr, Option<SmolStr>)> = Vec::new();
+        let mut flat_extent: HashMap<SmolStr, Extent> = HashMap::new();
         let mut out_idx = 0usize;
 
         for (outer_key, outer_extent) in sorted_outer {
@@ -387,7 +388,7 @@ impl FlattenTupleDomain {
                         "FlattenTupleDomain: outer field {outer_key} marked for flattening is not a Record, got {outer_extent}"
                     )
                 };
-                let mut sorted_inner: Vec<(&String, &Extent)> = inner_fields.iter().collect();
+                let mut sorted_inner: Vec<(&SmolStr, &Extent)> = inner_fields.iter().collect();
                 sorted_inner.sort_by_key(|(k, _)| tuple_field_index(k));
                 for (inner_key, inner_extent) in sorted_inner {
                     field_map.push((outer_key.clone(), Some(inner_key.clone())));
@@ -453,7 +454,7 @@ struct FlattenTupleDomainProducer {
     /// Maps output field index `i` to `(outer_field_key, inner_field_key_opt)`.
     ///
     /// `inner_field_key_opt = Some(k)` for flattened fields; `None` for pass-through fields.
-    field_map: Vec<(String, Option<String>)>,
+    field_map: Vec<(SmolStr, Option<SmolStr>)>,
 }
 
 impl TileProducer for FlattenTupleDomainProducer {
@@ -605,7 +606,7 @@ mod tests {
             ),
         ]);
 
-        let flat_domain: HashMap<String, ColumnValue> = field_map
+        let flat_domain: HashMap<SmolStr, ColumnValue> = field_map
             .iter()
             .enumerate()
             .map(|(out_idx, (outer_k, inner_k))| {
@@ -1102,7 +1103,7 @@ mod tests {
 
     /// field_map for `{ _0: A, _1: (B, C) }` with both flattened:
     /// flat._0 = outer._0 (pass-through), flat._1 = outer._1._0 (B), flat._2 = outer._1._1 (C).
-    fn nested_field_map() -> Vec<(String, Option<String>)> {
+    fn nested_field_map() -> Vec<(SmolStr, Option<SmolStr>)> {
         vec![
             (tuple_field(0), None),
             (tuple_field(1), Some(tuple_field(0))),

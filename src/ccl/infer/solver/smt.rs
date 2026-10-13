@@ -1055,8 +1055,8 @@ mod tests {
         )];
         let rhs = [elem_cmp(CompareKind::Equals, add(var("t"), lit(3)))];
         let rec = Type::Record(vec![
-            ("a".to_string(), singleton(10)),
-            ("b".to_string(), singleton(3)),
+            ("a".into(), singleton(10)),
+            ("b".into(), singleton(3)),
         ]);
 
         assert!(smt_sub(&int(), &lhs, &rhs, &scoped("x", rec)).unwrap());
@@ -1069,7 +1069,7 @@ mod tests {
     #[test]
     fn two_reads_of_one_path_are_one_constant() {
         let lhs = [elem_cmp(CompareKind::Equals, field("x", "b"))];
-        let unrefined = Type::Record(vec![("b".to_string(), int())]);
+        let unrefined = Type::Record(vec![("b".into(), int())]);
         let scope = scoped("x", unrefined);
         assert!(
             smt_sub(
@@ -1097,10 +1097,7 @@ mod tests {
     /// and establishes `__elem.y == 0`.
     #[test]
     fn a_product_subject_is_read_through_its_fields() {
-        let base = Type::Record(vec![
-            ("x".to_string(), singleton(1)),
-            ("y".to_string(), singleton(0)),
-        ]);
+        let base = Type::Record(vec![("x".into(), singleton(1)), ("y".into(), singleton(0))]);
         let refutes = [Refinement::born(Rc::new(
             TypedExpr::binop(
                 subject_field("y"),
@@ -1127,7 +1124,7 @@ mod tests {
     #[test]
     fn a_read_inside_a_binders_refinement_reroots_onto_the_binder() {
         let refined_rec = Type::refined(
-            Type::Record(vec![("b".to_string(), int())]),
+            Type::Record(vec![("b".into(), int())]),
             Refinement::born(Rc::new(
                 TypedExpr::binop(
                     subject_field("b"),

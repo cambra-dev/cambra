@@ -1550,10 +1550,7 @@ mod tests {
     fn record_field_reorder_is_not_a_move() {
         let rec = |fields: Vec<(&str, TypedExpr)>| {
             TypedExpr::new(TypedExprNode::Record(
-                fields
-                    .into_iter()
-                    .map(|(n, e)| (n.to_string(), e))
-                    .collect(),
+                fields.into_iter().map(|(n, e)| (n.into(), e)).collect(),
             ))
         };
         // Records are order-insensitive, so a field swap is a no-op to the diff
@@ -2459,10 +2456,7 @@ mod tests {
         // things to say, and both are reported.
         let rec = |fields: Vec<(&str, TypedExpr)>| {
             TypedExpr::new(N::Record(
-                fields
-                    .into_iter()
-                    .map(|(n, e)| (n.to_string(), e))
-                    .collect(),
+                fields.into_iter().map(|(n, e)| (n.into(), e)).collect(),
             ))
         };
         let v1 = rec(vec![("a", var("x"))]);
@@ -2487,10 +2481,7 @@ mod tests {
         // literal is a site of its own, and the record's own change — its
         // labels — must not be swallowed by it.
         let rec = |a: &str, n: i64| {
-            TypedExpr::new(N::Record(vec![
-                (a.to_string(), var("x")),
-                ("c".to_string(), int(n)),
-            ]))
+            TypedExpr::new(N::Record(vec![(a.into(), var("x")), ("c".into(), int(n))]))
         };
         let (v1, v2) = (rec("a", 1), rec("b", 2));
         let sites = diff(&v1, &v2).divergences();

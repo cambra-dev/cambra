@@ -2,6 +2,7 @@
 //! constants, the binary / unary operator kinds, the [`Builtin`] combinator
 //! enum, and projection keys.
 
+use smol_str::SmolStr;
 use std::fmt;
 
 use crate::ccl::{AggregateKind, FieldKey};
@@ -68,7 +69,7 @@ pub enum Lit {
     /// An integer constant.
     Int(i64),
     /// A string constant.
-    String(String),
+    String(SmolStr),
     /// A boolean constant.
     Bool(bool),
     /// The unit (null/None) constant.
@@ -992,7 +993,7 @@ pub enum ProjKey {
     /// Integer-indexed tuple projection: `.0`, `.1`, …
     Index(usize),
     /// Named record-field projection: `.fieldname`.
-    Field(String),
+    Field(SmolStr),
 }
 
 /// Renders bare — `0`, `name` — with the leading dot supplied by the caller, the

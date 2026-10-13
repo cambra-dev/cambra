@@ -38,6 +38,7 @@
 //! [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
 //! [`TileOperator::visit_inputs`]: crate::interpreter::tile_operators::TileOperator::visit_inputs
 
+use smol_str::SmolStr;
 use std::cell::RefCell;
 
 use crate::ccl::provenance::NodeId;
@@ -365,7 +366,7 @@ thread_local! {
 #[derive(Default)]
 struct Boundaries {
     /// Each compiled output field's node.
-    sinks: Vec<(String, NodeId)>,
+    sinks: Vec<(SmolStr, NodeId)>,
     /// Operators this compile took from the version it replaces, already rowed
     /// by [`record_kept_operators`]. One fan-out reaches several bindings, and a
     /// second row for one id is a defect the table asserts on.
@@ -401,7 +402,7 @@ impl BoundarySession {
     /// asked for its inputs afterwards would answer without them.
     ///
     /// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
-    pub(crate) fn into_graph(self, outputs: &[(String, Box<dyn TileOperator>)]) -> OperatorGraph {
+    pub(crate) fn into_graph(self, outputs: &[(SmolStr, Box<dyn TileOperator>)]) -> OperatorGraph {
         let boundaries = BOUNDARIES
             .with(|slot| slot.borrow_mut().take())
             .unwrap_or_default();
@@ -422,7 +423,7 @@ impl BoundarySession {
             };
             nodes.push(GraphNode::Sink {
                 id,
-                name: name.clone(),
+                name: name.to_string(),
                 input: InputEdge {
                     role: EdgeRole::Named("output"),
                     kind: EdgeKind::Value { deferred: false },
@@ -557,7 +558,7 @@ pub(crate) fn record_sink(name: &str) {
     crate::ccl::provenance::on_mint(id);
     BOUNDARIES.with(|slot| {
         if let Some(boundaries) = slot.borrow_mut().as_mut() {
-            boundaries.sinks.push((name.to_string(), id));
+            boundaries.sinks.push((SmolStr::new(name), id));
         }
     });
 }

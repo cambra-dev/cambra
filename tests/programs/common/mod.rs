@@ -368,7 +368,7 @@ pub fn tile_to_canonical(tile: Tile) -> String {
             // not the `HashMap`'s, which has none.
             let mut rows: Vec<(String, String)> = fields
                 .into_iter()
-                .map(|(name, tile)| (name, tile_to_canonical(tile)))
+                .map(|(name, tile)| (name.to_string(), tile_to_canonical(tile)))
                 .collect();
             let positional: Option<Vec<usize>> = rows
                 .iter()

@@ -330,8 +330,8 @@ mod tests {
                 &released(Some(0)),
             );
             let mut fields = HashMap::new();
-            fields.insert("text".to_string(), Tile::Scalar(strings(&["a"])));
-            fields.insert("tagged".to_string(), Tile::Scalar(strings(&["> a"])));
+            fields.insert("text".into(), Tile::Scalar(strings(&["a"])));
+            fields.insert("tagged".into(), Tile::Scalar(strings(&["> a"])));
             table.observe(
                 Some(ids[2]),
                 1,

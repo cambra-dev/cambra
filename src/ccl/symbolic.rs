@@ -811,7 +811,7 @@ mod tests {
     #[rstest]
     // Literals
     #[case(Expr::lit(Lit::Int(42)), "42")]
-    #[case(Expr::lit(Lit::String("hi".to_string())), r#""hi""#)]
+    #[case(Expr::lit(Lit::String("hi".into())), r#""hi""#)]
     #[case(Expr::lit(Lit::Bool(true)), "true")]
     #[case(Expr::lit(Lit::Unit), "unit")]
     // Variable
@@ -1074,8 +1074,8 @@ in x"
     // Record
     #[case(
         TypedExpr::new(TypedExprNode::Record(vec![
-            ("a".to_string(), Expr::lit(Lit::Int(1))),
-            ("b".to_string(), Expr::lit(Lit::Int(2))),
+            ("a".into(), Expr::lit(Lit::Int(1))),
+            ("b".into(), Expr::lit(Lit::Int(2))),
         ])),
         "(a: 1, b: 2)"
     )]

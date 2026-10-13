@@ -2,6 +2,7 @@
 //! `test_new_compile` symbolic-CCL parity matrix (asserting both the lowered
 //! CCL shape and the runtime tile).
 
+use smol_str::SmolStr;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -1111,7 +1112,7 @@ fn per_region_product(fields: &[(&str, [i64; 2])]) -> Tile {
             .iter()
             .map(|(name, column)| {
                 (
-                    name.to_string(),
+                    SmolStr::from(*name),
                     Tile::Scalar(ColumnValue::Ints(column.to_vec())),
                 )
             })

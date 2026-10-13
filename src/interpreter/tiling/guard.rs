@@ -1,6 +1,7 @@
 //! Release/intent guards: [`TileGuard`] (per-[`Tile`](crate::interpreter::Tile) region
 //! descriptor) and [`FunctionGuard`] (its function-shaped arm).
 
+use smol_str::SmolStr;
 use std::collections::HashMap;
 
 use crate::interpreter::{CurryLevel, Extent, Predicate, Tiling, Value};
@@ -14,7 +15,7 @@ pub enum TileGuard {
     /// True }`: under the enclosing paths `enclosing` admits, the value being the one cell
     /// its path ends in ([leaf rows](TileGuard::leaf_rows)).
     Scalar(Predicate),
-    Record(HashMap<String, TileGuard>),
+    Record(HashMap<SmolStr, TileGuard>),
     Function(FunctionGuard),
     /// An aggregate's result, named under the paths that reach it as [`Self::Scalar`] is.
     Aggregation(Predicate),
@@ -294,7 +295,7 @@ fn lift(chain: TileGuard) -> Vec<TileGuard> {
 ///
 /// What the fields name beyond those keys stays as a record arm, less the keys the lifted
 /// arm names, so the two arms do not both name one region.
-fn lift_record(fields: &HashMap<String, TileGuard>, depth: usize) -> Vec<TileGuard> {
+fn lift_record(fields: &HashMap<SmolStr, TileGuard>, depth: usize) -> Vec<TileGuard> {
     let record = || CurryLevel::new(depth).wrap_guard(TileGuard::Record(fields.clone()));
     let whole = fields.values().fold(Predicate::True, |acc, field| {
         acc.intersect(&whole_rows(field))
@@ -581,10 +582,10 @@ fn without_covered_arms(arms: Vec<TileGuard>) -> Vec<TileGuard> {
 /// a mismatch means two guards for different tilings met, which no producer can
 /// act on.
 fn zip_fields(
-    m1: &HashMap<String, TileGuard>,
-    m2: &HashMap<String, TileGuard>,
+    m1: &HashMap<SmolStr, TileGuard>,
+    m2: &HashMap<SmolStr, TileGuard>,
     combine: impl Fn(&TileGuard, &TileGuard) -> TileGuard,
-) -> HashMap<String, TileGuard> {
+) -> HashMap<SmolStr, TileGuard> {
     assert_eq!(
         m1.len(),
         m2.len(),
@@ -1074,8 +1075,8 @@ mod tests {
         let k = [Value::UInt(0)];
         let record = |xs: TileGuard| {
             codomain(TileGuard::Record(HashMap::from([
-                ("n".to_string(), TileGuard::Scalar(Predicate::True)),
-                ("xs".to_string(), xs),
+                ("n".into(), TileGuard::Scalar(Predicate::True)),
+                ("xs".into(), xs),
             ])))
         };
         assert!(!record(domain(Predicate::False)).covers_path(&k));
@@ -1349,7 +1350,7 @@ mod tests {
         TileGuard::Record(
             fields
                 .iter()
-                .map(|(k, g)| (k.to_string(), g.clone()))
+                .map(|(k, g)| (SmolStr::from(*k), g.clone()))
                 .collect(),
         )
     }
@@ -1617,8 +1618,8 @@ mod tests {
         let tiling = record_tiling(&[("x", Tiling::Scalar(int())), ("y", agg_tiling())]);
         let guard = TileGuard::Record(
             [
-                ("x".to_string(), TileGuard::Scalar(Predicate::True)),
-                ("y".to_string(), TileGuard::Aggregation(Predicate::False)),
+                ("x".into(), TileGuard::Scalar(Predicate::True)),
+                ("y".into(), TileGuard::Aggregation(Predicate::False)),
             ]
             .into(),
         );
@@ -1629,8 +1630,7 @@ mod tests {
     fn check_from_record_rejects_missing_key() {
         let tiling = record_tiling(&[("x", Tiling::Scalar(int())), ("y", Tiling::Scalar(int()))]);
         // Guard only has "x", not "y".
-        let guard =
-            TileGuard::Record([("x".to_string(), TileGuard::Scalar(Predicate::True))].into());
+        let guard = TileGuard::Record([("x".into(), TileGuard::Scalar(Predicate::True))].into());
         assert!(!guard.check_from(&tiling));
     }
 
@@ -1639,7 +1639,7 @@ mod tests {
         let tiling = record_tiling(&[("x", Tiling::Scalar(int()))]);
         // "x" field guard is Aggregation but tiling says Scalar.
         let guard =
-            TileGuard::Record([("x".to_string(), TileGuard::Aggregation(Predicate::True))].into());
+            TileGuard::Record([("x".into(), TileGuard::Aggregation(Predicate::True))].into());
         assert!(!guard.check_from(&tiling));
     }
 
@@ -1648,8 +1648,8 @@ mod tests {
         let tiling = record_tiling(&[("x", Tiling::Scalar(int()))]);
         let guard = TileGuard::Record(
             [
-                ("x".to_string(), TileGuard::Scalar(Predicate::True)),
-                ("y".to_string(), TileGuard::Scalar(Predicate::True)),
+                ("x".into(), TileGuard::Scalar(Predicate::True)),
+                ("y".into(), TileGuard::Scalar(Predicate::True)),
             ]
             .into(),
         );
