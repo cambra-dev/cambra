@@ -294,6 +294,26 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             .fold(root, |body, chain| fill_module_body(chain, body))
     });
     errors.extend(std::mem::take(&mut lowering.errors));
+    // Each `import` reaching a shared import brings its copy in.
+    for (statement, imported) in &lowering.imports {
+        let home = Home::Import(imported.shared.clone());
+        if ctx
+            .run_sites
+            .by_file
+            .values()
+            .any(|homes| homes.contains(&home))
+        {
+            let label = format!(
+                "this import reaches the shared import `{}`, whose copy fails",
+                imported.shared
+            );
+            ctx.run_sites
+                .statements
+                .entry(home)
+                .or_default()
+                .push((*statement, label));
+        }
+    }
     // Each module is checked on its own, once linking has found nothing wrong.
     // The root's check is the linked program's inference, unless its parameters
     // or the arguments its own runs and imports pass need one of their own.
@@ -404,6 +424,18 @@ pub(super) struct LoweredModule {
     /// The checks of each `run` statement's type arguments, by run name, which
     /// the module's check makes ([`LoweringContext::declare_run_types`]).
     pub(super) run_checks: HashMap<SmolStr, Vec<TypeCheck>>,
+}
+
+/// Where each run and shared import of a linked program is brought in, for the
+/// errors a pass after linking raises in its copy (`docs/modules.md`,
+/// "Diagnostics").
+#[derive(Debug, Default)]
+pub struct RunSites {
+    /// Each run's `run` statement, or each `import` that reaches a shared import,
+    /// with its label's text, by the run's home.
+    pub statements: HashMap<Home, Vec<(Span, String)>>,
+    /// The runs and shared imports of each module, by its file.
+    pub by_file: HashMap<FileId, Vec<Home>>,
 }
 
 /// One run of a module, created ([`ProgramLowering::create`]).
@@ -805,6 +837,23 @@ impl ProgramLowering<'_> {
             Some(place) if !self.checking => ctx.register_sinks(&lowered.sinks, Some(place)),
             _ => (Vec::new(), Vec::new()),
         };
+        if !self.checking
+            && let Some(home) = &home
+        {
+            if let Some((path, statement)) = &place {
+                let label = format!("the run `{path}`, whose copy fails");
+                ctx.run_sites
+                    .statements
+                    .entry(home.clone())
+                    .or_default()
+                    .push((*statement, label));
+            }
+            ctx.run_sites
+                .by_file
+                .entry(file)
+                .or_default()
+                .push(home.clone());
+        }
         self.errors.extend(refused);
         let scope = use_names(&lowered.scope, qualified);
         let mut uniquified = uniquify::run_in(chain, &raw_scope(&scope), home.clone());

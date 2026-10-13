@@ -17,7 +17,7 @@ use log::debug;
 
 use crate::{
     ccl::{
-        Expr, Name, Type, anf, channelize, comprehension,
+        Expr, Home, Name, Type, TypedExprNode, anf, channelize, comprehension,
         infer::{
             InferError, LocatedInferError, TypeInferenceContext, check_module,
             check_mut_discipline, check_mut_write_targets, check_pre_channelize,
@@ -26,7 +26,7 @@ use crate::{
         inline, lambda_elim,
         lower::{
             LoweredRoute, LoweringContext, LoweringError,
-            modules::{InferredArgument, ModuleCheck, lower_program},
+            modules::{InferredArgument, ModuleCheck, RunSites, lower_program},
         },
         mut_elim, mut_read, opaque_output,
         panes::gate_leaks,
@@ -97,7 +97,7 @@ pub enum CompileError {
         span: Span,
         /// The other positions the error involves, each with its label's text
         /// (`src/ccl/design/diagnostics.md`, "Secondary labels").
-        related: Vec<(Span, &'static str)>,
+        related: Vec<(Span, String)>,
     },
     /// Defer/Feed/Define channelization rejected the program (e.g. a defer
     /// binding with no feeds, mixed `<<`/`<<=` on the same handle, or a
@@ -111,6 +111,9 @@ pub enum CompileError {
         error: channelize::DeferError,
         /// The declaration of the deferred binding the error is about.
         span: Span,
+        /// The `run` and `import` statements that bring in the runs whose copies
+        /// raised it, each with its label's text.
+        related: Vec<(Span, String)>,
     },
     /// A post-inference phase rejected the program for a reason that only
     /// becomes visible after inlining and type inference — e.g. a nested
@@ -121,6 +124,9 @@ pub enum CompileError {
         message: String,
         /// Where.
         span: Span,
+        /// The `run` and `import` statements that bring in the runs whose copies
+        /// raised it, each with its label's text.
+        related: Vec<(Span, String)>,
     },
     /// A phase failed on a program it does not handle yet: a limitation of the
     /// compiler, not a mistake in the program.
@@ -149,6 +155,29 @@ impl CompileError {
             CompileError::Unsupported { message, .. } | CompileError::Internal { message, .. } => {
                 message.clone()
             }
+        }
+    }
+
+    /// The secondary labels of an error that carries them: an inference or
+    /// lowering error, and an error a pass after linking raises in a run's copy.
+    fn related(&self) -> Option<&Vec<(Span, String)>> {
+        match self {
+            CompileError::Infer { related, .. }
+            | CompileError::ChannelizeDefers { related, .. }
+            | CompileError::Unsupported { related, .. } => Some(related),
+            CompileError::Lower(e) => Some(e.related()),
+            _ => None,
+        }
+    }
+
+    /// [`Self::related`], to extend.
+    fn related_mut(&mut self) -> Option<&mut Vec<(Span, String)>> {
+        match self {
+            CompileError::Infer { related, .. }
+            | CompileError::ChannelizeDefers { related, .. }
+            | CompileError::Unsupported { related, .. } => Some(related),
+            CompileError::Lower(e) => Some(e.related_mut()),
+            _ => None,
         }
     }
 
@@ -227,11 +256,7 @@ impl CompileError {
             CompileError::ChannelizeDefers { span, .. } => ("deferred collection error", *span),
             CompileError::Unsupported { span, .. } => ("unsupported program", *span),
         };
-        let related = match self {
-            CompileError::Infer { related, .. } => related.as_slice(),
-            CompileError::Lower(e) => e.related(),
-            _ => &[],
-        };
+        let related = self.related().map_or(&[][..], Vec::as_slice);
         span_rendering(title, span, &self.message(), related, sources, color)
     }
 }
@@ -256,7 +281,7 @@ fn span_rendering(
     title: &str,
     span: Span,
     message: &str,
-    related: &[(Span, &'static str)],
+    related: &[(Span, String)],
     sources: &SourceMap,
     color: bool,
 ) -> Rendering {
@@ -282,7 +307,7 @@ fn span_rendering(
             .with_labels(
                 related
                     .iter()
-                    .map(|(at, text)| Label::new(*at).with_message(*text).with_color(Color::Blue)),
+                    .map(|(at, text)| Label::new(*at).with_message(text).with_color(Color::Blue)),
             )
             .finish(),
         detail,
@@ -376,6 +401,9 @@ struct Blame<'a> {
     derived: SourceProjection,
     /// The span of the whole root file.
     program: Span,
+    /// Where each run of the linked program is brought in, which an error in a
+    /// run's copy is labelled at. `None` for a module's check.
+    runs: Option<&'a RunSites>,
 }
 
 impl<'a> Blame<'a> {
@@ -385,7 +413,36 @@ impl<'a> Blame<'a> {
             projection,
             derived: SourceProjection::new(),
             program: Span::new(root, 0, sources.text(root).len()),
+            runs: None,
         }
+    }
+
+    /// This blame, labelling each error in a run's copy at the statements in
+    /// `runs` that bring that run in.
+    fn with_runs(self, runs: &'a RunSites) -> Self {
+        Blame {
+            runs: Some(runs),
+            ..self
+        }
+    }
+
+    /// The labels of an error raised at `node`, spanning `span`, in a run's copy:
+    /// at the statements that bring in the run `tree` places `node` in, or, where
+    /// it places it in none, at those of every run of `span`'s module.
+    fn run_labels(&self, node: NodeId, span: Span, tree: Option<&Expr>) -> Vec<(Span, String)> {
+        let Some(runs) = self.runs else {
+            return Vec::new();
+        };
+        let homes = match tree.and_then(|tree| home_of(tree, node)) {
+            Some(home) => vec![home],
+            None => runs.by_file.get(&span.file).cloned().unwrap_or_default(),
+        };
+        homes
+            .iter()
+            .filter_map(|home| runs.statements.get(home))
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     /// A blame over the same lowering projection, with no phase projections:
@@ -395,6 +452,7 @@ impl<'a> Blame<'a> {
             projection: self.projection,
             derived: SourceProjection::new(),
             program: self.program,
+            runs: None,
         }
     }
 
@@ -458,7 +516,7 @@ impl<'a> Blame<'a> {
                 let within = |inner: Span| {
                     inner.file == span.file && span.start <= inner.start && inner.end <= span.end
                 };
-                let mut related: Vec<(Span, &'static str)> = Vec::new();
+                let mut related: Vec<(Span, String)> = Vec::new();
                 for r in located.related.iter() {
                     let at = match r.origin {
                         crate::ccl::infer_var::Origin::Node(id) => self.traced(id, Some(tree)),
@@ -468,9 +526,10 @@ impl<'a> Blame<'a> {
                         && !within(at)
                         && !related.iter().any(|(seen, _)| *seen == at)
                     {
-                        related.push((at, r.role.label()));
+                        related.push((at, r.role.label().to_string()));
                     }
                 }
+                related.extend(self.run_labels(located.node_id, span, Some(tree)));
                 CompileError::Infer {
                     error: located.error,
                     span,
@@ -481,11 +540,65 @@ impl<'a> Blame<'a> {
     }
 
     fn unsupported(&self, error: Located<String>, tree: Option<&Expr>) -> Vec<CompileError> {
+        let span = self.span(error.node_id, tree);
         vec![CompileError::Unsupported {
-            span: self.span(error.node_id, tree),
+            span,
             message: error.error,
+            related: self.run_labels(error.node_id, span, tree),
         }]
     }
+}
+
+/// The run whose copy holds `node` in `tree`, the linked program: the home of the
+/// innermost binding of a run's member whose right-hand side holds it, or `None`
+/// where no such binding does.
+fn home_of(tree: &Expr, node: NodeId) -> Option<Home> {
+    fn find(expr: &Expr, node: NodeId, home: Option<&Home>) -> Option<Option<Home>> {
+        if expr.node_id() == node {
+            return Some(home.cloned());
+        }
+        if let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = &expr.node
+        {
+            let inner = binding.name.home().or(home);
+            return find(bound_expr, node, inner).or_else(|| find(body, node, home));
+        }
+        let mut found = None;
+        expr.walk_children(|child| {
+            if found.is_none() {
+                found = find(child, node, home);
+            }
+        });
+        found
+    }
+    find(tree, node, None).flatten()
+}
+
+/// The errors a pass after linking raised, with those raised alike in several
+/// runs' copies merged into one, labelled at every run.
+fn merged_copies(errors: Vec<CompileError>) -> Vec<CompileError> {
+    let mut merged: Vec<CompileError> = Vec::new();
+    for error in errors {
+        let key = (error.span(), error.message());
+        let same = merged
+            .iter_mut()
+            .find(|earlier| (earlier.span(), earlier.message()) == key);
+        let (Some(earlier), Some(labels)) = (same, error.related()) else {
+            merged.push(error);
+            continue;
+        };
+        if let Some(related) = earlier.related_mut() {
+            for label in labels {
+                if !related.contains(label) {
+                    related.push(label.clone());
+                }
+            }
+        }
+    }
+    merged
 }
 
 /// The first answer `own` gives for a node `node` was derived from, nearest first:
@@ -2061,6 +2174,7 @@ fn run_frontend(
     let lowering_session = LoweringSession::install();
     let lower_result = lower_program(program, ctx.lowering_ctx());
     let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
+    let run_sites = std::mem::take(&mut ctx.lowering_ctx().run_sites);
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
@@ -2142,9 +2256,10 @@ fn run_frontend(
         stop,
         capture,
         record,
-        Blame::new(&lowering_projection, sources),
+        Blame::new(&lowering_projection, sources).with_runs(&run_sites),
         &mut panes,
-    )?;
+    )
+    .map_err(merged_copies)?;
     Ok(Frontend {
         expr,
         panes,
@@ -2222,7 +2337,7 @@ fn check_modules(
             {
                 continue;
             } else if let Some(statement) = check.reached_by.get(&span.file) {
-                related.push((*statement, "brought in here"));
+                related.push((*statement, "brought in here".to_string()));
             }
             if seen.insert(key) {
                 reported.push(error);
@@ -2283,12 +2398,12 @@ fn note_parameter_types(
         parameters: &[SmolStr],
         inferred: &mut HashMap<(ModulePath, SmolStr), Type>,
     ) {
-        if let crate::ccl::TypedExprNode::Let {
+        if let TypedExprNode::Let {
             binding,
             bound_expr,
             ..
         } = &expr.node
-            && matches!(bound_expr.node, crate::ccl::TypedExprNode::Abstract)
+            && matches!(bound_expr.node, TypedExprNode::Abstract)
             && binding.name.home().is_none()
             && let Some(parameter) = parameters
                 .iter()
@@ -2314,7 +2429,7 @@ fn annotate_arguments(
     if arguments.is_empty() {
         return;
     }
-    if let crate::ccl::TypedExprNode::Let { binding, .. } = &mut tree.node
+    if let TypedExprNode::Let { binding, .. } = &mut tree.node
         && let Some(argument) = arguments.iter().find(|argument| {
             binding.name.base() == argument.binder && binding.name.home() == argument.home.as_ref()
         })
@@ -2621,9 +2736,11 @@ fn run_passes(
         channelize::run(phase_out)
     })
     .map_err(|Located { error, node_id }| {
+        let span = blame.span(node_id, None);
         vec![CompileError::ChannelizeDefers {
             error,
-            span: blame.span(node_id, None),
+            span,
+            related: blame.run_labels(node_id, span, None),
         }]
     })?;
     settle(&channelized, "post-channelize", Check::Typed)?;
@@ -2677,6 +2794,7 @@ fn run_passes(
             vec![CompileError::Unsupported {
                 message: error.to_string(),
                 span,
+                related: blame.run_labels(*list, span, None),
             }]
         }
     })?;
@@ -3571,6 +3689,7 @@ Error: lowering error
         let error = CompileError::Unsupported {
             message: "first line\n  second line".to_string(),
             span: Span::new(loaded.sources().root(), 0, 1),
+            related: Vec::new(),
         };
         let out = error.render(loaded.sources());
         let (report, detail) = out.split_once("───╯\n").expect("a framed report");

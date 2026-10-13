@@ -160,7 +160,7 @@ pub enum LoweringError {
         message: String,
         /// Other positions the message names, each with its label: the first declaration
         /// of a name declared twice.
-        related: Vec<(Span, &'static str)>,
+        related: Vec<(Span, String)>,
     },
     /// A program the language accepts and the compiler cannot compile yet, refused here
     /// rather than left to fail in a later phase: a compiler gap to fix, not a mistake in
@@ -171,7 +171,7 @@ pub enum LoweringError {
         /// What the compiler does not handle.
         message: String,
         /// Other positions the message names, each with its label, as for `Unsupported`.
-        related: Vec<(Span, &'static str)>,
+        related: Vec<(Span, String)>,
     },
 }
 
@@ -202,11 +202,8 @@ impl LoweringError {
     }
 
     /// This error with `span` labelled `label` beside its primary span.
-    pub fn with_related(mut self, span: Span, label: &'static str) -> Self {
-        match &mut self {
-            LoweringError::Unsupported { related, .. }
-            | LoweringError::Internal { related, .. } => related.push((span, label)),
-        }
+    pub fn with_related(mut self, span: Span, label: impl Into<String>) -> Self {
+        self.related_mut().push((span, label.into()));
         self
     }
 
@@ -227,7 +224,15 @@ impl LoweringError {
     }
 
     /// The other positions the error names, each with its label.
-    pub fn related(&self) -> &[(Span, &'static str)] {
+    pub fn related(&self) -> &Vec<(Span, String)> {
+        match self {
+            LoweringError::Unsupported { related, .. }
+            | LoweringError::Internal { related, .. } => related,
+        }
+    }
+
+    /// [`Self::related`], to extend.
+    pub fn related_mut(&mut self) -> &mut Vec<(Span, String)> {
         match self {
             LoweringError::Unsupported { related, .. }
             | LoweringError::Internal { related, .. } => related,
@@ -538,6 +543,9 @@ pub struct LoweringContext {
     /// The check tree of each module other than the root, which the compile
     /// infers before the linked program ([`modules::ModuleCheck`]).
     pub(crate) module_checks: Vec<modules::ModuleCheck>,
+    /// Where each run of the linked program is brought in
+    /// ([`modules::RunSites`]).
+    pub(crate) run_sites: modules::RunSites,
     /// Every binder the module being lowered writes, with its span, for the rule
     /// that none takes a name that denotes a module ([`module_name_binders`]).
     pub(super) module_binders: Vec<(SmolStr, Span)>,
