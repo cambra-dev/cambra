@@ -486,27 +486,17 @@ fn coalesce_compact_go(
         let mut inner_scope = scope.to_vec();
         inner_scope.extend(binders.iter().cloned());
         let scope: &[crate::ccl::ty::Witness] = &inner_scope;
-        // Materialize the codomain once (covariant), and each candidate
-        // domain (contravariant), deduplicating at the `Type` level — this catches
-        // var-level equalities that the compact-time `CompactType ==` dedup in
-        // `CompactTypeKind::merge` missed (simplify may have merged uids after compaction).
+        // Materialize the codomain once (covariant).
         let c = coalesce_compact_go(&cf.codomain, polarity, scope)?;
         // The domain, materialized contravariantly. At a `Data` position the atoms are
         // *alternatives* — one candidate each (see `denoted_domains`) — and a
         // `DomainConflict` reads them the same way, since naming both is the whole content
         // of its diagnostic. Everywhere else they are a collision, which
-        // `coalesce_compact_go` reports. Deduplicated at the
-        // `Type` level, which catches var-level equalities the compact-time `==` missed.
+        // `coalesce_compact_go` reports.
         let candidates: Vec<Type> = if (cf.kind.is_data() || cf.domains_disagree)
             && let Some(ds) = super::compact::denoted_domains(&cf.domain)
         {
-            let mut out: Vec<Type> = Vec::new();
-            for d in ds {
-                if !out.contains(&d) {
-                    out.push(d);
-                }
-            }
-            out
+            ds
         } else {
             vec![coalesce_compact_go(&cf.domain, !polarity, scope)?]
         };
@@ -1003,7 +993,8 @@ mod tests {
         };
         assert!(matches!(
             coalesce_compact(&graph),
-            Err(CoalesceError::DomainJoinConflict { .. })
+            Err(CoalesceError::DomainJoinConflict { domains })
+                if domains == [Type::UIntRange(2), Type::UIntRange(3)]
         ));
     }
 
