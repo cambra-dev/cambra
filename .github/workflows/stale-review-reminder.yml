@@ -10,6 +10,9 @@ jobs:
   remind:
     runs-on: ubuntu-latest
     permissions:
+      # actions: read lists a required workflow's runs on a PR's branch, which
+      # finds a green head among the PR's last five.
+      actions: read
       # checks and statuses: read let the GraphQL statusCheckRollup return the
       # head commit's check runs and commit statuses, which decide whether a
       # PR's CI has passed.
@@ -23,11 +26,14 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          # Only check out the scripts we need instead of the full repo.
+          # Only check out the scripts and the workflows instead of the full
+          # repo; the workflows say which one reports each required check.
           # sparse-checkout tells git to only materialise matching paths.
           # cone-mode (the fast default) matches whole directories rather
           # than arbitrary gitignore-style patterns.
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            .github/workflows
           sparse-checkout-cone-mode: true
 
       - name: Restore Slack user map

@@ -12,6 +12,7 @@ import urllib.request
 import urllib.parse
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 
@@ -49,8 +50,8 @@ class StaleReview:
 
 @dataclass
 class GeneralReviewPr:
-    """An open, non-draft PR with no review verdict, passing CI, and no individual
-    reviewer requested, which has waited past the threshold."""
+    """An open, non-draft PR with no review verdict, green CI on one of its recent
+    heads, and no individual reviewer requested, which has waited past the threshold."""
 
     pr_number: int
     title: str
@@ -60,6 +61,8 @@ class GeneralReviewPr:
     head: str
     opened_iso: str  # last ready-for-review time, or creation time
     last_action_iso: str  # the PR's updatedAt
+    ci: str  # the head's required checks: "passed", "running", or "failing"
+    last_green_iso: Optional[str]  # when an earlier head went green; None when `ci` is "passed"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -207,6 +210,41 @@ def get_review_request_dates(repo: str, pr_number: int) -> dict[str, str]:
         if login not in dates or ts > dates[login]:
             dates[login] = ts
     return dates
+
+
+def get_default_branch(repo: str) -> str:
+    return gh_lines("api", f"repos/{repo}", "--jq", ".default_branch")[0]
+
+
+def get_branch_rules(repo: str, branch: str) -> list[dict]:
+    """The rules every ruleset applies to `branch`, organization rulesets included."""
+    lines = gh_lines("api", f"repos/{repo}/rules/branches/{branch}", "--paginate", "--jq", ".[]")
+    return [json.loads(line) for line in lines]
+
+
+def load_workflows(repo_root: Path) -> dict[str, dict]:
+    """Every workflow under `repo_root`/.github/workflows, parsed, keyed by repo-relative path.
+
+    `yq` converts each file to JSON, which keeps this module to the standard library;
+    GitHub's Ubuntu runners ship it.
+    """
+    workflows = {}
+    for f in sorted((repo_root / ".github" / "workflows").glob("*.y*ml")):
+        result = subprocess.run(["yq", "-o=json", ".", str(f)], capture_output=True, text=True, check=True)
+        workflows[f.relative_to(repo_root).as_posix()] = json.loads(result.stdout)
+    return workflows
+
+
+def list_workflow_runs(repo: str, workflow_path: str, branch: str) -> list[dict]:
+    """The workflow's 30 newest runs on `branch`, newest first."""
+    lines = gh_lines(
+        "api", "-X", "GET",
+        f"repos/{repo}/actions/workflows/{Path(workflow_path).name}/runs",
+        "-f", f"branch={branch}",
+        "-F", "per_page=30",
+        "--jq", ".workflow_runs[] | {head_sha, status, conclusion, created_at, updated_at}",
+    )
+    return [json.loads(line) for line in lines]
 
 
 def list_collaborators(repo: str) -> list[str]:
@@ -404,39 +442,129 @@ def review_verdict(pr: dict) -> Optional[str]:
 
 
 _PASSING_CHECK_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+_PENDING_STATUS_STATES = {"PENDING", "EXPECTED"}
 
 
-def ci_passed(checks: list[dict]) -> bool:
-    """Whether the latest run of every check on the head commit passed.
+def ci_state(checks: list[dict], required: list[str]) -> str:
+    """The required checks' state on the head commit: "passed", "running", or "failing".
 
     A re-run leaves the earlier run's result in the rollup beside the new one, so
     each check name is judged by its most recent run rather than by the rollup's
-    aggregate state. Review approval is not a check context and plays no part.
-    A commit with no checks has not passed CI.
+    aggregate state. Checks outside `required` play no part, since merging ignores
+    them. A required check that has not reported yet is running.
     """
-    latest: dict[tuple[str, str], tuple[str, bool]] = {}
+    latest: dict[str, tuple[str, str]] = {}
     for c in checks:
         if c["__typename"] == "CheckRun":
-            key = ("check", c["name"])
-            started = c.get("startedAt") or ""
-            ok = c["status"] == "COMPLETED" and c["conclusion"] in _PASSING_CHECK_CONCLUSIONS
+            name, started = c["name"], c.get("startedAt") or ""
+            if c["status"] != "COMPLETED":
+                state = "running"
+            else:
+                state = "passed" if c["conclusion"] in _PASSING_CHECK_CONCLUSIONS else "failing"
         else:
-            key = ("status", c["context"])
-            started = c.get("createdAt") or ""
-            ok = c["state"] == "SUCCESS"
-        if key not in latest or started >= latest[key][0]:
-            latest[key] = (started, ok)
-    return bool(latest) and all(ok for _, ok in latest.values())
+            name, started = c["context"], c.get("createdAt") or ""
+            if c["state"] in _PENDING_STATUS_STATES:
+                state = "running"
+            else:
+                state = "passed" if c["state"] == "SUCCESS" else "failing"
+        if name not in latest or started >= latest[name][0]:
+            latest[name] = (started, state)
+    states = {latest[n][1] if n in latest else "running" for n in required}
+    return next(s for s in ("failing", "running", "passed") if s in states)
+
+
+# GitHub Actions' app ID, which a ruleset's required check names as its source.
+_ACTIONS_APP_ID = 15368
+
+
+def required_check_names(rules: list[dict]) -> list[str]:
+    """The check names `rules` (from `get_branch_rules`) require before a merge.
+
+    Raises on a requirement the reminder cannot judge: a check another app must
+    report, and a `workflows` rule, which requires a workflow file rather than a
+    named check. Raises when nothing is required, since every PR would then pass.
+    """
+    names = set()
+    for rule in rules:
+        if rule["type"] == "workflows":
+            raise ValueError("a `workflows` rule requires workflow files, which name no check")
+        if rule["type"] != "required_status_checks":
+            continue
+        for check in rule["parameters"]["required_status_checks"]:
+            app = check.get("integration_id")
+            if app is not None and app != _ACTIONS_APP_ID:
+                raise ValueError(f"required check {check['context']!r} is reported by app {app}, not GitHub Actions")
+            names.add(check["context"])
+    if not names:
+        raise ValueError("the rules require no status checks")
+    return sorted(names)
+
+
+def required_check_workflows(required: list[str], workflows: dict[str, dict]) -> dict[str, str]:
+    """Map each required check name to the path of the workflow whose job reports it.
+
+    `workflows` is `load_workflows`'s result. A job reports a check named by its
+    `name:`, or by its key under `jobs:` when it has none. A matrix job, a job
+    calling a reusable workflow, and a job named by an expression report names
+    decided at run time, so they report nothing here. Raises on a required name
+    that no workflow reports, or that two workflows report.
+    """
+    reporters: dict[str, set[str]] = {}
+    for path, workflow in workflows.items():
+        for key, job in (workflow.get("jobs") or {}).items():
+            name = str(job.get("name", key))
+            if "matrix" in (job.get("strategy") or {}) or "uses" in job or "${{" in name:
+                continue
+            reporters.setdefault(name, set()).add(path)
+    mapping = {}
+    for name in required:
+        paths = sorted(reporters.get(name, ()))
+        if len(paths) != 1:
+            found = f"reported by {paths}" if paths else "reported by no job with a fixed name"
+            raise ValueError(f"required check {name!r} is {found}")
+        mapping[name] = paths[0]
+    return mapping
+
+
+def last_green(runs_by_workflow: dict[str, list[dict]], heads: int = 5) -> Optional[str]:
+    """When the newest green head among a branch's last `heads` heads went green, or None.
+
+    `runs_by_workflow` holds each required workflow's runs on the branch, as
+    `list_workflow_runs` returns them. A head is a commit any of them ran on, and
+    the last `heads` are the distinct commits with the newest runs. A head is green
+    when every required workflow has a successful run on it, and went green when
+    the last of those runs finished.
+    """
+    newest_run: dict[str, str] = {}
+    for runs in runs_by_workflow.values():
+        for r in runs:
+            newest_run[r["head_sha"]] = max(newest_run.get(r["head_sha"], ""), r["created_at"])
+    for sha in sorted(newest_run, key=newest_run.__getitem__, reverse=True)[:heads]:
+        finished = []
+        for runs in runs_by_workflow.values():
+            green = [r["updated_at"] for r in runs if r["head_sha"] == sha and r["conclusion"] == "success"]
+            if not green:
+                break
+            finished.append(min(green))
+        else:
+            return max(finished)
+    return None
 
 
 def find_general_review_prs(
     prs: list[dict],
+    required: list[str],
+    get_last_green: Callable[[dict], Optional[str]],
     now: Optional[datetime] = None,
     threshold: timedelta = timedelta(hours=24),
 ) -> list[list[GeneralReviewPr]]:
     """Find PRs waiting on general review: non-draft, neither approved nor with
-    changes requested, passing CI, no individual reviewer requested, and open at
-    least `threshold`.
+    changes requested, CI green on a recent head, no individual reviewer requested,
+    and open at least `threshold`.
+
+    CI is green when the head's `required` checks passed. Otherwise
+    `get_last_green` takes the PR and returns when an earlier head went green, or
+    None to exclude the PR; it runs only for a PR every other condition admits.
 
     A PR with an individual reviewer requested belongs to that reviewer's
     reminder (`find_stale_reviews`) and is excluded here.
@@ -474,7 +602,9 @@ def find_general_review_prs(
         opened_iso = pr.get("readyForReviewAt") or pr["createdAt"]
         if now - parse_iso(opened_iso) < threshold:
             continue
-        if not ci_passed(pr["checks"]):
+        ci = ci_state(pr["checks"], required)
+        green_iso = None if ci == "passed" else get_last_green(pr)
+        if ci != "passed" and green_iso is None:
             continue
         chain = below(pr)
         root = chain[-1]["number"] if chain else pr["number"]
@@ -488,6 +618,8 @@ def find_general_review_prs(
             head=pr["headRefName"],
             opened_iso=opened_iso,
             last_action_iso=pr["updatedAt"],
+            ci=ci,
+            last_green_iso=green_iso,
         ))
 
     result = [sorted(g, key=lambda p: order[p.pr_number]) for g in groups.values()]
@@ -544,12 +676,11 @@ def format_pr_line(url: str, pr_number: int, title: str, author: str, times: str
 
 
 def _general_review_line(p: GeneralReviewPr, now: datetime, marker: str = "\u2022") -> str:
-    return format_pr_line(
-        p.url, p.pr_number, p.title, p.author,
-        f"open {format_duration(now - parse_iso(p.opened_iso))}, "
-        f"last action {format_duration(now - parse_iso(p.last_action_iso))} ago",
-        marker,
-    )
+    times = (f"open {format_duration(now - parse_iso(p.opened_iso))}, "
+             f"last action {format_duration(now - parse_iso(p.last_action_iso))} ago")
+    if p.last_green_iso is not None:
+        times += f", CI {p.ci}, last green {format_duration(now - parse_iso(p.last_green_iso))} ago"
+    return format_pr_line(p.url, p.pr_number, p.title, p.author, times, marker)
 
 
 # Open-time buckets, oldest first: (header, minimum age of the group's oldest PR).

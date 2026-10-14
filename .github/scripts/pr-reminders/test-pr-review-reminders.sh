@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Check dependencies
 missing=()
-for cmd in gh python3 git; do
+for cmd in gh python3 git yq; do
   command -v "${cmd}" &>/dev/null || missing+=("${cmd}")
 done
 if ((${#missing[@]} > 0)); then
@@ -64,7 +64,7 @@ usermap)
   ;;
 
 find)
-  echo "==> Finding PRs waiting on general review (open >24h, passing CI, no reviewer) and review requests (pending >10h)..."
+  echo "==> Finding PRs waiting on general review (open >24h, CI green on one of the last 5 heads, no reviewer) and review requests (pending >10h)..."
   python3 "${SCRIPT_DIR}/find_stale_prs.py"
   ;;
 
