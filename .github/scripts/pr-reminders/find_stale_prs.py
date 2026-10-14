@@ -8,7 +8,9 @@ checkout that report them; see prreminder.required_check_workflows.
 
 Outputs one JSON object to stdout:
   "now":       the reference time, ISO 8601
-  "general_review": groups of GeneralReviewPr (see prreminder.find_general_review_prs), each a list
+  "general_review": groups of GeneralReviewPr (see prreminder.find_general_review_prs), each a list;
+                    empty when "ci_error" is set
+  "ci_error":  why the required checks could not be judged, or null
   "reviews":   StaleReview objects, sorted by (reviewer, pr_number)
 
 Required env: GH_TOKEN, GH_REPOSITORY
@@ -56,23 +58,33 @@ def main() -> None:
     else:
         now = datetime.now(timezone.utc)
 
-    required = required_check_names(get_branch_rules(repo, get_default_branch(repo)))
-    workflows = sorted(set(required_check_workflows(required, load_workflows(REPO_ROOT)).values()))
-
-    def get_last_green(pr: dict) -> Optional[str]:
-        return last_green({w: list_workflow_runs(repo, w, pr["headRefName"]) for w in workflows})
-
     open_prs = list_open_prs(repo)
-    general_review = find_general_review_prs(open_prs, required, get_last_green, now=now)
 
     def get_dates(pr_number: int) -> dict[str, str]:
         return get_review_request_dates(repo, pr_number)
 
     reviews = find_stale_reviews(open_prs, get_dates, now=now)
 
+    # Reviewer reminders do not depend on CI, so failing to decide what CI
+    # requires skips only the general-review section.
+    general_review: list = []
+    ci_error: Optional[str] = None
+    try:
+        required = required_check_names(get_branch_rules(repo, get_default_branch(repo)))
+        workflows = sorted(set(required_check_workflows(required, load_workflows(REPO_ROOT)).values()))
+    except Exception as e:
+        ci_error = str(e)
+        print(f"::error::cannot judge required CI: {ci_error}", file=sys.stderr)
+    else:
+        def get_last_green(pr: dict) -> Optional[str]:
+            return last_green({w: list_workflow_runs(repo, w, pr["headRefName"]) for w in workflows})
+
+        general_review = find_general_review_prs(open_prs, required, get_last_green, now=now)
+
     json.dump({
         "now": now.isoformat(),
         "general_review": [[p.to_dict() for p in group] for group in general_review],
+        "ci_error": ci_error,
         "reviews": [r.to_dict() for r in reviews],
     }, sys.stdout)
     print()

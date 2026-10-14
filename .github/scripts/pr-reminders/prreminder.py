@@ -427,6 +427,8 @@ def review_verdict(pr: dict) -> Optional[str]:
 
 _PASSING_CHECK_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 _PENDING_STATUS_STATES = {"PENDING", "EXPECTED"}
+# Sorts after every ISO 8601 timestamp.
+_NOT_STARTED = "~"
 
 
 def ci_state(checks: list[dict], required: list[str]) -> str:
@@ -435,12 +437,13 @@ def ci_state(checks: list[dict], required: list[str]) -> str:
     A re-run leaves the earlier run's result in the rollup beside the new one, so
     each check name is judged by its most recent run rather than by the rollup's
     aggregate state. Checks outside `required` play no part, since merging ignores
-    them. A required check that has not reported yet is running.
+    them. A required check that has not reported yet is running. A check run with
+    no start time has not started, so it is newer than every run that has.
     """
     latest: dict[str, tuple[str, str]] = {}
     for c in checks:
         if c["__typename"] == "CheckRun":
-            name, started = c["name"], c.get("startedAt") or ""
+            name, started = c["name"], c.get("startedAt") or _NOT_STARTED
             if c["status"] != "COMPLETED":
                 state = "running"
             else:
@@ -497,7 +500,9 @@ def required_check_workflows(required: list[str], workflows: dict[str, dict]) ->
     for path, workflow in workflows.items():
         for key, job in (workflow.get("jobs") or {}).items():
             name = str(job.get("name", key))
-            if "matrix" in (job.get("strategy") or {}) or "uses" in job or "${{" in name:
+            # A `strategy:` written as an expression may evaluate to a matrix.
+            strategy = job.get("strategy") or {}
+            if not isinstance(strategy, dict) or "matrix" in strategy or "uses" in job or "${{" in name:
                 continue
             reporters.setdefault(name, set()).add(path)
     mapping = {}
@@ -518,6 +523,13 @@ def last_green(runs_by_workflow: dict[str, list[dict]], heads: int = 5) -> Optio
     the last `heads` are the distinct commits with the newest runs. A head is green
     when every required workflow has a successful run on it, and went green when
     the last of those runs finished.
+
+    This judges whole workflow runs, where `ci_state` judges the required checks
+    alone: a non-required job failing in a required workflow leaves the current
+    head "passed" but keeps an earlier head from counting as green. The tradeoff
+    is accepted because a workflow holds no flaky or known-failing jobs, and
+    `ci.yml`'s required `check` job depends on every other job, so the two
+    judgments agree on this repo's workflows.
     """
     newest_run: dict[str, str] = {}
     for runs in runs_by_workflow.values():
@@ -714,15 +726,21 @@ def build_thread_body(
     usermap: dict[str, str],
     general_review: Optional[list[list[GeneralReviewPr]]] = None,
     now: Optional[datetime] = None,
+    ci_error: Optional[str] = None,
 ) -> str:
-    """Build the threaded reply body: the "Waiting on General Review" section, then reviewer reminders."""
+    """Build the threaded reply body: the "Waiting on General Review" section, then reviewer reminders.
+
+    `ci_error` replaces the section with a notice that it was skipped and why.
+    """
     if now is None:
         now = datetime.now(timezone.utc)
     sections: list[str] = []
-    if general_review:
+    if ci_error is not None:
+        sections.append(f"*Waiting on General Review* skipped :warning: cannot judge required CI: {slack_escape(ci_error)}")
+    elif general_review:
         sections.append(build_general_review_section(general_review, now))
-        if reviews:
-            sections.append("")
+    if sections and reviews:
+        sections.append("")
     current_reviewer = None
 
     for r in reviews:

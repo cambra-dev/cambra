@@ -183,6 +183,7 @@ WORKFLOWS = {
         "lint": {"runs-on": "ubuntu-latest"},
         "check": {"needs": ["lint"], "runs-on": "ubuntu-latest"},
         "test": {"strategy": {"matrix": {"os": ["a", "b"]}}},
+        "computed": {"strategy": "${{ fromJSON(inputs.strategy) }}"},
     }},
     ".github/workflows/integration.yml": {"jobs": {
         "run": {"name": "IntegrationTests"},
@@ -294,6 +295,8 @@ def main() -> None:
         ([check_run("check", "FAILURE", 5), check_run("check", "SUCCESS", 1)], ["check"], "passed"),
         ([check_run("check", "SUCCESS", 5), check_run("check", "FAILURE", 1)], ["check"], "failing"),
         ([check_run("check", None, 1, status="QUEUED")], ["check"], "running"),
+        ([check_run("check", "SUCCESS", 5), {**check_run("check", None, 0, status="QUEUED"), "startedAt": None}],
+         ["check"], "running"),
         ([check_run("test", "SUCCESS", 1)], ["check"], "running"),
         ([pending_status("ext")], ["ext"], "running"),
         ([check_run("check", "FAILURE", 1), pending_status("ext")], ["check", "ext"], "failing"),
@@ -301,7 +304,8 @@ def main() -> None:
     ci_got = [ci_state(checks, required) for checks, required, _ in ci_cases]
     check(
         ci_got == [want for *_, want in ci_cases],
-        "ci_state judges each required check by its latest run, ignores the rest, and reads a missing one as running",
+        "ci_state judges each required check by its latest run, unstarted ones newest, ignores the rest, "
+        "and reads a missing one as running",
         f"ci_state: expected {[w for *_, w in ci_cases]}, got {ci_got}",
     )
     stack_top = groups[1][1]
@@ -379,8 +383,9 @@ def main() -> None:
     )
     check(
         all(raises(lambda n=n: required_check_workflows([n], WORKFLOWS))
-            for n in ("lint", "test", "shared", "missing")),
-        "required_check_workflows raises on a check two workflows report, a matrix job, a reusable call, and no job",
+            for n in ("lint", "test", "computed", "shared", "missing")),
+        "required_check_workflows raises on a check two workflows report, a matrix job, an expression strategy, "
+        "a reusable call, and no job",
         "required_check_workflows mapped a check it cannot place",
     )
     repo_root = Path(__file__).resolve().parents[3]
@@ -532,6 +537,16 @@ def main() -> None:
         only_prs == section,
         "build_thread_body with no stale reviews is the Waiting on General Review section alone",
         f"build_thread_body without reviews: {only_prs[:200]!r}",
+    )
+
+    skipped = build_thread_body(stale, usermap, general_review=groups, now=REFERENCE_TIME,
+                                ci_error="required check 'x' is reported by app 9, not GitHub Actions")
+    check(
+        skipped.startswith("*Waiting on General Review* skipped :warning: cannot judge required CI: "
+                           "required check 'x' is reported by app 9")
+        and "#202" not in skipped and "*<@U12345>*" in skipped,
+        "a CI error replaces Waiting on General Review with a notice and keeps reviewer reminders",
+        f"build_thread_body with ci_error: {skipped[:200]!r}",
     )
 
     # --- Summary ---
