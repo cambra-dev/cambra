@@ -1940,6 +1940,18 @@ fn convert_impl_inner(
             )))
         }
 
+        // `𝐹 ▷ strength_over`: each input beside each value of the collection `𝐹` gives for
+        // it, under that value's key. The input is fanned to the row side and to `𝐹`, and both
+        // feed the product directly: no pair is built between them to be taken apart again.
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::StrengthOver) =>
+        {
+            let input = expect_input(input, "strength_over")?;
+            strength_over_at(input, ctx, |slot, ctx| {
+                convert_impl(argument, Some(slot), ctx)
+            })
+        }
+
         // zip(f, g, ...): fan-out — apply each morphism to the same input.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Zip) =>
@@ -2530,22 +2542,24 @@ fn convert_impl_inner(
                     operands.len()
                 )));
             };
-            // `⟨id, const(𝐾)⟩ ≫ strength`, the chain planning writes where the site's
-            // type is not dependent: each row beside the one collection every row reads.
+            // `const(𝐾) ▷ strength_over`, the chain planning writes where the site's type is
+            // not dependent: each row beside the one collection every row reads.
             let keys = convert_impl(source, None, ctx)?;
-            let with_keys = Box::new(MapResultToConst::new_at(
-                outer,
-                keys,
-                MapResultToConstMode::ZipRight,
-                ctx.level(),
-            ));
-            let pairs = strength_at(with_keys, ctx.level())?;
-            // The morphism runs once per pair, over the iteration `strength` appends.
+            let level = ctx.level();
+            let pairs = strength_over_at(outer, ctx, |slot, _| {
+                Ok(Box::new(MapResultToConst::new_at(
+                    slot,
+                    keys,
+                    MapResultToConstMode::Replace,
+                    level,
+                )))
+            })?;
+            // The morphism runs once per pair, over the iteration `strength_over` appends.
             convert_lifted(morphism, Some(pairs), ctx)
         }
 
         // A curried morphism composed onto a collection is a correlated inner comprehension,
-        // which planning rewrites through `strength` (`src/ccl/planning/correlated.rs`). One
+        // which planning rewrites through `strength_over` (`src/ccl/planning/correlated.rs`). One
         // reaching here is a site planning did not rewrite.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Curry)
@@ -2553,7 +2567,7 @@ fn convert_impl_inner(
                 && as_builtin(argument).is_none() =>
         {
             Err(ConversionError::Unsupported(format!(
-                "a curried morphism planning did not rewrite through `strength`: `{}`",
+                "a curried morphism planning did not rewrite through `strength_over`: `{}`",
                 symbolic(expr)
             )))
         }
@@ -2658,11 +2672,11 @@ fn convert_impl_inner(
             let input = expect_input(input, &format!("Builtin({})", b.name()))?;
             match b {
                 Builtin::Id => Ok(input),
-                // `strength`: each enclosing value paired with each value of its own
-                // collection, under that value's key. Its input is the pair `⟨id, 𝑆⟩`
-                // made, one per row of the level it is converted at, so the two halves are
-                // that pair's fields.
-                Builtin::Strength => strength_at(input, ctx.level()),
+                // `strength_over` takes its function as an argument, converted where it is
+                // applied; a bare one has none to pair with.
+                Builtin::StrengthOver => Err(ConversionError::Unsupported(
+                    "`strength_over` takes the function to a collection it pairs with".into(),
+                )),
                 // Entering a sum is the identity at runtime. A sum's value is a domain paired
                 // with a collection over it, and a collection carries its own domain, so the
                 // witness is recoverable from the value and nothing represents it separately
@@ -5186,17 +5200,24 @@ fn proj_field(
     )))
 }
 
-/// `strength` over `input`, a pair `(𝑥, 𝐶)` at each row of `level`: each `𝑥` beside each value
-/// of its row's collection `𝐶`, under that value's key.
-fn strength_at(
+/// `strength_over` over `input`, one row per position of the level it is converted at: each row
+/// beside each value of the collection `collections` makes from it, under that value's key.
+///
+/// The row side is `input` itself. `collections` reads it too, so it is fanned to both and the
+/// product takes the two sides directly.
+fn strength_over_at(
     input: Box<dyn TileOperator>,
-    level: CurryLevel,
+    ctx: &mut OpConversionContext,
+    collections: impl FnOnce(
+        Box<dyn TileOperator>,
+        &mut OpConversionContext,
+    ) -> Result<Box<dyn TileOperator>, ConversionError>,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let pair = Rc::new(FanOut::new(Box::new(Memo::new(input))));
-    let rows = proj_field(pair.slot(), 0, level)?;
-    let collections = proj_field(pair.slot(), 1, level)?;
+    let level = ctx.level();
+    let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+    let collections = collections(fan_out.slot(), ctx)?;
     Ok(Box::new(Product::per_row_values_at(
-        rows,
+        fan_out.slot(),
         collections,
         level,
     )))

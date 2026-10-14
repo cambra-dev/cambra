@@ -823,7 +823,7 @@ while their arms carry one level and two.
 | a root: a conversion with no input | a stream of its own: level 1 when its type is a collection, 0 when a scalar |
 | `map(𝑓)` | 𝑓 one level in |
 | an application `𝑓(𝑎)` | 𝑎 as a root; 𝑓 at 𝑎's level, since it runs over 𝑎's iteration |
-| `curry_over(𝐾, 𝑔)` | 𝑔 one level in, over the iteration `strength` appends; 𝐾 is a root |
+| `curry_over(𝐾, 𝑔)` | 𝑔 one level in, over the iteration `strength_over` appends; 𝐾 is a root |
 | a top-level `Transact` | its body at level 1, over the store's own domain |
 | a nested `Transact` | its source and its seeds at the `Transact`'s level, a seed being one value per enclosing position; its body one level in |
 | every other node, composition included | the level it is converted at |
@@ -969,24 +969,23 @@ carries the correlation: an inner comprehension whose body and filter both read 
 never forms one, leaving a `const` that is computed once and broadcast.
 
 Compiling it is the pairing. The inner source does not mention the outer binder, so every row
-iterates the same collection 𝐾, and planning writes the site as
-`⟨id, const(𝐾)⟩ ≫ strength ≫ map(𝑔)` (`src/ccl/planning/correlated.rs`). `const` puts 𝐾
-beside each row (`MapResultToConst`), and `strength` gives each row a group holding 𝐾's values,
-one level deeper than the outer collection. `𝑔` then compiles over the pairs like any other
-morphism over a stream, its result inheriting the grouping. While 𝐾 is still arriving, each row
-holds what has arrived and is left open: no row is complete until 𝐾 is, since every row can gain
-its next element. Every row reads the whole of 𝐾, so `MapResultToConst` releases it only when
-everything is.
+iterates the same collection 𝐾, and planning writes the site as `const(𝐾) ▷ strength_over ≫ map(𝑔)`
+(`src/ccl/planning/correlated.rs`). `const` puts 𝐾 beside each row (`MapResultToConst`), and
+`strength_over` gives each row a group holding 𝐾's values, one level deeper than the outer
+collection. `𝑔` then compiles over the pairs like any other morphism over a stream, its result
+inheriting the grouping. While 𝐾 is still arriving, each row holds what has arrived and is left
+open: no row is complete until 𝐾 is, since every row can gain its next element. Every row reads the
+whole of 𝐾, so `MapResultToConst` releases it only when everything is.
 
-`strength` compiles to `Product::per_row_values_at`, which pairs each row with the values of its
-own collection and keeps that collection's keys as the paired level; `Product::per_row_at` pairs a
-row with the keys instead. The operands are the two fields of the pair `strength` takes, the row
-and its collection, and a collection whose values are collections pairs with whole. `simplify`
-emits the same `strength` for a generator over a sum whose element function reads the enclosing
-scope, where each row's collection is its own (`src/ccl/design/optimization.md`, "A generator over
-a sum composes with its source"). A per-row collection that arrives as a value rather than being
-selected by the binder has the same output shape
-([Where a collection is materialized](#where-a-collection-is-materialized)).
+`𝐹 ▷ strength_over` compiles to `Product::per_row_values_at`, which pairs each row with the values
+of its own collection and keeps that collection's keys as the paired level; `Product::per_row_at`
+pairs a row with the keys instead. The input is fanned to the row side and to `𝐹`, and the product
+takes the two directly, so no pair is built between them. A collection whose values are collections
+pairs with whole. `simplify` emits the same `strength_over` for a generator over a sum whose element
+function reads the enclosing scope, where each row's collection is its own
+(`src/ccl/design/optimization.md`, "A generator over a sum composes with its source"). A per-row
+collection that arrives as a value rather than being selected by the binder has the same output
+shape ([Where a collection is materialized](#where-a-collection-is-materialized)).
 
 Nothing downstream of the pairing is required. `MapAggregate` consumes the grouping where the
 comprehension is aggregated, and a comprehension that yields a collection per row leaves the

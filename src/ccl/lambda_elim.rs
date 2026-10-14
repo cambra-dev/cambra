@@ -304,6 +304,48 @@ pub(crate) fn zip_pair(f: Expr, g: Expr, fun_kind: &FunKind) -> Expr {
     Expr::apply(inner_tuple, zip_var).with_ty(result_ty)
 }
 
+/// Build `f ▷ strength_over`: each input beside each value of the collection `f` gives for it,
+/// under that value's key ([`Builtin::StrengthOver`]).
+///
+/// Represented as `Apply { argument: f, function: Builtin(StrengthOver) }`. The result takes
+/// `f`'s binder and the caller's `fun_kind`, as [`zip_pair`] does, and holds `f`'s collection
+/// over the same keys with `(𝑥, 𝑣)` for each value `𝑣`. Where `f` is not a function to a
+/// collection the type is [`Type::Hole`].
+pub(crate) fn strength_over(f: Expr, fun_kind: &FunKind) -> Expr {
+    let result_ty = strength_over_ty(&f, fun_kind);
+    let strength_ty = Type::compute_fun_or_hole(&f.ty, &result_ty);
+    let strength = Expr::builtin(Builtin::StrengthOver).with_ty(strength_ty);
+    Expr::apply(f, strength).with_ty(result_ty)
+}
+
+/// The type of [`strength_over`]: `f`'s function type with the collection its codomain names
+/// replaced by the same collection holding `(𝐴, 𝑣)` for each value `𝑣`.
+fn strength_over_ty(f: &Expr, fun_kind: &FunKind) -> Type {
+    let Type::Fun {
+        name,
+        domain,
+        codomain,
+        ..
+    } = f.ty.peel_refinements()
+    else {
+        return Type::Hole;
+    };
+    let (Some(keys), Some(values)) = (codomain.domain(), codomain.codomain()) else {
+        return Type::Hole;
+    };
+    let strengthened = Type::fun_like(
+        codomain,
+        keys.clone(),
+        Type::Tuple(vec![(**domain).clone(), values.clone()]),
+    );
+    Type::Fun {
+        name: name.clone(),
+        fun_kind: fun_kind.clone(),
+        domain: domain.clone(),
+        codomain: Box::new(strengthened),
+    }
+}
+
 /// Build `curry(f)`: `f ▷ curry` = `Apply { argument: f, function: Builtin(Curry) }`.
 ///
 /// Annotates the curry built-in with its type when `f` has a concrete function type.

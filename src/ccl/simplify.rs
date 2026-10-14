@@ -51,7 +51,7 @@
 use crate::ccl::ccl_utils::{
     PredMemo, apply_primitive, count_free, is_builtin, walk_refined_predicates_mut,
 };
-use crate::ccl::lambda_elim::{id, zip_pair};
+use crate::ccl::lambda_elim::{id, strength_over, zip_pair};
 use crate::ccl::names::SyntheticKind;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
@@ -770,10 +770,10 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
 }
 
 /// Composition with a curried function of the enclosing value, through **strength**:
-/// `⟨𝑆, curry(𝑔)⟩ ≫ compose  ⟹  ⟨id, 𝑆⟩ ≫ strength ≫ map(𝑔)`.
+/// `⟨𝑆, curry(𝑔)⟩ ≫ compose  ⟹  𝑆 ▷ strength_over ≫ map(𝑔)`.
 ///
 /// At each input `𝑥` the left side is `𝑆(𝑥) ≫ (𝑣 ↦ 𝑔(𝑥, 𝑣))`. The right side pairs `𝑥` with
-/// each value of `𝑆(𝑥)` under that value's own key ([`Builtin::Strength`]) and maps `𝑔` over
+/// each value of `𝑆(𝑥)` under that value's own key ([`Builtin::StrengthOver`]) and maps `𝑔` over
 /// the pairs, which is the same collection. `lambda_elim` leaves the left side for a generator
 /// over a sum whose element function reads the enclosing scope (`compose_sum_generators`), the
 /// counterpart of [`try_compose_constant_function`]'s shape where the function reads nothing.
@@ -816,13 +816,9 @@ fn try_compose_with_strength(expr: &mut Expr) -> bool {
             let paired = Type::Tuple(vec![enclosing.clone(), values.clone()]);
             let strengthened = Type::fun_like(&collection, keys.clone(), paired);
             let mapped = Type::fun_like(&collection, keys.clone(), result.clone());
-            let row_and_collection = Type::Tuple(vec![enclosing.clone(), collection]);
-            let id = id().with_ty(Type::fun(enclosing.clone(), enclosing));
-            let with_row = zip_pair(id, source, &fun_kind);
-            let strength = Expr::builtin(Builtin::Strength)
-                .with_ty(Type::fun(row_and_collection, strengthened.clone()));
+            let strength = strength_over(source, &fun_kind);
             let map = apply_primitive(g, Builtin::Map, Type::fun(strengthened, mapped));
-            vec![with_row, strength, map]
+            vec![strength, map]
         },
     )
 }
@@ -862,7 +858,7 @@ fn narrows_domain_irrecoverably(expr: &Expr) -> bool {
 /// An allow-list: a form it does not name is a form the caller leaves alone. It recurses
 /// through compose elements and `zip` arms, because a `zip` inner-joins its arms on their keys
 /// (`src/interpreter/design-operators.md`, "Tile Operators", on a scrutinee `Case`'s outer-binder
-/// arms): one arm that narrows narrows the pair, as `⟨id, s ≫ variant_project(c)⟩ ▷ zip` holds
+/// arms): one arm that narrows narrows the pair, as `⟨id, s ≫ variant_project(c)⟩` holds
 /// only the positions tagged `c`. The literals, projections and lookups it accepts are
 /// functions of the key that hold at every key the collection has;
 /// [`builtin_preserves_domain`] decides every builtin, with no wildcard, so a new builtin needs
@@ -913,7 +909,7 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         Builtin::EmptyMap
         | Builtin::Curry
         | Builtin::CurryOver
-        | Builtin::Strength
+        | Builtin::StrengthOver
         | Builtin::MapDomain
         | Builtin::Compose
         | Builtin::Converse
@@ -2157,7 +2153,7 @@ mod tests {
     }
 
     /// `zip` inner-joins its arms on their keys, so an arm that narrows narrows the pair:
-    /// `iterate ≫ ⟨id, variant_project(c)⟩ ▷ zip` holds only the positions tagged `c`, and
+    /// `iterate ≫ ⟨id, variant_project(c)⟩` holds only the positions tagged `c`, and
     /// `map_domain` of it is not the iteration. `preserves_domain` looks through the zip.
     #[test]
     fn map_domain_keeps_a_chain_whose_zip_arm_narrows() {

@@ -292,7 +292,7 @@ fn a_comprehension_over_a_witness_domained_collection_composes_with_it() {
 
 /// A correlated comprehension over a witness-domained collection: the inner comprehension
 /// iterates the outer row and reads it again, so each row's collection is composed with a
-/// function of that row, through `strength` (`src/ccl/design/optimization.md`, "A generator
+/// function of that row, through `strength_over` (`src/ccl/design/optimization.md`, "A generator
 /// over a sum composes with its source").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
