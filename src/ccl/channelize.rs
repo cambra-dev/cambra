@@ -1257,14 +1257,8 @@ fn refine_source_domain(source: &mut Expr, refinement: Refinement) {
 /// Safe to do after the main channelize walk: every remaining `e` is pure
 /// (its `Feed`/`Define` sites have been extracted, leaving `Unit`
 /// residue), so dropping it is value-preserving.
-fn drop_expr_stmts(expr: Expr) -> Expr {
-    let TypedExpr {
-        node,
-        ty,
-        user_annotation,
-        node_id,
-    } = expr;
-    let new_node = match node {
+fn drop_expr_stmts(mut expr: Expr) -> Expr {
+    match expr.node {
         TypedExprNode::Comprehension { .. } => {
             unreachable!(
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
@@ -1275,160 +1269,59 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         TypedExprNode::MutDecl { .. } => {
             unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
         }
-        // Defensive: a `For`/`MutWrite` marker is load-bearing structure, not
-        // extracted-feed residue, so keep the `ExprStmt` rather than dropping
-        // its effect. `mut_elim::run` (before channelize) eliminates every
-        // marker, so this arm is unreachable in the production pipeline;
-        // keeping it means a stray marker is passed through to the
-        // strict `typecheck` backstop instead of being silently discarded.
-        TypedExprNode::ExprStmt { expr: effect, body } if contains_phase_marker(&effect) => {
-            TypedExprNode::ExprStmt {
-                expr: Box::new(drop_expr_stmts(*effect)),
-                body: Box::new(drop_expr_stmts(*body)),
-            }
-        }
-        TypedExprNode::ExprStmt { body, .. } => return drop_expr_stmts(*body),
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => TypedExprNode::Let {
-            binding,
-            bound_expr: Box::new(drop_expr_stmts(*bound_expr)),
-            body: Box::new(drop_expr_stmts(*body)),
-        },
-        TypedExprNode::Apply { function, argument } => TypedExprNode::Apply {
-            function: Box::new(drop_expr_stmts(*function)),
-            argument: Box::new(drop_expr_stmts(*argument)),
-        },
-        TypedExprNode::Cast { value, target } => TypedExprNode::Cast {
-            value: Box::new(drop_expr_stmts(*value)),
-            target,
-        },
-        TypedExprNode::Realize(value) => TypedExprNode::Realize(Box::new(drop_expr_stmts(*value))),
-        TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
-            left: Box::new(drop_expr_stmts(*left)),
-            op,
-            right: Box::new(drop_expr_stmts(*right)),
-        },
-        TypedExprNode::UnaryOp(op, inner) => {
-            TypedExprNode::UnaryOp(op, Box::new(drop_expr_stmts(*inner)))
-        }
-        TypedExprNode::Lambda { param, body } => TypedExprNode::Lambda {
-            param,
-            body: Box::new(drop_expr_stmts(*body)),
-        },
-        TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
-            input: Box::new(drop_expr_stmts(*input)),
-            kind,
-        },
-        TypedExprNode::Tuple(elts) => {
-            TypedExprNode::Tuple(elts.into_iter().map(drop_expr_stmts).collect())
-        }
-        TypedExprNode::List(elts) => {
-            TypedExprNode::List(elts.into_iter().map(drop_expr_stmts).collect())
-        }
-        TypedExprNode::Compose(elts) => {
-            TypedExprNode::Compose(elts.into_iter().map(drop_expr_stmts).collect())
-        }
-        TypedExprNode::Copair(elts) => {
-            TypedExprNode::Copair(elts.into_iter().map(drop_expr_stmts).collect())
-        }
-        // Kept distinct from the copairing above: this arm *rebuilds* the node, so
-        // sharing it would silently turn a disjoint join into a coproduct.
-        TypedExprNode::DisjointJoin(elts) => {
-            TypedExprNode::DisjointJoin(elts.into_iter().map(drop_expr_stmts).collect())
-        }
-        TypedExprNode::Record(fields) => TypedExprNode::Record(
-            fields
-                .into_iter()
-                .map(|(n, e)| (n, drop_expr_stmts(e)))
-                .collect(),
-        ),
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => TypedExprNode::Case {
-            scrutinee: scrutinee.map(|s| Box::new(drop_expr_stmts(*s))),
-            branches: branches
-                .into_iter()
-                .map(|b| Branch {
-                    pattern: b.pattern,
-                    guard: drop_expr_stmts(b.guard),
-                    body: drop_expr_stmts(b.body),
-                })
-                .collect(),
-        },
-        // `Transact` is born by recognition, which runs *after* channelize
-        // (post-`lambda_elim`) — none can reach this pass.
+        // `Transact` is born by recognition, which runs after channelize
+        // (post-`lambda_elim`), so none can reach this pass.
         TypedExprNode::Transact { .. } => {
             unreachable!("channelize: Transact is born by recognition, after this pass")
         }
-        // Pure structural recursion: no ExprStmt can hide from the walk
-        // inside a binding body.
-        TypedExprNode::LetRec { bindings, body } => TypedExprNode::LetRec {
-            bindings: bindings
-                .into_iter()
-                .map(|(b, def)| (b, drop_expr_stmts(def)))
-                .collect(),
-            body: Box::new(drop_expr_stmts(*body)),
-        },
-        // Pre-phase markers: `mut_elim::run` eliminates these before
-        // channelize, so these arms are defensive (a stray marker recurses
-        // structurally and reaches the strict `typecheck` backstop; its interior
-        // ExprStmt chain is kept by the marker-bearing arm above).
-        TypedExprNode::For { target, iter, body } => TypedExprNode::For {
-            target,
-            iter: Box::new(drop_expr_stmts(*iter)),
-            body: Box::new(drop_expr_stmts(*body)),
-        },
-        TypedExprNode::MutWrite { name, key, value } => TypedExprNode::MutWrite {
-            name,
-            key: key.map(|k| Box::new(drop_expr_stmts(*k))),
-            value: Box::new(drop_expr_stmts(*value)),
-        },
-        TypedExprNode::Begin { body } => TypedExprNode::Begin {
-            body: Box::new(drop_expr_stmts(*body)),
-        },
-        // Feed/Define get caught by assert_no_defer_residue downstream.
-        node @ (TypedExprNode::Feed { .. }
-        | TypedExprNode::Define { .. }
-        | TypedExprNode::Defer
+        // `mut_elim::run` eliminates every `For`/`MutWrite` marker and
+        // `transact_phase::run` every `Begin`, both before channelize.
+        TypedExprNode::For { .. }
+        | TypedExprNode::MutWrite { .. }
+        | TypedExprNode::Begin { .. } => {
+            unreachable!(
+                "a For/MutWrite/Begin reached channelize; mut_elim and transact_phase must have \
+                 eliminated it"
+            )
+        }
+        TypedExprNode::Error => crate::unexpected_error_node!(),
+        // The effect is walked before it is discarded, so a `For`/`MutWrite`/`Begin`
+        // marker inside it reaches the `unreachable!` arm above instead of vanishing.
+        TypedExprNode::ExprStmt { expr: effect, body } => {
+            let _ = drop_expr_stmts(*effect);
+            drop_expr_stmts(*body)
+        }
+        // A surviving `Feed`/`Define` is reported by `assert_no_defer_residue`,
+        // which runs next and does not look inside it, so its value is left as it is.
+        TypedExprNode::Feed { .. } | TypedExprNode::Define { .. } => expr,
+        TypedExprNode::Defer
         | TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)
-        | TypedExprNode::LoadFrom(_)) => node,
-        TypedExprNode::Error => crate::unexpected_error_node!(),
-        // A tagged-variant value carries no ExprStmt of its own; recurse into
-        // the payload so a nested one is dropped.
-        TypedExprNode::VariantCtor { tag, payload } => TypedExprNode::VariantCtor {
-            tag,
-            payload: Box::new(drop_expr_stmts(*payload)),
-        },
-    };
-    TypedExpr {
-        node: new_node,
-        ty,
-        user_annotation,
-        node_id,
+        | TypedExprNode::LoadFrom(_)
+        | TypedExprNode::Apply { .. }
+        | TypedExprNode::Realize(_)
+        | TypedExprNode::Cast { .. }
+        | TypedExprNode::BinOp { .. }
+        | TypedExprNode::UnaryOp(..)
+        | TypedExprNode::Lambda { .. }
+        | TypedExprNode::Aggregate { .. }
+        | TypedExprNode::Let { .. }
+        | TypedExprNode::List(_)
+        | TypedExprNode::Tuple(_)
+        | TypedExprNode::Record(_)
+        | TypedExprNode::Case { .. }
+        | TypedExprNode::VariantCtor { .. }
+        | TypedExprNode::LetRec { .. }
+        | TypedExprNode::Compose(_)
+        | TypedExprNode::Copair(_)
+        | TypedExprNode::DisjointJoin(_) => {
+            expr.map_children(drop_expr_stmts);
+            expr
+        }
     }
-}
-
-/// Whether the subtree contains a pre-phase marker node (`For`/`MutWrite`)
-/// that the unified letrec phase consumes downstream of channelize. Used to
-/// keep marker-bearing `ExprStmt`s alive through [`drop_expr_stmts`].
-fn contains_phase_marker(expr: &Expr) -> bool {
-    if matches!(
-        expr.node,
-        TypedExprNode::For { .. } | TypedExprNode::MutWrite { .. }
-    ) {
-        return true;
-    }
-    let mut found = false;
-    expr.walk_children(|c| found = found || contains_phase_marker(c));
-    found
 }
 
 /// Confirm that no `Defer`/`Feed`/`Define` nodes remain after channelize, and
@@ -1445,90 +1338,61 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         TypedExprNode::MutDecl { .. } => {
             unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
         }
+        TypedExprNode::Transact { .. } => {
+            unreachable!("channelize: Transact is born by recognition, after this pass")
+        }
+        // `mut_elim::run` eliminates every `For`/`MutWrite` marker and
+        // `transact_phase::run` every `Begin`, both before channelize.
+        TypedExprNode::For { .. }
+        | TypedExprNode::MutWrite { .. }
+        | TypedExprNode::Begin { .. } => {
+            unreachable!(
+                "a For/MutWrite/Begin reached channelize; mut_elim and transact_phase must have \
+                 eliminated it"
+            )
+        }
+        TypedExprNode::Error => crate::unexpected_error_node!(),
         TypedExprNode::Defer => Err(Located::new(
             DeferError::UnboundDeferHandle(Name::from("<defer>")),
             expr.node_id,
         )),
-        TypedExprNode::DisjointJoin(elts) => elts.iter().try_for_each(assert_no_defer_residue),
         TypedExprNode::Feed { name, .. } | TypedExprNode::Define { name, .. } => Err(Located::new(
             DeferError::UnboundDeferHandle(name.clone()),
             expr.node_id,
         )),
-        TypedExprNode::Let {
-            bound_expr, body, ..
-        } => {
-            assert_no_defer_residue(bound_expr)?;
-            assert_no_defer_residue(body)
-        }
-        TypedExprNode::Apply { function, argument } => {
-            assert_no_defer_residue(function)?;
-            assert_no_defer_residue(argument)
-        }
-        TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => {
-            assert_no_defer_residue(value)
-        }
-        TypedExprNode::Begin { body } => assert_no_defer_residue(body),
-        TypedExprNode::BinOp { left, right, .. } => {
-            assert_no_defer_residue(left)?;
-            assert_no_defer_residue(right)
-        }
-        TypedExprNode::UnaryOp(_, inner) | TypedExprNode::Aggregate { input: inner, .. } => {
-            assert_no_defer_residue(inner)
-        }
-        TypedExprNode::Lambda { body, .. } => assert_no_defer_residue(body),
-        TypedExprNode::Tuple(elts)
-        | TypedExprNode::List(elts)
-        | TypedExprNode::Compose(elts)
-        | TypedExprNode::Copair(elts) => elts.iter().try_for_each(assert_no_defer_residue),
-        TypedExprNode::Record(fields) => fields
-            .iter()
-            .try_for_each(|(_, e)| assert_no_defer_residue(e)),
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            if let Some(s) = scrutinee {
-                assert_no_defer_residue(s)?;
-            }
-            branches.iter().try_for_each(|b| {
-                assert_no_defer_residue(&b.guard)?;
-                assert_no_defer_residue(&b.body)
-            })
-        }
-        TypedExprNode::Transact { .. } => {
-            unreachable!("channelize: Transact is born by recognition, after this pass")
-        }
-        TypedExprNode::ExprStmt { expr, body } => {
-            assert_no_defer_residue(expr)?;
-            assert_no_defer_residue(body)
-        }
-        // Pure structural check over the group's bodies.
-        TypedExprNode::LetRec { bindings, body } => {
-            bindings
-                .iter()
-                .try_for_each(|(_, def)| assert_no_defer_residue(def))?;
-            assert_no_defer_residue(body)
-        }
-        // Pre-phase markers are not defer residue (v1 lowering guarantees no
-        // defer nodes inside them); check their subtrees structurally.
-        TypedExprNode::For { iter, body, .. } => {
-            assert_no_defer_residue(iter)?;
-            assert_no_defer_residue(body)
-        }
-        TypedExprNode::MutWrite { key, value, .. } => {
-            if let Some(key) = key {
-                assert_no_defer_residue(key)?;
-            }
-            assert_no_defer_residue(value)
-        }
+        // Children in `walk_children` order, stopping at the first residue.
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)
-        | TypedExprNode::LoadFrom(_) => Ok(()),
-        TypedExprNode::Error => crate::unexpected_error_node!(),
-        TypedExprNode::VariantCtor { payload, .. } => assert_no_defer_residue(payload),
+        | TypedExprNode::LoadFrom(_)
+        | TypedExprNode::Apply { .. }
+        | TypedExprNode::Realize(_)
+        | TypedExprNode::Cast { .. }
+        | TypedExprNode::BinOp { .. }
+        | TypedExprNode::UnaryOp(..)
+        | TypedExprNode::Lambda { .. }
+        | TypedExprNode::Aggregate { .. }
+        | TypedExprNode::Let { .. }
+        | TypedExprNode::List(_)
+        | TypedExprNode::Tuple(_)
+        | TypedExprNode::Record(_)
+        | TypedExprNode::Case { .. }
+        | TypedExprNode::VariantCtor { .. }
+        | TypedExprNode::LetRec { .. }
+        | TypedExprNode::Compose(_)
+        | TypedExprNode::Copair(_)
+        | TypedExprNode::DisjointJoin(_)
+        | TypedExprNode::ExprStmt { .. } => {
+            let mut result = Ok(());
+            expr.walk_children(|child| {
+                if result.is_ok() {
+                    result = assert_no_defer_residue(child);
+                }
+            });
+            result
+        }
     }
 }
 
@@ -2161,148 +2025,6 @@ fn collect_free_vars_in_type(ty: &Type, out: &mut HashSet<Name>) {
     ty.walk_children(|child| collect_free_vars_in_type(child, out));
 }
 
-/// Collect every defer-target name referenced by a `Feed`/`Define`
-/// node in `expr`, respecting `Let`/`Lambda` shadowing on the term
-/// spine, returned in deterministic (sorted) order.
-///
-/// Used only by [`extract_for_defer`]'s debug assertion that a
-/// pre-phase `For`/`MutWrite` marker carries no feeds.
-fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
-    fn rec(expr: &Expr, bound: &mut Vec<Name>, out: &mut HashSet<Name>) {
-        match &expr.node {
-            TypedExprNode::Comprehension { .. } => unreachable!(
-                "a Comprehension reached channelize; the comprehension phase eliminates it"
-            ),
-            TypedExprNode::MutDecl { .. } => {
-                unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
-            }
-            TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
-                if !bound.iter().any(|b| b == name) {
-                    out.insert(name.clone());
-                }
-                rec(value, bound, out);
-            }
-            TypedExprNode::Let {
-                binding,
-                bound_expr,
-                body,
-            } => {
-                rec(bound_expr, bound, out);
-                bound.push(binding.name.clone());
-                rec(body, bound, out);
-                bound.pop();
-            }
-            TypedExprNode::Lambda { param, body, .. } => {
-                bound.push(param.name.clone());
-                rec(body, bound, out);
-                bound.pop();
-            }
-            TypedExprNode::Apply { function, argument } => {
-                rec(function, bound, out);
-                rec(argument, bound, out);
-            }
-            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => {
-                rec(value, bound, out)
-            }
-            TypedExprNode::Begin { body } => rec(body, bound, out),
-            TypedExprNode::BinOp { left, right, .. } => {
-                rec(left, bound, out);
-                rec(right, bound, out);
-            }
-            TypedExprNode::UnaryOp(_, inner) | TypedExprNode::Aggregate { input: inner, .. } => {
-                rec(inner, bound, out);
-            }
-            TypedExprNode::Tuple(elts)
-            | TypedExprNode::List(elts)
-            | TypedExprNode::Compose(elts)
-            | TypedExprNode::Copair(elts)
-            | TypedExprNode::DisjointJoin(elts) => {
-                for e in elts {
-                    rec(e, bound, out);
-                }
-            }
-            TypedExprNode::Record(fields) => {
-                for (_, e) in fields {
-                    rec(e, bound, out);
-                }
-            }
-            TypedExprNode::Case {
-                scrutinee,
-                branches,
-            } => {
-                if let Some(s) = scrutinee {
-                    rec(s, bound, out);
-                }
-                for b in branches {
-                    // A structural pattern binds its payload name over the
-                    // branch's guard and body.
-                    let pushed = if let Some(p) = &b.pattern {
-                        bound.push(p.binding.name.clone());
-                        true
-                    } else {
-                        false
-                    };
-                    rec(&b.guard, bound, out);
-                    rec(&b.body, bound, out);
-                    if pushed {
-                        bound.pop();
-                    }
-                }
-            }
-            TypedExprNode::Transact { .. } => {
-                unreachable!("channelize: Transact is born by recognition, after this pass")
-            }
-            TypedExprNode::ExprStmt { expr: e, body } => {
-                rec(e, bound, out);
-                rec(body, bound, out);
-            }
-            // Every group binder shadows across all binding bodies and the
-            // letrec body (mutual recursion).
-            TypedExprNode::LetRec { bindings, body } => {
-                for (b, _) in bindings {
-                    bound.push(b.name.clone());
-                }
-                for (_, def) in bindings {
-                    rec(def, bound, out);
-                }
-                rec(body, bound, out);
-                for _ in bindings {
-                    bound.pop();
-                }
-            }
-            // Pre-phase markers: the target binder scopes the loop body; a
-            // `MutWrite` names a mutable variable, not a feed target.
-            TypedExprNode::For { target, iter, body } => {
-                rec(iter, bound, out);
-                bound.push(target.name.clone());
-                rec(body, bound, out);
-                bound.pop();
-            }
-            TypedExprNode::MutWrite { key, value, .. } => {
-                if let Some(key) = key {
-                    rec(key, bound, out);
-                }
-                rec(value, bound, out);
-            }
-            TypedExprNode::Lit(_)
-            | TypedExprNode::Var(_)
-            | TypedExprNode::Builtin(_)
-            | TypedExprNode::Proj(_)
-            | TypedExprNode::Source(_)
-            | TypedExprNode::LoadFrom(_)
-            | TypedExprNode::Defer => {}
-            TypedExprNode::Error => crate::unexpected_error_node!(),
-            TypedExprNode::VariantCtor { payload, .. } => rec(payload, bound, out),
-        }
-    }
-    let mut targets: HashSet<Name> = HashSet::new();
-    rec(expr, &mut Vec::new(), &mut targets);
-    let mut sorted: Vec<Name> = targets.into_iter().collect();
-    // Deterministic order so generated field names compare reliably.
-    sorted.sort();
-    sorted
-}
-
 /// A single feed value passes through unchanged.  Multiple feed values
 /// are merged via [`TypedExprNode::Copair`] — the dedicated
 /// N-ary collection-union node — which compiles to a `UnionOperator`
@@ -2566,19 +2288,6 @@ fn extract_for_defer_impl(
         TypedExprNode::DisjointJoin(_) => {
             unreachable!("DisjointJoin is born by lambda_elim, which runs after channelize")
         }
-        // Defensive: `transact_phase` strips every `Begin` before channelize, so
-        // this is unreachable in the pipeline; recurse structurally if a stray
-        // one survives (reaching the strict typecheck backstop).
-        TypedExprNode::Begin { body } => TypedExprNode::Begin {
-            body: Box::new(extract_for_defer(
-                *body,
-                defer_name,
-                element,
-                feeds,
-                define,
-                in_inner_scope,
-            )?),
-        },
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -3283,21 +2992,15 @@ fn extract_for_defer_impl(
                 body: Box::new(body),
             }
         }
-        // Pre-phase markers: v1 lowering guarantees no feeds inside a
-        // `For` body or `MutWrite` value, so there is nothing to extract —
-        // pass them through untouched (debug-checked).
-        node @ (TypedExprNode::For { .. } | TypedExprNode::MutWrite { .. }) => {
-            debug_assert!(
-                {
-                    // `collect_feed_target_names` walks node structure only, so the
-                    // probe needs no type or annotation slots.
-                    let probe = Expr::throwaway(node.clone());
-                    collect_feed_target_names(&probe).is_empty()
-                },
-                "feed inside a For/MutWrite marker — v1 lowering must route \
-                 feed-bearing loops through the Loop path"
-            );
-            node
+        // `mut_elim::run` eliminates every `For`/`MutWrite` marker and
+        // `transact_phase::run` every `Begin`, both before channelize.
+        TypedExprNode::For { .. }
+        | TypedExprNode::MutWrite { .. }
+        | TypedExprNode::Begin { .. } => {
+            unreachable!(
+                "a For/MutWrite/Begin reached channelize; mut_elim and transact_phase must have \
+                 eliminated it"
+            )
         }
     };
     Ok(TypedExpr {
@@ -3412,6 +3115,22 @@ mod tests {
         );
         assert!(!s.contains("defer"), "no Defer should remain: {s}");
         assert!(!s.contains("define"), "no Define should remain: {s}");
+    }
+
+    /// A marker in an `ExprStmt`'s effect is rejected, not dropped with the effect.
+    ///
+    /// `mut_elim::run` asserts no `MutWrite` survives it, so the pipeline cannot
+    /// build this tree; the fixture stands in for that assert being removed or
+    /// for a caller that skips the phase.
+    #[test]
+    #[should_panic(expected = "a For/MutWrite/Begin reached channelize")]
+    fn marker_in_statement_effect_panics() {
+        let write = Expr::new(TypedExprNode::MutWrite {
+            name: Name::raw("x"),
+            key: None,
+            value: Box::new(lit(1)),
+        });
+        let _ = run(Expr::expr_stmt(write, lit(0)));
     }
 
     /// `let d = Defer in <body without feeds>` — error, raised at the `let`.
