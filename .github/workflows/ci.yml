@@ -1,26 +1,27 @@
 name: CI
 
 on:
+  # Every branch push, rather than `pull_request`. A restack pushes a stacked
+  # PR's head and its base branch together, and `pull_request` answers that pair
+  # with two runs at the new head. `push` starts one run per pushed branch, and
+  # the required `check` is read from the PR's head commit whichever event
+  # produced it. The `'**'` pattern excludes tags.
   push:
-    branches: [main]
-  pull_request: # Trigger on all PRs to satisfy branch protection
-    types: [opened, synchronize, reopened]
+    branches: ['**']
 
-# No `concurrency` group, so no run is ever cancelled for another. A push that
-# moves a stacked PR's head and force-pushes its base starts two identical runs
-# at the new head SHA. A group cancelling one of the pair leaves that run's
-# `check` job reporting failure on the head, and either run can be the one
-# cancelled, so `gh pr checks` and a watched run both misread the PR. Every run
-# completing costs a duplicate run per restacked PR, and a superseded head's run
-# finishing rather than stopping.
+# A newer push to a branch cancels that branch's in-progress run. The cancelled
+# run's commit is no longer the branch head, so its failing `check` lands on a
+# commit no PR reads. Main keys each run on its run id instead, so every commit
+# on main is checked to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 permissions:
   contents: read
-  # Permissions to see changed files for the paths-filter action below.
-  pull-requests: read
 
 # Each gate is its own job, so they run in parallel and the run takes as long as
 # its slowest gate rather than the sum of all of them. `check` at the bottom
@@ -74,7 +75,10 @@ jobs:
         run: ./ci.sh shared_state
 
       # Skip the code gates for changes that touch no code. Runs last so a
-      # failure above cannot leave the flag unset.
+      # failure above cannot leave the flag unset. On a branch push the filter
+      # diffs against the merge-base with main, so a docs-only PR stacked on
+      # code PRs runs the gates; on main it diffs against the commit before the
+      # push. Both come from git history, which the full fetch above provides.
       - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
         id: filter
         if: success() || failure()
@@ -302,11 +306,10 @@ jobs:
           exit 1
 
       - name: Notify Slack on failure
-        # Only notify on pushes to main, not PRs. The push trigger is scoped
-        # to branches: [main], so event_name == 'push' implies main. PR branch
-        # pushes fire as 'pull_request' events instead.
+        # Only notify on main. Every branch push runs this workflow, so the
+        # ref, not the event, is what identifies main.
         if: >-
-          failure() && github.event_name == 'push' &&
+          failure() && github.ref == 'refs/heads/main' &&
           needs.repo_checks.outputs.is_code_change == 'true'
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
