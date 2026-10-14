@@ -5,6 +5,9 @@ on:
     # 18:00 UTC = 11:00 AM MST, weekdays only
     - cron: "0 18 * * 1-5"
   workflow_dispatch: # Allow manual runs
+  # TESTING ONLY: drop this commit before merging.
+  push:
+    branches: [skylar/review-reminder-last-green-test]
 
 jobs:
   remind:
@@ -53,12 +56,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPOSITORY: ${{ github.repository }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL: ${{ vars.SLACK_REVIEW_CHANNEL }}
+          SLACK_CHANNEL: "#spam-testing" # TESTING ONLY
         run: python3 .github/scripts/pr-reminders/find_stale_prs.py | python3 .github/scripts/pr-reminders/post_slack_reminders.py
 
       - name: Post failure notice to Slack
         if: failure()
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL: ${{ vars.SLACK_REVIEW_CHANNEL }}
+          SLACK_CHANNEL: "#spam-testing" # TESTING ONLY
         run: python3 .github/scripts/pr-reminders/post_slack_reminders.py --failed
