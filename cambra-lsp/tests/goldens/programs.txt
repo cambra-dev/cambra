@@ -1,0 +1,425 @@
+== tests/compilation_pipeline/type_annotations/complex_refinement.cambra
+diagnostics:
+symbols:
+  function foo 1:1-2:20 (name 1:5-1:8)
+  variable y 4:1-4:23 (name 4:1-4:2)
+folds:
+  1-2
+== tests/compilation_pipeline/type_annotations/refined_div_zero.cambra
+diagnostics:
+symbols:
+  function refined_div 4:1-5:18 (name 4:5-4:16)
+  variable y 7:1-7:22 (name 7:1-7:2)
+folds:
+  1-2 comment
+  4-5
+== tests/compilation_pipeline/type_annotations/underscore.cambra
+diagnostics:
+symbols:
+  variable _ 3:1-3:6 (name 3:1-3:2)
+  variable y 5:1-5:10 (name 5:1-5:2)
+folds:
+== tests/programs/arithmetic/program.cambra
+diagnostics:
+symbols:
+  variable x 1:1-1:10 (name 1:1-1:2)
+  variable y 2:1-2:10 (name 2:1-2:2)
+folds:
+== tests/programs/defer_generators/program.cambra
+diagnostics:
+symbols:
+  function doubled 1:1-3:20 (name 1:5-1:12)
+  function squared 5:1-7:20 (name 5:5-5:12)
+  variable readings 9:1-9:24 (name 9:1-9:9)
+  variable totals 11:1-11:17 (name 11:1-11:7)
+folds:
+  1-3
+  2-3
+  5-7
+  6-7
+  13-14
+== tests/programs/defer_lift/program.cambra
+diagnostics:
+symbols:
+  function make_totals 1:1-4:6 (name 1:5-1:16)
+  variable readings 6:1-6:24 (name 6:1-6:9)
+  variable totals 7:1-7:31 (name 7:1-7:7)
+folds:
+  1-4
+  8-9
+== tests/programs/discount_contract/program.cambra
+diagnostics:
+  10:12-10:17 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+    10:5-10:11 while parsing statement
+    10:5-10:11 while parsing expression
+  11:12-11:20 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+    11:5-11:11 while parsing statement
+    11:5-11:11 while parsing expression
+  12:12-12:20 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+    12:5-12:11 while parsing statement
+    12:5-12:11 while parsing expression
+  14:12-14:13 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+    14:5-14:11 while parsing statement
+    14:5-14:11 while parsing expression
+symbols:
+  function discounted 9:1-15:6 (name 9:5-9:15)
+folds:
+  1-7 comment
+  9-15
+== tests/programs/fanout/program.cambra
+diagnostics:
+  10:15-11:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '=', or ':='
+    10:5-10:15 while parsing statement
+    10:8-10:15 while parsing expression
+symbols:
+  function fanout 9:1-14:6 (name 9:5-9:11)
+  variable log 16:1-16:34 (name 16:1-16:4)
+  variable out 17:1-17:35 (name 17:1-17:4)
+folds:
+  1-7 comment
+  9-14
+  11-13
+  18-19
+== tests/programs/filter_and_aggregate/program.cambra
+diagnostics:
+symbols:
+  variable users 1:1-6:2 (name 1:1-1:6)
+folds:
+  1-5
+== tests/programs/for_accumulator/program.cambra
+diagnostics:
+symbols:
+  variable acc 1:1-1:9 (name 1:1-1:4)
+folds:
+  2-3
+== tests/programs/generator_pipeline/program.cambra
+diagnostics:
+symbols:
+  function positives 1:1-4:20 (name 1:5-1:14)
+  function squared 6:1-8:20 (name 6:5-6:12)
+folds:
+  1-4
+  2-4
+  3-4
+  6-8
+  7-8
+== tests/programs/groupby_filtered_rollup/program.cambra
+diagnostics:
+symbols:
+  variable sales 1:1-8:2 (name 1:1-1:6)
+folds:
+  1-7
+== tests/programs/groupby_rollup/program.cambra
+diagnostics:
+symbols:
+  variable sales 1:1-7:2 (name 1:1-1:6)
+folds:
+  1-6
+== tests/programs/hot_reload/program.cambra
+diagnostics:
+symbols:
+  variable entries 1:1-1:14 (name 1:1-1:8)
+  variable sign_reqs 3:1-3:62 (name 3:1-3:10)
+  variable sign_resps 3:1-3:62 (name 3:12-3:22)
+  variable peek_reqs 4:1-4:61 (name 4:1-4:10)
+  variable peek_resps 4:1-4:61 (name 4:12-4:22)
+folds:
+  6-8
+  10-11
+== tests/programs/hot_reload/reloaded.cambra
+diagnostics:
+symbols:
+  variable entries 1:1-1:14 (name 1:1-1:8)
+  variable sign_reqs 3:1-3:62 (name 3:1-3:10)
+  variable sign_resps 3:1-3:62 (name 3:12-3:22)
+  variable peek_reqs 4:1-4:61 (name 4:1-4:10)
+  variable peek_resps 4:1-4:61 (name 4:12-4:22)
+folds:
+  6-8
+  10-11
+== tests/programs/http_accumulator/program.cambra
+diagnostics:
+symbols:
+  variable entries 16:1-16:14 (name 16:1-16:8)
+  variable sign_reqs 18:1-18:62 (name 18:1-18:10)
+  variable sign_resps 18:1-18:62 (name 18:12-18:22)
+folds:
+  1-14 comment
+  20-22
+== tests/programs/http_counter/program.cambra
+diagnostics:
+symbols:
+  variable set_reqs 27:1-27:59 (name 27:1-27:9)
+  variable set_resps 27:1-27:59 (name 27:11-27:20)
+  variable get_reqs 28:1-28:58 (name 28:1-28:9)
+  variable get_resps 28:1-28:58 (name 28:11-28:20)
+  variable latest 30:1-30:37 (name 30:1-30:7)
+folds:
+  1-25 comment
+  32-35
+  33-34
+  37-39
+  38-39
+== tests/programs/http_greeter/program.cambra
+diagnostics:
+symbols:
+  variable prefix 9:1-9:19 (name 9:1-9:7)
+  variable greet_reqs 11:1-11:64 (name 11:1-11:11)
+  variable greet_resps 11:1-11:64 (name 11:13-11:24)
+  variable echo_reqs 12:1-12:62 (name 12:1-12:10)
+  variable echo_resps 12:1-12:62 (name 12:12-12:22)
+  variable shout_reqs 13:1-13:65 (name 13:1-13:11)
+  variable shout_resps 13:1-13:65 (name 13:13-13:24)
+folds:
+  1-7 comment
+  15-16
+  18-19
+  21-22
+== tests/programs/inner_join/program.cambra
+diagnostics:
+symbols:
+  variable users 5:1-9:2 (name 5:1-5:6)
+  variable orders 11:1-16:2 (name 11:1-11:7)
+folds:
+  1-3 comment
+  5-8
+  11-15
+  18-22
+== tests/programs/join_then_groupby/program.cambra
+diagnostics:
+symbols:
+  variable users 7:1-11:2 (name 7:1-7:6)
+  variable orders 13:1-18:2 (name 13:1-13:7)
+  variable joined 20:1-25:3 (name 20:1-20:7)
+  variable grouped 27:1-27:69 (name 27:1-27:8)
+folds:
+  1-5 comment
+  7-10
+  13-17
+  20-24
+  20-25
+== tests/programs/ledger_balance/program.cambra
+diagnostics:
+  10:28-11:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '=', or ':='
+    10:1-10:28 while parsing statement
+    10:9-10:28 while parsing expression
+symbols:
+  module http 12:1-12:12 (name 12:8-12:12)
+  variable deposit_reqs 14:1-14:69 (name 14:1-14:13)
+  variable deposit_resps 14:1-14:69 (name 14:15-14:28)
+  variable balance_reqs 15:1-15:68 (name 15:1-15:13)
+  variable balance_resps 15:1-15:68 (name 15:15-15:28)
+folds:
+  1-8 comment
+  17-20
+  18-19
+  22-26
+  23-25
+== tests/programs/list_comp/program.cambra
+diagnostics:
+symbols:
+folds:
+== tests/programs/list_min/program.cambra
+diagnostics:
+symbols:
+folds:
+== tests/programs/nonneg_inventory/program.cambra
+diagnostics:
+  11:12-11:15 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+    11:5-11:11 while parsing statement
+    11:5-11:11 while parsing expression
+  19:21-19:26 found 'identifier', expected indented block
+    12:5-19:20 while parsing statement
+symbols:
+  variable inventory 8:1-8:69 (name 8:1-8:10)
+  function reserve 10:1-22:56 (name 10:5-10:12)
+  variable requests 23:1-23:72 (name 23:1-23:9)
+folds:
+  1-6 comment
+  10-22
+  21-22 comment
+  24-26
+  25-26
+  28-29
+== tests/programs/polymorphic/program.cambra
+diagnostics:
+symbols:
+  variable dup 1:1-1:19 (name 1:1-1:4)
+  variable a 2:1-2:11 (name 2:1-2:2)
+  variable b 3:1-3:16 (name 3:1-3:2)
+folds:
+== tests/programs/prefix_lines/program.cambra
+diagnostics:
+symbols:
+folds:
+== tests/programs/reachability/program.cambra
+diagnostics:
+  16:5-16:15 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+    16:1-16:4 while parsing statement
+    16:1-16:4 while parsing expression
+  25:38-26:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '=', or ':='
+    25:1-25:38 while parsing statement
+    25:13-25:38 while parsing expression
+symbols:
+  variable edges 8:1-13:2 (name 8:1-8:6)
+folds:
+  1-6 comment
+  8-12
+  16-20
+  16-21
+  23-24 comment
+  27-28
+  30-33
+  31-33
+  32-33
+== tests/programs/refinement/nested_refinement.cambra
+diagnostics:
+symbols:
+  function no_zero_no_one_div 1:1-2:18 (name 1:5-1:23)
+  variable y 4:1-4:29 (name 4:1-4:2)
+folds:
+  1-2
+== tests/programs/source_accumulator/program.cambra
+diagnostics:
+symbols:
+  variable seen 8:1-8:11 (name 8:1-8:5)
+folds:
+  1-6 comment
+  9-10
+== tests/programs/source_shared/program.cambra
+diagnostics:
+symbols:
+  variable tagged 1:1-1:43 (name 1:1-1:7)
+  variable shouted 2:1-2:43 (name 2:1-2:8)
+folds:
+== tests/programs/storefront/v0.cambra
+diagnostics:
+  41:23-41:25 found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '}', or '::'
+    41:1-41:41 while parsing statement
+    41:21-41:22 while parsing expression
+  62:12-62:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+    62:5-62:11 while parsing statement
+    62:5-62:11 while parsing expression
+  76:14-76:18 found 'with', expected expression, 'if', or 'match'
+    76:5-76:13 while parsing statement
+  86:1-86:1 found 'dedent', expected statement, 'newline', or end of input
+symbols:
+folds:
+  1-27 comment
+  34-37
+  43-46 comment
+  47-50
+  89-90 comment
+  100-105
+  117-118
+== tests/programs/storefront/v1.cambra
+diagnostics:
+  38:23-38:25 found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '}', or '::'
+    38:1-38:41 while parsing statement
+    38:21-38:22 while parsing expression
+  75:12-75:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+    75:5-75:11 while parsing statement
+    75:5-75:11 while parsing expression
+  89:14-89:18 found 'with', expected expression, 'if', or 'match'
+    89:5-89:13 while parsing statement
+  99:1-99:1 found 'dedent', expected statement, 'newline', or end of input
+symbols:
+folds:
+  1-24 comment
+  31-34
+  40-43 comment
+  44-47
+  56-59 comment
+  102-103 comment
+  113-118
+  130-131
+== tests/programs/streaming_echo/program.cambra
+diagnostics:
+symbols:
+folds:
+== tests/programs/txn_kv/program.cambra
+diagnostics:
+  33:28-33:33 found 'identifier', expected indented block
+    32:9-33:27 while parsing statement
+  41:24-41:25 found 'identifier', expected indented block
+    40:5-41:23 while parsing statement
+  47:1-47:1 found 'dedent', expected statement, 'newline', or end of input
+symbols:
+folds:
+  1-14 comment
+  29-31 comment
+  44-46 comment
+== tests/programs/txn_multi_read/program.cambra
+diagnostics:
+symbols:
+  variable out 1:1-1:14 (name 1:1-1:4)
+  variable pool 2:1-2:27 (name 2:1-2:5)
+folds:
+  3-8
+  4-8
+  5-6
+  7-8 comment
+== tests/programs/type_error/program.cambra
+diagnostics:
+symbols:
+folds:
+== tests/programs/udf_closure/program.cambra
+diagnostics:
+symbols:
+  variable g 1:1-1:7 (name 1:1-1:2)
+  function f 2:1-3:12 (name 2:5-2:6)
+folds:
+  2-3
+== tests/programs/while_counter/program.cambra
+diagnostics:
+  2:7-2:8 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+    2:1-2:6 while parsing statement
+    2:1-2:6 while parsing expression
+  4:1-4:1 found 'dedent', expected statement, 'newline', or end of input
+symbols:
+folds:
+== editors/sample-lexes-only.cambra
+diagnostics:
+  5:5-5:6 found '>', expected expression, or '-'
+    5:1-5:5 while parsing statement
+    5:1-5:5 while parsing expression
+  6:5-6:6 found '>', expected expression, or '-'
+    6:1-6:5 while parsing statement
+    6:1-6:5 while parsing expression
+symbols:
+folds:
+  1-2 comment
+== editors/sample.cambra
+diagnostics:
+symbols:
+  module catalog 7:1-7:39 (name 7:8-7:15)
+  module us 8:1-8:21 (name 8:19-8:21)
+  variable region 9:1-9:28 (name 9:7-9:13)
+  function quote 11:1-12:35 (name 11:9-11:14)
+  variable bigger 14:1-14:53 (name 14:1-14:7)
+  variable reqs 16:1-16:48 (name 16:1-16:5)
+  variable resps 16:1-16:48 (name 16:7-16:12)
+  variable total 18:1-19:21 (name 19:1-19:6)
+  variable events 21:1-21:17 (name 21:1-21:7)
+  function bump 25:1-34:29 (name 25:5-25:9)
+  function evens 36:1-38:16 (name 36:5-36:10)
+  variable opaque 47:1-47:16 (name 47:1-47:7)
+  variable pairs 48:1-48:59 (name 48:1-48:6)
+  variable escapes 49:1-49:29 (name 49:1-49:8)
+  variable totals 50:1-50:46 (name 50:1-50:7)
+  variable inc 51:1-51:18 (name 51:1-51:4)
+  variable held 52:1-52:28 (name 52:1-52:5)
+  variable apply 53:1-53:22 (name 53:1-53:6)
+folds:
+  1-5 comment
+  11-12
+  25-34
+  26-27
+  28-29
+  30-31
+  36-38
+  37-38
+  40-45
+  41-45
+  42-43
+  44-45

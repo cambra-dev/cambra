@@ -358,6 +358,24 @@ fn main() {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
 
+    // The language server speaks on stdout, so it runs before anything else
+    // could print there.
+    if args.get(1).is_some_and(|arg| arg == "--lsp") {
+        if args.len() > 2 {
+            eprintln!("error: --lsp takes no other arguments");
+            std::process::exit(1);
+        }
+        let status = match cambra_lsp::run_stdio() {
+            Ok(cambra_lsp::Ended::Shutdown) => 0,
+            Ok(cambra_lsp::Ended::WithoutShutdown) => 1,
+            Err(e) => {
+                eprintln!("error: cambra --lsp: {e}");
+                1
+            }
+        };
+        std::process::exit(status);
+    }
+
     let mut input_file = None;
     let mut inspect_port: Option<u16> = None;
     let mut control_port: Option<u16> = None;
@@ -385,7 +403,7 @@ fn main() {
     }
 
     let usage = "Usage: cambra [[--inspect[=PORT]] [--control[=PORT]] \
-| --inspect-only[=PORT] | --dump-snapshot] <input_file>";
+| --inspect-only[=PORT] | --dump-snapshot] <input_file>\n       cambra --lsp";
     let mode = match (inspect_port, control_port, inspect_only_port, dump_snapshot) {
         (None, None, Some(port), false) => Mode::InspectOnly { port },
         (None, None, None, true) => Mode::DumpSnapshot,

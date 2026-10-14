@@ -14,6 +14,7 @@
 
 use chl_parser::FileId;
 use chl_parser::lexer::{HighlightClass, Highlighted, highlight};
+use chl_parser::line_index::{LineCol, LineIndex};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -31,14 +32,19 @@ fn main() -> ExitCode {
             }
         };
         let Highlighted { spans, errors } = highlight(FileId::ROOT, &source);
+        let index = LineIndex::new(&source);
+        let line_col = |offset| {
+            let LineCol { line, col } = index.line_col(offset);
+            (line + 1, col + 1)
+        };
         for e in &errors {
-            let (line, col) = line_col(&source, e.span().start);
+            let (line, col) = line_col(e.span().start);
             eprintln!("{path}:{line}:{col}: {e}");
             failed = true;
         }
         let file = json_string(&path);
         for (class, span) in spans {
-            let (line, col) = line_col(&source, span.start);
+            let (line, col) = line_col(span.start);
             writeln!(
                 out,
                 r#"{{"file":{file},"start":{},"end":{},"line":{line},"col":{col},"class":"{}"}}"#,
@@ -60,13 +66,6 @@ fn main() -> ExitCode {
 }
 
 /// The 1-based line and 1-based byte column of byte `offset` in `source`.
-fn line_col(source: &str, offset: usize) -> (usize, usize) {
-    let before = &source[..offset];
-    let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    (line, offset - line_start + 1)
-}
-
 /// `s` as a JSON string literal.
 fn json_string(s: &str) -> String {
     let mut quoted = String::from("\"");

@@ -6,10 +6,12 @@ language id is `cambra` in both editors, and the TextMate scope is `source.cambr
 | Directory | Contents |
 | --- | --- |
 | `vscode/` | A VS Code extension with no code: the language, its comment and bracket configuration, and the TextMate grammar `syntaxes/cambra.tmLanguage.json`. |
-| `nvim/` | A Neovim runtime directory: filetype detection, a filetype plugin, an indent plugin, and the syntax file `syntax/cambra.vim`. |
+| `nvim/` | A Neovim runtime directory: filetype detection, a filetype plugin, an indent plugin, the syntax file `syntax/cambra.vim`, and the language server configuration `lsp/cambra.lua`. |
 
-A language server, run as `cambra --lsp`, is planned. It will add semantic tokens on top of these
-grammars rather than replace them.
+The language server, run as `cambra --lsp`, reports lex and parse errors, outlines a file, and folds
+it ([cambra-lsp/design-cambra-lsp.md](../cambra-lsp/design-cambra-lsp.md)). Neovim 0.11 and later
+can use it; [Neovim](#neovim) has the setup. Semantic tokens from the server will later sit on top
+of these grammars rather than replace them.
 
 ## Highlight classes
 
@@ -261,3 +263,24 @@ nvim --headless -u NONE --cmd 'set rtp^=editors/nvim' \
   -c 'filetype plugin indent on' -c 'syntax on' \
   -c 'e tests/programs/arithmetic/program.cambra' -c 'echo &ft b:current_syntax' -c 'qa!'
 ```
+
+### Language server
+
+`lsp/cambra.lua` configures `cambra --lsp` for Neovim 0.11 and later, which the server requires
+because it counts columns in UTF-8. With the runtime directory added as above and `cambra` on
+`PATH` (`cargo install --path .` from the repository root), enable it and fold through it in
+`init.lua`:
+
+```lua
+vim.lsp.enable('cambra')
+vim.api.nvim_create_autocmd('FileType', {
+  pattern = 'cambra',
+  callback = function()
+    vim.wo.foldmethod = 'expr'
+    vim.wo.foldexpr = 'v:lua.vim.lsp.foldexpr()'
+  end,
+})
+```
+
+`:checkhealth vim.lsp` shows whether the server is attached. Errors appear as diagnostics,
+`vim.lsp.buf.document_symbol()` lists the outline, and `zc` / `zo` close and open folds.
