@@ -49,9 +49,10 @@ def main() -> None:
     now = parse_iso(found["now"])
     general_review = [[GeneralReviewPr.from_dict(p) for p in group] for group in found["general_review"]]
     reviews = [StaleReview.from_dict(r) for r in found["reviews"]]
+    ci_error = found.get("ci_error")
 
     # Build parent message
-    if reviews or general_review:
+    if reviews or general_review or ci_error:
         parent_text = "Code Review Reminders! :thread:"
     else:
         parent_text = "Code Review Reminders! :thread:\nNo stale reviews! :meow_party:"
@@ -59,14 +60,15 @@ def main() -> None:
     # Post parent message
     parent = slack_post_message(token, channel, parent_text)
 
-    if not (reviews or general_review):
+    if not (reviews or general_review or ci_error):
         print("No stale reviews. Posted all-clear to Slack.")
         return
 
     # Post threaded reply
     thread_ts = parent["ts"]
     channel_id = parent["channel"]
-    body = build_thread_body(reviews, usermap, general_review=general_review, now=now)
+    body = build_thread_body(reviews, usermap, general_review=general_review, now=now,
+                             ci_error=ci_error)
     slack_post_message(token, channel_id, body, thread_ts=thread_ts)
 
     print("Reminders posted successfully.")

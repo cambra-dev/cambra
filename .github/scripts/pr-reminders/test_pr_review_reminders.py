@@ -7,61 +7,43 @@ Direct function calls against fixture data — no subprocess, no mock gh, no jq 
 import json
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from prreminder import (
     GeneralReviewPr,
+    open_pr_from_node,
     StaleReview,
     build_general_review_section,
     build_thread_body,
-    ci_passed,
+    ci_state,
     review_verdict,
     find_general_review_prs,
     find_stale_reviews,
     format_duration,
     format_mention,
     format_pr_link,
+    last_green,
+    load_workflows,
+    required_check_names,
+    required_check_workflows,
 )
 
 # Reference time: 2026-02-05T12:00:00Z — all fixture dates are relative to this.
 REFERENCE_TIME = datetime(2026, 2, 5, 12, 0, 0, tzinfo=timezone.utc)
 
+def reviewer_pr(number: int, title: str, author: str, reviewers: list[str], draft: bool = False) -> dict:
+    """An open PR with individual reviewers requested, as list_open_prs returns it."""
+    return {"number": number, "title": title, "url": f"https://github.com/test/repo/pull/{number}",
+            "author": author, "isDraft": draft, "requestedReviewers": reviewers}
+
+
 PRS = [
-    {
-        "number": 101, "title": "Fix the widget",
-        "url": "https://github.com/test/repo/pull/101",
-        "author": {"login": "alice"},
-        "reviewRequests": [{"login": "bob", "__typename": "User"}],
-    },
-    {
-        "number": 102, "title": "Update dependencies",
-        "url": "https://github.com/test/repo/pull/102",
-        "author": {"login": "bob"},
-        "reviewRequests": [{"login": "alice", "__typename": "User"}],
-    },
-    {
-        "number": 103, "title": "Team-only review",
-        "url": "https://github.com/test/repo/pull/103",
-        "author": {"login": "charlie"},
-        "reviewRequests": [
-            {"__typename": "Team", "name": "Engineering", "slug": "cambra-dev/engineering"},
-        ],
-    },
-    {
-        "number": 104, "title": "Per-reviewer staleness",
-        "url": "https://github.com/test/repo/pull/104",
-        "author": {"login": "alice"},
-        "reviewRequests": [
-            {"login": "bob", "__typename": "User"},
-            {"login": "charlie", "__typename": "User"},
-        ],
-    },
-    {
-        "number": 105, "title": "Draft PR being ignored",
-        "url": "https://github.com/test/repo/pull/105",
-        "author": {"login": "alice"},
-        "isDraft": True,
-        "reviewRequests": [{"login": "bob", "__typename": "User"}],
-    },
+    reviewer_pr(101, "Fix the widget", "alice", ["bob"]),
+    reviewer_pr(102, "Update dependencies", "bob", ["alice"]),
+    # Team-only review: list_open_prs keeps individual reviewers only.
+    reviewer_pr(103, "Team-only review", "charlie", []),
+    reviewer_pr(104, "Per-reviewer staleness", "alice", ["bob", "charlie"]),
+    reviewer_pr(105, "Draft PR being ignored", "alice", ["bob"], draft=True),
 ]
 
 TIMELINES: dict[int, dict[str, str]] = {
@@ -88,6 +70,8 @@ def check_run(name: str, conclusion: str | None, started_h: float, status: str =
             "conclusion": conclusion, "startedAt": hours_ago(started_h)}
 
 
+# The checks the rulesets require; "test" stands for a gate merging does not require.
+REQUIRED = ["check"]
 GREEN = [check_run("test", "SUCCESS", 1), check_run("check", "SUCCESS", 1)]
 
 
@@ -118,22 +102,27 @@ OPEN_PRS = [
         check_run("test", "CANCELLED", 10), check_run("check", "FAILURE", 10),
         check_run("test", "SUCCESS", 5), check_run("check", "SUCCESS", 5),
     ]),
-    # Excluded: CI failed.
+    # Excluded: the required check failed and no recent head was green.
     open_pr(203, opened_h=50, checks=[check_run("test", "SUCCESS", 1), check_run("check", "FAILURE", 1)]),
-    # Excluded: the latest run failed after an earlier one passed.
-    open_pr(213, opened_h=50, checks=[check_run("test", "SUCCESS", 10), check_run("test", "FAILURE", 5)]),
+    # Excluded: the required check's latest run failed after an earlier one passed.
+    open_pr(213, opened_h=50, checks=[check_run("check", "SUCCESS", 10), check_run("check", "FAILURE", 5)]),
     # Excluded: no checks have run.
     open_pr(205, opened_h=50, checks=[]),
     # Excluded: draft.
     open_pr(206, opened_h=50, checks=GREEN, draft=True),
     # Excluded: created 50h ago but marked ready for review 2h ago.
     open_pr(207, opened_h=50, checks=GREEN, ready_h=2),
-    # Excluded: a check is still running.
-    open_pr(208, opened_h=50, checks=GREEN + [check_run("formal", None, 1, status="IN_PROGRESS")]),
-    # Excluded: a commit status failed.
+    # Excluded: the required check is still running and no recent head was green.
+    open_pr(208, opened_h=50, checks=[check_run("test", "SUCCESS", 1),
+                                      check_run("check", None, 1, status="IN_PROGRESS")]),
+    # Included: a commit status merging does not require failed.
     open_pr(209, opened_h=50, checks=GREEN + [{
         "__typename": "StatusContext", "context": "ext", "state": "FAILURE",
         "createdAt": hours_ago(1)}]),
+    # Included: the required check failed, but an earlier head went green 3h ago.
+    open_pr(223, opened_h=49, checks=[check_run("check", "FAILURE", 1)]),
+    # Included: the required check is running, and an earlier head went green 2h ago.
+    open_pr(224, opened_h=47, checks=[check_run("check", None, 1, status="IN_PROGRESS")]),
     # Stack main <- b210 <- b211 (draft) <- b212, listed top first.
     open_pr(212, opened_h=60, checks=GREEN, base="b211", last_action_h=26),
     open_pr(211, opened_h=60, checks=GREEN, base="b210", draft=True),
@@ -160,6 +149,49 @@ OPEN_PRS = [
 def get_review_dates(pr_number: int) -> dict[str, str]:
     """Test fixture: return review request dates for a PR."""
     return TIMELINES.get(pr_number, {})
+
+
+LAST_GREEN = {223: hours_ago(3), 224: hours_ago(2)}
+
+
+def run(sha: str, created_h: float, conclusion: str | None, finished_h: float | None = None) -> dict:
+    """A workflow run as list_workflow_runs returns it."""
+    return {"head_sha": sha, "status": "completed" if conclusion else "in_progress",
+            "conclusion": conclusion, "created_at": hours_ago(created_h),
+            "updated_at": hours_ago(finished_h if finished_h is not None else created_h)}
+
+
+def raises(f) -> bool:
+    try:
+        f()
+    except ValueError:
+        return True
+    return False
+
+
+# Shaped like GET /repos/{repo}/rules/branches/main for this repo.
+RULES = [
+    {"type": "deletion", "ruleset_id": 1},
+    {"type": "pull_request", "ruleset_id": 1, "parameters": {"required_approving_review_count": 1}},
+    {"type": "required_status_checks", "ruleset_id": 2, "parameters": {
+        "required_status_checks": [{"context": "check", "integration_id": 15368}],
+        "strict_required_status_checks_policy": False}},
+]
+
+WORKFLOWS = {
+    ".github/workflows/ci.yml": {"jobs": {
+        "lint": {"runs-on": "ubuntu-latest"},
+        "check": {"needs": ["lint"], "runs-on": "ubuntu-latest"},
+        "test": {"strategy": {"matrix": {"os": ["a", "b"]}}},
+        "computed": {"strategy": "${{ fromJSON(inputs.strategy) }}"},
+    }},
+    ".github/workflows/integration.yml": {"jobs": {
+        "run": {"name": "IntegrationTests"},
+        "lint": {"name": "lint"},
+        "shared": {"uses": "./.github/workflows/reusable.yml"},
+        "dynamic": {"name": "${{ inputs.label }}"},
+    }},
+}
 
 
 def main() -> None:
@@ -213,13 +245,31 @@ def main() -> None:
 
     # --- General review tests ---
     print("\nGeneral review:")
-    groups = find_general_review_prs(OPEN_PRS, now=REFERENCE_TIME)
+    asked: list[int] = []
+
+    def get_last_green(pr: dict) -> str | None:
+        asked.append(pr["number"])
+        return LAST_GREEN.get(pr["number"])
+
+    groups = find_general_review_prs(OPEN_PRS, REQUIRED, get_last_green, now=REFERENCE_TIME)
     shape = [[p.pr_number for p in g] for g in groups]
-    expected = [[222], [210, 212], [201], [204], [221], [202]]
+    expected = [[222], [210, 212], [201], [209], [223], [224], [204], [221], [202]]
     check(
         shape == expected,
         f"general review groups are {expected}: stack bottom first, groups by earliest open time",
         f"general review groups: expected {expected}, got {shape}",
+    )
+    check(
+        sorted(asked) == [203, 205, 208, 213, 223, 224],
+        "earlier heads are looked up only for PRs that qualify but for their head's CI",
+        f"earlier heads looked up for {sorted(asked)}",
+    )
+    by_number = {p.pr_number: p for g in groups for p in g}
+    check(
+        [(by_number[n].ci, by_number[n].last_green_iso) for n in (201, 223, 224)]
+        == [("passed", None), ("failing", hours_ago(3)), ("running", hours_ago(2))],
+        "GeneralReviewPr carries the head's CI state and when an earlier head went green",
+        f"CI fields: {[(by_number[n].ci, by_number[n].last_green_iso) for n in (201, 223, 224)]}",
     )
     verdict_cases = [
         (dict(decision="APPROVED"), "APPROVED"),
@@ -236,10 +286,27 @@ def main() -> None:
         "review_verdict follows reviewDecision, else latest reviews",
         f"review_verdict: expected {[w for _, w in verdict_cases]}, got {verdict_got}",
     )
+    def pending_status(context: str) -> dict:
+        return {"__typename": "StatusContext", "context": context, "state": "PENDING", "createdAt": hours_ago(1)}
+
+    ci_cases = [
+        ([check_run("check", "SKIPPED", 1)], ["check"], "passed"),
+        ([check_run("check", "SUCCESS", 1), check_run("test", "FAILURE", 1)], ["check"], "passed"),
+        ([check_run("check", "FAILURE", 5), check_run("check", "SUCCESS", 1)], ["check"], "passed"),
+        ([check_run("check", "SUCCESS", 5), check_run("check", "FAILURE", 1)], ["check"], "failing"),
+        ([check_run("check", None, 1, status="QUEUED")], ["check"], "running"),
+        ([check_run("check", "SUCCESS", 5), {**check_run("check", None, 0, status="QUEUED"), "startedAt": None}],
+         ["check"], "running"),
+        ([check_run("test", "SUCCESS", 1)], ["check"], "running"),
+        ([pending_status("ext")], ["ext"], "running"),
+        ([check_run("check", "FAILURE", 1), pending_status("ext")], ["check", "ext"], "failing"),
+    ]
+    ci_got = [ci_state(checks, required) for checks, required, _ in ci_cases]
     check(
-        ci_passed([check_run("test", "SUCCESS", 1), check_run("lint", "SKIPPED", 1)]),
-        "ci_passed accepts a SKIPPED check",
-        "ci_passed rejected a SKIPPED check",
+        ci_got == [want for *_, want in ci_cases],
+        "ci_state judges each required check by its latest run, unstarted ones newest, ignores the rest, "
+        "and reads a missing one as running",
+        f"ci_state: expected {[w for *_, w in ci_cases]}, got {ci_got}",
     )
     stack_top = groups[1][1]
     check(
@@ -247,12 +314,110 @@ def main() -> None:
         "GeneralReviewPr carries open time and last-action time",
         f"GeneralReviewPr times wrong: {stack_top}",
     )
-    ready = find_general_review_prs([open_pr(220, opened_h=100, ready_h=30, checks=GREEN)], now=REFERENCE_TIME)
+    ready = find_general_review_prs([open_pr(220, opened_h=100, ready_h=30, checks=GREEN)], REQUIRED,
+                                   get_last_green, now=REFERENCE_TIME)
     check(
         ready[0][0].opened_iso == hours_ago(30),
         "open time is the ready-for-review time when there is one",
         f"open time for a once-draft PR: got {ready[0][0].opened_iso}",
     )
+
+    # --- Reading the open-PRs query ---
+    print("\nOpen-PR query nodes:")
+    # Shaped like #310's node: approved, then a comment-only review by the same reviewer.
+    node = {
+        "number": 310, "title": "t", "url": "u", "isDraft": False,
+        "createdAt": hours_ago(150), "updatedAt": hours_ago(17),
+        "baseRefName": "b309", "headRefName": "b310", "reviewDecision": None,
+        "author": {"login": "dpmills"},
+        "latestOpinionatedReviews": {"nodes": [{"state": "APPROVED"}]},
+        "reviewRequests": {"nodes": [
+            {"requestedReviewer": {"__typename": "Team"}},
+            {"requestedReviewer": {"__typename": "User", "login": "sortalongo"}},
+        ]},
+        "readyEvents": {"nodes": [{"createdAt": hours_ago(150)}]},
+        "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": GREEN}}}}]},
+    }
+    flat = open_pr_from_node(node)
+    check(
+        review_verdict(flat) == "APPROVED",
+        "an approval followed by a comment-only review still reads as approved",
+        f"verdict after approve-then-comment: {review_verdict(flat)}",
+    )
+    check(
+        flat["requestedReviewers"] == ["sortalongo"] and flat["author"] == "dpmills"
+        and flat["readyForReviewAt"] == hours_ago(150) and flat["checks"] == GREEN,
+        "open_pr_from_node keeps individual reviewers, the author's login, the ready time, and the head's checks",
+        f"open_pr_from_node: {flat}",
+    )
+
+    # --- Required checks ---
+    print("\nRequired checks:")
+    check(
+        required_check_names(RULES) == ["check"],
+        "required_check_names reads the required_status_checks rule",
+        f"required_check_names: {required_check_names(RULES)}",
+    )
+    unattributed = [{"type": "required_status_checks", "parameters": {
+        "required_status_checks": [{"context": "ext"}]}}]
+    check(
+        required_check_names(unattributed) == ["ext"],
+        "required_check_names accepts a check that names no app",
+        "required_check_names rejected a check that names no app",
+    )
+    other_app = [{"type": "required_status_checks", "parameters": {
+        "required_status_checks": [{"context": "ci/circle", "integration_id": 9}]}}]
+    required_workflow = RULES + [{"type": "workflows", "parameters": {"workflows": [{"path": "x.yml"}]}}]
+    check(
+        raises(lambda: required_check_names(other_app))
+        and raises(lambda: required_check_names(required_workflow))
+        and raises(lambda: required_check_names(RULES[:2])),
+        "required_check_names raises on another app's check, a workflows rule, and no requirement",
+        "required_check_names accepted a requirement it cannot judge",
+    )
+    check(
+        required_check_workflows(["IntegrationTests", "check"], WORKFLOWS)
+        == {"IntegrationTests": ".github/workflows/integration.yml", "check": ".github/workflows/ci.yml"},
+        "required_check_workflows maps a check to its workflow by job key or job name",
+        f"required_check_workflows: {required_check_workflows(['IntegrationTests', 'check'], WORKFLOWS)}",
+    )
+    check(
+        all(raises(lambda n=n: required_check_workflows([n], WORKFLOWS))
+            for n in ("lint", "test", "computed", "shared", "missing")),
+        "required_check_workflows raises on a check two workflows report, a matrix job, an expression strategy, "
+        "a reusable call, and no job",
+        "required_check_workflows mapped a check it cannot place",
+    )
+    repo_root = Path(__file__).resolve().parents[3]
+    real = required_check_workflows(["check"], load_workflows(repo_root))
+    check(
+        real == {"check": ".github/workflows/ci.yml"},
+        "this repo's workflows map `check` to ci.yml (needs yq)",
+        f"this repo's workflows map `check` to {real}",
+    )
+
+    # --- Last green head ---
+    print("\nLast green head:")
+    ci = ".github/workflows/ci.yml"
+    integ = ".github/workflows/integration.yml"
+    green_cases = [
+        ("newest head failed, the one before went green",
+         {ci: [run("h3", 1, "failure"), run("h2", 3, "success", 2.5)]}, hours_ago(2.5)),
+        ("a green head six heads back is out of range",
+         {ci: [run(f"h{i}", i, "failure") for i in range(1, 6)] + [run("h6", 6, "success")]}, None),
+        ("a green head five heads back counts",
+         {ci: [run(f"h{i}", i, "failure") for i in range(1, 5)] + [run("h5", 5, "success")]}, hours_ago(5)),
+        ("a cancelled run beside a successful one on the same head",
+         {ci: [run("h1", 1, None), run("h2", 4, "cancelled"), run("h2", 3, "success", 2)]}, hours_ago(2)),
+        ("a head green in one required workflow only",
+         {ci: [run("h1", 2, "success")], integ: [run("h1", 2, "failure")]}, None),
+        ("a head green in both workflows went green when the later finished",
+         {ci: [run("h1", 3, "success", 2.5)], integ: [run("h1", 3, "success", 1.5)]}, hours_ago(1.5)),
+        ("no runs", {ci: []}, None),
+    ]
+    for desc, runs, want in green_cases:
+        got = last_green(runs)
+        check(got == want, f"last_green: {desc}", f"last_green: {desc}: expected {want}, got {got}")
 
     # --- JSON round-trip test ---
     print("\nJSON round-trip:")
@@ -334,8 +499,11 @@ def main() -> None:
         line(212, "open 2.5d, last action 1.1d ago", "2."),
         "",
         line(201, "open 2.1d, last action ~1h ago"),
+        line(209, "open 2.1d, last action ~1h ago"),
+        line(223, "open 2.0d, last action ~1h ago, CI failing, last green ~3h ago"),
         "",
         "*Open &lt;2d*",
+        line(224, "open 2.0d, last action ~1h ago, CI running, last green ~2h ago"),
         line(204, "open 1.9d, last action ~1h ago"),
         line(221, "open 1.5d, last action ~1h ago"),
         line(202, "open 1.2d, last action ~1h ago"),
@@ -369,6 +537,16 @@ def main() -> None:
         only_prs == section,
         "build_thread_body with no stale reviews is the Waiting on General Review section alone",
         f"build_thread_body without reviews: {only_prs[:200]!r}",
+    )
+
+    skipped = build_thread_body(stale, usermap, general_review=groups, now=REFERENCE_TIME,
+                                ci_error="required check 'x' is reported by app 9, not GitHub Actions")
+    check(
+        skipped.startswith("*Waiting on General Review* skipped :warning: cannot judge required CI: "
+                           "required check 'x' is reported by app 9")
+        and "#202" not in skipped and "*<@U12345>*" in skipped,
+        "a CI error replaces Waiting on General Review with a notice and keeps reviewer reminders",
+        f"build_thread_body with ci_error: {skipped[:200]!r}",
     )
 
     # --- Summary ---
