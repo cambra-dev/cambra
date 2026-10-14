@@ -270,8 +270,9 @@ pub enum Stmt {
     ///
     /// The type parameters are the capitalized leading parameters, kept apart from
     /// `params` because they are not arguments: `params` alone is the arity.
+    /// `name` spans the identifier alone, not the `def` keyword.
     FunctionDef {
-        name: SmolStr,
+        name: Spanned<SmolStr>,
         type_params: Vec<TypeParam>,
         params: Vec<Param>,
         output: Option<Spanned<Expr>>,

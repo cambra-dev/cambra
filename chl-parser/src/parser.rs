@@ -1578,7 +1578,11 @@ where
             });
 
         let def_stmt = just(Token::Def)
-            .ignore_then(select! { Token::Ident(s) => s }.labelled("function name"))
+            .ignore_then(
+                select! { Token::Ident(s) => s }
+                    .map_with(|s, e| Spanned::new(e.span(), s))
+                    .labelled("function name"),
+            )
             .then(
                 param
                     .separated_by(just(Token::Comma))
@@ -3101,12 +3105,42 @@ mod tests {
                 body,
                 ..
             } => {
-                assert_eq!(name.as_str(), "f");
+                assert_eq!(name.node.as_str(), "f");
                 assert_eq!(params.len(), 2);
                 assert!(output.is_none());
                 assert_eq!(body.len(), 1);
             }
             other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    /// A def's name carries the span of the identifier after `def`, not of the
+    /// keyword or the whole statement.
+    #[test]
+    fn function_def_name_span_covers_the_identifier() {
+        let cases = [
+            (
+                indoc! {"
+                    def total(x, y):
+                        x + y
+                "},
+                "total",
+            ),
+            (
+                indoc! {"
+                    def larger(T, a: T, b: T) => T:
+                        b if a < b else a
+                "},
+                "larger",
+            ),
+        ];
+        for (src, expected) in cases {
+            let m = parse_m(src);
+            let Stmt::FunctionDef { name, .. } = &m.body[0].node else {
+                panic!("expected FunctionDef, got {:?}", m.body[0].node);
+            };
+            assert_eq!(name.node.as_str(), expected);
+            assert_eq!(&src[name.span.as_range()], expected, "{src:?}");
         }
     }
 

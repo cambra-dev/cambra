@@ -147,6 +147,10 @@ Key shape choices:
   is the arity. The split happens as the list is parsed (`split_params`), which rejects a type
   parameter after a value parameter. A type parameter's annotation is a `KindAnnotation`: its kind
   `T: K` or its bound `T <: U`.
+- **A `def`'s name carries its own span.** `Stmt::FunctionDef.name` is a `Spanned<SmolStr>`
+  covering the identifier after `def`, as `Stmt::Param.name` covers its name. The statement's span
+  starts at `def`, so a consumer pointing at the name, such as a language server's symbol
+  selection range, cannot derive it from the statement.
 - **A polymorphic type has its own variant.** `forall (T, U <: B) V requires …` parses to
   `Expr::Forall`, whose binder list holds only type parameters. The `)` closing the list ends the
   last kind, so the body follows with no separator.

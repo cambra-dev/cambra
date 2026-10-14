@@ -291,14 +291,16 @@ fn a_pub_statement_spans_its_keyword() {
 /// does: the layout pass reads past `pub` for the statement's head.
 #[test]
 fn a_pub_def_opens_its_body() {
-    let Stmt::FunctionDef { name, body, .. } = pub_inner(indoc! {"
+    let src = indoc! {"
         pub def quote(item, qty):
             total = item * qty
             total
-    "}) else {
+    "};
+    let Stmt::FunctionDef { name, body, .. } = pub_inner(src) else {
         panic!("expected a def");
     };
-    assert_eq!(name, "quote");
+    assert_eq!(name.node, "quote");
+    assert_eq!(&src[name.span.as_range()], "quote");
     assert_eq!(body.len(), 2);
 }
 
