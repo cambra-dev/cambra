@@ -554,6 +554,8 @@ fn denotes_a_uint_range(ct: &CompactType) -> bool {
 /// reads them to decide whether two domains had to be combined. Two readings would let one
 /// accept several atoms where the other saw one, and a position is either several domains or
 /// one at both.
+///
+/// The returned types are distinct: the atoms are a set, and [`AtomKey::to_type`] is injective.
 pub(super) fn denoted_domains(ct: &CompactType) -> Option<Vec<Type>> {
     let o = ct.occupied();
     // A witness atom denotes no domain *set*: it is one domain, the one the witness
@@ -563,7 +565,12 @@ pub(super) fn denoted_domains(ct: &CompactType) -> Option<Vec<Type>> {
         && o.fun.is_none()
         && !o.others
         && !ct.atoms.iter().any(|a| matches!(a, AtomKey::Witness(_)));
-    bare_atoms.then(|| ct.atoms.iter().map(|a| a.to_type()).collect())
+    let ds: Vec<Type> = bare_atoms.then(|| ct.atoms.iter().map(|a| a.to_type()).collect())?;
+    debug_assert!(
+        ds.iter().enumerate().all(|(i, d)| !ds[..i].contains(d)),
+        "denoted domains are distinct because AtomKey::to_type is injective: {ds:?}"
+    );
+    Some(ds)
 }
 
 /// Whether a contravariant meet of two **data** domains had to combine anything — which is
@@ -592,18 +599,6 @@ fn data_domains_disagree(a: &CompactType, b: &CompactType) -> bool {
             .map(|r| r.keys().cloned().collect::<Vec<_>>())
     };
     a.refinements != b.refinements || a.atoms != b.atoms || keys(a) != keys(b)
-}
-
-/// Whether these **types** denote more than one domain — [`denoted_domains`]'s reading,
-/// applied after a merge has put both sides in one position.
-fn denotes_several_domains_ty(ds: &[Type]) -> bool {
-    let mut seen: Vec<&Type> = Vec::new();
-    for d in ds {
-        if !seen.contains(&d) {
-            seen.push(d);
-        }
-    }
-    seen.len() > 1
 }
 
 /// Merge binder kinds positionally, retaining the lesser existing ID at each position.
@@ -683,8 +678,7 @@ impl CompactFun {
         let domains_disagree = a.domains_disagree
             || b.domains_disagree
             || (kind.is_data()
-                && (combined.is_some()
-                    || denoted_domains(&domain).is_some_and(|ds| denotes_several_domains_ty(&ds))));
+                && (combined.is_some() || denoted_domains(&domain).is_some_and(|ds| ds.len() > 1)));
         CompactFun {
             name,
             kind,
@@ -2520,6 +2514,16 @@ mod tests {
         };
         let merged = CompactType::merge(true, data_fun(refined()), data_fun(refined()));
         assert_eq!(merged.fun.expect("fun slot present").kind, KindPin::Data);
+    }
+
+    /// Two atoms in a merged data domain are two domains even when the inputs agree.
+    #[test]
+    fn a_data_domain_denoting_two_atoms_disagrees_after_merge() {
+        let mut f = compact_type(&Type::data_fun(Type::UIntRange(2), Type::Txn)).term;
+        let slot = f.fun.as_mut().expect("a function slot");
+        slot.domain.atoms.insert(AtomKey::UIntRange(3));
+        let merged = CompactType::merge(true, f.clone(), f);
+        assert!(merged.fun.expect("fun slot present").domains_disagree);
     }
 
     /// A variable beside a single range atom still denotes that range, and a variable alone
