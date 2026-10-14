@@ -5,10 +5,7 @@ use crate::interpreter::live_keys;
 use crate::interpreter::operator_graph::value_at;
 use crate::{
     ccl::TagMap,
-    interpreter::{
-        ColumnValue, Consumer, Extent, Scheduler, UnionArm, Value, forwarding_consumer,
-        shared_consumer,
-    },
+    interpreter::{ColumnValue, Consumer, Extent, Scheduler, UnionArm, Value, shared_consumer},
 };
 
 // ---------------------------------------------------------------------------
@@ -365,13 +362,7 @@ impl TileOperator for UnionOperator {
         let input_producers: Vec<Box<dyn TileProducer>> = self
             .inputs
             .iter_mut()
-            .map(|op| {
-                op.subscribe(
-                    op.tiling().universal_guard(),
-                    forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-                    scheduler,
-                )
-            })
+            .map(|op| subscribe_forwarding(&mut **op, &shared, scheduler))
             .collect();
         Box::new(UnionProducer {
             base: ProducerBase::new(

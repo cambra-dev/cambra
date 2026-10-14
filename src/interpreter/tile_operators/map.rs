@@ -6,7 +6,7 @@ use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{
         ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Scheduler, Value,
-        forwarding_consumer, shared_consumer,
+        shared_consumer,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -188,16 +188,8 @@ impl TileOperator for MapResult {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
-        let function_producer = self.function.subscribe(
-            self.function.tiling().universal_guard(),
-            forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-            scheduler,
-        );
-        let input_producer = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-            scheduler,
-        );
+        let function_producer = subscribe_forwarding(&mut *self.function, &shared, scheduler);
+        let input_producer = subscribe_forwarding(&mut *self.input, &shared, scheduler);
         Box::new(MapResultProducer {
             base: ProducerBase::new(
                 MapResultProducer::alloc_id(),
@@ -686,16 +678,8 @@ impl TileOperator for MapResultToConst {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
-        let constant_producer = self.constant.subscribe(
-            self.constant.tiling().universal_guard(),
-            forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-            scheduler,
-        );
-        let input_producer = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-            scheduler,
-        );
+        let constant_producer = subscribe_forwarding(&mut *self.constant, &shared, scheduler);
+        let input_producer = subscribe_forwarding(&mut *self.input, &shared, scheduler);
         Box::new(MapResultToConstProducer {
             base: ProducerBase::new(
                 MapResultToConstProducer::alloc_id(),

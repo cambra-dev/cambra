@@ -5,9 +5,7 @@ use bit_set::BitSet;
 
 use super::*;
 use crate::interpreter::operator_graph::{value, value_at};
-use crate::interpreter::{
-    Consumer, RowIndex, Scheduler, Value, forwarding_consumer, shared_consumer, tuple_field,
-};
+use crate::interpreter::{Consumer, RowIndex, Scheduler, Value, shared_consumer, tuple_field};
 
 /// Pairs its operands at `level`, producing a collection carrying the levels standing above it
 /// whose values are a record of what each operand holds there.
@@ -156,13 +154,7 @@ impl TileOperator for Zip {
             inputs: self
                 .inputs
                 .iter_mut()
-                .map(|i| {
-                    i.subscribe(
-                        i.tiling().universal_guard(),
-                        forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-                        scheduler,
-                    )
-                })
+                .map(|i| subscribe_forwarding(&mut **i, &shared, scheduler))
                 .collect(),
         })
     }
@@ -628,13 +620,7 @@ impl TileOperator for MakeRecord {
             inputs: self
                 .inputs
                 .iter_mut()
-                .map(|i| {
-                    i.subscribe(
-                        i.tiling().universal_guard(),
-                        forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-                        scheduler,
-                    )
-                })
+                .map(|i| subscribe_forwarding(&mut **i, &shared, scheduler))
                 .collect(),
         })
     }

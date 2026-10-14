@@ -31,7 +31,10 @@ use crate::{
     ccl::provenance::NodeId,
     interpreter::operator_graph::{EdgeKind, InputEdgeSpec},
     interpreter::value_probe::ProbeSlot,
-    interpreter::{ColumnValue, Consumer, Extent, Gate, Scheduler, Value, validate_tile},
+    interpreter::{
+        ColumnValue, Consumer, Extent, Gate, GatedConsumer, Scheduler, Value, forwarding_consumer,
+        validate_tile,
+    },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -185,6 +188,21 @@ pub trait TileOperator {
 // operator reads anything another operator computed, so the producer graph still
 // describes the whole dataflow.
 static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLock::new();
+
+/// Subscribe `op` at its universal guard with a consumer that forwards to `shared`, the
+/// consumer every input of one operator wakes
+/// ([`shared_consumer`](crate::interpreter::shared_consumer)).
+pub(crate) fn subscribe_forwarding(
+    op: &mut dyn TileOperator,
+    shared: &GatedConsumer,
+    scheduler: &mut Scheduler,
+) -> Box<dyn TileProducer> {
+    op.subscribe(
+        op.tiling().universal_guard(),
+        forwarding_consumer(shared, &scheduler.wakeup_queue()),
+        scheduler,
+    )
+}
 
 /// The concrete type's name with its module path stripped, e.g. `"MapResult"`.
 ///
