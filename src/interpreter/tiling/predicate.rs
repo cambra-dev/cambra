@@ -1370,15 +1370,14 @@ impl Predicate {
 /// `Value`'s discrete [`Domain`] knows each value's neighbours but not where a type ends,
 /// so the crate reads `(-∞, 0)` over `UInt` as nonempty. Clamping every set to this range
 /// is what makes emptiness, universality, and containment exact.
-fn type_range(sample: &Value) -> Option<IntervalSet<Value>> {
-    let range = match sample {
-        Value::UInt(_) => Interval::closed_unbound(Value::UInt(0)),
-        Value::Int(_) => Interval::closed(Value::Int(i64::MIN), Value::Int(i64::MAX)),
-        Value::Bool(_) => Interval::closed(Value::Bool(false), Value::Bool(true)),
-        Value::String(_) => Interval::closed_unbound(Value::String("".into())),
-        _ => return None,
-    };
-    Some(IntervalSet::from(range))
+fn type_range(sample: &Value) -> Option<Interval<Value>> {
+    match sample {
+        Value::UInt(_) => Some(Interval::closed_unbound(Value::UInt(0))),
+        Value::Int(_) => Some(Interval::closed(Value::Int(i64::MIN), Value::Int(i64::MAX))),
+        Value::Bool(_) => Some(Interval::closed(Value::Bool(false), Value::Bool(true))),
+        Value::String(_) => Some(Interval::closed_unbound(Value::String("".into()))),
+        _ => None,
+    }
 }
 
 /// A value `set` names, from which its type is read.
@@ -1391,12 +1390,11 @@ fn sample(set: &IntervalSet<Value>) -> Option<&Value> {
 /// Whether canonical `set` holds every value of its type, whose range is `range`: the
 /// range itself once clamped and normalized, or the unbounded interval for a type with no
 /// least or greatest value.
-fn is_whole(set: &IntervalSet<Value>, range: Option<&IntervalSet<Value>>) -> bool {
-    match range {
-        Some(range) => set == range,
-        None => {
-            matches!(set.intervals().as_slice(), [only] if only.left().is_none() && only.right().is_none())
-        }
+fn is_whole(set: &IntervalSet<Value>, range: Option<&Interval<Value>>) -> bool {
+    match (set.intervals().as_slice(), range) {
+        ([only], Some(range)) => only == range,
+        ([only], None) => only.left().is_none() && only.right().is_none(),
+        _ => false,
     }
 }
 
