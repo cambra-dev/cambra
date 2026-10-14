@@ -9,8 +9,8 @@
 //! Each line is `{"file", "start", "end", "line", "col", "class"}`. `start` and
 //! `end` are byte offsets, `end` exclusive. `line` and `col` locate `start`,
 //! both 1-based, with `col` counted in bytes as Vim's `col()` counts it.
-//! `class` is a [`HighlightClass::name`]. A file that lexes with errors prints
-//! them to stderr instead of its spans, and makes the exit status 1.
+//! `class` is a [`HighlightClass::name`]. A file that lexes with errors also
+//! prints them to stderr, and makes the exit status 1.
 
 use chl_parser::FileId;
 use chl_parser::lexer::{HighlightClass, Highlighted, highlight};
@@ -31,13 +31,10 @@ fn main() -> ExitCode {
             }
         };
         let Highlighted { spans, errors } = highlight(FileId::ROOT, &source);
-        if !errors.is_empty() {
-            for e in errors {
-                let (line, col) = line_col(&source, e.span().start);
-                eprintln!("{path}:{line}:{col}: {e}");
-            }
+        for e in &errors {
+            let (line, col) = line_col(&source, e.span().start);
+            eprintln!("{path}:{line}:{col}: {e}");
             failed = true;
-            continue;
         }
         let file = json_string(&path);
         for (class, span) in spans {

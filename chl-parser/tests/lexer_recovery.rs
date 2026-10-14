@@ -220,6 +220,7 @@ fn mutate(rng: &mut Rng, source: &str) -> String {
 /// The invariants `tokenize` keeps on every input
 /// (`chl-parser/design-chl-parser.md`, "Lexer recovery").
 fn check_invariants(source: &str) -> Result<(), String> {
+    use chl_parser::lexer::LexError as E;
     let Lexed { tokens, errors } = tokenize(FileId::ROOT, source);
     let in_bounds = |start: usize, end: usize| {
         start <= end
@@ -269,6 +270,39 @@ fn check_invariants(source: &str) -> Result<(), String> {
         return Err(format!("{open:?} never closed"));
     }
 
+    // `lex_then_grammar_errors` drops the grammar errors found at a zero-width
+    // closer on the strength of the lexical error each one comes with.
+    let zero_width_closers = tokens
+        .iter()
+        .filter(|(t, s)| {
+            matches!(t, Token::RParen | Token::RBracket | Token::RBrace) && s.start == s.end
+        })
+        .count();
+    let bracket_errors = errors
+        .iter()
+        .filter(|e| matches!(e, E::UnclosedBracket { .. } | E::MismatchedClose { .. }))
+        .count();
+    if zero_width_closers != bracket_errors {
+        return Err(format!(
+            "{zero_width_closers} zero-width closers, {bracket_errors} bracket errors"
+        ));
+    }
+    if errors
+        .windows(2)
+        .any(|w| w[1].span().start < w[0].span().start)
+    {
+        return Err(format!("errors out of source order: {errors:?}"));
+    }
+
+    // A block on an assignment's right-hand side closes with one `Dedent`
+    // that has no `Indent`, so `Dedent`s can outnumber `Indent`s and never
+    // the reverse.
+    let count = |kind: &Token| tokens.iter().filter(|(t, _)| t == kind).count();
+    let (indents, dedents) = (count(&Token::Indent), count(&Token::Dedent));
+    if dedents < indents {
+        return Err(format!("{indents} Indents but {dedents} Dedents"));
+    }
+
     let tail = tokens
         .iter()
         .rposition(|(t, _)| *t != Token::Dedent)
@@ -303,8 +337,7 @@ fn check_invariants(source: &str) -> Result<(), String> {
     }
 
     let highlighted = highlight(FileId::ROOT, source);
-    let lexical = |e: &&chl_parser::lexer::LexError| {
-        use chl_parser::lexer::LexError as E;
+    let lexical = |e: &&E| {
         matches!(
             e,
             E::InvalidToken { .. } | E::UnterminatedString { .. } | E::DetachedBacktick { .. }

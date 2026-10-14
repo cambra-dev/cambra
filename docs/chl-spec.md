@@ -113,7 +113,7 @@ xs = [
 ]
 ```
 
-An unclosed bracket at EOF is a hard lexical error (`UnclosedBracket`).
+An open bracket the source never closes is a lexical error (`UnclosedBracket`).
 There is no explicit line-continuation backslash.
 
 ### 1.5 Identifiers
@@ -4809,9 +4809,9 @@ the stream each error leaves.
 - **`UnmatchedClose`** — `)`, `]`, or `}` that matches no open bracket.
 - **`UnclosedBracket`** — an open `(`/`[`/`{` the source never closes. The span is the open
   bracket.
-- **`MismatchedClose`** — `)`, `]`, or `}` that matches no open bracket, met while an open
-  bracket the source never closes was innermost. The span is the close bracket; the error also
-  names the open bracket.
+- **`MismatchedClose`** — `)`, `]`, or `}` of another kind than the innermost open bracket,
+  where that open bracket is never closed. The span is the close bracket; the error also names
+  the open bracket.
 - **`InconsistentIndent`** — dedented to a level not on the indent
   stack.
 

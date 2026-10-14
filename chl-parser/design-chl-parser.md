@@ -45,8 +45,8 @@ logical statement's first line, not a later physical line containing the colon. 
 comment-only lines do not consume the pending request or change the stack.
 
 A stack of open brackets suppresses physical newlines and indentation processing while it is
-nonempty. Each entry records the bracket's kind, its span, and the indentation of the line its
-statement began on; a close bracket must match the innermost entry's kind.
+nonempty. Every open bracket belongs to the current logical line. A close bracket must match the
+innermost open bracket's kind.
 
 The token stream ends with a `Newline` and enough `Dedent`s to close the stack.
 Ordinary blocks balance `Indent` and `Dedent`; each pending assignment-side level contributes
@@ -315,18 +315,26 @@ A close bracket is compared with the open brackets on the stack:
 
 - **It matches the innermost.** The pair closes.
 - **It matches an outer one.** Each open bracket inside that one gets a zero-width closer just
-  before the close bracket and an `UnclosedBracket` at its opener. The close bracket then closes
-  the outer one.
+  before the close bracket. The innermost gets one `MismatchedClose` at the close bracket, naming
+  both; the others get an `UnclosedBracket` at their openers. The close bracket then closes the
+  outer one. CPython reports the same pair ("closing parenthesis ']' does not match opening
+  parenthesis '('"), and rustc labels both brackets.
 
   ```text
-  xs = [f(a]      →  xs = [ f ( a ) ]       UnclosedBracket at `(`
+  xs = [f(a]      →  xs = [ f ( a ) ]       MismatchedClose: `]` does not match `(`
   ```
+
+  When a line that ends the outer bracket's statement came before the close bracket, the outer
+  bracket was most likely the one left open, and it closes at that line instead
+  ([Unclosed brackets](#unclosed-brackets)).
 
 - **It matches none.** It is dropped, and the innermost open bracket, if any, keeps going. Which
   error it reports waits until that open bracket closes, because either bracket can be the
   mistake: a `]` typed for `)`, or a stray `]`. If the open bracket closes later, the close
   bracket was stray and gets `UnmatchedClose`. If it never closes, one `MismatchedClose` at the
   close bracket names both, and the open bracket gets no `UnclosedBracket` of its own.
+  Either way the open bracket closes no later than the first line that ends its statement
+  ([Unclosed brackets](#unclosed-brackets)).
 
   ```text
   x = f(a))       →  x = f ( a )            UnmatchedClose at the second `)`
@@ -350,18 +358,10 @@ Inside brackets the layout pass drops physical newlines and skips indentation, s
 bracket that is never closed turns every later line into part of one logical line. At the end of
 input each open bracket gets a zero-width closer and an `UnclosedBracket` at its opener.
 
-That alone leaves the rest of the file inside the bracket. When the layout pass ends with open
-brackets, `tokenize` runs it a second time, in which those brackets close early. Each one closes
-before the first later line that starts at or left of the indentation of the line where its
-opener's statement began.
-
-```text
-x = f(a, b        →  x = f ( a , b )        UnclosedBracket at `(`
-y = 2                y = 2
-```
-
-The second pass applies only to the brackets the first pass left open. A bracket the first pass
-closed keeps its tokens, such as the `[` of a closing bracket on its own line:
+That alone leaves the rest of the file inside the bracket. A physical line inside brackets ends
+their statement when it starts at or left of the indentation of the line the statement began on,
+with a token other than a close bracket. A close bracket on its own line, flush with its
+statement, ends the bracketed list and not the statement:
 
 ```text
 xs = [
@@ -369,8 +369,31 @@ xs = [
 ]
 ```
 
-A source with no unclosed bracket never reaches the second pass, so the second pass cannot change
-the tokens of a source with no lexical error.
+An open bracket closes before the first line that ends its statement in three cases:
+
+- A close bracket of another kind met it while it was innermost
+  ([Close brackets](#close-brackets)). The first layout pass closes it there.
+- The first layout pass ended with it open. `tokenize` runs layout a second time, in which it
+  closes there.
+- The first layout pass closed it with a close bracket of its kind, after a line that ended its
+  statement, and closed brackets inside it with zero-width closers on the way. The second layout
+  pass closes it at that line, and the close bracket is then compared with the brackets open in
+  the second pass.
+
+```text
+x = f(a, b        →  x = f ( a , b )        UnclosedBracket at `(`
+y = 2                y = 2
+
+x = f(a           →  x = f ( a )            UnclosedBracket at `(`
+y = [1, 2)           y = [ 1 , 2 ]          MismatchedClose: `)` does not match `[`
+z = 3                z = 3
+```
+
+CPython 3.14 reports the `)` in the second example with the same message, and stops there.
+
+Each case needs a lexical error, so a source with none is laid out once and keeps the tokens it
+had before recovery existed. Layout runs at most twice: the second pass closes the brackets the
+first found, and its own findings are not acted on.
 
 The rule closes too early where an unclosed bracket's own continuation lines start at the
 statement's indentation. `b,` and `c` become statements of their own rather than elements:
@@ -400,7 +423,14 @@ if c:
 
 `parse_module` and `parse_expression` report the lexer's errors first, then parse the stream. A
 grammar error whose found token is a `Token::Error` or a zero-width closer is dropped from the
-result, because the lexical error at that place already reports it.
+result, because the lexical error at that place already reports it. Each zero-width closer comes
+with exactly one `UnclosedBracket` or `MismatchedClose`, which `tokenize` asserts in debug builds.
+
+The dropped error can be a second mistake at the same place. In `x = f(a if`, the parser expects
+an expression at the zero-width `)`, and only the `UnclosedBracket` is reported.
+
+Only its empty span marks a zero-width closer. A consumer that needs to know a bracket is
+synthesized, such as a formatter or an AST span, has nothing else to read.
 
 #### Later: parser-driven recovery for unclosed brackets
 
@@ -429,8 +459,17 @@ idea without that:
 - **A pull parser.** Replace the Chumsky grammar with a hand-written parser that pulls tokens, as
   Ruff's does.
 
-Neither is implemented. A recovery corpus case where the second layout pass closes a bracket at
-the wrong line is the evidence for either.
+A third design fixes the diagnostics and leaves the tokens alone. On a grammar error, CPython's
+`_PyPegen_tokenize_full_source_to_check_for_errors` (`Parser/pegen_errors.c`) tokenizes the rest
+of the source. If the tokenizer fails, at the end of input included, while a bracket opened on a
+line before the grammar error's line is open, it replaces the grammar error with "'(' was never
+closed" at that bracket. Here the analogue drops a grammar error that falls between an
+`UnclosedBracket` and its zero-width closer, on a later line than the bracket. In the example
+above it removes the error at `return`, and `return x` stays inside `f`'s parameter list.
+
+None is implemented. A recovery corpus case where the second layout pass closes a bracket at the
+wrong line is the evidence for the first two. A grammar error inside an unclosed bracket that a
+corpus golden reports is the evidence for the third.
 
 ### Recovery API
 
@@ -458,8 +497,10 @@ if both outputs are empty, it synthesizes a parse error at `0..0`.
 
 `run_frontend` in `src/ccl/context.rs` accumulates parse errors before examining the AST.
 If no module is available, it returns those errors. An empty module gets an empty-program
-diagnostic. Otherwise it invokes `lower_stmts` even when parsing reported errors, allowing
-independent lowering errors to appear in the same response.
+diagnostic. Otherwise it invokes `lower_stmts` even when parsing reported errors, lexical errors
+included, allowing independent lowering errors to appear in the same response. Lowering sees the
+token stream [Lexer recovery](#lexer-recovery) leaves, so a call the lexer closed with a
+zero-width closer lowers as an ordinary call.
 
 Lowering maps recovered error nodes to `TypedExprNode::Error` without reporting the same
 parse failure again. `LoweringResult` also carries an optional value and errors.
@@ -468,8 +509,9 @@ stage reported an error. Inference and later phases do not run on that result.
 This guard applies to diagnostics from validation as well as explicit AST holes.
 
 The returned `Vec<CompileError>` contains stage-tagged errors, not an assertion that all
-possible errors were discovered. Regressions include `multiple_parse_errors_all_surface`
-and `multiple_lowering_errors_all_surface` in `src/ccl/context.rs`.
+possible errors were discovered. Regressions include `multiple_parse_errors_all_surface`,
+`lex_and_parse_errors_both_surface` and `multiple_lowering_errors_all_surface` in
+`src/ccl/context.rs`.
 
 ### Error message quality
 

@@ -812,16 +812,17 @@ pub enum LexError {
     DetachedBacktick { span: Span },
     /// A close bracket that matches no open bracket. [`tokenize`] drops it.
     UnmatchedClose { span: Span },
-    /// A close bracket that matches no open bracket, met while the open
-    /// bracket at `open` was innermost, where that open bracket is never
+    /// A close bracket of another kind than the open bracket at `open`, met
+    /// while that open bracket was innermost, where that open bracket is never
     /// closed. One error covers both: either bracket can be the mistake.
-    /// [`tokenize`] drops the close bracket and closes the open one as for
-    /// [`LexError::UnclosedBracket`].
+    /// [`tokenize`] closes the open bracket as for
+    /// [`LexError::UnclosedBracket`]. A close bracket that matches an outer
+    /// open bracket closes it; one that matches none is dropped.
     MismatchedClose {
         span: Span,
-        close: Token,
+        close: Bracket,
         open: Span,
-        opener: Token,
+        opener: Bracket,
     },
     /// An open bracket the source never closes. The span is the open bracket;
     /// [`tokenize`] closes it with a zero-width closer.
@@ -851,9 +852,12 @@ impl fmt::Display for LexError {
             LexError::InconsistentIndent { .. } => {
                 f.write_str("indentation does not match any enclosing level")
             }
-            LexError::MismatchedClose { close, opener, .. } => {
-                write!(f, "`{close}` does not match `{opener}`")
-            }
+            LexError::MismatchedClose { close, opener, .. } => write!(
+                f,
+                "`{}` does not match `{}`",
+                close.close_char(),
+                opener.open_char()
+            ),
         }
     }
 }
@@ -883,11 +887,78 @@ impl LexError {
     }
 }
 
+/// The kind of a bracket pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bracket {
+    /// `(` and `)`.
+    Paren,
+    /// `[` and `]`.
+    Square,
+    /// `{` and `}`.
+    Brace,
+}
+
+impl Bracket {
+    /// The kind of bracket `tok` opens, if it is an open bracket.
+    fn opened_by(tok: &Token) -> Option<Bracket> {
+        match tok {
+            Token::LParen => Some(Bracket::Paren),
+            Token::LBracket => Some(Bracket::Square),
+            Token::LBrace => Some(Bracket::Brace),
+            _ => None,
+        }
+    }
+
+    /// The kind of bracket `tok` closes, if it is a close bracket.
+    fn closed_by(tok: &Token) -> Option<Bracket> {
+        match tok {
+            Token::RParen => Some(Bracket::Paren),
+            Token::RBracket => Some(Bracket::Square),
+            Token::RBrace => Some(Bracket::Brace),
+            _ => None,
+        }
+    }
+
+    /// The token that closes this kind of bracket.
+    fn close_token(self) -> Token {
+        match self {
+            Bracket::Paren => Token::RParen,
+            Bracket::Square => Token::RBracket,
+            Bracket::Brace => Token::RBrace,
+        }
+    }
+
+    pub fn open_char(self) -> char {
+        match self {
+            Bracket::Paren => '(',
+            Bracket::Square => '[',
+            Bracket::Brace => '{',
+        }
+    }
+
+    pub fn close_char(self) -> char {
+        match self {
+            Bracket::Paren => ')',
+            Bracket::Square => ']',
+            Bracket::Brace => '}',
+        }
+    }
+}
+
 /// A token stream and the lexical errors found producing it, in source order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lexed {
     pub tokens: Vec<(Token, Span)>,
     pub errors: Vec<LexError>,
+}
+
+/// The logos tokens of a source, before layout, and the errors found in them.
+struct RawTokens {
+    tokens: Vec<(Token, Span)>,
+    errors: Vec<LexError>,
+    /// The indices into `tokens` of the backticks with a
+    /// [`LexError::DetachedBacktick`], ascending.
+    detached: Vec<usize>,
 }
 
 /// The logos tokens of `source`, before layout, and the errors found in them.
@@ -902,17 +973,17 @@ pub struct Lexed {
 ///   one [`LexError::InvalidToken`]: logos fails one character at a time.
 /// - A backtick not immediately followed by an identifier stays in the stream
 ///   with a [`LexError::DetachedBacktick`]; [`tokenize`] drops it.
-fn raw_tokens(file: FileId, source: &str) -> Lexed {
+fn raw_tokens(file: FileId, source: &str) -> RawTokens {
     let mut tokens: Vec<(Token, Span)> = Vec::new();
     let mut errors = Vec::new();
     let mut lex = Token::lexer(source);
     while let Some(result) = lex.next() {
         let range = lex.span();
         let span = Span::new(file, range.start, range.end);
-        let Err(()) = result else {
-            tokens.push((result.expect("matched Err above"), span));
+        if let Ok(tok) = result {
+            tokens.push((tok, span));
             continue;
-        };
+        }
         if let Some(quote @ ('"' | '\'')) = source[span.start..].chars().next() {
             let line_end = source[span.start..]
                 .find('\n')
@@ -939,17 +1010,25 @@ fn raw_tokens(file: FileId, source: &str) -> Lexed {
             }
         }
     }
+    let mut detached = Vec::new();
     for (i, (tok, span)) in tokens.iter().enumerate() {
         if !matches!(tok, Token::Backtick) {
             continue;
         }
         match tokens.get(i + 1) {
             Some((Token::Ident(_), next)) if next.start == span.end => {}
-            _ => errors.push(LexError::DetachedBacktick { span: *span }),
+            _ => {
+                detached.push(i);
+                errors.push(LexError::DetachedBacktick { span: *span });
+            }
         }
     }
     errors.sort_by_key(|e| e.span().start);
-    Lexed { tokens, errors }
+    RawTokens {
+        tokens,
+        errors,
+        detached,
+    }
 }
 
 /// One entry of the layout stack: a column a line returns to in order to
@@ -1024,33 +1103,50 @@ fn opens_block_at_line_start(tok: &Token) -> bool {
 ///   on. `block_value` in the parser consumes that one.
 /// - Brackets balance: every `LParen`/`LBracket`/`LBrace` has a closer of its
 ///   kind, possibly zero-width, and no `Newline` appears between them.
+/// - Each zero-width closer comes with one [`LexError::UnclosedBracket`] or
+///   [`LexError::MismatchedClose`] for its open bracket.
 ///
-/// Layout runs a second time when the first run ends with open brackets, so
-/// that those brackets close before the line their statement should have
-/// ended at (`chl-parser/design-chl-parser.md`, "Unclosed brackets"). A source
-/// whose first run leaves no bracket open is laid out once.
+/// Layout runs a second time when the first run finds a bracket that stays
+/// open past the end of its statement (`chl-parser/design-chl-parser.md`,
+/// "Unclosed brackets"). Only a source with a lexical error is laid out twice.
 pub fn tokenize(file: FileId, source: &str) -> Lexed {
     let raw = raw_tokens(file, source);
-    let detached: Vec<usize> = raw
-        .errors
-        .iter()
-        .filter_map(|e| match e {
-            LexError::DetachedBacktick { span } => Some(span.start),
-            _ => None,
-        })
-        .collect();
     let tokens: Vec<(Token, Span)> = raw
         .tokens
         .into_iter()
-        .filter(|(tok, span)| !(matches!(tok, Token::Backtick) && detached.contains(&span.start)))
+        .enumerate()
+        .filter(|(i, _)| raw.detached.binary_search(i).is_err())
+        .map(|(_, token)| token)
         .collect();
     let first = Layout::run(file, source, &tokens, &[]);
-    let unclosed = first.unclosed.clone();
-    let laid = if unclosed.is_empty() {
+    let mut resync: Vec<usize>;
+    let laid = if first.resync_next.is_empty() {
         first
     } else {
-        Layout::run(file, source, &tokens, &unclosed)
+        debug_assert!(
+            !first.errors.is_empty(),
+            "layout asks for a second run only after reporting a lexical error"
+        );
+        resync = first.resync_next;
+        resync.sort_unstable();
+        resync.dedup();
+        Layout::run(file, source, &tokens, &resync)
     };
+    debug_assert_eq!(
+        laid.out
+            .iter()
+            .filter(|(tok, span)| Bracket::closed_by(tok).is_some() && span.start == span.end)
+            .count(),
+        laid.errors
+            .iter()
+            .filter(|e| matches!(
+                e,
+                LexError::UnclosedBracket { .. } | LexError::MismatchedClose { .. }
+            ))
+            .count(),
+        "each zero-width closer has one UnclosedBracket or MismatchedClose, which \
+         `lex_then_grammar_errors` relies on to drop the grammar errors found at it"
+    );
     let mut errors = raw.errors;
     errors.extend(laid.errors);
     errors.sort_by_key(|e| e.span().start);
@@ -1062,28 +1158,30 @@ pub fn tokenize(file: FileId, source: &str) -> Lexed {
 
 /// An open bracket on the layout pass's stack.
 struct OpenBracket {
-    /// The bracket's own token, which says which closer matches it.
-    open: Token,
+    kind: Bracket,
     span: Span,
-    /// The indentation of the line its statement began on.
-    line_indent: usize,
-    /// Whether this bracket closes before a line at or left of `line_indent`:
-    /// the previous layout run left it open.
+    /// The bracket's index in the token slice layout runs over, the same in
+    /// both runs.
+    index: usize,
+    /// Whether the previous layout run asked for this bracket to close before
+    /// the first line that ends its statement.
     resync: bool,
-    /// The first close bracket that matched no open bracket while this one was
-    /// innermost. Its error waits until this bracket closes: one
+    /// Whether a line that ends the bracket's statement has started since the
+    /// bracket opened ([`Layout::physical_line`]).
+    statement_ended: bool,
+    /// The first close bracket met while this bracket was innermost that did
+    /// not close it. Its error waits until this bracket closes: one
     /// [`LexError::MismatchedClose`] if it never does, a
     /// [`LexError::UnmatchedClose`] if it does.
-    stray: Option<(Token, Span)>,
+    stray: Option<(Bracket, Span)>,
 }
 
-/// The closer that matches the open bracket `open`.
-fn closer(open: &Token) -> Token {
-    match open {
-        Token::LParen => Token::RParen,
-        Token::LBracket => Token::RBracket,
-        Token::LBrace => Token::RBrace,
-        other => unreachable!("only open brackets go on the bracket stack, got {other:?}"),
+impl OpenBracket {
+    /// Whether the bracket closes before the first line that ends its
+    /// statement: the previous run asked it to, or a close bracket of another
+    /// kind already met it. A source with no lexical error has neither.
+    fn closes_early(&self) -> bool {
+        self.resync || self.stray.is_some()
     }
 }
 
@@ -1094,33 +1192,41 @@ struct Layout<'a> {
     out: Vec<(Token, Span)>,
     errors: Vec<LexError>,
     indent_stack: Vec<Level>,
+    /// The open brackets, innermost last. All of them opened on the current
+    /// logical line, so `line_indent` is the indentation of each one's
+    /// statement.
     brackets: Vec<OpenBracket>,
-    /// The spans of the open brackets this run closes early.
-    resync: &'a [Span],
-    /// The spans of the open brackets still open at the end of input.
-    unclosed: Vec<Span>,
+    /// The indices of the open brackets this run closes before the first line
+    /// that ends their statement, ascending.
+    resync: &'a [usize],
+    /// The indices of the open brackets the next run should close that way:
+    /// each one still open at the end of input, and each one a close bracket
+    /// of its kind closed, with other brackets inside it, after a line that
+    /// ended its statement.
+    resync_next: Vec<usize>,
     at_line_start: bool,
     /// The first newline dropped inside brackets since the last token: the end
     /// of the physical line before the next token's.
     dropped_newline: Option<Span>,
-    // Set when the line just closed opened a block from somewhere other than
-    // its first token — an assignment's block right-hand side. Carries the
-    // statement's own column, the floor for the level that block opens.
+    /// Set when the line just closed opened a block from somewhere other than
+    /// its first token — an assignment's block right-hand side. Carries the
+    /// statement's own column, the floor for the level that block opens.
     block_value_open: Option<usize>,
-    // Whether the current line's first token is a block keyword, which is what
-    // separates a block that starts its line from one that does not.
+    /// Whether the current line's first token is a block keyword, which is what
+    /// separates a block that starts its line from one that does not.
     line_opens_at_first_token: bool,
-    // Whether the current line's first token is `pub`, so that its second token
-    // is the statement's head.
+    /// Whether the current line's first token is `pub`, so that its second
+    /// token is the statement's head.
     line_head_after_pub: bool,
-    // The indent of the line the current *logical* line started on. A bracketed
-    // header spans several physical lines, and the floor a block right-hand side
-    // opens belongs to the statement, not to the physical line its `:` lands on.
+    /// The indent of the line the current logical line started on. A
+    /// bracketed header spans several physical lines, and the floor a block
+    /// right-hand side opens belongs to the statement, not to the physical
+    /// line its `:` lands on.
     line_indent: usize,
 }
 
 impl<'a> Layout<'a> {
-    fn run(file: FileId, source: &'a str, raw: &[(Token, Span)], resync: &'a [Span]) -> Self {
+    fn run(file: FileId, source: &'a str, raw: &[(Token, Span)], resync: &'a [usize]) -> Self {
         let mut layout = Layout {
             file,
             source,
@@ -1129,7 +1235,7 @@ impl<'a> Layout<'a> {
             indent_stack: vec![Level::Fixed(0)],
             brackets: Vec::new(),
             resync,
-            unclosed: Vec::new(),
+            resync_next: Vec::new(),
             at_line_start: true,
             dropped_newline: None,
             block_value_open: None,
@@ -1137,8 +1243,8 @@ impl<'a> Layout<'a> {
             line_head_after_pub: false,
             line_indent: 0,
         };
-        for (tok, span) in raw {
-            layout.token(tok, *span);
+        for (index, (tok, span)) in raw.iter().enumerate() {
+            layout.token(index, tok, *span);
         }
         layout.finish();
         layout
@@ -1153,14 +1259,19 @@ impl<'a> Layout<'a> {
         (line_start, span.start - line_start)
     }
 
-    fn token(&mut self, tok: &Token, span: Span) {
+    /// The token `tok` at `span`, the `index`th of the slice the run is over.
+    fn token(&mut self, index: usize, tok: &Token, span: Span) {
         // Blank lines and comment-only lines: their only token is `Newline`,
         // and we want them to not affect indentation or appear in the output.
         if self.at_line_start && matches!(tok, Token::Newline) {
             return;
         }
-        if let Some(newline) = self.dropped_newline.take() {
-            self.close_early(span, newline);
+        // A blank or comment-only line inside brackets has no token, so it
+        // starts no physical line; its `Newline` waits with the first one.
+        if !matches!(tok, Token::Newline)
+            && let Some(newline) = self.dropped_newline.take()
+        {
+            self.physical_line(tok, span, newline);
         }
 
         if self.at_line_start && self.brackets.is_empty() {
@@ -1171,32 +1282,31 @@ impl<'a> Layout<'a> {
         }
         self.at_line_start = false;
 
-        match tok {
-            Token::LParen | Token::LBracket | Token::LBrace => {
-                self.brackets.push(OpenBracket {
-                    open: tok.clone(),
-                    span,
-                    line_indent: self.line_indent,
-                    resync: self.resync.contains(&span),
-                    stray: None,
-                });
-                self.out.push((tok.clone(), span));
+        if let Some(kind) = Bracket::opened_by(tok) {
+            self.brackets.push(OpenBracket {
+                kind,
+                span,
+                index,
+                resync: self.resync.binary_search(&index).is_ok(),
+                statement_ended: false,
+                stray: None,
+            });
+            self.out.push((tok.clone(), span));
+        } else if let Some(kind) = Bracket::closed_by(tok) {
+            self.close(kind, span);
+        } else if matches!(tok, Token::Newline) {
+            if self.brackets.is_empty() {
+                self.end_line(span);
+            } else {
+                // Newlines inside brackets are swallowed (implicit
+                // continuation); the first one is kept in case the next
+                // line closes the brackets early.
+                self.dropped_newline.get_or_insert(span);
             }
-            Token::RParen | Token::RBracket | Token::RBrace => self.close(tok, span),
-            Token::Newline => {
-                if self.brackets.is_empty() {
-                    self.end_line(span);
-                } else {
-                    // Newlines inside brackets are swallowed (implicit
-                    // continuation); the first one is kept in case the next
-                    // line closes the brackets early.
-                    self.dropped_newline.get_or_insert(span);
-                }
-            }
-            _ => self.out.push((tok.clone(), span)),
+        } else {
+            self.out.push((tok.clone(), span));
         }
     }
-
     /// The first token of a logical line: open or close indentation levels.
     fn line_start(&mut self, tok: &Token, span: Span) {
         let (line_start, indent) = self.column(span);
@@ -1256,53 +1366,75 @@ impl<'a> Layout<'a> {
         self.at_line_start = true;
     }
 
-    /// The token at `span` starts a physical line inside brackets, after
-    /// `newline`. Close each innermost bracket marked for resync whose
-    /// statement began at or right of this line's column. Closing them all
-    /// ends the logical line at `newline`.
+    /// The token `tok` at `span` starts a physical line inside brackets, after
+    /// `newline`. The line ends the brackets' statement when it starts at or
+    /// left of the statement's indentation with a token other than a close
+    /// bracket. A close bracket on its own line, flush with its statement, ends
+    /// the bracketed list and not the statement.
     ///
-    /// No later close bracket matches a bracket the previous run left open, so
-    /// a line starting with one needs no exception: the close bracket is
-    /// dropped whether or not the bracket closed before its line.
-    fn close_early(&mut self, span: Span, newline: Span) {
+    /// A line that ends the statement sets every open bracket's
+    /// `statement_ended`, and closes each innermost bracket that
+    /// [`OpenBracket::closes_early`]. Closing them all ends the logical line at
+    /// `newline`.
+    fn physical_line(&mut self, tok: &Token, span: Span, newline: Span) {
         let (_, indent) = self.column(span);
-        let at = Span::new(self.file, newline.start, newline.start);
-        while let Some(top) = self.brackets.last() {
-            if !top.resync || indent > top.line_indent {
+        if indent > self.line_indent || Bracket::closed_by(tok).is_some() {
+            return;
+        }
+        // This loop sets the flag on every open bracket, and a push adds one
+        // without it on top, so the brackets with it set are a bottom segment
+        // of the stack and the walk stops at the first one.
+        for bracket in self.brackets.iter_mut().rev() {
+            if bracket.statement_ended {
                 break;
             }
-            let top = self.brackets.pop().expect("checked non-empty");
-            self.out.push((closer(&top.open), at));
-            self.never_closed(top);
+            bracket.statement_ended = true;
+        }
+        let at = Span::new(self.file, newline.start, newline.start);
+        while self.brackets.last().is_some_and(OpenBracket::closes_early) {
+            let bracket = self.brackets.pop().expect("checked non-empty");
+            self.out.push((bracket.kind.close_token(), at));
+            self.never_closed(bracket);
         }
         if self.brackets.is_empty() {
             self.end_line(newline);
         }
     }
 
-    /// A close bracket: it closes the innermost open bracket of its kind, after
-    /// zero-width closers for the brackets inside that one, or it is dropped.
-    fn close(&mut self, tok: &Token, span: Span) {
-        let Some(i) = self.brackets.iter().rposition(|b| closer(&b.open) == *tok) else {
+    /// A close bracket of kind `kind`: it closes the innermost open bracket of
+    /// its kind, after zero-width closers for the brackets inside that one, or
+    /// it is dropped.
+    fn close(&mut self, kind: Bracket, span: Span) {
+        let Some(i) = self.brackets.iter().rposition(|b| b.kind == kind) else {
             match self.brackets.last_mut() {
                 Some(OpenBracket {
                     stray: slot @ None, ..
-                }) => *slot = Some((tok.clone(), span)),
+                }) => *slot = Some((kind, span)),
                 _ => self.errors.push(LexError::UnmatchedClose { span }),
             }
             return;
         };
         let at = Span::new(self.file, span.start, span.start);
-        let inner: Vec<OpenBracket> = self.brackets.drain(i + 1..).rev().collect();
-        for inner in inner {
-            self.out.push((closer(&inner.open), at));
-            self.never_closed(inner);
+        let mut inner: Vec<OpenBracket> = self.brackets.drain(i + 1..).rev().collect();
+        // The close bracket met the innermost of them and does not close it.
+        if let Some(innermost) = inner.first_mut() {
+            innermost.stray.get_or_insert((kind, span));
+        }
+        let closes_others = !inner.is_empty();
+        for bracket in inner {
+            self.out.push((bracket.kind.close_token(), at));
+            self.never_closed(bracket);
         }
         let matched = self.brackets.pop().expect("rposition found it");
+        // The source most likely left this bracket open at the line that ended
+        // its statement, and the close bracket belongs to one inside it.
+        if closes_others && matched.statement_ended {
+            self.resync_next.push(matched.index);
+        }
         if let Some((_, stray)) = matched.stray {
             self.errors.push(LexError::UnmatchedClose { span: stray });
         }
-        self.out.push((tok.clone(), span));
+        self.out.push((kind.close_token(), span));
     }
 
     /// The error for `bracket`, closed by a zero-width closer.
@@ -1312,7 +1444,7 @@ impl<'a> Layout<'a> {
                 span,
                 close,
                 open: bracket.span,
-                opener: bracket.open,
+                opener: bracket.kind,
             },
             None => LexError::UnclosedBracket { span: bracket.span },
         });
@@ -1323,8 +1455,8 @@ impl<'a> Layout<'a> {
     fn finish(&mut self) {
         let end_span = Span::new(self.file, self.source.len(), self.source.len());
         while let Some(open) = self.brackets.pop() {
-            self.out.push((closer(&open.open), end_span));
-            self.unclosed.push(open.span);
+            self.out.push((open.kind.close_token(), end_span));
+            self.resync_next.push(open.index);
             self.never_closed(open);
         }
         // Synthesise a trailing newline if needed, then dedent all the way

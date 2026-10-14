@@ -27,7 +27,8 @@ A string literal ends on the line it starts on
 ([1.7 Literals](../docs/chl-spec.md#17-literals)), so both grammars end a string at the end of its
 line as well as at its closing quote. An unterminated string, which the lexer reports as an error,
 colors the rest of its line and nothing after it. The editor highlight check below cannot exercise
-that rule, because `dump_tokens` prints no spans for a file with a lexical error.
+that rule, because its corpus lexes with no error (`every_repository_program_lexes_with_no_error`
+in `chl-parser/tests/lexer_recovery.rs`).
 
 A `TODO`, `FIXME` or `XXX` in a comment is a word when no ASCII letter, digit or `_` touches it, the
 characters that continue an identifier. Both grammars spell this boundary out instead of using `\b`

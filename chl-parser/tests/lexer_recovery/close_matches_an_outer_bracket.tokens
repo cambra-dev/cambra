@@ -13,7 +13,7 @@ tokens:
   2:5-2:6 Int(2)
   2:6-3:1 Newline
 lex errors:
-  1:8-1:9 bracket is never closed
+  1:10-1:11 `]` does not match `(`
 parse errors:
-  1:8-1:9 lex error: bracket is never closed
+  1:10-1:11 lex error: `]` does not match `(`
 statements: Assign, Assign
