@@ -565,7 +565,12 @@ pub(super) fn denoted_domains(ct: &CompactType) -> Option<Vec<Type>> {
         && o.fun.is_none()
         && !o.others
         && !ct.atoms.iter().any(|a| matches!(a, AtomKey::Witness(_)));
-    bare_atoms.then(|| ct.atoms.iter().map(|a| a.to_type()).collect())
+    let ds: Vec<Type> = bare_atoms.then(|| ct.atoms.iter().map(|a| a.to_type()).collect())?;
+    debug_assert!(
+        ds.iter().enumerate().all(|(i, d)| !ds[..i].contains(d)),
+        "denoted domains are distinct because AtomKey::to_type is injective: {ds:?}"
+    );
+    Some(ds)
 }
 
 /// Whether a contravariant meet of two **data** domains had to combine anything — which is
