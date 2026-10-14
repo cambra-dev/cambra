@@ -104,23 +104,6 @@ def gh_lines(*args: str) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
-def list_open_prs_with_reviewers(repo: str) -> list[dict]:
-    """List open, non-draft PRs that have at least one review request (individual user)."""
-    lines = gh_lines(
-        "pr",
-        "list",
-        "--repo",
-        repo,
-        "--state",
-        "open",
-        "--json",
-        "number,title,url,author,reviewRequests,isDraft",
-        "--jq",
-        ".[] | select(.isDraft == false and (.reviewRequests | length > 0))",
-    )
-    return [json.loads(line) for line in lines]
-
-
 _OPEN_PRS_QUERY = """
 query($owner: String!, $name: String!, $endCursor: String) {
   repository(owner: $owner, name: $name) {
@@ -130,7 +113,7 @@ query($owner: String!, $name: String!, $endCursor: String) {
         number title url isDraft createdAt updatedAt baseRefName headRefName
         reviewDecision
         author { login }
-        latestReviews(first: 50) { nodes { state } }
+        latestOpinionatedReviews(first: 50) { nodes { state } }
         reviewRequests(first: 20) {
           nodes { requestedReviewer { __typename ... on User { login } } }
         }
@@ -164,28 +147,32 @@ def list_open_prs(repo: str) -> list[dict]:
         "-F", f"name={name}",
         "--jq", ".data.repository.pullRequests.nodes[]",
     )
-    prs = []
-    for line in lines:
-        node = json.loads(line)
-        ready = node.pop("readyEvents")["nodes"]
-        requested = node.pop("reviewRequests")["nodes"]
-        latest_reviews = node.pop("latestReviews")["nodes"]
-        commits = node.pop("commits")["nodes"]
-        rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
-        prs.append({
-            **node,
-            "author": (node.get("author") or {}).get("login", "ghost"),
-            "readyForReviewAt": ready[0]["createdAt"] if ready else None,
-            # Individual reviewers only: a team request names no one, so it
-            # leaves the PR waiting on general review.
-            "latestReviewStates": [r["state"] for r in latest_reviews],
-            "requestedReviewers": [
-                r["requestedReviewer"]["login"] for r in requested
-                if (r.get("requestedReviewer") or {}).get("__typename") == "User"
-            ],
-            "checks": rollup["contexts"]["nodes"] if rollup else [],
-        })
-    return prs
+    return [open_pr_from_node(json.loads(line)) for line in lines]
+
+
+def open_pr_from_node(node: dict) -> dict:
+    """Flatten one `_OPEN_PRS_QUERY` pull request node into the dict the finders read."""
+    node = dict(node)
+    ready = node.pop("readyEvents")["nodes"]
+    requested = node.pop("reviewRequests")["nodes"]
+    # Opinionated reviews skip comment-only ones, so a comment left after an
+    # approval does not hide the approval.
+    latest_reviews = node.pop("latestOpinionatedReviews")["nodes"]
+    commits = node.pop("commits")["nodes"]
+    rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
+    return {
+        **node,
+        "author": (node.get("author") or {}).get("login", "ghost"),
+        "readyForReviewAt": ready[0]["createdAt"] if ready else None,
+        "latestReviewStates": [r["state"] for r in latest_reviews],
+        # Individual reviewers only: a team request names no one, so it
+        # leaves the PR waiting on general review.
+        "requestedReviewers": [
+            r["requestedReviewer"]["login"] for r in requested
+            if (r.get("requestedReviewer") or {}).get("__typename") == "User"
+        ],
+        "checks": rollup["contexts"]["nodes"] if rollup else [],
+    }
 
 
 def get_review_request_dates(repo: str, pr_number: int) -> dict[str, str]:
@@ -370,7 +357,7 @@ def find_stale_reviews(
     """Find reviews that have been pending longer than threshold.
 
     Args:
-        prs: List of PR dicts with keys: number, title, url, author, reviewRequests.
+        prs: Open PRs as list_open_prs returns them.
         get_review_dates: Callable taking a PR number, returning {login: iso_timestamp}.
         now: Reference time (defaults to utcnow).
         threshold: How long before a review is considered stale.
@@ -388,18 +375,13 @@ def find_stale_reviews(
         if pr.get("isDraft"):
             continue
 
-        # Extract individual reviewers (skip teams)
-        reviewers = [rr["login"] for rr in pr["reviewRequests"] if rr.get("login")]
+        reviewers = pr["requestedReviewers"]
         if not reviewers:
             continue
 
         review_dates = get_review_dates(pr["number"])
         if not review_dates:
             continue
-
-        author = (
-            pr["author"]["login"] if isinstance(pr["author"], dict) else pr["author"]
-        )
 
         for reviewer in reviewers:
             ts_str = review_dates.get(reviewer)
@@ -417,7 +399,7 @@ def find_stale_reviews(
                     pr_number=pr["number"],
                     title=pr["title"],
                     url=pr["url"],
-                    author=author,
+                    author=pr["author"],
                     requested_iso=ts_str,
                 )
             )
@@ -430,8 +412,10 @@ def review_verdict(pr: dict) -> Optional[str]:
     """The PR's review verdict: "APPROVED", "CHANGES_REQUESTED", or None.
 
     `reviewDecision` is GitHub's verdict where a review requirement applies to
-    the PR, and is null otherwise. Without it, any reviewer's latest review
-    requesting changes outweighs an approval. Comment-only reviews give no verdict.
+    the PR, and is null otherwise; the rulesets cover only the default branch,
+    so it is null for every stacked PR. Without it, each reviewer's latest review
+    that approved or requested changes counts, and a request for changes
+    outweighs an approval. Comment-only reviews give no verdict.
     """
     verdicts = ("CHANGES_REQUESTED", "APPROVED")
     decision = pr.get("reviewDecision")

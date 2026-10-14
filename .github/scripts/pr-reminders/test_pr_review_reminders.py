@@ -11,6 +11,7 @@ from pathlib import Path
 
 from prreminder import (
     GeneralReviewPr,
+    open_pr_from_node,
     StaleReview,
     build_general_review_section,
     build_thread_body,
@@ -30,43 +31,19 @@ from prreminder import (
 # Reference time: 2026-02-05T12:00:00Z — all fixture dates are relative to this.
 REFERENCE_TIME = datetime(2026, 2, 5, 12, 0, 0, tzinfo=timezone.utc)
 
+def reviewer_pr(number: int, title: str, author: str, reviewers: list[str], draft: bool = False) -> dict:
+    """An open PR with individual reviewers requested, as list_open_prs returns it."""
+    return {"number": number, "title": title, "url": f"https://github.com/test/repo/pull/{number}",
+            "author": author, "isDraft": draft, "requestedReviewers": reviewers}
+
+
 PRS = [
-    {
-        "number": 101, "title": "Fix the widget",
-        "url": "https://github.com/test/repo/pull/101",
-        "author": {"login": "alice"},
-        "reviewRequests": [{"login": "bob", "__typename": "User"}],
-    },
-    {
-        "number": 102, "title": "Update dependencies",
-        "url": "https://github.com/test/repo/pull/102",
-        "author": {"login": "bob"},
-        "reviewRequests": [{"login": "alice", "__typename": "User"}],
-    },
-    {
-        "number": 103, "title": "Team-only review",
-        "url": "https://github.com/test/repo/pull/103",
-        "author": {"login": "charlie"},
-        "reviewRequests": [
-            {"__typename": "Team", "name": "Engineering", "slug": "cambra-dev/engineering"},
-        ],
-    },
-    {
-        "number": 104, "title": "Per-reviewer staleness",
-        "url": "https://github.com/test/repo/pull/104",
-        "author": {"login": "alice"},
-        "reviewRequests": [
-            {"login": "bob", "__typename": "User"},
-            {"login": "charlie", "__typename": "User"},
-        ],
-    },
-    {
-        "number": 105, "title": "Draft PR being ignored",
-        "url": "https://github.com/test/repo/pull/105",
-        "author": {"login": "alice"},
-        "isDraft": True,
-        "reviewRequests": [{"login": "bob", "__typename": "User"}],
-    },
+    reviewer_pr(101, "Fix the widget", "alice", ["bob"]),
+    reviewer_pr(102, "Update dependencies", "bob", ["alice"]),
+    # Team-only review: list_open_prs keeps individual reviewers only.
+    reviewer_pr(103, "Team-only review", "charlie", []),
+    reviewer_pr(104, "Per-reviewer staleness", "alice", ["bob", "charlie"]),
+    reviewer_pr(105, "Draft PR being ignored", "alice", ["bob"], draft=True),
 ]
 
 TIMELINES: dict[int, dict[str, str]] = {
@@ -339,6 +316,35 @@ def main() -> None:
         ready[0][0].opened_iso == hours_ago(30),
         "open time is the ready-for-review time when there is one",
         f"open time for a once-draft PR: got {ready[0][0].opened_iso}",
+    )
+
+    # --- Reading the open-PRs query ---
+    print("\nOpen-PR query nodes:")
+    # Shaped like #310's node: approved, then a comment-only review by the same reviewer.
+    node = {
+        "number": 310, "title": "t", "url": "u", "isDraft": False,
+        "createdAt": hours_ago(150), "updatedAt": hours_ago(17),
+        "baseRefName": "b309", "headRefName": "b310", "reviewDecision": None,
+        "author": {"login": "dpmills"},
+        "latestOpinionatedReviews": {"nodes": [{"state": "APPROVED"}]},
+        "reviewRequests": {"nodes": [
+            {"requestedReviewer": {"__typename": "Team"}},
+            {"requestedReviewer": {"__typename": "User", "login": "sortalongo"}},
+        ]},
+        "readyEvents": {"nodes": [{"createdAt": hours_ago(150)}]},
+        "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": GREEN}}}}]},
+    }
+    flat = open_pr_from_node(node)
+    check(
+        review_verdict(flat) == "APPROVED",
+        "an approval followed by a comment-only review still reads as approved",
+        f"verdict after approve-then-comment: {review_verdict(flat)}",
+    )
+    check(
+        flat["requestedReviewers"] == ["sortalongo"] and flat["author"] == "dpmills"
+        and flat["readyForReviewAt"] == hours_ago(150) and flat["checks"] == GREEN,
+        "open_pr_from_node keeps individual reviewers, the author's login, the ready time, and the head's checks",
+        f"open_pr_from_node: {flat}",
     )
 
     # --- Required checks ---

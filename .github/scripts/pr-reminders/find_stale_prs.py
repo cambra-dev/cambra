@@ -31,7 +31,6 @@ from prreminder import (
     get_review_request_dates,
     last_green,
     list_open_prs,
-    list_open_prs_with_reviewers,
     list_workflow_runs,
     load_workflows,
     parse_iso,
@@ -63,12 +62,13 @@ def main() -> None:
     def get_last_green(pr: dict) -> Optional[str]:
         return last_green({w: list_workflow_runs(repo, w, pr["headRefName"]) for w in workflows})
 
-    general_review = find_general_review_prs(list_open_prs(repo), required, get_last_green, now=now)
+    open_prs = list_open_prs(repo)
+    general_review = find_general_review_prs(open_prs, required, get_last_green, now=now)
 
     def get_dates(pr_number: int) -> dict[str, str]:
         return get_review_request_dates(repo, pr_number)
 
-    reviews = find_stale_reviews(list_open_prs_with_reviewers(repo), get_dates, now=now)
+    reviews = find_stale_reviews(open_prs, get_dates, now=now)
 
     json.dump({
         "now": now.isoformat(),
