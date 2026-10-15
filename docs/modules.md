@@ -300,7 +300,8 @@ public and private, so that `m::hidden` can say the member is private and point 
 | member bound to a module, `pub audit = a` | its visibility, its statement, and the module it is bound to, as its module spells it |
 | parameter | its annotation, Module type, or bound, and whether it has a default |
 
-The interface holds no contract. A module's check infers its members' contracts (`check_module`).
+The interface holds no contract. A module's check infers its members' contracts (`check_module`),
+and `cambra check` prints them with the interface (`Interface::written`).
 
 A `def` with a `Mut` parameter lowers as a curried chain, and its call sites must match
 (`LoweringContext::mut_param_fns`). The interface carries that shape so a user's call site lowers
@@ -524,6 +525,19 @@ carries a secondary label at the module's `import` or `run` statement that bring
 inference. A module is checked against its dependencies' bodies, so each check infers them again;
 keeping each module's inferred schemes for its users would remove that cost.
 
+`cambra check lib.cambra` checks a file on its own (`check_program`). It lowers the file as a module
+rather than as a root (`lower_for_check`), so its parameters need no defaults, and links nothing: it
+checks each module the file reaches and then the file. Each check creates its module's runs as
+linking would, so an error in creating one is reported, once, as the error of the module whose code
+holds it (`ProgramLowering::check_all`). Each route a module declares is a source that opens
+nothing, so the check binds no port. It prints the file's interface
+(`Interface::written`): each parameter with its type, bound, or Module type, then each public member
+in the order declared. A value's contract is its annotation or the type it infers, a generalized
+one's written as a diagnostic writes an inferred polymorphic type, joins and all. Inference notes a
+generalized member's scheme while it is live (`Typing::note_scheme`), and a monomorphic member's
+type is the one its uses settled. Lowering expands an alias where it is written, so a type prints
+expanded: `base: {Int where _ > 0}` for `base: Count`.
+
 ---
 
 ## Files and spans
@@ -736,26 +750,25 @@ What each rule contributes:
 
 The work that remains, one PR per item, each updating the spec and design docs it touches:
 
-1. **`cambra check`**, which checks a file on its own and prints its interface.
-2. **Public mutable members.** `pub` on the `:=` that introduces a `Txn` variable, a `Txn` entry in
+1. **Public mutable members.** `pub` on the `:=` that introduces a `Txn` variable, a `Txn` entry in
    a Module type, a write through a qualifier, and an argument's member with a `Mut` parameter
    reached through a Module-typed parameter.
-3. **Labels through a Module-typed parameter**, whose module is the argument's and is not known
+2. **Labels through a Module-typed parameter**, whose module is the argument's and is not known
    where the module lowers.
-4. **Inferred type arguments.** A type parameter a `run` or an `import` leaves out, inferred from
+3. **Inferred type arguments.** A type parameter a `run` or an `import` leaves out, inferred from
    the types of its other arguments ([chl-spec.md, "9.4 Parameters"](chl-spec.md#94-parameters)).
-5. **The interface as written.** `cambra check` printing a type with the alias names its module
+4. **The interface as written.** `cambra check` printing a type with the alias names its module
    wrote, which needs a named wrapper type that every comparison looks through, and a diagnostic
    eliding the qualifier on its own module's members, which needs a diagnostic's text formatted once
    the error has a location ([Names carry their home](#names-carry-their-home)).
-6. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
+5. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
    removed.
-7. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
+6. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
    qualified `@LoadFrom` loads, `@Discard`.
-8. **No trailing expressions**, once an output sink exists. The compiler's own test harness keeps
+7. **No trailing expressions**, once an output sink exists. The compiler's own test harness keeps
    them through a compile option the CLI does not expose, and reads the value through the `main`
    output.
-9. **The inspector's multi-file source pane.**
+8. **The inspector's multi-file source pane.**
 
 ---
 

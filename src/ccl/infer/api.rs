@@ -1294,16 +1294,39 @@ pub fn infer(
 
 /// Check `expr`, the check tree of a module checked on its own, with the
 /// module's type parameters `params` open throughout it (`docs/modules.md`,
-/// "Checking a module on its own"). Only its errors are read: the tree is
-/// discarded, and no pass after inference runs on it.
+/// "Checking a module on its own"), and return the contract of each binding in
+/// `reported`, written in CHL: a generalized one's scheme, and another's type.
+/// The tree is discarded, and no pass after inference runs on it.
 pub fn check_module(
     expr: &mut Expr,
     ctx: &mut TypeInferenceContext,
     params: &[super::ModuleCheckParam],
-) -> Result<(), Vec<LocatedInferError>> {
+    reported: &HashSet<Name>,
+) -> Result<HashMap<Name, String>, Vec<LocatedInferError>> {
     // The arena tears down every variable the check mints, as for `infer`.
     let _arena = InferArena::new();
-    super::run_with_params(expr, &ctx.source_types, params).map(|_| ())
+    let (_, schemes) = super::run_with_params(expr, &ctx.source_types, params, reported)?;
+    let mut contracts: HashMap<Name, String> = schemes
+        .iter()
+        .map(|(name, scheme)| {
+            (
+                name.clone(),
+                crate::ccl::chl_print::chl_inferred_poly(scheme),
+            )
+        })
+        .collect();
+    // A monomorphic binding's type is the one its uses settled.
+    let mut at = &*expr;
+    while let TypedExprNode::Let { binding, body, .. }
+    | TypedExprNode::MutDecl { binding, body, .. } = &at.node
+    {
+        if reported.contains(&binding.name) && !contracts.contains_key(&binding.name) {
+            let written = crate::ccl::chl_print::chl_type(&binding.ty);
+            contracts.insert(binding.name.clone(), written);
+        }
+        at = body;
+    }
+    Ok(contracts)
 }
 
 /// Drop every `user_annotation` in the tree — inference has consumed them.

@@ -78,6 +78,18 @@ pub(super) fn raw_scope(names: &HashMap<QualifiedName, Name>) -> HashMap<String,
         .collect()
 }
 
+/// `errors` in source order, each once. A module's runs are created again by
+/// every check that reaches the module, so an error in creating one is raised
+/// once per such check.
+pub(super) fn in_source_order(mut errors: Vec<LoweringError>) -> Vec<LoweringError> {
+    errors.sort_by_cached_key(|e| {
+        let span = e.span();
+        (span.file, span.start, span.end, e.to_string())
+    });
+    errors.dedup_by(|a, b| a.span() == b.span() && a.to_string() == b.to_string());
+    errors
+}
+
 /// Lower every module of `program` once and link its runs into one tree
 /// (`docs/modules.md`, "A module lowers once", "Linking").
 ///
@@ -94,19 +106,7 @@ pub(super) fn raw_scope(names: &HashMap<QualifiedName, Name>) -> HashMap<String,
 pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> LoweringResult {
     let sources = program.sources();
     let root = sources.root();
-    let mut lowering = ProgramLowering {
-        program,
-        lowered: HashMap::new(),
-        imports: HashMap::new(),
-        type_keys: HashMap::new(),
-        shared: HashMap::new(),
-        import_refusals: HashSet::new(),
-        shared_chains: Vec::new(),
-        shared_reached: HashMap::new(),
-        checking: false,
-        import_checks: HashMap::new(),
-        errors: Vec::new(),
-    };
+    let mut lowering = ProgramLowering::new(program);
     // With a cycle there is no link order, and the root lowers with no module to
     // reach: loading has reported the cycle.
     let order = program.link_order().unwrap_or_default();
@@ -123,21 +123,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     if !order.contains(&root) {
         lowering.import_keys(root, &mut sites, ctx);
     }
-    let mut chains = Vec::new();
-    // A shared run is created after the shared runs it reaches, and a run's
-    // key holds the keys of the imports it passes, so the order is well founded.
-    let position: HashMap<FileId, usize> = order
-        .iter()
-        .enumerate()
-        .map(|(i, file)| (*file, i))
-        .collect();
-    let mut in_order: Vec<&SharedRun> = sites.keys().collect();
-    in_order.sort_by_key(|run| (position.get(&sites[*run].0).copied(), (*run).clone()));
-    for run in in_order {
-        if sites[run].0 != root {
-            lowering.ensure_shared_run(run, &sites, &mut chains, ctx);
-        }
-    }
+    let chains = lowering.shared_runs(order, &sites, ctx);
 
     let Some(ast) = program.root() else {
         return LoweringResult {
@@ -233,6 +219,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
                 scope: scope.clone(),
                 sinks: Vec::new(),
                 run_checks,
+                as_root: true,
             }
         });
     let value = lowered.value.map(|mut chain| {
@@ -297,17 +284,13 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         {
             lowering.lowered.insert(root, Some(Rc::new(root_lowered)));
         }
-        for &file in order {
-            if let Some(check) = lowering.check(file, ctx) {
-                ctx.module_checks.push(check);
-            }
-        }
+        lowering.check_all(order, ctx);
+        errors.extend(std::mem::take(&mut lowering.errors));
     }
-    errors.sort_by_key(|e| {
-        let span = e.span();
-        (span.file, span.start, span.end)
-    });
-    LoweringResult { value, errors }
+    LoweringResult {
+        value,
+        errors: in_source_order(errors),
+    }
 }
 
 /// The lowering of a program's modules: each module lowered once, the shared
@@ -385,6 +368,9 @@ pub(super) struct LoweredModule {
     /// The checks of each `run` statement's type arguments, by run name, which
     /// the module's check makes ([`LoweringContext::declare_run_types`]).
     pub(super) run_checks: HashMap<SmolStr, Vec<TypeCheck>>,
+    /// Whether it was lowered as the root, so its chain ends at its last
+    /// statement rather than at [`MODULE_BODY`].
+    pub(super) as_root: bool,
 }
 
 /// Where each run and shared run of a linked program is brought in, for the
@@ -411,7 +397,50 @@ pub(super) struct Created {
     pub(super) names: HashMap<QualifiedName, Name>,
 }
 
-impl ProgramLowering<'_> {
+impl<'a> ProgramLowering<'a> {
+    pub(super) fn new(program: &'a LoadedProgram) -> Self {
+        ProgramLowering {
+            program,
+            lowered: HashMap::new(),
+            imports: HashMap::new(),
+            type_keys: HashMap::new(),
+            shared: HashMap::new(),
+            import_refusals: HashSet::new(),
+            shared_chains: Vec::new(),
+            shared_reached: HashMap::new(),
+            checking: false,
+            import_checks: HashMap::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    /// Create each shared run in `sites` but one of the root's file, after the
+    /// shared runs it reaches, and return their chains in the order created. A
+    /// run's key holds the keys of the imports it passes, so the order is well
+    /// founded.
+    pub(super) fn shared_runs(
+        &mut self,
+        order: &[FileId],
+        sites: &HashMap<SharedRun, (FileId, ImportSite)>,
+        ctx: &mut LoweringContext,
+    ) -> Vec<Expr> {
+        let root = self.program.sources().root();
+        let position: HashMap<FileId, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(i, file)| (*file, i))
+            .collect();
+        let mut in_order: Vec<&SharedRun> = sites.keys().collect();
+        in_order.sort_by_key(|run| (position.get(&sites[*run].0).copied(), (*run).clone()));
+        let mut chains = Vec::new();
+        for run in in_order {
+            if sites[run].0 != root {
+                self.ensure_shared_run(run, sites, &mut chains, ctx);
+            }
+        }
+        chains
+    }
+
     /// Lower the module in `file` once, recording it, or `None` when it has no
     /// syntax tree or has errors of its own.
     pub(super) fn lower(&mut self, file: FileId, ctx: &mut LoweringContext) {
@@ -425,12 +454,16 @@ impl ProgramLowering<'_> {
         ctx: &mut LoweringContext,
     ) -> Option<LoweredModule> {
         let ast = self.program.ast(file)?;
-        let module = self
-            .program
-            .sources()
-            .module(file)
-            .expect("a module other than the root has a module path")
-            .clone();
+        // The root's file, lowered as a module for `cambra check`, is named by
+        // its file's stem.
+        let sources = self.program.sources();
+        let module = sources.module(file).cloned().unwrap_or_else(|| {
+            let stem = std::path::Path::new(sources.path(file))
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("main");
+            ModulePath::new([SmolStr::from(stem)])
+        });
         let scope = self.scope(ast, Some(module.clone()), ctx);
         ctx.begin_module(scope.clone());
         let lowered = lower_module_body(ast, ctx);
@@ -457,6 +490,7 @@ impl ProgramLowering<'_> {
             scope,
             sinks,
             run_checks,
+            as_root: false,
         })
     }
 
