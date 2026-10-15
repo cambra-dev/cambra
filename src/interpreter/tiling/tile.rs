@@ -1818,8 +1818,10 @@ impl Tile {
                 .map(|(row, path)| {
                     let (start, end) = node.row_run(row);
                     let keys = match (start, end) == (0, domain.len()) {
-                        true => Predicate::keys(domain),
-                        false => Predicate::keys(&domain.select_indices(start..end, end - start)),
+                        true => Predicate::from_column_value(domain),
+                        false => Predicate::from_column_value(
+                            &domain.select_indices(start..end, end - start),
+                        ),
                     };
                     Predicate::qualified(Predicate::exactly(path), keys)
                 })

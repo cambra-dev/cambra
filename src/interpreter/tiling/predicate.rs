@@ -1202,23 +1202,10 @@ impl Predicate {
         }
     }
 
-    /// The predicate admitting exactly the keys in `column`, a run of a collection's domain.
-    ///
-    /// The same predicate as [`from_column_value`](Self::from_column_value). A collection holds
-    /// thousands of integer keys where a predicate elsewhere names a few, so integer keys are
-    /// sorted and merged as integers, which [`from_column_value`](Self::from_column_value) does
-    /// not do for its other callers.
-    pub(crate) fn keys(column: &ColumnValue) -> Predicate {
-        match column {
-            ColumnValue::Ints(v) => single_interval_set_predicate(v),
-            ColumnValue::UInts(v) => single_interval_set_predicate(v),
-            other => Predicate::from_column_value(other),
-        }
-    }
-
     /// Converts a batch of concrete domain values into the predicate admitting exactly those values.
     ///
-    /// Each scalar value becomes a point interval; records are split field-by-field.
+    /// Each scalar value becomes a point interval; records are split field-by-field. An integer
+    /// column is sorted and merged as integers, since a column of keys can hold millions.
     pub fn from_column_value(cv: &ColumnValue) -> Predicate {
         match cv {
             // Unit is a single-value type; any Unit value satisfies the predicate.
@@ -1229,8 +1216,8 @@ impl Predicate {
                     Predicate::False
                 }
             }
-            ColumnValue::Ints(v) => vec_to_predicate(v),
-            ColumnValue::UInts(v) => vec_to_predicate(v),
+            ColumnValue::Ints(v) => single_interval_set_predicate(v),
+            ColumnValue::UInts(v) => single_interval_set_predicate(v),
             ColumnValue::Bools(v) => {
                 let mut vec = Vec::new();
                 if v.count_ones() > 0 {
@@ -1433,8 +1420,9 @@ fn value_is_of_extent(v: &Value, extent: &Extent) -> bool {
 /// The predicate admitting exactly the values of an integer column: one interval set holding the
 /// values' merged runs, in canonical form.
 ///
-/// The same predicate as [`Predicate::from_column_value`] builds for the column, with the values
-/// sorted as integers ([`single_interval_set`]).
+/// What [`Predicate::from_column_value`] builds for an integer column. The values are sorted as
+/// integers ([`single_interval_set`]), where [`vec_to_predicate`] converts each to a `Value` and
+/// sorts those.
 fn single_interval_set_predicate<T: IntegerKey>(data: &[T]) -> Predicate {
     Predicate::intervals(single_interval_set(data))
 }
@@ -3841,23 +3829,24 @@ mod tests {
         (*state >> 33) % below
     }
 
-    /// `Predicate::keys` admits what `from_column_value` admits, for integer columns, which take
-    /// the integer path, and for the others, which do not.
+    /// An integer column's predicate is the one the generic `Value` path builds, for unsigned
+    /// and signed columns, with duplicates, a gap, and no values.
     #[test]
-    fn keys_agrees_with_from_column_value() {
-        let columns = [
-            ColumnValue::UInts(vec![7, 3, 4, 0, 9, 3]),
-            ColumnValue::Ints(vec![-2, 5, -1, 0, 7]),
-            ColumnValue::strings(&["b", "a", "c"]),
-            ColumnValue::Bools(BitVec::from_fn(3, |i| i != 1)),
-            ColumnValue::UInts(vec![]),
-        ];
-        for column in columns {
-            assert_eq!(
-                Predicate::keys(&column),
-                Predicate::from_column_value(&column)
-            );
-        }
+    fn from_column_value_of_an_integer_column_agrees_with_the_value_path() {
+        let unsigned = [7u64, 3, 4, 0, 9, 3];
+        assert_eq!(
+            Predicate::from_column_value(&ColumnValue::UInts(unsigned.to_vec())),
+            vec_to_predicate(&unsigned)
+        );
+        let signed = [-2i64, 5, -1, 0, 7];
+        assert_eq!(
+            Predicate::from_column_value(&ColumnValue::Ints(signed.to_vec())),
+            vec_to_predicate(&signed)
+        );
+        assert_eq!(
+            Predicate::from_column_value(&ColumnValue::UInts(vec![])),
+            Predicate::False
+        );
     }
 
     /// Sorting a column as integers admits what sorting it as `Value`s does, including
