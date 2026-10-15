@@ -191,64 +191,6 @@ impl TileProducer for ConstantProducer {
     }
 }
 
-/// Unwraps a `DataFunction` with `domain = Units(1)` to produce its single codomain element.
-///
-/// The input must have a `DataFunction` tiling with `domain = Extent::Units(1)`.
-/// The output tiling is the codomain of that `DataFunction`.
-pub struct ToScalar {
-    /// The `DataFunction`-typed input to unwrap.
-    input: Box<dyn TileOperator>,
-    /// Output tiling: the codomain of the input's `DataFunction` tiling.
-    base: OperatorBase,
-}
-
-impl ToScalar {
-    /// Construct a `ToScalar` operator.
-    ///
-    /// Panics if `input` does not have a `DataFunction` tiling.
-    /// The domain `Units(1)` constraint is checked at `get`-time.
-    pub fn new(input: Box<dyn TileOperator>) -> Self {
-        let tiling = input.tiling().codomain().unwrap_or_else(|| {
-            panic!(
-                "ToScalar input had non-function tiling {:?}",
-                input.tiling()
-            )
-        });
-        Self {
-            base: OperatorBase::new(tiling),
-            input,
-        }
-    }
-}
-
-impl TileOperator for ToScalar {
-    impl_operator_base!();
-
-    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
-        visit(value("input", &*self.input));
-    }
-
-    fn subscribe(
-        &mut self,
-        _intent_guard: TileGuard,
-        consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
-    ) -> Box<dyn TileProducer> {
-        let input_producer =
-            self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
-        Box::new(ToScalarProducer {
-            base: ProducerBase::new(
-                ToScalarProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            ),
-            input: input_producer,
-        })
-    }
-}
-
 /// Wraps each element of a payload input into a tagged [`Value::Union`] at a
 /// fixed tag — the sum-**introduction** primitive, the dual of [`VariantProject`]
 /// and the runtime realization of a
@@ -971,40 +913,6 @@ impl TileProducer for VariantIsProducer {
         // forwards a release on the same key-preserving argument, over the
         // narrower domain it emits.
         self.input.release(obsolete_guard);
-    }
-}
-
-struct ToScalarProducer {
-    base: ProducerBase,
-    /// The subscribed input producer.
-    input: Box<dyn TileProducer>,
-}
-
-impl TileProducer for ToScalarProducer {
-    impl_producer_base!();
-
-    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("input", &*self.input);
-    }
-
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_result = self.input.get(self.input.tiling().universal_guard());
-        let Tile::DataFunction {
-            domain, codomain, ..
-        } = input_result
-        else {
-            panic!("ToScalarProducer expected a collection tile")
-        };
-        assert_eq!(domain, ColumnValue::Units(1));
-        *codomain
-    }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // The input is always read in full, so there is no sub-region of it this
-        // producer could stop requesting.
-        if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.input.release(self.input.tiling().universal_guard());
-        }
     }
 }
 
