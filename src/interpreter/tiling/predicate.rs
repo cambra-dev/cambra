@@ -12,6 +12,7 @@ use intervalsets::{
     ops::{Complement, Contains, Difference, Intersection, Union},
 };
 
+use super::interval_sets::{IntegerKey, single_interval_set};
 use crate::{
     ccl::{BaseType, FieldKey, TagMap},
     interpreter::{
@@ -1201,6 +1202,20 @@ impl Predicate {
         }
     }
 
+    /// The predicate admitting exactly the keys in `column`, a run of a collection's domain.
+    ///
+    /// The same predicate as [`from_column_value`](Self::from_column_value). A collection holds
+    /// thousands of integer keys where a predicate elsewhere names a few, so integer keys are
+    /// sorted and merged as integers, which [`from_column_value`](Self::from_column_value) does
+    /// not do for its other callers.
+    pub(crate) fn keys(column: &ColumnValue) -> Predicate {
+        match column {
+            ColumnValue::Ints(v) => single_interval_set_predicate(v),
+            ColumnValue::UInts(v) => single_interval_set_predicate(v),
+            other => Predicate::from_column_value(other),
+        }
+    }
+
     /// Converts a batch of concrete domain values into the predicate admitting exactly those values.
     ///
     /// Each scalar value becomes a point interval; records are split field-by-field.
@@ -1413,6 +1428,15 @@ fn value_is_of_extent(v: &Value, extent: &Extent) -> bool {
             | (Value::Bool(_), Extent::Base(BaseType::Bool))
             | (Value::String(_), Extent::Base(BaseType::String))
     )
+}
+
+/// The predicate admitting exactly the values of an integer column: one interval set holding the
+/// values' merged runs, in canonical form.
+///
+/// The same predicate as [`Predicate::from_column_value`] builds for the column, with the values
+/// sorted as integers ([`single_interval_set`]).
+fn single_interval_set_predicate<T: IntegerKey>(data: &[T]) -> Predicate {
+    Predicate::intervals(single_interval_set(data))
 }
 
 /// Converts a slice of values into a `Predicate::Intervals` with adjacent discrete values merged
@@ -3805,5 +3829,70 @@ mod tests {
         let pred = union_pred(int_intervals(&[1]), Predicate::True);
         let swapped = Extent::Union(TagMap::from_positional(vec![bool_ext(), int()]));
         assert!(!pred.is_applicable_to(&swapped));
+    }
+
+    // ── integer fast paths ────────────────────────────────────────────────────
+
+    /// A deterministic pseudo-random sequence.
+    fn lcg(state: &mut u64, below: u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) % below
+    }
+
+    /// `Predicate::keys` admits what `from_column_value` admits, for integer columns, which take
+    /// the integer path, and for the others, which do not.
+    #[test]
+    fn keys_agrees_with_from_column_value() {
+        let columns = [
+            ColumnValue::UInts(vec![7, 3, 4, 0, 9, 3]),
+            ColumnValue::Ints(vec![-2, 5, -1, 0, 7]),
+            ColumnValue::strings(&["b", "a", "c"]),
+            ColumnValue::Bools(BitVec::from_fn(3, |i| i != 1)),
+            ColumnValue::UInts(vec![]),
+        ];
+        for column in columns {
+            assert_eq!(
+                Predicate::keys(&column),
+                Predicate::from_column_value(&column)
+            );
+        }
+    }
+
+    /// Sorting a column as integers admits what sorting it as `Value`s does, including
+    /// duplicates, adjacent runs, and the greatest and least of each type, where a run cannot
+    /// extend.
+    #[test]
+    fn single_interval_set_predicate_agrees_with_the_value_path() {
+        let mut state = 11;
+        for span in [4u64, 16, 200] {
+            for _ in 0..500 {
+                let count = lcg(&mut state, 40) as usize;
+                let unsigned: Vec<u64> = (0..count).map(|_| lcg(&mut state, span)).collect();
+                assert_eq!(
+                    single_interval_set_predicate(&unsigned),
+                    vec_to_predicate(&unsigned)
+                );
+                let signed: Vec<i64> = (0..count)
+                    .map(|_| lcg(&mut state, span) as i64 - span as i64 / 2)
+                    .collect();
+                assert_eq!(
+                    single_interval_set_predicate(&signed),
+                    vec_to_predicate(&signed)
+                );
+            }
+        }
+        let edges_u = [u64::MAX, 0, u64::MAX - 1, 1, 7];
+        assert_eq!(
+            single_interval_set_predicate(&edges_u),
+            vec_to_predicate(&edges_u)
+        );
+        let edges_i = [i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1, 0, -1];
+        assert_eq!(
+            single_interval_set_predicate(&edges_i),
+            vec_to_predicate(&edges_i)
+        );
+        assert_eq!(single_interval_set_predicate::<u64>(&[]), Predicate::False);
     }
 }

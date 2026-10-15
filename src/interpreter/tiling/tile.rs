@@ -1790,6 +1790,43 @@ impl Tile {
         paths
     }
 
+    /// The predicate admitting exactly the nodes of `level`: the union of [`Predicate::exactly`]
+    /// over [`paths_at`](Self::paths_at).
+    ///
+    /// The nodes of a level are, for each row of the level above, that row's path qualifying the
+    /// row's run of keys. So the walk is [`paths_at`](Self::paths_at)'s, stopped at the rows of
+    /// `level`, and it builds one arm per row from the row's slice of the domain column, where
+    /// the union of [`Predicate::exactly`] builds one per key. At the outermost level there is one
+    /// row with the empty path, and the predicate is the one over the whole domain column.
+    pub fn paths_predicate(&self, level: CurryLevel) -> Predicate {
+        let mut node = self;
+        let mut row_paths = vec![Vec::new()];
+        for level in 0..level.index() {
+            row_paths = node.key_paths(&row_paths);
+            let Tile::DataFunction { codomain, .. } = node else {
+                panic!("{level} of {self:?} has no level there")
+            };
+            node = codomain;
+        }
+        let Tile::DataFunction { domain, .. } = node else {
+            panic!("paths_predicate is a collection's: {self:?}")
+        };
+        Predicate::union_all(
+            row_paths
+                .iter()
+                .enumerate()
+                .map(|(row, path)| {
+                    let (start, end) = node.row_run(row);
+                    let keys = match (start, end) == (0, domain.len()) {
+                        true => Predicate::keys(domain),
+                        false => Predicate::keys(&domain.select_indices(start..end, end - start)),
+                    };
+                    Predicate::qualified(Predicate::exactly(path), keys)
+                })
+                .collect(),
+        )
+    }
+
     /// Keep only the keys whose path `keep` admits, at every level down to and including
     /// `level`.
     ///
@@ -1882,19 +1919,7 @@ impl Tile {
         let depth = self
             .innermost_depth()
             .unwrap_or_else(|| unreachable!("a collection chain has an innermost level"));
-        let present = match depth {
-            0 => {
-                let Tile::DataFunction { domain, .. } = &self else {
-                    unreachable!("checked above")
-                };
-                Predicate::from_column_value(domain)
-            }
-            _ => self
-                .paths_at(CurryLevel::new(depth))
-                .iter()
-                .map(|path| Predicate::exactly(path))
-                .fold(Predicate::False, |all, one| all.union(&one)),
-        };
+        let present = self.paths_predicate(CurryLevel::new(depth));
         let Some(Tile::DataFunction {
             domain_predicate, ..
         }) = self.innermost_level_mut()
@@ -3444,6 +3469,124 @@ mod tests {
         assert_eq!(
             *rebuilt.values_at(CurryLevel::new(1)),
             out.values_at(CurryLevel::new(1)).empty_at_no_rows()
+        );
+    }
+
+    /// The predicate over a level's nodes admits the nodes `paths_at` names and no others, at
+    /// the outermost level, where it is built from the keys, and beneath it.
+    #[test]
+    fn paths_predicate_admits_exactly_the_paths_of_a_level() {
+        let same_region = |a: &Predicate, b: &Predicate| a.subsumes(b) && b.subsumes(a);
+        let by_paths = |tile: &Tile, level: CurryLevel| {
+            Predicate::union_all(
+                tile.paths_at(level)
+                    .iter()
+                    .map(|path| Predicate::exactly(path))
+                    .collect(),
+            )
+        };
+        let tile = two_rows();
+        for level in [CurryLevel::OUTERMOST, CurryLevel::new(1)] {
+            assert!(
+                same_region(&tile.paths_predicate(level), &by_paths(&tile, level)),
+                "{level}: {:?}",
+                tile.paths_predicate(level)
+            );
+        }
+        // Keys that are not a run, and keys of other types.
+        let sparse = Tile::data_function(
+            ColumnValue::UInts(vec![7, 3, 4, 0, 9]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4, 5]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        assert!(same_region(
+            &sparse.paths_predicate(CurryLevel::OUTERMOST),
+            &by_paths(&sparse, CurryLevel::OUTERMOST)
+        ));
+        let words = Tile::data_function(
+            ColumnValue::strings(&["b", "a", "c"]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        assert!(same_region(
+            &words.paths_predicate(CurryLevel::OUTERMOST),
+            &by_paths(&words, CurryLevel::OUTERMOST)
+        ));
+    }
+
+    /// Random three-level tiles, with empty groups and keys that are not runs: every level's
+    /// predicate admits what the union of `exactly` over its paths admits.
+    #[test]
+    fn paths_predicate_agrees_with_the_paths_of_every_level_of_random_tiles() {
+        let mut state = 31u64;
+        let mut next = |below: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % below
+        };
+        let same_region = |a: &Predicate, b: &Predicate| a.subsumes(b) && b.subsumes(a);
+        for _ in 0..200 {
+            // A run of up to three distinct keys per row, from a random start.
+            let level = |rows: usize, next: &mut dyn FnMut(u64) -> u64| {
+                let (mut starts, mut keys) = (Vec::new(), Vec::new());
+                for _ in 0..rows {
+                    starts.push(keys.len());
+                    let first = next(40);
+                    keys.extend((0..next(4)).map(|i| first + 2 * i));
+                }
+                (starts, keys)
+            };
+            let top: Vec<u64> = (0..1 + next(4)).map(|i| 3 * i).collect();
+            let (starts_2, keys_2) = level(top.len(), &mut next);
+            let (starts_3, keys_3) = level(keys_2.len(), &mut next);
+            let tile = Tile::data_function(
+                ColumnValue::UInts(top),
+                Box::new(Tile::grouped(
+                    starts_2,
+                    ColumnValue::UInts(keys_2),
+                    Box::new(Tile::grouped(
+                        starts_3.clone(),
+                        ColumnValue::UInts(keys_3.clone()),
+                        Box::new(Tile::Scalar(ColumnValue::Ints(vec![0; keys_3.len()]))),
+                        Predicate::False,
+                        BitSet::new(),
+                    )),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            );
+            for depth in 0..3 {
+                let level = CurryLevel::new(depth);
+                let by_paths = Predicate::union_all(
+                    tile.paths_at(level)
+                        .iter()
+                        .map(|path| Predicate::exactly(path))
+                        .collect(),
+                );
+                assert!(
+                    same_region(&tile.paths_predicate(level), &by_paths),
+                    "level {depth} of {tile:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paths_predicate_of_a_tile_without_keys_admits_nothing() {
+        let empty = Tile::data_function(
+            ColumnValue::UInts(vec![]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        assert_eq!(
+            empty.paths_predicate(CurryLevel::OUTERMOST),
+            Predicate::False
         );
     }
 

@@ -1,5 +1,6 @@
 //! Operations on [`IntervalSet`] that the `intervalsets` crate lacks: [`HasDifference`], whether
-//! one set holds a value that another does not.
+//! one set holds a value that another does not, and [`single_interval_set`], a column of integers
+//! as one interval set.
 //!
 //! `intervalsets` computes `a ∖ b` as `a ∩ complement(b)`, which builds both sets before
 //! [`MaybeEmpty::is_empty`] reads one bit of the answer. [`HasDifference`] answers the question
@@ -18,6 +19,8 @@ use std::borrow::Cow;
 use intervalsets::{
     Bound, BoundType, Bounding, Interval, IntervalSet, MaybeEmpty, Side, numeric::Domain,
 };
+
+use crate::interpreter::Value;
 
 /// Whether `self ∖ rhs` is not empty.
 ///
@@ -129,6 +132,67 @@ fn touches<T: Domain>(y: &Interval<T>, z: &Interval<T>) -> bool {
         // `v` is in neither unless `z` begins below it.
         (BoundType::Open, BoundType::Open) => w < v,
     }
+}
+
+/// A primitive integer type whose ranges are sorted and merged as plain numbers, where a
+/// [`Value`] comparison would go through [`Value`]'s ordering for every pair.
+pub(crate) trait IntegerKey: Copy + Ord {
+    /// The next value, or `None` at the type's greatest.
+    fn next(self) -> Option<Self>;
+    fn value(self) -> Value;
+}
+
+impl IntegerKey for u64 {
+    fn next(self) -> Option<Self> {
+        self.checked_add(1)
+    }
+    fn value(self) -> Value {
+        Value::UInt(self)
+    }
+}
+
+impl IntegerKey for i64 {
+    fn next(self) -> Option<Self> {
+        self.checked_add(1)
+    }
+    fn value(self) -> Value {
+        Value::Int(self)
+    }
+}
+
+/// `ranges` sorted, with overlapping and adjacent ranges merged into one.
+///
+/// A range is `(least, greatest)`, both included. Equal ranges are interchangeable, so the sort
+/// need not be stable.
+fn merged_ranges<T: IntegerKey>(mut ranges: Vec<(T, T)>) -> Vec<(T, T)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(T, T)> = Vec::with_capacity(ranges.len());
+    for (least, greatest) in ranges {
+        match merged.last_mut() {
+            Some((_, end)) if least <= *end || end.next() == Some(least) => {
+                *end = (*end).max(greatest);
+            }
+            _ => merged.push((least, greatest)),
+        }
+    }
+    merged
+}
+
+/// The values of an integer column as one interval set: their sorted runs, with overlapping and
+/// adjacent values merged.
+///
+/// The values are sorted as integers, and `Value`s are built only for the merged ranges.
+pub(crate) fn single_interval_set<T: IntegerKey>(data: &[T]) -> IntervalSet<Value> {
+    let merged = merged_ranges(data.iter().map(|&v| (v, v)).collect());
+    IntervalSet::new_unchecked(range_intervals(merged))
+}
+
+/// `ranges` as closed intervals.
+fn range_intervals<T: IntegerKey>(ranges: Vec<(T, T)>) -> Vec<Interval<Value>> {
+    ranges
+        .into_iter()
+        .map(|(least, greatest)| Interval::closed(least.value(), greatest.value()))
+        .collect()
 }
 
 /// Random sets over small integer domains, and the values to enumerate them against. Shared by
@@ -375,5 +439,160 @@ mod tests {
         assert!(some.has_difference(&empty));
         assert!(!one(Interval::<Value>::empty()).has_difference(&empty));
         assert!(one(Interval::unbounded()).has_difference(&some));
+    }
+
+    // ── single_interval_set ───────────────────────────────────────────────────
+
+    /// The closed ranges of a set, as plain pairs.
+    fn ranges_of(set: &IntervalSet<Value>) -> Vec<(Value, Value)> {
+        set.intervals()
+            .iter()
+            .map(|interval| {
+                (
+                    interval.lval().expect("a closed interval").clone(),
+                    interval.rval().expect("a closed interval").clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn uranges(pairs: &[(u64, u64)]) -> Vec<(Value, Value)> {
+        pairs.iter().map(|&(a, b)| (u(a), u(b))).collect()
+    }
+
+    #[test]
+    fn single_interval_set_of_no_values_is_empty() {
+        assert!(single_interval_set::<u64>(&[]).intervals().is_empty());
+    }
+
+    #[test]
+    fn single_interval_set_merges_adjacent_values_into_one_interval() {
+        assert_eq!(
+            ranges_of(&single_interval_set(&[1u64, 2, 3])),
+            uranges(&[(1, 3)])
+        );
+        assert_eq!(ranges_of(&single_interval_set(&[5u64])), uranges(&[(5, 5)]));
+    }
+
+    #[test]
+    fn single_interval_set_keeps_a_gap_between_runs() {
+        assert_eq!(
+            ranges_of(&single_interval_set(&[1u64, 2, 5, 6, 9])),
+            uranges(&[(1, 2), (5, 6), (9, 9)])
+        );
+    }
+
+    /// Order and repeats of the values do not matter.
+    #[test]
+    fn single_interval_set_sorts_and_deduplicates() {
+        assert_eq!(
+            ranges_of(&single_interval_set(&[7u64, 3, 4, 0, 8, 1, 2, 3, 7])),
+            uranges(&[(0, 4), (7, 8)])
+        );
+    }
+
+    /// A run crossing zero is one interval for signed values.
+    #[test]
+    fn single_interval_set_of_signed_values_runs_through_zero() {
+        let signed = |a: i64, b: i64| (Value::Int(a), Value::Int(b));
+        assert_eq!(
+            ranges_of(&single_interval_set(&[1i64, -2, 0, -1, 5])),
+            vec![signed(-2, 1), signed(5, 5)]
+        );
+    }
+
+    /// The greatest value of a type has no next value, so nothing extends past it, and the
+    /// least has no previous one.
+    #[test]
+    fn single_interval_set_handles_the_extremes_of_each_type() {
+        assert_eq!(
+            ranges_of(&single_interval_set(&[u64::MAX, 0, u64::MAX - 1, 7])),
+            uranges(&[(0, 0), (7, 7), (u64::MAX - 1, u64::MAX)])
+        );
+        let signed = |a: i64, b: i64| (Value::Int(a), Value::Int(b));
+        assert_eq!(
+            ranges_of(&single_interval_set(&[i64::MAX, i64::MIN, i64::MIN + 1, 0])),
+            vec![
+                signed(i64::MIN, i64::MIN + 1),
+                signed(0, 0),
+                signed(i64::MAX, i64::MAX)
+            ]
+        );
+    }
+
+    /// The set holds exactly the values it was built from, with its intervals ascending and
+    /// neither overlapping nor adjacent, for both integer types.
+    #[test]
+    fn single_interval_set_holds_exactly_its_values() {
+        let mut rng = Lcg(41);
+        for span in [4u64, 16, 200] {
+            for _ in 0..500 {
+                let count = rng.next(40) as usize;
+                let unsigned: Vec<u64> = (0..count).map(|_| rng.next(span)).collect();
+                let signed: Vec<i64> = unsigned
+                    .iter()
+                    .map(|&v| v as i64 - span as i64 / 2)
+                    .collect();
+                let from_unsigned = single_interval_set(&unsigned);
+                let from_signed = single_interval_set(&signed);
+                for v in 0..span + 2 {
+                    assert_eq!(from_unsigned.contains(&u(v)), unsigned.contains(&v), "{v}");
+                    let v = v as i64 - span as i64 / 2;
+                    assert_eq!(
+                        from_signed.contains(&Value::Int(v)),
+                        signed.contains(&v),
+                        "{v}"
+                    );
+                }
+                for set in [ranges_of(&from_unsigned), ranges_of(&from_signed)] {
+                    for pair in set.windows(2) {
+                        assert!(pair[0].1 < pair[1].0, "ascending and disjoint: {set:?}");
+                        let next = match &pair[0].1 {
+                            Value::UInt(v) => Value::UInt(v + 1),
+                            Value::Int(v) => Value::Int(v + 1),
+                            other => panic!("not an integer: {other:?}"),
+                        };
+                        assert!(next < pair[1].0, "not adjacent: {set:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    // ── merged_ranges ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn merged_ranges_joins_overlapping_nested_and_adjacent_ranges() {
+        assert_eq!(
+            merged_ranges(vec![
+                (10u64, 12),
+                (0, 3),
+                (2, 5),
+                (6, 6),
+                (11, 11),
+                (20, 30),
+                (22, 24)
+            ]),
+            vec![(0, 6), (10, 12), (20, 30)]
+        );
+    }
+
+    #[test]
+    fn merged_ranges_of_one_range_is_that_range() {
+        assert_eq!(merged_ranges(vec![(3i64, 9)]), vec![(3, 9)]);
+        assert!(merged_ranges::<u64>(vec![]).is_empty());
+    }
+
+    /// A range ending at the type's greatest value has no next value to be adjacent to.
+    #[test]
+    fn merged_ranges_does_not_join_past_the_greatest_value() {
+        assert_eq!(
+            merged_ranges(vec![(0u64, u64::MAX), (5, 6)]),
+            vec![(0, u64::MAX)]
+        );
+        assert_eq!(
+            merged_ranges(vec![(u64::MAX, u64::MAX), (0, 1)]),
+            vec![(0, 1), (u64::MAX, u64::MAX)]
+        );
     }
 }
