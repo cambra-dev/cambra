@@ -581,6 +581,15 @@ pub struct ConstructorParam {
     pub ty: Spanned<Expr>,
 }
 
+/// Whether `name` is written in the type world rather than the term world.
+///
+/// `Caps` means type, without exception (`docs/chl-spec.md`, "6.1 Direction:
+/// term/type syntax split \[Decided\]"), so the first character decides it and no
+/// other signal is consulted.
+pub fn is_type_name(name: &str) -> bool {
+    name.starts_with(char::is_uppercase)
+}
+
 /// A function parameter: a name with an optional type annotation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {

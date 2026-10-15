@@ -166,7 +166,7 @@ pub fn top_level_bindings(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
             _ => {}
         }
         for name in bound {
-            if crate::ccl::lower::stmts::is_type_name(&name) {
+            if chl_parser::ast::is_type_name(&name) {
                 continue;
             }
             out.push(TopLevelBinding {

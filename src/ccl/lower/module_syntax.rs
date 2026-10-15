@@ -17,12 +17,11 @@
 //! references").
 
 use super::LoweringError;
-use super::stmts::is_type_name;
 use crate::chl_parser::ast::{
     ArmPattern, AssignTarget, CompClause, Comprehension, ConstructorPattern, DiscardHead,
     Expr as ChlExpr, IfBranch, KindAnnotation, MatchArm, Module as ChlModule, Param,
     PayloadPattern, QualifiedName, RecordField, Requirement, Span, Spanned, Stmt as ChlStmt,
-    TypeAnnotation, TypeDeclBody, TypeParam, VariantPayload,
+    TypeAnnotation, TypeDeclBody, TypeParam, VariantPayload, is_type_name,
 };
 use smol_str::SmolStr;
 
