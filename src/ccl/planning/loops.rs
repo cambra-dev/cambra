@@ -199,14 +199,14 @@ fn unwrap_const(e: Expr) -> Expr {
 /// that record is **closed** in the writer's argument.
 ///
 /// Seeds that vary per enclosing position — the enclosing accumulators where an inner
-/// loop starts — are a record-valued morphism, `⟨…⟩ ▷ zip`, whose fields are already
+/// loop starts — are a record-valued morphism, the `zip` `⟨…⟩`, whose fields are already
 /// morphisms. Seeds closed in the argument are one `const` over the whole record,
-/// `⟨…⟩ ▷ const`, whose fields are values: every top-level loop's seeds, and an inner
+/// `(…) ▷ const`, whose fields are values: every top-level loop's seeds, and an inner
 /// loop's where the enclosing body introduced the mutable variable, so it starts at the
 /// same value at every enclosing position.
 fn unwrap_seed_record(e: Expr) -> (Expr, bool) {
     let TypedExprNode::Apply { argument, function } = e.node else {
-        panic!("letrec recognition: expected `⟨seeds⟩ ▷ const` or `⟨seeds⟩ ▷ zip`");
+        panic!("letrec recognition: expected `(seeds) ▷ const` or `⟨seeds⟩`");
     };
     let closed = match function.node {
         TypedExprNode::Builtin(Builtin::Const) => true,
@@ -484,7 +484,7 @@ fn snapshot_slot_label(slot: &Expr) -> SmolStr {
 enum TxnBinding {
     /// `hist_k : Txn ⇒ V = (⟨view⟩ ▷ const, id, ⟨init⟩ ▷ const) ▷ zip ≫ get_prev_txn`.
     History,
-    /// `commits_j : 𝐼 ⇒ {time, write_targets, decision} = let __t = begin in ⟨record⟩ ▷ zip`.
+    /// `commits_j : 𝐼 ⇒ {time, write_targets, decision} = let __t = begin in ⟨record⟩`.
     Commit,
     /// ``__to_<defer> : Txn ⤇ {`fired{V} | `idle} = (commits_j ▷ by_commit_time) ≫ .decision ≫
     /// variant_project(`commit) ≫ .field``.
@@ -1348,7 +1348,7 @@ fn per_row_view(read: Expr, steps: Vec<Expr>) -> Expr {
     .with_ty(Type::fun(enclosing, chain))
 }
 
-/// A view compose split into the `⟨…⟩ ▷ zip ≫ compose` head [`peel_view_steps`] reads and
+/// A view compose split into the `⟨…⟩ ≫ compose` head [`peel_view_steps`] reads and
 /// the elements after it, which take the view whole.
 ///
 /// `None` where `e` is not that shape, which the caller reads as `e` itself with no tail,
@@ -1378,7 +1378,7 @@ fn split_view_tail(e: &Expr) -> Option<(Expr, Vec<Expr>)> {
 /// steps applied to the history.
 ///
 /// `λ 𝑥 → h(𝑥) ≫ step₁ ≫ … ≫ stepₙ` eliminates to a left-nested
-/// `⟨view, stepᵢ ▷ const⟩ ▷ zip ≫ compose`, innermost first, so the steps come back
+/// `⟨view, stepᵢ ▷ const⟩ ≫ compose`, innermost first, so the steps come back
 /// in application order with the bare history as the base. `None` where the tree is
 /// not that shape or its base is not `h` — a history that does not depend on the
 /// writer's parameter keeps the flat `h ≫ step₁ ≫ …` compose instead, which the

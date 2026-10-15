@@ -354,7 +354,7 @@ pub enum Builtin {
     /// with the collection 𝐾 its result ranges over **named**, for a site whose type is
     /// dependent.
     ///
-    /// Planning rewrites a correlated `curry(𝑔)` to `⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫ map(𝑔)`
+    /// Planning rewrites a correlated `curry(𝑔)` to `⟨id, const(𝐾)⟩ ≫ strength ≫ map(𝑔)`
     /// (`src/ccl/planning/correlated.rs`). A correlated filter narrows the inner domain by the
     /// outer value, `(𝑟 : 𝐴) ⇒ ({𝑣 : 𝐷 | 𝑣 > 𝑟} ⤇ 𝑉)`, and that chain cannot carry the
     /// dependency: the narrowed domain names the chain's input, which no element after the
@@ -371,8 +371,8 @@ pub enum Builtin {
     ///
     /// **Born in simplify and in planning**, and so carries no scheme. Simplify rewrites a
     /// collection composed with a curried function of the enclosing value
-    /// (`⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose ⟹ ⟨id, 𝑆⟩ ▷ zip ≫ strength ≫ map(𝑔)`), and planning
-    /// rewrites a correlated `curry(𝑔)` to `⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫ map(𝑔)`
+    /// (`⟨𝑆, curry(𝑔)⟩ ≫ compose ⟹ ⟨id, 𝑆⟩ ≫ strength ≫ map(𝑔)`), and planning
+    /// rewrites a correlated `curry(𝑔)` to `⟨id, const(𝐾)⟩ ≫ strength ≫ map(𝑔)`
     /// (`src/ccl/planning/correlated.rs`). Each stamps its own type, which the post-inference
     /// check holds to the rule above (`check_strength` in `src/ccl/infer/check.rs`). Compiles to
     /// `Product::per_row_values_at`.
