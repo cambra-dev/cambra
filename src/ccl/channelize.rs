@@ -1264,6 +1264,9 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
             )
         }
+        TypedExprNode::LetType { .. } => {
+            unreachable!("uniquify removes every `LetType`")
+        }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
         TypedExprNode::MutDecl { .. } => {
@@ -1332,6 +1335,9 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
             unreachable!(
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
             )
+        }
+        TypedExprNode::LetType { .. } => {
+            unreachable!("uniquify removes every `LetType`")
         }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
@@ -2217,6 +2223,9 @@ fn extract_for_defer_impl(
             unreachable!(
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
             )
+        }
+        TypedExprNode::LetType { .. } => {
+            unreachable!("uniquify removes every `LetType`")
         }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.

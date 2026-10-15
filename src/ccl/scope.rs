@@ -19,6 +19,9 @@
 //!   `bound_expr` sits outside it (CCL's `let` is non-recursive).
 //! - [`MutDecl`](TypedExprNode::MutDecl) — `binding` scopes over `body`; `init`
 //!   sits outside it (a mutable variable's seed cannot reference the mutable variable).
+//! - [`LetType`](TypedExprNode::LetType) — introduces **no** binder: it binds a
+//!   type, which lowering has already expanded at every use, and its `body` is
+//!   in the node's own scope.
 //! - [`LetRec`](TypedExprNode::LetRec) — *every* group binder scopes over
 //!   *every* binding's definition and over `body` (mutual recursion).
 //! - [`For`](TypedExprNode::For) — `target` scopes over `body`; `iter` sits
@@ -319,6 +322,9 @@ where
             open(f, body);
         }
         N::Begin { body } => open(f, body),
+        // A type alias binds no value; its type is a type slot, reached by the
+        // caller's type walk.
+        N::LetType { body, .. } => open(f, body),
 
         // The write target is a *use* of the binder that introduced the defer
         // handle / mutable variable, so it resolves like any variable.
@@ -577,6 +583,7 @@ where
         | N::Begin { .. }
         | N::Lambda { .. }
         | N::Let { .. }
+        | N::LetType { .. }
         | N::MutDecl { .. }
         | N::LetRec { .. }
         | N::For { .. }
@@ -634,6 +641,7 @@ mod tests {
                 kind: crate::ccl::AggregateKind::Sum,
             }),
             TypedExpr::let_bind("l", var("bound"), var("l")),
+            TypedExpr::let_type("Alias", Type::Hole, var("aliased")),
             TypedExpr::mut_decl(
                 "md",
                 Type::mutable(Type::Hole, Type::Hole),
@@ -772,6 +780,7 @@ mod tests {
         N::Lambda { .. } => "Lambda",
         N::Aggregate { .. } => "Aggregate",
         N::Let { .. } => "Let",
+        N::LetType { .. } => "LetType",
         N::MutDecl { .. } => "MutDecl",
         N::List(_) => "List",
         N::Case { .. } => "Case",

@@ -252,14 +252,13 @@ fn lower_tx_block_scoped(
                 let val = lower_aug_binop(&name, *op, rhs, stmt.span, ctx)?;
                 write_or_let(name, val, chain, stmt.span, ctx)?
             }
+            ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
+                lower_type_alias_decl(target, stmt.span, chain, ctx)
+            }
             // `x = value` — a plain immutable binding: a per-transaction local
             // `let`. `=` never writes a mutable variable; a plain `=` to a mutable variable would be
             // a silent no-op shadow that dies at block end, so reject it and point
             // at `:=`. (A genuine local shadowing the mutable variable's name is fine.)
-            // A type alias binds nothing, so the chain passes through unchanged.
-            ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
-                chain
-            }
             ChlStmt::Assign {
                 target,
                 value,
