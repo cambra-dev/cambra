@@ -77,6 +77,7 @@ impl LoweringContext {
                     name: QualifiedName::new(name.node.clone()),
                     view: Some(Rc::new(view)),
                     view_base: QualifiedName::default(),
+                    types: TypeArguments::default(),
                 },
             );
             self.parameters.push(Parameter {
@@ -153,6 +154,11 @@ impl LoweringContext {
         for arg in args {
             let span = arg.name.span.join(arg.value.span);
             let parameter = parameters.iter().find(|p| p.name == arg.name.node);
+            // A type argument is lowered with the module's type aliases
+            // (`Self::declare_run_types`).
+            if parameter.is_some_and(Parameter::is_type) {
+                continue;
+            }
             let named = self.module_named(&arg.value);
             if let Some(error) =
                 parameter.and_then(|p| p.mismatched(named.is_some(), arg.value.span, RUN_MODULE))
@@ -236,6 +242,7 @@ impl LoweringContext {
                 .map(|(parameter, ..)| parameter.clone())
                 .collect(),
             modules: arguments.modules,
+            types: self.run_type_arguments.remove(name).unwrap_or_default(),
             body: Box::new(body),
         });
         let run = self.tag_image(run, statement);
@@ -243,14 +250,17 @@ impl LoweringContext {
             .module
             .qualifiers
             .get(name)
-            .and_then(|qualifier| qualifier.interface.as_ref())
-            .map(|interface| {
+            .and_then(|qualifier| Some((qualifier.interface.as_ref()?, &qualifier.types)))
+            .map(|(interface, types)| {
                 interface
                     .parameters
                     .iter()
                     .map(|parameter| {
-                        let run = QualifiedName::new(name);
-                        let ty = parameter.annotation().map(|ty| reroot(ty, &run));
+                        let ty = parameter.annotation().map(|ty| {
+                            let mut ty = reroot(ty, &QualifiedName::new(name));
+                            substitute(&mut ty, types);
+                            ty
+                        });
                         (parameter.name.clone(), ty)
                     })
                     .collect()
@@ -268,6 +278,149 @@ impl LoweringContext {
                 };
                 self.tag_image(bound, span)
             })
+    }
+
+    /// Declare the type parameter `name` of the module being lowered, which
+    /// `statement` declares with the bound `bound` and the default `default`:
+    /// an alias of a declared [`Type::Param`] from its statement down, as a
+    /// type alias is (`docs/chl-spec.md`, "9.4 Parameters"). Each run of the
+    /// module replaces the parameter by its argument or its default
+    /// ([`ProgramLowering::create`]).
+    pub(in crate::ccl::lower) fn declare_type_parameter(
+        &mut self,
+        name: &Spanned<SmolStr>,
+        statement: Span,
+        bound: Option<&Spanned<ChlExpr>>,
+        default: Option<&Spanned<ChlExpr>>,
+    ) -> Result<(), LoweringError> {
+        if crate::ccl::lower::is_builtin_type_name(&name.node) {
+            return Err(LoweringError::unsupported(
+                name.span,
+                format!(
+                    "`{}` is a built-in type and cannot name a type parameter",
+                    name.node
+                ),
+            ));
+        }
+        // A bound or a default in error is a hole, and the parameter is still
+        // declared, so its uses report nothing more.
+        let mut error = None;
+        let mut lower = |ty: &Spanned<ChlExpr>, ctx: &mut Self| {
+            crate::ccl::lower::stmts::lower_type_expr(ty, ctx).unwrap_or_else(|e| {
+                error.get_or_insert(e);
+                Type::Hole
+            })
+        };
+        let bound = bound.map(|bound| lower(bound, self));
+        let default = default.map(|default| lower(default, self));
+        let param = TypeParam::declared(name.node.as_str());
+        let alias = AliasType::Type(Type::Param(Rc::clone(&param)));
+        self.declare_type_alias(name.node.as_str(), statement, alias);
+        self.parameters.push(Parameter {
+            name: name.node.clone(),
+            declared: statement,
+            default: default.is_some(),
+            kind: ParameterKind::Type {
+                param,
+                bound,
+                default,
+            },
+        });
+        error.map_or(Ok(()), Err)
+    }
+
+    /// Lower the type arguments `args` of the `run` statement declaring the run
+    /// `run`, with the `use` clause `uses`, where the statement stands: in the
+    /// module's scope, with the type aliases above it. The run's qualifier
+    /// takes the types they give its module's type parameters, so a type member
+    /// reached through it does, and so does each of its `use` names.
+    ///
+    /// Lowering runs from the last statement to the first, so this runs ahead
+    /// of it, with the type aliases, for the statements below the run that
+    /// reach its type members.
+    pub(in crate::ccl::lower) fn declare_run_types(
+        &mut self,
+        run: &SmolStr,
+        args: &[KeywordArg],
+        uses: &[UseItem],
+    ) -> Vec<LoweringError> {
+        let Some(interface) = self
+            .module
+            .qualifiers
+            .get(run)
+            .and_then(|q| q.interface.clone())
+        else {
+            return Vec::new();
+        };
+        let mut errors = Vec::new();
+        let mut given = HashMap::new();
+        let mut lowered = Vec::new();
+        for arg in args {
+            let declared = interface
+                .parameters
+                .iter()
+                .any(|p| p.name == arg.name.node && p.is_type());
+            if !declared {
+                continue;
+            }
+            // An argument in error is a hole, so the run reports nothing more
+            // for it.
+            let ty = crate::ccl::lower::stmts::lower_type_expr(&arg.value, self).unwrap_or_else(
+                |error| {
+                    errors.push(error);
+                    Type::Hole
+                },
+            );
+            given.insert(arg.name.node.clone(), ty.clone());
+            let span = arg.name.span.join(arg.value.span);
+            lowered.push((arg.name.node.clone(), span, ty));
+        }
+        if !interface.parameters.iter().any(Parameter::is_type) {
+            return errors;
+        }
+        let types = reached_types(&interface, &QualifiedName::new(run.clone()), &given);
+        let qualifier = self
+            .module
+            .qualifiers
+            .get_mut(run)
+            .expect("the run's qualifier was read above");
+        qualifier.types = types;
+        let qualifier = qualifier.clone();
+        for item in uses {
+            let bound = item.alias.as_ref().unwrap_or(&item.name);
+            if crate::ccl::lower::stmts::is_type_name(&item.name.node) {
+                // A refused `use` item has no `use` name.
+                if !self.module.uses.contains_key(&bound.node) {
+                    continue;
+                }
+                let reached = qualifier.reach_type(
+                    &QualifiedName::new(run.clone()),
+                    &item.name.node,
+                    item.name.span,
+                );
+                if let Ok(ty) = &reached {
+                    let ty = ty.clone().unwrap_or(AliasType::Type(Type::Hole));
+                    self.declare_type_alias(bound.node.as_str(), bound.span, ty);
+                }
+                if let (Ok(reached), Some(used)) = (reached, self.module.uses.get_mut(&bound.node))
+                {
+                    used.reached = Reached::Type(reached);
+                }
+            } else if let Some(Ok(module)) = qualifier.used_module(&item.name.node)
+                && self.module.qualifiers.contains_key(&bound.node)
+            {
+                self.module.qualifiers.insert(
+                    bound.node.clone(),
+                    Qualifier {
+                        statement: bound.span,
+                        kind: QualifierKind::Use { run: true },
+                        ..module
+                    },
+                );
+            }
+        }
+        self.run_type_arguments.insert(run.clone(), lowered);
+        errors
     }
 }
 

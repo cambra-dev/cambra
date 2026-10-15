@@ -655,6 +655,7 @@ mod tests {
                 statement: chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
                 arguments: Vec::new(),
                 modules: Vec::new(),
+                types: Vec::new(),
                 body: Box::new(var("rest")),
             }),
             TypedExpr::mut_decl(

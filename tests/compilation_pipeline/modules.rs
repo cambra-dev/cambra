@@ -709,7 +709,7 @@ fn assert_shared_runs(root: &str, other: &str, expected: &[&str]) {
         import scaled(scale=1 + 2)
         1
     "},
-    "an argument to an import is supported only as a literal or an import name for now"
+    "an argument to an import is supported only as a literal, a type, or an import name for now"
 )]
 #[case::mistyped(indoc! {r#"
     import scaled(scale="x")

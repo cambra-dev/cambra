@@ -384,7 +384,9 @@ pub enum TypedExprNode {
     /// `arguments` are the parameters the statement passes value arguments
     /// for, each bound above the node, and `modules` each module argument, by
     /// its parameter: the module's spelling in the declaring module, or `None`
-    /// when that module has errors of its own, and the argument's span.
+    /// when that module has errors of its own, and the argument's span. `types`
+    /// are its type arguments, each with its parameter and its span, lowered
+    /// where the statement stands.
     ///
     /// Exists only between lowering and linking. Linking replaces it with the
     /// run's chain around `body`, so no pass after it sees one, and each has an
@@ -395,6 +397,7 @@ pub enum TypedExprNode {
         statement: Span,
         arguments: Vec<SmolStr>,
         modules: Vec<(SmolStr, Option<crate::ccl::names::QualifiedName>, Span)>,
+        types: Vec<(SmolStr, Span, Type)>,
         body: Box<TypedExpr>,
     },
 
@@ -2168,6 +2171,7 @@ impl TypedExpr {
         match &self.node {
             TypedExprNode::Cast { target, .. } => f(target),
             TypedExprNode::LetType { ty, .. } => ty.walk_types(&mut f),
+            TypedExprNode::Run { types, .. } => types.iter().for_each(|(_, _, ty)| f(ty)),
             _ => {}
         }
         if let TypedExprNode::Transact {
@@ -2198,6 +2202,7 @@ impl TypedExpr {
         match &mut self.node {
             TypedExprNode::Cast { target, .. } => f(target),
             TypedExprNode::LetType { ty, .. } => ty.walk_types_mut(&mut f),
+            TypedExprNode::Run { types, .. } => types.iter_mut().for_each(|(_, _, ty)| f(ty)),
             _ => {}
         }
         if let TypedExprNode::Transact {
