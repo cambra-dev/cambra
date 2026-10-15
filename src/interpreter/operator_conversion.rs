@@ -2530,7 +2530,7 @@ fn convert_impl_inner(
                     operands.len()
                 )));
             };
-            // `⟨id, const(𝐾)⟩ ▷ zip ≫ strength`, the chain planning writes where the site's
+            // `⟨id, const(𝐾)⟩ ≫ strength`, the chain planning writes where the site's
             // type is not dependent: each row beside the one collection every row reads.
             let keys = convert_impl(source, None, ctx)?;
             let with_keys = Box::new(MapResultToConst::new_at(
@@ -2659,7 +2659,7 @@ fn convert_impl_inner(
             match b {
                 Builtin::Id => Ok(input),
                 // `strength`: each enclosing value paired with each value of its own
-                // collection, under that value's key. Its input is the pair `⟨id, 𝑆⟩ ▷ zip`
+                // collection, under that value's key. Its input is the pair `⟨id, 𝑆⟩`
                 // made, one per row of the level it is converted at, so the two halves are
                 // that pair's fields.
                 Builtin::Strength => strength_at(input, ctx.level()),
@@ -5531,7 +5531,7 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
     }
 }
 
-/// `⟨a, b⟩ ▷ zip` split into its two legs.
+/// `⟨a, b⟩` split into its two legs.
 fn zip_pair(expr: &Expr) -> Option<(&Expr, &Expr)> {
     let TypedExprNode::Apply { argument, function } = &expr.node else {
         return None;
@@ -6022,7 +6022,7 @@ mod variant_ctor_tests {
     ///   `λ __c → match __c.decision { commit(w) → {out_t: __c.time, out_w: w} }`
     ///
     /// lambda_elim compiles it to the zip form `⟨id, .decision ▷
-    /// variant_project(0)⟩ ▷ zip ≫ (λ (__c, w) → …)`; we drive that over a
+    /// variant_project(0)⟩ ≫ (λ (__c, w) → …)`; we drive that over a
     /// two-row `{time, decision: commit}` stream. The outer element and the
     /// tag-restricted payload co-iterate by key through the `Zip`, so each row
     /// pairs its own `time` with its own commit payload.

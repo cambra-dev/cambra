@@ -1746,7 +1746,7 @@ fn elim_lambda_impl(
         // reading both the record's sibling field and the commit payload), the
         // arm zips the outer element alongside the projected payload:
         //
-        //   ⧺ᵢ ( ⟨id, scrut ≫ variant_project(cᵢ)⟩ ▷ zip ≫ (λ (param, wᵢ) → eᵢ) )
+        //   ⧺ᵢ ( ⟨id, scrut ≫ variant_project(cᵢ)⟩ ≫ (λ (param, wᵢ) → eᵢ) )
         //
         // Both components of the pair are morphisms **out of the outer binder**,
         // which is why `id` sits beside the whole `scrut ≫ variant_project(cᵢ)`
@@ -1754,9 +1754,9 @@ fn elim_lambda_impl(
         // (the full element the arm body reads its sibling fields off), and
         // `scrut ≫ ⟨id, variant_project(cᵢ)⟩` would deliver the *scrutinee*
         // instead — a different, strictly narrower value whenever `scrut` is a
-        // projection like `param.decision`. (`⟨f, g⟩ ▷ zip` is the fan-out
+        // projection like `param.decision`. (`⟨f, g⟩` is the fan-out
         // itself: an `Apply` of `Builtin::Zip` to the tuple of the two
-        // morphisms, hence `▷` there and `≫` on either side of it.)
+        // morphisms, which is a morphism, hence `≫` on either side of it.)
         //
         // `variant_project(cᵢ)` keeps the scrutinee's *real* domain keys (a union
         // *stream* carries them explicitly), so the outer `id` arm (the full
@@ -3005,7 +3005,7 @@ mod tests {
     /// project either half.
     ///
     ///   λ c → match c.decision { commit(w) → (c.time, w) }
-    ///     ⟹  ⟨id, .decision ≫ variant_project(`commit)⟩ ▷ zip ≫ (λ pair → …)
+    ///     ⟹  ⟨id, .decision ≫ variant_project(`commit)⟩ ≫ (λ pair → …)
     ///
     /// `id` sits *beside* the projection chain rather than inside it: both
     /// components are morphisms out of the **outer** binder, and the left one

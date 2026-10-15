@@ -6,7 +6,7 @@
 //! rewrites each site to the combinators it compiles:
 //!
 //! ```text
-//! curry(𝑔)  ⟹  ⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫ map(𝑔)
+//! curry(𝑔)  ⟹  ⟨id, const(𝐾)⟩ ≫ strength ≫ map(𝑔)
 //! ```
 //!
 //! `𝐾 : 𝐷 ⤇ 𝐷` is the collection the inner comprehension ranges over, holding its keys as its
@@ -96,7 +96,7 @@ pub(super) fn pair_correlated_sites(expr: &mut Expr) -> Result<(), String> {
     result
 }
 
-/// `curry(𝑔)` rewritten to `⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫ map(𝑔)`, `𝐾` being the
+/// `curry(𝑔)` rewritten to `⟨id, const(𝐾)⟩ ≫ strength ≫ map(𝑔)`, `𝐾` being the
 /// collection the site ranges over (the module doc says which). `None` where `expr` is not a
 /// correlated site: a `curry` of a builtin is a partial application, which op-conversion
 /// compiles as one.

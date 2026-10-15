@@ -673,7 +673,7 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
     )
 }
 
-/// Composition with a constant function: `⟨𝑆, 𝑓 ▷ const⟩ ▷ zip ≫ compose  ⟹  𝑆 ≫ map(𝑓)`,
+/// Composition with a constant function: `⟨𝑆, 𝑓 ▷ const⟩ ≫ compose  ⟹  𝑆 ≫ map(𝑓)`,
 /// and `⟹  𝑆` where `𝑓` is `id`.
 ///
 /// At each input `𝑥` the left side is `𝑆(𝑥) ≫ 𝑓`, which is `𝑆(𝑥)` post-composed with a
@@ -717,7 +717,7 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
 }
 
 /// Composition with a curried function of the enclosing value, through **strength**:
-/// `⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose  ⟹  ⟨id, 𝑆⟩ ▷ zip ≫ strength ≫ map(𝑔)`.
+/// `⟨𝑆, curry(𝑔)⟩ ≫ compose  ⟹  ⟨id, 𝑆⟩ ≫ strength ≫ map(𝑔)`.
 ///
 /// At each input `𝑥` the left side is `𝑆(𝑥) ≫ (𝑣 ↦ 𝑔(𝑥, 𝑣))`. The right side pairs `𝑥` with
 /// each value of `𝑆(𝑥)` under that value's own key ([`Builtin::Strength`]) and maps `𝑔` over
@@ -792,7 +792,7 @@ fn try_compose_with_strength(expr: &mut Expr) -> bool {
 /// the flat merge relies on not happening.
 ///
 /// Only a compose *element* is in scope. A projection nested inside a `zip` (the
-/// outer-binder arm `⟨id, s ≫ variant_project(c)⟩ ▷ zip ≫ eᵢ`) is not one, and
+/// outer-binder arm `⟨id, s ≫ variant_project(c)⟩ ≫ eᵢ`) is not one, and
 /// needs no guard: that arm reads the zipped pair, so it is never constant and
 /// there is nothing for const-reduce to collapse.
 fn narrows_domain_irrecoverably(expr: &Expr) -> bool {

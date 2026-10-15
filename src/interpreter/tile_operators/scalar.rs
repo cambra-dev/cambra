@@ -1206,7 +1206,7 @@ mod tests {
     /// **Outer-binder alignment.** Over a variant *stream* keyed by an explicit
     /// (non-`0..N`) domain, `VariantProject` keeps the real domain keys, so the
     /// projected payload co-iterates by key with the outer element under a
-    /// `Zip` (the `⟨id, x.f ≫ variant_project(cᵢ)⟩ ▷ zip` shape). This is the
+    /// `Zip` (the `⟨id, x.f ≫ variant_project(cᵢ)⟩` shape). This is the
     /// mechanism the outer-binder arm `λ (x, wᵢ) → eᵢ` relies on; the `Zip`
     /// inner-joins on the shared keys, so the outer arm need not be pre-restricted.
     #[test]
@@ -1260,7 +1260,7 @@ mod tests {
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
 
-        // ⟨outer, x.decision ≫ variant_project(`commit)⟩ ▷ zip — the Zip joins
+        // ⟨outer, x.decision ≫ variant_project(`commit)⟩ — the Zip joins
         // the full outer collection with the tag-restricted payload on shared keys.
         let ops: Vec<Box<dyn TileOperator>> = vec![
             Box::new(FixedOp {

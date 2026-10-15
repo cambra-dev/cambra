@@ -2818,7 +2818,7 @@ fn fun_parts(ty: &Type) -> (Type, Type) {
 /// `` {`commit{𝑃} | `abort} `` decision with a one-arm `commit` read:
 ///
 /// `⟨time: commits_j ≫ .time,
-///    write: commits_j ≫ .decision ≫ variant_project(`commit) ≫ .writes ≫ .k⟩ ▷ zip`
+///    write: commits_j ≫ .decision ≫ variant_project(`commit) ≫ .writes ≫ .k⟩`
 ///
 /// The `write` leg is **partial** — ``variant_project(`commit)`` restricts to the
 /// requests that committed (an `abort` position carries nothing), so the `zip`'s
@@ -2882,7 +2882,7 @@ fn per_key_view(
     ]);
     write_view.ty = Type::fun_like(&commits_ty, dom.clone(), value_ty.clone());
 
-    // ⟨time, write⟩ ▷ zip : dom ⇒ {time, write} — the zip inner-joins, so the
+    // ⟨time, write⟩ : dom ⇒ {time, write} — the zip inner-joins, so the
     // total `time` leg is narrowed to the committing positions of the `write` leg.
     let views_rec_ty = Type::Record(vec![
         (SmolStr::from(F_TIME), time_view.ty.clone()),
