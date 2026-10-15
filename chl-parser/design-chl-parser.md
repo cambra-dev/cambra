@@ -147,7 +147,8 @@ Key shape choices:
   `Stmt::FunctionDef` carries `type_params: Vec<TypeParam>` beside `params`, and `params` alone
   is the arity. The split happens as the list is parsed (`split_params`), which rejects a type
   parameter after a value parameter. A type parameter's annotation is a `KindAnnotation`: its kind
-  `T: K` or its bound `T <: U`.
+  `T: K` or its bound `T <: U`. `ast::is_type_name` is the capitalization test; the lexer,
+  parser and lowering all call it.
 - **A `def`'s name carries its own span.** `Stmt::FunctionDef.name` is a `Spanned<SmolStr>`
   covering the identifier after `def`, as `Stmt::Param.name` covers its name. The statement's span
   starts at `def`, so a consumer pointing at the name, such as a language server's symbol
