@@ -628,6 +628,12 @@ impl QualifiedName {
     pub fn raw(&self) -> Name {
         Name::raw(self.to_string())
     }
+
+    /// The raw name `raw`, written in the module this spelling reaches, as a
+    /// raw name spelled through this one: `m` and `limit` give `m::limit`.
+    pub fn qualify(&self, raw: &str) -> Name {
+        Name::raw(format!("{self}::{raw}"))
+    }
 }
 
 impl fmt::Display for QualifiedName {
