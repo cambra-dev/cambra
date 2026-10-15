@@ -149,7 +149,7 @@ Key shape choices:
   `forall`'s body. A clause after a nested `forall`'s body belongs to the innermost one.
 - **Module statements have their own variants.** `Stmt::Import`, `Stmt::Run`,
   `Stmt::Param` and `Stmt::Discard` carry the statements of
-  [docs/chl-spec.md](../docs/chl-spec.md), "9. Modules [Decided]". `Stmt::Pub`
+  [docs/chl-spec.md](../docs/chl-spec.md), "9. Modules". `Stmt::Pub`
   wraps the statement `pub` marks rather than being a field of each statement
   that can introduce a member, so one rule (`pub_refusal`) refuses `pub` on every
   statement that introduces none. It carries the keyword's span, because on a
