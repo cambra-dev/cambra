@@ -48,6 +48,9 @@ pub struct Qualifier {
     pub module: ModulePath,
     /// The module's file, or `None` when loading found none.
     pub file: Option<FileId>,
+    /// For an import name, the shared run it reaches, or `None` when its
+    /// arguments are in error.
+    pub shared: Option<SharedRun>,
     /// The `import` or `run` statement that binds the name.
     pub statement: Span,
     /// What the module declares. `None` when the module has no file or has
@@ -368,18 +371,22 @@ impl Qualifier {
     }
 }
 
-/// One error per argument in `args`, of a `run` of the module `interface`
-/// describes, that names no parameter of it or one an earlier argument already
-/// gives a value, each at the argument.
-pub(super) fn misused_arguments(args: &[RunArg], interface: &Interface) -> Vec<LoweringError> {
+/// One error per argument in `args`, of a `run` or an `import` of `module`,
+/// whose parameters are `parameters`, that names no parameter of it or one an
+/// earlier argument already gives a value, each at the argument.
+pub(super) fn misused_arguments(
+    args: &[KeywordArg],
+    module: &ModulePath,
+    parameters: &HashSet<&str>,
+) -> Vec<LoweringError> {
     let mut errors = Vec::new();
     let mut supplied = HashSet::new();
     for arg in args {
         let name = &arg.name.node;
-        if !interface.parameters.iter().any(|p| &p.name == name) {
+        if !parameters.contains(name.as_str()) {
             errors.push(LoweringError::unsupported(
                 arg.name.span,
-                format!("module `{}` has no parameter `{name}`", interface.module),
+                format!("module `{module}` has no parameter `{name}`"),
             ));
         } else if !supplied.insert(name) {
             errors.push(LoweringError::unsupported(
@@ -420,6 +427,7 @@ pub(super) fn module_scope(
     labels: Option<ModulePath>,
     program: &LoadedProgram,
     interfaces: &HashMap<Span, Option<Rc<Interface>>>,
+    shared: &HashMap<Span, SharedRun>,
     ctx: &LoweringContext,
     errors: &mut Vec<LoweringError>,
 ) -> ModuleScope {
@@ -458,6 +466,7 @@ pub(super) fn module_scope(
                 let qualifier = Qualifier {
                     module,
                     file,
+                    shared: shared.get(&stmt.span).cloned(),
                     statement: stmt.span,
                     interface,
                     run: false,
@@ -476,11 +485,17 @@ pub(super) fn module_scope(
                     continue;
                 };
                 if let Some(Some(interface)) = interfaces.get(&stmt.span) {
-                    errors.extend(misused_arguments(args, interface));
+                    let parameters = interface
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.name.as_str())
+                        .collect();
+                    errors.extend(misused_arguments(args, &module, &parameters));
                 }
                 let name = bound_name(&module, alias.as_ref());
                 let qualifier = Qualifier {
                     file: program.file_of(&module),
+                    shared: None,
                     module,
                     statement: stmt.span,
                     interface: interfaces.get(&stmt.span).cloned().flatten(),
