@@ -174,13 +174,13 @@ impl<'a> Diff<'a> {
                 if parent_matched {
                     out.push(Divergence::Inserted(e));
                 }
-                for c in child_exprs(e) {
+                for c in diff_children(e) {
                     reported |= walk(c, false, by_dst, lost_a_child, out);
                 }
                 return reported;
             };
             let mut reported_below = lost_a_child.contains(&(e as *const TypedExpr));
-            for c in child_exprs(e) {
+            for c in diff_children(e) {
                 reported_below |= walk(c, true, by_dst, lost_a_child, out);
             }
             // The node's own content changed: that is a site regardless of what
@@ -218,7 +218,7 @@ impl<'a> Diff<'a> {
             by_src: &HashMap<*const TypedExpr, *const TypedExpr>,
             out: &mut HashSet<*const TypedExpr>,
         ) {
-            let kids = child_exprs(e);
+            let kids = diff_children(e);
             if kids
                 .iter()
                 .any(|c| children.contains(&(*c as *const TypedExpr)))
@@ -258,7 +258,7 @@ impl<'a> Diff<'a> {
                 out.push(m);
                 return;
             }
-            for c in child_exprs(e) {
+            for c in diff_children(e) {
                 walk(c, by_dst, out);
             }
         }
@@ -383,7 +383,7 @@ impl<'a> Indexed<'a> {
             children: Vec::new(),
             unordered: has_unordered_children(e),
         });
-        let child_refs = child_exprs(e);
+        let child_refs = diff_children(e);
         let mut children = Vec::with_capacity(child_refs.len());
         let (mut size, mut max_h) = (1u32, 0u32);
         for c in child_refs {
@@ -426,10 +426,10 @@ fn has_unordered_children(e: &TypedExpr) -> bool {
 /// cast's target predicates after its value.
 ///
 /// A cast-target domain-refinement predicate is a comprehension filter or join
-/// condition, so the matcher has to see it as a term. `walk_children` omits it
+/// condition, so the differ has to see it as a term. `walk_children` omits it
 /// because it sits in a type slot. `cast_target_predicates` states which
 /// predicates are included and in what order.
-fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
+fn diff_children(e: &TypedExpr) -> Vec<&TypedExpr> {
     let mut children = e.child_exprs();
     if let super::TypedExprNode::Cast { target, .. } = &e.node {
         children.extend(cast_target_predicates(target));
@@ -926,7 +926,7 @@ fn resolved_hashes(t: &Indexed<'_>, correspondent_of: &dyn Fn(usize) -> u64) -> 
                     // equal — a `Content::Same` on two different computations,
                     // which is the unsound direction (`src/ccl/design/diffing.md`,
                     // "Direction of error"). Position within the group is the
-                    // correspondence, matching how `child_exprs` pairs the
+                    // correspondence, matching how `diff_children` pairs the
                     // group's definitions.
                     for (j, n) in names.iter().enumerate() {
                         scope.push((n, mix(correspondent, j as u64)));
@@ -1151,27 +1151,27 @@ impl std::fmt::Display for Diff<'_> {
 
 /// Whether every node in the differ's subtree belongs to `set`.
 ///
-/// Use `child_exprs`, not the ordinary term walk: a surviving cast predicate must
+/// Use `diff_children`, not the ordinary term walk: a surviving cast predicate must
 /// prevent its wrapper from being rendered as wholly inserted or deleted.
 fn subtree_entirely_in(e: &TypedExpr, set: &HashSet<*const TypedExpr>) -> bool {
     set.contains(&(e as *const TypedExpr))
-        && child_exprs(e)
+        && diff_children(e)
             .into_iter()
             .all(|c| subtree_entirely_in(c, set))
 }
 
 /// `    (+N nodes)` when `e` has descendants, so an elided subtree still
 /// reports how much it stands for; empty for a leaf. Counts over
-/// [`child_exprs`], the differ's child set, so the note matches what collapsed.
+/// [`diff_children`], the differ's child set, so the note matches what collapsed.
 fn size_note(e: &TypedExpr) -> String {
     let mut n = 0;
     fn count(e: &TypedExpr, n: &mut usize) {
         *n += 1;
-        for c in child_exprs(e) {
+        for c in diff_children(e) {
             count(c, n);
         }
     }
-    for c in child_exprs(e) {
+    for c in diff_children(e) {
         count(c, &mut n);
     }
     if n == 0 {
@@ -1197,7 +1197,7 @@ fn render_node(
         }
         None => {
             writeln!(f, "{indent}+ {}", head(e))?;
-            for c in child_exprs(e) {
+            for c in diff_children(e) {
                 render_node(f, c, depth + 1, by_dst, inserted)?;
             }
             Ok(())
@@ -1216,7 +1216,7 @@ fn render_node(
             // An unchanged subtree is unchanged all the way down; descending
             // would print it verbatim for no information.
             if m.content != Content::Same {
-                for c in child_exprs(e) {
+                for c in diff_children(e) {
                     render_node(f, c, depth + 1, by_dst, inserted)?;
                 }
             }
@@ -1241,7 +1241,7 @@ fn collect_deleted_roots<'a>(
             return;
         }
     }
-    for c in child_exprs(e) {
+    for c in diff_children(e) {
         collect_deleted_roots(c, gone, out);
     }
 }
@@ -2431,7 +2431,7 @@ mod tests {
 
     #[test]
     fn a_deleted_cast_with_a_surviving_predicate_is_not_wholly_deleted() {
-        // `child_exprs` descends into a cast target's refinement predicate — a
+        // `diff_children` descends into a cast target's refinement predicate — a
         // comprehension filter or join condition, a term the matcher can match.
         // The collapse tests must walk that same child set: over the narrower
         // `all_children` the cast reads as wholly gone while a matched node is
@@ -2483,7 +2483,9 @@ mod tests {
             .collect();
         fn any_matched(e: &TypedExpr, matched: &HashSet<*const TypedExpr>) -> bool {
             matched.contains(&(e as *const TypedExpr))
-                || child_exprs(e).into_iter().any(|c| any_matched(c, matched))
+                || diff_children(e)
+                    .into_iter()
+                    .any(|c| any_matched(c, matched))
         }
         for (root, whole) in roots {
             assert!(
