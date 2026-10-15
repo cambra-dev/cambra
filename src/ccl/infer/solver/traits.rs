@@ -1661,7 +1661,7 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                 }
                 Type::Record(fields) => {
                     for (name, ty) in fields {
-                        let key = FieldKey::Name(name.as_str().into());
+                        let key = FieldKey::Name(name.clone());
                         descend(ty, &path, Step::Field(key), &mut frontier);
                     }
                 }
@@ -2006,7 +2006,7 @@ pub(crate) fn product_fields(product: &Type) -> Vec<FieldKey> {
         Type::Tuple(elems) => (0..elems.len()).map(FieldKey::Index).collect(),
         Type::Record(fields) => fields
             .iter()
-            .map(|(name, _)| FieldKey::Name(name.as_str().into()))
+            .map(|(name, _)| FieldKey::Name(name.clone()))
             .collect(),
         other => unreachable!("`product_fields` is reached only for a product, got {other:?}"),
     }

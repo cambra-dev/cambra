@@ -14,6 +14,7 @@
 //! [`hash_all`] recomputes each subterm independently; see `src/ccl/design/diffing.md`,
 //! "Standalone hashing is the matcher's precondition".
 
+use crate::ccl::Label;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -493,7 +494,7 @@ fn hash_payload<'a>(
         N::Record(fields) => {
             fields.len().hash(h);
             if fold == Fold::Own {
-                let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                let mut names: Vec<&Label> = fields.iter().map(|(n, _)| n).collect();
                 names.sort_unstable();
                 names.hash(h);
             }
@@ -591,11 +592,8 @@ fn hash_rel<'a>(
         // Records are unordered by field name; field names are unique, so
         // sorting the (name, child-hash) pairs yields a canonical order.
         N::Record(fields) => {
-            let mut entries: Vec<(&str, u64)> = fields
-                .iter()
-                .map(|(n, _)| n.as_str())
-                .zip(children)
-                .collect();
+            let mut entries: Vec<(&Label, u64)> =
+                fields.iter().map(|(n, _)| n).zip(children).collect();
             entries.sort_unstable();
             entries.hash(&mut h);
         }

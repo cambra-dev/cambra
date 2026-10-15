@@ -771,7 +771,7 @@ mod tests {
             panic!("expected a record, got: {}", symbolic(&expr));
         };
         for (name, value) in outs {
-            let expected = name != "n";
+            let expected = name.name() != "n";
             assert_eq!(
                 is_iterate_apply(chain_head(value)),
                 expected,

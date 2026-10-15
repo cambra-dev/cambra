@@ -1696,7 +1696,7 @@ pub fn proposal_stream_tiling(key_extent: &Extent, value_extent: &Extent) -> Til
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
             (SmolStr::from(F_READS), Tiling::Scalar(map.clone())),
-            (SmolStr::from(F_WRITES), Tiling::Scalar(map)),
+            (F_WRITES.runtime_key(), Tiling::Scalar(map)),
         ])),
     )
 }
@@ -2116,7 +2116,7 @@ impl CommitProducer {
             crate::interpreter::tile_operators::assert_no_absent_cells(&absent);
             let snaps = record_field(&fields, F_SNAP);
             let reads = record_field(&fields, F_READS);
-            let writes = record_field(&fields, F_WRITES);
+            let writes = record_field(&fields, F_WRITES.name());
             // The proposal tile is an offset window: its domain carries the
             // absolute step values (the writer compacts its released prefix), so
             // read the step from the domain column and index the codomain by
@@ -6333,7 +6333,7 @@ fn decision_at_index(
     );
     let n_carry = write_keys.len() - tap_fields.len();
     let mut writes = Vec::with_capacity(write_keys.len());
-    match payload.get(F_WRITES)? {
+    match payload.get(F_WRITES.name())? {
         Value::Record(writes_rec) => {
             debug_assert_eq!(
                 writes_rec.len(),
@@ -6348,7 +6348,7 @@ fn decision_at_index(
                 else {
                     return None;
                 };
-                writes.push(writes_rec.get(name.as_str())?.clone());
+                writes.push(writes_rec.get(name.name())?.clone());
             }
         }
         // A read-only transaction's empty write set lowers to a unit value (not
@@ -6601,7 +6601,7 @@ impl TransactWriterProducer {
                     Tile::Scalar(ColumnValue::Variants(reads)),
                 ),
                 (
-                    SmolStr::from(F_WRITES),
+                    F_WRITES.runtime_key(),
                     Tile::Scalar(ColumnValue::Variants(writes)),
                 ),
             ]))),
@@ -7424,7 +7424,7 @@ mod tests {
     /// the key the same way the CCL side does.
     fn commit_payload_extent(key: &str) -> Extent {
         Extent::Record(HashMap::from([(
-            SmolStr::from(F_WRITES),
+            F_WRITES.runtime_key(),
             Extent::Record(HashMap::from([(SmolStr::from(key), value_extent())])),
         )]))
     }
@@ -7434,8 +7434,8 @@ mod tests {
     /// are listed in is immaterial.
     fn decision_union_extent(payload: Extent) -> Extent {
         Extent::Union(TagMap::from_arms(vec![
-            (FieldKey::Name(V_COMMIT.into()), payload),
-            (FieldKey::Name(V_ABORT.into()), Extent::Base(BaseType::Unit)),
+            (FieldKey::Name(V_COMMIT), payload),
+            (FieldKey::Name(V_ABORT), Extent::Base(BaseType::Unit)),
         ]))
     }
 
@@ -7445,9 +7445,9 @@ mod tests {
     fn commit_value(key: &str, write: Value) -> Value {
         let writes_rec = Value::Record(HashMap::from([(SmolStr::from(key), write)]));
         Value::Union {
-            tag: FieldKey::Name(V_COMMIT.into()),
+            tag: FieldKey::Name(V_COMMIT),
             inner: Box::new(Value::Record(HashMap::from([(
-                SmolStr::from(F_WRITES),
+                F_WRITES.runtime_key(),
                 writes_rec,
             )]))),
         }
@@ -7456,7 +7456,7 @@ mod tests {
     /// A `` `abort `` decision value (a carry / no proposal).
     fn abort_value() -> Value {
         Value::Union {
-            tag: FieldKey::Name(V_ABORT.into()),
+            tag: FieldKey::Name(V_ABORT),
             inner: Box::new(Value::Unit),
         }
     }
@@ -8939,7 +8939,7 @@ mod tests {
                     )),
                 ),
                 (
-                    SmolStr::from(F_WRITES),
+                    F_WRITES.runtime_key(),
                     Tile::Scalar(ColumnValue::Variants(
                         emitted.iter().map(|p| map_to_value(&p.2)).collect(),
                     )),
