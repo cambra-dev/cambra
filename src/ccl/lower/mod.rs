@@ -481,6 +481,12 @@ pub struct LoweringContext {
     /// the statement stands ([`Self::declare_run_types`]).
     pub(super) run_type_arguments:
         HashMap<SmolStr, Vec<(crate::ccl::names::QualifiedName, Span, Type)>>,
+    /// The checks of each `run` statement's type arguments, by run name
+    /// ([`Self::declare_run_types`]).
+    pub(super) run_type_checks: HashMap<SmolStr, Vec<modules::TypeCheck>>,
+    /// The check tree of each module other than the root, which the compile
+    /// infers before the linked program ([`modules::ModuleCheck`]).
+    pub(crate) module_checks: Vec<modules::ModuleCheck>,
     /// Every binder the module being lowered writes, with its span, for the rule
     /// that none takes a name that denotes a module ([`module_name_binders`]).
     pub(super) module_binders: Vec<(SmolStr, Span)>,

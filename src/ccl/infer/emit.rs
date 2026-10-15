@@ -271,9 +271,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 
         TypedExprNode::Defer => emit_defer(ctx),
-        TypedExprNode::Abstract => unreachable!(
-            "the linked program holds no `Abstract`: each run binds its module's parameters"
-        ),
+        // A value known only by its type, which the `let` binding it states.
+        TypedExprNode::Abstract => ctx.fresh(),
 
         TypedExprNode::Begin { body } => emit_begin(body, ctx)?,
 
@@ -1816,7 +1815,12 @@ pub(super) fn emit_let<C: Typing>(
     // reconstructed from its RHS afterwards instead, which is what forced the
     // mutability checks to read `user_annotation` as a proxy for it.
     binding.ty = scheme_ty.clone();
-    let generalize = ctx.is_generalizable(bound_expr);
+    // A stand-in for a polymorphic member of a Module-typed parameter is
+    // generalized at its polymorphic annotation, as a function definition is:
+    // each use's copy takes that use's instance. Unannotated, it stays one type,
+    // which all its uses settle.
+    let generalize = ctx.is_generalizable(bound_expr)
+        || (poly.is_some() && matches!(bound_expr.node, TypedExprNode::Abstract));
     // Lowering refuses a polymorphic annotation on a call or a collection; a name
     // of a monomorphic binding is known only here. A failed right-hand side names
     // nothing, so it is not asked.

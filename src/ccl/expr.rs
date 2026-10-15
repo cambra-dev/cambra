@@ -798,8 +798,11 @@ pub enum TypedExprNode {
 
     /// A value known only by its type: a module's parameter with no default, or
     /// a member a Module-typed parameter's Module type names, in the module's
-    /// chain (`docs/modules.md`, "Runs"). Each run binds the parameter to its
-    /// argument, so the linked program holds none.
+    /// chain (`docs/modules.md`, "Runs"), and any parameter while the module is
+    /// checked on its own (`docs/modules.md`, "Checking a module on its own").
+    /// Inference gives it a fresh type, which the `let` binding it states. Each
+    /// run binds the parameter to its argument, so the linked program holds
+    /// none, and inference is the last pass a module's check tree reaches.
     Abstract,
 
     /// A `with begin():` transaction block, as **one statement** (value `Unit`).

@@ -3870,12 +3870,12 @@ param payments: Module{charge: {amount: Int} => Receipt}
 - A **type parameter** is a capitalized parameter, since `Caps` means type
   ([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)).
   It names a type that varies with the run, and follows a `def`'s type parameter
-  ([Kinds and bounds](#kinds-and-bounds)). **[Planned]** With a bound it is opaque apart from it:
-  `Receipt` above has an `id` and nothing else checking can rely on. With none, its kind is inferred
-  from the module's uses. A run or an import supplies it as an argument, `Receipt=stripe::Receipt`,
-  as it does any parameter without a default. A default is a type over the module's import names and
-  the type parameters declared above it. **[Planned]** An argument left out is inferred from the
-  types of the other arguments.
+  ([Kinds and bounds](#kinds-and-bounds)). With a bound it is opaque apart from it: `Receipt` above
+  has an `id` and nothing else checking can rely on. With none, its kind is inferred from the
+  module's uses. A run or an import supplies it as an argument, `Receipt=stripe::Receipt`, as it
+  does any parameter without a default. A default is a type over the module's import names and the
+  type parameters declared above it. **[Planned]** An argument left out is inferred from the types
+  of the other arguments.
 - A value parameter is an immutable value. Its type is its annotation, or inferred from the module's
   uses the way a function parameter's is.
 - A parameter of Module type is how a module takes another module. The argument is a name that
@@ -4032,15 +4032,14 @@ A capitalized entry is a type member. Its `<:` is the bounded form of a type par
 ([9.4 Parameters](#94-parameters)), and it is the one place `<:` appears inside a type literal
 ([Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)). `Name: K`
 states its kind, as `T: K` does for a type parameter, so `Name: Type` is any type
-([Kinds and bounds](#kinds-and-bounds)). **[Planned]** A module reaching a type member through a
-Module type knows what its entry states and nothing more. Through `Name = T` it can build values of
-the member, and through `Name <: T` or `Name: K` it cannot. A type member is in scope in the entries
-after it, which is how `charge` above returns a `Receipt`.
+([Kinds and bounds](#kinds-and-bounds)). A module reaching a type member through a Module type
+knows what its entry states and nothing more. Through `Name = T` it can build values of the member,
+and through `Name <: T` or `Name: K` it cannot. A type member is in scope in the entries after it,
+which is how `charge` above returns a `Receipt`.
 
 `Module{…}` 𝐴 is a subtype of `Module{…}` 𝐵 when 𝐴 has every member 𝐵 names. A value member's type
 in 𝐴 is a subtype of its type in 𝐵, a `Mut` member's type is equal, since `Mut` is invariant, and a
-type member satisfies 𝐵's bound (**[Planned]**). Width subtyping lets a consumer name only the
-members it uses:
+type member satisfies 𝐵's bound. Width subtyping lets a consumer name only the members it uses:
 
 ```python
 # storefront.cambra
@@ -4196,40 +4195,42 @@ restrict what a type may mention.
 
 ### 9.14 Checking a module on its own
 
-**[Planned]** — the rules of this section.
-
 A module is checked once, alone, with no root and nothing that uses it. `cambra check lib.cambra`
-runs that check and prints the module's interface.
+runs that check and prints the module's interface (**[Planned]**).
 
 - **Parameters are typed binders.** A value parameter has its annotated type or the type its uses
   infer. A type parameter is opaque apart from its bound, and one with no bound has the kind its
   uses infer.
-- **Imports are read through interfaces.** A module sees another module's public contracts and
-  whether it performs IO or declares mutable state, never its bodies.
-- **A public member's contract is its type.** An annotated member's contract is the annotation,
-  checked against the body. An unannotated member's contract is its inferred type, refinements and
-  all.
-- **A run is checked at the `run` statement.** Each argument is checked against its parameter's
-  type. An argument's Module type is built from its members' contracts, so passing a module compares
-  contracts with the parameter's type, and no body is involved.
+- **Imports are read through contracts.** A module sees each member another module exports through
+  its contract, and whether the module performs IO or declares mutable state.
+- **A public member's contract is its type.** An exactly annotated member's contract is the
+  annotation, checked against the body, and a module using the member reads no body. An unannotated
+  member's contract is its inferred type, refinements and all, and a `<:` member's is its inferred
+  type below the bound. An inferred type depends on the body, so a module using such a member is
+  checked together with the member's body. Such a member is **coupled** to its uses.
+- **A run is checked at the `run` statement.** Each value argument is checked against its
+  parameter's type, and each type argument against its parameter's bound. A module argument's
+  members are checked against the parameter's Module type: each value member against its entry,
+  and each type member equal to an exact entry `Name = T`, or below a bound. An unannotated
+  parameter whose uses leave its type open, as `k * k` leaves `k`, is **coupled** to its
+  arguments, as an unannotated member is to its uses.
 
-The check covers parsing, name resolution, and typing, plus the module's own `run` statements:
-their argument types ([9.3 Runs](#93-runs)). Its guarantee: **a module
-that checks cannot be made to fail by a use that checks, in any of these.** Every error a use causes
-there is reported at the use, against a contract, with a secondary label at the library line the
-requirement comes from.
+The check covers parsing, name resolution, and typing, plus the module's own `run` and `import`
+statements: their arguments ([9.3 Runs](#93-runs)). Its guarantee: **a module that checks cannot be
+made to fail, in any of these, by a use that checks through members whose contracts are exact
+annotations.** Every error such a use causes is reported at the use, against the annotation, with a
+secondary label at the library line the requirement comes from. An error a use of a coupled member
+causes in that member's body is reported at the body, with a secondary label at the statement that
+brings the body into the using module.
 
 Some checks run only once the program is assembled from its root, because they need the bodies of
 called functions or the full set of runs: the mutable-variable and transaction rules of
 [8. Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds), feed routing, the
-dataflow shapes the compiler can emit, and route uniqueness across runs. One of these can refuse
-code inside a module that checked. The error is reported at the code it names, with the run whose
-copy failed, and with a secondary label at the `run` statement that created that run, or at each
-`import` that reaches a shared run.
-
-**[Planned]** — the guarantee needs every inferred type to state each requirement its body imposes.
-A trait requirement on a generic parameter is the exception today: it is enforced only when a
-concrete type reaches the parameter.
+dataflow shapes the compiler can emit, and route uniqueness across runs. So do the uses that
+several modules make of one coupled member together, such as a monomorphic member that two
+importers settle. One of these can refuse code inside a module that checked. The error is reported
+at the code it names, with the run whose copy failed, and with a secondary label at the `run`
+statement that created that run, or at each `import` that reaches a shared run.
 
 An inferred contract changes when its body changes. Every user in the engine is rechecked on reload,
 so a breaking change surfaces there. A library author sees it in the interface `cambra check`

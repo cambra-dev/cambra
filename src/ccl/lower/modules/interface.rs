@@ -52,8 +52,8 @@ pub enum ParameterKind {
     /// to, and its bound and default as its module lowered them.
     Type {
         param: Rc<TypeParam>,
-        /// The bound, recorded for checking a module on its own: nothing
-        /// compares an argument with it yet (`docs/modules.md`, "Runs").
+        /// The bound, which the declaring module's check compares each argument
+        /// with (`docs/modules.md`, "Checking a module on its own").
         bound: Option<Type>,
         default: Option<Type>,
     },
@@ -275,6 +275,20 @@ pub struct Reference {
 }
 
 impl Interface {
+    /// The value parameters that have no annotation, whose types a check infers
+    /// from the module's uses.
+    pub fn inferred_parameters(&self) -> impl Iterator<Item = &SmolStr> {
+        self.parameters
+            .iter()
+            .filter(|p| matches!(p.kind, ParameterKind::Value(None)))
+            .map(|p| &p.name)
+    }
+
+    /// Whether `parameter` is one of [`Self::inferred_parameters`].
+    pub(super) fn infers(&self, parameter: &str) -> bool {
+        self.inferred_parameters().any(|p| p == parameter)
+    }
+
     /// The interface of a module that importing is an error for. Each import of
     /// it is refused, so its members are never reached.
     pub(super) fn unimportable(module: ModulePath, why: Unimportable) -> Self {
