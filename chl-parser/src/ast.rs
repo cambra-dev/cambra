@@ -471,6 +471,17 @@ pub enum PayloadPattern {
     Absent,
 }
 
+/// Whether `name` is written in the type world rather than the term world.
+///
+/// `Caps` means type, without exception (`docs/chl-spec.md`, "6.1 Direction:
+/// term/type syntax split \[Decided\]"), so the first character decides it and no
+/// other signal is consulted. Identifiers are ASCII (the lexer's `Token::Ident`
+/// regex is `[A-Za-z_][A-Za-z0-9_]*`), so Unicode and ASCII uppercase agree on
+/// every name, and a leading `_` makes a term name.
+pub fn is_type_name(name: &str) -> bool {
+    name.starts_with(char::is_uppercase)
+}
+
 /// A function parameter: a name with an optional type annotation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
@@ -1034,4 +1045,17 @@ pub enum AugOp {
     Sub,
     Mul,
     FloorDiv,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_type_name;
+
+    #[test]
+    fn only_a_leading_uppercase_letter_makes_a_type_name() {
+        assert!(is_type_name("T"));
+        assert!(!is_type_name("t"));
+        assert!(!is_type_name("_T"));
+        assert!(!is_type_name(""));
+    }
 }

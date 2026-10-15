@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use super::*;
 use crate::{
     ccl::{Expr, Name, Type, TypedExprNode},
-    chl_parser::ast::{AnnotationMode, Param, Requirement, Span, Spanned, TypeParam},
+    chl_parser::ast::{AnnotationMode, Param, Requirement, Span, Spanned, TypeParam, is_type_name},
 };
 
 /// The binder a `=> T` output annotation introduces to check the body's result.
@@ -373,10 +373,7 @@ fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr
 /// alias, a `def`'s type parameter, or a polymorphic type (`docs/chl-spec.md`,
 /// "3.10 Lambda").
 pub(super) fn refuse_capitalized_lambda_binder(params: &[Param]) -> Result<(), LoweringError> {
-    match params
-        .iter()
-        .find(|p| p.name.starts_with(char::is_uppercase))
-    {
+    match params.iter().find(|p| is_type_name(&p.name)) {
         Some(param) => Err(LoweringError::unsupported(
             param.name_span,
             format!(

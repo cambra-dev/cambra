@@ -13,6 +13,7 @@ use crate::{
     chl_parser::ast::{
         AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, KindAnnotation, MatchArm,
         PayloadPattern, Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeParam,
+        is_type_name,
     },
 };
 
@@ -2017,15 +2018,6 @@ pub const RESERVED_TYPE_NAMES: &[&str] = &[
 /// name therefore never both resolve.
 pub fn is_builtin_type_name(name: &str) -> bool {
     BaseType::from_keyword(name).is_some() || RESERVED_TYPE_NAMES.contains(&name)
-}
-
-/// Whether `name` is written in the type world rather than the term world.
-///
-/// `Caps` means type, without exception (`docs/chl-spec.md`, "6.1 Direction:
-/// term/type syntax split [Decided]"), so the first character decides it and no
-/// other signal is consulted.
-pub(super) fn is_type_name(name: &str) -> bool {
-    name.chars().next().is_some_and(char::is_uppercase)
 }
 
 /// The name and right-hand side of a type-alias statement, or `None` when the

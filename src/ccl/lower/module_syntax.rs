@@ -8,11 +8,10 @@
 //! [`ChlExpr::Qualified`], a qualified label, or a qualified tag.
 
 use super::LoweringError;
-use super::stmts::is_type_name;
 use crate::chl_parser::ast::{
     AssignTarget, CompClause, Comprehension, Expr as ChlExpr, IfBranch, KindAnnotation, MatchArm,
     Module as ChlModule, Param, QualifiedName, RecordField, Requirement, Span, Spanned,
-    Stmt as ChlStmt, TypeAnnotation, TypeParam, VariantPayload,
+    Stmt as ChlStmt, TypeAnnotation, TypeParam, VariantPayload, is_type_name,
 };
 use smol_str::SmolStr;
 
