@@ -209,12 +209,21 @@ statements"](../../../docs/chl-spec.md#67-type-alias-statements)), so uniquify r
 
 ### `Run` — a `run` statement before linking
 
-`Run { name, module, statement, body }` is the `run` statement at `statement` that declares the run
-`name` of `module`, over `body`, the rest of the declaring module. A module lowers once, before any
-run of it exists, so the statement cannot stand for the run's chain yet. Linking creates the run
-and replaces the node with its chain around `body` ([docs/modules.md, "A module lowers
-once"](../../../docs/modules.md#a-module-lowers-once)). No pass after linking sees a `Run`, and
-each has an unreachable arm for one.
+`Run { name, module, statement, arguments, body }` is the `run` statement at `statement` that
+declares the run `name` of `module`, over `body`, the rest of the declaring module. `arguments`
+names the parameters it passes arguments for, each bound in a `let` above the node. A module
+lowers once, before any run of it exists, so the statement cannot stand for the run's chain yet.
+Linking creates the run and replaces the node with its chain around `body` ([docs/modules.md, "A
+module lowers once"](../../../docs/modules.md#a-module-lowers-once)). No pass after linking sees a
+`Run`, and each has an unreachable arm for one.
+
+### `Abstract` — a value known only by its type
+
+`Abstract` is a leaf with no definiens. It stands for a module's parameter with no default in the
+module's chain, as the `let` that binds the parameter ([docs/modules.md,
+"Runs"](../../../docs/modules.md#runs)). Each run binds the parameter to its argument, and refuses a
+run that passes none, so the linked program holds no `Abstract`, and inference and every pass after
+it have an unreachable arm for one.
 
 ### `Cast` — explicit refinement acquisition
 

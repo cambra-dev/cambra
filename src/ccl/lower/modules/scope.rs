@@ -70,6 +70,7 @@ impl LoweringContext {
         self.type_aliases.clear();
         self.mut_param_fns.clear();
         self.declared_sinks.clear();
+        self.parameters.clear();
         // A `use` type name is in scope throughout its module. One whose module
         // has errors of its own names no type, and stands for any. A `use` name
         // for a function with a `Mut` parameter takes the curried call shape the
@@ -367,6 +368,29 @@ impl Qualifier {
     }
 }
 
+/// One error per argument in `args`, of a `run` of the module `interface`
+/// describes, that names no parameter of it or one an earlier argument already
+/// gives a value, each at the argument.
+pub(super) fn misused_arguments(args: &[RunArg], interface: &Interface) -> Vec<LoweringError> {
+    let mut errors = Vec::new();
+    let mut supplied = HashSet::new();
+    for arg in args {
+        let name = &arg.name.node;
+        if !interface.parameters.iter().any(|p| &p.name == name) {
+            errors.push(LoweringError::unsupported(
+                arg.name.span,
+                format!("module `{}` has no parameter `{name}`", interface.module),
+            ));
+        } else if !supplied.insert(name) {
+            errors.push(LoweringError::unsupported(
+                arg.name.span,
+                format!("the parameter `{name}` already has an argument"),
+            ));
+        }
+    }
+    errors
+}
+
 /// The name an `import` or a `run` of `module` binds: its alias, or else the
 /// module path's last segment.
 pub(super) fn bound_name(module: &ModulePath, alias: Option<&Spanned<SmolStr>>) -> SmolStr {
@@ -403,7 +427,9 @@ pub(super) fn module_scope(
     let mut use_items = Vec::new();
     for stmt in &module.body {
         let (name, qualifier, uses) = match &stmt.node {
-            ChlStmt::Import { path, alias, uses } => {
+            ChlStmt::Import {
+                path, alias, uses, ..
+            } => {
                 // A segment the parser refused names no module.
                 let Some(module) = path.to_path() else {
                     continue;
@@ -439,12 +465,19 @@ pub(super) fn module_scope(
                 (name, qualifier, uses)
             }
             ChlStmt::Run {
-                path, alias, uses, ..
+                path,
+                alias,
+                uses,
+                args,
+                ..
             } => {
                 // A segment the parser refused names no module.
                 let Some(module) = path.to_path() else {
                     continue;
                 };
+                if let Some(Some(interface)) = interfaces.get(&stmt.span) {
+                    errors.extend(misused_arguments(args, interface));
+                }
                 let name = bound_name(&module, alias.as_ref());
                 let qualifier = Qualifier {
                     file: program.file_of(&module),

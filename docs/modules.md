@@ -1,8 +1,8 @@
 # Modules
 
 > **Status: [Sketched].** A proposed implementation. The first four items of the [Implementation
-> stack](#implementation-stack) are implemented, and the first part of the sixth, runs without
-> parameters ([Runs](#runs)).
+> stack](#implementation-stack) are implemented, and the sixth, runs and value parameters
+> ([Runs](#runs)).
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -276,15 +276,16 @@ qualifier of labels and tags, and `m::T` as a type.
   label, and `m::` qualifies the label of the module `m` names. `some` and `none` are `Option`'s in
   every module ([Names carry their home](#names-carry-their-home)).
 - **Refused:** a module as a value, and a member of a run another module declares. The later items
-  lift these.
+  lift these. A shared run takes every parameter's default, and a parameter without one is an error
+  at the parameter.
 
 A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
 into it adds no error.
 
 ### Runs
 
-Running modules without parameters is implemented: `run m` and `run a::b as n`, a run's members
-reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
+Running modules is implemented: `run m(x=e)` and `run a::b as n`, value parameters, a run's
+members reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
 
 - **A run is created from its module's lowering.** A `run` statement lowers to a `Run` node over
   the rest of the declaring module (`LoweringContext::take_run`), and creating the declaring
@@ -303,10 +304,21 @@ reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
 - **Routes are unique across runs.** Creating a run registers its routes. A route two runs serve is
   an error at the second `run` statement, with a note at the first. A route address is a literal,
   so two runs of one module that serves a route always conflict.
-- **Refused:** an argument to `run`, `@RenamedFrom`, and a `run` in an imported module. `pub` on a
-  `run` is a parse error: a module returns a run by binding it to a public member, which waits on
-  Module types.
-  `pub` on `:=` is refused, so no module reaches another run's mutable variable.
+- **A parameter is a `let` at the head of its module's chain**, of its default, or of an `Abstract`
+  when it has none ([ir.md, "`Abstract` — a value known only by its
+  type"](../src/ccl/design/ir.md#abstract--a-value-known-only-by-its-type)). The interface records
+  each parameter's annotation and whether it has a default.
+  A `run` statement binds each argument above its `Run` node under `argument_name`'s
+  double-underscore name, `__run::eu::port`, at the parameter's annotated type spelled through the
+  run name, so a mismatch is reported at the argument. Creating the run points each parameter with
+  an argument at that name, and refuses one with neither an argument nor a default at the `run`
+  statement. An unannotated parameter's type is inferred from the module's uses, so a bad argument
+  for one is reported where the module uses it, until a module is checked alone. The root and a
+  shared run take every parameter's default, and a parameter without one is an error there.
+- **Refused:** a type parameter and a parameter of Module type (item 7), `@RenamedFrom`, and a `run`
+  in an imported module. `pub` on a `run` is a parse error: a module returns a run by binding it to
+  a public member, which waits on Module types. `pub` on `:=` is refused, so no module reaches
+  another run's mutable variable.
 
 ### The module interface
 

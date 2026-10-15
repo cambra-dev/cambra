@@ -3747,7 +3747,8 @@ members ([9.8 Module types](#98-module-types)).
 - **Member.** A binding at a module's top level. Bindings inside a `def`, a loop, or a block are
   **locals**.
 - **Public member.** A member declared with `pub`. Every other member is private to its module.
-- **Parameter.** A value a run supplies, declared by a `param` statement.
+- **Parameter.** A value, a type, or a module that a run supplies, declared by a `param` statement
+  ([9.4 Parameters](#94-parameters)).
 - **Module type.** The structural type of a module's public members, `Module{…}`
   ([9.8 Module types](#98-module-types)).
 - **Module interface.** What checking records about a module for the modules that use it: its
@@ -3809,14 +3810,14 @@ run inventory as inv use stock                        # binds `inv`, and `stock`
   it as an argument ([9.9 Running](#99-running)).
 - A `use` clause on a run binds unqualified names to the run's public members, as an import's
   does.
-- **[Planned]** Arguments are keyword-only, one per parameter without a default. A module with no
-  parameters is run without parentheses.
+- Arguments are keyword-only, one per parameter without a default. A module with no parameters is
+  run without parentheses.
 - A run stands at its statement in the declaring module, and performs its module's top level there.
-  **[Planned]** An argument is any expression over the names above the statement: the declaring
-  module's members, earlier runs' members, imports, and parameters. A run's public members are what
-  it returns, so `run index(docs=p::documents) as ix` passes one run's member to another. An import
-  name or run name in an argument denotes its run as a value of its Module type, which is how a
-  module is passed to another.
+  An argument is any expression over the names above the statement: the declaring module's members,
+  earlier runs' members, imports, and parameters. A run's public members are what it returns, so
+  `run index(docs=p::documents) as ix` passes one run's member to another. An import name or run
+  name in an argument denotes its run as a value of its Module type, which is how a module is passed
+  to another (**[Planned]**).
 - A run name is bound from its statement to the end of the declaring module, as a value binding
   is, because a run is an evaluation. `eu::x` reaches the run's public member `x`. An argument names
   only runs above its own, so runs cannot depend on each other in a cycle: `run svc(peer=y) as x`
@@ -3831,8 +3832,6 @@ run inventory as inv use stock                        # binds `inv`, and `stock`
   refused.
 
 ### 9.4 Parameters
-
-**[Planned]** — the rules of this section.
 
 ```ebnf
 param_stmt ::= "param" ident [":" type] ["=" expr]
@@ -3849,25 +3848,27 @@ param Receipt <: {id: String}
 param payments: Module{charge: {amount: Int} => Receipt}
 ```
 
-- A **type parameter** is a capitalized parameter, since `Caps` means type
-  ([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)).
-  It names a type that varies with the run. The module is checked with it as an opaque type, known
-  only through its bound: `Receipt` above has an `id` and nothing else checking can rely on. A run
-  supplies it as an argument, `Receipt=stripe::Receipt`, or leaves it to be inferred from the other
-  arguments.
+- **[Planned]** A **type parameter** is a capitalized parameter, since `Caps` means type ([6.1
+  Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)). It
+  names a type that varies with the run. The module is checked with it as an opaque type, known only
+  through its bound: `Receipt` above has an `id` and nothing else checking can rely on. A run
+  supplies it as an argument, `Receipt=stripe::Receipt`, as it does any parameter without a default.
+  **[Planned]** An argument left out is inferred from the types of the other arguments.
 - A value parameter is an immutable value. Its type is its annotation, or inferred from the module's
   uses the way a function parameter's is.
-- A parameter of Module type is how a module takes another module. The argument is a name that
-  denotes a module ([9.6 Qualified references](#96-qualified-references)), and Module subtyping is
-  the check ([9.8 Module types](#98-module-types)). The parameter is a qualifier: `audit::events`
-  reaches the argument's member.
+- **[Planned]** A parameter of Module type is how a module takes another module. The argument is a
+  name that denotes a module ([9.6 Qualified references](#96-qualified-references)), and Module
+  subtyping is the check ([9.8 Module types](#98-module-types)). The parameter is a qualifier:
+  `audit::events` reaches the argument's member.
 - A parameter's type is the only thing checking reads about its argument
   ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). An interface is an
   alias of a Module type, usually exported by a library both sides import.
 - A parameter is in scope throughout its module. A member with the same spelling is an error naming
-  both sites. A local may shadow a value parameter, except one of Module type
-  ([9.6 Qualified references](#96-qualified-references)). A type parameter follows the scoping of a
-  type alias ([6.7 Type-alias statements](#67-type-alias-statements)).
+  both sites. A default is evaluated before the module's members, so it is an expression over the
+  module's import names and the parameters declared above it. A local may shadow a value
+  parameter, except one of Module type ([9.6 Qualified references](#96-qualified-references)). A
+  type parameter follows the scoping of a type alias
+  ([6.7 Type-alias statements](#67-type-alias-statements)).
 - A `param` stands at a module's top level, as an `import` does.
 - The root module has no required parameters. The engine runs it, and no `run` statement supplies
   arguments, so a root parameter takes its default. A root with a parameter that has no default is

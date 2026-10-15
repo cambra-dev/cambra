@@ -271,6 +271,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 
         TypedExprNode::Defer => emit_defer(ctx),
+        TypedExprNode::Abstract => unreachable!(
+            "the linked program holds no `Abstract`: each run binds its module's parameters"
+        ),
 
         TypedExprNode::Begin { body } => emit_begin(body, ctx)?,
 

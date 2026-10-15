@@ -213,6 +213,7 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Defer
+        | TypedExprNode::Abstract
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Lambda { .. } => true,
         // A comprehension is atomic when the term it encodes to is — which is
@@ -317,6 +318,7 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Defer
+        | TypedExprNode::Abstract
         | TypedExprNode::Builtin(_) => e,
 
         TypedExprNode::Error => crate::unexpected_error_node!(),

@@ -1268,6 +1268,9 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
             unreachable!("uniquify removes every `LetType`")
         }
         TypedExprNode::Run { .. } => unreachable!("linking expands every `Run`"),
+        TypedExprNode::Abstract => unreachable!(
+            "the linked program holds no `Abstract`: each run binds its module's parameters"
+        ),
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
         TypedExprNode::MutDecl { .. } => {
@@ -1341,6 +1344,9 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
             unreachable!("uniquify removes every `LetType`")
         }
         TypedExprNode::Run { .. } => unreachable!("linking expands every `Run`"),
+        TypedExprNode::Abstract => unreachable!(
+            "the linked program holds no `Abstract`: each run binds its module's parameters"
+        ),
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
         TypedExprNode::MutDecl { .. } => {
@@ -2230,6 +2236,9 @@ fn extract_for_defer_impl(
             unreachable!("uniquify removes every `LetType`")
         }
         TypedExprNode::Run { .. } => unreachable!("linking expands every `Run`"),
+        TypedExprNode::Abstract => unreachable!(
+            "the linked program holds no `Abstract`: each run binds its module's parameters"
+        ),
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
         TypedExprNode::MutDecl { .. } => {

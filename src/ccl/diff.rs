@@ -458,6 +458,7 @@ fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
         | N::Source(_)
         | N::LoadFrom(_)
         | N::Defer
+        | N::Abstract
         | N::Error => {
             vec![]
         }

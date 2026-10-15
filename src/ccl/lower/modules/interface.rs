@@ -13,8 +13,22 @@ pub struct Interface {
     pub(super) members: HashMap<SmolStr, Member>,
     /// Every top-level type alias, by spelling, public and private alike.
     pub(super) types: HashMap<SmolStr, TypeMember>,
+    /// Each value parameter, in the order declared.
+    pub(super) parameters: Vec<Parameter>,
     /// Why importing the module is an error, if it is.
     pub unimportable: Option<Unimportable>,
+}
+
+/// One value parameter of a module.
+#[derive(Debug, Clone)]
+pub struct Parameter {
+    pub name: SmolStr,
+    /// The `param` statement.
+    pub declared: Span,
+    /// Its annotated type, as its module lowered it, if it has one.
+    pub annotation: Option<Type>,
+    /// Whether it has a default, which a run that passes no argument takes.
+    pub default: bool,
 }
 
 /// What makes a module one that is run and not imported (`docs/chl-spec.md`,
@@ -66,21 +80,26 @@ impl Interface {
             module,
             members: HashMap::new(),
             types: HashMap::new(),
+            parameters: Vec::new(),
             unimportable: Some(why),
         }
     }
 
-    /// The interface of the module `module`, lowered to `chain`, whose top-level
-    /// bindings and type aliases are `bindings` and `aliases`, and which cannot be
+    /// The interface of the module `module`, lowered to `chain`, with the
+    /// parameters `parameters` its lowering recorded, and which cannot be
     /// imported for `unimportable`, if it has a reason.
     pub(super) fn of_lowered(
         module: ModulePath,
+        ast: &ChlModule,
         chain: &Expr,
-        bindings: &[TopLevelBinding],
-        aliases: &[TopLevelBinding],
+        mut parameters: Vec<Parameter>,
         mut_param_fns: impl Fn(&str) -> bool,
         unimportable: Option<Unimportable>,
     ) -> Self {
+        let bindings = &top_level_bindings(&ast.body);
+        let aliases = &top_level_aliases(&ast.body);
+        // Lowering runs from a module's last statement to its first.
+        parameters.sort_by_key(|parameter| parameter.declared.start);
         let members = bindings
             .iter()
             .map(|binding| {
@@ -118,6 +137,7 @@ impl Interface {
             module,
             members,
             types,
+            parameters,
             unimportable,
         }
     }

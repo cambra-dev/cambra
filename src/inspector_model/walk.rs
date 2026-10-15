@@ -103,6 +103,7 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         Define { name, .. } => format!("Define({name})"),
         Begin { .. } => "Begin".to_string(),
         Defer => "Defer".to_string(),
+        Abstract => "Abstract".to_string(),
         Error => "Error".to_string(),
     }
 }

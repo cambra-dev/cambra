@@ -4125,6 +4125,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Feed { .. }
         | N::Define { .. }
         | N::Defer
+        | N::Abstract
         | N::Begin { .. }
         | N::LoadFrom(_)
         | N::Error => true,
@@ -4163,7 +4164,7 @@ fn eq_term_modulo_ty_slots_go(
         // than a `VarRef`). Resolving it through the pairing would equate two spellings
         // that name different predecessors' variables.
         (N::LoadFrom(x), N::LoadFrom(y)) => x == y,
-        (N::Defer, N::Defer) | (N::Error, N::Error) => true,
+        (N::Defer, N::Defer) | (N::Abstract, N::Abstract) | (N::Error, N::Error) => true,
         (
             N::Apply {
                 function: f1,

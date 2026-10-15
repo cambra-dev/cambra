@@ -684,6 +684,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         }
 
         TypedExprNode::Defer => (Precedence::Atom, "defer".to_string()),
+        TypedExprNode::Abstract => (Precedence::Atom, "abstract".to_string()),
 
         TypedExprNode::Begin { body } => {
             let body_str = fmt(body, Precedence::Lowest, opts);
