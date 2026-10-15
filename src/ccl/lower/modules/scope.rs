@@ -3,8 +3,8 @@
 
 use super::*;
 
-/// The module being lowered: whose labels its unqualified ones are, and the
-/// modules its import names reach.
+/// The module being lowered: whose labels its unqualified ones are, the
+/// modules its import names reach, and the members its `use` names reach.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleScope {
     /// The module an unqualified label belongs to, or `None` for the root's
@@ -13,6 +13,20 @@ pub struct ModuleScope {
     /// The import names in scope, each throughout the module (`docs/chl-spec.md`,
     /// "9.6 Qualified references").
     pub qualifiers: HashMap<SmolStr, Qualifier>,
+    /// The names `use` clauses bind, each in scope throughout the module beneath
+    /// every local binder (`docs/modules.md`, "`use` names are environment
+    /// entries, not bindings").
+    pub uses: HashMap<SmolStr, Use>,
+}
+
+/// What a `use` name reaches.
+#[derive(Debug, Clone)]
+pub struct Use {
+    /// The member, spelled through its qualifier, or `None` when its module has
+    /// errors of its own.
+    pub member: Option<QualifiedName>,
+    /// The `use` item that binds the name.
+    pub item: Span,
 }
 
 /// What an import name reaches (`docs/chl-spec.md`, "9.6 Qualified
@@ -93,8 +107,12 @@ impl LoweringContext {
         q: &ParserQualifiedName,
         span: Span,
     ) -> Result<Option<Name>, LoweringError> {
-        self.qualifier_import(q, span, "value")?
-            .reach(&q.qualifier[0].node, &q.name.node, span)
+        let reached = self.qualifier_import(q, span, "value")?.reach(
+            &q.qualifier[0].node,
+            &q.name.node,
+            span,
+        )?;
+        Ok(reached.map(|spelling| spelling.raw()))
     }
 
     /// The import name `q`'s qualifier is, for a reference to a `what` at
@@ -137,15 +155,14 @@ impl LoweringContext {
 
 impl Qualifier {
     /// The public member `member`, reached through the qualifier `name` at
-    /// `span`, as a raw name spelled through it, or `None` when the module has
-    /// errors of its own or performs IO, each of which is reported where it
-    /// stands.
+    /// `span`, spelled through it, or `None` when the module has errors of its
+    /// own or performs IO, each of which is reported where it stands.
     pub(super) fn reach(
         &self,
         name: &str,
         member: &str,
         span: Span,
-    ) -> Result<Option<Name>, LoweringError> {
+    ) -> Result<Option<QualifiedName>, LoweringError> {
         if crate::ccl::lower::stmts::is_type_name(member) {
             return Err(LoweringError::unsupported(
                 span,
@@ -178,7 +195,7 @@ impl Qualifier {
                 ),
             ));
         }
-        Ok(Some(QualifiedName::new(name).child(member).raw()))
+        Ok(Some(QualifiedName::new(name).child(member)))
     }
 
     /// The interface whose members a reference reaches, or `None` when the module
@@ -206,21 +223,25 @@ pub(super) fn bound_name(module: &ModulePath, alias: Option<&Spanned<SmolStr>>) 
 }
 
 /// The scope `module` lowers in: `labels` as the module of its unqualified
-/// labels, and a [`Qualifier`] per `import`, each reaching the interface
-/// `interfaces` holds for its statement.
+/// labels, a [`Qualifier`] per `import`, each reaching the interface
+/// `interfaces` holds for its statement, and a [`Use`] per `use` item.
 ///
 /// An import of a module that performs IO is an error at the statement, and so
-/// is a second import binding one name.
+/// is a second import binding one name. A `use` item is an error when its member
+/// is not one the module reaches, or when its name is an import name, another
+/// `use` name, or a builtin's.
 pub(super) fn module_scope(
     module: &ChlModule,
     labels: Option<ModulePath>,
     program: &LoadedProgram,
     interfaces: &HashMap<Span, Option<Rc<Interface>>>,
+    ctx: &LoweringContext,
     errors: &mut Vec<LoweringError>,
 ) -> ModuleScope {
     let mut qualifiers: HashMap<SmolStr, Qualifier> = HashMap::new();
+    let mut use_items = Vec::new();
     for stmt in &module.body {
-        let ChlStmt::Import { path, alias, .. } = &stmt.node else {
+        let ChlStmt::Import { path, alias, uses } = &stmt.node else {
             continue;
         };
         // A segment the parser refused names no module.
@@ -250,6 +271,7 @@ pub(super) fn module_scope(
                 .with_note(site, "the IO it performs"),
             );
         }
+        use_items.extend(uses.iter().map(|item| (name.clone(), item)));
         qualifiers.insert(
             name,
             Qualifier {
@@ -261,5 +283,61 @@ pub(super) fn module_scope(
         );
     }
 
-    ModuleScope { labels, qualifiers }
+    let mut uses: HashMap<SmolStr, Use> = HashMap::new();
+    for (qualifier_name, item) in use_items {
+        let bound = item.alias.as_ref().unwrap_or(&item.name);
+        let reached =
+            qualifiers[&qualifier_name].reach(&qualifier_name, &item.name.node, item.name.span);
+        let refusal = if let Some(named) = qualifiers.get(&bound.node) {
+            Some(
+                LoweringError::unsupported(
+                    bound.span,
+                    format!(
+                        "`{}` is an import name, so no binder in its module takes it",
+                        bound.node
+                    ),
+                )
+                .with_note(named.statement, "imported here"),
+            )
+        } else if let Some(earlier) = uses.get(&bound.node) {
+            Some(
+                LoweringError::unsupported(
+                    bound.span,
+                    format!("`{}` is already a `use` name", bound.node),
+                )
+                .with_note(earlier.item, "bound by `use` here first"),
+            )
+        } else if SurfaceBuiltin::from_name(&bound.node).is_some()
+            || ctx.sources.contains_key(bound.node.as_str())
+        {
+            // A builtin resolves by its spelling before scope is consulted, so a
+            // `use` name spelled like one would never reach its member.
+            Some(LoweringError::unsupported(
+                bound.span,
+                format!(
+                    "`{}` is a builtin, so a `use` name cannot take it: bind the member under \
+                     another name, `use {} as …`",
+                    bound.node, item.name.node
+                ),
+            ))
+        } else {
+            reached.as_ref().err().cloned()
+        };
+        if let Some(refusal) = refusal {
+            errors.push(refusal);
+            continue;
+        }
+        uses.insert(
+            bound.node.clone(),
+            Use {
+                member: reached.expect("an unrefused `use` item reaches its member"),
+                item: bound.span,
+            },
+        );
+    }
+    ModuleScope {
+        labels,
+        qualifiers,
+        uses,
+    }
 }

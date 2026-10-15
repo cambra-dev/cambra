@@ -138,8 +138,8 @@ pub fn run(expr: Expr) -> Expr {
 
 /// [`run`] with `scope` beneath every binder of `expr`: a raw reference that no
 /// binder of `expr` binds resolves to the name `scope` maps its spelling to. A
-/// run's references to other modules' members, `m::f`, enter its tree this way
-/// (`docs/modules.md`, "A module lowers once").
+/// run's references to other modules' members, `m::f`, and its module's `use`
+/// names enter its tree this way (`docs/modules.md`, "A module lowers once").
 pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>) -> Expr {
     debug_assert!(
         scope.values().all(|name| !name.is_raw()),
