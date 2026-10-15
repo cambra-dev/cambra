@@ -9,39 +9,35 @@
 //!
 //! | CHL syntax | CCL output |
 //! |--------------|-----------|
-//! | Integer / string / bool / None literals | [`TypedExprNode::Lit`] |
+//! | Integer / string / bool literals, and `()` | [`TypedExprNode::Lit`] |
 //! | Variable references | [`TypedExprNode::Var`] |
 //! | Binary arithmetic (`+`, `-`, `*`, `//`) | [`TypedExprNode::BinOp`] |
 //! | Comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) | [`TypedExprNode::BinOp`] |
 //! | Chained comparisons (`a < b < c`) | nested [`TypedExprNode::BinOp`] with `and` |
 //! | Boolean operators (`and`, `or`) | left-folded [`TypedExprNode::BinOp`] chain |
 //! | List literals `[e0, e1, ...]` | [`TypedExprNode::List`] |
-//! | Single-generator list comprehensions (no `if`) | `Lambda`/`Apply` encoding |
-//! | 2-gen equality-join comprehensions (`if x.k == y.k`) | hash-join [`crate::ccl::Refinement`] predicate |
-//! | Multi-gen filtered comprehensions (non-equality or 3+ generators) | loop-join [`crate::ccl::Refinement`] predicate |
+//! | List comprehensions and generator expressions | [`TypedExprNode::Comprehension`] |
 //! | Assignment + expression blocks | nested [`TypedExprNode::Let`] |
-//! | Augmented assignment `x op= e` | desugared to [`TypedExprNode::Let`] via [`TypedExprNode::BinOp`] |
+//! | Augmented assignment `x op= e` | [`TypedExprNode::MutWrite`] of `x op e` |
 //! | Calls to builtins ([`chl_parser::builtins::SURFACE_BUILTINS`]) | per builtin, in `lower_call` (`exprs.rs`), the `with` block, and the sink declarations |
 //! | Lambda expressions `\x -> body`, `\x, y -> body` | single [`TypedExprNode::Lambda`] (tupled param when multi-arg) |
 //! | Unary negation (`-x`) | [`TypedExprNode::UnaryOp`] with [`crate::ccl::UnaryOpKind::Neg`] |
 //! | Boolean negation (`not x`) | [`TypedExprNode::UnaryOp`] with [`crate::ccl::UnaryOpKind::Not`] |
-//! | Unary plus (`+x`) | identity — lowered to `x` directly |
 //! | Single-arg call `f(a)` | [`TypedExprNode::Apply`] |
 //! | Multi-arg call `f(a, b, ...)` | [`TypedExprNode::Apply`] with a tupled argument |
 //! | Annotated assignment `x: T = expr` | [`TypedExprNode::Let`] with [`crate::ccl::TypedBinding::user_annotation`] set |
-//! | Generator expressions `(expr for x in xs)` | `Lambda`/`Apply` encoding (same as list comp) |
-//! | Generator functions `def f(xs): for x in xs: yield expr` | [`TypedExprNode::Let`] + uncurried [`TypedExprNode::Lambda`] wrapping `Lambda`/`Apply` encoding |
-//! | Nested-for generator functions | same encoding as multi-generator list comprehensions |
-//! | Let-bindings in generator bodies `y = f(x); yield y` | [`TypedExprNode::Let`] interleaved in the `Lambda`/`Apply` chain |
-//! | Pre-loop lets before generator for-loop | [`TypedExprNode::Let`] wrapping the generator expression |
 //! | Regular functions `def f(x, y, ...): expr` | [`TypedExprNode::Let`] + single [`TypedExprNode::Lambda`] (tupled param when multi-arg) |
-//! | Record literals `{field: expr, ...}` (identifier keys only) | [`TypedExprNode::Record`] |
+//! | Record values `(field=expr, ...)` | [`TypedExprNode::Record`] |
 //! | Field access `r.field` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Field`]`)` |
 //! | Positional access `t.0` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Index`]`)` |
 //! | Collection lookup `c[k]` | [`TypedExprNode::Apply`] — the same node as the call `c(k)` |
 //! | The outputs of a program that binds a sink | a [`TypedExprNode::Record`] at the tail of the root `Let*` chain |
 //!
-//! Everything else returns [`LoweringError::Unsupported`].
+//! `src/ccl/design/lowering.md`, "Lowering — CHL to CCL" specifies functions,
+//! builtins, `if`/`match`, variants, annotations and the deferred operators in
+//! detail. Generator functions lower as
+//! `src/ccl/design/lowering.md`, "Generator functions and feed-only loops"
+//! specifies. A construct with no lowering returns [`LoweringError::Unsupported`].
 //!
 //! # Name uniqueness
 //!
@@ -60,8 +56,8 @@
 //!
 //! # Module layout
 //!
-//! This pass is split across several submodules, all re-exported here so that
-//! the historical `crate::ccl::lower::…` paths continue to resolve:
+//! This module defines the pass's public surface and its shared
+//! [`LoweringContext`]; the submodules implement the lowering rules:
 //!
 //! - [`stmts`] — statement-block lowering (`Let` chains, `if`/`else`, sink-declaration
 //!   dispatch, mutation-loop dispatch).
@@ -73,6 +69,11 @@
 //! - [`sinks`] — recognizing a sink-declaring statement, and refusing one outside the
 //!   top-level block.
 //! - [`http`] — `http_serve` recognition and lowering.
+//! - [`module_syntax`] — refusing module syntax, which parses and does not lower yet.
+//! - [`transactions`] — `with begin():` transaction-block lowering, standalone and as a
+//!   loop body.
+//! - `test_sink` — `out = test_sink()` recognition and lowering, built only under
+//!   `cfg(test)` or the `test-helpers` feature.
 
 use smol_str::SmolStr;
 use std::{
@@ -400,15 +401,16 @@ pub struct LoweringContext {
     /// the usual single tupled-parameter lambda, because a `Mut` parameter must
     /// stay a named binder for inlining to rename the callee's `MutWrite` target
     /// to the caller's mutable variable (a tuple projection cannot be a write target). Its
-    /// call sites must apply curried to match — recorded here (the `def` lowers
-    /// before its calls) so [`lower_call`] can pick the matching shape.
+    /// call sites must apply curried to match. A block lowers right-to-left, so a
+    /// call lowers before the `def` above it; [`pre_register_txn_decls`] records the
+    /// name on entering the block so [`lower_call`] can pick the matching shape.
     ///
     /// **Block-scoped.** Keyed on the surface name (lowering precedes uniquify,
     /// so no α-unique name exists yet), the set is snapshot/restored around every
     /// nested block ([`lower_stmts_inner`]) so a `Mut`-param `def` local to one
     /// scope cannot leak its curried shape onto a same-named `def`/call in an
     /// enclosing or sibling scope. Within a block, the *last* definition of a name
-    /// wins (see [`pre_register_mut_param_fns`]).
+    /// wins (see [`pre_register_txn_decls`]).
     pub(super) mut_param_fns: HashSet<String>,
 
     /// Whether lowering is currently inside a refinement predicate `{T where p}`
@@ -630,8 +632,8 @@ impl LoweringContext {
     /// `tag_machinery` is **the lowering author's judgment about their own rule**.
     /// There is no rule to apply, and the codebase does not agree with itself: the
     /// same node kind at the same span role is tagged both ways — an `ExprStmt` at
-    /// a statement's span is `"lower.image"` at several sites and
-    /// `"lower.stmt_seq"` at nine.
+    /// a statement's span is `"lower.image"` at some sites and
+    /// `"lower.stmt_seq"` at others.
     ///
     /// So the guarantee is deliberately weak, and stating it is the point:
     /// **`"lower.image"` means "the rule that minted this node considered it an
@@ -689,10 +691,10 @@ impl LoweringContext {
     /// `walk_children` domain, so those assembly nodes have no leaf of their own
     /// and the widened `collect_tree_ids` would report them `Unrecorded`.
     ///
-    /// Call this on the predicate **immediately before** handing it to
-    /// `ccl_utils::refined_data_fun`, which is the single point a lowering
-    /// predicate is born. Nodes already recorded keep their own precise
-    /// attribution — see [`lowering_predicate_leaf`].
+    /// Call this on the predicate **immediately before** sealing it into a
+    /// `Refinement`, through `ccl_utils::refined_data_fun` or `Refinement::born`.
+    /// Nodes already recorded keep their own precise attribution — see
+    /// [`lowering_predicate_leaf`].
     ///
     /// [`lowering_predicate_leaf`]: crate::ccl::provenance::lowering_predicate_leaf
     pub(super) fn tag_predicate(&mut self, pred: &Expr, span: Span, label: RewriteLabel) {

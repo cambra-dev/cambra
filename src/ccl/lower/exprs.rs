@@ -373,7 +373,7 @@ fn lower_groupby(
     // the lowering fold therefore has to explain them. The `collection` clone is what
     // makes that load-bearing here: `Clone` freshens, so the clone does not alias an
     // already-tagged main-tree id. Everything on the main tree below is recorded — an
-    // unrecorded lowering mint is a `Leak::Unexplained` at the boundary.
+    // unrecorded lowering mint is a `Leak::Unrecorded` at the boundary.
     let bare_pred = Expr::binop(
         Expr::apply(
             Expr::apply(Expr::var(Name::elem()), collection.clone()),
@@ -470,7 +470,7 @@ fn present_key_domain(
     let characteristic = Expr::apply(morphism, Expr::builtin(Builtin::CollectionContains));
     // The domain's nodes are minted here and live in a type slot, outside the
     // `walk_children` domain the lowering fold covers — so the fold cannot explain
-    // them and they reach the boundary as `Leak::Unexplained`. Sweeping the predicate
+    // them and they reach the boundary as `Leak::Unrecorded`. Sweeping the predicate
     // is what records them, exactly as the group predicate is swept in [`lower_groupby`].
     let predicate = Expr::apply(Expr::var(Name::elem()), characteristic);
     ctx.tag_predicate(&predicate, span, "lower.present_key_domain");
