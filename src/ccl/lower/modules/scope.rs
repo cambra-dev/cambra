@@ -31,8 +31,8 @@ pub struct Use {
 /// spelling says. Each is `None` when its module has errors of its own.
 #[derive(Debug, Clone)]
 pub enum Reached {
-    /// The member, spelled through its qualifier.
-    Value(Option<QualifiedName>),
+    /// The member, as a reference through its qualifier.
+    Value(Option<Reference>),
     /// The type the alias names, spelled through its qualifier ([`reroot`]).
     Type(Option<Type>),
 }
@@ -64,10 +64,18 @@ impl LoweringContext {
         self.type_aliases.clear();
         self.mut_param_fns.clear();
         // A `use` type name is in scope throughout its module. One whose module
-        // has errors of its own names no type, and stands for any.
+        // has errors of its own names no type, and stands for any. A `use` name
+        // for a function with a `Mut` parameter takes the curried call shape the
+        // function was lowered with.
         for (name, used) in &scope.uses {
-            if let Reached::Type(ty) = &used.reached {
-                self.declare_type_throughout(name.as_str(), ty.clone().unwrap_or(Type::Hole));
+            match &used.reached {
+                Reached::Type(ty) => {
+                    self.declare_type_throughout(name.as_str(), ty.clone().unwrap_or(Type::Hole));
+                }
+                Reached::Value(Some(reference)) if reference.mut_param => {
+                    self.register_mut_param_fn(name.as_str());
+                }
+                Reached::Value(_) => {}
             }
         }
         self.module = scope;
@@ -121,13 +129,9 @@ impl LoweringContext {
         &self,
         q: &ParserQualifiedName,
         span: Span,
-    ) -> Result<Option<Name>, LoweringError> {
-        let reached = self.qualifier_import(q, span, "value")?.reach(
-            &q.qualifier[0].node,
-            &q.name.node,
-            span,
-        )?;
-        Ok(reached.map(|spelling| spelling.raw()))
+    ) -> Result<Option<Reference>, LoweringError> {
+        self.qualifier_import(q, span, "value")?
+            .reach(&q.qualifier[0].node, &q.name.node, span)
     }
 
     /// The type the type reference `q` names, or `None` when `q`'s module has
@@ -182,13 +186,13 @@ impl LoweringContext {
 impl Qualifier {
     /// The public member `member`, reached through the qualifier `name` at
     /// `span`, spelled through it, or `None` when the module has errors of its
-    /// own or performs IO, each of which is reported where it stands.
+    /// own or is not importable, each of which is reported where it stands.
     pub(super) fn reach(
         &self,
         name: &str,
         member: &str,
         span: Span,
-    ) -> Result<Option<QualifiedName>, LoweringError> {
+    ) -> Result<Option<Reference>, LoweringError> {
         if crate::ccl::lower::stmts::is_type_name(member) {
             return Err(LoweringError::unsupported(
                 span,
@@ -212,16 +216,10 @@ impl Qualifier {
             )
             .with_note(found.declared, "declared here without `pub`"));
         }
-        if found.mut_param {
-            return Err(LoweringError::unsupported(
-                span,
-                format!(
-                    "`{name}::{member}` takes a `Mut` parameter, and calling such a function \
-                     across modules is not supported yet"
-                ),
-            ));
-        }
-        Ok(Some(QualifiedName::new(name).child(member)))
+        Ok(Some(Reference {
+            name: QualifiedName::new(name).child(member),
+            mut_param: found.mut_param,
+        }))
     }
 
     /// The type of the public type alias `member`, reached through the qualifier
@@ -264,7 +262,7 @@ impl Qualifier {
     pub(super) fn reachable(&self) -> Option<&Interface> {
         self.interface
             .as_deref()
-            .filter(|interface| interface.io_site.is_none())
+            .filter(|interface| interface.unimportable.is_none())
     }
 }
 
@@ -287,10 +285,10 @@ pub(super) fn bound_name(module: &ModulePath, alias: Option<&Spanned<SmolStr>>) 
 /// labels, a [`Qualifier`] per `import`, each reaching the interface
 /// `interfaces` holds for its statement, and a [`Use`] per `use` item.
 ///
-/// An import of a module that performs IO is an error at the statement, and so
-/// is a second import binding one name. A `use` item is an error when its member
-/// is not one the module reaches, or when its name is an import name, another
-/// `use` name, a builtin's, or a built-in type's.
+/// An import of a module that performs IO or declares state is an error at the
+/// statement, and so is a second import binding one name. A `use` item is an
+/// error when its member is not one the module reaches, or when its name is an
+/// import name, another `use` name, a builtin's, or a built-in type's.
 pub(super) fn module_scope(
     module: &ChlModule,
     labels: Option<ModulePath>,
@@ -321,15 +319,21 @@ pub(super) fn module_scope(
             continue;
         }
         let interface = interfaces.get(&stmt.span).cloned().flatten();
-        if let Some(site) = interface.as_ref().and_then(|i| i.io_site) {
+        if let Some(why) = interface.as_ref().and_then(|i| i.unimportable) {
+            let (does, site, note) = match why {
+                Unimportable::Io(site) => ("performs IO", site, "the IO it performs"),
+                Unimportable::State(site) => {
+                    ("declares mutable state", site, "the state it declares")
+                }
+            };
             errors.push(
                 LoweringError::unsupported(
                     stmt.span,
                     format!(
-                        "module `{module}` performs IO, so importing it is an error: run it instead"
+                        "module `{module}` {does}, so importing it is an error: run it instead"
                     ),
                 )
-                .with_note(site, "the IO it performs"),
+                .with_note(site, note),
             );
         }
         use_items.extend(uses.iter().map(|item| (name.clone(), item)));

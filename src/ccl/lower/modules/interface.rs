@@ -13,9 +13,18 @@ pub struct Interface {
     pub(super) members: HashMap<SmolStr, Member>,
     /// Every top-level type alias, by spelling, public and private alike.
     pub(super) types: HashMap<SmolStr, TypeMember>,
-    /// Where the module performs IO, which makes importing it an error
-    /// (`docs/chl-spec.md`, "9.7 Importing asserts no IO").
-    pub io_site: Option<Span>,
+    /// Why importing the module is an error, if it is.
+    pub unimportable: Option<Unimportable>,
+}
+
+/// What makes a module one that is run and not imported (`docs/chl-spec.md`,
+/// "9.7 Importing asserts no IO and no state").
+#[derive(Debug, Clone, Copy)]
+pub enum Unimportable {
+    /// The module performs IO here: it opens a source or binds a sink.
+    Io(Span),
+    /// The module declares mutable state here.
+    State(Span),
 }
 
 /// One member of a module: a binding at its top level.
@@ -41,28 +50,36 @@ pub struct TypeMember {
     pub declared: Span,
 }
 
+/// A reference to another module's member: the member spelled through its
+/// qualifier, and whether calls to it take a curried shape.
+#[derive(Debug, Clone)]
+pub struct Reference {
+    pub name: QualifiedName,
+    pub mut_param: bool,
+}
+
 impl Interface {
-    /// The interface of a module that performs IO at `io_site`. Importing it is
-    /// refused, so its members are never reached.
-    pub(super) fn performing_io(module: ModulePath, io_site: Span) -> Self {
+    /// The interface of a module that importing is an error for. Each import of
+    /// it is refused, so its members are never reached.
+    pub(super) fn unimportable(module: ModulePath, why: Unimportable) -> Self {
         Interface {
             module,
             members: HashMap::new(),
             types: HashMap::new(),
-            io_site: Some(io_site),
+            unimportable: Some(why),
         }
     }
 
     /// The interface of the module `module`, lowered to `chain`, whose top-level
-    /// bindings and type aliases are `bindings` and `aliases`, and which performs
-    /// IO at `io_site`, if it does.
+    /// bindings and type aliases are `bindings` and `aliases`, and which cannot be
+    /// imported for `unimportable`, if it has a reason.
     pub(super) fn of_lowered(
         module: ModulePath,
         chain: &Expr,
         bindings: &[TopLevelBinding],
         aliases: &[TopLevelBinding],
         mut_param_fns: impl Fn(&str) -> bool,
-        io_site: Option<Span>,
+        unimportable: Option<Unimportable>,
     ) -> Self {
         let members = bindings
             .iter()
@@ -101,7 +118,7 @@ impl Interface {
             module,
             members,
             types,
-            io_site,
+            unimportable,
         }
     }
 }
