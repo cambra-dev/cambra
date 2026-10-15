@@ -1,5 +1,6 @@
 //! Operations on [`IntervalSet`] that the `intervalsets` crate lacks: [`HasDifference`], whether
-//! one set holds a value that another does not.
+//! one set holds a value that another does not, and [`single_interval_set`], a column of integers
+//! as one interval set.
 //!
 //! `intervalsets` computes `a ∖ b` as `a ∩ complement(b)`, which builds both sets before
 //! [`MaybeEmpty::is_empty`] reads one bit of the answer. [`HasDifference`] answers the question
@@ -18,6 +19,8 @@ use std::borrow::Cow;
 use intervalsets::{
     Bound, BoundType, Bounding, Interval, IntervalSet, MaybeEmpty, Side, numeric::Domain,
 };
+
+use crate::interpreter::Value;
 
 /// Whether `self ∖ rhs` is not empty.
 ///
@@ -129,6 +132,57 @@ fn touches<T: Domain>(y: &Interval<T>, z: &Interval<T>) -> bool {
         // `v` is in neither unless `z` begins below it.
         (BoundType::Open, BoundType::Open) => w < v,
     }
+}
+
+/// A primitive integer type whose ranges are sorted and merged as plain numbers, where a
+/// [`Value`] comparison would go through [`Value`]'s ordering for every pair.
+pub(crate) trait IntegerKey: Copy + Ord {
+    /// The next value, or `None` at the type's greatest.
+    fn next(self) -> Option<Self>;
+    fn value(self) -> Value;
+}
+
+impl IntegerKey for u64 {
+    fn next(self) -> Option<Self> {
+        self.checked_add(1)
+    }
+    fn value(self) -> Value {
+        Value::UInt(self)
+    }
+}
+
+impl IntegerKey for i64 {
+    fn next(self) -> Option<Self> {
+        self.checked_add(1)
+    }
+    fn value(self) -> Value {
+        Value::Int(self)
+    }
+}
+
+/// The values of an integer column as one interval set: their sorted runs, with duplicates dropped
+/// and adjacent values joined.
+///
+/// The values are sorted as integers, and `Value`s are built only for the ends of each run.
+pub(crate) fn single_interval_set<T: IntegerKey>(data: &[T]) -> IntervalSet<Value> {
+    let mut sorted = data.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut runs: Vec<Interval<Value>> = Vec::new();
+    let mut values = sorted.into_iter();
+    if let Some(first) = values.next() {
+        let (mut start, mut end) = (first, first);
+        for v in values {
+            if end.next() == Some(v) {
+                end = v;
+            } else {
+                runs.push(Interval::closed(start.value(), end.value()));
+                (start, end) = (v, v);
+            }
+        }
+        runs.push(Interval::closed(start.value(), end.value()));
+    }
+    IntervalSet::new_unchecked(runs)
 }
 
 /// Random sets over small integer domains, and the values to enumerate them against. Shared by

@@ -12,6 +12,7 @@ use intervalsets::{
     ops::{Complement, Contains, Difference, Intersection, Union},
 };
 
+use super::interval_sets::single_interval_set;
 use crate::{
     ccl::{BaseType, FieldKey, TagMap},
     interpreter::{
@@ -21,7 +22,7 @@ use crate::{
 };
 
 /// Whether two predicates admit the same values, whatever each is spelled as.
-fn same_region(a: &Predicate, b: &Predicate) -> bool {
+pub(crate) fn same_region(a: &Predicate, b: &Predicate) -> bool {
     a == b || (a.subsumes(b) && b.subsumes(a))
 }
 
@@ -1203,7 +1204,8 @@ impl Predicate {
 
     /// Converts a batch of concrete domain values into the predicate admitting exactly those values.
     ///
-    /// Each scalar value becomes a point interval; records are split field-by-field.
+    /// Each scalar value becomes a point interval; records are split field-by-field. An integer
+    /// column is sorted and merged as integers, since a column of keys can hold millions.
     pub fn from_column_value(cv: &ColumnValue) -> Predicate {
         match cv {
             // Unit is a single-value type; any Unit value satisfies the predicate.
@@ -1214,8 +1216,8 @@ impl Predicate {
                     Predicate::False
                 }
             }
-            ColumnValue::Ints(v) => vec_to_predicate(v),
-            ColumnValue::UInts(v) => vec_to_predicate(v),
+            ColumnValue::Ints(v) => Predicate::intervals(single_interval_set(v)),
+            ColumnValue::UInts(v) => Predicate::intervals(single_interval_set(v)),
             ColumnValue::Bools(v) => {
                 let mut vec = Vec::new();
                 if v.count_ones() > 0 {
@@ -3805,5 +3807,48 @@ mod tests {
         let pred = union_pred(int_intervals(&[1]), Predicate::True);
         let swapped = Extent::Union(TagMap::from_positional(vec![bool_ext(), int()]));
         assert!(!pred.is_applicable_to(&swapped));
+    }
+
+    // ── integer fast paths ────────────────────────────────────────────────────
+
+    /// An integer column's predicate is the one the generic `Value` path builds, for unsigned and
+    /// signed columns: random ones with duplicates, adjacent runs and gaps, the greatest and least
+    /// of each type, where a run cannot extend, and no values.
+    #[test]
+    fn from_column_value_of_an_integer_column_agrees_with_the_value_path() {
+        use super::super::interval_sets::test_support::Lcg;
+        let unsigned = |v: Vec<u64>| {
+            assert_eq!(
+                Predicate::from_column_value(&ColumnValue::UInts(v.clone())),
+                vec_to_predicate(&v),
+                "{v:?}"
+            );
+        };
+        let signed = |v: Vec<i64>| {
+            assert_eq!(
+                Predicate::from_column_value(&ColumnValue::Ints(v.clone())),
+                vec_to_predicate(&v),
+                "{v:?}"
+            );
+        };
+        let mut rng = Lcg(11);
+        for span in [4u64, 16, 200] {
+            for _ in 0..500 {
+                let count = rng.next(40) as usize;
+                unsigned((0..count).map(|_| rng.next(span)).collect());
+                signed(
+                    (0..count)
+                        .map(|_| rng.next(span) as i64 - span as i64 / 2)
+                        .collect(),
+                );
+            }
+        }
+        unsigned(vec![u64::MAX, 0, u64::MAX - 1, 1, 7]);
+        signed(vec![i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1, 0, -1]);
+        unsigned(vec![]);
+        assert_eq!(
+            Predicate::from_column_value(&ColumnValue::UInts(vec![])),
+            Predicate::False
+        );
     }
 }

@@ -757,17 +757,7 @@ impl MapResultToConstProducer {
         let mut live = input.clone();
         live.compact();
         (0..level.index())
-            .map(|depth| {
-                let held: Vec<Predicate> = live
-                    .paths_at(CurryLevel::new(depth))
-                    .iter()
-                    .map(|path| Predicate::exactly(path))
-                    .collect();
-                match held.is_empty() {
-                    true => Predicate::False,
-                    false => Predicate::flatten_or(held),
-                }
-            })
+            .map(|depth| live.paths_predicate(CurryLevel::new(depth)))
             .collect()
     }
 
@@ -860,15 +850,10 @@ impl TileProducer for MapResultToConstProducer {
         // A collection constant repeated down a column states each copy's completeness without
         // knowing which row holds it, so it is qualified by the rows that do
         // (`src/interpreter/design-operators.md`, "The completeness contract").
-        let held = self.level.enclosing().map(|rows| {
-            Predicate::union_all(
-                input_tile
-                    .paths_at(rows)
-                    .iter()
-                    .map(|path| Predicate::exactly(path))
-                    .collect(),
-            )
-        });
+        let held = self
+            .level
+            .enclosing()
+            .map(|rows| input_tile.paths_predicate(rows));
         // Stated over tiles rather than columns: `Replace` never reads the values, and the
         // two `Zip` modes pair with them whatever they carry — a level included, which a
         // column has nowhere to put.
