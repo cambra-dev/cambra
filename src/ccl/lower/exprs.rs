@@ -358,7 +358,8 @@ fn lower_curried_call(
     // curried `Apply`s are manufactured (the outermost `Apply` is the call's
     // image, tagged by `lower_expr`, whose entry overwrites the interim machinery
     // tag).
-    let mut acc = ctx.tag_image(Expr::var(callee), func_span);
+    let reference = ctx.reference(callee, func_span);
+    let mut acc = ctx.tag_image(reference, func_span);
     for arg in args {
         let applied = Expr::apply(lower_call_arg(arg, ctx)?, acc);
         acc = ctx.tag_machinery(applied, func_span, "lower.curried_call");
@@ -385,7 +386,8 @@ fn lower_application(
     debug_assert!(!args.is_empty(), "an ordinary call has an argument");
     if args.len() == 1 {
         let arg = lower_expr(&args[0], ctx)?;
-        let callee = ctx.tag_image(Expr::var(callee), func_span);
+        let callee = ctx.reference(callee, func_span);
+        let callee = ctx.tag_image(callee, func_span);
         return Ok(Expr::apply(arg, callee));
     }
     let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
@@ -393,7 +395,8 @@ fn lower_application(
     // the callee images the function the user named.
     let args_span = args[0].span.join(args[args.len() - 1].span);
     let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
-    let callee = ctx.tag_image(Expr::var(callee), func_span);
+    let callee = ctx.reference(callee, func_span);
+    let callee = ctx.tag_image(callee, func_span);
     Ok(Expr::apply(arg_tuple, callee))
 }
 

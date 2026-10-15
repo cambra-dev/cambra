@@ -2,17 +2,18 @@
 //! placement rules of module statements.
 //!
 //! [`refuse_module_syntax`] finds every such construct in a module, at any
-//! depth, and the module lowers nothing when it finds one. It refuses `run`,
-//! `param`, `@Discard`, `pub` on anything but a value binding, a write to
-//! another module's member, and a method reference. A qualified value,
-//! label, or tag reaches lowering, which resolves it against the module's
-//! import names (`super::modules`). Lowering therefore sees a top-level
-//! [`ChlStmt::Import`] and a top-level [`ChlStmt::Pub`] on a value binding, and
-//! no other module statement.
+//! depth, and the module lowers nothing when it finds one. It refuses an
+//! argument to `run`, `param`, `@RenamedFrom`, `@Discard`, `pub` on anything but
+//! a value binding, a `def` or a type alias, a write to another module's member,
+//! and a method reference. A qualified value, type, label, or tag reaches
+//! lowering, which resolves it against the module's import names and run names
+//! (`super::modules`). Lowering therefore sees a top-level [`ChlStmt::Import`],
+//! a top-level [`ChlStmt::Run`] without arguments, and a top-level
+//! [`ChlStmt::Pub`] on a binding, and no other module statement.
 //!
 //! The walk also collects every binder the module writes, for the rule that no
-//! binder takes an import name's spelling (`docs/chl-spec.md`, "9.6 Qualified
-//! references").
+//! binder takes an import name's or a run name's spelling (`docs/chl-spec.md`,
+//! "9.6 Qualified references").
 
 use super::LoweringError;
 use super::stmts::is_type_name;
@@ -115,18 +116,15 @@ impl Refusals {
             ChlStmt::Run {
                 args, renamed_from, ..
             } => {
-                // A renamed run's span begins at its decorator, so one refusal
-                // covers both.
-                self.refuse(
-                    stmt.span,
-                    match renamed_from {
-                        None => "`run` is not supported yet: a program is a single module",
-                        Some(_) => {
-                            "`run` and `@RenamedFrom` are not supported yet: a program is a \
-                             single module"
-                        }
-                    },
-                );
+                if let Some(renamed_from) = renamed_from {
+                    self.refuse(renamed_from.span, "`@RenamedFrom` is not supported yet");
+                }
+                if let (Some(first), Some(last)) = (args.first(), args.last()) {
+                    self.refuse(
+                        first.name.span.join(last.value.span),
+                        "an argument to `run` is not supported yet: a module has no parameters",
+                    );
+                }
                 for arg in args {
                     self.expr(&arg.value);
                 }
@@ -155,8 +153,7 @@ impl Refusals {
                     ChlStmt::MutAssign { .. } | ChlStmt::LoadFrom { .. } => {
                         self.refuse(*keyword, "a public mutable variable is not supported yet")
                     }
-                    // `pub` on any other statement is a parse error, and `pub run`
-                    // is refused with its `run`.
+                    // `pub` on any other statement is a parse error.
                     _ => {}
                 }
                 // The statement `pub` marks is checked as any other.
@@ -483,21 +480,18 @@ mod tests {
     #[test]
     fn each_module_statement_is_refused_at_its_span() {
         let refused = refusals(indoc! {r#"
-            run audit
+            run audit(log=1)
             param port: String
             @Discard
             stock
             1
         "#});
         let messages: Vec<&str> = refused.iter().map(|(_, m)| m.as_str()).collect();
-        assert!(messages[0].starts_with("`run` is not supported yet"));
+        assert!(messages[0].starts_with("an argument to `run` is not supported yet"));
         assert!(messages[1].starts_with("`param` is not supported yet"));
         assert_eq!(messages[2], "`@Discard` is not supported yet");
         let spans: Vec<&str> = refused.iter().map(|(s, _)| s.trim_end()).collect();
-        assert_eq!(
-            spans,
-            ["run audit", "param port: String", "@Discard\nstock"]
-        );
+        assert_eq!(spans, ["log=1", "param port: String", "@Discard\nstock"]);
     }
 
     /// `pub` on a mutable variable is refused at the keyword, and the
@@ -608,19 +602,14 @@ mod tests {
     }
 
     #[test]
-    fn a_renamed_run_is_refused_from_its_decorator() {
-        let code = indoc! {"
+    fn a_renamed_run_is_refused_at_its_decorator() {
+        let refused = refusals(indoc! {"
             @RenamedFrom(eu)
             run storefront as eu_west
-        "};
-        let refused = refusals(code);
+        "});
         assert_eq!(refused.len(), 1, "{refused:#?}");
-        assert_eq!(refused[0].0.trim_end(), code.trim_end());
-        assert!(
-            refused[0]
-                .1
-                .starts_with("`run` and `@RenamedFrom` are not supported yet")
-        );
+        assert_eq!(refused[0].0, "eu");
+        assert_eq!(refused[0].1, "`@RenamedFrom` is not supported yet");
     }
 
     /// A module statement in a nested body is refused as out of place, not as
@@ -677,10 +666,10 @@ mod tests {
     }
 
     #[test]
-    fn a_run_argument_is_checked() {
+    fn a_run_argument_is_refused() {
         assert_eq!(
-            refused_spans("run storefront(audit=audit_api::log)\n"),
-            ["run storefront(audit=audit_api::log)"]
+            refused_spans("run storefront(audit=audit_api::log, port=1)\n"),
+            ["audit=audit_api::log, port=1"]
         );
     }
 }

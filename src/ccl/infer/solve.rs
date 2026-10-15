@@ -1328,6 +1328,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")
         }
+        TypedExprNode::Run { .. } => unreachable!("linking expands every `Run`"),
         // A mutable variable introduction, resolved exactly like a monomorphic `let`: the
         // seed one level deeper, the binder slot resolved in place (it holds the
         // history `emit_mut_decl` bound it at), the body under the shadow. A

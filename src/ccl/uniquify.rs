@@ -145,8 +145,9 @@ pub fn run(expr: Expr) -> Expr {
 /// (`docs/modules.md`, "A module lowers once").
 ///
 /// `home` is the imported module or the run whose top-level binders are minted
-/// with it as their [`Name::home`]. A top-level binder is one on the
-/// chain of `let` and `LetType` bodies from the root of `expr`.
+/// with it as their [`Name::home`]. A top-level binder is one on the module's
+/// spine, the chain of `let`, `MutDecl`, statement, and `LetType` bodies from
+/// the root of `expr`.
 pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>, home: Option<Home>) -> Expr {
     debug_assert!(
         scope.values().all(|name| !name.is_raw()),
@@ -218,10 +219,10 @@ struct Uniquifier {
     /// The imported module or run whose top-level binders this pass mints
     /// ([`run_in`]).
     home: Option<Arc<Home>>,
-    /// Whether the node being entered is on the chain of `let` and `LetType`
-    /// bodies from the root, where a `let` binds a member of the module. Each
-    /// node clears it on entry, and a top-level `let` or `LetType` sets it again
-    /// for its body.
+    /// Whether the node being entered is on the module's spine, the chain of
+    /// `let`, `MutDecl`, statement, and `LetType` bodies from the root, where a
+    /// `let` or a `MutDecl` binds a member of the module. Each node clears it on
+    /// entry, and a top-level one of those sets it again for its body.
     top_level: bool,
     /// Lexical environment: source spelling → stack of minted names, the
     /// innermost binder last. Raw `Var`s resolve to the top of their
@@ -362,9 +363,19 @@ impl Uniquifier {
             } => {
                 self.expr(init);
                 self.binding_tys(binding);
-                let base = self.bind(binding);
+                let home = if top_level { self.home.clone() } else { None };
+                let base = self.bind_in(binding, home);
+                self.top_level = top_level;
                 self.expr(body);
                 self.unbind(base);
+            }
+
+            // A statement at a module's top level leaves the statements below it
+            // top-level.
+            TypedExprNode::ExprStmt { expr, body } => {
+                self.expr(expr);
+                self.top_level = top_level;
+                self.expr(body);
             }
 
             // Mutual recursion: mint *all* group binders before walking any

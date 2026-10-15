@@ -763,7 +763,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     // store planned later.
     let hist: HashMap<Name, Name> = key_names
         .iter()
-        .map(|k| (k.clone(), Name::fresh(k.base())))
+        .map(|k| (k.clone(), Name::fresh_like(k)))
         .collect();
 
     // Resolve every `await_final` marker to a terminal read over its mutable variable's
