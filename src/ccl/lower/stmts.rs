@@ -2,7 +2,7 @@
 //! mutation-loop dispatch.
 
 use crate::ccl::Label;
-use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType};
+use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType, TypeEntry, TypeEntryForm};
 use std::{collections::HashSet, rc::Rc};
 
 use super::modules::module_body;
@@ -13,8 +13,9 @@ use crate::{
         TypedExprNode,
     },
     chl_parser::ast::{
-        AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, KindAnnotation, MatchArm,
-        PayloadPattern, Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeParam,
+        AnnotationMode, AssignTarget, BinOp as ChlBinOp, EntryForm, IfBranch, KindAnnotation,
+        MatchArm, ModuleTypeEntry, PayloadPattern, Requirement, Span, Spanned, Stmt as ChlStmt,
+        TypeAnnotation, TypeParam,
     },
 };
 
@@ -30,7 +31,6 @@ pub(super) fn lower_chain_recovering(
     let stmts = &module.body[..];
     let outer_bindings = HashSet::new();
     errors.extend(pre_declare_module_types(stmts, ctx));
-    errors.extend(ctx.declare_module_parameters(stmts));
     pre_register_txn_decls(stmts, ctx);
     let span = match (stmts.first(), stmts.last()) {
         (Some(first), Some(last)) => first.span.join(last.span),
@@ -92,7 +92,6 @@ pub(super) fn lower_stmts_recovering(
     // because `pre_register_txn_decls` lowers the `Mut(V, Txn)` annotations it
     // scans — see [`with_block_type_aliases`] for the constraint.
     errors.extend(pre_declare_module_types(stmts, ctx));
-    errors.extend(ctx.declare_module_parameters(stmts));
     pre_register_txn_decls(stmts, ctx);
     // This block's value is its last *contributing* statement ([`contributing_stmts`]),
     // and the statements above that one are its prefix.
@@ -961,7 +960,7 @@ pub(super) fn lower_middle_stmt(
         } => {
             // A Module-typed parameter binds a `let` per value its Module type
             // names, each run binding it to the argument's member
-            // (`LoweringContext::declare_module_parameters`).
+            // (`LoweringContext::declare_module_parameter`).
             // A type parameter binds no value: it is an alias of its parameter
             // (`pre_declare_module_types`).
             if is_type_name(&name.node) {
@@ -2062,6 +2061,116 @@ fn module_type_as_value_type(span: Span, what: &str) -> LoweringError {
     )
 }
 
+/// The Module type whose entries are `fields` (`docs/chl-spec.md`, "9.8 Module
+/// types"), declaring each type member as an alias for the entries after it.
+fn lower_module_type(
+    fields: &[ModuleTypeEntry],
+    ctx: &mut LoweringContext,
+) -> Result<ModuleType, LoweringError> {
+    let mut module = ModuleType {
+        types: Vec::new(),
+        entries: Vec::new(),
+    };
+    for field in fields {
+        if !field.qualifier.is_empty() {
+            return Err(LoweringError::unsupported(
+                field.name_span,
+                "a Module type's entry names a member of the module, which takes no qualifier",
+            ));
+        }
+        if module.entry(&field.name).is_some() || module.type_entry(&field.name).is_some() {
+            return Err(LoweringError::unsupported(
+                field.name_span,
+                format!("`{}` is named twice in this Module type", field.name),
+            ));
+        }
+        if is_type_name(&field.name) {
+            let form = match field.form {
+                EntryForm::Exact => TypeEntryForm::Exact(lower_type_expr(&field.value, ctx)?),
+                EntryForm::Bounded => TypeEntryForm::Abstract {
+                    param: crate::ccl::ty::TypeParam::declared(field.name.as_str()),
+                    bound: Some(lower_type_expr(&field.value, ctx)?),
+                },
+                EntryForm::Annotated => TypeEntryForm::Abstract {
+                    param: crate::ccl::ty::TypeParam::declared(field.name.as_str()),
+                    bound: lower_entry_kind(field, ctx)?,
+                },
+            };
+            let entry = TypeEntry {
+                name: field.name.clone(),
+                form,
+            };
+            ctx.declare_type_throughout(field.name.as_str(), AliasType::Type(entry.written()));
+            module.types.push(entry);
+            continue;
+        }
+        if field.form != EntryForm::Annotated {
+            return Err(LoweringError::unsupported(
+                field.name_span,
+                format!(
+                    "`{0}` is a value member, written `{0}: T`: `=` and `<:` state a type \
+                     member",
+                    field.name
+                ),
+            ));
+        }
+        // A feed entry is a feed handle, its domain left to inference as a
+        // `Feed` parameter's is.
+        let ty = match &field.value.node {
+            ChlExpr::Call { func, args } => match (&func.node, args.as_slice()) {
+                (ChlExpr::Name(head), _) if head == "Mut" => {
+                    return Err(LoweringError::unsupported(
+                        field.value.span,
+                        format!(
+                            "`{}` is a `Txn` variable, which a Module type does not name yet",
+                            field.name
+                        ),
+                    ));
+                }
+                (ChlExpr::Name(head), [value]) if head == "Feed" => {
+                    AliasType::Type(Type::feed(Type::Hole, lower_type_expr(value, ctx)?))
+                }
+                _ => lower_alias_type(&field.value, ctx)?,
+            },
+            _ => lower_alias_type(&field.value, ctx)?,
+        };
+        module.entries.push(ModuleEntry {
+            name: field.name.clone(),
+            ty,
+        });
+    }
+    Ok(module)
+}
+
+/// The bound the kind of the type member `Name: K`, `field`, gives it: none
+/// for `Type`, and `T` for `SubtypesOf(T)` (`docs/chl-spec.md`, "Kinds and
+/// bounds"). Every other kind is refused.
+fn lower_entry_kind(
+    field: &ModuleTypeEntry,
+    ctx: &mut LoweringContext,
+) -> Result<Option<Type>, LoweringError> {
+    match &field.value.node {
+        ChlExpr::Name(kind) if kind == "Type" => Ok(None),
+        ChlExpr::Call { func, args } if matches!(&func.node, ChlExpr::Name(kind) if kind == "SubtypesOf") => {
+            match args.as_slice() {
+                [bound] => Ok(Some(lower_type_expr(bound, ctx)?)),
+                _ => Err(LoweringError::unsupported(
+                    field.value.span,
+                    "`SubtypesOf` takes one type",
+                )),
+            }
+        }
+        _ => Err(LoweringError::unsupported(
+            field.value.span,
+            format!(
+                "`{0}: …` states the kind of the type member `{0}`, `Type` or `SubtypesOf(T)`: \
+                 write `{0} = T` for a member that is `T`",
+                field.name
+            ),
+        )),
+    }
+}
+
 /// What `annotation` names where a Module type may stand: a parameter's
 /// annotation, an alias's right-hand side, and an entry of a Module type. A
 /// Module type, written or through an alias, is a [`ModuleType`]; anything else
@@ -2072,60 +2181,12 @@ pub(super) fn lower_alias_type(
 ) -> Result<AliasType, LoweringError> {
     match &annotation.node {
         ChlExpr::ModuleType(fields) => {
-            let mut entries: Vec<ModuleEntry> = Vec::with_capacity(fields.len());
-            for field in fields {
-                if !field.qualifier.is_empty() {
-                    return Err(LoweringError::unsupported(
-                        field.name_span,
-                        "a Module type's entry names a member of the module, which takes no \
-                         qualifier",
-                    ));
-                }
-                if is_type_name(&field.name) {
-                    return Err(LoweringError::unsupported(
-                        field.name_span,
-                        "a type member of a Module type is not supported yet",
-                    ));
-                }
-                if entries.iter().any(|entry| entry.name == field.name) {
-                    return Err(LoweringError::unsupported(
-                        field.name_span,
-                        format!("`{}` is named twice in this Module type", field.name),
-                    ));
-                }
-                // A feed entry is a feed handle, its domain left to inference as
-                // a `Feed` parameter's is.
-                if let ChlExpr::Call { func, args } = &field.value.node
-                    && let ChlExpr::Name(head) = &func.node
-                {
-                    match (head.as_str(), args.as_slice()) {
-                        ("Mut", _) => {
-                            return Err(LoweringError::unsupported(
-                                field.value.span,
-                                format!(
-                                    "`{}` is a `Txn` variable, which a Module type does not name \
-                                     yet",
-                                    field.name
-                                ),
-                            ));
-                        }
-                        ("Feed", [value]) => {
-                            let value = lower_type_expr(value, ctx)?;
-                            entries.push(ModuleEntry {
-                                name: field.name.clone(),
-                                ty: AliasType::Type(Type::feed(Type::Hole, value)),
-                            });
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
-                entries.push(ModuleEntry {
-                    name: field.name.clone(),
-                    ty: lower_alias_type(&field.value, ctx)?,
-                });
-            }
-            Ok(AliasType::Module(Rc::new(ModuleType { entries })))
+            // A type member is in scope in the entries after it, as a kind names
+            // the type parameters before it.
+            let aliases = ctx.snapshot_type_aliases();
+            let module = lower_module_type(fields, ctx);
+            ctx.restore_type_aliases(aliases);
+            Ok(AliasType::Module(Rc::new(module?)))
         }
         ChlExpr::Name(id) if name_type(id.as_str()).is_none() => {
             match ctx.type_alias(id.as_str(), annotation.span) {
@@ -2379,18 +2440,25 @@ pub(super) fn pre_declare_type_aliases(
 }
 
 /// [`pre_declare_type_aliases`] for a module's top level, which also declares
-/// its type parameters ([`LoweringContext::declare_type_parameter`]) and lowers
-/// its runs' type arguments ([`LoweringContext::declare_run_types`]), each in
-/// source order with the aliases: a type parameter is in scope from its
-/// statement down, as an alias is, and a run's type arguments see the aliases
-/// above it.
+/// its type parameters ([`LoweringContext::declare_type_parameter`]), its
+/// Module-typed parameters ([`LoweringContext::declare_module_parameter`]) and
+/// its members bound to modules ([`LoweringContext::declare_module_binding`]), and
+/// lowers its runs' type arguments ([`LoweringContext::declare_run_types`]),
+/// each in source order with the aliases: a type parameter is in scope from its
+/// statement down, as an alias is, a parameter's annotation sees the aliases
+/// above it, and a run's type arguments see the aliases, parameters and
+/// bindings above it.
 pub(super) fn pre_declare_module_types(
     stmts: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Vec<LoweringError> {
     let mut errors = Vec::new();
     let mut declared: HashSet<&str> = HashSet::new();
-    for stmt in stmts {
+    // A module's value parameters head its statements, since they are in scope
+    // throughout it, and this pass needs the order they were written in.
+    let mut written: Vec<&Spanned<ChlStmt>> = stmts.iter().collect();
+    written.sort_by_key(|stmt| stmt.span.start);
+    for stmt in written {
         match &stmt.node {
             ChlStmt::Param {
                 name,
@@ -2411,6 +2479,7 @@ pub(super) fn pre_declare_module_types(
                     errors.push(error);
                 }
             }
+            ChlStmt::Param { .. } => errors.extend(ctx.declare_module_parameter(stmt)),
             ChlStmt::Run {
                 path,
                 alias,
@@ -2422,9 +2491,13 @@ pub(super) fn pre_declare_module_types(
                     errors.extend(ctx.declare_run_types(&name, args, uses));
                 }
             }
-            _ => errors.extend(pre_declare_type_alias(stmt, &mut declared, ctx)),
+            _ => {
+                errors.extend(pre_declare_type_alias(stmt, &mut declared, ctx));
+                errors.extend(ctx.declare_module_binding(stmt));
+            }
         }
     }
+    errors.extend(ctx.module_binder_errors());
     errors
 }
 

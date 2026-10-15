@@ -4,130 +4,146 @@
 use super::*;
 
 impl LoweringContext {
-    /// Declare each Module-typed parameter and each binding of a module among
-    /// the top-level `stmts`, once the module's type aliases are declared
-    /// (`docs/modules.md`, "A Module type is not a `Type`").
+    /// Declare the Module-typed parameter `stmt` declares, if it declares one,
+    /// once the type aliases above it are declared (`docs/modules.md`, "A Module
+    /// type is not a `Type`").
     ///
-    /// A parameter is Module-typed when its annotation is a Module type. Its
-    /// view of what its Module type names is a name of the module, and it binds
-    /// a `let` per value entry, `audit::count`, which each run of the module
-    /// binds to its argument's member ([`ProgramLowering::create`]). Its default,
-    /// if it has one, names a module. A binding of a module, `k = a`, is a name
-    /// of the module that reaches what `a` does.
-    pub(in crate::ccl::lower) fn declare_module_parameters(
+    /// A parameter is Module-typed when its annotation is a Module type, which it
+    /// takes with a fresh type parameter for each abstract type member. Its view
+    /// of what its Module type names is a name of the module, and it binds a
+    /// `let` per value entry, `audit::count`, which each run of the module binds
+    /// to its argument's member ([`ProgramLowering::create`]). Its default, if it
+    /// has one, names a module.
+    pub(in crate::ccl::lower) fn declare_module_parameter(
         &mut self,
-        stmts: &[Spanned<ChlStmt>],
+        stmt: &Spanned<ChlStmt>,
     ) -> Vec<LoweringError> {
+        let ChlStmt::Param {
+            name,
+            annotation: Some(annotation),
+            default,
+        } = &stmt.node
+        else {
+            return Vec::new();
+        };
+        let ty = match self.module_annotation(&annotation.ty) {
+            Ok(Some(ty)) => instantiate(&ty),
+            Ok(None) => return Vec::new(),
+            Err(error) => return vec![error],
+        };
+        if let Some(earlier) = self.module.qualifiers.get(&name.node) {
+            return vec![
+                LoweringError::unsupported(
+                    stmt.span,
+                    format!("`{}` is already {}", name.node, earlier.kind.describe()),
+                )
+                .with_note(earlier.statement, "bound here first"),
+            ];
+        }
         let mut errors = Vec::new();
-        for stmt in stmts {
-            let ChlStmt::Param {
-                name,
-                annotation: Some(annotation),
-                default,
-            } = &stmt.node
-            else {
-                continue;
-            };
-            let ty = match self.module_annotation(&annotation.ty) {
-                Ok(Some(ty)) => ty,
-                Ok(None) => continue,
-                Err(error) => {
-                    errors.push(error);
-                    continue;
-                }
-            };
-            if let Some(earlier) = self.module.qualifiers.get(&name.node) {
-                errors.push(
-                    LoweringError::unsupported(
-                        stmt.span,
-                        format!("`{}` is already {}", name.node, earlier.kind.describe()),
-                    )
-                    .with_note(earlier.statement, "bound here first"),
-                );
-                continue;
-            }
-            let view = ModuleView::of(&QualifiedName::new(name.node.clone()), &ty, &mut Vec::new());
-            let mut module_default = None;
-            if let Some(default) = default {
-                match self.module_named(default) {
-                    Some(Ok(value)) => {
-                        errors.extend(uncovered(&value, &ty, default.span, stmt.span));
-                        module_default = Some(value.name);
+        let view = ModuleView::of(&QualifiedName::new(name.node.clone()), &ty, &mut Vec::new());
+        let mut module_default = None;
+        let mut default_types = HashMap::new();
+        if let Some(default) = default {
+            match self.module_named(default) {
+                Some(Ok(value)) => {
+                    errors.extend(uncovered(&value, &ty, default.span, stmt.span));
+                    let parameter = QualifiedName::new(name.node.clone());
+                    for (member, _) in abstract_members(&parameter, &ty) {
+                        let path = member
+                            .strip_prefix(&parameter)
+                            .expect("a member is spelled under its parameter");
+                        if let Ok(Some(AliasType::Type(found))) =
+                            value.reach_type_path(&value.name, &path, default.span)
+                        {
+                            default_types.insert(member, found);
+                        }
                     }
-                    Some(Err(error)) => errors.push(error),
-                    None => errors.push(LoweringError::unsupported(
-                        default.span,
-                        format!(
-                            "`{}` is of Module type, so its default names a module: an import \
-                             name",
-                            name.node
-                        ),
-                    )),
+                    module_default = Some(value.name);
                 }
+                Some(Err(error)) => errors.push(error),
+                None => errors.push(LoweringError::unsupported(
+                    default.span,
+                    format!(
+                        "`{}` is of Module type, so its default names a module: an import name",
+                        name.node
+                    ),
+                )),
             }
-            self.module.qualifiers.insert(
-                name.node.clone(),
-                Qualifier {
-                    module: ModulePath::new([name.node.clone()]),
-                    file: None,
-                    shared: None,
-                    statement: stmt.span,
-                    interface: None,
-                    kind: QualifierKind::Parameter,
-                    name: QualifiedName::new(name.node.clone()),
-                    view: Some(Rc::new(view)),
-                    view_base: QualifiedName::default(),
-                    types: TypeArguments::default(),
-                },
-            );
-            self.parameters.push(Parameter {
-                name: name.node.clone(),
-                declared: stmt.span,
-                default: default.is_some(),
-                kind: ParameterKind::Module {
-                    ty,
-                    default: module_default,
-                },
-            });
         }
-        for stmt in stmts {
-            let ChlStmt::Assign { target, value, .. } = &stmt.node else {
-                continue;
-            };
-            let AssignTarget::Name(name) = &target.node else {
-                continue;
-            };
-            // A qualifier in error leaves the statement a value's binding, whose
-            // lowering reports the error.
-            let Some(Ok(segments)) = self.module_path(value) else {
-                continue;
-            };
-            let value = match self.qualifier_path(&segments, value.span) {
-                Ok(value) => value,
-                // The statement still binds a module, one with errors of its
-                // own, so a reference through it reports nothing more.
-                Err(error) => {
-                    errors.push(error);
-                    Qualifier {
-                        interface: None,
-                        view: None,
-                        ..self.module.qualifiers[segments[0].node.as_str()].clone()
-                    }
-                }
-            };
-            let binding = Qualifier {
+        self.module.qualifiers.insert(
+            name.node.clone(),
+            Qualifier {
+                module: ModulePath::new([name.node.clone()]),
+                file: None,
+                shared: None,
                 statement: stmt.span,
-                kind: QualifierKind::Binding,
-                ..value
-            };
-            self.module.qualifiers.insert(name.clone(), binding);
-        }
-        errors.extend(crate::ccl::lower::module_name_binders(
-            &self.module_binders,
-            self,
-            |kind| matches!(kind, QualifierKind::Parameter | QualifierKind::Binding),
-        ));
+                interface: None,
+                kind: QualifierKind::Parameter,
+                name: QualifiedName::new(name.node.clone()),
+                view: Some(Rc::new(view)),
+                view_base: QualifiedName::default(),
+                types: TypeArguments::default(),
+            },
+        );
+        self.parameters.push(Parameter {
+            name: name.node.clone(),
+            declared: stmt.span,
+            default: default.is_some(),
+            kind: ParameterKind::Module {
+                ty,
+                default: module_default,
+                default_types,
+            },
+        });
         errors
+    }
+
+    /// Declare the member bound to a module that `stmt` writes, `k = a`, if it
+    /// writes one: a name of the module that reaches what `a` does.
+    pub(in crate::ccl::lower) fn declare_module_binding(
+        &mut self,
+        stmt: &Spanned<ChlStmt>,
+    ) -> Option<LoweringError> {
+        let ChlStmt::Assign { target, value, .. } = &stmt.node else {
+            return None;
+        };
+        let AssignTarget::Name(name) = &target.node else {
+            return None;
+        };
+        // A qualifier in error leaves the statement a value's binding, whose
+        // lowering reports the error.
+        let Some(Ok(segments)) = self.module_path(value) else {
+            return None;
+        };
+        let (value, error) = match self.qualifier_path(&segments, value.span) {
+            Ok(value) => (value, None),
+            // The statement still binds a module, one with errors of its own,
+            // so a reference through it reports nothing more.
+            Err(error) => (
+                Qualifier {
+                    interface: None,
+                    view: None,
+                    ..self.module.qualifiers[segments[0].node.as_str()].clone()
+                },
+                Some(error),
+            ),
+        };
+        let binding = Qualifier {
+            statement: stmt.span,
+            kind: QualifierKind::Binding,
+            ..value
+        };
+        self.module.qualifiers.insert(name.clone(), binding);
+        error
+    }
+
+    /// One error per binder of the module that takes the name of a parameter of
+    /// Module type or a member bound to a module, once both are declared.
+    pub(in crate::ccl::lower) fn module_binder_errors(&self) -> Vec<LoweringError> {
+        crate::ccl::lower::module_name_binders(&self.module_binders, self, |kind| {
+            matches!(kind, QualifierKind::Parameter | QualifierKind::Binding)
+        })
     }
 
     /// The arguments `args` of the `run` statement at `statement` declaring the
@@ -271,7 +287,7 @@ impl LoweringContext {
             .into_iter()
             .rev()
             .fold(run, |body, (parameter, span, value)| {
-                let bound = argument_name(name, &parameter);
+                let bound = argument_name(name, &QualifiedName::new(parameter.clone()));
                 let bound = match parameters.get(&parameter).cloned().flatten() {
                     Some(ty) => Expr::let_bind_annotated(bound, value, body, ty),
                     None => Expr::let_bind(bound, value, body),
@@ -356,11 +372,45 @@ impl LoweringContext {
         let mut given = HashMap::new();
         let mut lowered = Vec::new();
         for arg in args {
-            let declared = interface
+            let span = arg.name.span.join(arg.value.span);
+            let Some(parameter) = interface
                 .parameters
                 .iter()
-                .any(|p| p.name == arg.name.node && p.is_type());
-            if !declared {
+                .find(|p| p.name == arg.name.node)
+            else {
+                continue;
+            };
+            // Each abstract type member of a module argument's Module type is
+            // the argument's member, as this module writes it. A member the
+            // argument lacks is the argument's error (`uncovered`), and a hole.
+            if let Some(ty) = parameter.module() {
+                let module = self.module_named(&arg.value).and_then(Result::ok);
+                let under = QualifiedName::new(parameter.name.clone());
+                for (member, _) in abstract_members(&under, ty) {
+                    let path = member
+                        .strip_prefix(&under)
+                        .expect("a member is spelled under its parameter");
+                    let found = module.as_ref().and_then(|module| {
+                        module
+                            .reach_type_path(&module.name, &path, arg.value.span)
+                            .ok()
+                            .flatten()
+                    });
+                    // A module declared below the statement is not known here,
+                    // and gives no type ([`ProgramLowering::create`]).
+                    if module.is_none() {
+                        continue;
+                    }
+                    let ty = match found {
+                        Some(AliasType::Type(ty)) => ty,
+                        _ => Type::Hole,
+                    };
+                    given.insert(member.clone(), ty.clone());
+                    lowered.push((member, span, ty));
+                }
+                continue;
+            }
+            if !parameter.is_type() {
                 continue;
             }
             // An argument in error is a hole, so the run reports nothing more
@@ -371,11 +421,16 @@ impl LoweringContext {
                     Type::Hole
                 },
             );
-            given.insert(arg.name.node.clone(), ty.clone());
-            let span = arg.name.span.join(arg.value.span);
-            lowered.push((arg.name.node.clone(), span, ty));
+            given.insert(QualifiedName::new(arg.name.node.clone()), ty.clone());
+            lowered.push((QualifiedName::new(arg.name.node.clone()), span, ty));
         }
-        if !interface.parameters.iter().any(Parameter::is_type) {
+        let typed = interface.parameters.iter().any(|p| {
+            p.is_type()
+                || p.module().is_some_and(|ty| {
+                    !abstract_members(&QualifiedName::new(p.name.clone()), ty).is_empty()
+                })
+        });
+        if !typed {
             return errors;
         }
         let types = reached_types(&interface, &QualifiedName::new(run.clone()), &given);
@@ -440,11 +495,8 @@ pub(in crate::ccl::lower) struct RunArguments {
 /// binder takes a double-underscore name, run names are unique in their module,
 /// and `::` separates the run name from the parameter, so no two arguments in
 /// one module share one.
-pub(super) fn argument_name(run: &str, parameter: &str) -> Name {
-    QualifiedName::new("__run")
-        .child(run)
-        .child(parameter)
-        .raw()
+pub(super) fn argument_name(run: &str, parameter: &QualifiedName) -> Name {
+    QualifiedName::new("__run").child(run).then(parameter).raw()
 }
 
 /// Rebind, in `chain`, a copy of a module's chain, the `let` the Module-typed

@@ -177,9 +177,20 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             ))
         })
         .collect();
-    // The root's type parameters take their defaults, each after the ones
-    // declared above it, which its default may name.
+    // The root's type parameters take their defaults, and so do the abstract
+    // type members of its Module-typed parameters. Each type parameter takes
+    // its default after the ones declared above it, which its default may name.
     let mut defaults = HashMap::new();
+    for parameter in &ctx.parameters {
+        let Some(ty) = parameter.module() else {
+            continue;
+        };
+        for (member, param) in abstract_members(&QualifiedName::new(parameter.name.clone()), ty) {
+            if let Some(default) = parameter.default_type(&member) {
+                defaults.insert(param.id, default.clone());
+            }
+        }
+    }
     let mut declared: Vec<&Parameter> = ctx.parameters.iter().collect();
     declared.sort_by_key(|parameter| parameter.declared.start);
     for parameter in declared {
@@ -252,7 +263,11 @@ pub(super) enum Supplied<'a> {
     /// each bound above the run under its run name, its module arguments, each
     /// the names its module reaches, with the argument's span, and its type
     /// arguments, by parameter, as its declaring module's chain holds them.
-    Run(&'a [SmolStr], Vec<PassedModule>, HashMap<SmolStr, Type>),
+    Run(
+        &'a [SmolStr],
+        Vec<PassedModule>,
+        HashMap<QualifiedName, Type>,
+    ),
     /// A shared run's: its import's constants, a literal bound at the head of
     /// its chain under its spelling, `scaled(scale=3)`, and an import name
     /// reaching its shared run.
@@ -499,7 +514,7 @@ impl ProgramLowering<'_> {
         let mut arguments = HashMap::new();
         for parameter in &lowered.interface.parameters {
             if let ParameterKind::Type { param, default, .. } = &parameter.kind {
-                if let Some(argument) = given.get(&parameter.name) {
+                if let Some(argument) = given.get(&QualifiedName::new(parameter.name.clone())) {
                     arguments.insert(param.id, argument.clone());
                     continue;
                 }
@@ -510,6 +525,36 @@ impl ProgramLowering<'_> {
                     continue;
                 }
             } else if let Some(ty) = parameter.module() {
+                // Each abstract type member takes the argument's member, or,
+                // with no argument, the default's.
+                for (member, param) in
+                    abstract_members(&QualifiedName::new(parameter.name.clone()), ty)
+                {
+                    if let Some(argument) = given.get(&member) {
+                        arguments.insert(param.id, argument.clone());
+                    } else if let Some(default) = parameter.default_type(&member) {
+                        defaults.insert(param.id, default.clone());
+                    } else if let (Supplied::Run(_, modules, _), Some((_, statement))) =
+                        (&supplied, &place)
+                        && modules
+                            .iter()
+                            .any(|module| module.parameter == parameter.name)
+                    {
+                        // A run's module argument declared below its statement
+                        // was not known where its type arguments were lowered.
+                        self.errors.push(
+                            LoweringError::unsupported(
+                                *statement,
+                                format!(
+                                    "the argument for `{}` is declared below this statement, so \
+                                     the type member `{member}` it gives is not known here",
+                                    parameter.name
+                                ),
+                            )
+                            .with_note(parameter.declared, "the parameter"),
+                        );
+                    }
+                }
                 let argument = match &supplied {
                     Supplied::Run(_, arguments, _) => arguments
                         .iter()
@@ -568,7 +613,10 @@ impl ProgramLowering<'_> {
                 };
                 if given {
                     let argument = ctx.tag_image(
-                        Expr::var(argument_name(&prefix, &parameter.name)),
+                        Expr::var(argument_name(
+                            &prefix,
+                            &QualifiedName::new(parameter.name.clone()),
+                        )),
                         parameter.declared,
                     );
                     read_argument(&mut chain, &parameter.name, argument);
@@ -618,7 +666,7 @@ impl ProgramLowering<'_> {
                     .find(|p| &p.name == parameter)
                     .and_then(|p| p.annotation().cloned());
                 let value = ctx.tag_image(Expr::lit(value.clone()), *span);
-                let bound = argument_name(&prefix, parameter);
+                let bound = argument_name(&prefix, &QualifiedName::new(parameter.clone()));
                 let bound = match ty {
                     Some(ty) => Expr::let_bind_annotated(bound, value, chain, ty),
                     None => Expr::let_bind(bound, value, chain),

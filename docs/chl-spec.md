@@ -4024,13 +4024,18 @@ param payments: Module{Receipt <: {id: String}, charge: {amount: Int} => Receipt
 | feed | `name: Feed(T)` |
 | `Txn` mutable variable | **[Planned]** `name: Mut(V, Txn)` |
 | member bound to a module, `pub audit = a` | `name: Module{…}`, the Module type of the module it is bound to |
-| type alias | **[Planned]** `Name = T` for an exact type, or `Name <: T` for one known through a bound |
+| type alias | `Name = T` for an exact type, `Name <: T` for one known through a bound, or `Name: K` for one known through its kind |
 | nominal type | `Name = T`, where `T` is the nominal type |
 | private member | none |
 
-**[Planned]** A capitalized entry is a type member. Its `<:` is the bounded form of a type parameter
-([9.4 Parameters](#94-parameters)), and it is the one place `<:` appears inside a type literal ([Two
-annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
+A capitalized entry is a type member. Its `<:` is the bounded form of a type parameter
+([9.4 Parameters](#94-parameters)), and it is the one place `<:` appears inside a type literal
+([Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)). `Name: K`
+states its kind, as `T: K` does for a type parameter, so `Name: Type` is any type
+([Kinds and bounds](#kinds-and-bounds)). **[Planned]** A module reaching a type member through a
+Module type knows what its entry states and nothing more. Through `Name = T` it can build values of
+the member, and through `Name <: T` or `Name: K` it cannot. A type member is in scope in the entries
+after it, which is how `charge` above returns a `Receipt`.
 
 `Module{…}` 𝐴 is a subtype of `Module{…}` 𝐵 when 𝐴 has every member 𝐵 names. A value member's type
 in 𝐴 is a subtype of its type in 𝐵, a `Mut` member's type is equal, since `Mut` is invariant, and a

@@ -479,7 +479,8 @@ pub struct LoweringContext {
     /// The type arguments of each `run` statement of the module being lowered,
     /// by run name: each one's parameter, its span, and the type, lowered where
     /// the statement stands ([`Self::declare_run_types`]).
-    pub(super) run_type_arguments: HashMap<SmolStr, Vec<(SmolStr, Span, Type)>>,
+    pub(super) run_type_arguments:
+        HashMap<SmolStr, Vec<(crate::ccl::names::QualifiedName, Span, Type)>>,
     /// Every binder the module being lowered writes, with its span, for the rule
     /// that none takes a name that denotes a module ([`module_name_binders`]).
     pub(super) module_binders: Vec<(SmolStr, Span)>,
@@ -1557,7 +1558,7 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
 ///
 /// `kinds` selects the names checked: an import's, a run's, and a `use` name's
 /// are in scope before the module lowers, and a parameter's and a binding's once
-/// they are declared ([`LoweringContext::declare_module_parameters`]).
+/// they are declared ([`LoweringContext::declare_module_parameter`]).
 pub(super) fn module_name_binders(
     binders: &[(SmolStr, Span)],
     ctx: &LoweringContext,
