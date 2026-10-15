@@ -138,7 +138,8 @@ Key shape choices:
   `Stmt::FunctionDef` carries `type_params: Vec<TypeParam>` beside `params`, and `params` alone
   is the arity. The split happens as the list is parsed (`split_params`), which rejects a type
   parameter after a value parameter. A type parameter's annotation is a `KindAnnotation`: its kind
-  `T: K` or its bound `T <: U`.
+  `T: K` or its bound `T <: U`. `ast::is_type_name` is the capitalization test; the parser and
+  lowering both call it.
 - **A polymorphic type has its own variant.** `forall (T, U <: B) V requires …` parses to
   `Expr::Forall`, whose binder list holds only type parameters. The `)` closing the list ends the
   last kind, so the body follows with no separator.
