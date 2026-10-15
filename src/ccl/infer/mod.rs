@@ -234,7 +234,7 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             // `constrain_subtype(lhs, rhs)` means `lhs <: rhs`. If rhs is a function
             // and lhs is not, the caller passed a non-function where a function
             // was expected (e.g. applying a non-function at an Apply site).
-            if matches!(rhs, Type::Fun { .. }) && !matches!(lhs, Type::Fun { .. }) {
+            if matches!(*rhs, Type::Fun { .. }) && !matches!(*lhs, Type::Fun { .. }) {
                 InferError::ExpectedFunction {
                     found: lhs_ty,
                     at: ctx_label.to_string(),
@@ -249,7 +249,7 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         }
         ConstrainError::MissingField { key, in_type } => InferError::MissingField {
             key,
-            found: coalesce_for_error(&in_type),
+            found: Box::new(coalesce_for_error(&in_type)),
             at: ctx_label.to_string(),
         },
         // `ExtraTag` is `MissingField`'s dual: the width violation is a *tag set*,

@@ -594,10 +594,14 @@ fn project<'a>(
 }
 
 /// A name as a reader sees it, or `None` for one the compiler minted with no spelling a
-/// reader knows.
+/// reader knows. An imported module's member is qualified by its module, as
+/// [`Name`]'s `Display` writes it.
 fn spelling(name: &Name) -> Option<String> {
     let base = name.base();
-    (!base.starts_with("__")).then(|| base.to_string())
+    (!base.starts_with("__")).then(|| match name.home() {
+        Some(home) => format!("{home}::{base}"),
+        None => base.to_string(),
+    })
 }
 
 /// Collect into `out` the spelling of every name `ty` holds: its parameters, its
