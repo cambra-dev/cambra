@@ -283,8 +283,11 @@ establish a globally optimal correspondence or check denotational equivalence.
 
 `Indexed` assigns each visited node a pre-order index. A node at index `i` occupies
 `[i, i + size)` with its descendants; the root counts toward `size`. The index also records
-height, depth, parent, direct children, node kind and standalone hash. `child_exprs` defines
-the visited tree, including the cast predicates described above.
+height, depth, parent, direct children, node kind and standalone hash. `diff_children` defines
+the visited tree: `TypedExpr::child_exprs`, followed for a `Cast` by the cast predicates described
+above. Rendering and deletion reduction use the same enumeration. The regression
+`a_deleted_cast_with_a_surviving_predicate_is_not_wholly_deleted` checks that a surviving
+predicate prevents its cast from being reported as wholly deleted.
 
 ### Equal-hash anchoring
 
@@ -470,7 +473,7 @@ a + b
 The renderer stops below a `Same` node. It also collapses a wholly inserted or deleted subtree
 to its root, with `(+N nodes)` counting omitted descendants, not the root. A wrapper containing
 surviving nodes is not wholly new or deleted and is not collapsed on that basis.
-All these decisions use `child_exprs`, including its cast predicates.
+All these decisions use `diff_children`, including its cast predicates.
 
 Each node's label is the first line of its symbolic rendering, truncated to `RENDER_WIDTH`
 (currently 68 characters). A trailing `…` indicates truncation or additional symbolic lines.
@@ -565,7 +568,7 @@ Two calls with distinct literal singletons can therefore clone one helper before
 
 A literal edit can also change types on its references. Later passes can repeat a refinement
 predicate in several node types. Whole-subtree hashing includes those type slots, while
-`child_exprs` exposes only selected cast predicates as separate nodes. One source predicate
+`diff_children` exposes only selected cast predicates as separate nodes. One source predicate
 edit can consequently yield several sites without representing several independent source edits.
 
 These effects depend on the program, its inferred types and the current transformations.
@@ -647,13 +650,7 @@ of the same predicate across `sum` and `restrict` mentions, despite `Refinement:
 shared-allocation contract. Which pass rebuilds these copies, and whether that violates the
 contract, remains unexamined. Pointer identity alone cannot establish cross-version correspondence.
 
-### Child enumeration and scope maintenance
-
-`child_exprs` and `TypedExpr::walk_children` both enumerate term children exhaustively, with
-cast-target predicates added by the differ. Rendering and deletion reduction must use the
-differ's enumeration. The regression
-`a_deleted_cast_with_a_surviving_predicate_is_not_wholly_deleted` checks that a surviving
-predicate prevents its cast from being reported as wholly deleted.
+### Scope maintenance in substitution
 
 The shared observer in `scope.rs` does not eliminate rebuilding matches in substitution.
 `Subst::apply_expr_inner` still reconstructs nodes by variant; changes to binding forms require

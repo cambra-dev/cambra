@@ -174,13 +174,13 @@ impl<'a> Diff<'a> {
                 if parent_matched {
                     out.push(Divergence::Inserted(e));
                 }
-                for c in child_exprs(e) {
+                for c in diff_children(e) {
                     reported |= walk(c, false, by_dst, lost_a_child, out);
                 }
                 return reported;
             };
             let mut reported_below = lost_a_child.contains(&(e as *const TypedExpr));
-            for c in child_exprs(e) {
+            for c in diff_children(e) {
                 reported_below |= walk(c, true, by_dst, lost_a_child, out);
             }
             // The node's own content changed: that is a site regardless of what
@@ -218,7 +218,7 @@ impl<'a> Diff<'a> {
             by_src: &HashMap<*const TypedExpr, *const TypedExpr>,
             out: &mut HashSet<*const TypedExpr>,
         ) {
-            let kids = child_exprs(e);
+            let kids = diff_children(e);
             if kids
                 .iter()
                 .any(|c| children.contains(&(*c as *const TypedExpr)))
@@ -258,7 +258,7 @@ impl<'a> Diff<'a> {
                 out.push(m);
                 return;
             }
-            for c in child_exprs(e) {
+            for c in diff_children(e) {
                 walk(c, by_dst, out);
             }
         }
@@ -383,7 +383,7 @@ impl<'a> Indexed<'a> {
             children: Vec::new(),
             unordered: has_unordered_children(e),
         });
-        let child_refs = child_exprs(e);
+        let child_refs = diff_children(e);
         let mut children = Vec::with_capacity(child_refs.len());
         let (mut size, mut max_h) = (1u32, 0u32);
         for c in child_refs {
@@ -422,94 +422,19 @@ fn has_unordered_children(e: &TypedExpr) -> bool {
     matches!(e.node, N::Record(_) | N::DisjointJoin(_))
 }
 
-/// The direct child expressions of `e`, borrowed for `e`'s lifetime.
+/// The direct child expressions of `e`: [`TypedExpr::child_exprs`], plus a
+/// cast's target predicates after its value.
 ///
-/// The lifetime-preserving companion to [`TypedExpr::walk_children`], which it
-/// mirrors arm-for-arm **except for `Cast`**: a cast-target domain-refinement
-/// predicate is a load-bearing term (a comprehension filter/join condition), so
-/// the differ descends into it; `walk_children` excludes it (a type child,
-/// reached via type walks). The match is exhaustive — no wildcard — so adding a
-/// `TypedExprNode` variant is a compile error here until its children are
-/// declared.
-//
-// NOTE (recurring shape): this duplicates `walk_children`'s child enumeration.
-// The two could share a private `for_each_child<'a>(&'a self, &mut dyn
-// FnMut(&'a TypedExpr))`, but that adds dynamic dispatch to the hot
-// `walk_children` traversal, so it isn't folded in here.
-fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
-    use super::TypedExprNode as N;
-    match &e.node {
-        N::Comprehension {
-            generators,
-            element,
-        } => {
-            let mut v: Vec<&TypedExpr> = Vec::new();
-            for g in generators {
-                v.push(&g.iter);
-                v.extend(&g.guards);
-            }
-            v.push(element);
-            v
-        }
-        N::Lit(_)
-        | N::Var(_)
-        | N::Builtin(_)
-        | N::Proj(_)
-        | N::Source(_)
-        | N::LoadFrom(_)
-        | N::Defer
-        | N::Error => {
-            vec![]
-        }
-        N::Apply { function, argument } => vec![function, argument],
-        N::Realize(value) => vec![value],
-        N::Cast { value, target } => {
-            let mut children = vec![&**value];
-            children.extend(cast_target_predicates(target));
-            children
-        }
-        N::BinOp { left, right, .. } => vec![left, right],
-        N::UnaryOp(_, inner) => vec![inner],
-        N::Lambda { body, .. } => vec![body],
-        N::Aggregate { input, .. } => vec![input],
-        N::Let {
-            bound_expr, body, ..
-        } => vec![bound_expr, body],
-        N::List(xs) | N::Tuple(xs) | N::Compose(xs) | N::Copair(xs) | N::DisjointJoin(xs) => {
-            xs.iter().collect()
-        }
-        N::Case {
-            scrutinee,
-            branches,
-        } => {
-            let mut v: Vec<&TypedExpr> = scrutinee.as_deref().into_iter().collect();
-            for b in branches {
-                v.push(&b.guard);
-                v.push(&b.body);
-            }
-            v
-        }
-        N::VariantCtor { payload, .. } => vec![payload],
-        N::Record(fields) => fields.iter().map(|(_, e)| e).collect(),
-        N::Transact { keys, writers, .. } => {
-            let mut v: Vec<&TypedExpr> = keys.iter().map(|k| &k.init).collect();
-            for w in writers {
-                v.push(&w.source);
-                v.push(&w.body);
-            }
-            v
-        }
-        N::LetRec { bindings, body } => {
-            let mut v: Vec<&TypedExpr> = bindings.iter().map(|(_, def)| def).collect();
-            v.push(body);
-            v
-        }
-        N::MutDecl { init, body, .. } => vec![init, body],
-        N::For { iter, body, .. } => vec![iter, body],
-        N::Begin { body } => vec![body],
-        N::ExprStmt { expr, body } => vec![expr, body],
-        N::Feed { value, .. } | N::Define { value, .. } | N::MutWrite { value, .. } => vec![value],
+/// A cast-target domain-refinement predicate is a comprehension filter or join
+/// condition, so the differ has to see it as a term. `walk_children` omits it
+/// because it sits in a type slot. `cast_target_predicates` states which
+/// predicates are included and in what order.
+fn diff_children(e: &TypedExpr) -> Vec<&TypedExpr> {
+    let mut children = e.child_exprs();
+    if let super::TypedExprNode::Cast { target, .. } = &e.node {
+        children.extend(cast_target_predicates(target));
     }
+    children
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,7 +926,7 @@ fn resolved_hashes(t: &Indexed<'_>, correspondent_of: &dyn Fn(usize) -> u64) -> 
                     // equal — a `Content::Same` on two different computations,
                     // which is the unsound direction (`src/ccl/design/diffing.md`,
                     // "Direction of error"). Position within the group is the
-                    // correspondence, matching how `child_exprs` pairs the
+                    // correspondence, matching how `diff_children` pairs the
                     // group's definitions.
                     for (j, n) in names.iter().enumerate() {
                         scope.push((n, mix(correspondent, j as u64)));
@@ -1226,27 +1151,27 @@ impl std::fmt::Display for Diff<'_> {
 
 /// Whether every node in the differ's subtree belongs to `set`.
 ///
-/// Use `child_exprs`, not the ordinary term walk: a surviving cast predicate must
+/// Use `diff_children`, not the ordinary term walk: a surviving cast predicate must
 /// prevent its wrapper from being rendered as wholly inserted or deleted.
 fn subtree_entirely_in(e: &TypedExpr, set: &HashSet<*const TypedExpr>) -> bool {
     set.contains(&(e as *const TypedExpr))
-        && child_exprs(e)
+        && diff_children(e)
             .into_iter()
             .all(|c| subtree_entirely_in(c, set))
 }
 
 /// `    (+N nodes)` when `e` has descendants, so an elided subtree still
 /// reports how much it stands for; empty for a leaf. Counts over
-/// [`child_exprs`], the differ's child set, so the note matches what collapsed.
+/// [`diff_children`], the differ's child set, so the note matches what collapsed.
 fn size_note(e: &TypedExpr) -> String {
     let mut n = 0;
     fn count(e: &TypedExpr, n: &mut usize) {
         *n += 1;
-        for c in child_exprs(e) {
+        for c in diff_children(e) {
             count(c, n);
         }
     }
-    for c in child_exprs(e) {
+    for c in diff_children(e) {
         count(c, &mut n);
     }
     if n == 0 {
@@ -1272,7 +1197,7 @@ fn render_node(
         }
         None => {
             writeln!(f, "{indent}+ {}", head(e))?;
-            for c in child_exprs(e) {
+            for c in diff_children(e) {
                 render_node(f, c, depth + 1, by_dst, inserted)?;
             }
             Ok(())
@@ -1291,7 +1216,7 @@ fn render_node(
             // An unchanged subtree is unchanged all the way down; descending
             // would print it verbatim for no information.
             if m.content != Content::Same {
-                for c in child_exprs(e) {
+                for c in diff_children(e) {
                     render_node(f, c, depth + 1, by_dst, inserted)?;
                 }
             }
@@ -1316,7 +1241,7 @@ fn collect_deleted_roots<'a>(
             return;
         }
     }
-    for c in child_exprs(e) {
+    for c in diff_children(e) {
         collect_deleted_roots(c, gone, out);
     }
 }
@@ -2506,7 +2431,7 @@ mod tests {
 
     #[test]
     fn a_deleted_cast_with_a_surviving_predicate_is_not_wholly_deleted() {
-        // `child_exprs` descends into a cast target's refinement predicate — a
+        // `diff_children` descends into a cast target's refinement predicate — a
         // comprehension filter or join condition, a term the matcher can match.
         // The collapse tests must walk that same child set: over the narrower
         // `all_children` the cast reads as wholly gone while a matched node is
@@ -2558,7 +2483,9 @@ mod tests {
             .collect();
         fn any_matched(e: &TypedExpr, matched: &HashSet<*const TypedExpr>) -> bool {
             matched.contains(&(e as *const TypedExpr))
-                || child_exprs(e).into_iter().any(|c| any_matched(c, matched))
+                || diff_children(e)
+                    .into_iter()
+                    .any(|c| any_matched(c, matched))
         }
         for (root, whole) in roots {
             assert!(
@@ -2566,6 +2493,67 @@ mod tests {
                 "a wholly-deleted root must not cover a matched node:\n{r}",
             );
         }
+    }
+
+    #[test]
+    fn a_cast_predicate_edit_localizes_inside_the_predicate() {
+        // The differ indexes a cast target's refinement predicate after the cast's
+        // value, so an edit inside the predicate is one in-place literal update.
+        let cast = |n: i64| {
+            let pred = TypedExpr::binop(
+                TypedExpr::var(Name::elem()),
+                BinOpKind::Compare(CompareKind::Equals),
+                int(n),
+            );
+            TypedExpr::new(N::Cast {
+                value: Box::new(var("f")),
+                target: Type::Fun {
+                    name: None,
+                    fun_kind: FunKind::Compute,
+                    domain: Box::new(Type::Refinement(
+                        Box::new(Type::Base(BaseType::Int)),
+                        RefinementSet::one(Refinement {
+                            predicate: Rc::new(pred),
+                        }),
+                    )),
+                    codomain: Box::new(Type::Base(BaseType::Int)),
+                },
+            })
+        };
+        let (v1, v2) = (cast(7), cast(8));
+        let dv = diff(&v1, &v2).divergences();
+        assert_eq!(dv.len(), 1, "{dv:?}");
+        let Divergence::Changed(m) = dv[0] else {
+            panic!("expected a content change, got {:?}", dv[0])
+        };
+        assert!(matches!(m.src.node, N::Lit(Lit::Int(7))), "{dv:?}");
+        assert!(matches!(m.dst.node, N::Lit(Lit::Int(8))), "{dv:?}");
+    }
+
+    #[test]
+    fn a_keyed_write_key_edit_localizes_inside_the_key() {
+        // A keyed `MutWrite`'s key is a term child like its value, so an edit
+        // inside the key is one in-place literal update, not a change at the write.
+        let program = |k: i64| {
+            lower(&format!(
+                indoc! {"
+                    m: Mut(Map(Int, Int), Txn) := box(map([(0, 1)]))
+                    for r in [1, 2]:
+                        with begin():
+                            m[r + {}] := 10 * r
+                    await_final(m)
+                "},
+                k
+            ))
+        };
+        let (v1, v2) = (program(1), program(2));
+        let dv = diff(&v1, &v2).divergences();
+        assert_eq!(dv.len(), 1, "{dv:?}");
+        let Divergence::Changed(m) = dv[0] else {
+            panic!("expected a content change, got {:?}", dv[0])
+        };
+        assert!(matches!(m.src.node, N::Lit(Lit::Int(1))), "{dv:?}");
+        assert!(matches!(m.dst.node, N::Lit(Lit::Int(2))), "{dv:?}");
     }
 
     #[test]
