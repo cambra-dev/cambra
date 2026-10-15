@@ -276,9 +276,10 @@ redefined, and a name cannot be declared twice in one block. A type parameter is
 same table, in scope throughout its definition.
 
 The alias statement emits a `LetType` over the rest of its block (`lower_type_alias_decl`), holding
-the same `Type` its uses substitute. Uniquify resolves the type's predicates at that node, so a
-predicate reads the bindings the declaration sees, and then removes it ([ir.md, "Type aliases
-resolve where they are declared"](ir.md#type-aliases-resolve-where-they-are-declared)).
+the same `Type`, or Module type, its uses substitute. Uniquify resolves the type's predicates
+at that node, so a predicate reads the bindings the declaration sees, and then removes it
+([ir.md, "Type aliases resolve where they are
+declared"](ir.md#type-aliases-resolve-where-they-are-declared)).
 
 `with_block_type_aliases` snapshots and restores the alias map around nested blocks. Top-level
 recovery declares aliases directly and collects their errors so other statements can still be
@@ -319,8 +320,11 @@ per argument. A value `param` lowers to a `let` at the head of its module's chai
 which creating a run or a shared run replaces with its argument ([docs/modules.md,
 "Runs"](../../../docs/modules.md#runs)). A shared run's arguments are bound at the head of its
 chain, one shared run per module and distinct set of arguments ([docs/modules.md,
-"Imports"](../../../docs/modules.md#imports)). A sink is declared, and registered by each run of the
-module.
+"Imports"](../../../docs/modules.md#imports)). A Module-typed `param` lowers to a `let` per entry of
+its Module type, which creating a run binds to the argument's members, and a top-level binding of a
+module to nothing ([docs/modules.md, "A Module type is not a
+`Type`"](../../../docs/modules.md#a-module-type-is-not-a-type)). A sink is declared, and registered
+by each run of the module.
 
 The rest of the module syntax parses ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules") and
 does not lower yet: a type parameter, `@RenamedFrom`, `@Discard`, `pub` on a mutable variable, and
