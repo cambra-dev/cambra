@@ -14,7 +14,7 @@ use crate::ast::{
     CompClause, Comprehension, DiscardHead, Expr, FileId, IfBranch, KindAnnotation, Lit, MatchArm,
     MatchPattern, Module, ModulePath, Param, PayloadPattern, QualifiedName, RecordField,
     Requirement, RunArg, Span, Spanned, Stmt, TypeAnnotation, TypeParam, UnaryOp, UseItem,
-    VariantPayload,
+    VariantPayload, is_type_name,
 };
 use crate::lexer::{self, Token};
 
@@ -1340,7 +1340,7 @@ where
         let binder = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
         let module_alias = just(Token::As)
             .ignore_then(binder.validate(|name, _, emitter| {
-                if starts_capitalized(&name.node) {
+                if is_type_name(&name.node) {
                     emitter.emit(Rich::custom(
                         name.span,
                         format!(
@@ -1357,7 +1357,7 @@ where
             .then(just(Token::As).ignore_then(binder).or_not())
             .validate(|(name, alias), _, emitter| {
                 if let Some(alias) = &alias
-                    && starts_capitalized(&name.node) != starts_capitalized(&alias.node)
+                    && is_type_name(&name.node) != is_type_name(&alias.node)
                 {
                     emitter.emit(Rich::custom(
                         alias.span,
@@ -1438,7 +1438,7 @@ where
             )
             .then(just(Token::Eq).ignore_then(expr.clone()).or_not())
             .validate(|((name, annotation), default), e, emitter| {
-                let is_type = starts_capitalized(&name.node);
+                let is_type = is_type_name(&name.node);
                 match annotation.as_ref().map(|a| a.mode) {
                     Some(AnnotationMode::Bounded) if !is_type => emitter.emit(Rich::custom(
                         e.span(),
@@ -1798,12 +1798,6 @@ where
         })
 }
 
-/// Whether `name` begins with an uppercase letter, which makes it a type name
-/// (`docs/chl-spec.md`, "6.1 Direction: term/type syntax split [Decided]").
-fn starts_capitalized(name: &str) -> bool {
-    name.starts_with(|c: char| c.is_ascii_uppercase())
-}
-
 /// Why `pub` cannot mark `stmt`, or `None` if `stmt` may introduce a member
 /// (`docs/chl-spec.md`, "9.5 Visibility").
 ///
@@ -2022,7 +2016,7 @@ fn split_params<'src>(
     let mut type_params = Vec::new();
     let mut params: Vec<Param> = Vec::new();
     for item in items {
-        if !item.name.starts_with(char::is_uppercase) {
+        if !is_type_name(&item.name) {
             params.push(item);
             continue;
         }
@@ -2046,7 +2040,7 @@ fn split_params<'src>(
 ///
 /// Spec: `docs/chl-spec.md`, "Kinds and bounds".
 fn type_param<'src>(item: Param) -> Result<TypeParam, Rich<'src, Token, Span>> {
-    if !item.name.starts_with(char::is_uppercase) {
+    if !is_type_name(&item.name) {
         return Err(Rich::custom(
             item.name_span,
             format!(
