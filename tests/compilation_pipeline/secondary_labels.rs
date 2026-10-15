@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use cambra::ccl::context::{CompileError, GlobalContext, compile_program};
-use cambra::chl_parser::SourceMap;
+use cambra::ccl::load::LoadedProgram;
 use cambra::interpreter::Consumer;
 use indoc::indoc;
 use rstest_log::rstest;
@@ -22,8 +22,8 @@ use rstest_log::rstest;
 fn labels(code: &str) -> (String, Vec<(String, &'static str)>) {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<test>", code);
-    let Err(errs) = compile_program(&mut ctx, &sources, consumer) else {
+    let program = LoadedProgram::test(code);
+    let Err(errs) = compile_program(&mut ctx, &program, consumer) else {
         panic!("expected a compile error, but the program compiled");
     };
     let [CompileError::Infer { span, related, .. }] = errs.as_slice() else {

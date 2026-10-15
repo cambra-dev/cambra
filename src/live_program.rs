@@ -49,6 +49,7 @@ use std::{
     rc::{Rc, Weak},
 };
 
+use crate::ccl::load::LoadedProgram;
 use crate::ccl::{
     Expr,
     context::{
@@ -117,6 +118,9 @@ struct Branch {
     history: Vec<(u64, ReuseTally)>,
     /// The current version. Its source is the only one the entry keeps.
     program: CompiledProgram,
+    /// The files the current version was compiled from, kept to compile it
+    /// again for a difference.
+    loaded: LoadedProgram,
     /// The `main` output's producer, held out of `program.outputs` so the other
     /// outputs stay borrowable while the driver pulls it. `None` for a sink
     /// program and for a torn-down version.
@@ -176,10 +180,18 @@ impl Branch {
         self.program.outputs.clear();
     }
 
-    /// Install `program` as this entry's version, holding `operator_map`.
-    fn install(&mut self, program: CompiledProgram, operator_map: OperatorMap, reuse: ReuseTally) {
+    /// Install `program`, compiled from `loaded`, as this entry's version,
+    /// holding `operator_map`.
+    fn install(
+        &mut self,
+        program: CompiledProgram,
+        loaded: LoadedProgram,
+        operator_map: OperatorMap,
+        reuse: ReuseTally,
+    ) {
         let (program, main_producer) = driving(program);
         self.program = program;
+        self.loaded = loaded;
         self.main_producer = main_producer;
         self.operator_map = operator_map;
         self.version += 1;
@@ -375,7 +387,7 @@ pub fn render_unreadable(unreadable: &[UnreadablePrefix]) -> String {
     unreadable.iter().map(|u| format!("\n{u}")).collect()
 }
 
-/// How `sources` differs from `previous` at `phase`, or `None` where the two
+/// How `loaded` differs from `previous` at `phase`, or `None` where the two
 /// are identical.
 ///
 /// The difference alone. What a reload additionally reports rides its
@@ -388,24 +400,24 @@ pub fn render_unreadable(unreadable: &[UnreadablePrefix]) -> String {
 /// hold is named rather than opened
 /// ([`Endpoints::Inherited`](crate::ccl::lower::Endpoints::Inherited)).
 ///
-/// Every error returned renders against `sources`, as the callers render them.
-/// Recompiling `previous` could fail too, and its errors' spans name files of
-/// `previous`, whose [`FileId`]s mean nothing in `sources`. So those are
-/// rendered here, against their own map, and returned as one
+/// Every error returned renders against `loaded`'s sources, as the callers
+/// render them. Recompiling `previous` could fail too, and its errors' spans
+/// name files of `previous`, whose [`FileId`]s mean nothing in `loaded`'s. So
+/// those are rendered here, against their own map, and returned as one
 /// [`ReloadError::RunningVersion`].
 ///
 /// [`FileId`]: crate::chl_parser::FileId
 fn difference(
     ctx: &GlobalContext,
-    previous: &SourceMap,
-    sources: &SourceMap,
+    previous: &LoadedProgram,
+    loaded: &LoadedProgram,
     phase: Phase,
 ) -> Result<Option<String>, ReloadError> {
     let old = ctx
         .sources_and_sinks()
         .compile_to(previous, phase)
-        .map_err(|errs| ReloadError::RunningVersion(render_errors(&errs, previous)))?;
-    let new = ctx.sources_and_sinks().compile_to(sources, phase)?;
+        .map_err(|errs| ReloadError::RunningVersion(render_errors(&errs, previous.sources())))?;
+    let new = ctx.sources_and_sinks().compile_to(loaded, phase)?;
     let d = diff(&old, &new);
     if d.is_identical() {
         return Ok(None);
@@ -517,17 +529,16 @@ struct Checked {
 }
 
 impl LiveProgram {
-    /// Compile the program rooted at `sources`'s root and subscribe it as
-    /// `main@1`.
+    /// Compile `loaded` and subscribe it as `main@1`.
     pub fn start(
         ctx: &mut GlobalContext,
-        sources: &SourceMap,
+        loaded: &LoadedProgram,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<Self, Vec<CompileError>> {
         let main_notified = Rc::new(Cell::new(false));
         let program = compile_program(
             ctx,
-            sources,
+            loaded,
             branch_main_consumer(&main_notified, main_consumer),
         )?;
         let (program, main_producer) = driving(program);
@@ -539,6 +550,7 @@ impl LiveProgram {
             // everything it bound.
             history: vec![(1, ctx.reuse())],
             program,
+            loaded: loaded.clone(),
             main_producer,
             main_notified,
             main_finished: false,
@@ -731,20 +743,20 @@ impl LiveProgram {
         Some(self.branches[at].operator_map.live_state())
     }
 
-    /// Answer what `/diff/<branch>` asks: how `sources` differs from branch
+    /// Answer what `/diff/<branch>` asks: how `loaded` differs from branch
     /// `name`'s current version at `phase`, which is what its reload diffs
     /// against, and what reloading it would report. Changes nothing.
     pub fn diff_against(
         &self,
         ctx: &GlobalContext,
         name: &str,
-        sources: &SourceMap,
+        loaded: &LoadedProgram,
         phase: Phase,
     ) -> Result<DiffReport, BranchError> {
         let branch = &self.branches[self.index_of(name)?];
         // A version identical to the running one declares the same variables, so
         // none of them is new and the report is empty without being asked.
-        let Some(diff) = difference(ctx, &branch.program.sources, sources, phase)? else {
+        let Some(diff) = difference(ctx, &branch.loaded, loaded, phase)? else {
             return Ok(DiffReport {
                 diff: no_difference(phase),
                 unreadable: Vec::new(),
@@ -756,7 +768,7 @@ impl LiveProgram {
         // what separates asking from doing.
         let planned = ctx
             .sources_and_sinks()
-            .compile_to(sources, Phase::Planning)?;
+            .compile_to(loaded, Phase::Planning)?;
         Ok(DiffReport {
             diff,
             unreadable: ctx.unreadable_inputs(&branch.operator_map, &branch.program.ast, &planned),
@@ -776,12 +788,14 @@ impl LiveProgram {
         b: &str,
         phase: Phase,
     ) -> Result<String, BranchError> {
-        let from = &self.branches[self.index_of(a)?].program.sources;
-        let to = &self.branches[self.index_of(b)?].program.sources;
+        let from = &self.branches[self.index_of(a)?].loaded;
+        let to = &self.branches[self.index_of(b)?].loaded;
         // `b`'s version is a running one too, so its errors are rendered against
         // its own map, as `difference` renders `a`'s.
         let diff = difference(ctx, from, to, phase).map_err(|e| match e {
-            ReloadError::Compile(errs) => ReloadError::RunningVersion(render_errors(&errs, to)),
+            ReloadError::Compile(errs) => {
+                ReloadError::RunningVersion(render_errors(&errs, to.sources()))
+            }
             other => other,
         })?;
         Ok(diff.unwrap_or_else(|| no_difference(phase)))
@@ -796,12 +810,12 @@ impl LiveProgram {
     /// compile bound are handed back.
     fn check(
         ctx: &mut GlobalContext,
-        previous: &SourceMap,
+        previous: &LoadedProgram,
         previous_ast: &Expr,
         predecessor: &OperatorMap,
-        sources: &SourceMap,
+        loaded: &LoadedProgram,
     ) -> Result<Checked, ReloadError> {
-        let diff = difference(ctx, previous, sources, Phase::AsOfRead)?
+        let diff = difference(ctx, previous, loaded, Phase::AsOfRead)?
             .unwrap_or_else(|| no_difference(Phase::AsOfRead));
         // This compile binds the ports the new version adds and keeps the
         // listeners, because binding is the one step it and the compile that
@@ -810,7 +824,7 @@ impl LiveProgram {
         // hands the ports back.
         let planned = ctx
             .sources_and_sinks_mut()
-            .compile_to_opening(sources, Phase::Planning)
+            .compile_to_opening(loaded, Phase::Planning)
             .inspect_err(|_| ctx.sources_and_sinks_mut().release_unrouted_ports())?;
         // What the new version can take over is read off its planned tree,
         // before anything is built from it, so a version that would lose a value
@@ -849,7 +863,7 @@ the lagging branch first"
             .collect()
     }
 
-    /// Replace branch `name`'s version with the one `sources` describes, as
+    /// Replace branch `name`'s version with the one `loaded` describes, as
     /// version `n + 1` of that branch.
     ///
     /// The new version is diffed against the branch's own running version, the
@@ -891,7 +905,7 @@ the lagging branch first"
         &mut self,
         ctx: &mut GlobalContext,
         name: &str,
-        sources: &SourceMap,
+        loaded: &LoadedProgram,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<ReloadReport, BranchError> {
         let at = self.index_of(name)?;
@@ -899,10 +913,10 @@ the lagging branch first"
             let branch = &self.branches[at];
             Self::check(
                 ctx,
-                &branch.program.sources,
+                &branch.loaded,
                 &branch.program.ast,
                 &branch.operator_map,
-                sources,
+                loaded,
             )?
         };
 
@@ -925,14 +939,14 @@ the lagging branch first"
         // told which of its nodes the offer already has an operator for.
         let program = compile_replacement(
             ctx,
-            sources,
+            loaded,
             branch_main_consumer(&branch.main_notified, main_consumer),
             &branch.program.ast,
             &bound_elsewhere,
         )
         .expect("a version that compiled to Planning must compile to operators");
         let reuse = ctx.reuse();
-        branch.install(program, ctx.take_operator_map(), reuse);
+        branch.install(program, loaded.clone(), ctx.take_operator_map(), reuse);
         Ok(ReloadReport {
             diff: checked.diff,
             reuse,
@@ -941,7 +955,7 @@ the lagging branch first"
     }
 
     /// Create branch `name` from branch `parent`'s current version and reload
-    /// it with `sources`, as one step (`src/ccl/design/program-evolution.md`, "A
+    /// it with `loaded`, as one step (`src/ccl/design/program-evolution.md`, "A
     /// branch is created by branch-and-reload").
     ///
     /// The reload takes the parent's version as its predecessor: the difference,
@@ -972,7 +986,7 @@ the lagging branch first"
         ctx: &mut GlobalContext,
         name: &str,
         parent: &str,
-        sources: &SourceMap,
+        loaded: &LoadedProgram,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<Created, BranchError> {
         if !is_branch_name(name) {
@@ -988,13 +1002,7 @@ the lagging branch first"
         let from = self.index_of(parent)?;
         let checked = {
             let p = &self.branches[from];
-            Self::check(
-                ctx,
-                &p.program.sources,
-                &p.program.ast,
-                &p.operator_map,
-                sources,
-            )?
+            Self::check(ctx, &p.loaded, &p.program.ast, &p.operator_map, loaded)?
         };
 
         let bound_elsewhere = self.routes_bound_except(None);
@@ -1004,7 +1012,7 @@ the lagging branch first"
         let main_notified = Rc::new(Cell::new(false));
         let program = compile_replacement(
             ctx,
-            sources,
+            loaded,
             branch_main_consumer(&main_notified, main_consumer),
             &p.program.ast,
             &bound_elsewhere,
@@ -1024,6 +1032,7 @@ the lagging branch first"
             version,
             history: vec![(version, reuse)],
             program,
+            loaded: loaded.clone(),
             main_producer,
             main_notified,
             main_finished: false,

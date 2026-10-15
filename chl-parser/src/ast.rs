@@ -296,7 +296,7 @@ pub enum Stmt {
     /// `import a::b as c use f, T as U` — bind the shared run of a module
     /// (`docs/chl-spec.md`, "9.2 Imports").
     Import {
-        path: ModulePath,
+        path: WrittenPath,
         alias: Option<Spanned<SmolStr>>,
         uses: Vec<UseItem>,
     },
@@ -305,7 +305,7 @@ pub enum Stmt {
     /// (`docs/chl-spec.md`, "9.3 Runs"). `args` is empty for both `run m` and
     /// `run m()`.
     Run {
-        path: ModulePath,
+        path: WrittenPath,
         args: Vec<RunArg>,
         alias: Option<Spanned<SmolStr>>,
         uses: Vec<UseItem>,
@@ -366,22 +366,35 @@ pub enum Stmt {
     Error,
 }
 
-/// A module path, `shop::cart` (`docs/chl-spec.md`, "9.1 Vocabulary").
+/// A module path as a statement writes it, `shop::cart`, each segment with its
+/// span (`docs/chl-spec.md`, "9.1 Vocabulary"). [`Self::to_path`] gives the
+/// module it names.
 ///
 /// **Invariant:** at least one segment, each beginning with a lowercase letter
 /// and none with `__` (`docs/chl-spec.md`, "9.15 Module files"). The parser
 /// refuses any other path.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ModulePath {
+pub struct WrittenPath {
     pub segments: Vec<Spanned<SmolStr>>,
 }
 
-impl ModulePath {
+impl WrittenPath {
     /// The span from the first segment to the last.
     pub fn span(&self) -> Span {
         let first = self.segments.first().expect("a module path has a segment");
         let last = self.segments.last().expect("a module path has a segment");
         first.span.join(last.span)
+    }
+
+    /// The module this path names, or `None` when a segment breaks the rule
+    /// of [`crate::module_path::segment_error`], which the parser reported.
+    pub fn to_path(&self) -> Option<crate::module_path::ModulePath> {
+        self.segments
+            .iter()
+            .all(|s| crate::module_path::segment_error(&s.node).is_none())
+            .then(|| {
+                crate::module_path::ModulePath::new(self.segments.iter().map(|s| s.node.clone()))
+            })
     }
 }
 
@@ -410,11 +423,11 @@ pub enum DiscardHead {
     Name(Spanned<SmolStr>),
     /// `run m as n` — a run, and every variable it held.
     Run {
-        path: ModulePath,
+        path: WrittenPath,
         alias: Option<Spanned<SmolStr>>,
     },
     /// `import m` — the shared run of `m`, and every variable it held.
-    Import { path: ModulePath },
+    Import { path: WrittenPath },
 }
 
 /// One branch of an [`Stmt::If`]: a guard and the body to run when it holds.

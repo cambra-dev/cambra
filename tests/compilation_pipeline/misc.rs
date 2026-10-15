@@ -1,10 +1,10 @@
 //! Miscellaneous: operator-graph fan-out absence, scalar UDFs via lambda
 //! (inline pass), multi-arg UDFs, and dependent group-by lookups.
 
-use cambra::chl_parser::SourceMap;
 use std::time::Duration;
 
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
+use cambra::ccl::load::LoadedProgram;
 use cambra::interpreter::{Tile, Value};
 use cambra::pretty_graph::pretty_tile_operator;
 use indoc::indoc;
@@ -24,9 +24,9 @@ use crate::helpers::*;
 #[case("[x for x in [1,2,3] if x + 1 < 2]")]
 #[case("1 + 2 + 3")]
 fn test_no_fan_outs(#[case] code: &str) {
-    let sources = SourceMap::single("<test>", code);
-    let compiled = compile_program(&mut GlobalContext::default(), &sources, Box::new(|| {}))
-        .unwrap_or_render(&sources);
+    let loaded = LoadedProgram::test(code);
+    let compiled = compile_program(&mut GlobalContext::default(), &loaded, Box::new(|| {}))
+        .unwrap_or_render(&loaded);
     let op = &compiled.main().unwrap().op;
     let op_str = pretty_tile_operator(op.as_ref());
     assert!(!op_str.contains("FanOut#"), "found fan-out in {op_str}");
