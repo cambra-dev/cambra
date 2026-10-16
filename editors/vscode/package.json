@@ -1,7 +1,7 @@
 {
   "name": "cambra",
   "displayName": "Cambra",
-  "description": "Syntax highlighting for CHL, the Cambra High-level Language",
+  "description": "CHL, the Cambra High-level Language: syntax highlighting, and diagnostics, outline and folding from the language server",
   "version": "0.1.0",
   "publisher": "cambra-dev",
   "license": "Apache-2.0",
@@ -10,11 +10,12 @@
     "url": "https://github.com/cambra-dev/cambra"
   },
   "engines": {
-    "vscode": "^1.75.0"
+    "vscode": "^1.91.0"
   },
   "categories": [
     "Programming Languages"
   ],
+  "main": "./extension.js",
   "contributes": {
     "languages": [
       {
@@ -35,10 +36,42 @@
         "scopeName": "source.cambra",
         "path": "./syntaxes/cambra.tmLanguage.json"
       }
+    ],
+    "configuration": {
+      "title": "Cambra",
+      "properties": {
+        "cambra.server.path": {
+          "type": "string",
+          "default": "cambra",
+          "scope": "machine-overridable",
+          "markdownDescription": "The `cambra` binary to run as the language server (`cambra --lsp`). A bare name is looked up on `PATH`."
+        },
+        "cambra.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Logs the messages between VS Code and the language server to the Cambra output channel."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "cambra.restartServer",
+        "title": "Restart Language Server",
+        "category": "Cambra"
+      }
     ]
   },
   "devDependencies": {
+    "@vscode/test-electron": "3.1.0",
     "vscode-oniguruma": "2.0.1",
     "vscode-textmate": "9.3.2"
+  },
+  "dependencies": {
+    "vscode-languageclient": "10.1.2"
   }
 }

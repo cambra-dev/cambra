@@ -22,7 +22,6 @@ Not in the first version, in the order planned:
 - Diagnostics from the rest of the compiler: lowering, type inference and later phases. This
   needs the `cambra` library ([Package layout](#package-layout)) and a worker thread
   ([its design](#later-compiler-diagnostics-on-a-worker-thread)).
-- A VS Code client.
 - Semantic tokens, hover types, go-to-definition and completion.
 
 ## Package layout
@@ -251,6 +250,17 @@ from the text, because the lexer drops comments.
 command `cambra --lsp` and the `cambra` filetype. `vim.lsp.enable('cambra')` starts it. Folding
 through the server uses `vim.lsp.foldexpr()`. `editors/README.md` describes the setup.
 
+## VS Code client
+
+`editors/vscode/extension.js` starts the server with `vscode-languageclient`, VS Code's LSP
+client library, which offers only UTF-16 positions and fails to start against a server that
+answers with any other encoding. The client runs `<cambra.server.path> --lsp` over standard input
+and output for `cambra` documents with the scheme `file` or `untitled`; a selector by language
+alone would also attach to the `git:` documents of diff views. Changing `cambra.server.path`, or
+the command **Cambra: Restart Language Server**, stops the server and starts a new one. A binary
+that does not start is reported with an error naming the setting. `editors/README.md` describes
+the setup.
+
 ## Testing
 
 - **Batches.** Unit tests in `cambra-lsp/src/server.rs` hand one batch to the loop's batch
@@ -276,6 +286,11 @@ through the server uses `vim.lsp.foldexpr()`. `editors/README.md` describes the 
   a UTF-8 and a UTF-16 session, requires each position to be canonical, maps it back to a byte
   offset, and requires the two to agree, so a feature that computed a column without the session's
   encoding fails.
+- **Clients.** `./ci.sh editors` runs the server through Neovim's client
+  (`editors/nvim/test/check_lsp.lua`), and `./ci.sh vscode`, outside the full gate, through VS
+  Code's (`editors/vscode/test/lsp/`). Both check the handshake, diagnostics at the client's
+  columns, the outline, folds and edits on one file with a multi-byte character
+  (`editors/README.md`, "Language server checks").
 - **Positions.** A seeded fuzz test in `cambra-lsp/src/document.rs` (`CAMBRA_FUZZ_SEED`,
   `CAMBRA_FUZZ_N`) builds texts mixing ASCII, multi-byte characters and all three line breaks,
   and alternates the encoding between cases. It applies random edits, reversed and out-of-range

@@ -37,7 +37,7 @@ from typing import NamedTuple
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Directories that are not source-of-truth for references.
-SKIP_DIRS = {".git", "target", ".claude", "node_modules"}
+SKIP_DIRS = {".git", "target", ".claude", "node_modules", ".vscode-test"}
 
 # Link targets that are external / non-file and never checked.
 EXTERNAL_SCHEME = re.compile(r"^(https?:|mailto:|tel:|ftp:|#!)", re.IGNORECASE)

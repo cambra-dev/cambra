@@ -1,17 +1,19 @@
 # Editor support
 
-Regex-based syntax highlighting for CHL source files (`.cambra`) in VS Code and Neovim. The
-language id is `cambra` in both editors, and the TextMate scope is `source.cambra`.
+Regex-based syntax highlighting for CHL source files (`.cambra`) in VS Code and Neovim, and a
+client for each of them for the language server. The language id is `cambra` in both editors, and
+the TextMate scope is `source.cambra`.
 
 | Directory | Contents |
 | --- | --- |
-| `vscode/` | A VS Code extension with no code: the language, its comment and bracket configuration, and the TextMate grammar `syntaxes/cambra.tmLanguage.json`. |
+| `vscode/` | A VS Code extension: the language, its comment and bracket configuration, the TextMate grammar `syntaxes/cambra.tmLanguage.json`, and the language server client `extension.js`. |
 | `nvim/` | A Neovim runtime directory: filetype detection, a filetype plugin, an indent plugin, the syntax file `syntax/cambra.vim`, and the language server configuration `lsp/cambra.lua`. |
 
 The language server, run as `cambra --lsp`, reports lex and parse errors, outlines a file, and folds
 it ([cambra-lsp/design-cambra-lsp.md](../cambra-lsp/design-cambra-lsp.md)). Any client can use it,
-since it counts columns in UTF-8 or UTF-16; [Neovim](#neovim) has the setup. Semantic tokens from
-the server will later sit on top of these grammars rather than replace them.
+since it counts columns in UTF-8 or UTF-16. [VS Code](#vs-code) and [Neovim](#neovim) have the
+setup, and [Language server checks](#language-server-checks) runs it through both editors' clients.
+Semantic tokens from the server will later sit on top of these grammars rather than replace them.
 
 ## Highlight classes
 
@@ -104,8 +106,8 @@ in the cases listed under [VS Code](#vs-code); `indent-cases.json` holds a case 
 `./ci.sh editors` checks both grammars against the lexer over every `.cambra` file under `tests/`
 and `editors/`. It needs Node and npm for the TextMate grammar and Neovim 0.11 for the Vim syntax
 file. Without one, it skips that grammar and prints a line saying so; under CI it fails instead.
-The first run installs `vscode-textmate` and `vscode-oniguruma` into `vscode/node_modules` from
-`vscode/package-lock.json`.
+The first run installs the extension's npm packages into `vscode/node_modules` from
+`vscode/package-lock.json`; the grammar checker uses `vscode-textmate` and `vscode-oniguruma`.
 
 The check has three parts:
 
@@ -200,11 +202,42 @@ Enter limit listed under [VS Code](#vs-code) has a case marked `vscode`; no case
 requires each case's `lines`, `next` at `indent`, and `rest` to form a program `parse_module`
 accepts.
 
+## Language server checks
+
+`./ci.sh editors` also runs the language server through Neovim's client, and `./ci.sh vscode`
+through VS Code's. Both open the same four-line file, `x = f(1]` then `y = "😀" $` then a two-line
+`def g(a):`, and require:
+
+- The client starts and attaches.
+- Both lex errors arrive: the `]` at line 1, column 8, and the `$` at the column after `😀`, which
+  is byte column 12 in Neovim and UTF-16 column 10 in VS Code.
+- The outline lists `x` and `g`.
+- The body of `g` folds.
+- Replacing `]` with `)` leaves one diagnostic, and deleting the ` $` after `😀` leaves none.
+
+The VS Code check also requires the related link from `]` to its `(`, the ranges of `g`'s outline
+entry, and the extension's activation.
+
+- `nvim/test/check_lsp.lua` runs in headless Neovim with the runtime directory and
+  `lsp/cambra.lua`, against the `cambra` binary `./ci.sh editors` builds.
+- `vscode/test/lsp/run.mjs` starts VS Code under `@vscode/test-electron` on a fresh profile with
+  only this extension, and `vscode/test/lsp/suite.js` makes the checks inside it. On Linux VS Code
+  runs without a window, through Chromium's headless Ozone platform, so it needs no display.
+  `CAMBRA_VSCODE_SHOW=1` shows the window.
+
+`./ci.sh vscode` is not part of the full gate or of CI. Its first run downloads VS Code, about 1 GB
+unpacked, into `vscode/.vscode-test/`. `CAMBRA_VSCODE` names an installed VS Code to run instead,
+and `CAMBRA_VSCODE_VERSION` a version to download. Run it after changing `extension.js`, the
+extension's `package.json`, or how the server negotiates with a client.
+
 ## VS Code
 
-Link the extension into the extensions directory and reload the window:
+The extension needs its npm packages, and the language server needs `cambra` on `PATH`
+(`cargo install --path .` from the repository root) or named by the `cambra.server.path` setting.
+Install the packages, link the extension into the extensions directory, and reload the window:
 
 ```bash
+(cd editors/vscode && npm ci)
 ln -s "$PWD/editors/vscode" ~/.vscode/extensions/cambra-dev.cambra-0.1.0
 ```
 
@@ -222,6 +255,22 @@ extension directory.
 To check it, open a `.cambra` file such as `tests/programs/http_counter/program.cambra`. The status
 bar shows the language as Cambra. **Developer: Inspect Editor Tokens and Scopes** shows the scope
 under the cursor, which ends in `.cambra`.
+
+### Language server in VS Code
+
+The extension starts `cambra --lsp` when a `.cambra` file opens, for files on disk and untitled
+ones. Errors appear in the editor and the Problems panel, with a mismatched bracket's open bracket
+linked under its error. The Outline view, the breadcrumbs and **Go to Symbol in Editor** show the
+outline. The server's folding ranges replace VS Code's folding by indentation.
+
+| Setting or command | Effect |
+| --- | --- |
+| `cambra.server.path` | The `cambra` binary to run; default `cambra`, looked up on `PATH`. Changing it restarts the server. |
+| `cambra.trace.server` | `messages` or `verbose` logs the protocol traffic to the **Cambra** output channel. |
+| **Cambra: Restart Language Server** | Stops and restarts the server, to pick up a rebuilt binary. |
+
+The **Cambra** output channel also holds the server's own log messages. When the binary cannot be
+started, an error names `cambra.server.path`.
 
 Indentation follows [Indentation](#indentation). Typing `elif` or `else` and its `:` dedents the
 line one level, which lands it on its chain's level when the body above it sits at the level Enter
