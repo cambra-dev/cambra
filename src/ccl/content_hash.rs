@@ -714,11 +714,7 @@ mod tests {
             let decl = NominalDecl::declared("Light".into(), Vec::new(), span, false);
             decl.define(
                 tags.iter()
-                    .map(|t| NominalCtor {
-                        name: (*t).into(),
-                        span,
-                        params: Vec::new(),
-                    })
+                    .map(|t| NominalCtor::unwritten((*t).into(), span, Vec::new()))
                     .collect(),
             )
             .expect("no parameters to use");

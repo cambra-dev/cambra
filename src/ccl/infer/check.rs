@@ -27,9 +27,12 @@ use super::emit::{
 use super::schemes::OperatorSchemes;
 use super::typing::{LetScheme, Typing, escaped_opaque_binders};
 use super::{lit_base, map_constrain_err};
-use crate::ccl::infer::solver::traits::{Assoc, InstanceHead, Trait, offered_head};
+use crate::ccl::infer::solver::traits::{
+    Assoc, InstanceHead, InstanceTable, Trait, compares_by_value, offered_head,
+};
 use crate::util::ScopeStack;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Post-inference structural type-check state.
 ///
@@ -115,6 +118,8 @@ pub(super) struct CheckCtx {
     /// Entries accumulate and are never removed — a uniquified name denotes one
     /// binding, so the fact it records stays true.
     opaque_binders: HashMap<Name, Type>,
+    /// The program's instances, which say what a nominal type's comparisons are.
+    instances: Rc<InstanceTable>,
 }
 
 /// The environment a Check query runs in: the lexical scope at the query, plus
@@ -140,7 +145,7 @@ impl ScopeEnv for CheckScope<'_> {
 }
 
 impl CheckCtx {
-    fn new(root: NodeId) -> Self {
+    fn new(root: NodeId, instances: Rc<InstanceTable>) -> Self {
         // Level 0 matches inference (Stage 1 holds the level at 0) and the
         // scheme quantification level, so instantiated schemes mint vars at
         // the same level Check's `fresh` does.
@@ -154,6 +159,7 @@ impl CheckCtx {
             telescope: Telescope::empty(),
             scopes: ScopeStack::default(),
             opaque_binders: HashMap::new(),
+            instances,
         }
     }
 
@@ -229,11 +235,11 @@ impl Typing for CheckCtx {
     fn instances_of(
         &self,
         trait_: &Trait,
-    ) -> Vec<std::rc::Rc<crate::ccl::infer::solver::traits::TraitInstance>> {
+    ) -> Vec<Rc<crate::ccl::infer::solver::traits::TraitInstance>> {
         trait_.compiler_instances.clone()
     }
 
-    fn assumptions_in_scope(&self) -> &[std::rc::Rc<crate::ccl::ty::TraitRequirement>] {
+    fn assumptions_in_scope(&self) -> &[Rc<crate::ccl::ty::TraitRequirement>] {
         &[]
     }
 
@@ -291,6 +297,26 @@ impl Typing for CheckCtx {
                 trait_.name()
             )
         }
+        // A nominal type compares by value where the program declares the instance.
+        if trait_.is_structural()
+            && let [one, other] = operand_types
+            && let Type::Nominal(..) = strip_refinements(one)
+        {
+            if strip_refinements(one) == strip_refinements(other)
+                && compares_by_value(&trait_, one, &[], &self.instances)
+            {
+                return Ok(None);
+            }
+            let located = self.raise(InferError::NoTraitInstance {
+                trait_: trait_.to_string(),
+                position: 0,
+                found: Box::new((*one).clone()),
+                accepted: Vec::new(),
+                at: at(),
+            });
+            self.errors.push(located);
+            return Ok(assoc.map(|_| fresh_var(self.level)));
+        }
         // No obligation is created here, for two independent reasons. Types are
         // already concrete, so there is nothing to discharge incrementally; and Check
         // runs outside any `InferArena`, so an obligation's variable⇄obligation cycle
@@ -318,11 +344,10 @@ impl Typing for CheckCtx {
             // catches a later pass rewriting the tree into something ill-typed, and a
             // product is the shape inference answers structurally rather than through the
             // candidate set (`traits::narrow_product`), so nothing else downstream would.
-            if trait_.is_structural()
-                && operand_types
-                    .iter()
-                    .all(|t| matches!(strip_refinements(t), Type::Tuple(_) | Type::Record(_)))
-            {
+            if operand_types.iter().all(|t| {
+                let t = strip_refinements(t);
+                matches!(t, Type::Tuple(_) | Type::Record(_)) && trait_.admits_product(&t)
+            }) {
                 let shapes: Vec<Vec<FieldKey>> = operand_types
                     .iter()
                     .map(|t| product_fields(&strip_refinements(t)))
@@ -482,7 +507,7 @@ impl Typing for CheckCtx {
 
     fn with_assumptions<R>(
         &mut self,
-        _assumptions: &[std::rc::Rc<crate::ccl::ty::TraitRequirement>],
+        _assumptions: &[Rc<crate::ccl::ty::TraitRequirement>],
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         f(self)
@@ -1024,7 +1049,7 @@ fn check_predicates(
     ) {
         if let Type::Refinement(base, refinements) = ty {
             for r in refinements {
-                if !visited.insert(std::rc::Rc::as_ptr(&r.predicate)) {
+                if !visited.insert(Rc::as_ptr(&r.predicate)) {
                     continue;
                 }
                 // **The scratch lambda never enters a tree, so it consumes no identity.**
@@ -1126,13 +1151,17 @@ fn check_strength_over(ty: &Type, label: &str, ctx: &mut CheckCtx) {
 pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
     // Check-mode failures are compiler bugs (a pass produced an ill-typed tree), and
     // every caller of this entry `.expect()`s them, so the blame nodes go unread.
-    check_located(expr).map_err(|errs| errs.into_iter().map(|e| e.error).collect())
+    check_located(expr, &InstanceTable::builtin())
+        .map_err(|errs| errs.into_iter().map(|e| e.error).collect())
 }
 
-/// [`check`], keeping the node each error was raised at.
-pub(crate) fn check_located(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
+/// [`check`] of a program declaring `instances`, keeping the node each error was raised at.
+pub(crate) fn check_located(
+    expr: &Expr,
+    instances: &Rc<InstanceTable>,
+) -> Result<(), Vec<LocatedInferError>> {
     let mut cloned = expr.clone_preserving_ids();
-    let mut ctx = CheckCtx::new(cloned.node_id());
+    let mut ctx = CheckCtx::new(cloned.node_id(), Rc::clone(instances));
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —
     // `emit_case`'s `EmptyCase`, `emit_node`'s `UnboundVariable` — so the returned
@@ -1265,7 +1294,7 @@ mod tests {
         let (a_id, b_id) = (bad_a.node_id(), bad_b.node_id());
         let mut tree = TypedExpr::tuple(vec![bad_a, bad_b]);
 
-        let mut ctx = CheckCtx::new(tree.node_id());
+        let mut ctx = CheckCtx::new(tree.node_id(), InstanceTable::builtin());
         let _ = check_node(&mut tree, &mut ctx);
 
         let blamed: Vec<_> = ctx.errors.iter().map(|e| e.node_id).collect();
@@ -1305,7 +1334,7 @@ mod tests {
         let errors_for = |result: Type| {
             let mut node = Expr::builtin(Builtin::StrengthOver)
                 .with_ty(Type::fun(operand.clone(), Type::fun(int.clone(), result)));
-            let mut ctx = CheckCtx::new(node.node_id());
+            let mut ctx = CheckCtx::new(node.node_id(), InstanceTable::builtin());
             let _ = check_node(&mut node, &mut ctx);
             ctx.errors
         };

@@ -1584,9 +1584,8 @@ fn elim_lambda_impl(
         // BinOp — desugar to Apply + Tuple, then apply the application rule.
         // a op b  ≡  (a, b) ▷ op_fn
         //
-        // The `String + String → Concat` rewrite is handled by
-        // [`crate::ccl::simplify::try_string_add_to_concat`] (which runs after
-        // lambda elimination), so it's not duplicated here.
+        // The operator is the one its instance runs: inference made `String + String`
+        // `Concat` when it chose the `Addable` row.
         TypedExprNode::BinOp { left, op, right } => {
             let left = *left;
             let right = *right;
@@ -2636,11 +2635,11 @@ mod tests {
         let span = chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0);
         let t = TypeParam::declared("T");
         let decl = NominalDecl::declared("Box".into(), vec![Rc::clone(&t)], span, false);
-        decl.define(vec![NominalCtor {
-            name: "boxed".into(),
+        decl.define(vec![NominalCtor::unwritten(
+            "boxed".into(),
             span,
-            params: vec![(None, Type::Param(t))],
-        }])
+            vec![(None, Type::Param(t))],
+        )])
         .expect("`boxed` names `T`");
         let refine = |base: Type, by: &str| {
             let bool_ty = Type::Base(BaseType::Bool);

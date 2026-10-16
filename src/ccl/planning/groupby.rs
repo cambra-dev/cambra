@@ -32,7 +32,7 @@ use crate::ccl::ty::FunKind;
 ///
 /// Not matching is not an error: the site falls back to the generic iterate/restrict
 /// lowering, which is correct and unbucketized.
-pub(super) fn recognize_groupby_sites(expr: &mut Expr) {
+pub(super) fn recognize_groupby_sites(expr: &mut Expr, ctx: &PlanningCtx) {
     // The recording names the composition site — the term-tree node the
     // bucketize chain replaces — and deliberately not the key morphism the
     // rewrite lifts out of the refined domain's predicate. The composition is
@@ -59,12 +59,12 @@ pub(super) fn recognize_groupby_sites(expr: &mut Expr) {
             "planning.groupby",
             provenance::Nature::Expansion,
         );
-        convert_groupby_pointful(expr)
+        convert_groupby_pointful(expr, ctx)
     };
     if let Some(rewritten) = rewritten {
         *expr = rewritten;
     }
-    expr.walk_children_mut(recognize_groupby_sites);
+    expr.walk_children_mut(|child| recognize_groupby_sites(child, ctx));
 }
 
 /// Build the bucketize-and-aggregate chain `converse(keys) ≫ map(values)`
@@ -79,6 +79,7 @@ fn emit_groupby(
     key_binder: Option<Name>,
     key_dom: Type,
     value_ty: Type,
+    ctx: &PlanningCtx,
 ) -> Expr {
     // A partition is a **collection of collections**: keyed by `K`, each group the
     // index set of its members. Both are data — the transformer
@@ -105,16 +106,16 @@ fn emit_groupby(
 
     let converse_ty = partition(group_of(group_idx_ty.clone()));
     let grouped = apply_primitive(keys, Builtin::Converse, converse_ty);
-    typecheck(&grouped).expect("Bad group expr");
+    typecheck_in(&grouped, &ctx.instances).expect("Bad group expr");
     let values_fn = apply_primitive(
         values,
         Builtin::Map,
         Type::fun(group_of(group_idx_ty.clone()), group_of(value_ty.clone())),
     );
     let grouped_values_ty = partition(group_of(value_ty));
-    typecheck(&values_fn).expect("Bad values_fn expr");
+    typecheck_in(&values_fn, &ctx.instances).expect("Bad values_fn expr");
     let grouped_values = compose(grouped, values_fn).with_ty(grouped_values_ty);
-    typecheck(&grouped_values).expect("Bad grouped_values expr");
+    typecheck_in(&grouped_values, &ctx.instances).expect("Bad grouped_values expr");
     grouped_values
 }
 
@@ -320,12 +321,12 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite<'_>> {
 /// [`PointfulSite`] to the bucketize chain [`emit_groupby`] builds. `expr` is a
 /// `Compose` whose head is the source; the head is replaced and the tail (the
 /// per-group aggregate) kept.
-fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
+fn convert_groupby_pointful(expr: &Expr, ctx: &PlanningCtx) -> Option<Expr> {
     match &expr.node {
         // Consumed in place: `groupby(c, key) ≫ <per-group aggregate>`. Replace the head
         // and keep the tail.
         TypedExprNode::Compose(elts) => {
-            let grouped = rewrite_groupby_source(elts.first()?)?;
+            let grouped = rewrite_groupby_source(elts.first()?, ctx)?;
             let mut new_elts = vec![grouped];
             new_elts.extend(elts.iter().skip(1).cloned());
             Some(typed_compose(new_elts).with_ty(expr.ty.clone()))
@@ -334,13 +335,13 @@ fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
         // lookups or iterations of the grouping itself. Matching it here is what lets it
         // stay bound and be shared: the generic fallback would try to iterate its *key*
         // domain, which is an element type rather than an index set.
-        _ => rewrite_groupby_source(expr),
+        _ => rewrite_groupby_source(expr, ctx),
     }
 }
 
 /// The group-by source rewrite: recognize the pointful site and return the equivalent
 /// bucketize chain. See [`convert_groupby_pointful`].
-fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
+fn rewrite_groupby_source(head: &Expr, ctx: &PlanningCtx) -> Option<Expr> {
     let site = match_pointful_site(head)?;
     // Compile the pointful key function to a point-free morphism V ⇒ K, then
     // build `keys = c ≫ key : I ⇒ K` and `values = c : I ⇒ V`.
@@ -368,6 +369,7 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
         site.key_binder,
         site.key_dom,
         site.value_ty,
+        ctx,
     ))
 }
 
@@ -394,7 +396,7 @@ mod tests {
     #[test]
     fn test_recognize_groupby_sites_on_var() {
         let mut expr = var("x");
-        recognize_groupby_sites(&mut expr);
+        recognize_groupby_sites(&mut expr, &PlanningCtx::builtin());
         // Should remain unchanged
         assert!(matches!(expr.node, TypedExprNode::Var(ref v) if v.base() == "x"));
     }
@@ -442,7 +444,7 @@ mod tests {
     fn groupby_recognition_lifts_the_key_without_aliasing() {
         let key = var("key").with_ty(fun_ty(int_ty(), int_ty()));
         let mut expr = groupby_source_sharing_its_key(&key);
-        recognize_groupby_sites(&mut expr);
+        recognize_groupby_sites(&mut expr, &PlanningCtx::builtin());
 
         assert!(
             !matches!(&expr.node, TypedExprNode::Compose(elts)
@@ -543,7 +545,7 @@ mod tests {
 
         let mut expr = Expr::compose(vec![head, var("agg")]);
         let before = symbolic(&expr);
-        recognize_groupby_sites(&mut expr);
+        recognize_groupby_sites(&mut expr, &PlanningCtx::builtin());
         assert_eq!(
             symbolic(&expr),
             before,

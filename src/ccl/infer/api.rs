@@ -12,6 +12,7 @@ use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
+use crate::ccl::infer::solver::traits::InstanceTable;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
@@ -115,7 +116,7 @@ pub struct TypeInferenceContext {
     pub(crate) source_types: HashMap<String, Type>,
 
     /// The program's trait instances, which lowering builds.
-    pub(crate) instances: Rc<crate::ccl::infer::solver::traits::InstanceTable>,
+    pub(crate) instances: Rc<InstanceTable>,
 }
 
 /// RAII guard returned by [`TypeInferenceContext::enter_scope`].
@@ -1972,8 +1973,16 @@ fn collect_type_errors(
 /// Returns `Ok(())` if no errors are found, or all discovered errors as
 /// `Err(errs)`.
 pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
+    typecheck_in(expr, &InstanceTable::builtin())
+}
+
+/// [`typecheck`] of a program declaring `instances`.
+pub(crate) fn typecheck_in(
+    expr: &Expr,
+    instances: &Rc<InstanceTable>,
+) -> Result<(), Vec<InferError>> {
     check_fully_typed(expr)?;
-    super::check(expr)
+    crate::ccl::infer::check::check_located(expr, instances).map_err(unlocated)
 }
 
 /// [`typecheck`] for the window between inference and `channelize`:
@@ -1982,14 +1991,17 @@ pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// are permitted — the unified phase and `channelize` erase them (see
 /// [`Strictness::PreChannelize`]).
 pub fn check_pre_channelize(expr: &Expr) -> Result<(), Vec<InferError>> {
-    check_pre_channelize_located(expr).map_err(unlocated)
+    check_pre_channelize_located(expr, &InstanceTable::builtin()).map_err(unlocated)
 }
 
 /// [`check_pre_channelize`], keeping the node each error was raised at.
 ///
 /// The pipeline's post-inference check reports a residual `Type::Infer` as an
 /// ambiguous program, a user error, so it needs the node to point at.
-pub(crate) fn check_pre_channelize_located(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
+pub(crate) fn check_pre_channelize_located(
+    expr: &Expr,
+    instances: &Rc<InstanceTable>,
+) -> Result<(), Vec<LocatedInferError>> {
     // The relaxation applies only when the tree carries transient histories
     // (feed/mutable machinery). A program with none should be fully resolved
     // after inference, so a residual `Infer` there is an ambiguous program
@@ -2001,7 +2013,7 @@ pub(crate) fn check_pre_channelize_located(expr: &Expr) -> Result<(), Vec<Locate
         Strictness::Strict
     };
     check_annotated(expr, strictness)?;
-    crate::ccl::infer::check::check_located(expr)
+    crate::ccl::infer::check::check_located(expr, instances)
 }
 
 /// The errors of a located list, for a caller whose errors are compiler bugs:
@@ -3331,8 +3343,8 @@ mod tests {
     #[test]
     fn test_infer_string_add_infers_string() {
         let mut ctx = TypeInferenceContext::new();
-        // "hello" + "world"  =>  String; Add is left as-is (Concat rewriting
-        // happens at compile time, not inference time).
+        // "hello" + "world"  =>  String, and the operator runs the `Addable(String, String)`
+        // instance's primitive, `Concat`.
         let mut expr = Expr::binop(
             Expr::lit(Lit::String("hello".into())),
             BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -3340,9 +3352,8 @@ mod tests {
         );
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::String));
-        // The op is NOT rewritten at inference time.
         if let TypedExprNode::BinOp { op, .. } = &expr.node {
-            assert_eq!(*op, BinOpKind::Arithmetic(ArithmeticKind::Add));
+            assert_eq!(*op, BinOpKind::Concat);
         } else {
             panic!("expected BinOp");
         }

@@ -549,7 +549,8 @@ pub struct ImplBlock {
     pub assoc: Vec<AssocArg>,
     /// What an instance requires of its head's type variables.
     pub requires: Vec<Spanned<Requirement>>,
-    /// The block's `def`s, each a [`Stmt::FunctionDef`], or one under [`Stmt::Pub`].
+    /// The block's `def`s, each a [`Stmt::FunctionDef`], or one under [`Stmt::Pub`]. Empty
+    /// for a head written with no block, an instance of a trait that declares no function.
     pub defs: Vec<Spanned<Stmt>>,
 }
 

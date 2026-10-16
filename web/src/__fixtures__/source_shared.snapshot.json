@@ -549,7 +549,7 @@
           ]
         },
         {
-          "label": "BinOp(Arithmetic(Add))",
+          "label": "BinOp(Concat)",
           "nodeId": 74,
           "spans": [
             {
@@ -888,7 +888,7 @@
           ]
         },
         {
-          "label": "BinOp(Arithmetic(Add))",
+          "label": "BinOp(Concat)",
           "nodeId": 172,
           "spans": [
             {
@@ -1196,7 +1196,7 @@
           ]
         },
         {
-          "label": "BinOp(Arithmetic(Add))",
+          "label": "BinOp(Concat)",
           "nodeId": 74,
           "spans": [
             {
@@ -1490,7 +1490,7 @@
           ]
         },
         {
-          "label": "BinOp(Arithmetic(Add))",
+          "label": "BinOp(Concat)",
           "nodeId": 172,
           "spans": [
             {
@@ -1843,7 +1843,7 @@
           ]
         },
         {
-          "label": "BinOp(Arithmetic(Add))",
+          "label": "BinOp(Concat)",
           "nodeId": 74,
           "spans": [
             {
@@ -2137,7 +2137,7 @@
           ]
         },
         {
-          "label": "BinOp(Arithmetic(Add))",
+          "label": "BinOp(Concat)",
           "nodeId": 172,
           "spans": [
             {

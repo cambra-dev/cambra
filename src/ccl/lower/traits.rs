@@ -17,8 +17,8 @@ use smol_str::SmolStr;
 
 use super::*;
 use crate::ccl::infer::solver::traits::{
-    Assoc, DeclaredAt, InstanceHead, InstanceTable, Signature, Trait, TraitDecl, TraitFunction,
-    TraitInstance, replace_params, unify_all,
+    Assoc, DeclaredAt, Implementation, InstanceHead, InstanceTable, ProductReading, Signature,
+    Trait, TraitDecl, TraitFunction, TraitInstance, compares_by_value, replace_params, unify_all,
 };
 use crate::ccl::ty::{PolyParam, TraitRequirement, TypeKind, TypeParam, TypeParamId};
 use crate::ccl::{Expr, Name, Type, TypedExprNode};
@@ -279,7 +279,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         operands,
         assocs,
         functions,
-        structural: false,
+        products: ProductReading::None,
         compiler_instances: Vec::new(),
     }))
 }
@@ -488,15 +488,6 @@ fn declare_instance(
     ctx: &mut LoweringContext,
 ) -> Result<(), LoweringError> {
     let written = format!("{trait_}(…)");
-    if trait_.functions().is_empty() {
-        return Err(LoweringError::unsupported(
-            block.ty.span,
-            format!(
-                "`{trait_}` is an operator's trait, which declares no function an instance \
-                 could define; an instance of one is not supported yet"
-            ),
-        ));
-    }
     if block.args.len() != trait_.arity() {
         return Err(LoweringError::unsupported(
             block.ty.span,
@@ -565,6 +556,9 @@ fn declare_instance(
     }
     let head = head_spelling(&trait_, &operands, &assoc);
     let requires = lower_requirements(&block.requires, ctx)?;
+    if trait_ == Trait::equatable() || trait_ == Trait::orderable() {
+        check_comparison_instance(&trait_, &operands, &requires, &head, block, &ctx.instances)?;
+    }
     // No other instance accepts what this one does: two heads overlap exactly when some
     // types are an instance of both.
     let existing = ctx.instances.instances(&trait_);
@@ -583,7 +577,7 @@ fn declare_instance(
         });
     }
     // The block defines each of the trait's functions, and nothing else.
-    let mut functions: Vec<(SmolStr, Name)> = Vec::new();
+    let mut functions: Vec<(SmolStr, Implementation)> = Vec::new();
     for def in &block.defs {
         let (fname, fspan, owner) = match &def.node {
             ChlStmt::FunctionDef { name, owner, .. } => (&name.node, def.span, owner),
@@ -619,7 +613,10 @@ fn declare_instance(
                 format!("`impl {head}` defines `{fname}` twice"),
             ));
         }
-        functions.push((fname.clone(), Name::fresh(format!("{trait_}::{fname}"))));
+        functions.push((
+            fname.clone(),
+            Implementation::Binding(Name::fresh(format!("{trait_}::{fname}"))),
+        ));
     }
     if let Some(missing) = trait_
         .functions()
@@ -654,6 +651,26 @@ fn declare_instance(
                 ),
             )
             .with_related(first, "declared here"));
+        }
+        // The compiler's instances give the base types their operators' methods, `1.add(2)`.
+        if let Some(other) = Trait::compiler_traits().into_iter().find(|t| {
+            *t != trait_
+                && t.function(&f.name)
+                    .and_then(|m| m.receiver)
+                    .is_some_and(|at| {
+                        t.compiler_instances
+                            .iter()
+                            .any(|i| i.heads().get(at as usize) == Some(receiver))
+                    })
+        }) {
+            return Err(LoweringError::unsupported(
+                block.ty.span,
+                format!(
+                    "`impl {head}` gives `{ty}` a method `{}`, which the compiler's instance of \
+                     `{other}` gives it too; a type's methods share one namespace",
+                    f.name
+                ),
+            ));
         }
         if let Some((other, at)) = ctx
             .instance_methods
@@ -701,6 +718,69 @@ fn declare_instance(
         instance,
         variables,
     });
+    Ok(())
+}
+
+/// Check an instance of `Equatable` or `Orderable`, which compare by value
+/// (`docs/chl-spec.md`, "Equality and order"): the head names one nominal type twice, and
+/// each of its constructors' arguments compares by value, there and in order.
+fn check_comparison_instance(
+    trait_: &Trait,
+    operands: &[Type],
+    requires: &[Rc<TraitRequirement>],
+    head: &str,
+    block: &ImplBlock,
+    instances: &InstanceTable,
+) -> Result<(), LoweringError> {
+    let refuse = |message: String| Err(LoweringError::unsupported(block.ty.span, message));
+    let [one, other] = operands else {
+        unreachable!("`{trait_}` is over two types")
+    };
+    if one != other {
+        return refuse(format!(
+            "`impl {head}` relates two different types; a comparison is by value, so an \
+             instance of `{trait_}` names one type twice"
+        ));
+    }
+    let Type::Nominal(decl, args) = one else {
+        unreachable!("an instance's head names a nominal type, and this one names one type")
+    };
+    let ctors = &decl.body().ctors;
+    let orderable = *trait_ == Trait::orderable();
+    if orderable && ctors.len() != 1 {
+        return refuse(format!(
+            "`impl {head}`: `{}` has {} constructors, which have no order; only a type with \
+             one constructor is orderable",
+            decl.name,
+            ctors.len()
+        ));
+    }
+    for ctor in ctors {
+        // A constructor with no parameters holds nothing to compare: its value is its name.
+        if ctor.params.is_empty() {
+            continue;
+        }
+        let payload = decl.instantiate(
+            &crate::ccl::ccl_utils::strip_refinements(&ctor.payload()),
+            args,
+        );
+        if orderable && !ctor.payload_order().is_ordered() {
+            return refuse(format!(
+                "`impl {head}`: `{}::{}`'s argument holds a record its declaration does not \
+                 write, whose fields have no order; write the record in `{}`'s declaration",
+                decl.name, ctor.name, decl.name
+            ));
+        }
+        if !compares_by_value(trait_, &payload, requires, instances) {
+            return refuse(format!(
+                "`impl {head}`: `{}::{}`'s argument is `{}`, which is not `{trait_}`; a \
+                 nominal type compares by its constructor's argument",
+                decl.name,
+                ctor.name,
+                crate::ccl::chl_print::chl_type(&payload)
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -994,12 +1074,9 @@ fn lower_instance_def(
         .function(name)
         .cloned()
         .expect("`declare_instances` checked the instance's functions");
-    let binding = instance
-        .functions
-        .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, b)| b.clone())
-        .expect("`declare_instances` named each function's binding");
+    let Some(Implementation::Binding(binding)) = instance.implementation(name).cloned() else {
+        unreachable!("`declare_instances` named each function's binding")
+    };
     let qualified = format!("{trait_}::{name}");
     let sig = &function.signature;
     // The head's variables, then the function's own type parameters: the instance's
