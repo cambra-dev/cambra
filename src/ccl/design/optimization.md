@@ -164,10 +164,10 @@ composition function; it differs from the `TypedExprNode::Compose` chain.
 The other combinators introduced here include `Curry`, `Const`, `Apply`, `Map`, aggregation
 builtins, and the point-free `Copair` form. `Builtin::Copair` appears as
 `Apply(Tuple(arms), Builtin(Copair))` when a copair is lifted out of a lambda. A value-position
-`TypedExprNode::Copair` remains a value-form node. Planning later introduces `Iterate`,
-`Restrict`, `Strength`, `CurryOver`, `Converse`, `Uncurry`, and the domain transformations used by
-join plans; `simplify` introduces `Strength` as well.
-Lambda elimination does not introduce iteration sources.
+`TypedExprNode::Copair` remains a value-form node. Planning later introduces `Iterate`, `Restrict`,
+`StrengthOver`, `CurryOver`, `Converse`, `Uncurry`, and the domain transformations used by join
+plans; `simplify` introduces `StrengthOver` as well. Lambda elimination does not introduce iteration
+sources.
 
 ### Conditional expressions and filters
 
@@ -210,22 +210,21 @@ binder sits on the inner lambda's type rather than on the pair, and the key's wi
 the pair's first component, which `Type` has no dependent pair to state. After the rewrite the
 inner lambda is the element function `𝑓`, over the source's values, which carry no witness.
 
-Where `𝑓` reads nothing from the enclosing scope, elimination leaves
-`⟨𝑆, 𝑓 ▷ const⟩ ≫ compose`. `simplify` rewrites this to `𝑆 ≫ map(𝑓)`, or to `𝑆` for `id`.
-Where `𝑓` reads the enclosing scope, elimination leaves `⟨𝑆, curry(𝑔)⟩ ≫ compose`
-with `𝑔` over `(𝑋, 𝑉)`, which `simplify` rewrites to `⟨id, 𝑆⟩ ≫ strength ≫ map(𝑔)`.
-`strength : (𝑋, Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉) ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ (𝑋, 𝑉)` pairs a value with each value of a
-collection under that value's key, so the witness binds once, by the outer sum, and no dependent
-pair is needed. Operator conversion compiles it to `Product::per_row_values_at`, which pairs each
-row with the values of its own collection. Both rules are scoped to an `𝑆` whose values are a
-sum, because planning's recurrence recognition reads a history through the unrewritten form.
+Where `𝑓` reads nothing from the enclosing scope, elimination leaves `⟨𝑆, 𝑓 ▷ const⟩ ≫ compose`.
+`simplify` rewrites this to `𝑆 ≫ map(𝑓)`, or to `𝑆` for `id`. Where `𝑓` reads the enclosing scope,
+elimination leaves `⟨𝑆, curry(𝑔)⟩ ≫ compose` with `𝑔` over `(𝑋, 𝑉)`, which `simplify` rewrites to
+`𝑆 ▷ strength_over ≫ map(𝑔)`. `strength_over : (𝐴 ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉) ⇒ (𝐴 ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ (𝐴, 𝑉))`
+pairs each input with each value of its own collection under that value's key, so the witness binds
+once, by the outer sum, and no dependent pair is needed. Operator conversion compiles it to
+`Product::per_row_values_at`, which pairs each row with the values of its own collection. Both rules
+are scoped to an `𝑆` whose values are a sum, because planning's recurrence recognition reads a
+history through the unrewritten form.
 
 A correlated inner comprehension over a collection every row reads is the same shape with that
-collection constant: planning rewrites its `curry(𝑔)` to `⟨id, const(𝐾)⟩ ≫ strength ≫
-map(𝑔)`, where `𝐾` is the collection the inner comprehension ranges over
-(`src/ccl/planning/correlated.rs`). A site whose type is dependent stays one node,
-`(𝐾, 𝑔) ▷ curry_over`, since the chain has no spelling for a domain narrowed by its input
-(`src/ccl/ops.rs`, `Builtin::CurryOver`).
+collection constant: planning rewrites its `curry(𝑔)` to `const(𝐾) ▷ strength_over ≫ map(𝑔)`, where
+`𝐾` is the collection the inner comprehension ranges over (`src/ccl/planning/correlated.rs`). A site
+whose type is dependent stays one node, `(𝐾, 𝑔) ▷ curry_over`, since the chain has no spelling for a
+domain narrowed by its input (`src/ccl/ops.rs`, `Builtin::CurryOver`).
 
 #### A pair naming a sum's witness is refused
 

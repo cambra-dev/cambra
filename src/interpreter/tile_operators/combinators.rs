@@ -1333,8 +1333,9 @@ impl Product {
     /// [`Self::per_row_at`], pairing every row of `outer` with the **values** of the
     /// collection `inner` holds for it rather than its keys, one pair per key.
     ///
-    /// What `strength` compiles to, so the element function takes the row and a value: a
-    /// generator over a sum that reads its enclosing scope (`src/ccl/design/optimization.md`,
+    /// What [`Builtin::StrengthOver`](crate::ccl::Builtin::StrengthOver) compiles to, so the
+    /// element function takes the row and a value: a generator over a sum that reads its
+    /// enclosing scope (`src/ccl/design/optimization.md`,
     /// "A generator over a sum composes with its source") and a correlated inner
     /// comprehension (`src/ccl/planning/correlated.rs`). The output keeps the collection's
     /// keys as the paired level, so each row's result is a collection over its own

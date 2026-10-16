@@ -354,7 +354,7 @@ pub enum Builtin {
     /// with the collection 𝐾 its result ranges over **named**, for a site whose type is
     /// dependent.
     ///
-    /// Planning rewrites a correlated `curry(𝑔)` to `⟨id, const(𝐾)⟩ ≫ strength ≫ map(𝑔)`
+    /// Planning rewrites a correlated `curry(𝑔)` to `const(𝐾) ▷ strength_over ≫ map(𝑔)`
     /// (`src/ccl/planning/correlated.rs`). A correlated filter narrows the inner domain by the
     /// outer value, `(𝑟 : 𝐴) ⇒ ({𝑣 : 𝐷 | 𝑣 > 𝑟} ⤇ 𝑉)`, and that chain cannot carry the
     /// dependency: the narrowed domain names the chain's input, which no element after the
@@ -364,19 +364,22 @@ pub enum Builtin {
     /// **Born in planning**, and so carries no scheme: it stamps its own type, as planning's
     /// [`MapDomain`](Self::MapDomain) mint does.
     CurryOver,
-    /// `strength : (𝑋, Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉) ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ (𝑋, 𝑉)` — pair a value with each
-    /// value of a collection, keeping the collection's keys: the tensorial strength of the
-    /// collection functor. The witness is the same on both sides, so the sum states the type
-    /// with no further type former.
+    /// `strength_over : (𝐴 ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉) ⇒ (𝐴 ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ (𝐴, 𝑉))` — pair each
+    /// input with each value of its own collection, keeping the collection's keys: the
+    /// tensorial strength of the collection functor, applied to a function from the input to a
+    /// collection. `𝐹 ▷ strength_over` is `⟨id, 𝐹⟩` followed by the strength map
+    /// `(𝐴, 𝐶) ⇒ 𝐶′`. The witness is the same on both sides, so the sum states the type with no
+    /// further type former.
     ///
     /// **Born in simplify and in planning**, and so carries no scheme. Simplify rewrites a
     /// collection composed with a curried function of the enclosing value
-    /// (`⟨𝑆, curry(𝑔)⟩ ≫ compose ⟹ ⟨id, 𝑆⟩ ≫ strength ≫ map(𝑔)`), and planning
-    /// rewrites a correlated `curry(𝑔)` to `⟨id, const(𝐾)⟩ ≫ strength ≫ map(𝑔)`
+    /// (`⟨𝑆, curry(𝑔)⟩ ≫ compose ⟹ 𝑆 ▷ strength_over ≫ map(𝑔)`), and planning rewrites a
+    /// correlated `curry(𝑔)` to `const(𝐾) ▷ strength_over ≫ map(𝑔)`
     /// (`src/ccl/planning/correlated.rs`). Each stamps its own type, which the post-inference
-    /// check holds to the rule above (`check_strength` in `src/ccl/infer/check.rs`). Compiles to
-    /// `Product::per_row_values_at`.
-    Strength,
+    /// check holds to the rule above (`check_strength_over` in `src/ccl/infer/check.rs`).
+    /// Compiles to `Product::per_row_values_at` over the input and `𝐹` applied to it, with no
+    /// pair built between them.
+    StrengthOver,
     /// `const : A → (B → A)` — lift a value to a constant function.
     Const,
     /// `zip : ((A → B), (A → C)) → (A → (B, C))` — point-free product/fanout.
@@ -835,7 +838,7 @@ impl Builtin {
             Self::EmptyMap => "empty_map",
             Self::Curry => "curry",
             Self::CurryOver => "curry_over",
-            Self::Strength => "strength",
+            Self::StrengthOver => "strength_over",
             Self::Const => "const",
             Self::Zip => "zip",
             Self::Apply => "apply",

@@ -156,12 +156,12 @@ fn a_filter_aggregates_a_collection(#[case] program: &str, #[case] total: i64) {
 }
 
 /// A filter whose aggregate reads the element it filters: planning does not rewrite the
-/// correlated aggregate through `strength` yet, so the program is refused.
+/// correlated aggregate through `strength_over` yet, so the program is refused.
 #[test]
 fn a_filter_aggregating_over_its_own_element_is_refused() {
     check_compile_error(
         "sum([q for q in [1, 2, 3] if q > sum([z for z in [1, 2] if z < q])])",
-        "a curried morphism planning did not rewrite through `strength`",
+        "a curried morphism planning did not rewrite through `strength_over`",
     );
 }
 

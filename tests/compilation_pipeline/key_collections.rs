@@ -43,17 +43,17 @@ fn plan_and_run(code: &str) -> (String, cambra::interpreter::Tile) {
 #[timeout(Duration::from_secs(10))]
 #[case::a_mapped_list(
     "[sum([x + i for x in [z * 2 for z in [1, 2, 3]]]) for i in [1, 2]]",
-    "iterate ≫ [1, 2] ≫ (id, iterate ▷ const) ▷ zip ≫ strength ≫ ((.1 ≫ [1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ mul, .0) ▷ zip ≫ add) ▷ map ≫ sum",
+    "iterate ≫ [1, 2] ≫ iterate ▷ const ▷ strength_over ≫ ((.1 ≫ [1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ mul, .0) ▷ zip ≫ add) ▷ map ≫ sum",
     &[15, 18]
 )]
 #[case::a_filtered_list(
     "[sum([x + i for x in [y for y in [1, 2, 3] if y > 1]]) for i in [1, 2]]",
-    "iterate ≫ [1, 2] ≫ (id, iterate ▷ const) ▷ zip ≫ strength ≫ ((.1 ≫ [1, 2, 3] ≫ (id, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ (.1 ≫ cast([1, 2, 3]), .0) ▷ zip ≫ add) ▷ map ≫ sum",
+    "iterate ≫ [1, 2] ≫ iterate ▷ const ▷ strength_over ≫ ((.1 ≫ [1, 2, 3] ≫ (id, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ (.1 ≫ cast([1, 2, 3]), .0) ▷ zip ≫ add) ▷ map ≫ sum",
     &[7, 9]
 )]
 #[case::a_data_source(
     "[sum([x + i for x in testsource1()]) for i in [1, 2]]",
-    "iterate ≫ [1, 2] ≫ (id, iterate ▷ const) ▷ zip ≫ strength ≫ ((.1 ≫ source(testsource1), .0) ▷ zip ≫ add) ▷ map ≫ sum",
+    "iterate ≫ [1, 2] ≫ iterate ▷ const ▷ strength_over ≫ ((.1 ≫ source(testsource1), .0) ▷ zip ≫ add) ▷ map ≫ sum",
     &[33, 36]
 )]
 fn a_correlated_inner_source_keys_by_the_iteration(
@@ -82,7 +82,7 @@ fn a_bound_collection_keeps_its_map_domain() {
         term,
         indoc! {"
             let xs : ([0, 2] ⤇ Int) = iterate ≫ [1, 2, 3]
-            in iterate ≫ [1, 2] ≫ (id, xs ▷ map_domain ▷ const) ▷ zip ≫ strength ≫ ((.1 ≫ xs, .0) ▷ zip ≫ add) ▷ map ≫ sum"}
+            in iterate ≫ [1, 2] ≫ xs ▷ map_domain ▷ const ▷ strength_over ≫ ((.1 ≫ xs, .0) ▷ zip ≫ add) ▷ map ≫ sum"}
         .trim_end()
     );
     assert_eq!(

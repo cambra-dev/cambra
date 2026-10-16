@@ -1,4 +1,4 @@
-//! A **correlated** comprehension's `curry` site, rewritten through `strength`.
+//! A **correlated** comprehension's `curry` site, rewritten through [`Builtin::StrengthOver`].
 //!
 //! An inner comprehension whose body reads the outer binder runs once per outer row, and
 //! `lambda_elim` writes that as `curry(𝑔)` over the outer collection, where `𝑔` takes the pair
@@ -6,11 +6,11 @@
 //! rewrites each site to the combinators it compiles:
 //!
 //! ```text
-//! curry(𝑔)  ⟹  ⟨id, const(𝐾)⟩ ≫ strength ≫ map(𝑔)
+//! curry(𝑔)  ⟹  const(𝐾) ▷ strength_over ≫ map(𝑔)
 //! ```
 //!
 //! `𝐾 : 𝐷 ⤇ 𝐷` is the collection the inner comprehension ranges over, holding its keys as its
-//! values, so `strength` ([`Builtin::Strength`]) pairs each outer value with each key, and
+//! values, so `strength_over` ([`Builtin::StrengthOver`]) pairs each outer value with each key, and
 //! `map(𝑔)` runs `𝑔` over the pairs. It is the rule `simplify` applies to a generator over a
 //! sum (`src/ccl/design/optimization.md`, "A generator over a sum composes with its source"),
 //! with a collection that is the same for every row: `const` shares one collection between
@@ -45,7 +45,7 @@ use super::*;
 use std::rc::Rc;
 
 use crate::ccl::TypedExpr;
-use crate::ccl::lambda_elim::zip_pair;
+use crate::ccl::lambda_elim::strength_over;
 
 use super::predicates::fn_of_bare_predicate;
 
@@ -70,7 +70,7 @@ pub(super) fn emit_correlated_filters(expr: &mut Expr) {
     expr.walk_children_mut(emit_correlated_filters);
 }
 
-/// Rewrite every correlated `curry` site through `strength`.
+/// Rewrite every correlated `curry` site through [`Builtin::StrengthOver`].
 ///
 /// Runs after planning's first `simplify`, so a `curry` exponential eta reduces is gone
 /// first, and before the iteration-site walk, so the `map_domain` this mints is marked like
@@ -96,7 +96,7 @@ pub(super) fn pair_correlated_sites(expr: &mut Expr) -> Result<(), String> {
     result
 }
 
-/// `curry(𝑔)` rewritten to `⟨id, const(𝐾)⟩ ≫ strength ≫ map(𝑔)`, `𝐾` being the
+/// `curry(𝑔)` rewritten to `const(𝐾) ▷ strength_over ≫ map(𝑔)`, `𝐾` being the
 /// collection the site ranges over (the module doc says which). `None` where `expr` is not a
 /// correlated site: a `curry` of a builtin is a partial application, which op-conversion
 /// compiles as one.
@@ -191,8 +191,7 @@ fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
         inner_domain.clone(),
         Type::Tuple(vec![enclosing.clone(), inner_domain.clone()]),
     );
-    let with_keys = zip_pair(
-        id().with_ty(Type::fun(enclosing.clone(), enclosing.clone())),
+    let with_keys = strength_over(
         apply_primitive(
             keys,
             Builtin::Const,
@@ -200,11 +199,7 @@ fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
         ),
         fun_kind,
     );
-    let strength = Expr::builtin(Builtin::Strength).with_ty(Type::fun(
-        Type::Tuple(vec![enclosing.clone(), collection]),
-        strengthened.clone(),
-    ));
-    // `map`'s stamp takes the pairs `strength` makes, which is what the rewritten chain feeds
+    // `map`'s stamp takes the pairs `strength_over` makes, which is what the rewritten chain feeds
     // it; `𝑔` keeps the pair type it was written at, as it did under `curry`.
     let map = apply_primitive(
         g.as_ref().clone_preserving_ids(),
@@ -212,7 +207,7 @@ fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
         Type::fun(strengthened, curried),
     );
     Ok(Some(
-        Expr::compose(vec![with_keys, strength, map]).with_ty(expr.ty.clone()),
+        Expr::compose(vec![with_keys, map]).with_ty(expr.ty.clone()),
     ))
 }
 

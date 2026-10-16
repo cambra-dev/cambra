@@ -792,11 +792,11 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             expr.ty.clone()
         }
 
-        // `strength` is minted after inference with a type stamped by hand
+        // `strength_over` is minted after inference with a type stamped by hand
         // (`simplify::try_compose_with_strength`), so nothing resolved it: its rule is
         // checked rather than trusted.
-        TypedExprNode::Builtin(Builtin::Strength) => {
-            check_strength(&expr.ty, &label, ctx);
+        TypedExprNode::Builtin(Builtin::StrengthOver) => {
+            check_strength_over(&expr.ty, &label, ctx);
             expr.ty.clone()
         }
 
@@ -1026,40 +1026,28 @@ fn check_predicates(
     expr.walk_children(|child| check_predicates(child, ctx, visited));
 }
 
-/// The rule for [`Builtin::Strength`]: `(𝑋, 𝐶) ⇒ 𝐶′`, where `𝐶′` is `𝐶` over the same keys,
-/// and the same witness for a sum, holding `(𝑥, 𝑣)` for each value `𝑣` of `𝐶`. Recorded into
-/// `ctx.errors`, as `require_sub` records.
-fn check_strength(ty: &Type, label: &str, ctx: &mut CheckCtx) {
-    let expected = match ty {
-        Type::Fun { domain, .. } => match domain.as_ref() {
-            Type::Tuple(parts) => match parts.as_slice() {
-                [x, collection] => match (collection.domain(), collection.codomain()) {
-                    (Some(keys), Some(values)) => Some((
-                        Type::fun_like(
-                            collection,
-                            keys.clone(),
-                            Type::Tuple(vec![x.clone(), values.clone()]),
-                        ),
-                        ty.codomain().expect("a function has a codomain"),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
-    };
+/// The rule for [`Builtin::StrengthOver`]: `(𝐴 ⇒ 𝐶) ⇒ (𝐴 ⇒ 𝐶′)`, where `𝐶′` is `𝐶` over the same
+/// keys, and the same witness for a sum, holding `(𝑎, 𝑣)` for each value `𝑣` of `𝐶`. Recorded
+/// into `ctx.errors`, as `require_sub` records.
+fn check_strength_over(ty: &Type, label: &str, ctx: &mut CheckCtx) {
+    let expected = (|| {
+        let operand = ty.domain()?;
+        let (row, collection) = (operand.domain()?, operand.codomain()?);
+        let (keys, values) = (collection.domain()?, collection.codomain()?);
+        let expected = Type::fun_like(&collection, keys, Type::Tuple(vec![row, values]));
+        let recorded = ty.codomain()?.codomain()?;
+        Some((expected, recorded))
+    })();
     let Some((expected, recorded)) = expected else {
         let error = ctx.raise(InferError::TypeMismatch {
             found: Box::new(ty.clone()),
             expected: None,
-            ctx: format!("{label}: strength takes a value paired with a collection"),
+            ctx: format!("{label}: strength_over takes a function to a collection"),
         });
         ctx.errors.push(error);
         return;
     };
-    let at = || format!("{label}: strength pairs each value of its collection");
+    let at = || format!("{label}: strength_over pairs each value of its collection");
     // Both directions: the result is the collection's own shape, not a sub- or supertype.
     let _ = ctx.require_sub(&expected, &recorded, &at);
     let _ = ctx.require_sub(&recorded, &expected, &at);
@@ -1196,11 +1184,11 @@ mod tests {
         );
     }
 
-    /// `strength`'s stamped type is checked rather than trusted: its result must be the
-    /// collection's own shape, the same witness included, holding pairs. A result holding the
-    /// collection's values alone is reported.
+    /// `strength_over`'s stamped type is checked rather than trusted: its result must be the
+    /// operand's collection shape, the same witness included, holding pairs. A result holding
+    /// the collection's values alone is reported.
     #[test]
-    fn strength_is_checked_against_its_collection() {
+    fn strength_over_is_checked_against_its_collection() {
         let int = Type::Base(BaseType::Int);
         let collection = Type::sum_over(
             crate::ccl::TypeKind::Enumerated(vec![Type::UIntRange(2)]),
@@ -1213,10 +1201,10 @@ mod tests {
             keys.clone(),
             Type::Tuple(vec![int.clone(), int.clone()]),
         );
-        let domain = Type::Tuple(vec![int.clone(), collection.clone()]);
+        let operand = Type::fun(int.clone(), collection.clone());
         let errors_for = |result: Type| {
-            let mut node =
-                Expr::builtin(Builtin::Strength).with_ty(Type::fun(domain.clone(), result));
+            let mut node = Expr::builtin(Builtin::StrengthOver)
+                .with_ty(Type::fun(operand.clone(), Type::fun(int.clone(), result)));
             let mut ctx = CheckCtx::new(node.node_id());
             let _ = check_node(&mut node, &mut ctx);
             ctx.errors
