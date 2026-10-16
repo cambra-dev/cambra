@@ -287,6 +287,10 @@ eliminated by an additional set of simplifying rules:
 - **Compose identity**: `id ≫ f  ⟹  f` and `f ≫ id  ⟹  f`. The category identity laws.
 - **Product beta**: `⟨f, g⟩ ≫ .0  ⟹  f` and `⟨f, g⟩ ≫ .1  ⟹  g`. Projecting out of a
   zip selects the corresponding arm. This is the universal property of Cartesian Categories.
+  A dependent projection `.k : (x : P) ⇒ C(x)` binds the pair `x` over the chain after it, and
+  the rewrite removes that binder, so it reads `x.0` as `a ▷ f` and `x.1` as `a ▷ g` in the
+  types after it, `a` being the zip's input. It declines where the zip names no binder for its
+  input ([One binder for one value](/src/ccl/design/type-inference.md#one-binder-for-one-value)).
 - **CCC universal property**: `⟨.1, .0 ≫ curry(f)⟩ ≫ apply  ⟹  f` where
   `f : A × B → C, ∀ A B C: Type`. The universal property of Closed Cartesian Categories.
 - **Exponential beta**: `⟨g, curry(h)⟩ ≫ apply  ⟹  ⟨id, g⟩ ≫ h`. The CCC analog of
