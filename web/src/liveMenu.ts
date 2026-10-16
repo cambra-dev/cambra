@@ -15,13 +15,13 @@ import { TAG_SLOTS, tagColour } from "./liveView";
 const PANEL_ID = "live-menu-panel";
 
 /**
- * Build the menu into `parent`, and keep it in step with the store.
+ * Build the menu into `parent`, keep it in step with the store, and answer the
+ * function that detaches its listeners.
  *
  * Every render path goes through `sync`, so a change made elsewhere — a
  * clear, a new inspection — reaches the checkboxes too rather than only the
  * pane.
  */
-/** Mount the menu, and answer the function that detaches its listeners. */
 export function renderLiveMenu(parent: HTMLElement, live: LiveStore): () => void {
   const root = document.createElement("div");
   root.className = "live-menu";

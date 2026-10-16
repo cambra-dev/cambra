@@ -100,11 +100,8 @@ fn run_program(
     // `src/inspector_model/design.md`, "A reload of main is followed".
     let mut inspection = match inspect_port {
         Some(port) => {
-            let program = live
+            let (version, program) = live
                 .program(MAIN_BRANCH)
-                .expect("the process starts with `main`");
-            let version = live
-                .version(MAIN_BRANCH)
                 .expect("the process starts with `main`");
             match serve_compiled(program, src_name, port, version) {
                 Ok((channel, snapshot)) => Some(Inspection::new(
@@ -265,8 +262,7 @@ impl Inspection {
     /// version it ran (`src/inspector_model/design.md`, "A reload of main is
     /// followed").
     fn follow(&mut self, live: &LiveProgram) {
-        let (Some(version), Some(program)) = (live.version(MAIN_BRANCH), live.program(MAIN_BRANCH))
-        else {
+        let Some((version, program)) = live.program(MAIN_BRANCH) else {
             return;
         };
         if version == self.following {

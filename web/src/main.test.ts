@@ -289,6 +289,19 @@ describe("renderApp: pane visibility", () => {
     expect(measure).toHaveBeenCalled();
   });
 
+  it("destroys the CodeMirror editor when the panes are disposed", () => {
+    // CodeMirror's `window` and `document` listeners hold the view, and through
+    // it the snapshot, until `destroy` runs.
+    const destroy = vi.spyOn(EditorView.prototype, "destroy");
+    const next = document.createElement("div");
+    document.body.appendChild(next);
+    const dispose = renderApp(next, new Store(listMin));
+    expect(destroy).not.toHaveBeenCalled();
+
+    dispose();
+    expect(destroy).toHaveBeenCalledTimes(1);
+  });
+
   it("moves the last-visible marker off a hidden rightmost pane", () => {
     const panels = [...root.querySelectorAll<HTMLElement>(".panel")];
     const last = panels[panels.length - 1];

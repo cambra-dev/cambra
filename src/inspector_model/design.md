@@ -88,7 +88,7 @@ and only the source windows otherwise: nothing pulls after the run.
 
 Under `--inspect --control`, `/api/snapshot`, the source anchors and every probe frame describe the
 version `main` runs. The payload's `meta.version` and each frame's `version` carry that version's
-number from the branch table (`LiveProgram::version`), which starts at `1`. A payload no run
+number from the branch table (`LiveProgram::program`), which starts at `1`. A payload no run
 produced has `meta.version` `0`: `--inspect-only`, `--dump-snapshot`, a degraded payload, and every
 committed fixture.
 
@@ -97,6 +97,8 @@ change it renders the new version's payload into the served snapshot (`ServedSna
 re-derives each source's anchors (`source_nodes`), and stamps later frames with the new version
 (`LiveChannel::follow`), in that order. A frame stamped before the payload is installed would send a
 client to refetch the previous one.
+A request in flight finishes on the payload it started with, and the replacement does not wait for
+it, so a client that stops reading cannot stall the driver.
 
 A reload keeps some operators and rebuilds the rest. A kept operator keeps its `NodeId`. A rebuilt
 operator mints a fresh one, and the producers it replaced detach their probes at teardown, so no

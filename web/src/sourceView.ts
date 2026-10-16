@@ -369,6 +369,15 @@ export class SourceView {
     store.subscribe((resolved) => this.renderSelection(resolved));
   }
 
+  /**
+   * Destroy the editor. CodeMirror registers listeners on `window` and
+   * `document` that only `destroy` removes, and they hold the view, and through
+   * it this store's snapshot, after the view leaves the page.
+   */
+  dispose(): void {
+    this.view.destroy();
+  }
+
   /** Reflect the resolved selection as source-span highlights. */
   private renderSelection(resolved: Resolved): void {
     const spans = resolved.result.sourceSpans;

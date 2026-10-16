@@ -227,8 +227,9 @@ export function describePanes(
   // Pin the operators a position reaches, and reveal the values pane so the
   // reader sees the result of the gesture they just made.
   onInspect?: (nodeId: number, operators: readonly number[]) => void,
-  // Where a pane that subscribes to `live` leaves the function that stops it,
-  // so a redraw after a reload does not leave the previous panes listening.
+  // Where a pane leaves the function that releases what outlives its DOM: a
+  // `live` subscription, or the editor's `window` and `document` listeners. So a
+  // redraw after a reload leaves nothing of the previous panes listening.
   disposers: (() => void)[] = [],
 ): PaneDescriptor[] {
   const snap = store.snapshot;
@@ -243,6 +244,7 @@ export function describePanes(
       copyText: () => snap.source.text,
       mount: (body) => {
         const view = new SourceView(body, store, onInspect);
+        disposers.push(() => view.dispose());
         // A revealed editor has never measured against a real box, and it does
         // not reliably measure itself: CodeMirror's ResizeObserver path drops a
         // resize within 75ms of a docView update, and a selection made while

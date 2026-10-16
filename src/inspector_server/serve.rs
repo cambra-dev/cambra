@@ -74,26 +74,31 @@ struct Bodies {
 /// The `/api/snapshot` body being served, which the driver replaces when a
 /// reload installs a new version of `main`.
 ///
-/// A request holds the read side for its whole response, so it finishes against
-/// the body it started on rather than seeing parts of two. The snapshot is
-/// megabytes on a large program, and holding the guard is what spares every
-/// request a copy of it.
+/// A request takes its own reference to the current body and writes the
+/// response from it, so it finishes against the body it started on rather than
+/// seeing parts of two, and no request copies the megabytes a large program's
+/// snapshot runs to. The lock is held only to clone or swap that reference.
+/// Holding it for a whole response would let a client that stops reading block
+/// [`replace`](Self::replace), and with it the driver loop that calls it.
 #[derive(Clone)]
-pub struct ServedSnapshot(Arc<RwLock<String>>);
+pub struct ServedSnapshot(Arc<RwLock<Arc<str>>>);
 
 impl ServedSnapshot {
     fn new(snapshot: String) -> Self {
-        Self(Arc::new(RwLock::new(snapshot)))
+        Self(Arc::new(RwLock::new(snapshot.into())))
     }
 
-    /// The body being served, held for as long as the guard lives.
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, String> {
-        self.0.read().expect("served snapshot lock")
+    /// The body being served now.
+    fn read(&self) -> Arc<str> {
+        Arc::clone(&self.0.read().expect("served snapshot lock"))
     }
 
     /// Serve `compiled`, running as `main`'s version `version`, from now on.
+    // TODO: this renders the payload on the driver thread, which costs seconds
+    // in a debug build on a multi-megabyte payload. Rendering it off the
+    // driver thread needs the compiled program shared with that thread.
     pub fn replace(&self, compiled: &CompiledProgram, name: &str, version: u64) {
-        let snapshot = snapshot_json_at_version(compiled, name, version);
+        let snapshot: Arc<str> = snapshot_json_at_version(compiled, name, version).into();
         *self.0.write().expect("served snapshot lock") = snapshot;
     }
 }
@@ -271,10 +276,10 @@ fn serve_bodies(server: &tiny_http::Server, bodies: Bodies, live: &LiveServer) {
             }
             continue;
         }
-        // `bodies` and `INDEX_HTML` both outlive the loop, so a response
-        // borrows: the snapshot is megabytes on a large program and the bundle
-        // is a quarter of one, and every request would otherwise copy it. The
-        // snapshot's read guard is held until the response is written.
+        // A response borrows its body: the snapshot is megabytes on a large
+        // program and the bundle is a quarter of one, and every request would
+        // otherwise copy it. `snapshot` is this request's own reference, so a
+        // `replace` during the response neither waits for it nor changes it.
         let snapshot = bodies.snapshot.read();
         let (body, status, header) = match route(request.url()) {
             "/api/snapshot" => (snapshot.as_bytes(), 200, json_header()),
@@ -399,6 +404,56 @@ mod tests {
         assert_eq!(route("/api/live?t=1"), LIVE_PATH);
         assert_eq!(route("/api/snapshot"), "/api/snapshot");
         assert_eq!(route("/?"), "/");
+    }
+
+    /// A request holding the body it is serving does not block `replace`, and
+    /// keeps the body it took.
+    #[test]
+    fn a_body_being_served_does_not_block_replace() {
+        let mut ctx = GlobalContext::default();
+        let consumer: Box<dyn Consumer> = Box::new(|| {});
+        let Ok(compiled) = compile_program(
+            &mut ctx,
+            &SourceMap::single("prog.chl", "1 + 2\n"),
+            consumer,
+        ) else {
+            panic!("the program compiles");
+        };
+        let served = ServedSnapshot::new(snapshot_json_at_version(&compiled, "prog.chl", 1));
+        let version = |body: &str| {
+            serde_json::from_str::<Value>(body).expect("valid JSON")["meta"]["version"].clone()
+        };
+
+        // The request's thread holds the body until `replace` returns or 30
+        // seconds pass, so a `replace` that waited for it fails rather than hangs.
+        let (holding, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (held_version, released_in_time) = thread::scope(|scope| {
+            let served = &served;
+            let request = scope.spawn(move || {
+                let body = served.read();
+                holding.send(()).expect("the test is waiting");
+                let in_time = released
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .is_ok();
+                (version(&body), in_time)
+            });
+            held.recv().expect("the request took the body");
+            served.replace(&compiled, "prog.chl", 2);
+            let _ = release.send(());
+            request.join().expect("the request thread")
+        });
+
+        assert!(
+            released_in_time,
+            "`replace` waited for a request holding the body"
+        );
+        assert_eq!(held_version, 1, "the held body is the one taken");
+        assert_eq!(
+            version(&served.read()),
+            2,
+            "the next request gets the new body"
+        );
     }
 
     /// A port already in use is `serve_compiled`'s own `Err`: the bind happens
