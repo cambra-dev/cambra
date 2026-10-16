@@ -65,9 +65,13 @@ const LIVE: &[&str] = &[
     "defer_feed",
     "feed",
     "feed_in_loop",
+    "four_loop_collection_feed_in_mut_loop",
+    "four_loop_feed_in_mut_loop",
+    "four_loop_feed_writing_every_loop",
     "function_arg",
     "groupby_source",
     "keyed_write_value",
+    "loop_let_filter",
     "match_arm",
     "match_arm_in_loop",
     "match_scrutinee",
@@ -75,6 +79,8 @@ const LIVE: &[&str] = &[
     "mut_init",
     "mut_reads_itself",
     "mut_write_rhs",
+    "nested_feed_filter_in_mut_loop",
+    "nested_feed_let_filter_in_mut_loop",
     "nested_mut_over_row",
     "rec_comp_element",
     "rec_comp_filter",
@@ -237,6 +243,14 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             for i in [1, 2]:
                 out << {}
+        "#}},
+        // A filter on a `let` the loop body binds, so the guard is not the loop body itself.
+        Skeleton { name: "loop_let_filter", hole: Ty::Bool, scope: &[("i", Ty::Int), ("n", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2, 3]:
+                n = i * 10
+                if {}:
+                    out << n
         "#}},
         Skeleton { name: "comp_element", hole: Ty::Int, scope: &[("q", Ty::Int)], body: indoc! {r#"
             out = test_sink()
@@ -640,6 +654,79 @@ fn skeletons() -> Vec<Skeleton> {
                     ch << {}
             out = test_sink()
             out << sum(ch)
+        "#}},
+        Skeleton { name: "nested_feed_in_mut_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            t := 0
+            ch = defer()
+            for i in [1, 2]:
+                t += i
+                for q in [10, 20]:
+                    ch << {}
+            out = test_sink()
+            out << t + sum(ch)
+        "#}},
+        // A filter in a feed-only loop nested in a mutation loop. It may read the inner loop's
+        // variable and a binding above the mutation loop that no loop writes.
+        Skeleton { name: "nested_feed_filter_in_mut_loop", hole: Ty::Bool, scope: &[("q", Ty::Int), ("lim", Ty::Int)], body: indoc! {r#"
+            lim = 15
+            t := 0
+            ch = defer()
+            for i in [1, 2]:
+                t += i
+                for q in [10, 20]:
+                    if {}:
+                        ch << q + t
+            out = test_sink()
+            out << sum(ch)
+        "#}},
+        // The same filter reading a `let` of the feed-only loop's body.
+        Skeleton { name: "nested_feed_let_filter_in_mut_loop", hole: Ty::Bool, scope: &[("q", Ty::Int), ("n", Ty::Int), ("lim", Ty::Int)], body: indoc! {r#"
+            lim = 15
+            t := 0
+            ch = defer()
+            for i in [1, 2]:
+                t += i
+                for q in [10, 20]:
+                    n = q + 1
+                    if {}:
+                        ch << n + t
+            out = test_sink()
+            out << sum(ch)
+        "#}},
+        // Four loops deep, so the feed's key splices more than one pair of positions.
+        Skeleton { name: "four_loop_feed_in_mut_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            t := 0
+            ch = defer()
+            for i in [1, 2]:
+                t += i
+                for b in [10, 20]:
+                    for c in [100, 200]:
+                        for q in [1, 2]:
+                            ch << {}
+            out = test_sink()
+            out << t + sum(ch)
+        "#}},
+        Skeleton { name: "four_loop_feed_writing_every_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            t := 0
+            ch = defer()
+            for i in [1, 2]:
+                for b in [10, 20]:
+                    for c in [100, 200]:
+                        for q in [1, 2]:
+                            t += q
+                            ch << {}
+            out = test_sink()
+            out << t + sum(ch)
+        "#}},
+        Skeleton { name: "four_loop_collection_feed_in_mut_loop", hole: Ty::IntColl, scope: &[], body: indoc! {r#"
+            t := 0
+            out = test_sink()
+            for i in [1, 2]:
+                t += i
+                for b in [10, 20]:
+                    for c in [100, 200]:
+                        for q in [1, 2]:
+                            out << {}
         "#}},
 
         // Rows of a collection of collections, jagged or not.

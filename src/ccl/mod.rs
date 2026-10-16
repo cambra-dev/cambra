@@ -14,6 +14,7 @@ pub mod comprehension;
 pub mod content_hash;
 pub mod context;
 pub mod diff;
+pub mod feed_nest;
 pub mod infer;
 pub mod inline;
 pub mod lambda_elim;

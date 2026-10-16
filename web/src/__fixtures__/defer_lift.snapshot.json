@@ -1989,14 +1989,14 @@
           "spans": [
             {
               "file": 0,
-              "start": 85,
-              "end": 115
+              "start": 41,
+              "end": 53
             }
           ],
           "rewritten": {
             "via": "Channelize",
             "nature": "expansion",
-            "label": "channelize.cluster"
+            "label": "channelize.feed"
           },
           "type": "(Unit ⤇ Int)",
           "children": [
@@ -2053,14 +2053,14 @@
           "spans": [
             {
               "file": 0,
-              "start": 85,
-              "end": 115
+              "start": 139,
+              "end": 150
             }
           ],
           "rewritten": {
             "via": "Channelize",
             "nature": "expansion",
-            "label": "channelize.cluster"
+            "label": "channelize.feed"
           },
           "type": "([0, 3] ⤇ Int)",
           "children": [
@@ -2087,7 +2087,7 @@
           "rewritten": {
             "via": "Channelize",
             "nature": "expansion",
-            "label": "channelize.cluster"
+            "label": "channelize.feed"
           },
           "type": "([0, 3] ⤇ Int)",
           "children": []
@@ -2098,14 +2098,14 @@
           "spans": [
             {
               "file": 0,
-              "start": 85,
-              "end": 115
+              "start": 139,
+              "end": 150
             }
           ],
           "rewritten": {
             "via": "Channelize",
             "nature": "expansion",
-            "label": "channelize.cluster"
+            "label": "channelize.feed"
           },
           "type": "(Int ⇒ Int)",
           "children": [
@@ -2628,14 +2628,14 @@
           "spans": [
             {
               "file": 0,
-              "start": 85,
-              "end": 115
+              "start": 41,
+              "end": 53
             }
           ],
           "rewritten": {
             "via": "Channelize",
             "nature": "expansion",
-            "label": "channelize.cluster"
+            "label": "channelize.feed"
           },
           "type": "(Unit ⤇ Int)",
           "children": [
@@ -2692,14 +2692,14 @@
           "spans": [
             {
               "file": 0,
-              "start": 85,
-              "end": 115
+              "start": 139,
+              "end": 150
             }
           ],
           "rewritten": {
             "via": "Channelize",
             "nature": "expansion",
-            "label": "channelize.cluster"
+            "label": "channelize.feed"
           },
           "type": "([0, 3] ⤇ Int)",
           "children": [
@@ -2726,7 +2726,7 @@
           "rewritten": {
             "via": "Channelize",
             "nature": "expansion",
-            "label": "channelize.cluster"
+            "label": "channelize.feed"
           },
           "type": "([0, 3] ⤇ Int)",
           "children": []
@@ -2737,14 +2737,14 @@
           "spans": [
             {
               "file": 0,
-              "start": 85,
-              "end": 115
+              "start": 139,
+              "end": 150
             }
           ],
           "rewritten": {
             "via": "Channelize",
             "nature": "expansion",
-            "label": "channelize.cluster"
+            "label": "channelize.feed"
           },
           "type": "(Int ⇒ Int)",
           "children": [
@@ -5780,15 +5780,11 @@
           393
         ],
         [
-          12,
-          398
-        ],
-        [
-          12,
+          5,
           399
         ],
         [
-          12,
+          5,
           401
         ],
         [
@@ -5878,6 +5874,10 @@
         [
           101,
           370
+        ],
+        [
+          103,
+          398
         ]
       ]
     },

@@ -148,6 +148,15 @@ pub enum LoweringError {
         /// Human-readable description of why the construct is unsupported.
         message: String,
     },
+    /// A program the language accepts and the compiler cannot compile yet, refused here
+    /// rather than left to fail in a later phase: a compiler gap to fix, not a mistake in
+    /// the program.
+    Internal {
+        /// Span of the construct the compiler cannot compile.
+        span: Span,
+        /// What the compiler does not handle.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for LoweringError {
@@ -156,7 +165,8 @@ impl std::fmt::Display for LoweringError {
     /// diagnostic).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LoweringError::Unsupported { message, .. } => f.write_str(message),
+            LoweringError::Unsupported { message, .. }
+            | LoweringError::Internal { message, .. } => f.write_str(message),
         }
     }
 }
@@ -174,10 +184,18 @@ impl LoweringError {
         }
     }
 
+    /// Construct an `Internal` lowering error at the given span.
+    pub fn internal(span: Span, message: impl Into<String>) -> Self {
+        LoweringError::Internal {
+            span,
+            message: message.into(),
+        }
+    }
+
     /// Primary source span of this error.
     pub fn span(&self) -> Span {
         match self {
-            LoweringError::Unsupported { span, .. } => *span,
+            LoweringError::Unsupported { span, .. } | LoweringError::Internal { span, .. } => *span,
         }
     }
 }

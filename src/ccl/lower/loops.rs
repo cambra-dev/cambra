@@ -961,6 +961,134 @@ fn body_has_bare_call(body: &[Spanned<ChlStmt>]) -> bool {
     })
 }
 
+/// What a feed-only loop nested in a mutation loop holds that the compiler does not compile
+/// yet, if anything: a `yield`, a `match`, a filter that reads a name an enclosing loop binds
+/// or writes, or a source that reads such a name. The language accepts each, so the refusal is
+/// an internal error, a gap to close.
+///
+/// `source` and `body` are the lowered source and body of the loop over `iter_var`; in the
+/// body, a filter is a `Case` that feeds. A filter reads its own loop's variable, the `let`s
+/// its loop's body binds from what a filter may read, or what the scope around the mutation
+/// loop binds (`outer_bindings`), and a source only the last. A mutable variable the enclosing
+/// loops write (`written`) takes one value per position of theirs, as their variables do, so
+/// it counts as theirs even where `outer_bindings` holds it, and so does a `let` that reads
+/// one.
+fn nested_feed_only_gap(
+    body_stmts: &[Spanned<ChlStmt>],
+    iter_var: &str,
+    source: &Expr,
+    body: &Expr,
+    outer_bindings: &HashSet<String>,
+    written: &[String],
+) -> Option<&'static str> {
+    type Names = HashSet<crate::ccl::Name>;
+    if for_body_has_yield(body_stmts) {
+        return Some("a `yield` in a feed-only loop nested in a mutation loop is not compiled yet");
+    }
+    if body_has_match(body_stmts) {
+        return Some("a `match` in a feed-only loop nested in a mutation loop is not compiled yet");
+    }
+    let enclosing = |n: &crate::ccl::Name| {
+        !outer_bindings.contains(n.base()) || written.iter().any(|w| w == n.base())
+    };
+    let reads_enclosing = |e: &Expr, var: Option<&crate::ccl::Name>, lets: &Names| {
+        crate::ccl::ccl_utils::free_names(e)
+            .iter()
+            .any(|n| Some(n) != var && !lets.contains(n) && enclosing(n))
+    };
+    if reads_enclosing(source, None, &Names::new()) {
+        return Some(SOURCE_GAP);
+    }
+    fn feeds(expr: &Expr) -> bool {
+        matches!(expr.node, TypedExprNode::Feed { .. }) || expr.any_child(feeds)
+    }
+    /// The gap under `expr`, in the body of the loop over `var` whose `let`s so far that read
+    /// nothing enclosing are `lets`.
+    fn walk(
+        expr: &Expr,
+        var: &crate::ccl::Name,
+        lets: &mut Names,
+        reads_enclosing: &dyn Fn(&Expr, Option<&crate::ccl::Name>, &Names) -> bool,
+    ) -> Option<&'static str> {
+        match &expr.node {
+            TypedExprNode::Compose(elts) => match elts.split_last() {
+                Some((last, sources)) => match &last.node {
+                    TypedExprNode::Lambda { param, body } => {
+                        if sources
+                            .iter()
+                            .any(|s| reads_enclosing(s, None, &Names::new()))
+                        {
+                            return Some(SOURCE_GAP);
+                        }
+                        walk(body, &param.name, &mut Names::new(), reads_enclosing)
+                    }
+                    _ => children(expr, var, lets, reads_enclosing),
+                },
+                None => None,
+            },
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => walk(bound_expr, var, lets, reads_enclosing).or_else(|| {
+                if !reads_enclosing(bound_expr, Some(var), lets) {
+                    lets.insert(binding.name.clone());
+                }
+                walk(body, var, lets, reads_enclosing)
+            }),
+            // An `if` statement that feeds is a filter; a value's `Case` is not.
+            TypedExprNode::Case { branches, .. } if branches.iter().any(|b| feeds(&b.body)) => {
+                branches
+                    .iter()
+                    .find_map(|b| match reads_enclosing(&b.guard, Some(var), lets) {
+                        true => Some(FILTER_GAP),
+                        false => walk(&b.body, var, lets, reads_enclosing),
+                    })
+            }
+            _ => children(expr, var, lets, reads_enclosing),
+        }
+    }
+    fn children(
+        expr: &Expr,
+        var: &crate::ccl::Name,
+        lets: &mut Names,
+        reads_enclosing: &dyn Fn(&Expr, Option<&crate::ccl::Name>, &Names) -> bool,
+    ) -> Option<&'static str> {
+        let mut found = None;
+        expr.any_child(|c| {
+            found = walk(c, var, lets, reads_enclosing);
+            found.is_some()
+        });
+        found
+    }
+    const SOURCE_GAP: &str = "a loop whose source reads what an enclosing loop binds or writes, \
+                              nested in a mutation loop and only feeding, is not compiled yet";
+    const FILTER_GAP: &str = "a filter that reads what an enclosing loop binds or writes, in a \
+                              feed-only loop nested in a mutation loop, is not compiled yet";
+    walk(
+        body,
+        &crate::ccl::Name::from(iter_var),
+        &mut Names::new(),
+        &reads_enclosing,
+    )
+}
+
+/// Whether a statement list holds a `match` anywhere beneath it.
+fn body_has_match(stmts: &[Spanned<ChlStmt>]) -> bool {
+    stmts.iter().any(|stmt| match &stmt.node {
+        ChlStmt::Match { .. } => true,
+        ChlStmt::For { body, .. } => body_has_match(body),
+        ChlStmt::If {
+            branches,
+            else_body,
+        } => {
+            branches.iter().any(|b| body_has_match(&b.body))
+                || else_body.as_deref().is_some_and(body_has_match)
+        }
+        _ => false,
+    })
+}
+
 /// Lower an inner `for` in a loop body to the direct-mirror `For` node a top-level
 /// mutation loop produces.
 ///
@@ -997,11 +1125,11 @@ fn lower_nested_loop(
         ));
     }
     // A nested loop is folded as a recurrence over what it writes of the loops around it,
-    // so one that writes none of their mutable variables has nothing to fold: its body only
-    // binds, feeds, or writes variables of its own. That shape is not realized yet. A bare
-    // call may be a pass-by-reference write (`bump(y)`), which lowering runs too early to
-    // see, so a body holding one and no feed is left for `mut_elim` to classify, as a flat
-    // loop's is: it drops one whose calls turn out to write nothing.
+    // so one that writes none of their mutable variables has nothing to fold. One that feeds
+    // is a feed-only loop; one whose body only binds or writes variables of its own is not
+    // realized yet. A bare call may be a pass-by-reference write (`bump(y)`), which lowering
+    // runs too early to see, so a body holding one and no feed is left for `mut_elim` to
+    // classify, as a flat loop's is: it drops one whose calls turn out to write nothing.
     let mut writes = Vec::new();
     collect_mutation_loop_vars(
         body_stmts,
@@ -1010,16 +1138,49 @@ fn lower_nested_loop(
         &mut HashSet::new(),
     );
     let feeds = for_body_has_feed(body_stmts) || for_body_has_yield(body_stmts);
-    if writes.is_empty() && (!body_has_bare_call(body_stmts) || feeds) {
+    if writes.is_empty() && !feeds && !body_has_bare_call(body_stmts) {
         return Err(LoweringError::unsupported(
             for_span,
-            "a nested `for` loop must write a mutable variable declared outside it: one \
-             whose body only binds values, feeds, calls, or writes variables of its own is \
-             not supported yet.",
+            "a nested `for` loop must write a mutable variable declared outside it or \
+             feed: one whose body only binds values or writes variables of its own is not \
+             supported yet.",
         ));
     }
     let iter_var = extract_name_target(target, "for-loop target")?;
     let source = lower_expr(iter, ctx)?;
+    // One that feeds and writes nothing outside it is a feed-only loop, built as one is
+    // anywhere ([`tagged_for_loop`]); a `yield` in it feeds the enclosing generator.
+    if writes.is_empty() && feeds {
+        let frame_introduced = HashSet::from([iter_var.clone()]);
+        let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
+            lower_for_body_stmts(
+                body_stmts,
+                yield_defer,
+                outer_bindings,
+                frame_introduced,
+                ctx,
+            )
+        })?;
+        if let Some(gap) = nested_feed_only_gap(
+            body_stmts,
+            &iter_var,
+            &source,
+            &for_body,
+            outer_bindings,
+            acc_names,
+        ) {
+            return Err(LoweringError::internal(for_span, gap));
+        }
+        // A bare call may write an outer mutable variable by reference, which lowering
+        // cannot see and this route does not fold. `lower_for_body_stmts` refuses one in a
+        // loop body, which is what makes the route sound.
+        debug_assert!(
+            !body_has_bare_call(body_stmts),
+            "a feed-only nested loop lowered a body holding a bare call: a by-reference write \
+             in it would be dropped, since this route folds no recurrence"
+        );
+        return Ok(tagged_for_loop(iter_var, source, for_body, for_span, ctx));
+    }
     let chain = ctx.with_shadowed([iter_var.clone()], |ctx| {
         // A `yield` in the inner body feeds the generator the enclosing loop is in, one
         // value per inner iteration.
@@ -1758,12 +1919,141 @@ in guarded_let"
         ] {
             let stmts = parse_module(code);
             let err = expect_one_lowering_error(&stmts);
-            let LoweringError::Unsupported { message: msg, .. } = &err;
+            let LoweringError::Unsupported { message: msg, .. } = &err else {
+                panic!("expected an unsupported error, got {err:?}")
+            };
             assert!(
                 msg.contains("must do something"),
                 "expected a `with begin()` no-effect error, got: {msg}"
             );
         }
+    }
+
+    /// A feed-only loop nested in a mutation loop is refused with an internal error where it
+    /// holds what the compiler does not compile yet, and lowers where its filter reads only
+    /// its own variable, its body's `let`s of it, and what the scope around the mutation loop
+    /// binds and no loop writes.
+    #[rstest::rstest]
+    #[case::a_filter_reading_the_enclosing_loop(
+        indoc::indoc! {"
+            if j > i:
+                out << j
+        "},
+        Some("a filter that reads what an enclosing loop binds or writes")
+    )]
+    #[case::a_filter_reading_a_binding_of_the_enclosing_loop(
+        indoc::indoc! {"
+            if j > m:
+                out << j
+        "},
+        Some("a filter that reads what an enclosing loop binds or writes")
+    )]
+    #[case::a_filter_reading_a_mutable_variable_the_enclosing_loop_writes(
+        indoc::indoc! {"
+            if j > t:
+                out << j
+        "},
+        Some("a filter that reads what an enclosing loop binds or writes")
+    )]
+    #[case::a_filter_reading_a_binding_of_its_own_loop(
+        indoc::indoc! {"
+            n = j * 10
+            if n > 150:
+                out << j
+        "},
+        None
+    )]
+    #[case::a_filter_reading_a_binding_that_reads_the_enclosing_loop(
+        indoc::indoc! {"
+            n = i * 10
+            if j > n:
+                out << j
+        "},
+        Some("a filter that reads what an enclosing loop binds or writes")
+    )]
+    #[case::a_filter_reading_a_binding_that_reads_a_mutable_variable_the_enclosing_loop_writes(
+        indoc::indoc! {"
+            n = t * 10
+            if j > n:
+                out << j
+        "},
+        Some("a filter that reads what an enclosing loop binds or writes")
+    )]
+    #[case::a_source_reading_the_enclosing_loop(
+        indoc::indoc! {"
+            for k in [z for z in [1, 2] if z > j]:
+                out << k
+        "},
+        Some("a loop whose source reads what an enclosing loop binds or writes")
+    )]
+    #[case::a_source_reading_a_mutable_variable_the_enclosing_loop_writes(
+        indoc::indoc! {"
+            for k in [z for z in [1, 2] if z > t]:
+                out << k + j
+        "},
+        Some("a loop whose source reads what an enclosing loop binds or writes")
+    )]
+    #[case::a_match(
+        indoc::indoc! {"
+            match `some(j):
+                case `some(v):
+                    out << v
+                case `none:
+                    out << 0
+        "},
+        Some("a `match`")
+    )]
+    #[case::a_filter_reading_its_own_loop_and_the_outer_scope(
+        indoc::indoc! {"
+            if j > lim:
+                out << j + t
+        "},
+        None
+    )]
+    fn a_feed_only_loop_in_a_mutation_loop(#[case] inner: &str, #[case] gap: Option<&str>) {
+        let inner: String = inner.lines().map(|l| format!("        {l}\n")).collect();
+        let code = indoc::formatdoc! {"
+            lim = 15
+            t := 0
+            out = defer()
+            for i in [1, 2]:
+                t += i
+                m = i * 10
+                for j in [10, 20]:
+            {inner}"};
+        let stmts = parse_module(&code);
+        let lowered = lower_stmts(&stmts, &mut LoweringContext::default()).into_result();
+        match gap {
+            None => {
+                lowered.expect("lowering failed");
+            }
+            Some(gap) => {
+                let errs = lowered.expect_err("expected an internal error");
+                let [LoweringError::Internal { message, .. }] = errs.as_slice() else {
+                    panic!("expected one internal error, got {errs:?}")
+                };
+                assert!(message.contains(gap), "expected {gap:?}, got: {message}");
+            }
+        }
+    }
+
+    /// A `yield` from a feed-only loop nested in a generator's mutation loop is refused with an
+    /// internal error.
+    #[test]
+    fn a_yield_from_a_feed_only_loop_in_a_mutation_loop() {
+        let code = "\
+def g(xs):
+    t := 0
+    for i in xs:
+        t += i
+        for j in [10, 20]:
+            yield j
+g";
+        let err = expect_one_lowering_error(&parse_module(code));
+        let LoweringError::Internal { message, .. } = &err else {
+            panic!("expected an internal error, got {err:?}")
+        };
+        assert!(message.contains("a `yield`"), "got: {message}");
     }
 
     /// `store: Mut(Int, Txn) := 0` lowers as a plain `let store = 0`, registering
@@ -1773,7 +2063,9 @@ in guarded_let"
     fn test_mut_txn_bare_read_rejected() {
         let stmts = parse_module("store: Mut(Int, Txn) := 0\nstore");
         let err = expect_one_lowering_error(&stmts);
-        let LoweringError::Unsupported { message: msg, .. } = &err;
+        let LoweringError::Unsupported { message: msg, .. } = &err else {
+            panic!("expected an unsupported error, got {err:?}")
+        };
         assert!(
             msg.contains("inside a `with begin():` block"),
             "expected a `with begin():` hint for a bare transactional read, got: {msg}"
@@ -1850,7 +2142,9 @@ def bad(xs, n):
 bad";
         let stmts = parse_module(code);
         let err = expect_one_lowering_error(&stmts);
-        let LoweringError::Unsupported { message: msg, .. } = &err;
+        let LoweringError::Unsupported { message: msg, .. } = &err else {
+            panic!("expected an unsupported error, got {err:?}")
+        };
         assert!(
             msg.contains("mutation") && msg.contains("`n`") && msg.contains(":="),
             "error should call out mutation of `n` and hint at `:=`: {msg}"
@@ -1874,7 +2168,9 @@ def bad(xs, ys):
 bad";
         let stmts = parse_module(code);
         let err = expect_one_lowering_error(&stmts);
-        let LoweringError::Unsupported { message: msg, .. } = &err;
+        let LoweringError::Unsupported { message: msg, .. } = &err else {
+            panic!("expected an unsupported error, got {err:?}")
+        };
         assert!(
             msg.contains("mutation") && msg.contains("`y`"),
             "error should mention mutation of `y`: {msg}"
@@ -1893,7 +2189,9 @@ for i in [1, 2, 3]:
 x";
         let stmts = parse_module(code);
         let err = expect_one_lowering_error(&stmts);
-        let LoweringError::Unsupported { message: msg, .. } = &err;
+        let LoweringError::Unsupported { message: msg, .. } = &err else {
+            panic!("expected an unsupported error, got {err:?}")
+        };
         assert!(
             msg.contains("mutation") && msg.contains("`x`") && msg.contains(":="),
             "error should hint at `:=`: {msg}"
