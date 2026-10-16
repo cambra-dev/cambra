@@ -1,0 +1,27 @@
+tokens:
+  1:1-1:4 Def
+  1:5-1:6 Ident("f")
+  1:6-1:7 LParen
+  1:7-1:8 RParen
+  1:8-1:9 Colon
+  1:9-2:1 Newline
+  2:1-2:5 Indent
+  2:5-2:6 Ident("x")
+  2:7-2:8 Eq
+  2:9-2:12 Ident("foo")
+  2:12-2:13 LParen
+  2:13-2:14 Ident("a")
+  2:14-2:15 Comma
+  4:13-4:14 Ident("b")
+  4:14-4:14 RParen
+  4:14-5:1 Newline
+  5:5-5:6 Ident("y")
+  5:7-5:8 Eq
+  5:9-5:10 Int(2)
+  5:10-6:1 Newline
+  6:1-6:1 Dedent
+lex errors:
+  2:12-2:13 bracket is never closed
+parse errors:
+  2:12-2:13 lex error: bracket is never closed
+statements: FunctionDef

@@ -231,7 +231,9 @@ fn sample_parses() {
 /// `./ci.sh editors` never checks.
 #[test]
 fn sample_covers_every_highlight_class() {
-    let spans = highlight(FileId::ROOT, &read(SAMPLE)).expect("the sample lexes");
+    let lexed = highlight(FileId::ROOT, &read(SAMPLE));
+    assert_eq!(lexed.errors, vec![], "the sample lexes");
+    let spans = lexed.spans;
     let produced: BTreeSet<HighlightClass> = spans.iter().map(|(class, _)| *class).collect();
     let all: BTreeSet<HighlightClass> = HighlightClass::ALL.iter().copied().collect();
     assert!(
@@ -249,7 +251,8 @@ fn sample_covers_every_highlight_class() {
 /// `editors/sample-lexes-only.cambra` lexes, so `./ci.sh editors` checks it.
 #[test]
 fn lexes_only_sample_lexes() {
-    highlight(FileId::ROOT, &read(LEXES_ONLY)).expect("the lexes-only sample lexes");
+    let errors = highlight(FileId::ROOT, &read(LEXES_ONLY)).errors;
+    assert_eq!(errors, vec![], "the lexes-only sample lexes");
 }
 
 /// Every case in `editors/indent-cases.json` forms a program `parse_module`

@@ -1,0 +1,13 @@
+tokens:
+  1:1-1:6 Ident("total")
+  1:7-1:8 Eq
+  1:9-1:12 Ident("sum")
+  1:12-1:13 LParen
+  1:13-1:15 Ident("xs")
+  2:1-2:1 RParen
+  2:1-2:1 Newline
+lex errors:
+  1:12-1:13 bracket is never closed
+parse errors:
+  1:12-1:13 lex error: bracket is never closed
+statements: Assign

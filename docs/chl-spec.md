@@ -113,7 +113,7 @@ xs = [
 ]
 ```
 
-An unclosed bracket at EOF is a hard lexical error (`UnclosedBracket`).
+An open bracket the source never closes is a lexical error (`UnclosedBracket`).
 There is no explicit line-continuation backslash.
 
 ### 1.5 Identifiers
@@ -4795,8 +4795,10 @@ Sinks may observe the indices of collections passed to them if needed.
 
 ### 11.1 Lex errors
 
-The lexer reports six error kinds and stops emitting tokens at the
-first one:
+The lexer reports seven error kinds, every occurrence of each, and still emits a token stream the
+parser reads, so a lex error does not stop parsing.
+[chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md#lexer-recovery) specifies
+the stream each error leaves.
 
 - **`InvalidToken`** — no token rule matched at the position.
 - **`UnterminatedString`** — a string literal's line ended before its closing
@@ -4804,8 +4806,12 @@ first one:
 - **`DetachedBacktick`** — a backtick not immediately followed by an
   identifier ([1.8 Operators and punctuation](#18-operators-and-punctuation)).
   The span is the backtick.
-- **`UnmatchedClose`** — `)`, `]`, or `}` with no matching open.
-- **`UnclosedBracket`** — EOF reached with at least one open `(`/`[`/`{`.
+- **`UnmatchedClose`** — `)`, `]`, or `}` that matches no open bracket.
+- **`UnclosedBracket`** — an open `(`/`[`/`{` the source never closes. The span is the open
+  bracket.
+- **`MismatchedClose`** — `)`, `]`, or `}` of another kind than the innermost open bracket,
+  where that open bracket is never closed. The span is the close bracket; the error also names
+  the open bracket.
 - **`InconsistentIndent`** — dedented to a level not on the indent
   stack.
 

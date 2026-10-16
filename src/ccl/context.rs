@@ -3372,6 +3372,29 @@ y = 2 *
         );
     }
 
+    /// A lexical error does not stop parsing: the unclosed bracket on the first
+    /// line and the grammar error on the third both come back.
+    #[test]
+    fn lex_and_parse_errors_both_surface() {
+        let code = "\
+x = f(1, 2
+y = 2
+z = 3 +
+y
+";
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
+        let lex = errs
+            .iter()
+            .filter(|e| matches!(e, CompileError::Parse(ParseError::Lex(_))))
+            .count();
+        let grammar = errs
+            .iter()
+            .filter(|e| matches!(e, CompileError::Parse(ParseError::Parse(_))))
+            .count();
+        assert_eq!((lex, grammar), (1, 1), "{errs:?}");
+    }
+
     /// Lowering also recovers per top-level statement: if two distinct
     /// statements each carry a lowering-rejected construct, both errors come
     /// back instead of just the first.

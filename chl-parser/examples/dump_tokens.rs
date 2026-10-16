@@ -9,11 +9,11 @@
 //! Each line is `{"file", "start", "end", "line", "col", "class"}`. `start` and
 //! `end` are byte offsets, `end` exclusive. `line` and `col` locate `start`,
 //! both 1-based, with `col` counted in bytes as Vim's `col()` counts it.
-//! `class` is a [`HighlightClass::name`]. A file that fails to lex prints its
-//! error to stderr and makes the exit status 1.
+//! `class` is a [`HighlightClass::name`]. A file that lexes with errors also
+//! prints them to stderr, and makes the exit status 1.
 
 use chl_parser::FileId;
-use chl_parser::lexer::{HighlightClass, highlight};
+use chl_parser::lexer::{HighlightClass, Highlighted, highlight};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -30,15 +30,12 @@ fn main() -> ExitCode {
                 continue;
             }
         };
-        let spans = match highlight(FileId::ROOT, &source) {
-            Ok(spans) => spans,
-            Err(e) => {
-                let (line, col) = line_col(&source, e.span().start);
-                eprintln!("{path}:{line}:{col}: {e}");
-                failed = true;
-                continue;
-            }
-        };
+        let Highlighted { spans, errors } = highlight(FileId::ROOT, &source);
+        for e in &errors {
+            let (line, col) = line_col(&source, e.span().start);
+            eprintln!("{path}:{line}:{col}: {e}");
+            failed = true;
+        }
         let file = json_string(&path);
         for (class, span) in spans {
             let (line, col) = line_col(&source, span.start);

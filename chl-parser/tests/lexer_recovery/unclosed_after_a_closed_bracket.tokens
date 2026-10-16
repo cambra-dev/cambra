@@ -1,0 +1,24 @@
+tokens:
+  1:1-1:3 Ident("xs")
+  1:4-1:5 Eq
+  1:6-1:7 LBracket
+  2:5-2:6 Int(1)
+  2:6-2:7 Comma
+  3:1-3:2 RBracket
+  3:2-4:1 Newline
+  4:1-4:2 Ident("y")
+  4:3-4:4 Eq
+  4:5-4:6 Ident("f")
+  4:6-4:7 LParen
+  4:7-4:8 Ident("a")
+  4:8-4:8 RParen
+  4:8-5:1 Newline
+  5:1-5:2 Ident("z")
+  5:3-5:4 Eq
+  5:5-5:6 Int(2)
+  5:6-6:1 Newline
+lex errors:
+  4:6-4:7 bracket is never closed
+parse errors:
+  4:6-4:7 lex error: bracket is never closed
+statements: Assign, Assign, Assign

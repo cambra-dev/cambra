@@ -1,0 +1,18 @@
+tokens:
+  1:1-1:2 Ident("x")
+  1:3-1:4 Eq
+  1:7-1:10 Ident("foo")
+  1:10-2:1 Newline
+  2:1-2:2 Ident("y")
+  2:3-2:4 Eq
+  2:5-2:6 Backtick
+  2:6-2:10 Ident("some")
+  2:10-2:11 LParen
+  2:11-2:12 Int(1)
+  2:12-2:13 RParen
+  2:13-3:1 Newline
+lex errors:
+  1:5-1:6 backtick is not immediately followed by a tag name
+parse errors:
+  1:5-1:6 lex error: backtick is not immediately followed by a tag name
+statements: Assign, Assign

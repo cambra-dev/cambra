@@ -1,7 +1,10 @@
 //! CHL tokenization and indentation-sensitive layout.
 //!
-//! [`tokenize`] returns span-bearing tokens for the parser. Raw tokenization and
-//! tag-adjacency checks precede layout processing.
+//! [`tokenize`] returns span-bearing tokens for the parser, and every lexical
+//! error, for any input. [`raw_tokens`] runs logos and the tag-adjacency check
+//! for both [`tokenize`] and [`highlight`]; layout processing follows it in
+//! [`tokenize`]. The recovery rules are in `chl-parser/design-chl-parser.md`,
+//! "Lexer recovery".
 //!
 //! Source layout is specified in `docs/chl-spec.md`, "1.3 Indentation (off-side rule)".
 //! [`Level::Pending`] handles assignment-side blocks, whose closing `Dedent` has no
@@ -15,9 +18,9 @@ use std::fmt;
 
 /// The CHL token alphabet.
 ///
-/// All variants except [`Token::Indent`] and [`Token::Dedent`] are produced
-/// directly by logos. `Indent`/`Dedent` are synthesised by the layout pass in
-/// [`tokenize`].
+/// All variants except [`Token::Indent`], [`Token::Dedent`] and [`Token::Error`]
+/// are produced directly by logos. `Indent`/`Dedent` are synthesised by the
+/// layout pass in [`tokenize`], and `Error` by [`raw_tokens`].
 #[derive(Logos, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 // The tests enumerate every variant. A data field holds its `Default` value.
 #[cfg_attr(test, derive(strum::EnumIter))]
@@ -32,6 +35,10 @@ pub enum Token {
     Indent,
     /// Synthesised by the layout pass; never produced by logos.
     Dedent,
+    /// A maximal run of characters at which no rule matches, synthesised by
+    /// [`raw_tokens`] with one [`LexError::InvalidToken`]. No grammar rule
+    /// accepts it.
+    Error,
 
     // -- Keywords ---------------------------------------------------------
     //
@@ -242,7 +249,8 @@ pub enum Token {
     ///
     /// A literal ends on the line it starts on: neither a character nor an
     /// escaped character may be a raw newline, so a quote with no partner
-    /// before the line ends matches no rule, and [`lex_failure`] reports it as
+    /// before the line ends matches no rule. [`raw_tokens`] turns that failure
+    /// into a `String` of the rest of the line and a
     /// [`LexError::UnterminatedString`].
     #[regex(r#""([^"\\\n]|\\[^\n])*""#, |lex| process_string(lex.slice(), '"'))]
     #[regex(r#"'([^'\\\n]|\\[^\n])*'"#, |lex| process_string(lex.slice(), '\''))]
@@ -392,14 +400,14 @@ impl HighlightClass {
 }
 
 /// The highlight class of `token` read on its own, or `None` for a layout
-/// token. [`highlight`] overrides it for an identifier after `def`, a backtick
+/// token or a [`Token::Error`]. [`highlight`] overrides it for an identifier after `def`, a backtick
 /// or `@`, and for `_` after an annotation's `:`, `<:` or `=>` or a `{`. The
 /// match has no wildcard arm, so a new `Token` variant does not compile until
 /// it is classified here.
 pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
     use HighlightClass as C;
     let class = match token {
-        Token::Newline | Token::Indent | Token::Dedent => return None,
+        Token::Newline | Token::Indent | Token::Dedent | Token::Error => return None,
         Token::True | Token::False => C::Boolean,
         Token::If
         | Token::Elif
@@ -482,12 +490,20 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
     Some(class)
 }
 
+/// The highlight spans of `source`, in source order, and the errors
+/// [`raw_tokens`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Highlighted {
+    pub spans: Vec<(HighlightClass, Span)>,
+    pub errors: Vec<LexError>,
+}
+
 /// The highlight spans of `source`, in source order: one per logos token except
-/// layout tokens, a string literal split into [`HighlightClass::String`] and
-/// [`HighlightClass::Escape`] runs, and a comment split into
-/// [`HighlightClass::Comment`] and [`HighlightClass::Todo`] runs. The spans are
-/// disjoint, none contains a newline, and the bytes they leave uncovered are
-/// whitespace and newlines.
+/// layout tokens and [`Token::Error`], a string literal split into
+/// [`HighlightClass::String`] and [`HighlightClass::Escape`] runs, and a comment
+/// split into [`HighlightClass::Comment`] and [`HighlightClass::Todo`] runs. The
+/// spans are disjoint, none contains a newline, and the bytes they leave
+/// uncovered are whitespace, newlines and [`Token::Error`] runs.
 ///
 /// `_` directly after `:`, `<:`, `=>` or `{` is the type hole, so it is a
 /// [`HighlightClass::Type`]. The one `_` in that position that is a term is a
@@ -495,23 +511,18 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
 /// `` case `some(x): _ ``, which this misclassifies (`editors/README.md`,
 /// "Type annotations").
 ///
-/// It fails where [`tokenize`]'s first phase fails: at a span no token rule
-/// matches, and at a [`LexError::DetachedBacktick`]. It does not apply the
-/// off-side rule, so a layout error does not fail it.
-pub fn highlight(file: FileId, source: &str) -> Result<Vec<(HighlightClass, Span)>, LexError> {
-    let mut out = Vec::new();
-    let mut raw = Vec::new();
-    let mut lex = Token::lexer(source);
-    let mut previous: Option<Token> = None;
+/// It reports the errors of [`tokenize`]'s first phase and none of layout's: a
+/// detached backtick keeps its [`HighlightClass::VariantTag`] and an
+/// unterminated string its [`HighlightClass::String`].
+pub fn highlight(file: FileId, source: &str) -> Highlighted {
+    let raw = raw_tokens(file, source);
+    let mut spans = Vec::new();
+    let mut previous: Option<&Token> = None;
     let mut gap_start = 0;
-    while let Some(result) = lex.next() {
-        let range = lex.span();
-        let span = Span::new(file, range.start, range.end);
-        let token = result.map_err(|()| lex_failure(source, span))?;
-        raw.push((token.clone(), span));
-        push_comment(file, source, gap_start, span.start, &mut out);
+    for (token, span) in &raw.tokens {
+        push_comment(file, source, gap_start, span.start, &mut spans);
         gap_start = span.end;
-        let class = match (&previous, &token) {
+        let class = match (previous, token) {
             (Some(Token::Def), Token::Ident(_)) => Some(HighlightClass::FunctionName),
             (Some(Token::Backtick), Token::Ident(_)) => Some(HighlightClass::VariantTag),
             (Some(Token::At), Token::Ident(_)) => Some(HighlightClass::Decorator),
@@ -519,18 +530,20 @@ pub fn highlight(file: FileId, source: &str) -> Result<Vec<(HighlightClass, Span
                 Some(Token::Colon | Token::LtColon | Token::DoubleArrow | Token::LBrace),
                 Token::Ident(name),
             ) if name == "_" => Some(HighlightClass::Type),
-            _ => highlight_class(&token),
+            _ => highlight_class(token),
         };
         match class {
-            Some(HighlightClass::String) => push_string(source, span, &mut out),
-            Some(class) => out.push((class, span)),
+            Some(HighlightClass::String) => push_string(source, *span, &mut spans),
+            Some(class) => spans.push((class, *span)),
             None => {}
         }
         previous = Some(token);
     }
-    push_comment(file, source, gap_start, source.len(), &mut out);
-    check_tags(&raw)?;
-    Ok(out)
+    push_comment(file, source, gap_start, source.len(), &mut spans);
+    Highlighted {
+        spans,
+        errors: raw.errors,
+    }
 }
 
 /// The comment in the gap `source[start..end]` between two tokens, if any. A
@@ -639,6 +652,7 @@ impl fmt::Display for Token {
             Token::Newline => "newline",
             Token::Indent => "indent",
             Token::Dedent => "dedent",
+            Token::Error => "unrecognized characters",
             // Keywords
             Token::True => "True",
             Token::False => "False",
@@ -729,6 +743,13 @@ impl fmt::Display for Token {
 /// matched.
 fn process_string(raw: &str, quote: char) -> Option<String> {
     let inner = raw.strip_prefix(quote)?.strip_suffix(quote)?;
+    Some(unescape(inner))
+}
+
+/// `inner`, a string literal's text between its quotes, with its escapes
+/// processed. A backslash ending `inner` is kept: only an unterminated
+/// literal's text can end in one.
+fn unescape(inner: &str) -> String {
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
@@ -736,7 +757,10 @@ fn process_string(raw: &str, quote: char) -> Option<String> {
             out.push(c);
             continue;
         }
-        let next = chars.next()?;
+        let Some(next) = chars.next() else {
+            out.push('\\');
+            break;
+        };
         match escaped(next) {
             Some(value) => out.push(value),
             // Unknown escapes: preserve the backslash, matching `rustpython`'s
@@ -747,7 +771,7 @@ fn process_string(raw: &str, quote: char) -> Option<String> {
             }
         }
     }
-    Some(out)
+    out
 }
 
 /// The escape sequences the lexer interprets: `\c` for each `(c, value)`
@@ -772,25 +796,36 @@ fn escaped(c: char) -> Option<char> {
         .map(|&(_, value)| value)
 }
 
-/// Errors produced by [`tokenize`].
+/// The lexical errors [`tokenize`] reports. Each describes a place where the
+/// token stream differs from the source; `chl-parser/design-chl-parser.md`,
+/// "Lexer recovery" gives the stream each one leaves.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LexError {
-    /// Logos failed to match any token rule starting at this span.
+    /// A maximal run of characters at which no rule matches. The run lexes as
+    /// one [`Token::Error`].
     InvalidToken { span: Span },
     /// A string literal's opening quote has no closing quote before the end of
     /// its line. The span is the opening quote.
     UnterminatedString { span: Span },
     /// A backtick is not immediately followed by an identifier, so it begins no
-    /// variant tag. The span is the backtick.
+    /// variant tag. The span is the backtick, which [`tokenize`] drops.
     DetachedBacktick { span: Span },
-    /// A close bracket appeared with no matching open.
+    /// A close bracket that matches no open bracket. [`tokenize`] drops it.
     UnmatchedClose { span: Span },
-    /// EOF was reached with at least one open `(`, `[`, or `{` still
-    /// unclosed. The `span` points at the end of input. We surface this
-    /// explicitly because the layout pass swallows newlines inside
-    /// brackets — without this error, an unclosed bracket would silently
-    /// eat the rest of the file (no `NEWLINE`/`INDENT`/`DEDENT` emitted),
-    /// making the surrounding parser useless.
+    /// A close bracket of another kind than the open bracket at `open`, met
+    /// while that open bracket was innermost, where that open bracket is never
+    /// closed. One error covers both: either bracket can be the mistake.
+    /// [`tokenize`] closes the open bracket as for
+    /// [`LexError::UnclosedBracket`]. A close bracket that matches an outer
+    /// open bracket closes it; one that matches none is dropped.
+    MismatchedClose {
+        span: Span,
+        close: Bracket,
+        open: Span,
+        opener: Bracket,
+    },
+    /// An open bracket the source never closes. The span is the open bracket;
+    /// [`tokenize`] closes it with a zero-width closer.
     UnclosedBracket { span: Span },
     /// A dedent did not return the indent stack to a previous indent level
     /// (e.g. `0, 4, 2` — the `2` doesn't match `0` or `4`).
@@ -802,19 +837,28 @@ impl fmt::Display for LexError {
     /// itself. Without this, a caller showing the error text shows the struct
     /// dump `Debug` produces.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self {
-            LexError::InvalidToken { .. } => "unrecognized token",
+        match self {
+            LexError::InvalidToken { .. } => f.write_str("unrecognized token"),
             LexError::UnterminatedString { .. } => {
-                "string literal has no closing quote on its line"
+                f.write_str("string literal has no closing quote on its line")
             }
             LexError::DetachedBacktick { .. } => {
-                "backtick is not immediately followed by a tag name"
+                f.write_str("backtick is not immediately followed by a tag name")
             }
-            LexError::UnmatchedClose { .. } => "closing bracket with no opening bracket",
-            LexError::UnclosedBracket { .. } => "unclosed bracket at end of input",
-            LexError::InconsistentIndent { .. } => "indentation does not match any enclosing level",
-        };
-        f.write_str(message)
+            LexError::UnmatchedClose { .. } => {
+                f.write_str("closing bracket with no opening bracket")
+            }
+            LexError::UnclosedBracket { .. } => f.write_str("bracket is never closed"),
+            LexError::InconsistentIndent { .. } => {
+                f.write_str("indentation does not match any enclosing level")
+            }
+            LexError::MismatchedClose { close, opener, .. } => write!(
+                f,
+                "`{}` does not match `{}`",
+                close.close_char(),
+                opener.open_char()
+            ),
+        }
     }
 }
 
@@ -828,36 +872,162 @@ impl LexError {
             | LexError::DetachedBacktick { span }
             | LexError::UnmatchedClose { span }
             | LexError::UnclosedBracket { span }
-            | LexError::InconsistentIndent { span } => *span,
+            | LexError::InconsistentIndent { span }
+            | LexError::MismatchedClose { span, .. } => *span,
+        }
+    }
+
+    /// A second span the error concerns, with what it is: the open bracket of
+    /// a [`LexError::MismatchedClose`].
+    pub fn related(&self) -> Option<(Span, &'static str)> {
+        match self {
+            LexError::MismatchedClose { open, .. } => Some((*open, "this bracket is never closed")),
+            _ => None,
         }
     }
 }
 
-/// Every backtick in `raw` begins a variant tag: an identifier starts where
-/// the backtick ends ([`LexError::DetachedBacktick`] otherwise). The check reads
-/// the raw stream because the layout pass inserts tokens of its own.
-fn check_tags(raw: &[(Token, Span)]) -> Result<(), LexError> {
-    for (i, (tok, span)) in raw.iter().enumerate() {
+/// The kind of a bracket pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bracket {
+    /// `(` and `)`.
+    Paren,
+    /// `[` and `]`.
+    Square,
+    /// `{` and `}`.
+    Brace,
+}
+
+impl Bracket {
+    /// The kind of bracket `tok` opens, if it is an open bracket.
+    fn opened_by(tok: &Token) -> Option<Bracket> {
+        match tok {
+            Token::LParen => Some(Bracket::Paren),
+            Token::LBracket => Some(Bracket::Square),
+            Token::LBrace => Some(Bracket::Brace),
+            _ => None,
+        }
+    }
+
+    /// The kind of bracket `tok` closes, if it is a close bracket.
+    fn closed_by(tok: &Token) -> Option<Bracket> {
+        match tok {
+            Token::RParen => Some(Bracket::Paren),
+            Token::RBracket => Some(Bracket::Square),
+            Token::RBrace => Some(Bracket::Brace),
+            _ => None,
+        }
+    }
+
+    /// The token that closes this kind of bracket.
+    fn close_token(self) -> Token {
+        match self {
+            Bracket::Paren => Token::RParen,
+            Bracket::Square => Token::RBracket,
+            Bracket::Brace => Token::RBrace,
+        }
+    }
+
+    pub fn open_char(self) -> char {
+        match self {
+            Bracket::Paren => '(',
+            Bracket::Square => '[',
+            Bracket::Brace => '{',
+        }
+    }
+
+    pub fn close_char(self) -> char {
+        match self {
+            Bracket::Paren => ')',
+            Bracket::Square => ']',
+            Bracket::Brace => '}',
+        }
+    }
+}
+
+/// A token stream and the lexical errors found producing it, in source order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lexed {
+    pub tokens: Vec<(Token, Span)>,
+    pub errors: Vec<LexError>,
+}
+
+/// The logos tokens of a source, before layout, and the errors found in them.
+struct RawTokens {
+    tokens: Vec<(Token, Span)>,
+    errors: Vec<LexError>,
+    /// The indices into `tokens` of the backticks with a
+    /// [`LexError::DetachedBacktick`], ascending.
+    detached: Vec<usize>,
+}
+
+/// The logos tokens of `source`, before layout, and the errors found in them.
+/// Shared by [`tokenize`] and [`highlight`]; it never fails.
+///
+/// - A quote at which no rule matches starts a string literal with no closing
+///   quote on its line. It becomes a [`Token::String`] of the rest of the line
+///   and an [`LexError::UnterminatedString`] at the quote; the newline stays a
+///   token. Logos's failed span stops short of a backslash that ends the line,
+///   so the lexer is advanced to the line's end by hand.
+/// - Adjacent failed spans anywhere else merge into one [`Token::Error`] and
+///   one [`LexError::InvalidToken`]: logos fails one character at a time.
+/// - A backtick not immediately followed by an identifier stays in the stream
+///   with a [`LexError::DetachedBacktick`]; [`tokenize`] drops it.
+fn raw_tokens(file: FileId, source: &str) -> RawTokens {
+    let mut tokens: Vec<(Token, Span)> = Vec::new();
+    let mut errors = Vec::new();
+    let mut lex = Token::lexer(source);
+    while let Some(result) = lex.next() {
+        let range = lex.span();
+        let span = Span::new(file, range.start, range.end);
+        if let Ok(tok) = result {
+            tokens.push((tok, span));
+            continue;
+        }
+        if let Some(quote @ ('"' | '\'')) = source[span.start..].chars().next() {
+            let line_end = source[span.start..]
+                .find('\n')
+                .map_or(source.len(), |i| span.start + i);
+            lex.bump(line_end - span.end);
+            let span = Span::new(file, span.start, line_end);
+            let text = &source[span.start + quote.len_utf8()..span.end];
+            tokens.push((Token::String(unescape(text)), span));
+            errors.push(LexError::UnterminatedString {
+                span: Span::new(file, span.start, span.start + quote.len_utf8()),
+            });
+            continue;
+        }
+        match (tokens.last_mut(), errors.last_mut()) {
+            (Some((Token::Error, run)), Some(LexError::InvalidToken { span: error }))
+                if run.end == span.start =>
+            {
+                run.end = span.end;
+                error.end = span.end;
+            }
+            _ => {
+                tokens.push((Token::Error, span));
+                errors.push(LexError::InvalidToken { span });
+            }
+        }
+    }
+    let mut detached = Vec::new();
+    for (i, (tok, span)) in tokens.iter().enumerate() {
         if !matches!(tok, Token::Backtick) {
             continue;
         }
-        match raw.get(i + 1) {
+        match tokens.get(i + 1) {
             Some((Token::Ident(_), next)) if next.start == span.end => {}
-            _ => return Err(LexError::DetachedBacktick { span: *span }),
+            _ => {
+                detached.push(i);
+                errors.push(LexError::DetachedBacktick { span: *span });
+            }
         }
     }
-    Ok(())
-}
-
-/// The error for a span at which logos matched no rule. A quote starts no
-/// token but a string literal, so a failure at a quote is a literal whose line
-/// ends before its closing quote.
-fn lex_failure(source: &str, span: Span) -> LexError {
-    match source[span.start..].chars().next() {
-        Some('"' | '\'') => LexError::UnterminatedString {
-            span: Span::new(span.file, span.start, span.start + 1),
-        },
-        _ => LexError::InvalidToken { span },
+    errors.sort_by_key(|e| e.span().start);
+    RawTokens {
+        tokens,
+        errors,
+        detached,
     }
 }
 
@@ -921,147 +1091,384 @@ fn opens_block_at_line_start(tok: &Token) -> bool {
     )
 }
 
-/// Tokenise `source`, the text of `file`, into a layout-resolved token stream.
+/// Tokenise `source`, the text of `file`, into a layout-resolved token stream,
+/// with every lexical error. It never fails.
 ///
-/// Caller-visible invariants of the returned stream:
+/// Caller-visible invariants of the returned stream, for every input:
 /// - Always ends with a `Newline` followed by zero or more `Dedent`s back to
 ///   indent zero, so block-closing rules in the parser have a uniform exit.
 /// - `Indent` and `Dedent` are balanced, except that a block standing on the
 ///   right of an assignment closes with one `Dedent` more — the level it opened
 ///   for its `elif`/`else` chain, which never had a line of its own to indent
 ///   on. `block_value` in the parser consumes that one.
-/// - No `Newline` appears between a `LParen`/`LBracket`/`LBrace` and its
-///   matching closer.
-pub fn tokenize(file: FileId, source: &str) -> Result<Vec<(Token, Span)>, LexError> {
-    // Phase 1: raw logos token stream (span-attached, errors surfaced).
-    let mut raw: Vec<(Token, Span)> = Vec::new();
-    let mut lex = Token::lexer(source);
-    while let Some(result) = lex.next() {
-        let range = lex.span();
-        let span = Span::new(file, range.start, range.end);
-        match result {
-            Ok(tok) => raw.push((tok, span)),
-            Err(()) => return Err(lex_failure(source, span)),
-        }
+/// - Brackets balance: every `LParen`/`LBracket`/`LBrace` has a closer of its
+///   kind, possibly zero-width, and no `Newline` appears between them.
+/// - Each zero-width closer comes with one [`LexError::UnclosedBracket`] or
+///   [`LexError::MismatchedClose`] for its open bracket.
+///
+/// Layout runs a second time when the first run finds a bracket that stays
+/// open past the end of its statement (`chl-parser/design-chl-parser.md`,
+/// "Unclosed brackets"). Only a source with a lexical error is laid out twice.
+pub fn tokenize(file: FileId, source: &str) -> Lexed {
+    let raw = raw_tokens(file, source);
+    let tokens: Vec<(Token, Span)> = raw
+        .tokens
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| raw.detached.binary_search(i).is_err())
+        .map(|(_, token)| token)
+        .collect();
+    let first = Layout::run(file, source, &tokens, &[]);
+    let mut resync: Vec<usize>;
+    let laid = if first.resync_next.is_empty() {
+        first
+    } else {
+        debug_assert!(
+            !first.errors.is_empty(),
+            "layout asks for a second run only after reporting a lexical error"
+        );
+        resync = first.resync_next;
+        resync.sort_unstable();
+        resync.dedup();
+        Layout::run(file, source, &tokens, &resync)
+    };
+    debug_assert_eq!(
+        laid.out
+            .iter()
+            .filter(|(tok, span)| Bracket::closed_by(tok).is_some() && span.start == span.end)
+            .count(),
+        laid.errors
+            .iter()
+            .filter(|e| matches!(
+                e,
+                LexError::UnclosedBracket { .. } | LexError::MismatchedClose { .. }
+            ))
+            .count(),
+        "each zero-width closer has one UnclosedBracket or MismatchedClose, which \
+         `lex_then_grammar_errors` relies on to drop the grammar errors found at it"
+    );
+    let mut errors = raw.errors;
+    errors.extend(laid.errors);
+    errors.sort_by_key(|e| e.span().start);
+    Lexed {
+        tokens: laid.out,
+        errors,
     }
-    check_tags(&raw)?;
+}
 
-    // Phase 2: apply the off-side rule.
-    let mut out: Vec<(Token, Span)> = Vec::new();
-    let mut indent_stack: Vec<Level> = vec![Level::Fixed(0)];
-    let mut bracket_depth: usize = 0;
-    let mut at_line_start = true;
-    // Set when the line just closed opened a block from somewhere other than
-    // its first token — an assignment's block right-hand side. Carries the
-    // statement's own column, the floor for the level that block opens.
-    let mut block_value_open: Option<usize> = None;
-    // Whether the current line's first token is a block keyword, which is what
-    // separates a block that starts its line from one that does not.
-    let mut line_opens_at_first_token = false;
-    // Whether the current line's first token is `pub`, so that its second token
-    // is the statement's head.
-    let mut line_head_after_pub = false;
-    // The indent of the line the current *logical* line started on. A bracketed
-    // header spans several physical lines, and the floor a block right-hand side
-    // opens belongs to the statement, not to the physical line its `:` lands on.
-    let mut line_indent = 0usize;
+/// An open bracket on the layout pass's stack.
+struct OpenBracket {
+    kind: Bracket,
+    span: Span,
+    /// The bracket's index in the token slice layout runs over, the same in
+    /// both runs.
+    index: usize,
+    /// Whether the previous layout run asked for this bracket to close before
+    /// the first line that ends its statement.
+    resync: bool,
+    /// Whether a line that ends the bracket's statement has started since the
+    /// bracket opened ([`Layout::physical_line`]).
+    statement_ended: bool,
+    /// The first close bracket met while this bracket was innermost that did
+    /// not close it. Its error waits until this bracket closes: one
+    /// [`LexError::MismatchedClose`] if it never does, a
+    /// [`LexError::UnmatchedClose`] if it does.
+    stray: Option<(Bracket, Span)>,
+}
 
-    for (tok, span) in &raw {
+impl OpenBracket {
+    /// Whether the bracket closes before the first line that ends its
+    /// statement: the previous run asked it to, or a close bracket of another
+    /// kind already met it. A source with no lexical error has neither.
+    fn closes_early(&self) -> bool {
+        self.resync || self.stray.is_some()
+    }
+}
+
+/// One run of the off-side rule over the raw tokens.
+struct Layout<'a> {
+    file: FileId,
+    source: &'a str,
+    out: Vec<(Token, Span)>,
+    errors: Vec<LexError>,
+    indent_stack: Vec<Level>,
+    /// The open brackets, innermost last. All of them opened on the current
+    /// logical line, so `line_indent` is the indentation of each one's
+    /// statement.
+    brackets: Vec<OpenBracket>,
+    /// The indices of the open brackets this run closes before the first line
+    /// that ends their statement, ascending.
+    resync: &'a [usize],
+    /// The indices of the open brackets the next run should close that way:
+    /// each one still open at the end of input, and each one a close bracket
+    /// of its kind closed, with other brackets inside it, after a line that
+    /// ended its statement.
+    resync_next: Vec<usize>,
+    at_line_start: bool,
+    /// The first newline dropped inside brackets since the last token: the end
+    /// of the physical line before the next token's.
+    dropped_newline: Option<Span>,
+    /// Set when the line just closed opened a block from somewhere other than
+    /// its first token — an assignment's block right-hand side. Carries the
+    /// statement's own column, the floor for the level that block opens.
+    block_value_open: Option<usize>,
+    /// Whether the current line's first token is a block keyword, which is what
+    /// separates a block that starts its line from one that does not.
+    line_opens_at_first_token: bool,
+    /// Whether the current line's first token is `pub`, so that its second
+    /// token is the statement's head.
+    line_head_after_pub: bool,
+    /// The indent of the line the current logical line started on. A
+    /// bracketed header spans several physical lines, and the floor a block
+    /// right-hand side opens belongs to the statement, not to the physical
+    /// line its `:` lands on.
+    line_indent: usize,
+}
+
+impl<'a> Layout<'a> {
+    fn run(file: FileId, source: &'a str, raw: &[(Token, Span)], resync: &'a [usize]) -> Self {
+        let mut layout = Layout {
+            file,
+            source,
+            out: Vec::new(),
+            errors: Vec::new(),
+            indent_stack: vec![Level::Fixed(0)],
+            brackets: Vec::new(),
+            resync,
+            resync_next: Vec::new(),
+            at_line_start: true,
+            dropped_newline: None,
+            block_value_open: None,
+            line_opens_at_first_token: false,
+            line_head_after_pub: false,
+            line_indent: 0,
+        };
+        for (index, (tok, span)) in raw.iter().enumerate() {
+            layout.token(index, tok, *span);
+        }
+        layout.finish();
+        layout
+    }
+
+    /// The column of the token at `span`: its offset from its line's start.
+    fn column(&self, span: Span) -> (usize, usize) {
+        let line_start = self.source[..span.start]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        (line_start, span.start - line_start)
+    }
+
+    /// The token `tok` at `span`, the `index`th of the slice the run is over.
+    fn token(&mut self, index: usize, tok: &Token, span: Span) {
         // Blank lines and comment-only lines: their only token is `Newline`,
         // and we want them to not affect indentation or appear in the output.
-        if at_line_start && matches!(tok, Token::Newline) {
-            continue;
+        if self.at_line_start && matches!(tok, Token::Newline) {
+            return;
+        }
+        // A blank or comment-only line inside brackets has no token, so it
+        // starts no physical line; its `Newline` waits with the first one.
+        if !matches!(tok, Token::Newline)
+            && let Some(newline) = self.dropped_newline.take()
+        {
+            self.physical_line(tok, span, newline);
         }
 
-        if at_line_start && bracket_depth == 0 {
-            let line_start = source[..span.start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let indent = span.start - line_start;
-            line_indent = indent;
-            if let Some(min) = block_value_open.take() {
-                indent_stack.push(Level::Pending { min });
+        if self.at_line_start && self.brackets.is_empty() {
+            self.line_start(tok, span);
+        } else if self.line_head_after_pub {
+            self.line_head_after_pub = false;
+            self.line_opens_at_first_token = opens_block_at_line_start(tok);
+        }
+        self.at_line_start = false;
+
+        if let Some(kind) = Bracket::opened_by(tok) {
+            self.brackets.push(OpenBracket {
+                kind,
+                span,
+                index,
+                resync: self.resync.binary_search(&index).is_ok(),
+                statement_ended: false,
+                stray: None,
+            });
+            self.out.push((tok.clone(), span));
+        } else if let Some(kind) = Bracket::closed_by(tok) {
+            self.close(kind, span);
+        } else if matches!(tok, Token::Newline) {
+            if self.brackets.is_empty() {
+                self.end_line(span);
+            } else {
+                // Newlines inside brackets are swallowed (implicit
+                // continuation); the first one is kept in case the next
+                // line closes the brackets early.
+                self.dropped_newline.get_or_insert(span);
             }
-            let current = indent_stack
+        } else {
+            self.out.push((tok.clone(), span));
+        }
+    }
+    /// The first token of a logical line: open or close indentation levels.
+    fn line_start(&mut self, tok: &Token, span: Span) {
+        let (line_start, indent) = self.column(span);
+        self.line_indent = indent;
+        if let Some(min) = self.block_value_open.take() {
+            self.indent_stack.push(Level::Pending { min });
+        }
+        let current = self
+            .indent_stack
+            .last()
+            .expect("stack invariant: non-empty")
+            .floor();
+        if indent > current {
+            self.indent_stack.push(Level::Fixed(indent));
+            self.out
+                .push((Token::Indent, Span::new(self.file, line_start, span.start)));
+        } else {
+            while self
+                .indent_stack
                 .last()
                 .expect("stack invariant: non-empty")
-                .floor();
-            if indent > current {
-                indent_stack.push(Level::Fixed(indent));
-                out.push((Token::Indent, Span::new(file, line_start, span.start)));
-            } else {
-                while indent_stack
-                    .last()
-                    .expect("stack invariant: non-empty")
-                    .closes_at(indent)
-                {
-                    indent_stack.pop();
-                    out.push((Token::Dedent, Span::new(file, span.start, span.start)));
-                }
-                match indent_stack.last_mut().expect("stack invariant: non-empty") {
-                    Level::Fixed(c) if *c == indent => {}
-                    // The first line to land in a block right-hand side's level
-                    // fixes its column for the rest of the chain.
-                    slot @ Level::Pending { .. } => *slot = Level::Fixed(indent),
-                    Level::Fixed(_) => return Err(LexError::InconsistentIndent { span: *span }),
-                }
+                .closes_at(indent)
+            {
+                self.indent_stack.pop();
+                self.out
+                    .push((Token::Dedent, Span::new(self.file, span.start, span.start)));
             }
-            // `pub` prefixes the statement it marks, so the token after it is
-            // the one that says whether the statement opens a block itself.
-            line_head_after_pub = matches!(tok, Token::Pub);
-            line_opens_at_first_token = opens_block_at_line_start(tok);
-        } else if line_head_after_pub {
-            line_head_after_pub = false;
-            line_opens_at_first_token = opens_block_at_line_start(tok);
+            match self
+                .indent_stack
+                .last_mut()
+                .expect("stack invariant: non-empty")
+            {
+                Level::Fixed(c) if *c == indent => {}
+                // The first line to land in a block right-hand side's level
+                // fixes its column for the rest of the chain.
+                slot @ Level::Pending { .. } => *slot = Level::Fixed(indent),
+                // The line continues the deepest level left of it.
+                Level::Fixed(_) => self.errors.push(LexError::InconsistentIndent { span }),
+            }
         }
-        at_line_start = false;
+        // `pub` prefixes the statement it marks, so the token after it is
+        // the one that says whether the statement opens a block itself.
+        self.line_head_after_pub = matches!(tok, Token::Pub);
+        self.line_opens_at_first_token = opens_block_at_line_start(tok);
+    }
 
-        match tok {
-            Token::LParen | Token::LBracket | Token::LBrace => {
-                bracket_depth += 1;
-                out.push((tok.clone(), *span));
+    /// A `Newline` outside brackets: the logical line ends.
+    fn end_line(&mut self, span: Span) {
+        // A `:` last on the line opens a block. Where the line did not start
+        // with the keyword that opened it, the block is an assignment's
+        // right-hand side and continues at a column of its own rather than at
+        // the statement's.
+        if matches!(self.out.last(), Some((Token::Colon, _))) && !self.line_opens_at_first_token {
+            self.block_value_open = Some(self.line_indent);
+        }
+        self.out.push((Token::Newline, span));
+        self.at_line_start = true;
+    }
+
+    /// The token `tok` at `span` starts a physical line inside brackets, after
+    /// `newline`. The line ends the brackets' statement when it starts at or
+    /// left of the statement's indentation with a token other than a close
+    /// bracket. A close bracket on its own line, flush with its statement, ends
+    /// the bracketed list and not the statement.
+    ///
+    /// A line that ends the statement sets every open bracket's
+    /// `statement_ended`, and closes each innermost bracket that
+    /// [`OpenBracket::closes_early`]. Closing them all ends the logical line at
+    /// `newline`.
+    fn physical_line(&mut self, tok: &Token, span: Span, newline: Span) {
+        let (_, indent) = self.column(span);
+        if indent > self.line_indent || Bracket::closed_by(tok).is_some() {
+            return;
+        }
+        // This loop sets the flag on every open bracket, and a push adds one
+        // without it on top, so the brackets with it set are a bottom segment
+        // of the stack and the walk stops at the first one.
+        for bracket in self.brackets.iter_mut().rev() {
+            if bracket.statement_ended {
+                break;
             }
-            Token::RParen | Token::RBracket | Token::RBrace => {
-                bracket_depth = bracket_depth
-                    .checked_sub(1)
-                    .ok_or(LexError::UnmatchedClose { span: *span })?;
-                out.push((tok.clone(), *span));
-            }
-            Token::Newline => {
-                if bracket_depth == 0 {
-                    // A `:` last on the line opens a block. Where the line did
-                    // not start with the keyword that opened it, the block is
-                    // an assignment's right-hand side and continues at a column
-                    // of its own rather than at the statement's.
-                    if matches!(out.last(), Some((Token::Colon, _))) && !line_opens_at_first_token {
-                        block_value_open = Some(line_indent);
-                    }
-                    out.push((tok.clone(), *span));
-                    at_line_start = true;
-                }
-                // Newlines inside brackets are swallowed (implicit continuation).
-            }
-            _ => out.push((tok.clone(), *span)),
+            bracket.statement_ended = true;
+        }
+        let at = Span::new(self.file, newline.start, newline.start);
+        while self.brackets.last().is_some_and(OpenBracket::closes_early) {
+            let bracket = self.brackets.pop().expect("checked non-empty");
+            self.out.push((bracket.kind.close_token(), at));
+            self.never_closed(bracket);
+        }
+        if self.brackets.is_empty() {
+            self.end_line(newline);
         }
     }
 
-    // Tail: surface unclosed brackets explicitly. Without this, the
-    // bracket-depth tracker would have swallowed every `NEWLINE` after the
-    // unclosed `(`/`[`/`{`, leaving the parser unable to see statement
-    // boundaries for the rest of the file.
-    let end_span = Span::new(file, source.len(), source.len());
-    if bracket_depth > 0 {
-        return Err(LexError::UnclosedBracket { span: end_span });
-    }
-    // Synthesise a trailing newline if needed, then dedent all the way
-    // back to zero. Parsers can rely on this uniform shape.
-    if !matches!(out.last(), Some((Token::Newline, _))) {
-        out.push((Token::Newline, end_span));
-    }
-    while indent_stack.len() > 1 {
-        indent_stack.pop();
-        out.push((Token::Dedent, end_span));
+    /// A close bracket of kind `kind`: it closes the innermost open bracket of
+    /// its kind, after zero-width closers for the brackets inside that one, or
+    /// it is dropped.
+    fn close(&mut self, kind: Bracket, span: Span) {
+        let Some(i) = self.brackets.iter().rposition(|b| b.kind == kind) else {
+            match self.brackets.last_mut() {
+                Some(OpenBracket {
+                    stray: slot @ None, ..
+                }) => *slot = Some((kind, span)),
+                _ => self.errors.push(LexError::UnmatchedClose { span }),
+            }
+            return;
+        };
+        let at = Span::new(self.file, span.start, span.start);
+        let mut inner: Vec<OpenBracket> = self.brackets.drain(i + 1..).rev().collect();
+        // The close bracket met the innermost of them and does not close it.
+        if let Some(innermost) = inner.first_mut() {
+            innermost.stray.get_or_insert((kind, span));
+        }
+        let closes_others = !inner.is_empty();
+        for bracket in inner {
+            self.out.push((bracket.kind.close_token(), at));
+            self.never_closed(bracket);
+        }
+        let matched = self.brackets.pop().expect("rposition found it");
+        // The source most likely left this bracket open at the line that ended
+        // its statement, and the close bracket belongs to one inside it.
+        if closes_others && matched.statement_ended {
+            self.resync_next.push(matched.index);
+        }
+        if let Some((_, stray)) = matched.stray {
+            self.errors.push(LexError::UnmatchedClose { span: stray });
+        }
+        self.out.push((kind.close_token(), span));
     }
 
-    Ok(out)
+    /// The error for `bracket`, closed by a zero-width closer.
+    fn never_closed(&mut self, bracket: OpenBracket) {
+        self.errors.push(match bracket.stray {
+            Some((close, span)) => LexError::MismatchedClose {
+                span,
+                close,
+                open: bracket.span,
+                opener: bracket.kind,
+            },
+            None => LexError::UnclosedBracket { span: bracket.span },
+        });
+    }
+
+    /// End of input: close what is still open, end the last line, and dedent
+    /// back to column zero.
+    fn finish(&mut self) {
+        let end_span = Span::new(self.file, self.source.len(), self.source.len());
+        while let Some(open) = self.brackets.pop() {
+            self.out.push((open.kind.close_token(), end_span));
+            self.resync_next.push(open.index);
+            self.never_closed(open);
+        }
+        // Synthesise a trailing newline if needed, then dedent all the way
+        // back to zero. Parsers can rely on this uniform shape.
+        if !matches!(self.out.last(), Some((Token::Newline, _))) {
+            self.out.push((Token::Newline, end_span));
+        }
+        while self.indent_stack.len() > 1 {
+            self.indent_stack.pop();
+            self.out.push((Token::Dedent, end_span));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1071,13 +1478,26 @@ mod tests {
     use indoc::indoc;
 
     /// Tokenise `src` as the root of its own one-file map.
-    fn lex(src: &str) -> Result<Vec<(Token, Span)>, LexError> {
+    fn lex(src: &str) -> Lexed {
         tokenize(FileId::ROOT, src)
     }
 
-    /// Strip spans for assertion brevity; spans are exercised separately.
+    /// The tokens of `src`, which lexes with no error. Spans are stripped for
+    /// assertion brevity; they are exercised separately.
     fn tokens(src: &str) -> Vec<Token> {
-        lex(src).unwrap().into_iter().map(|(t, _)| t).collect()
+        let lexed = lex(src);
+        assert_eq!(lexed.errors, vec![], "{src:?} lexes with errors");
+        lexed.tokens.into_iter().map(|(t, _)| t).collect()
+    }
+
+    /// The tokens of `src` whatever its errors, spans stripped.
+    fn recovered(src: &str) -> Vec<Token> {
+        lex(src).tokens.into_iter().map(|(t, _)| t).collect()
+    }
+
+    /// The errors `src` lexes with.
+    fn errors(src: &str) -> Vec<LexError> {
+        lex(src).errors
     }
 
     #[test]
@@ -1101,21 +1521,32 @@ mod tests {
 
     /// A raw newline ends the line a string literal must close on, in either
     /// quote style and after a backslash alike. The error points at the
-    /// opening quote, not at the line break.
+    /// opening quote, not at the line break, and the literal holds the rest of
+    /// its line.
     #[test]
     fn a_newline_inside_a_string_is_an_error() {
         let file = FileId::ROOT;
-        for source in [
-            "x = \"ab\ncd\"",
-            "x = 'ab\ncd'",
-            "x = \"ab\\\ncd\"",
-            "x = \"ab",
+        for (source, text) in [
+            ("x = \"ab\ncd", "ab"),
+            ("x = 'ab\ncd", "ab"),
+            ("x = \"ab\\\ncd", "ab\\"),
+            ("x = \"ab", "ab"),
         ] {
             assert_eq!(
-                lex(source),
-                Err(LexError::UnterminatedString {
+                errors(source),
+                vec![LexError::UnterminatedString {
                     span: Span::new(file, 4, 5)
-                }),
+                }],
+                "{source:?}"
+            );
+            assert_eq!(
+                recovered(source)[..4],
+                [
+                    Token::Ident("x".into()),
+                    Token::Eq,
+                    Token::String(text.to_string()),
+                    Token::Newline,
+                ],
                 "{source:?}"
             );
         }
@@ -1135,11 +1566,15 @@ mod tests {
             ("x = `if", 4),
         ] {
             assert_eq!(
-                lex(source),
-                Err(LexError::DetachedBacktick {
+                errors(source),
+                vec![LexError::DetachedBacktick {
                     span: Span::new(file, start, start + 1)
-                }),
+                }],
                 "{source:?}"
+            );
+            assert!(
+                !recovered(source).contains(&Token::Backtick),
+                "{source:?} keeps its detached backtick"
             );
         }
         assert_eq!(
@@ -1152,7 +1587,7 @@ mod tests {
                 Token::Newline,
             ]
         );
-        assert!(lex("x = `some(1)").is_ok());
+        assert_eq!(errors("x = `some(1)"), vec![]);
     }
 
     /// The escape `\n` is two source characters on one line, so it still lexes
@@ -1178,12 +1613,13 @@ mod tests {
         let file = FileId::ROOT;
         for (source, start) in [("a / b", 2), ("a % b", 2), ("~a", 0)] {
             assert_eq!(
-                lex(source),
-                Err(LexError::InvalidToken {
+                errors(source),
+                vec![LexError::InvalidToken {
                     span: Span::new(file, start, start + 1)
-                }),
+                }],
                 "{source:?}"
             );
+            assert!(recovered(source).contains(&Token::Error), "{source:?}");
         }
         assert_eq!(
             tokens("a >> b"),
@@ -1226,11 +1662,7 @@ mod tests {
     fn highlight_splits_escapes_and_recovers_comments() {
         use HighlightClass as C;
         let source = "def f(x): # c\n    `t <- \"a\\nb\\d\"";
-        let spans: Vec<(C, &str)> = highlight(FileId::ROOT, source)
-            .unwrap()
-            .into_iter()
-            .map(|(class, span)| (class, &source[span.start..span.end]))
-            .collect();
+        let spans = highlighted(source);
         assert_eq!(
             spans,
             vec![
@@ -1254,8 +1686,9 @@ mod tests {
 
     /// The spans of `source` with their text, for assertions.
     fn highlighted(source: &str) -> Vec<(HighlightClass, &str)> {
-        highlight(FileId::ROOT, source)
-            .unwrap()
+        let Highlighted { spans, errors } = highlight(FileId::ROOT, source);
+        assert_eq!(errors, vec![], "{source:?} lexes with errors");
+        spans
             .into_iter()
             .map(|(class, span)| (class, &source[span.start..span.end]))
             .collect()
@@ -1338,15 +1771,31 @@ mod tests {
     }
 
     /// A backtick with no tag name directly after it is the same error from
-    /// `highlight` as from `tokenize`.
+    /// `highlight` as from `tokenize`, and keeps its class.
     #[test]
     fn highlight_reports_a_detached_backtick() {
+        let source = "x = ` foo";
+        let Highlighted { spans, errors } = highlight(FileId::ROOT, source);
+        assert_eq!(errors, self::errors(source));
         assert_eq!(
-            highlight(FileId::ROOT, "x = ` foo"),
-            Err(LexError::DetachedBacktick {
-                span: Span::new(FileId::ROOT, 4, 5)
-            })
+            spans[2],
+            (HighlightClass::VariantTag, Span::new(FileId::ROOT, 4, 5))
         );
+    }
+
+    /// A run of characters no rule matches is one error and no span; the
+    /// spans around it keep their classes.
+    #[test]
+    fn highlight_leaves_unrecognized_characters_unclassified() {
+        use HighlightClass as C;
+        let source = "a $$ b";
+        let Highlighted { spans, errors } = highlight(FileId::ROOT, source);
+        assert_eq!(errors, self::errors(source));
+        let classes: Vec<(C, &str)> = spans
+            .into_iter()
+            .map(|(class, span)| (class, &source[span.start..span.end]))
+            .collect();
+        assert_eq!(classes, vec![(C::Identifier, "a"), (C::Identifier, "b")]);
     }
 
     /// [`HighlightClass::ALL`] lists every variant, in declaration order.
@@ -1360,14 +1809,15 @@ mod tests {
     }
 
     /// A string with no closing quote on its line is the same error from
-    /// `highlight` as from `tokenize`.
+    /// `highlight` as from `tokenize`, and is a string to the end of its line.
     #[test]
     fn highlight_reports_an_unterminated_string() {
+        let source = "x = 'ab\ncd";
+        let Highlighted { spans, errors } = highlight(FileId::ROOT, source);
+        assert_eq!(errors, self::errors(source));
         assert_eq!(
-            highlight(FileId::ROOT, "x = 'ab\ncd'"),
-            Err(LexError::UnterminatedString {
-                span: Span::new(FileId::ROOT, 4, 5)
-            })
+            spans[2],
+            (HighlightClass::String, Span::new(FileId::ROOT, 4, 7))
         );
     }
 
@@ -1429,7 +1879,8 @@ mod tests {
     fn editor_sample_contains_every_token_spelling() {
         use strum::IntoEnumIterator;
         let sample = editor_sample();
-        let spans = highlight(FileId::ROOT, &sample).expect("the sample lexes");
+        let Highlighted { spans, errors } = highlight(FileId::ROOT, &sample);
+        assert_eq!(errors, vec![], "the sample lexes");
         let present: std::collections::BTreeSet<&str> = spans
             .iter()
             .map(|(_, span)| &sample[span.start..span.end])
@@ -1449,7 +1900,8 @@ mod tests {
     #[test]
     fn editor_sample_contains_every_escape() {
         let sample = editor_sample();
-        let spans = highlight(FileId::ROOT, &sample).expect("the sample lexes");
+        let Highlighted { spans, errors } = highlight(FileId::ROOT, &sample);
+        assert_eq!(errors, vec![], "the sample lexes");
         // An escape run holds one or more two-character escapes, `\` and the
         // escaped character.
         let present: std::collections::BTreeSet<char> = spans
@@ -1710,7 +2162,7 @@ mod tests {
         );
         // A later continuation at a different column no longer fits.
         assert!(matches!(
-            lex(indoc! {"
+            errors(indoc! {"
                 x = if c:
                         1
                     elif d:
@@ -1718,8 +2170,8 @@ mod tests {
                   else:
                         3
                 y
-            "}),
-            Err(LexError::InconsistentIndent { .. })
+            "})[..],
+            [LexError::InconsistentIndent { .. }]
         ));
     }
 
@@ -1790,6 +2242,9 @@ mod tests {
     fn inconsistent_indent_is_an_error() {
         // Indent to 4, dedent to 2 (which is neither 4 nor 0) — error.
         let src = "def f():\n    x\n  y\n";
-        assert!(matches!(lex(src), Err(LexError::InconsistentIndent { .. })));
+        assert!(matches!(
+            errors(src)[..],
+            [LexError::InconsistentIndent { .. }]
+        ));
     }
 }
