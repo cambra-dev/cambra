@@ -21,6 +21,8 @@ license = "Apache-2.0"
 description = "A programming language with a dependently-typed functional core and streaming-dataflow execution"
 repository = "https://github.com/cambra-dev/cambra"
 readme = "README.md"
+# The `[[test]]` targets below list every integration test binary.
+autotests = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -94,6 +96,21 @@ debug-assertions = false
 overflow-checks = false
 # No one runs a debugger on this tree: 11G with full debug info, 2.7G without.
 debug = false
+
+# The integration tests are one binary (`tests/it/main.rs`) plus the few that cannot
+# share a process, listed below; autodiscovery (`autotests = false`) would also build
+# every `tests/*.rs` as its own binary.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+# `alloc_probe` installs a counting `#[global_allocator]`, and an allocator is
+# per-process, so each binary that measures allocations is its own target.
+[[test]]
+name = "dead_code_specialization_cost"
+path = "tests/dead_code_specialization_cost.rs"
+[[test]]
+name = "scope_walk_allocations"
+path = "tests/scope_walk_allocations.rs"
 # The differential oracle belongs to the formal gate, not to the suite. It runs
 # `formal/.lake/build/bin/subverdict` and refuses to skip under CI, so a job
 # that runs the suite would need the whole Lean toolchain to check something
@@ -102,4 +119,5 @@ debug = false
 # `ci_formal` runs, still names it explicitly and builds it.
 [[test]]
 name = "differential_oracle"
+path = "tests/differential_oracle.rs"
 test = false

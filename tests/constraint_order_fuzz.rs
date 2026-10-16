@@ -13,7 +13,7 @@
 //! Seeded and dependency-free, so a failure replays: `CAMBRA_FUZZ_SEED` picks
 //! the seed and `CAMBRA_FUZZ_N` the number of constraint sets.
 
-mod type_gen;
+use crate::type_gen;
 
 use std::rc::Rc;
 

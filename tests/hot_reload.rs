@@ -144,5 +144,4 @@ mod cases;
 mod fanout_lag;
 #[path = "hot_reload/harness.rs"]
 mod harness;
-#[path = "support/serving.rs"]
-mod serving;
+use crate::serving;

@@ -15,7 +15,7 @@
 //!
 //! This is a single test binary split into themed modules. Shared fixtures
 //! (`run_pipeline`, `check_tile`, `make_int_list`, …) live in [`helpers`] and
-//! are reached from each themed module via `use crate::helpers::*;`.
+//! are reached from each themed module via `use self::helpers::*;`.
 
 // The crate root of a test binary resolves child modules relative to the
 // directory containing this file (`tests/`), not a `compilation_pipeline/`
@@ -68,5 +68,4 @@ mod type_parameters;
 mod variants;
 
 // Shared with the other test binaries that catch a panic, so it lives under `tests/support/`.
-#[path = "support/panic_message.rs"]
-mod panic_message;
+use crate::panic_message;

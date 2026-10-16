@@ -1,6 +1,6 @@
 //! What the cases drive: the programs, and the plumbing that runs one.
 //!
-//! Split from [`cases`](crate::cases) because it is the larger half — a running
+//! Split from [`cases`](super::cases) because it is the larger half — a running
 //! program, a control port and a swap are more setup than any one case's
 //! assertion. See `tests/hot_reload.rs` for what the programs are and what a
 //! reload may do to them.
@@ -18,7 +18,7 @@ use cambra::{
     },
 };
 
-use crate::serving::{raw_http, reserve_test_port};
+use super::serving::{raw_http, reserve_test_port};
 /// Run a `stdin`-sourced program under `--control`, feeding it `before`, then
 /// swapping it for `reloaded` and feeding it `after`.
 ///
@@ -956,7 +956,7 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
         live_program::{LiveProgram, MAIN_BRANCH},
     };
 
-    use crate::serving::no_main;
+    use super::serving::no_main;
 
     let mut ctx = GlobalContext::default();
     let source = Rc::new(RefCell::new(TestDataSource::new(

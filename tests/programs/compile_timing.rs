@@ -3,7 +3,7 @@
 //! Commands and measured intervals are specified in `docs/demo-programs.md`, "Timing a compile".
 //!
 //! These ignored tests report compilation outcomes, not correctness assertions.
-//! [`SERIAL`] protects the process-wide panic hook and keeps tables from interleaving.
+//! [`SERIAL`] keeps tables from interleaving.
 //! Measured products remain alive until their durations have been recorded. A fresh source
 //! provider allocates a port per compile, including both calls of a post-inference measurement.
 
@@ -25,7 +25,7 @@ use cambra::{
     interpreter::Consumer,
 };
 
-use super::{panic_message::panic_message, serving::reserve_test_port};
+use super::{panic_message::panic_message, quiet_panics, serving::reserve_test_port};
 
 /// Repetition count, the same switch the library's `provenance_pane_perf`
 /// reads: one knob for every ignored perf driver. Spelled here rather than
@@ -39,10 +39,8 @@ const ONLY_ENV: &str = "CAMBRA_TIMING_ONLY";
 /// Held for the length of a driver's run, so two drivers selected by one
 /// `--ignored` never overlap.
 ///
-/// Two things here are process-wide and neither is re-entrant: the panic hook
-/// [`time_gallery`] mutes around the repetitions, and the stderr the table is
-/// written to. Concurrent drivers would restore each other's hook mid-run and
-/// interleave their rows.
+/// The stderr the table is written to is process-wide, and concurrent drivers
+/// would interleave their rows.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// What one program's repetitions produced.
@@ -162,18 +160,17 @@ fn time_gallery<T>(
 
     // A rejected program panics inside a phase or returns errors; either way
     // the row carries the reason, so the hook only adds a backtrace between two
-    // table rows. Muting it is process-wide, which `SERIAL` is what makes safe.
-    let hook = panic::take_hook();
-    panic::set_hook(Box::new(|_| {}));
-    let mut rows: Vec<(String, usize, Outcome)> = programs
-        .iter()
-        .map(|(label, path)| {
-            let source = fs::read_to_string(path).expect("read program source");
-            let outcome = best_compile(label, &source, reps, &mut compile);
-            (label.clone(), source.lines().count(), outcome)
-        })
-        .collect();
-    panic::set_hook(hook);
+    // table rows.
+    let mut rows: Vec<(String, usize, Outcome)> = quiet_panics::quietly(|| {
+        programs
+            .iter()
+            .map(|(label, path)| {
+                let source = fs::read_to_string(path).expect("read program source");
+                let outcome = best_compile(label, &source, reps, &mut compile);
+                (label.clone(), source.lines().count(), outcome)
+            })
+            .collect()
+    });
 
     // Slowest first: the table is read top-down for what compilation costs, and
     // the rejected programs have no cost to rank, so they sit at the bottom.

@@ -78,14 +78,14 @@ containing `{PORT}` receives a freshly reserved port for each compile.
 Run a selected driver in release mode to avoid measuring debug-only checks:
 
 ```bash
-cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
+cargo test --release --test it -- --ignored --nocapture gallery_compile_timing
 ```
 
 To select one program and change the repetition count:
 
 ```bash
 CAMBRA_TIMING_ONLY=storefront CAMBRA_PERF_REPS=9 \
-  cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
+  cargo test --release --test it -- --ignored --nocapture gallery_compile_timing
 ```
 
 Successful rows are sorted slowest first. A returned compiler error or caught panic stops that
@@ -97,8 +97,8 @@ To compare provenance recording costs, alternate configurations on the same mach
 
 ```bash
 for i in 1 2 3; do
-  CAMBRA_PROVENANCE=1 cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
-  CAMBRA_PROVENANCE=0 cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
+  CAMBRA_PROVENANCE=1 cargo test --release --test it -- --ignored --nocapture gallery_compile_timing
+  CAMBRA_PROVENANCE=0 cargo test --release --test it -- --ignored --nocapture gallery_compile_timing
 done
 ```
 
@@ -108,7 +108,8 @@ This changes provenance recording, not every snapshot or operator-graph cost.
 
 Add a source and `mod.rs` under `tests/programs/<name>/`, register its module in
 [tests/programs/main.rs](../tests/programs/main.rs), and add a row to [Programs](#programs).
-Registration makes its tests part of `cargo test --test programs`.
+Registration makes its tests part of the `it` test binary, under `programs::`:
+`cargo test --test it programs::`.
 
 [common/mod.rs](../tests/programs/common/mod.rs) owns pipeline and subprocess helpers,
 including `expect_scalar`, `expect_compile_error` and `expect_scalar_currently_buggy`.
