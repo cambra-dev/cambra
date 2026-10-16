@@ -624,3 +624,62 @@ fn a_collection_fed_from_inside_a_loop_does_not_compile() {
         "the span is the element `x`: {rendered}"
     );
 }
+
+/// A correlated inner comprehension over a source that delivers in two batches. Its key
+/// collection is the source's own iteration (`try_map_domain_of_iteration`), so the keys must
+/// arrive with the data: neither delivery is the whole answer, and the two together are.
+#[test]
+fn a_correlated_loop_over_a_streaming_source_waits_for_both_deliveries() {
+    let mut ctx = GlobalContext::default();
+    let src = Rc::new(RefCell::new(TestDataSource::new(
+        "nums",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(src.clone());
+    let sink = ctx.register_test_sink("out");
+
+    src.borrow_mut()
+        .add_data(&[(Value::UInt(0), Value::Int(1))]);
+    src.borrow_mut()
+        .set_yield_predicate(Predicate::at_or_below(Value::UInt(0)));
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let code = indoc! {r#"
+        out = test_sink()
+        for i in [1, 2]:
+            out << sum([x + i for x in nums()])
+    "#};
+    let program = match compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer) {
+        Ok(p) => p,
+        Err(e) => panic!("compile failed: {e:?}"),
+    };
+
+    for _ in 0..200 {
+        ctx.scheduler().check_for_notifications();
+    }
+    assert_eq!(
+        sink.value(),
+        Err(SinkReadError::Incomplete),
+        "a sum over a source that may still deliver is not complete"
+    );
+
+    src.borrow_mut()
+        .add_data(&[(Value::UInt(1), Value::Int(2))]);
+    src.borrow_mut().set_yield_predicate(Predicate::True);
+    let mut completed = false;
+    for _ in 0..400 {
+        ctx.scheduler().check_for_notifications();
+        if program.done.try_recv().is_ok() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "the program did not complete within 400 pulls");
+
+    // i = 1: (1 + 1) + (2 + 1) = 5; i = 2: (1 + 2) + (2 + 2) = 7.
+    assert_eq!(
+        format!("{}", sink.value().expect("a value")),
+        "Function [ 5, 7 ]"
+    );
+}

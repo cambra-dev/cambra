@@ -286,32 +286,38 @@ fn try_string_add_to_concat(expr: &mut Expr) -> bool {
 /// Returns `true` if any rule fired.
 fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool {
     let mut changed = false;
-    // Always-safe rules — neither discard sub-expressions nor relocate
-    // iteration sources, so they fire regardless of any `iterate` present.
-    // (They also preserve the subtree's iteration set, so `contains_iteration`
-    // — computed before they run — is still accurate at the guard below.)
-    changed |= ruled("simplify.compose_identity", expr, try_compose_identity);
-    changed |= ruled("simplify.flatten_compose", expr, try_flatten_compose);
-    changed |= ruled(
+    // Always-safe rules: none drops or relocates an `iterate` source, so each fires whether or
+    // not the subtree holds one. Each preserves the subtree's iteration set, which keeps
+    // `contains_iteration`, computed before they run, accurate at the guard below. A rule here
+    // drops a sub-expression only after checking that it holds no iteration, as
+    // `try_map_domain_of_iteration` does for the steps after its source.
+    changed |= ruled_keeping_iteration("simplify.compose_identity", expr, try_compose_identity);
+    changed |= ruled_keeping_iteration("simplify.flatten_compose", expr, try_flatten_compose);
+    changed |= ruled_keeping_iteration(
         "simplify.string_add_to_concat",
         expr,
         try_string_add_to_concat,
     );
-    changed |= ruled("simplify.partial_lookup", expr, try_partial_lookup);
-    changed |= ruled(
+    changed |= ruled_keeping_iteration("simplify.partial_lookup", expr, try_partial_lookup);
+    changed |= ruled_keeping_iteration(
         "simplify.compose_constant_function",
         expr,
         try_compose_constant_function,
     );
-    changed |= ruled(
+    changed |= ruled_keeping_iteration(
         "simplify.let_morphism_inline",
         expr,
         try_let_morphism_inline,
     );
-    changed |= ruled(
+    changed |= ruled_keeping_iteration(
         "simplify.compose_with_strength",
         expr,
         try_compose_with_strength,
+    );
+    changed |= ruled_keeping_iteration(
+        "simplify.map_domain_of_iteration",
+        expr,
+        try_map_domain_of_iteration,
     );
 
     // Rules that may discard or restructure sub-expressions.  Equationally
@@ -381,6 +387,53 @@ fn ruled(
         crate::ccl::provenance::Nature::Machinery,
     );
     rule(expr)
+}
+
+/// [`ruled`] for an always-safe rule: a rule that fires leaves the `iterate` sources inside
+/// `expr` exactly as they were.
+///
+/// The comment on [`apply_simplification_rules`] states this for the group. Each rule checks
+/// it for itself, so a rule added to the group without the check would strand an iteration
+/// without a test noticing. With debug assertions on, this makes the statement a check every
+/// test runs. A rule that duplicates, drops or re-mints an `iterate` node changes the set of
+/// ids and fails it.
+fn ruled_keeping_iteration(
+    label: crate::ccl::provenance::RewriteLabel,
+    expr: &mut Expr,
+    rule: impl FnOnce(&mut Expr) -> bool,
+) -> bool {
+    let before = if cfg!(debug_assertions) {
+        iteration_ids(expr)
+    } else {
+        Vec::new()
+    };
+    let fired = ruled(label, expr, rule);
+    if fired {
+        debug_assert_eq!(
+            iteration_ids(expr),
+            before,
+            "an always-safe rule must leave the `iterate` sources of the subtree it rewrote \
+             as they were: {label}",
+        );
+    }
+    fired
+}
+
+/// The ids of the `iterate` sources inside `expr`, in sorted order.
+fn iteration_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
+    fn collect(expr: &Expr, ids: &mut Vec<crate::ccl::provenance::NodeId>) {
+        if is_iteration(expr) {
+            ids.push(expr.node_id());
+        }
+        expr.any_child(|child| {
+            collect(child, ids);
+            false
+        });
+    }
+    let mut ids = Vec::new();
+    collect(expr, &mut ids);
+    ids.sort_unstable();
+    ids
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +854,153 @@ fn narrows_domain_irrecoverably(expr: &Expr) -> bool {
         TypedExprNode::Builtin(Builtin::VariantProject(_)) => true,
         _ => false,
     }
+}
+
+/// Whether the morphism `expr`, composed after a collection, leaves that collection's keys as
+/// they were: no key is dropped and none is added.
+///
+/// An allow-list: a form it does not name is a form the caller leaves alone. It recurses
+/// through compose elements and `zip` arms, because a `zip` inner-joins its arms on their keys
+/// (`src/interpreter/design-operators.md`, "Tile Operators", on a scrutinee `Case`'s outer-binder
+/// arms): one arm that narrows narrows the pair, as `⟨id, s ≫ variant_project(c)⟩ ▷ zip` holds
+/// only the positions tagged `c`. The literals, projections and lookups it accepts are
+/// functions of the key that hold at every key the collection has;
+/// [`builtin_preserves_domain`] decides every builtin, with no wildcard, so a new builtin needs
+/// a decision here.
+fn preserves_domain(expr: &Expr) -> bool {
+    match &expr.node {
+        TypedExprNode::Compose(steps) => steps.iter().all(preserves_domain),
+        TypedExprNode::Tuple(items) => items.iter().all(preserves_domain),
+        TypedExprNode::Record(fields) => fields.iter().all(|(_, item)| preserves_domain(item)),
+        TypedExprNode::Apply { function, argument } => match &function.node {
+            // `𝑐 ▷ const` returns `𝑐` at every key, and `ℎ ▷ map` maps the values and keeps
+            // the keys; neither reads the keys, so what the argument holds is not their concern.
+            TypedExprNode::Builtin(Builtin::Const | Builtin::Map) => true,
+            TypedExprNode::Builtin(builtin) => {
+                builtin_preserves_domain(builtin) && preserves_domain(argument)
+            }
+            _ => false,
+        },
+        TypedExprNode::Builtin(builtin) => builtin_preserves_domain(builtin),
+        TypedExprNode::Proj(_)
+        | TypedExprNode::Lit(_)
+        | TypedExprNode::List(_)
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Var(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether the builtin, as a step after a collection or as the function a step applies, keeps
+/// the collection's keys. `true` is a pointwise function of the value or a zip's own arms
+/// (`Zip` recurses through [`preserves_domain`] at its argument); anything that narrows,
+/// joins, regroups, aggregates, reads a store, or whose effect on the keys is not stated here
+/// is `false`.
+fn builtin_preserves_domain(builtin: &Builtin) -> bool {
+    match builtin {
+        Builtin::Id
+        | Builtin::Box
+        | Builtin::Const
+        | Builtin::Zip
+        | Builtin::Apply
+        | Builtin::Map
+        | Builtin::BinOp(_)
+        | Builtin::Neg
+        | Builtin::NotFn
+        | Builtin::VariantWrap(_)
+        | Builtin::VariantIs(_)
+        | Builtin::CollectionContains => true,
+        Builtin::EmptyMap
+        | Builtin::Curry
+        | Builtin::CurryOver
+        | Builtin::Strength
+        | Builtin::MapDomain
+        | Builtin::Compose
+        | Builtin::Converse
+        | Builtin::Uncurry
+        | Builtin::Restrict
+        | Builtin::Iterate
+        | Builtin::PermuteDomain
+        | Builtin::FlattenDomain
+        | Builtin::FilterValues
+        | Builtin::Sum
+        | Builtin::Max
+        | Builtin::Min
+        | Builtin::Drain
+        | Builtin::Sole
+        | Builtin::FinalOrDefault
+        | Builtin::GetPrevSeq
+        | Builtin::GetPrevTxn
+        | Builtin::BeginTxn
+        | Builtin::ByCommitTime
+        | Builtin::AwaitFinal
+        | Builtin::Copair
+        | Builtin::AsOfRead
+        | Builtin::FinalRead
+        | Builtin::AsOf
+        | Builtin::VariantProject(_)
+        | Builtin::LookupChecked
+        | Builtin::Insert => false,
+    }
+}
+
+/// Whether `expr` holds an `iterate` source anywhere inside it.
+fn holds_iteration(expr: &Expr) -> bool {
+    is_iteration(expr) || expr.any_child(holds_iteration)
+}
+
+/// Map-domain of an iteration: `(iterate ≫ h) ▷ map_domain  ⟹  iterate`.
+///
+/// `iterate` is the identity collection on its extent, `D ⤇ D`, so its values already are its
+/// keys and `map_domain`, which replaces each value by its key, returns it unchanged. A
+/// morphism `h` composed after it changes the values and nothing else, and `map_domain`
+/// discards the values, so the steps after the source are dead too.
+///
+/// Guards, each of which the rewrite needs to stay sound:
+///
+/// * **The keys survive `h`.** Every step after the source must satisfy [`preserves_domain`].
+///   The rewrite is type-preserving, so the source's own type then equals the type of the
+///   whole term, which is asserted rather than tested: a restriction or a refinement on the
+///   chain is a step `preserves_domain` declines.
+/// * **Nothing iterates in the dropped steps.** Dropping an `iterate` strands its iteration
+///   (see [`is_iteration`]). The source itself is kept, so this rule belongs with the always-safe
+///   rules and checks its own tail instead of relying on `contains_iteration`.
+fn try_map_domain_of_iteration(expr: &mut Expr) -> bool {
+    let TypedExprNode::Apply { argument, function } = &expr.node else {
+        return false;
+    };
+    if !is_builtin(function, Builtin::MapDomain) {
+        return false;
+    }
+    let (source, tail): (&Expr, &[Expr]) = match &argument.node {
+        TypedExprNode::Compose(elts) => match elts.split_first() {
+            Some((first, rest)) => (first, rest),
+            None => return false,
+        },
+        _ => (&**argument, &[]),
+    };
+    if !is_iteration(source)
+        || tail
+            .iter()
+            .any(|step| !preserves_domain(step) || holds_iteration(step))
+    {
+        return false;
+    }
+    debug_assert!(
+        source.ty == expr.ty,
+        "the steps after an iteration preserve its keys, so the iteration has the type of the \
+         whole term: {} vs {}",
+        source.ty,
+        expr.ty,
+    );
+    let TypedExprNode::Apply { argument, .. } = take(expr).node else {
+        unreachable!("matched as an application above")
+    };
+    *expr = match argument.node {
+        TypedExprNode::Compose(mut elts) => elts.swap_remove(0),
+        _ => *argument,
+    };
+    true
 }
 
 /// Const reduce: `f ≫ g ▷ const  ⟹  g ▷ const` (with updated type)
@@ -1859,6 +2059,123 @@ mod tests {
             guarded,
             "const-reduce must not drop the iterate source"
         );
+    }
+
+    // ---- `try_map_domain_of_iteration` ------------------------------------------------
+
+    /// The positions `[0, 3)`, the domain every collection below ranges over.
+    fn positions() -> Type {
+        Type::UIntRange(3)
+    }
+
+    /// `iterate`, the identity collection on the positions: `[0, 3) ⤇ [0, 3)`.
+    fn iteration() -> Expr {
+        make_iterate(trivially_true_predicate(positions()))
+    }
+
+    /// A morphism out of the positions standing in for a list literal, `[0, 3) ⇒ Int`.
+    fn values_by_position(name: &str) -> Expr {
+        var(name).with_ty(fun_ty(positions(), int_ty()))
+    }
+
+    /// `argument ▷ map_domain`, typed as the identity collection on `domain`.
+    fn map_domain_of(argument: Expr, domain: Type) -> Expr {
+        let result = Type::data_fun(domain.clone(), domain);
+        let function =
+            Expr::builtin(Builtin::MapDomain).with_ty(fun_ty(argument.ty.clone(), result.clone()));
+        Expr::apply(argument, function).with_ty(result)
+    }
+
+    /// `iterate ≫ h`, a collection led by the iteration.
+    fn iteration_then(steps: Vec<Expr>) -> Expr {
+        let mut chain = vec![iteration()];
+        chain.extend(steps);
+        let values = chain.last().unwrap().ty.codomain().unwrap();
+        Expr::compose(chain).with_ty(Type::data_fun(positions(), values))
+    }
+
+    /// A bare iteration is its own key collection: its values already are its keys.
+    #[test]
+    fn map_domain_of_an_iteration_is_the_iteration() {
+        let term = map_domain_of(iteration(), positions());
+        assert_eq!(simplify(term), iteration());
+    }
+
+    /// The values the steps after an iteration compute are discarded by `map_domain`, so they
+    /// go too, however many there are and whatever they read: `(iterate ≫ [1, 2, 3]) ▷
+    /// map_domain` is `iterate`.
+    #[test]
+    fn map_domain_drops_every_value_step_after_the_iteration() {
+        let doubled = || var("double").with_ty(fun_ty(int_ty(), int_ty()));
+        let source = || {
+            Expr::new(TypedExprNode::Source("testsource1".into()))
+                .with_ty(fun_ty(positions(), int_ty()))
+        };
+        let tails = [
+            vec![values_by_position("xs")],
+            vec![values_by_position("xs"), doubled()],
+            vec![source()],
+        ];
+        for tail in tails {
+            let term = map_domain_of(iteration_then(tail.clone()), positions());
+            assert_eq!(simplify(term), iteration(), "tail: {tail:?}");
+        }
+    }
+
+    /// A step that narrows the domain changes the keys, so `map_domain` of the chain is not
+    /// the iteration's: the surviving keys are what it answers.
+    #[test]
+    fn map_domain_keeps_a_chain_that_narrows_the_domain() {
+        let keep = apply_primitive(
+            var("p").with_ty(fun_ty(int_ty(), Type::Base(BaseType::Bool))),
+            Builtin::FilterValues,
+            fun_ty(int_ty(), int_ty()),
+        );
+        let term = map_domain_of(
+            iteration_then(vec![values_by_position("xs"), keep]),
+            positions(),
+        );
+        assert_eq!(simplify(term.clone()), term);
+    }
+
+    /// A step that iterates is a source of its own; dropping it strands the iteration.
+    #[test]
+    fn map_domain_keeps_a_chain_with_a_second_iteration() {
+        let term = map_domain_of(iteration_then(vec![iteration()]), positions());
+        assert_eq!(simplify(term.clone()), term);
+    }
+
+    /// A collection that is not iteration-led has no known relation between values and keys.
+    /// This one has the identity's type, `[0, 3) ⤇ [0, 3)`, and could hold the permutation
+    /// `[2, 0, 1]`, whose `map_domain` is `[0, 1, 2]` and not itself: only the iteration check
+    /// keeps it.
+    #[test]
+    fn map_domain_of_a_collection_typed_like_the_identity_is_left_alone() {
+        let permutation = var("xs").with_ty(Type::data_fun(positions(), positions()));
+        let term = map_domain_of(permutation, positions());
+        assert_eq!(simplify(term.clone()), term);
+    }
+
+    /// `zip` inner-joins its arms on their keys, so an arm that narrows narrows the pair:
+    /// `iterate ≫ ⟨id, variant_project(c)⟩ ▷ zip` holds only the positions tagged `c`, and
+    /// `map_domain` of it is not the iteration. `preserves_domain` looks through the zip.
+    #[test]
+    fn map_domain_keeps_a_chain_whose_zip_arm_narrows() {
+        let identity = id().with_ty(fun_ty(int_ty(), int_ty()));
+        let tagged = Expr::builtin(Builtin::VariantProject(FieldKey::Index(0)))
+            .with_ty(fun_ty(int_ty(), int_ty()));
+        let pair = zip_pair(identity, tagged, &FunKind::Compute);
+        let term = map_domain_of(iteration_then(vec![pair]), positions());
+        assert_eq!(simplify(term.clone()), term);
+    }
+
+    /// The same zip with arms that keep the keys is dropped like any other value step.
+    #[test]
+    fn map_domain_drops_a_chain_whose_zip_arms_keep_the_keys() {
+        let identity = id().with_ty(fun_ty(int_ty(), int_ty()));
+        let pair = zip_pair(identity.clone(), identity, &FunKind::Compute);
+        let term = map_domain_of(iteration_then(vec![pair]), positions());
+        assert_eq!(simplify(term), iteration());
     }
 
     /// A `restrict` filter is protected *transitively*: it is always applied
