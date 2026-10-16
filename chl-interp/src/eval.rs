@@ -600,16 +600,16 @@ impl Interp {
                     }
                     return Ok(None);
                 }
-                let v = self.eval(value)?;
-                self.bind(name, Slot::Val(v));
+                let slot = self.binding_of(value)?;
+                self.bind(name, slot);
                 Ok(None)
             }
 
             // The annotation states a type; nothing here reads types.
             Stmt::AnnAssign { target, value, .. } => {
                 let name = name_of(target)?;
-                let v = self.eval(value)?;
-                self.bind(name, Slot::Val(v));
+                let slot = self.binding_of(value)?;
+                self.bind(name, slot);
                 Ok(None)
             }
 
@@ -1782,7 +1782,7 @@ impl Interp {
                 };
                 Slot::Mut(cell)
             } else {
-                Slot::Val(self.eval(arg)?)
+                self.binding_of(arg)?
             };
             params.push((param.clone(), slot));
         }
@@ -1814,6 +1814,30 @@ impl Interp {
         self.scopes = caller;
         self.speculating_at_call = caller_speculating_at;
         outcome
+    }
+
+    /// What a binding of `e` holds: the function `e` denotes, or else its value.
+    ///
+    /// A function is held by its binding rather than as a [`Value`]. A name or a parameter
+    /// bound to one is called by name, as a `def` is, and no value observes it. A lambda
+    /// denotes a function value (`docs/chl-spec.md`, "3.10 Lambda") and captures its free names
+    /// where it is written, as a `def` does (`docs/chl-spec.md`, "4.1 `def` — function
+    /// definition"). A name bound to a function denotes that function.
+    fn binding_of(&mut self, e: &Spanned<Expr>) -> Result<Slot, Error> {
+        match &e.node {
+            Expr::Lambda { params, body } => Ok(Slot::Fn(Rc::new(Function {
+                params: params.iter().map(|p| (p.name.to_string(), false)).collect(),
+                body: vec![Spanned {
+                    span: body.span,
+                    node: Stmt::Expr((**body).clone()),
+                }],
+                env: self.captured_scopes(),
+            }))),
+            Expr::Name(n) if let Some(Slot::Fn(function)) = self.slot(n) => {
+                Ok(Slot::Fn(function.clone()))
+            }
+            _ => Ok(Slot::Val(self.eval(e)?)),
+        }
     }
 
     /// Apply a lambda written at the call site.

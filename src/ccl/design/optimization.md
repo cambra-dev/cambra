@@ -78,8 +78,13 @@ entail the parameter's refinements. The pass asserts when it cannot establish th
 since dropping the parameter without preserving its precondition would be unsound. For
 multi-argument UDFs lowered with a tuple parameter, substitution can leave
 `Apply(Tuple(...), Proj(Index(i)))`; `simplify::try_literal_tuple_projection` folds that shape
-later. Finally, the pass revisits the reduced result, so newly exposed `Let` bindings can undergo
-the same inlining checks.
+later. That rule reads only a bare tuple, so beta-reduction floats the `Let` chain wrapping an
+argument out around the reduced body: `(let 𝑥 = 𝑒 in 𝑣) ▷ (λ 𝑝 → body)` reduces to
+`let 𝑥 = 𝑒 in body[𝑝 := 𝑣]`. A-normalization produces that chain whenever a call passes a
+compound argument, as in ``ap(\x -> x * 10, `some(2))``. Substituting the whole chain at each
+read of `𝑝` would leave a function component inside an unfolded tuple, which op-conversion
+compiles as a tuple element with no input. Finally, the pass revisits the reduced result, so newly
+exposed `Let` bindings can undergo the same inlining checks.
 
 ### Moving a binding into a list element
 

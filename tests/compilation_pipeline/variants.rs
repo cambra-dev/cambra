@@ -677,6 +677,105 @@ fn test_match_on_parameter(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
+/// A function-typed parameter applied to a payload taken out of a `match` on another
+/// parameter.
+///
+/// A-normalization names a compound argument (here the constructor `` `some(2) ``), so the
+/// call's argument tuple reaches inlining as ``let __anf = `some(2) in (λ x → x * 10,
+/// __anf)``. Beta reduction floats that `Let` out of the argument, leaving each read of a
+/// parameter a projection of the bare tuple, which `simplify` folds. Substituting the whole
+/// argument instead leaves `f` as `(let … in (λ x → x * 10, __anf)).0`, and op-conversion
+/// compiles the lambda inside that tuple as a value: `zip requires an input operator`. The
+/// `match` is not needed for that: the last case applies `f` directly.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    indoc! {r"
+        def ap(f, b):
+            match b:
+                case `some(v):
+                    f(v)
+                case `none:
+                    0
+
+        ap(\x -> x * 10, `some(2))
+    "},
+    Value::Int(20)
+)]
+// The other arm, taken.
+#[case(
+    indoc! {r"
+        def ap(f, b):
+            match b:
+                case `some(v):
+                    f(v)
+                case `none:
+                    0
+
+        ap(\x -> x * 10, `none)
+    "},
+    Value::Int(0)
+)]
+// The payload bound by an assignment from the `match`, then applied.
+#[case(
+    indoc! {r"
+        def ap(f, b):
+            y = match b:
+                case `some(v):
+                    v
+                case `none:
+                    0
+            f(y)
+
+        ap(\x -> x * 10, `some(2))
+    "},
+    Value::Int(20)
+)]
+// A named `def` passed for `f` instead of a lambda.
+#[case(
+    indoc! {r"
+        def times_ten(x):
+            x * 10
+
+        def ap(f, b):
+            match b:
+                case `some(v):
+                    f(v)
+                case `none:
+                    0
+
+        ap(times_ten, `some(2))
+    "},
+    Value::Int(20)
+)]
+// `f` read twice, beside a compound argument nested in a constructor.
+#[case(
+    indoc! {r"
+        def ap(f, b):
+            match b:
+                case `some(v):
+                    f(f(v))
+                case `none:
+                    0
+
+        ap(\x -> x + 1, `some(2 + 3))
+    "},
+    Value::Int(7)
+)]
+// No `match`: the same `Let`-wrapped argument tuple, with `f` applied directly.
+#[case(
+    indoc! {r"
+        def ap(f, x):
+            f(x)
+
+        ap(\x -> x * 10, 2 + 3)
+    "},
+    Value::Int(50)
+)]
+fn test_function_parameter_applied_to_a_match_payload(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 /// A default arm on a `match` over a **field** of a parameter, whose value carries a
 /// tag no arm names.
 ///
