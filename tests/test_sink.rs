@@ -74,17 +74,19 @@ fn a_scalar_feed_is_one_contribution_keyed_by_unit() {
     assert_eq!(format!("{}", v.expect("a value")), "Function [ () -> 3 ]");
 }
 
-/// A collection fed at a site that does not iterate lands flat: the channel takes the
-/// collection's own keys (`keys: UInts([0, 1, 2])`) rather than one unit-keyed contribution
-/// holding it, `() -> [2, 4, 6]`, which `docs/chl-spec.md`, "3.7 Feed operator `<<`" makes
-/// it. Pinned as observed.
+/// A collection fed at a site that does not iterate is one contribution keyed by unit, holding
+/// the collection (`docs/chl-spec.md`, "3.7 Feed operator `<<`"), not the collection's own
+/// keys.
 #[test]
-fn a_collection_feed_lands_flat_rather_than_nesting() {
+fn a_collection_feed_is_one_contribution_keyed_by_unit() {
     let v = observe_one(indoc! {r#"
         out = test_sink()
         out << [x * 2 for x in [1, 2, 3]]
     "#});
-    assert_eq!(format!("{}", v.expect("a value")), "Function [ 2, 4, 6 ]");
+    assert_eq!(
+        format!("{}", v.expect("a value")),
+        "Function [ () -> Function [ 2, 4, 6 ] ]"
+    );
 }
 
 #[test]
@@ -119,7 +121,7 @@ fn an_unwritten_sink_says_so_rather_than_answering_empty() {
     assert_eq!(observed[0], Err(SinkReadError::NothingWritten));
     assert_eq!(
         format!("{}", observed[1].clone().expect("a value")),
-        "Function [  ]"
+        "Function [ () -> Function [  ] ]"
     );
 }
 
@@ -133,7 +135,7 @@ fn a_filtered_collection_keeps_the_keys_of_its_survivors() {
     "#});
     assert_eq!(
         format!("{}", v.expect("a value")),
-        "Function [ u2 -> 3, u3 -> 4 ]"
+        "Function [ () -> Function [ u2 -> 3, u3 -> 4 ] ]"
     );
 }
 
@@ -162,7 +164,7 @@ fn a_collection_of_records() {
     "#});
     assert_eq!(
         format!("{}", v.expect("a value")),
-        "Function [ {id: 1, sq: 1}, {id: 2, sq: 4} ]"
+        "Function [ () -> Function [ {id: 1, sq: 1}, {id: 2, sq: 4} ] ]"
     );
 }
 
@@ -190,7 +192,7 @@ fn a_collection_of_collections() {
     "#});
     assert_eq!(
         format!("{}", v.expect("a value")),
-        "Function [ Function [ 1, 2 ], Function [ 2, 4 ] ]"
+        "Function [ () -> Function [ Function [ 1, 2 ], Function [ 2, 4 ] ] ]"
     );
 }
 
@@ -201,7 +203,10 @@ fn an_empty_collection_is_a_value() {
         out = test_sink()
         out << [x for x in [1, 2] if x > 5]
     "#});
-    assert_eq!(format!("{}", v.expect("a value")), "Function [  ]");
+    assert_eq!(
+        format!("{}", v.expect("a value")),
+        "Function [ () -> Function [  ] ]"
+    );
 }
 
 #[test]
@@ -438,7 +443,13 @@ fn a_collection_keyed_by_strings() {
         out = test_sink()
         out << [sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]
     "#});
-    let Value::Function(bindings) = v.expect("a value") else {
+    let Value::Function(fed) = v.expect("a value") else {
+        panic!("a collection");
+    };
+    let [contribution] = fed.as_slice() else {
+        panic!("one contribution, keyed by unit");
+    };
+    let Value::Function(bindings) = &contribution.output else {
         panic!("a collection");
     };
     // Compared as a set of bindings: the group order is not part of the value.
