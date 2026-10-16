@@ -75,26 +75,30 @@ pub enum AtomKey {
     /// parameter").
     Param(Rc<crate::ccl::ty::TypeParam>),
     /// A dependent tuple, which matches only a tuple equal to it up to binder
-    /// names ([`DepTupleAtom`]). The lattice's product slot keys fields with
+    /// names ([`ClosedAtom`]). The lattice's product slot keys fields with
     /// nothing in scope between them, so a telescope rides as a whole; comparing
     /// its components under subtyping is not represented here.
-    DepTuple(DepTupleAtom),
+    DepTuple(ClosedAtom),
+    /// A witness projected through a sum's value ([`Type::WitnessProjection`]), which
+    /// matches only a projection equal to it: one witness, named the same way.
+    Projection(ClosedAtom),
 }
 
-/// A [`Type::DepTuple`] as an [`AtomKey`]: equal to another exactly when the two are `==` up to
-/// binder names, which [`Type::without_pi_names`] strips (references are indices, so nothing
-/// else names a binder). `==` on a refinement ignores its predicate's type slots, so the atom
+/// A type born after inference, held whole as an [`AtomKey`]: a [`Type::DepTuple`] or a
+/// [`Type::WitnessProjection`]. It holds no inference variable, so the solver has nothing to
+/// relate inside it, and it matches only a type `==` to it up to binder names, which
+/// [`Type::without_pi_names`] strips (references are indices, so nothing else names a binder). `==` on a refinement ignores its predicate's type slots, so the atom
 /// is keyed by `Type`'s own `Hash`, which ignores them too, and not by the content hash, which
 /// reads them. Two unequal tuples sharing a hash are told apart by `rank`, the order in which
 /// this thread first met each ([`rank_among_equal_hashes`]).
 #[derive(Debug, Clone)]
-pub struct DepTupleAtom {
+pub struct ClosedAtom {
     hash: u64,
     rank: usize,
     ty: Rc<Type>,
 }
 
-impl DepTupleAtom {
+impl ClosedAtom {
     fn new(ty: &Type) -> Self {
         // `Hash` and `==` read a reference between components as an index, so a component
         // naming an earlier one by name would compare by its spelling, and two α-equivalent
@@ -116,8 +120,7 @@ impl DepTupleAtom {
         // tuple holding no variable.
         debug_assert!(
             !crate::ccl::subst::type_contains_infer(ty),
-            "a dependent tuple is born after inference and the solver holds it as a closed \
-             atom: {ty}"
+            "a closed atom is born after inference and the solver holds it whole: {ty}"
         );
         let unnamed = ty.without_pi_names();
         let hash = {
@@ -126,7 +129,7 @@ impl DepTupleAtom {
             unnamed.hash(&mut hasher);
             hasher.finish()
         };
-        DepTupleAtom {
+        ClosedAtom {
             hash,
             rank: rank_among_equal_hashes(hash, unnamed),
             ty: Rc::new(ty.clone()),
@@ -157,23 +160,23 @@ fn rank_among_equal_hashes(hash: u64, unnamed: Type) -> usize {
     })
 }
 
-impl PartialEq for DepTupleAtom {
+impl PartialEq for ClosedAtom {
     fn eq(&self, other: &Self) -> bool {
         (self.hash, self.rank) == (other.hash, other.rank)
     }
 }
-impl Eq for DepTupleAtom {}
-impl PartialOrd for DepTupleAtom {
+impl Eq for ClosedAtom {}
+impl PartialOrd for ClosedAtom {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for DepTupleAtom {
+impl Ord for ClosedAtom {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (self.hash, self.rank).cmp(&(other.hash, other.rank))
     }
 }
-impl std::hash::Hash for DepTupleAtom {
+impl std::hash::Hash for ClosedAtom {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.hash.hash(state)
     }
@@ -192,7 +195,8 @@ impl AtomKey {
             Type::WitnessRef(b) => Some(AtomKey::Witness(*b)),
             Type::ChanDom(n, l) => Some(AtomKey::ChanDom(n.clone(), *l)),
             Type::Param(p) => Some(AtomKey::Param(Rc::clone(p))),
-            Type::DepTuple(_) => Some(AtomKey::DepTuple(DepTupleAtom::new(ty))),
+            Type::DepTuple(_) => Some(AtomKey::DepTuple(ClosedAtom::new(ty))),
+            Type::WitnessProjection(_) => Some(AtomKey::Projection(ClosedAtom::new(ty))),
             _ => None,
         }
     }
@@ -206,7 +210,7 @@ impl AtomKey {
             AtomKey::Witness(b) => Type::WitnessRef(*b),
             AtomKey::ChanDom(n, l) => Type::ChanDom(n.clone(), *l),
             AtomKey::Param(p) => Type::Param(Rc::clone(p)),
-            AtomKey::DepTuple(a) => (*a.ty).clone(),
+            AtomKey::DepTuple(a) | AtomKey::Projection(a) => (*a.ty).clone(),
         }
     }
 }
@@ -2000,6 +2004,7 @@ fn compact_go(
         | Type::ChanDom(..)
         | Type::Param(_)
         | Type::DepTuple(_)
+        | Type::WitnessProjection(_)
         | Type::Txn => CompactType::from_atom(AtomKey::from_type(ty).unwrap()),
         // `emit_let` opens a `Poly` and binds at its body; none reaches the solver.
         Type::Poly(_) => unreachable!("a polymorphic type reached `compact`"),

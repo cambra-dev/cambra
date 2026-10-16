@@ -1808,6 +1808,17 @@ the compilation declined outlives it here"
                 "a collection whose domain is a witness with no binder in hand ({ty}) has no \
                  extent: iterating one is not implemented"
             ))),
+            // A witness projected through its sum: the bound its kind gives, which the sum's
+            // own term carries in its type (`src/ccl/design/collections.md`, "A projection
+            // at runtime").
+            Type::WitnessProjection(p) => match p.witness() {
+                Some(witness) => self.witness_domain_extent(&witness.type_kind(), ty),
+                None => Err(ConversionError::TypeError(format!(
+                    "a witness projection through a term binding no witness at its position: \
+                     {ty}; this is a compiler bug — erasure rewrites the projection of a \
+                     collection whose witness it removes"
+                ))),
+            },
             other => Err(ConversionError::TypeError(format!(
                 "Cannot convert CCL type {other:?} to an interpreter extent; \
                  this is a compiler bug — type inference should have resolved \
@@ -2768,6 +2779,44 @@ fn convert_impl_inner(
                 // one whose witness the value carries, described or listed
                 // (`src/ccl/planning/conditionals.rs`, `binds_an_undetermined_witness`).
                 Builtin::Box => Ok(input),
+                // **`unbox(𝑐)` is tiled at its witness's bound**, the extent its type
+                // `σ(𝑐) ⤇ 𝑉` converts to, so a key typed by the witness applies to it: a
+                // `[1, 2]` bound as a `List(Int)` ranges over `UInt`, not `[0, 1]`. A one-leg
+                // flat merge at the bound is that re-view, as realization's merge of several
+                // legs is (`src/ccl/design/collections.md`, "A projection at runtime"). An
+                // input already at the bound, a keyed sum's, is passed through.
+                Builtin::Unbox => {
+                    let unboxed = expr.ty.codomain().ok_or_else(|| {
+                        ConversionError::TypeError(format!(
+                            "`unbox` is a function to a collection; its type is {}",
+                            expr.ty
+                        ))
+                    })?;
+                    let Extent::Function { domain, .. } = ctx.extent_of(&unboxed)? else {
+                        unreachable!("an unboxed sum converts to a function extent: {unboxed}")
+                    };
+                    // Only the keys are re-viewed: the values keep the extent the input gives
+                    // them, rows of a jagged collection included. A collection materialized
+                    // into a value carries its keys in the value, which a column's extent bounds
+                    // without enumerating, so it passes through.
+                    let Tiling::DataFunction {
+                        codomain: values, ..
+                    } = input.tiling().values_at(ctx.level())
+                    else {
+                        return Ok(input);
+                    };
+                    let values = values.extent();
+                    if input.tiling().domain_extent().as_ref() == Some(&*domain) {
+                        Ok(input)
+                    } else {
+                        Ok(Box::new(UnionOperator::new_flat_over(
+                            vec![input],
+                            Some(*domain),
+                            values,
+                            ctx.level(),
+                        )))
+                    }
+                }
                 // `insert(m, k, v)` — pointwise over the zipped `(collection, key, value)`
                 // triple, one map in and one map out, the same shape a binop takes over its
                 // pair. The output extent is the node's own codomain: a keyed sum's extent

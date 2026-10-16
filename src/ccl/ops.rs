@@ -323,6 +323,16 @@ pub enum Builtin {
     /// exactly — `box(5)` is `Σ (σ : [5]). σ`, not `Σ (σ : [Int]). σ`. Retaining the
     /// alternatives rather than joining past them is the whole service.
     Box,
+    /// `unbox : (𝑐 : Σ (σ : 𝐾). 𝐷[σ] ⤇ 𝑉) ⇒ 𝐷[σ ↦ σ(𝑐)] ⤇ 𝑉` — the collection a sum pairs with
+    /// its witness, over the domain the witness names through the sum itself
+    /// (`src/ccl/design/collections.md`, "Projecting a sum's witness"). The identity on the
+    /// value: a sum's value is its collection, keys and all.
+    ///
+    /// **Born after inference**, so it carries no scheme: the body is a function of the
+    /// witness, which a scheme cannot quantify over, so each use stamps its own type
+    /// ([`crate::ccl::ty::unbox_type`]) and the post-inference check holds the stamp to the
+    /// rule (`check_unbox` in `src/ccl/infer/check.rs`).
+    Unbox,
     /// `empty_map : Σ (σ : SubtypesOf(𝐾)). σ ⤇ 𝑉` — the collection with no entries.
     /// **\[Interim\].**
     ///
@@ -840,6 +850,7 @@ impl Builtin {
         match self {
             Self::Id => "id",
             Self::Box => "box",
+            Self::Unbox => "unbox",
             Self::EmptyMap => "empty_map",
             Self::Curry => "curry",
             Self::CurryOver => "curry_over",

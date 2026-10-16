@@ -1706,6 +1706,7 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                 // and the rest are placeholders or nullary carriers. A witness reference
                 // names a binder and holds no type.
                 Type::WitnessRef(_)
+                | Type::WitnessProjection(_)
                 | Type::Base(_)
                 | Type::UIntRange(_)
                 | Type::Hole

@@ -400,14 +400,13 @@ fn jagged_rows_merged_by_a_keyed_write_do_not_compile(#[case] code: &str, #[case
     check_compile_error(code, needle);
 }
 
-/// **A `for` loop over a collection whose type is a sum is rejected by name**, in every build.
-///
-/// A loop's history is a function over its source's domain, and a sum's domain is the witness
-/// the sum binds, so the history would name a witness outside its binder
-/// (`src/ccl/design/collections.md`, "Compiling a conditional collection"). The first case's
-/// outer domain is an undetermined witness, the `UIntRanges` a `List(𝑇)` annotation binds. The
-/// second's is determined: planning would erase it, but only after the loop's history is
-/// typed.
+/// **A `for` loop over a sum ranges over the keys the sum's value holds.** Its history is
+/// typed over the source's witness projected through the source, and its items are read from
+/// the source unboxed (`src/ccl/design/collections.md`, "A `for` loop over a sum"). The first
+/// case's witness is undetermined, the `UIntRanges` a `List(𝑇)` annotation binds, so the
+/// positions come from the value. The second's is determined, so planning erases it to the
+/// one candidate after the history was typed over its projection. The third reads a mutable
+/// variable, whose seed keeps its `box` because the variable states the kind.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(indoc! {r"
@@ -416,17 +415,48 @@ fn jagged_rows_merged_by_a_keyed_write_do_not_compile(#[case] code: &str, #[case
     for r in xs:
         total += 1
     total
-"})]
+"}, Value::Int(2))]
 #[case(indoc! {r"
     total := 0
     for x in box([1, 2]):
         total += x
     total
+"}, Value::Int(3))]
+#[case(indoc! {r"
+    xs: Mut(List(Int)) := box([1, 2, 3])
+    total := 0
+    for x in xs:
+        total += x
+    total
+"}, Value::Int(6))]
+fn a_loop_over_a_sum_ranges_over_its_keys(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// **A loop writing a mutable variable over a conditional is refused**, written in place or
+/// bound by a `let`. Realization copies a conditional into each consumer, and the copy a
+/// projection quotes is one it does not rewrite. A loop that only feeds a sink compiles.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {r"
+    c: Bool = True
+    total := 0
+    for x in (box([1, 2]) if c else box([1, 2, 3])):
+        total += x
+    total
 "})]
-fn a_loop_over_a_sum_is_unsupported(#[case] code: &str) {
+#[case(indoc! {r"
+    c: Bool = True
+    xs = box([1, 2]) if c else box([1, 2, 3])
+    total := 0
+    for x in xs:
+        total += x
+    total
+"})]
+fn a_loop_writing_over_a_conditional_is_refused(#[case] code: &str) {
     check_compile_error(
         code,
-        "a `for` loop over a collection whose type is a sum is not supported yet",
+        "a `for` loop writing a mutable variable over a conditional collection is not compiled yet",
     );
 }
 

@@ -262,6 +262,15 @@ fn keys_family(
         &crate::ccl::subst::Mapping::Rename(x.clone()),
         component,
     );
+    // **A projection through the row**: the inner collection is a sum the row holds, whose
+    // keys are its own, so the family is that collection unboxed and re-viewed at its keys,
+    // `(λ 𝑥 → unbox(𝑡(𝑥))) ≫ map_domain` (`src/ccl/design/collections.md`, "A `for` loop over a
+    // sum").
+    if let Type::WitnessProjection(projection) = &component
+        && ccl_utils::is_free(&x, &projection.term)
+    {
+        return row_keys_family(&x, enclosing, &component, &projection.term, witnesses);
+    }
     let image = component
         .refinements()
         .iter()
@@ -355,6 +364,88 @@ fn keys_family(
             key_set,
         )),
     )
+}
+
+/// [`keys_family`] for a component projected through the row: `𝑥 ↦ map_domain(unbox(𝑡(𝑥)))`.
+fn row_keys_family(
+    x: &Name,
+    enclosing: &Type,
+    component: &Type,
+    row: &Rc<Expr>,
+    witnesses: &mut Witnesses,
+) -> Result<Expr, String> {
+    let (unboxed, unboxed_ty) = {
+        let _g = provenance::enter(
+            row.node_id(),
+            "planning.row_keys",
+            provenance::Nature::Machinery,
+        );
+        let stamp = crate::ccl::ty::unbox_type(&row.ty)
+            .ok_or_else(|| format!("a projection's term is a sum, got {}", row.ty))?;
+        let unboxed_ty = crate::ccl::ty::unboxed_type(&row.ty, row)
+            .ok_or_else(|| format!("a projection's term is a sum, got {}", row.ty))?;
+        let term = {
+            let _frame = provenance::copy_frame("planning.row_keys_term");
+            (**row).clone()
+        };
+        let unboxed = Expr::apply(term, Expr::builtin(Builtin::Unbox).with_ty(stamp))
+            .with_ty(unboxed_ty.clone());
+        (unboxed, unboxed_ty)
+    };
+    let per_row = predicates::eliminate_lifted(
+        Expr::lambda(x, enclosing.clone(), unboxed).with_ty(Type::pi(
+            x.clone(),
+            enclosing.clone(),
+            unboxed_ty.clone(),
+        )),
+    )
+    .map_err(|e| format!("eliminating a dependent tuple's row collection: {e:?}"))?;
+    let mut per_row = plan_before_iteration(per_row, witnesses)?;
+    // The head binds `𝑥` for the whole chain, as in [`keys_family`].
+    if let Type::Fun {
+        fun_kind,
+        domain,
+        codomain,
+        ..
+    } = &per_row.ty
+    {
+        per_row.ty = Type::pi_kinded(
+            x.clone(),
+            (**domain).clone(),
+            (**codomain).clone(),
+            fun_kind.clone(),
+        );
+    }
+    // `map_domain` reads the collection at the position the last morphism yields it, which a
+    // type after that morphism names by its binder (`src/ccl/design/type-inference.md`, "A
+    // chain names each position"); the chain's own type then reads that position as the row
+    // carried there.
+    let mut elements = match per_row.node {
+        TypedExprNode::Compose(elements) => elements,
+        node => vec![TypedExpr { node, ..per_row }],
+    };
+    let last = elements.last().expect("a chain has a morphism");
+    let yielded = crate::ccl::subst::open_codomain(
+        &last.ty,
+        &last
+            .ty
+            .codomain()
+            .ok_or_else(|| format!("a row's collection is a morphism, got {}", last.ty))?,
+    );
+    let keys = yielded
+        .domain()
+        .ok_or_else(|| format!("a row's unboxed collection is a function, got {yielded}"))?;
+    let map_domain = Expr::builtin(Builtin::MapDomain)
+        .with_ty(Type::fun(yielded, Type::data_fun(keys.clone(), keys)));
+    elements.push(map_domain);
+    Ok(ccl_utils::chain_typed(
+        elements,
+        Type::pi(
+            x.clone(),
+            enclosing.clone(),
+            Type::data_fun(component.clone(), component.clone()),
+        ),
+    ))
 }
 
 /// `component` with only its membership refinements: the domain of the collection

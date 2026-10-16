@@ -58,9 +58,11 @@ const BROKEN: &[(&str, &str)] = &[
     ("groupby_tuple_key", "rec_filtered"),
     ("groupby_tuple_key", "rec_list"),
     ("loop_source_in_loop", "binder_cond_boxed[i]"),
+    ("loop_source_in_loop", "boxed"),
     ("loop_source_in_loop", "cond_boxed"),
     ("loop_source_in_loop", "cond_coll"),
     ("loop_source_in_loop", "dup_union"),
+    ("loop_source_in_loop", "list_annotated"),
     ("loop_source_in_loop", "map_arrow"),
     ("loop_source_in_loop", "map_lit"),
     ("loop_source_in_loop", "union"),
@@ -85,9 +87,7 @@ const BROKEN: &[(&str, &str)] = &[
     ("record_in_list", "ternary"),
     ("record_in_list", "union_sum"),
     ("rows_loop_feed", "rows_filtered"),
-    ("rows_nested_mut", "rows_cond"),
     ("rows_nested_mut", "rows_filtered"),
-    ("rows_nested_mut", "rows_jagged"),
     ("terminal_read", "terminal_in_agg[pool]"),
     ("terminal_read_after_guard", "terminal_in_agg[pool]"),
     ("txn_reply", "generator_max"),
@@ -840,6 +840,8 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "cond_boxed", ty: Ty::IntColl, needs: &[], decls: "", expr: "(box([1, 2]) if 2 > 1 else box([3, 4, 5]))" },
         Filler { name: "binder_cond_coll", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "([1, 2] if {b} > 1 else [3, 4])" },
         Filler { name: "binder_cond_boxed", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "(box([1, 2]) if {b} > 1 else box([3, 4, 5]))" },
+        Filler { name: "boxed", ty: Ty::IntColl, needs: &[], decls: "", expr: "box([1, 2, 3])" },
+        Filler { name: "list_annotated", ty: Ty::IntColl, needs: &[], decls: "la: List(Int) = box([1, 2, 3])\n", expr: "la" },
         Filler { name: "generator_coll", ty: Ty::IntColl, needs: &[], decls: indoc! {r#"
             def helper_gen2(hxs):
                 for hx in hxs:

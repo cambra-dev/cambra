@@ -142,7 +142,7 @@ fn blame_node_for_place(
             Type::DepTuple(cs) => cs.iter().any(|(_, t)| mentions(t, uid)),
             Type::Record(fields) => fields.iter().any(|(_, t)| mentions(t, uid)),
             Type::Variant(arms, _) => arms.iter().any(|(_, t)| mentions(t, uid)),
-            Type::WitnessRef(_) => false,
+            Type::WitnessRef(_) | Type::WitnessProjection(_) => false,
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole

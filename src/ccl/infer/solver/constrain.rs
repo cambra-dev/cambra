@@ -2018,7 +2018,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         Type::Refinement(inner, r) => {
             Type::refined(extrude(inner, pol, target_level, cache), r.clone())
         }
-        Type::WitnessRef(_) => ty.clone(),
+        Type::WitnessRef(_) | Type::WitnessProjection(_) => ty.clone(),
         // Invariant payload: polarity is meaningless under invariance, so
         // both children are extruded with two-way proxies (a history is read
         // *and* written) instead of the polar one-way approximation below.

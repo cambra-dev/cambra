@@ -115,7 +115,7 @@ pub fn type_level(ty: &Type) -> Level {
         // The witness's type children and the body carry the sum's inference
         // A witness reference is a leaf (level 0) — naming its binder gives it no
         // solver content.
-        Type::WitnessRef(_) => 0,
+        Type::WitnessRef(_) | Type::WitnessProjection(_) => 0,
         // Unlike a channel domain, a type parameter reports the level it was opened
         // at: it must not flow to a lower-level variable, and reporting its level is
         // what routes such an edge to the escape check
