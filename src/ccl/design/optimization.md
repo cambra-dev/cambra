@@ -86,7 +86,10 @@ entail the parameter's refinements. The pass asserts when it cannot establish th
 since dropping the parameter without preserving its precondition would be unsound. For
 multi-argument UDFs lowered with a tuple parameter, substitution can leave
 `Apply(Tuple(...), Proj(Index(i)))`; `simplify::try_literal_tuple_projection` folds that shape
-later. Finally, the pass revisits the reduced result, so newly exposed `Let` bindings can undergo
+later. An argument A-normalization named a part of is a `let` chain around the tuple,
+`let 𝑎 = 𝑒 in (𝑎, λ…)`; its bindings are floated out over the call first (`peel_lets`), so the
+substituted argument is the tuple itself, and `𝑒` is bound once rather than copied into each
+projection. Finally, the pass revisits the reduced result, so newly exposed `Let` bindings can undergo
 the same inlining checks.
 
 ### Moving a binding into a list element
