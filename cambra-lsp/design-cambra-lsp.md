@@ -206,9 +206,12 @@ bound twice at the top level appears twice. `x <<= ...` defines an output declar
 it adds no entry, and neither do the names an `import` or `run` brings in with `use`, a key write
 (`m[k] := v`), or a write to another module's variable (`c::count := v`).
 
-An entry's range is the statement's span without its trailing whitespace; a block statement's
-span runs past the line break after its body. A function's name range is the span of the name
-after `def`.
+An entry's range runs from the start of the statement's span to the end of its source. A block
+statement's span runs to the next statement's first token, over the blank lines and comments
+after its body, so the end of its source is the end of its last token that is not a line break or
+an indentation token. The end extends over the rest of that token's line up to a comment, which
+keeps a close bracket the lexer dropped from the stream inside the range (`Document::content_end`).
+A function's name range is the span of the name after `def`.
 
 When `parse_module` returns no module, which happens after an error the parser does not recover
 from, the outline is empty.
@@ -221,9 +224,9 @@ whole lines only, and keep the first line of a range visible.
 - **Blocks.** Every statement body folds: a `def`, each `if`, `elif` and `else` branch, a `for`,
   each `case` of a `match`, a `with`, and the block on the right of an assignment. A range starts
   at the line holding the token just before the body, which is the header's `:`, so a header
-  wrapped over several lines stays visible. It ends at the last line of the body's last
-  statement that holds more than whitespace. A body on the same line as its header does not
-  fold.
+  wrapped over several lines stays visible. It ends on the line the body's last statement's
+  source ends on, as an outline entry's range does, so the comments after a body stay outside
+  its fold. A body on the same line as its header does not fold.
 - **Matches.** A `match` also folds as a whole, from the line its header ends on to its last
   arm's last line. Its arms carry no spans, so the header's end is the first line break in the
   token stream after the statement starts.
