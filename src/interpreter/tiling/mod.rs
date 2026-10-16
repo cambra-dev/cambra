@@ -7,12 +7,14 @@ use std::{collections::HashMap, hash::Hash};
 
 mod curry_level;
 mod guard;
+mod interval_sets;
 mod predicate;
 mod tile;
 mod tiling_kind;
 
 pub use curry_level::*;
 pub use guard::*;
+pub use interval_sets::*;
 pub use predicate::*;
 pub use tile::*;
 pub use tiling_kind::*;

@@ -4,11 +4,10 @@
 use smol_str::SmolStr;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use intervalsets::ops::Difference;
 use intervalsets::{Bounding, Interval, IntervalSet, MaybeEmpty};
 
 use crate::ccl::TagMap;
-use crate::interpreter::{Predicate, Tile};
+use crate::interpreter::{HasDifference, Predicate, Tile};
 use crate::util::fmt_record;
 
 use super::ColumnValue;
@@ -218,7 +217,7 @@ impl Extent {
             (Extent::Base(BaseType::UInt), Extent::UIntRange(..)) => true,
 
             // UIntRange: s1 includes s2 iff s2 is a subset of s1.
-            (Extent::UIntRange(s1), Extent::UIntRange(s2)) => s2.difference(s1).is_empty(),
+            (Extent::UIntRange(s1), Extent::UIntRange(s2)) => !s2.has_difference(s1),
 
             // DataSourceDomain: identity check
             (Extent::DataSourceDomain(d1), Extent::DataSourceDomain(d2)) => d1 == d2,

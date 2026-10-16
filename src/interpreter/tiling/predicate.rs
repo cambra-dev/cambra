@@ -14,7 +14,10 @@ use intervalsets::{
 
 use crate::{
     ccl::{BaseType, FieldKey, TagMap},
-    interpreter::{ColumnValue, Extent, Position, Tile, UnionArm, Value, transform_hashmap_values},
+    interpreter::{
+        ColumnValue, Extent, HasDifference, Position, Tile, UnionArm, Value,
+        transform_hashmap_values,
+    },
 };
 
 /// Whether two predicates admit the same values, whatever each is spelled as.
@@ -768,9 +771,9 @@ impl Predicate {
             // Everything subsumes the empty set, and the universal set subsumes everything.
             (_, o) if o.is_false() => true,
             (s, _) if s.is_true() => true,
-            // Both canonical, so `b ∖ a` lies inside the type's range with normalized bounds,
-            // and the crate's emptiness is the set's.
-            (Predicate::Intervals(a), Predicate::Intervals(b)) => b.difference(a).is_empty(),
+            // `a` covers `b` when `b ∖ a` is empty. `has_difference` stops at the first interval of
+            // `b` that `a` does not cover and builds no set.
+            (Predicate::Intervals(a), Predicate::Intervals(b)) => !b.has_difference(a),
             // self subsumes a union iff it subsumes every arm.
             (_, Predicate::Or(arms)) => arms.iter().all(|a| self.subsumes(a)),
             (Predicate::Or(arms), _) => {
@@ -1065,16 +1068,14 @@ impl Predicate {
     /// positions. Each bound is normalized, which the crate does for a finite interval and
     /// not for a half-bounded one, so a complement's `(4, ∞)` reads as `[5, ∞)`. Then the
     /// empty set is [`Predicate::False`], a set covering its type is [`Predicate::True`],
-    /// and intervals meeting at a shared value are merged.
+    /// and intervals that meet, at a shared value or at adjacent discrete values, are merged.
     pub(crate) fn intervals(set: IntervalSet<Value>) -> Predicate {
         let range = sample(&set).and_then(type_range);
         let set = match &range {
             Some(range) => set.intersection(range),
             None => set,
         };
-        let set = coalesce_abutting(IntervalSet::new(
-            set.intervals().iter().map(normalized).collect(),
-        ));
+        let set = canonical_runs(set);
         if set.is_empty() {
             return Predicate::False;
         }
@@ -1387,21 +1388,6 @@ fn sample(set: &IntervalSet<Value>) -> Option<&Value> {
         .find_map(|iv| iv.lval().or_else(|| iv.rval()))
 }
 
-/// `interval` with each bound normalized, closed where the domain names the neighbouring
-/// value ([`Bound::normalized`](intervalsets::Bound::normalized)).
-fn normalized(interval: &Interval<Value>) -> Interval<Value> {
-    match (interval.left(), interval.right()) {
-        (None, None) => interval.clone(),
-        (Some(left), None) => {
-            Interval::new_half_bounded(Side::Left, left.clone().normalized(Side::Left))
-        }
-        (None, Some(right)) => {
-            Interval::new_half_bounded(Side::Right, right.clone().normalized(Side::Right))
-        }
-        (Some(left), Some(right)) => Interval::new_finite(left.clone(), right.clone()),
-    }
-}
-
 /// Whether canonical `set` holds every value of its type, whose range is `range`: the
 /// range itself once clamped and normalized, or the unbounded interval for a type with no
 /// least or greatest value.
@@ -1473,33 +1459,87 @@ where
     Predicate::intervals(IntervalSet::new_unchecked(intervals))
 }
 
-/// Merge intervals that meet at a shared value with no gap between them.
+/// `set` with each bound normalized and the intervals that meet with no gap between them
+/// merged: at a shared value, or at adjacent discrete values.
+///
+/// Normalizing closes a bound where the domain names the neighbouring value
+/// ([`Bound::normalized`](intervalsets::Bound::normalized)). The crate does it for a finite
+/// interval when the interval is built and not for a half-bounded one, so only the half-bounded
+/// intervals change here. Moving an open bound inward by one value cannot make an interval empty.
+/// A set that is not sorted and disjoint, which `IntervalSet::new` accepts for half-bounded
+/// intervals (it keeps two equal ones), is rebuilt by `IntervalSet::new` after the first pass.
 ///
 /// `intervalsets` merges intervals that overlap, and over a discrete domain those that are
-/// adjacent, but leaves `(-∞, 𝑥)` beside `[𝑥, 𝑦]` as two — neither holds a value the other
-/// does, and `𝑥` has no predecessor to make them adjacent. Together they are `(-∞, 𝑦]`.
-/// Where the shared value is open on both sides it belongs to neither, which is a real gap
-/// and stays.
-fn coalesce_abutting(set: IntervalSet<Value>) -> IntervalSet<Value> {
-    let mut merged: Vec<Interval<Value>> = Vec::with_capacity(set.intervals().len());
-    for next in set.intervals() {
-        match merged.pop() {
-            None => merged.push(next.clone()),
-            Some(prev) => match joined(&prev, next) {
-                Some(one) => merged.push(one),
-                None => merged.extend([prev, next.clone()]),
-            },
-        }
+/// adjacent, but only when its input is unsorted or overlapping: [`IntervalSet::new`] skips
+/// `merge_sorted` for sorted, disjoint input, so `[3, 4]` and `[5, 5]` stay two intervals. It
+/// also leaves `(-∞, 𝑥)` beside `[𝑥, 𝑦]` as two — neither holds a value the other does, and
+/// `𝑥` has no predecessor to make them adjacent. Together they are `(-∞, 𝑦]`. Where the shared
+/// value is open on both sides it belongs to neither, which is a real gap and stays.
+fn canonical_runs(set: IntervalSet<Value>) -> IntervalSet<Value> {
+    let (merged, ordered) = normalize_and_join(set);
+    if ordered {
+        return IntervalSet::new_unchecked(merged);
     }
-    // The walk preserves the crate's ordering and disjointness, having only replaced
-    // neighbours by their union.
+    // The crate's `intersection` with the type's range turns two equal half-bounded intervals into
+    // two equal finite ones. `IntervalSet::new` sorts and merges them.
+    let (merged, ordered) = normalize_and_join(IntervalSet::new(merged));
+    debug_assert!(
+        ordered,
+        "canonical_runs: intervals of a set built by `IntervalSet::new` are sorted and disjoint: {merged:?}"
+    );
     IntervalSet::new_unchecked(merged)
 }
 
-/// `a` and `b` as one interval where they meet at a single value with no gap, else `None`.
+/// The intervals of `set` normalized and joined where they meet, and whether the result is sorted
+/// and disjoint.
+///
+/// One comparison per interval checks the order, which is cheap beside the clones it replaces.
+fn normalize_and_join(set: IntervalSet<Value>) -> (Vec<Interval<Value>>, bool) {
+    let mut ordered = true;
+    let mut merged: Vec<Interval<Value>> = Vec::with_capacity(set.intervals().len());
+    for next in set {
+        let next = match (next.left(), next.right()) {
+            (Some(left), None) => {
+                Interval::new_half_bounded(Side::Left, left.clone().normalized(Side::Left))
+            }
+            (None, Some(right)) => {
+                Interval::new_half_bounded(Side::Right, right.clone().normalized(Side::Right))
+            }
+            (Some(left), Some(right)) => {
+                debug_assert!(
+                    *left == left.clone().normalized(Side::Left)
+                        && *right == right.clone().normalized(Side::Right),
+                    "canonical_runs: a finite interval is normalized when `intervalsets` builds it: {next:?}"
+                );
+                next
+            }
+            (None, None) => next,
+        };
+        match merged.last().and_then(|prev| joined(prev, &next)) {
+            Some(one) => *merged.last_mut().expect("joined with the last interval") = one,
+            None => {
+                if let Some(prev) = merged.last() {
+                    ordered &= *prev < next;
+                }
+                merged.push(next);
+            }
+        }
+    }
+    (merged, ordered)
+}
+
+/// `a` and `b` as one interval where they meet at a single value or at adjacent discrete values
+/// with no gap, else `None`.
 fn joined(a: &Interval<Value>, b: &Interval<Value>) -> Option<Interval<Value>> {
     let (end, start) = (a.right()?, b.left()?);
-    if end.value() != start.value() || (end.is_open() && start.is_open()) {
+    let meets = if end.value() == start.value() {
+        !(end.is_open() && start.is_open())
+    } else {
+        !end.is_open()
+            && !start.is_open()
+            && end.value().try_adjacent(Side::Right).as_ref() == Some(start.value())
+    };
+    if !meets {
         return None;
     }
     Some(match (a.left(), b.right()) {
@@ -2632,7 +2672,7 @@ mod tests {
 
     /// The set below a value, joined with that value on its own, is the set up to it.
     /// `intervalsets` leaves the two apart — neither holds a value the other does, and
-    /// `u0` has no predecessor to make them adjacent — so [`coalesce_abutting`] merges
+    /// `u0` has no predecessor to make them adjacent — so [`canonical_runs`] merges
     /// them. Two spellings of one region compare unequal, which is what release
     /// accumulation reads as a change.
     #[test]
@@ -2669,7 +2709,7 @@ mod tests {
     /// Merging a pair exposes the next one, so a run of abutting intervals collapses to a
     /// single interval rather than to a shorter run. The keys are strings, which have no
     /// adjacent value: the crate merges neither, so what collapses the run is
-    /// [`coalesce_abutting`] alone.
+    /// [`canonical_runs`] alone.
     #[test]
     fn a_run_of_abutting_intervals_collapses_to_one() {
         let key = |v: &str| Value::String(v.into());
@@ -2682,6 +2722,124 @@ mod tests {
             run,
             Predicate::intervals(IntervalSet::new(vec![Interval::unbound_closed(key("f"))]))
         );
+    }
+
+    /// Integer runs that touch are one run: `IntervalSet::new` leaves `[3, 4]` and `[5, 5]` as
+    /// two intervals when its input is sorted and disjoint, so [`canonical_runs`] joins them.
+    #[test]
+    fn touching_integer_runs_are_one_interval() {
+        let closed = |a: u64, b: u64| Interval::closed(Value::UInt(a), Value::UInt(b));
+        let touching = Predicate::intervals(IntervalSet::new(vec![
+            closed(0, 1),
+            closed(3, 4),
+            closed(5, 5),
+        ]));
+        assert_eq!(
+            touching,
+            Predicate::intervals(IntervalSet::new(vec![closed(0, 1), closed(3, 5)]))
+        );
+        let Predicate::Intervals(set) = touching else {
+            panic!("an interval predicate")
+        };
+        assert_eq!(set.intervals().len(), 2, "got {set:?}");
+    }
+
+    /// `IntervalSet::new` keeps two equal half-bounded intervals, and the crate's `intersection`
+    /// with the type's range then returns two equal finite ones. [`canonical_runs`] rebuilds the set.
+    #[test]
+    fn equal_half_bounded_intervals_are_one_interval() {
+        let below = || Interval::unbound_open(Value::Int(5));
+        let doubled = IntervalSet::new(vec![below(), below()]);
+        assert_eq!(
+            doubled.intervals().len(),
+            2,
+            "`new` keeps both: {doubled:?}"
+        );
+        let canonical = Predicate::intervals(doubled);
+        assert_eq!(
+            canonical,
+            Predicate::intervals(IntervalSet::new(vec![below()]))
+        );
+        let Predicate::Intervals(canonical) = canonical else {
+            panic!("an interval predicate")
+        };
+        assert_eq!(canonical.intervals().len(), 1, "got {canonical:?}");
+    }
+
+    /// `[3, 6]` minus `{[0, 1], [3, 4], [5, 5]}` is `{6}`. The crate's `difference` answers the
+    /// empty set when it is handed the touching runs unmerged.
+    #[test]
+    fn minus_a_predicate_built_from_touching_runs_keeps_the_gap() {
+        let closed = |a: u64, b: u64| Interval::closed(Value::UInt(a), Value::UInt(b));
+        let whole = Predicate::intervals(IntervalSet::new(vec![closed(3, 6)]));
+        let touching = Predicate::intervals(IntervalSet::new(vec![
+            closed(0, 1),
+            closed(3, 4),
+            closed(5, 5),
+        ]));
+        let rest = whole.minus(&touching);
+        assert_eq!(
+            rest,
+            Predicate::intervals(IntervalSet::new(vec![closed(6, 6)]))
+        );
+        assert!(intervals_contains(&rest, Value::UInt(6)));
+    }
+
+    /// `union`, `intersect`, `minus`, `subsumes` and `same_region` over random interval
+    /// predicates agree with asking each value of a small domain.
+    ///
+    /// The predicates are built by [`Predicate::intervals`] from sets that hold touching runs
+    /// unmerged, which `IntervalSet::new` keeps apart, and from half-bounded intervals with open
+    /// bounds, which the crate does not normalize. Both are inputs on which the crate's own set
+    /// operations answer wrongly, so the oracle is enumeration and not the crate.
+    #[test]
+    fn interval_predicate_operations_agree_with_enumeration() {
+        use super::super::interval_sets::test_support::{Key, Lcg, random_set};
+        for (key, seed, span) in [
+            (Key::UInt, 1, 6),
+            (Key::UInt, 2, 12),
+            (Key::UInt, 3, 30),
+            (Key::Int, 5, 12),
+        ] {
+            let domain = key.domain(span);
+            let mut rng = Lcg(seed);
+            for _ in 0..20_000 {
+                let a = Predicate::intervals(random_set(&mut rng, span, key));
+                let b = Predicate::intervals(random_set(&mut rng, span, key));
+                let at = |p: &Predicate, v: &Value| p.contains(v);
+                let context = || format!("{key:?}: {a:?} against {b:?}");
+                for (name, got, want) in [
+                    (
+                        "union",
+                        a.union(&b),
+                        Box::new(|v: &Value| at(&a, v) || at(&b, v)) as Box<dyn Fn(&Value) -> bool>,
+                    ),
+                    (
+                        "intersect",
+                        a.intersect(&b),
+                        Box::new(|v: &Value| at(&a, v) && at(&b, v)),
+                    ),
+                    (
+                        "minus",
+                        a.minus(&b),
+                        Box::new(|v: &Value| at(&a, v) && !at(&b, v)),
+                    ),
+                ] {
+                    for v in &domain {
+                        assert_eq!(
+                            got.contains(v),
+                            want(v),
+                            "{name} at {v:?}, {}: got {got:?}",
+                            context()
+                        );
+                    }
+                }
+                let covers = domain.iter().all(|v| !at(&b, v) || at(&a, v));
+                assert_eq!(a.subsumes(&b), covers, "subsumes, {}", context());
+                let same = domain.iter().all(|v| at(&a, v) == at(&b, v));
+                assert_eq!(same_region(&a, &b), same, "same_region, {}", context());
+            }
+        }
     }
 
     // Record ∪ Record: cannot push OR through AND, result must be Or([r1, r2]).
