@@ -140,16 +140,13 @@ fn accumulators_at_two_depths_keep_their_own_domains() {
 }
 
 /// Jagged inner sources, so a flattened iteration of fixed width would answer
-/// differently. Answers 21 once it compiles.
-///
-/// Rows of differing length are of differing type, so the collection is a sum, and a `for`
-/// loop over a sum is rejected by name before its history is built. Nesting and jaggedness
-/// are both beside the point: a single loop over any boxed source is rejected the same way
-/// (`a_loop_over_a_sum_is_unsupported` in `sums.rs`), and this case adds a level of nesting
-/// to it.
+/// differently. Rows of differing length are of differing type, so each row is a sum, and
+/// the inner loop ranges over the keys the row it reads holds: its positions are the row's
+/// witness projected through the row (`src/ccl/design/collections.md`, "A `for` loop over a
+/// sum").
 #[test]
-fn jagged_inner_sources_need_a_witness_domained_source() {
-    check_compile_error(
+fn jagged_inner_sources_range_over_each_rows_keys() {
+    check_scalar(
         indoc! {r"
             total := 0
             for xs in box([box([1]), box([2, 3]), box([4, 5, 6])]):
@@ -157,7 +154,7 @@ fn jagged_inner_sources_need_a_witness_domained_source() {
                     total += x
             total
         "},
-        "a `for` loop over a collection whose type is a sum is not supported yet",
+        Value::Int(21),
     );
 }
 
