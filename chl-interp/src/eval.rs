@@ -185,6 +185,355 @@ pub(crate) struct Interp {
     /// What the module declares of each nominal type, by the type's name. Collected before
     /// the program runs, since a declaration is in scope throughout its module.
     types: Rc<BTreeMap<String, TypeMembers>>,
+    /// The traits' functions and the module's instances, which a trait function's call
+    /// picks among by its arguments.
+    traits: Rc<Traits>,
+    /// Every instance function bound so far, by its bound name. A call inside an instance's
+    /// function reaches the functions of that instance through it, its own included, since
+    /// each `def` of the block captures its scope before the block's names are bound
+    /// (`docs/chl-spec.md`, "Declaring an instance").
+    instance_functions: BTreeMap<String, Rc<Function>>,
+    /// The prefixes of the instances whose functions are running, innermost last.
+    running_instances: Vec<String>,
+}
+
+/// What dispatch reads of the traits a module names and the instances it declares
+/// (`docs/chl-spec.md`, "Declaring a trait").
+#[derive(Default)]
+struct Traits {
+    /// Each trait function, by trait and name: for each value parameter, the operand its
+    /// annotation names, if it names one.
+    functions: BTreeMap<(String, String), Vec<Option<usize>>>,
+    instances: Vec<InstanceShape>,
+    /// Each nominal type's parameters and each of its constructors' parameter types, by the
+    /// type's name: what reading a head's arguments off a value needs.
+    declared: BTreeMap<String, DeclaredType>,
+}
+
+/// A nominal type as its declaration writes it.
+#[derive(Default)]
+struct DeclaredType {
+    params: Vec<String>,
+    ctors: BTreeMap<String, Vec<Expr>>,
+}
+
+/// An instance a module declares: the pattern at each of its operands, and the prefix its
+/// functions are bound under.
+struct InstanceShape {
+    trait_: String,
+    heads: Vec<TypePattern>,
+    bound: String,
+}
+
+/// A type as dispatch reads it off a value: an instance's head, or a declaration's parameter
+/// type at the head's arguments. The interpreter has no types, so it reads them off the
+/// values, and a value that does not show one, an element of an empty collection, is
+/// [`Tells::Unknown`].
+#[derive(Clone)]
+enum TypePattern {
+    /// A type variable, one type wherever the head names it.
+    Var(String),
+    Base(String),
+    Nominal(String, Vec<TypePattern>),
+    Tuple(Vec<TypePattern>),
+    Record(Vec<(String, TypePattern)>),
+    /// A collection's elements, each of the pattern.
+    Elements(Box<TypePattern>),
+    /// A type whose values show nothing to tell, a function's.
+    Opaque,
+}
+
+/// Whether a value is of a [`TypePattern`].
+#[derive(Clone, Copy, PartialEq)]
+enum Tells {
+    Yes,
+    No,
+    Unknown,
+}
+
+impl Tells {
+    fn and(self, other: Tells) -> Tells {
+        match (self, other) {
+            (Tells::No, _) | (_, Tells::No) => Tells::No,
+            (Tells::Unknown, _) | (_, Tells::Unknown) => Tells::Unknown,
+            _ => Tells::Yes,
+        }
+    }
+}
+
+impl Traits {
+    /// The pattern `ty`, a type written in a head or a declaration, names, with `vars` its
+    /// variables and `env` what the declaration's parameters stand for.
+    fn pattern(
+        &self,
+        ty: &Expr,
+        vars: &[String],
+        env: &BTreeMap<String, TypePattern>,
+    ) -> TypePattern {
+        match ty {
+            Expr::Name(n) if env.contains_key(n.as_str()) => env[n.as_str()].clone(),
+            Expr::Name(n) if vars.iter().any(|v| v == n.as_str()) => {
+                TypePattern::Var(n.to_string())
+            }
+            Expr::Name(n) if self.declared.contains_key(n.as_str()) => {
+                TypePattern::Nominal(n.to_string(), Vec::new())
+            }
+            Expr::Name(n) => TypePattern::Base(n.to_string()),
+            Expr::Call { func, args } => match &func.node {
+                Expr::Name(n) if self.declared.contains_key(n.as_str()) => TypePattern::Nominal(
+                    n.to_string(),
+                    args.iter()
+                        .map(|a| self.pattern(&a.node, vars, env))
+                        .collect(),
+                ),
+                Expr::Name(n) if matches!(n.as_str(), "List" | "Set" | "Collection") => {
+                    match args.first() {
+                        Some(a) => {
+                            TypePattern::Elements(Box::new(self.pattern(&a.node, vars, env)))
+                        }
+                        None => TypePattern::Opaque,
+                    }
+                }
+                _ => TypePattern::Opaque,
+            },
+            Expr::BraceGroup(parts) => TypePattern::Tuple(
+                parts
+                    .iter()
+                    .map(|p| self.pattern(&p.node, vars, env))
+                    .collect(),
+            ),
+            Expr::BraceRecord(fields) => TypePattern::Record(
+                fields
+                    .iter()
+                    .map(|f| (f.name.to_string(), self.pattern(&f.value.node, vars, env)))
+                    .collect(),
+            ),
+            Expr::BraceRefinement { base, .. } => self.pattern(&base.node, vars, env),
+            _ => TypePattern::Opaque,
+        }
+    }
+
+    /// Whether `v` is of `p`, with each variable standing for one type throughout, `bound`
+    /// recording what each stands for where a value shows it.
+    fn tells(&self, p: &TypePattern, v: &Value, bound: &mut BTreeMap<String, String>) -> Tells {
+        match (p, v) {
+            (_, Value::Pending) => Tells::Unknown,
+            (TypePattern::Opaque, _) => Tells::Yes,
+            (TypePattern::Var(x), v) => match (describe(v), bound.get(x)) {
+                (Some(d), Some(b)) if d != *b => Tells::No,
+                (Some(d), None) => {
+                    bound.insert(x.clone(), d);
+                    Tells::Yes
+                }
+                _ => Tells::Yes,
+            },
+            (TypePattern::Base(b), Value::Int(_)) => tell(b == "Int" || b == "UInt"),
+            (TypePattern::Base(b), Value::Str(_)) => tell(b == "String"),
+            (TypePattern::Base(b), Value::Bool(_)) => tell(b == "Bool"),
+            (TypePattern::Base(b), Value::Unit) => tell(b == "Unit"),
+            (TypePattern::Nominal(name, args), Value::Nominal { ty, ctor, payload }) => {
+                if name != ty {
+                    return Tells::No;
+                }
+                if args.is_empty() {
+                    return Tells::Yes;
+                }
+                let Some(decl) = self.declared.get(name) else {
+                    return Tells::Unknown;
+                };
+                let env: BTreeMap<String, TypePattern> = decl
+                    .params
+                    .iter()
+                    .cloned()
+                    .zip(args.iter().cloned())
+                    .collect();
+                let Some(params) = decl.ctors.get(ctor) else {
+                    return Tells::Unknown;
+                };
+                let patterns: Vec<TypePattern> =
+                    params.iter().map(|t| self.pattern(t, &[], &env)).collect();
+                match patterns.as_slice() {
+                    [] => Tells::Yes,
+                    [one] => self.tells(one, payload, bound),
+                    several => self.tells(&TypePattern::Tuple(several.to_vec()), payload, bound),
+                }
+            }
+            (TypePattern::Tuple(parts), Value::Record(fields)) => {
+                let mut out = Tells::Yes;
+                for (i, p) in parts.iter().enumerate() {
+                    out = out.and(match fields.iter().find(|(n, _)| *n == format!("_{i}")) {
+                        Some((_, f)) => self.tells(p, f, bound),
+                        None => Tells::No,
+                    });
+                }
+                out
+            }
+            (TypePattern::Record(parts), Value::Record(fields)) => {
+                let mut out = Tells::Yes;
+                for (name, p) in parts {
+                    out = out.and(match fields.iter().find(|(n, _)| n == name) {
+                        Some((_, f)) => self.tells(p, f, bound),
+                        None => Tells::No,
+                    });
+                }
+                out
+            }
+            (TypePattern::Elements(p), Value::Collection(c)) => {
+                let mut out = Tells::Unknown;
+                for (_, e) in c.entries() {
+                    out = match out {
+                        Tells::Unknown => self.tells(p, e, bound),
+                        known => known.and(self.tells(p, e, bound)),
+                    };
+                }
+                out
+            }
+            _ => Tells::No,
+        }
+    }
+
+    /// The instances of `trait_` whose operands admit `values` at the operands `params` name,
+    /// with whether each is sure to.
+    fn admitting(
+        &self,
+        trait_: &str,
+        params: &[Option<usize>],
+        values: &[Value],
+    ) -> Vec<(&InstanceShape, Tells)> {
+        self.instances
+            .iter()
+            .filter(|i| i.trait_ == trait_)
+            .map(|i| {
+                let mut bound = BTreeMap::new();
+                let mut out = Tells::Yes;
+                for (operand, v) in params.iter().zip(values) {
+                    if let Some(h) = operand.and_then(|o| i.heads.get(o)) {
+                        out = out.and(self.tells(h, v, &mut bound));
+                    }
+                }
+                (i, out)
+            })
+            .filter(|(_, t)| *t != Tells::No)
+            .collect()
+    }
+}
+
+fn tell(yes: bool) -> Tells {
+    if yes { Tells::Yes } else { Tells::No }
+}
+
+/// The type a value shows, where it shows one: what a type variable standing for it is
+/// compared by.
+fn describe(v: &Value) -> Option<String> {
+    Some(match v {
+        Value::Int(_) => "Int".into(),
+        Value::Str(_) => "String".into(),
+        Value::Bool(_) => "Bool".into(),
+        Value::Unit => "Unit".into(),
+        Value::Nominal { ty, .. } => ty.clone(),
+        Value::Record(fields) => {
+            let parts: Option<Vec<String>> = fields
+                .iter()
+                .map(|(n, f)| describe(f).map(|d| format!("{n}: {d}")))
+                .collect();
+            format!("{{{}}}", parts?.join(", "))
+        }
+        _ => return None,
+    })
+}
+
+/// The traits `body` declares, and the instances `body` declares of them.
+fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
+    let mut functions = BTreeMap::new();
+    for stmt in body {
+        let Stmt::TraitDecl(decl) = &stmt.node else {
+            continue;
+        };
+        for item in &decl.items {
+            let chl_parser::ast::TraitItem::Function(sig) = item else {
+                continue;
+            };
+            let params = sig
+                .node
+                .params
+                .iter()
+                .map(|p| match p.annotation.as_ref().map(|a| &a.ty.node) {
+                    Some(Expr::Name(n)) => decl.params.iter().position(|o| o.node == *n),
+                    _ => None,
+                })
+                .collect();
+            functions.insert(
+                (decl.name.node.to_string(), sig.node.name.node.to_string()),
+                params,
+            );
+        }
+    }
+    let mut declared = BTreeMap::from([(
+        OPTION.to_string(),
+        DeclaredType {
+            params: vec!["T".to_string()],
+            ctors: BTreeMap::from([
+                ("none".to_string(), Vec::new()),
+                ("some".to_string(), vec![Expr::Name("T".into())]),
+            ]),
+        },
+    )]);
+    for stmt in body {
+        if let Stmt::TypeDecl(decl) = &stmt.node {
+            let ctors = match &decl.body {
+                chl_parser::ast::TypeDeclBody::Single(ty) => {
+                    BTreeMap::from([("new".to_string(), vec![ty.node.clone()])])
+                }
+                chl_parser::ast::TypeDeclBody::Constructors(lines) => lines
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.name.node.to_string(),
+                            c.params.iter().map(|p| p.ty.node.clone()).collect(),
+                        )
+                    })
+                    .collect(),
+            };
+            declared.insert(
+                decl.name.node.to_string(),
+                DeclaredType {
+                    params: decl.params.iter().map(|p| p.node.to_string()).collect(),
+                    ctors,
+                },
+            );
+        }
+    }
+    let mut traits = Traits {
+        functions,
+        instances: Vec::new(),
+        declared,
+    };
+    for stmt in body {
+        let Stmt::Impl(block) = &stmt.node else {
+            continue;
+        };
+        let trait_ = block.ty.node.to_string();
+        if !traits.functions.keys().any(|(t, _)| *t == trait_) {
+            continue;
+        }
+        let vars: Vec<String> = block.vars.iter().map(|v| v.node.to_string()).collect();
+        let heads = block
+            .args
+            .iter()
+            .map(|a| traits.pattern(&a.node, &vars, &BTreeMap::new()))
+            .collect();
+        traits.instances.push(InstanceShape {
+            bound: instance_prefix(&trait_, stmt.span.start),
+            trait_,
+            heads,
+        });
+    }
+    traits
+}
+
+/// The prefix the functions of the instance `impl T(…)` at `at` are bound under.
+fn instance_prefix(trait_: &str, at: usize) -> String {
+    format!("impl {trait_}@{at}")
 }
 
 /// A loop over a collection not keyed by position, whose iteration order is not defined
@@ -218,6 +567,9 @@ impl Interp {
             txn: None,
             loop_keys: Vec::new(),
             types: Rc::default(),
+            traits: Rc::default(),
+            instance_functions: BTreeMap::new(),
+            running_instances: Vec::new(),
             cells_made: 0,
             order_watches: Vec::new(),
         }
@@ -308,6 +660,7 @@ pub fn run(source: &str) -> Result<Observations, Error> {
     let mut feed_sites = BTreeMap::new();
     collect_feed_sites(&module.body, &mut feed_sites);
     let types = Rc::new(collect_types(&module.body));
+    let traits = Rc::new(collect_traits(&module.body));
 
     // Each pass completes at least one channel or ends the run, so there is at most one pass per
     // channel, plus the last.
@@ -315,6 +668,7 @@ pub fn run(source: &str) -> Result<Observations, Error> {
     loop {
         let mut interp = Interp::new(feed_sites.clone(), finals.clone());
         interp.types = Rc::clone(&types);
+        interp.traits = Rc::clone(&traits);
         // A failure outside speculation is on the path the program takes, whatever a later
         // pass would read, so it is the program's.
         interp.exec_block(&module.body)?;
@@ -901,6 +1255,35 @@ impl Interp {
                 }),
             },
 
+            // An instance binds each `def` under its own prefix, which dispatch names.
+            Stmt::Impl(block)
+                if self
+                    .traits
+                    .functions
+                    .keys()
+                    .any(|(t, _)| *t == block.ty.node) =>
+            {
+                let prefix = instance_prefix(&block.ty.node, stmt.span.start);
+                for def in &block.defs {
+                    let Stmt::FunctionDef {
+                        name, params, body, ..
+                    } = &def.node
+                    else {
+                        return err("an instance's `impl` block holds `def`s");
+                    };
+                    let function = Rc::new(Function {
+                        params: params.iter().map(|p| (p.name.to_string(), false)).collect(),
+                        body: body.clone(),
+                        env: self.captured_scopes(),
+                    });
+                    let bound = format!("{prefix}::{}", name.node);
+                    self.instance_functions
+                        .insert(bound.clone(), Rc::clone(&function));
+                    self.bind(bound, Slot::Fn(function));
+                }
+                Ok(None)
+            }
+
             // `impl N:` binds each `def` as `def N::f` does.
             Stmt::Impl(block) => {
                 for def in &block.defs {
@@ -1113,7 +1496,7 @@ impl Interp {
             }
 
             // A declaration binds no value; its members were collected before the run.
-            Stmt::Pass | Stmt::TypeDecl(_) => Ok(None),
+            Stmt::Pass | Stmt::TypeDecl(_) | Stmt::TraitDecl(_) => Ok(None),
             other => err(format!("unsupported statement: {other:?}")),
         }
     }
@@ -1146,6 +1529,83 @@ impl Interp {
         Ok(())
     }
 
+    /// The trait function `trait_::function` at `values`: the function of the one instance
+    /// whose operands admit the arguments their parameters are annotated with.
+    fn dispatch(
+        &mut self,
+        trait_: &str,
+        function: &str,
+        values: Vec<Value>,
+    ) -> Result<Value, Error> {
+        if any_pending(values.iter()) {
+            return Ok(Value::Pending);
+        }
+        let Some(params) = self
+            .traits
+            .functions
+            .get(&(trait_.to_string(), function.to_string()))
+            .cloned()
+        else {
+            return err(format!("`{trait_}` declares no function `{function}`"));
+        };
+        let admitting = self.traits.admitting(trait_, &params, &values);
+        let (instance, bound) = match admitting.as_slice() {
+            [(one, Tells::Yes)] => (one.bound.clone(), format!("{}::{function}", one.bound)),
+            [] => {
+                return err(format!(
+                    "no instance of `{trait_}` admits the arguments of `{trait_}::{function}`"
+                ));
+            }
+            several => {
+                return err(format!(
+                    "{} instances of `{trait_}` may admit the arguments of \
+                     `{trait_}::{function}`; the interpreter reads types off values, and these \
+                     do not tell the instances apart",
+                    several.len()
+                ));
+            }
+        };
+        let f = match self.slot(&bound) {
+            Some(Slot::Fn(f)) => Rc::clone(f),
+            _ => match self.instance_functions.get(&bound) {
+                Some(f) if self.running_instances.contains(&instance) => Rc::clone(f),
+                _ => {
+                    return err(format!(
+                        "`{trait_}::{function}` is answered by an instance declared after the call"
+                    ));
+                }
+            },
+        };
+        self.running_instances.push(instance);
+        let answer = self.call_with_values(&bound, &f, values);
+        self.running_instances.pop();
+        answer
+    }
+
+    /// The trait whose method `method` a receiver `v` has, when no type's own method of the
+    /// name has its constructor: the one trait whose instance admits it at the operand the
+    /// method's `self` is.
+    fn trait_with_method(&self, method: &str, v: &Value) -> Option<String> {
+        let traits: Vec<String> = self
+            .traits
+            .functions
+            .iter()
+            .filter(|((_, f), _)| f == method)
+            .filter_map(|((t, _), params)| {
+                let receiver = (*params.first()?)?;
+                let mut at = vec![None; receiver + 1];
+                at[receiver] = Some(receiver);
+                let mut values = vec![Value::Unit; receiver + 1];
+                values[receiver] = v.clone();
+                (!self.traits.admitting(t, &at, &values).is_empty()).then(|| t.clone())
+            })
+            .collect();
+        match traits.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        }
+    }
+
     /// `receiver.method(args)`: the method of the one type that declares it and has the
     /// receiver's constructor, called with the receiver as `self`.
     fn call_method(
@@ -1155,13 +1615,29 @@ impl Interp {
         args: &[Spanned<Expr>],
     ) -> Result<Value, Error> {
         let v = self.eval(receiver)?;
+        if let Value::Pending = v {
+            return Ok(Value::Pending);
+        }
+        let own = match &v {
+            Value::Nominal { ty, .. } => self
+                .types
+                .get(ty.as_str())
+                .is_some_and(|t| t.methods.contains(method)),
+            _ => false,
+        };
+        // A type's own methods and its instances' share one namespace, so a receiver whose
+        // type has no method of the name has its instance's.
+        if !own && let Some(trait_) = self.trait_with_method(method, &v) {
+            let mut values = vec![v.clone()];
+            for a in args {
+                values.push(self.eval(a)?);
+            }
+            return self.dispatch(&trait_, method, values);
+        }
         let Value::Nominal { ty, ctor, payload } = &v else {
-            return match v {
-                Value::Pending => Ok(Value::Pending),
-                other => err(format!(
-                    "`.{method}(…)` on {other}, which is not a nominal value"
-                )),
-            };
+            return err(format!(
+                "`.{method}(…)` on {v}, which is not a nominal value"
+            ));
         };
         // A nominal value names its type, which is the one whose method this is.
         let declares = self
@@ -1223,12 +1699,45 @@ impl Interp {
     /// the argument, or the tuple of several (`docs/chl-spec.md`, "Declaring a nominal
     /// type").
     fn construct(&mut self, q: &QualifiedName, args: &[Spanned<Expr>]) -> Result<Value, Error> {
+        // `T::f(args)`, a trait's function, answered by the instance the arguments pick.
+        if let [ty] = q.qualifier.as_slice()
+            && self.traits.functions.keys().any(|(t, _)| *t == ty.node)
+        {
+            let mut values = Vec::with_capacity(args.len());
+            for a in args {
+                values.push(self.eval(a)?);
+            }
+            return self.dispatch(&ty.node, &q.name.node, values);
+        }
         // An associated function, `N::f(args)`, is bound under its qualified name.
         if let [ty] = q.qualifier.as_slice() {
             let bound = format!("{}::{}", ty.node, q.name.node);
             if let Some(Slot::Fn(function)) = self.slot(&bound) {
                 let function = function.clone();
                 return self.call_user(&bound, &function, args);
+            }
+        }
+        // `N::m(x, a…)`, a method `N` has through an instance: `x.m(a…)` with `x` an `N`.
+        if let [ty] = q.qualifier.as_slice()
+            && self.member(q).is_err()
+            && let Some((receiver, rest)) = args.split_first()
+        {
+            let v = self.eval(receiver)?;
+            if let Value::Pending = v {
+                return Ok(Value::Pending);
+            }
+            if !matches!(&v, Value::Nominal { ty: t, .. } if *t == ty.node) {
+                return err(format!(
+                    "`{}::{}` takes a `{}`, got {v}",
+                    ty.node, q.name.node, ty.node
+                ));
+            }
+            if let Some(trait_) = self.trait_with_method(&q.name.node, &v) {
+                let mut values = vec![v];
+                for a in rest {
+                    values.push(self.eval(a)?);
+                }
+                return self.dispatch(&trait_, &q.name.node, values);
             }
         }
         // `N::extract(n)` is the payload of `n`'s one constructor `new`, and
@@ -2532,6 +3041,148 @@ mod tests {
         for (source, message) in cases {
             assert_eq!(refused(source), message, "{source}");
         }
+    }
+
+    /// A trait function's call runs the instance its arguments' constructors and base
+    /// types pick, however the call is written.
+    #[test]
+    fn a_trait_function_runs_the_instance_its_arguments_pick() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Circle:
+                circle(r: Int)
+            type Bag(T):
+                bag(xs: List(T))
+            trait Area(S):
+                def area(self: S) => Int
+            trait Join(A, B):
+                def join(self: A, other: B) => Int
+            impl Area(Circle):
+                def area(self):
+                    Circle::circle(r) = self
+                    3 * r
+            impl Join(Circle, Int):
+                def join(self, other):
+                    Circle::circle(r) = self
+                    r + other
+            impl Join(Circle, String):
+                def join(self, other):
+                    0
+            trait Sized(C):
+                def size(self: C) => Int
+            impl forall (T) Sized(Bag(T)):
+                def size(self):
+                    Bag::bag(xs) = self
+                    sum([1 for x in xs]) + 100
+            def double(s):
+                2 * s.area()
+            c = Circle::circle(2)
+            out << (c.area(), Area::area(c), double(c), c.join(5), Join::join(c, "x"), Bag::bag([1, 2]).size())
+        "#});
+        assert_eq!(
+            v.to_string(),
+            "[() -> (_0: 6, _1: 6, _2: 12, _3: 7, _4: 0, _5: 102)]"
+        );
+    }
+
+    /// An instance's function calls its own instance at a smaller type, and a function of
+    /// the block declared after it, and a type's name reaches the method its instance gives
+    /// it (`docs/chl-spec.md`, "Declaring an instance").
+    #[test]
+    fn an_instance_s_functions_reach_their_own_instance() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Circle = Int
+            type One(T) = T
+            trait Area(S):
+                def area(self: S) => Int
+                def twice(self: S) => Int
+            impl Area(Circle):
+                def area(self):
+                    self.extract()
+                def twice(self):
+                    2 * self.area()
+            impl forall (T) Area(One(T)) requires Area(T):
+                def area(self):
+                    self.twice() - self.extract().area() + 1
+                def twice(self):
+                    self.extract().twice()
+            o = One::new(One::new(Circle::new(1)))
+            out << (o.area(), One::area(o), Circle::twice(Circle::new(4)))
+        "#});
+        assert_eq!(v.to_string(), "[() -> (_0: 1, _1: 1, _2: 8)]");
+    }
+
+    /// Instances of one nominal type at different arguments: the arguments are read off the
+    /// value's payload through the type's declaration.
+    #[test]
+    fn an_instance_is_picked_by_its_head_s_arguments() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Two(T) = {T, T}
+            type Bag(T):
+                bag(xs: List(T))
+            trait Describe(C):
+                def code(self: C) => Int
+            impl Describe(Two(Int)):
+                def code(self):
+                    1
+            impl Describe(Two(String)):
+                def code(self):
+                    2
+            impl forall (T) Describe(Two(Two(T))):
+                def code(self):
+                    3
+            impl Describe(Bag(Int)):
+                def code(self):
+                    4
+            impl Describe(Bag(Bool)):
+                def code(self):
+                    5
+            out << (Two::new((1, 2)).code(), Two::new(("a", "b")).code(), Two::new((Two::new((1, 1)), Two::new((2, 2)))).code(), Bag::bag([True]).code())
+        "#});
+        assert_eq!(v.to_string(), "[() -> (_0: 1, _1: 2, _2: 3, _3: 5)]");
+    }
+
+    /// A type variable standing as a whole operand admits any value, so its method is every
+    /// value's.
+    #[test]
+    fn a_blanket_method() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Vec2 = {Int, Int}
+            trait Scales(V, F):
+                def scale(self: V, f: F) => V
+                def times(self: F, v: V) => V
+            impl forall (F) Scales(Vec2, F) requires Multipliable(Int, F, Output=Int):
+                def scale(self, f):
+                    Vec2::new((self.extract().0 * f, self.extract().1 * f))
+                def times(self, v):
+                    v.scale(self)
+            out << 3.times(Vec2::new((1, 2))).extract().1
+        "#});
+        assert_eq!(v.to_string(), "[() -> 6]");
+    }
+
+    /// Two single-constructor types share the constructor `new`, and a value names its type,
+    /// which chooses the instance.
+    #[test]
+    fn instances_of_two_types_sharing_a_constructor_name() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Circle = Int
+            type Square = Int
+            trait Area(S):
+                def area(self: S) => Int
+            impl Area(Circle):
+                def area(self):
+                    1
+            impl Area(Square):
+                def area(self):
+                    2
+            out << (Area::area(Circle::new(2)), Square::new(3).area())
+        "#});
+        assert_eq!(v.to_string(), "[() -> (_0: 1, _1: 2)]");
     }
 
     #[test]

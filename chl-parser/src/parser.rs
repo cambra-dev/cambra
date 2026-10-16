@@ -12,10 +12,10 @@ use smol_str::SmolStr;
 use crate::ast::{
     AnnotationMode, ArmPattern, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp,
     CmpOp, CompClause, Comprehension, Constructor, ConstructorParam, ConstructorPattern,
-    DiscardHead, Expr, FileId, IfBranch, ImplBlock, KindAnnotation, Lit, MatchArm, MatchPattern,
-    Module, ModulePath, Param, PayloadPattern, QualifiedName, RecordField, Requirement, RunArg,
-    Span, Spanned, Stmt, TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem,
-    VariantPayload,
+    DiscardHead, Expr, FileId, FunctionSignature, IfBranch, ImplBlock, KindAnnotation, Lit,
+    MatchArm, MatchPattern, Module, ModulePath, Param, PayloadPattern, QualifiedName, RecordField,
+    Requirement, RunArg, Span, Spanned, Stmt, TraitDecl, TraitItem, TypeAnnotation, TypeDecl,
+    TypeDeclBody, TypeParam, UnaryOp, UseItem, VariantPayload,
 };
 use crate::lexer::{self, Token};
 
@@ -1706,6 +1706,7 @@ where
             .ignore_then(def_name)
             .then(
                 param
+                    .clone()
                     .separated_by(just(Token::Comma))
                     .allow_trailing()
                     .collect::<Vec<_>>()
@@ -1749,18 +1750,36 @@ where
                     },
                 ),
             });
+        // The head is a type applied to its parameters, or a trait applied to the types an
+        // instance is for, spelled as a requirement is: lowering tells them apart by what
+        // the name names.
+        // An instance's type variables are declared before its head, `impl forall (T)
+        // Area(Two(T))`; each is a capitalized name.
+        let instance_vars = just(Token::Forall).ignore_then(
+            binder
+                .validate(|name, _, emitter| {
+                    if !starts_capitalized(&name.node) {
+                        emitter.emit(Rich::custom(
+                            name.span,
+                            format!(
+                                "type variable `{}` begins with a lowercase letter; it names \
+                                 a type, so it is capitalized",
+                                name.node
+                            ),
+                        ));
+                    }
+                    name
+                })
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        );
         let impl_stmt = just(Token::Impl)
-            .ignore_then(binder)
-            .then(
-                binder
-                    .separated_by(just(Token::Comma))
-                    .at_least(1)
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen))
-                    .or_not()
-                    .map(Option::unwrap_or_default),
-            )
+            .ignore_then(instance_vars.or_not())
+            .then(requirement(expr.clone()))
+            .then(requires_clause(expr.clone()).or_not())
             .then_ignore(just(Token::Colon))
             .then_ignore(just(Token::Newline))
             .then_ignore(just(Token::Indent).labelled("indented `def`s"))
@@ -1772,8 +1791,113 @@ where
                     .collect::<Vec<_>>(),
             )
             .then_ignore(just(Token::Dedent))
-            .map_with(|((ty, params), defs), e| {
-                Spanned::new(e.span(), Stmt::Impl(ImplBlock { ty, params, defs }))
+            .map_with(|(((vars, head), requires), defs), e| {
+                let Requirement {
+                    name,
+                    name_span,
+                    args,
+                    assoc,
+                } = head.node;
+                Spanned::new(
+                    e.span(),
+                    Stmt::Impl(ImplBlock {
+                        vars: vars.unwrap_or_default(),
+                        ty: Spanned::new(name_span, name),
+                        args,
+                        assoc,
+                        requires: requires.unwrap_or_default(),
+                        defs,
+                    }),
+                )
+            });
+
+        // ---- trait T(P…): ( type A | def f(…) => R requires … )+ -------
+        // (`docs/chl-spec.md`, "Declaring a trait")
+        let fn_signature = just(Token::Def)
+            .ignore_then(
+                select! { Token::Ident(s) => s }
+                    .labelled("function name")
+                    .map_with(|s, e| Spanned::new(e.span(), s)),
+            )
+            .then(
+                param
+                    .separated_by(just(Token::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .try_map(|items, _| split_params(items))
+                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+            )
+            .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
+            .then(requires_clause(expr.clone()).or_not())
+            .map_with(|(((name, (type_params, params)), output), requires), e| {
+                TraitItem::Function(Box::new(Spanned::new(
+                    e.span(),
+                    FunctionSignature {
+                        name,
+                        type_params,
+                        params,
+                        output,
+                        requires: requires.unwrap_or_default(),
+                    },
+                )))
+            });
+        let trait_item = choice((
+            just(Token::Type)
+                .ignore_then(binder)
+                .map(TraitItem::AssocType),
+            fn_signature,
+        ))
+        .then_ignore(just(Token::Newline));
+        let trait_stmt = just(Token::Trait)
+            .ignore_then(binder)
+            .then(
+                binder
+                    .separated_by(just(Token::Comma))
+                    .at_least(1)
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+            )
+            .then(requires_clause(expr.clone()).or_not())
+            .then_ignore(just(Token::Colon))
+            .then_ignore(just(Token::Newline))
+            .then_ignore(just(Token::Indent).labelled("indented associated types and signatures"))
+            .then(
+                trait_item
+                    .then_ignore(just(Token::Newline).repeated())
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(Token::Dedent))
+            .validate(|(((name, params), requires), items), e, emitter| {
+                let heads = std::iter::once((&name, "trait name"))
+                    .chain(params.iter().map(|p| (p, "trait operand")))
+                    .chain(items.iter().filter_map(|i| match i {
+                        TraitItem::AssocType(a) => Some((a, "associated type")),
+                        TraitItem::Function(_) => None,
+                    }));
+                for (head, what) in heads {
+                    if !starts_capitalized(&head.node) {
+                        emitter.emit(Rich::custom(
+                            head.span,
+                            format!(
+                                "{what} `{}` begins with a lowercase letter; it names a type, \
+                                 so it is capitalized",
+                                head.node
+                            ),
+                        ));
+                    }
+                }
+                Spanned::new(
+                    e.span(),
+                    Stmt::TraitDecl(TraitDecl {
+                        name,
+                        params,
+                        requires: requires.unwrap_or_default(),
+                        items,
+                    }),
+                )
             });
 
         // ---- simple statements (must end at NEWLINE) ----------------
@@ -1903,6 +2027,7 @@ where
             def_stmt,
             type_stmt,
             impl_stmt,
+            trait_stmt,
             decorated_stmt,
             pub_stmt,
             block_assign,
@@ -1971,6 +2096,7 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
         | Stmt::MutAssign { .. }
         | Stmt::FunctionDef { .. }
         | Stmt::TypeDecl(_)
+        | Stmt::TraitDecl(_)
         | Stmt::Run {
             renamed_from: None, ..
         }
@@ -2107,6 +2233,24 @@ where
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
 {
+    just(Token::Requires).ignore_then(
+        requirement(expr)
+            .separated_by(just(Token::Comma))
+            .at_least(1)
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// One requirement, `Addable(A, B, Output=O)`: a name, optionally applied to its operand
+/// types and then its associated types by name. An instance's head has the same shape
+/// (`docs/chl-spec.md`, "Declaring an instance").
+fn requirement<'src, I, E>(
+    expr: E,
+) -> impl Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
     enum Arg {
         Operand(Spanned<Expr>),
         Assoc(AssocArg),
@@ -2128,7 +2272,7 @@ where
         .allow_trailing()
         .collect::<Vec<_>>()
         .delimited_by(just(Token::LParen), just(Token::RParen));
-    let requirement = ident
+    ident
         .labelled("requirement")
         .then(args.or_not())
         .try_map_with(|((name, name_span), args), e| {
@@ -2161,13 +2305,7 @@ where
                     assoc: assocs,
                 },
             ))
-        });
-    just(Token::Requires).ignore_then(
-        requirement
-            .separated_by(just(Token::Comma))
-            .at_least(1)
-            .collect::<Vec<_>>(),
-    )
+        })
 }
 
 /// Split a parameter list into its type parameters, the capitalized names, and its
@@ -2691,9 +2829,69 @@ mod tests {
             panic!("expected an impl block, got {:?}", m.body[1].node)
         };
         assert_eq!(block.ty.node, "Option");
-        assert_eq!(block.params.len(), 1);
+        assert_eq!(block.args.len(), 1);
         assert_eq!(block.defs.len(), 2);
         assert!(matches!(block.defs[1].node, Stmt::Pub { .. }));
+    }
+
+    /// A trait declares a `requires` clause, associated types and bodiless signatures; an
+    /// instance declares its type variables with `forall`, and its head is spelled as a
+    /// requirement, with associated types and a `requires` clause.
+    #[test]
+    fn trait_declaration_and_instance_head() {
+        let m = parse_mod(indoc! {"
+            trait Container(C) requires Equatable(C, C):
+                type Elem
+                def first(self: C, otherwise: Elem) => Elem
+                def tag(R, self: C, label: R) => {R, Elem} requires Equatable(R, R)
+            impl forall (T) Container(Two(T), Elem=T) requires Container(T):
+                def first(self, otherwise):
+                    otherwise
+        "})
+        .into_result()
+        .expect("parses");
+        let Stmt::TraitDecl(decl) = &m.body[0].node else {
+            panic!("expected a trait declaration, got {:?}", m.body[0].node)
+        };
+        assert_eq!(decl.name.node, "Container");
+        assert_eq!(decl.params.len(), 1);
+        assert_eq!(decl.requires.len(), 1);
+        let [
+            TraitItem::AssocType(elem),
+            TraitItem::Function(first),
+            TraitItem::Function(tag),
+        ] = decl.items.as_slice()
+        else {
+            panic!(
+                "expected `type Elem` and two signatures, got {:?}",
+                decl.items
+            )
+        };
+        assert_eq!(elem.node, "Elem");
+        assert_eq!(first.node.params.len(), 2);
+        assert_eq!(tag.node.type_params.len(), 1);
+        assert_eq!(tag.node.requires.len(), 1);
+        let Stmt::Impl(block) = &m.body[1].node else {
+            panic!("expected an impl block, got {:?}", m.body[1].node)
+        };
+        assert_eq!(block.ty.node, "Container");
+        assert_eq!(block.vars.len(), 1);
+        assert_eq!(block.args.len(), 1);
+        assert_eq!(block.assoc.len(), 1);
+        assert_eq!(block.requires.len(), 1);
+    }
+
+    /// A trait's associated type is a type, so it is capitalized.
+    #[test]
+    fn a_lowercase_associated_type_is_refused() {
+        let result = parse_mod("trait T(C):\n    type elem\n");
+        let errors = result.into_result().expect_err("refused");
+        assert!(
+            errors.iter().any(|e| e
+                .to_string()
+                .contains("associated type `elem` begins with a lowercase")),
+            "{errors:?}"
+        );
     }
 
     /// `pub` stands on each `def` in an `impl` block, not on the block.

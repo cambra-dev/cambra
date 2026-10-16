@@ -248,6 +248,7 @@ The remaining nodes supply values or mark source structure for a later phase:
 | `VariantCtor` | Tag and payload construction, dual to a `Case` pattern. |
 | `NominalCtor` | A nominal type's constructor applied to its payload, typed by the declaration rather than as a variant ([nominal-types.md](nominal-types.md#constructors)). |
 | `Method` | A method call's unresolved function, with a reference to each candidate; inference replaces it with the one its receiver's type names ([nominal-types.md](nominal-types.md#method-calls)). |
+| `TraitFn` | A trait's function, the compiler's or a declared trait's, typed by the trait's signature at its operand types; coalescing replaces it with the function of the instance those types match, a term the compiler builds or a use of the binding a declared instance's `def` lowers to ([type-inference.md](type-inference.md#trait-functions)). |
 | `DefGroup` | An `impl` block's functions, which reach each other in any order; inference rewrites the group into the `Let`s that bind each after the functions it calls ([type-inference.md](type-inference.md#a-definition-group-is-emitted-in-the-order-its-references-need)). |
 | `Proj` | First-class tuple or record projection; applying it to a value gives field access. |
 | `Compose` | Function composition in application order, built by lowering and lambda elimination. |

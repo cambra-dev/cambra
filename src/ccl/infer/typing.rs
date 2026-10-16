@@ -172,6 +172,18 @@ pub(super) trait Typing {
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError>;
 
+    /// Every instance of `trait_` the program has: the compiler's and its modules' in
+    /// Emit, and the compiler's alone in Check, which meets no declared trait and no
+    /// method call.
+    fn instances_of(
+        &self,
+        trait_: &Trait,
+    ) -> Vec<std::rc::Rc<crate::ccl::infer::solver::traits::TraitInstance>>;
+
+    /// The requirements the `requires` clauses enclosing the current position state: none in
+    /// Check, where no `Poly` survives.
+    fn assumptions_in_scope(&self) -> &[std::rc::Rc<crate::ccl::ty::TraitRequirement>];
+
     /// Normalize a user annotation / binder type into a solver-ready `Type`
     /// (holes → fresh vars; refinements kept). See
     /// [`InferCtx::normalize_annotation`](super::context::InferCtx::normalize_annotation).
@@ -281,6 +293,17 @@ pub(super) trait Typing {
     /// call of it fails, so the definition's error is reported rather than the call's.
     /// Check has none to report.
     fn definition_alone_error(&self, name: &Name) -> Option<LocatedInferError>;
+
+    /// After an application passes its argument to the trait function `function`: where the
+    /// call's obligation now selects an instance whose functions are a group being emitted,
+    /// emit that function first, so the group binds it before the function calling it
+    /// (`src/ccl/design/type-inference.md`, "Trait functions"). Check has no group.
+    fn bind_instance_function_called(
+        &mut self,
+        _function: NodeId,
+    ) -> Result<(), LocatedInferError> {
+        Ok(())
+    }
 
     /// Run `f` with a `let` binding in scope over the body, at the type
     /// `binding.ty` records. Unless `scheme` is [`LetScheme::Monomorphic`], Emit

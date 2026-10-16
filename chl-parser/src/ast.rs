@@ -289,8 +289,13 @@ pub enum Stmt {
     TypeDecl(TypeDecl),
 
     /// `impl N(P…):` over `def`s, each an associated function of `N`
-    /// (`docs/chl-spec.md`, "Associated functions and methods").
+    /// (`docs/chl-spec.md`, "Associated functions and methods"), or `impl T(A…):`, an
+    /// instance of the trait `T` (`docs/chl-spec.md`, "Declaring an instance").
     Impl(ImplBlock),
+
+    /// `trait T(P…):` over associated types and function signatures
+    /// (`docs/chl-spec.md`, "Declaring a trait").
+    TraitDecl(TraitDecl),
 
     /// `with <binding> = <context>: body` — a transaction block. The context
     /// is `begin()` (the transaction marker); `binding`, when present, names
@@ -528,15 +533,60 @@ pub struct TypeDecl {
     pub body: TypeDeclBody,
 }
 
-/// An `impl` block ([`Stmt::Impl`]).
+/// An `impl` block ([`Stmt::Impl`]): a nominal type's associated functions, or an instance
+/// of a trait. The parser does not tell the two apart; lowering does, by what the head's name
+/// names.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImplBlock {
-    /// The type whose associated functions the block declares.
+    /// An instance's type variables, `T` in `impl forall (T) Area(Two(T)):`; empty for a
+    /// type's own block, whose head names its parameters.
+    pub vars: Vec<Spanned<SmolStr>>,
+    /// The type whose associated functions the block declares, or the trait the block is an
+    /// instance of.
     pub ty: Spanned<SmolStr>,
-    /// The type's parameters, bound once for every `def` in the block.
-    pub params: Vec<Spanned<SmolStr>>,
+    /// The head's arguments: the type's parameters, `T` in `impl Option(T):`, bound once for
+    /// every `def` in the block; or the types an instance is for, `Bag(T)` in
+    /// `impl Container(Bag(T), Elem=T):`.
+    pub args: Vec<Spanned<Expr>>,
+    /// The associated types an instance fixes, `Elem=T`.
+    pub assoc: Vec<AssocArg>,
+    /// What an instance requires of its head's type variables.
+    pub requires: Vec<Spanned<Requirement>>,
     /// The block's `def`s, each a [`Stmt::FunctionDef`], or one under [`Stmt::Pub`].
     pub defs: Vec<Spanned<Stmt>>,
+}
+
+/// A trait declaration ([`Stmt::TraitDecl`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitDecl {
+    /// The capitalized trait name.
+    pub name: Spanned<SmolStr>,
+    /// The operand types, `C` in `trait Container(C):`.
+    pub params: Vec<Spanned<SmolStr>>,
+    /// What every instance of the trait requires of its operands, `Equatable(A, B)` in
+    /// `trait Ordered(A, B) requires Equatable(A, B):`.
+    pub requires: Vec<Spanned<Requirement>>,
+    /// The body's lines, in source order.
+    pub items: Vec<TraitItem>,
+}
+
+/// One line of a [`TraitDecl`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum TraitItem {
+    /// `type Elem`: an associated type.
+    AssocType(Spanned<SmolStr>),
+    /// `def f(…) => T requires …`: a function the trait declares, with no body.
+    Function(Box<Spanned<FunctionSignature>>),
+}
+
+/// A `def` line with no body: the signature a trait declares a function by.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionSignature {
+    pub name: Spanned<SmolStr>,
+    pub type_params: Vec<TypeParam>,
+    pub params: Vec<Param>,
+    pub output: Option<Spanned<Expr>>,
+    pub requires: Vec<Spanned<Requirement>>,
 }
 
 /// What a [`TypeDecl`] declares after its head.

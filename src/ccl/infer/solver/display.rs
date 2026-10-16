@@ -229,7 +229,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
             assoc: stated
                 .assoc
                 .iter()
-                .map(|(name, _)| *name)
+                .map(|(name, _)| name.clone())
                 .zip(assoc_tys.iter().cloned())
                 .collect(),
             at: None,

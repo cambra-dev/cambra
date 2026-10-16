@@ -431,6 +431,23 @@ pub enum TypedExprNode {
         candidates: Vec<MethodCandidate>,
     },
 
+    /// A trait's function whose instance is not chosen yet, `Trait::f`: what `Area::area(c)`
+    /// and a method call resolved to a trait method lower to
+    /// (`src/ccl/design/type-inference.md`, "Trait functions").
+    ///
+    /// Typed by the trait's signature at an obligation over `operands`, which stay in the
+    /// node as type slots. Coalescing replaces the node with the function of the instance
+    /// its resolved operand types match, so none survives inference. A [`Method`](Self::Method)
+    /// picks which function a method call names, and becomes this node when the function is
+    /// a trait's; this node picks which instance of it runs.
+    TraitFn {
+        trait_: crate::ccl::infer::solver::traits::Trait,
+        function: SmolStr,
+        /// The trait's operand types at this use: holes from lowering, the obligation's
+        /// operand variables from emission.
+        operands: Vec<Type>,
+    },
+
     /// Tagged variant constructor: `` `Tag(payload) ``.
     ///
     /// Produces a [`Type::Variant`] containing a single tag whose payload type
@@ -860,6 +877,7 @@ impl TypedExprNode {
             TypedExprNode::VariantCtor { .. } => "VariantCtor",
             TypedExprNode::NominalCtor { .. } => "NominalCtor",
             TypedExprNode::Method { .. } => "Method",
+            TypedExprNode::TraitFn { .. } => "TraitFn",
             TypedExprNode::Transact { .. } => "Transact",
             TypedExprNode::LetRec { .. } => "LetRec",
             TypedExprNode::DefGroup { .. } => "DefGroup",
@@ -1708,6 +1726,7 @@ impl TypedExpr {
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
+            | TypedExprNode::TraitFn { .. }
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
             | TypedExprNode::LoadFrom(_)
@@ -1912,6 +1931,7 @@ impl TypedExpr {
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
+            | TypedExprNode::TraitFn { .. }
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
             | TypedExprNode::LoadFrom(_)
@@ -2061,6 +2081,7 @@ impl TypedExpr {
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
             | TypedExprNode::Method { .. }
+            | TypedExprNode::TraitFn { .. }
             | TypedExprNode::VariantCtor { .. }
             | TypedExprNode::NominalCtor { .. }
             | TypedExprNode::List(_)
@@ -2116,6 +2137,7 @@ impl TypedExpr {
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
             | TypedExprNode::Method { .. }
+            | TypedExprNode::TraitFn { .. }
             | TypedExprNode::VariantCtor { .. }
             | TypedExprNode::NominalCtor { .. }
             | TypedExprNode::List(_)
@@ -2184,6 +2206,9 @@ impl TypedExpr {
         if let TypedExprNode::Cast { target, .. } = &self.node {
             f(target);
         }
+        if let TypedExprNode::TraitFn { operands, .. } = &self.node {
+            operands.iter().for_each(&mut f);
+        }
         if let TypedExprNode::Transact {
             domain, parameter, ..
         } = &self.node
@@ -2211,6 +2236,9 @@ impl TypedExpr {
         }
         if let TypedExprNode::Cast { target, .. } = &mut self.node {
             f(target);
+        }
+        if let TypedExprNode::TraitFn { operands, .. } = &mut self.node {
+            operands.iter_mut().for_each(&mut f);
         }
         if let TypedExprNode::Transact {
             domain, parameter, ..
@@ -2390,15 +2418,26 @@ pub struct Branch {
     pub body: TypedExpr,
 }
 
-/// One type's method a [`TypedExprNode::Method`] may resolve to.
+/// One method a [`TypedExprNode::Method`] may resolve to: a nominal type's own, or a
+/// trait's.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MethodCandidate {
-    /// The nominal type declaring the method.
-    pub decl: std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+    /// What declares the method.
+    pub owner: MethodOwner,
     /// The number of value parameters the method declares after `self`.
     pub params: usize,
-    /// A reference to the method's binding.
+    /// A reference to the method's binding, or the trait function
+    /// ([`TypedExprNode::TraitFn`]).
     pub function: TypedExpr,
+}
+
+/// What declares a [`MethodCandidate`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum MethodOwner {
+    /// A nominal type's own method, `N::m`.
+    Type(std::rc::Rc<crate::ccl::nominal::NominalDecl>),
+    /// A trait's method, `Trait::m`, on whichever type its receiver operand is.
+    Trait(crate::ccl::infer::solver::traits::Trait),
 }
 
 /// What a [`Pattern`] matches: a structural variant's tag, or a nominal type's
@@ -2631,5 +2670,15 @@ mod tests {
             reached(&nested),
             vec!["node_ty", "transact_domain", "writer_parameter"]
         );
+
+        // A `TraitFn` carries its trait's operand types, which coalescing resolves to
+        // choose the instance.
+        let mut trait_fn = TypedExpr::new(TypedExprNode::TraitFn {
+            trait_: crate::ccl::infer::solver::traits::Trait::addable(),
+            function: "add".into(),
+            operands: vec![marker("operand")],
+        });
+        trait_fn.ty = marker("node_ty");
+        assert_eq!(reached(&trait_fn), vec!["node_ty", "operand"]);
     }
 }

@@ -145,7 +145,10 @@ The single-constructor form also binds `N::extract`, the function
 `def` named `N::f`, bound where the statement stands, as a module function is. A block's `def`s take
 its type parameters before their own. A method's `self` without an annotation is annotated
 `N(𝑃…)`, the declaration at the block's parameters. Outside a block a parameterised type's method
-annotates its `self`. `N::f` in an expression names the binding, and `N::f(𝑎…)` applies it.
+annotates its `self`. `N::f` in an expression names the binding, and `N::f(𝑎…)` applies it. Where
+`N` declares no member `f` and an instance gives it a method `f`, `N::f` lowers to that trait
+method's `TraitFn` with `N`, applied to holes, stated at `self`'s operand
+(`traits::type_qualified_method`), which emission bounds the operand by.
 
 A block's functions reach each other in any order, so the block lowers to one
 `TypedExprNode::DefGroup` of them, in source order, whose binders scope over every definition and
@@ -167,18 +170,21 @@ with a `Mut` parameter is refused.
 
 ### Method calls
 
-A method call `𝑥.m(𝑎…)` is the call `N::m(𝑥, 𝑎…)` for the `N` that `𝑥`'s type names, which
-lowering does not know. The parser keeps the call apart from a call of a field, `(𝑟.f)(𝑎…)`, as
-`Expr::MethodCall`. Lowering builds the application with a placeholder for the function:
+A method call `𝑥.m(𝑎…)` is the call `N::m(𝑥, 𝑎…)` for the `N` that `𝑥`'s type names, or the
+trait method call `Trait::m(𝑥, 𝑎…)` ([type-inference.md, "Trait functions"](type-inference.md#trait-functions)).
+Lowering does not know which. The parser keeps the call apart from a call of a field,
+`(𝑟.f)(𝑎…)`, as `Expr::MethodCall`. Lowering builds the application with a placeholder for the
+function:
 
 ```
-(𝑥, 𝑎…) ▷ method(m; N₁::m, N₂::m, …)
+(𝑥, 𝑎…) ▷ method(m; N₁::m, N₂::m, …, Trait₁::m, …)
 ```
 
 The placeholder, `TypedExprNode::Method`, holds the method's name, whether the call passes
-arguments after the receiver, and, as its children, a reference to each `N::m` the module declares,
-so `uniquify` resolves the candidates as it resolves any reference. ANF treats it as an atom, so it
-stays the application's function. No type declaring `m` is a lowering error.
+arguments after the receiver, and, as its children, a reference to each `N::m` the module declares
+and a `TraitFn` for each trait declaring a method `m`, the compiler's and the module's. `uniquify` resolves the references as it
+resolves any reference. ANF treats the placeholder as an atom, so it stays the application's
+function. No type or trait declaring `m` is a lowering error.
 
 Inference resolves the placeholder where it emits the application (`resolve_method`, called from
 `emit_apply`). The argument is emitted first, as for every application, so the receiver is typed by
@@ -192,18 +198,29 @@ unresolved at a method call in its body. `what_states_a_receivers_type_before_it
 case. A lambda applied where it stands has its parameter
 related to the argument before its body is emitted, as a `let` binds its value, and a
 comprehension's generator is one: its element reads each binder's type from the source. The receiver
-is the argument, or the first component of its tuple type when the call passes arguments. That type
-names a nominal head, directly or through the bounds its variable has gathered, or the call is an
-error asking for an annotation on the receiver: no later use decides it (`docs/chl-spec.md`,
-"Associated functions and methods"). The head's candidate replaces the placeholder, and the
-application is emitted as any call of a `def`. The other candidates are dropped without being
-emitted, so one whose `def` stands later in the module than the call reports nothing. The chosen one
-is unbound there, as a module function called before its `def` is. Each candidate records the
-parameters its method declares after `self`, and a call passing another number of arguments is an
-error naming the method and both counts. A head with no candidate is an error naming the type and
-the method, and a type that is not nominal is an error saying it has no methods. No `Method` node
-survives inference. A method no type declares is a lowering error pointing at `(r.f)(…)`, the call
-of a field's function, and a position, `t.0(…)`, names no method.
+is the argument, or the first component of its tuple type when the call passes arguments. Its type,
+read directly or through the bounds its variable has gathered, selects the candidates
+(`docs/chl-spec.md`, "Associated functions and methods"):
+
+| Receiver's type | Candidates |
+| --- | --- |
+| A nominal type `N` | `N::m`, and each trait candidate whose trait has an instance for `N` |
+| A type parameter | each trait candidate whose trait a `requires` clause states of it, or every trait candidate where none does |
+| Nothing yet | every trait candidate |
+| Any other type | each trait candidate whose trait has an instance for it |
+
+Exactly one candidate replaces the placeholder; none or several is an error asking for an
+annotation on the receiver, or naming the type and the method. No later use decides it. A trait
+candidate on a type parameter is answered by the `requires` clause naming it, and where no clause
+states a trait with the method, the obligation of the one trait declaring it reports the missing
+requirement. An inherent candidate is emitted as any call of a `def`, and a trait
+candidate as its `TraitFn`. The other candidates are dropped without being emitted, so a `def`
+standing later in the module than the call reports nothing. The chosen one is unbound there, as a
+module function called before its `def` is. Each candidate records the parameters its method
+declares after `self`, and a call passing another number of arguments is an error naming the method
+and both counts. No `Method` node survives inference. A method no type declares is a lowering
+error pointing at `(r.f)(…)`, the call of a field's function, and a position, `t.0(…)`, names no
+method.
 
 ### The compiler-provided `Option`
 
@@ -271,16 +288,27 @@ and display walks follow the same layout and polarities.
 
 ### Traits
 
-A nominal type offers no trait (`traits::offered`), so `==`, ordering and arithmetic on a nominal
-value are rejected where the operator is applied.
+A nominal type offers its declaration as its head (`traits::offered`), which only a declared
+instance accepts ([type-inference.md, "What the tables hold"](type-inference.md#what-the-tables-hold)).
+No operator trait has a declared instance, so `==`, ordering and arithmetic on a nominal value are
+rejected where the operator is applied.
+
+Lowering declares a module's traits after its types and before their associated functions, and
+its instances after those (`lower::traits`): an instance shares its type's namespace with the type's
+own functions, so a method an instance gives a type that the type or another instance already has
+is refused there. An instance's `def`s lower where its `impl` stands, each completed from the
+trait's signature at the instance's types: a missing annotation becomes the trait's type there,
+and one the `def` writes is compared with it. The block's functions are a `DefGroup`, bound so that
+each follows the ones of its instance it calls
+([type-inference.md, "Trait functions"](type-inference.md#trait-functions)).
 
 ---
 
 ## After inference
 
 A nominal type is concrete, and stays in every type slot to operator conversion. A nominal value is
-opaque to the passes after inference: it has no fields and satisfies no trait, so it is never a
-key, a domain, or an operator's operand, and those passes move it without reading its shape. The
+opaque to the passes after inference: it has no fields, and no operator trait accepts it, so it is
+never a key, a domain, or an operator's operand, and those passes move it without reading its shape. The
 shape is read where a value is built or taken apart, through `Type::structure`, which answers a
 nominal type's **representation** and every other type itself:
 

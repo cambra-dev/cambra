@@ -50,8 +50,9 @@ use panic_message::panic_message;
 /// The skeletons whose every cell agrees, so a change that breaks one of them fails
 /// `live_rows_agree`.
 ///
-/// `function_body` is not here: its `rows_sum` cell does not compile
-/// (`a_def_body_summing_jagged_rows_does_not_compile`, in `tests/compilation_pipeline/sums.rs`).
+/// `function_body` and `trait_instance_body` are not here: their `rows_sum` cell does not
+/// compile (`a_def_body_summing_jagged_rows_does_not_compile`, in
+/// `tests/compilation_pipeline/sums.rs`).
 const LIVE: &[&str] = &[
     "aggregate_arg",
     "binop_operand",
@@ -107,6 +108,9 @@ const LIVE: &[&str] = &[
     "terminal_read_after_guard",
     "terminal_read_guard",
     "ternary_branch",
+    "trait_generic_use",
+    "trait_instance_chain",
+    "trait_method_receiver",
     "tuple_component",
     "two_feed_sites",
     "txn_guard",
@@ -303,6 +307,60 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             t = ({}, 2)
             out << t.0 + t.1
+        "#}},
+        Skeleton { name: "trait_method_receiver", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            type Box = Int
+            trait Area(S):
+                def area(self: S) => Int
+            impl Area(Box):
+                def area(self):
+                    self.extract() * 2
+
+            out = test_sink()
+            out << Box::new({}).area()
+        "#}},
+        Skeleton { name: "trait_instance_body", hole: Ty::Int, scope: &[("n", Ty::Int)], body: indoc! {r#"
+            type Box = Int
+            trait Area(S):
+                def area(self: S, k: Int) => Int
+            impl Area(Box):
+                def area(self, n):
+                    {}
+
+            out = test_sink()
+            out << Box::new(1).area(5)
+        "#}},
+        Skeleton { name: "trait_instance_chain", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            type Box = Int
+            type One(T) = T
+            trait Area(S):
+                def area(self: S) => Int
+            impl Area(Box):
+                def area(self):
+                    self.extract()
+            impl forall (T) Area(One(T)) requires Area(T):
+                def area(self):
+                    self.extract().area() + 1
+
+            out = test_sink()
+            out << One::new(One::new(Box::new({}))).area()
+        "#}},
+        Skeleton { name: "trait_generic_use", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            type Box = Int
+            type Two(T) = {T, T}
+            trait Area(S):
+                def area(self: S) => Int
+            impl Area(Box):
+                def area(self):
+                    self.extract()
+            impl forall (T) Area(Two(T)) requires Area(T):
+                def area(self):
+                    self.extract().0.area() + self.extract().1.area()
+            def total(s):
+                s.area()
+
+            out = test_sink()
+            out << total(Two::new((Box::new({}), Box::new(1))))
         "#}},
         Skeleton { name: "function_arg", hole: Ty::Int, scope: &[], body: indoc! {r#"
             def fn_under_test(n):

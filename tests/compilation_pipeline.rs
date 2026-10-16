@@ -58,6 +58,8 @@ mod secondary_labels;
 mod sources_incremental;
 #[path = "compilation_pipeline/sums.rs"]
 mod sums;
+#[path = "compilation_pipeline/traits.rs"]
+mod traits;
 #[path = "compilation_pipeline/transactions.rs"]
 mod transactions;
 #[path = "compilation_pipeline/type_aliases.rs"]
