@@ -5,9 +5,13 @@
 //!   requests the server does not handle.
 //! - Goldens: the diagnostics, outline and folding ranges of every `.cambra`
 //!   file under the repository's `tests/` and `editors/`, and of the lexer
-//!   recovery corpus. `CAMBRA_BLESS=1` rewrites them.
+//!   recovery corpus, and of the non-ASCII fixtures in both encodings.
+//!   `CAMBRA_BLESS=1` rewrites them.
+//! - Encoding independence: every file reports the same features under UTF-8
+//!   and UTF-16 columns.
 
 use cambra_lsp::Ended;
+use chl_parser::line_index::{Encoding, LineCol, LineIndex};
 use indoc::indoc;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use serde_json::{Value, json};
@@ -28,8 +32,9 @@ struct TestServer {
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 impl TestServer {
-    /// A server initialized by a client offering `encodings`.
-    fn with_encodings(encodings: &[&str]) -> (TestServer, Response) {
+    /// A server initialized by a client offering `encodings`, or offering
+    /// none when `encodings` is `None`.
+    fn with_encodings(encodings: Option<&[&str]>) -> (TestServer, Response) {
         let (server, client) = Connection::memory();
         let handle =
             std::thread::spawn(move || cambra_lsp::run(&server).map_err(|e| e.to_string()));
@@ -39,19 +44,32 @@ impl TestServer {
             next_id: 0,
             unread: Vec::new(),
         };
-        let response = test.request_raw(
-            "initialize",
-            json!({"capabilities": {"general": {"positionEncodings": encodings}}}),
-        );
+        let capabilities = match encodings {
+            Some(encodings) => json!({"general": {"positionEncodings": encodings}}),
+            None => json!({}),
+        };
+        let response = test.request_raw("initialize", json!({"capabilities": capabilities}));
         (test, response)
     }
 
-    fn new() -> TestServer {
-        let (test, response) = TestServer::with_encodings(&["utf-8", "utf-16"]);
+    /// A server initialized by a client offering `encodings`, after checking
+    /// that it chose `expected`.
+    fn negotiated(encodings: Option<&[&str]>, expected: &str) -> TestServer {
+        let (test, response) = TestServer::with_encodings(encodings);
         let result = response.response_result.expect("initialize succeeds");
-        assert_eq!(result["capabilities"]["positionEncoding"], json!("utf-8"));
+        assert_eq!(result["capabilities"]["positionEncoding"], json!(expected));
         test.notify("initialized", json!({}));
         test
+    }
+
+    /// A server whose columns count UTF-8 bytes.
+    fn new() -> TestServer {
+        TestServer::negotiated(Some(&["utf-8", "utf-16"]), "utf-8")
+    }
+
+    /// A server whose columns count UTF-16 code units, as VS Code's are.
+    fn utf16() -> TestServer {
+        TestServer::negotiated(Some(&["utf-16"]), "utf-16")
     }
 
     fn notify(&self, method: &str, params: Value) {
@@ -182,12 +200,42 @@ fn requests_after_shutdown_are_refused() {
 }
 
 #[test]
-fn a_client_without_utf8_is_refused() {
-    let (server, response) = TestServer::with_encodings(&["utf-16"]);
-    let error = response.response_result.expect_err("initialize fails");
-    assert!(error.message.contains("Neovim 0.11"), "{error:?}");
-    let ended = server.server.expect("spawned").join().expect("no panic");
-    assert!(ended.is_err(), "{ended:?}");
+fn a_client_offering_only_utf16_is_served_in_utf16() {
+    assert_eq!(TestServer::utf16().shutdown(), Ended::Shutdown);
+}
+
+/// The protocol's default when a client names no encoding is UTF-16.
+#[test]
+fn a_client_offering_no_encodings_is_served_in_utf16() {
+    assert_eq!(
+        TestServer::negotiated(None, "utf-16").shutdown(),
+        Ended::Shutdown
+    );
+}
+
+/// `😀` is 4 bytes and 2 UTF-16 units, so the `$` after it is at column 9 in
+/// UTF-16 and 11 in UTF-8. An edit sent in UTF-16 columns removes it.
+#[test]
+fn utf16_columns_count_code_units() {
+    let uri = "file:///a.cambra";
+    let text = "s = \"😀\" $\n";
+    for (mut server, dollar) in [(TestServer::new(), 11), (TestServer::utf16(), 9)] {
+        server.open(uri, text);
+        let diagnostics = server.diagnostics(uri, 1);
+        assert_eq!(
+            diagnostics[0]["range"],
+            json!({"start": {"line": 0, "character": dollar}, "end": {"line": 0, "character": dollar + 1}})
+        );
+        server.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri, "version": 2},
+                "contentChanges": [{"range": {"start": {"line": 0, "character": dollar - 1}, "end": {"line": 0, "character": dollar + 1}}, "text": ""}],
+            }),
+        );
+        assert_eq!(server.diagnostics(uri, 2), json!([]));
+        server.shutdown();
+    }
 }
 
 #[test]
@@ -303,11 +351,44 @@ fn render_symbols(out: &mut String, symbols: &Value, depth: usize) {
     }
 }
 
+/// What the server reports for one file: its diagnostics, outline and folds.
+struct Features {
+    diagnostics: Value,
+    symbols: Value,
+    folds: Value,
+}
+
+fn features(server: &mut TestServer, uri: &str, text: &str) -> Features {
+    server.open(uri, text);
+    let diagnostics = server.diagnostics(uri, 1);
+    let symbols = server.request(
+        "textDocument/documentSymbol",
+        json!({"textDocument": {"uri": uri}}),
+    );
+    let folds = server.request(
+        "textDocument/foldingRange",
+        json!({"textDocument": {"uri": uri}}),
+    );
+    server.notify(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri}}),
+    );
+    Features {
+        diagnostics,
+        symbols,
+        folds,
+    }
+}
+
 /// The golden rendering of one file: its diagnostics, outline and folds.
 fn render(server: &mut TestServer, uri: &str, text: &str) -> String {
-    server.open(uri, text);
+    let Features {
+        diagnostics,
+        symbols,
+        folds,
+    } = features(server, uri, text);
     let mut out = String::from("diagnostics:\n");
-    for d in server.diagnostics(uri, 1).as_array().unwrap() {
+    for d in diagnostics.as_array().unwrap() {
         writeln!(
             out,
             "  {} {}",
@@ -326,16 +407,8 @@ fn render(server: &mut TestServer, uri: &str, text: &str) -> String {
         }
     }
     out.push_str("symbols:\n");
-    let symbols = server.request(
-        "textDocument/documentSymbol",
-        json!({"textDocument": {"uri": uri}}),
-    );
     render_symbols(&mut out, &symbols, 0);
     out.push_str("folds:\n");
-    let folds = server.request(
-        "textDocument/foldingRange",
-        json!({"textDocument": {"uri": uri}}),
-    );
     for fold in folds.as_array().unwrap() {
         let kind = fold["kind"]
             .as_str()
@@ -349,28 +422,35 @@ fn render(server: &mut TestServer, uri: &str, text: &str) -> String {
         )
         .unwrap();
     }
-    server.notify(
-        "textDocument/didClose",
-        json!({"textDocument": {"uri": uri}}),
-    );
     out
 }
 
-/// Renders every file in `files` into one golden at `golden`, each section
-/// headed by the file's path from the repository root.
-fn check_golden(files: &[PathBuf], golden: &str) {
+/// A file's path from the repository root, and its text.
+fn read(path: &Path) -> (String, String) {
     let root = repo_root().canonicalize().unwrap();
-    let mut server = TestServer::new();
+    let path = path.canonicalize().unwrap();
+    let name = path.strip_prefix(&root).unwrap().display().to_string();
+    (name, std::fs::read_to_string(&path).unwrap())
+}
+
+/// A suffix for a golden's section headings, and the server the sections are
+/// rendered under.
+type Session = (&'static str, fn() -> TestServer);
+
+/// Renders every file in `files` into one golden at `golden`, each section
+/// headed by the file's path from the repository root, under each of
+/// `sessions`.
+fn check_golden(files: &[PathBuf], sessions: &[Session], golden: &str) {
     let mut rendered = String::new();
-    for path in files {
-        let path = path.canonicalize().unwrap();
-        let name = path.strip_prefix(&root).unwrap().display().to_string();
-        let text = std::fs::read_to_string(&path).unwrap();
-        let uri = format!("file:///{name}");
-        writeln!(rendered, "== {name}").unwrap();
-        rendered.push_str(&render(&mut server, &uri, &text));
+    for (label, make) in sessions {
+        let mut server = make();
+        for path in files {
+            let (name, text) = read(path);
+            writeln!(rendered, "== {name}{label}").unwrap();
+            rendered.push_str(&render(&mut server, &format!("file:///{name}"), &text));
+        }
+        server.shutdown();
     }
-    server.shutdown();
     let golden_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/goldens")
         .join(golden);
@@ -392,12 +472,88 @@ fn repository_programs_match_their_golden() {
     let mut files = cambra_files(&root.join("tests"));
     files.extend(cambra_files(&root.join("editors")));
     assert!(!files.is_empty());
-    check_golden(&files, "programs.txt");
+    check_golden(&files, &[("", TestServer::new)], "programs.txt");
 }
 
 #[test]
 fn lexer_recovery_corpus_matches_its_golden() {
     let files = cambra_files(&repo_root().join("chl-parser/tests/lexer_recovery"));
     assert!(!files.is_empty());
-    check_golden(&files, "lexer_recovery.txt");
+    check_golden(&files, &[("", TestServer::new)], "lexer_recovery.txt");
+}
+
+/// The non-ASCII fixtures' positions in both encodings, so each UTF-16
+/// column can be checked by hand against its UTF-8 one.
+#[test]
+fn non_ascii_fixtures_match_their_golden_in_both_encodings() {
+    let files = cambra_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/non_ascii"));
+    assert!(!files.is_empty());
+    check_golden(
+        &files,
+        &[
+            (" (utf-8)", TestServer::new),
+            (" (utf-16)", TestServer::utf16),
+        ],
+        "non_ascii.txt",
+    );
+}
+
+/// `value` with every protocol position, an object holding exactly `line`
+/// and `character`, replaced by the byte offset it names in `text`.
+fn to_offsets(value: &Value, text: &str, index: &LineIndex, encoding: Encoding) -> Value {
+    match value {
+        Value::Object(fields)
+            if fields.len() == 2
+                && fields.contains_key("line")
+                && fields.contains_key("character") =>
+        {
+            let pos = LineCol {
+                line: fields["line"].as_u64().unwrap() as usize,
+                col: fields["character"].as_u64().unwrap() as usize,
+            };
+            json!(index.offset_in(text, pos, encoding))
+        }
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), to_offsets(v, text, index, encoding)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| to_offsets(v, text, index, encoding))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Every file the goldens cover reports the same diagnostics, outline and
+/// folds under UTF-8 and UTF-16 once each position is mapped back to a byte
+/// offset. A feature that computed a column without the session's encoding
+/// would differ on a line holding a multi-byte character.
+#[test]
+fn features_do_not_depend_on_the_encoding() {
+    let root = repo_root();
+    let mut files = cambra_files(&root.join("tests"));
+    files.extend(cambra_files(&root.join("editors")));
+    files.extend(cambra_files(&root.join("chl-parser/tests/lexer_recovery")));
+    files.extend(cambra_files(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/non_ascii"),
+    ));
+    let (mut utf8, mut utf16) = (TestServer::new(), TestServer::utf16());
+    for path in &files {
+        let (name, text) = read(path);
+        let uri = format!("file:///{name}");
+        let index = LineIndex::new(&text);
+        let as_offsets = |f: Features, encoding| {
+            [f.diagnostics, f.symbols, f.folds].map(|v| to_offsets(&v, &text, &index, encoding))
+        };
+        let in_utf8 = as_offsets(features(&mut utf8, &uri, &text), Encoding::Utf8);
+        let in_utf16 = as_offsets(features(&mut utf16, &uri, &text), Encoding::Utf16);
+        assert_eq!(in_utf8, in_utf16, "{name}");
+    }
+    utf8.shutdown();
+    utf16.shutdown();
 }

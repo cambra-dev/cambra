@@ -1,0 +1,14 @@
+# Each diagnostic, symbol and fold below sits on a line holding a character
+# wider than one byte, so its UTF-8 and UTF-16 columns differ: é is 2 bytes
+# and 1 UTF-16 unit, € 3 and 1, 😀 4 and 2.
+greeting = "héllo 😀"
+price = "€" $
+def shout(s):
+    s + "😀" + café
+def tag(a,
+        b):  # 😀€
+    a + b + "😀"
+pairs = ["😀", "é",
+         "€"]
+bad = f("😀", 1]
+x = "😀"

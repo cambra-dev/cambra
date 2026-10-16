@@ -9,9 +9,9 @@ language id is `cambra` in both editors, and the TextMate scope is `source.cambr
 | `nvim/` | A Neovim runtime directory: filetype detection, a filetype plugin, an indent plugin, the syntax file `syntax/cambra.vim`, and the language server configuration `lsp/cambra.lua`. |
 
 The language server, run as `cambra --lsp`, reports lex and parse errors, outlines a file, and folds
-it ([cambra-lsp/design-cambra-lsp.md](../cambra-lsp/design-cambra-lsp.md)). Neovim 0.11 and later
-can use it; [Neovim](#neovim) has the setup. Semantic tokens from the server will later sit on top
-of these grammars rather than replace them.
+it ([cambra-lsp/design-cambra-lsp.md](../cambra-lsp/design-cambra-lsp.md)). Any client can use it,
+since it counts columns in UTF-8 or UTF-16; [Neovim](#neovim) has the setup. Semantic tokens from
+the server will later sit on top of these grammars rather than replace them.
 
 ## Highlight classes
 
@@ -266,10 +266,10 @@ nvim --headless -u NONE --cmd 'set rtp^=editors/nvim' \
 
 ### Language server
 
-`lsp/cambra.lua` configures `cambra --lsp` for Neovim 0.11 and later, which the server requires
-because it counts columns in UTF-8. With the runtime directory added as above and `cambra` on
-`PATH` (`cargo install --path .` from the repository root), enable it and fold through it in
-`init.lua`:
+`lsp/cambra.lua` configures `cambra --lsp` for Neovim 0.11's `vim.lsp.config`. Neovim 0.10 has no
+`vim.lsp.config`, and starts the server with `vim.lsp.start` instead. With the runtime directory
+added as above and `cambra` on `PATH` (`cargo install --path .` from the repository root), enable it
+and fold through it in `init.lua`:
 
 ```lua
 vim.lsp.enable('cambra')
