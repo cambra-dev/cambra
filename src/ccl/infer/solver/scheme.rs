@@ -901,15 +901,17 @@ fn freshen_watches(
                 .collect(),
         );
         let _f = crate::ccl::provenance::copy_frame("infer.freshen_obligation_inputs");
-        copy.set_input_exprs(
-            copy.input_exprs()
-                .into_iter()
-                .map(|mut expr| {
-                    freshen_expr_type_slots(&mut expr, lim, target, cache);
-                    expr
-                })
-                .collect(),
-        );
+        if let Some(operands) = copy.refinement_operands() {
+            copy.set_refinement_operands(
+                operands
+                    .into_iter()
+                    .map(|mut expr| {
+                        freshen_expr_type_slots(&mut expr, lim, target, cache);
+                        expr
+                    })
+                    .collect(),
+            );
+        }
     }
 }
 
