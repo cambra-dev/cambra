@@ -390,6 +390,62 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
     any_feed.then_some(arms)
 }
 
+/// The `let`s `body` binds ahead of what it ends in, outermost first, and that end:
+/// `let 𝑛₁ = 𝑒₁ in … let 𝑛ₖ = 𝑒ₖ in 𝑒`. The chain stops at a `let` that rebinds `defer_name`
+/// or whose definition feeds it, which the fan-out must see as a statement of the body.
+fn let_chain<'e>(body: &'e Expr, defer_name: &Name) -> (Vec<(TypedBinding, Expr)>, &'e Expr) {
+    let mut lets = Vec::new();
+    let mut end = body;
+    while let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &end.node
+    {
+        if &binding.name == defer_name || collect_feed_target_names(bound_expr).contains(defer_name)
+        {
+            break;
+        }
+        lets.push((binding.clone(), (**bound_expr).clone()));
+        end = body;
+    }
+    (lets, end)
+}
+
+/// `term` under the `let`s of a [`let_chain`], typed as `term`.
+fn under_lets(lets: &[(TypedBinding, Expr)], term: Expr) -> Expr {
+    lets.iter().rev().fold(term, |body, (binding, def)| {
+        Expr::let_in(binding.clone(), def.clone(), body)
+    })
+}
+
+/// `body` with the end of its first `depth` `let`s replaced by `f` of it, each `let` keeping
+/// its identity and taking its new body's type.
+fn map_let_chain_tail(body: Expr, depth: usize, f: impl FnOnce(Expr) -> Expr) -> Expr {
+    if depth == 0 {
+        return f(body);
+    }
+    let TypedExpr {
+        node:
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            },
+        node_id,
+        ..
+    } = body
+    else {
+        unreachable!("`let_chain` counted {depth} more `let`s here")
+    };
+    Expr::let_in_preserving(
+        node_id,
+        binding,
+        *bound_expr,
+        map_let_chain_tail(*body, depth - 1, f),
+    )
+}
+
 /// The defer-returning lift's output.
 struct DeferLift {
     /// `let y = Defer in …` — the two defer scopes merged into one.
@@ -2658,7 +2714,11 @@ fn extract_for_defer_impl(
                         // becomes one refined-source channel per feeding arm
                         // plus a Lambda whose body collapses to `Unit`.  See
                         // [`try_extract_fanout_feed`].
-                        if let Some(fanout_arms) = try_extract_fanout_feed(&body, defer_name) {
+                        // The `let`s the body binds ahead of the `Case` stay around each arm's
+                        // guard and value and around the residual, so a guard reading one is
+                        // still a filter on this loop's source.
+                        let (lets, case) = let_chain(&body, defer_name);
+                        if let Some(fanout_arms) = try_extract_fanout_feed(case, defer_name) {
                             // Fan the feeding arms out into one refined-source
                             // channel each (unioned via `++` at the cluster bind
                             // site), encoding the `Case`'s first-match order:
@@ -2695,7 +2755,7 @@ fn extract_for_defer_impl(
                             let TypedExprNode::Case {
                                 branches: original_branches,
                                 ..
-                            } = &body.node
+                            } = &case.node
                             else {
                                 unreachable!(
                                     "`try_extract_fanout_feed` returned `Some`, which \
@@ -2757,7 +2817,8 @@ fn extract_for_defer_impl(
                                         "channelize.feed",
                                         provenance::Nature::Expansion,
                                     );
-                                    let pred = synthesize_arm_predicate(&guard, &prior);
+                                    let pred =
+                                        under_lets(&lets, synthesize_arm_predicate(&guard, &prior));
                                     let elem = Expr::var(Name::elem()).with_ty(src_domain.clone());
                                     let source_at_elem = Expr::apply(elem, source_prefix.clone())
                                         .with_ty(src_item.clone());
@@ -2769,8 +2830,11 @@ fn extract_for_defer_impl(
                                         Refinement::born(Rc::new(pred_on_source));
                                     let mut refined_prefix = source_prefix.clone();
                                     refine_source_domain(&mut refined_prefix, refinement_struct);
-                                    let channel_lambda =
-                                        Expr::lambda(&param.name, param.ty.clone(), value);
+                                    let channel_lambda = Expr::lambda(
+                                        &param.name,
+                                        param.ty.clone(),
+                                        under_lets(&lets, value),
+                                    );
                                     // stamp the channel at
                                     // construction — `Fun(refined-domain,
                                     // value)` off the two elements' concrete
@@ -2795,7 +2859,9 @@ fn extract_for_defer_impl(
                             let new_lambda = TypedExpr {
                                 node: TypedExprNode::Lambda {
                                     param,
-                                    body: Box::new(residual_after_fanout(*body, defer_name)),
+                                    body: Box::new(map_let_chain_tail(*body, lets.len(), |case| {
+                                        residual_after_fanout(case, defer_name)
+                                    })),
                                 },
                                 ty: elt_ty,
                                 user_annotation: elt_user_ann,
