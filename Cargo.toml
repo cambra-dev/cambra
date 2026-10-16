@@ -70,6 +70,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
+# Line tables only: backtraces, profilers and line breakpoints keep `file.rs:line`,
+# and a debugger loses variables, arguments and types. Full debug info is ~80% of
+# a test binary, and every test binary links the whole library, so it is most of
+# `target/`: 12G of it at full against 5.0G here. `CARGO_PROFILE_DEV_DEBUG=full`
+# turns it back on for a debugging session (`CLAUDE.md`, "Debug symbols").
+# Stripping only the dependencies is not the saving: nearly all of it is this
+# workspace's own crates.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 debug = "line-tables-only"
 
@@ -82,6 +92,8 @@ debug = "line-tables-only"
 inherits = "dev"
 debug-assertions = false
 overflow-checks = false
+# No one runs a debugger on this tree: 11G with full debug info, 2.7G without.
+debug = false
 # The differential oracle belongs to the formal gate, not to the suite. It runs
 # `formal/.lake/build/bin/subverdict` and refuses to skip under CI, so a job
 # that runs the suite would need the whole Lean toolchain to check something

@@ -73,8 +73,19 @@ release pinned in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 ```bash
 cargo build          # build
 cargo test           # run tests
+./ci.sh fast         # local gate (fmt + debug clippy + tests + the frontend checks)
 ./ci.sh              # full CI suite (fmt + clippy in debug & release + doc + tests)
 ```
+
+Debug builds carry line tables only, so backtraces and profilers name `file.rs:line` but a
+debugger cannot show variables. For a debugging session, build with full debug info:
+
+```bash
+CARGO_PROFILE_DEV_DEBUG=full cargo build   # likewise cargo test / cargo run
+```
+
+To keep it on, export the variable, or set `debug = "full"` under `[profile.dev]` in
+`~/.cargo/config.toml`. [CLAUDE.md](CLAUDE.md#debug-symbols) has the details.
 
 Run a program:
 

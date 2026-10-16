@@ -15,14 +15,14 @@ cargo clippy --release --all-targets -- -D warnings  # Lint (release) — CI run
 ./ci.sh formal   # The Lean model (formal/): `lake build` — which elaborates every theorem and evaluates every #guard — then the differential oracles. Skips loudly with no `lake` on PATH; fails instead under CI.
 ./ci.sh solver   # Checks for `z3` on PATH. Refinement subtyping runs queries against it, so without it the suite is red; this reports it once instead of as dozens of unrelated failures. Runs inside `fast` and the full gate.
 ./ci.sh editors  # The editor grammars (`editors/`) against the lexer: the TextMate grammar under Node, the Vim syntax file under headless Neovim, over every `.cambra` file, and each editor's indentation against `editors/indent-cases.json`. Skips loudly per editor with no `node` or `nvim` on PATH; fails instead under CI. Part of the full gate, not of `fast`.
-./ci.sh --fix    # Authoritative gate: fmt + ALL THREE clippy passes + doc + formal + tests + fixtures, auto-formatting first. Must pass before pushing a PR.
+./ci.sh --fix    # Authoritative gate: fmt + ALL THREE clippy passes + doc + formal + tests + fixtures, auto-formatting first. Run when asked; GitHub CI runs the same gates on every push.
 cargo test -q --no-fail-fast      # Run all tests
 cargo test <name>  # Run a specific test by name
 ```
 
-For the tight edit→check loop, prefer `./ci.sh fast` (or a bare `cargo test <name>`) over the full `./ci.sh`; run the full gate before pushing.
+The local default is `./ci.sh fast` (or a bare `cargo test <name>`), including before pushing. Run the full `./ci.sh` when asked.
 
-CI lints in **three configurations**, because each one compiles code the others do not. Passing the plain debug `cargo clippy` is **not** sufficient; run `./ci.sh` to catch all three.
+CI lints in **three configurations**, because each one compiles code the others do not. Passing the plain debug `cargo clippy` is **not** sufficient; the full `./ci.sh` and GitHub CI run all three.
 
 | Pass | What only it compiles |
 |---|---|
@@ -31,6 +31,29 @@ CI lints in **three configurations**, because each one compiles code the others 
 | `ci_clippy_lib` | the library with **no** features: the other two unify the self dev-dependency's `test-helpers` into the lib, so only this one compiles the configuration a consumer builds |
 
 The pattern is the same in each case: a configuration that nothing compiles is a configuration that rots, and the failure is silent rather than loud — `--all-targets` hides the `test-helpers` gap the way a default-off feature would hide a gated impl.
+
+### Debug symbols
+
+The `dev` profile builds with `debug = "line-tables-only"`. Backtraces, `perf`, and breakpoints on
+a function or a `file.rs:line` work. A debugger (gdb, lldb, VS Code's CodeLLDB) shows no variables,
+arguments, or types: `info args` answers `No symbol table info available`.
+
+For a debugging session, build with full debug info:
+
+```bash
+CARGO_PROFILE_DEV_DEBUG=full cargo test --no-run   # or cargo build / cargo run
+gdb target/debug/deps/<test-binary>-<hash>
+```
+
+The setting changes every crate's compile flags, so the first build with it and the first build
+after it rebuild the workspace into the same `target/debug`. To keep full debug info on, export
+`CARGO_PROFILE_DEV_DEBUG=full` in the shell, or put `[profile.dev]` with `debug = "full"` in
+`~/.cargo/config.toml`, which applies it to every Cargo project for that user. A launch
+configuration that builds through Cargo (CodeLLDB's `"cargo"` key) takes the same variable in its
+`env`. Do not set it in a committed file: `target/` sizes grow about 2.4× (`Cargo.toml`, the
+comment on `[profile.dev]`).
+
+The `no-assertions` profile builds with `debug = false`; nothing debugs that tree.
 
 ## General Instructions
 
@@ -247,7 +270,7 @@ Do not render type information as Rust struct syntax (e.g., `Fun { name: Some("k
 
 ### Workflow
 
-After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. While iterating, `./ci.sh fast` (fmt + debug clippy + the frontend's typecheck and tests + the Rust suite) is the quick check — roughly a third of the full gate's time. **Before creating or pushing a PR, run the full `./ci.sh` and confirm it is clean** — GitHub CI gates on the same checks, and `./ci.sh` runs the parts no single `cargo` command covers and that `fast` skips: the other three clippy configurations (release, `serde`, lib-only), the doc build, the vendored-bundle freshness check in `ci_web`, and the `formal` gate (the Lean model plus its differential oracles). A green debug `cargo clippy` (or `./ci.sh fast`) is not enough (see Build Commands above).
+After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. **Before creating or pushing a PR, run `./ci.sh fast` and confirm it is clean** (fmt + debug clippy + the frontend's typecheck and tests + the Rust suite, roughly a third of the full gate's time). Run the full `./ci.sh` only when asked. GitHub CI runs every gate on each push, including the parts `fast` skips: the release and lib-only clippy configurations, the doc build, the suite with `debug_assertions` off, the vendored-bundle freshness check in `ci_web`, and the `formal` gate (the Lean model plus its differential oracles). A green `fast` does not guarantee a green CI run; read the PR's checks after pushing.
 
 When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md` and other `*/design-*.md` files close to source files that were changed.
 
@@ -305,9 +328,10 @@ gh pr create --base dmills/<name> --head dmills/<next> --fill
 has. 0.44 has no `--allow-new`. Branch names carry the `dmills/` prefix, applied by hand. A PR
 stacked on a draft stays a draft: take the flag from the base rather than from this recipe.
 
-**Before pushing:** run `./ci.sh` at the tip and confirm it passes — an un-run release clippy pass
-is the most common way CI fails after a green `cargo clippy`. Do not sweep it down the stack head by
-head; every PR gets its own CI job, so pushing runs them all in parallel.
+**Before pushing:** run `./ci.sh fast` at the tip and confirm it passes; run the full `./ci.sh`
+when asked. The release clippy pass is the gate `fast` skips that fails CI most often, so read the
+PR's checks after pushing. Do not sweep a gate down the stack head by head; every PR gets its own CI
+job, so pushing runs them all in parallel.
 
 #### Following main
 
