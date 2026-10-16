@@ -1829,11 +1829,7 @@ fn convert_impl_inner(
     // history's values, as the steps after a top-level store's read do.
     if let Some(read) = as_nested_store_read(expr, ctx) {
         expect_no_input(input, "nested store read")?;
-        let mut op = convert_store_read(&read.store, &read.field, ctx)?;
-        for step in read.steps {
-            op = convert_impl(step, Some(op), ctx)?;
-        }
-        return Ok(op);
+        return convert_nested_store_read(read, ctx);
     }
     let result: Result<Box<dyn TileOperator>, ConversionError> = match &expr.node {
         // f ≫ g: left-to-right composition.  Apply left first, then right.
@@ -1856,11 +1852,7 @@ fn convert_impl_inner(
                     result = Some(convert_store_settled_read(&read.store, &read.field, ctx)?);
                     rest = &elems[3..];
                 } else {
-                    let mut op = convert_store_read(&read.store, &read.field, ctx)?;
-                    for step in read.steps {
-                        op = convert_impl(step, Some(op), ctx)?;
-                    }
-                    result = Some(op);
+                    result = Some(convert_nested_store_read(read, ctx)?);
                     rest = &elems[2..];
                 }
             }
@@ -2732,7 +2724,11 @@ fn convert_impl_inner(
                             .map_err(ConversionError::Unsupported)?,
                     ))
                 }
-                Builtin::MapDomain => Ok(Box::new(MapDomain::new(input))),
+                // Both act on the collection each row of the input holds, beneath the levels
+                // it is converted under: a group-by whose key or source varies with an enclosing row
+                // inverts each row's collection on its own.
+                Builtin::MapDomain => Ok(Box::new(MapDomain::new_at(input, ctx.level()))),
+                Builtin::Converse => Ok(Box::new(Converse::new_at(input, ctx.level()))),
                 // `variant_project(c)` consumes the fed scrutinee stream and
                 // narrows it to that tag's restricted sub-domain, yielding the
                 // arm's inner payload column. The union extents come from the fed
@@ -2759,6 +2755,17 @@ fn convert_impl_inner(
                             input.tiling()
                         )));
                     }
+                    // `VariantProject` reads its level off the scrutinee's tiling, where the
+                    // union stands beneath every level. A step taking each element of the
+                    // levels it is converted under sees that union at its own level, so a
+                    // mismatch is a step converted at the wrong level.
+                    debug_assert_eq!(
+                        CurryLevel::values_of(input.tiling()),
+                        ctx.level(),
+                        "variant_project({tag}) converted at a level other than its scrutinee's \
+                         union, {}",
+                        input.tiling()
+                    );
                     // The projected arm's extent comes from this node's codomain:
                     // the scrutinee may be a width-subtype that never carries the
                     // tag, in which case its extent has no arm to read it from.
@@ -5604,6 +5611,20 @@ struct NestedStoreRead<'a> {
     store: Name,
     field: SmolStr,
     steps: Vec<&'a Expr>,
+}
+
+/// A nested store's read with its steps. The read answers one inner history per row of the
+/// level the read is converted at, and its steps take that history's values, so they convert
+/// one level in, as `map`'s function does.
+fn convert_nested_store_read(
+    read: NestedStoreRead<'_>,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let mut op = convert_store_read(&read.store, &read.field, ctx)?;
+    for step in read.steps {
+        op = convert_lifted(step, Some(op), ctx)?;
+    }
+    Ok(op)
 }
 
 /// `expr` as a read of a **nested** induction store's key: `__hist ≫ .k`, a morphism of the

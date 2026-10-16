@@ -1434,19 +1434,39 @@ impl Tile {
         if domain.len() <= row {
             return None;
         }
-        let mut group = (**codomain).clone();
-        group.retain_rows(&BitVec::from_fn(domain.len(), |i| i == row));
+        // Only this row's group is gathered, and only its path is read, so taking every row's
+        // group out in turn costs the level once rather than once per row.
+        let mut group = codomain.select_rows(&[row]);
         // The group is a collection in its own right, so its completeness is stated over its
         // own paths ([`Predicate::within`]). A key some level above calls complete is
         // complete at every depth beneath it, and the group taken out on its own has no
         // level above to read that from, so it says so itself.
-        let path = &self.paths_at(enclosing)[row];
-        let row_complete = self.completion_at(enclosing).contains_path(path);
+        let path = self.path_to(enclosing, row);
+        let row_complete = self.completion_at(enclosing).contains_path(&path);
         group.map_level_predicates(&mut |depth, pred| match row_complete {
             true => Predicate::True,
-            false => pred.within(path, depth),
+            false => pred.within(&path, depth),
         });
         Some(Cow::Owned(group))
+    }
+
+    /// The key path of key `index` of `level`, outermost key first: the path
+    /// [`paths_at`](Self::paths_at) gives it, read up the levels above it alone. A key stands
+    /// in the row of the level above whose run holds it.
+    fn path_to(&self, level: CurryLevel, mut index: usize) -> Vec<Value> {
+        let mut path = Vec::with_capacity(level.index() + 1);
+        for depth in (0..=level.index()).rev() {
+            let Tile::DataFunction {
+                row_starts, domain, ..
+            } = self.values_at(CurryLevel::new(depth))
+            else {
+                panic!("{level} of {self:?} has no level at depth {depth}")
+            };
+            path.push(domain.index_at(index));
+            index = row_starts.partition_point(|&start| start <= index) - 1;
+        }
+        path.reverse();
+        path
     }
 
     /// Which paths through `level` are complete, over whole paths: those `level` calls
@@ -3379,6 +3399,30 @@ mod tests {
             stated,
             BitSet::new(),
         )
+    }
+
+    /// The path to one key, read up the levels above it, is the one `paths_at` gives it, an
+    /// empty row in between included.
+    #[test]
+    fn the_path_to_a_key_is_the_one_paths_at_gives() {
+        let tile = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2, 3]),
+            Box::new(Tile::grouped(
+                vec![0, 2, 2],
+                ColumnValue::Ints(vec![10, 20, 30, 40]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 6, 7, 8]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        for level in [CurryLevel::OUTERMOST, CurryLevel::new(1)] {
+            let paths = tile.paths_at(level);
+            for (index, path) in paths.iter().enumerate() {
+                assert_eq!(&tile.path_to(level, index), path, "key {index} of {level}");
+            }
+        }
     }
 
     /// At the outermost level the whole tile is the one group, so the rebuild is the group.

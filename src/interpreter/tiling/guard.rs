@@ -396,27 +396,60 @@ fn without_covered_keys(guard: TileGuard, covered: &[Predicate]) -> TileGuard {
 /// guard reaching the values here names part of them, and the input's release waits for
 /// the key.
 pub(crate) fn through_shared_levels(guard: TileGuard, levels: usize, input: &Tiling) -> TileGuard {
-    fn walk(guard: TileGuard, depth: usize, levels: usize, input: &Tiling) -> TileGuard {
-        let values = || input.values_at(CurryLevel::new(depth));
+    through_standing_levels(guard, levels, input, &mut |beneath| {
+        let values = input.values_at(CurryLevel::new(levels));
+        match beneath.is_universal() {
+            true => values.universal_guard(),
+            false => values.empty_guard(),
+        }
+    })
+}
+
+/// `guard`, released against an operator's output, restated for an input whose keys at the
+/// outermost `levels` collection levels are the output's own: the operator leaves those levels
+/// standing and changes only what lies beneath them.
+///
+/// The keys of a standing level are the same on both sides, so a `Domain` step through one
+/// names the same input rows and passes through as it is. Beneath the standing levels the
+/// guard names what the operator produced, and only the operator can say what part of its
+/// input that is: `beneath` restates it, given one arm of the canonical guard
+/// ([`TileGuard::flatten_or`]) at depth `levels`. With no standing level, that is the whole
+/// guard. An empty guard is the input's empty guard, and a universal one its universal guard.
+pub(crate) fn through_standing_levels(
+    guard: TileGuard,
+    levels: usize,
+    input: &Tiling,
+    beneath: &mut dyn FnMut(TileGuard) -> TileGuard,
+) -> TileGuard {
+    fn walk(
+        guard: TileGuard,
+        depth: usize,
+        levels: usize,
+        beneath: &mut dyn FnMut(TileGuard) -> TileGuard,
+    ) -> TileGuard {
         if depth == levels {
-            return match guard.is_universal() {
-                true => values().universal_guard(),
-                false => values().empty_guard(),
-            };
+            return beneath(guard);
         }
         match guard {
-            TileGuard::Or(arms) => TileGuard::flatten_or(
-                arms.into_iter()
-                    .map(|arm| walk(arm, depth, levels, input))
-                    .collect(),
-            ),
             TileGuard::Function(FunctionGuard::Codomain(inner)) => TileGuard::Function(
-                FunctionGuard::Codomain(Box::new(walk(*inner, depth + 1, levels, input))),
+                FunctionGuard::Codomain(Box::new(walk(*inner, depth + 1, levels, beneath))),
             ),
-            other => other,
+            // A canonical arm is a chain of codomain steps, so what ends it above the
+            // standing levels' bottom names their keys.
+            keys => keys,
         }
     }
-    match walk(TileGuard::flatten_or(vec![guard]), 0, levels, input) {
+    let restated = match TileGuard::flatten_or(vec![guard]) {
+        g if g.is_empty() => return input.empty_guard(),
+        g if g.is_universal() => return input.universal_guard(),
+        TileGuard::Or(arms) => TileGuard::flatten_or(
+            arms.into_iter()
+                .map(|arm| walk(arm, 0, levels, beneath))
+                .collect(),
+        ),
+        arm => TileGuard::flatten_or(vec![walk(arm, 0, levels, beneath)]),
+    };
+    match restated {
         // The input's own empty guard, which for a collection is `Domain(False)`, however the
         // walk came to name nothing.
         g if g.is_empty() => input.empty_guard(),
