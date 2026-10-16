@@ -8,6 +8,7 @@ use std::{collections::HashMap, hash::Hash};
 mod curry_level;
 mod guard;
 mod interval_sets;
+mod point_arms;
 mod predicate;
 mod tile;
 mod tiling_kind;

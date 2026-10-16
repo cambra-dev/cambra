@@ -13,6 +13,7 @@ use intervalsets::{
 };
 
 use super::interval_sets::single_interval_set;
+use super::point_arms::PointArms;
 use crate::{
     ccl::{BaseType, FieldKey, TagMap},
     interpreter::{
@@ -307,6 +308,20 @@ impl Predicate {
         // without this a region is one arm per row however regular it is, and every later union
         // compares all of them. A joined arm goes round again, since one join can enable the next,
         // and takes the earliest place it came from.
+        // Points that no join touches and none repeats are returned as they are, which a column
+        // of records usually is, and spares the pairwise passes below.
+        if PointArms::of(&flat).is_some_and(|points| points.independent()) {
+            return match flat.len() {
+                1 => flat.into_iter().next().unwrap(),
+                _ => Predicate::Or(flat),
+            };
+        }
+        Self::join_and_reduce(flat)
+    }
+
+    /// `flat`, a list of arms none of which is an `Or`, as one predicate: the arms that join into
+    /// one componentwise predicate joined, and the arms another arm subsumes dropped.
+    fn join_and_reduce(flat: Vec<Predicate>) -> Predicate {
         let mut joined: Vec<Predicate> = Vec::with_capacity(flat.len());
         for mut arm in flat {
             let mut slot = joined.len();
@@ -588,6 +603,13 @@ impl Predicate {
 
     /// Returns the predicate that admits exactly the values accepted by both `self` and `other`.
     pub fn intersect(&self, other: &Predicate) -> Predicate {
+        // Two sets of points meet in the points they share.
+        if let (Predicate::Or(a), Predicate::Or(b)) = (self, other)
+            && let (Some(a_points), Some(b_points)) = (PointArms::of(a), PointArms::of(b))
+            && let Some(shared) = a_points.positions_in(&b_points, true)
+        {
+            return Predicate::union_all(shared.into_iter().map(|at| a[at].clone()).collect());
+        }
         match (self, other) {
             // True is the universal predicate: identity under intersection.
             (Predicate::True, p) | (p, Predicate::True) => p.clone(),
@@ -619,6 +641,19 @@ impl Predicate {
     ///
     /// `self ∖ other = { x | x ∈ self ∧ x ∉ other }`
     pub fn minus(&self, other: &Predicate) -> Predicate {
+        // A set of points, or one point, less a set of points keeps the points that are not in it.
+        if let Predicate::Or(b) = other {
+            let minuend = std::slice::from_ref(self);
+            let (arms, points) = match self {
+                Predicate::Or(a) => (a.as_slice(), PointArms::of(a)),
+                _ => (minuend, PointArms::of(minuend)),
+            };
+            if let (Some(a_points), Some(b_points)) = (points, PointArms::of(b))
+                && let Some(kept) = a_points.positions_in(&b_points, false)
+            {
+                return Predicate::union_all(kept.into_iter().map(|at| arms[at].clone()).collect());
+            }
+        }
         match (self, other) {
             // p ∖ ∅ = p
             (s, o) if o.is_false() => s.clone(),
@@ -2838,6 +2873,94 @@ mod tests {
                 assert_eq!(a.subsumes(&b), covers, "subsumes, {}", context());
                 let same = domain.iter().all(|v| at(&a, v) == at(&b, v));
                 assert_eq!(same_region(&a, &b), same, "same_region, {}", context());
+            }
+        }
+    }
+
+    /// Sets of points, as a column of records builds them, combine like sets of values: `flatten_or`,
+    /// `intersect` and `minus` over random lists of point records, with repeats and points that
+    /// differ in one field, agree with asking every record of a small domain.
+    #[test]
+    fn point_record_sets_combine_like_sets_of_values() {
+        use super::super::interval_sets::test_support::Lcg;
+        let fields = ["x", "y", "z"];
+        let record = |values: &[u64]| {
+            Value::Record(
+                fields
+                    .iter()
+                    .zip(values)
+                    .map(|(name, v)| (SmolStr::new(name), u(*v)))
+                    .collect(),
+            )
+        };
+        let mut rng = Lcg(77);
+        for (width, span) in [(2usize, 5u64), (3, 3), (2, 12), (3, 6)] {
+            let domain: Vec<Vec<u64>> = (0..span.pow(width as u32))
+                .map(|i| (0..width as u32).map(|d| i / span.pow(d) % span).collect())
+                .collect();
+            let points = |rng: &mut Lcg, count: u64| -> Vec<Vec<u64>> {
+                (0..count)
+                    .map(|_| (0..width).map(|_| rng.next(span)).collect())
+                    .collect()
+            };
+            let predicate = |values: &[u64]| match Predicate::point(record(values)) {
+                p @ Predicate::Record(_) => p,
+                other => panic!("a point record is a record predicate: {other:?}"),
+            };
+            for _ in 0..400 {
+                let (count_a, count_b) = (1 + rng.next(8), 1 + rng.next(8));
+                let (a, b) = (points(&mut rng, count_a), points(&mut rng, count_b));
+                let (pa, pb): (Vec<Predicate>, Vec<Predicate>) = (
+                    a.iter().map(|v| predicate(v)).collect(),
+                    b.iter().map(|v| predicate(v)).collect(),
+                );
+                let (or_a, or_b) = (Predicate::Or(pa.clone()), Predicate::Or(pb.clone()));
+                for (name, got, want) in [
+                    (
+                        "flatten_or",
+                        Predicate::flatten_or(pa.clone()),
+                        Box::new(|v: &Vec<u64>| a.contains(v)) as Box<dyn Fn(&Vec<u64>) -> bool>,
+                    ),
+                    (
+                        "intersect",
+                        or_a.intersect(&or_b),
+                        Box::new(|v: &Vec<u64>| a.contains(v) && b.contains(v)),
+                    ),
+                    (
+                        "minus",
+                        or_a.minus(&or_b),
+                        Box::new(|v: &Vec<u64>| a.contains(v) && !b.contains(v)),
+                    ),
+                    (
+                        "point minus",
+                        pa[0].minus(&or_b),
+                        Box::new(|v: &Vec<u64>| *v == a[0] && !b.contains(v)),
+                    ),
+                ] {
+                    for v in &domain {
+                        assert_eq!(
+                            got.contains(&record(v)),
+                            want(v),
+                            "{name} at {v:?}: {a:?} and {b:?}, got {got:?}"
+                        );
+                    }
+                }
+                // Where the fast path applies, it returns what the pairwise passes do.
+                if PointArms::of(&pa).is_some_and(|points| points.independent()) {
+                    assert_eq!(
+                        Predicate::join_and_reduce(pa.clone()),
+                        Predicate::flatten_or(pa.clone()),
+                        "{a:?}"
+                    );
+                }
+                // Distinct points that agree on no n-1 fields stay as they are.
+                let distinct: Vec<Vec<u64>> = (0..span)
+                    .map(|i| (0..width).map(|d| (i + d as u64) % span).collect())
+                    .collect();
+                let arms: Vec<Predicate> = distinct.iter().map(|v| predicate(v)).collect();
+                if width == 2 && arms.len() > 1 {
+                    assert_eq!(Predicate::flatten_or(arms.clone()), Predicate::Or(arms));
+                }
             }
         }
     }

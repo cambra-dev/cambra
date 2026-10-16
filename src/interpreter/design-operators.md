@@ -254,6 +254,11 @@ the enclosing path and the key. One algebra serves both (`Componentwise` in `til
 - A difference is a staircase: step `i` keeps what component `i` alone leaves, over the
   components before it that the subtrahend holds and the components after it untouched.
 - Containment is componentwise, which is exact for a nonempty componentwise predicate.
+- A set of points is an `Or` whose arms are records of single values over one set of field names,
+  which is what `from_column_value` builds for a record column. `flatten_or` returns it unchanged
+  when no two arms are equal or differ in one field. `intersect` and `minus` between two such sets,
+  or between one point and one, hash each arm once (`PointArms` in `tiling/point_arms.rs`), where
+  any other pair of `Or`s compares every arm with every arm.
 
 A **prefix** of a lexicographic order is a staircase of componentwise predicates: `≤ (𝑎, 𝑏)` is
 `{_0 < 𝑎} ∪ {_0 = 𝑎, _1 ≤ 𝑏}`. `domain_prefix` builds one across levels, one qualified arm per
