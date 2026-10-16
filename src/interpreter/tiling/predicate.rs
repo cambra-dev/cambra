@@ -290,13 +290,13 @@ impl Predicate {
     /// variants.  Returns the single element directly when `arms` has length
     /// one to avoid gratuitous wrapping.
     pub fn flatten_or(arms: Vec<Predicate>) -> Predicate {
-        let flat: Vec<Predicate> = arms
-            .into_iter()
-            .flat_map(|p| match p {
-                Predicate::Or(inner) => inner,
-                other => vec![other],
-            })
-            .collect();
+        let mut flat = Vec::with_capacity(arms.len());
+        for arm in arms {
+            match arm {
+                Predicate::Or(inner) => flat.extend(inner),
+                other => flat.push(other),
+            }
+        }
         if flat.is_empty() {
             unreachable!("flatten_or called with no arms");
         }
