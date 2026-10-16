@@ -2631,11 +2631,11 @@ mod tests {
         let span = chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0);
         let t = TypeParam::declared("T");
         let decl = NominalDecl::declared("Box".into(), vec![Rc::clone(&t)], span, false);
-        decl.define(vec![NominalCtor {
-            name: "boxed".into(),
+        decl.define(vec![NominalCtor::unwritten(
+            "boxed".into(),
             span,
-            params: vec![(None, Type::Param(t))],
-        }])
+            vec![(None, Type::Param(t))],
+        )])
         .expect("`boxed` names `T`");
         let refine = |base: Type, by: &str| {
             let bool_ty = Type::Base(BaseType::Bool);

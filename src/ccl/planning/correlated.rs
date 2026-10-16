@@ -55,7 +55,7 @@ use super::predicates::fn_of_bare_predicate;
 /// The error is planning's, from the filter it lifts ([`plan_lifted`]).
 pub(super) fn emit_correlated_filters(
     expr: &mut Expr,
-    witnesses: &mut Witnesses,
+    ctx: &mut PlanningCtx,
 ) -> Result<(), String> {
     let node_id = expr.node_id();
     if let TypedExprNode::Apply { argument, function } = &mut expr.node
@@ -66,7 +66,7 @@ pub(super) fn emit_correlated_filters(
             "planning.correlated_filter",
             provenance::Nature::Machinery,
         );
-        if emit_pair_filter(argument, witnesses)? {
+        if emit_pair_filter(argument, ctx)? {
             // `curry`'s own stamp says what it takes; the argument's domain just moved.
             function.ty = Type::fun(argument.ty.clone(), expr.ty.clone());
         }
@@ -74,7 +74,7 @@ pub(super) fn emit_correlated_filters(
     let mut result = Ok(());
     expr.walk_children_mut(|child| {
         if result.is_ok() {
-            result = emit_correlated_filters(child, witnesses);
+            result = emit_correlated_filters(child, ctx);
         }
     });
     result
@@ -85,17 +85,14 @@ pub(super) fn emit_correlated_filters(
 /// Runs after planning's first `simplify`, so a `curry` exponential eta reduces is gone
 /// first, and before the iteration-site walk, so the `map_domain` this mints is marked like
 /// any other iteration source.
-pub(super) fn pair_correlated_sites(
-    expr: &mut Expr,
-    witnesses: &mut Witnesses,
-) -> Result<(), String> {
+pub(super) fn pair_correlated_sites(expr: &mut Expr, ctx: &mut PlanningCtx) -> Result<(), String> {
     let rewritten = {
         let _g = provenance::enter(
             expr.node_id(),
             "planning.correlated",
             provenance::Nature::Machinery,
         );
-        through_strength(expr, witnesses)?
+        through_strength(expr, ctx)?
     };
     if let Some(rewritten) = rewritten {
         *expr = rewritten;
@@ -103,7 +100,7 @@ pub(super) fn pair_correlated_sites(
     let mut result = Ok(());
     expr.walk_children_mut(|child| {
         if result.is_ok() {
-            result = pair_correlated_sites(child, witnesses);
+            result = pair_correlated_sites(child, ctx);
         }
     });
     result
@@ -113,7 +110,7 @@ pub(super) fn pair_correlated_sites(
 /// collection the site ranges over (the module doc says which). `None` where `expr` is not a
 /// correlated site: a `curry` of a builtin is a partial application, which op-conversion
 /// compiles as one.
-fn through_strength(expr: &Expr, witnesses: &mut Witnesses) -> Result<Option<Expr>, String> {
+fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, String> {
     let TypedExprNode::Apply {
         argument: g,
         function,
@@ -129,7 +126,7 @@ fn through_strength(expr: &Expr, witnesses: &mut Witnesses) -> Result<Option<Exp
     // dependent tuple"). The site pairs each enclosing value with its own keys rather
     // than with one collection every row shares.
     if let Some(Type::DepTuple(components)) = g.ty.domain().map(|d| d.peel_refinements().clone()) {
-        let family = keys_family(&components, witnesses)?;
+        let family = keys_family(&components, ctx)?;
         let family_ty = family.ty.clone();
         let pair = Expr::tuple(vec![family, g.as_ref().clone_preserving_ids()])
             .with_ty(Type::Tuple(vec![family_ty, g.ty.clone()]));
@@ -247,10 +244,7 @@ fn through_strength(expr: &Expr, witnesses: &mut Witnesses) -> Result<Option<Exp
 /// The component is read under a name for `𝑥`. A membership refinement `{𝐾 | 𝑘 ∈ 𝑀(𝑥)}`
 /// states the keys as the image of the collection `𝑀(𝑥)`, so the keys are
 /// `map_domain(converse(𝑀(𝑥)))`, and `𝐹` is `(λ 𝑥 → 𝑀(𝑥)) ≫ converse ≫ map_domain`.
-fn keys_family(
-    components: &[(Option<Name>, Type)],
-    witnesses: &mut Witnesses,
-) -> Result<Expr, String> {
+fn keys_family(components: &[(Option<Name>, Type)], ctx: &mut PlanningCtx) -> Result<Expr, String> {
     let [(name, enclosing), (_, component)] = components else {
         return Err(format!(
             "a dependent tuple of {} components under one `curry` is not supported yet",
@@ -329,7 +323,7 @@ fn keys_family(
         .with_ty(Type::pi(x.clone(), enclosing.clone(), image_ty.clone())),
     )
     .map_err(|e| format!("eliminating a dependent tuple's key collection: {e:?}"))?;
-    let mut per_row = plan_lifted(per_row, PlanningPhase::PairCorrelatedSites, witnesses)?;
+    let mut per_row = plan_lifted(per_row, PlanningPhase::PairCorrelatedSites, ctx)?;
     // **The head binds `𝑥` for the whole chain**, whether or not its own codomain reads it:
     // the keys `map_domain` yields are the component at `𝑥`, so its type does, and a
     // chain scopes a morphism's binder over every morphism after it.
@@ -441,7 +435,7 @@ fn inner_source<'a>(g: &'a Expr, inner_domain: &Type) -> Option<&'a Expr> {
 /// for a gate that varies with the element (`src/ccl/ops.rs`, `Builtin::FilterValues`), and a
 /// gate that varies with the row is the same thing. The domain loses the refinement in every
 /// slot the chain is written at, because the term now carries it.
-fn emit_pair_filter(g: &mut Expr, witnesses: &mut Witnesses) -> Result<bool, String> {
+fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String> {
     let Type::Fun {
         fun_kind,
         domain,
@@ -478,7 +472,7 @@ fn emit_pair_filter(g: &mut Expr, witnesses: &mut Witnesses) -> Result<bool, Str
         let p = plan_lifted(
             fn_of_bare_predicate(&pair_ty, &predicate, &[]),
             PlanningPhase::EmitCorrelatedFilters,
-            witnesses,
+            ctx,
         )?;
         let filter = apply_primitive(
             p,

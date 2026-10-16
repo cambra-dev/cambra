@@ -2967,6 +2967,11 @@ coalescing has chosen the row. A primitive is one operation at every base its ro
 at `Int` and at `UInt` is one primitive, and the interpreter runs it at the operand column's
 representation (`apply_binop_column`, in `src/interpreter/binop.rs`).
 
+A comparison associates no function because it is by value: two values are equal when they are
+the same value, and a nominal type's order is the one its declaration writes (`docs/chl-spec.md`,
+"Equality and order"). No instance redefines either, which is what lets a hash join's equality,
+`groupby`'s partition and a refinement's `==` mean one thing.
+
 Traits and instances are *data*, one representation for the compiler's and a module's alike.
 Every trait is a declaration (`TraitDecl`, held by `Trait`): its operands, its associated types
 and its functions. The compiler builds its traits once, as it builds `Option` (`Trait::addable` and
@@ -2980,9 +2985,11 @@ a declared trait or instance is a table extension rather than a new mechanism.
 
 An instance names a **pattern** at each operand: a type variable, a base type, or a nominal type
 applied to patterns. The pattern's **head** (`InstanceHead`) is a base type, a nominal type at any
-arguments, or `Any` for a variable standing as the whole operand, which is what narrowing reads. Every compiler instance accepts
+arguments, or `Any` for a variable standing as the whole operand, which is what narrowing reads. Every compiler instance but one accepts
 bases only, and every one is homogeneous: `Addable(Int, Int ⇝ Int)`, never
-`Addable(Int, String ⇝ …)`. Two instances overlap when their patterns unify (`unify_all`), which
+`Addable(Int, String ⇝ …)`. The one is `Equatable(Option(𝑇), Option(𝑇)) requires Equatable(𝑇, 𝑇)`,
+the compiler's as `Option` is, which no module may declare (`docs/chl-spec.md`, "Equality and
+order"). Two instances overlap when their patterns unify (`unify_all`), which
 lowering refuses. These are the tables' content, not properties of resolution: nothing in
 narrowing or deposit assumes them. So a trait rejecting a variant is what these rows happen to be,
 and not a judgement that such types are incomparable.
@@ -3020,8 +3027,9 @@ the selected instance's bound enforces, and dispatch matches the whole pattern (
 
 A declared instance states its associated types and its conditions over its head's variables,
 `Container(Two(𝑇) ⇝ 𝑇)` or `Area(Two(𝑇)) requires Area(𝑇)`, so they are known only at an
-obligation's operand types. Once a contribution has narrowed an obligation's candidates to one
-declared instance (`TraitObligation::try_select`), its variables become fresh variables `𝛼`, and:
+obligation's operand types; so does the compiler's instance for `Option`. Once a contribution has
+narrowed an obligation's candidates to one such instance (`TraitObligation::try_select`), its
+variables become fresh variables `𝛼`, and:
 
 - each operand is bounded **above** by the type the head names there, `Two(𝛼)`. That is what the
   instance accepts, and the bound carries the operand's arguments into `𝛼`;
@@ -3334,6 +3342,18 @@ coalesce, from the operands' resolved types (`dispatch_operator`, `run_instance_
   its operator becomes the row's (`InstanceBody::Binary`): `Concat` for two strings. A `TraitFn`
   a compiler instance answers, `summon(Addable(_, _))::add(1, 2)`, becomes the primitive's function
   (`build_instance_function`).
+- **A comparison stays a comparison.** `==` on a nominal type compares the representation, a
+  constructor and its argument, which a nominal type's instance of `Equatable` admits
+  (`compares_by_value`). An ordering on a type holding a nominal one is compiled to a comparison
+  of order keys by operator conversion: each value is read as the tuple of its fields in the order
+  its declaration writes them (`OrderKey`, `NominalCtor::orders`), which is a rearrangement of its
+  columns, and the tuples compare lexicographically. `max` and `min` over such elements read their
+  keys, take the primitive extreme of the tuples, and read the element back.
+
+Every check after inference judges a comparison on a nominal type against the program's
+`InstanceTable`: the check at each phase boundary (`typecheck_in`), and planning's checks of the
+terms it builds, which read it from the `PlanningCtx`, since a term such as `converse` states
+`Equatable` of its keys.
 
 ---
 
