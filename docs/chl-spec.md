@@ -356,6 +356,7 @@ aug_op          ::= "+=" | "-=" | "*=" | "//="
 assign_target   ::= ident
                  |  "(" assign_target ( "," assign_target )* [ "," ] ")"
                  |  assign_target ( "," assign_target )+ [ "," ]
+                 |  assign_target "->" assign_target     -- a pair: the two-tuple (k, v)
 
 compound_stmt   ::= if_stmt | match_stmt | for_stmt | with_stmt | def_stmt
                  |  load_from_stmt | renamed_from_stmt | discard_stmt | pub_stmt
@@ -365,7 +366,7 @@ if_stmt         ::= "if" expression ":" block
                     [ "else" ":" block ]
 
 match_stmt      ::= "match" expression ":" NEWLINE INDENT case_arm+ DEDENT
-case_arm        ::= "case" case_pattern ":" block
+case_arm        ::= "case" case_pattern ":" ( block | expression NEWLINE )  -- the second [Decided]
 case_pattern    ::= "`" ident [ "(" ( ident | "_" ) ")" ]
                  |  "_"
 
@@ -451,7 +452,7 @@ noted:
 | 6 | `or` | short-circuit; n-ary flattening |
 | 7 | `and` | short-circuit; n-ary flattening |
 | 8 | `not` | prefix |
-| 9 | `==` `!=` `<` `<=` `>` `>=` | chained, *not* left-fold (see [3.4 Comparisons](#34-comparisons)) |
+| 9 | `==` `!=` `<` `<=` `>` `>=`, and `in` `not in` (**[Decided]**) | chained, *not* left-fold (see [3.4 Comparisons](#34-comparisons)); `in` and `not in` do not chain ([Membership expressions](#membership-expressions-decided)) |
 | 10 | `\|` | logical or |
 | 11 | `^` | logical xor |
 | 12 | `&` | logical and |
@@ -859,12 +860,44 @@ equality. A wider record is not compared only on its shared fields. Products do 
 ordering comparators; collection elements are not product fields, so this rule does not provide
 collection equality.
 
-`is`, `is not`, `in`, and `not in` are not comparison operators. A comprehension with a
-guard or an aggregate can express a membership query.
+`is` and `is not` are not operators. Membership `in` and `not in` are planned
+([Membership expressions](#membership-expressions-decided)); until they land, a comprehension
+with a guard or an aggregate expresses a membership query.
 
-> **Direction [Decided] — Membership expressions.** `e in s` is planned for set membership,
-> and `k in m` for map-key membership. This does not change `in` as an iteration keyword in
-> `for x in xs`.
+#### Membership expressions [Decided]
+
+`e in s` tests membership, and `e not in s` is `not (e in s)`. Both answer `Bool`. What `in`
+tests depends on the collection: a key of a `Set` or `Map`, a value of a `List`, an array or a
+collection ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)).
+Neither is implemented.
+
+`in` and `not in` share level 9 with the comparators
+([2.3 Expression precedence](#23-expression-precedence)), Python's placement, so an expression
+groups as it does in Python. Unlike the comparators they do not chain: an `in` or `not in`
+shares no chain with a comparator or with another `in`, and such a chain is a parse error that
+asks for parentheses. Python's chain `x in s == t` means `x in s and s == t`, which no reader of
+the first form expects.
+
+| Source | Reads as |
+|---|---|
+| `k in m` | `k in m` |
+| `i + 1 in ks` | `(i + 1) in ks` |
+| `x in a ++ b` | `x in (a ++ b)` |
+| `not k in m` | `not (k in m)`, which is `k not in m` |
+| `k in m and m[k]! > 0` | `(k in m) and (m[k]! > 0)` |
+| `a if k in m else b` | `a if (k in m) else b` |
+| `\r -> r.key in allowed` | `\r -> (r.key in allowed)` |
+| `{String where _ in ks}` | the strings `ks` holds |
+| `u -> u in admins` | `u -> (u in admins)`, a pair whose value is a `Bool` |
+| `x in s == true` | parse error; `(x in s) == true` |
+| `a < b in s` | parse error; `(a < b) and (b in s)` |
+| `x in s \| y in t` | parse error: `\|` binds tighter, so this is `x in (s \| y) in t`; `(x in s) or (y in t)` |
+
+`for x in xs` and a comprehension's `for x in xs` keep `in` as a keyword. What stands between
+`for` and that `in` is an `assign_target`, a name or a tuple of names, which holds no
+expression, so its `in` is never read as membership. A pair target `for k -> v in m` is a tuple
+target. The iterated expression after that `in` is an ordinary expression, so `for x in a in b`
+iterates `a in b`.
 
 ### 3.5 Short-circuit `not`, `and`, `or`
 
@@ -1039,7 +1072,7 @@ refined by whether the key is present, and postfix `!` takes an `Option` refined
 `none`:
 
 ```
-_[_] : {m: Map(K, V), k: K} => {Option(V) where _.is_none() == not (k in m)}
+_[_] : {m: Map(K, V), k: K} => {Option(V) where _.is_none() == (k not in m)}
 _!   : {Option(T) where not _.is_none()} => T
 ```
 
@@ -2087,6 +2120,28 @@ payload, with no nesting, no literal patterns, and no per-arm guard.
 > pattern determines the scrutinee's type without an annotation. Tag arms and constructor arms do
 > not mix in one `match`.
 
+#### An arm on its `case` line
+
+**[Decided]**, not implemented: the parser takes an arm's body only as an indented block today.
+An arm whose body is one expression may write it on the `case` line, after the `:`, in place of
+the indented block:
+
+```python
+match x:
+    case `some(v): v + 1
+    case `none: 0
+```
+
+The line break ends the arm, and arms of both shapes mix in one `match`. Such an arm means the
+indented arm whose block is that one expression. The body is an expression, not a statement:
+an assignment or a `:=` write takes the indented block. A line indented past the arm's `case`
+line after a body on it is an error.
+
+The `match` around such an arm is still the indented form, with one arm per line, so it needs no
+bracket. Its arms stay unambiguous: an expression cannot derive a `match` outside a bracket
+([The one-line form](#the-one-line-form)), so a `match` written after `` case `p: `` carries its
+own bracket and its own arm list.
+
 **Both statement contexts admit a `match`** — a `for`-loop body and a `with
 begin():` block. An arm may `yield` or `<<`, and the fed value may read the arm's
 payload, the loop's accumulators, or both.
@@ -2123,7 +2178,8 @@ lambda body and a `=>` codomain each take a whole expression, so an inner
 `match` reappears through either of them.
 
 The indented and one-line forms differ in the arm body and in nothing else:
-same arms, same partition rule, same value.
+same arms, same partition rule, same value. An indented `match` whose arms sit on their `case`
+lines ([An arm on its `case` line](#an-arm-on-its-case-line)) is the indented form.
 
 > **Direction [Tentative].**
 > `_` is accepted as an unused binder in a **pattern payload** only.
