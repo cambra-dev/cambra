@@ -228,8 +228,6 @@ diagnostics:
   11:12-11:15 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
     11:5-11:11 while parsing statement
     11:5-11:11 while parsing expression
-  19:21-19:26 found 'identifier', expected indented block
-    12:5-19:20 while parsing statement
 symbols:
   variable inventory 8:1-8:69 (name 8:1-8:10)
   function reserve 10:1-19:26 (name 10:5-10:12)
@@ -237,6 +235,10 @@ symbols:
 folds:
   1-6 comment
   10-19
+  12-19
+  13-18
+  14-16
+  17-18
   21-22 comment
   24-26
   25-26
@@ -405,10 +407,6 @@ symbols:
 folds:
 == tests/programs/txn_kv/program.cambra
 diagnostics:
-  33:28-33:33 found 'identifier', expected indented block
-    32:9-33:27 while parsing statement
-  41:24-41:25 found 'identifier', expected indented block
-    40:5-41:23 while parsing statement
 symbols:
   module http 16:1-16:12 (name 16:8-16:12)
   variable get_reqs 18:1-18:61 (name 18:1-18:9)
@@ -425,8 +423,10 @@ folds:
   27-35
   28-34
   29-31 comment
+  32-34
   37-42
   38-39
+  40-42
   44-46 comment
   47-50
   48-50

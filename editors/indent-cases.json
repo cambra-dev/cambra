@@ -65,6 +65,13 @@
       "rest": ["        case `none:", "            return 0"]
     },
     {
+      "name": "an arm on its case line keeps the next arm at its level",
+      "lines": ["def f(o):", "    y = match o:", "        case `some(v): v"],
+      "indent": 8,
+      "next": "case `none: 0",
+      "rest": ["    return y"]
+    },
+    {
       "name": "an if on the right of an assignment indents its body two levels",
       "lines": ["def f(c):", "    label = if c:"],
       "indent": 12,
