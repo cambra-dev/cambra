@@ -1285,16 +1285,23 @@ where
         //
         // The arm list is itself an indented block, so a `match` is two levels
         // of layout: `Indent` for the arms, then each arm's own `block` for its
-        // body. The arms themselves come from `match_arms`, shared with the
-        // one-line form in `expression()`.
+        // body. An arm may instead hold one expression on its `case` line, which
+        // its `Newline` ends (`docs/chl-spec.md`, "An arm on its `case` line"). The
+        // arms themselves come from `match_arms`, shared with the one-line form in
+        // `expression()`.
+        let arm_on_its_line = expr
+            .clone()
+            .map_with(|body: Spanned<Expr>, e| vec![Spanned::new(e.span(), Stmt::Expr(body))])
+            .then_ignore(just(Token::Newline).repeated().at_least(1));
         let match_stmt = just(Token::Match)
             .ignore_then(expr.clone())
             .then_ignore(just(Token::Colon))
             .then_ignore(just(Token::Newline))
             .then_ignore(just(Token::Indent).labelled("indented `case` arms"))
-            .then(match_arms(
+            .then(match_arms(choice((
                 block.clone().then_ignore(just(Token::Newline).repeated()),
-            ))
+                arm_on_its_line,
+            ))))
             .then_ignore(just(Token::Dedent))
             .map_with(|(scrutinee, arms), e| {
                 Spanned::new(e.span(), Stmt::Match { scrutinee, arms })
@@ -3724,6 +3731,104 @@ mod tests {
         }
     }
 
+    /// An arm's body may sit on its `case` line, as one expression, beside arms
+    /// with indented blocks; it parses as the indented arm whose block is that
+    /// expression (`docs/chl-spec.md`, "An arm on its `case` line").
+    #[test]
+    fn an_arm_body_may_sit_on_its_case_line() {
+        let m = parse_m(indoc! {"
+            match x:
+                case `some(v): v + 1
+                case `other:
+                    2
+                case `none: 0
+        "});
+        let Stmt::Match { arms, .. } = &m.body[0].node else {
+            panic!("expected Match, got {:?}", m.body[0].node)
+        };
+        assert_eq!(arms.len(), 3);
+        for arm in arms {
+            assert_eq!(arm.body.len(), 1);
+            assert!(matches!(arm.body[0].node, Stmt::Expr(_)));
+        }
+    }
+
+    /// The arms of a `match` on the right of an assignment may sit on their
+    /// `case` lines too, and the statement after it parses.
+    #[test]
+    fn arms_on_their_case_lines_in_a_block_right_hand_side() {
+        let m = parse_m(indoc! {"
+            for req in reqs:
+                resp = match r:
+                    case `some(v): v
+                    case `none: 0
+                out << resp
+            after = 2
+        "});
+        assert_eq!(m.body.len(), 2);
+        let Stmt::For { body, .. } = &m.body[0].node else {
+            panic!("expected For, got {:?}", m.body[0].node)
+        };
+        assert!(matches!(body[0].node, Stmt::Assign { .. }));
+        assert!(matches!(body[1].node, Stmt::Expr(_)));
+    }
+
+    /// A body on the `case` line is one expression: an assignment there, a body on
+    /// the line followed by an indented block, and an unbracketed `match` on the
+    /// line are each one error, at `:=`, at the deeper line's `Indent`, and at
+    /// `match`. Recovery keeps the statement after the `match`.
+    #[test]
+    fn an_arm_on_its_case_line_holds_one_expression() {
+        for (src, found) in [
+            (
+                indoc! {"
+                    match x:
+                        case `some(v): y := v
+                        case `none: 0
+                    after = 2
+                "},
+                Token::ColonEq,
+            ),
+            (
+                indoc! {"
+                    match x:
+                        case `some(v): v
+                            v + 1
+                        case `none: 0
+                    after = 2
+                "},
+                Token::Indent,
+            ),
+            (
+                indoc! {"
+                    match x:
+                        case `some(v): match v: case `a: 1
+                        case `none: 0
+                    after = 2
+                "},
+                Token::Match,
+            ),
+        ] {
+            let result = parse_mod(src);
+            let [ParseError::Parse(err)] = result.errors.as_slice() else {
+                panic!("expected one parse error, got {:?}\n{src}", result.errors)
+            };
+            assert_eq!(err.found, Some(found), "{src}");
+            let m = result.value.expect("recovery yields a module");
+            assert!(
+                matches!(m.body.last().map(|s| &s.node), Some(Stmt::Assign { .. })),
+                "the statement after the `match` survives recovery: {:?}\n{src}",
+                m.body
+            );
+        }
+        // With its own bracket, a one-line `match` on the arm's line is one expression.
+        parse_m(indoc! {"
+            match x:
+                case `some(v): (match v: case `a: 1 case `b: 2)
+                case `none: 0
+        "});
+    }
+
     /// A one-line `match` in a bracket parses to an [`Expr::Block`] over the
     /// same [`Stmt::Match`] the indented form builds.
     #[test]
@@ -4203,8 +4308,10 @@ mod tests {
                 indoc! {"
                     for req in reqs:
                         resp = match r:
-                            case `some(v): v
-                            case `none: 0
+                            case some(v):
+                                v
+                            case none:
+                                0
                         out << resp
                     after = 2
                 "},
