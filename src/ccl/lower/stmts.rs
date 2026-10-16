@@ -1644,7 +1644,7 @@ pub(super) fn lower_requirements(
                  parameters are not implemented",
             ));
         }
-        let Some(trait_) = Trait::from_surface_name(name) else {
+        let Some(trait_) = Trait::compiler_named(name) else {
             return Err(LoweringError::unsupported(
                 req.node.name_span,
                 format!(
@@ -1700,7 +1700,8 @@ pub(super) fn lower_requirements(
             }
             assoc.push((n, ty));
         }
-        expand_requirement(trait_, args, assoc, req.span, &mut out)?;
+        let instances = crate::ccl::infer::solver::traits::InstanceTable::builtin();
+        expand_requirement(trait_, args, assoc, req.span, &instances, &mut out)?;
     }
     Ok(out)
 }
@@ -1734,6 +1735,7 @@ fn expand_requirement(
     args: Vec<Type>,
     assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
     span: Span,
+    instances: &crate::ccl::infer::solver::traits::InstanceTable,
     out: &mut Vec<Rc<crate::ccl::ty::TraitRequirement>>,
 ) -> Result<(), LoweringError> {
     let unsatisfiable = |args: &[Type]| {
@@ -1773,7 +1775,7 @@ fn expand_requirement(
                         crate::ccl::infer::solver::traits::product_components(a)[i].clone()
                     })
                     .collect();
-                expand_requirement(trait_, at_field, Vec::new(), span, out)?;
+                expand_requirement(trait_.clone(), at_field, Vec::new(), span, instances, out)?;
             }
             return Ok(());
         }
@@ -1814,22 +1816,20 @@ fn expand_requirement(
     if !args.iter().all(is_requirement_operand) {
         return Err(unsatisfiable(&args));
     }
-    // A row fits when each base stands where the row has it, associated types
-    // included, and each type parameter stands for one base throughout.
-    let fits = |row: &crate::ccl::infer::solver::traits::TraitInstance| {
-        let mut bound: HashMap<crate::ccl::ty::TypeParamId, BaseType> = HashMap::new();
-        let mut agrees = |stated: &Type, accepted: &BaseType| match stated {
-            Type::Base(base) => base == accepted,
-            Type::Param(p) => bound.entry(p.id).or_insert_with(|| accepted.clone()) == accepted,
-            _ => false,
-        };
-        args.iter().zip(row.args.iter()).all(|(a, b)| agrees(a, b))
-            && assoc.iter().all(|(name, t)| {
-                row.assoc_ty(*name)
-                    .is_some_and(|(accepted, _)| agrees(t, accepted))
-            })
+    // An instance fits when its head and the associated types it fixes unify with the
+    // requirement's: some types are an instance of both.
+    let fits = |row: &Rc<crate::ccl::infer::solver::traits::TraitInstance>| {
+        let mut stated = row.operands.clone();
+        let mut wanted = args.clone();
+        for (name, t) in &assoc {
+            if let Some(accepted) = row.assoc_ty(name) {
+                stated.push(accepted);
+                wanted.push(t.clone());
+            }
+        }
+        crate::ccl::infer::solver::traits::unify_all(&stated, &wanted)
     };
-    if !trait_.instances().iter().any(fits) {
+    if !instances.instances(&trait_).iter().any(fits) {
         return Err(unsatisfiable(&args));
     }
     if args.iter().all(|a| matches!(a, Type::Base(_))) {
