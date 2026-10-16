@@ -1664,11 +1664,11 @@ where
         // quality is unaffected: the furthest-progress alternative wins.
         // The block opened a layout level of its own for its `elif`/`else`
         // chain (`lexer.rs`, `Level::Pending`), and that level closes with a
-        // `Dedent` no block inside the chain claims. Consuming it here ends the
-        // statement, and it is what a chain written at the statement's own
-        // column fails on: that spelling leaves the `Dedent` unmatched.
+        // `BlockValueDedent`. Consuming it here ends the statement, and it is
+        // what a chain written at the statement's own column fails on: that
+        // spelling closes the level before the chain's first line.
         let block_value = choice((if_stmt.clone(), match_stmt.clone()))
-            .then_ignore(just(Token::Dedent))
+            .then_ignore(just(Token::BlockValueDedent))
             .map(|stmt: Spanned<Stmt>| {
                 let span = stmt.span;
                 Spanned::new(span, Expr::Block(Box::new(stmt)))
@@ -1718,6 +1718,12 @@ where
         // statements can make no progress, or recovery can consume a surrounding block's
         // Dedent and report cascading errors. See `chl-parser/design-chl-parser.md`,
         // "Statement-level recovery".
+        //
+        // A failed statement's extent is its line, the block that line opens,
+        // the `elif`/`else` lines continuing it with their blocks, and the
+        // `BlockValueDedent` closing a block right-hand side's level. Leaving the
+        // `BlockValueDedent` behind ends the enclosing block early, and at the top
+        // level fails the whole module.
         let skip_to_newline = any()
             .and_is(just(Token::Newline).not())
             .and_is(just(Token::Dedent).not())
@@ -1726,8 +1732,13 @@ where
             .then_ignore(just(Token::Newline).or_not());
         let skip_indented_block =
             nested_delimiters(Token::Indent, Token::Dedent, [], |_span| ()).or_not();
-        let stmt_recovery = skip_to_newline
-            .then(skip_indented_block)
+        let skip_line_and_block = skip_to_newline.then(skip_indented_block);
+        let skip_chain = choice((just(Token::Elif), just(Token::Else)))
+            .then(skip_line_and_block.clone())
+            .repeated();
+        let stmt_recovery = skip_line_and_block
+            .then(skip_chain)
+            .then(just(Token::BlockValueDedent).or_not())
             .map_with(|_, e| Spanned::new(e.span(), Stmt::Error));
 
         choice((
@@ -3694,5 +3705,113 @@ mod tests {
     #[test]
     fn forall_is_a_keyword() {
         assert!(!parse_mod("forall = 1").errors.is_empty());
+    }
+
+    /// The variant name of each statement in `body`, `Error` for a recovered one.
+    fn stmt_kinds(body: &[Spanned<Stmt>]) -> Vec<String> {
+        body.iter()
+            .map(|stmt| {
+                let debug = format!("{:?}", stmt.node);
+                let end = debug.find(|c: char| !c.is_alphanumeric());
+                debug[..end.unwrap_or(debug.len())].to_owned()
+            })
+            .collect()
+    }
+
+    /// A statement whose line ends in `:` without starting with a block keyword
+    /// opens a block right-hand side's level (`lexer.rs`, `Level::Pending`), which
+    /// closes with a `BlockValueDedent` rather than a `Dedent`. When that statement
+    /// fails, statement-level recovery skips its header, its block, any `elif`/`else`
+    /// chain, and the `BlockValueDedent`, so the statements around it survive with
+    /// one diagnostic.
+    #[test]
+    fn recovery_skips_a_failed_block_right_hand_side() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "a header the grammar has no statement for",
+                indoc! {"
+                    i = 0
+                    while i < 5:
+                        i = i + 1
+                    i
+                "},
+                &["Assign", "Error", "Expr"],
+            ),
+            (
+                "a block right-hand side the grammar does not accept",
+                indoc! {"
+                    for req in reqs:
+                        result = with begin():
+                            stock = 1
+                        out << result
+                    after = 2
+                "},
+                &["For", "Assign"],
+            ),
+            (
+                "a `match` right-hand side whose arms fail",
+                indoc! {"
+                    for req in reqs:
+                        resp = match r:
+                            case `some(v): v
+                            case `none: 0
+                        out << resp
+                    after = 2
+                "},
+                &["For", "Assign"],
+            ),
+            (
+                "a broken `if` right-hand side header with an `else` chain",
+                indoc! {"
+                    x = if c d:
+                            1
+                        else:
+                            2
+                    y = 3
+                "},
+                &["Error", "Assign"],
+            ),
+            (
+                "a broken `if` header with an `elif`/`else` chain",
+                indoc! {"
+                    if c d:
+                        1
+                    elif e:
+                        2
+                    else:
+                        3
+                    y = 3
+                "},
+                &["Error", "Assign"],
+            ),
+        ];
+        for (name, src, kinds) in cases {
+            let r = parse_mod(src);
+            assert_eq!(r.errors.len(), 1, "case {name:?}: {:#?}", r.errors);
+            let m = r
+                .value
+                .unwrap_or_else(|| panic!("case {name:?} produced no module"));
+            assert_eq!(stmt_kinds(&m.body), *kinds, "case {name:?}");
+        }
+    }
+
+    /// The `for` body keeps the statement after the failed one: recovery consumed
+    /// exactly the failed statement's layout tokens, so the body's own `Dedent`
+    /// still closes it.
+    #[test]
+    fn recovery_inside_a_block_keeps_the_block_s_later_statements() {
+        let src = indoc! {"
+            for req in reqs:
+                result = with begin():
+                    stock = 1
+                out << result
+            after = 2
+        "};
+        let r = parse_mod(src);
+        let m = r.value.expect("a module");
+        let Stmt::For { body, .. } = &m.body[0].node else {
+            panic!("expected a `for`, got {:?}", m.body[0].node);
+        };
+        assert_eq!(stmt_kinds(body), ["Error", "Expr"]);
     }
 }
