@@ -82,7 +82,7 @@ use crate::ccl::{
     ccl_utils::{free_names_in_value, is_free, is_free_in_value, synthesize_arm_predicate},
     feed_nest::LoopFeed,
     mut_elim::{
-        binding, close_recurrence_group, fold_induction_loop, hoist_feeds, is_true_lit,
+        binding, close_recurrence_group, conjoin_path, fold_induction_loop, hoist_feeds,
         mut_var_value_tys, proj_of, tvar,
     },
     provenance,
@@ -2587,7 +2587,7 @@ fn walk_case(
         let guard = Subst::discharge_env_in_place(br.guard.clone(), &snapshot);
         let pi = synthesize_arm_predicate(&guard, &priors);
         priors.push(guard.clone());
-        let arm_path = and_path(path, &pi);
+        let arm_path = conjoin_path(path, &pi);
         let mut arm_env = snapshot.clone();
         walk_block(
             &br.body,
@@ -2647,23 +2647,6 @@ fn walk_case(
         c.ty = vty;
         env.insert(wk.clone(), c);
     }
-}
-
-/// `path ∧ guard`, collapsing a `true` path to just the guard.
-fn and_path(path: &Expr, guard: &Expr) -> Expr {
-    if is_true_lit(path) {
-        return guard.clone();
-    }
-    if is_true_lit(guard) {
-        return path.clone();
-    }
-    let mut e = Expr::binop(
-        path.clone(),
-        crate::ccl::BinOpKind::BoolLogic(crate::ccl::LogicKind::And),
-        guard.clone(),
-    );
-    e.ty = Type::Base(BaseType::Bool);
-    e
 }
 
 /// A mutable variable key's `let` declaration, as the phase folds it away.
@@ -2732,17 +2715,6 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
 /// `final_or_default` reduction, an `as_of` join. `Type::fun` would declare it a capability.
 fn history_ty(value_ty: &Type) -> Type {
     Type::data_fun(Type::Txn, value_ty.clone())
-}
-
-/// `let name : name_ty = def in body`, typed as `body`.
-fn let_typed(name: Name, name_ty: Type, def: Expr, body: Expr) -> Expr {
-    let ty = body.ty.clone();
-    Expr::new(TypedExprNode::Let {
-        binding: binding(name, name_ty),
-        bound_expr: Box::new(def),
-        body: Box::new(body),
-    })
-    .with_ty(ty)
 }
 
 /// `arg ▷ func : ty`.
@@ -3047,7 +3019,7 @@ fn plan_store(
         commit_rec_ty.push(rec_ty.clone());
 
         // commits_j = λ r → let t = begin(r) in {time, write_targets, decision}
-        let commit_body = let_typed(t, Type::Txn, begin, rec);
+        let commit_body = Expr::let_in(binding(t, Type::Txn), begin, rec);
         let mut commit_lambda = Expr::lambda(r, dom.clone(), commit_body);
         commit_lambda.ty = Type::data_fun(dom.clone(), rec_ty.clone());
         commit_bindings.push((
@@ -3714,7 +3686,7 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
             provenance::Nature::Machinery,
         );
         for (b, def) in reads.into_iter().rev() {
-            inner = let_typed(b.name, b.ty, def, inner);
+            inner = Expr::let_in(binding(b.name, b.ty), def, inner);
         }
         inner = hoist_feeds(inner, feeds);
     }
@@ -3959,24 +3931,5 @@ mod tests {
             Ok(()),
             "the emitted transaction letrec must be guarded"
         );
-    }
-
-    /// A literal-`true` side of `path ∧ guard` collapses to the other side.
-    #[test]
-    fn and_path_collapses_true_side() {
-        let bool_ty = Type::Base(BaseType::Bool);
-        let t = Expr::lit(Lit::Bool(true)).with_ty(bool_ty.clone());
-        let (g_name, h_name) = (Name::fresh("g"), Name::fresh("h"));
-        let g = tvar(&g_name, bool_ty.clone());
-        let h = tvar(&h_name, bool_ty);
-        let is_var = |e: &Expr, name: &Name| matches!(&e.node, TypedExprNode::Var(n) if n == name);
-        assert!(is_var(&and_path(&t, &g), &g_name));
-        assert!(is_var(&and_path(&h, &t), &h_name));
-        let both = and_path(&g, &h);
-        assert!(matches!(
-            &both.node,
-            TypedExprNode::BinOp { left, op: BinOpKind::BoolLogic(crate::ccl::LogicKind::And), right }
-                if is_var(left, &g_name) && is_var(right, &h_name)
-        ));
     }
 }
