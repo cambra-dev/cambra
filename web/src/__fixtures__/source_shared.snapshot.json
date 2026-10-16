@@ -60,6 +60,7 @@
   "diagnostics": [],
   "meta": {
     "payloadKind": "program",
+    "version": 0,
     "schema": 1
   },
   "panes": [

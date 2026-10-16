@@ -26,6 +26,7 @@ function probe(overrides: Record<string, unknown> = {}) {
 
 function frame(overrides: Record<string, unknown> = {}) {
   return {
+    version: 1,
     published: 1,
     final: false,
     nodes: [{ nodeId: 202, probes: [probe()] }],
@@ -44,6 +45,7 @@ describe("validateLiveFrame", () => {
 
   it("names the failing path", () => {
     expect(() => validateLiveFrame(frame({ published: "1" }))).toThrow(/frame\.published/);
+    expect(() => validateLiveFrame(frame({ version: undefined }))).toThrow(/frame\.version/);
     const bad = frame({ nodes: [{ nodeId: 1, probes: [probe({ rows: [{ key: "u0" }] })] }] });
     expect(() => validateLiveFrame(bad)).toThrow(/nodes\[0\]\.probes\[0\]\.rows\[0\]\.value/);
   });

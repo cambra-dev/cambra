@@ -15,13 +15,14 @@ import { TAG_SLOTS, tagColour } from "./liveView";
 const PANEL_ID = "live-menu-panel";
 
 /**
- * Build the menu into `parent`, and keep it in step with the store.
+ * Build the menu into `parent`, keep it in step with the store, and answer the
+ * function that detaches its listeners.
  *
  * Every render path goes through `sync`, so a change made elsewhere — a
  * clear, a new inspection — reaches the checkboxes too rather than only the
  * pane.
  */
-export function renderLiveMenu(parent: HTMLElement, live: LiveStore): void {
+export function renderLiveMenu(parent: HTMLElement, live: LiveStore): () => void {
   const root = document.createElement("div");
   root.className = "live-menu";
 
@@ -107,13 +108,18 @@ export function renderLiveMenu(parent: HTMLElement, live: LiveStore): void {
       button.focus();
     }
   });
-  document.addEventListener("pointerdown", (event) => {
+  const outside = (event: PointerEvent): void => {
     if (panel.hidden) return;
     if (!root.contains(event.target as Node)) open(false);
-  });
+  };
+  document.addEventListener("pointerdown", outside);
 
-  live.subscribe(sync);
+  const unsubscribe = live.subscribe(sync);
   sync();
+  return () => {
+    unsubscribe();
+    document.removeEventListener("pointerdown", outside);
+  };
 }
 
 /** One row: the checkbox, the tag, and the button that forgets it. */

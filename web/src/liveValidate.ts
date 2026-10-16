@@ -159,6 +159,7 @@ export function validateLiveFrame(value: unknown): LiveFrame {
     }
   }
   return {
+    version: num(o["version"], "version"),
     published: num(o["published"], "published"),
     final: bool(o["final"], "final"),
     nodes,
