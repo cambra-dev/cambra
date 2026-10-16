@@ -463,7 +463,8 @@ durable forms are:
 | `Variant` | Tagged sum; source tags use `FieldKey::Name`, while anonymous positional sums use `FieldKey::Index`. `Openness` distinguishes a complete tag set from an open requirement. |
 | `Refinement` | A base type restricted by a nonempty set of predicates; construction flattens nested refinements. |
 | `DataSource`, `Txn` | An external source's nominal domain and the transaction sequencing domain. |
-| `WitnessRef` | Reference to a dependent-sum witness; eliminated when the sum is consumed or realized. |
+| `WitnessRef` | Reference to a dependent-sum witness, inside the sum's own type; realization or erasure replaces it with a candidate. |
+| `WitnessProjection` | `σᵢ(𝑐)`, the `i`th witness of the sum the term `𝑐` holds: how a type outside the sum names it ([Projecting a sum's witness](collections.md#projecting-a-sums-witness)). |
 
 A `Label` (`src/ccl/label.rs`) is a record field label or a variant tag: a spelling and the module
 it belongs to ([chl-spec.md, "9.12 Field labels and tags belong to a
@@ -476,13 +477,13 @@ compiler builds for itself and with the tags of nominal types' constructors (`no
 `Label::runtime_key`: `name`, `module::name` for another module's label, and `@run::name` for a
 run's, whose `Display` is `run::name`.
 
-A data function can carry witness binders in its `FunKind`: for example,
-`Σ (𝐷 : [𝐷₀, 𝐷₁]). 𝐷 ⤇ 𝑉` ranges over two possible collection domains. The witness reference
-survives inference and is resolved by planning's realization step; it is not an inference
-placeholder. Its binder range is a `TypeKind`, separate from the `Type::Variant` used for tagged
-values. The positional `Variant` used by `Copair` is thus a data domain, while the Σ records a
-choice of domain for one collection. See [type inference](type-inference.md) for witness subtyping
-and consumption.
+A data function can carry witness binders in its `FunKind`: for example, `Σ (𝐷 : [𝐷₀, 𝐷₁]). 𝐷 ⤇ 𝑉`
+ranges over two possible collection domains. The witness reference survives inference and is
+resolved by planning's realization step; it is not an inference placeholder. Outside the sum's own
+type the witness is named through a term, `σᵢ(𝑐)`, and the collection is read as `unbox(𝑐)`. Its
+binder range is a `TypeKind`, separate from the `Type::Variant` used for tagged values. The
+positional `Variant` used by `Copair` is thus a data domain, while the Σ records a choice of domain
+for one collection. See [type inference](type-inference.md) for witness subtyping and consumption.
 
 ### Transient types and inference slots
 

@@ -446,6 +446,15 @@ pub(super) fn wrap_with_iterate(
     if is_iteration_bearing(expr) {
         return Ok(());
     }
+    // A `box` planning left standing is the identity at runtime, so its argument is the
+    // collection iterated: the sum it builds has a witness for a domain, which no source
+    // enumerates, while the argument's domain is the one its keys stand at.
+    // `mark_component_source` looks through it for the same reason.
+    if let TypedExprNode::Apply { argument, function } = &mut expr.node
+        && matches!(function.node, TypedExprNode::Builtin(Builtin::Box))
+    {
+        return wrap_with_iterate(argument, ctx, memo, site);
+    }
     let Some(domain_ty) = expr.ty.domain() else {
         // Non-function expressions can't be iterated; leave them alone.
         return Ok(());
@@ -737,6 +746,15 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
             ) =>
         {
             true
+        }
+        // `unbox(𝑐)` is `𝑐`'s value over the domain its witness names, keys and all, so it
+        // iterates exactly when `𝑐` does: an `iterate` over its projected domain would
+        // enumerate the witness's whole bound (`src/ccl/design/collections.md`, "A projection
+        // at runtime").
+        TypedExprNode::Apply { function, argument }
+            if builtin_at_function_position(function) == Some(Builtin::Unbox) =>
+        {
+            is_iteration_bearing(argument)
         }
         TypedExprNode::Apply { function, .. } => match builtin_at_function_position(function) {
             // `Iterate` is the canonical head marker; `Restrict` heads a

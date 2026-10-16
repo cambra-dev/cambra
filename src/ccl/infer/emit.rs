@@ -584,6 +584,7 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::WitnessRef(_)
+        | Type::WitnessProjection(_)
         | Type::Txn
         | Type::Hole
         | Type::BarrierVar(_)

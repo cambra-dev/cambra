@@ -1396,18 +1396,18 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
         e.walk_children(|c| ids_of(c, out));
     }
     fn from_ty(t: &Type, acc: &mut HashMap<usize, HashSet<NodeId>>) {
-        t.walk_refinements(&mut |r| {
-            let key = Rc::as_ptr(&r.predicate) as usize;
+        t.walk_quoted_terms(&mut |term| {
+            let key = Rc::as_ptr(term) as usize;
             if let std::collections::hash_map::Entry::Vacant(slot) = acc.entry(key) {
                 let mut s = HashSet::new();
-                ids_of(&r.predicate, &mut s);
+                ids_of(term, &mut s);
                 slot.insert(s);
                 // A predicate is an expression, so its own type slots are an
                 // expression walk's business rather than the type descent's. Once per
                 // term, like its ids: a term shared across type slots holds the same
                 // predicates in its own, and descending at every occurrence would walk
                 // the sharing out into a tree.
-                from_expr_ty(&r.predicate, acc);
+                from_expr_ty(term, acc);
             }
         });
     }
@@ -1458,9 +1458,9 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
     use crate::ccl::ty::Type;
 
     fn from_ty(t: &Type, acc: &mut HashSet<NodeId>) {
-        // Every refinement's predicate rides the slot, so every one of them
+        // Every term the slot quotes, a refinement's predicate or a projection's sum,
         // carries ids the projections must explain.
-        t.walk_refinements(&mut |r| from_expr(&r.predicate, acc));
+        t.walk_quoted_terms(&mut |term| from_expr(term, acc));
     }
 
     fn from_expr(e: &Expr, acc: &mut HashSet<NodeId>) {
@@ -2542,7 +2542,12 @@ fn run_passes(
     // silently absorbed into the outer block's read-your-writes env, dropping its
     // commit. Reject it before the phase strips the sites.
     check_transact_rejections(&expr, &txn_mut_vars, &blame)?;
-    mut_elim::check_no_loop_over_a_sum(&expr).map_err(|e| blame.unsupported(e, Some(&expr)))?;
+    mut_elim::refuse_uncompiled_loops_over_sums(&expr).map_err(|message| {
+        vec![CompileError::Internal {
+            stage: "letrec",
+            message,
+        }]
+    })?;
     mut_elim::check_iteration_channel_feeds(&expr)
         .map_err(|e| blame.unsupported(e, Some(&expr)))?;
 
@@ -2551,7 +2556,7 @@ fn run_passes(
     // audit span opened above as `Leak::Unrecorded`, and the span's floor stops being
     // reachable.
     expr = recorded(capture_provenance, Phase::Transact, || {
-        let mut expr = expr;
+        let mut expr = mut_elim::bind_sum_loop_sources(expr);
         // A mutable variable's seed and writes enter the value type its binder declares — a
         // concrete collection reaches an abstract one only through an introduction.
         mut_elim::view_values_at_value_type(&mut expr);

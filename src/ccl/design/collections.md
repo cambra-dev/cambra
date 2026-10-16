@@ -401,10 +401,100 @@ The current compiler does not implement that introduction rule. The regression
 applications of the key function and projected source fields. This is missing functionality,
 not a decision that such keys must remain unusable.
 
-An opaque sum adds a separate representation problem: a consumer sees the abstract witness,
-not automatically its concrete membership predicate. A future rule must preserve the link
-between the key and the collection while respecting witness scope. Neither naming a producer
-nor iterating its values currently supplies the complete rule.
+A key whose type names a sum's witness through the sum's value is a member by its type; see
+[Projecting a sum's witness](#projecting-a-sums-witness).
+
+## Projecting a sum's witness
+
+A sum `𝑐 : Σ (σ : 𝐾). 𝐷[σ] ⤇ 𝑉` is a pair of a witness and a collection over it, and it has the
+pair's two projections:
+
+- `σᵢ(𝑐)` is the `i`th witness, as a type, counting the sum's binders outermost first
+  (`Type::WitnessProjection`). It is how a type outside the sum names `σ`, which no reference to
+  `σ` can do outside the sum's own type.
+- `unbox(𝑐)` is the collection, at the type `𝐷[σ ↦ σ₁(𝑐)] ⤇ 𝑉` (`Builtin::Unbox`).
+
+`unbox` inverts `box`: `box` pairs a collection with the one candidate its domain is, and
+`unbox(box(𝑥))` is `𝑥` over `σ₁(box(𝑥))`, which erasure rewrites to that candidate.
+
+A projection is a candidate like any other: the domain of `𝑐` outside its type is `𝐷[σ ↦ σ₁(𝑐)]`,
+built by the substitution realization and erasure already perform (`instantiate_witness`). So a
+sum over `σ` has domain `σ₁(𝑐)`, a filtered one `{σ₁(𝑐) | 𝑞}`, and one over a product of two
+binders `(σ₁(𝑐), σ₂(𝑐))`. A plain collection binds no witness and has no projection.
+
+The subscript counts the sum's binders, not its candidates, the term selects which value's witness
+is meant, and nesting adds no positions. Two examples:
+
+- **One binder, per row.** The jagged rows `box([box([1]), box([2, 3]), box([4, 5, 6])])` have
+  type `Σ (τ : [0..3]). τ ⤇ Σ (σ : [0..1, 0..2, 0..3]). σ ⤇ Int`. Every row is a sum of its own,
+  and its domain is `σ₁` of that row: `σ₁(box([1]))`, `σ₁(box([2, 3]))` and
+  `σ₁(box([4, 5, 6]))`, which are `0..1`, `0..2` and `0..3` at runtime. A loop over the row
+  `𝑡(𝑥)` at outer position `𝑥` ranges over `σ₁(𝑡(𝑥))`, whose keys are that row's own. The outer
+  list is a separate sum with a `σ₁` of its own, whose one candidate is `0..3`.
+- **Three binders, one value.** With `c : Bool`, the comprehension
+
+  ```
+  [x + y + z for x in (box([1]) if c else box([1, 2]))
+             for y in (box([3]) if c else box([3, 4]))
+             for z in (box([5]) if c else box([5, 6, 7]))]
+  ```
+
+  has type `Σ (σ : [0..1, 0..2]). Σ (τ : [0..1, 0..2]). Σ (υ : [0..1, 0..3]). (σ, τ, υ) ⤇ Int`:
+  one collection over a tuple domain, with three witnesses. `Display` prints all three binders as
+  `σ`; `CCL_SHOW_BINDERS=1` tells them apart. Outside its type the domain is
+  `(σ₁(𝑐), σ₂(𝑐), σ₃(𝑐))`, and `σ₃(𝑐)` is the third generator's range: `0..1` when `c` holds and
+  `0..3` otherwise.
+
+`σᵢ(𝑐)` holds the term `𝑐` as a refinement holds its predicate: shared by `Rc` and compared by
+normal form. `𝑐`'s type carries the sum's binders, so the projection reads a witness's kind and
+bound off its own term. It holds the binder's position rather than its id: inference renames a
+sum's binders into each consumer's scope, and the term and the position stay the same. A type that
+mentions `σᵢ(𝑥)` and leaves the binding of `𝑥` substitutes `𝑥`'s definition, as any type naming a
+`let` binder does ([`let` binders and scope exit](type-inference.md#let-binders-and-scope-exit)).
+Planning's erasure of a determined witness rewrites `σᵢ(𝑐)` to the candidate, and `unbox` of a
+collection whose witness it erased to that collection. It reads the witness off the term the
+projection quotes, under the id that term was typed with.
+
+### Typing
+
+`unbox` has no scheme. Its result type is the sum's body as a function of the witness, which a
+scheme cannot quantify over, so each use carries a dependent type stamped for its argument's sum,
+`(𝑐 : Σ (σ : 𝐾). 𝐷[σ] ⤇ 𝑉) ⇒ 𝐷[σ ↦ σ₁(𝑐)] ⤇ 𝑉` (`ty::unbox_type`), and the post-inference check
+holds the stamp to that rule (`check_unbox`), as it does `strength_over`'s. Applying it discharges
+`𝑐` to the argument. A key typed `σ₁(𝑐)` then applies to `unbox(𝑐)` as to any collection over that
+domain. Two projections are equal when their positions are and their terms are equal by normal
+form.
+
+A witness with no key bound has no extent: one over `Type`, or over `Enumerated` candidates whose
+key types differ. A consumer that needs the extent of a projection of one refuses it by name.
+
+### A projection at runtime
+
+A projection has no runtime representation of its own. A sum's value is a `Tile::DataFunction`
+holding its keys in its domain column, and the extent of `σᵢ(𝑐)` is the `i`th witness's key bound
+(`OpConversionContext::witness_domain_extent`). `unbox(𝑐)` is `𝑐`'s value tiled at that bound: a
+one-leg flat merge where the value stands at its own domain, as a `[1, 2]` bound as a `List(Int)`
+stands at `0..2`, and `𝑐`'s operator where it already stands at the bound or is a collection
+materialized into a value, which carries its keys. `unbox(𝑐)` carries
+`𝑐`'s keys, so it is an iteration source exactly when `𝑐` is. No `IterateExtent` ranges over a
+projected domain, since it would enumerate the whole bound.
+
+### A `for` loop over a sum
+
+`mut_elim` types the history of `for 𝑥 in 𝑐` over `𝑐`'s projected domain, and the body reads the
+item as `__pos ▷ unbox(𝑐)`. The induction driver takes its positions from the source tile's keys,
+as for a map source ([The store](../../interpreter/design-operators.md#the-store)).
+
+A source `𝑒` that is not a variable and reads nothing an enclosing loop binds or writes is bound
+first, as `let __src = 𝑒 in for 𝑥 in __src` (`mut_elim::bind_sum_loop_sources`). The projection
+quotes `__src`, and a pass rewriting `𝑒` rewrites the binding's definition. The binding stands
+outside every enclosing loop, so the domain depends on no enclosing position. A source computed per
+position of an enclosing loop is quoted as written.
+
+A loop over an outer loop's element ranges over the projected domain of that element, so the
+nested positions are a dependent tuple whose second component is `σ₁(𝑡(𝑥))` for the row `𝑡(𝑥)`
+the outer position `𝑥` reads. Its keys at `𝑥` are the row's own:
+`(λ 𝑥 → unbox(𝑡(𝑥))) ≫ map_domain` (`planning/correlated.rs`, `row_keys_family`).
 
 ## Compiling a conditional collection
 
@@ -440,16 +530,13 @@ The standalone `WitnessRef` case in `extent_of` rejects that use. A comprehensio
 instead compose its generator with the collection, taking the keys from its values; see
 [Sum-source generators](optimization.md#a-generator-over-a-sum-composes-with-its-source).
 
-A `for` loop over a sum never reaches op-conversion. Its history is a function over the source's
-domain, and a sum's domain is a reference to the witness the sum binds, so the history would
-name the witness outside its binder. `mut_elim::check_no_loop_over_a_sum` rejects such a loop by
-name before the history is built. The rejection covers a determined sum too, because planning
-erases one only after the history is typed.
+A `for` loop over a sum types its history over the source's domain; see
+[A `for` loop over a sum](#a-for-loop-over-a-sum).
 
-`unbox` decides whether to retain a row's introduction from the position it fills. Inlining
-can move a let-bound row into a jagged literal position, where its box is preserved. A row
-read from mutable storage has already had its determined witness erased. Such a bare row
-cannot fill a sum-typed element position; `reject_rows_fixed_elsewhere` reports the mismatch.
+`erase_determined_boxes` decides whether to retain a row's introduction from the position it fills.
+Inlining can move a let-bound row into a jagged literal position, where its box is preserved. A row
+read from mutable storage has already had its determined witness erased. Such a bare row cannot fill
+a sum-typed element position; `reject_rows_fixed_elsewhere` reports the mismatch.
 
 Realization operates at a site whose type carries the witnesses and whose subtree contains
 their conditionals. Unboxed arms sharing a domain need no sum; boxed arms sharing a domain
@@ -498,9 +585,9 @@ for i in [1, 2]:
 ```
 
 Each row's value has type `Σ (σ : [0..2, 0..3]). σ ⤇ Int` and carries its own `σ`, so each
-arm keeps its `box`, as a row of a jagged list literal does. `unbox` erases a `box` whose type has
-one candidate unless the type its position requires is a sum. `walk_children_with_demand` passes
-the position's type through each leg to its arm by two rules:
+arm keeps its `box`, as a row of a jagged list literal does. `erase_determined_boxes` erases a
+`box` whose type has one candidate unless the type its position requires is a sum.
+`walk_children_with_demand` passes the position's type through each leg to its arm by two rules:
 
 - The last step of a `≫` chain receives the chain's result type.
 - The argument of `𝑎 ▷ const` receives the result type, since `𝑎 ▷ const` returns `𝑎` at every

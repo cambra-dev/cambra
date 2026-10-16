@@ -9,8 +9,8 @@ use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
 use crate::ccl::subst::Subst;
 use crate::ccl::{
     BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, F_WRITES, FieldKey, Lit,
-    LogicKind, Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedBinding,
-    TypedExprNode, UnaryOpKind, V_ABORT, V_COMMIT, V_FIRED, V_IDLE,
+    LogicKind, Name, PredicateId, ProjKey, QuotedTerm, Refinement, RefinementSet, Type,
+    TypedBinding, TypedExprNode, UnaryOpKind, V_ABORT, V_COMMIT, V_FIRED, V_IDLE,
 };
 
 /// The `commit` selector field of the **intermediate** decision record the two
@@ -1874,6 +1874,7 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::WitnessRef(_)
+        | Type::WitnessProjection(_)
         | Type::Param(_)
         | Type::Txn => ty.clone(),
         Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(strip_refinements))),
@@ -2559,6 +2560,12 @@ fn count_free_in_type_go(name: &Name, ty: &Type, visited: &mut HashSet<Predicate
                     }
                 }
             }
+            // A projection's sum is a term the type quotes, counted as a predicate is.
+            if let Type::WitnessProjection(p) = ty
+                && visited.insert(Rc::as_ptr(&p.term))
+            {
+                count += count_free_with_visited(name, &p.term, visited);
+            }
             ty.walk_children(|child| count += count_free_in_type_go(name, child, visited));
             count
         }
@@ -2677,14 +2684,12 @@ struct Entry<C> {
 }
 
 impl<C> MemoStore<C> {
-    /// Point `refinement` at `to`, counting it when the `Rc` actually changes.
-    fn point_at(&mut self, refinement: &mut Refinement, to: Rc<Expr>) {
-        if !Rc::ptr_eq(&refinement.predicate, &to) {
-            // Check shape only when installing a different predicate allocation.
-            crate::ccl::ty::debug_assert_predicate_shape(&to);
+    /// Point `quoted` at `to`, counting it when the `Rc` actually changes.
+    fn point_at(&mut self, quoted: &mut impl QuotedTerm, to: Rc<Expr>) {
+        if !Rc::ptr_eq(quoted.quoted(), &to) {
             self.revision += 1;
         }
-        refinement.predicate = to;
+        quoted.requote(to);
     }
 }
 
@@ -2708,7 +2713,7 @@ impl<C: PartialEq + Clone> PredMemo<C> {
     /// See `src/ccl/design/type-inference.md`, "Predicate rebuild completion".
     pub fn rebuild(
         &self,
-        refinement: &mut Refinement,
+        refinement: &mut impl QuotedTerm,
         context: &C,
         f: impl FnOnce(&mut Expr) -> bool,
     ) -> bool {
@@ -2716,7 +2721,7 @@ impl<C: PartialEq + Clone> PredMemo<C> {
             let mut store = self.0.borrow_mut();
             let hit = store
                 .entries
-                .get(&refinement.predicate_id())
+                .get(&Rc::as_ptr(refinement.quoted()))
                 .and_then(|es| es.iter().find(|e| e.context == *context))
                 .map(|e| Rc::clone(&e.rebuilt));
             match hit {
@@ -2725,7 +2730,7 @@ impl<C: PartialEq + Clone> PredMemo<C> {
                     return false;
                 }
                 None => {
-                    let keepalive = Rc::clone(&refinement.predicate);
+                    let keepalive = Rc::clone(refinement.quoted());
                     let rev = store.revision;
                     (keepalive, rev)
                 }
@@ -2780,8 +2785,8 @@ impl TermMemo {
     /// Ordinary callback return completes installation; unwinding does not.
     /// Later copies are discarded after their callbacks, retaining per-occurrence
     /// effects without splitting the shared allocation.
-    pub fn rebuild_always(&self, refinement: &mut Refinement, f: impl FnOnce(&mut Expr)) {
-        let keepalive = Rc::clone(&refinement.predicate);
+    pub fn rebuild_always(&self, refinement: &mut impl QuotedTerm, f: impl FnOnce(&mut Expr)) {
+        let keepalive = Rc::clone(refinement.quoted());
         // Copy and rewrite under the memo's declared intent; see `rebuild`.
         let pred = if self.0.is_replacing() {
             crate::ccl::provenance::preserving_ids(|| {

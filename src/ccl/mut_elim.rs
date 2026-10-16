@@ -49,7 +49,8 @@
 //! writer sources inside letrec bindings — deferred until something needs it.)
 
 use crate::ccl::Label;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::ccl::feed_nest::LoopFeed;
 use crate::ccl::opaque_output;
@@ -917,12 +918,12 @@ fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
 /// [`Builtin::Box`]. A write `m := box(…)` names one key domain the same way. A keyed write
 /// needs nothing here: [`desugar_keyed_writes`] builds its `insert` at the variable's type.
 ///
-/// Stating the mutable variable's value type on that introduction is also what keeps it. `unbox`
-/// erases a box whose **stated** sum lists one candidate, reading the kind off `box`'s own
-/// function type, and a described kind lists none
-/// (`src/ccl/planning/conditionals.rs`). So a seed built by a conditional still realizes —
-/// the fan-out acts on the inner, multi-candidate sum — while the introduction that states
-/// the mutable variable's type survives realization and carries the value into it.
+/// Stating the mutable variable's value type on that introduction is also what keeps it.
+/// `erase_determined_boxes` erases a box whose **stated** sum lists one candidate, reading the kind
+/// off `box`'s own function type, and a described kind lists none
+/// (`src/ccl/planning/conditionals.rs`). So a seed built by a conditional still realizes — the
+/// fan-out acts on the inner, multi-candidate sum — while the introduction that states the mutable
+/// variable's type survives realization and carries the value into it.
 ///
 /// Runs after inference, so it stamps the types it builds and the CHECK-mode `typecheck`
 /// behind it validates them: the reconcile there is `derived <: recorded`, and the derived
@@ -1179,39 +1180,104 @@ pub(crate) fn tvar(name: &Name, ty: Type) -> Expr {
     e
 }
 
-/// Reject a `for` loop over a collection whose type is a sum.
+/// Refuse a loop that writes a mutable variable over a sum this phase does not compile. A loop
+/// over a sum types its history over the source's projected witness
+/// (`src/ccl/design/collections.md`, "A `for` loop over a sum"), and three sources break that:
 ///
-/// A loop's history is a function over its source's domain ([`fun_parts`]), and a sum's
-/// domain is a reference to the witness the sum binds. The history stands outside the sum, so
-/// the reference in its domain has no binder, and nothing drives a loop over a domain only
-/// the value holds (`src/ccl/design/collections.md`, "Compiling a conditional collection").
-/// This holds for a determined sum as well: planning erases one only after this phase has
-/// typed the history. Runs on the inlined tree ahead of the transactional slice and
-/// [`run`], which both build a history over a loop's source.
-pub(crate) fn check_no_loop_over_a_sum(expr: &Expr) -> Result<(), provenance::Located<String>> {
-    if let TypedExprNode::For { iter, .. } = &expr.node
-        && matches!(
-            fun_parts(&iter.ty).0.peel_refinements(),
-            Type::WitnessRef(_)
-        )
+/// - A conditional collection, written in place or bound by a `let`. Realization copies a
+///   conditional into each of its consumers, a copy the projection quotes and realization does
+///   not rewrite.
+/// - A filtered sum. The filter's predicate applies the collection it filters at a position of
+///   the witness, and once the witness is projected, the check relates a projection to that
+///   collection's own witness, which it relates to a witness reference only.
+/// - A source computed per position of an enclosing loop, other than a variable.
+///   [`bind_sum_loop_sources`] binds a source only outside every loop, so the projection quotes
+///   this one itself, a copy the passes after this phase do not rewrite.
+pub(crate) fn refuse_uncompiled_loops_over_sums(expr: &Expr) -> Result<(), String> {
+    refuse_under(expr, &mut Vec::new(), &HashSet::new())
+}
+
+/// [`refuse_uncompiled_loops_over_sums`] under the `let`-bound conditionals in scope, each with
+/// its definition's rendering, and the names the enclosing loops scope.
+fn refuse_under(
+    expr: &Expr,
+    conditionals: &mut Vec<(Name, String)>,
+    enclosing: &HashSet<Name>,
+) -> Result<(), String> {
+    if let TypedExprNode::For { iter, body, .. } = &expr.node {
+        refuse_loop(iter, body, conditionals, enclosing)?;
+        refuse_under(iter, conditionals, enclosing)?;
+        let mut scoped = enclosing.clone();
+        names_scoped_by(expr, &mut scoped);
+        return refuse_under(body, conditionals, &scoped);
+    }
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &expr.node
     {
-        return Err(provenance::Located::new(
-            format!(
-                "a `for` loop over a collection whose type is a sum is not supported yet: `{}` \
-                 has type {}. A comprehension over it compiles",
-                symbolic(iter),
-                iter.ty
-            ),
-            iter.node_id(),
-        ));
+        refuse_under(bound_expr, conditionals, enclosing)?;
+        let scope = conditionals.len();
+        if matches!(bound_expr.node, TypedExprNode::Case { .. }) {
+            conditionals.push((binding.name.clone(), symbolic(bound_expr)));
+        }
+        let result = refuse_under(body, conditionals, enclosing);
+        conditionals.truncate(scope);
+        return result;
     }
     let mut result = Ok(());
     expr.walk_children(|child| {
         if result.is_ok() {
-            result = check_no_loop_over_a_sum(child);
+            result = refuse_under(child, conditionals, enclosing);
         }
     });
     result
+}
+
+/// The refusal of [`refuse_uncompiled_loops_over_sums`] for one loop, over `iter` with body
+/// `body`.
+fn refuse_loop(
+    iter: &Expr,
+    body: &Expr,
+    conditionals: &[(Name, String)],
+    enclosing: &HashSet<Name>,
+) -> Result<(), String> {
+    if !writes_a_mutable(body) || source_fun(&iter.ty).sum().is_none() {
+        return Ok(());
+    }
+    let conditional = match &iter.node {
+        TypedExprNode::Case { .. } => Some(symbolic(iter)),
+        TypedExprNode::Var(name) => conditionals
+            .iter()
+            .find(|(bound, _)| bound == name)
+            .map(|(_, definition)| definition.clone()),
+        _ => None,
+    };
+    if let Some(conditional) = conditional {
+        return Err(format!(
+            "a `for` loop writing a mutable variable over a conditional collection is not \
+             compiled yet: `{conditional}` has type {}",
+            iter.ty
+        ));
+    }
+    if matches!(fun_parts(&iter.ty).0, Type::Refinement(..)) {
+        return Err(format!(
+            "a `for` loop writing a mutable variable over a filtered collection whose type \
+             is a sum is not compiled yet: `{}` has type {}",
+            symbolic(iter),
+            iter.ty
+        ));
+    }
+    if !matches!(iter.node, TypedExprNode::Var(_)) && reads_any(iter, enclosing) {
+        return Err(format!(
+            "a `for` loop writing a mutable variable over a sum computed per position of an \
+             enclosing loop is not compiled yet: `{}` has type {}",
+            symbolic(iter),
+            iter.ty
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse a feed a loop body declares that the iteration feeds in two places: the two
@@ -1297,6 +1363,16 @@ fn feeds_into(expr: &Expr, channel: &Name, out: &mut Vec<NodeId>) {
     expr.walk_children(|child| feeds_into(child, channel, out));
 }
 
+/// Whether `body` writes a mutable variable anywhere.
+fn writes_a_mutable(body: &Expr) -> bool {
+    if matches!(body.node, TypedExprNode::MutWrite { .. }) {
+        return true;
+    }
+    let mut found = false;
+    body.walk_children(|child| found = found || writes_a_mutable(child));
+    found
+}
+
 /// Destructure a (possibly refinement- or `Mut`-wrapped) function type.
 ///
 /// A `Mut`-typed collection used as a loop source (`xs := [..]; for i in
@@ -1304,6 +1380,17 @@ fn feeds_into(expr: &Expr, channel: &Name, out: &mut Vec<NodeId>) {
 /// mutable variable's value type; `erase_mut` clears the residual `Mut` on the source node
 /// at the end of the phase.
 pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
+    match source_fun(ty) {
+        Type::Fun {
+            domain, codomain, ..
+        } => (*domain, *codomain),
+        other => panic!("letrec phase: loop source is not a function: {other}"),
+    }
+}
+
+/// The function type a loop source denotes, under its refinements and a mutable collection's
+/// `Mut` ([`fun_parts`]).
+fn source_fun(ty: &Type) -> Type {
     let mut t = ty;
     loop {
         match t {
@@ -1314,16 +1401,174 @@ pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
             Type::History {
                 history_kind: HistoryKind::Overwrite,
                 ..
-            } => t = t.history_parts().expect("matched a history").1,
-            _ => break,
+            } => return source_fun(t.history_parts().expect("matched a history").1),
+            _ => return t.clone(),
         }
     }
-    match t {
-        Type::Fun {
-            domain, codomain, ..
-        } => ((**domain).clone(), (**codomain).clone()),
-        other => panic!("letrec phase: loop source is not a function: {other}"),
+}
+
+/// `iter` as the collection a loop reads its items from: a sum unboxed, so its domain names the
+/// witness through the source exactly as the loop's positions do ([`loop_domain`]). A plain
+/// collection is itself.
+fn unboxed_source(iter: &Expr) -> Expr {
+    let value_ty = source_fun(&iter.ty);
+    // Every node this builds, the stamp's binder reference included, is a mint the loop's
+    // source owes: recorded against it, so a later rewrite naming one has its history.
+    let _g = provenance::enter(
+        iter.node_id(),
+        "mut_elim.unbox",
+        provenance::Nature::Machinery,
+    );
+    let Some(stamp) = crate::ccl::ty::unbox_type(&value_ty) else {
+        return iter.clone();
+    };
+    let source = Rc::new(source_value(iter));
+    let unboxed_ty = crate::ccl::ty::unboxed_type(&value_ty, &source)
+        .expect("`unbox_type` stamped a type, so the source is a sum");
+    let mut unboxed = Expr::apply(
+        source_value(iter),
+        Expr::builtin(Builtin::Unbox).with_ty(stamp),
+    );
+    unboxed.ty = unboxed_ty;
+    unboxed
+}
+
+/// A copy of the loop source at the collection it denotes: a mutable collection read to its value
+/// ([`fun_parts`]), as `erase_mut` leaves the source node.
+fn source_value(iter: &Expr) -> Expr {
+    let _frame = provenance::copy_frame("mut_elim.projected_source");
+    let mut source = iter.clone();
+    source.ty = source_fun(&iter.ty);
+    source
+}
+
+/// Bind the source of every `for` loop over a sum to a fresh name, unless it is a variable
+/// already: `for x in e: …` becomes `let __src = e in for x in __src: …`.
+///
+/// A loop over a sum types its history over the source's projected witness ([`loop_domain`]),
+/// and a projection quotes its term. Quoting a variable leaves every later rewrite of the
+/// source to the binding's definition, where the passes after this phase already reach it;
+/// a quoted copy of the source itself is a second copy those passes skip. Runs ahead of the
+/// transactional slice and [`run`], which both fold a loop through [`loop_domain`].
+///
+/// Only a source no enclosing loop varies is bound: one reading nothing an enclosing loop binds
+/// or writes. Its binding stands outside every enclosing loop, so the inner domain depends on no
+/// enclosing position. A source computed per position of an enclosing loop is left in place
+/// ([`refuse_uncompiled_loops_over_sums`]).
+pub(crate) fn bind_sum_loop_sources(expr: Expr) -> Expr {
+    bind_sources(expr, &HashSet::new(), &mut HashSet::new())
+}
+
+/// [`bind_sum_loop_sources`] under the names the enclosing loops scope, recording each name it
+/// binds in `sources`.
+fn bind_sources(mut expr: Expr, enclosing: &HashSet<Name>, sources: &mut HashSet<Name>) -> Expr {
+    let TypedExprNode::ExprStmt {
+        expr: effect,
+        body: cont,
+    } = &mut expr.node
+    else {
+        expr.map_children(|child| bind_sources(child, enclosing, sources));
+        return expr;
+    };
+    **cont = bind_sources(std::mem::take(&mut **cont), enclosing, sources);
+    if !matches!(effect.node, TypedExprNode::For { .. }) {
+        **effect = bind_sources(std::mem::take(&mut **effect), enclosing, sources);
+        return expr;
     }
+    let mut scoped = enclosing.clone();
+    names_scoped_by(effect, &mut scoped);
+    let TypedExprNode::For { iter, body, .. } = &mut effect.node else {
+        unreachable!("matched a For")
+    };
+    **iter = bind_sources(std::mem::take(&mut **iter), enclosing, sources);
+    **body = bind_sources(std::mem::take(&mut **body), &scoped, sources);
+    let mut invariant = Vec::new();
+    take_sources(body, sources, &mut invariant);
+    debug_assert!(
+        invariant
+            .iter()
+            .all(|(_, _, definition)| !reads_any(definition, &scoped)),
+        "a source binding taken out of a loop reads a name the loop scopes"
+    );
+    if !matches!(iter.node, TypedExprNode::Var(_))
+        && source_fun(&iter.ty).sum().is_some()
+        && !reads_any(iter, enclosing)
+    {
+        let _g = provenance::enter(
+            iter.node_id(),
+            "mut_elim.loop_source",
+            provenance::Nature::Machinery,
+        );
+        let source = Name::fresh("__src");
+        let reference = tvar(&source, iter.ty.clone());
+        let definition = std::mem::replace(&mut **iter, reference);
+        sources.insert(source.clone());
+        expr = Expr::let_in(binding(source, definition.ty.clone()), definition, expr);
+    }
+    for (id, binding, definition) in invariant.into_iter().rev() {
+        expr = Expr::let_in_preserving(id, binding, definition, expr);
+    }
+    expr
+}
+
+/// Whether `e` reads any of `names`.
+fn reads_any(e: &Expr, names: &HashSet<Name>) -> bool {
+    crate::ccl::ccl_utils::free_names(e)
+        .iter()
+        .any(|name| names.contains(name))
+}
+
+/// Every name a binder in `e` binds or a write in `e` writes.
+fn names_scoped_by(e: &Expr, out: &mut HashSet<Name>) {
+    e.walk_binders(|b| {
+        out.insert(b.name.clone());
+    });
+    if let TypedExprNode::MutWrite { name, .. } = &e.node {
+        out.insert(name.clone());
+    }
+    e.walk_children(|child| names_scoped_by(child, out));
+}
+
+/// Remove from `e` each binding of one of `sources`, collecting it in `out` in the order met.
+fn take_sources(e: &mut Expr, sources: &HashSet<Name>, out: &mut Vec<PrefixBinding>) {
+    while let TypedExprNode::Let { binding, .. } = &e.node
+        && sources.contains(&binding.name)
+    {
+        let id = e.node_id();
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = std::mem::take(e).node
+        else {
+            unreachable!("matched a Let")
+        };
+        out.push((id, binding, *bound_expr));
+        *e = *body;
+    }
+    e.walk_children_mut(|child| take_sources(child, sources, out));
+}
+
+/// The domain a loop over `iter` ranges over, spelled for types outside the source's own: a
+/// sum's witnesses projected through the source (`src/ccl/design/collections.md`, "A `for`
+/// loop over a sum"). A plain collection's domain is its own.
+fn loop_domain(iter: &Expr) -> Type {
+    let fun = source_fun(&iter.ty);
+    let (domain, _) = fun_parts(&fun);
+    let Some(witnesses) = fun.sum() else {
+        return domain;
+    };
+    let source = Rc::new(source_value(iter));
+    witnesses
+        .iter()
+        .enumerate()
+        .fold(domain, |domain, (position, witness)| {
+            let projection = Type::WitnessProjection(crate::ccl::WitnessProjection::new(
+                Rc::clone(&source),
+                position,
+            ));
+            crate::ccl::ty::instantiate_witness(&domain, witness.id(), &projection)
+        })
 }
 
 /// A per-iteration feed collected from a loop body: the target defer, the
@@ -1791,7 +2036,8 @@ pub(crate) fn fold_induction_loop(
         "fold_induction_loop: caller must guard on a non-empty accumulator set"
     );
 
-    let (domain_ty, item_ty) = fun_parts(&iter.ty);
+    let (_, item_ty) = fun_parts(&iter.ty);
+    let domain_ty = loop_domain(iter);
     let acc_tys: Vec<Type> = accs.iter().map(|a| a.ty.clone()).collect();
     // The proposed write set, labelled by the accumulators' own names. A
     // positional tuple reads the same everywhere downstream and costs nothing
@@ -1882,7 +2128,7 @@ pub(crate) fn fold_induction_loop(
             app
         })
         .collect();
-    let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), iter.clone());
+    let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), unboxed_source(iter));
     item_read.ty = item_ty.clone();
     snap_elts.push(item_read);
     // The type rewrites read the argument without placing it, so they take copies that keep
@@ -2880,7 +3126,7 @@ fn iteration_channel(
             if conditional {
                 crate::ccl::channelize::refine_source_domain(
                     &mut view,
-                    crate::ccl::Refinement::born(std::rc::Rc::new(f.fire)),
+                    crate::ccl::Refinement::born(Rc::new(f.fire)),
                 );
             }
             let mut define = Expr::define(inner.clone(), view);
