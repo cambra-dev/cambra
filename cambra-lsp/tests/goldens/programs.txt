@@ -300,17 +300,48 @@ diagnostics:
   62:12-62:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
     62:5-62:11 while parsing statement
     62:5-62:11 while parsing expression
-  76:14-76:18 found 'with', expected expression, 'if', or 'match'
+  76:14-76:18 found 'with', expected 'if', or 'match'
     76:5-76:13 while parsing statement
-  86:1-86:1 found 'dedent', expected statement, 'newline', or end of input
+  86:82-87:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '=', or ':='
+    86:1-86:82 while parsing statement
+    86:9-86:82 while parsing expression
 symbols:
+  variable Dollars 30:1-30:14 (name 30:1-30:8)
+  variable Qty 31:1-31:25 (name 31:1-31:4)
+  variable ItemPricing 32:1-32:72 (name 32:1-32:12)
+  variable catalog 34:1-38:2 (name 34:1-34:8)
+  variable SKU 41:1-41:41 (name 41:1-41:4)
+  variable inventory 47:1-51:2 (name 47:1-47:10)
+  module std::http 53:1-53:17 (name 53:8-53:17)
+  variable order_reqs 55:1-55:67 (name 55:1-55:11)
+  variable order_resps 55:1-55:67 (name 55:15-55:26)
+  variable restock_reqs 56:1-56:69 (name 56:1-56:13)
+  variable restock_resps 56:1-56:69 (name 56:15-56:28)
+  variable stats_reqs 57:1-57:66 (name 57:1-57:11)
+  variable stats_resps 57:1-57:66 (name 57:15-57:26)
+  function quote 59:1-63:6 (name 59:5-59:10)
+  function reserve 65:1-73:75 (name 65:5-65:12)
 folds:
   1-27 comment
   34-37
   43-46 comment
   47-50
+  59-63
+  65-73
+  67-69
+  70-71
+  75-83
+  88-111
   89-90 comment
+  91-109
+  92-93
+  94-109
+  95-109
+  97-107
   100-105
+  108-109
+  114-120
+  115-118
   117-118
 == tests/programs/storefront/v1.cambra
 diagnostics:
@@ -320,18 +351,53 @@ diagnostics:
   75:12-75:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
     75:5-75:11 while parsing statement
     75:5-75:11 while parsing expression
-  89:14-89:18 found 'with', expected expression, 'if', or 'match'
+  89:14-89:18 found 'with', expected 'if', or 'match'
     89:5-89:13 while parsing statement
-  99:1-99:1 found 'dedent', expected statement, 'newline', or end of input
+  99:82-100:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '=', or ':='
+    99:1-99:82 while parsing statement
+    99:9-99:82 while parsing expression
 symbols:
+  variable Dollars 27:1-27:14 (name 27:1-27:8)
+  variable Qty 28:1-28:25 (name 28:1-28:4)
+  variable ItemPricing 29:1-29:72 (name 29:1-29:12)
+  variable catalog 31:1-35:2 (name 31:1-31:8)
+  variable SKU 38:1-38:41 (name 38:1-38:4)
+  variable inventory 44:1-48:2 (name 44:1-44:10)
+  module std::http 50:1-50:17 (name 50:8-50:17)
+  variable order_reqs 52:1-52:67 (name 52:1-52:11)
+  variable order_resps 52:1-52:67 (name 52:15-52:26)
+  variable restock_reqs 53:1-53:69 (name 53:1-53:13)
+  variable restock_resps 53:1-53:69 (name 53:15-53:28)
+  variable stats_reqs 54:1-54:66 (name 54:1-54:11)
+  variable stats_resps 54:1-54:66 (name 54:15-54:26)
+  function is_promo_spent 60:1-64:52 (name 60:5-60:19)
+  function quote 66:1-76:6 (name 66:5-66:10)
+  function reserve 78:1-86:75 (name 78:5-78:12)
 folds:
   1-24 comment
   31-34
   40-43 comment
   44-47
   56-59 comment
+  60-64
+  66-76
+  70-71
+  72-73
+  78-86
+  80-82
+  83-84
+  88-96
+  101-124
   102-103 comment
+  104-122
+  105-106
+  107-122
+  108-122
+  110-120
   113-118
+  121-122
+  127-133
+  128-131
   130-131
 == tests/programs/streaming_echo/program.cambra
 diagnostics:
@@ -343,12 +409,27 @@ diagnostics:
     32:9-33:27 while parsing statement
   41:24-41:25 found 'identifier', expected indented block
     40:5-41:23 while parsing statement
-  47:1-47:1 found 'dedent', expected statement, 'newline', or end of input
 symbols:
+  module std::http 16:1-16:17 (name 16:8-16:17)
+  variable get_reqs 18:1-18:61 (name 18:1-18:9)
+  variable get_resps 18:1-18:61 (name 18:13-18:22)
+  variable set_reqs 19:1-19:61 (name 19:1-19:9)
+  variable set_resps 19:1-19:61 (name 19:13-19:22)
+  variable stats_reqs 20:1-20:63 (name 20:1-20:11)
+  variable stats_resps 20:1-20:63 (name 20:13-20:24)
+  variable store 22:1-22:43 (name 22:1-22:6)
+  function put 24:1-25:24 (name 24:5-24:8)
 folds:
   1-14 comment
+  24-25
+  27-35
+  28-34
   29-31 comment
+  37-46
+  38-39
   44-46 comment
+  47-50
+  48-50
 == tests/programs/txn_multi_read/program.cambra
 diagnostics:
 symbols:
@@ -372,11 +453,11 @@ folds:
   2-3
 == tests/programs/while_counter/program.cambra
 diagnostics:
-  2:7-2:8 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+  2:7-2:8 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', or '::'
     2:1-2:6 while parsing statement
     2:1-2:6 while parsing expression
-  4:1-4:1 found 'dedent', expected statement, 'newline', or end of input
 symbols:
+  variable i 1:1-1:6 (name 1:1-1:2)
 folds:
 == editors/sample-lexes-only.cambra
 diagnostics:

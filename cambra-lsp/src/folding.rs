@@ -97,10 +97,16 @@ fn body_fold(
 ) -> Option<FoldingRange> {
     let (first, last) = (body.first()?, body.last()?);
     let before = tokens.partition_point(|(_, span)| span.start < first.span.start);
-    let (_, header_end) = tokens[..before]
-        .iter()
-        .rev()
-        .find(|(tok, _)| !matches!(tok, Token::Newline | Token::Indent | Token::Dedent))?;
+    let (_, header_end) = tokens[..before].iter().rev().find(|(tok, _)| {
+        !matches!(
+            tok,
+            Token::Newline
+                | Token::Indent
+                | Token::Dedent
+                | Token::BlockValueIndent
+                | Token::BlockValueDedent
+        )
+    })?;
     let start_line = doc.line(header_end.start);
     let end_line = last_line(doc, last.span);
     (end_line > start_line).then(|| range(start_line, end_line, None))

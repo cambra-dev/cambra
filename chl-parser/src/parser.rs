@@ -1817,10 +1817,11 @@ where
 
         // `x = if c: … else: …` and `x = match v: …` — a block statement on the
         // right of an assignment, whose value is the block's own
-        // (`docs/chl-spec.md`, "4.5 `if` / `elif` / `else`"). The block's
-        // `Dedent` ends the statement, so this form takes no `stmt_terminator`
-        // and cannot ride `simple_stmt`, which is why the two are separate
-        // alternatives rather than one production over both right-hand sides.
+        // (`docs/chl-spec.md`, "4.5 `if` / `elif` / `else`"). The
+        // `BlockValueDedent` after the block ends the statement, so this form
+        // takes no `stmt_terminator` and cannot ride `simple_stmt`, which is why
+        // the two are separate alternatives rather than one production over both
+        // right-hand sides.
         //
         // Ordering costs a second parse of the target. `block_assign` is tried
         // first and `.clone()` on a chumsky combinator copies the parser without
@@ -1829,17 +1830,19 @@ where
         // leading `bare_tuple` twice, once here and once in `simple_stmt`. Error
         // quality is unaffected: the furthest-progress alternative wins.
         // The block opened a layout level of its own for its `elif`/`else`
-        // chain (`lexer.rs`, `Level::Pending`), and that level closes with a
-        // `Dedent` no block inside the chain claims. Consuming it here ends the
-        // statement, and it is what a chain written at the statement's own
-        // column fails on: that spelling leaves the `Dedent` unmatched.
+        // chain (`lexer.rs`, `Level::Pending`), which opens with the
+        // `BlockValueIndent` before the statement and closes with a
+        // `BlockValueDedent`. Consuming the closer here ends the statement, and
+        // it is what a chain written at the statement's own column fails on:
+        // that spelling closes the level before the chain's first line.
         let block_value = choice((if_stmt.clone(), match_stmt.clone()))
-            .then_ignore(just(Token::Dedent))
+            .then_ignore(just(Token::BlockValueDedent))
             .map(|stmt: Spanned<Stmt>| {
                 let span = stmt.span;
                 Spanned::new(span, Expr::Block(Box::new(stmt)))
             });
-        let block_assign = bare_tuple
+        let block_assign = just(Token::BlockValueIndent)
+            .ignore_then(bare_tuple.clone())
             .then(assign_tail(block_value, expr.clone()))
             .try_map_with(|(target, tail), e| assign_stmt(target, tail, e.span()));
 
@@ -1880,21 +1883,44 @@ where
                 )
             });
 
-        // Recovery must consume a non-boundary token before succeeding. Otherwise repeated
-        // statements can make no progress, or recovery can consume a surrounding block's
-        // Dedent and report cascading errors. See `chl-parser/design-chl-parser.md`,
-        // "Statement-level recovery".
-        let skip_to_newline = any()
-            .and_is(just(Token::Newline).not())
-            .and_is(just(Token::Dedent).not())
-            .repeated()
-            .at_least(1)
-            .then_ignore(just(Token::Newline).or_not());
-        let skip_indented_block =
-            nested_delimiters(Token::Indent, Token::Dedent, [], |_span| ()).or_not();
-        let stmt_recovery = skip_to_newline
-            .then(skip_indented_block)
-            .map_with(|_, e| Spanned::new(e.span(), Stmt::Error));
+        // Recovery skips a failed statement's whole extent, and every layout
+        // token in it in balanced pairs. A layout token left behind closes the
+        // enclosing block early, or at the top level matches nothing and fails
+        // the whole module; one taken without its partner does the same to the
+        // partner. See `chl-parser/design-chl-parser.md`, "Statement-level
+        // recovery".
+        //
+        // Recovery must also consume a token before succeeding. Otherwise
+        // repeated statements can make no progress.
+        let skip_indented_block = nested_delimiters(Token::Indent, Token::Dedent, [], |_span| ());
+        // `pub` is no part of this extent: `pub_stmt` parses the statement
+        // after it, whose own recovery starts at the `BlockValueIndent`.
+        let skip_block_value = nested_delimiters(
+            Token::BlockValueIndent,
+            Token::BlockValueDedent,
+            [],
+            |_span| (),
+        );
+        let skip_to_newline = none_of([
+            Token::Newline,
+            Token::Indent,
+            Token::Dedent,
+            Token::BlockValueIndent,
+            Token::BlockValueDedent,
+        ])
+        .repeated()
+        .at_least(1)
+        .then_ignore(just(Token::Newline).or_not());
+        let skip_line_and_block = skip_to_newline.then(skip_indented_block.clone().or_not());
+        let skip_chain = choice((just(Token::Elif), just(Token::Else)))
+            .then(skip_line_and_block.clone())
+            .repeated();
+        let stmt_recovery = choice((
+            skip_block_value,
+            skip_indented_block,
+            skip_line_and_block.then(skip_chain).ignored(),
+        ))
+        .map_with(|_, e| Spanned::new(e.span(), Stmt::Error));
 
         choice((
             if_stmt,
@@ -4108,5 +4134,193 @@ mod tests {
     #[test]
     fn forall_is_a_keyword() {
         assert!(!parse_mod("forall = 1").errors.is_empty());
+    }
+
+    /// The variant name of each statement in `body`, `Error` for a recovered one,
+    /// followed by the outline of a `def`, `for` or `with` body in parentheses.
+    fn stmt_kinds(body: &[Spanned<Stmt>]) -> Vec<String> {
+        body.iter()
+            .map(|stmt| {
+                let debug = format!("{:?}", stmt.node);
+                let end = debug.find(|c: char| !c.is_alphanumeric());
+                let name = &debug[..end.unwrap_or(debug.len())];
+                match &stmt.node {
+                    Stmt::FunctionDef { body, .. }
+                    | Stmt::For { body, .. }
+                    | Stmt::With { body, .. } => {
+                        format!("{name}({})", stmt_kinds(body).join(", "))
+                    }
+                    _ => name.to_owned(),
+                }
+            })
+            .collect()
+    }
+
+    /// Each case parses to a module with one diagnostic and the statement
+    /// outline `kinds` (`stmt_kinds`).
+    fn assert_recovers(cases: &[(&str, &str, &[&str])]) {
+        for (name, src, kinds) in cases {
+            let r = parse_mod(src);
+            assert_eq!(r.errors.len(), 1, "case {name:?}: {:#?}", r.errors);
+            let m = r
+                .value
+                .unwrap_or_else(|| panic!("case {name:?} produced no module"));
+            assert_eq!(stmt_kinds(&m.body), *kinds, "case {name:?}");
+        }
+    }
+
+    /// A statement whose line ends in `:` without starting with a block keyword
+    /// opens a block right-hand side's level (`lexer.rs`, `Level::Pending`),
+    /// between a `BlockValueIndent` before the statement and a `BlockValueDedent`.
+    /// When that statement fails, statement-level recovery skips from the one to
+    /// the other, so the statements around it survive with one diagnostic.
+    #[test]
+    fn recovery_skips_a_failed_block_right_hand_side() {
+        assert_recovers(&[
+            (
+                "a header the grammar has no statement for",
+                indoc! {"
+                    i = 0
+                    while i < 5:
+                        i = i + 1
+                    i
+                "},
+                &["Assign", "Error", "Expr"],
+            ),
+            (
+                "a block right-hand side the grammar does not accept",
+                indoc! {"
+                    for req in reqs:
+                        result = with begin():
+                            stock = 1
+                        out << result
+                    after = 2
+                "},
+                &["For(Error, Expr)", "Assign"],
+            ),
+            (
+                "a `match` right-hand side whose arms fail",
+                indoc! {"
+                    for req in reqs:
+                        resp = match r:
+                            case `some(v): v
+                            case `none: 0
+                        out << resp
+                    after = 2
+                "},
+                &["For(Error, Expr)", "Assign"],
+            ),
+            (
+                "a broken `if` right-hand side header with an `else` chain",
+                indoc! {"
+                    x = if c d:
+                            1
+                        else:
+                            2
+                    y = 3
+                "},
+                &["Error", "Assign"],
+            ),
+            (
+                "a broken `pub` block right-hand side",
+                indoc! {"
+                    pub x = if c d:
+                            1
+                        else:
+                            2
+                    y = 3
+                "},
+                &["Pub", "Assign"],
+            ),
+            (
+                "a typo'd `elif` at the chain's column",
+                indoc! {"
+                    def f():
+                        x = if c:
+                                1
+                            elf d:
+                                2
+                        y = 3
+                "},
+                &["FunctionDef(Error, Assign)"],
+            ),
+            (
+                "a line at the chain's column after the `else` block",
+                indoc! {"
+                    x = if c:
+                            1
+                        else:
+                            2
+                        z
+                    y = 3
+                "},
+                &["Error", "Assign"],
+            ),
+            (
+                "a broken `if` header with an `elif`/`else` chain",
+                indoc! {"
+                    if c d:
+                        1
+                    elif e:
+                        2
+                    else:
+                        3
+                    y = 3
+                "},
+                &["Error", "Assign"],
+            ),
+        ]);
+    }
+
+    /// A line indented deeper than its siblings starts with an `Indent`, which
+    /// recovery skips with the block it opens up to its `Dedent`. A line that
+    /// dedents short of its block's column stays in the block (`lexer.rs`,
+    /// `Layout::line_start`) with an `InconsistentIndent`, the one diagnostic.
+    #[test]
+    fn recovery_skips_a_stray_indentation_level() {
+        assert_recovers(&[
+            ("an indented first line", " = 2 = 2\n", &["Error"]),
+            (
+                "a line deeper than its siblings",
+                indoc! {"
+                    a = 1
+                      b = 2
+                    c = 3
+                "},
+                &["Assign", "Error", "Assign"],
+            ),
+            (
+                "a line deeper than its siblings in a body",
+                indoc! {"
+                    def f():
+                        a = 1
+                            b = 2
+                        c = 3
+                    d = 4
+                "},
+                &["FunctionDef(Assign, Error, Assign)", "Assign"],
+            ),
+            (
+                "a line dedented between two levels",
+                indoc! {"
+                    def f():
+                        a = 1
+                      b = 2
+                        c = 3
+                    d = 4
+                "},
+                &["FunctionDef(Assign, Assign, Assign)", "Assign"],
+            ),
+            (
+                "a body whose first line is deeper than the rest",
+                indoc! {"
+                    def f():
+                          a = 1
+                        b = 2
+                    c = 3
+                "},
+                &["FunctionDef(Assign, Assign)", "Assign"],
+            ),
+        ]);
     }
 }
