@@ -246,10 +246,15 @@ intersection cannot read.
 
 ### Lowering requirements
 
-`lower_requirements` resolves each requirement against the trait table: the name
-(`Trait::compiler_named`), the operand count, and each associated type by name
-(`Assoc::from_surface_name`). Refinements are stripped from every operand, since an instance row
-matches a base whatever its refinements.
+`lower_named_requirements` resolves each requirement against the trait table
+(`lower_trait_type`): the name (`Trait::compiler_named`, or a trait the module declares), the
+operand count, and each associated type by name (`Trait::assoc_named`). Refinements are stripped
+from every operand, since an instance matches a base whatever its refinements. A requirement states
+nothing of what its trait requires of every instance, so a definition under
+`requires Ranked(T, T)` that uses `Same(T, T)` states it too. A named requirement, `a: Area(S)`, is
+also returned with its name at the types the clause writes, for `a::f` in the body;
+`lower_requirements` lowers a clause that may name none, a polymorphic type's or a trait function's
+signature's.
 
 - **Products of one shape** are read through the product rule, the one instance a product
   satisfies the trait by: the requirement states the trait of each field's components, paired by

@@ -1315,8 +1315,8 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
         TypedExprNode::DefGroup { .. } => {
             unreachable!("a DefGroup reached channelize; inference rewrites it into `Let`s")
         }
-        TypedExprNode::Method { .. } => {
-            unreachable!("a Method reached channelize; inference resolves every method")
+        TypedExprNode::Method { .. } | TypedExprNode::TraitFn { .. } => {
+            unreachable!("a Method or TraitFn reached channelize; inference resolves every one")
         }
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")
@@ -1398,8 +1398,8 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         TypedExprNode::DefGroup { .. } => {
             unreachable!("a DefGroup reached channelize; inference rewrites it into `Let`s")
         }
-        TypedExprNode::Method { .. } => {
-            unreachable!("a Method reached channelize; inference resolves every method")
+        TypedExprNode::Method { .. } | TypedExprNode::TraitFn { .. } => {
+            unreachable!("a Method or TraitFn reached channelize; inference resolves every one")
         }
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")
@@ -2114,8 +2114,8 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             TypedExprNode::MutDecl { .. } => {
                 unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
             }
-            TypedExprNode::Method { .. } => {
-                unreachable!("a Method reached channelize; inference resolves every method")
+            TypedExprNode::Method { .. } | TypedExprNode::TraitFn { .. } => {
+                unreachable!("a Method or TraitFn reached channelize; inference resolves every one")
             }
             TypedExprNode::LetType { .. } => unreachable!("uniquify removes every `LetType`"),
             TypedExprNode::Run { .. } => unreachable!("linking expands every `Run`"),
@@ -2379,8 +2379,8 @@ fn extract_for_defer_impl(
         TypedExprNode::DefGroup { .. } => {
             unreachable!("a DefGroup reached channelize; inference rewrites it into `Let`s")
         }
-        TypedExprNode::Method { .. } => {
-            unreachable!("a Method reached channelize; inference resolves every method")
+        TypedExprNode::Method { .. } | TypedExprNode::TraitFn { .. } => {
+            unreachable!("a Method or TraitFn reached channelize; inference resolves every one")
         }
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")

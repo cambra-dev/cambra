@@ -468,6 +468,25 @@ pub enum TypedExprNode {
         candidates: Vec<MethodCandidate>,
     },
 
+    /// A function of an instance not chosen yet: what `summon(Area(_))::area` and `a::area`,
+    /// under `requires a: Area(S)`, lower to (`src/ccl/design/type-inference.md`, "Trait
+    /// functions").
+    ///
+    /// Typed by the trait's signature at an obligation over `operands`, which stay in the
+    /// node as type slots. Coalescing replaces the node with the function of the instance
+    /// its resolved operand types match, so none survives inference.
+    TraitFn {
+        trait_: crate::ccl::infer::solver::traits::Trait,
+        function: SmolStr,
+        /// The trait's operand types at this use: as the trait type states them from
+        /// lowering, a hole where it writes `_`, and with each hole a fresh variable from
+        /// emission.
+        operands: Vec<Type>,
+        /// The associated types the trait type states, by name, which emission normalizes as
+        /// it does `operands`.
+        assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+    },
+
     /// Tagged variant constructor: `` `Tag(payload) ``.
     ///
     /// Produces a [`Type::Variant`] containing a single tag whose payload type
@@ -911,6 +930,7 @@ impl TypedExprNode {
             TypedExprNode::VariantCtor { .. } => "VariantCtor",
             TypedExprNode::NominalCtor { .. } => "NominalCtor",
             TypedExprNode::Method { .. } => "Method",
+            TypedExprNode::TraitFn { .. } => "TraitFn",
             TypedExprNode::Transact { .. } => "Transact",
             TypedExprNode::LetRec { .. } => "LetRec",
             TypedExprNode::DefGroup { .. } => "DefGroup",
@@ -1770,6 +1790,7 @@ impl TypedExpr {
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
+            | TypedExprNode::TraitFn { .. }
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
@@ -1978,6 +1999,7 @@ impl TypedExpr {
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
+            | TypedExprNode::TraitFn { .. }
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
@@ -2132,6 +2154,7 @@ impl TypedExpr {
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
             | TypedExprNode::Method { .. }
+            | TypedExprNode::TraitFn { .. }
             | TypedExprNode::VariantCtor { .. }
             | TypedExprNode::NominalCtor { .. }
             | TypedExprNode::List(_)
@@ -2190,6 +2213,7 @@ impl TypedExpr {
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
             | TypedExprNode::Method { .. }
+            | TypedExprNode::TraitFn { .. }
             | TypedExprNode::VariantCtor { .. }
             | TypedExprNode::NominalCtor { .. }
             | TypedExprNode::List(_)
@@ -2262,6 +2286,15 @@ impl TypedExpr {
         {
             f(target);
         }
+        if let TypedExprNode::TraitFn {
+            operands, assoc, ..
+        } = &self.node
+        {
+            operands
+                .iter()
+                .chain(assoc.iter().map(|(_, t)| t))
+                .for_each(&mut f);
+        }
         if let TypedExprNode::Transact {
             domain, parameter, ..
         } = &self.node
@@ -2291,6 +2324,15 @@ impl TypedExpr {
             &mut self.node
         {
             f(target);
+        }
+        if let TypedExprNode::TraitFn {
+            operands, assoc, ..
+        } = &mut self.node
+        {
+            operands
+                .iter_mut()
+                .chain(assoc.iter_mut().map(|(_, t)| t))
+                .for_each(&mut f);
         }
         if let TypedExprNode::Transact {
             domain, parameter, ..
@@ -2713,5 +2755,19 @@ mod tests {
             reached(&nested),
             vec!["node_ty", "transact_domain", "writer_parameter"]
         );
+
+        // A `TraitFn` carries its trait's operand types, which coalescing resolves to
+        // choose the instance, and the associated types it states.
+        let mut trait_fn = TypedExpr::new(TypedExprNode::TraitFn {
+            trait_: crate::ccl::infer::solver::traits::Trait::addable(),
+            function: "add".into(),
+            operands: vec![marker("operand")],
+            assoc: vec![(
+                crate::ccl::infer::solver::traits::Assoc::Output,
+                marker("assoc"),
+            )],
+        });
+        trait_fn.ty = marker("node_ty");
+        assert_eq!(reached(&trait_fn), vec!["assoc", "node_ty", "operand"]);
     }
 }

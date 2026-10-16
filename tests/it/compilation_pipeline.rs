@@ -38,6 +38,7 @@ mod scalars_collections;
 mod secondary_labels;
 mod sources_incremental;
 mod sums;
+mod traits;
 mod transactions;
 mod type_aliases;
 mod type_annotations;
