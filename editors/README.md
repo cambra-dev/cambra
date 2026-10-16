@@ -266,10 +266,9 @@ nvim --headless -u NONE --cmd 'set rtp^=editors/nvim' \
 
 ### Language server
 
-`lsp/cambra.lua` configures `cambra --lsp` for Neovim 0.11's `vim.lsp.config`. Neovim 0.10 has no
-`vim.lsp.config`, and starts the server with `vim.lsp.start` instead. With the runtime directory
-added as above and `cambra` on `PATH` (`cargo install --path .` from the repository root), enable it
-and fold through it in `init.lua`:
+`lsp/cambra.lua` configures `cambra --lsp` for `vim.lsp.config`, so the setup needs Neovim 0.11.
+With the runtime directory added as above and `cambra` on `PATH` (`cargo install --path .` from the
+repository root), enable it and fold through it in `init.lua`:
 
 ```lua
 vim.lsp.enable('cambra')

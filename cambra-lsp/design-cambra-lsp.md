@@ -144,8 +144,8 @@ a column counts during `initialize`:
 - UTF-16 code units: one per character up to U+FFFF, two (a surrogate pair) for a character above
   it. The protocol requires every server to support UTF-16, and a client that names no encoding
   means it. It is the only encoding VS Code's client, `vscode-languageclient`, offers or accepts.
-- UTF-32 code units, which is one per character. The server does not support it; every client
-  that offers it also offers UTF-8.
+- UTF-32 code units, one per character. The server does not support it. A client that offers
+  only UTF-32 gets UTF-16, which the protocol requires every client to support.
 
 The server chooses UTF-8 when the client offers it, since spans need no conversion then, and
 UTF-16 otherwise, so it serves every client. Neovim 0.11 offers UTF-8; Neovim 0.10 and VS Code
@@ -268,12 +268,14 @@ through the server uses `vim.lsp.foldexpr()`. `editors/README.md` describes the 
 - **Goldens.** `cambra-lsp/tests/goldens/programs.txt` holds the diagnostics, outline and folds
   of every `.cambra` file under `tests/` and `editors/`, and `lexer_recovery.txt` those of the
   lexer recovery corpus, so files with errors are covered. `non_ascii.txt` holds those of the
-  fixtures in `cambra-lsp/tests/non_ascii/` under both encodings; every position there sits on a
-  line holding a multi-byte character, because the repository's programs hold one only in
-  comments. `CAMBRA_BLESS=1` rewrites them, as it does the repository's other goldens.
+  fixtures in `cambra-lsp/tests/non_ascii/` under both encodings, since the repository's programs
+  hold multi-byte characters only in comments. Each diagnostic's range and each symbol's range end
+  there falls after a multi-byte character, so its two columns differ. `CAMBRA_BLESS=1` rewrites
+  them, as it does the repository's other goldens.
 - **Encoding independence.** `features_do_not_depend_on_the_encoding` runs every file above under
-  a UTF-8 and a UTF-16 session, maps each position back to a byte offset, and requires the two to
-  agree, so a feature that computed a column without the session's encoding fails.
+  a UTF-8 and a UTF-16 session, requires each position to be canonical, maps it back to a byte
+  offset, and requires the two to agree, so a feature that computed a column without the session's
+  encoding fails.
 - **Positions.** A seeded fuzz test in `cambra-lsp/src/document.rs` (`CAMBRA_FUZZ_SEED`,
   `CAMBRA_FUZZ_N`) builds texts mixing ASCII, multi-byte characters and all three line breaks,
   and alternates the encoding between cases. It applies random edits, reversed and out-of-range

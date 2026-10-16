@@ -128,9 +128,14 @@ impl LineIndex {
     ///
     /// # Panics
     ///
-    /// When `offset` is past the end of the text or inside a character.
+    /// When `offset` is past the end of the text or inside a character, in
+    /// every encoding.
     pub fn line_col_in(&self, text: &str, offset: usize, encoding: Encoding) -> LineCol {
         let bytes = self.line_col(offset);
+        assert!(
+            text.is_char_boundary(offset),
+            "offset {offset} is inside a character"
+        );
         match encoding {
             Encoding::Utf8 => bytes,
             Encoding::Utf16 if self.ascii => bytes,
@@ -259,6 +264,13 @@ mod tests {
             lc(0, 1),
             "inside CRLF"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "inside a character")]
+    fn a_utf8_column_of_an_offset_inside_a_character_panics() {
+        let text = "aé";
+        LineIndex::new(text).line_col_in(text, 2, Encoding::Utf8);
     }
 
     #[test]

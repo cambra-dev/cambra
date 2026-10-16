@@ -500,6 +500,11 @@ fn non_ascii_fixtures_match_their_golden_in_both_encodings() {
 
 /// `value` with every protocol position, an object holding exactly `line`
 /// and `character`, replaced by the byte offset it names in `text`.
+///
+/// # Panics
+///
+/// When a position is not canonical: one that `offset_in` clamps, past the
+/// end of its line or inside a character, would hide a wrong column.
 fn to_offsets(value: &Value, text: &str, index: &LineIndex, encoding: Encoding) -> Value {
     match value {
         Value::Object(fields)
@@ -511,7 +516,13 @@ fn to_offsets(value: &Value, text: &str, index: &LineIndex, encoding: Encoding) 
                 line: fields["line"].as_u64().unwrap() as usize,
                 col: fields["character"].as_u64().unwrap() as usize,
             };
-            json!(index.offset_in(text, pos, encoding))
+            let offset = index.offset_in(text, pos, encoding);
+            assert_eq!(
+                index.line_col_in(text, offset, encoding),
+                pos,
+                "{fields:?} is not canonical"
+            );
+            json!(offset)
         }
         Value::Object(fields) => Value::Object(
             fields
