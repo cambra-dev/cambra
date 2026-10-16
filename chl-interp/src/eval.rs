@@ -772,7 +772,7 @@ impl Interp {
                     body: body.clone(),
                     env: self.captured_scopes(),
                 };
-                self.bind(name.to_string(), Slot::Fn(Rc::new(function)));
+                self.bind(name.node.to_string(), Slot::Fn(Rc::new(function)));
                 Ok(None)
             }
 

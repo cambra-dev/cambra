@@ -753,7 +753,7 @@ pub(super) fn lower_middle_stmt(
                 fn_body,
                 ctx,
             )?;
-            let name = name.as_str().to_string();
+            let name = name.node.as_str().to_string();
             Ok(ctx.tag_image(
                 match annotation {
                     Some(poly) => Expr::let_bind_annotated(name, func_expr, body, poly),
@@ -880,7 +880,7 @@ pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet
                 }
             }
             ChlStmt::FunctionDef { name, .. } => {
-                names.insert(name.as_str().to_string());
+                names.insert(name.node.as_str().to_string());
             }
             _ => {}
         }
@@ -1230,9 +1230,9 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
                         .is_some_and(|a| is_mut_annotation(a, ctx))
                 });
                 if has_mut_param {
-                    ctx.register_mut_param_fn(name.as_str());
+                    ctx.register_mut_param_fn(name.node.as_str());
                 } else {
-                    ctx.unregister_mut_param_fn(name.as_str());
+                    ctx.unregister_mut_param_fn(name.node.as_str());
                 }
             }
             _ => {}
@@ -2145,7 +2145,7 @@ fn sink_rebindings(stmts: &[Spanned<ChlStmt>], ctx: &LoweringContext) -> Vec<Low
             | ChlStmt::AnnAssign { target, .. }
             | ChlStmt::MutAssign { target, .. }
             | ChlStmt::LoadFrom { target, .. } => target_names(&target.node, &mut bound),
-            ChlStmt::FunctionDef { name, .. } => bound.push(name.as_str()),
+            ChlStmt::FunctionDef { name, .. } => bound.push(name.node.as_str()),
             _ => {}
         }
         for name in bound {

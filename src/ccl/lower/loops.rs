@@ -457,7 +457,7 @@ fn lower_for_body_stmts_scoped(
                 requires,
                 body: fn_body,
             } => {
-                let name_str = name.as_str().to_string();
+                let name_str = name.node.as_str().to_string();
                 if mutation_scope.contains(&name_str) {
                     return Err(outer_binding_write_error(stmt.span, &name_str));
                 }
