@@ -1509,7 +1509,7 @@ impl TraitRequirement {
     /// This requirement with `f` applied to each operand and associated type.
     pub fn map_types(&self, mut f: impl FnMut(&Type) -> Type) -> TraitRequirement {
         TraitRequirement {
-            trait_: self.trait_,
+            trait_: self.trait_.clone(),
             args: self.args.iter().map(&mut f).collect(),
             assoc: self.assoc.iter().map(|(n, t)| (*n, f(t))).collect(),
             at: self.at,

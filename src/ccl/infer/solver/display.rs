@@ -224,7 +224,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
             .collect();
         let (args, assoc_tys) = tys.split_at(stated.args.len());
         let requirement = TraitRequirement {
-            trait_: stated.trait_,
+            trait_: stated.trait_.clone(),
             args: args.to_vec(),
             assoc: stated
                 .assoc

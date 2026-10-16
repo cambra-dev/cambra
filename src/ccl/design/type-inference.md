@@ -1388,7 +1388,9 @@ and collection operators use their declared rules; aggregates must retain the co
 information their rules consume.
 
 Computing a result refinement is different from inheriting one. The `AddRefined` operation `^+`
-has a refinement-producing trait instance. It does not establish that ordinary `+` propagates
+refines its result by the sum it is: its obligation builds `__elem == 𝑎 ^+ 𝑏` from its operands
+when it deposits `Output` (`OperatorResult::AssociatedRefined`, `OutputRefinement`), so the
+refinement is the operator's whichever instance answers. It does not establish that ordinary `+` propagates
 singletons or that arbitrary arithmetic predicates are inferred. Any proposed richer rule must
 remain valid as operand bounds accumulate: a refinement inferred from only one lower-bound
 contribution can become too strong after another arrives. Recurrences also require soundness when
@@ -2893,8 +2895,11 @@ from the operand column's runtime representation (`apply_binop_column`, in
 to name the code.
 
 Associating functions, and a CHL surface for declaring the relation, are the two
-extensions this shape exists to take: the instances are already *data*
-(`Trait::instances`), so both are table extensions rather than new mechanisms.
+extensions this shape exists to take. Traits and instances are already *data*: every trait is a
+declaration (`TraitDecl`, held by `Trait`) of its operands, its associated types and its
+instances, which the compiler builds once as it builds `Option` (`Trait::addable` and the rest).
+An instance (`TraitInstance`) is the operand types it accepts and the types it associates. Both
+extensions are therefore more data rather than new mechanisms.
 
 #### What the tables hold
 
@@ -2903,6 +2908,11 @@ homogeneous — `Addable(Int, Int ⇝ Int)`, never `Addable(Int, String ⇝ …)
 facts are the tables' content, not properties of resolution: nothing in narrowing or
 deposit assumes either. So a trait rejecting a variant is what these rows happen to be,
 and not a judgement that such types are incomparable.
+
+The compiler's rows mirror the interpreter's primitives (`apply_binop_column`, in
+`src/interpreter/binop.rs`), so a program inference accepts is one the interpreter can run: there
+is no `Unit` row, since the interpreter compares no units, and no cross-base row, since `Int` and
+`UInt` never join.
 
 ### A product is answered off the table
 
