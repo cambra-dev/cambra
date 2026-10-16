@@ -31,16 +31,14 @@
 //!   cause, with a count, sample cells and the first sample's detail, lists the [`UNDEFINED`]
 //!   cells apart, and names every fully agreeing row [`LIVE`] does not list yet. A fix that
 //!   makes a row agree moves it into [`LIVE`]:
-//!   `cargo test --test generated_pairs full_grid -- --ignored --nocapture`.
+//!   `cargo test --test it generated_pairs::full_grid -- --ignored --nocapture`.
 
-#[path = "support/differential.rs"]
-mod differential;
-#[path = "support/panic_message.rs"]
-mod panic_message;
+use crate::differential;
+use crate::panic_message;
+use crate::quiet_panics;
 
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 
 use chl_interp::Value;
 use differential::{Compiled, run_compiled, run_interpreted};
@@ -1308,11 +1306,6 @@ fn a_message_stem_drops_what_varies_per_program() {
     );
 }
 
-thread_local! {
-    /// Whether this thread is inside `classify`, where a panic is an outcome.
-    static CLASSIFYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Run every cell of the skeletons `rows` admits, and answer each cell's outcome.
 ///
 /// Two pairs can spell one program (`feed/sum_lit` is `aggregate_arg/list_lit`); it runs once,
@@ -1320,18 +1313,8 @@ thread_local! {
 /// sits in.
 fn run_cells(rows: impl Fn(&Skeleton) -> bool) -> BTreeMap<String, Outcome> {
     // A panic inside `classify` is an outcome, so the default hook's backtrace is noise
-    // there. Only those are silenced: the hook is process-wide, the other tests in this
-    // binary run concurrently, and a test's own assertions must still print.
-    let previous: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> =
-        Arc::from(std::panic::take_hook());
+    // there; `quiet_panics` mutes this thread's panics only, so the other tests' still print.
     let show = std::env::var("PAIRS_SHOW_PANICS").is_ok();
-    let delegate = previous.clone();
-    std::panic::set_hook(Box::new(move |info| {
-        if show || !CLASSIFYING.get() {
-            delegate(info);
-        }
-    }));
-
     let (skeletons, fillers) = (skeletons(), fillers());
     let mut outcomes = BTreeMap::new();
     let mut programs: BTreeMap<String, Outcome> = BTreeMap::new();
@@ -1343,10 +1326,11 @@ fn run_cells(rows: impl Fn(&Skeleton) -> bool) -> BTreeMap<String, Outcome> {
                 let outcome = programs
                     .entry(source)
                     .or_insert_with_key(|source| {
-                        CLASSIFYING.set(true);
-                        let outcome = classify(source);
-                        CLASSIFYING.set(false);
-                        outcome
+                        if show {
+                            classify(source)
+                        } else {
+                            quiet_panics::quietly(|| classify(source))
+                        }
                     })
                     .clone();
                 outcomes.insert(cell, outcome);
@@ -1354,7 +1338,6 @@ fn run_cells(rows: impl Fn(&Skeleton) -> bool) -> BTreeMap<String, Outcome> {
         }
     }
 
-    std::panic::set_hook(Box::new(move |info| previous(info)));
     outcomes
 }
 

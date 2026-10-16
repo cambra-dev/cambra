@@ -17,7 +17,7 @@ use cambra::interpreter::{Extent, Predicate, TestDataSource, Value, sort_functio
 use indoc::indoc;
 use rstest_log::rstest;
 
-use crate::helpers::*;
+use super::helpers::*;
 
 /// Plan and run `code` with `testsource1` registered: the keys 0, 1, 2 holding 0, 10, 20.
 fn plan_and_run(code: &str) -> (String, cambra::interpreter::Tile) {

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tungstenite::{Message, WebSocket};
 
-use crate::harness::launch_under_control_with;
-use crate::serving::{http_get, raw_http, reserve_test_port};
+use super::harness::launch_under_control_with;
+use super::serving::{http_get, raw_http, reserve_test_port};
 
 /// The served `/api/snapshot`, parsed.
 fn snapshot(port: u16) -> Value {

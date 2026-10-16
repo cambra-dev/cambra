@@ -11,8 +11,8 @@ use std::time::Duration;
 use indoc::indoc;
 use rstest_log::rstest;
 
-use crate::helpers::{check_compile_error, run_pipeline};
-use crate::panic_message::panic_message;
+use super::helpers::{check_compile_error, run_pipeline};
+use super::panic_message::panic_message;
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]

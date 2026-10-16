@@ -9,7 +9,7 @@ use cambra::interpreter::Value;
 use indoc::indoc;
 use rstest_log::rstest;
 
-use crate::helpers::*;
+use super::helpers::*;
 
 // ---------------------------------------------------------------------------
 // Consuming a boxed collection — the unfiltered baseline

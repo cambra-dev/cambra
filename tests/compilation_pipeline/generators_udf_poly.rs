@@ -11,7 +11,7 @@ use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
 use indoc::indoc;
 use rstest_log::rstest;
 
-use crate::helpers::*;
+use super::helpers::*;
 
 // ---------------------------------------------------------------------------
 // Regular function definitions — def f(x): body; f(arg)

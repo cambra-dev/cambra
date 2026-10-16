@@ -626,4 +626,4 @@ The grammar does not specify a portable maximum nesting depth.
   assert the AST shape only at the level required to catch regressions.
 
 Run with `cargo test -p chl-parser` for the unit tests and
-`cargo test --test chl_parser_roundtrip` for the integration tests.
+`cargo test --test it chl_parser_roundtrip::` for the integration tests.

@@ -11,7 +11,7 @@ use cambra::interpreter::Value;
 use indoc::indoc;
 use rstest_log::rstest;
 
-use crate::helpers::{check_compile_error, check_scalar};
+use super::helpers::{check_compile_error, check_scalar};
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]

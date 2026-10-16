@@ -146,5 +146,4 @@ mod fanout_lag;
 mod harness;
 #[path = "hot_reload/inspector.rs"]
 mod inspector;
-#[path = "support/serving.rs"]
-mod serving;
+use crate::serving;

@@ -32,8 +32,8 @@ use cambra::{
     live_program::{BranchError, LiveProgram, MAIN_BRANCH},
 };
 
-use crate::harness::{OneFile, launch_under_control, source};
-use crate::serving::{
+use super::harness::{OneFile, launch_under_control, source};
+use super::serving::{
     exchange, http_get, http_post, no_main, raw_http, raw_http_response, reserve_test_port,
     start_sink,
 };

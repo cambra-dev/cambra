@@ -6,8 +6,8 @@
 //!
 //! To add a new program: create `tests/programs/<name>/` with a
 //! `program.cambra` and a `mod.rs`, then add a `mod <name>;` line below.
-//! Cargo collects every `mod.rs`'s `#[test]` items into this one integration
-//! test binary (`cargo test --test programs`).
+//! Every `mod.rs`'s `#[test]` items are part of the `it` integration test
+//! binary, under `programs::` (`cargo test --test it programs::`).
 //!
 //! `compile_timing.rs` is the gallery's ignored compile-time driver rather than
 //! a program: it discovers the `.cambra` files itself, so a new program needs
@@ -17,10 +17,9 @@
 
 mod common;
 mod compile_timing;
-#[path = "../support/panic_message.rs"]
-mod panic_message;
-#[path = "../support/serving.rs"]
-mod serving;
+use crate::panic_message;
+use crate::quiet_panics;
+use crate::serving;
 
 mod arithmetic;
 mod defer_generators;

@@ -9,7 +9,7 @@ use indoc::indoc;
 use cambra::ccl::FieldKey;
 use cambra::interpreter::Value;
 
-use crate::helpers::{check_compile_error, check_scalar, make_record, make_tuple};
+use super::helpers::{check_compile_error, check_scalar, make_record, make_tuple};
 
 /// A `Value::Union` at the constructor `tag` carrying `inner`.
 fn ctor(tag: &str, inner: Value) -> Value {
@@ -396,7 +396,7 @@ fn an_invariant_parameter_relates_only_equal_arguments() {
     7
 "#})]
 fn a_join_of_an_invariant_type_reaches_no_compiler_panic(#[case] src: &str) {
-    if let Err(payload) = std::panic::catch_unwind(|| crate::helpers::run_pipeline(src)) {
+    if let Err(payload) = std::panic::catch_unwind(|| super::helpers::run_pipeline(src)) {
         let msg = payload
             .downcast_ref::<String>()
             .cloned()
