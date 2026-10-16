@@ -27,17 +27,22 @@ fails: [Lexer recovery](#lexer-recovery) specifies the stream and errors it retu
 with lexical errors. This section describes a source with none.
 Logos produces span-bearing keywords, identifiers, literals, punctuation and physical newlines.
 It skips comments and horizontal whitespace. The source-level layout rules are owned by
-[Indentation](../docs/chl-spec.md#13-indentation-off-side-rule); the implementation uses two
+[Indentation](../docs/chl-spec.md#13-indentation-off-side-rule); the implementation uses three
 level forms:
 
 - `Fixed(column)` records an established indentation width. Increasing indentation emits
   `Indent`; closing the level emits `Dedent`. A dedent that reaches no compatible level
   produces `InconsistentIndent`.
 - `Pending { min }` records the assignment column when a block starts within a logical line.
-  Entering this level emits no `Indent`. A branch body opens a `Fixed` level above it; the first
-  line that dedents back into it, the `elif` or `else`, fixes its column. A line at or below
-  `min` closes it. The parser's `block_value` consumes the extra closing `Dedent` after parsing
-  the `if` or `match` statement.
+  Entering this level emits no `Indent`. A branch body opens a `Fixed` level above it. A line at
+  or below `min` closes it.
+- `Pinned(column)` is a `Pending` level whose column the first line dedenting back into it, the
+  `elif` or `else`, has fixed. A line continues it as it continues a `Fixed` level.
+
+A `Pending` or `Pinned` level closes with `BlockValueDedent` rather than `Dedent`. The parser's
+`block_value` consumes it after parsing the `if` or `match` statement, and statement-level
+recovery skips it with the statement it closes
+([Statement-level recovery](#statement-level-recovery)).
 
 The stack starts with `Fixed(0)`. `block_value_open` requests a pending level when a logical
 line ends in `:` but did not start with a block-opening keyword. The floor comes from the
@@ -48,9 +53,9 @@ A stack of open brackets suppresses physical newlines and indentation processing
 nonempty. Every open bracket belongs to the current logical line. A close bracket must match the
 innermost open bracket's kind.
 
-The token stream ends with a `Newline` and enough `Dedent`s to close the stack.
-Ordinary blocks balance `Indent` and `Dedent`; each pending assignment-side level contributes
-one extra `Dedent`. Tests include `block_right_hand_side_opens_a_level_of_its_own`,
+The token stream ends with a `Newline` and the `Dedent`s and `BlockValueDedent`s that close the
+stack. `Indent` and `Dedent` balance; each assignment-side level contributes one
+`BlockValueDedent`. Tests include `block_right_hand_side_opens_a_level_of_its_own`,
 `a_wrapped_header_floors_the_level_at_the_statement`,
 `the_chain_column_is_fixed_by_its_first_line` and
 `a_match_right_hand_side_closes_its_level_unpinned`.
@@ -255,10 +260,23 @@ failure. It relies on the lexer's stream having balanced brackets
 
 ### Statement-level recovery
 
-`skip_to_newline` consumes at least one token other than `Newline` or `Dedent`, followed
-by an optional `Newline`. If an `Indent` follows, `skip_indented_block` consumes its
-balanced block. The result is `Stmt::Error` over the skipped region. Discarding an attached
-body prevents a malformed header from leaving orphan block tokens in the enclosing parser.
+Recovery skips the failed statement's whole extent and returns `Stmt::Error` over it:
+
+1. `skip_to_newline` consumes at least one token other than `Newline` or `Dedent`, followed by
+   an optional `Newline`.
+2. If an `Indent` follows, `skip_indented_block` consumes its balanced block.
+3. Each following line that starts with `elif` or `else` is skipped the same way, with its
+   block.
+4. A `BlockValueDedent` that follows is consumed.
+
+A statement whose line ends in `:` opens a block, and the layout tokens of that block belong to
+the statement. Leaving any of them for the enclosing parser ends the enclosing block early. At
+the top level a leftover `Dedent` or `BlockValueDedent` matches nothing, and `parse_module`
+returns no module. The `BlockValueDedent` is present whenever the lexer opened a block
+right-hand side's level: the line ended in `:` without starting with a block keyword, which
+includes a header the grammar has no statement for, such as `while i < 5:`. The parser does not
+repeat that rule. It reads the decision from the token.
+`recovery_skips_a_failed_block_right_hand_side` in `parser.rs` covers each case.
 
 Recovery stops before `Dedent` rather than scanning through it. Its `at_least(1)` requirement
 makes it decline at `Newline`, `Dedent` and EOF when no token has been consumed. This prevents

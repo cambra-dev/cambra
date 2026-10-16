@@ -259,7 +259,9 @@ fn check_invariants(source: &str) -> Result<(), String> {
                     ));
                 }
             }
-            Token::Newline | Token::Indent | Token::Dedent if !open.is_empty() => {
+            Token::Newline | Token::Indent | Token::Dedent | Token::BlockValueDedent
+                if !open.is_empty() =>
+            {
                 return Err(format!("{token:?} at {span:?} inside brackets"));
             }
             _ => {}
@@ -293,18 +295,17 @@ fn check_invariants(source: &str) -> Result<(), String> {
         return Err(format!("errors out of source order: {errors:?}"));
     }
 
-    // A block on an assignment's right-hand side closes with one `Dedent`
-    // that has no `Indent`, so `Dedent`s can outnumber `Indent`s and never
-    // the reverse.
+    // A block on an assignment's right-hand side closes its level with a
+    // `BlockValueDedent`, so `Indent`s and `Dedent`s balance.
     let count = |kind: &Token| tokens.iter().filter(|(t, _)| t == kind).count();
     let (indents, dedents) = (count(&Token::Indent), count(&Token::Dedent));
-    if dedents < indents {
+    if dedents != indents {
         return Err(format!("{indents} Indents but {dedents} Dedents"));
     }
 
     let tail = tokens
         .iter()
-        .rposition(|(t, _)| *t != Token::Dedent)
+        .rposition(|(t, _)| !matches!(t, Token::Dedent | Token::BlockValueDedent))
         .map(|i| &tokens[i].0);
     if tail != Some(&Token::Newline) {
         return Err(format!(

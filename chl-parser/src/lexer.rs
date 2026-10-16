@@ -7,8 +7,9 @@
 //! "Lexer recovery".
 //!
 //! Source layout is specified in `docs/chl-spec.md`, "1.3 Indentation (off-side rule)".
-//! [`Level::Pending`] handles assignment-side blocks, whose closing `Dedent` has no
-//! corresponding `Indent`; see [`tokenize`] for the parser-facing token contract.
+//! [`Level::Pending`] handles assignment-side blocks, whose level closes with a
+//! [`Token::BlockValueDedent`] that no `Indent` opened; see [`tokenize`] for the
+//! parser-facing token contract.
 
 use crate::ast::{FileId, Span};
 use crate::builtins::SurfaceBuiltin;
@@ -18,9 +19,10 @@ use std::fmt;
 
 /// The CHL token alphabet.
 ///
-/// All variants except [`Token::Indent`], [`Token::Dedent`] and [`Token::Error`]
-/// are produced directly by logos. `Indent`/`Dedent` are synthesised by the
-/// layout pass in [`tokenize`], and `Error` by [`raw_tokens`].
+/// All variants except [`Token::Indent`], [`Token::Dedent`],
+/// [`Token::BlockValueDedent`] and [`Token::Error`] are produced directly by
+/// logos. The three layout tokens are synthesised by the layout pass in
+/// [`tokenize`], and `Error` by [`raw_tokens`].
 #[derive(Logos, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 // The tests enumerate every variant. A data field holds its `Default` value.
 #[cfg_attr(test, derive(strum::EnumIter))]
@@ -35,6 +37,10 @@ pub enum Token {
     Indent,
     /// Synthesised by the layout pass; never produced by logos.
     Dedent,
+    /// Closes the level a block right-hand side opens for its `elif`/`else`
+    /// chain ([`Level::Pending`]), which no `Indent` opened. Synthesised by the
+    /// layout pass; never produced by logos.
+    BlockValueDedent,
     /// A maximal run of characters at which no rule matches, synthesised by
     /// [`raw_tokens`] with one [`LexError::InvalidToken`]. No grammar rule
     /// accepts it.
@@ -407,7 +413,9 @@ impl HighlightClass {
 pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
     use HighlightClass as C;
     let class = match token {
-        Token::Newline | Token::Indent | Token::Dedent | Token::Error => return None,
+        Token::Newline | Token::Indent | Token::Dedent | Token::BlockValueDedent | Token::Error => {
+            return None;
+        }
         Token::True | Token::False => C::Boolean,
         Token::If
         | Token::Elif
@@ -651,7 +659,7 @@ impl fmt::Display for Token {
             // Layout
             Token::Newline => "newline",
             Token::Indent => "indent",
-            Token::Dedent => "dedent",
+            Token::Dedent | Token::BlockValueDedent => "dedent",
             Token::Error => "unrecognized characters",
             // Keywords
             Token::True => "True",
@@ -1053,14 +1061,28 @@ enum Level {
     /// A block right-hand side's level, before a continuation line has fixed
     /// its column. `min` is the column of the statement that opened it.
     Pending { min: usize },
+    /// A block right-hand side's level after its first continuation line fixed
+    /// its column. A line continues it as it does a `Fixed` level.
+    Pinned(usize),
 }
 
 impl Level {
     /// The column a line must exceed to open a block under this level.
     fn floor(self) -> usize {
         match self {
-            Level::Fixed(c) => c,
+            Level::Fixed(c) | Level::Pinned(c) => c,
             Level::Pending { min } => min,
+        }
+    }
+
+    /// The token that closes this level. A block right-hand side's level
+    /// closes with [`Token::BlockValueDedent`], so the parser tells it apart
+    /// from the `Dedent` of an indented block without repeating the layout rule
+    /// that opened it.
+    fn closer(self) -> Token {
+        match self {
+            Level::Fixed(_) => Token::Dedent,
+            Level::Pending { .. } | Level::Pinned(_) => Token::BlockValueDedent,
         }
     }
 
@@ -1069,7 +1091,7 @@ impl Level {
     /// is a continuation it can still take.
     fn closes_at(self, indent: usize) -> bool {
         match self {
-            Level::Fixed(c) => c > indent,
+            Level::Fixed(c) | Level::Pinned(c) => c > indent,
             Level::Pending { min } => min >= indent,
         }
     }
@@ -1095,12 +1117,14 @@ fn opens_block_at_line_start(tok: &Token) -> bool {
 /// with every lexical error. It never fails.
 ///
 /// Caller-visible invariants of the returned stream, for every input:
-/// - Always ends with a `Newline` followed by zero or more `Dedent`s back to
-///   indent zero, so block-closing rules in the parser have a uniform exit.
-/// - `Indent` and `Dedent` are balanced, except that a block standing on the
-///   right of an assignment closes with one `Dedent` more — the level it opened
+/// - Always ends with a `Newline` followed by zero or more `Dedent`s and
+///   `BlockValueDedent`s back to indent zero, so block-closing rules in the
+///   parser have a uniform exit.
+/// - `Indent` and `Dedent` are balanced. A block standing on the right of an
+///   assignment also closes with one `BlockValueDedent`: the level it opened
 ///   for its `elif`/`else` chain, which never had a line of its own to indent
-///   on. `block_value` in the parser consumes that one.
+///   on. `block_value` in the parser consumes it, and statement-level recovery
+///   skips it with the statement it closes.
 /// - Brackets balance: every `LParen`/`LBracket`/`LBrace` has a closer of its
 ///   kind, possibly zero-width, and no `Newline` appears between them.
 /// - Each zero-width closer comes with one [`LexError::UnclosedBracket`] or
@@ -1330,21 +1354,23 @@ impl<'a> Layout<'a> {
                 .expect("stack invariant: non-empty")
                 .closes_at(indent)
             {
-                self.indent_stack.pop();
+                let level = self.indent_stack.pop().expect("stack invariant: non-empty");
                 self.out
-                    .push((Token::Dedent, Span::new(self.file, span.start, span.start)));
+                    .push((level.closer(), Span::new(self.file, span.start, span.start)));
             }
             match self
                 .indent_stack
                 .last_mut()
                 .expect("stack invariant: non-empty")
             {
-                Level::Fixed(c) if *c == indent => {}
+                Level::Fixed(c) | Level::Pinned(c) if *c == indent => {}
                 // The first line to land in a block right-hand side's level
                 // fixes its column for the rest of the chain.
-                slot @ Level::Pending { .. } => *slot = Level::Fixed(indent),
+                slot @ Level::Pending { .. } => *slot = Level::Pinned(indent),
                 // The line continues the deepest level left of it.
-                Level::Fixed(_) => self.errors.push(LexError::InconsistentIndent { span }),
+                Level::Fixed(_) | Level::Pinned(_) => {
+                    self.errors.push(LexError::InconsistentIndent { span })
+                }
             }
         }
         // `pub` prefixes the statement it marks, so the token after it is
@@ -1465,8 +1491,8 @@ impl<'a> Layout<'a> {
             self.out.push((Token::Newline, end_span));
         }
         while self.indent_stack.len() > 1 {
-            self.indent_stack.pop();
-            self.out.push((Token::Dedent, end_span));
+            let level = self.indent_stack.pop().expect("stack invariant: non-empty");
+            self.out.push((level.closer(), end_span));
         }
     }
 }
@@ -2077,9 +2103,19 @@ mod tests {
         );
     }
 
+    /// How many `Indent`s, `Dedent`s and `BlockValueDedent`s `toks` holds.
+    fn layout_counts(toks: &[Token]) -> (usize, usize, usize) {
+        let count = |kind: Token| toks.iter().filter(|t| **t == kind).count();
+        (
+            count(Token::Indent),
+            count(Token::Dedent),
+            count(Token::BlockValueDedent),
+        )
+    }
+
     /// A block on the right of an assignment opens a level of its own, which
-    /// the `elif` line fixes. The chain's `Dedent`s therefore outnumber its
-    /// `Indent`s by one — the level no line indented onto.
+    /// the `elif` line fixes. The chain's `Indent`s and `Dedent`s balance, and one
+    /// `BlockValueDedent` closes the level no line indented onto.
     #[test]
     fn block_right_hand_side_opens_a_level_of_its_own() {
         let src = indoc! {"
@@ -2091,10 +2127,7 @@ mod tests {
                     3
             y
         "};
-        let toks = tokens(src);
-        let indents = toks.iter().filter(|t| **t == Token::Indent).count();
-        let dedents = toks.iter().filter(|t| **t == Token::Dedent).count();
-        assert_eq!((indents, dedents), (3, 4));
+        assert_eq!(layout_counts(&tokens(src)), (3, 3, 1));
     }
 
     /// A block whose header starts its own line takes that line's column, so a
@@ -2177,8 +2210,8 @@ mod tests {
 
     /// A `match` on the right needs no level of its own to be pinned: its arms
     /// are the block's body, so nothing dedents between the statement and them.
-    /// The level it opens still closes, which is what keeps the extra `Dedent`
-    /// uniform across the two block right-hand sides.
+    /// The level it opens still closes, which is what keeps the
+    /// `BlockValueDedent` uniform across the two block right-hand sides.
     #[test]
     fn a_match_right_hand_side_closes_its_level_unpinned() {
         let src = indoc! {"
@@ -2189,10 +2222,23 @@ mod tests {
                     0
             y
         "};
-        let toks = tokens(src);
-        let indents = toks.iter().filter(|t| **t == Token::Indent).count();
-        let dedents = toks.iter().filter(|t| **t == Token::Dedent).count();
-        assert_eq!((indents, dedents), (3, 4));
+        assert_eq!(layout_counts(&tokens(src)), (3, 3, 1));
+    }
+
+    /// End of input closes a block right-hand side's level with the same token
+    /// a dedenting line does.
+    #[test]
+    fn end_of_input_closes_a_block_right_hand_side_with_its_own_token() {
+        let src = indoc! {"
+            x = if c:
+                    1
+                else:
+                    2
+        "};
+        assert_eq!(
+            tokens(src)[tokens(src).len() - 2..],
+            [Token::Dedent, Token::BlockValueDedent]
+        );
     }
 
     #[test]
