@@ -20,7 +20,8 @@ not, and none reads other files from disk.
 Not in the first version, in the order planned:
 
 - Diagnostics from the rest of the compiler: lowering, type inference and later phases. This
-  needs the `cambra` library; see [Package layout](#package-layout).
+  needs the `cambra` library ([Package layout](#package-layout)) and a worker thread
+  ([its design](#later-compiler-diagnostics-on-a-worker-thread)).
 - A VS Code client, and with it UTF-16 positions ([Positions](#positions)).
 - Semantic tokens, hover types, go-to-definition and completion.
 
@@ -78,6 +79,10 @@ Parsing runs on the loop's thread. A release build parses `tests/programs/storef
 (133 lines) in 0.5 ms and that file repeated 500 times (66,500 lines) in 19 ms. Neovim already
 holds edits for 150 ms before sending them (`flags.debounce_text_changes`), so the server adds no
 delay of its own.
+
+### Later: compiler diagnostics on a worker thread
+
+The first version reports no compiler diagnostics ([Scope](#scope)). This is their design.
 
 Compiling is slow and cannot be interrupted once started. Compiler diagnostics therefore run on
 one long-lived worker thread, so the loop keeps answering parser features while a compile runs:
@@ -206,8 +211,7 @@ span runs past the line break after its body. A function's name range is the spa
 after `def`.
 
 When `parse_module` returns no module, which happens after an error the parser does not recover
-from, the outline is empty. Four programs under `tests/programs/` end that way today
-(`storefront/v0.cambra`, `storefront/v1.cambra`, `txn_kv`, `while_counter`).
+from, the outline is empty.
 
 ## Folding ranges
 
