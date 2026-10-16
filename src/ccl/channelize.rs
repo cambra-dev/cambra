@@ -118,11 +118,11 @@ use std::fmt;
 
 use std::rc::Rc;
 
+use crate::ccl::ccl_utils::compose_typed_or_hole;
 use crate::ccl::ccl_utils::{
     PredMemo, make_cast, walk_refined_predicates, walk_refined_predicates_mut,
 };
-use crate::ccl::feed_nest::{indexed_nest, key_by_positions};
-use crate::ccl::mut_elim::LoopFeed;
+use crate::ccl::feed_nest::{LoopFeed, indexed_nest, key_by_positions};
 use crate::ccl::{
     BaseType, BindingTransparency, Branch, Expr, FunKind, HistoryKind, Lit, Name, Pattern,
     PredicateId, Refinement, Type, TypedBinding, TypedExpr, TypedExprNode,
@@ -839,7 +839,7 @@ fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
 /// type — the domain of its constructed `Fun`, or, for an alias channel that
 /// is itself a defer read (`x <<= y` leaves `Var(y) : feed(…)`), the read's
 /// handle domain (a `ChanDom` closed later by [`close_chan_domains`]).
-pub(crate) fn channel_domain_of(ty: &Type) -> Option<Type> {
+fn channel_domain_of(ty: &Type) -> Option<Type> {
     match ty.peel_refinements() {
         Type::Fun { domain, .. } => Some((**domain).clone()),
         Type::History {
@@ -1130,39 +1130,6 @@ fn erase_chan_domains(
     erase_chan_domains_in_slot(&mut expr.ty, map, kinds, predicates);
     if let Some(ann) = &mut expr.user_annotation {
         erase_chan_domains_in_slot(ann, map, kinds, predicates);
-    }
-}
-
-/// The codomain of `ty` viewed as a function, peeling outer refinements.
-///
-/// a `Feed`-kind history is viewed as its `domain ⤇ value` — with rigid
-/// nominal domains an unresolved defer read has a usable
-/// (concrete-modulo-`ChanDom`) function view, so a channel built on
-/// a read prefix (a nested generator's inner channel block) types at
-/// construction instead of leaving a `Hole` for a re-derivation pass.
-fn fun_codomain(ty: &Type) -> Option<Type> {
-    match ty.peel_refinements() {
-        Type::Fun { codomain, .. } => Some((**codomain).clone()),
-        Type::History {
-            value,
-            history_kind: HistoryKind::Append,
-            ..
-        } => Some((**value).clone()),
-        _ => None,
-    }
-}
-
-/// The domain of `ty` viewed as a function, peeling outer refinements.
-/// See [`fun_codomain`] for the feed-history read view.
-fn fun_domain(ty: &Type) -> Option<Type> {
-    match ty.peel_refinements() {
-        Type::Fun { domain, .. } => Some((**domain).clone()),
-        Type::History {
-            domain,
-            history_kind: HistoryKind::Append,
-            ..
-        } => Some((**domain).clone()),
-        _ => None,
     }
 }
 
@@ -2255,26 +2222,6 @@ fn join_refinements(a: &Type, b: &Type) -> Type {
             .cloned()
             .collect(),
     )
-}
-
-/// Build a [`TypedExprNode::Compose`] typed `Fun(first-domain, last-codomain)`.
-/// With nominal channel domains every element is concrete-modulo-`ChanDom` at
-/// construction (the feed-history read view of [`fun_domain`] /
-/// [`fun_codomain`]), so a `Hole` here means a genuinely untyped input (the
-/// untyped-mode pipeline); the debug residue assert and the strict wall
-/// backstop the typed mode.
-pub(crate) fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
-    let d = elts.first().and_then(|e| fun_domain(&e.ty));
-    let c = elts.last().and_then(|e| fun_codomain(&e.ty));
-    // `fun_like`, not `Type::fun`: the chain is the head read through the rest, so it is a
-    // collection exactly when the head is. The head here is routinely a feed handle that
-    // `erase_chan_domains` has not yet turned into a `Type::Fun`, which `fun_like` reads as
-    // the read view it states.
-    let ty = match (d, c) {
-        (Some(d), Some(c)) => Type::fun_like(&elts[0].ty, d, c),
-        _ => Type::Hole,
-    };
-    Expr::compose(elts).with_ty(ty)
 }
 
 /// Walk `expr` collecting `Feed`/`Define` nodes for `defer_name`.

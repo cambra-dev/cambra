@@ -81,9 +81,8 @@ use crate::ccl::{
     F_WRITES, FieldKey, HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode,
     WriterSite,
     ccl_utils::{free_names_in_value, is_free, is_free_in_value, synthesize_arm_predicate},
-    mut_elim::{
-        LoopFeed, close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys,
-    },
+    feed_nest::LoopFeed,
+    mut_elim::{close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys},
     provenance,
     provenance::{Located, NodeId},
     subst::Subst,

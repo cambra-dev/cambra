@@ -51,6 +51,7 @@
 use smol_str::SmolStr;
 use std::collections::HashMap;
 
+use crate::ccl::feed_nest::LoopFeed;
 use crate::ccl::{
     BaseType, BindingTransparency, Branch, Builtin, Expr, F_WRITES, HistoryKind, Lit, Name, Type,
     TypedBinding, TypedExprNode,
@@ -1374,16 +1375,6 @@ pub(crate) fn close_recurrence_group(
         body: Box::new(body),
     })
     .with_ty(ty)
-}
-
-/// A feed out of a loop, lifted out of the loop with the values it fed: `view` holds them,
-/// keyed by the positions of the `levels` loops around the feed, curried outermost first —
-/// for an induction loop, `__hist ▷ .__to_<feed>` (see [`hist_field_view`]); for a `with
-/// begin():` block, a commit-record tap binding.
-pub(crate) struct LoopFeed {
-    pub defer: Name,
-    pub view: Expr,
-    pub levels: usize,
 }
 
 /// Wrap `body` in one loop per collected in-body feed, feeding each value the loop fed:

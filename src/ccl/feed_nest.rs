@@ -18,12 +18,23 @@
 
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::{apply_primitive, cast_target_refinement, count_free};
-use crate::ccl::channelize::{channel_domain_of, compose_typed_or_hole};
+use crate::ccl::ccl_utils::{
+    apply_primitive, cast_target_refinement, compose_typed_or_hole, count_free,
+};
 use crate::ccl::{
     BaseType, BindingTransparency, Builtin, Expr, FunKind, Lit, Name, Refinement, Type,
     TypedBinding, TypedExpr, TypedExprNode, provenance::NodeId,
 };
+
+/// A feed out of a loop, lifted out of the loop with the values it fed: `view` holds them,
+/// keyed by the positions of the `levels` loops around the feed, curried outermost first —
+/// for an induction loop, `__hist ▷ .__to_<feed>` (`mut_elim`'s `hist_field_view`); for a
+/// `with begin():` block, a commit-record tap binding.
+pub(crate) struct LoopFeed {
+    pub defer: Name,
+    pub view: Expr,
+    pub levels: usize,
+}
 
 /// A feed's contribution from under `levels` loops, keyed by the tuple of their positions:
 /// rebuilt over their product where it is one, and otherwise indexed per level and flattened
@@ -369,10 +380,10 @@ fn generator_nest(
 }
 
 /// The domain of a loop's source: a collection's, or, for a read of a deferred collection
-/// (a generator's channel, typed by its handle until this pass assembles it), the handle's
-/// channel domain ([`channel_domain_of`]).
+/// (a generator's channel, typed by its handle until `channelize` assembles it), the handle's
+/// channel domain, which its read view states ([`Type::read_view`]).
 fn source_domain(ty: &Type) -> Option<Type> {
-    ty.domain().or_else(|| channel_domain_of(ty))
+    ty.read_view().domain()
 }
 
 /// The type of one item of a loop's source: a collection's codomain, or a deferred

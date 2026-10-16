@@ -78,6 +78,7 @@ const LIVE: &[&str] = &[
     "mut_init",
     "mut_reads_itself",
     "mut_write_rhs",
+    "nested_feed_filter_in_mut_loop",
     "nested_mut_over_row",
     "rec_comp_element",
     "rec_comp_filter",
@@ -653,6 +654,20 @@ fn skeletons() -> Vec<Skeleton> {
                     ch << {}
             out = test_sink()
             out << t + sum(ch)
+        "#}},
+        // A filter in a feed-only loop nested in a mutation loop. It may read the inner loop's
+        // variable and a binding above the mutation loop that no loop writes.
+        Skeleton { name: "nested_feed_filter_in_mut_loop", hole: Ty::Bool, scope: &[("q", Ty::Int), ("lim", Ty::Int)], body: indoc! {r#"
+            lim = 15
+            t := 0
+            ch = defer()
+            for i in [1, 2]:
+                t += i
+                for q in [10, 20]:
+                    if {}:
+                        ch << q + t
+            out = test_sink()
+            out << sum(ch)
         "#}},
         // Four loops deep, so the feed's key splices more than one pair of positions.
         Skeleton { name: "four_loop_feed_in_mut_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"

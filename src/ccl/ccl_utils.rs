@@ -834,6 +834,25 @@ pub fn typed_compose(elts: Vec<Expr>) -> Expr {
     })
 }
 
+/// Build a [`TypedExprNode::Compose`] typed `Fun(first-domain, last-codomain)`, reading each
+/// end through its read view ([`Type::read_view`]), so a chain headed by a feed handle types as
+/// the collection the handle reads as. A `Hole` here means a genuinely untyped input (the
+/// untyped-mode pipeline); `channelize`'s debug residue assert and the strict wall backstop the
+/// typed mode.
+pub(crate) fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
+    let d = elts.first().and_then(|e| e.ty.read_view().domain());
+    let c = elts.last().and_then(|e| e.ty.read_view().codomain());
+    // `fun_like`, not `Type::fun`: the chain is the head read through the rest, so it is a
+    // collection exactly when the head is. The head is routinely a feed handle that
+    // `channelize` has not yet turned into a `Type::Fun`, which `fun_like` reads as the read
+    // view it states.
+    let ty = match (d, c) {
+        (Some(d), Some(c)) => Type::fun_like(&elts[0].ty, d, c),
+        _ => Type::Hole,
+    };
+    Expr::compose(elts).with_ty(ty)
+}
+
 /// Construct the trivially-true predicate `λ _ → true` over the given domain,
 /// represented in point-free form as `true ▷ const`.
 ///
