@@ -96,32 +96,8 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseError::Lex(e) => write!(f, "lex error: {e}"),
-            ParseError::Parse(info) if info.custom.is_some() => {
-                let msg = info.custom.as_deref().expect("guarded by the match arm");
-                f.write_str(msg)?;
-                for (label, span) in &info.context {
-                    write!(f, " (in {label} at {span})")?;
-                }
-                Ok(())
-            }
             ParseError::Parse(info) => {
-                match &info.found {
-                    Some(t) => write!(f, "found '{t}'")?,
-                    None => write!(f, "found end of input")?,
-                }
-                if !info.expected.is_empty() {
-                    f.write_str(", expected ")?;
-                    for (i, exp) in info.expected.iter().enumerate() {
-                        if i > 0 {
-                            if i + 1 == info.expected.len() {
-                                f.write_str(", or ")?;
-                            } else {
-                                f.write_str(", ")?;
-                            }
-                        }
-                        write!(f, "{exp}")?;
-                    }
-                }
+                f.write_str(&info.message())?;
                 for (label, span) in &info.context {
                     write!(f, " (in {label} at {span})")?;
                 }
@@ -257,7 +233,7 @@ impl ParseError {
                     .with_message("parse error")
                     .with_label(
                         Label::new(label_span(info.span))
-                            .with_message(primary_label_message(info))
+                            .with_message(info.message())
                             .with_color(Color::Red),
                     );
                 // chumsky pushes contexts inside-out as the parse stack
@@ -275,32 +251,36 @@ impl ParseError {
     }
 }
 
-fn primary_label_message(info: &ParseErrorInfo) -> String {
-    // A rule that rejected what it parsed already said why, in a sentence
-    // aimed at the construct; the derived found/expected pair would only
-    // restate the tokens it accepted.
-    if let Some(msg) = &info.custom {
-        return msg.clone();
-    }
-    let mut s = String::new();
-    match &info.found {
-        Some(t) => s.push_str(&format!("found '{t}'")),
-        None => s.push_str("found end of input"),
-    }
-    if !info.expected.is_empty() {
-        s.push_str(", expected ");
-        for (i, exp) in info.expected.iter().enumerate() {
-            if i > 0 {
-                if i + 1 == info.expected.len() {
-                    s.push_str(", or ");
-                } else {
-                    s.push_str(", ");
-                }
-            }
-            s.push_str(&format!("{exp}"));
+impl ParseErrorInfo {
+    /// What went wrong, without where: the custom message, or the found and
+    /// expected tokens. The context spans are left to the caller, which
+    /// renders them as labels or as text.
+    pub fn message(&self) -> String {
+        // A rule that rejected what it parsed already said why, in a sentence
+        // aimed at the construct; the derived found/expected pair would only
+        // restate the tokens it accepted.
+        if let Some(msg) = &self.custom {
+            return msg.clone();
         }
+        let mut s = match &self.found {
+            Some(t) => format!("found '{t}'"),
+            None => "found end of input".to_owned(),
+        };
+        if !self.expected.is_empty() {
+            s.push_str(", expected ");
+            for (i, exp) in self.expected.iter().enumerate() {
+                if i > 0 {
+                    if i + 1 == self.expected.len() {
+                        s.push_str(", or ");
+                    } else {
+                        s.push_str(", ");
+                    }
+                }
+                s.push_str(&exp.to_string());
+            }
+        }
+        s
     }
-    s
 }
 
 // ---------------------------------------------------------------------------

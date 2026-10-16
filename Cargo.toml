@@ -9,9 +9,9 @@
 # unification `ci_clippy_lib` relies on arrived in 2 and is unchanged in 3, so
 # that gate is not what this setting decides.
 resolver = "3"
-members = ["chl-parser", "chl-interp"]
+members = ["chl-parser", "chl-interp", "cambra-lsp"]
 # A bare `cargo test` or `cargo clippy` at the root covers every member.
-default-members = [".", "chl-parser", "chl-interp"]
+default-members = [".", "chl-parser", "chl-interp", "cambra-lsp"]
 
 [package]
 name = "cambra"
@@ -46,6 +46,8 @@ test-log = "0.2.19"
 # CHL parser, its own crate so a consumer can depend on the front end alone.
 # See chl-parser/design-chl-parser.md.
 chl-parser = { path = "chl-parser" }
+# The language server `--lsp` runs. See cambra-lsp/design-cambra-lsp.md.
+cambra-lsp = { path = "cambra-lsp" }
 ariadne = "0.4"
 easy-smt = "0.3.2"
 indoc = "1.0"

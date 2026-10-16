@@ -23,6 +23,7 @@
 pub mod ast;
 pub mod builtins;
 pub mod lexer;
+pub mod line_index;
 pub mod parser;
 pub mod source_map;
 

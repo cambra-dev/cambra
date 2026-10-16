@@ -12,6 +12,7 @@
 //!   mutated sources, as in the repository's other fuzz tests.
 
 use chl_parser::lexer::{Lexed, Token, highlight, tokenize};
+use chl_parser::line_index::{LineCol, LineIndex};
 use chl_parser::{FileId, ParseError, parse_module};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -45,16 +46,14 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
-/// The 1-based line and column of byte `offset`, the column counted in bytes.
-fn line_col(source: &str, offset: usize) -> String {
-    let before = &source[..offset];
-    let line = before.matches('\n').count() + 1;
-    let col = offset - before.rfind('\n').map_or(0, |i| i + 1) + 1;
-    format!("{line}:{col}")
-}
-
+/// `start..end` as 1-based `line:col-line:col`, the column counted in bytes.
 fn range(source: &str, start: usize, end: usize) -> String {
-    format!("{}-{}", line_col(source, start), line_col(source, end))
+    let index = LineIndex::new(source);
+    let line_col = |offset| {
+        let LineCol { line, col } = index.line_col(offset);
+        format!("{}:{}", line + 1, col + 1)
+    };
+    format!("{}-{}", line_col(start), line_col(end))
 }
 
 /// The golden rendering of `source`: tokens, lexical errors, the errors
