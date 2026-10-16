@@ -28,7 +28,7 @@ use super::emit::{
 use super::schemes::OperatorSchemes;
 use super::typing::{LetScheme, Typing};
 use super::{lit_base, map_constrain_err};
-use crate::ccl::infer::solver::traits::{Assoc, Trait, offered_base};
+use crate::ccl::infer::solver::traits::{Assoc, InstanceHead, InstanceTable, Trait, offered_head};
 use crate::util::ScopeStack;
 use std::collections::HashMap;
 
@@ -251,12 +251,42 @@ impl Typing for CheckCtx {
         ann.clone()
     }
 
-    fn require_trait(
+    fn require_trait_refined(
         &mut self,
         trait_: Trait,
         operator_node_id: NodeId,
         operand_types: &[&Type],
         operand_exprs: &[&Expr],
+        assoc: Assoc,
+        refinement: crate::ccl::RefinementTemplate,
+        at: &dyn Fn() -> String,
+    ) -> Result<Type, LocatedInferError> {
+        let base = self
+            .require_trait(trait_, operator_node_id, operand_types, Some(assoc), at)?
+            .expect("an operator asking for an association gets its position back");
+        // A position the rows did not settle is the residue the walls judge, unrefined.
+        if matches!(base, Type::Infer(_)) {
+            return Ok(base);
+        }
+        let _f = provenance::enter(
+            operator_node_id,
+            "check.require_trait",
+            provenance::Nature::Machinery,
+        );
+        let args: Vec<TypedExpr> = operand_exprs.iter().map(|e| (*e).clone()).collect();
+        Ok(Type::Refinement(
+            Box::new(base),
+            RefinementSet::one(Refinement::born_from_template(refinement, &args)),
+        ))
+    }
+
+    fn require_trait(
+        &mut self,
+        trait_: Trait,
+        // Check mints no obligation, so nothing records the node; a product's components are
+        // required under the same one.
+        _operator_node_id: NodeId,
+        operand_types: &[&Type],
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError> {
@@ -278,8 +308,9 @@ impl Typing for CheckCtx {
         // [`Typing::require_sub`] reuses `TypeMismatch` here: the error vocabulary
         // describes the inconsistency, the wall supplies the interpretation. Measured
         // across the suite: it never fires.
-        let bases: Option<Vec<&BaseType>> = operand_types.iter().map(|t| offered_base(t)).collect();
-        let Some(bases) = bases else {
+        let heads: Option<Vec<InstanceHead>> =
+            operand_types.iter().map(|t| offered_head(t)).collect();
+        let Some(heads) = heads else {
             // **A product is determined, so it is not residue.** A structural trait is
             // answered componentwise, so the operands' components pair and each pair has to
             // answer the trait in turn. Checked here rather than excused: this rule is what
@@ -337,14 +368,7 @@ impl Typing for CheckCtx {
                             &c[at]
                         })
                         .collect();
-                    self.require_trait(
-                        trait_,
-                        operator_node_id,
-                        &at_field,
-                        operand_exprs,
-                        None,
-                        at,
-                    )?;
+                    self.require_trait(trait_.clone(), _operator_node_id, &at_field, None, at)?;
                 }
                 return Ok(assoc.map(|_| self.fresh()));
             }
@@ -354,53 +378,29 @@ impl Typing for CheckCtx {
             // type is tolerable at this point in the pipeline.
             return Ok(assoc.map(|_| self.fresh()));
         };
-        let matched = trait_
-            .instances()
-            .iter()
-            .find(|i| i.args.len() == bases.len() && i.args.iter().eq(bases.iter().copied()));
+        let instances = InstanceTable::builtin().instances(&trait_);
+        let matched = instances.iter().find(|i| i.heads() == heads.as_slice());
         match matched {
             Some(matched) => Ok(assoc.map(|name| {
                 matched
-                    .assoc_ty(name)
-                    .map(|(b, template)| {
-                        let base = Type::Base(b.clone());
-                        match template {
-                            Some(template) => {
-                                let _f = provenance::enter(
-                                    operator_node_id,
-                                    "check.require_trait",
-                                    provenance::Nature::Machinery,
-                                );
-                                let args: Vec<TypedExpr> =
-                                    operand_exprs.iter().map(|e| (*e).clone()).collect();
-                                Type::Refinement(
-                                    Box::new(base),
-                                    RefinementSet::one(Refinement::born_from_template(
-                                        template, &args,
-                                    )),
-                                )
-                            }
-                            None => base,
-                        }
-                    })
+                    .assoc_ty(&name)
                     .unwrap_or_else(|| fresh_var(self.level))
             })),
             None => {
                 // Blame the last position: with the earlier ones fixed, it is the one
                 // whose type ruled the instance out.
-                let position = bases.len().saturating_sub(1);
-                let prefix: Vec<BaseType> =
-                    bases[..position].iter().map(|b| (*b).clone()).collect();
-                let accepted: Vec<Type> = trait_
-                    .instances()
+                let position = heads.len().saturating_sub(1);
+                let accepted: Vec<Type> = instances
                     .iter()
-                    .filter(|i| i.args.len() == bases.len() && i.args[..position] == prefix[..])
-                    .filter_map(|i| i.args.get(position).cloned().map(Type::Base))
+                    .filter(|i| {
+                        i.heads().len() == heads.len() && i.heads()[..position] == heads[..position]
+                    })
+                    .filter_map(|i| i.heads().get(position).map(InstanceHead::as_type))
                     .collect();
                 let located = self.raise(InferError::NoTraitInstance {
                     trait_: trait_.to_string(),
                     position: position as u8,
-                    found: Box::new(Type::Base(bases[position].clone())),
+                    found: Box::new(heads[position].as_type()),
                     accepted,
                     at: at(),
                 });

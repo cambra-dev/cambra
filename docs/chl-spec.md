@@ -3314,7 +3314,8 @@ types. The traits are built in:
 
 `max` and `min` place `Orderable(T, T)` on their element type `T`. A binary trait is satisfied by
 two operands of one listed type, and a tuple or record satisfies `Equatable` only against the same
-product ([3.4 Comparisons](#34-comparisons)). A trait's `Output` is the type that satisfies it.
+product ([3.4 Comparisons](#34-comparisons)). A listed instance's `Output` is its operand type, so
+the sum of two `Int`s is an `Int`.
 
 - **An associated type is written by name after the operands.** `requires Addable(A, B, Output=O)`
   states that `A` and `B` are `Addable` and that `O` is their `Output`. Omitting `Output=…` leaves

@@ -131,10 +131,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                         let named = r.assoc.first();
                         let require = |ctx: &mut InferCtx| {
                             ctx.require_trait(
-                                r.trait_,
+                                r.trait_.clone(),
                                 node_id,
                                 &r.args.iter().collect::<Vec<_>>(),
-                                &[],
                                 named.map(|(n, _)| *n),
                                 &at,
                             )
@@ -1353,26 +1352,21 @@ fn require_single_obligation<C: Typing>(
     at: &dyn Fn() -> String,
 ) -> Result<Type, LocatedInferError> {
     match result {
+        OperatorResult::AssociatedRefined(name, refinement) => ctx.require_trait_refined(
+            trait_,
+            operator_node_id,
+            operand_types,
+            operand_exprs,
+            *name,
+            *refinement,
+            at,
+        ),
         OperatorResult::Associated(name) => {
-            let ty = ctx.require_trait(
-                trait_,
-                operator_node_id,
-                operand_types,
-                operand_exprs,
-                Some(*name),
-                at,
-            )?;
+            let ty = ctx.require_trait(trait_, operator_node_id, operand_types, Some(*name), at)?;
             Ok(ty.expect("an operator asking for an association gets its position back"))
         }
         OperatorResult::Fixed(base) => {
-            ctx.require_trait(
-                trait_,
-                operator_node_id,
-                operand_types,
-                operand_exprs,
-                None,
-                at,
-            )?;
+            ctx.require_trait(trait_, operator_node_id, operand_types, None, at)?;
             Ok(Type::Base(base.clone()))
         }
     }
@@ -1427,7 +1421,7 @@ pub(super) fn emit_binop<C: Typing>(
         OpSignature::Scheme(scheme) => apply_binary_scheme(ctx, scheme, &left_ty, &right_ty, &at),
         OpSignature::SingleObligation { trait_, result } => require_single_obligation(
             ctx,
-            *trait_,
+            trait_.clone(),
             operator_node_id,
             &[&left_ty, &right_ty],
             &[left, right],
@@ -1449,7 +1443,7 @@ pub(super) fn emit_unary<C: Typing>(
         OpSignature::Scheme(scheme) => apply_unary_scheme(ctx, scheme, &inner_ty, &at),
         OpSignature::SingleObligation { trait_, result } => require_single_obligation(
             ctx,
-            *trait_,
+            trait_.clone(),
             operator_node_id,
             &[&inner_ty],
             &[inner],
@@ -1804,10 +1798,9 @@ pub(super) fn emit_aggregate<C: Typing>(
     // the result type stays the scheme's.
     if kind == AggregateKind::Max || kind == AggregateKind::Min {
         ctx.require_trait(
-            Trait::Orderable,
+            Trait::orderable(),
             operator_node_id,
             &[&result, &result],
-            &[input, input],
             None,
             &at,
         )?;

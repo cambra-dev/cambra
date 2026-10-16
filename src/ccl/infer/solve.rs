@@ -1387,9 +1387,9 @@ fn obligation_choices(v: &crate::ccl::infer_var::InferVar) -> Option<Vec<crate::
     // the first watch's own list, because every trait table today begins with `Int`
     // — but the pin must not choose a type some requirement rejects, and that is a
     // property of the tables rather than of this code.
-    let mut candidates = first.accepted_at(*pos);
+    let mut candidates = first.accepted_bases_at(*pos);
     for (obligation, pos) in rest {
-        let also = obligation.accepted_at(*pos);
+        let also = obligation.accepted_bases_at(*pos);
         candidates.retain(|c| also.contains(c));
     }
     Some(candidates)
