@@ -77,9 +77,10 @@ Beta-reduction has a further condition for a refined outer parameter: the argume
 entail the parameter's refinements. The pass asserts when it cannot establish that condition,
 since dropping the parameter without preserving its precondition would be unsound. For
 multi-argument UDFs lowered with a tuple parameter, substitution can leave
-`Apply(Tuple(...), Proj(Index(i)))`; `simplify::try_literal_tuple_projection` folds that shape
-later. Finally, the pass revisits the reduced result, so newly exposed `Let` bindings can undergo
-the same inlining checks.
+`Apply(Tuple(...), Proj(Index(i)))`. A tuple that holds a function is folded here ([Functions held
+in products](#functions-held-in-products)), and `simplify::try_literal_tuple_projection` folds every
+other such shape later. Finally, the pass revisits the reduced result, so newly exposed `Let`
+bindings can undergo the same inlining checks.
 
 ### Moving a binding into a list element
 
@@ -107,6 +108,34 @@ descend into refinement predicates. Rewriting one copy alone leaves a node's typ
 describing a collection its value no longer is, which the `post-inline` check reports as a
 domain mismatch.
 
+### Functions held in products
+
+A tuple or record that holds a function has no tile, because a tile carries values and not
+functions. The inliner takes such a product apart until each function it holds sits in call
+position, where it inlines as a let-bound one does. A product **holds a capability** when one of its
+components is a capability or is itself a product holding one (`holds_capability`).
+
+Two rewrites do it:
+
+- **A projection of a literal is folded.** `(𝑎₀, …, 𝑎ₙ).𝑖` becomes `𝑎ᵢ`, and likewise a record
+  literal's field, when the literal holds a capability (`fold_product_projection`). The literal is
+  folded whichever component is read: folding only the function components would leave
+  `(f=𝑔, k=1).k` with `𝑔` inside it. This is how a function passed to a multi-argument function
+  reaches its call, since the parameter is a component of the argument tuple.
+- **A let-bound literal is split.** `let 𝑟 = (𝑘₀=𝑎₀, …) in body` becomes one `let` per component,
+  with each `𝑟.𝑘ᵢ` in the body replaced by that component's binder (`split_product_let`). A
+  function component then inlines, and a collection component stays bound once, so nothing is
+  recomputed per use. The split applies only when every use of `𝑟` is a projection. A whole use,
+  such as `𝑟` placed in a list, leaves the binding as it is.
+
+A lambda that reaches call position through a fold, as in `use(\x -> x + 1, 1)`, is beta-reduced
+there (`beta_reduce_folded_call`). A lambda written in call position is not this case: lowering binds
+it first (`lower::exprs::lower_expression_call`), so it inlines as a let-bound lambda, and an
+anonymous `Apply(arg, Lambda)` that no fold produced is left for `lambda_elim`.
+
+A product whose functions no rewrite reaches, such as one chosen by a conditional, still holds a
+function after inlining, and compilation fails in planning or at operator conversion.
+
 ### Limitations
 
 - **Unapplied or partially applied compute functions:** An unapplied nested lambda can leave a
@@ -114,8 +143,8 @@ domain mismatch.
   as `add(1)` can eliminate that combinator but still leave a compute-function result: debug
   planning rejects it at the data-site assertion, while a build without that assertion attempts
   to iterate its non-enumerable `Int` domain. Binding each application and ultimately consuming the
-  result, `x = add(1)` followed by `x(2)`, lets inlining eliminate both parameter layers. The
-  spelling `add(1)(2)` is separately rejected because CHL call lowering requires a named target.
+  result, `x = add(1)` followed by `x(2)`, lets inlining eliminate both parameter layers, and so
+  does the chained spelling `add(1)(2)`.
   Curried data functions are different: grouping constructs them through `converse`, and the
   runtime represents them with nested `DataFunction` tilings.
 - **Collection bindings:** A `Type::Fun` with `FunKind::Data` is not expanded by the function
