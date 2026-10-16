@@ -2255,6 +2255,15 @@ pub fn codomain_depends_on(binder: &Name, codomain: &Type) -> bool {
     references_enclosing_function(codomain) || type_free_vars(codomain).contains(binder)
 }
 
+/// Whether `ty` is a function whose codomain reads its input, `(𝑘: 𝐾) ⇒ 𝐶[𝑘]`, under any
+/// refinements ([`codomain_depends_on`]).
+pub fn is_dependent(ty: &Type) -> bool {
+    matches!(
+        ty.peel_refinements(),
+        Type::Fun { name: Some(k), codomain, .. } if codomain_depends_on(k, codomain)
+    )
+}
+
 /// Plug `argument` in for `binder` throughout `codomain` — the action
 /// [`codomain_depends_on`] is the test for, admitting the same two reference forms.
 ///

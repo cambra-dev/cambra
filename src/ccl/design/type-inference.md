@@ -1996,7 +1996,10 @@ to match its equality predicate. A missing name on a function whose codomain ref
 is debug-asserted rather than treated as a valid anonymous dependency.
 
 Scope entry accompanies opening. `emit_compose`'s recursive chain walk enters preceding dependent
-function binders before checking following morphisms. `normalize_annotation` extends the telescope
+function binders before checking following morphisms. Adjacent steps are coupled by that name, so
+a rewrite that splices a nested dependent chain into its enclosing one renames the nested chain's
+last step's binder to the chain's own: `simplify`'s compose flattening does
+(`flatten_compose_arm`). `normalize_annotation` extends the telescope
 for a named function's codomain. Variables minted under either traversal must admit the names the
 opened refinements contain.
 

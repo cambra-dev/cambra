@@ -445,11 +445,62 @@ fn iteration_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
 /// If `expr` is an n-ary [`TypedExprNode::Compose`], return its elements;
 /// otherwise return a single-element `vec![expr]`.  Used by
 /// [`try_flatten_compose`] to merge already-flattened child compose nodes.
+///
+/// A nested chain with a dependent type, `(𝑏: 𝐷) ⇒ 𝐶[𝑏]`, takes its binder and its codomain
+/// from its last step (`infer::emit`'s `emit_compose`). The steps before that one pass their
+/// input through unchanged, so the last step's input is the chain's input. The steps after the
+/// nested chain refer to that input as `𝑏`. Once spliced, they follow the last step directly,
+/// and the checker names the input by the last step's own binder. Renaming that binder to `𝑏`
+/// makes the two names agree. The last step's codomain refers to its binder by index rather
+/// than by name, so the rename changes nothing else.
+///
+/// A `const` last step, `𝑔 ▷ const`, carries the same function type inside its builtin's,
+/// `𝐺 ⇒ ((𝑘: 𝐾) ⇒ 𝐶)`, which is renamed with it.
 fn flatten_compose_arm(expr: Expr) -> Vec<Expr> {
     match expr.node {
-        TypedExprNode::Compose(elts) => elts,
+        TypedExprNode::Compose(mut elts) => {
+            if let Type::Fun { name: Some(b), .. } = expr.ty.peel_refinements()
+                && let Some(last) = elts.last_mut()
+                && rename_dependent_binder(&mut last.ty, b).is_some()
+                && let TypedExprNode::Apply { function, .. } = &mut last.node
+                && matches!(function.node, TypedExprNode::Builtin(Builtin::Const))
+                && let Type::Fun { codomain, .. } = &mut function.ty
+            {
+                rename_dependent_binder(codomain, b);
+            }
+            elts
+        }
         _ => vec![expr],
     }
+}
+
+/// Rename the binder of `ty`, a function under any refinements whose codomain reads its
+/// binder by index, to `b`, and answer the old name. `None`, and `ty` unchanged, where it is
+/// no such function or its binder is `b` already.
+fn rename_dependent_binder(ty: &mut Type, b: &Name) -> Option<Name> {
+    let mut ty = ty;
+    while let Type::Refinement(inner, _) = ty {
+        ty = inner;
+    }
+    let Type::Fun {
+        name: Some(k),
+        codomain,
+        ..
+    } = ty
+    else {
+        return None;
+    };
+    if k == b || !crate::ccl::subst::references_enclosing_function(codomain) {
+        return None;
+    }
+    // A codomain that names `𝑏` free reads the chain's input through the chain's binder,
+    // which is the last step's input too, so the renamed binder binds what it meant.
+    debug_assert!(
+        !crate::ccl::subst::type_free_vars(codomain).contains(k),
+        "a codomain closed over its binder `{k}` also names it, which the rename would leave \
+         unbound"
+    );
+    Some(std::mem::replace(k, b.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,7 +1073,15 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
         // A `left ≫ const(g)` collapses to `const(g)` carrying `left`'s *type*
         // domain — sound only when `left` is a pure reshaping, which is exactly what
         // `narrows_domain_irrecoverably` rules out.
-        |left, right| as_const(right).is_some() && !narrows_domain_irrecoverably(left),
+        //
+        // A dependent `const(g)`, `(𝑘: 𝐾) ⇒ 𝐶[𝑘]`, is constant in value but not in type: its
+        // codomain reads the input `left` delivers, and the rest of the chain speaks that
+        // input by `𝑘`'s name. Collapsed, nothing would bind `𝑘`, so it stays a step.
+        |left, right| {
+            as_const(right).is_some()
+                && !narrows_domain_irrecoverably(left)
+                && !crate::ccl::subst::is_dependent(&right.ty)
+        },
         |left, right, mint_kind| {
             // The collapsed constant takes `left`'s domain (see
             // `try_pairwise_in_compose` for which kind that makes it).
@@ -1157,26 +1216,34 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
             // `zip_pair_ty` takes it as an argument, and reads the domain off the
             // first, the binder off either.
             //
-            // `mint` drops the binder: a dependent `g` carries its binder reference
-            // in `g_cod`, and `name: None` leaves nothing to open it at — the shape
-            // `subst::open_codomain` rejects. It reaches the zip below because
-            // `.with_ty` overrides the type `zip_pair_ty` computed, which does carry
-            // the binder. `arm_ty` in the zip-distribution rewrite has the same
-            // shape.
+            // A dependent `g`, `(𝑏: 𝐴) ⇒ 𝐶[𝑏]`, reads its input in its codomain by index, and
+            // the pair `⟨id, 𝑔⟩` takes the same input, so the pair's type keeps `g`'s binder:
+            // `(𝑏: 𝐴) ⇒ (𝐴, 𝐶[𝑏])`. Unnamed, nothing would bind the index (the shape
+            // `subst::open_codomain` rejects).
             let g_dom = g.ty.domain();
             let g_cod = g.ty.codomain();
-            let mint = |d: Type, c: Type| Type::Fun {
-                name: None,
+            let g_binder = match g.ty.peel_refinements() {
+                Type::Fun { name, codomain, .. }
+                    if crate::ccl::subst::references_enclosing_function(codomain) =>
+                {
+                    name.clone()
+                }
+                _ => None,
+            };
+            let mint = |name: Option<Name>, d: Type, c: Type| Type::Fun {
+                name,
                 fun_kind: mint_kind.clone(),
                 domain: Box::new(d),
                 codomain: Box::new(c),
             };
             let id_ty = g_dom
                 .as_ref()
-                .map(|a| mint(a.clone(), a.clone()))
+                .map(|a| mint(None, a.clone(), a.clone()))
                 .unwrap_or(Type::Hole);
             let zip_ty = match (g_dom.as_ref(), g_cod.as_ref()) {
-                (Some(a), Some(c)) => mint(a.clone(), Type::Tuple(vec![a.clone(), c.clone()])),
+                (Some(a), Some(c)) => {
+                    mint(g_binder, a.clone(), Type::Tuple(vec![a.clone(), c.clone()]))
+                }
                 _ => Type::Hole,
             };
             let id_node = id().with_ty(id_ty);
@@ -1420,6 +1487,9 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
 
             // Each distributed arm is `left ≫ arm`, taking `left`'s domain (see
             // `try_pairwise_in_compose` for which kind that makes it).
+            //
+            // A dependent arm reads its own input, which is `left`'s output, so `left ≫ arm`
+            // would have to open the arm's codomain at `left`'s answer; nothing here does.
             let arm_ty = |arm: &Expr| match (&left.ty, &arm.ty) {
                 (
                     Type::Fun { domain: dom, .. },
@@ -1436,6 +1506,13 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
                 },
                 _ => Type::Hole,
             };
+            assert!(
+                !crate::ccl::subst::is_dependent(&g.ty) && !crate::ccl::subst::is_dependent(&h.ty),
+                "zip distribution reached a dependent arm, whose codomain would have to be \
+                 opened at the morphism it is distributed after: `{}` and `{}`",
+                crate::ccl::symbolic::symbolic(&g),
+                crate::ccl::symbolic::symbolic(&h),
+            );
             let g_ty = arm_ty(&g);
             let h_ty = arm_ty(&h);
 
@@ -2503,6 +2580,49 @@ mod tests {
         let expr = typed_compose(vec![aa.clone(), zip, apply, bb.clone()]);
         let expected = typed_compose(vec![aa, f, bb]);
         assert_eq!(simplify(expr), expected);
+    }
+
+    /// `(k: Int) ⇒ {Int | k}`: a morphism whose codomain reads its own binder.
+    fn dependent(binder: &str) -> Type {
+        let k = Name::from(binder);
+        Type::pi(
+            k.clone(),
+            int_ty(),
+            Type::refined(
+                int_ty(),
+                crate::ccl::RefinementSet::one(crate::ccl::Refinement::born(std::rc::Rc::new(
+                    Expr::var(k).with_ty(int_ty()),
+                ))),
+            ),
+        )
+    }
+
+    /// `f ≫ const(7) : (k: Int) ⇒ {Int | k}` stays two steps: collapsed, nothing binds `k`.
+    #[test]
+    fn simplify_keeps_a_dependent_const_as_a_step() {
+        let f = var("f").with_ty(fun_ty(int_ty(), int_ty()));
+        let mut c = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
+        c.ty = dependent("k");
+        let mut compose = typed_compose2(f, c);
+        compose.ty = dependent("k");
+        assert_eq!(simplify(compose.clone()), compose);
+    }
+
+    /// `(f ≫ c : (b: Int) ⇒ …) ≫ g` flattens with `c` binding `b`, the name `g` speaks.
+    #[test]
+    fn simplify_flatten_renames_a_dependent_tail_to_the_chain_binder() {
+        let f = var("f").with_ty(fun_ty(int_ty(), int_ty()));
+        let mut c = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
+        c.ty = dependent("k");
+        let mut inner = typed_compose2(f, c);
+        inner.ty = dependent("b");
+        let g = var("g").with_ty(fun_ty(int_ty(), int_ty()));
+        let outer = Expr::compose(vec![inner, g]).with_ty(fun_ty(int_ty(), int_ty()));
+        let TypedExprNode::Compose(elts) = simplify(outer).node else {
+            panic!("expected a chain")
+        };
+        assert_eq!(elts.len(), 3);
+        assert!(matches!(&elts[1].ty, Type::Fun { name: Some(n), .. } if *n == Name::from("b")));
     }
 
     /// Flatten: f ≫ g ≫ h (binary tree)  ⟹  Compose([f, g, h])
