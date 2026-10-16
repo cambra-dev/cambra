@@ -856,7 +856,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Record(fs) => emit_record(fs, ctx)?,
 
         // The projection's function type is already recorded; decompose it.
-        TypedExprNode::Proj(key) => emit_proj(key, &expr.ty, ctx)?,
+        TypedExprNode::Proj(key) => emit_proj(key, &expr.ty, expr.node_id, ctx)?,
 
         TypedExprNode::List(elts) => emit_list(elts, &recorded_ty, ctx)?,
 
@@ -1115,6 +1115,55 @@ mod tests {
         )
         .with_ty(prim(BaseType::Bool));
         Type::refined_one(prim(BaseType::Int), Refinement::born(Rc::new(predicate)))
+    }
+
+    /// `(a : Int) × {Int | __elem == a}`: component 1 reads component 0.
+    fn reads_its_first_component() -> Type {
+        let a = Name::fresh("a");
+        Type::dep_tuple(vec![
+            (Some(a.clone()), prim(BaseType::Int)),
+            (
+                None,
+                refined(
+                    CompareKind::Equals,
+                    TypedExpr::var(a).with_ty(prim(BaseType::Int)),
+                ),
+            ),
+        ])
+    }
+
+    /// `.1 : (p : (a : Int) × {Int | __elem == a}) ⇒ {Int | __elem op p.0}`.
+    fn dependent_projection(op: CompareKind) -> TypedExpr {
+        let pair = reads_its_first_component();
+        let p = Name::fresh("p");
+        let p_0 = TypedExpr::apply(
+            TypedExpr::var(p.clone()).with_ty(pair.clone()),
+            TypedExpr::proj_index(0).with_ty(Type::fun(pair.clone(), prim(BaseType::Int))),
+        )
+        .with_ty(prim(BaseType::Int));
+        TypedExpr::proj_index(1).with_ty(Type::pi(p, pair, refined(op, p_0)))
+    }
+
+    /// A dependent tuple's component is typed opened at the projected value's earlier
+    /// components (`src/ccl/design/type-inference.md`, "Projection"): `.1` out of
+    /// `(a : Int) × {Int | __elem == a}` is `{Int | __elem == p.0}`, which is not
+    /// `{Int | __elem > p.0}`.
+    #[test]
+    fn a_dependent_projection_opens_its_component_at_the_earlier_ones() {
+        assert_eq!(check(&dependent_projection(CompareKind::Equals)), Ok(()));
+        assert!(
+            check(&dependent_projection(CompareKind::Greater)).is_err(),
+            "`.1` equals `p.0`, so it is not greater than it"
+        );
+    }
+
+    /// An index past a dependent tuple's last component is reported as one past a plain
+    /// tuple's end is, not a panic.
+    #[test]
+    fn a_projection_past_a_dependent_tuples_end_is_an_error() {
+        let pair = reads_its_first_component();
+        let past = TypedExpr::proj_index(2).with_ty(Type::fun(pair, prim(BaseType::Int)));
+        assert!(check(&past).is_err());
     }
 
     /// A refinement deficit is decided in the Γ the walk builds from the tree.

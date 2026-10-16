@@ -74,6 +74,109 @@ pub enum AtomKey {
     /// `String` do (`src/ccl/design/type-parameters.md`, "Subtyping with a type
     /// parameter").
     Param(Rc<crate::ccl::ty::TypeParam>),
+    /// A dependent tuple, which matches only a tuple equal to it up to binder
+    /// names ([`DepTupleAtom`]). The lattice's product slot keys fields with
+    /// nothing in scope between them, so a telescope rides as a whole; comparing
+    /// its components under subtyping is not represented here.
+    DepTuple(DepTupleAtom),
+}
+
+/// A [`Type::DepTuple`] as an [`AtomKey`]: equal to another exactly when the two are `==` up to
+/// binder names, which [`Type::without_pi_names`] strips (references are indices, so nothing
+/// else names a binder). `==` on a refinement ignores its predicate's type slots, so the atom
+/// is keyed by `Type`'s own `Hash`, which ignores them too, and not by the content hash, which
+/// reads them. Two unequal tuples sharing a hash are told apart by `rank`, the order in which
+/// this thread first met each ([`rank_among_equal_hashes`]).
+#[derive(Debug, Clone)]
+pub struct DepTupleAtom {
+    hash: u64,
+    rank: usize,
+    ty: Rc<Type>,
+}
+
+impl DepTupleAtom {
+    fn new(ty: &Type) -> Self {
+        // `Hash` and `==` read a reference between components as an index, so a component
+        // naming an earlier one by name would compare by its spelling, and two α-equivalent
+        // tuples would land apart. `Type::dep_tuple` closes them.
+        debug_assert!(
+            match ty.peel_refinements() {
+                Type::DepTuple(components) => components.iter().enumerate().all(|(k, (_, t))| {
+                    components[..k]
+                        .iter()
+                        .filter_map(|(name, _)| name.as_ref())
+                        .all(|name| !crate::ccl::ccl_utils::is_free_in_type(name, t))
+                }),
+                _ => true,
+            },
+            "a dependent tuple whose component names an earlier one by name, not by index: \
+             {ty} (build with Type::dep_tuple)"
+        );
+        // `extrude` and `freshen_above` return the tuple as it is, which is right only for a
+        // tuple holding no variable.
+        debug_assert!(
+            !crate::ccl::subst::type_contains_infer(ty),
+            "a dependent tuple is born after inference and the solver holds it as a closed \
+             atom: {ty}"
+        );
+        let unnamed = ty.without_pi_names();
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            unnamed.hash(&mut hasher);
+            hasher.finish()
+        };
+        DepTupleAtom {
+            hash,
+            rank: rank_among_equal_hashes(hash, unnamed),
+            ty: Rc::new(ty.clone()),
+        }
+    }
+}
+
+thread_local! {
+    /// The distinct unnamed tuples met with each hash, in the order met.
+    static MET: std::cell::RefCell<HashMap<u64, Vec<Type>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Where `unnamed` stands among the distinct tuples this thread has met with `hash`: the same
+/// for every tuple `==` to it, and different for every other. A hash almost always has one, so
+/// this decides only between two unequal tuples whose hashes collide.
+fn rank_among_equal_hashes(hash: u64, unnamed: Type) -> usize {
+    MET.with(|met| {
+        let mut met = met.borrow_mut();
+        let bucket = met.entry(hash).or_default();
+        match bucket.iter().position(|t| *t == unnamed) {
+            Some(rank) => rank,
+            None => {
+                bucket.push(unnamed);
+                bucket.len() - 1
+            }
+        }
+    })
+}
+
+impl PartialEq for DepTupleAtom {
+    fn eq(&self, other: &Self) -> bool {
+        (self.hash, self.rank) == (other.hash, other.rank)
+    }
+}
+impl Eq for DepTupleAtom {}
+impl PartialOrd for DepTupleAtom {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for DepTupleAtom {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.hash, self.rank).cmp(&(other.hash, other.rank))
+    }
+}
+impl std::hash::Hash for DepTupleAtom {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.hash.hash(state)
+    }
 }
 
 impl AtomKey {
@@ -89,6 +192,7 @@ impl AtomKey {
             Type::WitnessRef(b) => Some(AtomKey::Witness(*b)),
             Type::ChanDom(n, l) => Some(AtomKey::ChanDom(n.clone(), *l)),
             Type::Param(p) => Some(AtomKey::Param(Rc::clone(p))),
+            Type::DepTuple(_) => Some(AtomKey::DepTuple(DepTupleAtom::new(ty))),
             _ => None,
         }
     }
@@ -102,6 +206,7 @@ impl AtomKey {
             AtomKey::Witness(b) => Type::WitnessRef(*b),
             AtomKey::ChanDom(n, l) => Type::ChanDom(n.clone(), *l),
             AtomKey::Param(p) => Type::Param(Rc::clone(p)),
+            AtomKey::DepTuple(a) => (*a.ty).clone(),
         }
     }
 }
@@ -1809,6 +1914,7 @@ fn compact_go(
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Param(_)
+        | Type::DepTuple(_)
         | Type::Txn => CompactType::from_atom(AtomKey::from_type(ty).unwrap()),
         // `emit_let` opens a `Poly` and binds at its body; none reaches the solver.
         Type::Poly(_) => unreachable!("a polymorphic type reached `compact`"),
@@ -2287,6 +2393,70 @@ mod tests {
         CoalesceError, ConstrainCache, coalesce_compact, constrain_subtype, fresh_var,
     };
     use crate::ccl::{BaseType, Lit, Refinement, TypedExpr};
+
+    /// A dependent tuple is an atom of the solver's lattice: two α-variants of
+    /// `(a : Int) × {Int | __elem == a}` flowing into one variable compact to one atom, and
+    /// coalescing reads the tuple back.
+    #[test]
+    fn a_dependent_tuple_compacts_and_coalesces_as_one_atom() {
+        use crate::ccl::infer::solver::simplify_type;
+        use crate::ccl::{BinOpKind, CompareKind};
+        let int = || Type::Base(BaseType::Int);
+        let tuple = |binder: &str| {
+            let a = Name::fresh(binder);
+            let elem_is_a = TypedExpr::binop(
+                TypedExpr::var(Name::elem()).with_ty(int()),
+                BinOpKind::Compare(CompareKind::Equals),
+                TypedExpr::var(a.clone()).with_ty(int()),
+            )
+            .with_ty(Type::Base(BaseType::Bool));
+            Type::dep_tuple(vec![
+                (Some(a), int()),
+                (
+                    None,
+                    Type::refined_one(int(), Refinement::born(Rc::new(elem_is_a))),
+                ),
+            ])
+        };
+        let v = fresh_var(0);
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&tuple("a"), &v, &mut cache).expect("the first copy flows in");
+        constrain_subtype(&tuple("b"), &v, &mut cache).expect("and the second");
+        let compact = compact_type(&v);
+        assert_eq!(compact.term.atoms.len(), 1, "{:?}", compact.term.atoms);
+        let back = coalesce_compact(&simplify_type(compact)).expect("one atom coalesces");
+        assert_eq!(
+            back.without_pi_names(),
+            tuple("c").without_pi_names(),
+            "{back}"
+        );
+    }
+
+    /// Two copies of `(i : Int) × {Int | i}` that differ only in the predicate
+    /// reference's type slot, stored as:
+    ///
+    ///   a: DepTuple[ (i, Int), (–, {Int | #0 : _  }) ]
+    ///   b: DepTuple[ (i, Int), (–, {Int | #0 : Int}) ]
+    ///
+    /// `Type ==` ignores type slots inside a predicate, so the two are equal; their
+    /// atoms must be too.
+    #[test]
+    fn a_dependent_tuple_atom_agrees_with_type_equality() {
+        let tuple = |slot: Type| {
+            let i = Name::fresh("i");
+            let pred = TypedExpr::var(i.clone()).with_ty(slot);
+            Type::dep_tuple(vec![
+                (Some(i), Type::Base(BaseType::Int)),
+                (
+                    None,
+                    Type::refined_one(Type::Base(BaseType::Int), Refinement::born(Rc::new(pred))),
+                ),
+            ])
+        };
+        let (a, b) = (tuple(Type::Hole), tuple(Type::Base(BaseType::Int)));
+        assert_eq!(a.without_pi_names(), b.without_pi_names());
+        assert_eq!(AtomKey::from_type(&a), AtomKey::from_type(&b));
+    }
 
     /// A negative position's reading is the meet of both sides: the requirement side
     /// says what the uses demand, the value side what actually arrives, and the

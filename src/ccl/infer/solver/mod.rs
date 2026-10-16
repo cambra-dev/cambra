@@ -94,6 +94,7 @@ pub fn type_level(ty: &Type) -> Level {
             .max(type_level(d))
             .max(type_level(c)),
         Type::Tuple(ts) => ts.iter().map(type_level).max().unwrap_or(0),
+        Type::DepTuple(cs) => cs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Record(fs) => fs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Variant(tags, _) => tags.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Refinement(inner, _) => type_level(inner),

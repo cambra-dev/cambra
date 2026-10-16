@@ -139,6 +139,7 @@ fn blame_node_for_place(
             } => mentions(domain, uid) || mentions(codomain, uid),
             Type::History { value, domain, .. } => mentions(value, uid) || mentions(domain, uid),
             Type::Tuple(elems) => elems.iter().any(|t| mentions(t, uid)),
+            Type::DepTuple(cs) => cs.iter().any(|(_, t)| mentions(t, uid)),
             Type::Record(fields) => fields.iter().any(|(_, t)| mentions(t, uid)),
             Type::Variant(arms, _) => arms.iter().any(|(_, t)| mentions(t, uid)),
             Type::WitnessRef(_) => false,

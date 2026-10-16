@@ -1659,6 +1659,15 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                         descend(elem, &path, Step::Field(FieldKey::Index(i)), &mut frontier);
                     }
                 }
+                // A component that reads an earlier one does so by index, which points at
+                // nothing once the component is taken out of the telescope. The sweep takes no
+                // type out: `descend` follows only an inference variable found beneath a
+                // component's refinements, so the reference is never read.
+                Type::DepTuple(components) => {
+                    for (i, (_, elem)) in components.iter().enumerate() {
+                        descend(elem, &path, Step::Field(FieldKey::Index(i)), &mut frontier);
+                    }
+                }
                 Type::Record(fields) => {
                     for (name, ty) in fields {
                         let key = FieldKey::Name(name.as_str().into());

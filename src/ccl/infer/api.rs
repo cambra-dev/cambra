@@ -1731,6 +1731,15 @@ fn collect_type_errors(
                  (build products with Type::tuple)"
             );
         }
+        Type::DepTuple(components) => {
+            debug_assert!(
+                components.iter().enumerate().any(|(k, (_, t))| {
+                    crate::ccl::subst::references_binder_within(t, k as u32)
+                }),
+                "a dependent tuple with no component reading an earlier one at \
+                 `{context_sym}`: it is the plain tuple (build with Type::dep_tuple)"
+            );
+        }
         Type::Record(fields) => {
             debug_assert!(
                 !fields.is_empty(),
