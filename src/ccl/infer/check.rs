@@ -514,34 +514,13 @@ impl Typing for CheckCtx {
     }
 
     fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type {
-        // An opaque binder carries no definiens, so Emit recorded no discharge
-        // and there is none to re-run: the binder's name stands in the lifted
-        // type, and the reconstruction matches the recorded type by keeping it
-        // there.
-        if binding.transparency == BindingTransparency::Opaque {
-            // The name stays in the lifted type, so what it means there — the type it
-            // was bound at — outlives the scope ([`CheckCtx::opaque_binders`],
-            // recorded by `scoped_let` on the way in).
-            return body_ty;
-        }
-        let name = &binding.name;
-        // Mirror the let-closing in `coalesce_node`'s Let arm (design §6.2):
-        // the recorded node type has the binding discharged, so the
-        // reconstruction must re-run the same substitution to reconcile under
-        // structural predicate equality.
-        // Vacuous unless the binder is free in the body type's refinement
-        // predicates — then return the (owned) body type unchanged rather than
-        // cloning `bound_expr` for a no-op discharge.
-        if crate::ccl::subst::type_free_vars(&body_ty).contains(name) {
-            // A type-level discharge. The template keeps its ids because a
-            // template is not a tree node — it is cloned again at every read, and
-            // that read is where the sibling is minted. (Not because predicates
-            // are out of the id domain; they are in it.)
-            crate::ccl::subst::Subst::discharge(name, bound_expr.clone_preserving_ids())
-                .apply_type(&body_ty)
-        } else {
-            body_ty
-        }
+        // Mirror the let-closing in `coalesce_node`'s Let arm (design §6.2): the recorded
+        // node type has the binding discharged, so the reconstruction re-runs the same
+        // substitution to reconcile under structural predicate equality. An opaque binder's
+        // name stays in the lifted type, and what it means there, the type it was bound at,
+        // outlives the scope ([`CheckCtx::opaque_binders`], recorded by `scoped_let` on the
+        // way in).
+        crate::ccl::ccl_utils::closed_let_type(binding, bound_expr, body_ty)
     }
 
     fn close_body_type(&mut self, body_ty: Type) -> Result<Type, LocatedInferError> {
