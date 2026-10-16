@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
 use crate::ccl::infer::solver::display::InferredPoly;
@@ -121,6 +122,9 @@ pub struct TypeInferenceContext {
 
     /// Types of known externally-registered data sources.
     pub(crate) source_types: HashMap<String, Type>,
+
+    /// The program's trait instances, which lowering builds.
+    pub(crate) instances: Rc<crate::ccl::infer::solver::traits::InstanceTable>,
 }
 
 /// RAII guard returned by [`TypeInferenceContext::enter_scope`].
@@ -433,6 +437,35 @@ pub enum InferError {
         /// The receiver's type, or `None` where nothing before the call determines it.
         receiver: Option<Type>,
     },
+    /// A trait function's call whose instance a module declares below it: the instance's
+    /// functions are in scope after its `impl`, as a `def` is after its own
+    /// (`docs/chl-spec.md`, "Declaring an instance").
+    InstanceAfterUse {
+        /// The trait function called, `Area::area`.
+        function: String,
+        /// The instance's head, `Area(Circle)`.
+        instance: String,
+    },
+    /// A trait function's call, inside a function of an instance, that the same function
+    /// answers at the same types: the call is the one it is in, so it would never end.
+    InstanceCallsItself {
+        /// The trait function called, `Area::area`.
+        function: String,
+        /// The types it is called at: the instance's head, or the call's function type.
+        at: String,
+    },
+    /// A call reaching an instance's function inside a specialization of that function, at
+    /// types each containing the specialization's at its place: a chain of such calls need
+    /// not end (`docs/chl-spec.md`, "Declaring an instance").
+    InstanceCallContains {
+        /// The trait function called, `Area::area`.
+        function: String,
+        /// The types the call instantiates the function's type parameters at, each with its
+        /// parameter's spelling (empty where the types are the whole function type).
+        at: Vec<(smol_str::SmolStr, Type)>,
+        /// The same, for the specialization it is inside.
+        within: Vec<(smol_str::SmolStr, Type)>,
+    },
     /// Functions of an `impl` block that reach themselves through the calls their
     /// definitions make: each calls the next, and the last the first (`docs/chl-spec.md`,
     /// "Associated functions and methods").
@@ -725,6 +758,10 @@ impl InferError {
             InferError::MutInCompositeType { ty, .. } => each(ty),
             InferError::ScopeViolation { ty, .. } => each(ty),
             InferError::OpaqueEscape { ty, .. } => each(ty),
+            InferError::InstanceCallContains { at, within, .. } => {
+                at.iter_mut().for_each(|(_, t)| each(t));
+                within.iter_mut().for_each(|(_, t)| each(t));
+            }
             InferError::UnresolvedMethod { receiver, .. } => receiver.iter_mut().for_each(each),
             // No type to render: these carry a name, an id, or a rendered label.
             InferError::UnboundVariable(_)
@@ -743,6 +780,8 @@ impl InferError {
             | InferError::DefinitionCycle { .. }
             | InferError::MissingRequirement { .. }
             | InferError::MonomorphicPolyBinding { .. }
+            | InferError::InstanceAfterUse { .. }
+            | InferError::InstanceCallsItself { .. }
             | InferError::MutWriteToNonMutable { .. } => {}
         }
     }
@@ -1098,6 +1137,16 @@ impl std::fmt::Debug for InferError {
                 accepted,
                 at,
             } => {
+                // A trait with no instance accepting anything at the position, as one a
+                // module declares no instance of, has no type to list.
+                if accepted.is_empty() {
+                    return write!(
+                        f,
+                        "No {trait_} instance for {at}: operand {} is {found}, and no instance \
+                         of `{trait_}` accepts a type there",
+                        position + 1,
+                    );
+                }
                 let accepted = accepted
                     .iter()
                     .map(|t| t.to_string())
@@ -1108,6 +1157,44 @@ impl std::fmt::Debug for InferError {
                     "No {trait_} instance for {at}: operand {} is {found}, but \
                      the only type accepted there is {accepted}",
                     position + 1,
+                )
+            }
+            InferError::InstanceAfterUse { function, instance } => write!(
+                f,
+                "this call of `{function}` is answered by `impl {instance}`, which is declared \
+                 below it; an instance's functions are in scope after its `impl`, so declare \
+                 the instance above the call, or above the definition the call is in"
+            ),
+            InferError::InstanceCallsItself { function, at } => write!(
+                f,
+                "this call of `{function}` is answered by the function it is in, at the same \
+                 types, `{at}`, so it would never end; a function does not reach itself"
+            ),
+            InferError::InstanceCallContains {
+                function,
+                at,
+                within,
+            } => {
+                let list = |ts: &[(smol_str::SmolStr, Type)]| {
+                    ts.iter()
+                        .map(|(name, t)| {
+                            if name.is_empty() {
+                                format!("`{t}`")
+                            } else {
+                                format!("`{name} = {t}`")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                write!(
+                    f,
+                    "this call of `{function}` is at {}, inside its function's specialization \
+                     at {}, whose types the call's contain; a call of an instance's function \
+                     inside its own specialization is at types that do not contain the \
+                     specialization's, or the chain of calls need not end",
+                    list(at),
+                    list(within)
                 )
             }
             InferError::MonomorphicPolyBinding { name } => write!(
@@ -1423,7 +1510,7 @@ pub fn infer(
     // variable's bounds, breaking the `Rc` cycles that would otherwise leak
     // the whole variable graph. See [`InferArena`].
     let _arena = InferArena::new();
-    let ty = super::run(expr, &ctx.source_types);
+    let ty = super::run(expr, &ctx.source_types, &ctx.instances);
     #[cfg(debug_assertions)]
     if std::env::var_os("DUMP_KINDS").is_some() {
         eprintln!("=== kind vars ===\n{}", crate::ccl::ty::dump_kind_vars());
@@ -1455,7 +1542,8 @@ pub fn check_module(
 ) -> Result<HashMap<Name, Contract>, Vec<LocatedInferError>> {
     // The arena tears down every variable the check mints, as for `infer`.
     let _arena = InferArena::new();
-    let (_, schemes, opened) = super::run_with_params(expr, &ctx.source_types, params, reported)?;
+    let (_, schemes, opened) =
+        super::run_with_params(expr, &ctx.source_types, &ctx.instances, params, reported)?;
     let mut contracts: HashMap<Name, Contract> = schemes
         .into_iter()
         .map(|(name, mut scheme)| {
@@ -1541,7 +1629,7 @@ fn write_opened(ty: &mut Type, opened: &super::OpenedVars) {
     if let Type::Infer(var) = ty
         && let Some(param) = opened.get(&var.uid)
     {
-        *ty = Type::Param(std::rc::Rc::clone(param));
+        *ty = Type::Param(Rc::clone(param));
         return;
     }
     ty.walk_children_mut(|child| write_opened(child, opened));
@@ -1710,7 +1798,7 @@ pub fn debug_assert_no_free_witness(expr: &Expr, stage: &str) {
         }
         if let Type::Refinement(_, refinements) = t {
             for r in refinements {
-                if visited.insert(std::rc::Rc::as_ptr(&r.predicate)) {
+                if visited.insert(Rc::as_ptr(&r.predicate)) {
                     go(&r.predicate, stage, scope, visited);
                 }
             }
@@ -4400,7 +4488,7 @@ mod tests {
     /// into its body or bound, so a `Hole` there is not reported a second time.
     #[test]
     fn test_check_fully_typed_survivor_children_not_reported() {
-        let poly = Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
+        let poly = Type::Poly(Rc::new(crate::ccl::ty::PolyType {
             params: vec![],
             requires: vec![],
             body: Type::Hole,
@@ -4932,7 +5020,7 @@ mod tests {
         );
         let key_domain = Type::refined_one(
             Type::Base(BaseType::Int),
-            crate::ccl::ty::Refinement::born(std::rc::Rc::new(Expr::apply(
+            crate::ccl::ty::Refinement::born(Rc::new(Expr::apply(
                 Expr::var(Name::elem()),
                 morphism,
             ))),
@@ -4966,7 +5054,7 @@ mod tests {
         let predicate = Expr::let_bind("d", defer, truth).with_ty(Type::Base(BaseType::Bool));
         let refined = Type::refined_one(
             Type::UIntRange(3),
-            crate::ccl::ty::Refinement::born(std::rc::Rc::new(predicate)),
+            crate::ccl::ty::Refinement::born(Rc::new(predicate)),
         );
         let tree = Expr::lambda("x", refined, Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1)));
         typecheck(&tree).expect("before planning, a predicate holding a `defer` is source form");

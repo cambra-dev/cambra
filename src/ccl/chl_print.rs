@@ -145,21 +145,14 @@ impl Printer {
         let params: Vec<String> = poly
             .params
             .iter()
+            .filter(|p| !poly.is_member(&p.param))
             .map(|p| match p.bound() {
                 Some(bound) => format!("{} <: {}", p.param.spelling, self.ty(bound)),
                 None => p.param.spelling.to_string(),
             })
             .collect();
         let body = self.ty(&poly.body);
-        let requires: Vec<String> = poly
-            .requires
-            .iter()
-            .map(|r| {
-                let mut args: Vec<String> = r.args.iter().map(|t| self.ty(t)).collect();
-                args.extend(r.assoc.iter().map(|(n, t)| format!("{n}={}", self.ty(t))));
-                format!("{}({})", r.trait_, args.join(", "))
-            })
-            .collect();
+        let requires = poly.requires_text(|t| self.ty(t));
         let mut text = format!("forall ({}) {body}", params.join(", "));
         if !requires.is_empty() {
             text.push_str(" requires ");
@@ -751,8 +744,8 @@ mod tests {
         "forall (T, U <: {at: Int}) {T, U} => T"
     )]
     #[case(
-        "forall (T) {T, T} => T requires Addable(T, T, Output=T)",
-        "forall (T) {T, T} => T requires Addable(T, T, Output=T)"
+        "forall (T) {T, T} => T requires r: Addable(T, T), r::Output <: T",
+        "forall (T) {T, T} => T requires r: Addable(T, T), r::Output <: T"
     )]
     fn a_written_type_prints_as_an_annotation_that_lowers_back(
         #[case] annotation: &str,

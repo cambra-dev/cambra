@@ -29,7 +29,7 @@ use super::schemes::OperatorSchemes;
 use super::solve::value_type;
 use super::typing::{LetScheme, Typing};
 use super::{coalesce_for_error, map_constrain_err};
-use crate::ccl::infer::solver::traits::{Assoc, Trait, TraitObligation};
+use crate::ccl::infer::solver::traits::{Assoc, InstanceTable, Trait, TraitObligation};
 use crate::ccl::ty::TraitRequirement;
 
 /// A lexical-scope entry: the binder's polymorphic scheme.
@@ -92,6 +92,8 @@ impl ScopeEnv for ScopeStack<Name, Binding> {
 ///   caller's scope. An alias of a generalized binding duplicates nothing: a use of
 ///   it specializes a copy of the `Var`, which specializes the binding it names
 ///   (`docs/chl-spec.md`, "6.10 Polymorphic types").
+/// - A function of an instance, `summon(Area(_))::area`, whose signature each use opens
+///   afresh (`src/ccl/design/type-inference.md`, "Trait functions").
 ///
 /// Emission and coalescing use the same predicate. There is no use-count or
 /// collection-producing-UDF exception. Specializations are keyed by the use's
@@ -115,6 +117,7 @@ pub(super) fn should_generalize(
             }
         ),
         TypedExprNode::Var(name) => generalized(name),
+        TypedExprNode::TraitFn { .. } => true,
         _ => false,
     };
     polymorphic_form && type_level(&def.ty) > level
@@ -126,6 +129,9 @@ pub(super) fn should_generalize(
 /// into the AST during emission and resolved in place during coalesce — there
 /// is no side table.
 pub(super) struct InferCtx {
+    /// The program's trait instances, from which every obligation emission mints takes
+    /// its candidates.
+    pub(super) instances: Rc<InstanceTable>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
     /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
     /// polymorphic `let` additionally stashes its typed definition subtree so
@@ -233,6 +239,10 @@ pub(super) struct InferCtx {
     /// The [`DefGroup`](crate::ccl::TypedExprNode::DefGroup)s whose emission encloses the
     /// current position, innermost last.
     pub(super) groups: Vec<OpenGroup>,
+    /// Each trait function's call emitted, by its node: the obligation its emission placed,
+    /// and the function it calls, for the application that passes it its arguments
+    /// ([`Typing::bind_instance_function_called`]).
+    pub(super) trait_calls: HashMap<NodeId, (Rc<TraitObligation>, smol_str::SmolStr, Vec<Type>)>,
 }
 
 /// A [`DefGroup`](crate::ccl::TypedExprNode::DefGroup) under emission: what its members are
@@ -354,7 +364,9 @@ impl InferCtx {
             bound_at_annotation: HashSet::new(),
             errors: Vec::new(),
             poisoned_reads: 0,
+            instances: InstanceTable::builtin(),
             groups: Vec::new(),
+            trait_calls: HashMap::new(),
         }
     }
 
@@ -550,7 +562,10 @@ impl InferCtx {
         let positions: Vec<Type> = operand_types.iter().map(|_| self.fresh()).collect();
         // Only a requested association gets a variable for the obligation to settle;
         // a pure requirement determines nothing and mints none.
-        let wanted: Vec<(Assoc, Type)> = assoc.iter().map(|name| (*name, self.fresh())).collect();
+        let wanted: Vec<(Assoc, Type)> = assoc
+            .iter()
+            .map(|name| (name.clone(), self.fresh()))
+            .collect();
         // The recording covers the operand expressions an output refinement clones, and the
         // nodes a deposit reached from here mints by building it, both at construction and
         // from the `require_sub` narrowing below. So it names the node being typed, as the
@@ -561,7 +576,8 @@ impl InferCtx {
             "infer.require_trait",
             crate::ccl::provenance::Nature::Machinery,
         );
-        let obligation = TraitObligation::new(
+        let obligation = TraitObligation::new_in(
+            &self.instances,
             trait_,
             wanted.clone(),
             operator_node_id,
@@ -596,6 +612,15 @@ impl InferCtx {
             self.require_sub(operand, position, at)?;
         }
         Ok((wanted.into_iter().map(|(_, ty)| ty).collect(), obligation))
+    }
+
+    /// The type the innermost open `Poly` declaring the type parameter `id` opened it at.
+    pub(super) fn opened_param(&self, id: crate::ccl::ty::TypeParamId) -> Option<Type> {
+        self.opened_params
+            .iter()
+            .rev()
+            .find(|(p, _)| *p == id)
+            .map(|(_, opened)| opened.clone())
     }
 
     /// Normalize a user annotation / source type into a solver-ready
@@ -980,6 +1005,13 @@ impl TelescopeWalk for InferCtx {
 }
 
 impl Typing for InferCtx {
+    fn bind_instance_function_called(&mut self, function: NodeId) -> Result<(), LocatedInferError> {
+        let Some((obligation, name, operands)) = self.trait_calls.get(&function).cloned() else {
+            return Ok(());
+        };
+        super::emit::bind_selected_instance_function(&obligation, &name, &operands, self)
+    }
+
     fn pred_memo(&self) -> TermMemo {
         self.pred_memo.clone()
     }
@@ -1056,7 +1088,7 @@ impl Typing for InferCtx {
             operator_node_id,
             operand_types,
             std::slice::from_ref(&assoc),
-            Some((assoc, refinement, operand_exprs)),
+            Some((assoc.clone(), refinement, operand_exprs)),
             at,
         )?;
         Ok(settled

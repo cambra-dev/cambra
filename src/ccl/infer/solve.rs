@@ -11,10 +11,11 @@ use crate::ccl::ccl_utils::{PredMemo, canonical_cast_ty};
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::emit::read_through;
 use crate::ccl::infer::solver::barrier::EdgeReport;
+use crate::ccl::infer::solver::traits::{Assoc, InstanceTable, TraitInstance};
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
     compact_type, compact_type_polarity_only, constrain_subtype, constrain_subtype_in,
-    freshen_expr_type_slots, seed_chan_dom_pairings, simplify_type, spec_key,
+    freshen_above, freshen_expr_type_slots, seed_chan_dom_pairings, simplify_type, spec_key,
 };
 use crate::ccl::infer_var::InferVarId;
 use crate::ccl::provenance::NodeId;
@@ -141,6 +142,12 @@ fn push_coalesce_err(
 /// check guard against invalidating types already consumed by a parent. See
 /// `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
 pub(super) struct CoalesceCtx {
+    /// The program's trait instances, which a trait function's call is dispatched to
+    /// ([`matching_instance`]).
+    instances: Rc<InstanceTable>,
+    /// The bindings declared instances' functions are lowered to, which a call in their own
+    /// specializations may reach ([`specialize_use`]).
+    instance_functions: std::collections::HashSet<Name>,
     /// The walk's lexical scope: one [`ScopeEntry::Generalized`] frame per
     /// in-scope generalized `let`, plus a [`ScopeEntry::Shadow`] marker per
     /// other binder so an inner binder hides an outer generalized binding of
@@ -194,6 +201,11 @@ pub(super) struct CoalesceCtx {
     /// error records them, so an error a use causes inside a clone is reported at the
     /// use that clone serves ([`coalesce_generalized_let`]).
     specializing: Vec<ActiveSpecialization>,
+    /// The monomorphic `let`s whose right-hand sides the walk is inside: with
+    /// [`specializing`](Self::specializing)'s, the definitions a trait function's call
+    /// cannot be answered by, since a definition does not reach itself
+    /// ([`use_instance_function`]).
+    defining: Vec<Name>,
     /// The levels of the type parameters held opaque by the definitions being checked
     /// alone, innermost last ([`typecheck_discarded_definition`]). A use there can
     /// carry one into a specialization of a binding declared further out, so
@@ -623,6 +635,11 @@ struct SpecializeFrame {
     /// it: what a specialization's obligation copies stop assuming
     /// ([`TraitObligation::reset_for_specialization`](crate::ccl::infer::solver::traits::TraitObligation::reset_for_specialization)).
     own_params: Rc<[TypeParamId]>,
+    /// The binding's own type parameters that stand for an associated type of a requirement
+    /// its clause names, `a::Output` under `requires a: Addable(T, T)`, each with the
+    /// requirement and the associated type: what a specialization defines it as, the
+    /// instance's type at the clone's operands, rather than solving for it.
+    members: Vec<(TypeParamId, Rc<TraitRequirement>, Assoc)>,
     /// Whether this binding is itself inside a subtree being discarded — recorded
     /// from [`CoalesceCtx::discarding`] when the frame is pushed, the one moment
     /// the answer is unambiguous.
@@ -673,6 +690,13 @@ struct HeldError {
 /// ([`CoalesceCtx::specializing`]).
 #[derive(Clone)]
 struct ActiveSpecialization {
+    /// The binding the clone specializes.
+    name: Name,
+    /// The use's key, and the types an instance function's specialization instantiates its
+    /// type parameters at ([`InstanceTable::specialization_arguments`]): what a call of the
+    /// same function inside the clone is compared with.
+    key: SpecKey,
+    arguments: Vec<(smol_str::SmolStr, Type)>,
     /// The use the clone serves.
     at_use: NodeId,
     /// Each node of the clone paired with the node of the definition it copies
@@ -721,6 +745,11 @@ struct Specialization {
     /// predicate. Debug builds only, for the assertion in [`specialize_use`].
     #[cfg(debug_assertions)]
     quoted: bool,
+    /// Whether the use that minted this specialization is a trait function's call
+    /// [`use_instance_function`] made. Debug builds only, for the assertion in
+    /// [`specialize_use`].
+    #[cfg(debug_assertions)]
+    instance_call: bool,
     /// Its binding name — a [`Name::mono`] carrying the source binding's name
     /// as provenance and a globally-fresh uid for identity (so it can neither
     /// capture nor be captured).
@@ -1381,6 +1410,8 @@ fn obligation_choices(v: &crate::ccl::infer_var::InferVar) -> Option<Vec<crate::
                 }),
         );
     }
+    // An obligation whose candidates take any type at the position restricts nothing there.
+    watches.retain(|(obligation, pos)| !obligation.has_variable_at(*pos));
     let ((first, pos), rest) = watches.split_first()?;
     // Every requirement on the payload has to hold at once, so the choices are the
     // *intersection* of what each still accepts. No test separates this from taking
@@ -1455,8 +1486,12 @@ pub(super) fn push_barrier_failures(
 pub(super) fn coalesce_pass(
     expr: &mut Expr,
     bound_at_annotation: std::collections::HashSet<Name>,
+    instances: Rc<InstanceTable>,
 ) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
+        instance_functions: instances.declared_bindings().cloned().collect(),
+        instances,
+        defining: Vec::new(),
         scope: Vec::new(),
         bound_at_annotation,
         current_node: expr.node_id(),
@@ -1782,12 +1817,34 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// The body of [`coalesce_node`]; see the wrapper for the per-error blame
 /// bookkeeping it is wrapped in.
 fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
+    // A trait function's call answered by an instance a module declares becomes a use of
+    // the function the instance's `def` binds, before anything reads the node: the use then
+    // specializes below, as any use of a generalized definition does. A walk whose types are
+    // dropped resolves nothing to choose by: its operands are the definition's own, and
+    // each use's clone chooses at its own types.
+    let mut instance_call = false;
+    if matches!(expr.node, TypedExprNode::TraitFn { .. }) && !ctx.discarding {
+        match matching_instance(expr, ctx) {
+            Err(error) => {
+                let label = symbolic(expr);
+                ctx.push_error(error, label);
+                return;
+            }
+            Ok(Some(instance)) => {
+                if !use_instance_function(expr, &instance, ctx) {
+                    return;
+                }
+                instance_call = true;
+            }
+            Ok(None) => {}
+        }
+    }
     // Specialization stamps the resolved type itself; skip the generic tail.
     // Shadow markers prevent lookup through a same-named inner binder.
     if let TypedExprNode::Var(name) = &expr.node
         && let Some(frame_idx) = lookup_generalized(&ctx.scope, name)
     {
-        specialize_use(expr, frame_idx, ctx);
+        specialize_use(expr, frame_idx, instance_call, ctx);
         return;
     }
     // A generalized `let` rebuilds itself around its body's demanded
@@ -1891,7 +1948,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                  coalesces it as monomorphic, so its literals are never pinned: the two must \
                  agree on `should_generalize`"
             );
+            ctx.defining.push(binding.name.clone());
             coalesce_node(bound_expr, level + 1, ctx);
+            ctx.defining.pop();
             // Binder slot: resolve the type `emit_let` bound the variable at,
             // in place. The bottom-up `expr.ty` resolution doesn't reach this
             // slot, so it is handled explicitly — exactly as the `LetRec`
@@ -2062,6 +2121,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::Method { .. } => {
             unreachable!("emission resolves every method; none reaches coalesce")
         }
+        // A leaf; its instance is chosen once its type and operands resolve, below.
+        TypedExprNode::TraitFn { .. } => {}
         TypedExprNode::ExprStmt { expr: e, body } => {
             coalesce_node(e, level, ctx);
             coalesce_node(body, level, ctx);
@@ -2319,6 +2380,108 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     }
 }
 
+/// The instance a `TraitFn`'s operand types match (`src/ccl/design/type-inference.md`,
+/// "Trait functions"), or `None` while an operand does not resolve: the node's own type
+/// holds the same variable, and its resolution failure is reported there.
+///
+/// The obligation the node's emission placed accepted these operands, so an instance
+/// matches; one that does not is reported as a missing instance.
+fn matching_instance(
+    expr: &Expr,
+    ctx: &CoalesceCtx,
+) -> Result<Option<Rc<TraitInstance>>, InferError> {
+    let TypedExprNode::TraitFn {
+        trait_,
+        function,
+        operands,
+        ..
+    } = &expr.node
+    else {
+        unreachable!("`matching_instance` is called on a `TraitFn`")
+    };
+    let Ok(resolved) = operands
+        .iter()
+        .map(resolve_var_type)
+        .collect::<Result<Vec<Type>, _>>()
+    else {
+        return Ok(None);
+    };
+    let instances = ctx.instances.instances(trait_);
+    let mut matching = instances.iter().filter(|i| i.matches(&resolved));
+    let Some(instance) = matching.next() else {
+        let position = resolved
+            .iter()
+            .enumerate()
+            .position(|(pos, ty)| !instances.iter().any(|i| i.accepts(pos as u8, ty)))
+            .unwrap_or(0);
+        let mut accepted: Vec<Type> = Vec::new();
+        for t in instances
+            .iter()
+            .filter_map(|i| i.accepted_type(position as u8))
+        {
+            if !accepted.contains(&t) {
+                accepted.push(t);
+            }
+        }
+        return Err(InferError::NoTraitInstance {
+            trait_: trait_.to_string(),
+            position: position as u8,
+            found: Box::new(resolved[position].clone()),
+            accepted,
+            at: format!("{trait_}::{function}"),
+        });
+    };
+    assert!(
+        matching.next().is_none(),
+        "two instances of `{trait_}` match {resolved:?}; lowering refuses overlapping instances"
+    );
+    Ok(Some(Rc::clone(instance)))
+}
+
+/// Replace a `TraitFn` answered by an instance a module declares with a use of the function
+/// the instance's `def` binds, keeping the node's identity and its type, which is the
+/// trait's signature at the call's types. Returns whether it did: an instance declared
+/// below the call is not in scope there, which is reported.
+fn use_instance_function(expr: &mut Expr, instance: &TraitInstance, ctx: &mut CoalesceCtx) -> bool {
+    let TypedExprNode::TraitFn {
+        trait_, function, ..
+    } = &expr.node
+    else {
+        unreachable!("`use_instance_function` is called on a `TraitFn`")
+    };
+    let Some(binding) = instance.implementation(function) else {
+        panic!("an instance of `{trait_}` binds every function its trait declares")
+    };
+    let binding = binding.clone();
+    let in_scope = ctx.scope.iter().any(|entry| match entry {
+        ScopeEntry::Generalized(frame) => frame.name == binding,
+        ScopeEntry::Shadow(name) => *name == binding,
+    });
+    if !in_scope {
+        let declared = instance
+            .declared
+            .as_ref()
+            .expect("an instance with a function is a module's");
+        let function = format!("{trait_}::{function}");
+        let instance = declared.head.clone();
+        let inside =
+            ctx.defining.contains(&binding) || ctx.specializing.iter().any(|s| s.name == binding);
+        let error = if inside {
+            InferError::InstanceCallsItself {
+                function,
+                at: instance,
+            }
+        } else {
+            InferError::InstanceAfterUse { function, instance }
+        };
+        let label = symbolic(expr);
+        ctx.push_error(error, label);
+        return false;
+    }
+    expr.node = TypedExprNode::Var(binding);
+    true
+}
+
 /// Coalesce refinement predicates embedded anywhere in `ty` (see the call
 /// site in `coalesce_node`). Each predicate is an immutable term, so its var
 /// slots are resolved by coalescing a copy and reinstalling it as a fresh
@@ -2487,12 +2650,32 @@ fn coalesce_type_predicates_go(
 // already consumed. See `src/ccl/design/type-inference.md`,
 // "Specialization scope and lifecycle" and "Coalesce ordering and read stability".
 
+/// Whether `ty` holds no inference variable and no type parameter: a type an instance head
+/// can be matched against.
+fn names_no_variable(ty: &Type) -> bool {
+    if matches!(
+        ty,
+        Type::Infer(_) | Type::Param(_) | Type::BarrierVar(_) | Type::Hole
+    ) {
+        return false;
+    }
+    let mut closed = true;
+    ty.walk_children(|child| closed &= names_no_variable(child));
+    closed
+}
+
 /// What a failed specialization pin reports its edge as.
 const PIN_LABEL: &str = "monomorphization specialization";
 
+/// The types of a specialization's named arguments.
+fn types_of(arguments: &[(smol_str::SmolStr, Type)]) -> Vec<Type> {
+    arguments.iter().map(|(_, t)| t.clone()).collect()
+}
+
 /// Rewrite a generalized use to its specialization and stamp the resolved type.
 ///
-/// `frame_idx` identifies the generalized binding in `ctx.scope`. Key the live
+/// `frame_idx` identifies the generalized binding in `ctx.scope`, and `instance_call` says
+/// the use is a trait function's call [`use_instance_function`] made. Key the live
 /// instantiation before pinning; coalesce new clones in the definition's scope,
 /// not the caller's. Memo hits are not pinned again.
 /// See `src/ccl/design/type-inference.md`, "Specialization scope and lifecycle".
@@ -2500,7 +2683,12 @@ const PIN_LABEL: &str = "monomorphization specialization";
 // mutability; the solver relies on identity-by-`uid`, not the mutable payload
 // (matching the solver's module-level allow).
 #[allow(clippy::mutable_key_type)]
-pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) {
+pub(super) fn specialize_use(
+    use_expr: &mut Expr,
+    frame_idx: usize,
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))] instance_call: bool,
+    ctx: &mut CoalesceCtx,
+) {
     // Resolve against the current graph, including pins made before this visit.
     // A use inside another specialization sees that outer clone's pin. Later pins
     // can still add bounds; assert_reads_stable checks the recorded structure.
@@ -2562,10 +2750,14 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     if let Some(spec) = frame.specs.iter().find(|s| shares(s)) {
         // Equal instantiations identify copies of one use only while inference instantiates
         // every use with fresh variables. Two uses in the tree itself are distinct, so where
-        // the key would not share, one of the two is a predicate's copy.
+        // the key would not share, one of the two is a predicate's copy, or both are calls of
+        // a trait function, typed at the operands their call states rather than fresh ones.
         #[cfg(debug_assertions)]
         assert!(
-            (shareable && spec.shareable && spec.key == key) || spec.quoted || ctx.in_predicate > 0,
+            (shareable && spec.shareable && spec.key == key)
+                || spec.quoted
+                || ctx.in_predicate > 0
+                || (spec.instance_call && instance_call),
             "two uses of `{}` in the tree share the instantiation {instantiation}: \
              inference instantiates each use with fresh variables, and only a refinement \
              predicate's copy of a use may carry them (`src/ccl/design/type-inference.md`, \
@@ -2623,6 +2815,54 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     }
     let base_name = frame.name.clone();
     let cutoff = frame.cutoff;
+    // An instance's function reached again while one of its specializations is being built:
+    // at the same types it would never end, and at types containing the specialization's the
+    // chain need not end (`docs/chl-spec.md`, "Declaring an instance").
+    let arguments = if ctx.instance_functions.contains(&base_name) {
+        let arguments = ctx
+            .instances
+            .specialization_arguments(&base_name, &resolved)
+            .unwrap_or_else(|| {
+                vec![(
+                    smol_str::SmolStr::default(),
+                    crate::ccl::ccl_utils::strip_refinements(&resolved),
+                )]
+            });
+        let active: Vec<&ActiveSpecialization> = ctx
+            .specializing
+            .iter()
+            .filter(|s| s.name == base_name)
+            .collect();
+        let function = base_name.base().to_string();
+        let error = if active.iter().any(|s| s.key == key) {
+            Some(InferError::InstanceCallsItself {
+                function,
+                at: resolved.to_string(),
+            })
+        } else {
+            active
+                .iter()
+                .find(|s| {
+                    crate::ccl::infer::solver::containment::all_inside(
+                        &types_of(&s.arguments),
+                        &types_of(&arguments),
+                    )
+                })
+                .map(|s| InferError::InstanceCallContains {
+                    function,
+                    at: arguments.clone(),
+                    within: s.arguments.clone(),
+                })
+        };
+        if let Some(error) = error {
+            let label = symbolic(use_expr);
+            ctx.push_error(error, label);
+            return;
+        }
+        arguments
+    } else {
+        Vec::new()
+    };
     // A monomorphization name carrying the source binding as provenance and a
     // globally-fresh uid for identity — so it can neither capture nor be
     // captured (the uid is what the old `__mono{N}` counter hand-rolled).
@@ -2751,6 +2991,39 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
             obligation.redeliver(&mut cache)
         })
     });
+    // A parameter standing for an associated type is the instance's type at the clone's
+    // operands, which the pin has just delivered: it is defined there, not solved for, so
+    // the clone's copies of what the definition typed through it read that type
+    // (`src/ccl/design/type-parameters.md`, "Specialization").
+    let pinned = pinned.and_then(|()| {
+        let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
+            unreachable!("lookup_generalized returns indices of Generalized entries only");
+        };
+        let members = frame.members.clone();
+        for (member, requirement, name) in &members {
+            let Some((_, standing)) = fresh.params.get(member).cloned() else {
+                continue;
+            };
+            let operands: Option<Vec<Type>> = requirement
+                .args
+                .iter()
+                .map(|a| {
+                    let a = freshen_above(cutoff, a, target, &mut fresh);
+                    resolve_var_type(&a).ok().filter(names_no_variable)
+                })
+                .collect();
+            let Some(operands) = operands else { continue };
+            let Some(associated) =
+                ctx.instances
+                    .associated_at(&requirement.trait_, &operands, name)
+            else {
+                continue;
+            };
+            constrain_subtype(&associated, &standing, &mut cache)?;
+            constrain_subtype(&standing, &associated, &mut cache)?;
+        }
+        Ok(())
+    });
     cache.report_recorded(|| EdgeReport::Labeled(PIN_LABEL.to_string()));
     // The pin added bounds to the clone's copies of the definition's barrier variables,
     // and the walk below compacts them, so they are checked first.
@@ -2784,8 +3057,20 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     let mut kept: Vec<(Option<NodeId>, LocatedInferError)> = Vec::new();
     let before = ctx.errors.len();
     let origins = Rc::new(origins);
-    let suspended = ctx.scope.split_off(frame_idx);
+    //
+    // An instance's function is the exception: a trait function's call in its body may be
+    // answered by the same instance at other types, `Area(Two(T))`'s `area` calling `Area`
+    // at `T`, so its frame stays in scope and that call specializes it again. No source
+    // names the binding, so nothing else reaches it.
+    let suspended = if ctx.instance_functions.contains(&base_name) {
+        ctx.scope.split_off(frame_idx + 1)
+    } else {
+        ctx.scope.split_off(frame_idx)
+    };
     ctx.specializing.push(ActiveSpecialization {
+        name: base_name.clone(),
+        key: key.clone(),
+        arguments,
         at_use: use_expr.node_id(),
         copies: Rc::clone(&origins),
     });
@@ -2854,6 +3139,8 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         instantiation,
         #[cfg(debug_assertions)]
         quoted: ctx.in_predicate > 0,
+        #[cfg(debug_assertions)]
+        instance_call,
         name: spec_name,
         def: clone,
         referenced,
@@ -2914,6 +3201,17 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
         _ => (Rc::from([]), Vec::new()),
     };
     let has_type_params = !own_params.is_empty();
+    let members = requires
+        .iter()
+        .flat_map(|r| {
+            r.assoc.iter().filter_map(|(name, ty)| match ty {
+                Type::Param(p) if own_params.contains(&p.id) => {
+                    Some((p.id, Rc::clone(r), name.clone()))
+                }
+                _ => None,
+            })
+        })
+        .collect();
     let bound_at_annotation = ctx.bound_at_annotation.contains(&binding.name);
     ctx.scope
         .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
@@ -2922,6 +3220,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             cutoff: level,
             bound_at_annotation,
             own_params,
+            members,
             inside_discarded: ctx.discarding,
             held: Vec::new(),
             failed_uses: Vec::new(),

@@ -551,8 +551,9 @@ pub(crate) fn bool_lit_ty(b: bool) -> Type {
 pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
+    instances: &Rc<solver::traits::InstanceTable>,
 ) -> Result<Type, Vec<LocatedInferError>> {
-    run_with_params(expr, sources, &[], &HashSet::new()).map(|(ty, _, _)| ty)
+    run_with_params(expr, sources, instances, &[], &HashSet::new()).map(|(ty, _, _)| ty)
 }
 
 /// The scheme each generalized binding a module check reports was bound at.
@@ -569,6 +570,7 @@ pub(crate) type OpenedVars = HashMap<crate::ccl::InferVarId, Rc<crate::ccl::ty::
 pub(crate) fn run_with_params(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
+    instances: &Rc<solver::traits::InstanceTable>,
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
 ) -> Result<(Type, NotedSchemes, OpenedVars), Vec<LocatedInferError>> {
@@ -581,7 +583,9 @@ pub(crate) fn run_with_params(
             .collect();
         // Seed the blame cursor with the root: every error is stamped with the
         // node whose rule raised it, and the root is the outermost such node.
-        InferCtx::new(translated, expr.node_id())
+        let mut ctx = InferCtx::new(translated, expr.node_id());
+        ctx.instances = Rc::clone(instances);
+        ctx
     };
     let opened = sub_ctx.open_module_params(params).map_err(|e| vec![e])?;
     sub_ctx.reported = reported.clone();
@@ -707,7 +711,11 @@ pub(crate) fn run_with_params(
     // state, so nothing needs to be kept in sync across them.
     // Each coalesce error arrives blamed on the node whose rule raised it, so
     // this pass's (potentially several) errors need no post-hoc attribution.
-    let errors = coalesce_pass(expr, std::mem::take(&mut sub_ctx.bound_at_annotation));
+    let errors = coalesce_pass(
+        expr,
+        std::mem::take(&mut sub_ctx.bound_at_annotation),
+        Rc::clone(instances),
+    );
     if !errors.is_empty() {
         return Err(errors);
     }

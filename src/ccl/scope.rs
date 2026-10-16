@@ -281,6 +281,7 @@ where
         // binder at all.
         N::Lit(_)
         | N::Builtin(_)
+        | N::TraitFn { .. }
         | N::Proj(_)
         | N::Source(..)
         | N::LoadFrom(_)
@@ -562,6 +563,7 @@ where
         // above.
         N::Lit(_)
         | N::Builtin(_)
+        | N::TraitFn { .. }
         | N::Proj(_)
         | N::Source(..)
         | N::LoadFrom(_)
@@ -681,6 +683,12 @@ mod tests {
                 "c",
                 var("pl"),
             ),
+            node(N::TraitFn {
+                trait_: crate::ccl::infer::solver::traits::Trait::addable(),
+                function: "add".into(),
+                operands: vec![Type::Hole],
+                assoc: Vec::new(),
+            }),
             node(N::Method {
                 name: "m".into(),
                 args: 0,
@@ -835,6 +843,7 @@ mod tests {
         N::VariantCtor { .. } => "VariantCtor",
         N::NominalCtor { .. } => "NominalCtor",
         N::Method { .. } => "Method",
+        N::TraitFn { .. } => "TraitFn",
         N::Transact { .. } => "Transact",
         N::LetRec { .. } => "LetRec",
         N::DefGroup { .. } => "DefGroup",

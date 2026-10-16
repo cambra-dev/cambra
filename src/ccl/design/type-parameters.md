@@ -28,7 +28,12 @@ type, both in `ccl/ty.rs`:
   at that level.
 - A `PolyType` holds its parameters in declaration order, each a `PolyParam` (a declared
   `TypeParam` and its kind); its `requires` clause, each requirement a `TraitRequirement` (a
-  trait, its operand types and its associated types by name); and its body.
+  trait, its operand types and the types its associated types are, by name); and its body.
+- An associated type of a requirement the clause names, `a::Output` under
+  `requires a: Addable(T, T)`, is a **member parameter**: a parameter of the `PolyType`, spelled
+  `a::Output`, that the requirement's associated type is, and that a bound in the clause,
+  `a::Output <: T`, gives its kind. It is defined by the requirement's operands rather than chosen
+  by a call ([Instantiation](#instantiation), [Specialization](#specialization)).
 
 A parameter's kind is a `TypeKind`, the kind a `Σ` binder ranges over. Lowering writes `Type` for
 an unbounded parameter and `SubtypesOf(𝐵)` for one bounded by `𝐵`, and refuses every other
@@ -237,8 +242,9 @@ a pair. The conditions the rule mints start from the same assumptions as the obl
 field's condition.
 
 Deposit reads instances and assumptions: once every surviving row agrees on an associated type, it
-is deposited, and it may be a parameter, so `a + b` under `requires Addable(T, T, Output=T)` gives
-the sum type `T`. An assumption that leaves `Output` unnamed leaves the position open in the body.
+is deposited, and it may be a parameter, so `x + y` under `requires a: Addable(T, T)` gives the
+member parameter `a::Output`, below `T` where the clause bounds it `a::Output <: T`. An assumption
+of an unnamed requirement leaves the position open in the body.
 
 The sweep of [Requirements are read together, once](type-inference.md#requirements-are-read-together-once)
 skips an obligation that still holds assumptions: its operand is a parameter, which the sweep's base
@@ -246,10 +252,21 @@ intersection cannot read.
 
 ### Lowering requirements
 
-`lower_requirements` resolves each requirement against the trait table: the name
-(`Trait::compiler_named`), the operand count, and each associated type by name
-(`Assoc::from_surface_name`). Refinements are stripped from every operand, since an instance row
-matches a base whatever its refinements.
+`lower_named_requirements` resolves each requirement against the trait table
+(`lower_trait_type`): the name (`Trait::compiler_named`, or a trait the module declares), the
+operand count, and each associated type by name (`Trait::assoc_named`). Refinements are stripped
+from every operand, since an instance matches a base whatever its refinements. A requirement states
+nothing of what its trait requires of every instance, so a definition under
+`requires Ranked(T, T)` that uses `Same(T, T)` states it too. A named requirement, `a: Area(S)`, is
+also returned with its name at the types the clause writes, for `a::f` in the body. Where the clause
+belongs to a definition with parameters (a `def`, a `forall`, an instance's head, a trait
+function's signature), a named requirement mints a member parameter for each associated type its
+trait declares, and a bound item `a::Output <: 𝐵` gives that parameter the kind `SubtypesOf(𝐵)`; a
+trait function's signature takes no bound yet. A bound with no parameter in it that no instance
+accepting the operands meets is refused (`check_bounds_satisfiable`). An instance's member
+parameters join its head's variables (`TraitInstance::params`), with their bounds in
+`TraitInstance::bounds`, which selection checks against the condition's settled associated types.
+`lower_requirements` lowers a clause that names none, an instance function's restated one.
 
 - **Products of one shape** are read through the product rule, the one instance a product
   satisfies the trait by: the requirement states the trait of each field's components, paired by
@@ -259,13 +276,14 @@ matches a base whatever its refinements.
   refused: no finite type satisfies it.
 - **Otherwise** every operand must be a type parameter or a base type, and the requirement must fit
   some instance: each base where the row has it, associated types included, and each parameter
-  standing for one base throughout. A requirement on bases only is checked and dropped.
+  standing for one base throughout. A requirement on bases only is checked and dropped, unless it
+  names associated types, which each use then reads off the instance.
 
 Any other requirement is refused at the requirement, since no use could satisfy it. `Transaction`
 is refused until
 [chl-spec.md, "8.7 Direction [Decided]: transactions as contextual parameters"](../../../docs/chl-spec.md#87-direction-decided-transactions-as-contextual-parameters)
-is implemented. For the check that every parameter is determined, a parameter that is the
-associated type of a requirement whose operands are determined counts as determined.
+is implemented. For the check that every parameter is determined, a member parameter of a
+requirement whose operands are determined counts as determined.
 
 ---
 
@@ -302,7 +320,11 @@ whose it is, relative to the cutoff:
 | at or below the cutoff: an enclosing definition's | itself |
 
 The clone's pin against the use's instantiation type ties each fresh variable to the use's types
-where the parameter stands in the signature. A `Poly` with a body binds at its annotation, so the
+where the parameter stands in the signature. A member parameter is defined instead: once the pin
+has settled the requirement's operands, `specialize_use` equates its variable with the instance's
+associated type at those operands (`InstanceTable::associated_at`), so what the definition typed
+through it reads that type in the clone. A member whose operands the pin leaves open, as in a clone
+inside a definition still generic, stays the variable the clone's reset obligations settle. A `Poly` with a body binds at its annotation, so the
 pin is one way, clone below use ([type-inference.md, "Specialization scope and
 lifecycle"](type-inference.md#specialization-scope-and-lifecycle), step 5). Where it stands only in
 a bound, as for a parameter `x <: T`, the variable takes the types flowing in through the pinned
@@ -386,7 +408,7 @@ hashed tree holds one after inference.
 the joins and meets the notation cannot write recorded beside it. An annotation mismatch against a
 `Poly` (`InferError::PolyAnnotationMismatch`) uses it for the right-hand side's type, with the
 cutoff at the binding's level, so `pick: forall (T) T => T = inc` reports `inc` as
-`forall (A) A => Int requires Addable(A, Int, Output=Int)`, written in CHL by
+`forall (A) A => Int requires r: Addable(A, Int), r::Output <: Int`, written in CHL by
 `chl_print::chl_inferred_poly`.
 
 - **One term.** The type is compacted together with the operands and associated types of every

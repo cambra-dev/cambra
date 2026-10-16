@@ -1113,6 +1113,13 @@ variables. Two uses in the tree itself are distinct uses, so `specialize_use` as
 builds that a use sharing a clone by its instantiation, where the key would not share it, has at
 least one of the two occurrences inside a refinement predicate.
 
+A trait function's call is the exception. Its use is typed at the operands the call states
+([Trait functions](#trait-functions)), not at fresh variables, so two calls of `a::area` under
+`requires a: Area(𝑇)` carry the same `𝑇`. Whatever reaches either call reaches that one variable,
+so the clone pinned for the first answers the second, as it answers a copy. Their keys can still
+differ, because the first call's pin bounds `𝑇` before the second call's key is read. The
+assertion admits a pair of such calls (`Specialization::instance_call`).
+
 This rests on one invariant: a clone reaches the program only through its use's instantiation,
 since `specialize_use` relates the two by pinning the clone's type against the use's type. A
 variable inside the definition that the instantiation does not mention, such as the element of a
@@ -2935,7 +2942,7 @@ The constraint lattice can state that two positions are **equal** or **related b
 * An **associated type** is a type a trait *names* — `Output`, the type an arithmetic operator's result takes. A trait is a requirement rather than a function, so it associates any number, **including none**. A type is associated only when it *depends* on the types satisfying the trait: a comparison's `Bool` is the same for every pair `Equatable` accepts, so it belongs to the operator's signature and `Equatable` associates nothing — recording it as an association would claim the trait determines something it does not.
 * An **obligation** is what one *use* of a trait records: the demand that some instance fit the type positions at that use — one **operand position** per argument the trait takes, and one **associated position** per type it names. It is a single claim with two halves, and neither alone is the obligation: *the operand positions are types some instance accepts*, **and** *each associated position is what that same instance associates*. Every position is an ordinary inference variable, unrelated to the others.
 
-A signature carries an obligation beside its type — `𝑓 : 𝐴 ⇒ 𝐵 requires MyTrait(𝐴 ⇝ 𝐵)` — and inference must find an instance satisfying it. Nothing about that is operator-specific: obligations ride variables into schemes ([Requirements are generalized](#requirements-are-generalized)), so a function inherits the requirements of the operators in its body, and `λ 𝑎 𝑏 → 𝑎 + 𝑏` is `∀ 𝐴 𝐵 𝑂. 𝐴 ⇒ 𝐵 ⇒ 𝑂 requires Addable(𝐴, 𝐵 ⇝ 𝑂)`. What is missing is only the *surface* — no CHL syntax writes `requires` yet, so every obligation is minted by an operator. (`requires` is the keyword the spec reserves for it, in [transactions as contextual parameters](../../../docs/chl-spec.md#87-direction-decided-transactions-as-contextual-parameters).)
+A signature carries an obligation beside its type — `𝑓 : 𝐴 ⇒ 𝐵 requires MyTrait(𝐴 ⇝ 𝐵)` — and inference must find an instance satisfying it. Nothing about that is operator-specific: obligations ride variables into schemes ([Requirements are generalized](#requirements-are-generalized)), so a function inherits the requirements of the operators in its body, and `λ 𝑎 𝑏 → 𝑎 + 𝑏` is `∀ 𝐴 𝐵 𝑂. 𝐴 ⇒ 𝐵 ⇒ 𝑂 requires Addable(𝐴, 𝐵 ⇝ 𝑂)`. An operator mints one, and so do a `requires` clause at a use ([type-parameters.md](type-parameters.md)) and a call of a trait's function ([Trait functions](#trait-functions)).
 
 An operator's own signature is `𝐴₁ ⇒ … ⇒ 𝐴ₙ ⇒ 𝑅` plus its obligation, for the trait's arity `𝑛`, where `𝑅` is either one of the associated positions or a type the operator fixes. The three shapes the current operators take:
 
@@ -2958,12 +2965,12 @@ determining side from the determined one. An instance is one hyper-edge, and
 resolution is the search for a hyper-edge consistent with what inference has determined
 about the operand positions.
 
-Cambra implements `𝑁 ∈ {1, 2}`, `𝐴 ∈ {0, 1}` (`Output`, or nothing) and **`𝐹 = 0`**,
-with the relation built into the compiler rather than declared in CHL.
+The compiler's traits have `𝑁 ∈ {1, 2}`, `𝐴 ∈ {0, 1}` (`Output`, or nothing) and `𝐹 = 0`. A trait
+a module declares has any `𝑁`, `𝐴` and `𝐹` ([Trait functions](#trait-functions)).
 
-`𝐹 = 0` is a gap rather than a decision. A trait's rows *do* denote distinct
-functions — `Addable(String, String ⇝ String)` is concatenation and
-`Addable(Int, Int ⇝ Int)` is integer addition — and a trait that cannot associate a
+An operator trait's `𝐹 = 0` is a gap rather than a decision. Its rows denote distinct
+functions: `Addable(String, String ⇝ String)` is concatenation and
+`Addable(Int, Int ⇝ Int)` is integer addition, and a trait that cannot associate a
 function cannot say which. The function is therefore recovered twice outside the trait:
 `simplify.rs` rewrites the `String` case to `Concat` (see
 [BinOp type rules](#binop-type-rules)), and the interpreter picks the machine operation
@@ -2971,28 +2978,126 @@ from the operand column's runtime representation (`apply_binop_column`, in
 `src/interpreter/binop.rs`). The type system narrows to a row of types and then declines
 to name the code.
 
-Associating functions, and a CHL surface for declaring the relation, are the two
-extensions this shape exists to take. Traits and instances are already *data*. Every trait is a
-declaration (`TraitDecl`, held by `Trait`): its operands, its associated types and its functions.
-The compiler builds its traits once, as it builds `Option` (`Trait::addable` and the rest). An
-instance (`TraitInstance`) is a head of patterns over its type variables, the associated types it
-fixes, its conditions and its functions; a compiler instance's head names base types. A program's
-instances are its `InstanceTable`, which holds the compiler's, and every obligation reads its
-candidates from it. Both extensions are therefore more data rather than new mechanisms.
+Traits and instances are *data*, one representation for the compiler's and a module's alike.
+Every trait is a declaration (`TraitDecl`, held by `Trait`): its operands, its associated types
+and its functions. The compiler builds its traits once, as it builds `Option` (`Trait::addable` and
+the rest). An instance (`TraitInstance`) is a head of patterns over its type variables, the
+associated types it fixes, its conditions and its functions; a compiler instance's head names base
+types. A program's `InstanceTable` holds the compiler's instances and the ones lowering adds, of
+its traits and of the compiler's. Inference reads every obligation's candidates from that table, so
+a declared trait or instance is a table extension rather than a new mechanism.
 
 #### What the tables hold
 
-An instance names a **pattern** at each operand. The pattern's **head** (`InstanceHead`) is what
-narrowing reads. Every compiler instance accepts **base types only**, and every one is
-homogeneous — `Addable(Int, Int ⇝ Int)`, never `Addable(Int, String ⇝ …)`. Both
-facts are the tables' content, not properties of resolution: nothing in narrowing or
-deposit assumes either. So a trait rejecting a variant is what these rows happen to be,
+An instance names a **pattern** at each operand: a type variable, a base type, or a nominal type
+applied to patterns. The pattern's **head** (`InstanceHead`) is a base type, a nominal type at any
+arguments, or `Any` for a variable standing as the whole operand, which is what narrowing reads. Every compiler instance accepts
+bases only, and every one is homogeneous: `Addable(Int, Int ⇝ Int)`, never
+`Addable(Int, String ⇝ …)`. Two instances overlap when their patterns unify (`unify_all`), which
+lowering refuses. These are the tables' content, not properties of resolution: nothing in
+narrowing or deposit assumes them. So a trait rejecting a variant is what these rows happen to be,
 and not a judgement that such types are incomparable.
 
 The compiler's rows mirror the interpreter's primitives (`apply_binop_column`, in
 `src/interpreter/binop.rs`), so a program inference accepts is one the interpreter can run: there
 is no `Unit` row, since the interpreter compares no units, and no cross-base row, since `Int` and
 `UInt` never join.
+
+A nominal head names no one type, so the requirement sweep deposits nothing for
+it ([Requirements are read together, once](#requirements-are-read-together-once)), and a pin never
+chooses it. An `Any` head accepts every contribution: a base or a nominal type narrows the
+candidates to those with its head or `Any` there, and anything else, a product, a function, a
+variant or a type parameter, to those with `Any` (`narrow_to_variables`). A position some
+candidate takes any type at is no requirement on its own place, so the sweep and a pin skip it.
+
+#### An instance's arguments
+
+Instances of one nominal type at different arguments, `Describe(Two(Int))` and
+`Describe(Two(String))`, share the operand's head, so the operand's declaration leaves both. Once a
+nominal type arrives at a position whose candidates differ below it, the obligation opens an
+**argument position** for each of its arguments (`TraitObligation::expand`). The position's path is
+the operand and the argument indices into the nominal types along the way. A variable standing
+at an argument is watched there, and one already determined is offered at once, so `Int` reaching
+`Two(𝑋)`'s `𝑋` narrows to the first instance as a base reaching an operand would.
+
+A candidate admits a contribution at an argument position when its pattern there is that head, or
+a type variable at or above it; a type variable admits anything, including a product or a type
+parameter. An assumption admits it when it states that type there. An argument position is no
+requirement on its own place, so the requirement sweep reads only operand positions. Narrowing
+at argument positions is not a match: a variable named twice in a head stands for one type, which
+the selected instance's bound enforces, and dispatch matches the whole pattern (`matches`).
+
+#### Selecting a declared instance
+
+A declared instance states its associated types and its conditions over its head's variables,
+`Container(Two(𝑇) ⇝ 𝑇)` or `Area(Two(𝑇)) requires Area(𝑇)`, so they are known only at an
+obligation's operand types. Once a contribution has narrowed an obligation's candidates to one
+declared instance (`TraitObligation::try_select`), its variables become fresh variables `𝛼`, and:
+
+- each operand is bounded **above** by the type the head names there, `Two(𝛼)`. That is what the
+  instance accepts, and the bound carries the operand's arguments into `𝛼`;
+- each associated position receives the instance's type for it, `𝛼` for `Elem`;
+- each condition becomes an obligation of its own at `𝛼`, answered by the instances and by the
+  assumptions in scope where the selecting obligation was minted.
+
+Selection waits for a contribution: a trait with one instance has not chosen it before anything is
+known about the operands, so a definition that calls the trait's function on a parameter states the
+requirement rather than the instance. An obligation an assumption still answers selects nothing.
+
+#### An instance's conditions end
+
+Selecting an instance mints an obligation for each of its conditions, and each of those selects an
+instance in turn. Lowering refuses an instance whose conditions could select without end where the
+instance is declared (`traits::check_conditions_end`), by the rule of `docs/chl-spec.md`,
+"Declaring an instance":
+
+- A type's **depth** is how deeply it nests, a type variable counting 0.
+- Each condition is **no deeper** than the head: its depth is at most the head's, and each type
+  variable stands in it no deeper than at its deepest place in the head. No instantiation then
+  makes the condition deeper than the head.
+- A condition on the instance's own trait, or on a trait not declared before it
+  (`declared_before`), is **shallower**: both comparisons are strict, so every instantiation makes
+  the condition shallower than the head.
+
+Traits are ordered by declaration: the compiler's first, then a module's in source order. Along a
+chain of obligations depth never grows, and a step that keeps the depth moves to an earlier trait.
+Traits are finitely many, so an endless chain would shrink a natural number infinitely often, and
+every chain ends. The check covers every entry of the instance's `requires`, since `try_select`
+mints an obligation for each. `traits::entailed`, lowering's
+check of a trait's requirements at an instance, follows the same conditions and a product's
+components, which are shallower than the product, so it ends too.
+
+An instance is judged by its head, its conditions and the order of the traits they name, all of
+which its module declares or imports. A variable may stand in a condition more often than in the
+head: repeating a variable leaves depth unchanged, and a binary trait at one type,
+`Equatable(𝑇, 𝑇)`, repeats one.
+
+##### Termination rules not taken
+
+Instance resolution is resolution over Horn clauses, for which termination is undecidable; GHC's
+type classes under `UndecidableInstances` are Turing-complete. Each rule here is a sufficient
+condition. The rule above measures terms by depth and orders traits, a level mapping in the terms of
+termination proofs for logic programs (Bezem's recurrent programs; De Schreye and Decorte,
+"Termination of logic programs: the never-ending story").
+
+- **Size, with traits unordered** (GHC's Paterson conditions): each condition has fewer
+  constructors and variables than the head, and no variable more often. It refuses
+  `impl forall (F) Scales(Vec2, F) requires Multipliable(Int, F)`, whose condition has the head's
+  size, and `requires Equatable(T, T)` under a head that names `T` once.
+- **Size within cycles of the instance graph**: only a condition whose instance can reach its own
+  again shrinks. Whether it can depends on instances its module need not see. With traits `P` and
+  `Q` and a type `Pair` in one module,
+  `impl forall (X, Y) P(Pair(Wa(X), Y)) requires Q(Pair(Y, Wa(X)))` in `Wa`'s module and
+  `impl forall (U, V) Q(Pair(Wb(U), V)) requires P(Pair(V, Wb(U)))` in `Wb`'s resolve
+  `P(Pair(Wa(𝑎), Wb(𝑏)))` back to itself, and only a module importing both sees the cycle.
+- **A check along each chain as it resolves**, refusing a condition whose types embed an earlier
+  one's, as Scala's implicit divergence check does and as calls of an instance's function are
+  judged ([Trait functions](#trait-functions)): it reports at a use rather than at the instance.
+- **A depth limit**, as Rust's `recursion_limit` and GHC's `-freduction-depth` impose: it refuses by
+  a number the language does not state.
+- **Coinduction**, answering a goal identical to one being resolved, as GHC's recursive
+  dictionaries and Rust's auto traits do: it ends only a chain that repeats a goal, not one that
+  grows.
 
 ### A product is answered off the table
 
@@ -3041,10 +3146,10 @@ A contribution arriving at a position is one of four things, and each has its ow
 
 | contribution | example | outcome |
 |---|---|---|
-| a **base** | `Int` | narrows the candidate set |
+| a **base** or a **nominal type** | `Int`, `Two(Int)` | narrows the candidate set by its head, and by a nominal type's arguments where the instances differ below it ([An instance's arguments](#an-instances-arguments)) |
 | **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately | nothing to say |
 | a **product** | a tuple, a record | answered componentwise by a structural trait, rejected by every other ([A product is answered off the table](#a-product-is-answered-off-the-table)) |
-| **determined, and neither** | a variant, a function | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
+| **determined, and none of these** | a variant, a function | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
 | a **type parameter** | `T` in `def f(T, x: T)` | answered by a `requires` assumption naming it; otherwise its bound is offered in its place, and with no bound, `MissingRequirement` ([type-parameters.md, "Obligations under assumptions"](type-parameters.md#obligations-under-assumptions)) |
 
 The last is a rejection and not silence, because "no base here" is true of both it and the second. A collection that merely failed to narrow would leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position to strand, so nothing downstream would object either.
@@ -3141,6 +3246,86 @@ That the list is closed is an argument about today's code, not something the com
 ### Requirements are generalized
 
 Obligations ride variables through `freshen_above`, so a generalized function carries its operators' requirements into its scheme. Each use instantiates and resolves its **own** copy — sharing one would let a `String` use empty an `Int` use's candidate set.
+
+### Trait functions
+
+A function read from an instance, `summon(Area(_))::area` or `a::area` under
+`requires a: Area(S)`, is typed by the trait's signature before any instance is chosen, and the
+instance supplies the code once the operand types are known. Its IR node is
+`TypedExprNode::TraitFn`, which lowering builds at the types the trait type or the requirement
+states: a hole where a summon writes `_`, and the requirement's types, its associated types
+included, for a name.
+
+- **Emission** (`emit_trait_fn`) writes the stated operands into the node's operand slots, each
+  hole a fresh variable, places an obligation over them with a variable per associated type, and
+  types the node by the function's signature at those operands: `summon(Area(_))::area` is
+  `𝑆 ⇒ Int` under `Area(𝑆)`. An associated type the node states bounds the one the obligation
+  settles. A signature (`Signature`) is a type over the trait's operands, its associated types and
+  the function's own type parameters; the last are fresh at each call, and the function's
+  `requires` clause becomes obligations there, as a generic definition's does at a use. An
+  argument no instance accepts fails the obligation where it arrives, as an operator's operand
+  does. A `let` binding a name to a function of an instance is generalized (`should_generalize`),
+  so each use of the name opens the signature afresh.
+- **A requirement's name** chooses no instance. Under `requires a: Area(S)`, `a::area` is the node
+  at `Area(S)`, whose obligation the assumption `Area(S)` answers, as it answers
+  `summon(Area(_))::area` applied to an `S`. Each use of the definition passes the instance its
+  types pick, so specialization chooses the instance either way.
+- **Coalescing** resolves the operand slots and finds the one instance the resolved operands match
+  (`matching_instance`). The slots are type slots, so a generalized definition's specialization
+  clone freshens them with the rest of the clone, and each clone chooses its own instance. A walk
+  whose types are dropped chooses nothing. No `TraitFn` survives inference.
+  - An instance's functions are `def`s, which lowering binds where the `impl` stands, each
+    under a name the instance records. Before anything reads the node, `use_instance_function`
+    makes it a use of that name with the node's own type, the signature at the call's types, and
+    the use then specializes as any use of a generalized definition does, pinned against that type
+    ([Specialization scope and lifecycle](#specialization-scope-and-lifecycle)); a monomorphic
+    function's use is an ordinary reference. A name not in the walk's scope is a function declared
+    below the call, or the monomorphic function the call is inside, which reaches itself, and
+    each is reported.
+  - An instance's function may be reached from one of its own specializations at other types:
+    `Area(Two(𝑇))`'s `area` calls `Area` at `𝑇`. A clone is coalesced in its definition's scope,
+    which leaves out the definition's own frame, so an instance function's frame is kept there
+    (`instance_functions`); no source names the binding, so only such a call reaches it. Each
+    specialization finishes before the one that calls it, so the splice order stays callees
+    first. A use whose key matches a specialization of the same function still being built
+    would never end, and is reported (`InstanceCallsItself`). So is a use whose types contain
+    those of a specialization of the same function still being built (`InstanceCallContains`):
+    the types the use gives the head's variables and the function's own type parameters
+    (`InstanceTable::specialization_arguments`), each compared with the one at its place by
+    homeomorphic embedding (`solver::containment`). Every infinite sequence of types has an
+    earlier one embedded in a later one, so every chain of accepted uses ends. The check
+    compares a new specialization with the active ones of its own function, skipping each pair
+    where the earlier type is bigger, and memoizes each pair of subterms, so it costs
+    `O(𝑑 · |𝑠| · |𝑡|)` for `𝑑` active specializations.
+
+The obligation and the choice read the same heads, so the one instance a resolved operand matches
+is the one its obligation narrowed to.
+
+An instance's functions are a `DefGroup`, as a type's own `impl` block's are
+([A definition group is emitted in the order its references need](#a-definition-group-is-emitted-in-the-order-its-references-need)).
+A call is a reference to one of them once its obligation has selected the instance at the
+instance's own types: the head, matched against the operands' bounds so far, binds each of its
+variables to the parameter the enclosing function opened for it. The member is then emitted first
+(`bind_selected_instance_function`), so each function is bound after the ones of its instance it
+calls, and two that call each other at the instance's types are a cycle. An application emits its
+argument before its function, so `emit_trait_fn` asks before the argument reaches the operands, and
+`emit_apply` asks again once it has (`Typing::bind_instance_function_called`). A call at other
+types is answered by another instance or by an assumption, or by this instance at other types,
+which the chain rule at coalesce judges, and orders nothing.
+
+#### A trait's requirements
+
+A trait states what every instance requires of its types (`TraitDecl::requires`), over its operands
+and associated types. An instance is checked where it is declared: each requirement of its trait at
+the instance's types (`Trait::requirements_at`) must hold (`traits::entailed`) by an assumption of the
+instance's own clause, a product's components for a structural trait, or an instance declared above
+whose head matches and whose conditions hold in turn.
+
+A requirement of the trait states nothing of these: `requires Ranked(T, T)` adds no assumption of
+`Same(T, T)`, so a definition under it that uses `Same` at `T` requires it too. The requirements
+the trait's clause names (`TraitDecl::named`) are read only by each instance's functions, which
+lowering gives the names at the instance's types, beside the names the instance's own clause
+binds.
 
 ---
 

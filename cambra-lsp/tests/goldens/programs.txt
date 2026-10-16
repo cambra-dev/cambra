@@ -492,6 +492,7 @@ symbols:
   variable inc 52:1-52:18 (name 52:1-52:4)
   variable held 53:1-53:28 (name 53:1-53:5)
   variable apply 54:1-54:22 (name 54:1-54:6)
+  variable n 69:1-69:42 (name 69:1-69:2)
 folds:
   1-5 comment
   12-13

@@ -505,6 +505,7 @@ pub(super) fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
         | ChlExpr::GenExp(_)
         | ChlExpr::Yield(_)
         | ChlExpr::Feed { .. }
+        | ChlExpr::Summon { .. }
         | ChlExpr::Block(_) => {}
     }
 }

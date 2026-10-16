@@ -96,6 +96,7 @@ const BROKEN: &[(&str, &str, &str)] = &[
         "terminal_in_agg[pool]",
         "CompilerRejects",
     ),
+    ("trait_instance_body", "rows_sum", "CompilerPanics"),
     ("txn_reply", "generator_max", "CompilerRejects"),
     ("txn_write_rhs", "generator_max", "CompilerRejects"),
 ];
@@ -329,6 +330,76 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             t = ({}, 2)
             out << t.0 + t.1
+        "#}},
+        Skeleton { name: "trait_function_argument", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            type Box = Int
+            trait Area(S):
+                def area(s: S) => Int
+            impl Area(Box):
+                def area(s):
+                    s.extract() * 2
+
+            out = test_sink()
+            out << summon(Area(_))::area(Box::new({}))
+        "#}},
+        Skeleton { name: "trait_instance_body", hole: Ty::Int, scope: &[("n", Ty::Int)], body: indoc! {r#"
+            type Box = Int
+            trait Area(S):
+                def area(s: S, k: Int) => Int
+            impl Area(Box):
+                def area(s, n):
+                    {}
+
+            out = test_sink()
+            out << summon(Area(_))::area(Box::new(1), 5)
+        "#}},
+        Skeleton { name: "trait_instance_chain", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            type Box = Int
+            type One(T) = T
+            trait Area(S):
+                def area(s: S) => Int
+            impl Area(Box):
+                def area(s):
+                    s.extract()
+            impl forall (T) Area(One(T)) requires Area(T):
+                def area(s):
+                    summon(Area(_))::area(s.extract()) + 1
+
+            out = test_sink()
+            out << summon(Area(_))::area(One::new(One::new(Box::new({}))))
+        "#}},
+        Skeleton { name: "trait_function_value", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            type Box = Int
+            type Pair = {Int, Int}
+            trait Area(S):
+                def area(s: S) => Int
+            impl Area(Box):
+                def area(s):
+                    s.extract() * 2
+            impl Area(Pair):
+                def area(s):
+                    s.extract().0 * s.extract().1
+            f = summon(Area(_))::area
+
+            out = test_sink()
+            out << f(Box::new({})) + f(Pair::new((3, 4)))
+        "#}},
+        Skeleton { name: "trait_generic_use", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            type Box = Int
+            type Two(T) = {T, T}
+            trait Area(S):
+                def area(s: S) => Int
+            impl Area(Box):
+                def area(s):
+                    s.extract()
+            impl forall (T) Area(Two(T)) requires Area(T):
+                def area(s):
+                    summon(Area(_))::area(s.extract().0) + summon(Area(_))::area(s.extract().1)
+            def total(s):
+                summon(Area(_))::area(s)
+
+            out = test_sink()
+            out << total(Two::new((Box::new({}), Box::new(1))))
         "#}},
         Skeleton { name: "function_arg", hole: Ty::Int, scope: &[], body: indoc! {r#"
             def fn_under_test(n):

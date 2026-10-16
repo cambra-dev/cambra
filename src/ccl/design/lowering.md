@@ -50,7 +50,8 @@ default parameters.
 `lower_call` resolves a call's name through `SurfaceBuiltin::from_name`, the table in
 [design-chl-parser.md, "Surface builtins"](../../../chl-parser/design-chl-parser.md#surface-builtins),
 before it consults scope. A `Function`-kind builtin lowers in its own arm, and a call of the wrong
-arity is refused. Any other name, including a builtin of another kind, lowers as a call to a
+arity is refused. A call of the `Qualifier`-kind `summon` is refused: the parser reads
+`summon(T)::f` itself. Any other name, including a builtin of another kind, lowers as a call to a
 registered source when one has that name and as an ordinary application otherwise. A zero-argument
 call to such a name that no registered source has is refused, because an ordinary application needs
 an argument; `begin()` and `test_sink()` in expression position are refused this way. The `with`
