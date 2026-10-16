@@ -216,6 +216,46 @@ struct Traits {
     /// The requirements each trait's `requires` clause names, by the trait's name, which its
     /// instances' functions read.
     named: BTreeMap<String, Scope>,
+    /// The order of each constructor's argument, by its type and its name, as the declaration
+    /// writes it (`docs/chl-spec.md`, "Equality and order").
+    orders: BTreeMap<(String, String), ValueOrder>,
+}
+
+/// How a value of a type a declaration writes is ordered: each product by its fields in the
+/// order the declaration writes them, a tuple's being `_0`, `_1`, ….
+#[derive(Clone, PartialEq)]
+enum ValueOrder {
+    /// By the value's own order.
+    Whole,
+    Fields(Vec<(String, ValueOrder)>),
+}
+
+impl ValueOrder {
+    /// The order of the type `ty` a declaration writes.
+    fn written(ty: &Expr) -> ValueOrder {
+        match ty {
+            Expr::BraceRefinement { base, .. } => ValueOrder::written(&base.node),
+            Expr::BraceRecord(fields) => ValueOrder::Fields(
+                fields
+                    .iter()
+                    .map(|f| (f.name.to_string(), ValueOrder::written(&f.value.node)))
+                    .collect(),
+            ),
+            Expr::BraceGroup(parts) if !parts.is_empty() => ValueOrder::positions(parts),
+            _ => ValueOrder::Whole,
+        }
+    }
+
+    /// The order of a tuple of the types `parts` a declaration writes.
+    fn positions(parts: &[Spanned<Expr>]) -> ValueOrder {
+        ValueOrder::Fields(
+            parts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (format!("_{i}"), ValueOrder::written(&p.node)))
+                .collect(),
+        )
+    }
 }
 
 /// A nominal type as its declaration writes it.
@@ -519,8 +559,35 @@ fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
             ]),
         },
     )]);
+    let mut orders: BTreeMap<(String, String), ValueOrder> = BTreeMap::new();
     for stmt in body {
         if let Stmt::TypeDecl(decl) = &stmt.node {
+            let ty = decl.name.node.to_string();
+            match &decl.body {
+                TypeDeclBody::Single(t) => {
+                    orders.insert(
+                        (ty.clone(), "new".to_string()),
+                        ValueOrder::written(&t.node),
+                    );
+                }
+                TypeDeclBody::Constructors(ctors) => {
+                    for c in ctors {
+                        let order = match c.params.as_slice() {
+                            [one] => ValueOrder::written(&one.ty.node),
+                            several => ValueOrder::Fields(
+                                several
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, p)| {
+                                        (format!("_{i}"), ValueOrder::written(&p.ty.node))
+                                    })
+                                    .collect(),
+                            ),
+                        };
+                        orders.insert((ty.clone(), c.name.node.to_string()), order);
+                    }
+                }
+            }
             let ctors = match &decl.body {
                 chl_parser::ast::TypeDeclBody::Single(ty) => {
                     BTreeMap::from([("new".to_string(), vec![ty.node.clone()])])
@@ -549,6 +616,7 @@ fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
         instances: Vec::new(),
         declared,
         named,
+        orders,
     };
     for stmt in body {
         let Stmt::Impl(block) = &stmt.node else {
@@ -1705,8 +1773,8 @@ impl Interp {
         binop(op, l, r)
     }
 
-    /// `l op r` for a comparison (`docs/chl-spec.md`, "3.4 Comparisons"): equal values are the
-    /// same value, and an ordering compares by [`Self::order`].
+    /// `l op r` for a comparison, by value (`docs/chl-spec.md`, "Equality and order"): equal
+    /// values are the same value, and an ordering compares by [`Self::order`].
     fn comparison(&mut self, op: CmpOp, l: Value, r: Value) -> Result<Value, Error> {
         if any_pending([&l, &r]) {
             return Ok(Value::Pending);
@@ -1725,30 +1793,66 @@ impl Interp {
         }))
     }
 
-    /// The order of two values: a base's own, and a tuple's lexicographically by position.
+    /// The order of two values: a base's own, a tuple's lexicographically by position, and a
+    /// nominal value's by its constructor's argument in the order its declaration writes it.
     fn order(&self, l: &Value, r: &Value) -> Result<std::cmp::Ordering, Error> {
         match (l, r) {
             (Value::Int(a), Value::Int(b)) => Ok(a.cmp(b)),
             (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
             (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
-            (Value::Record(a), Value::Record(b)) => {
-                for i in 0..a.len() {
-                    let name = format!("_{i}");
-                    let field = |v: &[(String, Value)]| {
-                        v.iter()
-                            .find(|(n, _)| *n == name)
-                            .map(|(_, x)| x.clone())
-                            .ok_or_else(|| Error(format!("a tuple has no field `{name}`")))
-                    };
-                    match self.order(&field(a)?, &field(b)?)? {
-                        std::cmp::Ordering::Equal => continue,
-                        other => return Ok(other),
-                    }
+            (Value::Record(a), Value::Record(_)) => {
+                let positions = (0..a.len()).map(|i| (format!("_{i}"), ValueOrder::Whole));
+                self.order_by(l, r, &ValueOrder::Fields(positions.collect()))
+            }
+            (
+                Value::Nominal {
+                    ty,
+                    ctor,
+                    payload: a,
+                },
+                Value::Nominal {
+                    ty: other_ty,
+                    ctor: other,
+                    payload: b,
+                },
+            ) if ty == other_ty && ctor == other => {
+                match self.traits.orders.get(&(ty.clone(), ctor.clone())) {
+                    Some(order) => self.order_by(a, b, order),
+                    None => self.order(a, b),
                 }
-                Ok(std::cmp::Ordering::Equal)
             }
             _ => err(format!("{l} and {r} have no order")),
         }
+    }
+
+    /// The order of `l` and `r` by `order`: each field in turn, until one differs.
+    fn order_by(
+        &self,
+        l: &Value,
+        r: &Value,
+        order: &ValueOrder,
+    ) -> Result<std::cmp::Ordering, Error> {
+        let ValueOrder::Fields(fields) = order else {
+            return self.order(l, r);
+        };
+        let (Value::Record(a), Value::Record(b)) = (l, r) else {
+            return err(format!(
+                "{l} and {r} are not the products their order reads"
+            ));
+        };
+        let field = |v: &[(String, Value)], name: &str| {
+            v.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, x)| x.clone())
+                .ok_or_else(|| Error(format!("a product has no field `{name}`")))
+        };
+        for (name, inner) in fields {
+            match self.order_by(&field(a, name)?, &field(b, name)?, inner)? {
+                std::cmp::Ordering::Equal => continue,
+                other => return Ok(other),
+            }
+        }
+        Ok(std::cmp::Ordering::Equal)
     }
 
     /// The greatest value of collection `c`'s, or the least, by [`Self::order`]. Not defined
@@ -3447,8 +3551,8 @@ mod tests {
         assert_eq!(v.to_string(), "[() -> 6]");
     }
 
-    /// An arithmetic operator on nominal values calls its instance's function
-    /// (`docs/chl-spec.md`, "Declaring an instance").
+    /// An arithmetic operator on nominal values calls its instance's function, and a
+    /// comparison compares by value (`docs/chl-spec.md`, "Equality and order").
     #[test]
     fn an_operator_on_nominal_values() {
         let v = out(indoc! {r#"
@@ -3462,20 +3566,38 @@ mod tests {
                 Output = Money
                 def neg(x):
                     Money::new(0 - x.extract())
+            impl Equatable(Money, Money)
+            impl Orderable(Money, Money)
             m = Money::new(1) + Money::new(2)
-            out << (m.extract(), (-m).extract(), summon(Addable(_, _))::add(1, 2))
+            out << (m.extract(), (-m).extract(), m == Money::new(3), m < Money::new(2), max([m, Money::new(9)]).extract())
         "#});
-        assert_eq!(v.to_string(), "[() -> (_0: 3, _1: -3, _2: 3)]");
+        assert_eq!(
+            v.to_string(),
+            "[() -> (_0: 3, _1: -3, _2: true, _3: false, _4: 9)]"
+        );
     }
 
-    /// A tuple orders lexicographically by position, and `max` reads it so.
+    /// A nominal value orders by its constructor's argument, a record its declaration writes
+    /// by its fields as written, and a tuple lexicographically by position.
     #[test]
-    fn a_tuple_orders_lexicographically() {
+    fn a_nominal_value_orders_as_its_declaration_writes() {
         let v = out(indoc! {r#"
             out = test_sink()
-            out << ((1, 2) < (1, 3), (2, 0) > (1, 9), max([(1, 2), (2, 0), (1, 9)]).0)
+            type Person = {age: Int, name: String}
+            type Version:
+                version(major: Int, minor: Int)
+            impl Equatable(Person, Person)
+            impl Orderable(Person, Person)
+            impl Equatable(Version, Version)
+            impl Orderable(Version, Version)
+            a = Person::new((age=3, name="b"))
+            b = Person::new((age=4, name="a"))
+            out << (a < b, max([a, b]).extract().name, Version::version(1, 9) < Version::version(2, 0), (1, 2) < (1, 3))
         "#});
-        assert_eq!(v.to_string(), "[() -> (_0: true, _1: true, _2: 2)]");
+        assert_eq!(
+            v.to_string(),
+            "[() -> (_0: true, _1: \"a\", _2: true, _3: true)]"
+        );
     }
 
     /// Two single-constructor types share the constructor `new`, and a value names its type,

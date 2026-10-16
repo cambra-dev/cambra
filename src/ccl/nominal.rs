@@ -48,16 +48,8 @@ fn option_declaration() -> Rc<NominalDecl> {
         false,
     );
     decl.define(vec![
-        NominalCtor {
-            name: V_NONE.name().into(),
-            span,
-            params: Vec::new(),
-        },
-        NominalCtor {
-            name: V_SOME.name().into(),
-            span,
-            params: vec![(None, Type::Param(t))],
-        },
+        NominalCtor::unwritten(V_NONE.name().into(), span, Vec::new()),
+        NominalCtor::unwritten(V_SOME.name().into(), span, vec![(None, Type::Param(t))]),
     ])
     .expect("`some` names `T`");
     decl
@@ -159,9 +151,87 @@ pub struct NominalCtor {
     pub span: Span,
     /// The declared parameters: the name each is documented by, and its type.
     pub params: Vec<(Option<SmolStr>, Type)>,
+    /// Each parameter's order, as the declaration writes its type, positionally.
+    pub orders: Vec<WrittenOrder>,
+}
+
+/// How a value of a type a declaration writes is ordered (`docs/chl-spec.md`, "Equality and
+/// order"): each product by its fields in the order the declaration writes them.
+///
+/// A record type has no order of its own, so the order of a record in a constructor's
+/// parameter types is the declaration's, kept here rather than read off [`Type::Record`],
+/// whose fields no pass keeps in any order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WrittenOrder {
+    /// By the type's own order: a base type, a type parameter or a nominal type. A type
+    /// with no order, such as a function, is one too, and no `Orderable` instance accepts
+    /// it, nor a record a type argument names in place of a type parameter.
+    Whole,
+    /// A product, by its fields in this order, each by its own order.
+    Fields(Vec<(FieldKey, WrittenOrder)>),
+    /// A record the declaration does not write, reached through an alias: it has no order.
+    Unordered,
+}
+
+impl WrittenOrder {
+    /// The order of `ty` where no declaration writes it: a tuple by position, and a record
+    /// none.
+    pub fn of_type(ty: &Type) -> WrittenOrder {
+        match ty.peel_refinements() {
+            Type::Tuple(elems) => WrittenOrder::Fields(
+                elems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (FieldKey::Index(i), WrittenOrder::of_type(t)))
+                    .collect(),
+            ),
+            Type::Record(_) => WrittenOrder::Unordered,
+            _ => WrittenOrder::Whole,
+        }
+    }
+
+    /// Whether every product this order reaches has an order.
+    pub fn is_ordered(&self) -> bool {
+        match self {
+            WrittenOrder::Whole => true,
+            WrittenOrder::Fields(fields) => fields.iter().all(|(_, o)| o.is_ordered()),
+            WrittenOrder::Unordered => false,
+        }
+    }
 }
 
 impl NominalCtor {
+    /// A constructor whose parameter types no declaration writes, ordered as
+    /// [`WrittenOrder::of_type`] reads them.
+    pub fn unwritten(name: SmolStr, span: Span, params: Vec<(Option<SmolStr>, Type)>) -> Self {
+        let orders = params
+            .iter()
+            .map(|(_, t)| WrittenOrder::of_type(t))
+            .collect();
+        NominalCtor {
+            name,
+            span,
+            params,
+            orders,
+        }
+    }
+
+    /// The order of [`payload`](Self::payload): its one parameter's, or its parameters' by
+    /// position.
+    pub fn payload_order(&self) -> WrittenOrder {
+        match self.orders.as_slice() {
+            [] => WrittenOrder::Whole,
+            [one] => one.clone(),
+            several => WrittenOrder::Fields(
+                several
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| (FieldKey::Index(i), o.clone()))
+                    .collect(),
+            ),
+        }
+    }
+
     /// The type of the one argument the constructor takes: `Unit` for none, the
     /// parameter's type for one, and their tuple for several. `Shape::rect(w: Int, h: Int)`
     /// takes `{Int, Int}`.
@@ -956,11 +1026,11 @@ mod tests {
             Span::new(FileId::ROOT, 0, 0),
             false,
         );
-        let ctor = NominalCtor {
-            name: "c".into(),
-            span: Span::new(FileId::ROOT, 0, 0),
-            params: vec![(None, shape(Type::Param(t)))],
-        };
+        let ctor = NominalCtor::unwritten(
+            "c".into(),
+            Span::new(FileId::ROOT, 0, 0),
+            vec![(None, shape(Type::Param(t)))],
+        );
         decl.define(vec![ctor])
             .map_err(|p| p.spelling.to_string())?;
         Ok(decl.body().variances[0])
@@ -1024,11 +1094,11 @@ mod tests {
             Span::new(FileId::ROOT, 0, 0),
             false,
         );
-        decl.define(vec![NominalCtor {
-            name: "c".into(),
-            span: Span::new(FileId::ROOT, 0, 0),
-            params: vec![(None, Type::fun(Type::Param(t.clone()), Type::Param(t)))],
-        }])
+        decl.define(vec![NominalCtor::unwritten(
+            "c".into(),
+            Span::new(FileId::ROOT, 0, 0),
+            vec![(None, Type::fun(Type::Param(t.clone()), Type::Param(t)))],
+        )])
         .expect("`T` is used");
         let (input, output) = (Type::Base(BaseType::Bool), int());
         let arg = split(input.clone(), output.clone());
@@ -1049,11 +1119,11 @@ mod tests {
                 Span::new(FileId::ROOT, 0, 0),
                 false,
             );
-            decl.define(vec![NominalCtor {
-                name: "c".into(),
-                span: Span::new(FileId::ROOT, 0, 0),
-                params: vec![(None, variance_shape(Type::Param(u)))],
-            }])
+            decl.define(vec![NominalCtor::unwritten(
+                "c".into(),
+                Span::new(FileId::ROOT, 0, 0),
+                vec![(None, variance_shape(Type::Param(u)))],
+            )])
             .expect("U is used");
             decl
         };
@@ -1079,11 +1149,11 @@ mod tests {
         let span = Span::new(FileId::ROOT, 0, 0);
         let t = TypeParam::declared("T");
         let decl = NominalDecl::declared("N".into(), vec![t.clone()], span, false);
-        decl.define(vec![NominalCtor {
-            name: "c".into(),
+        decl.define(vec![NominalCtor::unwritten(
+            "c".into(),
             span,
-            params: vec![(None, refine(int(), "declared")), (None, Type::Param(t))],
-        }])
+            vec![(None, refine(int(), "declared")), (None, Type::Param(t))],
+        )])
         .expect("`c` names `T`");
         let argument = refine(int(), "written");
         assert_eq!(

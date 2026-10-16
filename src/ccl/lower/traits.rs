@@ -20,9 +20,11 @@ use smol_str::SmolStr;
 use super::*;
 use crate::ccl::infer::solver::traits::{
     Assoc, DeclaredAt, Implementation, InstanceHead, InstanceTable, ProductReading, Signature,
-    Trait, TraitDecl, TraitFunction, TraitInstance, entailed, replace_params, unify_all,
+    Trait, TraitDecl, TraitFunction, TraitInstance, compares_by_value, entailed, replace_params,
+    unify_all,
 };
-use crate::ccl::ty::{PolyParam, TraitRequirement, TypeKind, TypeParam, TypeParamId};
+use crate::ccl::nominal::WrittenOrder;
+use crate::ccl::ty::{FieldKey, PolyParam, TraitRequirement, TypeKind, TypeParam, TypeParamId};
 use crate::ccl::{Expr, Name, Type, TypedBinding, TypedExprNode};
 use crate::chl_parser::ast::{
     AnnotationMode, Expr as ChlExpr, FunctionSignature, ImplBlock, Param, QualifiedName, Spanned,
@@ -563,15 +565,6 @@ fn declare_instance(
     ctx: &mut LoweringContext,
 ) -> Result<(), LoweringError> {
     let written = format!("{trait_}(…)");
-    if trait_.is_compiler() && trait_.functions().is_empty() {
-        return Err(LoweringError::unsupported(
-            block.ty.span,
-            format!(
-                "`{trait_}` is an operator's trait, which declares no function an instance \
-                 could define; an instance of one is not supported yet"
-            ),
-        ));
-    }
     if block.args.len() != trait_.arity() {
         return Err(LoweringError::unsupported(
             block.ty.span,
@@ -753,6 +746,9 @@ fn declare_instance(
         ));
     }
     check_conditions_end(&trait_, &operands, &requires, &head, block, ctx)?;
+    if trait_ == Trait::equatable() || trait_ == Trait::orderable() {
+        check_comparison_instance(&trait_, &operands, &requires, &head, block, &ctx.instances)?;
+    }
     // What the trait requires of every instance holds at this one's types, by the instances
     // declared above it and what this one requires.
     for needed in trait_.requirements_at(&operands, &assoc) {
@@ -992,6 +988,95 @@ fn deepest_written_leaf(ty: &Type, at: usize) -> Option<usize> {
     if leaf { Some(at) } else { deepest }
 }
 
+/// Check an instance of `Equatable` or `Orderable`, which compare by value
+/// (`docs/chl-spec.md`, "Equality and order"): the head names one nominal type twice, and
+/// each of its constructors' arguments compares by value, there and in order.
+fn check_comparison_instance(
+    trait_: &Trait,
+    operands: &[Type],
+    requires: &[Rc<TraitRequirement>],
+    head: &str,
+    block: &ImplBlock,
+    instances: &InstanceTable,
+) -> Result<(), LoweringError> {
+    let refuse = |message: String| Err(LoweringError::unsupported(block.ty.span, message));
+    let [one, other] = operands else {
+        unreachable!("`{trait_}` is over two types")
+    };
+    if one != other {
+        return refuse(format!(
+            "`impl {head}` relates two different types; a comparison is by value, so an \
+             instance of `{trait_}` names one type twice"
+        ));
+    }
+    let Type::Nominal(decl, args) = one else {
+        unreachable!("an instance's head names a nominal type, and this one names one type")
+    };
+    let ctors = &decl.body().ctors;
+    let orderable = *trait_ == Trait::orderable();
+    if orderable && ctors.len() != 1 {
+        return refuse(format!(
+            "`impl {head}`: `{}` has {} constructors, which have no order; only a type with \
+             one constructor is orderable",
+            decl.name,
+            ctors.len()
+        ));
+    }
+    for ctor in ctors {
+        // A constructor with no parameters holds nothing to compare: its value is its name.
+        if ctor.params.is_empty() {
+            continue;
+        }
+        let payload = decl.instantiate(
+            &crate::ccl::ccl_utils::strip_refinements(&ctor.payload()),
+            args,
+        );
+        if orderable && !ctor.payload_order().is_ordered() {
+            return refuse(format!(
+                "`impl {head}`: `{}::{}`'s argument holds a record its declaration does not \
+                 write, whose fields have no order; write the record in `{}`'s declaration",
+                decl.name, ctor.name, decl.name
+            ));
+        }
+        if !compares_as_written(trait_, &payload, &ctor.payload_order(), requires, instances) {
+            return refuse(format!(
+                "`impl {head}`: `{}::{}`'s argument is `{}`, which is not `{trait_}`; a \
+                 nominal type compares by its constructor's argument",
+                decl.name,
+                ctor.name,
+                crate::ccl::chl_print::chl_type(&payload)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether values of `ty`, a constructor's argument ordered as its declaration writes it,
+/// `order`, compare by value under `trait_`: each product the declaration writes by its
+/// components, a record among them in the order its fields are written, and every other type
+/// as [`compares_by_value`] reads it, where a record has no order.
+fn compares_as_written(
+    trait_: &Trait,
+    ty: &Type,
+    order: &WrittenOrder,
+    requires: &[Rc<TraitRequirement>],
+    instances: &InstanceTable,
+) -> bool {
+    let each = |t: &Type, o: &WrittenOrder| compares_as_written(trait_, t, o, requires, instances);
+    match (order, ty.peel_refinements()) {
+        (WrittenOrder::Fields(fields), Type::Record(types)) => fields.iter().all(|(key, o)| {
+            types
+                .iter()
+                .find(|(n, _)| matches!(key, FieldKey::Name(k) if k == n))
+                .is_some_and(|(_, t)| each(t, o))
+        }),
+        (WrittenOrder::Fields(fields), Type::Tuple(elems)) if fields.len() == elems.len() => {
+            fields.iter().zip(elems).all(|((_, o), t)| each(t, o))
+        }
+        _ => compares_by_value(trait_, ty, requires, instances),
+    }
+}
+
 /// A pattern of an instance's head: a type variable, a base type, or a nominal type applied
 /// to patterns (`docs/chl-spec.md`, "Declaring an instance").
 fn instance_pattern(
@@ -1111,6 +1196,10 @@ pub(super) fn lower_instance(
             None => TypedBinding::new_unannotated(name),
         };
         lowered.push((binding, func));
+    }
+    // An instance of a trait that declares no function binds nothing.
+    if lowered.is_empty() {
+        return Ok(body);
     }
     Ok(ctx.tag_image(Expr::def_group(lowered, body), span))
 }

@@ -73,6 +73,27 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("nested_mut_source", "map_arrow", "CompilerPanics"),
     ("nested_mut_source", "map_lit", "CompilerPanics"),
     ("nested_mut_source", "union", "CompilerRejects"),
+    (
+        "nominal_key_groupby",
+        "binder_in_comp_filter[x]",
+        "CompilerPanics",
+    ),
+    (
+        "nominal_key_groupby",
+        "binder_in_corr_filter[x]",
+        "CompilerPanics",
+    ),
+    (
+        "nominal_key_join",
+        "binder_in_comp_filter[x]",
+        "CompilerPanics",
+    ),
+    (
+        "nominal_key_join",
+        "binder_in_corr_filter[x]",
+        "CompilerPanics",
+    ),
+    ("nominal_key_join", "rows_sum", "CompilerPanics"),
     ("record_in_list", "comp_sum", "CompilerRejects"),
     ("record_in_list", "filtered_sum", "CompilerRejects"),
     ("record_in_list", "generator_max", "CompilerRejects"),
@@ -366,6 +387,41 @@ fn skeletons() -> Vec<Skeleton> {
                 t += Money::new({})
             out = test_sink()
             out << t.extract()
+        "#}},
+        Skeleton { name: "nominal_key_guard", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
+            type Money = Int
+            impl Equatable(Money, Money)
+            impl Orderable(Money, Money)
+
+            out = test_sink()
+            out << sum([x for x in [1, 2, 3] if Money::new(x) < Money::new({})])
+        "#}},
+        Skeleton { name: "nominal_key_groupby", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
+            type Money = Int
+            impl Equatable(Money, Money)
+            impl Orderable(Money, Money)
+
+            g = groupby([1, 2, 3, 4], \x -> Money::new(x + {}))
+            out = test_sink()
+            out << sum([max(grp) for grp in g])
+        "#}},
+        Skeleton { name: "nominal_key_join", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
+            type Money = Int
+            impl Equatable(Money, Money)
+            impl Orderable(Money, Money)
+
+            xs = [Money::new(x + {}) for x in [1, 2, 3]]
+            ys = [Money::new(y) for y in [2, 3, 4]]
+            out = test_sink()
+            out << sum([a.extract() for a in xs for b in ys if a == b])
+        "#}},
+        Skeleton { name: "nominal_extreme", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
+            type Money = Int
+            impl Equatable(Money, Money)
+            impl Orderable(Money, Money)
+
+            out = test_sink()
+            out << max([Money::new(x + {}) for x in [1, 2]]).extract()
         "#}},
         Skeleton { name: "trait_function_argument", hole: Ty::Int, scope: &[], body: indoc! {r#"
             type Box = Int

@@ -866,7 +866,8 @@ equality. A wider record is not compared only on its shared fields. A tuple orde
 lexicographically: by its first components, then, where they are equal, by its second, and so on,
 each component supporting the ordering comparators. A record does not order, since its fields have
 no order. Collection elements are not product fields, so these rules do not provide collection
-equality or order.
+equality or order. A nominal type compares as its declaration states
+([Equality and order](#equality-and-order)).
 
 `is` and `is not` are not operators. Membership `in` and `not in` are specified in
 [Membership expressions](#membership-expressions-decided).
@@ -886,8 +887,9 @@ _ in _ : forall (C, E) {e: E, c: C} => Bool requires Iterable(C, Item=E), Equata
   `FullMap`. Key membership in a map is `k in m.keys()`. `k in m` with `k: K` is a type error,
   since the items of `m` are `(K, V)`.
 - **The item type is `Equatable`.** A nominal item type has membership only through an
-  `Equatable` instance, and declaring one is **[Open]**. A collection whose items are collections
-  has no membership test. A type with an `Iterable` instance has `in` with no further instance.
+  `Equatable` instance ([Equality and order](#equality-and-order)). A collection whose items are
+  collections has no membership test. A type with an `Iterable` instance has `in` with no further
+  instance.
 - **A wider `e` widens the collection.** `List`, `Set` and `Map` are covariant, so with
   `ks: List(Key)` and `Key` a refinement of `String`, `"x" in ks` is checked at `List(String)`.
 - **Readiness follows checked lookup**
@@ -3006,12 +3008,11 @@ associated functions, so whatever name it takes is unavailable to every type dec
 - **A declared nominal type satisfies the traits its module declares instances of**
   ([Declaring an instance](#declaring-an-instance)), and no other. None is inherited from the
   constructors' parameter types: `type Price = {Int where _ >= 0}` is not `Addable` because `Int`
-  is. An instance of an arithmetic operator's trait defines the operator on its values. An
-  instance of `Equatable` or `Orderable`, which would let them be compared and make them keys of a
-  `Set`, a `Map` or a `groupby`, is **[Planned]**; until then those are errors on its values.
-  Deriving an instance from the constructors, as with Rust's `#[derive]`, is **[Open]**. The
-  nominal builtins `Set`, `Map` and `FullMap` satisfy the built-in instances of `Iterable`, which
-  the compiler provides.
+  is. An instance of an arithmetic operator's trait defines the operator on its values, and an
+  instance of `Equatable` or `Orderable` lets them be compared and makes them keys of a `Set`, a
+  `Map` or a `groupby` ([Equality and order](#equality-and-order)). Deriving an instance from the
+  constructors, as with Rust's `#[derive]`, is **[Open]**. The nominal builtins `Set`, `Map` and
+  `FullMap` satisfy the built-in instances of `Iterable`, which the compiler provides.
 - **The type of a nominal value is fixed by the expression that produced it.** Every producer of a
   value names the same nominal type, so a method and a trait requirement resolve the same way
   wherever the value flows.
@@ -3326,14 +3327,14 @@ requirement names one as it names these, which are built in:
 two operands of one listed type. A tuple or record satisfies `Equatable` only against the same
 product, and a tuple satisfies `Orderable` only against a tuple of the same length
 ([3.4 Comparisons](#34-comparisons)). A listed instance's `Output` is its operand type, so the sum
-of two `Int`s is an `Int`. A nominal type satisfies an arithmetic operator's trait where its module
-declares an instance ([Declaring an instance](#declaring-an-instance)).
+of two `Int`s is an `Int`. A nominal type satisfies these traits where its module declares an
+instance ([Equality and order](#equality-and-order)).
 
 - **An operator calls its trait's function.** `a + b` is `summon(Addable(_, _))::add(a, b)`, and
   `-a` is `summon(Negatable(_))::neg(a)`. The compiler's instances run the built-in operation:
   `add` of two strings joins them.
-- **A comparison calls no function.** `Equatable` and `Orderable` declare none, and an instance of
-  either is **[Planned]**.
+- **A comparison calls no function.** `Equatable` and `Orderable` compare values by value
+  ([Equality and order](#equality-and-order)), so an instance of either defines nothing.
 
 - **A named requirement binds its instance.** In `def total(S, s: S) => Int requires a: Area(S)`,
   `a` is the instance each call passes, and `a::area(s)` calls its `area`
@@ -3505,8 +3506,8 @@ trait Scales(V, F):
 
 ```ebnf
 impl_stmt   ::= "impl" [ "forall" "(" Ident ( "," Ident )* [ "," ] ")" ]
-                trait_name "(" expression ( "," expression )* ")" [ requires_clause ] ":"
-                NEWLINE INDENT impl_item+ DEDENT
+                trait_name "(" expression ( "," expression )* ")" [ requires_clause ]
+                ( ":" NEWLINE INDENT impl_item+ DEDENT | NEWLINE )
 impl_item   ::= Ident "=" expression NEWLINE | def_stmt
 ```
 
@@ -3605,6 +3606,61 @@ impl forall (T) Area(Two(T)) requires a: Area(T):
   exponent is a non-negative `Int` whichever instance answers it
   ([3.3 Arithmetic and logical operators](#33-arithmetic-and-logical-operators)), so an instance
   of `Exponentiable` names `Int` as its second operand.
+- **An instance of a trait that declares no function has no block.** `impl Equatable(Money, Money)`
+  is the whole declaration. A type's own `impl` block declares at least one function.
+
+#### Equality and order
+
+```python
+type Money = Int
+type Person = {age: Int, name: String}
+type Version:
+    new(major: Int, minor: Int)
+type Two(T) = {T, T}
+
+impl Equatable(Money, Money)
+impl Orderable(Money, Money)
+impl Equatable(Person, Person)
+impl Orderable(Person, Person)      # by age, then name
+impl Equatable(Version, Version)
+impl Orderable(Version, Version)    # by major, then minor
+impl forall (T) Equatable(Two(T), Two(T)) requires Equatable(T, T)
+impl forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T, T)
+```
+
+- **Two values are equal when they are the same value.** `Equatable` and `Orderable` declare no
+  function, and an instance defines none: `==` compares a nominal value's constructor and its
+  constructor's argument, as it compares a product's components. No instance redefines equality,
+  so a key of a `Set`, a `Map` or a `groupby` and the equality a join or a refinement states mean
+  one thing everywhere. A grouping or a comparison by something coarser names it at the use, as
+  `groupby(names, lower)` does.
+- **A nominal type opts in.** An instance names one nominal type twice, and every constructor's
+  argument must compare by value where the instance's `requires` clause holds: a base type the
+  compiler compares, a product of such types, or a nominal type with its own instance, declared
+  above. A constructor with no parameters compares by its name alone. `impl Equatable(F, F)` for
+  `type F = Int => Int` is an error at the `impl`, since no function is `Equatable`.
+- **What orders by value is equal by value.** `Orderable(A, B)` requires `Equatable(A, B)`
+  ([Declaring a trait](#declaring-a-trait)), so an instance of `Orderable` needs one of `Equatable`
+  at its types. A requirement is not transitive: a definition that compares `T`'s values with `==`
+  under `requires Orderable(T, T)` requires `Equatable(T, T)` too.
+- **A nominal type's order is the order its declaration writes.** An orderable type has one
+  constructor. Its values order by the constructor's argument: several parameters
+  lexicographically, in the order they are written. A parameter whose type is a record type,
+  `{age: Int, name: String}`, orders by its fields in the order they are listed, and so does a
+  record type that is a field or a tuple component of it. `Person` orders by `age`, then `name`.
+  Reordering a declaration's parameters or fields changes the order.
+- **A type with no written order is not orderable.** A type with several constructors is not,
+  since its constructors have no order ([Declaring a nominal type](#declaring-a-nominal-type)).
+  Any record other than one the declaration lists has no order: one named by an alias, as in
+  `type P = PersonFields`, or passed as a type argument, as in `type P = Two({b: Int, a: Int})`.
+  Each is an error at the `impl`.
+- **`Option` compares by value where its argument does.** The compiler declares
+  `impl forall (T) Equatable(Option(T), Option(T)) requires Equatable(T, T)`, as it declares
+  `Option`, so `Option::some(1) == Option::none` is `False` and an `Option` is a key of a `groupby`.
+  `Option` has two constructors, so it is not orderable.
+- **`max` and `min` read the same order.** `max([Person::new((age=3, name="a")), …])` is the
+  greatest value in it by `age`, then `name`. Every field takes part, so no two different values
+  tie.
 
 #### Traits and instances across modules [Decided]
 

@@ -47,12 +47,12 @@ use crate::ccl::{Refinement, application_order, subst::open_codomain};
 /// filter.
 pub(super) fn insert_per_group_filters(
     expr: &mut Expr,
-    witnesses: &mut Witnesses,
+    ctx: &mut PlanningCtx,
 ) -> Result<(), String> {
     let mut result = Ok(());
     expr.walk_children_mut(|child| {
         if result.is_ok() {
-            result = insert_per_group_filters(child, witnesses);
+            result = insert_per_group_filters(child, ctx);
         }
     });
     result?;
@@ -91,11 +91,7 @@ pub(super) fn insert_per_group_filters(
     // The filter evaluates its predicate per value, so it is planned as a `restrict`'s
     // predicate is ([`iterate::planned_restrict`]): a collection it aggregates is an
     // iteration site.
-    let value_predicate = plan_lifted(
-        value_predicate,
-        PlanningPhase::InsertPerGroupFilters,
-        witnesses,
-    )?;
+    let value_predicate = plan_lifted(value_predicate, PlanningPhase::InsertPerGroupFilters, ctx)?;
     let narrowed = site_codomain
         .domain()
         .expect("a per-group filter site returns a collection");

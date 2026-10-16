@@ -605,7 +605,11 @@ fn build_join_plan(
 /// `refinement` is the join predicate over the n-tuple domain; it must decompose into
 /// single-arm equality conditions (see [`collect_join_conditions`]).  Returns `None` if the
 /// condition graph is disconnected or any condition spans more than one arm per side.
-fn plan_loop_join(arm_types: &[Type], refinement: &Expr) -> Option<(JoinPlan, Vec<usize>)> {
+fn plan_loop_join(
+    arm_types: &[Type],
+    refinement: &Expr,
+    instances: &Rc<InstanceTable>,
+) -> Option<(JoinPlan, Vec<usize>)> {
     let n = arm_types.len();
     if n < 2 {
         trace!("plan_loop_join: tuple has {} elements, need at least 2", n);
@@ -640,9 +644,9 @@ fn plan_loop_join(arm_types: &[Type], refinement: &Expr) -> Option<(JoinPlan, Ve
         let mut key_a = raw_a.clone();
         let mut key_b = raw_b.clone();
         replace_tuple_project_with_id(&mut key_a, &arm_types[arm_a]);
-        typecheck(&key_a).ok()?;
+        typecheck_in(&key_a, instances).ok()?;
         replace_tuple_project_with_id(&mut key_b, &arm_types[arm_b]);
-        typecheck(&key_b).ok()?;
+        typecheck_in(&key_b, instances).ok()?;
 
         trace!(
             "plan_loop_join: condition arm{arm_a}={} : {}  arm{arm_b}={} : {}",
@@ -700,7 +704,12 @@ fn flatten_tuple_types(indices_to_flatten: &[i64], a: &Type, b: &Type) -> Type {
 ///
 /// Each key and residual predicate it places is a term lifted out of the join condition, and
 /// its id goes to `lifted` for [`try_hash_join_rewrite`] to plan once the join is built.
-fn join_plan_to_expr(plan: &JoinPlan, types: &[Type], lifted: &mut Vec<NodeId>) -> Expr {
+fn join_plan_to_expr(
+    plan: &JoinPlan,
+    types: &[Type],
+    instances: &Rc<InstanceTable>,
+    lifted: &mut Vec<NodeId>,
+) -> Expr {
     match plan {
         // For loop joins (including the trivial one-branch sort), iterate a tuple
         // type consisting of the types of just the arms in this join.
@@ -714,7 +723,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type], lifted: &mut Vec<NodeId>) 
         // and op-conversion recognises it as a filter-free iteration.
         JoinPlan::Loop { arms, predicate } => {
             let base_iteration = if arms.len() == 1 {
-                match convert_refinement_to_join(&types[arms[0]], lifted) {
+                match convert_refinement_to_join(&types[arms[0]], instances, lifted) {
                     Some(transformed) => {
                         trace!(
                             "Converted iteration to {} : {}",
@@ -776,7 +785,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type], lifted: &mut Vec<NodeId>) 
             // Build side: group by the build key using converse.
             // Use the full build output tuple type so that converse groups entire
             // build tuples (not just the key arm), preserving all arms through the join.
-            let build_input = join_plan_to_expr(build, types, lifted);
+            let build_input = join_plan_to_expr(build, types, instances, lifted);
             let build_output_ty = build_input.ty.codomain().unwrap().clone();
             let build_key = if let Some(build_key_idx) = build_key_idx {
                 typed_compose(vec![
@@ -798,7 +807,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type], lifted: &mut Vec<NodeId>) 
                 Type::data_fun(build_output_ty.clone(), build_output_ty.clone()),
             );
             let build_side = apply_primitive(build_key, Builtin::Converse, converse_ty);
-            typecheck(&build_side).expect("Bad build expr");
+            typecheck_in(&build_side, instances).expect("Bad build expr");
 
             trace!(
                 "join_plan_to_expr: build_side={} : {}",
@@ -808,7 +817,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type], lifted: &mut Vec<NodeId>) 
 
             // Probe side: compose the probe key with the build side lookup.
             // Use the full probe output tuple type for the same reason.
-            let probe_input = join_plan_to_expr(probe, types, lifted);
+            let probe_input = join_plan_to_expr(probe, types, instances, lifted);
             let probe_output_ty = probe_input.ty.codomain().unwrap().clone();
             let probe_key = if let Some(probe_key_idx) = probe_key_idx {
                 typed_compose(vec![
@@ -824,7 +833,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type], lifted: &mut Vec<NodeId>) 
             };
 
             let probe_expr = typed_compose(vec![probe_key, build_side]);
-            typecheck(&probe_expr).expect("Bad probe expr");
+            typecheck_in(&probe_expr, instances).expect("Bad probe expr");
 
             trace!(
                 "join_plan_to_expr: probe={} : {}",
@@ -924,7 +933,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type], lifted: &mut Vec<NodeId>) 
                 map_domain
             };
 
-            typecheck(&result).expect("Bad hash join expr");
+            typecheck_in(&result, instances).expect("Bad hash join expr");
             result
         }
     }
@@ -945,16 +954,16 @@ fn lifted_copy(term: &Expr, lifted: &mut Vec<NodeId>) -> Expr {
 fn plan_lifted_terms(
     expr: &mut Expr,
     lifted: &[NodeId],
-    witnesses: &mut Witnesses,
+    ctx: &mut PlanningCtx,
 ) -> Result<usize, String> {
     if lifted.contains(&expr.node_id()) {
-        *expr = plan_lifted(take(expr), PlanningPhase::MarkIterationSites, witnesses)?;
+        *expr = plan_lifted(take(expr), PlanningPhase::MarkIterationSites, ctx)?;
         return Ok(1);
     }
     let mut planned = Ok(0);
     expr.walk_children_mut(|child| {
         if let Ok(n) = planned {
-            planned = plan_lifted_terms(child, lifted, witnesses).map(|m| n + m);
+            planned = plan_lifted_terms(child, lifted, ctx).map(|m| n + m);
         }
     });
     planned
@@ -964,7 +973,12 @@ fn plan_lifted_terms(
 ///
 /// Delegates to [`plan_loop_join`] to build a [`JoinPlan`], then to [`join_plan_to_expr`]
 /// to generate the CCL output. Returns `None` if the pattern does not match.
-fn convert_loop_join(base_ty: &Type, refinement: &Expr, lifted: &mut Vec<NodeId>) -> Option<Expr> {
+fn convert_loop_join(
+    base_ty: &Type,
+    refinement: &Expr,
+    instances: &Rc<InstanceTable>,
+    lifted: &mut Vec<NodeId>,
+) -> Option<Expr> {
     trace!(
         "convert_loop_join: base_ty={}, refinement={} : {}",
         base_ty,
@@ -977,9 +991,9 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr, lifted: &mut Vec<NodeId>
         trace!("convert_loop_join: base_ty is not a tuple");
         return None;
     };
-    let (plan, arm_order) = plan_loop_join(arm_types, refinement)?;
+    let (plan, arm_order) = plan_loop_join(arm_types, refinement, instances)?;
     trace!("convert_loop_join: planning succeeded. Plan:\n{plan:#?}");
-    let expr = join_plan_to_expr(&plan, arm_types, lifted);
+    let expr = join_plan_to_expr(&plan, arm_types, instances, lifted);
 
     // The morphism produces the join-satisfying extent; surface that on its
     // codomain so downstream consumers (e.g. a `cast({base | r} ⇒ …)` reading
@@ -1047,7 +1061,7 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr, lifted: &mut Vec<NodeId>
         Type::data_fun(canonical_ty.clone(), canonical_ty.clone()),
     );
     let result = refine_extent(result, refinement);
-    typecheck(&result).expect("Bad permute_domain expr");
+    typecheck_in(&result, instances).expect("Bad permute_domain expr");
     Some(result)
 }
 
@@ -1060,7 +1074,11 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr, lifted: &mut Vec<NodeId>
 /// a chain: when several are joinable, which one becomes the join is a free
 /// choice a cost model may later make, and the rest remain filters either way.
 /// `None` for an unrefined domain or when no refinement forms a join.
-fn convert_refinement_to_join(domain_ty: &Type, lifted: &mut Vec<NodeId>) -> Option<Expr> {
+fn convert_refinement_to_join(
+    domain_ty: &Type,
+    instances: &Rc<InstanceTable>,
+    lifted: &mut Vec<NodeId>,
+) -> Option<Expr> {
     let Type::Refinement(base, refinements) = domain_ty else {
         return None;
     };
@@ -1077,7 +1095,7 @@ fn convert_refinement_to_join(domain_ty: &Type, lifted: &mut Vec<NodeId>) -> Opt
         );
         // `convert_loop_join` only reads the predicate (it builds a new expr),
         // so borrow the immutable term rather than clone it.
-        convert_loop_join(&rest, &r.predicate, lifted)
+        convert_loop_join(&rest, &r.predicate, instances, lifted)
     })
 }
 
@@ -1106,7 +1124,7 @@ fn convert_refinement_to_join(domain_ty: &Type, lifted: &mut Vec<NodeId>) -> Opt
 pub(super) fn try_hash_join_rewrite(
     expr: &mut Expr,
     domain_ty: &Type,
-    witnesses: &mut Witnesses,
+    ctx: &mut PlanningCtx,
 ) -> bool {
     trace!(
         "Attempting hash-join rewrite at iteration site: {}",
@@ -1156,7 +1174,8 @@ pub(super) fn try_hash_join_rewrite(
         provenance::Nature::Machinery,
     );
     let mut lifted = Vec::new();
-    let Some(mut transformed) = convert_refinement_to_join(domain_ty, &mut lifted) else {
+    let Some(mut transformed) = convert_refinement_to_join(domain_ty, &ctx.instances, &mut lifted)
+    else {
         trace!("Hash-join pattern did not match");
         return false;
     };
@@ -1164,7 +1183,7 @@ pub(super) fn try_hash_join_rewrite(
     // iterate-then-restricts chain, which plans the same refinement as one `restrict` and
     // reports what fails. The attempt records its witness decisions on a copy, kept only
     // when the join is, so the fallback decides each witness afresh.
-    let mut attempt = witnesses.clone();
+    let mut attempt = ctx.clone();
     match plan_lifted_terms(&mut transformed, &lifted, &mut attempt) {
         Ok(planned) => assert_eq!(
             planned,
@@ -1173,7 +1192,7 @@ pub(super) fn try_hash_join_rewrite(
         ),
         Err(_) => return false,
     }
-    *witnesses = attempt;
+    *ctx = attempt;
     // The whole domain, not the refinement the recogniser accepted:
     // `join_plan_to_expr` re-enters `convert_refinement_to_join` on an arm's own
     // refinement for a nested join, three frames below this guard and with no
@@ -1220,7 +1239,12 @@ mod tests {
         let refinement = var("ref").with_ty(int_ty_val.clone());
 
         // Base type is not a tuple, should return None
-        let result = convert_loop_join(&int_ty_val, &refinement, &mut Vec::new());
+        let result = convert_loop_join(
+            &int_ty_val,
+            &refinement,
+            &InstanceTable::builtin(),
+            &mut Vec::new(),
+        );
         assert_eq!(result, None);
     }
 
@@ -1235,7 +1259,12 @@ mod tests {
         let refinement = var("ref").with_ty(int_ty_val.clone());
 
         // Refinement is not a valid join condition, should return None
-        let result = convert_loop_join(&triple_tuple, &refinement, &mut Vec::new());
+        let result = convert_loop_join(
+            &triple_tuple,
+            &refinement,
+            &InstanceTable::builtin(),
+            &mut Vec::new(),
+        );
         assert_eq!(result, None);
     }
 
@@ -1246,7 +1275,12 @@ mod tests {
         let refinement = var("ref").with_ty(int_ty_val.clone());
 
         // Refinement is not a compose, should return None
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &mut Vec::new());
+        let result = convert_loop_join(
+            &tuple_ty_val,
+            &refinement,
+            &InstanceTable::builtin(),
+            &mut Vec::new(),
+        );
         assert_eq!(result, None);
     }
 
@@ -1265,7 +1299,12 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &mut Vec::new());
+        let result = convert_loop_join(
+            &tuple_ty_val,
+            &refinement,
+            &InstanceTable::builtin(),
+            &mut Vec::new(),
+        );
         assert_eq!(result, None);
     }
 
@@ -1283,7 +1322,12 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &mut Vec::new());
+        let result = convert_loop_join(
+            &tuple_ty_val,
+            &refinement,
+            &InstanceTable::builtin(),
+            &mut Vec::new(),
+        );
         assert_eq!(result, None);
     }
 
@@ -1302,7 +1346,12 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &mut Vec::new());
+        let result = convert_loop_join(
+            &tuple_ty_val,
+            &refinement,
+            &InstanceTable::builtin(),
+            &mut Vec::new(),
+        );
         assert_eq!(result, None);
     }
 
@@ -1330,7 +1379,12 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &mut Vec::new());
+        let result = convert_loop_join(
+            &tuple_ty_val,
+            &refinement,
+            &InstanceTable::builtin(),
+            &mut Vec::new(),
+        );
         assert_eq!(result, None);
     }
 
@@ -1354,7 +1408,12 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &mut Vec::new());
+        let result = convert_loop_join(
+            &tuple_ty_val,
+            &refinement,
+            &InstanceTable::builtin(),
+            &mut Vec::new(),
+        );
         assert_eq!(result, None);
     }
 
@@ -1379,7 +1438,12 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &mut Vec::new());
+        let result = convert_loop_join(
+            &tuple_ty_val,
+            &refinement,
+            &InstanceTable::builtin(),
+            &mut Vec::new(),
+        );
         assert_eq!(result, None);
     }
 
@@ -1413,7 +1477,12 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &mut Vec::new());
+        let result = convert_loop_join(
+            &tuple_ty_val,
+            &refinement,
+            &InstanceTable::builtin(),
+            &mut Vec::new(),
+        );
         assert_eq!(result, None);
     }
 
@@ -1455,7 +1524,12 @@ mod tests {
         });
 
         // Should successfully convert
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &mut Vec::new());
+        let result = convert_loop_join(
+            &tuple_ty_val,
+            &refinement,
+            &InstanceTable::builtin(),
+            &mut Vec::new(),
+        );
         assert!(
             result.is_some(),
             "convert_loop_join should succeed with valid hash join pattern"
@@ -1825,7 +1899,7 @@ mod tests {
         });
 
         // Should succeed: eq condition drives the hash join, filter becomes a predicate.
-        let result = convert_loop_join(&t, &refinement, &mut Vec::new());
+        let result = convert_loop_join(&t, &refinement, &InstanceTable::builtin(), &mut Vec::new());
         assert!(
             result.is_some(),
             "convert_loop_join should succeed when eq conditions + extra filter are present"
@@ -1855,7 +1929,7 @@ mod tests {
         .with_ty(fun_ty(t.clone(), bool_ty_val));
 
         assert_eq!(
-            convert_loop_join(&t, &filter, &mut Vec::new()),
+            convert_loop_join(&t, &filter, &InstanceTable::builtin(), &mut Vec::new()),
             None,
             "should return None when no equality conditions are present"
         );
