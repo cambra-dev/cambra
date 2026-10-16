@@ -366,7 +366,7 @@ if_stmt         ::= "if" expression ":" block
                     [ "else" ":" block ]
 
 match_stmt      ::= "match" expression ":" NEWLINE INDENT case_arm+ DEDENT
-case_arm        ::= "case" case_pattern ":" ( block | expression NEWLINE )  -- the second [Decided]
+case_arm        ::= "case" case_pattern ":" ( block | expression NEWLINE )
 case_pattern    ::= "`" ident [ "(" ( ident | "_" ) ")" ]
                  |  "_"
 
@@ -2122,7 +2122,6 @@ payload, with no nesting, no literal patterns, and no per-arm guard.
 
 #### An arm on its `case` line
 
-**[Decided]**, not implemented: the parser takes an arm's body only as an indented block today.
 An arm whose body is one expression may write it on the `case` line, after the `:`, in place of
 the indented block:
 
