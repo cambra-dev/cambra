@@ -19,7 +19,7 @@ use cambra::interpreter::{
 use indoc::{formatdoc, indoc};
 use rstest_log::rstest;
 
-use crate::helpers::*;
+use super::helpers::*;
 
 // ---------------------------------------------------------------------------
 // Multi-generator comprehensions / joins

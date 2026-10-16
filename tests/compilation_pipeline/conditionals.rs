@@ -9,7 +9,7 @@ use cambra::interpreter::{ColumnValue, Tile, Value};
 use indoc::{formatdoc, indoc};
 use rstest_log::rstest;
 
-use crate::helpers::*;
+use super::helpers::*;
 
 // BUG: the right operand need not be defined once the left fixes the result.
 // These programs must return the given Bool without evaluating division by zero.

@@ -28,7 +28,7 @@ use cambra::ccl::FieldKey;
 use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::interpreter::Consumer;
 
-use crate::helpers::*;
+use super::helpers::*;
 
 /// A `Value::Union` at the named `tag` carrying `inner`.
 fn union(tag: &str, inner: Value) -> Value {

@@ -9,7 +9,7 @@ use cambra::interpreter::{ColumnValue, Predicate, Tile, Value, tuple_field};
 use indoc::indoc;
 use rstest_log::rstest;
 
-use crate::helpers::*;
+use super::helpers::*;
 
 // ---------------------------------------------------------------------------
 // Basic list comprehensions

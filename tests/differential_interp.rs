@@ -9,8 +9,7 @@
 //! A case the two are known to disagree on pins both answers, so a change to either side
 //! fails the pin.
 
-#[path = "support/differential.rs"]
-mod differential;
+use crate::differential;
 
 use chl_interp::{Collection, Value};
 use differential::{Compiled, run_compiled, run_interpreted};

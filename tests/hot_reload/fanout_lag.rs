@@ -26,8 +26,8 @@ use cambra::{
     live_program::{LiveProgram, MAIN_BRANCH},
 };
 
-use crate::harness::{OneFile, stdin_across_reload};
-use crate::serving::no_main;
+use super::harness::{OneFile, stdin_across_reload};
+use super::serving::no_main;
 
 const ITEMS: &str = r#"["a", "b", "c", "d", "e", "f", "g", "h"]"#;
 

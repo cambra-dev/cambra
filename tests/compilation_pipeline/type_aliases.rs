@@ -7,7 +7,7 @@
 
 use indoc::indoc;
 
-use crate::helpers::{check_compile_error, check_scalar};
+use super::helpers::{check_compile_error, check_scalar};
 
 use cambra::ccl::BaseType;
 use cambra::ccl::lower::{RESERVED_TYPE_NAMES, is_builtin_type_name};

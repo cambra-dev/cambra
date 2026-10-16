@@ -19,7 +19,7 @@
 //! seed and `CAMBRA_FUZZ_N` the number of chains, the same two knobs the
 //! order fuzz reads.
 
-mod type_gen;
+use crate::type_gen;
 
 use cambra::ccl::Type;
 use cambra::ccl::infer::solver::{ConstrainCache, constrain_subtype};

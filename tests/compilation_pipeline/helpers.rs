@@ -14,7 +14,7 @@
 //! Unlike the unit tests in each module, these tests validate the composition
 //! of all passes together.
 //!
-//! Each themed module reaches these via `use crate::helpers::*;`.
+//! Each themed module reaches these via `use super::helpers::*;`.
 //!
 //! ## Timeout budget
 //!
@@ -43,7 +43,7 @@ use cambra::interpreter::{
 use cambra::pretty_graph::VizOptions;
 use cambra::pretty_tree::InspectNode;
 
-use crate::panic_message::panic_message;
+use super::panic_message::panic_message;
 
 // ---------------------------------------------------------------------------
 // Helpers — CCL pipeline path

@@ -4,7 +4,7 @@ use bit_set::BitSet;
 use indoc::indoc;
 use rstest::rstest;
 
-use crate::helpers::{check_compile_error, check_scalar, check_tile};
+use super::helpers::{check_compile_error, check_scalar, check_tile};
 
 use cambra::interpreter::{ColumnValue, Predicate, Tile, Value};
 

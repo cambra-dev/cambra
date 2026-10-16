@@ -10,7 +10,7 @@ use cambra::pretty_graph::pretty_tile_operator;
 use indoc::indoc;
 use rstest_log::rstest;
 
-use crate::helpers::*;
+use super::helpers::*;
 
 // ---------------------------------------------------------------------------
 // Operator-graph shape: no spurious fan-outs for simple binops
