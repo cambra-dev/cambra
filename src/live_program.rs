@@ -559,21 +559,16 @@ impl LiveProgram {
             .ok_or_else(|| BranchError::Unknown(name.to_string()))
     }
 
-    /// The compiled program branch `name` runs.
-    pub fn program(&self, name: &str) -> Option<&CompiledProgram> {
-        let at = self.index_of(name).ok()?;
-        Some(&self.branches[at].program)
-    }
-
-    /// Branch `name`'s version number.
+    /// The compiled program branch `name` runs, with its version number.
     ///
-    /// Bumped by every accepted reload of the branch and by nothing else, and
-    /// never repeated under the name: a branch deleted and created again
-    /// continues from its tombstone. So a change in this number is exactly a
-    /// change in what [`program`](Self::program) answers for `name`.
-    pub fn version(&self, name: &str) -> Option<u64> {
+    /// The number changes on every accepted reload of the branch and on its
+    /// creation after a delete, and is never repeated under the name: a
+    /// re-created branch continues from its tombstone. So a change in the
+    /// number is a change in the program.
+    pub fn program(&self, name: &str) -> Option<(u64, &CompiledProgram)> {
         let at = self.index_of(name).ok()?;
-        Some(self.branches[at].version)
+        let branch = &self.branches[at];
+        Some((branch.version, &branch.program))
     }
 
     /// Branch `name`'s `main` output's producer, for a driver to pull.
