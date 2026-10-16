@@ -11,12 +11,11 @@ use crate::ccl::infer::solver::{
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::infer_var::{Telescope, TelescopeWalk};
-use crate::ccl::provenance;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, BindingTransparency, Builtin, Expr, FieldKey, Level, Name, Refinement, RefinementSet,
-    Type, TypedBinding, TypedExpr, TypedExprNode,
+    BaseType, BindingTransparency, Builtin, Expr, FieldKey, Level, Name, Type, TypedBinding,
+    TypedExprNode,
 };
 
 use super::emit::{
@@ -28,7 +27,7 @@ use super::emit::{
 use super::schemes::OperatorSchemes;
 use super::typing::{LetScheme, Typing, escaped_opaque_binders};
 use super::{lit_base, map_constrain_err};
-use crate::ccl::infer::solver::traits::{Assoc, Trait, offered_base};
+use crate::ccl::infer::solver::traits::{Assoc, InstanceHead, Trait, offered_head};
 use crate::util::ScopeStack;
 use std::collections::HashMap;
 
@@ -227,6 +226,17 @@ impl Typing for CheckCtx {
         scheme.instantiate_in(self.level, &self.telescope)
     }
 
+    fn instances_of(
+        &self,
+        trait_: &Trait,
+    ) -> Vec<std::rc::Rc<crate::ccl::infer::solver::traits::TraitInstance>> {
+        trait_.compiler_instances.clone()
+    }
+
+    fn assumptions_in_scope(&self) -> &[std::rc::Rc<crate::ccl::ty::TraitRequirement>] {
+        &[]
+    }
+
     fn normalize(&mut self, ann: &Type) -> Type {
         // A fully-typed tree carries no `Hole`s, so normalization is the
         // identity; refinements are kept (as everywhere else).
@@ -250,15 +260,17 @@ impl Typing for CheckCtx {
         if matches!(base, Type::Infer(_)) {
             return Ok(base);
         }
-        let _f = provenance::enter(
+        let _f = crate::ccl::provenance::enter(
             operator_node_id,
             "check.require_trait",
-            provenance::Nature::Machinery,
+            crate::ccl::provenance::Nature::Machinery,
         );
-        let args: Vec<TypedExpr> = operand_exprs.iter().map(|e| (*e).clone()).collect();
+        let args: Vec<crate::ccl::TypedExpr> = operand_exprs.iter().map(|e| (*e).clone()).collect();
         Ok(Type::Refinement(
             Box::new(base),
-            RefinementSet::one(Refinement::born_from_template(refinement, &args)),
+            crate::ccl::RefinementSet::one(crate::ccl::Refinement::born_from_template(
+                refinement, &args,
+            )),
         ))
     }
 
@@ -271,6 +283,14 @@ impl Typing for CheckCtx {
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError> {
+        // A declared trait is required only by a trait function's call and by a `requires`
+        // clause, and inference replaces the one and monomorphizes the other away.
+        if !trait_.is_compiler() {
+            unreachable!(
+                "the declared trait `{}` is required after inference",
+                trait_.name()
+            )
+        }
         // No obligation is created here, for two independent reasons. Types are
         // already concrete, so there is nothing to discharge incrementally; and Check
         // runs outside any `InferArena`, so an obligation's variable⇄obligation cycle
@@ -289,8 +309,9 @@ impl Typing for CheckCtx {
         // [`Typing::require_sub`] reuses `TypeMismatch` here: the error vocabulary
         // describes the inconsistency, the wall supplies the interpretation. Measured
         // across the suite: it never fires.
-        let bases: Option<Vec<&BaseType>> = operand_types.iter().map(|t| offered_base(t)).collect();
-        let Some(bases) = bases else {
+        let heads: Option<Vec<InstanceHead>> =
+            operand_types.iter().map(|t| offered_head(t)).collect();
+        let Some(heads) = heads else {
             // **A product is determined, so it is not residue.** A structural trait is
             // answered componentwise, so the operands' components pair and each pair has to
             // answer the trait in turn. Checked here rather than excused: this rule is what
@@ -361,33 +382,29 @@ impl Typing for CheckCtx {
         let matched = trait_
             .compiler_instances
             .iter()
-            .find(|i| i.operands.len() == bases.len() && i.bases() == bases);
+            .find(|i| i.heads() == heads.as_slice());
         match matched {
             Some(matched) => Ok(assoc.map(|name| {
                 matched
-                    .assoc_ty(name)
-                    .cloned()
+                    .assoc_ty(&name)
                     .unwrap_or_else(|| fresh_var(self.level))
             })),
             None => {
                 // Blame the last position: with the earlier ones fixed, it is the one
                 // whose type ruled the instance out.
-                let position = bases.len().saturating_sub(1);
-                let prefix: Vec<BaseType> =
-                    bases[..position].iter().map(|b| (*b).clone()).collect();
+                let position = heads.len().saturating_sub(1);
                 let accepted: Vec<Type> = trait_
                     .compiler_instances
                     .iter()
                     .filter(|i| {
-                        i.operands.len() == bases.len()
-                            && i.bases()[..position].iter().copied().eq(prefix.iter())
+                        i.heads().len() == heads.len() && i.heads()[..position] == heads[..position]
                     })
-                    .filter_map(|i| i.base_at(position).cloned().map(Type::Base))
+                    .filter_map(|i| i.heads().get(position).map(InstanceHead::as_type))
                     .collect();
                 let located = self.raise(InferError::NoTraitInstance {
                     trait_: trait_.to_string(),
                     position: position as u8,
-                    found: Box::new(Type::Base(bases[position].clone())),
+                    found: Box::new(heads[position].as_type()),
                     accepted,
                     at: at(),
                 });
@@ -781,6 +798,9 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Method { .. } => {
             unreachable!("a Method reached the check; inference resolves every method")
         }
+        TypedExprNode::TraitFn { .. } => {
+            unreachable!("a TraitFn reached the check; coalescing chooses every instance")
+        }
         // Verify the **base**, trust the refinement. A literal's singleton predicate
         // (`{Int | __elem == 5}`) is a resolved predicate like any other, and by the
         // time this mode runs post-planning it has been compiled to point-free form.
@@ -1134,7 +1154,7 @@ pub(crate) fn check_located(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{BinOpKind, CompareKind, Lit, TypedExpr};
+    use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement, TypedExpr};
     use std::rc::Rc;
 
     /// `{Int | p}` over the predicate `__elem <op> rhs`.

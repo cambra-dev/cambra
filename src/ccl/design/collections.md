@@ -300,12 +300,6 @@ trait tables. General contextual-parameter/typeclass resolution remains future w
   refinement. The surface spellings are governed by the CHL reference, not duplicated here.
 - Membership would test map/set domains and list/collection values. A key-membership guard
   would introduce the evidence required for proven lookup.
-- `len(c)` places the built-in requirement `HasLen(𝐶)`
-  ([chl-spec, Trait requirements](../../../docs/chl-spec.md#trait-requirements)). Each instance
-  reads the size of the collection's domain: an `Array`'s static `𝑛`, a `List`'s witness range,
-  the key count of a `Set`, `Map` or `FullMap`, and the position count of a `Collection`. A
-  `FullMap`'s key type is a finite present-key domain, the only kind a producer constructs.
-  Nothing implements it yet.
 - Ordering would come from positional domains or an explicit ordering instance, rather than
   the incidental storage order of keyed data. Loop-carried dependencies and collection order
   remain distinct questions.

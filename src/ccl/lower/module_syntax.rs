@@ -14,8 +14,8 @@ use super::stmts::is_type_name;
 use crate::chl_parser::ast::{
     ArmPattern, AssignTarget, CompClause, Comprehension, ConstructorPattern, Expr as ChlExpr,
     IfBranch, KindAnnotation, MatchArm, Module as ChlModule, Param, QualifiedName, RecordField,
-    Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeDeclBody, TypeParam,
-    VariantPayload,
+    Requirement, Span, Spanned, Stmt as ChlStmt, TraitItem, TypeAnnotation, TypeDeclBody,
+    TypeParam, VariantPayload,
 };
 use smol_str::SmolStr;
 
@@ -184,7 +184,28 @@ impl Refusals {
                 self.expr(context);
                 self.stmts(body);
             }
-            ChlStmt::Impl(block) => self.stmts(&block.defs),
+            ChlStmt::Impl(block) => {
+                for arg in &block.args {
+                    self.expr(arg);
+                }
+                for assoc in &block.assoc {
+                    self.expr(&assoc.value);
+                }
+                self.requires(&block.requires);
+                self.stmts(&block.defs);
+            }
+            ChlStmt::TraitDecl(decl) => {
+                for item in &decl.items {
+                    if let TraitItem::Function(sig) = item {
+                        self.type_params(&sig.node.type_params);
+                        self.params(&sig.node.params);
+                        if let Some(output) = &sig.node.output {
+                            self.expr(output);
+                        }
+                        self.requires(&sig.node.requires);
+                    }
+                }
+            }
             ChlStmt::TypeDecl(decl) => match &decl.body {
                 TypeDeclBody::Constructors(ctors) => {
                     for ctor in ctors {

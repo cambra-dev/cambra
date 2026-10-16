@@ -211,6 +211,30 @@ fn a_method_of_two_types_sharing_a_constructor_name() {
     "#});
 }
 
+/// A trait function, called by name and as a method, runs the instance of its argument's
+/// type, where two types' constructors share a name.
+#[test]
+fn a_trait_function_dispatches_by_type() {
+    agree(indoc! {r#"
+        type Circle = Int
+        type Square = Int
+
+        trait Area(S):
+            def area(self: S) => Int
+
+        impl Area(Circle):
+            def area(self):
+                3 * self.extract() * self.extract()
+        impl Area(Square):
+            def area(self):
+                self.extract() * self.extract()
+
+        out = test_sink()
+        for n in [1, 2]:
+            out << (Area::area(Circle::new(n)), Square::new(n).area())
+    "#});
+}
+
 /// A mutable variable holding a nominal value: its history's value type is the nominal
 /// type, through `mut_elim` and the store.
 #[test]

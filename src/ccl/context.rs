@@ -1999,6 +1999,8 @@ fn run_frontend(
 
     // Drain sink bindings before taking sources.
     let sink_bindings = ctx.lowering_ctx().take_sink_bindings();
+    // The instances the program declares are inference's to read.
+    ctx.inference_ctx().instances = Rc::new(ctx.lowering_ctx().take_instances());
 
     // Drain the lowering log and fold it once, at the lowering→pipeline
     // handoff (before uniquify/inference, so the release `InferError` read timing

@@ -185,6 +185,125 @@ pub(crate) struct Interp {
     /// What the module declares of each nominal type, by the type's name. Collected before
     /// the program runs, since a declaration is in scope throughout its module.
     types: Rc<BTreeMap<String, TypeMembers>>,
+    /// The traits' functions and the module's instances, which a trait function's call
+    /// picks among by its arguments.
+    traits: Rc<Traits>,
+}
+
+/// What dispatch reads of the traits a module names and the instances it declares
+/// (`docs/chl-spec.md`, "Declaring a trait").
+#[derive(Default)]
+struct Traits {
+    /// Each trait function, by trait and name: for each value parameter, the operand its
+    /// annotation names, if it names one.
+    functions: BTreeMap<(String, String), Vec<Option<usize>>>,
+    instances: Vec<InstanceShape>,
+}
+
+/// An instance a module declares: what each of its operands is, and the prefix its
+/// functions are bound under.
+struct InstanceShape {
+    trait_: String,
+    heads: Vec<HeadPattern>,
+    bound: String,
+}
+
+/// What a value at an instance's operand is: a nominal type, by name, or a base type. A
+/// nominal value names its type ([`Value::Nominal`]).
+enum HeadPattern {
+    Nominal(String),
+    Base(String),
+}
+
+impl HeadPattern {
+    fn admits(&self, v: &Value) -> bool {
+        match (self, v) {
+            (HeadPattern::Nominal(name), Value::Nominal { ty, .. }) => name == ty,
+            (HeadPattern::Base(b), Value::Int(_)) => b == "Int" || b == "UInt",
+            (HeadPattern::Base(b), Value::Str(_)) => b == "String",
+            (HeadPattern::Base(b), Value::Bool(_)) => b == "Bool",
+            (HeadPattern::Base(b), Value::Unit) => b == "Unit",
+            _ => false,
+        }
+    }
+}
+
+/// The traits `body` declares, and the instances `body` declares of them.
+fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
+    let mut functions = BTreeMap::new();
+    for stmt in body {
+        let Stmt::TraitDecl(decl) = &stmt.node else {
+            continue;
+        };
+        for item in &decl.items {
+            let chl_parser::ast::TraitItem::Function(sig) = item else {
+                continue;
+            };
+            let params = sig
+                .node
+                .params
+                .iter()
+                .map(|p| match p.annotation.as_ref().map(|a| &a.ty.node) {
+                    Some(Expr::Name(n)) => decl.params.iter().position(|o| o.node == *n),
+                    _ => None,
+                })
+                .collect();
+            functions.insert(
+                (decl.name.node.to_string(), sig.node.name.node.to_string()),
+                params,
+            );
+        }
+    }
+    let mut types: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::from([OPTION.to_string()]);
+    for stmt in body {
+        if let Stmt::TypeDecl(decl) = &stmt.node {
+            types.insert(decl.name.node.to_string());
+        }
+    }
+    let mut instances = Vec::new();
+    for stmt in body {
+        let Stmt::Impl(block) = &stmt.node else {
+            continue;
+        };
+        let trait_ = block.ty.node.to_string();
+        if !functions.keys().any(|(t, _)| *t == trait_) {
+            continue;
+        }
+        let heads = block
+            .args
+            .iter()
+            .map(|a| {
+                let name = match &a.node {
+                    Expr::Name(n) => n.to_string(),
+                    Expr::Call { func, .. } => match &func.node {
+                        Expr::Name(n) => n.to_string(),
+                        _ => String::new(),
+                    },
+                    _ => String::new(),
+                };
+                if types.contains(&name) {
+                    HeadPattern::Nominal(name)
+                } else {
+                    HeadPattern::Base(name)
+                }
+            })
+            .collect();
+        instances.push(InstanceShape {
+            bound: instance_prefix(&trait_, stmt.span.start),
+            trait_,
+            heads,
+        });
+    }
+    Traits {
+        functions,
+        instances,
+    }
+}
+
+/// The prefix the functions of the instance `impl T(…)` at `at` are bound under.
+fn instance_prefix(trait_: &str, at: usize) -> String {
+    format!("impl {trait_}@{at}")
 }
 
 /// A loop over a collection not keyed by position, whose iteration order is not defined
@@ -218,6 +337,7 @@ impl Interp {
             txn: None,
             loop_keys: Vec::new(),
             types: Rc::default(),
+            traits: Rc::default(),
             cells_made: 0,
             order_watches: Vec::new(),
         }
@@ -308,6 +428,7 @@ pub fn run(source: &str) -> Result<Observations, Error> {
     let mut feed_sites = BTreeMap::new();
     collect_feed_sites(&module.body, &mut feed_sites);
     let types = Rc::new(collect_types(&module.body));
+    let traits = Rc::new(collect_traits(&module.body));
 
     // Each pass completes at least one channel or ends the run, so there is at most one pass per
     // channel, plus the last.
@@ -315,6 +436,7 @@ pub fn run(source: &str) -> Result<Observations, Error> {
     loop {
         let mut interp = Interp::new(feed_sites.clone(), finals.clone());
         interp.types = Rc::clone(&types);
+        interp.traits = Rc::clone(&traits);
         // A failure outside speculation is on the path the program takes, whatever a later
         // pass would read, so it is the program's.
         interp.exec_block(&module.body)?;
@@ -901,6 +1023,35 @@ impl Interp {
                 }),
             },
 
+            // An instance binds each `def` under its own prefix, which dispatch names.
+            Stmt::Impl(block)
+                if self
+                    .traits
+                    .functions
+                    .keys()
+                    .any(|(t, _)| *t == block.ty.node) =>
+            {
+                let prefix = instance_prefix(&block.ty.node, stmt.span.start);
+                for def in &block.defs {
+                    let Stmt::FunctionDef {
+                        name, params, body, ..
+                    } = &def.node
+                    else {
+                        return err("an instance's `impl` block holds `def`s");
+                    };
+                    let function = Function {
+                        params: params.iter().map(|p| (p.name.to_string(), false)).collect(),
+                        body: body.clone(),
+                        env: self.captured_scopes(),
+                    };
+                    self.bind(
+                        format!("{prefix}::{}", name.node),
+                        Slot::Fn(Rc::new(function)),
+                    );
+                }
+                Ok(None)
+            }
+
             // `impl N:` binds each `def` as `def N::f` does.
             Stmt::Impl(block) => {
                 for def in &block.defs {
@@ -1113,7 +1264,7 @@ impl Interp {
             }
 
             // A declaration binds no value; its members were collected before the run.
-            Stmt::Pass | Stmt::TypeDecl(_) => Ok(None),
+            Stmt::Pass | Stmt::TypeDecl(_) | Stmt::TraitDecl(_) => Ok(None),
             other => err(format!("unsupported statement: {other:?}")),
         }
     }
@@ -1146,6 +1297,86 @@ impl Interp {
         Ok(())
     }
 
+    /// The trait function `trait_::function` at `values`: the function of the one instance
+    /// whose operands admit the arguments their parameters are annotated with.
+    fn dispatch(
+        &mut self,
+        trait_: &str,
+        function: &str,
+        values: Vec<Value>,
+    ) -> Result<Value, Error> {
+        if any_pending(values.iter()) {
+            return Ok(Value::Pending);
+        }
+        let Some(params) = self
+            .traits
+            .functions
+            .get(&(trait_.to_string(), function.to_string()))
+            .cloned()
+        else {
+            return err(format!("`{trait_}` declares no function `{function}`"));
+        };
+        let matching: Vec<String> = self
+            .traits
+            .instances
+            .iter()
+            .filter(|i| i.trait_ == trait_)
+            .filter(|i| {
+                params.iter().zip(&values).all(|(operand, v)| {
+                    operand.is_none_or(|o| i.heads.get(o).is_some_and(|h| h.admits(v)))
+                })
+            })
+            .map(|i| i.bound.clone())
+            .collect();
+        let bound = match matching.as_slice() {
+            [one] => format!("{one}::{function}"),
+            [] => {
+                return err(format!(
+                    "no instance of `{trait_}` admits the arguments of `{trait_}::{function}`"
+                ));
+            }
+            several => {
+                return err(format!(
+                    "{} instances of `{trait_}` admit the arguments of `{trait_}::{function}`; \
+                     the interpreter tells instances apart by their operands' types, not by \
+                     those types' arguments",
+                    several.len()
+                ));
+            }
+        };
+        let Some(Slot::Fn(f)) = self.slot(&bound) else {
+            return err(format!(
+                "`{trait_}::{function}` is answered by an instance declared after the call"
+            ));
+        };
+        let f = f.clone();
+        self.call_with_values(&bound, &f, values)
+    }
+
+    /// The trait whose method `method` a receiver `v` has, when no type's own method of the
+    /// name has its constructor: the one trait whose instance admits it at the operand the
+    /// method's `self` is.
+    fn trait_with_method(&self, method: &str, v: &Value) -> Option<String> {
+        let traits: Vec<String> = self
+            .traits
+            .functions
+            .iter()
+            .filter(|((_, f), _)| f == method)
+            .filter_map(|((t, _), params)| {
+                let receiver = (*params.first()?)?;
+                self.traits
+                    .instances
+                    .iter()
+                    .any(|i| i.trait_ == *t && i.heads.get(receiver).is_some_and(|h| h.admits(v)))
+                    .then(|| t.clone())
+            })
+            .collect();
+        match traits.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        }
+    }
+
     /// `receiver.method(args)`: the method of the one type that declares it and has the
     /// receiver's constructor, called with the receiver as `self`.
     fn call_method(
@@ -1155,13 +1386,29 @@ impl Interp {
         args: &[Spanned<Expr>],
     ) -> Result<Value, Error> {
         let v = self.eval(receiver)?;
+        if let Value::Pending = v {
+            return Ok(Value::Pending);
+        }
+        let own = match &v {
+            Value::Nominal { ty, .. } => self
+                .types
+                .get(ty.as_str())
+                .is_some_and(|t| t.methods.contains(method)),
+            _ => false,
+        };
+        // A type's own methods and its instances' share one namespace, so a receiver whose
+        // type has no method of the name has its instance's.
+        if !own && let Some(trait_) = self.trait_with_method(method, &v) {
+            let mut values = vec![v.clone()];
+            for a in args {
+                values.push(self.eval(a)?);
+            }
+            return self.dispatch(&trait_, method, values);
+        }
         let Value::Nominal { ty, ctor, payload } = &v else {
-            return match v {
-                Value::Pending => Ok(Value::Pending),
-                other => err(format!(
-                    "`.{method}(…)` on {other}, which is not a nominal value"
-                )),
-            };
+            return err(format!(
+                "`.{method}(…)` on {v}, which is not a nominal value"
+            ));
         };
         // A nominal value names its type, which is the one whose method this is.
         let declares = self
@@ -1223,6 +1470,16 @@ impl Interp {
     /// the argument, or the tuple of several (`docs/chl-spec.md`, "Declaring a nominal
     /// type").
     fn construct(&mut self, q: &QualifiedName, args: &[Spanned<Expr>]) -> Result<Value, Error> {
+        // `T::f(args)`, a trait's function, answered by the instance the arguments pick.
+        if let [ty] = q.qualifier.as_slice()
+            && self.traits.functions.keys().any(|(t, _)| *t == ty.node)
+        {
+            let mut values = Vec::with_capacity(args.len());
+            for a in args {
+                values.push(self.eval(a)?);
+            }
+            return self.dispatch(&ty.node, &q.name.node, values);
+        }
         // An associated function, `N::f(args)`, is bound under its qualified name.
         if let [ty] = q.qualifier.as_slice() {
             let bound = format!("{}::{}", ty.node, q.name.node);
@@ -2532,6 +2789,69 @@ mod tests {
         for (source, message) in cases {
             assert_eq!(refused(source), message, "{source}");
         }
+    }
+
+    /// A trait function's call runs the instance its arguments' constructors and base
+    /// types pick, however the call is written.
+    #[test]
+    fn a_trait_function_runs_the_instance_its_arguments_pick() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Circle:
+                circle(r: Int)
+            type Bag(T):
+                bag(xs: List(T))
+            trait Area(S):
+                def area(self: S) => Int
+            trait Join(A, B):
+                def join(self: A, other: B) => Int
+            impl Area(Circle):
+                def area(self):
+                    Circle::circle(r) = self
+                    3 * r
+            impl Join(Circle, Int):
+                def join(self, other):
+                    Circle::circle(r) = self
+                    r + other
+            impl Join(Circle, String):
+                def join(self, other):
+                    0
+            trait Sized(C):
+                def size(self: C) => Int
+            impl Sized(Bag(T)):
+                def size(self):
+                    Bag::bag(xs) = self
+                    sum([1 for x in xs]) + 100
+            def double(s):
+                2 * s.area()
+            c = Circle::circle(2)
+            out << (c.area(), Area::area(c), double(c), c.join(5), Join::join(c, "x"), Bag::bag([1, 2]).size())
+        "#});
+        assert_eq!(
+            v.to_string(),
+            "[() -> (_0: 6, _1: 6, _2: 12, _3: 7, _4: 0, _5: 102)]"
+        );
+    }
+
+    /// Two single-constructor types share the constructor `new`, and a value names its type,
+    /// which chooses the instance.
+    #[test]
+    fn instances_of_two_types_sharing_a_constructor_name() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Circle = Int
+            type Square = Int
+            trait Area(S):
+                def area(self: S) => Int
+            impl Area(Circle):
+                def area(self):
+                    1
+            impl Area(Square):
+                def area(self):
+                    2
+            out << (Area::area(Circle::new(2)), Square::new(3).area())
+        "#});
+        assert_eq!(v.to_string(), "[() -> (_0: 1, _1: 2)]");
     }
 
     #[test]

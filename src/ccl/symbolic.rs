@@ -270,6 +270,9 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         }
 
         TypedExprNode::Builtin(b) => (Precedence::Atom, b.name().to_string()),
+        TypedExprNode::TraitFn {
+            trait_, function, ..
+        } => (Precedence::Atom, format!("{trait_}::{function}")),
 
         TypedExprNode::BinOp { left, op, right } => {
             let Binding {

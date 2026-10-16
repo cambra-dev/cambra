@@ -91,6 +91,9 @@ pub enum Token {
     /// "Associated functions and methods").
     #[token("impl", priority = 3)]
     Impl,
+    /// Opens a trait declaration (`docs/chl-spec.md`, "Declaring a trait").
+    #[token("trait", priority = 3)]
+    Trait,
     // The module keywords (`docs/chl-spec.md`, "9. Modules [Decided]").
     #[token("import", priority = 3)]
     Import,
@@ -300,6 +303,7 @@ pub const KEYWORDS: &[(&str, Token)] = &[
     ("requires", Token::Requires),
     ("type", Token::Type),
     ("impl", Token::Impl),
+    ("trait", Token::Trait),
     ("import", Token::Import),
     ("use", Token::Use),
     ("as", Token::As),
@@ -438,6 +442,7 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::Requires
         | Token::Type
         | Token::Impl
+        | Token::Trait
         | Token::Import
         | Token::Use
         | Token::As
@@ -672,6 +677,7 @@ impl fmt::Display for Token {
             Token::Requires => "requires",
             Token::Type => "type",
             Token::Impl => "impl",
+            Token::Trait => "trait",
             Token::And => "and",
             Token::Or => "or",
             Token::Not => "not",
@@ -1100,6 +1106,7 @@ fn opens_block_at_line_start(tok: &Token) -> bool {
             | Token::Def
             | Token::Type
             | Token::Impl
+            | Token::Trait
             | Token::With
             | Token::Match
             | Token::Case

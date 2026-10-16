@@ -172,6 +172,18 @@ pub(super) trait Typing {
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError>;
 
+    /// Every instance of `trait_` the program has: the compiler's and its modules' in
+    /// Emit, and the compiler's alone in Check, which meets no declared trait and no
+    /// method call.
+    fn instances_of(
+        &self,
+        trait_: &Trait,
+    ) -> Vec<std::rc::Rc<crate::ccl::infer::solver::traits::TraitInstance>>;
+
+    /// The requirements the `requires` clauses enclosing the current position state: none in
+    /// Check, where no `Poly` survives.
+    fn assumptions_in_scope(&self) -> &[std::rc::Rc<crate::ccl::ty::TraitRequirement>];
+
     /// Normalize a user annotation / binder type into a solver-ready `Type`
     /// (holes → fresh vars; refinements kept). See
     /// [`InferCtx::normalize_annotation`](super::context::InferCtx::normalize_annotation).

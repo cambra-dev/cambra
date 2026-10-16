@@ -247,9 +247,9 @@ intersection cannot read.
 ### Lowering requirements
 
 `lower_requirements` resolves each requirement against the trait table: the name
-(`Trait::compiler_named`), the operand count, and each associated type by name
-(`Assoc::from_surface_name`). Refinements are stripped from every operand, since an instance row
-matches a base whatever its refinements.
+(`Trait::compiler_named`, or a trait the module declares), the operand count, and each associated
+type by name (`Trait::assoc_named`). Refinements are stripped from every operand, since an
+instance matches a base whatever its refinements.
 
 - **Products of one shape** are read through the product rule, the one instance a product
   satisfies the trait by: the requirement states the trait of each field's components, paired by

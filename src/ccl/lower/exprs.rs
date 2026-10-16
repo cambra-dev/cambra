@@ -45,7 +45,12 @@ pub(super) fn lower_call(
 ) -> Result<Expr, LoweringError> {
     let name = match &func.node {
         ChlExpr::Name(id) => id.as_str(),
-        ChlExpr::Qualified(q) => return nominal::lower_member_call(q, func.span, args, ctx),
+        ChlExpr::Qualified(q) => {
+            return match traits::qualifying_trait(q, ctx) {
+                Some(trait_) => traits::lower_trait_member_call(trait_, q, func.span, args, ctx),
+                None => nominal::lower_member_call(q, func.span, args, ctx),
+            };
+        }
         _ => {
             return Err(LoweringError::unsupported(
                 func.span,

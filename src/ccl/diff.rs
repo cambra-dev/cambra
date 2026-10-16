@@ -454,6 +454,7 @@ fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
         N::Lit(_)
         | N::Var(_)
         | N::Builtin(_)
+        | N::TraitFn { .. }
         | N::Proj(_)
         | N::Source(_)
         | N::LoadFrom(_)

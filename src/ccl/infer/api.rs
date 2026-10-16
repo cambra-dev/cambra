@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
 use crate::ccl::provenance::NodeId;
@@ -112,6 +113,9 @@ pub struct TypeInferenceContext {
 
     /// Types of known externally-registered data sources.
     pub(crate) source_types: HashMap<String, Type>,
+
+    /// The program's trait instances, which lowering builds.
+    pub(crate) instances: Rc<crate::ccl::infer::solver::traits::InstanceTable>,
 }
 
 /// RAII guard returned by [`TypeInferenceContext::enter_scope`].
@@ -415,6 +419,31 @@ pub enum InferError {
         /// The receiver's type, or `None` where nothing before the call determines it.
         receiver: Option<Type>,
     },
+    /// A trait function's call whose instance a module declares below it: the instance's
+    /// functions are in scope after its `impl`, as a `def` is after its own
+    /// (`docs/chl-spec.md`, "Declaring an instance").
+    InstanceAfterUse {
+        /// The trait function called, `Area::area`.
+        function: String,
+        /// The instance's head, `Area(Circle)`.
+        instance: String,
+    },
+    /// A trait function's call, inside a function of an instance, that the same function
+    /// answers at the same types: the call is the one it is in, so it would never end.
+    InstanceCallsItself {
+        /// The trait function called, `Area::area`.
+        function: String,
+        /// The types it is called at: the instance's head, or the call's function type.
+        at: String,
+    },
+    /// A chain of calls through one instance's function at types that keep changing, cut off
+    /// at a depth: `Two(T)`'s function calling itself at `Two(Two(T))`, and so on.
+    InstanceSpecializationGrows {
+        /// The trait function called, `Area::area`.
+        function: String,
+        /// The type of each call in the chain, outermost first.
+        chain: Vec<Type>,
+    },
     /// Functions of an `impl` block that reach themselves through the calls their
     /// definitions make: each calls the next, and the last the first (`docs/chl-spec.md`,
     /// "Associated functions and methods").
@@ -696,6 +725,9 @@ impl InferError {
             }
             InferError::MutInCompositeType { ty, .. } => each(ty),
             InferError::ScopeViolation { ty, .. } => each(ty),
+            InferError::InstanceSpecializationGrows { chain, .. } => {
+                chain.iter_mut().for_each(each)
+            }
             InferError::UnresolvedMethod { receiver, .. } => receiver.iter_mut().for_each(each),
             // No type to render: these carry a name, an id, or a rendered label.
             InferError::UnboundVariable(_)
@@ -714,6 +746,8 @@ impl InferError {
             | InferError::DefinitionCycle { .. }
             | InferError::MissingRequirement { .. }
             | InferError::MonomorphicPolyBinding { .. }
+            | InferError::InstanceAfterUse { .. }
+            | InferError::InstanceCallsItself { .. }
             | InferError::MutWriteToNonMutable { .. } => {}
         }
     }
@@ -1060,6 +1094,28 @@ impl std::fmt::Debug for InferError {
                     position + 1,
                 )
             }
+            InferError::InstanceAfterUse { function, instance } => write!(
+                f,
+                "this call of `{function}` is answered by `impl {instance}`, which is declared \
+                 below it; an instance's functions are in scope after its `impl`, so declare \
+                 the instance above the call, or above the definition the call is in"
+            ),
+            InferError::InstanceCallsItself { function, at } => write!(
+                f,
+                "this call of `{function}` is answered by the function it is in, at the same \
+                 types, `{at}`, so it would never end; a function does not reach itself"
+            ),
+            InferError::InstanceSpecializationGrows { function, chain } => {
+                let first = chain.first().map(|t| t.to_string()).unwrap_or_default();
+                let last = chain.last().map(|t| t.to_string()).unwrap_or_default();
+                write!(
+                    f,
+                    "`{function}` calls itself at {} different types in a row, from {first} to \
+                     {last}; a chain of calls through an instance whose types keep changing \
+                     would never end",
+                    chain.len()
+                )
+            }
             InferError::MonomorphicPolyBinding { name } => write!(
                 f,
                 "`{name}` is annotated with a polymorphic type, but its right-hand side is \
@@ -1102,7 +1158,7 @@ impl std::fmt::Debug for InferError {
             } => write!(
                 f,
                 "`.{method}(…)` calls a method of its receiver's type, and nothing before the \
-                 call determines that type; annotate the receiver with a nominal type"
+                 call determines that type; annotate the receiver"
             ),
             InferError::UnresolvedMethod {
                 method,
@@ -1110,11 +1166,20 @@ impl std::fmt::Debug for InferError {
             } => write!(f, "`{ty}` has no method `{method}`"),
             InferError::UnresolvedMethod {
                 method,
+                receiver: Some(ty @ Type::Param(_)),
+            } => write!(
+                f,
+                "`{ty}` has no method `{method}`: a type parameter has the methods of the \
+                 traits a `requires` clause states of it, and no trait declares a method \
+                 `{method}`"
+            ),
+            InferError::UnresolvedMethod {
+                method,
                 receiver: Some(ty),
             } => write!(
                 f,
-                "`.{method}(…)` calls a method, and `{ty}` is not a nominal type, so it has no \
-                 methods; the function a field holds is called as `(r.{method})(…)`"
+                "`{ty}` has no method `{method}`: no trait with a method `{method}` has an \
+                 instance for it; the function a field holds is called as `(r.{method})(…)`"
             ),
             InferError::TypeParamEscapes { param, target, at } => match target {
                 Some(EscapeTarget::Argument { function }) => write!(
@@ -1356,7 +1421,7 @@ pub fn infer(
     // variable's bounds, breaking the `Rc` cycles that would otherwise leak
     // the whole variable graph. See [`InferArena`].
     let _arena = InferArena::new();
-    let ty = super::run(expr, &ctx.source_types);
+    let ty = super::run(expr, &ctx.source_types, &ctx.instances);
     #[cfg(debug_assertions)]
     if std::env::var_os("DUMP_KINDS").is_some() {
         eprintln!("=== kind vars ===\n{}", crate::ccl::ty::dump_kind_vars());
@@ -1524,7 +1589,7 @@ pub fn debug_assert_no_free_witness(expr: &Expr, stage: &str) {
         }
         if let Type::Refinement(_, refinements) = t {
             for r in refinements {
-                if visited.insert(std::rc::Rc::as_ptr(&r.predicate)) {
+                if visited.insert(Rc::as_ptr(&r.predicate)) {
                     go(&r.predicate, stage, scope, visited);
                 }
             }
@@ -4009,7 +4074,7 @@ mod tests {
     /// into its body or bound, so a `Hole` there is not reported a second time.
     #[test]
     fn test_check_fully_typed_survivor_children_not_reported() {
-        let poly = Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
+        let poly = Type::Poly(Rc::new(crate::ccl::ty::PolyType {
             params: vec![],
             requires: vec![],
             body: Type::Hole,
@@ -4541,7 +4606,7 @@ mod tests {
         );
         let key_domain = Type::refined_one(
             Type::Base(BaseType::Int),
-            crate::ccl::ty::Refinement::born(std::rc::Rc::new(Expr::apply(
+            crate::ccl::ty::Refinement::born(Rc::new(Expr::apply(
                 Expr::var(Name::elem()),
                 morphism,
             ))),
