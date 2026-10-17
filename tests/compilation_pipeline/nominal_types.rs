@@ -2155,3 +2155,17 @@ fn a_boxed_payload_reads_back_as_its_collection() {
         Value::Int(6),
     );
 }
+
+/// A constructor call is a compound argument, and a function passed beside it is still applied.
+#[test]
+fn a_function_beside_a_constructed_argument() {
+    check_scalar(
+        indoc! {"
+            type One = Int
+            def apply(t: One, f: Int => Int) => Int:
+                f(t.extract())
+            apply(One::new(1), \\x -> x * 10)
+        "},
+        Value::Int(10),
+    );
+}

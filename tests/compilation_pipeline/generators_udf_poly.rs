@@ -27,6 +27,22 @@ fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
+/// A function argument beside a compound one: A-normalization names the compound argument
+/// inside the argument tuple, and the call still reduces to the function applied.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_compound_argument(
+    "def apply(t: Int, f: Int => Int) => Int:\n    f(t)\napply(1 + 2, \\x -> x * 10)",
+    Value::Int(30)
+)]
+#[case::the_compound_argument_read_twice(
+    "def twice(t: Int, f: Int => Int) => Int:\n    f(t) + t\ntwice(1 + 2, \\x -> x * 10)",
+    Value::Int(33)
+)]
+fn a_function_argument_beside_a_compound_one(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 // A polymorphic UDF applied at two *distinct* argument types in the same
 // program, end-to-end. `x == x` is `∀α. α → Bool`, so the two calls have
 // incompatible domains (Int vs String) — under a monomorphic `let` they would

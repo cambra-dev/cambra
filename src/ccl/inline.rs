@@ -24,7 +24,9 @@
 //! passes (lambda-elim, operator conversion) see fully-reduced expressions.
 //! Multi-arg uncurried call sites leave behind `Apply(Tuple, Proj(Index(i)))`
 //! references; those are folded by [`crate::ccl::simplify`]'s
-//! `try_literal_tuple_projection` rule, not here.
+//! `try_literal_tuple_projection` rule, not here. An argument wrapped in the
+//! `let`s A-normalization named its parts with has them floated out over the
+//! call first, so the tuple is what is substituted.
 //!
 //! # Why a single pre-lambda-elim pass works for both
 //!
@@ -823,6 +825,34 @@ fn inline_impl(expr: Expr) -> Expr {
     }
 }
 
+/// One `let` an argument is wrapped in: its node's id, binder, bound expression and annotation.
+type PeeledLet = (
+    provenance::NodeId,
+    crate::ccl::TypedBinding,
+    Expr,
+    Option<Type>,
+);
+
+/// `expr`'s outer `let`s, outermost first, and the expression they wrap.
+fn peel_lets(mut expr: Expr) -> (Vec<PeeledLet>, Expr) {
+    let mut out = Vec::new();
+    loop {
+        match expr.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                out.push((expr.node_id, binding, *bound_expr, expr.user_annotation));
+                expr = *body;
+            }
+            node => {
+                return (out, Expr { node, ..expr });
+            }
+        }
+    }
+}
+
 /// Substitute `lambda` at every free occurrence of `name` in `expr`, and
 /// beta-reduce at each call-site Apply chain — i.e. where `Var(name)` sits in
 /// the function position of an `Apply(arg, …)` (optionally nested for curried
@@ -921,7 +951,26 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
                 // the substituted argument's copies arrive through `on_copy` as
                 // copies of the argument's own interior, which is what they are.
                 let _g = provenance::enter(node_id, "inline.beta", provenance::Nature::Expansion);
-                return substitute(*body, &param.name, &argument);
+                // An argument A-normalization named a part of, `let 𝑎 = 𝑒 in (𝑎, λ…)`, has its
+                // bindings floated out over the call, so the body reads the tuple itself:
+                // its projections then fold (`simplify::try_literal_tuple_projection`), and
+                // `𝑒` is bound once rather than copied into each projection. Binders are
+                // unique after `uniquify`, so floating captures nothing.
+                let (bindings, argument) = peel_lets(argument);
+                let reduced = substitute(*body, &param.name, &argument);
+                return bindings.into_iter().rev().fold(
+                    reduced,
+                    |acc, (id, binding, bound, ann)| Expr {
+                        node_id: id,
+                        ty: ty.clone(),
+                        user_annotation: ann,
+                        node: TypedExprNode::Let {
+                            binding,
+                            bound_expr: Box::new(bound),
+                            body: Box::new(acc),
+                        },
+                    },
+                );
             }
             // Not a Lambda (e.g. the bound expression is Var("id") rather
             // than a literal lambda) — skip beta-reduction and reconstruct
