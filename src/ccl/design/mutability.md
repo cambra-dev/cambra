@@ -1452,12 +1452,12 @@ one straight-line writer body and one transaction is still one decision. Walking
 (`ccl_utils::wrap_decision_variant`) where:
 
 - **the `` `commit ``/`` `abort `` tag is chosen by the disjunction of the path-conditions of every
-  mutable write and feed** (`or_commit`; an empty taken path — a position matching no guard, including a
-  missing `else` — is `` `abort ``). A spine write's path is `true`, so a write beside a guard commits
-  unconditionally: **a guard scopes only its own arm's writes**, not the whole transaction. (This
-  subsumes the former single-deny: `if 𝑝: x := 𝑒` → one write at path `𝑝` → `` `commit `` iff `𝑝`,
-  observationally identical.) The whole-transaction grant/deny is the *tag*, not a `commit` field — an
-  illegal "denied yet real writes" state is unrepresentable.
+  mutable write and feed** (`ccl_utils::disjoin`; an empty taken path — a position matching no
+  guard, including a missing `else` — is `` `abort ``). A spine write's path is `true`, so a write
+  beside a guard commits unconditionally: **a guard scopes only its own arm's writes**, not the
+  whole transaction. (This subsumes the former single-deny: `if 𝑝: x := 𝑒` → one write at path `𝑝` →
+  `` `commit `` iff `𝑝`, observationally identical.) The whole-transaction grant/deny is the *tag*,
+  not a `commit` field — an illegal "denied yet real writes" state is unrepresentable.
 - **each written key is rejoined as a carry-forward `Case`** over the branch structure
   (read-your-writes; a branch that does not write a key contributes its snapshot value). An
   unconditional write never enters a `Case` (it stays a bare write); cross-key routing

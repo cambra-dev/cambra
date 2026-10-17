@@ -834,9 +834,10 @@ pub(super) fn find_mutation_loop_vars(
 }
 
 /// Recurse the accumulator scan into `if`/`elif`/`else` branches, `match` arms and inner
-/// `for` loops: a `+=` / `:=` under a conditional is still a loop-carried accumulator (one
-/// recurrence leg per path), and one inside an inner loop is a write the nested recurrence
-/// carries. `with begin()` blocks are not entered: they carry their own transactional keys.
+/// `for` loops: a `+=` / `:=` under a conditional is still a loop-carried accumulator
+/// (`mut_elim::transform_chain` merges the paths into one writer decision), and one inside an
+/// inner loop is a write the nested recurrence carries. `with begin()` blocks are not entered:
+/// they carry their own transactional keys.
 fn collect_mutation_loop_vars(
     body: &[Spanned<ChlStmt>],
     scope: &HashSet<String>,
@@ -1571,9 +1572,9 @@ fn lower_loop_body_chain_scoped(
                 ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
             }
             // `if p: … [else: …]` — a conditional write path. Lowered to a
-            // statement-position filter-`Case` (`[gᵢ → branchᵢ; true → else|unit]`)
-            // that `letrec_phase` forks into one recurrence leg per path (the
-            // write legs plus the carry-forward complement). See
+            // statement-position filter-`Case` (`[gᵢ → branchᵢ; true → else|unit]`).
+            // `mut_elim::transform_chain` merges its branches into one writer
+            // decision with a per-accumulator value-`Case`. See
             // `src/ccl/design/mutability.md`, "Value-selecting `Case` and
             // conditional induction writes (partially implemented)".
             ChlStmt::If {
@@ -1664,8 +1665,8 @@ fn lower_loop_body_chain_scoped(
 /// lowered through [`lower_loop_body_chain`] (so nested writes and feeds lower
 /// identically to top-level ones); a missing `else` becomes an implicit
 /// `true → unit` carry-forward branch — the position where the accumulator
-/// keeps its previous value. `letrec_phase` forks this `Case` into one
-/// recurrence leg per branch.
+/// keeps its previous value. `mut_elim::transform_chain` merges this `Case`'s
+/// branches into one writer decision with a per-accumulator value-`Case`.
 fn build_loop_if_case(
     branches: &[IfBranch],
     else_body: Option<&[Spanned<ChlStmt>]>,
@@ -2206,8 +2207,8 @@ x";
     fn test_mutation_nested_in_if_else_now_lowers() {
         // A mutation nested under an `if`/`else` is a conditional induction
         // write — no longer rejected. Both legs become branches of the
-        // statement-position filter-`Case`; `letrec_phase` forks them into
-        // per-path recurrence legs.
+        // statement-position filter-`Case`, which `mut_elim::transform_chain`
+        // merges into one writer decision with a per-accumulator value-`Case`.
         let code = "\
 x := 0
 for i in [1, 2]:
@@ -2274,8 +2275,8 @@ f";
     /// A conditional induction write `if p: x += i` lowers the loop body to
     /// a statement-position filter-`Case` — the write leg under the guard and an
     /// implicit `true → unit` carry-forward branch — with the accumulator write a
-    /// `MutWrite` marker inside the guarded branch. `letrec_phase` forks this into
-    /// per-path recurrence legs.
+    /// `MutWrite` marker inside the guarded branch. `mut_elim::transform_chain`
+    /// merges these branches into one writer decision with a per-accumulator value-`Case`.
     #[test]
     fn test_lower_conditional_induction_write() {
         let code = "\

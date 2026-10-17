@@ -2300,7 +2300,7 @@ fn build_writer(
         t
     };
     // Each write/feed records the control-flow path it fires on; the transaction
-    // commits on their disjunction (`or_commit`). A spine write's path is `true`,
+    // commits on their disjunction (`ccl_utils::disjoin`). A spine write's path is `true`,
     // so a write beside a guard commits unconditionally (the guard scopes only its
     // own arm's writes) — the path-scoped deny semantics.
     let mut commit_paths: Vec<Expr> = Vec::new();

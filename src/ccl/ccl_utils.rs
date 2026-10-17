@@ -224,7 +224,7 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
 /// `commit` must already be the writer's *final* commit gate — including every
 /// feed's fire path, so a feed-only committing position appends a change carrying
 /// the tap (the caller folds fires into `commit` before calling; see
-/// `transact_phase`'s `commit_paths` and `letrec_phase`'s widen).
+/// `transact_phase`'s `commit_paths` and `mut_elim::attach_feed_fields`'s widen).
 pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(SmolStr, Expr, Expr)]) -> Expr {
     let mut fields: Vec<(SmolStr, Expr)> = Vec::with_capacity(2 + feeds.len() * 2);
     fields.push((SmolStr::from(COMMIT_SELECTOR), commit.clone()));
