@@ -39,6 +39,33 @@ fn agree(source: &str) {
     );
 }
 
+/// A boxed conditional chosen once and observed by its keys. Realization unions one gated leg
+/// per arm, and the value is the leg holding rows, keyed by its own keys
+/// (`src/ccl/design/collections.md`, "Compiling a conditional collection").
+#[rstest]
+#[case::fed_to_the_sink(indoc! {r#"
+    out = test_sink()
+    out << (box([1, 2]) if 2 > 1 else box([3, 4, 5]))
+"#})]
+#[case::the_second_arm_fed_to_the_sink(indoc! {r#"
+    c: Bool = False
+    out = test_sink()
+    out << (box([1, 2]) if c else box([3, 4, 5]))
+"#})]
+#[case::a_loop_source(indoc! {r#"
+    out = test_sink()
+    for q in (box([1, 2]) if 2 > 1 else box([3, 4, 5])):
+        out << q
+"#})]
+#[case::a_record_field(indoc! {r#"
+    out = test_sink()
+    r = (xs=(box([1, 2]) if 2 > 1 else box([3, 4, 5])), n=1)
+    out << sum(r.xs)
+"#})]
+fn a_boxed_conditional_keyed_by_its_arm(#[case] source: &str) {
+    agree(source);
+}
+
 /// A conditional collection whose condition reads the row: each row takes its own arm. Lambda
 /// elimination fans the rows out by the arms' gates, and each leg broadcasts its arm; boxed
 /// arms keep their `box`, since the union's codomain binds a witness per row
