@@ -466,7 +466,7 @@ fn a_bare_groupby_tail_is_driven() {
 )]
 #[case(
     "[x for x in [y for y in [1,2,3] if y < 3] if x < 2]",
-    "iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(cast([1, 2, 3])):({0..3 | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt), __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⤇ Int)",
+    "let __anf : ({0..3 | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} ⤇ Int) = iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast([1, 2, 3])\nin iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((__anf ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(__anf):({0..3 | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt), __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⤇ Int)",
     make_int_list(&[1])
 )]
 #[case(
@@ -577,7 +577,7 @@ fn a_bare_groupby_tail_is_driven() {
 )]
 #[case(
     "[x + y for x in [2] for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]",
-    "(iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ add):({(0..1, {(0..2, 0..3) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) | __elem ▷ ((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ eq)} ⤇ Int)",
+    "let __anf : ({(0..2, 0..3) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)} ⤇ Int) = (iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)\nin (iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ __anf) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ __anf) ▷ zip ≫ add):({(0..1, {(0..2, 0..3) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) | __elem ▷ ((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ eq)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
             ("_1".into(), ColumnValue::Records(HashMap::from([
@@ -1490,15 +1490,19 @@ fn expected_per_region_record() -> Tile {
     )
 }
 
-/// A nested `for` over a group's rows, `[r for g in groupby(xs, \s -> s) for r in g]`, recurses
-/// without bound while coalescing. Coalescing grows its stack on the heap (`stacker`), so the
-/// recursion runs until memory runs out rather than overflowing the stack.
+/// A nested `for` over a group's rows, `[r for g in groupby(xs, \s -> s) for r in g]`, does not
+/// compile. A debug build stops where a substitution leaves the discharged `xs` free in a
+/// predicate; without debug assertions the type check after inference finds `__anf` out of scope.
 ///
 /// The program runs in a `cambra` child process with a time limit, since unbounded recursion
 /// aborts or exhausts the process rather than unwinding. The assertion reads its exit status and
 /// stderr.
 #[test]
-#[should_panic(expected = "did not finish within")]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "discharged binder `xs` still free after substitution")
+)]
+#[cfg_attr(not(debug_assertions), should_panic(expected = "Scope violation"))]
 fn a_nested_for_over_a_groups_rows() {
     // A healthy run of a program this size takes well under a second, so a few seconds already
     // shows it does not finish. The child's address space is capped as well, so a runaway

@@ -156,10 +156,12 @@ impl Sort {
 /// scope, and a binder nothing mentions can still change the answer — a
 /// contradictory one would prove the entailment outright.
 ///
-/// Two implementors answer: inference's lexical scope (`InferCtx`'s `ScopeStack`,
-/// `src/ccl/infer/context.rs`) and the post-inference check's Γ, built from the tree
-/// it walks (`CheckCtx`, `src/ccl/infer/check.rs`). [`NoScope`] is the empty
-/// environment, which a caller holding a tree's binders neither way passes. See
+/// Three implementors answer: inference's lexical scope (`InferCtx`'s `ScopeStack`,
+/// `src/ccl/infer/context.rs`), and the Γ the post-inference check (`CheckCtx`,
+/// `src/ccl/infer/check.rs`) and inlining (`src/ccl/inline.rs`) build from the tree they
+/// walk. Each states a transparent binder's definition as well as its type
+/// ([`defined_as`]). [`NoScope`] is the empty environment, for a caller holding no tree's
+/// binders. See
 /// `src/ccl/design/type-inference.md`, "The scope a query runs in".
 pub trait ScopeEnv {
     /// The type a value has given `name` here, or `None` when this scope does not
@@ -193,6 +195,59 @@ impl ScopeEnv for NoScope {
     }
     fn is_skip_smt(&self) -> bool {
         false
+    }
+}
+
+/// What a scope knows about a transparent binder: the type it is bound at, refined by
+/// `__elem == definition`.
+///
+/// A transparent binding carries its definiens, so the binder equals it wherever the binder is in
+/// scope. A type leaving the scope has the definiens substituted for the binder
+/// (`src/ccl/design/type-inference.md`, "`let` binders and scope exit"); this is the same fact, stated while the
+/// binder is still in scope, where a type names the binder instead. Only a definition built from
+/// the forms [`Encode::expr`] translates is stated, since the encoding would drop any other one.
+///
+/// The definition is read in its normal form ([`normal_form`]), the spelling predicates are
+/// compared in. Lambda elimination spells `x + 1` as `(x, 1) ▷ add`, and the normal form reads it
+/// back, so a check after that pass assumes what inference assumed.
+///
+/// [`normal_form`]: crate::ccl::ccl_utils::normal_form
+pub fn defined_as(ty: Type, definition: &TypedExpr) -> Type {
+    let definition = if in_term_fragment(definition) {
+        definition.clone_preserving_ids()
+    } else {
+        let normal = crate::ccl::ccl_utils::normal_form(definition);
+        if !in_term_fragment(&normal) {
+            return ty;
+        }
+        normal
+    };
+    // Throwaway nodes and an id-preserving copy: the only reader of a scope's answer is the
+    // encoding, which reads the predicate and keeps nothing of it.
+    let predicate = TypedExpr::throwaway(TypedExprNode::BinOp {
+        left: Box::new(
+            TypedExpr::throwaway(TypedExprNode::Var(Name::elem()))
+                .with_ty(ty.peel_refinements().clone()),
+        ),
+        op: BinOpKind::Compare(CompareKind::Equals),
+        right: Box::new(definition),
+    })
+    .with_ty(Type::Base(BaseType::Bool));
+    Type::refined_one(ty, Refinement::born(std::rc::Rc::new(predicate)))
+}
+
+/// Whether `e` is built only from the node forms [`Encode::expr`] translates: integer and boolean
+/// literals, paths, and unary and binary operators over them. An operator the encoding has no
+/// rule for still fails there, which drops the assumption.
+fn in_term_fragment(e: &TypedExpr) -> bool {
+    match &e.node {
+        TypedExprNode::Lit(Lit::Int(_) | Lit::Bool(_)) | TypedExprNode::Var(_) => true,
+        TypedExprNode::Apply { .. } => Path::of(e).is_some(),
+        TypedExprNode::UnaryOp(_, operand) => in_term_fragment(operand),
+        TypedExprNode::BinOp { left, right, .. } => {
+            in_term_fragment(left) && in_term_fragment(right)
+        }
+        _ => false,
     }
 }
 
