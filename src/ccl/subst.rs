@@ -1561,6 +1561,17 @@ impl Subst {
             // A type parameter names no term binder; its bound is a child of the
             // `Poly` that declares it, reached by the arm below.
             | Type::Param(_) => {}
+            // The projected sum is a term the type quotes, rebuilt once per substitution
+            // as a predicate is. It binds no element, so the substitution acts on it whole.
+            Type::WitnessProjection(p) => {
+                memo.rebuild(p, self, |term| {
+                    if !self.acts_on(term) {
+                        return false;
+                    }
+                    self.rewrite_expr_go(term, memo);
+                    true
+                });
+            }
             Type::Infer(v) => *ty = self.suspended(v),
             Type::Poly(poly) => Rc::make_mut(poly)
                 .types_mut()
@@ -1884,6 +1895,19 @@ impl Subst {
                 None => ty.clone(),
             },
 
+            // The projected sum is a term the type quotes: substituted as a term, so a binder
+            // the projection leaves projects that binder's definition. A substitution acting
+            // on nothing in it keeps the `Rc`.
+            Type::WitnessProjection(p) => {
+                if !self.acts_on(&p.term) {
+                    return ty.clone();
+                }
+                Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(
+                    Rc::new(self.apply_expr(&p.term)),
+                    p.position,
+                ))
+            }
+
             // rename the named defer binder, mirroring the
             // in-place mode (`rewrite_type_go`).
             Type::ChanDom(name, lvl) => Type::ChanDom(self.handle_target(name), *lvl),
@@ -2087,7 +2111,9 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         | Type::Hole
         | Type::SharedHole(_)
         | Type::Param(_)
-        | Type::WitnessRef(_) => false,
+        | Type::WitnessRef(_)
+        // Minted after inference, so its term's type slots hold no variable.
+        | Type::WitnessProjection(_) => false,
         Type::Infer(_) => true,
         Type::Poly(poly) => poly.types().any(type_contains_infer),
         Type::Fun {
@@ -2162,6 +2188,13 @@ fn collect_type_fv(
         Type::Poly(poly) => {
             for t in poly.types() {
                 collect_type_fv(t, bound, visited, out);
+            }
+        }
+        // The projected sum is a term the type quotes, walked once as a predicate is. It
+        // binds no element: the term is the collection, not a condition on a key.
+        Type::WitnessProjection(p) => {
+            if visited.insert(Rc::as_ptr(&p.term)) {
+                collect_expr_fv(&p.term, bound, visited, out);
             }
         }
         Type::Fun {
@@ -2808,7 +2841,7 @@ impl<'a> PiWalk<'a> {
             }
             Type::Refinement(base, refinements) => {
                 self.ty(base, depth);
-                refinements.rewrite_each(|_, r| self.refinement(r, depth));
+                refinements.rewrite_each(|_, r| self.quoted(r, depth));
             }
             Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
             // Component `𝑘` sits inside the scopes of the `𝑘` components before it.
@@ -2828,6 +2861,8 @@ impl<'a> PiWalk<'a> {
             // A witness reference is a leaf in its own namespace: it neither is
             // nor crosses a Pi index.
             Type::WitnessRef(_) => {}
+            // The projected sum is converted as a predicate is; it binds no element.
+            Type::WitnessProjection(p) => self.quoted(p, depth),
         }
     }
 
@@ -2856,12 +2891,14 @@ impl<'a> PiWalk<'a> {
         }
     }
 
-    fn refinement(&mut self, r: &mut crate::ccl::Refinement, depth: u32) {
+    /// Convert a term a type quotes — a refinement's predicate or a projection's sum — once
+    /// per pass, every occurrence re-pointed at the one conversion.
+    fn quoted(&mut self, r: &mut impl crate::ccl::QuotedTerm, depth: u32) {
         let shadow = self.shadow_key();
         let pass_key = self
             .conversion_key()
-            .map(|c| (r.predicate_id(), c, depth, shadow.clone()));
-        let key = (r.predicate_id(), depth, shadow);
+            .map(|c| (Rc::as_ptr(r.quoted()), c, depth, shadow.clone()));
+        let key = (Rc::as_ptr(r.quoted()), depth, shadow);
         let from_pass = pass_key.as_ref().and_then(|k| {
             CONVERSION_MEMO.with(|m| {
                 m.borrow()
@@ -2873,8 +2910,8 @@ impl<'a> PiWalk<'a> {
             self.memo.insert(key.clone(), Rc::clone(&done));
         }
         if let Some(done) = self.memo.get(&key) {
-            if !Rc::ptr_eq(done, &r.predicate) {
-                *r = crate::ccl::Refinement::sharing(done);
+            if !Rc::ptr_eq(done, r.quoted()) {
+                r.requote(Rc::clone(done));
                 // A memo hit is a rewrite, and an enclosing predicate's walk reads
                 // this counter to decide whether its own clone was touched. Leaving
                 // the hit uncounted makes that decision depend on visit order: the
@@ -2896,14 +2933,14 @@ impl<'a> PiWalk<'a> {
         // `PredMemo::rebuild` uses for its deriving branch. Without the guard the
         // fresh ids are minted with nothing recording, and surface as dangling
         // parents once a later recorded rewrite names the converted root.
-        let r_origin = Rc::clone(&r.predicate);
+        let r_origin = Rc::clone(r.quoted());
         let (pred, before) = {
             let _g = crate::ccl::provenance::enter(
-                r.predicate.node_id(),
+                r.quoted().node_id(),
                 "predicate.coordinate",
                 crate::ccl::provenance::Nature::Machinery,
             );
-            let mut pred = (*r.predicate).clone();
+            let mut pred = (**r.quoted()).clone();
             let before = self.changed;
             self.expr(&mut pred, depth);
             (pred, before)
@@ -2912,10 +2949,10 @@ impl<'a> PiWalk<'a> {
             // Occurrences that shared the original re-share the conversion
             // through the memo.
             let done = Rc::new(pred);
-            *r = crate::ccl::Refinement::sharing(&done);
+            r.requote(Rc::clone(&done));
             done
         } else {
-            Rc::clone(&r.predicate)
+            Rc::clone(r.quoted())
         };
         if let Some(k) = pass_key {
             let origin = Rc::clone(&r_origin);
@@ -3073,6 +3110,10 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
             // A witness reference is a leaf in its own namespace: it neither is
             // nor crosses a Pi index.
             Type::WitnessRef(_) => false,
+            Type::WitnessProjection(p) => {
+                visited.insert((Rc::as_ptr(&p.term), depth))
+                    && expr_scan(&p.term, depth, within, visited)
+            }
         }
     }
     fn expr_scan(
@@ -3199,7 +3240,7 @@ impl RefinementScope {
         }
         let mut walk = PiWalk::new(PiMode::Close(&self.enclosing));
         let mut out = r.clone();
-        walk.refinement(&mut out, 0);
+        walk.quoted(&mut out, 0);
         self.memo.insert(key, out.clone());
         out
     }

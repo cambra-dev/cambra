@@ -1034,6 +1034,7 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
     match builtin {
         Builtin::Id
         | Builtin::Box
+        | Builtin::Unbox
         | Builtin::Const
         | Builtin::Zip
         | Builtin::Apply

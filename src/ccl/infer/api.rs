@@ -1914,6 +1914,7 @@ fn collect_type_errors(
         }
         Type::Variant(..)
         | Type::WitnessRef(_)
+        | Type::WitnessProjection(_)
         | Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)

@@ -1398,6 +1398,11 @@ pub enum Type {
     /// Named for the *reference*: the witness itself is the [`Witness`] in the function's
     /// slot ([`FunKind::Data`]), classified by a [`TypeKind`].
     WitnessRef(WitnessId),
+    /// **The witness of a sum, projected through the sum's value**: `σᵢ(𝑐)`, the witness at
+    /// binder position `i` of the sum `𝑐` denotes, as a type. It is how a type outside a sum
+    /// names that sum's witness, which a [`Type::WitnessRef`] can do only inside the sum's own
+    /// type (`src/ccl/design/collections.md`, "Projecting a sum's witness").
+    WitnessProjection(WitnessProjection),
     /// A **type parameter**, `T` in `def f(T, x: T)`: opaque inside the binding that
     /// declares it, a subtype only of itself and of its bound, and instantiated as a
     /// fresh inference variable at each use.
@@ -2578,6 +2583,19 @@ fn fmt_type(
                 write!(f, "σ")
             }
         }
+        // `σ₁(𝑐)`: the subscript counts the sum's binders from one, outermost first.
+        Type::WitnessProjection(p) => {
+            let subscript: String = (p.position + 1)
+                .to_string()
+                .chars()
+                .map(|d| char::from_u32(0x2080 + d.to_digit(10).unwrap_or(0)).unwrap_or(d))
+                .collect();
+            write!(
+                f,
+                "σ{subscript}({})",
+                symbolic::symbolic_under(&p.term, binders)
+            )
+        }
     }
 }
 
@@ -3585,6 +3603,7 @@ impl Type {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
+            | Type::WitnessProjection(_)
             | Type::Param(_)
             | Type::Txn => self.clone(),
         }
@@ -3643,28 +3662,30 @@ impl Type {
     /// [`TypedExpr`], not a `Type`).  Callers that need to walk a
     /// refinement's predicate must handle [`Type::Refinement`] explicitly
     /// — e.g. by matching on it before calling this helper.
-    /// Every [`Refinement`] riding this type or any of its nested type children,
-    /// in pre-order: the refinements at each level before that level's children.
+    /// Every term this type or any of its nested type children quotes, in pre-order: each
+    /// refinement's predicate and each witness projection's sum ([`QuotedTerm`]), those at a
+    /// level before that level's children.
     ///
-    /// The one place that shape is written. Three callers need it and each wants
-    /// something different from a refinement — the predicate's ids, the
-    /// predicate's `Rc` identity, the predicate itself as a child edge — so what
-    /// they share is the descent and not the projection. Written out per caller
-    /// it was the same `if let Type::Refinement(_, rs) = t { for r in rs … }`
-    /// followed by the same `t.walk_children(recurse)`, three times, and a type
-    /// variant that carries a nested type would have to be remembered in each.
+    /// The one place that shape is written. Three callers need it and each wants something
+    /// different from a quoted term — its ids, its `Rc` identity, the term itself as a child
+    /// edge — so what they share is the descent and not the projection. A type variant that
+    /// quotes a term is remembered here once rather than in each.
     ///
-    /// Does **not** descend into a predicate's own type slots: a predicate is a
-    /// [`TypedExpr`], so its slots are an expression walk's business. A caller
-    /// that needs them recurses itself, which `collect_tree_ids` and
-    /// `predicate_id_collisions` (`crate::ccl::context`) both do.
-    pub fn walk_refinements<'a>(&'a self, f: &mut impl FnMut(&'a Refinement)) {
-        if let Type::Refinement(_, refinements) = self {
-            for r in refinements.iter() {
-                f(r);
+    /// Does **not** descend into a quoted term's own type slots: the term is a
+    /// [`TypedExpr`], so its slots are an expression walk's business. A caller that needs
+    /// them recurses itself, which `collect_tree_ids` and `predicate_id_collisions`
+    /// (`crate::ccl::context`) both do.
+    pub fn walk_quoted_terms<'a>(&'a self, f: &mut impl FnMut(&'a Rc<TypedExpr>)) {
+        match self {
+            Type::Refinement(_, refinements) => {
+                for r in refinements.iter() {
+                    f(&r.predicate);
+                }
             }
+            Type::WitnessProjection(p) => f(&p.term),
+            _ => {}
         }
-        self.walk_children(|c| c.walk_refinements(f));
+        self.walk_children(|c| c.walk_quoted_terms(f));
     }
 
     pub fn walk_children<'a>(&'a self, mut f: impl FnMut(&'a Type)) {
@@ -3677,6 +3698,7 @@ impl Type {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
+            | Type::WitnessProjection(_)
             | Type::Param(_)
             | Type::Txn => {}
             // A `Poly`'s bounds are its children as its body is: a pass that rewrites
@@ -3740,6 +3762,7 @@ impl Type {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
+            | Type::WitnessProjection(_)
             | Type::Param(_)
             | Type::Txn => {}
             Type::Poly(poly) => Rc::make_mut(poly).types_mut().for_each(f),
@@ -3864,6 +3887,143 @@ impl Refinement {
         let normal = Rc::new(ccl_utils::normal_form(&self.predicate));
         *self.normal.0.borrow_mut() = Some((Rc::clone(&self.predicate), Rc::clone(&normal)));
         normal
+    }
+}
+
+/// The payload of [`Type::WitnessProjection`]: the sum's term and the binder position projected.
+///
+/// The term is quoted as a refinement quotes its predicate: shared by `Rc`, compared and hashed by
+/// its normal form with its type slots skipped. The term's own type carries the sum's binders, so
+/// the witness's kind and bound are read off it. The position, counted outermost first, survives
+/// the renaming inference applies to a sum's binder ids.
+#[derive(Clone)]
+pub struct WitnessProjection {
+    /// The sum the witness is projected from.
+    pub term: Rc<TypedExpr>,
+    /// Which of the sum's binders, outermost first.
+    pub position: usize,
+    /// The term's normal form, what equality and hashing compare.
+    pub normal: NormalFormCache,
+}
+
+impl WitnessProjection {
+    pub fn new(term: Rc<TypedExpr>, position: usize) -> Self {
+        WitnessProjection {
+            term,
+            position,
+            normal: NormalFormCache::default(),
+        }
+    }
+
+    /// The term's normal form ([`crate::ccl::ccl_utils::normal_form`]).
+    pub(crate) fn normal(&self) -> Rc<TypedExpr> {
+        if let Some((for_term, normal)) = &*self.normal.0.borrow()
+            && Rc::ptr_eq(for_term, &self.term)
+        {
+            return Rc::clone(normal);
+        }
+        let normal = Rc::new(ccl_utils::normal_form(&self.term));
+        *self.normal.0.borrow_mut() = Some((Rc::clone(&self.term), Rc::clone(&normal)));
+        normal
+    }
+
+    /// The witness this projects, as the term's own type binds it.
+    pub fn witness(&self) -> Option<&Witness> {
+        self.term.ty.peel_refinements().sum()?.get(self.position)
+    }
+}
+
+/// The type `unbox(𝑡)` has for a term `𝑡` of the sum type `sum_ty`: the sum's body with each
+/// witness it binds replaced by its projection through `𝑡` (`src/ccl/design/collections.md`,
+/// "Projecting a sum's witness"). `None` when `sum_ty` binds no witness.
+pub fn unboxed_type(sum_ty: &Type, term: &Rc<TypedExpr>) -> Option<Type> {
+    let witnesses = sum_ty.peel_refinements().sum()?.to_vec();
+    Some(
+        witnesses
+            .iter()
+            .enumerate()
+            .fold(sum_ty.clone(), |ty, (position, witness)| {
+                let projection =
+                    Type::WitnessProjection(WitnessProjection::new(Rc::clone(term), position));
+                instantiate_witness(&ty, witness.id(), &projection)
+            }),
+    )
+}
+
+/// The type a use of [`crate::ccl::Builtin::Unbox`] stamps for an argument of type `sum_ty`:
+/// `(𝑐 : sum_ty) ⇒ unboxed_type(sum_ty, 𝑐)`, closed over its binder. `None` when `sum_ty` binds
+/// no witness. The binder's reference lives in a type, so the caller opens the provenance frame
+/// it is minted under.
+pub fn unbox_type(sum_ty: &Type) -> Option<Type> {
+    let boxed = crate::ccl::Name::fresh("__boxed");
+    let term = Rc::new(TypedExpr::var(boxed.clone()).with_ty(sum_ty.clone()));
+    let body = unboxed_type(sum_ty, &term)?;
+    Some(Type::pi(boxed, sum_ty.clone(), body))
+}
+
+impl PartialEq for WitnessProjection {
+    /// Equal positions of terms equal as [`Refinement`] predicates are: pointer-equal, or
+    /// equal by normal form with their type slots skipped.
+    fn eq(&self, other: &Self) -> bool {
+        self.position == other.position
+            && (Rc::ptr_eq(&self.term, &other.term)
+                || eq_term_modulo_ty_slots(&self.normal(), &other.normal()))
+    }
+}
+
+impl Eq for WitnessProjection {}
+
+impl std::hash::Hash for WitnessProjection {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.position.hash(state);
+        hash_term_modulo_ty_slots(&self.normal(), state, &mut Vec::new());
+    }
+}
+
+impl fmt::Debug for WitnessProjection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WitnessProjection")
+            .field("term", &self.term)
+            .field("position", &self.position)
+            .finish()
+    }
+}
+
+/// A term a type quotes: a refinement's predicate, or the sum a [`WitnessProjection`] projects.
+///
+/// A quoted term rides every type slot its type reaches, shared by `Rc`, so a pass rewriting the
+/// terms a type holds rebuilds it once and re-points every occurrence at the rebuild
+/// ([`crate::ccl::ccl_utils::PredMemo`]).
+pub trait QuotedTerm {
+    /// The quoted term.
+    fn quoted(&self) -> &Rc<TypedExpr>;
+    /// Install `to` as the quoted term.
+    fn requote(&mut self, to: Rc<TypedExpr>);
+}
+
+impl QuotedTerm for Refinement {
+    fn quoted(&self) -> &Rc<TypedExpr> {
+        &self.predicate
+    }
+    fn requote(&mut self, to: Rc<TypedExpr>) {
+        // The rewrite half of the boundary `Refinement::born` guards: a pass that
+        // substitutes into a predicate can put a whole function body there, and
+        // this is where such a term would be installed. Checked only where the
+        // term actually changes — re-pointing at the `Rc` already installed
+        // re-checks what was checked when it was installed.
+        if !Rc::ptr_eq(&self.predicate, &to) {
+            debug_assert_predicate_shape(&to);
+        }
+        self.predicate = to;
+    }
+}
+
+impl QuotedTerm for WitnessProjection {
+    fn quoted(&self) -> &Rc<TypedExpr> {
+        &self.term
+    }
+    fn requote(&mut self, to: Rc<TypedExpr>) {
+        self.term = to;
     }
 }
 

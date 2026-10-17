@@ -281,6 +281,11 @@ fn hash_type<'a>(
                 depth.hash(state);
             }
         }
+        // The projected sum is a term the type quotes, hashed as a predicate is.
+        T::WitnessProjection(p) => {
+            p.position.hash(state);
+            hash_rel(&p.term, env, wenv, free).hash(state);
+        }
         T::Tuple(tys) => {
             tys.len().hash(state);
             for t in tys {

@@ -1872,6 +1872,7 @@ fn coalesce_type_predicates_go(
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::WitnessRef(_)
+        | Type::WitnessProjection(_)
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
