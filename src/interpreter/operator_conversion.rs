@@ -6155,7 +6155,7 @@ mod variant_ctor_tests {
                 scrutinee: Some(Box::new(c_decision)),
                 branches: vec![Branch {
                     pattern: Some(Pattern {
-                        tag: "commit".into(),
+                        head: crate::ccl::PatternHead::Tag("commit".into()),
                         binding: binding("w", int_ty.clone()),
                         empty_payload: false,
                     }),

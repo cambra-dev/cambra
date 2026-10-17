@@ -76,6 +76,13 @@ fn bound_names(
                 bound_names(doc, part, range, out);
             }
         }
+        AssignTarget::Constructor(pattern) => {
+            for binder in pattern.binders.iter().flatten() {
+                if let Some(name) = &binder.node {
+                    out.push(symbol(doc, name, SymbolKind::Variable, range, binder.span));
+                }
+            }
+        }
         AssignTarget::Subscript { .. } | AssignTarget::Qualified(_) => {}
     }
 }

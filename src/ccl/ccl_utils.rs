@@ -163,7 +163,7 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
             });
             continue;
         };
-        let tag = FieldKey::Name(pat.tag.clone().into());
+        let tag = FieldKey::Name(pat.tag().into());
         let payload_ty = pat.binding.ty.clone();
         let mut guard = Expr::apply(
             scrut.clone(),

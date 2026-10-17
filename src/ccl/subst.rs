@@ -3385,7 +3385,7 @@ mod rewrite_tests {
     fn case_pays_the_capture_check_once_per_branch_not_once_per_child() {
         let branch = |tag: &str, payload: &str| Branch {
             pattern: Some(crate::ccl::Pattern {
-                tag: tag.into(),
+                head: crate::ccl::PatternHead::Tag(tag.into()),
                 binding: TypedBinding::new_unannotated(payload),
                 empty_payload: false,
             }),

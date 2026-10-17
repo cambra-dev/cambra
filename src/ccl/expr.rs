@@ -2339,6 +2339,44 @@ pub struct Branch {
     pub body: TypedExpr,
 }
 
+/// What a [`Pattern`] matches: a structural variant's tag, or a nominal type's
+/// constructor (`docs/chl-spec.md`, "4.10 `match` — tag dispatch").
+///
+/// Both match a runtime row by the same tag, so a pass that only dispatches reads
+/// [`Pattern::tag`]. Inference types the two differently, which is why they are two
+/// variants: a tag relates the scrutinee to a structural variant, and a constructor to its
+/// declaration ([`crate::ccl::infer`]'s `emit_case`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PatternHead {
+    /// `` `tag ``: a tag of a structural variant.
+    Tag(String),
+    /// `N::c`: the constructor `ctor` of the nominal type `decl`. Every head of one `Case`
+    /// names the same declaration, or none does.
+    Constructor {
+        decl: std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+        ctor: String,
+    },
+}
+
+/// As the source spells the head: `` `tag `` or `N::c`.
+impl std::fmt::Display for PatternHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PatternHead::Tag(tag) => write!(f, "`{tag}"),
+            PatternHead::Constructor { decl, ctor } => write!(f, "{}::{ctor}", decl.name),
+        }
+    }
+}
+
+impl PatternHead {
+    /// The tag a matching row carries: the tag itself, or the constructor's name.
+    pub fn tag(&self) -> &str {
+        match self {
+            PatternHead::Tag(tag) | PatternHead::Constructor { ctor: tag, .. } => tag,
+        }
+    }
+}
+
 /// The structural part of a [`Branch`]: a variant tag plus the binding that
 /// receives its payload — `` `Tag(binder) ``, the destructuring form mirroring
 /// [`TypedExprNode::VariantCtor`]'s construction.
@@ -2348,9 +2386,8 @@ pub struct Branch {
 /// inference to the per-tag narrowed payload type.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
-    /// Tag this branch matches; must agree with one of the scrutinee
-    /// variant's keys.
-    pub tag: String,
+    /// What this branch matches; its tag must agree with one of the scrutinee's.
+    pub head: PatternHead,
     /// Payload binding, in scope for the branch's `guard` and `body`.
     ///
     /// Always present, including for an arm whose source named no payload: the name is
@@ -2365,6 +2402,13 @@ pub struct Pattern {
     /// payload does not match the first. `emit_case` records it as `payload <: Unit` on
     /// that arm alone, which lets the rejection name the arm.
     pub empty_payload: bool,
+}
+
+impl Pattern {
+    /// The tag a matching row carries ([`PatternHead::tag`]).
+    pub fn tag(&self) -> &str {
+        self.head.tag()
+    }
 }
 
 #[cfg(test)]

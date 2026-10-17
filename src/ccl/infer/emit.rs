@@ -14,8 +14,8 @@ use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
-    AggregateKind, BaseType, Branch, Expr, Name, ProjKey, Refinement, TransactKey, Type,
-    TypedBinding, TypedExprNode, V_ABORT, V_COMMIT, WriterSite,
+    AggregateKind, BaseType, Branch, Expr, Name, PatternHead, ProjKey, Refinement, TransactKey,
+    Type, TypedBinding, TypedExprNode, V_ABORT, V_COMMIT, WriterSite,
 };
 
 use super::context::InferCtx;
@@ -2434,7 +2434,7 @@ pub(super) fn emit_list<C: Typing>(
 /// branch carries the literal-`true` guard), and every branch body flows
 /// one-way into one shared variable, so the node's type is the arms' **join**.
 pub(super) fn emit_case<C: Typing>(
-    scrutinee: Option<&mut Expr>,
+    mut scrutinee: Option<&mut Expr>,
     branches: &mut [Branch],
     label: &str,
     ctx: &mut C,
@@ -2448,13 +2448,40 @@ pub(super) fn emit_case<C: Typing>(
     // Structural dispatch: constrain the scrutinee to the Variant of the
     // branch pattern tags, minting one payload var αᵢ per pattern branch and
     // writing it into the branch's binding slot (coalesce resolves it later).
-    if let Some(scrut) = scrutinee {
+    // Arms naming a nominal type's constructors relate the scrutinee to that declaration.
+    let nominal = branches
+        .iter()
+        .find_map(|b| match &b.pattern.as_ref()?.head {
+            PatternHead::Constructor { decl, .. } => Some(decl.clone()),
+            PatternHead::Tag(_) => None,
+        });
+    // Both paths below rely on it, and `lower_match` is what refuses any other `Case`. A
+    // `Case` some pass built with a mix is a compiler bug, stated here once.
+    assert!(
+        branches
+            .iter()
+            .filter_map(|b| b.pattern.as_ref())
+            .all(|p| match (&p.head, &nominal) {
+                (PatternHead::Tag(_), None) => true,
+                (PatternHead::Constructor { decl, .. }, Some(d)) => decl == d,
+                _ => false,
+            }),
+        "a `Case` names the constructors of one nominal type, or tags only (`lower_match` \
+         refuses any other arms)"
+    );
+    if let (Some(scrut), Some(decl)) = (scrutinee.as_deref_mut(), nominal) {
+        emit_nominal_scrutinee(scrut, &decl, branches, ctx)?;
+    } else if let Some(scrut) = scrutinee {
         let scrut_ty = emit_value_read(scrut, ctx)?;
         let mut expected_tags: BTreeMap<FieldKey, Type> = BTreeMap::new();
         for b in branches.iter_mut() {
             if let Some(p) = &mut b.pattern {
+                let PatternHead::Tag(tag) = &p.head else {
+                    unreachable!("a `Case` names constructors of one nominal type or tags only")
+                };
+                let tag = SmolStr::from(tag.as_str());
                 let alpha = ctx.binding_slot(&mut p.binding.ty);
-                expected_tags.insert(FieldKey::Name(SmolStr::from(p.tag.as_str())), alpha);
+                expected_tags.insert(FieldKey::Name(tag), alpha);
             }
         }
         // One constraint, always the same shape: the scrutinee flows into the arms'
@@ -2491,7 +2518,7 @@ pub(super) fn emit_case<C: Typing>(
         // scrutinee's instead.
         for b in branches.iter() {
             if let Some(p) = &b.pattern.as_ref().filter(|p| p.empty_payload) {
-                let tag = p.tag.clone();
+                let tag = p.tag().to_string();
                 ctx.require_sub(&p.binding.ty, &prim(BaseType::Unit), &|| {
                     format!("payload of arm `` `{tag} ``, which names none")
                 })?;
@@ -2522,6 +2549,54 @@ pub(super) fn emit_case<C: Typing>(
         ctx.require_sub(&body_ty, &result_ty, &|| "Case arm".to_string())?;
     }
     Ok(result_ty)
+}
+
+/// The scrutinee of a `Case` whose patterns name constructors of the nominal type `decl`.
+///
+/// The scrutinee is below `decl` at fresh arguments, and each arm binds its constructor's
+/// payload at those arguments. The payload keeps the declaration's refinements: every
+/// value of the type was built by a constructor, whose function discharged them. Lowering
+/// has checked that the arms name constructors of `decl` alone and cover it
+/// (`lower::nominal::constructor_arms_type`).
+fn emit_nominal_scrutinee<C: Typing>(
+    scrut: &mut Expr,
+    decl: &std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+    branches: &mut [Branch],
+    ctx: &mut C,
+) -> Result<(), LocatedInferError> {
+    let scrut_ty = emit_value_read(scrut, ctx)?;
+    let args: Vec<Type> = decl.params.iter().map(|_| ctx.fresh()).collect();
+    let expected = Type::Nominal(decl.clone(), args.clone());
+    ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
+    for b in branches.iter_mut() {
+        let Some(p) = &mut b.pattern else {
+            continue;
+        };
+        let PatternHead::Constructor { decl: named, ctor } = &p.head else {
+            unreachable!("a `Case` names constructors of one nominal type or tags only")
+        };
+        debug_assert!(
+            named == decl,
+            "the patterns of one `Case` name constructors of one nominal type"
+        );
+        let ctor_name = ctor.clone();
+        let ctor = decl.ctor(&ctor_name).unwrap_or_else(|| {
+            panic!(
+                "`{}` declares no constructor `{ctor_name}`; lowering checks a pattern's \
+                 constructor",
+                decl.name
+            )
+        });
+        let mut payload = decl.instantiate(&ctor.payload(), &args);
+        ctx.type_annotation_predicates(&mut payload)?;
+        let payload = ctx.normalize(&payload);
+        let slot = ctx.binding_slot(&mut p.binding.ty);
+        let ty = decl.name.clone();
+        ctx.require_sub(&payload, &slot, &|| {
+            format!("the parameters of `{ty}::{ctor_name}`")
+        })?;
+    }
+    Ok(())
 }
 
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the

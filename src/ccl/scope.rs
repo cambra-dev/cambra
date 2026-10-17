@@ -649,6 +649,7 @@ mod tests {
                     "N".into(),
                     Vec::new(),
                     chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
+                    false,
                 ),
                 "c",
                 var("pl"),
@@ -719,7 +720,7 @@ mod tests {
             branches: vec![
                 Branch {
                     pattern: Some(Pattern {
-                        tag: "T".into(),
+                        head: crate::ccl::PatternHead::Tag("T".into()),
                         binding: bind("payload"),
                         empty_payload: false,
                     }),

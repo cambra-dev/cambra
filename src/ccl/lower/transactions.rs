@@ -256,6 +256,7 @@ fn lower_tx_block_scoped(
             // `let`. `=` never writes a mutable variable; a plain `=` to a mutable variable would be
             // a silent no-op shadow that dies at block end, so reject it and point
             // at `:=`. (A genuine local shadowing the mutable variable's name is fine.)
+            // A constructor pattern's names are each checked so.
             // A type alias binds nothing, so the chain passes through unchanged.
             ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
                 chain
@@ -266,21 +267,21 @@ fn lower_tx_block_scoped(
                 transparency,
             } => {
                 refuse_nested_sink(target, value, stmt.span)?;
-                let name = extract_name_target(target, "assignment")?;
-                if !ctx.is_shadowed(&name) && ctx.is_transactional_mut_var(&name) {
-                    return Err(LoweringError::unsupported(
-                        stmt.span,
-                        format!(
-                            "write mutable variable `{name}` inside a `with begin():` block with `:=` \
-                             (`=` binds immutably — a plain `=` here is a no-op shadow)"
-                        ),
-                    ));
+                let assignment = AssignmentBindings::of(target, *transparency, stmt.span, ctx)?;
+                for name in assignment.names() {
+                    if !ctx.is_shadowed(&name) && ctx.is_transactional_mut_var(&name) {
+                        return Err(LoweringError::unsupported(
+                            stmt.span,
+                            format!(
+                                "write mutable variable `{name}` inside a `with begin():` block \
+                                 with `:=` (`=` binds immutably — a plain `=` here is a no-op \
+                                 shadow)"
+                            ),
+                        ));
+                    }
                 }
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
-                ctx.tag_image(
-                    Expr::let_bind_with(name, val, chain, binding_transparency(*transparency)),
-                    stmt.span,
-                )
+                assignment.wrap(val, chain, stmt.span, ctx)
             }
             // `if cond: <writes>` — a conditional (deny) write. The no-else
             // branch is the deny: `commit = false` for the whole transaction.

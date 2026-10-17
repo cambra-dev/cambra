@@ -278,7 +278,7 @@ pub(super) fn uncurry_params(
         let var = ctx.tag_machinery(Expr::var(&tuple_name), site, up);
         let idx = ctx.tag_machinery(Expr::proj_index(i), site, up);
         let proj = ctx.tag_machinery(Expr::apply(var, idx), site, up);
-        substitute_param_in_body(acc, &Name::raw(arg.name.as_str()), &proj)
+        substitute_param_in_body(acc, &Name::raw(arg.name.as_str()), &proj, up)
     });
     // Attach the *tuple* of per-parameter annotations (checking mode), mirroring the
     // single-parameter case: each annotated position is enforced at the call site,
@@ -357,14 +357,21 @@ pub(super) fn lower_lambda(
 /// that user code cannot bind, with a fresh unique id per multi-arg lambda
 /// ([`LoweringContext::fresh_tuple_arg`]), so the engine's no-capture assert
 /// cannot fire.
-fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
+///
+/// `label` names the lowering rule the copies are recorded under.
+pub(super) fn substitute_param_in_body(
+    expr: Expr,
+    name: &Name,
+    replacement: &Expr,
+    label: RewriteLabel,
+) -> Expr {
     use crate::ccl::provenance::copy_frame;
     let mut expr = expr;
     // A lowering copy sink: the discharge's interior freshens fire `on_copy` into
     // this recording, which writes them as `Copy` LoweringSteps (mirroring the
     // template) into the always-on lowering log. A no-op when no session is
     // installed (the lower unit tests).
-    let _frame = copy_frame("lower.uncurry_proj");
+    let _frame = copy_frame(label);
     crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
     expr
 }

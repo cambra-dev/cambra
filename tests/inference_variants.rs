@@ -53,7 +53,7 @@ fn variant(tags: &[(&str, Type)]) -> Type {
 fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> Branch {
     Branch {
         pattern: Some(Pattern {
-            tag: tag.into(),
+            head: cambra::ccl::PatternHead::Tag(tag.into()),
             binding: TypedBinding {
                 name: binding.into(),
                 ty: Type::Hole,
@@ -355,7 +355,7 @@ fn match_fills_arm_binding_and_body_var_types() {
     };
     let some_arm = branches
         .iter()
-        .find(|b| b.pattern.as_ref().is_some_and(|p| p.tag == "some"))
+        .find(|b| b.pattern.as_ref().is_some_and(|p| p.tag() == "some"))
         .expect("Some arm");
     let some_pat = some_arm.pattern.as_ref().expect("Some arm has a pattern");
     assert_eq!(
@@ -542,7 +542,7 @@ fn arm_payload_ty(expr: &TypedExpr, tag: &str) -> Type {
         if let TypedExprNode::Case { branches, .. } = &expr.node {
             for b in branches {
                 if let Some(p) = &b.pattern
-                    && p.tag == tag
+                    && p.tag() == tag
                 {
                     return Some(p.binding.ty.clone());
                 }

@@ -1687,10 +1687,10 @@ that can *fail* to match, which is why they appear only in a `case` arm or where
 exhaustive: a variant pattern against a single-tag variant type, and a constructor pattern against
 a type that declares one constructor (`Price::new(r) = p`).
 
-Today's grammar accepts only the tuple forms, unannotated, with the
-annotation restricted to the whole target (`ann_assign_stmt`, §2.2);
-record, variant, constructor, wildcard, and per-component annotations are all
-unimplemented.
+Today's grammar accepts the tuple forms, unannotated, with the
+annotation restricted to the whole target (`ann_assign_stmt`, §2.2), and a constructor pattern on
+the left of `=`; record, variant, and wildcard patterns, a constructor pattern in a `for` binder,
+and per-component annotations are all unimplemented.
 
 ### 4.4 Define statement `<<=`
 
@@ -4926,10 +4926,10 @@ with parser-level support that lowering rejects:
   tag dispatch over a variant is implemented (§4.10), in both the indented and
   the one-line form, but patterns are shallow: no nesting, no literal patterns,
   and no per-arm guard.
-- **Destructuring patterns** beyond tuples — record, variant, constructor, and
-  wildcard patterns in assignment targets and `for` binders (a `match`
-  arm's tag pattern is §4.10), and per-component annotations with `:`
-  binding tighter than `,` (**[Decided]**, §4.3.1).
+- **Destructuring patterns** beyond tuples and a constructor pattern on the left of `=` — record,
+  variant, and wildcard patterns in assignment targets and `for` binders, a constructor pattern in a
+  `for` binder (a `match` arm's tag or constructor pattern is §4.10), and per-component annotations
+  with `:` binding tighter than `,` (**[Decided]**, §4.3.1).
 - **Unit values do not run** — the type surface is settled (`{}` for the type,
   `()` for the value, §6.6) and both typecheck, but a unit-valued program
   output cannot be materialized by the interpreter: it has no column
@@ -4943,9 +4943,9 @@ with parser-level support that lowering rejects:
   or Unicode `[k ↦ v, …]` are superseded by the map-literal decision.
 - **Map comprehensions** — `[k -> v for …]` is a comprehension of pairs, and reading one as a
   `Map` is `map([k -> v for …])` ([3.12 Comprehensions](#312-comprehensions)).
-- **Nominal types** — a recursive `type` declaration, constructor patterns, `extract`, associated
-  functions and methods, `@RenamedFrom` on a type, and carrying a value of a nominal type over a
-  reload are **[Decided]** and unimplemented
+- **Nominal types** — a recursive `type` declaration, associated functions and methods,
+  `@RenamedFrom` on a type, and carrying a value of a nominal type over a reload are **[Decided]**
+  and unimplemented
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
 - **The target syntax at large** — the mutation and transaction **core is implemented** (`:=`,
   `with begin():`, `Mut(…, Txn)` mutable variables, feeds — §8), now spelled in the canonical target
