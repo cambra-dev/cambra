@@ -9,10 +9,19 @@ use crate::scalar_ops::{
     zip_arithmetic, zip_bool_compare, zip_bool_logic, zip_compare, zip_concat,
 };
 
-use super::ColumnValue;
+use super::{BaseType, ColumnValue, Extent};
+
+/// Output [`Extent`] for a [`BinOpKind`].
+pub fn binop_output_extent(op: &BinOpKind) -> Extent {
+    match op {
+        BinOpKind::Arithmetic(_) => Extent::Base(BaseType::Int),
+        BinOpKind::Compare(_) | BinOpKind::BoolLogic(_) => Extent::Base(BaseType::Bool),
+        BinOpKind::Concat => Extent::Base(BaseType::String),
+    }
+}
 
 /// The empty column that holds the result of `op` over operands shaped like `left`.
-fn result_column(op: BinOpKind, left: &ColumnValue) -> ColumnValue {
+pub fn binop_result_column(op: BinOpKind, left: &ColumnValue) -> ColumnValue {
     match op {
         BinOpKind::Arithmetic(_) => left.empty_like(),
         BinOpKind::Concat => ColumnValue::Strings(Vec::new()),
@@ -136,7 +145,7 @@ pub fn apply_binop_into(
 ///
 /// Neither operand's buffer is reused.
 pub fn apply_binop_column(op: BinOpKind, left: &ColumnValue, right: &ColumnValue) -> ColumnValue {
-    let mut out = result_column(op, left);
+    let mut out = binop_result_column(op, left);
     apply_binop_into(op, left, right, &mut out);
     out
 }

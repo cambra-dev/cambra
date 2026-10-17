@@ -457,7 +457,7 @@ boundary and is rejected.
 | `f ≫ g` | Compile `f`, then feed its result to `g` |
 | `id`, `map(g)` | Pass the input through; `map` compiles `g` with that input |
 | `const(c)` | `MapResultToConst` on the input |
-| `zip(f, g)` | Share input through `FanOut` and combine results with `Zip` |
+| `zip(f, g)` | Share input through `FanOut` and combine results with `Zip`, unless the enclosing chain is element-wise (see [Element-wise chains](#element-wise-chains)) |
 | `zip((a: f, b: g))` | `zip_arms_named_at` selects `Zip` or `MakeRecord` |
 | `.n`, `.field` | Project a tuple or record field |
 | `add`, `neg`, and other scalar builtins | Apply the corresponding scalar operator |
@@ -469,6 +469,22 @@ boundary and is rejected.
 | `List` | `MapResult` over an index stream |
 | `Lit`, value-position `Tuple` or `Record` | `Constant` or `MakeRecord` |
 | `Source(name)` | `MapResultWithSource` reads the registered source using the supplied upstream input |
+
+### Element-wise chains
+
+`operator_conversion::fusable_prefix` reads each `Compose` chain at every position where an input
+operator exists. It takes the longest prefix that is a function of the input column built from
+`id`, projections, literal constants, binary and unary scalar builtins, and `zip`s of such chains,
+and converts it to `MapResult(input, Constant(FunctionDef::Scalar(expr)))`
+(`interpreter/scalar_expr.rs`, `fuse_prefix`). The arms of a `zip` in the prefix read the same
+input, so the fused chain has no `Memo`, `FanOut`, `Zip` or intermediate pair. A prefix of fewer
+than two operations converts as before, since fusing it would replace one operator with one.
+
+The prefix ends before the first element outside that set. An aggregate, a lookup, a conditional,
+a store read, or a constant that is not a literal stays an operator. Conversion also declines when
+the input is a bare product, whose fields are tiles, or when its values at the current level hold
+a collection, since neither is a column. A chain that ends in a `zip` is a tile of fields and
+stays on the `Zip` path; only a chain that ends in one column fuses.
 
 `build_product` uses the node's extent to distinguish a record of tiles from a collection of
 records. A record extent uses `MakeRecord`; a function extent uses `zip_arms_named_at`, which

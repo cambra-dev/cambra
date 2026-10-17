@@ -25,9 +25,11 @@ use crate::{
         FunctionDef,
         Position,
         Predicate,
+        ScalarExpr,
         Tile,
         UnaryOpKind,
         Value,
+        binop_output_extent,
         // The runtime commit engine. Its `TransactWriter` is the *operator*
         // (aliased `CommitWriter` to avoid clashing with the CCL `TransactWriter`
         // node field imported from `ccl` above).
@@ -37,6 +39,7 @@ use crate::{
             full_store_tiling, nested_engines_tiling, store_value_now,
         },
         operator_graph::{record_kept_operators, record_sink},
+        scalar_expr,
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
             Filter, FlattenTupleDomain, IterateExtent, MakeRecord, MapAggregate, MapDomain,
@@ -1878,6 +1881,21 @@ fn convert_impl_inner(
                 }
             }
             while let [elem, after @ ..] = rest {
+                if let Some(fused) = result
+                    .as_deref()
+                    .and_then(|input| fusable_prefix(rest, input.tiling(), ctx.level()))
+                {
+                    let input = result.take().expect("fusable_prefix read an input");
+                    result = Some(apply_scalar_expr(
+                        input,
+                        fused.expr,
+                        fused.domain,
+                        fused.codomain,
+                        ctx.level(),
+                    ));
+                    rest = &rest[fused.consumed..];
+                    continue;
+                }
                 result = Some(convert_impl(elem, result.take(), ctx)?);
                 rest = after;
             }
@@ -5417,6 +5435,38 @@ fn apply_binop(
     )))
 }
 
+/// The pointwise prefix of `chain` that fuses into one [`ScalarExpr`] map over `input`, when
+/// `input` holds a column of values at `level`.
+///
+/// A bare product's fields are tiles and a value holding a level is not a column, so the
+/// function has nothing to read in either ([`selects_a_tile`]).
+fn fusable_prefix(chain: &[Expr], input: &Tiling, level: CurryLevel) -> Option<scalar_expr::Fused> {
+    if matches!(input, Tiling::Record(_)) || input.values_at(level).holds_a_level() {
+        return None;
+    }
+    scalar_expr::fuse_prefix(chain, &value_extent_at(input, level))
+}
+
+/// `MapResult(input, Constant(Scalar(expr)))`: one pass over the column the chain started from.
+fn apply_scalar_expr(
+    input: Box<dyn TileOperator>,
+    expr: ScalarExpr,
+    domain: Extent,
+    codomain: Extent,
+    level: CurryLevel,
+) -> Box<dyn TileOperator> {
+    let fn_value = Value::ComputableFunction(FunctionDef::Scalar(expr));
+    let fn_extent = Extent::Function {
+        domain: Box::new(domain),
+        codomain: Box::new(codomain),
+    };
+    Box::new(MapResult::new_at(
+        input,
+        Box::new(Constant::new(fn_value, fn_extent)),
+        level,
+    ))
+}
+
 /// Which of the two collection-combining operations a union node denotes.
 ///
 /// Read off the node rather than inferred: `Copair` is a **copairing** (operands
@@ -5590,17 +5640,6 @@ fn builtin_to_unaryop(b: Builtin) -> Option<UnaryOpKind> {
     })
 }
 
-/// Output [`Extent`] for an interpreter [`BinOpKind`].
-fn binop_output_extent(op: &InterpreterBinOp) -> Extent {
-    match op {
-        InterpreterBinOp::Arithmetic(_) => Extent::Base(BaseType::Int),
-        InterpreterBinOp::Compare(_) | InterpreterBinOp::BoolLogic(_) => {
-            Extent::Base(BaseType::Bool)
-        }
-        InterpreterBinOp::Concat => Extent::Base(BaseType::String),
-    }
-}
-
 /// Output [`Extent`] for a [`UnaryOpKind`].
 fn unaryop_output_extent(op: &UnaryOpKind) -> Extent {
     match op {
@@ -5617,14 +5656,13 @@ fn value_extent_at(tiling: &Tiling, level: CurryLevel) -> Extent {
 
 /// Extract the extent of a named record field.
 fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, ConversionError> {
-    match record_extent {
-        Extent::Record(fields) => fields
+    match record_extent.record_fields() {
+        Some(fields) => fields
             .get(field_name)
             .cloned()
             .ok_or_else(|| ConversionError::TypeError(format!("record has no field {field_name}"))),
-        Extent::Restricted { base, .. } => field_extent_of(base, field_name),
-        other => Err(ConversionError::TypeError(format!(
-            "Proj applied to non-record extent {other:?}"
+        None => Err(ConversionError::TypeError(format!(
+            "Proj applied to non-record extent {record_extent:?}"
         ))),
     }
 }
