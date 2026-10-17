@@ -5,11 +5,10 @@
 use std::collections::BTreeMap;
 
 use crate::ccl::FieldKey;
-use crate::ccl::infer::solver::traits::{Assoc, Trait};
+use crate::ccl::infer::solver::traits::{Assoc, OperatorCall, Trait};
 use crate::ccl::infer::solver::{PolyScheme, fresh_var, fun, prim};
 use crate::ccl::{
-    AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Level, Type,
-    UnaryOpKind,
+    AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, Level, Type, UnaryOpKind,
 };
 
 use super::product;
@@ -392,52 +391,45 @@ impl OperatorSchemes {
     /// Which typing rule `op` states.
     ///
     /// The arithmetic and comparison operators are polymorphic in their operands, so
-    /// they state a trait; `and`/`or`/… and `++` have fixed operand types, so an
-    /// ordinary scheme says everything there is to say and an obligation would add a
-    /// mechanism with no choice to make.
+    /// they state the trait their [`OperatorCall`] names; `and`/`or`/… and `++` have fixed
+    /// operand types, so an ordinary scheme says everything there is to say and an
+    /// obligation would add a mechanism with no choice to make.
     ///
     /// A scheme is cloned rather than borrowed so the caller's `ctx` borrow is
     /// released before the rule takes `ctx` mutably; a [`PolyScheme`] is `Rc`-shaped,
     /// so this is cheap.
     pub(super) fn binop(&self, op: BinOpKind) -> OpSignature {
-        let arithmetic = |trait_| OpSignature::SingleObligation {
-            trait_,
-            result: OperatorResult::Associated(Assoc::Output),
+        let Some(call) = OperatorCall::of_binop(op) else {
+            return match op {
+                BinOpKind::BoolLogic(_) => OpSignature::Scheme(self.bool_logic.clone()),
+                BinOpKind::Concat => OpSignature::Scheme(self.concat.clone()),
+                _ => unreachable!("`{op:?}` requires a trait"),
+            };
         };
-        // Every comparison yields `Bool` whatever operands it accepts, so the result
-        // is the operator's to state and `Equatable`/`Orderable` associate nothing.
-        let comparison = |trait_| OpSignature::SingleObligation {
-            trait_,
-            result: OperatorResult::Fixed(BaseType::Bool),
-        };
-        match op {
-            BinOpKind::Arithmetic(ArithmeticKind::Add) => arithmetic(Trait::addable()),
-            BinOpKind::Arithmetic(ArithmeticKind::AddRefined) => OpSignature::SingleObligation {
-                trait_: Trait::addable_refined(),
-                result: OperatorResult::AssociatedRefined(Assoc::Output, sum_of_the_operands),
-            },
-            BinOpKind::Arithmetic(ArithmeticKind::Sub) => arithmetic(Trait::subtractable()),
-            BinOpKind::Arithmetic(ArithmeticKind::Mul) => arithmetic(Trait::multipliable()),
-            BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => arithmetic(Trait::divisible()),
-            BinOpKind::Arithmetic(ArithmeticKind::Pow) => arithmetic(Trait::exponentiable()),
-            BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals) => {
-                comparison(Trait::equatable())
+        let result = match op {
+            // Every comparison yields `Bool` whatever operands it accepts, so the result
+            // is the operator's to state and `Equatable`/`Orderable` associate nothing.
+            BinOpKind::Compare(_) => OperatorResult::Fixed(BaseType::Bool),
+            BinOpKind::Arithmetic(ArithmeticKind::AddRefined) => {
+                OperatorResult::AssociatedRefined(Assoc::Output, sum_of_the_operands)
             }
-            BinOpKind::Compare(_) => comparison(Trait::orderable()),
-            BinOpKind::BoolLogic(_) => OpSignature::Scheme(self.bool_logic.clone()),
-            BinOpKind::Concat => OpSignature::Scheme(self.concat.clone()),
+            _ => OperatorResult::Associated(Assoc::Output),
+        };
+        OpSignature::SingleObligation {
+            trait_: call.trait_,
+            result,
         }
     }
 
     /// See [`Self::binop`] — the same split. `not` is genuinely monomorphic
     /// (`Bool → Bool`), so it keeps a scheme.
     pub(super) fn unary(&self, op: UnaryOpKind) -> OpSignature {
-        match op {
-            UnaryOpKind::Neg => OpSignature::SingleObligation {
-                trait_: Trait::negatable(),
+        match OperatorCall::of_unary(op) {
+            Some(call) => OpSignature::SingleObligation {
+                trait_: call.trait_,
                 result: OperatorResult::Associated(Assoc::Output),
             },
-            UnaryOpKind::Not => OpSignature::Scheme(self.not_op.clone()),
+            None => OpSignature::Scheme(self.not_op.clone()),
         }
     }
 
@@ -558,8 +550,8 @@ mod tests {
     /// Closes `type-checker-traits-comparability` (P3) in the project vault.
     #[test]
     fn max_over_a_non_orderable_codomain_is_rejected() {
-        // Aggregate { input: λx → (1, 2), kind: Max }. The input stands in for a
-        // data collection of tuples (what `max` really consumes), so it carries
+        // Aggregate { input: λx → (a=1, b=2), kind: Max }. The input stands in for a
+        // data collection of records (what `max` really consumes), so it carries
         // the `data_fun` provenance stamp lowering puts on a collection — without
         // it, the bare lambda is a `Compute` capability and `max`'s `Data` demand
         // rejects it on *kind* before the codomain orderability under test.
@@ -570,14 +562,14 @@ mod tests {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
             },
-            body: Box::new(TypedExpr::new(TypedExprNode::Tuple(vec![
-                lit_int(1),
-                lit_int(2),
+            body: Box::new(TypedExpr::new(TypedExprNode::Record(vec![
+                ("a".into(), lit_int(1)),
+                ("b".into(), lit_int(2)),
             ]))),
         })
         .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole));
         let mut e = TypedExpr::aggregate(lam, AggregateKind::Max);
-        let errs = run_inference(&mut e).expect_err("a tuple codomain is not orderable");
+        let errs = run_inference(&mut e).expect_err("a record codomain is not orderable");
         assert!(
             errs.iter().any(|e| matches!(
                 e,

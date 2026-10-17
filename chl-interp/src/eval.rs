@@ -198,6 +198,46 @@ struct Traits {
     /// annotation names, if it names one.
     functions: BTreeMap<(String, String), Vec<Option<usize>>>,
     instances: Vec<InstanceShape>,
+    /// The order of each constructor's argument, by its type and its name, as the declaration
+    /// writes it (`docs/chl-spec.md`, "Equality and order").
+    orders: BTreeMap<(String, String), ValueOrder>,
+}
+
+/// How a value of a type a declaration writes is ordered: each product by its fields in the
+/// order the declaration writes them, a tuple's being `_0`, `_1`, ….
+#[derive(Clone, PartialEq)]
+enum ValueOrder {
+    /// By the value's own order.
+    Whole,
+    Fields(Vec<(String, ValueOrder)>),
+}
+
+impl ValueOrder {
+    /// The order of the type `ty` a declaration writes.
+    fn written(ty: &Expr) -> ValueOrder {
+        match ty {
+            Expr::BraceRefinement { base, .. } => ValueOrder::written(&base.node),
+            Expr::BraceRecord(fields) => ValueOrder::Fields(
+                fields
+                    .iter()
+                    .map(|f| (f.name.to_string(), ValueOrder::written(&f.value.node)))
+                    .collect(),
+            ),
+            Expr::BraceGroup(parts) if !parts.is_empty() => ValueOrder::positions(parts),
+            _ => ValueOrder::Whole,
+        }
+    }
+
+    /// The order of a tuple of the types `parts` a declaration writes.
+    fn positions(parts: &[Spanned<Expr>]) -> ValueOrder {
+        ValueOrder::Fields(
+            parts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (format!("_{i}"), ValueOrder::written(&p.node)))
+                .collect(),
+        )
+    }
 }
 
 /// An instance a module declares: what each of its operands is, and the prefix its
@@ -228,9 +268,40 @@ impl HeadPattern {
     }
 }
 
-/// The traits `body` declares, and the instances `body` declares of them.
+/// The compiler's traits and their functions, each with the operand its parameters are at.
+const BUILTIN_FUNCTIONS: &[(&str, &str, &[usize])] = &[
+    ("Addable", "add", &[0, 1]),
+    ("Subtractable", "sub", &[0, 1]),
+    ("Multipliable", "mul", &[0, 1]),
+    ("Divisible", "div", &[0, 1]),
+    ("Exponentiable", "pow", &[0, 1]),
+    ("Negatable", "neg", &[0]),
+];
+
+/// The function of an operator's trait an arithmetic operator calls (`docs/chl-spec.md`,
+/// "Trait requirements"). `^+` calls none: its trait declares none.
+fn arithmetic_function(op: BinOp) -> Option<(&'static str, &'static str)> {
+    Some(match op {
+        BinOp::Add => ("Addable", "add"),
+        BinOp::Sub => ("Subtractable", "sub"),
+        BinOp::Mul => ("Multipliable", "mul"),
+        BinOp::FloorDiv => ("Divisible", "div"),
+        BinOp::Pow => ("Exponentiable", "pow"),
+        _ => return None,
+    })
+}
+
+/// The traits `body` declares, the compiler's, and the instances `body` declares of them.
 fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
-    let mut functions = BTreeMap::new();
+    let mut functions: BTreeMap<(String, String), Vec<Option<usize>>> = BUILTIN_FUNCTIONS
+        .iter()
+        .map(|(t, f, params)| {
+            (
+                (t.to_string(), f.to_string()),
+                params.iter().map(|p| Some(*p)).collect(),
+            )
+        })
+        .collect();
     for stmt in body {
         let Stmt::TraitDecl(decl) = &stmt.node else {
             continue;
@@ -256,9 +327,34 @@ fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
     }
     let mut types: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::from([OPTION.to_string()]);
+    let mut orders: BTreeMap<(String, String), ValueOrder> = BTreeMap::new();
     for stmt in body {
         if let Stmt::TypeDecl(decl) = &stmt.node {
-            types.insert(decl.name.node.to_string());
+            let ty = decl.name.node.to_string();
+            types.insert(ty.clone());
+            let mut order_of = |tag: &str, order: ValueOrder| {
+                orders.insert((ty.clone(), tag.to_string()), order);
+            };
+            match &decl.body {
+                TypeDeclBody::Single(t) => order_of("new", ValueOrder::written(&t.node)),
+                TypeDeclBody::Constructors(ctors) => {
+                    for c in ctors {
+                        let order = match c.params.as_slice() {
+                            [one] => ValueOrder::written(&one.ty.node),
+                            several => ValueOrder::Fields(
+                                several
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, p)| {
+                                        (format!("_{i}"), ValueOrder::written(&p.ty.node))
+                                    })
+                                    .collect(),
+                            ),
+                        };
+                        order_of(&c.name.node, order);
+                    }
+                }
+            }
         }
     }
     let mut instances = Vec::new();
@@ -298,6 +394,7 @@ fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
     Traits {
         functions,
         instances,
+        orders,
     }
 }
 
@@ -1308,29 +1405,20 @@ impl Interp {
         if any_pending(values.iter()) {
             return Ok(Value::Pending);
         }
-        let Some(params) = self
+        if !self
             .traits
             .functions
-            .get(&(trait_.to_string(), function.to_string()))
-            .cloned()
-        else {
+            .contains_key(&(trait_.to_string(), function.to_string()))
+        {
             return err(format!("`{trait_}` declares no function `{function}`"));
-        };
-        let matching: Vec<String> = self
-            .traits
-            .instances
-            .iter()
-            .filter(|i| i.trait_ == trait_)
-            .filter(|i| {
-                params.iter().zip(&values).all(|(operand, v)| {
-                    operand.is_none_or(|o| i.heads.get(o).is_some_and(|h| h.admits(v)))
-                })
-            })
-            .map(|i| i.bound.clone())
-            .collect();
+        }
+        let matching = self.declared_instances(trait_, function, &values);
         let bound = match matching.as_slice() {
             [one] => format!("{one}::{function}"),
             [] => {
+                if let Some(answer) = builtin_function(trait_, function, &values) {
+                    return answer;
+                }
                 return err(format!(
                     "no instance of `{trait_}` admits the arguments of `{trait_}::{function}`"
                 ));
@@ -1353,6 +1441,151 @@ impl Interp {
         self.call_with_values(&bound, &f, values)
     }
 
+    /// The prefixes of the instances of `trait_` a module declares whose operands admit
+    /// `values`, the arguments of its function `function`, at the operands its parameters
+    /// are annotated with.
+    fn declared_instances(&self, trait_: &str, function: &str, values: &[Value]) -> Vec<String> {
+        let Some(params) = self
+            .traits
+            .functions
+            .get(&(trait_.to_string(), function.to_string()))
+        else {
+            return Vec::new();
+        };
+        self.traits
+            .instances
+            .iter()
+            .filter(|i| i.trait_ == trait_)
+            .filter(|i| {
+                params.iter().zip(values).all(|(operand, v)| {
+                    operand.is_none_or(|o| i.heads.get(o).is_some_and(|h| h.admits(v)))
+                })
+            })
+            .map(|i| i.bound.clone())
+            .collect()
+    }
+
+    /// `l op r` for an arithmetic operator: the call of its trait's function, which an
+    /// instance a module declares answers when one admits the operands, and the compiler's
+    /// otherwise.
+    fn arithmetic(&mut self, op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
+        if let Some((trait_, function)) = arithmetic_function(op)
+            && !any_pending([&l, &r])
+            && !self
+                .declared_instances(trait_, function, &[l.clone(), r.clone()])
+                .is_empty()
+        {
+            return self.dispatch(trait_, function, vec![l, r]);
+        }
+        binop(op, l, r)
+    }
+
+    /// `l op r` for a comparison, by value (`docs/chl-spec.md`, "Equality and order"): equal
+    /// values are the same value, and an ordering compares by [`Self::order`].
+    fn comparison(&mut self, op: CmpOp, l: Value, r: Value) -> Result<Value, Error> {
+        if any_pending([&l, &r]) {
+            return Ok(Value::Pending);
+        }
+        let ord = match op {
+            CmpOp::Eq => return Ok(Value::Bool(l == r)),
+            CmpOp::NotEq => return Ok(Value::Bool(l != r)),
+            _ => self.order(&l, &r)?,
+        };
+        Ok(Value::Bool(match op {
+            CmpOp::Lt => ord.is_lt(),
+            CmpOp::LtE => ord.is_le(),
+            CmpOp::Gt => ord.is_gt(),
+            CmpOp::GtE => ord.is_ge(),
+            CmpOp::Eq | CmpOp::NotEq => unreachable!(),
+        }))
+    }
+
+    /// The order of two values: a base's own, a tuple's lexicographically by position, and a
+    /// nominal value's by its constructor's argument in the order its declaration writes it.
+    fn order(&self, l: &Value, r: &Value) -> Result<std::cmp::Ordering, Error> {
+        match (l, r) {
+            (Value::Int(a), Value::Int(b)) => Ok(a.cmp(b)),
+            (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
+            (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
+            (Value::Record(a), Value::Record(_)) => {
+                let positions = (0..a.len()).map(|i| (format!("_{i}"), ValueOrder::Whole));
+                self.order_by(l, r, &ValueOrder::Fields(positions.collect()))
+            }
+            (
+                Value::Nominal {
+                    ty,
+                    ctor,
+                    payload: a,
+                },
+                Value::Nominal {
+                    ty: other_ty,
+                    ctor: other,
+                    payload: b,
+                },
+            ) if ty == other_ty && ctor == other => {
+                match self.traits.orders.get(&(ty.clone(), ctor.clone())) {
+                    Some(order) => self.order_by(a, b, order),
+                    None => self.order(a, b),
+                }
+            }
+            _ => err(format!("{l} and {r} have no order")),
+        }
+    }
+
+    /// The order of `l` and `r` by `order`: each field in turn, until one differs.
+    fn order_by(
+        &self,
+        l: &Value,
+        r: &Value,
+        order: &ValueOrder,
+    ) -> Result<std::cmp::Ordering, Error> {
+        let ValueOrder::Fields(fields) = order else {
+            return self.order(l, r);
+        };
+        let (Value::Record(a), Value::Record(b)) = (l, r) else {
+            return err(format!(
+                "{l} and {r} are not the products their order reads"
+            ));
+        };
+        let field = |v: &[(String, Value)], name: &str| {
+            v.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, x)| x.clone())
+                .ok_or_else(|| Error(format!("a product has no field `{name}`")))
+        };
+        for (name, inner) in fields {
+            match self.order_by(&field(a, name)?, &field(b, name)?, inner)? {
+                std::cmp::Ordering::Equal => continue,
+                other => return Ok(other),
+            }
+        }
+        Ok(std::cmp::Ordering::Equal)
+    }
+
+    /// The greatest value of collection `c`'s, or the least, by [`Self::order`]. Not defined
+    /// for an empty collection (`docs/chl-spec.md`, "7.1 Aggregates").
+    fn extreme(&self, c: &Collection, greatest: bool, name: &str) -> Result<Value, Error> {
+        let mut best: Option<Value> = None;
+        for (_, v) in c.entries() {
+            best = Some(match best {
+                None => v.clone(),
+                Some(b) => {
+                    let beyond = if greatest {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    };
+                    if self.order(v, &b)? == beyond {
+                        v.clone()
+                    } else {
+                        b
+                    }
+                }
+            });
+        }
+        best.ok_or_else(|| Error(format!("`{name}` of an empty collection is not defined")))
+    }
+
     /// The trait whose method `method` a receiver `v` has, when no type's own method of the
     /// name has its constructor: the one trait whose instance admits it at the operand the
     /// method's `self` is.
@@ -1373,6 +1606,11 @@ impl Interp {
             .collect();
         match traits.as_slice() {
             [one] => Some(one.clone()),
+            // A base value's methods are the compiler's traits'.
+            [] if !matches!(v, Value::Variant { .. } | Value::Collection(_)) => BUILTIN_FUNCTIONS
+                .iter()
+                .find(|(_, f, _)| *f == method)
+                .map(|(t, _, _)| t.to_string()),
             _ => None,
         }
     }
@@ -2109,6 +2347,13 @@ impl Interp {
 
             Expr::UnaryOp { op, operand } => {
                 let v = self.eval(operand)?;
+                if let UnaryOp::Neg = op
+                    && !self
+                        .declared_instances("Negatable", "neg", std::slice::from_ref(&v))
+                        .is_empty()
+                {
+                    return self.dispatch("Negatable", "neg", vec![v]);
+                }
                 match (op, v) {
                     (_, Value::Pending) => Ok(Value::Pending),
                     (UnaryOp::Neg, Value::Int(i)) => i
@@ -2122,7 +2367,7 @@ impl Interp {
 
             Expr::BinOp { op, left, right } => {
                 let (l, r) = (self.eval(left)?, self.eval(right)?);
-                binop(*op, l, r)
+                self.arithmetic(*op, l, r)
             }
 
             Expr::Compare {
@@ -2133,7 +2378,7 @@ impl Interp {
                 let mut prev = self.eval(left)?;
                 for (i, (op, rhs)) in ops.iter().zip(comparators).enumerate() {
                     let next = self.eval(rhs)?;
-                    match compare(*op, prev, next.clone())? {
+                    match self.comparison(*op, prev, next.clone())? {
                         Value::Bool(true) => {}
                         Value::Bool(false) => return Ok(Value::Bool(false)),
                         // Whether the chain stops here is undecided, so the comparands after
@@ -2354,15 +2599,7 @@ impl Interp {
                     Value::Pending => return Ok(Value::Pending),
                     _ => return err("`max` takes a collection"),
                 };
-                let mut best: Option<i64> = None;
-                for (_, v) in c.entries() {
-                    let Value::Int(i) = v else {
-                        return err("`max` takes a collection of integers");
-                    };
-                    best = Some(best.map_or(*i, |b: i64| b.max(*i)));
-                }
-                best.map(Value::Int)
-                    .ok_or_else(|| Error("`max` of an empty collection is not defined".into()))
+                self.extreme(&c, true, "max")
             }
 
             // `min` of an empty collection is not defined, as for `max`.
@@ -2372,15 +2609,7 @@ impl Interp {
                     Value::Pending => return Ok(Value::Pending),
                     _ => return err("`min` takes a collection"),
                 };
-                let mut best: Option<i64> = None;
-                for (_, v) in c.entries() {
-                    let Value::Int(i) = v else {
-                        return err("`min` takes a collection of integers");
-                    };
-                    best = Some(best.map_or(*i, |b: i64| b.min(*i)));
-                }
-                best.map(Value::Int)
-                    .ok_or_else(|| Error("`min` of an empty collection is not defined".into()))
+                self.extreme(&c, false, "min")
             }
 
             Some(SurfaceBuiltin::Sum) => {
@@ -2694,29 +2923,32 @@ fn binop(op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
     }
 }
 
-fn compare(op: CmpOp, l: Value, r: Value) -> Result<Value, Error> {
-    if any_pending([&l, &r]) {
-        return Ok(Value::Pending);
-    }
-    let ord = match (&l, &r) {
-        (Value::Int(a), Value::Int(b)) => a.cmp(b),
-        (Value::Str(a), Value::Str(b)) => a.cmp(b),
-        _ => {
-            return match op {
-                CmpOp::Eq => Ok(Value::Bool(l == r)),
-                CmpOp::NotEq => Ok(Value::Bool(l != r)),
-                _ => err(format!("unsupported {op:?} on {l} and {r}")),
-            };
-        }
+/// A compiler instance's function at `values`, or `None` for a function no compiler instance
+/// of an operator's trait has at them.
+fn builtin_function(
+    trait_: &str,
+    function: &str,
+    values: &[Value],
+) -> Option<Result<Value, Error>> {
+    let pair = |values: &[Value]| match values {
+        [l, r] => Some((l.clone(), r.clone())),
+        _ => None,
     };
-    Ok(Value::Bool(match op {
-        CmpOp::Eq => ord.is_eq(),
-        CmpOp::NotEq => ord.is_ne(),
-        CmpOp::Lt => ord.is_lt(),
-        CmpOp::LtE => ord.is_le(),
-        CmpOp::Gt => ord.is_gt(),
-        CmpOp::GtE => ord.is_ge(),
-    }))
+    Some(match (trait_, function) {
+        ("Addable", "add") => pair(values).map(|(l, r)| binop(BinOp::Add, l, r))?,
+        ("Subtractable", "sub") => pair(values).map(|(l, r)| binop(BinOp::Sub, l, r))?,
+        ("Multipliable", "mul") => pair(values).map(|(l, r)| binop(BinOp::Mul, l, r))?,
+        ("Divisible", "div") => pair(values).map(|(l, r)| binop(BinOp::FloorDiv, l, r))?,
+        ("Exponentiable", "pow") => pair(values).map(|(l, r)| binop(BinOp::Pow, l, r))?,
+        ("Negatable", "neg") => match values {
+            [Value::Int(i)] => i
+                .checked_neg()
+                .map(Value::Int)
+                .ok_or_else(|| Error(format!("-({i}) is not defined"))),
+            _ => return None,
+        },
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -2830,6 +3062,51 @@ mod tests {
         assert_eq!(
             v.to_string(),
             "[() -> (_0: 6, _1: 6, _2: 12, _3: 7, _4: 0, _5: 102)]"
+        );
+    }
+
+    /// An arithmetic operator on nominal values calls its instance's function, and a
+    /// comparison compares by value (`docs/chl-spec.md`, "Equality and order").
+    #[test]
+    fn an_operator_on_nominal_values() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Money = Int
+            impl Addable(Money, Money, Output=Money):
+                def add(self, other):
+                    Money::new(self.extract() + other.extract())
+            impl Negatable(Money, Output=Money):
+                def neg(self):
+                    Money::new(0 - self.extract())
+            impl Equatable(Money, Money)
+            impl Orderable(Money, Money)
+            m = Money::new(1) + Money::new(2)
+            out << (m.extract(), (-m).extract(), m == Money::new(3), m < Money::new(2), max([m, Money::new(9)]).extract())
+        "#});
+        assert_eq!(
+            v.to_string(),
+            "[() -> (_0: 3, _1: -3, _2: true, _3: false, _4: 9)]"
+        );
+    }
+
+    /// A nominal value orders by its constructor's argument, a record its declaration writes
+    /// by its fields as written, and a tuple lexicographically by position.
+    #[test]
+    fn a_nominal_value_orders_as_its_declaration_writes() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Person = {age: Int, name: String}
+            type Version:
+                version(major: Int, minor: Int)
+            impl Orderable(Person, Person)
+            impl Orderable(Version, Version)
+            a = Person::new((age=3, name="b"))
+            b = Person::new((age=4, name="a"))
+            out << (a < b, max([a, b]).extract().name, Version::version(1, 9) < Version::version(2, 0), (1, 2) < (1, 3))
+        "#});
+        assert_eq!(
+            v.to_string(),
+            "[() -> (_0: true, _1: \"a\", _2: true, _3: true)]"
         );
     }
 

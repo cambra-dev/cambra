@@ -20,10 +20,10 @@ use smol_str::SmolStr;
 
 use super::stmts::{is_mut_annotation, lower_type_expr, reserved_name};
 use super::{LoweringContext, LoweringError};
-use crate::ccl::nominal::{NominalCtor, NominalDecl};
+use crate::ccl::nominal::{NominalCtor, NominalDecl, WrittenOrder};
 use crate::ccl::ty::{PolyParam, PolyType, TypeKind, TypeParam};
 use crate::ccl::{
-    Expr, Lit, MethodCandidate, MethodOwner, Pattern, PatternHead, Type, TypedBinding,
+    Expr, FieldKey, Lit, MethodCandidate, MethodOwner, Pattern, PatternHead, Type, TypedBinding,
     TypedExprNode,
 };
 use crate::ccl::{V_NONE, V_SOME};
@@ -116,6 +116,17 @@ pub(super) fn associated_defs<'a>(
         ChlStmt::FunctionDef { owner: Some(_), .. } => vec![view(stmt, None, Vec::new())],
         // An instance of a trait is `traits::declare_instances`'s.
         ChlStmt::Impl(block) if ctx.trait_named(&block.ty.node).is_some() => Vec::new(),
+        ChlStmt::Impl(block) if block.defs.is_empty() => {
+            return Err(LoweringError::unsupported(
+                block.ty.span,
+                format!(
+                    "`impl {}` defines no function; a type's `impl` block declares its \
+                     associated functions, and only an instance of a trait that declares none \
+                     is written without a block",
+                    block.ty.node
+                ),
+            ));
+        }
         ChlStmt::Impl(block) => {
             let params = inherent_params(block)?;
             block
@@ -354,11 +365,15 @@ fn lower_constructors(
     let result = (|| {
         let mut ctors: Vec<NominalCtor> = Vec::new();
         match &decl.body {
-            TypeDeclBody::Single(ty) => ctors.push(NominalCtor {
-                name: SmolStr::new_static("new"),
-                span: decl.name.span,
-                params: vec![(None, lower_parameter_type(ty, ctx)?)],
-            }),
+            TypeDeclBody::Single(ty) => {
+                let lowered = lower_parameter_type(ty, ctx)?;
+                ctors.push(NominalCtor {
+                    name: SmolStr::new_static("new"),
+                    span: decl.name.span,
+                    orders: vec![written_order(ty, &lowered)],
+                    params: vec![(None, lowered)],
+                })
+            }
             TypeDeclBody::Constructors(lines) => {
                 let mut seen: HashMap<&str, Span> = HashMap::new();
                 for line in lines {
@@ -381,10 +396,17 @@ fn lower_constructors(
                             Ok((name, lower_parameter_type(&p.ty, ctx)?))
                         })
                         .collect::<Result<Vec<_>, LoweringError>>()?;
+                    let orders = line
+                        .params
+                        .iter()
+                        .zip(&params)
+                        .map(|(p, (_, ty))| written_order(&p.ty, ty))
+                        .collect();
                     ctors.push(NominalCtor {
                         name: line.name.node.clone(),
                         span: line.name.span,
                         params,
+                        orders,
                     });
                 }
             }
@@ -394,6 +416,38 @@ fn lower_constructors(
     ctx.type_params_in_scope.truncate(scoped);
     ctx.restore_type_aliases(aliases);
     result
+}
+
+/// The order of the parameter type `ty` the declaration writes as `written`: each record it
+/// writes by its fields as written, and what it names through an alias as
+/// [`WrittenOrder::of_type`] reads it.
+fn written_order(written: &Spanned<ChlExpr>, ty: &Type) -> WrittenOrder {
+    match (&written.node, ty.peel_refinements()) {
+        (ChlExpr::BraceRefinement { base, .. }, _) => written_order(base, ty),
+        (ChlExpr::BraceRecord(fields), Type::Record(types)) => WrittenOrder::Fields(
+            fields
+                .iter()
+                .map(|f| {
+                    let order = types
+                        .iter()
+                        .find(|(n, _)| *n == f.name)
+                        .map_or(WrittenOrder::Whole, |(_, t)| written_order(&f.value, t));
+                    (FieldKey::Name(f.name.as_str().into()), order)
+                })
+                .collect(),
+        ),
+        (ChlExpr::BraceGroup(parts), Type::Tuple(elems)) if parts.len() == elems.len() => {
+            WrittenOrder::Fields(
+                parts
+                    .iter()
+                    .zip(elems)
+                    .enumerate()
+                    .map(|(i, (p, t))| (FieldKey::Index(i), written_order(p, t)))
+                    .collect(),
+            )
+        }
+        _ => WrittenOrder::of_type(ty),
+    }
 }
 
 /// Lower a constructor's parameter type, which is written in full: nothing infers a

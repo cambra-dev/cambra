@@ -15,6 +15,8 @@
 //! Hash-join planning is just one *specialised* strategy folded in at a site,
 //! not the whole job (hence `planning`, not `join_plan`).
 
+use std::rc::Rc;
+
 use log::trace;
 
 use crate::ccl::ccl_utils::{
@@ -28,7 +30,7 @@ use crate::ccl::{
     BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, Name, ProjKey, Type,
     TypedExprNode,
     ccl_utils::apply_primitive,
-    infer::typecheck,
+    infer::{solver::traits::InstanceTable, typecheck_in},
     lambda_elim::{self, compose, id},
     provenance,
     simplify::simplify,
@@ -57,6 +59,28 @@ pub(crate) use loops::plan_loops;
 pub(crate) use predicates::compile_refinement_predicates;
 #[allow(unused_imports)]
 pub(crate) use predicates::fn_of_bare_predicate;
+
+/// What planning's rewrites read besides the tree.
+pub(crate) struct PlanningCtx {
+    /// The witnesses [`conditionals::realize_conditional_collections`] realized, whose sums
+    /// owe no witness at an iteration site.
+    pub realized: std::collections::HashSet<crate::ccl::ty::WitnessId>,
+    /// The program's instances, which the checks of the terms planning builds read: a
+    /// rewrite's term can state an obligation an instance the program declares answers, as
+    /// `converse` states `Equatable` of its keys.
+    pub instances: Rc<InstanceTable>,
+}
+
+impl PlanningCtx {
+    /// The context of a program that declares no instance and realizes no witness.
+    #[cfg(test)]
+    pub(crate) fn builtin() -> PlanningCtx {
+        PlanningCtx {
+            realized: Default::default(),
+            instances: InstanceTable::builtin(),
+        }
+    }
+}
 
 /// Materialize every iteration site in the post-lambda-elim CCL, choosing
 /// an efficient implementation strategy at each one.
@@ -95,7 +119,7 @@ pub(crate) use predicates::fn_of_bare_predicate;
 /// The error is an unsupported program: a jagged row realization cannot keep
 /// ([`conditionals::realize_conditional_collections`]), or a per-group narrowing no
 /// filter materializes ([`per_group_filter::reject_unmaterialized_narrowings`]).
-pub fn run(mut expr: Expr) -> Result<Expr, String> {
+pub fn run(mut expr: Expr, instances: &Rc<InstanceTable>) -> Result<Expr, String> {
     // Refinement predicates travel through inference and lambda-elim as bare
     // expressions over the implicit `REFINEMENT_BINDER` (design §6.3) and are
     // compiled to point-free form only when a refined type is iterated (§6.5).
@@ -105,17 +129,19 @@ pub fn run(mut expr: Expr) -> Result<Expr, String> {
     // Realize conditional collections first: the gated union it produces is an ordinary
     // collection, so every later phase — recognizers, iteration-site materialisation,
     // predicate compilation — sees one shape rather than needing a `Case` case.
-    let realized = conditionals::realize_conditional_collections(&mut expr)?;
-    groupby::recognize_groupby_sites(&mut expr);
+    let ctx = PlanningCtx {
+        realized: conditionals::realize_conditional_collections(&mut expr)?,
+        instances: Rc::clone(instances),
+    };
+    groupby::recognize_groupby_sites(&mut expr, &ctx);
     correlated::emit_correlated_filters(&mut expr);
     let mut expr = simplify(expr);
     correlated::pair_correlated_sites(&mut expr)?;
     // Constant-fold before the iteration walk so a collection literal's elements are
-    // already values when op conversion reads them. It runs after `simplify` because
-    // `try_string_add_to_concat` is what retargets `String + String` to `Concat`, and the
-    // fold dispatches on the operator it is handed.
+    // already values when op conversion reads them. The fold dispatches on the operator it
+    // is handed, which inference made `Concat` for `String + String`.
     const_fold::fold_constants(&mut expr);
-    insert_iterate_markers(&mut expr, &realized);
+    insert_iterate_markers(&mut expr, &ctx);
     // Normalize every remaining bare predicate tree-wide to point-free form.
     // `wrap_with_iterate` compiles each iteration *site*'s predicate, but a
     // refinement also rides **consumer contracts** that sit outside any site —
@@ -133,7 +159,7 @@ pub fn run(mut expr: Expr) -> Result<Expr, String> {
     // and this one is a codomain in. It runs after predicate compilation because it
     // matches the point-free predicate, and after the group-by rewrite because the
     // site's upstream is the `converse` chain it splices into.
-    per_group_filter::insert_per_group_filters(&mut expr, &realized);
+    per_group_filter::insert_per_group_filters(&mut expr, &ctx);
     per_group_filter::reject_unmaterialized_narrowings(&expr)?;
     // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
     // boilerplate that [`join::try_hash_join_rewrite`] emits via
@@ -398,6 +424,7 @@ mod tests {
     use super::test_helpers::*;
     use super::*;
     use crate::ccl::Expr;
+    use crate::ccl::infer::typecheck;
     use crate::ccl::symbolic::symbolic;
     // `super::*` also glob-imports `lambda_elim::compose` into scope; name the
     // test-helper `compose` (`Expr::compose`) explicitly so it wins over the
@@ -694,7 +721,7 @@ mod tests {
 
         let mut expr = Expr::let_bind("xs".to_string(), list_123(), body_chain).with_ty(list_ty);
 
-        insert_iterate_markers(&mut expr, &Default::default());
+        insert_iterate_markers(&mut expr, &PlanningCtx::builtin());
 
         let TypedExprNode::Let {
             bound_expr, body, ..
@@ -729,7 +756,7 @@ mod tests {
             fun_ty(fun_ty(Type::UIntRange(3), int.clone()), int.clone()),
             int,
         );
-        insert_iterate_markers(&mut expr, &Default::default());
+        insert_iterate_markers(&mut expr, &PlanningCtx::builtin());
         let TypedExprNode::Apply { argument, function } = &expr.node else {
             panic!("expected Apply, got: {}", symbolic(&expr));
         };
@@ -765,7 +792,7 @@ mod tests {
             ("n".into(), int),
         ]));
 
-        insert_iterate_markers(&mut expr, &Default::default());
+        insert_iterate_markers(&mut expr, &PlanningCtx::builtin());
 
         let TypedExprNode::Record(outs) = &expr.node else {
             panic!("expected a record, got: {}", symbolic(&expr));

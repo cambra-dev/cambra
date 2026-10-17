@@ -417,10 +417,12 @@ fn exponentiation_rejects_an_operand_with_no_instance() {
 /// associated type to leave unresolved, so nothing downstream would object either. What
 /// decides it is the distinction between *not determined yet* and *determined, and not a
 /// base* (`Offered` in `src/ccl/infer/solver/traits.rs`): the second is answered
-/// componentwise for `Equatable` ([`products_are_equatable_componentwise`]) and rejected
-/// for every other trait, and a collection has no components to answer with.
+/// componentwise for `Equatable` ([`products_are_equatable_componentwise`]) and, on a tuple,
+/// `Orderable` ([`tuples_are_orderable_lexicographically`]), and rejected for every other
+/// trait. A record's fields carry no order, and a collection has no components to answer
+/// with.
 #[rstest]
-#[case::tuple_ordering("(1, 2) < (3, 4)", "Orderable")]
+#[case::record_ordering("(a=1, b=2) < (a=3, b=4)", "Orderable")]
 #[case::tuple_arithmetic("(1, 2) + (3, 4)", "Addable")]
 #[case::collection_equality("[1, 2] == [3, 4]", "Equatable")]
 #[case::tuple_with_a_collection_component("(1, [1, 2]) == (1, [3, 4])", "Equatable")]
@@ -436,9 +438,9 @@ fn a_composite_satisfies_no_trait(#[case] code: &str, #[case] expected: &str) {
 /// `Equatable` reads a **product** componentwise: two tuples or records are equatable when
 /// they are the same shape and each component is.
 ///
-/// Equality is the one trait with that reading — ordering would need an order on the
-/// components and a record's fields carry none ([`a_composite_satisfies_no_trait`]) — so it
-/// is answered off the table rather than by a row, and the obligation is discharged by one
+/// Ordering reads a tuple the same way, lexicographically, and a record not, its fields
+/// carrying no order ([`a_composite_satisfies_no_trait`]). Either is answered off the table
+/// rather than by a row, and the obligation is discharged by one
 /// obligation per component. A component still unknown when the product arrives therefore
 /// resolves by the ordinary delivery path, which is what a group-by's key needs
 /// (`src/ccl/design/collections.md`, "The key domain is the key morphism's image").
@@ -446,6 +448,25 @@ fn a_composite_satisfies_no_trait(#[case] code: &str, #[case] expected: &str) {
 /// The two operands are **one** product, the rows being homogeneous, so a mismatch in shape
 /// is a rejection rather than a comparison over the fields they share — and a wider record
 /// is a subtype, so nothing but the shape check states that.
+/// `Orderable` reads a **tuple** lexicographically by position, each component in turn
+/// (`docs/chl-spec.md`, "3.4 Comparisons").
+#[test]
+fn tuples_are_orderable_lexicographically() {
+    assert_eq!(infer_program("(1, 2) < (3, 4)").to_string(), "Bool");
+    assert_eq!(
+        infer_program("(1, (2, \"a\")) >= (3, (4, \"b\"))").to_string(),
+        "Bool",
+        "a component that is itself a tuple orders lexicographically again"
+    );
+    let errs = infer_program_err("(1, [1]) < (1, [2])");
+    assert!(
+        errs.iter().any(
+            |e| matches!(e, InferError::NoTraitInstance { trait_, .. } if trait_ == "Orderable")
+        ),
+        "a collection component has no order, got {errs:?}"
+    );
+}
+
 #[test]
 fn products_are_equatable_componentwise() {
     assert_eq!(infer_program("(1, 2) == (3, 4)").to_string(), "Bool");

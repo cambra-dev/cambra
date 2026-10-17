@@ -614,7 +614,7 @@ fn build_join_plan(
 fn plan_loop_join(
     arm_types: &[Type],
     refinement: &Expr,
-    realized: &HashSet<crate::ccl::ty::WitnessId>,
+    ctx: &PlanningCtx,
 ) -> Option<(JoinPlan, Vec<usize>)> {
     let n = arm_types.len();
     if n < 2 {
@@ -650,14 +650,14 @@ fn plan_loop_join(
         let mut key_a = raw_a.clone();
         let mut key_b = raw_b.clone();
         replace_tuple_project_with_id(&mut key_a, &arm_types[arm_a]);
-        typecheck(&key_a).ok()?;
+        typecheck_in(&key_a, &ctx.instances).ok()?;
         replace_tuple_project_with_id(&mut key_b, &arm_types[arm_b]);
-        typecheck(&key_b).ok()?;
+        typecheck_in(&key_b, &ctx.instances).ok()?;
         // A key is computed per row, as a filter's predicate is, and the equality it came
         // from was compiled out of a refinement, which the iteration walk never reached:
         // plan the collections it aggregates now.
-        iterate::insert_iterate_recurse(&mut key_a, realized);
-        iterate::insert_iterate_recurse(&mut key_b, realized);
+        iterate::insert_iterate_recurse(&mut key_a, ctx);
+        iterate::insert_iterate_recurse(&mut key_b, ctx);
 
         trace!(
             "plan_loop_join: condition arm{arm_a}={} : {}  arm{arm_b}={} : {}",
@@ -712,11 +712,7 @@ fn flatten_tuple_types(indices_to_flatten: &[i64], a: &Type, b: &Type) -> Type {
 ///
 /// `types[i]` is the type of the i-th original input arm.  `plan` is the tree of
 /// [`JoinPlan::Hash`] and [`JoinPlan::Loop`] nodes produced by [`build_join_plan`].
-fn join_plan_to_expr(
-    plan: &JoinPlan,
-    types: &[Type],
-    realized: &HashSet<crate::ccl::ty::WitnessId>,
-) -> Expr {
+fn join_plan_to_expr(plan: &JoinPlan, types: &[Type], ctx: &PlanningCtx) -> Expr {
     match plan {
         // For loop joins (including the trivial one-branch sort), iterate a tuple
         // type consisting of the types of just the arms in this join.
@@ -731,8 +727,7 @@ fn join_plan_to_expr(
         JoinPlan::Loop { arms, predicate } => {
             let base_iteration = (|| {
                 if arms.len() == 1 {
-                    if let Some(transformed) = convert_refinement_to_join(&types[arms[0]], realized)
-                    {
+                    if let Some(transformed) = convert_refinement_to_join(&types[arms[0]], ctx) {
                         trace!(
                             "Converted iteration to {} : {}",
                             symbolic(&transformed),
@@ -793,7 +788,7 @@ fn join_plan_to_expr(
             // Build side: group by the build key using converse.
             // Use the full build output tuple type so that converse groups entire
             // build tuples (not just the key arm), preserving all arms through the join.
-            let build_input = join_plan_to_expr(build, types, realized);
+            let build_input = join_plan_to_expr(build, types, ctx);
             let build_output_ty = build_input.ty.codomain().unwrap().clone();
             let build_key = if let Some(build_key_idx) = build_key_idx {
                 typed_compose(vec![
@@ -815,7 +810,7 @@ fn join_plan_to_expr(
                 Type::data_fun(build_output_ty.clone(), build_output_ty.clone()),
             );
             let build_side = apply_primitive(build_key, Builtin::Converse, converse_ty);
-            typecheck(&build_side).expect("Bad build expr");
+            typecheck_in(&build_side, &ctx.instances).expect("Bad build expr");
 
             trace!(
                 "join_plan_to_expr: build_side={} : {}",
@@ -825,7 +820,7 @@ fn join_plan_to_expr(
 
             // Probe side: compose the probe key with the build side lookup.
             // Use the full probe output tuple type for the same reason.
-            let probe_input = join_plan_to_expr(probe, types, realized);
+            let probe_input = join_plan_to_expr(probe, types, ctx);
             let probe_output_ty = probe_input.ty.codomain().unwrap().clone();
             let probe_key = if let Some(probe_key_idx) = probe_key_idx {
                 typed_compose(vec![
@@ -841,7 +836,7 @@ fn join_plan_to_expr(
             };
 
             let probe_expr = typed_compose(vec![probe_key, build_side]);
-            typecheck(&probe_expr).expect("Bad probe expr");
+            typecheck_in(&probe_expr, &ctx.instances).expect("Bad probe expr");
 
             trace!(
                 "join_plan_to_expr: probe={} : {}",
@@ -941,7 +936,7 @@ fn join_plan_to_expr(
                 map_domain
             };
 
-            typecheck(&result).expect("Bad hash join expr");
+            typecheck_in(&result, &ctx.instances).expect("Bad hash join expr");
             result
         }
     }
@@ -951,11 +946,7 @@ fn join_plan_to_expr(
 ///
 /// Delegates to [`plan_loop_join`] to build a [`JoinPlan`], then to [`join_plan_to_expr`]
 /// to generate the CCL output. Returns `None` if the pattern does not match.
-fn convert_loop_join(
-    base_ty: &Type,
-    refinement: &Expr,
-    realized: &HashSet<crate::ccl::ty::WitnessId>,
-) -> Option<Expr> {
+fn convert_loop_join(base_ty: &Type, refinement: &Expr, ctx: &PlanningCtx) -> Option<Expr> {
     trace!(
         "convert_loop_join: base_ty={}, refinement={} : {}",
         base_ty,
@@ -968,9 +959,9 @@ fn convert_loop_join(
         trace!("convert_loop_join: base_ty is not a tuple");
         return None;
     };
-    let (plan, arm_order) = plan_loop_join(arm_types, refinement, realized)?;
+    let (plan, arm_order) = plan_loop_join(arm_types, refinement, ctx)?;
     trace!("convert_loop_join: planning succeeded. Plan:\n{plan:#?}");
-    let expr = join_plan_to_expr(&plan, arm_types, realized);
+    let expr = join_plan_to_expr(&plan, arm_types, ctx);
 
     // The morphism produces the join-satisfying extent; surface that on its
     // codomain so downstream consumers (e.g. a `cast({base | r} ⇒ …)` reading
@@ -1038,7 +1029,7 @@ fn convert_loop_join(
         Type::data_fun(canonical_ty.clone(), canonical_ty.clone()),
     );
     let result = refine_extent(result, refinement);
-    typecheck(&result).expect("Bad permute_domain expr");
+    typecheck_in(&result, &ctx.instances).expect("Bad permute_domain expr");
     Some(result)
 }
 
@@ -1051,10 +1042,7 @@ fn convert_loop_join(
 /// a chain: when several are joinable, which one becomes the join is a free
 /// choice a cost model may later make, and the rest remain filters either way.
 /// `None` for an unrefined domain or when no refinement forms a join.
-fn convert_refinement_to_join(
-    domain_ty: &Type,
-    realized: &HashSet<crate::ccl::ty::WitnessId>,
-) -> Option<Expr> {
+fn convert_refinement_to_join(domain_ty: &Type, ctx: &PlanningCtx) -> Option<Expr> {
     let Type::Refinement(base, refinements) = domain_ty else {
         return None;
     };
@@ -1071,7 +1059,7 @@ fn convert_refinement_to_join(
         );
         // `convert_loop_join` only reads the predicate (it builds a new expr),
         // so borrow the immutable term rather than clone it.
-        convert_loop_join(&rest, &r.predicate, realized)
+        convert_loop_join(&rest, &r.predicate, ctx)
     })
 }
 
@@ -1097,11 +1085,7 @@ fn convert_refinement_to_join(
 /// conditions that form a spanning tree.  Build/probe assignment follows
 /// the BFS order of that spanning tree.  For now, predicates must be
 /// expressed as conjunctions of single-arm equality conditions.
-pub(super) fn try_hash_join_rewrite(
-    expr: &mut Expr,
-    domain_ty: &Type,
-    realized: &HashSet<crate::ccl::ty::WitnessId>,
-) -> bool {
+pub(super) fn try_hash_join_rewrite(expr: &mut Expr, domain_ty: &Type, ctx: &PlanningCtx) -> bool {
     trace!(
         "Attempting hash-join rewrite at iteration site: {}",
         symbolic(expr),
@@ -1149,12 +1133,12 @@ pub(super) fn try_hash_join_rewrite(
         "planning.hash_join",
         provenance::Nature::Machinery,
     );
-    let Some(mut transformed) = convert_refinement_to_join(domain_ty, realized) else {
+    let Some(mut transformed) = convert_refinement_to_join(domain_ty, ctx) else {
         trace!("Hash-join pattern did not match");
         return false;
     };
     // The plan's residual filters are built above, whole; plan their predicates now.
-    iterate::plan_filter_predicates(&mut transformed, realized);
+    iterate::plan_filter_predicates(&mut transformed, ctx);
     // The whole domain, not the refinement the recogniser accepted:
     // `join_plan_to_expr` re-enters `convert_refinement_to_join` on an arm's own
     // refinement for a nested join, three frames below this guard and with no
@@ -1201,7 +1185,7 @@ mod tests {
         let refinement = var("ref").with_ty(int_ty_val.clone());
 
         // Base type is not a tuple, should return None
-        let result = convert_loop_join(&int_ty_val, &refinement, &HashSet::new());
+        let result = convert_loop_join(&int_ty_val, &refinement, &PlanningCtx::builtin());
         assert_eq!(result, None);
     }
 
@@ -1216,7 +1200,7 @@ mod tests {
         let refinement = var("ref").with_ty(int_ty_val.clone());
 
         // Refinement is not a valid join condition, should return None
-        let result = convert_loop_join(&triple_tuple, &refinement, &HashSet::new());
+        let result = convert_loop_join(&triple_tuple, &refinement, &PlanningCtx::builtin());
         assert_eq!(result, None);
     }
 
@@ -1227,7 +1211,7 @@ mod tests {
         let refinement = var("ref").with_ty(int_ty_val.clone());
 
         // Refinement is not a compose, should return None
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &HashSet::new());
+        let result = convert_loop_join(&tuple_ty_val, &refinement, &PlanningCtx::builtin());
         assert_eq!(result, None);
     }
 
@@ -1246,7 +1230,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &HashSet::new());
+        let result = convert_loop_join(&tuple_ty_val, &refinement, &PlanningCtx::builtin());
         assert_eq!(result, None);
     }
 
@@ -1264,7 +1248,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &HashSet::new());
+        let result = convert_loop_join(&tuple_ty_val, &refinement, &PlanningCtx::builtin());
         assert_eq!(result, None);
     }
 
@@ -1283,7 +1267,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &HashSet::new());
+        let result = convert_loop_join(&tuple_ty_val, &refinement, &PlanningCtx::builtin());
         assert_eq!(result, None);
     }
 
@@ -1311,7 +1295,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &HashSet::new());
+        let result = convert_loop_join(&tuple_ty_val, &refinement, &PlanningCtx::builtin());
         assert_eq!(result, None);
     }
 
@@ -1335,7 +1319,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &HashSet::new());
+        let result = convert_loop_join(&tuple_ty_val, &refinement, &PlanningCtx::builtin());
         assert_eq!(result, None);
     }
 
@@ -1360,7 +1344,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &HashSet::new());
+        let result = convert_loop_join(&tuple_ty_val, &refinement, &PlanningCtx::builtin());
         assert_eq!(result, None);
     }
 
@@ -1394,7 +1378,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &HashSet::new());
+        let result = convert_loop_join(&tuple_ty_val, &refinement, &PlanningCtx::builtin());
         assert_eq!(result, None);
     }
 
@@ -1436,7 +1420,7 @@ mod tests {
         });
 
         // Should successfully convert
-        let result = convert_loop_join(&tuple_ty_val, &refinement, &HashSet::new());
+        let result = convert_loop_join(&tuple_ty_val, &refinement, &PlanningCtx::builtin());
         assert!(
             result.is_some(),
             "convert_loop_join should succeed with valid hash join pattern"
@@ -1806,7 +1790,7 @@ mod tests {
         });
 
         // Should succeed: eq condition drives the hash join, filter becomes a predicate.
-        let result = convert_loop_join(&t, &refinement, &HashSet::new());
+        let result = convert_loop_join(&t, &refinement, &PlanningCtx::builtin());
         assert!(
             result.is_some(),
             "convert_loop_join should succeed when eq conditions + extra filter are present"
@@ -1836,7 +1820,7 @@ mod tests {
         .with_ty(fun_ty(t.clone(), bool_ty_val));
 
         assert_eq!(
-            convert_loop_join(&t, &filter, &HashSet::new()),
+            convert_loop_join(&t, &filter, &PlanningCtx::builtin()),
             None,
             "should return None when no equality conditions are present"
         );

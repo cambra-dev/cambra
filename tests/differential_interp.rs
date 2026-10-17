@@ -235,6 +235,30 @@ fn a_trait_function_dispatches_by_type() {
     "#});
 }
 
+/// An arithmetic operator on a nominal type calls its instance's function, and a comparison
+/// and `max` compare by value, ordered as the declaration writes its fields.
+#[test]
+fn operators_on_nominal_values() {
+    agree(indoc! {r#"
+        type Money = Int
+        type Version:
+            version(major: Int, minor: Int)
+
+        impl Addable(Money, Money, Output=Money):
+            def add(self, other):
+                Money::new(self.extract() + other.extract())
+        impl Equatable(Money, Money)
+        impl Orderable(Money, Money)
+        impl Orderable(Version, Version)
+
+        out = test_sink()
+        for n in [1, 2]:
+            m = Money::new(n) + Money::new(10)
+            top = max([Money::new(k * n) for k in [3, 7, 5]])
+            out << (m.extract(), m == Money::new(11), m < Money::new(12), Version::version(n, 0) < Version::version(1, 5), top.extract())
+    "#});
+}
+
 /// A mutable variable holding a nominal value: its history's value type is the nominal
 /// type, through `mut_elim` and the store.
 #[test]

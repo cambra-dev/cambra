@@ -27,6 +27,110 @@ pub enum FunctionDef {
     /// where it was absent. Applied to a `Records` column of the tupled argument
     /// ([`crate::ccl::Builtin::Insert`]), pointwise: one map in, one map out.
     Insert,
+    /// A value read as the tuple it orders by ([`OrderKey`]).
+    ToOrderKey(std::sync::Arc<OrderKey>),
+    /// The value an [`OrderKey`] tuple is read from: [`Self::ToOrderKey`]'s inverse.
+    FromOrderKey(std::sync::Arc<OrderKey>),
+    /// A comparison of the tupled pair's two values by the tuple each orders by.
+    CompareByKey(crate::interpreter::CompareKind, std::sync::Arc<OrderKey>),
+}
+
+/// How a value is read as the tuple it orders by (`docs/chl-spec.md`, "Equality and order"):
+/// a nominal value by its constructor's argument, and each product by its fields in the
+/// order the declaration writes them, as a tuple of `_0`, `_1`, …. Operator conversion
+/// builds one from a type, which the column alone does not carry: a record's fields have no
+/// order of their own.
+///
+/// The key holds every field, so it is a rearrangement of the value's columns and is read
+/// back exactly ([`OrderKey::from_key`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum OrderKey {
+    /// The value itself: a base type.
+    Whole,
+    /// A product's fields, by column name, each read by its own key, in key order.
+    Fields(Vec<(SmolStr, OrderKey)>),
+    /// The value of a type with one constructor, by its argument: the union's one arm.
+    Payload(FieldKey, Box<OrderKey>),
+}
+
+impl OrderKey {
+    /// `column` read as its key.
+    pub fn key(&self, column: ColumnValue) -> ColumnValue {
+        match (self, column) {
+            (OrderKey::Whole, column) => column,
+            (OrderKey::Fields(fields), ColumnValue::Records(mut columns)) => ColumnValue::Records(
+                fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, key))| {
+                        let field = columns
+                            .remove(name)
+                            .unwrap_or_else(|| panic!("a product's key reads its field `{name}`"));
+                        (tuple_field(i), key.key(field))
+                    })
+                    .collect(),
+            ),
+            (OrderKey::Payload(tag, key), ColumnValue::Union(arms)) => {
+                let len = arms.iter().map(|(_, a)| a.rows().len()).sum::<usize>();
+                let arm = arms
+                    .get(tag)
+                    .unwrap_or_else(|| panic!("a value of one constructor is its arm `{tag}`"));
+                debug_assert!(
+                    arm.rows().iter().copied().eq(0..len),
+                    "a type of one constructor fills every row with it"
+                );
+                key.key(arm.values().clone())
+            }
+            (key, column) => panic!("{key:?} does not read {column:?}"),
+        }
+    }
+
+    /// The value `column`, a column of keys, was read from.
+    pub fn from_key(&self, column: ColumnValue) -> ColumnValue {
+        match (self, column) {
+            (OrderKey::Whole, column) => column,
+            (OrderKey::Fields(fields), ColumnValue::Records(mut columns)) => ColumnValue::Records(
+                fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, key))| {
+                        let field = columns
+                            .remove(&tuple_field(i))
+                            .unwrap_or_else(|| panic!("a key has its position {i}"));
+                        (name.clone(), key.from_key(field))
+                    })
+                    .collect(),
+            ),
+            (OrderKey::Payload(tag, key), column) => {
+                let payload = key.from_key(column);
+                let rows = (0..payload.len()).collect();
+                ColumnValue::Union(crate::ccl::TagMap::from_arms(vec![(
+                    tag.clone(),
+                    super::UnionArm::new(rows, payload),
+                )]))
+            }
+            (key, column) => panic!("{key:?} does not read back {column:?}"),
+        }
+    }
+
+    /// The extent of the keys of values of `extent`.
+    pub fn key_extent(&self, extent: &Extent) -> Extent {
+        match (self, extent) {
+            (OrderKey::Whole, e) => e.clone(),
+            (OrderKey::Fields(fields), Extent::Record(extents)) => Extent::Record(
+                fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, key))| (tuple_field(i), key.key_extent(&extents[name])))
+                    .collect(),
+            ),
+            (OrderKey::Payload(tag, key), Extent::Union(arms)) => key.key_extent(
+                arms.get(tag)
+                    .unwrap_or_else(|| panic!("a value of one constructor is its arm `{tag}`")),
+            ),
+            (key, extent) => panic!("{key:?} does not read {extent:?}"),
+        }
+    }
 }
 
 impl FunctionDef {
@@ -38,6 +142,13 @@ impl FunctionDef {
                 &fields[&tuple_field(1)],
             ),
             (FunctionDef::UnaryOp(op), cv) => apply_unaryop_column(*op, cv),
+            (FunctionDef::ToOrderKey(key), cv) => key.key(cv),
+            (FunctionDef::FromOrderKey(key), cv) => key.from_key(cv),
+            (FunctionDef::CompareByKey(op, key), ColumnValue::Records(mut fields)) => {
+                let left = key.key(fields.remove(&tuple_field(0)).expect("Not a tuple"));
+                let right = key.key(fields.remove(&tuple_field(1)).expect("Not a tuple"));
+                apply_binop_column(BinOpKind::Compare(*op), left, &right)
+            }
             (FunctionDef::RecordField(f), ColumnValue::Records(mut fields)) => fields
                 .remove(f)
                 .unwrap_or_else(|| panic!("Missing field {f}")),
@@ -174,6 +285,9 @@ impl std::fmt::Display for FunctionDef {
             FunctionDef::BinOp(op) => write!(f, "BinOp({})", fmt_binop(op)),
             FunctionDef::RecordField(field) => write!(f, ".{field}"),
             FunctionDef::Insert => write!(f, "insert"),
+            FunctionDef::ToOrderKey(_) => write!(f, "order_key"),
+            FunctionDef::FromOrderKey(_) => write!(f, "from_order_key"),
+            FunctionDef::CompareByKey(op, _) => write!(f, "compare_by_key({op:?})"),
         }
     }
 }

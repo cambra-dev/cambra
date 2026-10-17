@@ -72,6 +72,14 @@ impl AggregateKind {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => Some(Extent::Base(BaseType::Int)),
             (AggregateKind::Max, Extent::Base(b)) => Some(Extent::Base(b.clone())),
             (AggregateKind::Min, Extent::Base(b)) => Some(Extent::Base(b.clone())),
+            // A tuple's extreme is lexicographic, seeded by each position's.
+            (AggregateKind::Max | AggregateKind::Min, e @ Extent::Record(fields))
+                if fields
+                    .values()
+                    .all(|f| self.output_extent(f).as_ref() == Some(f)) =>
+            {
+                Some(e.clone())
+            }
             // `Drain` folds any element type to `unit`.
             (AggregateKind::Drain, _) => Some(Extent::Base(BaseType::Unit)),
             // `Sole` yields an element of the group, so the extent is unchanged.
@@ -126,6 +134,16 @@ impl AggregateKind {
             }
             (AggregateKind::Min, Extent::Base(BaseType::Bool)) => {
                 ColumnValue::Bools(BitVec::from_elem(1, true))
+            }
+            // A tuple's identity is each position's, lexicographically least for `Max` and
+            // greatest for `Min`.
+            (AggregateKind::Max | AggregateKind::Min, Extent::Record(fields)) => {
+                ColumnValue::Records(
+                    fields
+                        .iter()
+                        .map(|(name, f)| (name.clone(), self.scalar_seed(f)))
+                        .collect(),
+                )
             }
             // The single `unit` a drained group collapses to; further elements
             // fold in as no-ops (see `accumulate`).
@@ -193,6 +211,31 @@ impl AggregateKind {
                     acc.set(0, false);
                 }
             }
+            // A tuple's extreme, lexicographically: the row the batch holds beyond the one
+            // held, if any.
+            (
+                kind @ (AggregateKind::Max | AggregateKind::Min),
+                acc @ ColumnValue::Records(_),
+                vs @ ColumnValue::Records(_),
+            ) => {
+                let beyond = if *kind == AggregateKind::Max {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                };
+                let mut held = acc.index_at(0);
+                let mut chosen = None;
+                for i in start..end {
+                    let v = vs.index_at(i);
+                    if crate::interpreter::compare_values(&v, &held) == Some(beyond) {
+                        held = v;
+                        chosen = Some(i);
+                    }
+                }
+                if let Some(i) = chosen {
+                    *acc = vs.select_indices(std::iter::once(i), 1);
+                }
+            }
             // `Drain`: the accumulator already holds the single `unit` the group
             // collapses to; folding in more elements is a no-op (any positive
             // multiplicity yields one `unit`). The values column is ignored.
@@ -220,6 +263,7 @@ impl AggregateKind {
             | (AggregateKind::Min, ColumnValue::Ints(_))
             | (AggregateKind::Min, ColumnValue::UInts(_))
             | (AggregateKind::Min, ColumnValue::Bools(_))
+            | (AggregateKind::Max | AggregateKind::Min, ColumnValue::Records(_))
             | (AggregateKind::Drain, ColumnValue::Units(_)) => accumulator,
             _ => panic!("Invalid accumulate"),
         }
