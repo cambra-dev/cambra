@@ -660,12 +660,15 @@ fn coalesce_outcome(r: &Result<Type, CoalesceError>) -> Option<String> {
                 CoalesceError::RecursiveType { .. } => "RecursiveType",
                 CoalesceError::DomainJoinConflict { .. } => "DomainJoinConflict",
                 CoalesceError::KindConflict { .. } => "KindConflict",
-                // Two rejections the model has no counterpart for: a kind edge whose two
-                // sides state incomparable kinds, and a witness whose binder is not in
-                // scope where the reference materialized. Neither is reachable from the
-                // fragment this oracle serializes — a sum leaves it at `ty_json` — so
-                // report no verdict rather than inventing a wire name.
-                CoalesceError::KindMismatch { .. } | CoalesceError::WitnessScope { .. } => {
+                // Three rejections the model has no counterpart for: a kind edge whose two
+                // sides state incomparable kinds, a witness whose binder is not in scope
+                // where the reference materialized, and a domain naming a binder a
+                // contribution joins over. None is reachable from the fragment this oracle
+                // serializes — a sum leaves it at `ty_json`, and a graph built here records
+                // no join violation — so report no verdict rather than inventing a wire name.
+                CoalesceError::KindMismatch { .. }
+                | CoalesceError::WitnessScope { .. }
+                | CoalesceError::NoJoinOverBinder { .. } => {
                     return None;
                 }
             };
@@ -705,6 +708,7 @@ fn differential_coalesce_vs_lean_model() {
         let graph = CompactGraph {
             term: acc.clone(),
             rec_vars: std::collections::BTreeMap::new(),
+            join_violations: Vec::new(),
         };
         let (Some(ct), Some(got)) = (cty_json(&acc), coalesce_outcome(&coalesce_compact(&graph)))
         else {

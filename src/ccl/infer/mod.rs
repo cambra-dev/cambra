@@ -407,6 +407,14 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             domains,
             origin: ctx_label.to_string(),
         },
+        CoalesceError::NoJoinOverBinder {
+            binders,
+            refinement,
+        } => InferError::NoJoinOverBinder {
+            binders,
+            reads: Vec::new(),
+            keys: refinement.predicate,
+        },
         // The same violation `check_scope_valid` reports post-inference, caught where it is
         // made: a materialized type carrying a witness reference no binder covers. A
         // compiler bug in whatever built the position, like `KindConflict` below.

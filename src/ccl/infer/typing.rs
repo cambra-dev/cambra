@@ -247,6 +247,17 @@ pub(super) trait Typing {
     where
         Self: Sized;
 
+    /// [`Self::scoped`] for a mutable variable's binder, `name := …`. Emit also records that
+    /// a contribution crossing the binder keeps its name: a mutable variable is one variable,
+    /// not a binder taking a value per iteration or call, and no type names it
+    /// ([`InferCtx::require_contribution`](super::context::InferCtx::require_contribution)).
+    fn scoped_mut<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized,
+    {
+        self.scoped(name, ty, f)
+    }
+
     /// Emit/check a `let` RHS. Emit bumps the polymorphism level so RHS-local
     /// variables become generalizable at the binding site; Check (which trusts
     /// recorded types) runs `f` unchanged.
@@ -281,9 +292,15 @@ pub(super) trait Typing {
     /// a query outside the binder's scope reads, and a bound recorded *inside*
     /// it on a variable minted outside already needs the name accounted for
     /// (see [`Telescope`](crate::ccl::infer_var::Telescope)).
+    ///
+    /// Emit also records a transparent binding's `definition`, `None` for one that did
+    /// not type: a contribution to a history declared outside the binding crosses it,
+    /// and discharges it
+    /// ([`InferCtx::require_contribution`](super::context::InferCtx::require_contribution)).
     fn scoped_let<R>(
         &mut self,
         binding: &TypedBinding,
+        definition: Option<&Expr>,
         scheme: LetScheme,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R

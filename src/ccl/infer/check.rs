@@ -488,6 +488,7 @@ impl Typing for CheckCtx {
     fn scoped_let<R>(
         &mut self,
         binding: &TypedBinding,
+        _definition: Option<&Expr>,
         _scheme: LetScheme,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {

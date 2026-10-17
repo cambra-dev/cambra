@@ -76,9 +76,9 @@
 //! # A read binder in a diagnostic
 //!
 //! [`read_respelling`] maps each binder back to the variable it reads, and
-//! `compile_program` applies the rename to an inference error's types. The
-//! binder exists for inference, so a message carrying one names something the
-//! reader cannot look up.
+//! `compile_program` applies the rename to an inference error's types and the
+//! binders it names. The binder exists for inference, so a message carrying one
+//! names something the reader cannot look up.
 //!
 //! # What ends a segment
 //!

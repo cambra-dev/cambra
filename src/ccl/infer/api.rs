@@ -12,6 +12,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
 use crate::ccl::provenance::NodeId;
+use crate::ccl::subst::Subst;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     Expr, FieldKey, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode,
@@ -369,6 +370,22 @@ pub enum InferError {
         /// source and once in CCL. A caller that has no span can still reach it.
         origin: String,
     },
+    /// A feed or a mutable variable receives a collection whose keys depend on a binder
+    /// bound between the target's declaration and the write, which the contribution's edge
+    /// joins over (`src/ccl/design/type-inference.md`, "A contribution crosses the binders
+    /// after its target"). The target's type is the join over every value written to it, and
+    /// collections over different keys have no join (`docs/chl-spec.md`, "Joining the types
+    /// of several values").
+    NoJoinOverBinder {
+        /// The binders the keys depend on.
+        binders: Vec<Name>,
+        /// The mutable variables whose reads the keys depend on, each read taking one value
+        /// per iteration or call. Inference reports these among `binders`, as the binders
+        /// naming the reads, and [`InferError::respell`] moves them here.
+        reads: Vec<Name>,
+        /// The predicate stating the keys.
+        keys: std::rc::Rc<Expr>,
+    },
     /// The expression kind is not yet handled by this inference pass.
     Unsupported(String),
     /// A [`crate::ccl::TypedExprNode::Case`] with no branches was encountered.
@@ -595,7 +612,8 @@ impl InferError {
         unsited(self).same_defect(&unsited(other))
     }
 
-    /// Rewrite every type this error renders through `f`.
+    /// Rewrite every binder this error renders through `rename`: each type it
+    /// carries, and the binders and keys a [`InferError::NoJoinOverBinder`] names.
     ///
     /// The one caller is the diagnostic boundary in
     /// [`compile_program`](crate::ccl::context::compile_program), which respells
@@ -608,8 +626,23 @@ impl InferError {
     /// included. A rewrite that means nothing for a base type costs nothing
     /// there, and the alternative is a list of exceptions each of which has to
     /// stay true as the variants change.
-    pub(crate) fn map_types(&mut self, f: &dyn Fn(&Type) -> Type) {
-        let mut each = |ty: &mut Type| *ty = f(ty);
+    pub(crate) fn respell(&mut self, rename: &Subst) {
+        if let InferError::NoJoinOverBinder {
+            binders,
+            reads,
+            keys,
+        } = self
+        {
+            binders.retain(|binder| match rename.renamed(binder) {
+                Some(variable) => {
+                    reads.push(variable.clone());
+                    false
+                }
+                None => true,
+            });
+            *keys = std::rc::Rc::new(rename.apply_expr(keys));
+        }
+        let mut each = |ty: &mut Type| *ty = rename.apply_type(ty);
         let each_requirement = |r: &mut StatedRequirement| {
             r.accepted.iter_mut().for_each(&mut each);
             for (_, accepted) in r.siblings.iter_mut() {
@@ -663,8 +696,10 @@ impl InferError {
             }
             InferError::MutInCompositeType { ty, .. } => each(ty),
             InferError::ScopeViolation { ty, .. } => each(ty),
-            // No type to render: these carry a name, an id, or a rendered label.
+            // No type to render: these carry a name, an id, a rendered label, or (the
+            // binder join) a term respelled above.
             InferError::UnboundVariable(_)
+            | InferError::NoJoinOverBinder { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
             | InferError::UnresolvedHole { .. }
@@ -1203,6 +1238,38 @@ impl std::fmt::Debug for InferError {
                      A collection's domain is its data, so a join may not narrow it. Wrap each \
                      arm in `box` to keep them.",
                     listed.join(" vs ")
+                )
+            }
+            InferError::NoJoinOverBinder {
+                binders,
+                reads,
+                keys,
+            } => {
+                let spelled =
+                    |names: &[Name]| names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>();
+                let mut depends = Vec::new();
+                if !binders.is_empty() {
+                    depends.push(format!(
+                        "{}, bound between the target's declaration and the write",
+                        spelled(binders).join(", ")
+                    ));
+                }
+                if !reads.is_empty() {
+                    depends.push(format!(
+                        "{}, read between the target's declaration and the write where the read \
+                         takes one value per iteration or call",
+                        spelled(reads).join(", ")
+                    ));
+                }
+                let keys = symbolic(keys);
+                write!(
+                    f,
+                    "Type Inference Error: the keys of a collection written to a feed or mutable \
+                     variable depend on {}\n\
+                     Keys: {keys}\n\
+                     The target's type is the join of every value written to it, and collections \
+                     over different keys have no join.",
+                    depends.join("; and on ")
                 )
             }
             InferError::MutNotBareVariable { at } => {
