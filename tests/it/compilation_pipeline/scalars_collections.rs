@@ -387,33 +387,31 @@ fn an_element_with_no_result_is_rejected(#[case] code: &str) {
     run_pipeline(code);
 }
 
-/// A **compound** constant is not substituted, so an element built from one stays a
-/// computation.
+/// A **compound** constant read inside an element is moved into it before planning, so the
+/// element folds.
 ///
-/// Replacing `expr.node` with a `Lit` mints nothing; substituting a tuple, a record or a
-/// variant copies nodes, and a copy needs minted `NodeId`s and a recording
-/// (`src/ccl/planning/const_fold.rs`, "What does not fold"). A record shows it: a bound tuple
-/// literal's positions reach the element already folded, by the inline pass's tuple-projection
-/// rule (the module docs of `src/ccl/inline.rs`), as
-/// `an_element_read_from_a_bound_tuple_literal_folds` pins.
+/// Constant folding does not substitute a tuple, a record or a variant
+/// (`src/ccl/planning/const_fold.rs`, "What does not fold"). Inlining moves a binding read
+/// anywhere inside a list element into the element (`inline_list_element_reads`), so the
+/// element reads the tuple itself rather than a binder.
 #[test]
-#[should_panic(expected = "constant folding did not reduce this one")]
-fn an_element_built_from_a_compound_constant_is_rejected() {
-    run_pipeline(indoc! {r"
-        p = (a=1, b=2)
-        sum([p.a + p.b])"});
-}
-
-/// A projection of a bound tuple literal that lands on a literal is that literal by the time
-/// constant folding runs, so the element folds.
-#[test]
-fn an_element_read_from_a_bound_tuple_literal_folds() {
+fn an_element_built_from_a_compound_constant_folds() {
     check_scalar(
         indoc! {r"
             p = (1, 2)
             sum([p.0 + p.1])"},
         Value::Int(3),
     );
+}
+
+/// A record constant is moved into the element as a tuple is, and a projection of a record
+/// literal is not folded, so the element is rejected.
+#[test]
+#[should_panic(expected = "constant folding did not reduce this one")]
+fn an_element_built_from_a_record_constant_is_rejected() {
+    run_pipeline(indoc! {r"
+        p = (a=1, b=2)
+        sum([p.a + p.b])"});
 }
 
 /// The `discharged` guard skips the whole **subtree**, so an unrelated downstream `^+`
@@ -705,22 +703,12 @@ fn test_unions(#[case] code: &str, #[case] expected: Tile) {
     assert_eq!(result, expected);
 }
 
-/// A union-domained collection **read at a projected index** — what a `++` generator
-/// beside a second generator lowers to. Two spellings, two different missing
-/// capabilities, both pre-existing on `main` and both measured 2026-09-01:
-///
-/// - inline, the union sits in the generator's lookup position, so op-conversion is
-///   handed a **fed** copairing and rejects it by name (`union_operand_ops`);
-/// - let-bound, the lookup goes through the `Var`/`FanOut` path instead and reaches
-///   runtime, where `ColumnValue::transform_by_map` panics on two union keys whose
-///   arms carry different row sets — the site's product rows against the
-///   collection's own.
-///
-/// This is the capability per-combination realization of a conditional collection
-/// exists to avoid needing: it copies the whole site per arm-tuple so that every
-/// generator's domain is a plain range, and no union is ever looked up.
-// The two spellings hit **different** walls, so each is pinned on its own rather than
-// deferred together: an `#[ignore]` would report the same green whichever one closed.
+/// A union-domained collection **read at a projected index**, what a `++` generator beside
+/// a second generator lowers to. Inline, the union sits in the generator's lookup position,
+/// so op-conversion is handed a **fed** copairing and rejects it by name
+/// (`union_operand_ops`). Per-combination realization of a conditional collection copies the
+/// whole site per arm-tuple so that every generator's domain is a plain range, and never
+/// needs this.
 #[test]
 #[should_panic(expected = "a fed copairing: its arms are over distinct index sets")]
 fn an_inline_union_generator_beside_a_second_generator() {
@@ -731,10 +719,9 @@ fn an_inline_union_generator_beside_a_second_generator() {
 }
 
 /// The `let`-bound spelling of [`an_inline_union_generator_beside_a_second_generator`],
-/// which reaches the runtime instead: the product's key column is union-tagged on both
-/// sides and `transform_by_map` has no case relating two of them.
+/// which looks the collection up through the `Var`/`FanOut` path: the product's key column
+/// is union-tagged, and `transform_by_map` matches each tagged key as one value.
 #[test]
-#[should_panic(expected = "transform_by_map: key type mismatch or unsupported")]
 fn a_let_bound_union_generator_beside_a_second_generator() {
     check_scalar(
         indoc! {r"

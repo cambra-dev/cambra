@@ -524,6 +524,24 @@ fn a_let_bound_call_result_carries_no_refinement() {
 // `src/ccl/design/type-inference.md`, "The scope a query runs in".
 // ---------------------------------------------------------------------------
 
+/// A transparent binder is assumed equal to its definition. `y`'s type is `Int`, since
+/// `+` puts no refinement on its result, so `w`'s refinement `__elem == y ^+ 0` meets the
+/// annotation only through `y == x + 1`. The checks after lambda elimination read the
+/// definition `(x, 1) ▷ add` in its normal form and assume the same fact.
+#[test]
+fn a_binder_is_assumed_equal_to_its_definition() {
+    check_scalar(
+        indoc! {r#"
+            x: Int = 4
+            y = x + 1
+            w = y ^+ 0
+            z: {Int where _ == x + 1} = w
+            z
+        "#},
+        Value::Int(5),
+    )
+}
+
 /// `t ^+ x == t + 2` follows only from `x == 2`, which is the refinement on the
 /// type the top-level binder holds. The literal puts that singleton on the node,
 /// so the scope answers without resolving anything.
@@ -856,6 +874,21 @@ fn complex_anf() {
 1 + 2 + "Hello" + 4 + 5
         "#},
         "1 + 2 + \"Hello\" + 4 + 5",
+    )
+}
+
+/// The same error in a chain holding a mutable variable's read, which A-normalization flattens
+/// onto the statement spine. The message is built from a partly typed tree, and respelling the
+/// chain's temps there keeps every occurrence it replaces typed.
+#[test]
+fn a_type_error_in_a_chain_holding_a_read() {
+    check_compile_error(
+        indoc! {r#"
+            x := 1
+            y = x + "a" + 2 + 3
+            y
+        "#},
+        "No Addable instance for BinOp: operand 2 is String",
     )
 }
 

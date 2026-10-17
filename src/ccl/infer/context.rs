@@ -342,13 +342,24 @@ enum ScopeExit {
 pub(super) struct SolverScope<'a> {
     scopes: &'a ScopeStack<Name, Binding>,
     opaque_binders: &'a HashMap<Name, Type>,
+    /// What each transparent binder is defined as, read while it is in scope
+    /// ([`defined_as`](crate::ccl::infer::solver::smt::defined_as)).
+    scope_exits: &'a HashMap<Name, Vec<ScopeExit>>,
 }
 
 impl ScopeEnv for SolverScope<'_> {
     fn binder_type(&self, name: &Name) -> Option<Type> {
-        self.scopes
-            .binder_type(name)
-            .or_else(|| self.opaque_binders.get(name).and_then(value_type))
+        if let Some(ty) = self.scopes.binder_type(name) {
+            return Some(
+                match self.scope_exits.get(name).and_then(|exits| exits.last()) {
+                    Some(ScopeExit::Discharge(definition)) => {
+                        crate::ccl::infer::solver::smt::defined_as(ty, definition)
+                    }
+                    _ => ty,
+                },
+            );
+        }
+        self.opaque_binders.get(name).and_then(value_type)
     }
     fn is_skip_smt(&self) -> bool {
         false
@@ -1044,6 +1055,7 @@ impl InferCtx {
         let scope = SolverScope {
             scopes: &self.scopes,
             opaque_binders: &self.opaque_binders,
+            scope_exits: &self.scope_exits,
         };
         self.cache.at(self.here(), self.here());
         let result = constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope);
@@ -1079,6 +1091,7 @@ impl InferCtx {
             let scope = SolverScope {
                 scopes: &self.scopes,
                 opaque_binders: &self.opaque_binders,
+                scope_exits: &self.scope_exits,
             };
             self.cache.at(self.here(), self.here());
             let result = constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope);
@@ -1689,6 +1702,7 @@ impl Typing for InferCtx {
         let scope = SolverScope {
             scopes: &self.scopes,
             opaque_binders: &self.opaque_binders,
+            scope_exits: &self.scope_exits,
         };
         self.cache.at(self.here(), self.demand_at.or(self.here()));
         let result = constrain_subtype_in(sub, sup, &mut self.cache, &scope);

@@ -640,14 +640,17 @@ op-conversion rejects the domain. The copy is also what lets each consumer's sub
 differ: two consumers filtering one conditional instantiate the same witness into two
 different predicates, which one set of legs cannot hold.
 
-Only an **undetermined** witness is copied — a kind naming more than one candidate. A
-determined one has no realization to feed, since the candidate is already its domain and the
-erasure removes the binder where it stands; copying it duplicates the arms and puts a `box`
-inside each consumer, where the erasure reaches the term but not every type that named it.
-Materializing the conditional rather than realizing it would remove the copy, by letting one
-value serve several consumers; planning realizes it, so the copy is the only compiling form. It
-would also make this substitution one choice among several rather than the only expressible
-form — the point at which the duplication becomes a cost question instead of an obligation.
+A determined witness is copied too. A same-domain conditional names one candidate, and its
+`Case` still realizes into one leg per arm. Realized in its binding instead, the `Case` stays in
+every type the definition was discharged into. A filtered comprehension whose source is bound
+inside the comprehension's own scope is one: the `let`'s type holds the `Case` in its predicate,
+and the realized definition no longer matches it (`inline_conditional_bindings` in
+`src/ccl/planning/conditionals.rs`).
+
+Materializing the conditional rather than realizing it would remove the copy, by letting one value
+serve several consumers; planning realizes it, so the copy is the only compiling form. It would
+also make this substitution one choice among several rather than the only expressible form — the
+point at which the duplication becomes a cost question instead of an obligation.
 
 ### A site's witnesses are compiled together
 

@@ -53,9 +53,9 @@
 //!
 //! # Tuple projections
 //!
-//! A projection chain `𝑡.𝑖…` of a `let`-bound tuple literal that lands on a literal, a source, a
-//! `Var` bound to a `Defer`, or a tuple of those is replaced by a copy of the element, and a
-//! tuple `let` that nothing reads afterwards is dropped. `channelize` resolves a feed handle
+//! A projection chain `𝑡.𝑖…` of a `let`-bound tuple literal whose elements are literals, sources,
+//! `Var`s bound to a `Defer`, or tuples of those is replaced by a copy of the element it lands
+//! on, and a tuple `let` that nothing reads afterwards is dropped. `channelize` resolves a feed handle
 //! through `Var` aliases only, and runs before [`crate::ccl::simplify`] folds literal
 //! projections, so this is what lets `o = t.1` over `t = (1, out)` feed `out`. A projection
 //! standing directly on a literal is left to `simplify`.
@@ -77,15 +77,115 @@
 use crate::ccl::{
     BindingTransparency, Expr, Lit, Name, ProjKey, Refinement, Type, TypedBinding, TypedExprNode,
     ccl_utils::{
-        PredMemo, count_free, discharge_transparent_lets, free_names_in_value, is_free,
+        PredMemo, count_free, discharge_transparent_lets, free_names, free_names_in_value, is_free,
         refresh_let_binder, spelled_in_a_type, walk_refined_predicates_mut,
     },
     lambda_elim::substitute,
     provenance,
 };
 
-use crate::ccl::infer::solver::smt::{NoScope, SmtError, smt_sub};
+use crate::ccl::infer::solver::smt::{ScopeEnv, SmtError, defined_as, smt_sub};
 use std::collections::HashSet;
+
+/// The binders in scope where this pass checks a substitution, each at the type a query under it
+/// assumes: the type it is bound at, and for a transparent `let` its definition as well
+/// ([`defined_as`]). The same environment the post-inference check builds (`CheckScope` in
+/// `src/ccl/infer/check.rs`), so a refinement inference discharged with a binder's facts is
+/// discharged here with the same facts.
+///
+/// An opaque binder's type is kept past its scope, as the check keeps it: a type lifted past the
+/// binder keeps its name. A binder this walk does not track (a loop target, a pattern binder, a
+/// `letrec` group) contributes no assumption, which only weakens a query.
+///
+/// `channels` holds the names the walk has met bound to a `Defer`: the feed handles
+/// `channelize` resolves, which [`project_bound_tuple`] may copy out of a tuple. Names are
+/// unique by this pass, and a binder encloses every mention of its name, so the walk, which
+/// visits a node before its children, records a channel before reaching any tuple that holds
+/// it. A defer-mediating function's parameter is replaced by the caller's handle when the
+/// function is inlined, so the handles a tuple holds by then are channel names.
+#[derive(Default)]
+struct Scope {
+    frames: Vec<Frame>,
+    opaque_binders: std::collections::HashMap<Name, Type>,
+    channels: HashSet<Name>,
+}
+
+/// One binder in a [`Scope`]: the type it is bound at, and for a transparent `let` the definition
+/// that refines it. The refinement is computed when a query first reads the binder: most binders
+/// the walk enters are never queried, and [`defined_as`] normalizes the definition.
+struct Frame {
+    name: Name,
+    ty: Type,
+    definition: Option<Expr>,
+    assumed: std::cell::OnceCell<Type>,
+}
+
+impl Frame {
+    /// The type a query assumes for the binder.
+    fn assumed(&self) -> &Type {
+        match &self.definition {
+            None => &self.ty,
+            Some(definition) => self
+                .assumed
+                .get_or_init(|| defined_as(self.ty.clone(), definition)),
+        }
+    }
+}
+
+impl Scope {
+    fn under<R>(&mut self, name: &Name, ty: Type, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.frames.push(Frame {
+            name: name.clone(),
+            ty,
+            definition: None,
+            assumed: std::cell::OnceCell::new(),
+        });
+        let out = f(self);
+        self.frames.pop();
+        out
+    }
+
+    fn under_let<R>(
+        &mut self,
+        binding: &TypedBinding,
+        definition: &Expr,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        match binding.transparency {
+            BindingTransparency::Transparent => {
+                self.frames.push(Frame {
+                    name: binding.name.clone(),
+                    ty: binding.ty.clone(),
+                    definition: Some(definition.clone_preserving_ids()),
+                    assumed: std::cell::OnceCell::new(),
+                });
+                let out = f(self);
+                self.frames.pop();
+                out
+            }
+            BindingTransparency::Opaque => {
+                self.opaque_binders
+                    .insert(binding.name.clone(), binding.ty.clone());
+                self.under(&binding.name, binding.ty.clone(), f)
+            }
+        }
+    }
+}
+
+impl ScopeEnv for Scope {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        self.frames
+            .iter()
+            .rev()
+            .find(|f| &f.name == name)
+            .map(Frame::assumed)
+            .or_else(|| self.opaque_binders.get(name))
+            .cloned()
+    }
+    fn is_skip_smt(&self) -> bool {
+        false
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -106,7 +206,7 @@ use std::collections::HashSet;
 /// ([`fold_product_projection`]); `crate::ccl::simplify` folds the rest as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_capability_lambdas(expr: Expr) -> Expr {
-    let expr = inline_impl(expr, &mut HashSet::new());
+    let expr = inline_impl(expr, &mut Scope::default());
     let expr = beta_reduce_variable_arguments(expr);
     inline_list_element_reads(expr, &PredMemo::new()).0
 }
@@ -158,19 +258,41 @@ pub(crate) fn check_calls_resolved(expr: &Expr) -> Result<(), provenance::Locate
 /// redex is left to lambda elimination, whose rules read its shape: a group-by's partition
 /// is recognized as a lambda of its own.
 fn beta_reduce_variable_arguments(expr: Expr) -> Expr {
-    beta_reduce_variable_arguments_under(expr, &mut Vec::new())
+    beta_reduce_variable_arguments_under(expr, &mut Vec::new(), &mut Scope::default())
 }
 
-fn beta_reduce_variable_arguments_under(mut expr: Expr, enclosing: &mut Vec<Name>) -> Expr {
+fn beta_reduce_variable_arguments_under(
+    mut expr: Expr,
+    enclosing: &mut Vec<Name>,
+    scope: &mut Scope,
+) -> Expr {
     if let TypedExprNode::Lambda { param, body } = &mut expr.node {
         enclosing.push(param.name.clone());
-        let reduced =
-            beta_reduce_variable_arguments_under(std::mem::take(body.as_mut()), enclosing);
+        let reduced = scope.under(&param.name, param.ty.clone(), |scope| {
+            beta_reduce_variable_arguments_under(std::mem::take(body.as_mut()), enclosing, scope)
+        });
         enclosing.pop();
         **body = reduced;
         return expr;
     }
-    expr.map_children(|child| beta_reduce_variable_arguments_under(child, enclosing));
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &mut expr.node
+    {
+        **bound_expr = beta_reduce_variable_arguments_under(
+            std::mem::take(bound_expr.as_mut()),
+            enclosing,
+            scope,
+        );
+        let reduced = scope.under_let(binding, bound_expr, |scope| {
+            beta_reduce_variable_arguments_under(std::mem::take(body.as_mut()), enclosing, scope)
+        });
+        **body = reduced;
+        return expr;
+    }
+    expr.map_children(|child| beta_reduce_variable_arguments_under(child, enclosing, scope));
     let reducible = matches!(
         &expr.node,
         TypedExprNode::Apply { argument, function }
@@ -180,7 +302,7 @@ fn beta_reduce_variable_arguments_under(mut expr: Expr, enclosing: &mut Vec<Name
                     if crate::ccl::subst::type_free_vars(&param.ty)
                         .iter()
                         .any(|n| enclosing.contains(n))
-                        && refinement_discharged_by(&argument.ty, &param.ty))
+                        && refinement_discharged_by(&argument.ty, &param.ty, scope))
     );
     if !reducible {
         return expr;
@@ -341,7 +463,7 @@ fn calls_a_lambda(expr: &Expr) -> bool {
 /// The inliner leaves the latter for `lambda_elim`, whose comprehension and scalar
 /// shapes depend on it (`src/ccl/design/optimization.md`, "Substitution and
 /// beta-reduction"). The caller has also checked [`calls_a_lambda`].
-fn beta_reduce_folded_call(expr: Expr) -> Expr {
+fn beta_reduce_folded_call(expr: Expr, scope: &Scope) -> Expr {
     let node_id = expr.node_id();
     let TypedExprNode::Apply { function, argument } = expr.node else {
         unreachable!("beta_reduce_folded_call: not a call")
@@ -355,6 +477,7 @@ fn beta_reduce_folded_call(expr: Expr) -> Expr {
         *body,
         *argument,
         "a lambda held in a product",
+        scope,
     )
 }
 
@@ -547,10 +670,10 @@ fn reads_a_variable_written_in(definiens: &Expr, body: &Expr) -> bool {
 ///
 /// A list literal's elements are a value position. Op-conversion compiles the
 /// whole literal to one table read at graph-build time, so an element is
-/// sequenced against nothing and a binding read there can be moved into it. The
-/// moved element need not be a constant: op-conversion accepts only constant
-/// formers in the position, and a non-constant one reaches that rejection spelled
-/// as the computation it is rather than as the binder that held it.
+/// sequenced against nothing and a binding read anywhere inside one can be moved
+/// into it. The moved element need not be a constant: op-conversion accepts only
+/// constant formers in the position, and a non-constant one reaches that rejection
+/// spelled as the computation it is rather than as the binder that held it.
 /// [`flatten_anf_bindings`] first substitutes away the bindings A-normalization
 /// left inside what moves, so a nested constant arrives as the value former it
 /// denotes rather than as a `Let` chain building one.
@@ -659,8 +782,12 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
     )
 }
 
-/// Replace every list element of `body` that reads `name` with `definiens`,
+/// Replace every read of `name` inside a list element of `body` with `definiens`,
 /// reporting whether any did.
+///
+/// A read anywhere inside the element moves, not only an element that is the read:
+/// A-normalization names a former's components on the statement spine, so
+/// `[(a: 1 + 2)]` arrives as `let __anf = 1 + 2 in [(a: __anf)]`.
 ///
 /// An occurrence in any other position is left alone, so a binding read both in a
 /// list and elsewhere keeps its `Let` and gains a copy at the element. A binding
@@ -696,6 +823,10 @@ fn move_into_list_elements(
         for elt in elts.iter_mut() {
             if matches!(&elt.node, TypedExprNode::Var(read) if read == name) {
                 *elt = flatten_anf_bindings(definiens.clone_at(elt.node_id()));
+                moved = true;
+            } else if is_free(name, elt) {
+                let read = std::mem::replace(elt, Expr::lit(Lit::Unit));
+                *elt = flatten_anf_bindings(substitute(read, name, definiens));
                 moved = true;
             }
         }
@@ -860,14 +991,7 @@ fn anf_chain_builds_a_product(e: &Expr) -> bool {
 /// routes them through the defer-aware [`crate::ccl::subst::Subst`] engine,
 /// which renames a fed-to handle when a defer-mediating UDF is inlined. The
 /// defer-returning lift itself lives in `channelize::lift_defer`.
-///
-/// `channels` holds the names the walk has met bound to a `Defer`: the feed handles
-/// `channelize` resolves, which [`project_bound_tuple`] may copy out of a tuple. Names are
-/// unique by this pass, and a binder encloses every mention of its name, so the walk, which
-/// visits a node before its children, records a channel before reaching any tuple that holds
-/// it. A defer-mediating function's parameter is replaced by the caller's handle when the
-/// function is inlined, so the handles a tuple holds by then are channel names.
-fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
+fn inline_impl(expr: Expr, scope: &mut Scope) -> Expr {
     if let TypedExprNode::Let {
         binding,
         bound_expr,
@@ -875,7 +999,7 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
     } = &expr.node
         && matches!(bound_expr.node, TypedExprNode::Defer)
     {
-        channels.insert(binding.name.clone());
+        scope.channels.insert(binding.name.clone());
     }
     // Carry `node_id` through every rebuild: reconstructing a node with
     // inlined children is a Preserve (the same node, same identity), so the
@@ -893,8 +1017,8 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
             bound_expr,
             body,
         } => {
-            let bound_expr = inline_impl(*bound_expr, channels);
-            let body = inline_impl(*body, channels);
+            let bound_expr = inline_impl(*bound_expr, scope);
+            let body = scope.under_let(&binding, &bound_expr, |scope| inline_impl(*body, scope));
 
             // Alias: `let y = x` is pure α-renaming — substitute y → x in body
             // and drop the Let.  This must run before lambda_elim so that the
@@ -949,7 +1073,7 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
                         provenance::enter(node_id, "inline.split", provenance::Nature::Machinery);
                     split_product_let(&binding, bound_expr, body)
                 };
-                return inline_impl(split, channels);
+                return inline_impl(split, scope);
             }
 
             if !binder_spelled_in_a_type
@@ -996,7 +1120,7 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
                 // inside a refinement predicate, an `Rc` no term walk rebuilds.
                 // Leave the binding standing.
                 return match unplaced {
-                    None => inline_impl(body, channels),
+                    None => inline_impl(body, scope),
                     Some(bound_expr) => Expr {
                         node_id,
                         node: TypedExprNode::Let {
@@ -1044,7 +1168,7 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
                 // the substitution and land between the projection and the
                 // former again, one level in.
                 let former = flatten_anf_bindings(bound_expr);
-                return inline_impl(substitute(body, &binding.name, &former), channels);
+                return inline_impl(substitute(body, &binding.name, &former), scope);
             }
 
             if !binder_spelled_in_a_type && should_inline(&bound_expr.ty) {
@@ -1061,21 +1185,20 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
                 // expanding a defer-returning UDF) are eligible for the alias
                 // and lift rewrites on the second pass.
                 let _g = provenance::enter(node_id, "inline.udf", provenance::Nature::Expansion);
-                return inline_impl(
-                    inline_and_beta_reduce(
-                        body,
-                        &binding.name,
-                        &bound_expr,
-                        // One memo for the whole `[name ↦ lambda]` rewrite, so a
-                        // predicate rebuilt at one node is re-pointed at (not
-                        // re-derived for) its occurrences on every other node this
-                        // sweep touches. Scoped to *this* rewrite, not the `inline`
-                        // pass: a different binder's rewrite maps the same origin
-                        // `Rc` to a different result.
-                        &PredMemo::new(),
-                    ),
-                    channels,
+                let reduced = inline_and_beta_reduce(
+                    body,
+                    &binding.name,
+                    &bound_expr,
+                    scope,
+                    // One memo for the whole `[name ↦ lambda]` rewrite, so a
+                    // predicate rebuilt at one node is re-pointed at (not
+                    // re-derived for) its occurrences on every other node this
+                    // sweep touches. Scoped to *this* rewrite, not the `inline`
+                    // pass: a different binder's rewrite maps the same origin
+                    // `Rc` to a different result.
+                    &PredMemo::new(),
                 );
+                return inline_impl(reduced, scope);
             }
 
             // **A projection of a bound tuple literal** reads the element it lands on, when
@@ -1088,14 +1211,16 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
                     "inline.tuple_projection",
                     provenance::Nature::Machinery,
                 );
-                match project_bound_tuple(body, &binding.name, &bound_expr, channels) {
+                match project_bound_tuple(body, &binding.name, &bound_expr, &scope.channels) {
                     (body, true)
                         if count_free(&binding.name, &body) == 0
                             && !crate::ccl::subst::type_free_vars(&ty).contains(&binding.name) =>
                     {
-                        return inline_impl(body, channels);
+                        return inline_impl(body, scope);
                     }
-                    (body, true) => inline_impl(body, channels),
+                    (body, true) => {
+                        scope.under_let(&binding, &bound_expr, |scope| inline_impl(body, scope))
+                    }
                     (body, false) => body,
                 }
             } else {
@@ -1118,9 +1243,19 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
         TypedExprNode::Compose(terms) => TypedExprNode::Compose(
             terms
                 .into_iter()
-                .map(|t| inline_impl(t, channels))
+                .map(|term| inline_impl(term, scope))
                 .collect(),
         ),
+
+        TypedExprNode::Lambda { param, body } => {
+            let body = scope.under(&param.name, param.ty.clone(), |scope| {
+                inline_impl(*body, scope)
+            });
+            TypedExprNode::Lambda {
+                param,
+                body: Box::new(body),
+            }
+        }
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
 
@@ -1137,7 +1272,7 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
                 ty,
                 user_annotation,
             };
-            expr.map_children(|c| inline_impl(c, channels));
+            expr.map_children(|child| inline_impl(child, scope));
             // **A projection of a tuple literal holding a feed handle** is the element it
             // lands on. Beta reduction leaves this shape where a function of several
             // parameters is called with a handle: the parameter the body feeds is bound to a
@@ -1149,7 +1284,7 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
                 let mut held = Vec::new();
                 collect_var_elements(base, &mut held);
                 (matches!(base.node, TypedExprNode::Tuple(_))
-                    && held.iter().any(|n| channels.contains(n)))
+                    && held.iter().any(|n| scope.channels.contains(n)))
                 .then_some(base)
             }) {
                 let _g = provenance::enter(
@@ -1160,7 +1295,7 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
                 return element.clone();
             }
             if calls_a_projection && calls_a_lambda(&expr) {
-                return inline_impl(beta_reduce_folded_call(expr), channels);
+                return inline_impl(beta_reduce_folded_call(expr, scope), scope);
             }
             return fold_product_projection(expr);
         }
@@ -1206,6 +1341,11 @@ fn bind_argument(mut param: TypedBinding, argument: Expr, body: Expr) -> Expr {
 /// that handle, reads to `channelize` as a channel depending on itself. A nested tuple landed on
 /// is bound by its own `let` in turn, which is how `(b, o) = t.1` reaches `o`.
 ///
+/// Only a tuple whose every element is copyable is projected: one holding a computed value
+/// stays bound, so a handle copied out of it would be fed through a tuple that holds it, and
+/// `channelize` would read the channel as depending on itself. Left projected, the handle is
+/// refused as a feed taken out of a data structure.
+///
 /// A channel name `body` rebinds is left projected, as the alias rule leaves such a `let`. A
 /// `body` that rebinds `name` itself is left whole.
 fn project_bound_tuple(
@@ -1235,6 +1375,9 @@ fn project_bound_tuple(
         .into_iter()
         .filter(|n| channels.contains(n) && !is_let_bound(n, &body))
         .collect();
+    if !is_copyable(tuple, &|n| readable.contains(n)) {
+        return (body, false);
+    }
     let changed = walk(&mut body, name, tuple, &readable);
     (body, changed)
 }
@@ -1310,7 +1453,13 @@ fn collect_var_elements(tuple: &Expr, out: &mut Vec<Name>) {
 /// TODO: reducing the rest is equationally sound, but it perturbs CCC simplify's
 /// input shape for list comprehensions, scalar UDFs, and BinOp paths in ways that
 /// need test-suite triage first.
-fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMemo) -> Expr {
+fn inline_and_beta_reduce(
+    expr: Expr,
+    name: &Name,
+    lambda: &Expr,
+    scope: &mut Scope,
+    memo: &PredMemo,
+) -> Expr {
     // Direct occurrence: replace the variable with the Lambda value — a UDF used
     // as an unapplied value, or the function side of a call about to
     // beta-reduce.
@@ -1331,7 +1480,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
     // A binder's own type is in the enclosing scope (a binder does not bind in
     // its own type), so the shadowing checks further down do not apply to it.
     let mut expr = expr;
-    expr.walk_type_slots_mut(|ty| inline_in_type_predicates(ty, name, lambda, memo));
+    expr.walk_type_slots_mut(|ty| inline_in_type_predicates(ty, name, lambda, scope, memo));
 
     // Apply chain ending in `Var(name)` — beta-reduce after recursively
     // substituting the argument and collapsing the function side.
@@ -1348,11 +1497,11 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
             TypedExprNode::Apply { function, argument } => (function, argument),
             _ => unreachable!(),
         };
-        let argument = inline_and_beta_reduce(*argument, name, lambda, memo);
-        let function = inline_and_beta_reduce(*function, name, lambda, memo);
+        let argument = inline_and_beta_reduce(*argument, name, lambda, scope, memo);
+        let function = inline_and_beta_reduce(*function, name, lambda, scope, memo);
         match function.node {
             TypedExprNode::Lambda { param, body } => {
-                return beta_reduce(node_id, param, *body, argument, name);
+                return beta_reduce(node_id, param, *body, argument, name, scope);
             }
             // Not a Lambda (e.g. the bound expression is Var("id") rather
             // than a literal lambda) — skip beta-reduction and reconstruct
@@ -1389,9 +1538,12 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
                 // shadowed — stop substituting inside
                 TypedExprNode::Lambda { param, body }
             } else {
+                let body = scope.under(&param.name, param.ty.clone(), |scope| {
+                    inline_and_beta_reduce(*body, name, lambda, scope, memo)
+                });
                 TypedExprNode::Lambda {
                     param,
-                    body: Box::new(inline_and_beta_reduce(*body, name, lambda, memo)),
+                    body: Box::new(body),
                 }
             }
         }
@@ -1401,11 +1553,13 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
             bound_expr,
             body,
         } => {
-            let new_bound = inline_and_beta_reduce(*bound_expr, name, lambda, memo);
+            let new_bound = inline_and_beta_reduce(*bound_expr, name, lambda, scope, memo);
             let new_body = if &binding.name == name {
                 *body
             } else {
-                inline_and_beta_reduce(*body, name, lambda, memo)
+                scope.under_let(&binding, &new_bound, |scope| {
+                    inline_and_beta_reduce(*body, name, lambda, scope, memo)
+                })
             };
             TypedExprNode::Let {
                 binding,
@@ -1424,9 +1578,9 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
                 TypedExprNode::LetRec {
                     bindings: bindings
                         .into_iter()
-                        .map(|(b, def)| (b, inline_and_beta_reduce(def, name, lambda, memo)))
+                        .map(|(b, def)| (b, inline_and_beta_reduce(def, name, lambda, scope, memo)))
                         .collect(),
-                    body: Box::new(inline_and_beta_reduce(*body, name, lambda, memo)),
+                    body: Box::new(inline_and_beta_reduce(*body, name, lambda, scope, memo)),
                 }
             }
         }
@@ -1436,11 +1590,11 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
         // The loop target shadows `name` inside the body only; the source
         // still substitutes.
         TypedExprNode::For { target, iter, body } => {
-            let iter = Box::new(inline_and_beta_reduce(*iter, name, lambda, memo));
+            let iter = Box::new(inline_and_beta_reduce(*iter, name, lambda, scope, memo));
             let body = if &target.name == name {
                 body
             } else {
-                Box::new(inline_and_beta_reduce(*body, name, lambda, memo))
+                Box::new(inline_and_beta_reduce(*body, name, lambda, scope, memo))
             };
             TypedExprNode::For { target, iter, body }
         }
@@ -1456,7 +1610,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
                 ty,
                 user_annotation,
             };
-            expr.map_children(|child| inline_and_beta_reduce(child, name, lambda, memo));
+            expr.map_children(|child| inline_and_beta_reduce(child, name, lambda, scope, memo));
             return expr;
         }
     };
@@ -1477,6 +1631,7 @@ fn beta_reduce(
     body: Expr,
     argument: Expr,
     callee: impl std::fmt::Display,
+    scope: &dyn ScopeEnv,
 ) -> Expr {
     // A domain refinement on this outer lambda encodes a precondition
     // `P(arg)` that beta reduction must not lose. Such refinements ride
@@ -1498,7 +1653,7 @@ fn beta_reduce(
     // path, and a release build proceeding past it would miscompile to
     // wrong results rather than fail.
     assert!(
-        refinement_discharged_by(&argument.ty, &param.ty),
+        refinement_discharged_by(&argument.ty, &param.ty, scope),
         "inline: outer lambda for `{callee}` has parameter type {} which the \
              argument type {} does not entail; beta reduction would silently drop \
              the precondition. This needs a `restrict` lift, not a substitution.",
@@ -1516,6 +1671,30 @@ fn beta_reduce(
     substitute_floating_lets(body, param, argument)
 }
 
+/// `body` with each `let` binding a name in `names` renamed fresh, so a term reading those
+/// names can be substituted into it without capture.
+fn refresh_lets_binding(mut body: Expr, names: &HashSet<Name>) -> Expr {
+    if names.is_empty() {
+        return body;
+    }
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body: let_body,
+    } = &mut body.node
+    {
+        **bound_expr = refresh_lets_binding(std::mem::take(bound_expr.as_mut()), names);
+        let mut inner = refresh_lets_binding(std::mem::take(let_body.as_mut()), names);
+        if names.contains(&binding.name) {
+            inner = refresh_let_binder(binding, inner);
+        }
+        **let_body = inner;
+        return body;
+    }
+    body.map_children(|child| refresh_lets_binding(child, names));
+    body
+}
+
 /// `body[param := argument]`, with the `Let` chain wrapping `argument` floated out around
 /// the result: `(let 𝑥 = 𝑒 in 𝑣) ▷ (λ param → body)` reduces to `let 𝑥 = 𝑒 in
 /// body[param := 𝑣]`.
@@ -1530,7 +1709,10 @@ fn beta_reduce(
 /// Each floated binder is renamed fresh, because `body` may bind the same name: a
 /// specialization clone copies its definition's binders, so a clone's argument and the body
 /// of another clone of the same definition it calls spell one `__anf`. Floated under its own
-/// name, the binder's reads in the argument would be captured by the body's.
+/// name, the binder's reads in the argument would be captured by the body's. For the same
+/// reason a `let` in `body` binding a name the argument reads from outside it, a binder of the
+/// calling clone, is renamed fresh before the argument is substituted under it
+/// ([`refresh_lets_binding`]).
 fn substitute_floating_lets(body: Expr, param: TypedBinding, argument: Expr) -> Expr {
     let mut lets = Vec::new();
     let mut value = argument;
@@ -1548,6 +1730,7 @@ fn substitute_floating_lets(body: Expr, param: TypedBinding, argument: Expr) -> 
         value = refresh_let_binder(&mut binding, *let_body);
         lets.push((node_id, binding, *bound_expr));
     }
+    let body = refresh_lets_binding(body, &free_names(&value));
     let reduced = if is_shared_computation(&value, &param.name, &body) {
         bind_argument(param, value, body)
     } else {
@@ -1580,7 +1763,13 @@ fn substitute_floating_lets(body: Expr, param: TypedBinding, argument: Expr) -> 
 /// serve it. This claim depends on that skipping: an arm rewritten to
 /// descend-with-a-guard would need the rewrite's scope in `C`, exactly as `subst`
 /// carries its `Subst`.
-fn inline_in_type_predicates(ty: &mut Type, name: &Name, lambda: &Expr, memo: &PredMemo) {
+fn inline_in_type_predicates(
+    ty: &mut Type,
+    name: &Name,
+    lambda: &Expr,
+    scope: &mut Scope,
+    memo: &PredMemo,
+) {
     walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
         // A predicate the inlined binder does not occur in is reported
         // *unchanged*, so it keeps its origin `Rc` and stays pointer-shared with
@@ -1590,7 +1779,7 @@ fn inline_in_type_predicates(ty: &mut Type, name: &Name, lambda: &Expr, memo: &P
             return false;
         }
         let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
-        *pred = inline_and_beta_reduce(old, name, lambda, memo);
+        *pred = inline_and_beta_reduce(old, name, lambda, scope, memo);
         true
     });
 }
@@ -1617,9 +1806,9 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
 /// the very refinement the parameter acquired *from* it — is an equality and the two
 /// copies legitimately differ in inference metadata. A demand the argument entails
 /// without matching it — `Int@6` against `{Int | __elem == 1 ^+ 5}` — goes to the
-/// same semantic fallback the deficit rule uses during inference ([`smt_sub`]). The
-/// query runs under [`NoScope`], because this pass holds no binder types for the
-/// tree it was handed; an assumption left out only weakens the antecedent.
+/// same semantic fallback the deficit rule uses during inference ([`smt_sub`]), under
+/// the binders in scope at the call ([`Scope`]). An argument A-normalization named reads
+/// a binder (`__anf ^+ 2`, where `__anf = 1 ^+ 3`), and only the scope says what it is.
 ///
 /// Both sides have their transparent `let` bindings discharged first
 /// ([`discharge_transparent_lets`]), for the reason the deficit rule does it: a
@@ -1629,7 +1818,7 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
 ///
 /// Anything subtler than both is exactly what should trip the assert and get a real
 /// `restrict` lift.
-fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
+fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type, scope: &dyn ScopeEnv) -> bool {
     if param_ty.refinements().is_empty() {
         return true;
     }
@@ -1661,7 +1850,7 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
     // The base the query runs over is the argument's value, so the `Mut` stamp comes
     // off here for the reason it does above.
     let base = arg_ty.mut_value_type().unwrap_or(arg_ty).peel_refinements();
-    match smt_sub(base, &supplied, &demanded, &NoScope) {
+    match smt_sub(base, &supplied, &demanded, scope) {
         Ok(entailed) => entailed,
         // A predicate the encoder cannot read leaves the entailment undecided, which
         // is the structural answer: the demand is not discharged, and the caller's
@@ -2128,7 +2317,13 @@ mod tests {
         let lambda = TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
             .with_ty(fn_ty(int.clone(), int.clone()));
         let body = TypedExpr::var("f").with_ty(fn_ty(int.clone(), int));
-        let result = inline_and_beta_reduce(body, &Name::raw("f"), &lambda, &PredMemo::new());
+        let result = inline_and_beta_reduce(
+            body,
+            &Name::raw("f"),
+            &lambda,
+            &mut Scope::default(),
+            &PredMemo::new(),
+        );
         assert_eq!(result, lambda);
     }
 
@@ -2141,7 +2336,13 @@ mod tests {
         let arg = TypedExpr::lit(Lit::Int(3)).with_ty(int.clone());
         let call = TypedExpr::apply(arg.clone(), TypedExpr::var("f").with_ty(lambda.ty.clone()))
             .with_ty(int);
-        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda, &PredMemo::new());
+        let result = inline_and_beta_reduce(
+            call,
+            &Name::raw("f"),
+            &lambda,
+            &mut Scope::default(),
+            &PredMemo::new(),
+        );
         assert_eq!(result, arg);
     }
 
@@ -2164,7 +2365,13 @@ mod tests {
             .with_ty(fn_ty(int.clone(), int.clone())),
         )
         .with_ty(int.clone());
-        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda, &PredMemo::new());
+        let result = inline_and_beta_reduce(
+            call,
+            &Name::raw("f"),
+            &lambda,
+            &mut Scope::default(),
+            &PredMemo::new(),
+        );
         assert_eq!(result, TypedExpr::lit(Lit::Int(1)).with_ty(int));
     }
 
@@ -2188,6 +2395,7 @@ mod tests {
             shadowed.clone(),
             &Name::raw("f"),
             &replacement,
+            &mut Scope::default(),
             &PredMemo::new(),
         );
         assert_eq!(result, shadowed);
