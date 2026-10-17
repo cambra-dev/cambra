@@ -51,14 +51,14 @@
 //! segment, so opacity is a property of the segment rather than of the read: a
 //! binding sealed here would open a segment at every hoisted read.
 //!
-//! **A chain holding one is flattened onto the statement spine** ([`peel`]).
+//! **Every chain is flattened onto the statement spine** ([`peel`]).
 //! [`normalize`] seals the bindings an operand needed around that operand, and
-//! an enclosing hoist nests the seal inside its own definiens, where the outer
-//! binding's type names a binder bound strictly inside the term it types. An
-//! ordinary chain survives that nesting, a transparent binder being discharged
-//! into the types leaving its scope. The binding `mut_read` seals is opaque and
-//! is not discharged, so a chain holding a read is peeled and re-sealed one
-//! level out.
+//! an enclosing hoist would nest the seal inside its own definiens, where the
+//! outer binding's type names a binder bound strictly inside the term it types.
+//! The binding `mut_read` seals is opaque and is not discharged, so nested, that
+//! type names a binder out of scope; a transparent binder is discharged, which
+//! copies its definition into the type. So every chain is peeled and re-sealed
+//! one level out.
 //!
 //! A **handle** position holds the variable rather than its value, so the
 //! mention there is not a read and stays where it stands
@@ -166,8 +166,10 @@
 //! buried under a `Let` again, which this pass cannot prevent since it runs
 //! before that substitution exists.
 
+use std::collections::HashMap;
+
 use crate::ccl::{
-    Branch, Expr, Name, TypedBinding, TypedExprNode,
+    BindingTransparency, Branch, Expr, Name, Type, TypedBinding, TypedExprNode,
     ccl_utils::is_free,
     mut_scope::{Muts, is_mut_var, under_param, with},
     provenance::{self, Nature},
@@ -191,6 +193,40 @@ pub fn run(expr: Expr) -> Expr {
     #[cfg(debug_assertions)]
     debug_assert_flat_spines(&out);
     out
+}
+
+/// The substitution a diagnostic spells each A-normalization temp through: the term the temp
+/// names.
+///
+/// A temp is a binder no program mentions. A type leaving a transparent temp's scope has the
+/// temp discharged, so a type naming one was read inside the scope, and a message reporting it
+/// would print the temp. Each definition is respelled through the temps bound around it first, so
+/// no such temp is left in the range. An opaque temp is a read segment's, which
+/// [`read_respelling`](crate::ccl::mut_read::read_respelling) spells as its variable. Display
+/// alone, as that is, and applied ahead of it, since a definition can hold a read's binder.
+pub fn temp_respelling(expr: &Expr) -> Subst {
+    fn go(expr: &Expr, env: &mut HashMap<Name, Expr>) {
+        if let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &expr.node
+            && binding.name.is_anf_temp()
+            && binding.transparency == BindingTransparency::Transparent
+        {
+            let mut definition = Subst::discharge_env_in_place((**bound_expr).clone(), env);
+            // An inference error leaves the tree partly typed. A definition has its binder's
+            // type, so the substitution keeps every occurrence typed.
+            if matches!(definition.ty, Type::Hole) {
+                definition.ty = binding.ty.clone();
+            }
+            env.insert(binding.name.clone(), definition);
+        }
+        expr.walk_children(|child| go(child, env));
+    }
+    let mut env = HashMap::new();
+    go(expr, &mut env);
+    Subst::discharging(&env)
 }
 
 /// Is `e` already atomic — safe to leave directly in a position ANF requires
@@ -291,6 +327,35 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
                     name_reads(guard, muts, &mut reads);
                 }
             }
+            // **A filtered comprehension's sources are bound ahead of it.** Its encoding is a
+            // refined cast whose predicate reads each generator's source, so a source left in
+            // place is copied into the predicate, and a source that is itself a filtered
+            // comprehension carries a copy of its own: the term doubles at each level of
+            // nesting. Bound ahead, the predicate and the cast's value read one name. A source
+            // reading an earlier generator's binder stays in place, since no binding ahead of
+            // the comprehension has that binder in scope.
+            let mut sources = Vec::new();
+            if !crate::ccl::comprehension::encodes_to_lambda(&generators) {
+                for k in 0..generators.len() {
+                    let reads_a_binder = generators[..k]
+                        .iter()
+                        .any(|earlier| is_free(&earlier.target.name, &generators[k].iter));
+                    if reads_a_binder {
+                        continue;
+                    }
+                    // The source's own bindings join the chain ahead as siblings ([`peel`]).
+                    let iter = std::mem::take(&mut generators[k].iter);
+                    let (binds, core) = peel(normalize(iter, muts));
+                    sources.extend(binds);
+                    generators[k].iter = if is_atomic(&core, muts) {
+                        core
+                    } else {
+                        let name = Name::anf_temp();
+                        sources.push((TypedBinding::new_unannotated(name.clone()), core));
+                        Expr::var(name)
+                    };
+                }
+            }
             // Under **no** mutable variables: a comprehension is a map, so its
             // element is evaluated once per source position with no write in
             // between, and a read of an enclosing mutable variable denotes one
@@ -298,8 +363,10 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             // it in sequence with the writes beside it, and here there are
             // none.
             let element = normalize(*element, &Muts::new());
+            let mut bindings = read_bindings(reads);
+            bindings.extend(sources);
             let_chain(
-                read_bindings(reads),
+                bindings,
                 rebuild(TypedExprNode::Comprehension {
                     generators,
                     element: Box::new(element),
@@ -518,7 +585,7 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             bound_expr,
             body,
         } => {
-            let (binds, bound_expr) = peel(normalize(*bound_expr, muts), muts);
+            let (binds, bound_expr) = peel(normalize(*bound_expr, muts));
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Let {
@@ -675,7 +742,7 @@ fn read_bindings(reads: Vec<(Name, Name)>) -> Vec<(TypedBinding, Expr)> {
 /// wrap around its own reconstruction (via [`let_chain`]), plus the atomic
 /// term to use in `e`'s original position.
 fn atomize(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
-    let (mut binds, core) = peel(normalize(e, muts), muts);
+    let (mut binds, core) = peel(normalize(e, muts));
     if is_atomic(&core, muts) {
         return (binds, core);
     }
@@ -690,28 +757,20 @@ fn atomize(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
 /// around a normalized operand back off, so the caller re-seals them one level
 /// out, beside its own.
 ///
-/// A sealed chain in a position about to be hoisted nests one binding's scope
-/// inside another's definiens — `let __anf₂ = (let __anf₁ = x in __anf₁ ^+ 1)`
-/// — and inference refines a binding by the term that computed it, so
-/// `__anf₂`'s type reads `{Int | __elem == __anf₁ ^+ 1}`: a type naming a
-/// binder bound strictly inside the term it types, which the Barendregt check
-/// in [`crate::ccl::subst`] reports the moment that type passes under the
-/// binder. Peeled, the two are siblings on one spine and every type is written
-/// where its binders are in scope.
-///
-/// Only a chain holding a read is peeled, and then all of it: peeling a
-/// *subset* would move a read across a sibling binding that may write, which is
-/// the mis-ordering this pass is sequencing the read to avoid. A chain of
-/// ordinary hoists keeps its nesting, where every binder is discharged into the
-/// types leaving its scope and a refinement stays written in closed terms.
+/// A sealed chain in a position about to be hoisted nests one binding's scope inside another's
+/// definiens — `let __anf₂ = (let __anf₁ = x in __anf₁ ^+ 1)` — and inference refines a binding
+/// by the term that computed it, so `__anf₂`'s type reads `{Int | __elem == __anf₁ ^+ 1}`, naming
+/// a binder bound inside the term it types. A read's binder is opaque, so the type keeps naming it
+/// outside its scope, which the Barendregt check in [`crate::ccl::subst`] reports. A transparent
+/// binder is replaced by its definition as the type leaves its scope, which copies the
+/// definition into the type; a filtered comprehension's source already holds a copy of its own
+/// source in its type, so the copy doubles at every level of nesting. Peeled, the two are
+/// siblings on one spine and every type names its binders where they are in scope.
 ///
 /// Only this pass's own binders are peeled ([`Name::is_anf_temp`]). A `let` the
 /// program wrote, or a statement spine in a value position, is a block of its
 /// own whose writes belong where they stand.
-fn peel(mut e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
-    if !seals_a_read(&e, muts) {
-        return (Vec::new(), e);
-    }
+fn peel(mut e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
     let mut binds = Vec::new();
     loop {
         match &e.node {
@@ -887,27 +946,6 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
         }
         _ => (Vec::new(), normalize(expr, muts)),
     }
-}
-
-/// Does the chain this pass sealed at the root of `e` hold a read — a binding
-/// whose definiens is a bare reference to a mutable variable?
-fn seals_a_read(e: &Expr, muts: &Muts) -> bool {
-    let mut cursor = e;
-    while let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        body,
-    } = &cursor.node
-    {
-        if !binding.name.is_anf_temp() {
-            return false;
-        }
-        if is_mut_var(bound_expr, muts) {
-            return true;
-        }
-        cursor = body;
-    }
-    false
 }
 
 /// Wrap `tail` in `binds`, innermost binding last — `binds[0]` becomes the

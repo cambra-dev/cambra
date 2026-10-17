@@ -1035,6 +1035,19 @@ impl ColumnValue {
                     mk.into_iter().enumerate().map(|(i, k)| (k, i)).collect();
                 take(v).into_iter().map(|k| pos[&k]).collect()
             }
+            // A tuple key, such as a join's pair, is a record row, and a key of a `++`
+            // collection is an arm's tag with that arm's index; each is matched as one value.
+            (keys @ ColumnValue::Records(_), mk @ ColumnValue::Records(_))
+            | (keys @ ColumnValue::Union(_), mk @ ColumnValue::Union(_)) => {
+                let pos: HashMap<Value, usize> =
+                    (0..mk.len()).map(|i| (mk.index_at(i), i)).collect();
+                let indices = (0..keys.len()).map(|i| pos[&keys.index_at(i)]).collect();
+                *keys = match keys {
+                    ColumnValue::Records(_) => ColumnValue::Records(HashMap::new()),
+                    _ => ColumnValue::Union(Default::default()),
+                };
+                indices
+            }
             (s, mk) => panic!(
                 "transform_by_map: key type mismatch or unsupported: {:?} vs {:?}",
                 s, mk

@@ -2228,11 +2228,14 @@ fn run_passes(
     // the node it was cloned from, or failing that the nodes enclosing it.
     if let Err(errors) = infer_outcome {
         // A refinement in a message names the binder a mutable variable's read
-        // was given rather than the variable, which is machinery no program
-        // mentions. Respell it here, where the tree still carries the bindings
-        // (`mut_read::unbind` erases them below) and nothing types the error's
-        // types again.
-        let respelling = mut_read::read_respelling(&expr);
+        // was given rather than the variable, and an A-normalization temp rather
+        // than the term it names: machinery no program mentions. Respell both
+        // here, where the tree still carries the bindings (`mut_read::unbind`
+        // erases them below) and nothing types the error's types again.
+        let respelling = crate::ccl::subst::Subst::then(
+            &anf::temp_respelling(&expr),
+            &mut_read::read_respelling(&expr),
+        );
         let errors = errors
             .into_iter()
             .map(|mut located| {

@@ -505,6 +505,19 @@ impl Subst {
         Subst::of_binders(m)
     }
 
+    /// The discharge of every binding in `env` at once: [`discharge`](Self::discharge) per entry,
+    /// with no composition between them, so a term in the range is plugged in as it stands.
+    pub fn discharging(env: &HashMap<Name, TypedExpr>) -> Self {
+        Subst::of_binders(
+            env.iter()
+                .map(|(name, term)| {
+                    debug_assert_no_pi_bound(name);
+                    (name.clone(), Mapping::Discharge(Box::new(term.clone())))
+                })
+                .collect(),
+        )
+    }
+
     /// `[binder ↦ join]`: the type leaves `binder`'s scope as the join over every value
     /// it takes ([`Mapping::Join`]).
     pub fn join(binder: impl Into<Name>) -> Self {

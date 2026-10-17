@@ -451,7 +451,7 @@ fn a_bare_groupby_tail_is_driven() {
 )]
 #[case(
     "[x for x in [y for y in [1,2,3] if y < 3] if x < 2]",
-    "iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(cast([1, 2, 3])):({[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt), __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⤇ Int)",
+    "let __anf : ({[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} ⤇ Int) = iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast([1, 2, 3])\nin iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((__anf ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(__anf):({[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt), __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⤇ Int)",
     make_int_list(&[1])
 )]
 #[case(
@@ -562,7 +562,7 @@ fn a_bare_groupby_tail_is_driven() {
 )]
 #[case(
     "[x + y for x in [2] for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]",
-    "(iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ add):({([0, 0], {([0, 1], [0, 2]) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) | __elem ▷ ((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ eq)} ⤇ Int)",
+    "let __anf : ({([0, 1], [0, 2]) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)} ⤇ Int) = (iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)\nin (iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ __anf) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ __anf) ▷ zip ≫ add):({([0, 0], {([0, 1], [0, 2]) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) | __elem ▷ ((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ eq)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
             ("_1".into(), ColumnValue::Records(HashMap::from([

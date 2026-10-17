@@ -83,7 +83,10 @@ to its key is recognized as a lambda of its own.
 
 Beta-reduction has a further condition for a refined outer parameter: the argument's type must
 entail the parameter's refinements. The pass asserts when it cannot establish that condition,
-since dropping the parameter without preserving its precondition would be unsound. For
+since dropping the parameter without preserving its precondition would be unsound. The query runs
+under the binders enclosing the call, a transparent `let` at its definition too
+([The scope a query runs in](type-inference.md#the-scope-a-query-runs-in)): an argument naming a
+binder, `__anf ^+ 2` where `__anf = 1 ^+ 3`, is decided by what the binder is. For
 multi-argument UDFs lowered with a tuple parameter, substitution can leave
 `Apply(Tuple(...), Proj(Index(i)))`; `simplify::try_literal_tuple_projection` folds that shape
 later. That rule reads only a bare tuple, so beta-reduction floats the `Let` chain wrapping an
@@ -98,8 +101,10 @@ inlining checks.
 
 ### Moving a binding into a list element
 
-`inline_list_element_reads` replaces a list element that reads a `Let` binder with that
-binder's definiens, dropping the `Let` when no reader remains. An opaque binder named in a type
+`inline_list_element_reads` replaces each read of a `Let` binder inside a list element with
+that binder's definiens, dropping the `Let` when no reader remains. A read anywhere inside the
+element moves, since A-normalization names a former's components on the statement spine:
+`[(a: 1 + 2)]` arrives as `let __anf = 1 + 2 in [(a: __anf)]`. An opaque binder named in a type
 is left in place. A list literal's elements
 are a value position: op-conversion compiles the whole literal to one table read at
 graph-build time, so an element is sequenced against nothing and the move changes no
