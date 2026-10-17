@@ -237,7 +237,24 @@ pub(crate) fn fn_of_bare_predicate(
         }
         _ => lam,
     };
-    lambda_elim::run(lam).expect("lambda-elim of refinement predicate")
+    eliminate_lifted(lam).expect("lambda-elim of refinement predicate")
+}
+
+/// Point-free `term`, a term lifted out of a refinement predicate, by the passes it skipped
+/// while it sat in a type (`src/ccl/design/optimization.md`, "Planning a lifted term").
+///
+/// A predicate is in source form until it is lifted: the phases between inference and
+/// lambda elimination do not rewrite inside a type. A generator called in a filter or a key
+/// leaves its `defer` block there, which channelize turns into the loop feeding its channel,
+/// and recognition then reads that loop as the collection it builds. A term holding no
+/// `defer` skipped nothing those two do.
+pub(crate) fn eliminate_lifted(term: Expr) -> Result<Expr, lambda_elim::LambdaElimError> {
+    if !crate::ccl::channelize::holds_defer(&term) {
+        return lambda_elim::run(term);
+    }
+    let channelized = crate::ccl::channelize::run(term)
+        .unwrap_or_else(|e| panic!("channelizing a term lifted out of a predicate: {e:?}"));
+    Ok(plan_loops(lambda_elim::run(channelized)?))
 }
 
 fn compile_predicates_in_type(

@@ -113,6 +113,16 @@ fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
     }
 }
 
+/// A join's equality side holding a union is planned as a lifted term: the union is iterated, and
+/// the pairs `(1, 3)` and `(2, 4)` give 3 + 8.
+#[test]
+fn a_join_side_holding_a_union() {
+    check_scalar(
+        "sum([a * b for a in [1, 2, 3] for b in [1, 2, 3, 4] if a + sum([1] ++ [1]) == b])",
+        Value::Int(11),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Aggregates
 // ---------------------------------------------------------------------------
@@ -1200,18 +1210,25 @@ fn a_zip_with_a_constant_arm_pairs_at_the_groups(#[case] fast: &str, #[case] gen
     );
 }
 
+/// A group-by under a loop whose key reads the loop's binder, over a source the loop's binder
+/// filters: under `i = 1` the source is `[2, 3]`, two groups, and under `i = 2` it is `[3]`,
+/// one.
+#[test]
+fn a_group_by_under_a_loop_over_a_source_the_loop_filters() {
+    check_scalar(
+        indoc! {r#"
+            out = defer()
+            for i in [1, 2]:
+                out << sum([1 for g in groupby([x for x in [1, 2, 3] if x > i], \e -> e // i)])
+            sum([v for v in out])
+        "#},
+        Value::Int(3),
+    );
+}
+
 /// A group-by under a loop whose key reads the loop's binder, in shapes the compiler does not
 /// compile yet. Each is refused as a compiler gap rather than reaching a later pass.
 #[rstest]
-#[case::over_a_source_the_loop_filters(
-    indoc! {r#"
-        out = defer()
-        for i in [1, 2]:
-            out << sum([1 for g in groupby([x for x in [1, 2, 3] if x > i], \e -> e // i)])
-        sum([v for v in out])
-    "#},
-    "lifting a filter whose subterms' types read"
-)]
 #[case::reading_an_outer_loops_binder(
     indoc! {r#"
         out = defer()
