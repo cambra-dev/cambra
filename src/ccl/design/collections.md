@@ -56,12 +56,19 @@ With no requirements, it becomes `unit`. No element can be read from the empty d
 type language has no uninhabited type; see
 [The empty product is unit](../../../docs/chl-spec.md#66-the-empty-product-is-unit).
 
-`pin_empty_list_elements` runs before the coalescing traversal. For an empty literal whose
-element variable has no incoming value, `pin_empty_list_element` applies
-[An unobservable arm payload is pinned to what its uses require](type-inference.md#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require).
+An empty literal whose element no value reaches is a pin site of
+[An unobservable variable takes the type of its position](type-inference.md#an-unobservable-variable-takes-the-type-of-its-position).
+The element takes the type of its position, so in `box([1]) if c else box([])` it takes the other
+branch's element type, `{Int where _ == 1}`. With no answer from the position, it takes the arm
+payload's fallback
+([An unobservable arm payload is pinned to what its uses require](type-inference.md#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require)).
 The choice is constrained in both directions against the element variable, so bindings and
 iteration targets that share it see the same choice. Choosing `unit` during emission would
 instead conflict with later requirements for another element type.
+
+Each walk pins the literals in its own tree, so a literal inside a generalized definition is
+pinned once per use. `def f(x: Int): []` called as `xs: List(Int) = box(f(1))` gives that use's
+element `Int`.
 
 An empty literal can have incompatible use sites. Failure to satisfy all recorded bounds is
 returned as a type error, not asserted as an internal invariant. The regression
@@ -72,8 +79,8 @@ covers conflicting `List(Int)` and `List(String)` annotations.
 The pass selects syntactically empty `List` nodes, not every unresolved collection element type.
 Emptiness is what makes the choice unobservable. A nonempty comprehension such as
 `\x -> [x for z in [1, 2]]` leaves its element type ambiguous, and pinning it would accept a
-program that has no type. The pre-pass walks expression children, not copies stored in refinement
-predicate type slots.
+program that has no type. The pinning pass walks expression children, not copies stored in
+refinement predicate type slots.
 
 ### The empty collection has no key morphism [Interim]
 

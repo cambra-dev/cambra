@@ -1167,6 +1167,8 @@ see [Re-keying is explicit](#re-keying-is-explicit-decided).
 
 `[]` supplies no element type. Its uses or annotation constrain the type; an otherwise
 unconstrained element type becomes unit. For example, `xs: List(Int) = box([])` selects `Int`.
+A value it is joined with is a use: in `box([1]) if c else box([])`, `[]` takes the other
+branch's element type, so the empty branch is an `Array(0, {Int where _ == 1})`.
 This does not provide a key type to `map([])` or `set([])`; those constructors are rejected.
 
 `empty_map()` directly constructs an empty keyed sum. Its annotation must determine the key

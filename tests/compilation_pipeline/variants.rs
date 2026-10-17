@@ -433,6 +433,46 @@ fn test_match_keeps_unreachable_arms(#[case] code: &str, #[case] expected: Value
     check_scalar(code, expected);
 }
 
+/// An unreachable arm whose binder is part of the arm's result takes the type the other
+/// arm gives that part of the join, here the payload of `` `p ``. Nothing reads `w`, so
+/// `unit` would collide with `Int` in the join.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_unreachable_arm_payload_takes_its_type_from_the_join() {
+    check_scalar(
+        indoc! {r"
+            x = `a(1)
+            match x:
+                case `a(v):
+                    `p(v)
+                case `b(w):
+                    `p(w)
+        "},
+        union("p", Value::Int(1)),
+    );
+}
+
+/// A join that gives an unreachable payload a type its own reads reject is a type error.
+/// `w + w` admits no `Bool` and no tuple, so the pin keeps to what `+` accepts and the arms
+/// collide.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_base("True")]
+#[case::a_tuple("(1, 2)")]
+fn an_unreachable_arm_payload_its_reads_reject_is_a_type_error(#[case] payload: &str) {
+    let program = indoc! {r"
+        match x:
+            case `a(v):
+                `p(v)
+            case `b(w):
+                `p(w) if w + w == w else `q(1)
+    "};
+    check_compile_error(
+        &format!("x = `a({payload})\n{program}"),
+        "Incompatible lower bounds",
+    );
+}
+
 /// The **default arm** `case _:` matches whatever the tagged arms did not.
 ///
 /// It needs no tag-complement predicate: it fires exactly when no tagged arm

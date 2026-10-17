@@ -85,6 +85,16 @@ use crate::panic_message::panic_message;
     "},
     "Box(Array(2, Int) | Array(3, Int))"
 )]
+// An empty alternative takes its element type from the join, which nothing downstream
+// constrains (`src/ccl/design/type-inference.md`, "An unobservable variable takes the type
+// of its position"). A fixed `unit` would collide with `Int` there.
+#[case::boxed_empty_alternative(
+    indoc! {"
+        c = True
+        b = box([1]) if c else box([])
+    "},
+    "Box(Array(1, {Int where _ == 1}) | Array(0, {Int where _ == 1}))"
+)]
 #[case::list("b: List(Int) = box([1, 2])", "List(Int)")]
 #[case::map(
     indoc! {r#"

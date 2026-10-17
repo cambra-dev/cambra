@@ -510,9 +510,10 @@ the `Case` rather than inferred from that narrowed view.
 
 `compact_type_polarity_only` disables both opposite-side rules. It answers which information
 arrived along the selected bound direction, without resolving an uninhabited position from its
-demands. [Unobservable-arm payload pinning](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require)
-needs that distinction: an unreachable arm can acquire upper-bound requirements without receiving
-a value.
+demands.
+[An unobservable variable takes the type of its position](#an-unobservable-variable-takes-the-type-of-its-position)
+needs that distinction twice. An unreachable arm can acquire upper-bound requirements without
+receiving a value, and a joined variable's reading at a position is what the join's values give it.
 
 ##### An invariant position reads both sides however the walk reached it
 
@@ -583,6 +584,115 @@ Monomorphic variable uses share their binder's inference variables; they do not 
 lookup merely to read those bounds. Generalized uses do require the specialization scope, and
 lambda-parameter domain refresh is a separate operation. Slot resolution uses the type stored on
 the binder; specialization still needs its lexical scope.
+
+#### An unobservable variable takes the type of its position
+
+A variable is **unobservable** when a coalescing walk, the program's or a specialization clone's,
+is about to read it and nothing has determined it. What counts as determining it differs by site,
+as the table below gives. At an output site, an arm payload or a list literal's element, a value
+reaching it does (`value_reaches`) and a demand alone does not. At a lambda parameter, a value or a
+demand does. The walk pins each unobservable variable at a pin site to the type of its position,
+before any node reads it. The pin is recorded in both directions against the variable,
+so every occurrence reads the chosen type. Where the position determines nothing, each site
+applies its own fallback.
+
+The pin gives a node the type its context already has. A join whose lower bounds are `𝐴` and an
+otherwise unbounded `𝛼` reads `𝐴`, because simplification removes a variable occurring at only one
+polarity ([Simplification](#simplification)). The node holding `𝛼` has no other contribution, so
+its own type keeps the variable. In `box([1]) if c else box([])`, the conditional's element type
+reads `{Int where _ == 1}` and the `[]` node's element is `𝛼`. Pinning `𝛼` to that type leaves the
+conditional's reading unchanged.
+
+##### Pin sites
+
+| Site | Example | Pinned to | Pinned variable | Unobservable when | No answer from the position |
+| --- | --- | --- | --- | --- | --- |
+| Unreachable `match` arm | ``x = `a(1)``; ``case `a(v): `p(v)``; ``case `b(w): `p(w)`` | `w : Int@1`, the `` `p `` payload of the join | the payload binder's type | no value reaches it | [An unobservable arm payload is pinned to what its uses require](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require) |
+| Empty list literal | `box([1]) if c else box([])` | element `Int@1`, the other branch's element | the element type | no value reaches it | as an arm payload ([The empty literal names no element type](collections.md#the-empty-literal-names-no-element-type)) |
+| Lambda parameter | `(\x -> 1) if c else (\y -> y + 2)` | `x : Int`, the join's domain | the parameter's type | neither a value nor a demand reaches it | the variable remains, and the post-inference check reports `UnresolvedInfer` |
+
+##### The type of a position
+
+`position_type` answers for a variable `𝛼` from two kinds of bound:
+
+1. **An upper bound `𝛼 <: 𝑈`.** The answer is `𝑈` resolved, with the bound's recorded substitution
+   applied. Where `𝑈` resolves to a variable, the answer is the type of that variable's position.
+2. **An occurrence in a lower bound.** A variable `𝑉` has a lower bound in which `𝛼` occurs at
+   position `𝑝`. The answer is `𝑉`'s polarity-correct reading (`compact_type_polarity_only`) at
+   `𝑝`. Where that reading leaves `𝑝` unresolved, the answer is the type of `𝑉`'s position, read at
+   `𝑝`.
+
+A bare variable is not an answer. The first answer that resolves fully wins; with none, the first
+answer with an unresolved position inside it does, which is what an upper bound to a partly known
+shape gives. Where the variable's trait obligations watch it, an answer that is not a base they
+accept, a product or a function among them, is not used (`accepted_position_type`): the site's
+fallback applies, and the conflict between the variable's reads and its context is reported where
+the two meet. A variable met again while its own answer is being computed contributes nothing,
+which ends the recursion at a cycle. Each variable's answer is computed once per question, and a
+variable met again, through another holder or at another position of the same one, reuses it,
+unless the answer was computed while a cycle through a variable still being asked about was cut
+short: that answer is computed again on each path that meets it. Each upper bound is resolved as its own position, for the reason
+[The collapse happens at the position](#the-collapse-happens-at-the-position) gives.
+
+The second kind covers every join. A conditional's branches, a list literal's elements and a
+polymorphic call's arguments each record their types as lower bounds on one variable. The recursion
+covers nesting. Take a list literal whose element variable `𝜀` has the lower bound `(𝛼, Int)`, and
+whose type `[0, 0] ⤇ 𝜀` is a lower bound of a conditional's `𝑅` beside `[0, 0] ⤇ (Bool, Int)`:
+
+- `𝛼` occurs in `𝜀`'s lower bound at tuple position `0`. `𝜀`'s own reading there is `𝛼` alone, so
+  the answer is the type of `𝜀`'s position, read at `0`.
+- `𝜀` occurs in `𝑅`'s lower bound at the element position, where `𝑅` reads `(Bool, Int)`.
+- Read at `0`, that is `Bool`.
+
+##### Finding the occurrences
+
+The solver records a lower bound only on the variable that receives it, so `𝛼` holds no record of
+occurring in `𝑉`'s bound. Lower bounds are pushed from several places in the solver and in
+freshening, so the occurrence is indexed where it is read. `OccurrenceIndex` takes each walk's tree
+as roots, its node types and binder slots, and the first question after that sweeps the bounds
+reachable from them. Each variable occurring in a lower bound is indexed under the variable holding
+that bound and the position, with the bound's substitution applied. A variable is swept once, so a
+lower bound recorded on it afterwards is not indexed. The bounds this misses are the ones
+`specialize_use` adds when it pins a clone to its use: the use's variables were swept with the
+program's tree, and a clone variable occurring in a bound they receive then is not found through
+that occurrence. Such a variable's answer comes from its other occurrences and its upper bounds, or,
+with none, from the site's fallback, and the pin is still checked by `constrain_subtype`.
+
+##### When the pins run
+
+An arm payload is pinned when the walk reaches its `Case`, before the scrutinee and branches. A
+lambda parameter is pinned when the walk reaches the lambda, before its body. Empty literals are
+pinned by `pin_empty_list_elements` before the walk starts, because `Apply` walks its function
+before its argument, so a comprehension's lambda reads the element of an inline `[]` before the walk
+reaches the literal.
+
+Each walk pins its own tree: the program's walk, and the walk of each specialization clone, which
+runs after `specialize_use` has pinned the clone to its use
+([Specialization scope and lifecycle](#specialization-scope-and-lifecycle)).
+`pin_empty_list_elements` skips the right-hand side of a generalized `let`, whose clones are walked,
+and pinned, one per use. So `def f(x: Int): []` called at `List(Int)` and at `List(String)` gives
+each use's element the type that use requires. A use whose instantiation leaves a variable for the
+pins shares no clone, so two uses that only their joins tell apart get one clone each
+([A use the key does not determine shares no clone](#a-use-the-key-does-not-determine-shares-no-clone)).
+
+The program's own literals are pinned before any specialization. A literal passed to a call, as in
+`total([])`, takes its element from the call's instantiated parameter type, which carries the
+requirements emission copied into it from the definition. A requirement that only the walk of the
+definition's clone would state is not seen there, and the site's fallback applies.
+
+A walk whose types are dropped pins nothing
+([Checking a definition alone](#checking-a-definition-alone)). There, an unbounded variable stands
+for what the uses supply. The arm-payload site keeps the exception that section states for a
+scrutinee a value reaches.
+
+Pinning before the reads keeps the
+[read-stability contract](#coalesce-ordering-and-read-stability): a pin adds to `𝛼` the type its
+position already reads. The answer is fixed when the pin runs, and a bound recorded afterwards is
+not consulted.
+
+The first answer wins. A variable occurring in two positions that read differently is pinned to the
+first answer. The second position then joins two incompatible shapes, and coalescing reports
+`IncompatibleBounds` there.
 
 ### Pass 3: Stripping Predicate Interiors
 
@@ -935,6 +1045,27 @@ insertion order.
 The key also preserves distinctions needed by code generation, including function kind, history
 kind, and witness/kind shape. It does not use fresh inference-variable identities as a substitute
 for those distinctions.
+
+##### A use the key does not determine shares no clone
+
+A clone may be shared only where the key determines it. A clone's pins give each variable its
+instantiation leaves undetermined what the join around the use supplies there
+([An unobservable variable takes the type of its position](#an-unobservable-variable-takes-the-type-of-its-position)),
+which the key does not read: `box([1]) if c else box(f(1))` and `box([1]) if c else box(f(2))`
+key `f` alike and need clones pinned from different joins. So a use whose instantiation leaves a
+variable for the pins shares no clone and is specialized on its own (`specialize_use`). The test
+is the pins' own: nothing reaches the variable, or it stands at an output and no value reaches it
+(`has_output_variable`). A demand alone does not count at an output: `sum` demanding `Int` of the
+element of `box(f(2))` says nothing of what the element is. A use that is fully determined shares
+as before.
+
+This rests on one invariant: a clone reaches the program only through its use's instantiation,
+since `specialize_use` relates the two by pinning the clone's type against the use's type. A
+variable inside the definition that the instantiation does not mention, such as the element of a
+`[]` the body sums, is pinned from inside the clone, the same way for every use. A change that
+relates a clone to its context another way breaks the rule.
+
+The rule over-splits: two under-determined uses whose joins supply one type get two clones.
 
 `key_go` has a cycle guard and a completed-result memo. The memo includes variable identity,
 polarity, and enclosing binders, and is used only with an identity accumulated substitution.
@@ -2827,9 +2958,9 @@ Both rejections say no argument could work, and they differ in what collides. An
 
 Placement is forced at both ends. **After emission**, because that is when a definition's requirements are all recorded. **Before coalesce**, because a generalized definition's subtree is never coalesced in place, so a walk of the tree would see only use-site clones — and a clone that goes unsatisfiable already fails by delivery. The pass repeats **to a fixpoint**: determining one value can leave a neighbouring obligation with a single row, determining another.
 
-**One write lands after the sweep, and it only selects.** An unreachable `match` arm's payload is a position no value reaches, so its type comes from a demand recorded on it or from its own reads, and only coalesce can tell that nothing else did. `pin_unobservable_arm_payload` chooses there: the concrete type an upper bound requires the payload to flow into, else a base every requirement the arm's reads state accepts, else `Unit`. Each is a selection from a set this pass read rather than a restriction past it, which `assert_post_emission_narrowing_selects` checks. The pin records its choice in both directions, because an upper bound does not participate in a merge: the `Case`'s join would read the position as contributing nothing and settle on a type narrower than the arm's own slot, which the post-inference check rejects.
+**The pins land after the sweep, and they only select.** A pin site ([An unobservable variable takes the type of its position](#an-unobservable-variable-takes-the-type-of-its-position)) is a variable nothing determined, and only coalesce can tell that nothing did. A pin chooses the type of the variable's position when every requirement on it accepts that type (`accepted_position_type`); an arm payload or an empty literal's element otherwise takes a base every requirement accepts, else `Unit`. Each is a selection from a set this pass read rather than a restriction past it, which `assert_post_emission_narrowing_selects` checks. The pin records its choice in both directions, because an upper bound does not participate in a merge: the `Case`'s join would read the position as contributing nothing and settle on a type narrower than the arm's own slot, which the post-inference check rejects.
 
-A delivery also tightens what the obligation's other positions accept: `Addable` narrowed to `Int` at position 0 accepts only `Int` at position 1. Nothing re-reads a variable standing at such a position against the requirements this pass already intersected for it. What the pin can deliver bounds the exposure. A base the sweep deposited was narrowed into the obligations by the sweep itself, at fixpoint, so the tightening is not new. `payload_trait_default` delivers `Int`, which every trait table contains, so every sibling intersection still accepts it. A base read off a consumer's bound is neither of those, and an obligation that cannot accept it empties and fails the pin's own assertion rather than narrowing quietly. Whether a stale sibling verdict is reachable at all is unresolved — no program in the corpus reaches one, and the bound is a property of the trait tables rather than of this code.
+A delivery also tightens what the obligation's other positions accept: `Addable` narrowed to `Int` at position 0 accepts only `Int` at position 1. Nothing re-reads a variable standing at such a position against the requirements this pass already intersected for it. What the pin can deliver bounds the exposure. A base the sweep deposited was narrowed into the obligations by the sweep itself, at fixpoint, so the tightening is not new. `payload_trait_default` delivers `Int`, which every trait table contains, so every sibling intersection still accepts it. A base read off the payload's position is neither of those, and an obligation that cannot accept it empties and fails the pin's own assertion rather than narrowing quietly. Whether a stale sibling verdict is reachable at all is unresolved — no program in the corpus reaches one, and the bound is a property of the trait tables rather than of this code.
 
 This is the gap [Checking a definition alone](#checking-a-definition-alone) names. The two are complementary. That walk resolves a definition's recorded bounds, which catches `λ 𝑎 → (𝑎.0, 𝑎.foo)`; this pass needs no delivery, and does not depend on whether anything calls the definition.
 
@@ -3149,34 +3280,26 @@ not a write-through handle; this does not relax the restriction on writable argu
 
 #### An unobservable arm payload is pinned to what its uses require
 
-A pattern payload with no transitive value contribution on its lower side needs a concrete
-type when that use of the match is materialized. Upper bounds and trait requirements do
-not establish that a value reaches it. `value_reaches` therefore examines lower-bound
-reachability separately from ordinary type resolution.
+A pattern payload that no value reaches is a pin site of
+[An unobservable variable takes the type of its position](#an-unobservable-variable-takes-the-type-of-its-position).
+Upper bounds and trait requirements do not establish that a value reaches it, so `value_reaches`
+reads the lower side alone.
 
-`pin_unobservable_arm_payload` chooses a type using `payload_pin`:
+`payload_pin` chooses the payload's type:
 
-1. Resolve each upper bound independently, with its recorded substitution. Use the first
-   concrete result returned by `payload_flow_target`; unresolved results are skipped.
-2. Otherwise intersect the types accepted at that payload position by its trait
-   obligations. Choose the first surviving type in instance-table order.
-3. With no obligations, choose `Unit`. An empty intersection also falls back to `Unit`,
-   leaving contradictory requirements to fail the pin's assertion rather than silently
-   treating the intersection as unconstrained.
+1. The type of its position, from `position_type`.
+2. Otherwise, the first type in instance-table order that every trait obligation on the payload
+   accepts at that position.
+3. With no obligations, `Unit`. An empty intersection of obligations also gives `Unit`, and the
+   contradiction then fails the pin's assertion.
 
-A body consisting of its payload binder can constrain that payload through the arms'
-result type. Defaulting such a payload to `Unit` before reading the upper bound would
-add `Unit` to the result join and conflict with reachable arms.
+A body consisting of its payload binder constrains that payload through the arms' result type, which
+is an upper bound and so the payload's position. Choosing `Unit` before reading it would add `Unit`
+to the result join and conflict with the reachable arms.
 
-Each upper bound is resolved as its own position. Resolving it through the payload's
-bound chain could collapse another variable's quantifier as a side effect; see
-[The collapse happens at the position](#the-collapse-happens-at-the-position).
-
-The chosen type is constrained in both directions against the payload variable. Updating
-only the binding slot would leave other occurrences, including the scrutinee's expected
-variant, unresolved. The pin occurs during coalescing of a use, before walking the
-scrutinee and branches. Generalized definitions are not pinned in place. A debug-only
-`assert_pinned_tags_are_unreachable` checks the premise after the scrutinee resolves.
+The pin is recorded on the variable, not only on the binding slot, because the scrutinee's expected
+variant holds the same variable. A debug-only `assert_pinned_tags_are_unreachable` checks, after
+the scrutinee resolves, that the scrutinee carries none of the pinned tags.
 
 Unreachable arms remain in the tree. Their tag projections select no rows at that use;
 pruning the arms would also change the declared input type of an enclosing function.

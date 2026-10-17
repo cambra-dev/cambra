@@ -115,10 +115,57 @@ fn empty_list_takes_its_element_type_from_the_use_site(
     check_scalar(code, expected);
 }
 
+// A literal in a generalized definition is pinned in each use's specialization, so two
+// uses take two element types. Pinned once for the definition, both would get `unit`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_empty_literal_in_a_definition_takes_each_uses_element_type() {
+    check_scalar(
+        indoc! {r#"
+            def f(x: Int):
+                []
+
+            xs: List(Int) = box(f(1))
+            ys: List(String) = box(f(2))
+            sum([x for x in xs]) + 5
+        "#},
+        Value::Int(5),
+    );
+}
+
+// Two uses that only their joins tell apart take one clone each, so each use's element is
+// the type its own join supplies: a use the specialization key does not determine shares no
+// clone.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::one_type(
+    "box([1]) if c else box(f(2))",
+    "sum([x for x in a]) + sum([y for y in b])",
+    2
+)]
+#[case::two_types("box([\"s\"]) if c else box(f(2))", "sum([x for x in a])", 1)]
+fn an_empty_literal_in_a_definition_takes_each_joins_element_type(
+    #[case] second: &str,
+    #[case] result: &str,
+    #[case] expected: i64,
+) {
+    let program = indoc! {r#"
+        def f(x: Int):
+            []
+
+        c = True
+        a = box([1]) if c else box(f(1))
+    "#};
+    check_scalar(
+        &format!("{program}b = {second}\n{result}\n"),
+        Value::Int(expected),
+    );
+}
+
 // Two use sites that cannot both be satisfied is a **type error**, not a panic. The pin
-// takes the first upper bound that resolves concretely, and the rule it borrows —
-// `payload_pin`, from an unreachable arm's payload — has one demand to satisfy where a
-// reachable literal has as many as the program writes. Two annotations rather than two
+// takes the first answer `position_type` gives, and the rule it borrows — `payload_pin`,
+// from an unreachable arm's payload — has one demand to satisfy where a reachable literal
+// has as many as the program writes. Two annotations rather than two
 // operator reads: a trait obligation conflicts at emission, where an annotation's upper
 // bound waits for a lower bound that a literal with no elements never supplies.
 #[rstest]

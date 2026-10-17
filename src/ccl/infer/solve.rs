@@ -189,10 +189,19 @@ pub(super) struct CoalesceCtx {
     /// obligations are answered by these (`src/ccl/design/type-parameters.md`,
     /// "Specialization").
     assumptions: Vec<Rc<TraitRequirement>>,
+    /// Where each variable occurs in other variables' lower bounds, for the pins
+    /// ([`position_type`]).
+    occurrences: OccurrenceIndex,
     /// Every read the walk performed, for the end-of-pass ordering-invariant
     /// check ([`assert_reads_stable`]). Debug builds only.
     #[cfg(debug_assertions)]
     reads: Vec<ReadRecord>,
+    /// The right-hand sides [`pin_empty_list_elements`] skipped as generalized, whose
+    /// literals only the walk's copies pin. The walk checks that it generalizes each of
+    /// them too: one it walked as monomorphic would keep a literal nothing pins. Debug
+    /// builds only.
+    #[cfg(debug_assertions)]
+    skipped_as_generalized: std::collections::HashSet<NodeId>,
 }
 
 impl CoalesceCtx {
@@ -657,6 +666,11 @@ struct Specialization {
     /// is what makes the comparison self-consistent (see
     /// `src/ccl/design/type-inference.md`, "Keying a specialization").
     key: SpecKey,
+    /// Whether another use with this key may share it: false for a use whose instantiation
+    /// still held a variable, which the clone's pins answered from that use's own join
+    /// (`src/ccl/design/type-inference.md`, "A use the key does not determine shares no
+    /// clone").
+    shareable: bool,
     /// Its binding name — a [`Name::mono`] carrying the source binding's name
     /// as provenance and a globally-fresh uid for identity (so it can neither
     /// capture nor be captured).
@@ -728,7 +742,7 @@ fn with_shadows<R>(
 /// Choice order and bound-resolution requirements are specified in
 /// `src/ccl/design/type-inference.md`, "An unobservable arm payload is pinned to
 /// what its uses require".
-fn pin_unobservable_arm_payload(p: &Pattern) -> bool {
+fn pin_unobservable_arm_payload(p: &Pattern, ctx: &mut CoalesceCtx) -> bool {
     // Unobservability is *transitive*: the variable's bound list is rarely empty
     // — the scrutinee constraint gives it the scrutinee's own per-tag variable as
     // a lower bound — and what matters is whether anything concrete reaches it
@@ -745,10 +759,8 @@ fn pin_unobservable_arm_payload(p: &Pattern) -> bool {
     if value_reaches(&p.binding.ty) {
         return false;
     }
-    let chosen = payload_pin(&p.binding.ty);
-    let mut cache = ConstrainCache::new();
-    let pinned = constrain_subtype(&chosen, &p.binding.ty, &mut cache)
-        .and_then(|()| constrain_subtype(&p.binding.ty, &chosen, &mut cache));
+    let chosen = payload_pin(&p.binding.ty, ctx);
+    let pinned = pin_both_ways(&chosen, &p.binding.ty);
     assert!(
         pinned.is_ok(),
         "pinning an unreachable payload variable cannot fail: its only bounds are \
@@ -779,15 +791,13 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
     if value_reaches(codomain) {
         return;
     }
-    let chosen = payload_pin(codomain);
-    let mut cache = ConstrainCache::new();
-    let pinned = constrain_subtype(&chosen, codomain, &mut cache)
-        .and_then(|()| constrain_subtype(codomain, &chosen, &mut cache));
-    // **Reported, not asserted.** `payload_flow_target` takes the first upper bound that
-    // resolves concretely, and the premise that the rest still accept it holds for the
-    // unreachable arm payload the rule came from — one position, one demand. An empty
-    // literal is ordinary reachable code, so any number of use sites can constrain it and
-    // two of them can disagree: `xs = []` read at `Int` and at `String` fails here
+    let chosen = payload_pin(codomain, ctx);
+    let pinned = pin_both_ways(&chosen, codomain);
+    // **Reported, not asserted.** `position_type` takes the first answer, and the premise
+    // that every other position still accepts it holds for the unreachable arm payload the
+    // rule came from — one position, one demand. An empty literal is ordinary reachable
+    // code, so any number of use sites can constrain it and two of them can disagree:
+    // `xs = []` read at `Int` and at `String` fails here
     // (`an_empty_literal_read_at_two_types_is_a_type_error`).
     if let Err(err) = pinned {
         let label = format!("empty collection literal pinned to `{chosen}`");
@@ -795,66 +805,454 @@ fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
     }
 }
 
-/// [`pin_empty_list_element`] over every empty list literal in `expr`, in one pass before
-/// coalescing reads anything.
+/// [`pin_empty_list_element`] over every empty list literal in the tree a walk is about
+/// to coalesce, before the walk reads anything.
+///
+/// Skips the right-hand side of a generalized `let`: each use's specialization clone is
+/// walked, and pinned, on its own, so a literal there takes each use's type rather than
+/// one chosen for the definition. `level` follows the walk's levels, which is what
+/// [`should_generalize`] reads.
 ///
 /// Term nodes only: a refinement predicate rides a *type* slot, which this walk does not
 /// enter, so a predicate's copy keeps its own variables and is answered by whatever the
 /// original resolves to.
-fn pin_empty_list_elements(expr: &Expr, ctx: &mut CoalesceCtx) {
-    if matches!(&expr.node, TypedExprNode::List(elts) if elts.is_empty()) {
-        let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
-        pin_empty_list_element(&expr.ty, ctx);
-        ctx.current_node = prev;
+fn pin_empty_list_elements(expr: &Expr, level: Level, ctx: &mut CoalesceCtx) {
+    match &expr.node {
+        TypedExprNode::List(elts) if elts.is_empty() => {
+            let prev = std::mem::replace(&mut ctx.current_node, expr.node_id());
+            pin_empty_list_element(&expr.ty, ctx);
+            ctx.current_node = prev;
+        }
+        // The scope lookup `should_generalize` takes answers only for a right-hand side
+        // that is a bare name, which holds no literal to pin.
+        TypedExprNode::Let {
+            bound_expr, body, ..
+        } => {
+            if should_generalize(bound_expr, level, |_| false) {
+                #[cfg(debug_assertions)]
+                ctx.skipped_as_generalized.insert(bound_expr.node_id());
+            } else {
+                pin_empty_list_elements(bound_expr, level + 1, ctx);
+            }
+            pin_empty_list_elements(body, level, ctx);
+            return;
+        }
+        TypedExprNode::MutDecl { init, body, .. } => {
+            pin_empty_list_elements(init, level + 1, ctx);
+            pin_empty_list_elements(body, level, ctx);
+            return;
+        }
+        _ => {}
     }
-    expr.walk_children(|child| pin_empty_list_elements(child, ctx));
+    expr.walk_children(|child| pin_empty_list_elements(child, level, ctx));
 }
 
-/// The type to pin an unobservable position to: the concrete type it is required
-/// to flow into, else one its operator reads accept, else `Unit`. See
-/// [`pin_unobservable_arm_payload`], which is the whole rationale.
-fn payload_pin(payload: &Type) -> Type {
+/// Pin a lambda's parameter when neither a value nor a demand reaches it, to the type of
+/// its position. With no answer the variable stays, for the post-inference check to
+/// report. See `src/ccl/design/type-inference.md`, "Pin sites".
+fn pin_unobservable_param(lambda_ty: &Type, ctx: &mut CoalesceCtx) {
+    let Type::Fun { domain, .. } = lambda_ty.peel_refinements() else {
+        return;
+    };
+    let Type::Infer(v) = domain.as_ref() else {
+        return;
+    };
+    if !matches!(resolve_var_type(domain), Ok(Type::Infer(_))) {
+        return;
+    }
+    let Some(chosen) = accepted_position_type(v, ctx) else {
+        return;
+    };
+    if let Err(err) = pin_both_ways(&chosen, domain) {
+        let label = format!("lambda parameter pinned to `{chosen}`");
+        ctx.push_error(map_constrain_err(err, &label), label);
+    }
+}
+
+/// The type to pin an unobservable arm payload or empty-literal element to: the type of
+/// its position, else one its operator reads accept, else `Unit`. See
+/// `src/ccl/design/type-inference.md`, "An unobservable arm payload is pinned to what its
+/// uses require".
+fn payload_pin(payload: &Type, ctx: &mut CoalesceCtx) -> Type {
     let Type::Infer(v) = payload else {
         return Type::Base(crate::ccl::BaseType::Unit);
     };
-    if let Some(flows_into) = payload_flow_target(v) {
-        return flows_into;
+    if let Some(position) = accepted_position_type(v, ctx) {
+        return position;
     }
     Type::Base(payload_trait_default(v))
 }
 
-/// The concrete type an unreachable payload is required to flow into, if its
-/// upper bounds name one.
+/// [`position_type`], when the trait obligations on `v` accept it.
 ///
-/// Each bound is resolved on its own — [`resolve_var_type`] enters the walk at
-/// that variable, so the collapse that materializes it happens at *its* position
-/// rather than as a hop along the payload's chain (see
-/// [`pin_unobservable_arm_payload`]). A bound that resolves to another variable
-/// says nothing yet and is skipped; an operand's upper bound is exactly that
-/// shape, which is why the operator case falls through to the obligations.
+/// A pin chooses from what the obligations already accept, which is what
+/// `assert_post_emission_narrowing_selects` holds it to. The obligations accept bases only,
+/// so a position that is not a base they accept, a product or a function among them, is a
+/// conflict between the variable's own reads and the type its context gives it; the site's
+/// fallback then stands, and the conflict surfaces where the two meet.
+fn accepted_position_type(
+    v: &Rc<crate::ccl::infer_var::InferVar>,
+    ctx: &mut CoalesceCtx,
+) -> Option<Type> {
+    let position = position_type(v, &mut ctx.occurrences)?;
+    if let Some(choices) = obligation_choices(v)
+        && !matches!(position.peel_refinements(), Type::Base(b) if choices.contains(b))
+    {
+        return None;
+    }
+    Some(position)
+}
+
+/// Pin `var` to `chosen` in both directions, so every occurrence of the variable reads it.
+fn pin_both_ways(
+    chosen: &Type,
+    var: &Type,
+) -> Result<(), crate::ccl::infer::solver::ConstrainError> {
+    let mut cache = ConstrainCache::new();
+    constrain_subtype(chosen, var, &mut cache)
+        .and_then(|()| constrain_subtype(var, chosen, &mut cache))
+}
+
+/// One step from a type to a type it contains. A path of these is a position, read the
+/// same way in a lower bound and in the type its holder resolves to.
 ///
-/// The first concrete answer wins. Several distinct ones would be a meet the type
-/// language cannot spell, and none arises: a payload has at most one upper bound
-/// resolving concretely, since the flows that record more than one are operator
-/// operands, whose bounds are requirement variables.
-fn payload_flow_target(v: &crate::ccl::infer_var::InferVar) -> Option<Type> {
-    // Cloned out of the `RefCell` before resolving: the walk reads bound lists
-    // across the graph, and the pin's `constrain_subtype` will take them mutably.
-    let upper = Rc::clone(v.bounds.borrow().upper());
-    upper.iter().find_map(|b| {
-        let ty = b.render_subst().apply_type(&b.ty);
-        match resolve_var_type(&ty) {
-            Ok(t) if !matches!(t, Type::Infer(_)) => Some(t),
-            _ => None,
+/// A refinement takes no step: [`read_at`] looks through it, as the occurrence sweep does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PositionStep {
+    Domain,
+    Codomain,
+    Component(usize),
+    Field(smol_str::SmolStr),
+    Arm(crate::ccl::FieldKey),
+    HistoryValue,
+    HistoryDomain,
+}
+
+/// Every [`Type::Infer`] in `ty`, with the position it occupies.
+///
+/// Kinds and polymorphic types are not entered: a variable there stands for a candidate or
+/// a quantified type, not a value at a position.
+fn for_each_positioned_var(
+    ty: &Type,
+    path: &mut Vec<PositionStep>,
+    f: &mut impl FnMut(&Rc<crate::ccl::infer_var::InferVar>, &[PositionStep]),
+) {
+    let mut step = |child: &Type, s: PositionStep, path: &mut Vec<PositionStep>| {
+        path.push(s);
+        for_each_positioned_var(child, path, f);
+        path.pop();
+    };
+    match ty {
+        Type::Infer(v) => f(v, path),
+        Type::Fun {
+            domain, codomain, ..
+        } => {
+            step(domain, PositionStep::Domain, path);
+            step(codomain, PositionStep::Codomain, path);
         }
-    })
+        Type::Tuple(ts) => {
+            for (i, t) in ts.iter().enumerate() {
+                step(t, PositionStep::Component(i), path);
+            }
+        }
+        Type::DepTuple(cs) => {
+            for (i, (_, t)) in cs.iter().enumerate() {
+                step(t, PositionStep::Component(i), path);
+            }
+        }
+        Type::Record(fs) => {
+            for (name, t) in fs {
+                step(t, PositionStep::Field(name.clone()), path);
+            }
+        }
+        Type::Variant(arms, _) => {
+            for (key, t) in arms {
+                step(t, PositionStep::Arm(key.clone()), path);
+            }
+        }
+        Type::History { value, domain, .. } => {
+            step(value, PositionStep::HistoryValue, path);
+            step(domain, PositionStep::HistoryDomain, path);
+        }
+        Type::Refinement(base, _) | Type::BoundedHole(base) => {
+            for_each_positioned_var(base, path, f);
+        }
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::ChanDom(..)
+        | Type::Txn
+        | Type::Hole
+        | Type::SharedHole(_)
+        | Type::Param(_)
+        | Type::WitnessRef(_)
+        | Type::Poly(_) => {}
+    }
+}
+
+/// The type at `path` inside `ty`, looking through refinements; `None` where `ty` has no
+/// such position.
+fn read_at<'a>(ty: &'a Type, path: &[PositionStep]) -> Option<&'a Type> {
+    let Some((first, rest)) = path.split_first() else {
+        return Some(ty);
+    };
+    let inner = match (ty.peel_refinements(), first) {
+        (Type::Fun { domain, .. }, PositionStep::Domain) => domain.as_ref(),
+        (Type::Fun { codomain, .. }, PositionStep::Codomain) => codomain.as_ref(),
+        (Type::Tuple(ts), PositionStep::Component(i)) => ts.get(*i)?,
+        (Type::DepTuple(cs), PositionStep::Component(i)) => &cs.get(*i)?.1,
+        (Type::Record(fs), PositionStep::Field(name)) => &fs.iter().find(|(n, _)| n == name)?.1,
+        (Type::Variant(arms, _), PositionStep::Arm(key)) => &arms.iter().find(|(k, _)| k == key)?.1,
+        (Type::History { value, .. }, PositionStep::HistoryValue) => value.as_ref(),
+        (Type::History { domain, .. }, PositionStep::HistoryDomain) => domain.as_ref(),
+        _ => return None,
+    };
+    read_at(inner, rest)
+}
+
+/// For each variable, the lower bounds it occurs in: the variable holding the bound and
+/// the position inside it. The solver records a bound only on the variable receiving it,
+/// so this is what lets [`position_type`] ask what a variable is part of.
+///
+/// Built lazily. A walk registers its tree's types as roots
+/// ([`OccurrenceIndex::add_roots`]), and the first question after that sweeps the bound
+/// graph reachable from them. A variable is swept once, so a lower bound recorded on it
+/// afterwards is not indexed. See `src/ccl/design/type-inference.md`, "Finding the
+/// occurrences".
+#[derive(Default)]
+pub(super) struct OccurrenceIndex {
+    pending: Vec<Type>,
+    swept: std::collections::HashSet<InferVarId>,
+    occurrences: HashMap<InferVarId, Vec<Occurrence>>,
+}
+
+/// A variable's occurrence in a lower bound of `holder`, at `position` inside it.
+#[derive(Clone)]
+struct Occurrence {
+    holder: Rc<crate::ccl::infer_var::InferVar>,
+    position: Rc<[PositionStep]>,
+}
+
+impl OccurrenceIndex {
+    /// Register every type slot in `expr`'s tree as a root of the next sweep.
+    fn add_roots(&mut self, expr: &Expr) {
+        expr.walk_type_slots(|ty| {
+            if crate::ccl::subst::type_contains_infer(ty) {
+                self.pending.push(ty.clone());
+            }
+        });
+        if let TypedExprNode::Case { branches, .. } = &expr.node {
+            for p in branches.iter().filter_map(|b| b.pattern.as_ref()) {
+                self.pending.push(p.binding.ty.clone());
+            }
+        }
+        expr.walk_children(|child| self.add_roots(child));
+    }
+
+    /// The occurrences of `v`, after sweeping whatever roots are pending.
+    fn of(&mut self, v: InferVarId) -> Vec<Occurrence> {
+        self.sweep();
+        self.occurrences.get(&v).cloned().unwrap_or_default()
+    }
+
+    fn sweep(&mut self) {
+        let mut stack = std::mem::take(&mut self.pending);
+        while let Some(ty) = stack.pop() {
+            let mut found = Vec::new();
+            for_each_positioned_var(&ty, &mut Vec::new(), &mut |v, _| found.push(Rc::clone(v)));
+            for v in found {
+                if !self.swept.insert(v.uid) {
+                    continue;
+                }
+                let (lower, upper) = {
+                    let bounds = v.bounds.borrow();
+                    (Rc::clone(bounds.lower()), Rc::clone(bounds.upper()))
+                };
+                for b in lower.iter() {
+                    let bound_ty = b.render_subst().apply_type(&b.ty);
+                    for_each_positioned_var(&bound_ty, &mut Vec::new(), &mut |u, position| {
+                        self.occurrences.entry(u.uid).or_default().push(Occurrence {
+                            holder: Rc::clone(&v),
+                            position: position.into(),
+                        });
+                    });
+                    stack.push(bound_ty);
+                }
+                stack.extend(upper.iter().map(|b| b.ty.clone()));
+            }
+        }
+    }
+}
+
+/// The type of `v`'s position, if one is determined.
+///
+/// The answers come from `v`'s upper bounds and from the lower bounds it occurs in, each
+/// read where it stands and, where that reading is a bare variable, through that variable's
+/// own position. A fully resolved answer wins over a partial one, and the first of each
+/// kind wins over the rest. See `src/ccl/design/type-inference.md`, "The type of a
+/// position".
+fn position_type(
+    v: &Rc<crate::ccl::infer_var::InferVar>,
+    index: &mut OccurrenceIndex,
+) -> Option<Type> {
+    let mut partial = None;
+    let mut question = PositionQuestion::default();
+    let full = position_type_go(v, index, &mut question, &mut partial);
+    full.or(partial)
+}
+
+/// What one [`position_type`] question has learned so far.
+#[derive(Default)]
+struct PositionQuestion {
+    /// Each variable the question has asked about.
+    answers: HashMap<InferVarId, PositionAnswer>,
+    /// The variables met again while their own answers were being computed, in order: each
+    /// is a cycle cut short, and an answer computed under one still open is not cached.
+    cuts: Vec<InferVarId>,
+}
+
+/// One variable's answer within a [`position_type`] question.
+enum PositionAnswer {
+    /// Being computed: a variable met again here is a cycle and contributes nothing.
+    Asking,
+    /// The fully resolved answer, if any, and the first partial one.
+    Answered {
+        full: Option<Type>,
+        partial: Option<Type>,
+    },
+}
+
+/// [`position_type`] for one variable of the question; `partial` holds the first answer
+/// with an unresolved position inside it.
+///
+/// A variable met a second time, through another holder or at another position of the
+/// same one, reuses its answer, so each path reads that answer at its own position. An
+/// answer is reused only when it is final: one computed while a cycle through a variable
+/// still being asked about was cut short could differ on a path that reaches it after
+/// that variable is answered, so it is computed again there.
+fn position_type_go(
+    v: &Rc<crate::ccl::infer_var::InferVar>,
+    index: &mut OccurrenceIndex,
+    question: &mut PositionQuestion,
+    partial: &mut Option<Type>,
+) -> Option<Type> {
+    let (full, own_partial) = match question.answers.get(&v.uid) {
+        Some(PositionAnswer::Asking) => {
+            question.cuts.push(v.uid);
+            return None;
+        }
+        Some(PositionAnswer::Answered { full, partial }) => (full.clone(), partial.clone()),
+        None => {
+            question.answers.insert(v.uid, PositionAnswer::Asking);
+            let mark = question.cuts.len();
+            let mut own_partial = None;
+            let full = position_answer(v, index, question, &mut own_partial);
+            // A cycle back to `v` closes here; one through a variable asked about above
+            // `v` is still open.
+            let mut k = mark;
+            while k < question.cuts.len() {
+                if question.cuts[k] == v.uid {
+                    question.cuts.remove(k);
+                } else {
+                    k += 1;
+                }
+            }
+            if question.cuts.len() > mark {
+                question.answers.remove(&v.uid);
+            } else {
+                question.answers.insert(
+                    v.uid,
+                    PositionAnswer::Answered {
+                        full: full.clone(),
+                        partial: own_partial.clone(),
+                    },
+                );
+            }
+            (full, own_partial)
+        }
+    };
+    if full.is_none()
+        && let Some(own) = own_partial
+    {
+        partial.get_or_insert(own);
+    }
+    full
+}
+
+/// The answer [`position_type_go`] records for `v`, read from its upper bounds and the
+/// lower bounds it occurs in.
+fn position_answer(
+    v: &Rc<crate::ccl::infer_var::InferVar>,
+    index: &mut OccurrenceIndex,
+    question: &mut PositionQuestion,
+    partial: &mut Option<Type>,
+) -> Option<Type> {
+    // A candidate answer, sorted into the full and the partial ones; a bare variable is
+    // not an answer.
+    fn offer(t: &Type, partial: &mut Option<Type>) -> Option<Type> {
+        match t {
+            Type::Infer(_) => None,
+            t if !crate::ccl::subst::type_contains_infer(t) => Some(t.clone()),
+            t => {
+                partial.get_or_insert_with(|| t.clone());
+                None
+            }
+        }
+    }
+    // Cloned out of the `RefCell` before resolving: resolution reads bound lists across
+    // the graph, and the pin's `constrain_subtype` takes them mutably.
+    let upper = Rc::clone(v.bounds.borrow().upper());
+    for b in upper.iter() {
+        // Each bound is resolved as its own position: `resolve_var_type` enters at that
+        // type, so a collapse it causes happens there rather than along `v`'s chain.
+        let ty = b.render_subst().apply_type(&b.ty);
+        if let Ok(resolved) = resolve_var_type(&ty)
+            && let Some(answer) = offer(&resolved, partial)
+        {
+            return Some(answer);
+        }
+        if let Type::Infer(u) = &ty
+            && let Some(answer) = position_type_go(u, index, question, partial)
+        {
+            return Some(answer);
+        }
+    }
+    for Occurrence { holder, position } in index.of(v.uid) {
+        let holder_ty = Type::Infer(Rc::clone(&holder));
+        if let Ok(reading) = coalesce_positive(&holder_ty)
+            && let Some(at) = read_at(&reading, &position)
+            && let Some(answer) = offer(at, partial)
+        {
+            return Some(answer);
+        }
+        let mut outer_partial = None;
+        let outer = position_type_go(&holder, index, question, &mut outer_partial);
+        for outer in outer.iter().chain(outer_partial.iter()) {
+            if let Some(at) = read_at(outer, &position)
+                && let Some(answer) = offer(at, partial)
+            {
+                return Some(answer);
+            }
+        }
+    }
+    None
 }
 
 /// The type an unreachable payload's *operator* reads accept — the trait half of
 /// [`payload_pin`].
 fn payload_trait_default(v: &crate::ccl::infer_var::InferVar) -> crate::ccl::BaseType {
-    use crate::ccl::BaseType;
+    // An empty intersection means the body's own requirements cannot be met together,
+    // which is a real type error in the arm — one this function has no business
+    // reporting. Leave `Unit` to fail the pin's assertion rather than inventing a type
+    // that hides it.
+    obligation_choices(v)
+        .and_then(|choices| choices.first().cloned())
+        .unwrap_or(crate::ccl::BaseType::Unit)
+}
 
+/// The bases every trait obligation on `v` still accepts, in instance-table order, or
+/// `None` when no obligation watches it.
+fn obligation_choices(v: &crate::ccl::infer_var::InferVar) -> Option<Vec<crate::ccl::BaseType>> {
     // The obligations watching the payload, or any variable it flows into: an operand
     // variable an operator minted sits above the payload, as does a variable of a
     // generalized definition the payload reaches from an enclosing scope.
@@ -886,9 +1284,7 @@ fn payload_trait_default(v: &crate::ccl::infer_var::InferVar) -> crate::ccl::Bas
                 }),
         );
     }
-    let Some(((first, pos), rest)) = watches.split_first() else {
-        return BaseType::Unit;
-    };
+    let ((first, pos), rest) = watches.split_first()?;
     // Every requirement on the payload has to hold at once, so the choices are the
     // *intersection* of what each still accepts. No test separates this from taking
     // the first watch's own list, because every trait table today begins with `Int`
@@ -899,11 +1295,7 @@ fn payload_trait_default(v: &crate::ccl::infer_var::InferVar) -> crate::ccl::Bas
         let also = obligation.accepted_at(*pos);
         candidates.retain(|c| also.contains(c));
     }
-    // An empty intersection means the body's own requirements cannot be met
-    // together, which is a real type error in the arm — one this function has no
-    // business reporting. Leave `Unit` to fail the pin's assertion rather than
-    // inventing a type that hides it.
-    candidates.first().cloned().unwrap_or(BaseType::Unit)
+    Some(candidates)
 }
 
 pub(super) fn coalesce_pass(
@@ -922,14 +1314,18 @@ pub(super) fn coalesce_pass(
         specializing: Vec::new(),
         opaque_params_at: Vec::new(),
         assumptions: Vec::new(),
+        occurrences: OccurrenceIndex::default(),
         #[cfg(debug_assertions)]
         reads: Vec::new(),
+        #[cfg(debug_assertions)]
+        skipped_as_generalized: std::collections::HashSet::new(),
     };
     // Before the walk, because the walk cannot reach the literal first: the `Apply` arm
     // descends into `function` before `argument` on purpose, so a comprehension over an
     // inline `[]` reads the lambda's parameter before it ever sees the list. See
     // [`pin_empty_list_element`] for what the pin is and why it runs here.
-    pin_empty_list_elements(expr, &mut ctx);
+    ctx.occurrences.add_roots(expr);
+    pin_empty_list_elements(expr, 0, &mut ctx);
     coalesce_node(expr, 0, &mut ctx);
     debug_assert!(
         ctx.scope.is_empty(),
@@ -1131,6 +1527,26 @@ fn value_reaches(ty: &Type) -> bool {
     !matches!(coalesce_positive(ty), Ok(Type::Infer(_)))
 }
 
+/// Whether `ty`, a type read by the values that reached it ([`coalesce_positive`]), holds a
+/// variable at a position of polarity `pol` that is an output: one no value reached.
+///
+/// A variable at an input position is read from what its uses demand, so it is not an
+/// output here; whether anything reaches it is what [`resolve_var_type`] answers.
+fn has_output_variable(ty: &Type, pol: bool) -> bool {
+    match ty {
+        Type::Infer(_) => pol,
+        Type::Fun {
+            domain, codomain, ..
+        } => has_output_variable(domain, !pol) || has_output_variable(codomain, pol),
+        Type::Refinement(base, _) => has_output_variable(base, pol),
+        other => {
+            let mut found = false;
+            other.walk_children(|child| found |= has_output_variable(child, pol));
+            found
+        }
+    }
+}
+
 /// [`resolve_var_type`] with the opposite-polarity fallback suppressed — what a
 /// value has made of `ty`, never what something demanded of it.
 fn coalesce_positive(ty: &Type) -> Result<Type, CoalesceError> {
@@ -1278,6 +1694,11 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         TypedExprNode::UnaryOp(_, inner) => coalesce_node(inner, level, ctx),
         TypedExprNode::Lambda { param, body } => {
+            // Before the body reads the parameter. In a walk whose types are dropped, an
+            // unbounded parameter is the definition's own, and the uses supply it.
+            if !ctx.discarding {
+                pin_unobservable_param(&expr.ty, ctx);
+            }
             let param_name = param.name.clone();
             ctx.lambda_params.push(param_name.clone());
             // The kind is still a variable here — the node's type is coalesced in the tail,
@@ -1302,6 +1723,13 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // the RHS lives one level deeper, and the binder slot is filled
             // from it. CCL `let` is non-recursive, so the RHS coalesces
             // outside the binding's shadow.
+            #[cfg(debug_assertions)]
+            assert!(
+                !ctx.skipped_as_generalized.contains(&bound_expr.node_id()),
+                "the empty-literal pre-pass skipped this `let` as generalized and the walk \
+                 coalesces it as monomorphic, so its literals are never pinned: the two must \
+                 agree on `should_generalize`"
+            );
             coalesce_node(bound_expr, level + 1, ctx);
             // Binder slot: resolve the type `emit_let` bound the variable at,
             // in place. The bottom-up `expr.ty` resolution doesn't reach this
@@ -1427,7 +1855,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             let pinned_tags: Vec<String> = branches
                 .iter()
                 .filter_map(|b| b.pattern.as_ref())
-                .filter(|p| pin && pin_unobservable_arm_payload(p))
+                .filter(|p| pin && pin_unobservable_arm_payload(p, ctx))
                 .map(|p| p.tag.clone())
                 .collect();
             if let Some(s) = scrutinee {
@@ -1917,14 +2345,20 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     //
     // An under-determined instantiation (a generic definition the program never
     // exercises at a concrete type) keys as the canonical empty `SpecKey` rather
-    // than on fresh `Infer` placeholder ids, so such uses *do* share one
-    // specialization. Inference deliberately tolerates the residue
-    // (`Type::Infer`'s invariant); the strict post-inference typecheck rejects it.
+    // than on fresh `Infer` placeholder ids. Inference deliberately tolerates the
+    // residue (`Type::Infer`'s invariant); the strict post-inference typecheck rejects it.
     let key = spec_key(&use_expr.ty);
+    // A use whose instantiation leaves a variable for the clone's pins shares no clone: the
+    // pins give that variable what the join around the use supplies, which the key does not
+    // read, so the key does not determine the clone. The test is the pins' own: nothing
+    // reaches the variable, or, at an output, no value does. See
+    // `src/ccl/design/type-inference.md`, "A use the key does not determine shares no clone".
+    let shareable = !crate::ccl::subst::type_contains_infer(&resolved)
+        && !coalesce_positive(&use_expr.ty).is_ok_and(|values| has_output_variable(&values, true));
     let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
         unreachable!("lookup_generalized returns indices of Generalized entries only");
     };
-    if let Some(spec) = frame.specs.iter().find(|s| s.key == key) {
+    if shareable && let Some(spec) = frame.specs.iter().find(|s| s.shareable && s.key == key) {
         let (name, ty) = (spec.name.clone(), spec.def.ty.clone());
         // Sharing is what makes an entry live: an entry minted for a discarded use
         // is spliced after all once a surviving use adopts it.
@@ -1935,7 +2369,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
             let spec = frame
                 .specs
                 .iter_mut()
-                .find(|s| s.key == key)
+                .find(|s| s.shareable && s.key == key)
                 .expect("the entry just found is still there");
             spec.referenced = true;
         }
@@ -1958,7 +2392,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         let shared: Vec<HeldError> = frame
             .specs
             .iter()
-            .find(|s| s.key == key)
+            .find(|s| s.shareable && s.key == key)
             .expect("the entry just found is still there")
             .raised
             .iter()
@@ -2134,6 +2568,14 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         at_use: use_expr.node_id(),
         copies: Rc::clone(&origins),
     });
+    // The clone is a tree of its own, with variables no earlier walk could register or
+    // pin. See `src/ccl/design/type-inference.md`, "When the pins run". Its roots are
+    // registered in a discarding walk too, since an arm whose scrutinee a value reaches is
+    // pinned there.
+    ctx.occurrences.add_roots(&clone);
+    if !ctx.discarding {
+        pin_empty_list_elements(&clone, cutoff + 1 + raise, ctx);
+    }
     coalesce_node(&mut clone, cutoff + 1 + raise, ctx);
     ctx.specializing.pop();
     ctx.scope.extend(suspended);
@@ -2173,14 +2615,15 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // table write-only (see `src/ccl/design/type-inference.md`,
     // "Keying a specialization").
     debug_assert!(
-        frame.specs.iter().all(|s| s.key != key),
-        "specialization memo invariant (one entry per distinct key) violated: \
+        !shareable || frame.specs.iter().all(|s| !s.shareable || s.key != key),
+        "specialization memo invariant (one shareable entry per distinct key) violated: \
          minting a second specialization of `{}` for key {key} — the lookup and \
          the insert disagree about what identifies a specialization",
         frame.name,
     );
     frame.specs.push(Specialization {
         key,
+        shareable,
         name: spec_name,
         def: clone,
         referenced,

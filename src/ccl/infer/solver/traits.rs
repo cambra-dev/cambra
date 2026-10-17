@@ -1432,10 +1432,11 @@ pub fn seal_emission() {
 /// swept set records a choice the sweep already licensed, and re-running the sweep
 /// reaches the same verdict.
 ///
-/// One pass narrows after emission and it is of the second kind:
-/// `pin_unobservable_arm_payload` (`src/ccl/infer/solve.rs`) types an unreachable arm's
-/// payload. No value reaches that position, so its type comes from a demand recorded on
-/// it or from the arm body's own reads, and both are sets this sweep read.
+/// The pins narrow after emission, and they are of the second kind
+/// (`src/ccl/design/type-inference.md`, "Pin sites"). Each types a variable nothing
+/// determined: from the type of its position when its obligations accept that
+/// (`accepted_position_type` in `src/ccl/infer/solve.rs`), else from the obligations' own
+/// choices. Both are selections from sets this sweep read.
 ///
 /// An obligation minted since the mark is unconstrained: a freshened clone is a
 /// per-instantiation copy the sweep never read, and one that goes unsatisfiable fails
