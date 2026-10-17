@@ -2,7 +2,7 @@
 //! text (`cambra-lsp/design-cambra-lsp.md`, "Documents").
 
 use chl_parser::ast::{Module, Span};
-use chl_parser::line_index::{LineCol, LineIndex};
+use chl_parser::line_index::{Encoding, LineCol, LineIndex};
 use chl_parser::parser::ParseResult;
 use chl_parser::{FileId, parse_module};
 use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
@@ -12,17 +12,21 @@ pub(crate) struct Document {
     text: String,
     version: i32,
     index: LineIndex,
+    /// What the protocol positions' columns count, chosen for the session at
+    /// `initialize`.
+    encoding: Encoding,
     /// The parse of `text`, made the first time it is asked for and
     /// discarded when `text` changes.
     parsed: OnceCell<ParseResult<Module>>,
 }
 
 impl Document {
-    pub(crate) fn new(text: String, version: i32) -> Document {
+    pub(crate) fn new(text: String, version: i32, encoding: Encoding) -> Document {
         Document {
             index: LineIndex::new(&text),
             text,
             version,
+            encoding,
             parsed: OnceCell::new(),
         }
     }
@@ -72,18 +76,19 @@ impl Document {
     }
 
     /// The byte offset of `pos`, clamped into the text
-    /// ([`LineIndex::offset`]).
+    /// ([`LineIndex::offset_in`]).
     fn offset(&self, pos: Position) -> usize {
-        self.index.offset(
+        self.index.offset_in(
             &self.text,
             LineCol {
                 line: pos.line as usize,
                 col: pos.character as usize,
             },
+            self.encoding,
         )
     }
 
-    /// The protocol range of `span`, with columns in bytes.
+    /// The protocol range of `span`, with columns in the session's encoding.
     pub(crate) fn range(&self, span: Span) -> Range {
         Range {
             start: self.position(span.start),
@@ -92,7 +97,7 @@ impl Document {
     }
 
     pub(crate) fn position(&self, offset: usize) -> Position {
-        let LineCol { line, col } = self.index.line_col(offset);
+        let LineCol { line, col } = self.index.line_col_in(&self.text, offset, self.encoding);
         Position {
             line: to_u32(line),
             character: to_u32(col),
@@ -135,7 +140,7 @@ mod tests {
 
     #[test]
     fn edits_apply_in_order() {
-        let mut doc = Document::new("x = 1\ny = 2\n".to_owned(), 1);
+        let mut doc = Document::new("x = 1\ny = 2\n".to_owned(), 1, Encoding::Utf8);
         doc.apply(edit((0, 4), (0, 5), "10")).unwrap();
         doc.apply(edit((1, 0), (1, 1), "z")).unwrap();
         assert_eq!(doc.text(), "x = 10\nz = 2\n");
@@ -143,23 +148,38 @@ mod tests {
 
     #[test]
     fn positions_past_the_end_clamp() {
-        let mut doc = Document::new("ab\ncd".to_owned(), 1);
+        let mut doc = Document::new("ab\ncd".to_owned(), 1, Encoding::Utf8);
         doc.apply(edit((0, 9), (9, 0), "!")).unwrap();
         assert_eq!(doc.text(), "ab!");
     }
 
     #[test]
     fn a_reversed_range_is_refused() {
-        let mut doc = Document::new("abc".to_owned(), 1);
+        let mut doc = Document::new("abc".to_owned(), 1, Encoding::Utf8);
         assert!(doc.apply(edit((0, 2), (0, 1), "x")).is_err());
         assert_eq!(doc.text(), "abc");
     }
 
     #[test]
     fn a_column_inside_a_character_edits_from_its_start() {
-        let mut doc = Document::new("é".to_owned(), 1);
+        let mut doc = Document::new("é".to_owned(), 1, Encoding::Utf8);
         doc.apply(edit((0, 1), (0, 2), "e")).unwrap();
         assert_eq!(doc.text(), "e");
+    }
+
+    /// In UTF-16, `😀` is two columns and `é` one.
+    #[test]
+    fn utf16_edits_count_code_units() {
+        let mut doc = Document::new("s = \"😀é\" $".to_owned(), 1, Encoding::Utf16);
+        doc.apply(edit((0, 9), (0, 11), "")).unwrap();
+        assert_eq!(doc.text(), "s = \"😀é\"");
+        assert_eq!(
+            doc.position(doc.text().len()),
+            Position {
+                line: 0,
+                character: 9
+            }
+        );
     }
 
     /// splitmix64, as in `chl-parser/tests/lexer_recovery.rs`: deterministic
@@ -188,10 +208,13 @@ mod tests {
             .collect()
     }
 
-    /// For random texts and edits: every character boundary survives a trip
-    /// through a position, and no edit panics, reversed and out-of-range ones
-    /// included. `CAMBRA_FUZZ_SEED` and `CAMBRA_FUZZ_N` pick the seed and the
-    /// number of cases.
+    /// For random texts and edits, in each encoding: no edit panics, reversed
+    /// and out-of-range ones included; every character boundary survives a
+    /// trip through a position; a column agrees with the UTF-16 length of the
+    /// line up to it; and every column on a line, including one inside a
+    /// surrogate pair, names a character boundary at or before it.
+    /// `CAMBRA_FUZZ_SEED` and `CAMBRA_FUZZ_N` pick the seed and the number of
+    /// cases.
     #[test]
     fn random_edits_keep_positions_consistent() {
         let env = |key: &str, default: u64| {
@@ -203,7 +226,9 @@ mod tests {
         let (seed, n) = (env("CAMBRA_FUZZ_SEED", 0x5EED), env("CAMBRA_FUZZ_N", 2000));
         let mut rng = Rng(seed);
         for case in 0..n {
-            let mut doc = Document::new(text(&mut rng), 1);
+            let encoding = [Encoding::Utf8, Encoding::Utf16][(case % 2) as usize];
+            let at = format!("case {case} (CAMBRA_FUZZ_SEED={seed}, {encoding:?})");
+            let mut doc = Document::new(text(&mut rng), 1, encoding);
             for _ in 0..rng.below(4) {
                 let mut pos = || (rng.below(6) as u32, rng.below(8) as u32);
                 let (start, end) = (pos(), pos());
@@ -212,13 +237,15 @@ mod tests {
                 assert_eq!(
                     *doc.index(),
                     LineIndex::new(doc.text()),
-                    "case {case} (CAMBRA_FUZZ_SEED={seed}): the index follows the text"
+                    "{at}: the index follows the text"
                 );
             }
             let text = doc.text();
+            let width = |s: &str| match encoding {
+                Encoding::Utf8 => s.len(),
+                Encoding::Utf16 => s.encode_utf16().count(),
+            };
             for offset in (0..=text.len()).filter(|&o| text.is_char_boundary(o)) {
-                let position = doc.index().line_col(offset);
-                let back = doc.index().offset(text, position);
                 // An offset between `\r` and `\n` names the end of its line.
                 let expected = if text[..offset].ends_with('\r') && text[offset..].starts_with('\n')
                 {
@@ -226,10 +253,33 @@ mod tests {
                 } else {
                     offset
                 };
+                let position = doc.position(offset);
+                let line_start = doc
+                    .index()
+                    .line_range(position.line as usize)
+                    .expect("the position's line exists")
+                    .start;
                 assert_eq!(
-                    back, expected,
-                    "case {case} (CAMBRA_FUZZ_SEED={seed}): {text:?} at {offset}"
+                    position.character as usize,
+                    width(&text[line_start..expected]),
+                    "{at}: the column of {offset} in {text:?}"
                 );
+                assert_eq!(doc.offset(position), expected, "{at}: {text:?} at {offset}");
+            }
+            for line in 0..doc.index().line_count() {
+                let content = doc.index().line_range(line).expect("the line exists");
+                for col in 0..=width(&text[content.clone()]) + 1 {
+                    let offset = doc.offset(Position {
+                        line: line as u32,
+                        character: col as u32,
+                    });
+                    assert!(
+                        text.is_char_boundary(offset)
+                            && (content.start..=content.end).contains(&offset)
+                            && width(&text[content.start..offset]) <= col,
+                        "{at}: column {col} of line {line} in {text:?} gave {offset}"
+                    );
+                }
             }
         }
     }

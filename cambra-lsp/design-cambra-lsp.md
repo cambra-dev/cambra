@@ -3,8 +3,8 @@
 `cambra-lsp` is a language server for CHL. An editor starts it as `cambra --lsp` and talks to it
 over standard input and output using the Language Server Protocol (LSP) 3.17. The first version
 reports lex and parse errors as you type, lists a file's functions and top-level bindings, and
-folds blocks, brackets and comment runs. It works on one file at a time and supports Neovim 0.11
-and later.
+folds blocks, brackets and comment runs. It works on one file at a time and serves any client,
+counting columns in UTF-8 or UTF-16 ([Positions](#positions)).
 
 ## Scope
 
@@ -22,7 +22,7 @@ Not in the first version, in the order planned:
 - Diagnostics from the rest of the compiler: lowering, type inference and later phases. This
   needs the `cambra` library ([Package layout](#package-layout)) and a worker thread
   ([its design](#later-compiler-diagnostics-on-a-worker-thread)).
-- A VS Code client, and with it UTF-16 positions ([Positions](#positions)).
+- A VS Code client.
 - Semantic tokens, hover types, go-to-definition and completion.
 
 ## Package layout
@@ -48,8 +48,7 @@ The server runs on one thread and handles messages in batches, in the order they
 - **Start.** The server reads `initialize`, picks a position encoding from the client's
   capabilities ([Positions](#positions)), and answers with its capabilities and `serverInfo`. It
   uses `lsp-server`'s `initialize_start` and `initialize_finish`, which reject anything sent
-  before `initialize` or between it and `initialized`. A client that does not offer UTF-8 gets an
-  error response, and the session ends.
+  before `initialize` or between it and `initialized`.
 - **Batches.** The loop waits for one message, then takes every message already waiting behind
   it, and handles them in order as one batch:
   - Edits are applied to the document text without reparsing.
@@ -110,6 +109,7 @@ struct Document {
     text: String,
     version: i32,
     index: LineIndex,
+    encoding: Encoding,
     parsed: OnceCell<ParseResult<Module>>,
 }
 ```
@@ -140,24 +140,31 @@ The compiler measures everything in bytes: a `Span` holds byte offsets into the 
 text. LSP positions are a line number and a column instead. The client and server agree on what
 a column counts during `initialize`:
 
-- UTF-8 bytes, the server's choice whenever the client offers it. A column is then the byte offset
-  from the start of the line.
-- UTF-16 code units, the protocol's default and the only encoding VS Code supports.
-- UTF-32 code units, which is one per character.
+- UTF-8 bytes. A column is the byte offset from the start of the line.
+- UTF-16 code units: one per character up to U+FFFF, two (a surrogate pair) for a character above
+  it. The protocol requires every server to support UTF-16, and a client that names no encoding
+  means it. It is the only encoding VS Code's client, `vscode-languageclient`, offers or accepts.
+- UTF-32 code units, one per character. The server does not support it. A client that offers
+  only UTF-32 gets UTF-16, which the protocol requires every client to support.
 
-The first version supports UTF-8 only. Neovim 0.11 offers it; Neovim 0.10 and VS Code do not.
-When the client does not offer UTF-8, `initialize` fails with an error saying the server needs
-Neovim 0.11 or later. UTF-16 arrives with the VS Code client.
+The server chooses UTF-8 when the client offers it, since spans need no conversion then, and
+UTF-16 otherwise, so it serves every client. Neovim 0.11 offers UTF-8; Neovim 0.10 and VS Code
+get UTF-16. The choice holds for the session, and `Document` converts every position the server
+reads or writes in it. Folding needs only line numbers, which do not depend on the encoding.
 
-`LineIndex` converts between the two. It lives in `chl-parser`, so the editor highlight dump
-(`chl-parser/examples/dump_tokens.rs`) and the recovery tests use it in place of their own
-`line_col` helpers. It records where each line starts and follows the protocol's rules exactly:
+`LineIndex` converts between offsets and positions. It lives in `chl-parser`, so the editor
+highlight dump (`chl-parser/examples/dump_tokens.rs`) and the recovery tests use it in place of
+their own `line_col` helpers; their columns stay in bytes. It records where each line starts and
+whether the text is all ASCII, in which case a UTF-16 column is the byte column. Otherwise it
+counts the UTF-16 units of the line up to the offset on each conversion. It follows the
+protocol's rules exactly:
 
 - A line ends at `\n`, at `\r\n`, or at a `\r` not followed by `\n`. The lexer rejects `\r`
   today, but the index must still count lines the way the editor does.
 - A line past the last one means the end of the document.
 - A column past the end of its line means the end of the line, before the line break.
-- A column in the middle of a multi-byte character means the start of that character.
+- A column in the middle of a character means the start of that character: a byte column inside
+  a multi-byte character, or a UTF-16 column between the two halves of a surrogate pair.
 
 ## Diagnostics
 
@@ -255,14 +262,24 @@ through the server uses `vim.lsp.foldexpr()`. `editors/README.md` describes the 
   `lsp-server`'s in-memory `Connection::memory()`. Its `TestServer` performs the handshake,
   sends requests and notifications, and waits for the diagnostics of a given version. Ending a
   session joins the server thread and fails the test on any unread message other than a
-  superseded diagnostics publish. It covers the handshake, the UTF-8 check, shutdown and exit,
-  an unhandled request, incremental edits, and related information.
+  superseded diagnostics publish. It covers the handshake and the encoding each client is given,
+  shutdown and exit, an unhandled request, incremental edits, related information, and columns
+  counted in UTF-16.
 - **Goldens.** `cambra-lsp/tests/goldens/programs.txt` holds the diagnostics, outline and folds
   of every `.cambra` file under `tests/` and `editors/`, and `lexer_recovery.txt` those of the
-  lexer recovery corpus, so files with errors are covered. `CAMBRA_BLESS=1` rewrites them, as it
-  does the repository's other goldens.
+  lexer recovery corpus, so files with errors are covered. `non_ascii.txt` holds those of the
+  fixtures in `cambra-lsp/tests/non_ascii/` under both encodings, since the repository's programs
+  hold multi-byte characters only in comments. Each diagnostic's range and each symbol's range end
+  there falls after a multi-byte character, so its two columns differ. `CAMBRA_BLESS=1` rewrites
+  them, as it does the repository's other goldens.
+- **Encoding independence.** `features_do_not_depend_on_the_encoding` runs every file above under
+  a UTF-8 and a UTF-16 session, requires each position to be canonical, maps it back to a byte
+  offset, and requires the two to agree, so a feature that computed a column without the session's
+  encoding fails.
 - **Positions.** A seeded fuzz test in `cambra-lsp/src/document.rs` (`CAMBRA_FUZZ_SEED`,
-  `CAMBRA_FUZZ_N`) builds texts mixing ASCII, multi-byte characters and all three line breaks. It
-  applies random edits, reversed and out-of-range ones included, checks that the line index
-  follows the text, and checks that every character boundary survives a trip through a
-  position.
+  `CAMBRA_FUZZ_N`) builds texts mixing ASCII, multi-byte characters and all three line breaks,
+  and alternates the encoding between cases. It applies random edits, reversed and out-of-range
+  ones included, and checks that the line index follows the text, that every character boundary
+  survives a trip through a position, that each column equals the UTF-8 or UTF-16 length of its
+  line up to the offset, and that every column on a line names a character boundary at or before
+  it.

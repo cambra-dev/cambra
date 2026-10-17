@@ -4,6 +4,7 @@
 use crate::Error;
 use crate::document::Document;
 use crate::{diagnostics, folding, symbols};
+use chl_parser::line_index::Encoding;
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CancelNotification, CancelParams, DidChangeTextDocumentNotification,
@@ -34,21 +35,9 @@ pub enum Ended {
 pub fn run(connection: &Connection) -> Result<Ended, Error> {
     let (id, params) = connection.initialize_start()?;
     let params: InitializeParams = serde_json::from_value(params)?;
-    let offers_utf8 = params
-        .capabilities
-        .general
-        .and_then(|general| general.position_encodings)
-        .is_some_and(|encodings| encodings.contains(&PositionEncodingKind::UTF8));
-    if !offers_utf8 {
-        let message = "cambra-lsp counts columns in UTF-8, which the client does not offer; \
-                       it needs Neovim 0.11 or later";
-        connection.sender.send(
-            Response::new_err(id, ErrorCode::RequestFailed as i32, message.to_owned()).into(),
-        )?;
-        return Err(message.into());
-    }
+    let encoding = encoding(&params);
     let result = InitializeResult {
-        capabilities: capabilities(),
+        capabilities: capabilities(encoding),
         server_info: Some(ServerInfo {
             name: "cambra-lsp".to_owned(),
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
@@ -58,6 +47,7 @@ pub fn run(connection: &Connection) -> Result<Ended, Error> {
 
     let mut server = Server {
         connection,
+        encoding,
         documents: HashMap::new(),
         shutdown_requested: false,
     };
@@ -73,9 +63,30 @@ pub fn run(connection: &Connection) -> Result<Ended, Error> {
     }
 }
 
-fn capabilities() -> ServerCapabilities {
+/// The encoding protocol columns count in for this session: UTF-8 when the
+/// client offers it, since spans are byte offsets and need no conversion, and
+/// otherwise UTF-16. The protocol requires every server to support UTF-16,
+/// and a client that offers no encodings means it.
+fn encoding(params: &InitializeParams) -> Encoding {
+    let offers_utf8 = params
+        .capabilities
+        .general
+        .as_ref()
+        .and_then(|general| general.position_encodings.as_ref())
+        .is_some_and(|encodings| encodings.contains(&PositionEncodingKind::UTF8));
+    if offers_utf8 {
+        Encoding::Utf8
+    } else {
+        Encoding::Utf16
+    }
+}
+
+fn capabilities(encoding: Encoding) -> ServerCapabilities {
     ServerCapabilities {
-        position_encoding: Some(PositionEncodingKind::UTF8),
+        position_encoding: Some(match encoding {
+            Encoding::Utf8 => PositionEncodingKind::UTF8,
+            Encoding::Utf16 => PositionEncodingKind::UTF16,
+        }),
         text_document_sync: Some(TextDocumentSync::Options(TextDocumentSyncOptions {
             open_close: Some(true),
             change: Some(TextDocumentSyncKind::Incremental),
@@ -91,6 +102,8 @@ fn capabilities() -> ServerCapabilities {
 
 struct Server<'a> {
     connection: &'a Connection,
+    /// What the columns of every position in this session count.
+    encoding: Encoding,
     /// The open documents, keyed by the URI the client sent.
     documents: HashMap<Uri, Document>,
     shutdown_requested: bool,
@@ -200,8 +213,10 @@ impl Server<'_> {
                     format!("{} was opened twice", item.uri),
                 )?;
             }
-            self.documents
-                .insert(item.uri.clone(), Document::new(item.text, item.version));
+            self.documents.insert(
+                item.uri.clone(),
+                Document::new(item.text, item.version, self.encoding),
+            );
             mark_changed(changed, item.uri);
         } else if method == DidChangeTextDocumentNotification::METHOD.as_str() {
             let Some(params) = self.params::<DidChangeTextDocumentParams>(n)? else {
@@ -354,6 +369,7 @@ mod tests {
         let (server, client) = Connection::memory();
         let mut s = Server {
             connection: &server,
+            encoding: Encoding::Utf8,
             documents: HashMap::new(),
             shutdown_requested: false,
         };
