@@ -1268,8 +1268,8 @@ struct FeedSite {
 }
 
 /// `p ▷ .i : elt_ty` — projection of a tuple-typed variable (a writer-body
-/// snapshot slot). Mirrors `transact_phase`'s `proj_tuple`.
-fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
+/// snapshot slot).
+pub(crate) fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
     let mut proj = Expr::proj_index(i);
     proj.ty = Type::fun(tuple_ty.clone(), elt_ty.clone());
     let mut app = Expr::apply(tvar(p, tuple_ty.clone()), proj);
@@ -1302,7 +1302,7 @@ fn writes_key_view(
     comp
 }
 
-/// A `Var(name) : ty`.
+/// A [`TypedBinding`] with `name : ty` and no user annotation.
 pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
     TypedBinding {
         name,
@@ -3049,12 +3049,15 @@ fn decision_record(commit: Expr, write_elts: Vec<Expr>, writes_ty: &Type) -> Exp
     rec
 }
 
-/// Conjoin the enclosing control-flow `path` with a branch's first-match
-/// predicate `pi`. On the loop spine the path is the `true` literal, so the
-/// branch path is just `pi` (no redundant `true ∧ pi`).
-fn conjoin_path(path: &Expr, pi: &Expr) -> Expr {
+/// `path ∧ pi`: the enclosing control-flow `path` conjoined with a branch's first-match
+/// predicate `pi`, collapsing a literal-`true` side to the other. On the loop spine the path is
+/// `true`, so the branch path is `pi`; a lone `true` arm's `pi` is `true`, so its path is `path`.
+pub(crate) fn conjoin_path(path: &Expr, pi: &Expr) -> Expr {
     if is_true_lit(path) {
         return pi.clone();
+    }
+    if is_true_lit(pi) {
+        return path.clone();
     }
     let mut o = Expr::binop(
         path.clone(),
@@ -3065,6 +3068,7 @@ fn conjoin_path(path: &Expr, pi: &Expr) -> Expr {
     o
 }
 
+/// Whether `e` is the literal `true`.
 fn is_true_lit(e: &Expr) -> bool {
     matches!(&e.node, TypedExprNode::Lit(Lit::Bool(true)))
 }
@@ -3559,5 +3563,24 @@ mod tests {
                 "and blames the first write's marker and both of the second's nodes",
             );
         }
+    }
+
+    /// A literal-`true` side of `path ∧ pi` collapses to the other side.
+    #[test]
+    fn conjoin_path_collapses_true_side() {
+        let bool_ty = Type::Base(BaseType::Bool);
+        let t = Expr::lit(Lit::Bool(true)).with_ty(bool_ty.clone());
+        let (g_name, h_name) = (Name::fresh("g"), Name::fresh("h"));
+        let g = tvar(&g_name, bool_ty.clone());
+        let h = tvar(&h_name, bool_ty);
+        let is_var = |e: &Expr, name: &Name| matches!(&e.node, TypedExprNode::Var(n) if n == name);
+        assert!(is_var(&conjoin_path(&t, &g), &g_name));
+        assert!(is_var(&conjoin_path(&h, &t), &h_name));
+        let both = conjoin_path(&g, &h);
+        assert!(matches!(
+            &both.node,
+            TypedExprNode::BinOp { left, op: crate::ccl::BinOpKind::BoolLogic(crate::ccl::LogicKind::And), right }
+                if is_var(left, &g_name) && is_var(right, &h_name)
+        ));
     }
 }

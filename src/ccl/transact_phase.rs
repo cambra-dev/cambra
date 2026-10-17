@@ -77,12 +77,14 @@ use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
-    BaseType, BindingTransparency, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS,
-    F_WRITES, FieldKey, HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode,
-    WriterSite,
+    BaseType, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES, FieldKey,
+    HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
     ccl_utils::{free_names_in_value, is_free, is_free_in_value, synthesize_arm_predicate},
     feed_nest::LoopFeed,
-    mut_elim::{close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys},
+    mut_elim::{
+        binding, close_recurrence_group, conjoin_path, fold_induction_loop, hoist_feeds,
+        mut_var_value_tys, proj_of, tvar,
+    },
     provenance,
     provenance::{Located, NodeId},
     subst::Subst,
@@ -2183,22 +2185,6 @@ fn collect_footprint(block: &Expr, txn_mut_vars: &HashSet<Name>) -> (Vec<Name>, 
     (reads, writes)
 }
 
-/// A `Var(name) : ty`.
-fn tvar(name: &Name, ty: Type) -> Expr {
-    let mut e = Expr::var(name.clone());
-    e.ty = ty;
-    e
-}
-
-/// `p ▷ .i : elt_ty` — projection of the writer body's tuple parameter.
-fn proj_tuple(p: &Name, tuple_ty: &Type, i: usize, elt_ty: Type) -> Expr {
-    let mut proj = Expr::proj_index(i);
-    proj.ty = Type::fun(tuple_ty.clone(), elt_ty.clone());
-    let mut app = Expr::apply(tvar(p, tuple_ty.clone()), proj);
-    app.ty = elt_ty;
-    app
-}
-
 /// Build one [`WriterSite`] from a stripped site: its ``{`commit{writes} | `abort}`` decision lambda over the snapshot-tuple parameter, plus its footprint
 /// and source. The decision reads mutable variable snapshots and the loop item off the tuple,
 /// threads read-your-writes by substitution, and picks the `` `commit ``/`` `abort `` tag
@@ -2266,12 +2252,9 @@ fn build_writer(
     // parameter `p.i`, the loop item at the trailing position `p.m`.
     let mut env: HashMap<Name, Expr> = HashMap::new();
     for (i, rk) in site.read_keys.iter().enumerate() {
-        env.insert(
-            rk.clone(),
-            proj_tuple(&p, &tuple_ty, i, read_tys[i].clone()),
-        );
+        env.insert(rk.clone(), proj_of(&p, &tuple_ty, i, &read_tys[i]));
     }
-    let item = proj_tuple(&p, &tuple_ty, site.read_keys.len(), item_ty.clone());
+    let item = proj_of(&p, &tuple_ty, site.read_keys.len(), &item_ty);
     if site_accs.is_empty() {
         env.insert(site.target.name.clone(), item);
     } else {
@@ -2604,7 +2587,7 @@ fn walk_case(
         let guard = Subst::discharge_env_in_place(br.guard.clone(), &snapshot);
         let pi = synthesize_arm_predicate(&guard, &priors);
         priors.push(guard.clone());
-        let arm_path = and_path(path, &pi);
+        let arm_path = conjoin_path(path, &pi);
         let mut arm_env = snapshot.clone();
         walk_block(
             &br.body,
@@ -2664,28 +2647,6 @@ fn walk_case(
         c.ty = vty;
         env.insert(wk.clone(), c);
     }
-}
-
-/// Whether `e` is the literal `true`.
-fn is_true_lit(e: &Expr) -> bool {
-    matches!(e.node, TypedExprNode::Lit(Lit::Bool(true)))
-}
-
-/// `path ∧ guard`, collapsing a `true` path to just the guard.
-fn and_path(path: &Expr, guard: &Expr) -> Expr {
-    if is_true_lit(path) {
-        return guard.clone();
-    }
-    if is_true_lit(guard) {
-        return path.clone();
-    }
-    let mut e = Expr::binop(
-        path.clone(),
-        crate::ccl::BinOpKind::BoolLogic(crate::ccl::LogicKind::And),
-        guard.clone(),
-    );
-    e.ty = Type::Base(BaseType::Bool);
-    e
 }
 
 /// A mutable variable key's `let` declaration, as the phase folds it away.
@@ -2754,27 +2715,6 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
 /// `final_or_default` reduction, an `as_of` join. `Type::fun` would declare it a capability.
 fn history_ty(value_ty: &Type) -> Type {
     Type::data_fun(Type::Txn, value_ty.clone())
-}
-
-/// A [`TypedBinding`] with `name : ty` and no user annotation.
-fn binding(name: Name, ty: Type) -> TypedBinding {
-    TypedBinding {
-        name,
-        ty,
-        user_annotation: None,
-        transparency: BindingTransparency::Transparent,
-    }
-}
-
-/// `let name : name_ty = def in body`, typed as `body`.
-fn let_typed(name: Name, name_ty: Type, def: Expr, body: Expr) -> Expr {
-    let ty = body.ty.clone();
-    Expr::new(TypedExprNode::Let {
-        binding: binding(name, name_ty),
-        bound_expr: Box::new(def),
-        body: Box::new(body),
-    })
-    .with_ty(ty)
 }
 
 /// `arg ▷ func : ty`.
@@ -3079,7 +3019,7 @@ fn plan_store(
         commit_rec_ty.push(rec_ty.clone());
 
         // commits_j = λ r → let t = begin(r) in {time, write_targets, decision}
-        let commit_body = let_typed(t, Type::Txn, begin, rec);
+        let commit_body = Expr::let_in(binding(t, Type::Txn), begin, rec);
         let mut commit_lambda = Expr::lambda(r, dom.clone(), commit_body);
         commit_lambda.ty = Type::data_fun(dom.clone(), rec_ty.clone());
         commit_bindings.push((
@@ -3746,7 +3686,7 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
             provenance::Nature::Machinery,
         );
         for (b, def) in reads.into_iter().rev() {
-            inner = let_typed(b.name, b.ty, def, inner);
+            inner = Expr::let_in(binding(b.name, b.ty), def, inner);
         }
         inner = hoist_feeds(inner, feeds);
     }
