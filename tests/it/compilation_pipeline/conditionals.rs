@@ -1618,8 +1618,8 @@ fn two_filters_on_one_conditional_generator_beside_a_filtered_second(
 /// program placed differently: the `Case` sits in a binding rather than in the generator.
 ///
 /// Realization needs it below the site — the legs are copies of the site with the `Case`
-/// replaced — so a binding whose witness is undetermined is copied into each consumer
-/// first (`ccl::planning::conditionals::inline_undetermined_conditionals`). Left where it
+/// replaced — so a conditional binding is copied into each consumer first
+/// (`ccl::planning::conditionals::inline_conditional_bindings`). Left where it
 /// was, each conditional realizes at its own binding and the product site is left holding
 /// a domain of two witnesses nothing has materialized, which op-conversion rejects
 /// (`zip requires an input operator`).
