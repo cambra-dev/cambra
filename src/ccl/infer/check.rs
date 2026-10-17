@@ -233,12 +233,41 @@ impl Typing for CheckCtx {
         ann.clone()
     }
 
-    fn require_trait(
+    fn require_trait_refined(
         &mut self,
         trait_: Trait,
         operator_node_id: NodeId,
         operand_types: &[&Type],
         operand_exprs: &[&Expr],
+        assoc: Assoc,
+        refinement: crate::ccl::RefinementTemplate,
+        at: &dyn Fn() -> String,
+    ) -> Result<Type, LocatedInferError> {
+        let base = self
+            .require_trait(trait_, operator_node_id, operand_types, Some(assoc), at)?
+            .expect("an operator asking for an association gets its position back");
+        // A position the rows did not settle is the residue the walls judge, unrefined.
+        if matches!(base, Type::Infer(_)) {
+            return Ok(base);
+        }
+        let _f = provenance::enter(
+            operator_node_id,
+            "check.require_trait",
+            provenance::Nature::Machinery,
+        );
+        let args: Vec<TypedExpr> = operand_exprs.iter().map(|e| (*e).clone()).collect();
+        Ok(Type::Refinement(
+            Box::new(base),
+            RefinementSet::one(Refinement::born_from_template(refinement, &args)),
+        ))
+    }
+
+    fn require_trait(
+        &mut self,
+        trait_: Trait,
+        // No obligation is minted here, so nothing records the node.
+        _operator_node_id: NodeId,
+        operand_types: &[&Type],
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError> {
@@ -319,14 +348,7 @@ impl Typing for CheckCtx {
                             &c[at]
                         })
                         .collect();
-                    self.require_trait(
-                        trait_,
-                        operator_node_id,
-                        &at_field,
-                        operand_exprs,
-                        None,
-                        at,
-                    )?;
+                    self.require_trait(trait_.clone(), _operator_node_id, &at_field, None, at)?;
                 }
                 return Ok(assoc.map(|_| self.fresh()));
             }
@@ -337,34 +359,14 @@ impl Typing for CheckCtx {
             return Ok(assoc.map(|_| self.fresh()));
         };
         let matched = trait_
-            .instances()
+            .compiler_instances
             .iter()
-            .find(|i| i.args.len() == bases.len() && i.args.iter().eq(bases.iter().copied()));
+            .find(|i| i.operands.len() == bases.len() && i.bases() == bases);
         match matched {
             Some(matched) => Ok(assoc.map(|name| {
                 matched
                     .assoc_ty(name)
-                    .map(|(b, template)| {
-                        let base = Type::Base(b.clone());
-                        match template {
-                            Some(template) => {
-                                let _f = provenance::enter(
-                                    operator_node_id,
-                                    "check.require_trait",
-                                    provenance::Nature::Machinery,
-                                );
-                                let args: Vec<TypedExpr> =
-                                    operand_exprs.iter().map(|e| (*e).clone()).collect();
-                                Type::Refinement(
-                                    Box::new(base),
-                                    RefinementSet::one(Refinement::born_from_template(
-                                        template, &args,
-                                    )),
-                                )
-                            }
-                            None => base,
-                        }
-                    })
+                    .cloned()
                     .unwrap_or_else(|| fresh_var(self.level))
             })),
             None => {
@@ -374,10 +376,13 @@ impl Typing for CheckCtx {
                 let prefix: Vec<BaseType> =
                     bases[..position].iter().map(|b| (*b).clone()).collect();
                 let accepted: Vec<Type> = trait_
-                    .instances()
+                    .compiler_instances
                     .iter()
-                    .filter(|i| i.args.len() == bases.len() && i.args[..position] == prefix[..])
-                    .filter_map(|i| i.args.get(position).cloned().map(Type::Base))
+                    .filter(|i| {
+                        i.operands.len() == bases.len()
+                            && i.bases()[..position].iter().copied().eq(prefix.iter())
+                    })
+                    .filter_map(|i| i.base_at(position).cloned().map(Type::Base))
                     .collect();
                 let located = self.raise(InferError::NoTraitInstance {
                     trait_: trait_.to_string(),

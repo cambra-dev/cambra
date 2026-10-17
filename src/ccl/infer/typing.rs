@@ -153,10 +153,24 @@ pub(super) trait Typing {
         trait_: Trait,
         operator_node_id: NodeId,
         operand_types: &[&Type],
-        operand_exprs: &[&Expr],
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError>;
+
+    /// [`require_trait`](Self::require_trait) for an operator whose result is the associated
+    /// type `assoc` refined by a predicate built from its operands: the type deposited there
+    /// is refined by `refinement` applied to `operand_exprs`, as `^+`'s result is.
+    #[allow(clippy::too_many_arguments)]
+    fn require_trait_refined(
+        &mut self,
+        trait_: Trait,
+        operator_node_id: NodeId,
+        operand_types: &[&Type],
+        operand_exprs: &[&Expr],
+        assoc: Assoc,
+        refinement: crate::ccl::RefinementTemplate,
+        at: &dyn Fn() -> String,
+    ) -> Result<Type, LocatedInferError>;
 
     /// Normalize a user annotation / binder type into a solver-ready `Type`
     /// (holes → fresh vars; refinements kept). See

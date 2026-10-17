@@ -21,11 +21,16 @@ use super::product;
 /// depends on the types satisfying it, and an operator whose result is the same
 /// whatever it accepts states that itself. Keeping the two apart is what stops a
 /// constant from being mis-recorded as an associated type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum OperatorResult {
     /// An associated type of the required trait — `+`'s result is `Addable`'s
     /// `Output`.
     Associated(Assoc),
+    /// An associated type, refined by a predicate the operator builds from its operands:
+    /// `^+`'s result is `AddableRefined`'s `Output` refined by `__elem == 𝑎 ^+ 𝑏`
+    /// ([`sum_of_the_operands`]). The refinement is the operator's, the same whichever
+    /// instance answers.
+    AssociatedRefined(Assoc, crate::ccl::RefinementTemplate),
     /// Fixed by the operator regardless of the operand types — `==` yields `Bool` for
     /// every pair `Equatable` accepts, which is why `Equatable` associates nothing.
     Fixed(BaseType),
@@ -59,6 +64,33 @@ pub(super) enum OpSignature {
         /// Where the operator's own result type comes from.
         result: OperatorResult,
     },
+}
+
+/// The bare predicate `__elem == a1 ^+ a2` refining `^+`'s result: it is the sum of its
+/// operands.
+///
+/// Bare in the sense of [`crate::ccl::ccl_utils::refine_with_bare`] — [`crate::ccl::Name::elem`]
+/// is free, and the refinement it lands in is what binds it. Every node is typed at
+/// construction because `AddableRefined`'s instances fix both operand bases and the associated
+/// base at `Int` or `UInt`, leaving nothing for inference to resolve, the same reason
+/// [`crate::ccl::infer::singleton_predicate`]'s term is ground.
+pub(super) fn sum_of_the_operands(args: &[crate::ccl::TypedExpr]) -> crate::ccl::TypedExpr {
+    use crate::ccl::{ArithmeticKind, CompareKind, Name, TypedExpr};
+    let [a1, a2] = args else {
+        panic!("`^+` is binary, so its refinement receives two operands");
+    };
+    let int = prim(BaseType::Int);
+    TypedExpr::binop(
+        TypedExpr::var(Name::elem()).with_ty(int.clone()),
+        BinOpKind::Compare(CompareKind::Equals),
+        TypedExpr::binop(
+            a1.clone(),
+            BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
+            a2.clone(),
+        )
+        .with_ty(int),
+    )
+    .with_ty(prim(BaseType::Bool))
 }
 
 /// Schemes for operators that lift cleanly to fixed signatures.
@@ -379,16 +411,19 @@ impl OperatorSchemes {
             result: OperatorResult::Fixed(BaseType::Bool),
         };
         match op {
-            BinOpKind::Arithmetic(ArithmeticKind::Add) => arithmetic(Trait::Addable),
-            BinOpKind::Arithmetic(ArithmeticKind::AddRefined) => arithmetic(Trait::AddableRefined),
-            BinOpKind::Arithmetic(ArithmeticKind::Sub) => arithmetic(Trait::Subtractable),
-            BinOpKind::Arithmetic(ArithmeticKind::Mul) => arithmetic(Trait::Multipliable),
-            BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => arithmetic(Trait::Divisible),
-            BinOpKind::Arithmetic(ArithmeticKind::Pow) => arithmetic(Trait::Exponentiable),
+            BinOpKind::Arithmetic(ArithmeticKind::Add) => arithmetic(Trait::addable()),
+            BinOpKind::Arithmetic(ArithmeticKind::AddRefined) => OpSignature::SingleObligation {
+                trait_: Trait::addable_refined(),
+                result: OperatorResult::AssociatedRefined(Assoc::Output, sum_of_the_operands),
+            },
+            BinOpKind::Arithmetic(ArithmeticKind::Sub) => arithmetic(Trait::subtractable()),
+            BinOpKind::Arithmetic(ArithmeticKind::Mul) => arithmetic(Trait::multipliable()),
+            BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => arithmetic(Trait::divisible()),
+            BinOpKind::Arithmetic(ArithmeticKind::Pow) => arithmetic(Trait::exponentiable()),
             BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals) => {
-                comparison(Trait::Equatable)
+                comparison(Trait::equatable())
             }
-            BinOpKind::Compare(_) => comparison(Trait::Orderable),
+            BinOpKind::Compare(_) => comparison(Trait::orderable()),
             BinOpKind::BoolLogic(_) => OpSignature::Scheme(self.bool_logic.clone()),
             BinOpKind::Concat => OpSignature::Scheme(self.concat.clone()),
         }
@@ -399,7 +434,7 @@ impl OperatorSchemes {
     pub(super) fn unary(&self, op: UnaryOpKind) -> OpSignature {
         match op {
             UnaryOpKind::Neg => OpSignature::SingleObligation {
-                trait_: Trait::Negatable,
+                trait_: Trait::negatable(),
                 result: OperatorResult::Associated(Assoc::Output),
             },
             UnaryOpKind::Not => OpSignature::Scheme(self.not_op.clone()),
