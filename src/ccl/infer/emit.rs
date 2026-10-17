@@ -14,16 +14,19 @@ use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
-    AggregateKind, BaseType, Branch, Expr, Name, PatternHead, ProjKey, Refinement, TransactKey,
-    Type, TypedBinding, TypedExprNode, V_ABORT, V_COMMIT, WriterSite,
+    AggregateKind, BaseType, Branch, Expr, MethodCandidate, MethodOwner, Name, PatternHead,
+    ProjKey, Refinement, TransactKey, Type, TypedBinding, TypedExprNode, V_ABORT, V_COMMIT,
+    WriterSite,
 };
 
 use super::context::InferCtx;
 use super::schemes::{OpSignature, OperatorResult};
 use super::typing::{LetScheme, Typing};
 use super::{product, variant_type};
-use crate::ccl::infer::solver::traits::Trait;
+use crate::ccl::infer::solver::traits::{Assoc, Signature, Trait, function_over, replace_params};
 use crate::ccl::infer_var::Origin;
+use crate::ccl::ty::{TraitRequirement, TypeParamId};
+use std::collections::HashMap;
 
 /// Walk one expression node, emit constraints for it, write its inferred
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
@@ -77,6 +80,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Method { name, .. } => {
             unreachable!("method `{name}` reached emission outside the application it resolves in")
         }
+        TypedExprNode::TraitFn {
+            trait_,
+            function,
+            operands,
+        } => emit_trait_fn(trait_.clone(), function, operands, node_id, ctx)?,
         TypedExprNode::Lit(lit) => {
             // A literal's type is its singleton, `{Int | __elem == n}`, and the
             // three nodes of that `__elem == n` term are minted *here* — the
@@ -129,20 +137,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     // "Instantiation").
                     for r in &instance.requires {
                         let at = || format!("the requirement {}(…) of `{name}`", r.trait_);
-                        let named = r.assoc.first();
-                        let require = |ctx: &mut InferCtx| {
-                            ctx.require_trait(
-                                r.trait_.clone(),
-                                node_id,
-                                &r.args.iter().collect::<Vec<_>>(),
-                                named.map(|(n, _)| *n),
-                                &at,
-                            )
-                        };
-                        let settled = ctx.with_demand_at(r.at.map(Origin::Written), require)?;
-                        if let (Some(settled), Some((_, named))) = (settled, named) {
-                            ctx.require_sub(&settled, named, &at)?;
-                        }
+                        require_stated(r, node_id, &at, ctx)?;
                     }
                     instance.ty
                 }
@@ -1365,12 +1360,18 @@ fn require_single_obligation<C: Typing>(
             operator_node_id,
             operand_types,
             operand_exprs,
-            *name,
+            name.clone(),
             *refinement,
             at,
         ),
         OperatorResult::Associated(name) => {
-            let ty = ctx.require_trait(trait_, operator_node_id, operand_types, Some(*name), at)?;
+            let ty = ctx.require_trait(
+                trait_,
+                operator_node_id,
+                operand_types,
+                Some(name.clone()),
+                at,
+            )?;
             Ok(ty.expect("an operator asking for an association gets its position back"))
         }
         OperatorResult::Fixed(base) => {
@@ -2796,12 +2797,106 @@ fn emit_nominal_scrutinee<C: Typing>(
     Ok(())
 }
 
+/// Type a trait function `Trait::f` by its trait's signature, at one fresh variable per
+/// operand of an obligation of the trait and the variables it settles for the trait's
+/// associated types (`src/ccl/design/type-inference.md`, "Trait functions").
+///
+/// The variables are written into the node's operand slots, so coalescing reads what each
+/// resolved to and chooses the instance there; the obligation's narrowing is what rejects an
+/// argument no instance accepts, here or at a use of a generalized definition.
+///
+/// The signature opens the function's own type parameters afresh at each call, and each
+/// requirement it states becomes an obligation at the call's types.
+fn emit_trait_fn(
+    trait_: Trait,
+    function: &str,
+    operands: &mut [Type],
+    node_id: NodeId,
+    ctx: &mut InferCtx,
+) -> Result<Type, LocatedInferError> {
+    let declared = trait_.function(function).cloned().unwrap_or_else(|| {
+        panic!("lowering names a function `{trait_}` declares, got `{trait_}::{function}`")
+    });
+    for slot in operands.iter_mut() {
+        *slot = ctx.fresh();
+    }
+    let at = || format!("{trait_}::{function}");
+    let settled = ctx.require_trait_associating(
+        trait_.clone(),
+        node_id,
+        &operands.iter().collect::<Vec<_>>(),
+        &trait_.assocs(),
+        &at,
+    )?;
+    let Signature {
+        params,
+        inputs,
+        output,
+        requires,
+    } = &declared.signature;
+    let mut opened: HashMap<TypeParamId, Type> = HashMap::new();
+    for (param, operand) in trait_.operands.iter().zip(operands.iter()) {
+        opened.insert(param.id, operand.clone());
+    }
+    for ((_, param), assoc) in trait_.assocs.iter().zip(&settled) {
+        opened.insert(param.id, assoc.clone());
+    }
+    for param in params {
+        opened.insert(param.id, ctx.fresh());
+    }
+    for requirement in requires {
+        let requirement = requirement.map_types(|t| replace_params(t, &opened));
+        let at = || {
+            format!(
+                "the requirement {}(…) of `{trait_}::{function}`",
+                requirement.trait_
+            )
+        };
+        require_stated(&requirement, node_id, &at, ctx)?;
+    }
+    let mut ty = replace_params(&function_over(inputs, output.clone()), &opened);
+    ctx.type_annotation_predicates(&mut ty)?;
+    Ok(ctx.normalize_annotation(&ty))
+}
+
+/// Mint the obligation the requirement `r` states at the types it names, as an operator's
+/// is minted, and give each associated type it names what the obligation settles
+/// (`src/ccl/design/type-parameters.md`, "Instantiation").
+fn require_stated(
+    r: &TraitRequirement,
+    node_id: NodeId,
+    at: &dyn Fn() -> String,
+    ctx: &mut InferCtx,
+) -> Result<(), LocatedInferError> {
+    let names: Vec<Assoc> = r.assoc.iter().map(|(n, _)| n.clone()).collect();
+    let require = |ctx: &mut InferCtx| {
+        ctx.require_trait_associating(
+            r.trait_.clone(),
+            node_id,
+            &r.args.iter().collect::<Vec<_>>(),
+            &names,
+            at,
+        )
+    };
+    let settled = ctx.with_demand_at(r.at.map(Origin::Written), require)?;
+    for (settled, (_, named)) in settled.iter().zip(&r.assoc) {
+        ctx.require_sub(settled, named, at)?;
+    }
+    Ok(())
+}
+
 /// Replace the `Method` placeholder `function` with the candidate its receiver's type names
 /// (`src/ccl/design/nominal-types.md`, "Method calls").
 ///
 /// The receiver is the argument, or the first component of the argument's tuple type. Its type is
 /// what the program has stated before the call: the type itself, or the bounds its
 /// variable has gathered so far. A later use does not decide it.
+///
+/// A nominal receiver resolves among its type's own methods and the trait methods its type has
+/// an instance for, which share one namespace. Any other receiver resolves among trait methods
+/// alone: a type's own method needs the type before the call, and a trait method does not,
+/// since its obligation chooses the instance once the receiver's type is known. A receiver
+/// nothing determines yet resolves to the one trait method of the name, where there is one.
 fn resolve_method<C: Typing>(
     function: &mut Expr,
     arg_ty: &Type,
@@ -2824,31 +2919,131 @@ fn resolve_method<C: Typing>(
         method: name.clone(),
         receiver,
     };
+    let is_trait = |c: &MethodCandidate| matches!(c.owner, MethodOwner::Trait(_));
     let head = receiver_ty.map_or(Head::Unknown, |ty| nominal_head(&read_through(&ty)));
-    let decl = match head {
-        Head::Nominal(decl) => decl,
-        Head::Unknown => return Err(ctx.raise(unresolved(None))),
-        Head::Other(ty) => return Err(ctx.raise(unresolved(Some(ty)))),
+    let fitting: Vec<usize> = match &head {
         Head::Two(a, b) => {
             return Err(ctx.raise(InferError::AmbiguousReceiver {
                 method: name.clone(),
                 types: (a.name.to_string(), b.name.to_string()),
             }));
         }
+        Head::Nominal(decl) => {
+            let receiver = decl.applied_to_params();
+            candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| match &c.owner {
+                    MethodOwner::Type(d) => d == decl,
+                    MethodOwner::Trait(t) => has_instance_for_receiver(t, name, &receiver, ctx),
+                })
+                .map(|(i, _)| i)
+                .collect()
+        }
+        // A type parameter has the methods of the traits a `requires` clause states of it.
+        // Where none states one with the method, the one trait declaring it is the candidate,
+        // and its obligation reports the missing requirement.
+        Head::Other(Type::Param(param)) => {
+            let receiver = Type::Param(std::rc::Rc::clone(param));
+            let stated: Vec<usize> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| match &c.owner {
+                    MethodOwner::Trait(t) => {
+                        stated_of(t, name, &receiver, ctx.assumptions_in_scope())
+                    }
+                    MethodOwner::Type(_) => false,
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if stated.is_empty() {
+                candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| is_trait(c))
+                    .map(|(i, _)| i)
+                    .collect()
+            } else {
+                stated
+            }
+        }
+        Head::Unknown => candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| is_trait(c))
+            .map(|(i, _)| i)
+            .collect(),
+        Head::Other(ty) => candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| match &c.owner {
+                MethodOwner::Trait(t) => has_instance_for_receiver(t, name, ty, ctx),
+                MethodOwner::Type(_) => false,
+            })
+            .map(|(i, _)| i)
+            .collect(),
     };
-    let Some(at) = candidates.iter().position(|c| c.decl == decl) else {
-        return Err(ctx.raise(unresolved(Some(decl.applied_to_params()))));
+    let at = match fitting.as_slice() {
+        [one] => *one,
+        several => {
+            debug_assert!(
+                several.is_empty() || matches!(head, Head::Unknown | Head::Other(Type::Param(_))),
+                "a determined receiver's methods share one namespace, so at most one fits"
+            );
+            let receiver = match head {
+                Head::Nominal(decl) => Some(decl.applied_to_params()),
+                Head::Other(ty) => Some(ty),
+                Head::Unknown | Head::Two(..) => None,
+            };
+            return Err(ctx.raise(unresolved(receiver)));
+        }
     };
     let chosen = candidates.swap_remove(at);
     if chosen.params != *args {
+        let owner = match &chosen.owner {
+            MethodOwner::Type(decl) => decl.name.to_string(),
+            MethodOwner::Trait(t) => t.to_string(),
+        };
         return Err(ctx.raise(InferError::MethodArity {
-            method: format!("{}::{name}", decl.name),
+            method: format!("{owner}::{name}"),
             params: chosen.params,
             args: *args,
         }));
     }
     *function = chosen.function;
     Ok(())
+}
+
+/// Whether a requirement in `assumptions` states `trait_` of `receiver` at the operand its
+/// method `method` takes `self` at.
+fn stated_of(
+    trait_: &Trait,
+    method: &str,
+    receiver: &Type,
+    assumptions: &[std::rc::Rc<TraitRequirement>],
+) -> bool {
+    let Some(pos) = trait_.function(method).and_then(|f| f.receiver) else {
+        return false;
+    };
+    assumptions
+        .iter()
+        .any(|a| a.trait_ == *trait_ && a.args.get(pos as usize) == Some(receiver))
+}
+
+/// Whether `trait_` has an instance accepting `receiver` at the operand its method `method`
+/// takes `self` at.
+fn has_instance_for_receiver<C: Typing>(
+    trait_: &Trait,
+    method: &str,
+    receiver: &Type,
+    ctx: &C,
+) -> bool {
+    let Some(pos) = trait_.function(method).and_then(|f| f.receiver) else {
+        return false;
+    };
+    ctx.instances_of(trait_)
+        .iter()
+        .any(|i| i.accepts(pos, receiver))
 }
 
 /// Visit each bound `var` has gathered so far, following variable-to-variable bounds, with
@@ -3195,7 +3390,7 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(SmolStr, Type)> {
 /// any extra `__to_<defer>` fields ride the `` `commit `` payload as width-subtyped taps.
 fn emit_transact_writer<C: Typing>(
     writer: &mut WriterSite,
-    key_types: &std::collections::HashMap<Name, Type>,
+    key_types: &HashMap<Name, Type>,
     parameter: Option<&Type>,
     ctx: &mut C,
 ) -> Result<(), LocatedInferError> {
@@ -3379,7 +3574,7 @@ mod review_tests {
 
         // Our stack seeds the blame cursor at construction; this unit test has no
         // enclosing tree, so the predicate term itself is the root to blame.
-        let mut ctx = InferCtx::new(std::collections::HashMap::new(), shared.node_id());
+        let mut ctx = InferCtx::new(HashMap::new(), shared.node_id());
         let d1 = ctx.fresh();
         let d2 = ctx.fresh();
         emit_bare_predicate(&mut r1, &d1, &mut ctx).expect("first occurrence types");

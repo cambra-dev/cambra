@@ -278,6 +278,7 @@ where
         // binder at all.
         N::Lit(_)
         | N::Builtin(_)
+        | N::TraitFn { .. }
         | N::Proj(_)
         | N::Source(_)
         | N::LoadFrom(_)
@@ -560,6 +561,7 @@ where
         // above.
         N::Lit(_)
         | N::Builtin(_)
+        | N::TraitFn { .. }
         | N::Proj(_)
         | N::Source(_)
         | N::LoadFrom(_)
@@ -661,15 +663,22 @@ mod tests {
                 "c",
                 var("pl"),
             ),
+            node(N::TraitFn {
+                trait_: crate::ccl::infer::solver::traits::Trait::addable(),
+                function: "add".into(),
+                operands: vec![Type::Hole],
+            }),
             node(N::Method {
                 name: "m".into(),
                 args: 0,
                 candidates: vec![crate::ccl::MethodCandidate {
-                    decl: crate::ccl::nominal::NominalDecl::declared(
-                        "N".into(),
-                        Vec::new(),
-                        chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
-                        false,
+                    owner: crate::ccl::MethodOwner::Type(
+                        crate::ccl::nominal::NominalDecl::declared(
+                            "N".into(),
+                            Vec::new(),
+                            chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
+                            false,
+                        ),
                     ),
                     params: 0,
                     function: var("N::m"),
@@ -811,6 +820,7 @@ mod tests {
         N::VariantCtor { .. } => "VariantCtor",
         N::NominalCtor { .. } => "NominalCtor",
         N::Method { .. } => "Method",
+        N::TraitFn { .. } => "TraitFn",
         N::Transact { .. } => "Transact",
         N::LetRec { .. } => "LetRec",
         N::DefGroup { .. } => "DefGroup",

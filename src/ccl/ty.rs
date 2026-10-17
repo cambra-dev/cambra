@@ -1511,29 +1511,46 @@ impl TraitRequirement {
         TraitRequirement {
             trait_: self.trait_.clone(),
             args: self.args.iter().map(&mut f).collect(),
-            assoc: self.assoc.iter().map(|(n, t)| (*n, f(t))).collect(),
+            assoc: self.assoc.iter().map(|(n, t)| (n.clone(), f(t))).collect(),
             at: self.at,
         }
     }
 
     /// The type this requirement associates with `name`, if it names one.
-    pub fn assoc_ty(&self, name: crate::ccl::infer::solver::traits::Assoc) -> Option<&Type> {
-        self.assoc.iter().find(|(n, _)| *n == name).map(|(_, t)| t)
+    pub fn assoc_ty(&self, name: &crate::ccl::infer::solver::traits::Assoc) -> Option<&Type> {
+        self.assoc.iter().find(|(n, _)| n == name).map(|(_, t)| t)
     }
 
-    /// Whether an operand is one of the type parameters `params`.
+    /// Whether an operand names one of the type parameters `params`, at its root or inside a
+    /// nominal type, as `Describe(Two(T))` names `T`.
     pub fn mentions_any(&self, params: &[TypeParamId]) -> bool {
         self.args
             .iter()
-            .any(|t| matches!(t, Type::Param(p) if params.contains(&p.id)))
+            .any(|t| params_at_or_below(t).any(|p| params.contains(&p)))
     }
 
-    /// Whether an operand is a type parameter other than `params`.
+    /// Whether an operand names a type parameter other than `params`, at its root or inside a
+    /// nominal type.
     pub fn mentions_other_than(&self, params: &[TypeParamId]) -> bool {
         self.args
             .iter()
-            .any(|t| matches!(t, Type::Param(p) if !params.contains(&p.id)))
+            .any(|t| params_at_or_below(t).any(|p| !params.contains(&p)))
     }
+}
+
+/// The type parameters `ty` is, or a nominal type in it is applied to, through any depth of
+/// nominal types.
+fn params_at_or_below(ty: &Type) -> impl Iterator<Item = TypeParamId> {
+    fn go(ty: &Type, out: &mut Vec<TypeParamId>) {
+        match ty {
+            Type::Param(p) => out.push(p.id),
+            Type::Nominal(_, args) => args.iter().for_each(|a| go(a, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    go(ty, &mut out);
+    out.into_iter()
 }
 
 impl PolyType {
@@ -4212,6 +4229,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::VariantCtor { .. }
         | N::NominalCtor { .. }
         | N::Method { .. }
+        | N::TraitFn { .. }
         | N::For { .. }
         | N::MutDecl { .. }
         | N::MutWrite { .. }
@@ -4256,6 +4274,18 @@ fn eq_term_modulo_ty_slots_go(
         (N::Lit(x), N::Lit(y)) => x == y,
         (N::Var(x), N::Var(y)) => paired_refs_match(pairs, x, y),
         (N::Builtin(x), N::Builtin(y)) => x == y,
+        (
+            N::TraitFn {
+                trait_: t1,
+                function: f1,
+                ..
+            },
+            N::TraitFn {
+                trait_: t2,
+                function: f2,
+                ..
+            },
+        ) => t1 == t2 && f1 == f2,
         (N::Proj(x), N::Proj(y)) => x == y,
         (N::Source(x), N::Source(y)) => x == y,
         // A `LoadFrom` name is not a reference to a binder the compared term introduces:
@@ -4483,7 +4513,7 @@ fn eq_term_modulo_ty_slots_go(
                 && a1 == a2
                 && c1.len() == c2.len()
                 && c1.iter().zip(c2).all(|(x, y)| {
-                    x.decl == y.decl
+                    x.owner == y.owner
                         && x.params == y.params
                         && eq_term_modulo_ty_slots_go(&x.function, &y.function, pairs)
                 })
@@ -4604,6 +4634,12 @@ fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
         TypedExprNode::Method { name, args, .. } => {
             name.hash(state);
             args.hash(state);
+        }
+        TypedExprNode::TraitFn {
+            trait_, function, ..
+        } => {
+            trait_.hash(state);
+            function.hash(state);
         }
         TypedExprNode::Proj(ProjKey::Index(i)) => i.hash(state),
         TypedExprNode::Proj(ProjKey::Field(f)) => f.hash(state),

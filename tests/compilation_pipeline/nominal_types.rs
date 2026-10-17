@@ -1504,7 +1504,8 @@ fn method_errors_name_what_is_wrong() {
 
                 f(Price::new(1))
             "#},
-            "`T` is not a nominal type, so it has no methods",
+            "`T` has no method `cents`: a type parameter has the methods of the traits a \
+             `requires` clause states of it",
         ),
         (
             indoc! {r#"
@@ -1574,7 +1575,7 @@ fn method_errors_name_what_is_wrong() {
                 r = (cents=1)
                 r.cents()
             "#},
-            "is not a nominal type, so it has no methods",
+            "the function a field holds is called as `(r.cents)(…)`",
         ),
         (
             indoc! {r#"
@@ -1594,7 +1595,7 @@ fn method_errors_name_what_is_wrong() {
 
                 Price::new(1).cents()
             "#},
-            "no type this module declares has a method `cents`",
+            "no type this module declares and no trait has a method `cents`",
         ),
         (
             indoc! {r#"
@@ -1811,8 +1812,8 @@ fn method_errors_name_what_is_wrong() {
                 r = (f=\x -> x + 1)
                 r.f(1)
             "#},
-            "no type this module declares has a method `f`; the function a field holds is \
-             called as `(r.f)(…)`",
+            "no type this module declares and no trait has a method `f`; the function a field \
+             holds is called as `(r.f)(…)`",
         ),
     ] {
         check_compile_error(src, needle);

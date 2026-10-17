@@ -108,6 +108,7 @@ mod sinks;
 mod stmts;
 #[cfg(any(test, feature = "test-helpers"))]
 mod test_sink;
+mod traits;
 mod transactions;
 
 /// The names a type alias may not rebind, re-exported so the test that pins the
@@ -437,6 +438,29 @@ pub struct LoweringContext {
     /// The associated functions the module declares, recorded before anything lowers so a
     /// method call anywhere names every type declaring its method.
     pub(super) associated_functions: Vec<nominal::AssociatedFunction>,
+
+    /// The traits the module declares (`docs/chl-spec.md`, "Declaring a trait"), declared
+    /// before anything lowers so a call anywhere names them. Declared only at the top level,
+    /// so never snapshotted.
+    pub(super) traits: Vec<crate::ccl::infer::solver::traits::Trait>,
+
+    /// The instances the module declares, of its traits and of the compiler's, which
+    /// inference reads every obligation's candidates from ([`take_instances`]).
+    ///
+    /// [`take_instances`]: Self::take_instances
+    pub(super) instances: crate::ccl::infer::solver::traits::InstanceTable,
+
+    /// What each instance's `impl` block needs to lower its `def`s where it stands.
+    pub(super) instance_blocks: Vec<traits::InstanceBlock>,
+
+    /// The methods each instance gives a type: the type's head, the method, the trait and the
+    /// instance's head, for the namespace a type's methods share.
+    pub(super) instance_methods: Vec<(
+        crate::ccl::infer::solver::traits::InstanceHead,
+        SmolStr,
+        crate::ccl::infer::solver::traits::Trait,
+        Span,
+    )>,
 
     /// The members of compiler-provided declarations the module names, by binding name.
     /// `nominal::bind_constructors` binds only these, so a module that names no member of
@@ -1025,7 +1049,10 @@ fn lower_expr_inner(
             }
             Ok(Expr::var(name.to_string()))
         }
-        ChlExpr::Qualified(q) => nominal::lower_member(q, expr.span, ctx),
+        ChlExpr::Qualified(q) => match traits::qualifying_trait(q, ctx) {
+            Some(trait_) => traits::lower_trait_member(trait_, q, expr.span, ctx),
+            None => nominal::lower_member(q, expr.span, ctx),
+        },
         ChlExpr::MethodCall {
             receiver,
             method,

@@ -64,34 +64,36 @@
 //! operator's requirement on its own, why the two deposit polarities are not the same
 //! move, why the requirement sweep sits between emission and coalesce and runs to a
 //! fixpoint, why refinement transparency is permanent rather than a convenience, what
-//! the tables hold and what that does *not* say about resolution, and what a trait
-//! would relate beyond types — associated *functions*, which the shape here allows and
-//! does not yet have. Which operators state which requirement, and which take a fixed
-//! result rather than an associated one, is `schemes.rs`'s business, not this module's.
+//! the tables hold and what that does *not* say about resolution, how an obligation
+//! selects a declared instance, and how a trait's function is typed and dispatched ("Trait
+//! functions"). Which operators state which requirement, and which take a fixed result
+//! rather than an associated one, is `schemes.rs`'s business, not this module's.
 
 use crate::ccl::ty::TraitRequirement;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use chl_parser::ast::Span;
 use smol_str::SmolStr;
 
-use crate::ccl::ty::TypeParam;
-
+use crate::ccl::nominal::NominalDecl;
+use crate::ccl::ty::{TypeParam, TypeParamId};
 use crate::ccl::{
-    BaseType, FieldKey, InferVar, InferVarId, Refinement, RefinementSet, RefinementTemplate, Type,
-    TypedExpr, provenance,
+    BaseType, FieldKey, InferVar, InferVarId, Name, Refinement, RefinementSet, Type, TypedExpr,
+    provenance,
 };
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
 
 /// A trait: a named requirement on types, together with any types it associates
-/// with them.
+/// with them and the functions it declares.
 ///
 /// Every trait is a declaration ([`TraitDecl`]): the compiler builds its own here, as
-/// [`crate::ccl::nominal::option`] builds `Option` ([`Trait::addable`] and the rest), so a
-/// user-declared trait is more data rather than a new mechanism.
+/// [`crate::ccl::nominal::option`] builds `Option` ([`Trait::addable`] and the rest), and
+/// lowering builds a module's. A program's instances of either are its [`InstanceTable`]'s.
 ///
 /// Equality, ordering and hashing are the declaration's, by the module that declares it and
 /// its name. `Ord` so a diagnostic can order the requirements it lists; resolution does not
@@ -107,53 +109,59 @@ pub struct Trait(Rc<TraitDecl>);
 /// number, **including none**: a bare requirement (`Orderable(γ, γ)` on an aggregate's
 /// codomain) associates nothing, and saying so is better than manufacturing an
 /// output no one reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Assoc {
     /// The type an operator's result takes.
     Output,
+    /// An associated type a declared trait names, `Elem` in `type Elem`.
+    Declared(SmolStr),
 }
 
 impl Assoc {
-    /// The associated type a `requires` clause names by `name`, as in `Output=O`.
-    pub fn from_surface_name(name: &str) -> Option<Assoc> {
-        match name {
-            "Output" => Some(Assoc::Output),
-            _ => None,
+    /// The name a program writes the associated type by.
+    pub fn name(&self) -> &str {
+        match self {
+            Assoc::Output => "Output",
+            Assoc::Declared(name) => name,
         }
     }
 }
 
 impl fmt::Display for Assoc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Assoc::Output => f.write_str("Output"),
-        }
+        f.write_str(self.name())
     }
 }
 
-/// A trait's declaration: its operands, its associated types and its instances
-/// (`docs/chl-spec.md`, "Trait requirements").
+/// A trait's declaration: its operands, its associated types, its functions, and, for one
+/// the compiler provides, its instances (`docs/chl-spec.md`, "Trait requirements" and
+/// "Declaring a trait").
 ///
 /// Identified by the path of the module that declares it and its name, as a
-/// [`NominalDecl`](crate::ccl::nominal::NominalDecl) is: equality, ordering and hashing are by
-/// that pair.
+/// [`NominalDecl`] is: equality, ordering and hashing are by that pair.
 pub struct TraitDecl {
-    /// The path of the module that declares it: `std` for the compiler's.
+    /// The path of the module that declares it: empty for the program's root module, and
+    /// `std` for the compiler's.
     pub module: Vec<SmolStr>,
     pub name: SmolStr,
-    /// The operand types, declared ([`TypeParam::declared`]).
+    /// The declaration's name, for diagnostics naming it; empty for the compiler's.
+    pub span: Span,
+    /// The operand types, declared ([`TypeParam::declared`]); a signature names them.
     pub operands: Vec<Rc<TypeParam>>,
-    /// The associated types, each with the parameter that stands for it.
+    /// The associated types, each with the parameter a signature names it by.
     pub assocs: Vec<(Assoc, Rc<TypeParam>)>,
+    /// In declaration order.
+    pub functions: Vec<TraitFunction>,
     /// Whether a **product** satisfies the trait when its components do.
     ///
     /// The one that does is `Equatable`: equality is defined componentwise on any product,
     /// which is what makes the decomposition a reading of the trait rather than a new
     /// relation. Ordering is not: comparing two products needs an order on their
     /// components, and a record's fields carry none. Arithmetic has no product reading at
-    /// all.
+    /// all, and neither has a module's trait.
     pub structural: bool,
-    /// The instances the compiler provides, which every program has.
+    /// The instances the compiler provides, which every program has; none for a module's
+    /// trait.
     pub compiler_instances: Vec<Rc<TraitInstance>>,
 }
 
@@ -285,26 +293,39 @@ fn operator_decl(
     let compiler_instances = rows
         .into_iter()
         .map(|(bases, output)| {
+            let operands: Vec<Type> = bases.into_iter().map(Type::Base).collect();
             Rc::new(TraitInstance {
-                operands: bases.into_iter().map(Type::Base).collect(),
+                params: Vec::new(),
+                heads: operands.iter().map(InstanceHead::of_pattern).collect(),
+                operands,
                 assoc: output
                     .into_iter()
                     .map(|b| (Assoc::Output, Type::Base(b)))
                     .collect(),
+                requires: Vec::new(),
+                functions: Vec::new(),
+                declared: None,
             })
         })
         .collect();
     TraitDecl {
         module: vec![SmolStr::new_static(COMPILER_MODULE)],
         name: name.into(),
+        span: Span::new(chl_parser::FileId::ROOT, 0, 0),
         operands,
         assocs,
+        functions: Vec::new(),
         structural,
         compiler_instances,
     }
 }
 
 impl Trait {
+    /// A trait a module declares.
+    pub fn declared(decl: TraitDecl) -> Trait {
+        Trait(Rc::new(decl))
+    }
+
     fn compiler(decl: TraitDecl) -> Trait {
         Trait(Rc::new(decl))
     }
@@ -372,6 +393,21 @@ impl Trait {
             .find(|t| t.name == name && *t != Trait::addable_refined())
     }
 
+    /// Whether the compiler provides this trait.
+    pub fn is_compiler(&self) -> bool {
+        self.module.len() == 1 && self.module[0] == COMPILER_MODULE
+    }
+
+    /// The functions this trait declares, in declaration order.
+    pub fn functions(&self) -> &[TraitFunction] {
+        &self.0.functions
+    }
+
+    /// The function this trait declares by `name`.
+    pub fn function(&self, name: &str) -> Option<&TraitFunction> {
+        self.functions().iter().find(|f| f.name == name)
+    }
+
     /// How many types this trait is over.
     pub fn arity(&self) -> usize {
         self.operands.len()
@@ -379,7 +415,12 @@ impl Trait {
 
     /// The types this trait associates, by name. Empty for a pure requirement.
     pub fn assocs(&self) -> Vec<Assoc> {
-        self.assocs.iter().map(|(a, _)| *a).collect()
+        self.assocs.iter().map(|(a, _)| a.clone()).collect()
+    }
+
+    /// The associated type this trait names `name`.
+    pub fn assoc_named(&self, name: &str) -> Option<Assoc> {
+        self.assocs().into_iter().find(|a| a.name() == name)
     }
 
     /// Whether a product satisfies this trait when its components do
@@ -413,37 +454,352 @@ impl fmt::Display for Trait {
     }
 }
 
-/// One instance of a trait: the types it accepts, and what it associates with them.
-///
-/// The compiler's instances are data like any other: each names base types.
-#[derive(Debug)]
-pub struct TraitInstance {
-    /// The operand types the instance accepts, positionally.
-    pub operands: Vec<Type>,
-    /// The types this instance associates, by name. Empty for a trait that is a pure
-    /// requirement.
-    pub assoc: Vec<(Assoc, Type)>,
+/// What an instance accepts at one operand position: the **head** of the types it matches,
+/// with refinements peeled.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum InstanceHead {
+    /// One base type.
+    Base(BaseType),
+    /// A nominal type, at any arguments: what an instance's pattern states below it is read
+    /// at argument positions ([`TraitObligation::expand`]).
+    Nominal(Rc<NominalDecl>),
 }
 
-impl TraitInstance {
-    /// The base this instance accepts at operand position `pos`.
-    pub fn base_at(&self, pos: usize) -> Option<&BaseType> {
-        match self.operands.get(pos)? {
-            Type::Base(b) => Some(b),
-            _ => None,
+impl InstanceHead {
+    /// The head of an instance's pattern at an operand: a base type or a nominal type.
+    pub fn of_pattern(pattern: &Type) -> InstanceHead {
+        match pattern {
+            Type::Base(b) => InstanceHead::Base(b.clone()),
+            Type::Nominal(decl, _) => InstanceHead::Nominal(Rc::clone(decl)),
+            other => unreachable!("an instance's operand is a base or a nominal type, got {other}"),
         }
     }
 
-    /// The bases this instance accepts, positionally.
-    pub fn bases(&self) -> Vec<&BaseType> {
-        (0..self.operands.len())
-            .filter_map(|p| self.base_at(p))
-            .collect()
+    /// The base this head is, if it is one.
+    pub fn base(&self) -> Option<&BaseType> {
+        match self {
+            InstanceHead::Base(b) => Some(b),
+            InstanceHead::Nominal(_) => None,
+        }
     }
 
-    /// The type this instance associates with `name`, if any.
-    pub fn assoc_ty(&self, name: Assoc) -> Option<&Type> {
-        self.assoc.iter().find(|(n, _)| *n == name).map(|(_, t)| t)
+    /// The head as a type, for a diagnostic listing what a position accepts: a nominal type
+    /// is applied to `_`s.
+    pub fn as_type(&self) -> Type {
+        match self {
+            InstanceHead::Base(b) => Type::Base(b.clone()),
+            InstanceHead::Nominal(decl) => Type::Nominal(
+                Rc::clone(decl),
+                decl.params.iter().map(|_| Type::Hole).collect(),
+            ),
+        }
+    }
+}
+
+impl fmt::Display for InstanceHead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_type())
+    }
+}
+
+/// One instance of a trait: the types it accepts, what it associates with them, what it
+/// requires of them, and the function it supplies for each of its trait's functions
+/// (`docs/chl-spec.md`, "Declaring an instance").
+///
+/// The compiler's and a module's are the same data. A compiler instance's head names
+/// base types and nothing else; a module's, `impl Container(Bag(T), Elem=T) requires …:`,
+/// is built by lowering.
+#[derive(Debug)]
+pub struct TraitInstance {
+    /// The head's type variables, `T` in `Bag(T)`, declared ([`TypeParam::declared`]).
+    pub params: Vec<Rc<TypeParam>>,
+    /// The operand types the head names, over `params`: each a **pattern**, built from base
+    /// types and nominal types applied to patterns or to the variables.
+    pub operands: Vec<Type>,
+    /// Each operand's head, positionally ([`InstanceHead::of_pattern`]).
+    pub heads: Vec<InstanceHead>,
+    /// The associated types the head fixes, over `params`.
+    pub assoc: Vec<(Assoc, Type)>,
+    /// What the instance requires of its type variables, over `params`: it answers only
+    /// where these hold.
+    pub requires: Vec<Rc<TraitRequirement>>,
+    /// The binding each of its functions is lowered to, by the trait function's name.
+    pub functions: Vec<(SmolStr, Name)>,
+    /// Where a module declares it; `None` for the compiler's.
+    pub declared: Option<DeclaredAt>,
+}
+
+/// Where a module declares an instance, for diagnostics.
+#[derive(Debug)]
+pub struct DeclaredAt {
+    /// The instance's head as its `impl` writes it, `Area(Circle)`.
+    pub head: String,
+    /// The instance's head.
+    pub span: Span,
+}
+
+impl TraitInstance {
+    /// The accepted heads, positionally.
+    pub fn heads(&self) -> &[InstanceHead] {
+        &self.heads
+    }
+
+    /// The type this instance associates with `name`, if any, over its type variables.
+    pub fn assoc_ty(&self, name: &Assoc) -> Option<Type> {
+        self.assoc
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| t.clone())
+    }
+
+    /// Whether the types this instance states depend on its head's type variables, so that
+    /// what it associates is known only at the types an obligation's operands have.
+    fn has_type_variables(&self) -> bool {
+        !self.params.is_empty()
+    }
+
+    /// Whether this instance accepts `ty` at operand position `pos`, judged on `ty`'s head
+    /// as [`offered`] reads it.
+    pub fn accepts(&self, pos: u8, ty: &Type) -> bool {
+        let Some(head) = self.heads.get(pos as usize) else {
+            return false;
+        };
+        offered_head(ty).as_ref() == Some(head)
+    }
+
+    /// Whether this instance accepts `operands`, the types at every operand position: each
+    /// matches the head's pattern there, with each type variable standing for one type
+    /// throughout.
+    pub fn matches(&self, operands: &[Type]) -> bool {
+        let mut bound = HashMap::new();
+        self.operands.len() == operands.len()
+            && self
+                .operands
+                .iter()
+                .zip(operands)
+                .all(|(pattern, ty)| match_pattern(pattern, ty, &mut bound))
+    }
+
+    /// What this instance's head states at `path`: an operand position, then the argument
+    /// indices into the nominal types along the way.
+    fn pattern_at(&self, path: &[u8]) -> PatternAt {
+        let Some((first, rest)) = path.split_first() else {
+            return PatternAt::Absent;
+        };
+        let Some(mut at) = self.operands.get(*first as usize) else {
+            return PatternAt::Absent;
+        };
+        for i in rest {
+            match at {
+                Type::Nominal(_, args) => match args.get(*i as usize) {
+                    Some(arg) => at = arg,
+                    None => return PatternAt::Absent,
+                },
+                Type::Param(_) => return PatternAt::Any,
+                _ => return PatternAt::Absent,
+            }
+        }
+        match at {
+            Type::Param(_) => PatternAt::Any,
+            Type::Base(b) => PatternAt::Head(InstanceHead::Base(b.clone())),
+            Type::Nominal(decl, _) => PatternAt::Head(InstanceHead::Nominal(Rc::clone(decl))),
+            _ => PatternAt::Absent,
+        }
+    }
+
+    /// Whether this instance's head admits `head` at `path`: it states that head there, or
+    /// a type variable at or above it.
+    fn admits_at(&self, path: &[u8], head: &InstanceHead) -> bool {
+        match self.pattern_at(path) {
+            PatternAt::Head(h) => h == *head,
+            PatternAt::Any => true,
+            PatternAt::Absent => false,
+        }
+    }
+
+    /// The type this instance accepts at operand position `pos`, for a diagnostic: the
+    /// head's pattern with each variable `_`.
+    pub fn accepted_type(&self, pos: u8) -> Option<Type> {
+        self.operands.get(pos as usize).map(|t| {
+            let holes: HashMap<TypeParamId, Type> =
+                self.params.iter().map(|p| (p.id, Type::Hole)).collect();
+            replace_params(t, &holes)
+        })
+    }
+
+    /// The binding the function `name` of this instance is lowered to.
+    pub fn implementation(&self, name: &str) -> Option<&Name> {
+        self.functions
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, binding)| binding)
+    }
+}
+
+/// What an instance's head states at one place inside an operand.
+enum PatternAt {
+    /// A base or a nominal type, which a contribution's head must be.
+    Head(InstanceHead),
+    /// A type variable, at or above the place, which admits anything.
+    Any,
+    /// Nothing: the head has no such place.
+    Absent,
+}
+
+/// Whether `ty` matches `pattern`, binding each of the pattern's type variables in `bound`
+/// to the type it stands for, refinements peeled.
+fn match_pattern(pattern: &Type, ty: &Type, bound: &mut HashMap<TypeParamId, Type>) -> bool {
+    let ty = ty.peel_refinements();
+    match pattern {
+        Type::Param(p) => {
+            let stated = crate::ccl::ccl_utils::strip_refinements(ty);
+            match bound.get(&p.id) {
+                Some(b) => *b == stated,
+                None => {
+                    bound.insert(p.id, stated);
+                    true
+                }
+            }
+        }
+        Type::Base(b) => matches!(ty, Type::Base(c) if c == b),
+        Type::Nominal(decl, pargs) => match ty {
+            Type::Nominal(other, args) if other == decl && args.len() == pargs.len() => pargs
+                .iter()
+                .zip(args)
+                .all(|(p, a)| match_pattern(p, a, bound)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether two lists of types unify, reading every type parameter in either as a variable:
+/// whether some types are an instance of both. Two instance heads overlap exactly when they
+/// unify, and a requirement can be satisfied by an instance exactly when they do.
+pub fn unify_all(a: &[Type], b: &[Type]) -> bool {
+    fn walk<'t>(ty: &'t Type, subst: &'t HashMap<TypeParamId, Type>) -> &'t Type {
+        let mut ty = ty.peel_refinements();
+        while let Type::Param(p) = ty {
+            match subst.get(&p.id) {
+                Some(next) => ty = next.peel_refinements(),
+                None => break,
+            }
+        }
+        ty
+    }
+    fn occurs(id: TypeParamId, ty: &Type, subst: &HashMap<TypeParamId, Type>) -> bool {
+        let ty = walk(ty, subst);
+        if let Type::Param(p) = ty {
+            return p.id == id;
+        }
+        let mut found = false;
+        ty.walk_children(|c| found |= occurs(id, c, subst));
+        found
+    }
+    fn unify(a: &Type, b: &Type, subst: &mut HashMap<TypeParamId, Type>) -> bool {
+        let (a, b) = (walk(a, subst).clone(), walk(b, subst).clone());
+        match (&a, &b) {
+            (Type::Param(p), Type::Param(q)) if p.id == q.id => true,
+            (Type::Param(p), other) | (other, Type::Param(p)) => {
+                if occurs(p.id, other, subst) {
+                    return false;
+                }
+                subst.insert(p.id, other.clone());
+                true
+            }
+            (Type::Nominal(d, xs), Type::Nominal(e, ys)) => {
+                d == e && xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| unify(x, y, subst))
+            }
+            _ => a == b,
+        }
+    }
+    let mut subst = HashMap::new();
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| unify(x, y, &mut subst))
+}
+
+/// A function a trait declares: what a call of it is typed by, before any instance is
+/// chosen (`src/ccl/design/type-inference.md`, "Trait functions").
+#[derive(Debug, Clone)]
+pub struct TraitFunction {
+    pub name: SmolStr,
+    /// The operand position `self` stands at, for a method; `None` for a function without
+    /// `self`, which is reached only through its trait's name.
+    pub receiver: Option<u8>,
+    /// The value parameters other than `self`.
+    pub params_after_self: usize,
+    /// The function's type.
+    pub signature: Signature,
+}
+
+/// A trait function's type, before any instance is chosen: a function type over the trait's
+/// operands and associated types and the function's own type parameters, which each call
+/// opens afresh.
+#[derive(Debug, Clone)]
+pub struct Signature {
+    /// The function's own type parameters, `R` in `def fold(R, self: C, …)`.
+    pub params: Vec<Rc<TypeParam>>,
+    /// Each value parameter's type, `self`'s first.
+    pub inputs: Vec<Type>,
+    pub output: Type,
+    /// What the function requires, checked at each call's types.
+    pub requires: Vec<Rc<TraitRequirement>>,
+}
+
+/// A program's instances: the compiler's, which its traits hold, and the instances its
+/// modules declare, of the compiler's traits and of their own
+/// (`src/ccl/design/type-inference.md`, "Trait functions").
+///
+/// Lowering builds it, and inference reads it wherever an obligation is minted.
+#[derive(Debug, Default)]
+pub struct InstanceTable {
+    declared: Vec<(Trait, Rc<TraitInstance>)>,
+}
+
+thread_local! {
+    static NO_DECLARED_INSTANCES: Rc<InstanceTable> = Rc::new(InstanceTable::default());
+}
+
+/// The type of a function over `inputs`, as a `def` over them lowers: over the one input,
+/// or over the tuple of several.
+pub fn function_over(inputs: &[Type], output: Type) -> Type {
+    let domain = match inputs {
+        [one] => one.clone(),
+        several => Type::Tuple(several.to_vec()),
+    };
+    crate::ccl::infer::solver::fun(domain, output)
+}
+
+impl InstanceTable {
+    /// The table of a program that declares no instance.
+    pub fn builtin() -> Rc<InstanceTable> {
+        NO_DECLARED_INSTANCES.with(Rc::clone)
+    }
+
+    /// Add a declared instance of `trait_`.
+    pub fn add(&mut self, trait_: Trait, instance: Rc<TraitInstance>) {
+        self.declared.push((trait_, instance));
+    }
+
+    /// The binding each function of a declared instance is lowered to.
+    pub fn declared_bindings(&self) -> impl Iterator<Item = &Name> {
+        self.declared
+            .iter()
+            .flat_map(|(_, i)| i.functions.iter().map(|(_, b)| b))
+    }
+
+    /// Every instance of `trait_`: the compiler's, then the program's in declaration order.
+    pub fn instances(&self, trait_: &Trait) -> Vec<Rc<TraitInstance>> {
+        trait_
+            .compiler_instances
+            .iter()
+            .cloned()
+            .chain(
+                self.declared
+                    .iter()
+                    .filter(|(t, _)| t == trait_)
+                    .map(|(_, i)| Rc::clone(i)),
+            )
+            .collect()
     }
 }
 
@@ -475,6 +831,9 @@ pub struct TraitObligation {
     pub uid: TraitObligationId,
     /// The trait being required.
     pub trait_: Trait,
+    /// The program's instances, which a reset copy and a condition this obligation mints
+    /// read their candidates from.
+    table: Rc<InstanceTable>,
     /// The instances still consistent with everything seen so far.
     /// Monotonically shrinking; empty is unrepresentable (it is the error).
     candidates: RefCell<Vec<Rc<TraitInstance>>>,
@@ -488,6 +847,20 @@ pub struct TraitObligation {
     /// obligation this one mints for a product's component starts from
     /// ([`narrow_product`](Self::narrow_product)).
     in_scope: RefCell<Rc<Vec<Rc<TraitRequirement>>>>,
+    /// Every assumption in scope at minting, of any trait: what a condition of the
+    /// instance this obligation selects is answered by ([`try_select`](Self::try_select)).
+    context: RefCell<Rc<Vec<Rc<TraitRequirement>>>>,
+    /// Whether a contribution has narrowed the candidates, so that the one left, if one
+    /// is, was chosen by an operand's type rather than by being the only instance.
+    narrowed: Cell<bool>,
+    /// Whether the instance left has stated its types and conditions
+    /// ([`try_select`](Self::try_select)).
+    selected: Cell<bool>,
+    /// The **argument positions** opened past the trait's operands, each the argument of a
+    /// nominal type standing at another position: the parent position, the argument's index
+    /// and the type's declaration. Position `arity + i` is the `i`th
+    /// ([`expand`](Self::expand)).
+    arg_slots: RefCell<Vec<(u8, u8, Rc<NominalDecl>)>>,
     /// The type standing at each operand position, indexed by position.
     ///
     /// Recorded by [`watch`](Self::watch), which is the one place a position is bound to a
@@ -557,7 +930,7 @@ pub struct OutputRefinement {
     /// The associated type it refines.
     pub assoc: Assoc,
     /// Builds the predicate from the operands.
-    pub template: RefinementTemplate,
+    pub template: crate::ccl::RefinementTemplate,
     /// The operator's operand expressions, in argument order.
     pub operands: Vec<TypedExpr>,
 }
@@ -577,8 +950,26 @@ struct AssocPosition {
 
 impl TraitObligation {
     /// Record an instance of `trait_` whose associated names stand at the given type
-    /// positions, with every instance still a candidate.
+    /// positions, with every instance the compiler provides still a candidate.
     pub fn new(
+        trait_: Trait,
+        assoc: Vec<(Assoc, Type)>,
+        operator_node_id: provenance::NodeId,
+        required_at: crate::ccl::infer_var::Origin,
+    ) -> Rc<TraitObligation> {
+        Self::new_in(
+            &InstanceTable::builtin(),
+            trait_,
+            assoc,
+            operator_node_id,
+            required_at,
+        )
+    }
+
+    /// Record an instance of `trait_` whose associated names stand at the given type
+    /// positions, with every instance `table` holds of it still a candidate.
+    pub fn new_in(
+        table: &Rc<InstanceTable>,
         trait_: Trait,
         assoc: Vec<(Assoc, Type)>,
         operator_node_id: provenance::NodeId,
@@ -586,9 +977,14 @@ impl TraitObligation {
     ) -> Rc<TraitObligation> {
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
-            candidates: RefCell::new(trait_.compiler_instances.clone()),
+            candidates: RefCell::new(table.instances(&trait_)),
+            table: Rc::clone(table),
             assumptions: RefCell::new(Vec::new()),
             in_scope: RefCell::new(Rc::new(Vec::new())),
+            context: RefCell::new(Rc::new(Vec::new())),
+            narrowed: Cell::new(false),
+            selected: Cell::new(false),
+            arg_slots: RefCell::new(Vec::new()),
             operands: RefCell::new(Vec::new()),
             product_rule: RefCell::new(if trait_.is_structural() {
                 ProductRule::Open
@@ -629,16 +1025,21 @@ impl TraitObligation {
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
             trait_: original.trait_.clone(),
+            table: Rc::clone(&original.table),
             candidates: RefCell::new(original.candidates()),
             assumptions: RefCell::new(original.assumptions.borrow().clone()),
             in_scope: RefCell::new(Rc::clone(&original.in_scope.borrow())),
+            context: RefCell::new(Rc::clone(&original.context.borrow())),
+            narrowed: Cell::new(original.narrowed.get()),
+            selected: Cell::new(original.selected.get()),
+            arg_slots: RefCell::new(original.arg_slots.borrow().clone()),
             operands: RefCell::new(Vec::new()),
             product_rule: RefCell::new(original.product_rule.borrow().clone()),
             assoc: original
                 .assoc
                 .iter()
                 .map(|p| AssocPosition {
-                    name: p.name,
+                    name: p.name.clone(),
                     ty: RefCell::new(p.ty.borrow().clone()),
                     deposited: Cell::new(p.deposited.get()),
                 })
@@ -687,7 +1088,12 @@ impl TraitObligation {
             );
             return;
         };
-        v.watches.borrow_mut().push((Rc::clone(self), pos));
+        {
+            let mut watches = v.watches.borrow_mut();
+            if !watches.iter().any(|(o, p)| o.uid == self.uid && *p == pos) {
+                watches.push((Rc::clone(self), pos));
+            }
+        }
         {
             let mut operands = self.operands.borrow_mut();
             if operands.len() <= pos as usize {
@@ -720,6 +1126,7 @@ impl TraitObligation {
             .collect();
         *self.assumptions.borrow_mut() = rows.clone();
         *self.in_scope.borrow_mut() = Rc::new(rows);
+        *self.context.borrow_mut() = Rc::new(in_scope.to_vec());
     }
 
     /// Rewrite every type its assumptions state through `f`: a specialization clone
@@ -731,8 +1138,10 @@ impl TraitObligation {
         };
         let assumptions = map(&self.assumptions.borrow());
         let in_scope = map(&self.in_scope.borrow());
+        let context = map(&self.context.borrow());
         *self.assumptions.borrow_mut() = assumptions;
         *self.in_scope.borrow_mut() = Rc::new(in_scope);
+        *self.context.borrow_mut() = Rc::new(context);
     }
 
     /// Replace each variable an assumption of a reset copy states with what `resolve`
@@ -752,6 +1161,15 @@ impl TraitObligation {
     /// Add `more` to the assumptions this obligation is answered by, keeping those
     /// about its trait that it does not hold yet.
     pub(crate) fn assume_more(&self, more: &[Rc<TraitRequirement>]) {
+        {
+            let mut context = (**self.context.borrow()).clone();
+            for a in more {
+                if !context.contains(a) {
+                    context.push(Rc::clone(a));
+                }
+            }
+            *self.context.borrow_mut() = Rc::new(context);
+        }
         let mut assumptions = self.assumptions.borrow_mut();
         let mut in_scope = (**self.in_scope.borrow()).clone();
         for a in more.iter().filter(|a| a.trait_ == self.trait_) {
@@ -775,13 +1193,15 @@ impl TraitObligation {
     /// types ([`settle_assumptions`](Self::settle_assumptions)). Returns whether it was
     /// reset; a reset copy is [redelivered](Self::redeliver) once the clone is pinned
     /// (`src/ccl/design/type-parameters.md`, "Specialization").
-    pub(super) fn reset_for_specialization(&self, own: &[crate::ccl::ty::TypeParamId]) -> bool {
+    pub(super) fn reset_for_specialization(&self, own: &[TypeParamId]) -> bool {
         let names_own = |a: &Rc<TraitRequirement>| a.mentions_any(own);
         if !self.assumptions.borrow().iter().any(names_own) {
             return false;
         }
         let only_own = |a: &&Rc<TraitRequirement>| names_own(a) && !a.mentions_other_than(own);
-        *self.candidates.borrow_mut() = self.trait_.compiler_instances.clone();
+        *self.candidates.borrow_mut() = self.table.instances(&self.trait_);
+        self.narrowed.set(false);
+        self.selected.set(false);
         *self.product_rule.borrow_mut() = if self.trait_.is_structural() {
             ProductRule::Open
         } else {
@@ -834,6 +1254,170 @@ impl TraitObligation {
             }
             for (contribution, origin) in contributions {
                 deliver(self, pos as u8, &contribution, origin, cache)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `pos` is an argument position rather than one of the trait's operands.
+    fn is_arg_slot(&self, pos: u8) -> bool {
+        pos as usize >= self.trait_.arity()
+    }
+
+    /// The path an argument position stands at: its operand, then the argument index into
+    /// each nominal type along the way. An operand position's path is itself.
+    fn path(&self, pos: u8) -> Vec<u8> {
+        let arity = self.trait_.arity() as u8;
+        let slots = self.arg_slots.borrow();
+        let mut path = Vec::new();
+        let mut at = pos;
+        while at >= arity {
+            let (parent, index, _) = &slots[(at - arity) as usize];
+            path.push(*index);
+            at = *parent;
+        }
+        path.push(at);
+        path.reverse();
+        path
+    }
+
+    /// The argument position for the `index`th argument of the nominal type `decl` standing
+    /// at `parent`, opening it if it is not open yet.
+    fn arg_slot(&self, parent: u8, index: u8, decl: &Rc<NominalDecl>) -> u8 {
+        let arity = self.trait_.arity();
+        let mut slots = self.arg_slots.borrow_mut();
+        let at = match slots
+            .iter()
+            .position(|(p, i, _)| *p == parent && *i == index)
+        {
+            Some(at) => at,
+            None => {
+                slots.push((parent, index, Rc::clone(decl)));
+                slots.len() - 1
+            }
+        };
+        u8::try_from(arity + at).expect("an obligation opens fewer than 256 positions")
+    }
+
+    /// The operand type a contribution `ty` at argument position `pos` stands in, for a
+    /// diagnostic: the nominal types along `pos`'s path, `_` everywhere but the path.
+    fn operand_around(&self, pos: u8, ty: &Type) -> (u8, Type) {
+        let arity = self.trait_.arity() as u8;
+        let slots = self.arg_slots.borrow();
+        let mut inner = ty.clone();
+        let mut at = pos;
+        while at >= arity {
+            let (parent, index, decl) = &slots[(at - arity) as usize];
+            let args = (0..decl.params.len())
+                .map(|i| {
+                    if i == *index as usize {
+                        inner.clone()
+                    } else {
+                        Type::Hole
+                    }
+                })
+                .collect();
+            inner = Type::Nominal(Rc::clone(decl), args);
+            at = *parent;
+        }
+        (at, inner)
+    }
+
+    /// Narrow by `contribution` arriving at argument position `pos`: the instances whose
+    /// heads admit it at that path stay, and so do the assumptions stating it there
+    /// (`src/ccl/design/type-inference.md`, "An instance's arguments").
+    ///
+    /// A head narrows to the instances stating that head there or a type variable above it.
+    /// Anything else, a product, a function, a variant or a type parameter, is admitted by a
+    /// type variable alone, since a pattern names no other type.
+    fn narrow_arg(
+        self: &Rc<Self>,
+        pos: u8,
+        contribution: &Type,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        if matches!(offered(contribution), Offered::Unknown) {
+            return Ok(());
+        }
+        let path = self.path(pos);
+        let head = offered_head(contribution);
+        let (operand, around) = self.operand_around(pos, contribution);
+        let accepted = self.accepted_types_at(operand);
+        let stated = crate::ccl::ccl_utils::strip_refinements(contribution);
+        self.assumptions.borrow_mut().retain(|a| {
+            a.args
+                .get(path[0] as usize)
+                .and_then(|arg| type_at(arg, &path[1..]))
+                .is_some_and(|t| {
+                    *t == stated || (head.is_some() && offered_head(t).as_ref() == head.as_ref())
+                })
+        });
+        self.candidates.borrow_mut().retain(|i| match &head {
+            Some(h) => i.admits_at(&path, h),
+            None => matches!(i.pattern_at(&path), PatternAt::Any),
+        });
+        self.narrowed.set(true);
+        if self.exhausted() {
+            return Err(ConstrainError::NoTraitInstance {
+                trait_: self.trait_.clone(),
+                position: operand,
+                found: around,
+                accepted,
+            });
+        }
+        if let Type::Nominal(decl, args) = contribution.peel_refinements() {
+            self.expand(pos, decl, args, cache)?;
+        }
+        self.try_deposit(cache)
+    }
+
+    /// Open an argument position for each argument of the nominal type `decl(args…)`
+    /// standing at `pos`, and offer each what its argument carries, when a candidate left
+    /// tells instances apart by what stands there.
+    ///
+    /// An argument that is a variable is watched there, as an operand is, so the type that
+    /// reaches it later narrows the candidates too; one already determined is offered now.
+    fn expand(
+        self: &Rc<Self>,
+        pos: u8,
+        decl: &Rc<NominalDecl>,
+        args: &[Type],
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        let path = self.path(pos);
+        let distinguishes = (0..args.len()).any(|i| {
+            let mut below = path.clone();
+            below.push(i as u8);
+            self.candidates
+                .borrow()
+                .iter()
+                .any(|c| matches!(c.pattern_at(&below), PatternAt::Head(_)))
+        }) || !self.assumptions.borrow().is_empty();
+        if !distinguishes {
+            return Ok(());
+        }
+        for (index, arg) in args.iter().enumerate() {
+            let slot = self.arg_slot(pos, index as u8, decl);
+            match arg.peel_refinements() {
+                Type::Infer(var) => {
+                    let watched = Type::Infer(Rc::clone(var));
+                    self.watch(&watched, slot);
+                    // What the variable already carries arrived before the watch.
+                    let lower: Vec<Type> = var
+                        .bounds
+                        .borrow()
+                        .lower()
+                        .iter()
+                        .map(|b| b.ty.clone())
+                        .collect();
+                    for bound in lower {
+                        match &bound {
+                            Type::Infer(below) => link_watches(below, var, cache)?,
+                            other => deliver(self, slot, other, None, cache)?,
+                        }
+                    }
+                }
+                other => deliver(self, slot, other, None, cache)?,
             }
         }
         Ok(())
@@ -910,7 +1494,14 @@ impl TraitObligation {
     /// What position `pos` still accepts, from the instances and the assumptions
     /// alike, for a diagnostic.
     fn accepted_types_at(&self, pos: u8) -> Vec<Type> {
-        let mut out: Vec<Type> = self.accepted_at(pos).into_iter().map(Type::Base).collect();
+        let mut out: Vec<Type> = Vec::new();
+        for i in self.candidates.borrow().iter() {
+            if let Some(t) = i.accepted_type(pos)
+                && !out.contains(&t)
+            {
+                out.push(t);
+            }
+        }
         for a in self.assumptions.borrow().iter() {
             if let Some(arg) = a.args.get(pos as usize)
                 && !out.contains(arg)
@@ -936,15 +1527,19 @@ impl TraitObligation {
         if self.answered_by_product().is_some() {
             return None;
         }
+        let arity = self.trait_.arity();
         let operands = self.operands();
-        if operands.len() != self.trait_.arity() {
+        if operands.len() < arity {
             return None;
         }
-        let args = operands.into_iter().collect::<Option<Vec<Type>>>()?;
+        let args = operands
+            .into_iter()
+            .take(arity)
+            .collect::<Option<Vec<Type>>>()?;
         let assoc = self
             .assoc
             .iter()
-            .map(|p| (p.name, p.ty.borrow().clone()))
+            .map(|p| (p.name.clone(), p.ty.borrow().clone()))
             .collect();
         Some(TraitRequirement {
             trait_: self.trait_.clone(),
@@ -954,7 +1549,7 @@ impl TraitObligation {
         })
     }
 
-    /// The type standing at each operand position, `None` where none is yet.
+    /// The type standing at each operand and argument position, `None` where none is yet.
     pub(super) fn operands(&self) -> Vec<Option<Type>> {
         self.operands.borrow().clone()
     }
@@ -987,7 +1582,7 @@ impl TraitObligation {
     fn reject(self: &Rc<Self>, pos: u8, found: &Type) -> Result<(), ConstrainError> {
         let accepted = match self.answered_by_product() {
             Some(product) => vec![product],
-            None => self.accepted_at(pos).into_iter().map(Type::Base).collect(),
+            None => self.accepted_types_at(pos),
         };
         Err(ConstrainError::NoTraitInstance {
             trait_: self.trait_.clone(),
@@ -1002,7 +1597,7 @@ impl TraitObligation {
     /// Arity is read off a surviving row rather than stored: every row of a trait has
     /// a type at every position that trait declares, which is the same invariant
     /// [`accepted_at`](Self::accepted_at) rests on.
-    fn siblings_of(&self, pos: u8) -> Vec<(u8, Vec<BaseType>)> {
+    fn siblings_of(&self, pos: u8) -> Vec<(u8, Vec<InstanceHead>)> {
         let arity = self.trait_.arity();
         (0..arity as u8)
             .filter(|i| *i != pos)
@@ -1010,7 +1605,7 @@ impl TraitObligation {
             .collect()
     }
 
-    /// Restrict position `pos` to instances accepting `base`, then deposit the
+    /// Restrict position `pos` to instances accepting `head`, then deposit the
     /// output if that settles it.
     ///
     /// Monotone and idempotent: narrowing by a base already consistent with every
@@ -1019,7 +1614,7 @@ impl TraitObligation {
     fn narrow(
         self: &Rc<Self>,
         pos: u8,
-        base: &BaseType,
+        head: &InstanceHead,
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
         // The product rule answers this obligation, which leaves the rows no part in it, so
@@ -1030,7 +1625,7 @@ impl TraitObligation {
             match &*rule {
                 ProductRule::Applied(_) => {
                     drop(rule);
-                    return self.reject(pos, &Type::Base(base.clone()));
+                    return self.reject(pos, &head.as_type());
                 }
                 ProductRule::Open | ProductRule::Pending(_) => *rule = ProductRule::RuledOut,
                 ProductRule::Absent | ProductRule::RuledOut => {}
@@ -1041,30 +1636,33 @@ impl TraitObligation {
         #[cfg(debug_assertions)]
         let accepted = self.accepted_at(pos);
         let accepted_types = self.accepted_types_at(pos);
-        // An assumption accepts a base where it states that base.
-        self.assumptions
-            .borrow_mut()
-            .retain(|a| matches!(a.args.get(pos as usize), Some(Type::Base(b)) if b == base));
+        // An assumption accepts a head where it states a type of that head.
+        self.assumptions.borrow_mut().retain(|a| {
+            a.args
+                .get(pos as usize)
+                .is_some_and(|arg| offered_head(arg).as_ref() == Some(head))
+        });
         {
             let mut candidates = self.candidates.borrow_mut();
             #[cfg(debug_assertions)]
             let before = candidates.len();
             // A candidate with no such position is one this trait's arity does not
             // reach; it cannot accept the contribution, so it drops out too.
-            candidates.retain(|i| i.base_at(pos as usize) == Some(base));
+            candidates.retain(|i| i.heads().get(pos as usize) == Some(head));
             // Re-delivery of a fact already recorded is the common case and changes
             // nothing; only an actual shrink can move the verdict this obligation
             // contributes, so only a shrink is worth policing.
             #[cfg(debug_assertions)]
             if candidates.len() < before {
-                assert_post_emission_narrowing_selects(self, pos, base, &accepted);
+                assert_post_emission_narrowing_selects(self, pos, head, &accepted);
             }
             drop(candidates);
+            self.narrowed.set(true);
             if self.exhausted() {
                 return Err(ConstrainError::NoTraitInstance {
                     trait_: self.trait_.clone(),
                     position: pos,
-                    found: Type::Base(base.clone()),
+                    found: head.as_type(),
                     accepted: accepted_types,
                 });
             }
@@ -1230,7 +1828,8 @@ impl TraitObligation {
             })
             .collect();
         for at_field in &slots {
-            let condition = TraitObligation::new(
+            let condition = TraitObligation::new_in(
+                &self.table,
                 self.trait_.clone(),
                 Vec::new(),
                 self.operator_node_id,
@@ -1238,7 +1837,7 @@ impl TraitObligation {
             );
             // A condition is answered by the same `requires` clauses as the product:
             // `Equatable({T, U}, {V, W})` is stated through its components too.
-            condition.assume(&self.in_scope.borrow());
+            condition.assume(&self.context.borrow());
             for (pos, slot) in at_field.iter().enumerate() {
                 condition.watch(slot, pos as u8);
             }
@@ -1269,11 +1868,12 @@ impl TraitObligation {
     /// phase. The [`Cell`] is set before constraining, so a re-entrant narrow reached
     /// through this very edge cannot deposit twice.
     pub fn try_deposit(self: &Rc<Self>, cache: &mut ConstrainCache) -> Result<(), ConstrainError> {
+        self.try_select(cache)?;
         for position in &self.assoc {
             if position.deposited.get() {
                 continue;
             }
-            let Some(settled) = self.agreed_assoc(position.name) else {
+            let Some(settled) = self.agreed_assoc(&position.name) else {
                 continue;
             };
             position.deposited.set(true);
@@ -1295,6 +1895,103 @@ impl TraitObligation {
         Ok(())
     }
 
+    /// Once a contribution has left one declared instance answering this obligation, state
+    /// what that instance says at the operands' types
+    /// (`src/ccl/design/type-inference.md`, "Selecting a declared instance").
+    ///
+    /// The instance's type variables become fresh variables, and each operand is bounded
+    /// **above** by the type the head names there, `Bag(𝛼)` for `Bag(T)`. That is what the
+    /// instance accepts, and the bound carries the operand's arguments into `𝛼`, so the
+    /// associated types the head fixes over its variables are deposited at those
+    /// arguments, and each requirement the instance states becomes an obligation of its
+    /// own at them.
+    ///
+    /// Only after a contribution narrowed the candidates: a trait whose one instance is the
+    /// only candidate before anything is known about the operands has not chosen it, and a
+    /// definition that uses the trait on a parameter states the requirement rather than
+    /// the instance.
+    fn try_select(self: &Rc<Self>, cache: &mut ConstrainCache) -> Result<(), ConstrainError> {
+        if self.selected.get() || !self.narrowed.get() || !self.assumptions.borrow().is_empty() {
+            return Ok(());
+        }
+        let declared = {
+            let candidates = self.candidates.borrow();
+            let [only] = candidates.as_slice() else {
+                return Ok(());
+            };
+            if only.declared.is_none() {
+                return Ok(());
+            }
+            Rc::clone(only)
+        };
+        self.selected.set(true);
+        let _f = provenance::enter(
+            self.operator_node_id,
+            "infer.select_instance",
+            provenance::Nature::Machinery,
+        );
+        let operands = self.operands.borrow().clone();
+        let level = operands
+            .iter()
+            .flatten()
+            .map(super::type_level)
+            .max()
+            .unwrap_or(0);
+        let fresh: HashMap<TypeParamId, Type> = declared
+            .params
+            .iter()
+            .map(|p| (p.id, crate::ccl::infer::solver::fresh_var(level)))
+            .collect();
+        let open = |ty: &Type| replace_params(ty, &fresh);
+        for (operand, stated) in operands.iter().zip(&declared.operands) {
+            if let Some(operand) = operand {
+                constrain_subtype(operand, &open(stated), cache)?;
+            }
+        }
+        for position in &self.assoc {
+            if position.deposited.get() {
+                continue;
+            }
+            let Some((_, stated)) = declared.assoc.iter().find(|(n, _)| *n == position.name) else {
+                continue;
+            };
+            position.deposited.set(true);
+            let target = position.ty.borrow().clone();
+            constrain_subtype(&open(stated), &target, cache)?;
+        }
+        for requirement in &declared.requires {
+            let positions: Vec<Type> = requirement
+                .args
+                .iter()
+                .map(|_| crate::ccl::infer::solver::fresh_var(level))
+                .collect();
+            let assoc: Vec<(Assoc, Type)> = requirement
+                .assoc
+                .iter()
+                .map(|(name, _)| (name.clone(), crate::ccl::infer::solver::fresh_var(level)))
+                .collect();
+            let condition = TraitObligation::new_in(
+                &self.table,
+                requirement.trait_.clone(),
+                assoc.clone(),
+                self.operator_node_id,
+                self.required_at,
+            );
+            condition.assume(&self.context.borrow());
+            for (pos, position) in positions.iter().enumerate() {
+                condition.watch(position, pos as u8);
+            }
+            condition.try_deposit(cache)?;
+            for (arg, position) in requirement.args.iter().zip(&positions) {
+                constrain_subtype(&open(arg), position, cache)?;
+            }
+            for ((_, settled), (_, named)) in assoc.iter().zip(&requirement.assoc) {
+                constrain_subtype(settled, &open(named), cache)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The types the surviving instances still accept at operand position `pos`.
     ///
     /// The operand-side reading of [`agreed_assoc`](Self::agreed_assoc), and
@@ -1310,11 +2007,21 @@ impl TraitObligation {
     /// Never empty for a position the trait's arity reaches: a candidate set is
     /// non-empty by invariant (emptying it is the error), and every instance of a
     /// trait carries a type at every position that trait declares.
-    pub fn accepted_at(&self, pos: u8) -> Vec<BaseType> {
+    pub fn accepted_at(&self, pos: u8) -> Vec<InstanceHead> {
         self.candidates
             .borrow()
             .iter()
-            .filter_map(|i| i.base_at(pos as usize).cloned())
+            .filter_map(|i| i.heads().get(pos as usize).cloned())
+            .collect()
+    }
+
+    /// The bases among [`accepted_at`](Self::accepted_at): the types a pin can choose
+    /// for a variable at `pos`. A data-function head names no one type, so it is no
+    /// choice.
+    pub fn accepted_bases_at(&self, pos: u8) -> Vec<BaseType> {
+        self.accepted_at(pos)
+            .iter()
+            .filter_map(|h| h.base().cloned())
             .collect()
     }
 
@@ -1324,7 +2031,7 @@ impl TraitObligation {
     /// Instances and assumptions are read alike: an assumption associates the type
     /// its `requires` clause names, and one that names none leaves the position
     /// open.
-    fn agreed_assoc(&self, name: Assoc) -> Option<Type> {
+    fn agreed_assoc(&self, name: &Assoc) -> Option<Type> {
         let mut settled: Option<Type> = None;
         let mut agree = |ty: Type| match &settled {
             None => {
@@ -1334,8 +2041,13 @@ impl TraitObligation {
             Some(s) => *s == ty,
         };
         for instance in self.candidates.borrow().iter() {
+            // What an instance with type variables associates is stated where it is
+            // selected, at its operands' types.
+            if instance.has_type_variables() {
+                return None;
+            }
             let ty = instance.assoc_ty(name)?;
-            if !agree(ty.clone()) {
+            if !agree(ty) {
                 return None;
             }
         }
@@ -1430,7 +2142,7 @@ pub fn verify_narrowing_is_complete(resolve: impl Fn(&Type) -> Option<Type>) {
                 // there is no single base narrowing could have been offered.
                 continue;
             };
-            let Some(base) = offered_base(&resolved) else {
+            let Some(head) = offered_head(&resolved) else {
                 // Not a base leaf. A product owes `narrow_product`, which answers it by
                 // the product rule — it bounds every operand by the shape and mints a
                 // condition per field — rather than shrinking the candidate set this walk
@@ -1438,12 +2150,11 @@ pub fn verify_narrowing_is_complete(resolve: impl Fn(&Type) -> Option<Type>) {
                 continue;
             };
             let candidates = obligation.candidates();
+            let path = obligation.path(*pos);
             debug_assert!(
-                candidates
-                    .iter()
-                    .all(|i| i.base_at(*pos as usize) == Some(base)),
+                candidates.iter().all(|i| i.admits_at(&path, &head)),
                 "trait narrowing missed a bound: operand {pos} of {obligation:?} \
-                 resolves to {base:?}, but its candidate set still holds {candidates:?} \
+                 resolves to {head:?}, but its candidate set still holds {candidates:?} \
                  — some path wrote this variable's lower bounds without delivering to \
                  its watches (see `verify_narrowing_is_complete`)",
             );
@@ -1530,17 +2241,17 @@ pub fn seal_emission() {
 fn assert_post_emission_narrowing_selects(
     obligation: &Rc<TraitObligation>,
     pos: u8,
-    base: &BaseType,
-    accepted: &[BaseType],
+    head: &InstanceHead,
+    accepted: &[InstanceHead],
 ) {
     EMISSION_MARK.with(|m| {
         let Some(mark) = m.get() else {
             return;
         };
         debug_assert!(
-            obligation.uid.0 >= mark || accepted.contains(base),
+            obligation.uid.0 >= mark || accepted.contains(head),
             "{obligation:?} was minted during emission, and narrowing it at position \
-             {pos} to `{base}` restricts a set `resolve_operand_requirements` already \
+             {pos} to `{head}` restricts a set `resolve_operand_requirements` already \
              read as final ({accepted:?} did not accept it), so the sweep's verdict is \
              now stale. Either the check has to move later, or this write belongs in \
              emission.",
@@ -1559,8 +2270,8 @@ pub struct OperandRequirement {
     pub trait_: Trait,
     /// Which of its operand positions this variable stands at.
     pub position: u8,
-    /// The bases still accepted there.
-    pub accepted: Vec<BaseType>,
+    /// The heads still accepted there.
+    pub accepted: Vec<InstanceHead>,
     /// The trait's *other* operand positions and what each still accepts.
     ///
     /// A requirement on its own reads as an unexplained demand — "only `Int` here" is
@@ -1568,7 +2279,7 @@ pub struct OperandRequirement {
     /// reached the operand beside it, so carrying the siblings lets a diagnostic say
     /// where the demand came from without any provenance being recorded: they are read
     /// off the same candidate set. Empty for a unary trait, which has no beside.
-    pub siblings: Vec<(u8, Vec<BaseType>)>,
+    pub siblings: Vec<(u8, Vec<InstanceHead>)>,
 }
 
 /// Find an operand no type can satisfy: two or more requirements on one variable
@@ -1715,8 +2426,12 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
             //
             // An obligation that still holds assumptions is about a type parameter its
             // `requires` clause states, which the sweep's base intersection cannot read.
+            //
+            // An argument position is no requirement on its own: a type variable in a head
+            // admits what no row lists, so its accepted heads are no intersection to take.
             if obligation.answered_by_product().is_some()
                 || !obligation.assumptions.borrow().is_empty()
+                || obligation.is_arg_slot(*pos)
             {
                 continue;
             }
@@ -1874,11 +2589,11 @@ fn resolve_pass(
                  set was emptied without raising, or a watch was placed past its \
                  trait's arity",
             );
-            // The intersection: bases every requirement at this place accepts.
+            // The intersection: heads every requirement at this place accepts.
             // Commutative, so the verdict does not depend on traversal order.
             // Owned rather than borrowed from `requirements`, which the failure arms
             // below move into the diagnostic.
-            let common: Vec<BaseType> = requirements[0]
+            let common: Vec<InstanceHead> = requirements[0]
                 .accepted
                 .iter()
                 .filter(|base| requirements[1..].iter().all(|r| r.accepted.contains(base)))
@@ -1916,7 +2631,11 @@ fn resolve_pass(
                 // it states what may flow in, which is exactly what the requirement
                 // says. It adds no lower bound, so a genuinely under-connected value is
                 // still under-determined afterwards.
-                [only] => {
+                // A nominal type at any arguments determines no one type, so there is nothing
+                // to deposit; the instance an obligation selects states its own types
+                // ([`TraitObligation::try_select`]).
+                [InstanceHead::Nominal(_)] => {}
+                [InstanceHead::Base(only)] => {
                     for var in &place.vars {
                         // Read the lattice before writing to it. `constrain_subtype`
                         // *records* a bound rather than checking it against the ones
@@ -1952,7 +2671,8 @@ fn resolve_pass(
                     // lets the fact travel: pinning `𝑎` to `Int` leaves `Addable(𝑎, 𝑏)`
                     // with one row, which determines `𝑏` next round.
                     for (obligation, pos) in &place.reqs {
-                        obligation.narrow(*pos, only, cache).map_err(|error| {
+                        let head = InstanceHead::Base(only.clone());
+                        obligation.narrow(*pos, &head, cache).map_err(|error| {
                             debug_assert!(
                                 false,
                                 "narrowing by a base the intersection just proved \
@@ -2039,15 +2759,20 @@ pub enum Offered<'a> {
     Unknown,
     /// A determined **product** — a tuple or a record.
     ///
-    /// No row keys on one ([`TraitInstance::operands`] are bases), so a product is
+    /// No instance keys on one ([`TraitInstance::heads`] are bases and nominal types), so a
+    /// product is
     /// answered structurally or not at all: a
     /// [structural](Trait::is_structural) trait decomposes it into one obligation per
     /// component, and every other trait rejects it as [`NotABase`](Self::NotABase) does.
     Product(&'a Type),
-    /// A determined type that is neither a base leaf nor a product — a variant or a
-    /// function.
+    /// A determined nominal type. A row keys on its declaration as
+    /// [`InstanceHead::Nominal`].
+    Nominal(&'a Rc<NominalDecl>),
+    /// A determined type that is neither a base leaf, a product nor a nominal type — a
+    /// variant or a function.
     ///
-    /// Every instance is keyed on a base ([`TraitInstance::operands`]), so nothing in
+    /// Every instance is keyed on a base or a nominal type ([`TraitInstance::heads`]), so
+    /// nothing in
     /// any table accepts it and the requirement fails here rather than silently
     /// going unresolved. That the tables hold only bases is their *content*, not a
     /// property of resolution: giving `Equatable` a variant would add rows, and
@@ -2176,10 +2901,11 @@ pub fn offered(ty: &Type) -> Offered<'_> {
         // A product is determined and is not a base, but it has components a
         // structural trait can be asked of ([`Trait::is_structural`]).
         Type::Tuple(_) | Type::Record(_) => Offered::Product(cur),
-        // Sums and functions are fully determined and are not bases. A collection
-        // compared or added is the same mistake as a variant. A declared nominal type
-        // satisfies no trait (`docs/chl-spec.md`, "A nominal type is opaque").
-        Type::Variant(_, _) | Type::Fun { .. } | Type::Nominal(..) => Offered::NotABase,
+        // Sums and functions are fully determined and are not bases. A collection compared
+        // or added is the same mistake as a variant.
+        Type::Variant(_, _) | Type::Fun { .. } => Offered::NotABase,
+        // A nominal type satisfies the traits its module's instances name.
+        Type::Nominal(decl, _) => Offered::Nominal(decl),
         Type::Param(param) => Offered::Param(param),
         // Everything else is either a variable, a placeholder, or a carrier whose
         // payload reaches the watch by another route.
@@ -2192,6 +2918,15 @@ pub fn offered_base(ty: &Type) -> Option<&BaseType> {
     match offered(ty) {
         Offered::Base(b) => Some(b),
         _ => None,
+    }
+}
+
+/// The instance head `ty` offers, if it offers one: a base or a nominal type.
+pub fn offered_head(ty: &Type) -> Option<InstanceHead> {
+    match offered(ty) {
+        Offered::Base(b) => Some(InstanceHead::Base(b.clone())),
+        Offered::Nominal(decl) => Some(InstanceHead::Nominal(Rc::clone(decl))),
+        Offered::Unknown | Offered::Product(_) | Offered::NotABase | Offered::Param(_) => None,
     }
 }
 
@@ -2253,10 +2988,11 @@ pub(super) fn link_watches(
     // unchecked.
     let (known, params, below) = {
         let bounds = lower.bounds.borrow();
-        let known: Vec<(BaseType, Option<crate::ccl::infer_var::Origin>)> = bounds
+        let known: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
             .lower()
             .iter()
-            .filter_map(|b| offered_base(&b.ty).map(|base| (base.clone(), b.origin)))
+            .filter(|b| offered_head(&b.ty).is_some())
+            .map(|b| (b.ty.clone(), b.origin))
             .collect();
         let params: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
             .lower()
@@ -2275,11 +3011,8 @@ pub(super) fn link_watches(
         (known, params, below)
     };
     for (obligation, pos) in &added {
-        for (base, origin) in &known {
-            if let Err(e) = obligation.narrow(*pos, base, cache) {
-                cache.note_failure_with(*origin, Some(obligation.required_at()));
-                return Err(e);
-            }
+        for (known, origin) in &known {
+            deliver(obligation, *pos, known, *origin, cache)?;
         }
         for (param, origin) in &params {
             deliver(obligation, *pos, param, *origin, cache)?;
@@ -2330,8 +3063,23 @@ fn deliver(
     value: Option<crate::ccl::infer_var::Origin>,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
+    if obligation.is_arg_slot(pos) {
+        let delivered = obligation.narrow_arg(pos, contribution, cache);
+        if delivered.is_err() {
+            cache.note_failure_with(value, Some(obligation.required_at()));
+        }
+        return delivered;
+    }
     let delivered = match offered(contribution) {
-        Offered::Base(base) => obligation.narrow(pos, base, cache),
+        Offered::Base(base) => obligation.narrow(pos, &InstanceHead::Base(base.clone()), cache),
+        // A nominal type narrows by its declaration, then by its arguments where the
+        // instances left tell apart by them.
+        Offered::Nominal(decl) => obligation
+            .narrow(pos, &InstanceHead::Nominal(Rc::clone(decl)), cache)
+            .and_then(|()| match contribution.peel_refinements() {
+                Type::Nominal(decl, args) => obligation.expand(pos, decl, args, cache),
+                _ => Ok(()),
+            }),
         Offered::Product(product) => obligation.narrow_product(pos, product, cache),
         Offered::NotABase => obligation.reject(pos, contribution),
         Offered::Param(param) => obligation.narrow_param(pos, param, cache),
@@ -2343,6 +3091,34 @@ fn deliver(
         cache.note_failure_with(value, Some(obligation.required_at()));
     }
     delivered
+}
+
+/// The type `ty` holds at `path`, argument indices into the nominal types along the way.
+fn type_at<'t>(ty: &'t Type, path: &[u8]) -> Option<&'t Type> {
+    let mut at = ty.peel_refinements();
+    for i in path {
+        match at {
+            Type::Nominal(_, args) => at = args.get(*i as usize)?.peel_refinements(),
+            _ => return None,
+        }
+    }
+    Some(at)
+}
+
+/// `ty` with each type parameter in `map` replaced by its type.
+pub(crate) fn replace_params(ty: &Type, map: &HashMap<TypeParamId, Type>) -> Type {
+    fn go(ty: &mut Type, map: &HashMap<TypeParamId, Type>) {
+        if let Type::Param(p) = ty
+            && let Some(to) = map.get(&p.id)
+        {
+            *ty = to.clone();
+            return;
+        }
+        ty.walk_children_mut(|child| go(child, map));
+    }
+    let mut out = ty.clone();
+    go(&mut out, map);
+    out
 }
 
 #[cfg(test)]
@@ -2376,7 +3152,7 @@ mod tests {
         let mut cache = ConstrainCache::new();
 
         for (pos, base) in steps {
-            ob.narrow(*pos, base, &mut cache)
+            ob.narrow(*pos, &InstanceHead::Base(base.clone()), &mut cache)
                 .expect("Int + Int is addable");
         }
 
@@ -2407,12 +3183,12 @@ mod tests {
         );
         let mut cache = ConstrainCache::new();
 
-        ob.narrow(1, &BaseType::Int, &mut cache)
+        ob.narrow(1, &InstanceHead::Base(BaseType::Int), &mut cache)
             .expect("Int is addable");
 
         assert!(
             matches!(
-                ob.agreed_assoc(Assoc::Output),
+                ob.agreed_assoc(&Assoc::Output),
                 Some(Type::Base(BaseType::Int))
             ),
             "(Int, Int) ⇝ Int is the only row left, so its Output is settled, and \
@@ -2422,7 +3198,13 @@ mod tests {
         let [only] = candidates.as_slice() else {
             panic!("(Int, Int) ⇝ Int is the only Addable row left, got {candidates:?}");
         };
-        assert_eq!(only.bases(), [&BaseType::Int, &BaseType::Int]);
+        assert_eq!(
+            only.heads(),
+            &[
+                InstanceHead::Base(BaseType::Int),
+                InstanceHead::Base(BaseType::Int)
+            ]
+        );
         assert!(matches!(
             only.assoc.as_slice(),
             [(Assoc::Output, Type::Base(BaseType::Int))]
@@ -2450,8 +3232,12 @@ mod tests {
                     operands: operands(),
                 });
             }
-            ob.narrow(0, &BaseType::Int, &mut ConstrainCache::new())
-                .expect("Int adds to Int under either trait");
+            ob.narrow(
+                0,
+                &InstanceHead::Base(BaseType::Int),
+                &mut ConstrainCache::new(),
+            )
+            .expect("Int adds to Int under either trait");
             let Type::Infer(v) = &out else { unreachable!() };
             let bounds = v.bounds.borrow();
             bounds
@@ -2487,13 +3273,14 @@ mod tests {
         let mut cache = ConstrainCache::new();
 
         ob.try_deposit(&mut cache).expect("nothing to deposit");
-        assert_eq!(ob.agreed_assoc(Assoc::Output), None);
+        assert_eq!(ob.agreed_assoc(&Assoc::Output), None);
 
         // The requirement half is untouched.
-        ob.narrow(0, &BaseType::Int, &mut cache)
+        ob.narrow(0, &InstanceHead::Base(BaseType::Int), &mut cache)
             .expect("Int is equatable");
         assert!(
-            ob.narrow(1, &BaseType::String, &mut cache).is_err(),
+            ob.narrow(1, &InstanceHead::Base(BaseType::String), &mut cache)
+                .is_err(),
             "nothing equates an Int to a String",
         );
     }
@@ -2512,10 +3299,10 @@ mod tests {
         );
         let mut cache = ConstrainCache::new();
 
-        ob.narrow(0, &BaseType::Int, &mut cache)
+        ob.narrow(0, &InstanceHead::Base(BaseType::Int), &mut cache)
             .expect("Int is orderable");
         let err = ob
-            .narrow(1, &BaseType::String, &mut cache)
+            .narrow(1, &InstanceHead::Base(BaseType::String), &mut cache)
             .expect_err("nothing compares an Int to a String");
 
         let ConstrainError::NoTraitInstance {
@@ -2632,13 +3419,13 @@ mod tests {
         let mut cache = ConstrainCache::new();
         let product = Type::Tuple(vec![Type::Base(BaseType::Int)]);
         let result = if base_first {
-            ob.narrow(0, &BaseType::Int, &mut cache)
+            ob.narrow(0, &InstanceHead::Base(BaseType::Int), &mut cache)
                 .expect("Int is equatable");
             ob.narrow_product(1, &product, &mut cache)
         } else {
             ob.narrow_product(0, &product, &mut cache)
                 .expect("a tuple of Int is equatable");
-            ob.narrow(1, &BaseType::Int, &mut cache)
+            ob.narrow(1, &InstanceHead::Base(BaseType::Int), &mut cache)
         };
         assert!(
             matches!(result, Err(ConstrainError::NoTraitInstance { .. })),
@@ -2659,7 +3446,7 @@ mod tests {
                     arity,
                     "{trait_} has rows of differing arity: {row:?}",
                 );
-                let names: Vec<Assoc> = row.assoc.iter().map(|(n, _)| *n).collect();
+                let names: Vec<Assoc> = row.assoc.iter().map(|(n, _)| n.clone()).collect();
                 assert_eq!(
                     names, assocs,
                     "{trait_} has rows associating different names: {row:?}",

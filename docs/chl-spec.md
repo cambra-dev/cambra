@@ -139,6 +139,7 @@ match  case
 pass
 where
 forall requires
+type   impl   trait
 import use    as     pub    run    param  this
 ```
 
@@ -161,6 +162,10 @@ refuses each of them until modules are implemented.
 
 `match` and `case` introduce tag dispatch over a variant (§4.10).
 
+`type` declares a nominal type, `impl` its associated functions or an instance of a trait, and
+`trait` a trait ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided),
+[Declaring a trait](#declaring-a-trait)).
+
 `forall` begins a polymorphic type (**[Planned]**,
 [Polymorphic type annotations](#polymorphic-type-annotations)). `requires` begins a `requires`
 clause, which ends a `def` signature or a polymorphic type
@@ -169,16 +174,15 @@ clause, which ends a `def` signature or a polymorphic type
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
 > `rec` (recursive binding — §4.3, **[Decided]**), `given` and `summon` (the
-> transactions-as-contextual-parameters layer — §8.7, **[Decided]**), `type` and `impl` (nominal
-> types and their associated functions, **[Decided]**,
-> [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
+> transactions-as-contextual-parameters layer — §8.7, **[Decided]**),
 > and `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
 > surface, **[Open]** as to what `static` demands). Avoid taking these names for other purposes.
-> (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires` and the module keywords are
-> **already** lexed — the first two carry today's transactions and mutation, §8, `match`/`case`
-> carry tag dispatch, §4.10, `where` separates a refinement's predicate, §6.4, and `forall` and
-> `requires` begin a polymorphic type and a `requires` clause, §6.10 — so they are not in this
-> list.)
+> (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `type`, `impl`, `trait` and
+> the module keywords are **already** lexed — the first two carry today's transactions and
+> mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a refinement's
+> predicate, §6.4, `forall` and `requires` begin a polymorphic type and a `requires` clause, §6.10,
+> and `type`, `impl` and `trait` declare nominal types, their functions and traits, §6.8 and
+> §6.10 — so they are not in this list.)
 
 ### 1.7 Literals
 
@@ -1048,10 +1052,8 @@ so presence is stated by a term predicate over it rather than by a subtype namin
 `is_none` is a method of `Option` declared with it, and the predicate calls it because a nominal
 type has no `==`. A lookup into a `Set` has the same type at `Option(unit)`. A lookup into an
 `Array(n, T)` states presence as `i < n`, and a `FullMap` lookup's result is
-`{Option(V) where not _.is_none()}` for every key. A `List(T)` lookup states presence through
-its length, `{Option(T) where _.is_none() == not (i < len(xs))}`
-([Trait requirements](#trait-requirements)); an index drawn from iterating `xs` lies in its index
-range, so it establishes `i < len(xs)`.
+`{Option(V) where not _.is_none()}` for every key. A `List(T)` lookup states presence as `i`
+lying in `xs`'s index range; an index drawn from iterating `xs` lies in it.
 
 `c[k]!` is accepted exactly where the refinement on `c[k]` entails `not _.is_none()`: under an
 `in` guard, for a key drawn from iterating `c`, or for a `FullMap`. Failure to establish presence
@@ -2551,9 +2553,6 @@ of a constructor into an unboxed term.
   [Iteration](#46-for--iteration); storage order does not establish a source-language ordering.
 - Membership `in` tests keys for sets/maps and values for arrays/lists/collections.
   A successful key-membership guard refines the key for proven access.
-- `len(c)` answers the size of a collection's domain, through the built-in `HasLen` trait
-  ([Trait requirements](#trait-requirements)). A `List` lookup states presence as
-  `i < len(xs)` ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
 - Maps iterate entries, sets keys, and arrays/lists/collections values. The methods
   `m.keys()`, `m.values()` and `m.items()` of a `Map` or `FullMap`, and `s.keys()` of a `Set`,
   expose lazy collection views. Numeric `sum(m)` rejects entries; `sum(m.values())` requests
@@ -2572,7 +2571,7 @@ compiler provides, so `Set(K)` and `Map(K, unit)` are distinct types. Nothing re
 three to a structural collection type: none widens to `Collection`, and the methods `keys`,
 `values` and `items` are the written route. `FullMap` has every operation `Map` has, and differs
 only in how it is built and in its lookup's refinement. The operations of all three are built in:
-lookup, membership `in`, iteration, `len`, the methods `keys`, `values` and `items` (`keys` alone
+lookup, membership `in`, iteration, the methods `keys`, `values` and `items` (`keys` alone
 for a `Set`), and the re-keying constructors `set([…])` and `map([…])`. The representation is
 [Telling `Set` and `Map` apart](../src/ccl/design/collections.md#telling-set-and-map-apart-decided).
 
@@ -2586,8 +2585,7 @@ A builtin differs from a declared nominal type in five ways:
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
 - **A type family as a parameter.** `FullMap(K, V)`'s `V` may depend on the key, as a group-by's
   groups do. A declared type's parameter takes a type.
-- **Trait instances.** All three satisfy `Iterable` and `HasLen` through instances the compiler
-  provides ([Trait requirements](#trait-requirements)). Which traits a declared type satisfies is
+- **Trait instances.** All three satisfy `Iterable` through instances the compiler provides ([Trait requirements](#trait-requirements)). Which traits a declared type satisfies is
   **[Open]**.
 - **Stated variances.** A declared type's variance is read off its constructors' parameter types,
   and a builtin has none to read, so each is stated. `Set(K)` is covariant in `K`, and `Map(K, V)`
@@ -2974,13 +2972,14 @@ associated functions, so whatever name it takes is unavailable to every type dec
   ([4.3.1 Destructuring patterns](#431-destructuring-patterns)), `extract`, and the type's own
   functions are the only ways in. A nominal value has no fields: `p.amount` is an error, and
   `p.extract().amount` is the projection.
-- **[Open] — which traits a declared nominal type satisfies.** None is inherited from the
+- **A declared nominal type satisfies the traits its module declares instances of**
+  ([Declaring an instance](#declaring-an-instance)), and no other. None is inherited from the
   constructors' parameter types: `type Price = {Int where _ >= 0}` is not `Addable` because `Int`
-  is. The direction is opt-in derivation, as with Rust's `#[derive]`, where the declaration names
-  each trait it takes from its constructors. Until then a declared nominal type satisfies no trait,
-  so `==`, ordering and arithmetic are errors on its values, and one is not a key of a `Set`, a
-  `Map` or a `groupby`. The nominal builtins `Set`, `Map` and `FullMap` satisfy the built-in
-  instances of `Iterable` and `HasLen`, which the compiler provides.
+  is. An instance of an operator's trait, which would give `==`, ordering and arithmetic on a
+  nominal type's values and make one a key of a `Set`, a `Map` or a `groupby`, is **[Planned]**;
+  until then those are errors on its values. Deriving an instance from the constructors, as with
+  Rust's `#[derive]`, is **[Open]**. The nominal builtins `Set`, `Map` and `FullMap` satisfy the
+  built-in instances of `Iterable`, which the compiler provides.
 - **The type of a nominal value is fixed by the expression that produced it.** Every producer of a
   value names the same nominal type, so a method and a trait requirement resolve the same way
   wherever the value flows.
@@ -3081,8 +3080,8 @@ impl Option(T):
   ([Type parameters](#type-parameters)), with `self` of type `Option(T)` unannotated. A `def` may
   add type parameters of its own.
 - **The block names a type of its own module.** `impl shop::Price:` from another module is the
-  spelling an extension would take, and is **[Open]** with extensions. Whether an `impl` block also
-  declares trait instances, as `impl HasLen(Bag(T)):`, is **[Open]** with instance declarations.
+  spelling an extension would take, and is **[Open]** with extensions. An `impl` block whose head
+  names a trait declares an instance of it ([Declaring an instance](#declaring-an-instance)).
 
 **Methods and fields are separate namespaces, and the parentheses decide which is meant.**
 `r.f(args)` is a method call, and `r.f` is a field and never a method. A nominal value has no
@@ -3106,20 +3105,31 @@ segments decides. A qualified field label followed by call parentheses is an err
 belongs to a type and not to a module. Calling the function such a field holds is written
 `(r.mod2::f1)(args)`.
 
-**A method call needs its receiver's type.** `x.m()` resolves `m` from the type of `x`. When
-nothing that precedes the call determines that type to be a nominal type, the call is a type error
-that asks for an annotation on `x`. What precedes a call is the program text before it and the
+**A method call resolves by its receiver's type.** `x.m()` resolves `m` from the type of `x` that
+the program states before the call. What precedes a call is the program text before it and the
 clauses of each comprehension the call stands in, which bind the names its element reads
 ([3.12 Comprehensions](#312-comprehensions)): in `[p.cents() for p in prices]`, the type of
-`prices` determines the type of `p`. A polymorphic `def` therefore calls no method on a value whose
-type is one of its type parameters. An operation that works across types is a trait
-requirement instead, as iteration is ([4.6 `for` — iteration](#46-for--iteration)).
+`prices` determines the type of `p`. A trait's function whose first parameter is `self` is a
+**trait method**, and `x.m(a…)` resolved to one is the call `Trait::m(x, a…)`
+([Trait requirements](#trait-requirements)).
 
-> **Direction [Planned] — trait methods.** Method-call syntax extends to an operation a trait
-> requires: `xs.len()` resolves through `HasLen` ([Trait requirements](#trait-requirements)) as
-> `len(xs)` does. The receiver's type then need not be nominal, and a polymorphic `def` may call a
-> trait method on a value whose type is a type parameter, through the requirement the call places.
-> The rule above then covers only a type's own associated functions.
+| `x`'s type before the call | `x.m(…)` resolves to |
+| --- | --- |
+| A nominal type `N` | `N`'s method `m`: its own, or the trait method `m` of a trait `N` has an instance of |
+| Any other determined type | the trait method `m` of a trait that type has an instance of: `2.scale_vec(v)` is `Scales::scale_vec(2, v)` where an instance of `Scales` has `Int` as its `F` ([Declaring a trait](#declaring-a-trait)) |
+| A type parameter `T` | the trait method `m` of a trait a `requires` clause states of `T` |
+| Not determined | the trait method `m`, where exactly one trait declares a method `m` |
+
+- **A type's own methods and its trait methods share one namespace.** A nominal type with its own
+  method `m` and an instance of a trait declaring a method `m` is an error at the instance, and so
+  are instances of two traits that both give one type, nominal or not, a method `m`. A type's method name therefore
+  names at most one function; which instance of its trait runs can still depend on the call's other
+  arguments.
+- **A type's own method needs the type before the call.** A receiver whose type nothing before the
+  call determines resolves only to a trait method, and a call that no single trait method answers
+  is a type error that asks for an annotation on `x`. Resolving to a trait method places the trait's
+  requirement on the receiver, so `def total(s): s.area()` requires `Area(S)` of its parameter, as
+  `def total(s): Area::area(s)` does.
 
 ### 6.9 Effects in function types [Tentative]
 
@@ -3264,7 +3274,8 @@ req_arg         ::= expression | Ident "=" expression
 ```
 
 A **trait** is a named requirement on a list of types. Each operator places one on its operand
-types. The traits are built in:
+types. A module declares traits of its own ([Declaring a trait](#declaring-a-trait)), and a
+requirement names one as it names these, which are built in:
 
 | Trait | Required by | Operands | Associated type | Satisfied by |
 | --- | --- | --- | --- | --- |
@@ -3286,12 +3297,15 @@ product ([3.4 Comparisons](#34-comparisons)). A trait's `Output` is the type tha
   it unnamed.
 - **A requirement's arguments are any types.** `Equatable` reads a product componentwise, as `==`
   does ([3.4 Comparisons](#34-comparisons)), so `requires Equatable({T, U}, {T, U})` also states
-  `Equatable(T, T)` and `Equatable(U, U)`.
+  `Equatable(T, T)` and `Equatable(U, U)`. `requires Describe(Two(T))` states `Describe` of the
+  nominal type `Two(T)`, which a definition needs where the instances are at particular arguments,
+  as `impl Describe(Two(Int))` is ([Declaring an instance](#declaring-an-instance)).
 - **A requirement no instance can satisfy is an error at the requirement.**
   `requires Orderable(List(T), List(T))` is rejected where it is written: no `List` is `Orderable`,
   so no call could satisfy it.
-- **A requirement on base types alone states nothing about a parameter.** It must be satisfiable,
-  and it has no other effect; naming a type parameter as its associated type is an error.
+- **A requirement on types without type parameters states nothing about a parameter.** It must be
+  satisfiable, and it has no other effect; naming a type parameter as its associated type is an
+  error.
 - **One clause holds every requirement.** `Transaction`
   ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters))
   is written in the same clause: `requires Transaction, Orderable(T, T)` (**[Planned]**).
@@ -3300,27 +3314,138 @@ product ([3.4 Comparisons](#34-comparisons)). A trait's `Output` is the type tha
   requirement decides: `a + b` under `T <: Int` and `requires Addable(T, T, Output=T)` is a `T`.
 - **Each call satisfies each requirement at its own instantiation.** A call that does not is
   rejected at the call. A secondary label at the requirement is **[Decided]**.
-- Declaring a trait or an instance is **[Open]**.
 
-> **Direction [Decided] — collection traits.** Two more traits are built in, with instances the
+> **Direction [Decided] — collection traits.** One more trait is built in, with instances the
 > compiler provides for the collection types
 > ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)):
 >
 > | Trait | Required by | Operands | Associated type | Satisfied by |
 > | --- | --- | --- | --- | --- |
 > | `Iterable` | `for`-in, a comprehension's `for` clause | 1 | `Item` | `Array`, `List`, `Collection`, `Set`, `Map`, `FullMap`, and every comprehension result |
-> | `HasLen` | `len` | 1 | none | `Array`, `List`, `Collection`, `Set`, `Map`, `FullMap` |
 >
-> `Iterable`'s `Item` is what [4.6 `for` — iteration](#46-for--iteration) binds. `len` is the
-> operation `HasLen` requires, as `+` is the operation `Addable` requires: the builtin
-> `len : forall (C) C => UInt requires HasLen(C)`, called as `len(c)`, places `HasLen(C)` on its
-> argument's type. Each instance answers the size of the collection's domain: `n` for an
-> `Array(n, T)`, the length of a `List`'s index range, the count of keys of a `Set`, `Map` or
-> `FullMap`, and the count of positions of a `Collection`. A `FullMap`'s key type is finite
-> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), so
-> `len(g)` counts a group-by's groups. `len` is a function, not a method: `List` is structural, so
-> `xs.len()` has no type to resolve against until trait methods
-> ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+> `Iterable`'s `Item` is what [4.6 `for` — iteration](#46-for--iteration) binds.
+
+#### Declaring a trait
+
+```ebnf
+trait_stmt  ::= "trait" Ident "(" Ident ( "," Ident )* [ "," ] ")" ":"
+                NEWLINE INDENT trait_item+ DEDENT
+trait_item  ::= "type" Ident NEWLINE
+             |  "def" ident "(" params ")" "=>" expression [ requires_clause ] NEWLINE
+```
+
+A `trait` declaration binds a capitalized name to a new trait over its **operands**, the types it
+names in parentheses. Its body declares **associated types**, `type Elem`, and **functions**, each a
+`def` line with a signature and no body.
+
+```python
+trait Area(S):
+    def area(self: S) => Int
+    def scaled(self: S, k: Int) => S
+
+trait Container(C):
+    type Elem
+    def first(self: C, otherwise: Elem) => Elem
+    def tag(R, self: C, label: R) => {R, Elem}
+
+trait Scales(V, F):
+    def scale(self: V, f: F) => V
+    def scale_vec(self: F, v: V) => V
+```
+
+- **A signature states every type.** Each parameter is annotated and the result is written. The
+  operands and associated types are types in every signature. A function may declare type
+  parameters of its own, as `tag` declares `R`, and a `requires` clause; each call opens the
+  parameters at its own types and satisfies the clause there.
+- **A function whose first parameter is `self` is a method** of the operand `self` is annotated
+  with: `scale` is a method of a `Scales` instance's `V`, and `scale_vec` of its `F`. In a trait,
+  `self` is always annotated, with one of the trait's operands. A function without `self` is
+  reached only through the trait's name.
+- **A function declares at least one parameter.** A function of no argument is a constant
+  ([3.8 Function calls](#38-function-calls)), and a trait's constant has no spelling.
+- **A trait's functions are reached through its name.** `Area::area(c)` calls `area` of the
+  instance for `c`'s type, and `c.area()` is the same call
+  ([Associated functions and methods](#associated-functions-and-methods)). `Area::area` is the
+  function as a value.
+- **A trait's names are types.** The trait's name, its operands and its associated types are
+  capitalized, and none is a type the module declares or a built-in name. A trait is declared at a
+  module's top level, and its signatures name the traits declared above it.
+- **A requirement names a declared trait as it names a built-in one.** `requires Area(S)` states
+  that `S` has an instance of `Area`, and `requires Container(C, Elem=E)` that `E` is the `Elem` of
+  `C`'s. A definition that calls a trait's function on a value of an open type requires the trait of
+  it, whether the clause states it or not, as an operator does.
+
+#### Declaring an instance
+
+```ebnf
+impl_stmt   ::= "impl" Ident "(" req_arg ( "," req_arg )* ")" [ requires_clause ] ":"
+                NEWLINE INDENT def_stmt+ DEDENT
+```
+
+An `impl` block whose head names a trait declares an **instance** of it: the types it is for, the
+associated types it fixes, and a definition of each of the trait's functions.
+
+```python
+type Circle = Int
+type Two(T) = {T, T}
+
+impl Area(Circle):
+    def area(self) => Int:
+        3 * self.extract() * self.extract()
+    def scaled(self, k):
+        Circle::new(self.extract() * k)
+
+impl Container(Two(T), Elem=T):
+    def first(self, otherwise):
+        self.extract().0
+    def tag(self, label):
+        (label, self.extract().0)
+
+impl Area(Two(T)) requires Area(T):
+    def area(self):
+        self.extract().0.area() + self.extract().1.area()
+    def scaled(self, k):
+        Two::new((self.extract().0.scaled(k), self.extract().1.scaled(k)))
+```
+
+- **An instance is for a nominal type.** Each operand of the head is a base type or a nominal type,
+  and at least one is a nominal type the module declares or `Option`. A nominal type is applied to
+  **patterns**: type variables, base types, and nominal types applied to patterns in turn, as in
+  `Two(T)`, `Two(Int)` and `Duo(Two(Int), B)`. A type variable is a capitalized name no type has;
+  it stands for any type, one type wherever the head names it, and is a type parameter of every
+  function in the block. The compiler provides the instances for the other types, as the
+  operators' traits' for the base types.
+- **The head fixes every associated type,** once each, with `Name=Type` as a requirement writes
+  it, over the head's variables.
+- **A `requires` clause makes the instance conditional.** `impl Area(Two(T)) requires Area(T)`
+  answers `Area(Two(X))` only where `Area(X)` holds, and its functions may use that.
+- **The block defines each of the trait's functions, and nothing else.** A `def` in it is the
+  trait's function at the instance's types. A parameter it leaves unannotated, its result, its own
+  type parameters and its `requires` clause are the trait's there, and one it writes must be the
+  trait's; `self` is unannotated as in an `impl` block of a type. A `def` names no type of its own,
+  and `pub` does not mark one.
+- **No two instances of a trait accept one type.** Two instances overlap when some types match both
+  heads, as `Two(T)` and `Two(Int)` do, and `Duo(Int, B)` and `Duo(A, String)`; the second is an
+  error. `Two(Int)` and `Two(String)` do not overlap, and a call picks between them by its
+  argument's type.
+- **An instance gives its type the trait's methods,** which share a namespace with the type's own
+  ([Associated functions and methods](#associated-functions-and-methods)).
+- **An instance's functions are in scope after its `impl`,** as a `def`'s name is after the `def`.
+  A call answered by an instance declared below it is an error, and so is a call inside a generic
+  definition declared above the instance that a use answers with it. Within the block, a function
+  may call another of the instance's, in either order, and two that call each other are an error.
+- **An instance's function may call its own instance at other types.** `Area(Two(T))`'s `area`
+  calls `area` at `T`, so at `Two(Two(Circle))` it calls `Area(Two(Circle))`'s, which calls
+  `Area(Circle)`'s; each type is a different function, and the chain ends. A call at the same
+  types as the call it is in would never end, and is an error. So is a chain whose types keep
+  changing, as when `area` calls `area` at `Two(Two(T))`: it is refused once it reaches one
+  instance's function at 17 types in a row.
+- **A call runs the instance its types pick.** Each call of a trait's function, and each use of a
+  generic definition that calls one, is resolved at its own types to the one instance that accepts
+  them, and runs that instance's function. An instance is declared at a module's top level.
+- An instance of an operator's trait is **[Planned]**. Each operator trait gains a function its
+  operator calls, `add` for `+`, so that `impl Addable(Money, Money, Output=Money)` defines `+` on
+  `Money`.
 
 #### Polymorphic type annotations
 
