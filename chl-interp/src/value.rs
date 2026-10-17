@@ -22,6 +22,15 @@ pub enum Value {
         tag: String,
         payload: Box<Value>,
     },
+    /// A value of a nominal type: the type a `type` declaration names, the constructor that
+    /// built it, and the constructor's argument (`docs/chl-spec.md`, "Declaring a nominal
+    /// type"). The type is part of the value, so two declarations' constructors of one name
+    /// build different values, and a variant's tag never matches a constructor.
+    Nominal {
+        ty: String,
+        ctor: String,
+        payload: Box<Value>,
+    },
     Collection(Collection),
     /// A value that depends on a channel whose contents are not complete yet, on a pass of
     /// evaluation before the one [`crate::run`] answers from (see [`crate::eval`]). It
@@ -201,6 +210,18 @@ impl PartialEq for Value {
                     payload: p2,
                 },
             ) => t1 == t2 && p1 == p2,
+            (
+                Value::Nominal {
+                    ty: n1,
+                    ctor: c1,
+                    payload: p1,
+                },
+                Value::Nominal {
+                    ty: n2,
+                    ctor: c2,
+                    payload: p2,
+                },
+            ) => n1 == n2 && c1 == c2 && p1 == p2,
             (Value::Collection(a), Value::Collection(b)) => a == b,
             _ => false,
         }
@@ -224,6 +245,7 @@ fn total_cmp(a: &Value, b: &Value) -> Ordering {
             Value::Str(_) => 3,
             Value::Record(_) => 4,
             Value::Variant { .. } => 5,
+            Value::Nominal { .. } => 9,
             Value::Collection(_) => 6,
             Value::Pending => 8,
         }
@@ -244,6 +266,21 @@ fn total_cmp(a: &Value, b: &Value) -> Ordering {
                 payload: py,
             },
         ) => x.cmp(y).then_with(|| total_cmp(px, py)),
+        (
+            Value::Nominal {
+                ty: tx,
+                ctor: x,
+                payload: px,
+            },
+            Value::Nominal {
+                ty: ty_,
+                ctor: y,
+                payload: py,
+            },
+        ) => tx
+            .cmp(ty_)
+            .then_with(|| x.cmp(y))
+            .then_with(|| total_cmp(px, py)),
         // Records and collections order by rendering: a stable tie-break, never a claim
         // about their contents.
         (x, y) if rank(x) == rank(y) => x.to_string().cmp(&y.to_string()),
@@ -267,6 +304,7 @@ impl fmt::Display for Value {
                 write!(f, "({})", body.join(", "))
             }
             Value::Variant { tag, payload } => write!(f, "`{tag}({payload})"),
+            Value::Nominal { ty, ctor, payload } => write!(f, "{ty}::{ctor}({payload})"),
             Value::Collection(c) => {
                 let dense = c
                     .sorted()

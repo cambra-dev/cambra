@@ -84,6 +84,9 @@ pub enum Token {
     Forall,
     #[token("requires", priority = 3)]
     Requires,
+    /// Opens a nominal type declaration (`docs/chl-spec.md`, "Declaring a nominal type").
+    #[token("type", priority = 3)]
+    Type,
     // The module keywords (`docs/chl-spec.md`, "9. Modules [Decided]").
     #[token("import", priority = 3)]
     Import,
@@ -291,6 +294,7 @@ pub const KEYWORDS: &[(&str, Token)] = &[
     ("case", Token::Case),
     ("forall", Token::Forall),
     ("requires", Token::Requires),
+    ("type", Token::Type),
     ("import", Token::Import),
     ("use", Token::Use),
     ("as", Token::As),
@@ -427,6 +431,7 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::Not
         | Token::Forall
         | Token::Requires
+        | Token::Type
         | Token::Import
         | Token::Use
         | Token::As
@@ -659,6 +664,7 @@ impl fmt::Display for Token {
             Token::Where => "where",
             Token::Forall => "forall",
             Token::Requires => "requires",
+            Token::Type => "type",
             Token::And => "and",
             Token::Or => "or",
             Token::Not => "not",
@@ -1085,6 +1091,7 @@ fn opens_block_at_line_start(tok: &Token) -> bool {
             | Token::Else
             | Token::For
             | Token::Def
+            | Token::Type
             | Token::With
             | Token::Match
             | Token::Case

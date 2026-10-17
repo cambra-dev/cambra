@@ -332,6 +332,10 @@ struct KeyReadInfo {
     /// The per-commit value extent for [`StoreValueStream`] (`commit` stores
     /// only; the accumulator value extent for induction stores).
     value_extent: Extent,
+    /// Whether the variable's declared type mentions a nominal type, whose value no
+    /// reload carries over yet ([`StateConflict::NominalState`]). Read only for a
+    /// `carried` key.
+    holds_nominal: bool,
 }
 
 impl KeyReadInfo {
@@ -655,6 +659,13 @@ identities is not distinguishing them",
             .flat_map(StoreReadInfo::carried_keys)
             .find(|(p, _)| *p == path)
             .map(|(_, key)| key.value_extent.clone())
+    }
+
+    /// Whether the variable at `path` is declared at a type that mentions a nominal type.
+    fn holds_nominal(&self, path: &VarPath) -> bool {
+        self.stores()
+            .flat_map(StoreReadInfo::carried_keys)
+            .any(|(p, key)| p == path && key.holds_nominal)
     }
 
     /// Every `Transact` store the graph holds. The handover is one map over all
@@ -1363,6 +1374,11 @@ in it has a correspondent",
                 taken_over.insert(path);
                 continue;
             }
+            if predecessor.holds_nominal(&path) || site.ty.mentions_nominal() {
+                out.push(StateConflict::NominalState { path: path.clone() });
+                taken_over.insert(path);
+                continue;
+            }
             // The same comparison a declaration gets, for the same reason: a
             // value used at another shape is a constant of the wrong extent, and
             // the operator built around it fails on its first pull rather than
@@ -1394,11 +1410,12 @@ in it has a correspondent",
                 };
                 // A declared type the conversion context cannot resolve to an
                 // extent is a compile error the real compile will raise with its
-                // own diagnostic; this check has nothing to add.
-                let Ok(extent) = self.extent_of(&decl.ty) else {
-                    continue;
-                };
-                if extent != key.value_extent {
+                // own diagnostic; the extent comparison has nothing to add.
+                if key.holds_nominal || decl.ty.mentions_nominal() {
+                    out.push(StateConflict::NominalState { path: path.clone() });
+                } else if let Ok(extent) = self.extent_of(&decl.ty)
+                    && extent != key.value_extent
+                {
                     out.push(StateConflict::Retyped {
                         path: path.clone(),
                         held: key.value_extent.clone(),
@@ -1674,6 +1691,8 @@ the compilation declined outlives it here"
         match ty {
             // Strip refinements at every level — Filter handles them instead.
             Type::Refinement(inner, _) => self.extent_of(inner),
+            // A nominal value is held as its representation (`Type::structure`).
+            Type::Nominal(..) => self.extent_of(&ty.structure()),
             // Look up the runtime impl and wrap it in DataSourceDomain.
             Type::DataSource(name) => self
                 .sources
@@ -2808,11 +2827,8 @@ fn convert_impl_inner(
                             expr.ty
                         ))
                     })?;
-                    let mut union_ty = &codomain;
-                    while let Type::Refinement(inner, _) = union_ty {
-                        union_ty = inner;
-                    }
-                    let Type::Variant(variants, _) = union_ty else {
+                    let union_ty = codomain.peel_refinements().structure();
+                    let Type::Variant(variants, _) = &*union_ty else {
                         return Err(ConversionError::TypeError(format!(
                             "variant_wrap({tag}) codomain must be a Variant, got {codomain}"
                         )));
@@ -2932,13 +2948,15 @@ fn convert_impl_inner(
         // Compiles to a `Scalar(Union)` tile via `VariantWrap` — the net-new
         // runtime construct that mirrors `ColumnValue::Union`, reusing the union
         // column machinery already built for `iterate`/`++`.
-        TypedExprNode::VariantCtor { tag, payload } => {
+        // A nominal constructor builds the same column: its value is the union row of its
+        // type's representation (`Type::structure`).
+        TypedExprNode::VariantCtor { tag, payload }
+        | TypedExprNode::NominalCtor {
+            ctor: tag, payload, ..
+        } => {
             expect_no_input(input, "variant constructor")?;
-            let mut ty = &expr.ty;
-            while let Type::Refinement(inner, _) = ty {
-                ty = inner;
-            }
-            let Type::Variant(variants, _) = ty else {
+            let ty = expr.ty.peel_refinements().structure();
+            let Type::Variant(variants, _) = &*ty else {
                 return Err(ConversionError::TypeError(format!(
                     "VariantCtor `{tag}` has non-variant type {}; inference should have \
                      width-subtyped it to a Type::Variant before op-conversion",
@@ -3334,7 +3352,10 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
         // Without it, a list literal of variants (``[`a(1), `b(2)]``) is rejected even
         // though `ColumnValue::from_values` builds a union column from a `Union`
         // extent perfectly well.
-        TypedExprNode::VariantCtor { tag, payload } => Ok(Value::Union {
+        TypedExprNode::VariantCtor { tag, payload }
+        | TypedExprNode::NominalCtor {
+            ctor: tag, payload, ..
+        } => Ok(Value::Union {
             tag: FieldKey::Name(tag.as_str().into()),
             inner: Box::new(expr_to_value(payload)?),
         }),
@@ -3584,6 +3605,7 @@ fn build_commit_store(
                 carried: Some(paths[i].clone()),
                 runtime_key,
                 value_extent: key_value_extent,
+                holds_nominal: k.init.ty.mentions_nominal(),
             },
         );
         debug_assert!(
@@ -3719,6 +3741,7 @@ fn build_commit_store(
                     carried: None,
                     runtime_key: store_key(&field),
                     value_extent: tap_value_extent,
+                    holds_nominal: false,
                 },
             );
             // A tap shares this map with the mutable-variable keys, so its
@@ -4358,6 +4381,16 @@ pub enum StateConflict {
     /// upgrade of a specific predecessor, and the remedy is the version the
     /// author needs anyway: the one with the migration taken out.
     NoPredecessor { name: String },
+    /// The running program holds it, or the new version declares or loads it, at a type
+    /// that mentions a nominal type.
+    ///
+    /// Extents cannot carry such a value over: an extent is the nominal type's
+    /// representation, which leaves out the type's name and its declaration's
+    /// refinements, so a renamed type or a tightened refinement compares equal. The check
+    /// the spec states compares the two declarations (`src/ccl/design/program-evolution.md`,
+    /// "A nominal type is compared by declaration"); until it exists, every such value is
+    /// refused, an unchanged declaration included.
+    NominalState { path: VarPath },
 }
 
 /// A loop this version declares that begins above the beginning of what it
@@ -4427,6 +4460,10 @@ impl std::fmt::Display for StateConflict {
             StateConflict::NoPredecessor { name } => {
                 write!(f, "`@LoadFrom({name})` has no variable to read")
             }
+            StateConflict::NominalState { path } => write!(
+                f,
+                "{path} holds a value of a nominal type, which a reload does not carry over yet",
+            ),
             StateConflict::LoadFromAnonymous { name } => write!(
                 f,
                 "`@LoadFrom({name})` names several declarations that are told apart only by \
@@ -4536,6 +4573,7 @@ fn store_parts(
                 carried: None,
                 runtime_key,
                 value_extent,
+                holds_nominal: false,
             },
         );
         // A tap is minted into the double-underscore namespace
@@ -4724,6 +4762,7 @@ fn build_nested_induction_store(
                 carried: None,
                 runtime_key: rk,
                 value_extent,
+                holds_nominal: false,
             },
         );
         debug_assert!(
@@ -4885,6 +4924,7 @@ fn build_induction_store_single(
                 carried: Some(paths[i].clone()),
                 runtime_key: rk,
                 value_extent,
+                holds_nominal: k.init.ty.mentions_nominal(),
             },
         );
         debug_assert!(

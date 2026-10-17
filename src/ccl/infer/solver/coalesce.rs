@@ -186,6 +186,11 @@ pub fn refuse_param_joined_with_outer_variable(graph: &CompactGraph) -> Result<(
             go(value, polarity)?;
             go(domain, polarity)?;
         }
+        for (decl, args) in &ct.nominal {
+            for (arg, v) in args.iter().zip(decl.sided_variances()) {
+                go(arg, v.polarity(polarity))?;
+            }
+        }
         Ok(())
     }
     go(&graph.term, true)
@@ -631,6 +636,40 @@ fn coalesce_compact_go(
             coalesce_compact_go(value, polarity, scope)?,
             *history_kind,
         ));
+    }
+    // Two applications whose arguments at an invariant parameter differ have no join.
+    if let Some((decl, a, b)) = &ct.nominal_conflict {
+        return Err(CoalesceError::IncompatibleBounds {
+            polarity,
+            vars: ct.vars.iter().copied().collect(),
+            details: format!(
+                "two `{}` values at different arguments of an invariant parameter: {} and {}",
+                decl.name,
+                coalesce_compact_go(a, polarity, scope)?,
+                coalesce_compact_go(b, polarity, scope)?,
+            ),
+        });
+    }
+    // Each declaration is one shape, so two at one position fall to the conflict below. A
+    // bipolar argument's two sides are coalesced at their own polarities and joined back
+    // into one argument (`nominal::split`).
+    for (decl, args) in &ct.nominal {
+        let mut sides = args.iter().zip(decl.sided_variances());
+        let mut slots = Vec::with_capacity(decl.params.len());
+        for v in &decl.body().variances {
+            let mut next = || {
+                let (arg, side) = sides.next().expect("one side per sided variance");
+                coalesce_compact_go(arg, side.polarity(polarity), scope)
+            };
+            slots.push(match v {
+                crate::ccl::nominal::Variance::Bipolar => {
+                    let input = next()?;
+                    crate::ccl::nominal::split(input, next()?)
+                }
+                _ => next()?,
+            });
+        }
+        shapes.push(Type::Nominal(decl.clone(), slots));
     }
     let mut all = Vec::new();
     all.append(&mut atoms);

@@ -222,6 +222,31 @@ fn hash_type<'a>(
         // its spelling is what is folded. None survives inference, so this is
         // reached only by a hash of a pre-inference tree.
         T::Param(param) => param.spelling.hash(state),
+        // A declaration is identified by its module's path and its name, the same in
+        // every compilation. Two versions of a program may declare one name differently,
+        // and the hash is what compares them, so it folds the declaration's body too: each
+        // constructor's name and parameter types, in declaration order. A declaration
+        // reaches no other declaration that reaches it back, so the fold ends.
+        T::Nominal(decl, args) => {
+            decl.hash(state);
+            let ctors = &decl.body().ctors;
+            ctors.len().hash(state);
+            for ctor in ctors {
+                ctor.name.hash(state);
+                ctor.params.len().hash(state);
+                for (_, t) in &ctor.params {
+                    hash_type(t, &mut Vec::new(), &mut Vec::new(), free, state);
+                }
+            }
+            args.len().hash(state);
+            for t in args {
+                hash_type(t, env, wenv, free, state);
+            }
+        }
+        T::Split { input, output } => {
+            hash_type(input, env, wenv, free, state);
+            hash_type(output, env, wenv, free, state);
+        }
         T::Poly(poly) => {
             for p in &poly.params {
                 p.param.spelling.hash(state);
@@ -500,6 +525,10 @@ fn hash_payload<'a>(
         N::UnaryOp(kind, _) => kind.hash(h),
         N::Aggregate { kind, .. } => kind.hash(h),
         N::VariantCtor { tag, .. } => tag.hash(h),
+        N::NominalCtor { decl, ctor, .. } => {
+            decl.hash(h);
+            ctor.hash(h);
+        }
         // Field *names* are folded together with their values in `hash_rel`,
         // which is what keeps `(a: 1, b: 2)` distinct from `(a: 2, b: 1)` under
         // the order-insensitive fold. An [`Fold::Own`] fold has no children to
@@ -659,6 +688,33 @@ mod tests {
     }
     fn h(e: &TypedExpr) -> ContentHash {
         content_hash(e)
+    }
+
+    /// Two versions of a program that declare one name with different constructors hash a
+    /// value of the type differently, though no node of the tree changes.
+    #[test]
+    fn a_nominal_type_hashes_its_declaration() {
+        use crate::ccl::nominal::{NominalCtor, NominalDecl};
+        let span = chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0);
+        let light = |tags: &[&str]| {
+            let decl = NominalDecl::declared("Light".into(), Vec::new(), span);
+            decl.define(
+                tags.iter()
+                    .map(|t| NominalCtor {
+                        name: (*t).into(),
+                        span,
+                        params: Vec::new(),
+                    })
+                    .collect(),
+            )
+            .expect("no parameters to use");
+            TypedExpr::lit(Lit::Unit).with_ty(Type::Nominal(decl, Vec::new()))
+        };
+        assert_eq!(h(&light(&["red", "green"])), h(&light(&["red", "green"])));
+        assert_ne!(
+            h(&light(&["red", "green"])),
+            h(&light(&["red", "green", "blue"]))
+        );
     }
 
     #[test]

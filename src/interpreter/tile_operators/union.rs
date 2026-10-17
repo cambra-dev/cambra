@@ -597,8 +597,27 @@ impl TileProducer for UnionProducer {
         // position can only be *tagged* — the solver won't infer an untagged sum from a
         // collision — so differing arms are both `ColumnValue::Union` and appending merges
         // their tag maps.
+        //
+        // Arms whose codomain tilings differ merge into one column at the declared codomain
+        // ([`Self::new`]), so a value-shaped arm is restated in that shape first, as
+        // [`flat_merge`] restates its arms: a product arm may arrive as a record of columns.
+        let Tiling::DataFunction {
+            codomain: codomain_tiling,
+            ..
+        } = self.tiling()
+        else {
+            panic!("a union tiling is a function, got {}", self.tiling())
+        };
+        let codomain_tiling = (**codomain_tiling).clone();
+        let restated = |arm: Tile| {
+            if arm.holds_a_level() || codomain_tiling.holds_a_level() {
+                arm
+            } else {
+                column_value_to_tile(scalar_tile_to_column_value(arm), &codomain_tiling)
+            }
+        };
         let codomain_tile: Tile = {
-            let mut arms = codomains.into_iter();
+            let mut arms = codomains.into_iter().map(restated);
             let mut combined = arms.next().expect("at least one arm");
             for arm in arms {
                 combined.merge_rows(arm);

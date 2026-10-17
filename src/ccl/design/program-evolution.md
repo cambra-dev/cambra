@@ -730,7 +730,7 @@ the reload is refused.
 
 **Identity**, meaning which declaration a value belongs to, is checked separately: a value landing
 in its neighbour's variable is receivable, so takeover does not catch it. It is the third and fourth
-refusals of [Five refusals](#five-refusals).
+refusals of [Six refusals](#six-refusals).
 
 `LiveProgram::check` runs both checks before anything is torn down, for `reload` and
 `create_branch` alike. It compares the variables the predecessor holds against those the new version
@@ -849,7 +849,7 @@ its two fields is refused (`StateConflict::LoadFromAt`), not narrowed, because a
 another shape becomes a constant of the wrong extent and the operator built around it fails on its
 first pull.
 
-### Five refusals
+### Six refusals
 
 - **A variable the new version neither declares nor loads.** Its value has nowhere to be seeded.
 - **A variable it declares, or loads, at a different type.** Its value cannot seed a store built for
@@ -871,6 +871,11 @@ first pull.
   a store nothing reads is never driven, so it declares its variables and hands on nothing. The two
   are reported separately, because in the second case the source is right about where the value goes
   and only the value is missing.
+- **A variable held, declared or loaded at a type that mentions a nominal type.** An extent leaves
+  out the type's name and its declaration's refinements, so the second refusal would let through a
+  value the spec refuses, per [A nominal type is compared by
+  declaration](#a-nominal-type-is-compared-by-declaration). Until that comparison exists, every
+  such variable is refused (`StateConflict::NominalState`), an unchanged declaration included.
 
 Nothing else is refused. A lost value is refused because the program carries on answering afterwards
 with only the accumulated history gone, so the author has nothing to notice. One other outcome is
@@ -881,7 +886,8 @@ visibly.
 
 ### A nominal type is compared by declaration
 
-> **Status: [Prescribed].** Nominal types are not implemented.
+> **Status: [Prescribed].** Until it is implemented, a reload refuses every variable whose type
+> mentions a nominal type (the sixth of [Six refusals](#six-refusals)).
 
 The second refusal compares types after inference, and a nominal type survives inference, so the
 comparison sees the nominal type and not only its constructors' parameter types. The rules a stored

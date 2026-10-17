@@ -230,6 +230,15 @@ impl Printer {
                 format!("Feed({})", self.ty(value))
             }
             Type::Poly(poly) => self.poly(poly),
+            Type::Nominal(decl, args) if args.is_empty() => decl.name.to_string(),
+            Type::Nominal(decl, args) => {
+                let args: Vec<String> = args.iter().map(|t| self.ty(t)).collect();
+                format!("{}({})", decl.name, args.join(", "))
+            }
+            // No program writes one; this names both sides.
+            Type::Split { input, output } => {
+                format!("in {} out {}", self.ty(input), self.ty(output))
+            }
             Type::ChanDom(..) | Type::WitnessRef(_) | Type::BoundedHole(_) | Type::DepTuple(_) => {
                 self.fallback(ty)
             }

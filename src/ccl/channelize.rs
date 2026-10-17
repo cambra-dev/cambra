@@ -1323,6 +1323,7 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
         | TypedExprNode::Record(_)
         | TypedExprNode::Case { .. }
         | TypedExprNode::VariantCtor { .. }
+        | TypedExprNode::NominalCtor { .. }
         | TypedExprNode::LetRec { .. }
         | TypedExprNode::Compose(_)
         | TypedExprNode::Copair(_)
@@ -1389,6 +1390,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         | TypedExprNode::Record(_)
         | TypedExprNode::Case { .. }
         | TypedExprNode::VariantCtor { .. }
+        | TypedExprNode::NominalCtor { .. }
         | TypedExprNode::LetRec { .. }
         | TypedExprNode::Compose(_)
         | TypedExprNode::Copair(_)
@@ -2169,7 +2171,8 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer => {}
             TypedExprNode::Error => crate::unexpected_error_node!(),
-            TypedExprNode::VariantCtor { payload, .. } => rec(payload, bound, out),
+            TypedExprNode::VariantCtor { payload, .. }
+            | TypedExprNode::NominalCtor { payload, .. } => rec(payload, bound, out),
         }
     }
     let mut targets: HashSet<Name> = HashSet::new();
@@ -3105,6 +3108,21 @@ fn extract_for_defer_impl(
         TypedExprNode::Error => crate::unexpected_error_node!(),
         TypedExprNode::VariantCtor { tag, payload } => TypedExprNode::VariantCtor {
             tag,
+            payload: Box::new(extract_for_defer(
+                *payload,
+                defer_name,
+                feeds,
+                define,
+                in_inner_scope,
+            )?),
+        },
+        TypedExprNode::NominalCtor {
+            decl,
+            ctor,
+            payload,
+        } => TypedExprNode::NominalCtor {
+            decl,
+            ctor,
             payload: Box::new(extract_for_defer(
                 *payload,
                 defer_name,

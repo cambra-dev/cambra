@@ -450,6 +450,23 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
+        // A constructor's payload is an operand like a tagged variant's.
+        TypedExprNode::NominalCtor {
+            decl,
+            ctor,
+            payload,
+        } => {
+            let (binds, payload) = atomize(*payload, muts);
+            let_chain(
+                binds,
+                rebuild(TypedExprNode::NominalCtor {
+                    decl,
+                    ctor,
+                    payload: Box::new(payload),
+                }),
+            )
+        }
+
         TypedExprNode::Feed { name, value } => {
             let (binds, value) = atomize_handle(*value, muts);
             let_chain(

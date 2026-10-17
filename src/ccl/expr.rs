@@ -429,6 +429,25 @@ pub enum TypedExprNode {
         payload: Box<TypedExpr>,
     },
 
+    /// A nominal type's constructor applied to its payload, `N::c(payload)`: a value of
+    /// [`Type::Nominal`] `N` at arguments inference reads off the payload
+    /// (`src/ccl/design/nominal-types.md`, "Constructors"). Where [`VariantCtor`](Self::VariantCtor)
+    /// builds a one-tag structural variant that width-subtypes into wider ones, this builds
+    /// a value related only to `N`. A runtime value of either is the union row its tag
+    /// names, which is how `lambda_elim` lowers both.
+    ///
+    /// Lowering builds one only as the body of the function a constructor with parameters
+    /// declares, whose parameter annotation states the constructor's parameter type
+    /// refinements included, and as the value of a constructor that declares none.
+    NominalCtor {
+        /// The declaration whose constructor this is.
+        decl: std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+        /// The constructor's name.
+        ctor: String,
+        /// The constructor's payload ([`crate::ccl::nominal::NominalCtor::payload`]).
+        payload: Box<TypedExpr>,
+    },
+
     /// A transactional mutable variable: a set of scalar-variable **keys** sharing one
     /// sequencing domain, driven by concurrent **writers** that read the
     /// shared mutable variables and propose per-position writes.
@@ -808,6 +827,7 @@ impl TypedExprNode {
             TypedExprNode::List(_) => "List",
             TypedExprNode::Case { .. } => "Case",
             TypedExprNode::VariantCtor { .. } => "VariantCtor",
+            TypedExprNode::NominalCtor { .. } => "NominalCtor",
             TypedExprNode::Transact { .. } => "Transact",
             TypedExprNode::LetRec { .. } => "LetRec",
             TypedExprNode::For { .. } => "For",
@@ -1570,6 +1590,20 @@ impl TypedExpr {
         })
     }
 
+    /// Construct a [`TypedExprNode::NominalCtor`] building a value of the nominal type
+    /// `decl` with its constructor `ctor`.
+    pub fn nominal_ctor(
+        decl: std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+        ctor: impl Into<String>,
+        payload: TypedExpr,
+    ) -> Self {
+        Self::new(TypedExprNode::NominalCtor {
+            decl,
+            ctor: ctor.into(),
+            payload: Box::new(payload),
+        })
+    }
+
     /// Construct a pattern-matching [`TypedExprNode::Case`] node — a `Case`
     /// with a scrutinee whose branches carry structural [`Pattern`]s.
     pub fn match_expr(scrutinee: TypedExpr, branches: Vec<Branch>) -> Self {
@@ -1681,7 +1715,8 @@ impl TypedExpr {
                     f(&b.body);
                 }
             }
-            TypedExprNode::VariantCtor { payload, .. } => f(payload.as_ref()),
+            TypedExprNode::VariantCtor { payload, .. }
+            | TypedExprNode::NominalCtor { payload, .. } => f(payload.as_ref()),
             TypedExprNode::Record(fields) => fields.iter().for_each(|(_, e)| f(e)),
             // `domain` is a `Type`, not an `Expr` child, so the expr-walker
             // skips it (its type residue is reached via `expr.ty` walks). Child
@@ -1882,7 +1917,8 @@ impl TypedExpr {
                     f(&mut b.body);
                 }
             }
-            TypedExprNode::VariantCtor { payload, .. } => f(payload.as_mut()),
+            TypedExprNode::VariantCtor { payload, .. }
+            | TypedExprNode::NominalCtor { payload, .. } => f(payload.as_mut()),
             TypedExprNode::Record(fields) => fields.iter_mut().for_each(|(_, e)| f(e)),
             // `domain` is a `Type`, not an `Expr` child (see `walk_children`).
             // Child order mirrors `walk_transact`.
@@ -1976,6 +2012,7 @@ impl TypedExpr {
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
             | TypedExprNode::VariantCtor { .. }
+            | TypedExprNode::NominalCtor { .. }
             | TypedExprNode::List(_)
             | TypedExprNode::Tuple(_)
             | TypedExprNode::Record(_)
@@ -2029,6 +2066,7 @@ impl TypedExpr {
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
             | TypedExprNode::VariantCtor { .. }
+            | TypedExprNode::NominalCtor { .. }
             | TypedExprNode::List(_)
             | TypedExprNode::Tuple(_)
             | TypedExprNode::Record(_)

@@ -210,6 +210,7 @@ impl CompileError {
         };
         let related = match self {
             CompileError::Infer { related, .. } => related.as_slice(),
+            CompileError::Lower(e) => e.related(),
             _ => &[],
         };
         span_rendering(title, span, &self.message(), related, sources, color)

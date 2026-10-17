@@ -403,6 +403,22 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         // bookkeeping, not identity - see `ChanLevel`).
         (Type::ChanDom(a, _), Type::ChanDom(b, _)) => a == b,
         (Type::Param(a), Type::Param(b)) => a == b,
+        (Type::Nominal(d1, a1), Type::Nominal(d2, a2)) => {
+            d1 == d2
+                && a1
+                    .iter()
+                    .zip(a2)
+                    .all(|(x, y)| types_agree_modulo_unread(x, y, refinements))
+        }
+        // A bipolar argument read once whole and once split agrees side by side.
+        (Type::Split { .. }, _) | (_, Type::Split { .. }) => {
+            let ((ri, ro), (ni, no)) = (
+                crate::ccl::nominal::sides(read),
+                crate::ccl::nominal::sides(now),
+            );
+            types_agree_modulo_unread(ri, ni, refinements)
+                && types_agree_modulo_unread(ro, no, refinements)
+        }
         (
             Type::Fun {
                 name: n1,
@@ -869,6 +885,32 @@ fn pin_unobservable_param(lambda_ty: &Type, ctx: &mut CoalesceCtx) {
     }
 }
 
+/// Pin each argument of a constructed nominal value that neither its payload nor a demand
+/// determines, to the type of its position: `Opt::none` joined with `Opt::some(1)` is an
+/// `Opt(Int)`. With no answer the variable stays, for the post-inference check to report
+/// (`docs/chl-spec.md`, "Type parameters"). See
+/// `src/ccl/design/type-inference.md`, "Pin sites".
+fn pin_unobservable_ctor_args(value_ty: &Type, ctx: &mut CoalesceCtx) {
+    let Type::Nominal(decl, args) = value_ty.peel_refinements() else {
+        return;
+    };
+    for arg in args {
+        let Type::Infer(v) = arg else {
+            continue;
+        };
+        if !matches!(resolve_var_type(arg), Ok(Type::Infer(_))) {
+            continue;
+        }
+        let Some(chosen) = accepted_position_type(v, ctx) else {
+            continue;
+        };
+        if let Err(err) = pin_both_ways(&chosen, arg) {
+            let label = format!("an argument of `{}` pinned to `{chosen}`", decl.name);
+            ctx.push_error(map_constrain_err(err, &label), label);
+        }
+    }
+}
+
 /// The type to pin an unobservable arm payload or empty-literal element to: the type of
 /// its position, else one its operator reads accept, else `Unit`. See
 /// `src/ccl/design/type-inference.md`, "An unobservable arm payload is pinned to what its
@@ -926,6 +968,12 @@ enum PositionStep {
     Arm(crate::ccl::FieldKey),
     HistoryValue,
     HistoryDomain,
+    /// An argument of an application of this declaration.
+    Argument(Rc<crate::ccl::nominal::NominalDecl>, usize),
+    /// The input side of a bipolar parameter's argument ([`Type::Split`]).
+    Input,
+    /// Its output side.
+    Output,
 }
 
 /// Every [`Type::Infer`] in `ty`, with the position it occupies.
@@ -974,6 +1022,15 @@ fn for_each_positioned_var(
             step(value, PositionStep::HistoryValue, path);
             step(domain, PositionStep::HistoryDomain, path);
         }
+        Type::Nominal(decl, args) => {
+            for (i, t) in args.iter().enumerate() {
+                step(t, PositionStep::Argument(Rc::clone(decl), i), path);
+            }
+        }
+        Type::Split { input, output } => {
+            step(input, PositionStep::Input, path);
+            step(output, PositionStep::Output, path);
+        }
         Type::Refinement(base, _) | Type::BoundedHole(base) => {
             for_each_positioned_var(base, path, f);
         }
@@ -1005,6 +1062,11 @@ fn read_at<'a>(ty: &'a Type, path: &[PositionStep]) -> Option<&'a Type> {
         (Type::Variant(arms, _), PositionStep::Arm(key)) => &arms.iter().find(|(k, _)| k == key)?.1,
         (Type::History { value, .. }, PositionStep::HistoryValue) => value.as_ref(),
         (Type::History { domain, .. }, PositionStep::HistoryDomain) => domain.as_ref(),
+        (Type::Nominal(decl, args), PositionStep::Argument(at, i)) if decl == at => args.get(*i)?,
+        (Type::Split { input, .. }, PositionStep::Input) => input.as_ref(),
+        (Type::Split { output, .. }, PositionStep::Output) => output.as_ref(),
+        // An argument that is not split is both its sides.
+        (_, PositionStep::Input | PositionStep::Output) => return read_at(ty, rest),
         _ => return None,
     };
     read_at(inner, rest)
@@ -1538,6 +1600,10 @@ fn has_output_variable(ty: &Type, pol: bool) -> bool {
         Type::Fun {
             domain, codomain, ..
         } => has_output_variable(domain, !pol) || has_output_variable(codomain, pol),
+        Type::Nominal(decl, args) => args
+            .iter()
+            .zip(&decl.body().variances)
+            .any(|(t, v)| has_output_variable(t, v.polarity(pol))),
         Type::Refinement(base, _) => has_output_variable(base, pol),
         other => {
             let mut found = false;
@@ -1885,7 +1951,13 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 }
             }
         }
-        TypedExprNode::VariantCtor { payload, .. } => {
+        TypedExprNode::VariantCtor { payload, .. } => coalesce_node(payload, level, ctx),
+        TypedExprNode::NominalCtor { payload, .. } => {
+            // Before anything reads the value's type. In a walk whose types are dropped, an
+            // argument nothing determines is the definition's own, and the uses supply it.
+            if !ctx.discarding {
+                pin_unobservable_ctor_args(&expr.ty, ctx);
+            }
             coalesce_node(payload, level, ctx);
         }
         TypedExprNode::ExprStmt { expr: e, body } => {
@@ -2251,9 +2323,13 @@ fn coalesce_type_predicates_go(
             coalesce_type_predicates_go(c, level, ctx, scope);
             scope.exit();
         }
-        Type::Tuple(ts) => ts
+        Type::Tuple(ts) | Type::Nominal(_, ts) => ts
             .iter_mut()
             .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
+        Type::Split { input, output } => {
+            coalesce_type_predicates_go(input, level, ctx, scope);
+            coalesce_type_predicates_go(output, level, ctx, scope);
+        }
         // Component `𝑘` is inside the scopes of the `𝑘` components before it.
         Type::DepTuple(cs) => {
             let n = cs.len();

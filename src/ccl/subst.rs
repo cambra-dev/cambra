@@ -1310,6 +1310,11 @@ impl Subst {
                     }
                 }
             }
+            Type::Nominal(_, ts) => ts.iter_mut().for_each(|t| self.rewrite_type_go(t, memo)),
+            Type::Split { input, output } => {
+                self.rewrite_type_go(input, memo);
+                self.rewrite_type_go(output, memo);
+            }
             Type::Record(fs) => fs
                 .iter_mut()
                 .for_each(|(_, t)| self.rewrite_type_go(t, memo)),
@@ -1600,6 +1605,13 @@ impl Subst {
                 }
                 Type::DepTuple(out)
             }
+            Type::Nominal(d, ts) => {
+                Type::Nominal(d.clone(), ts.iter().map(|t| self.apply_type(t)).collect())
+            }
+            Type::Split { input, output } => Type::Split {
+                input: Box::new(self.apply_type(input)),
+                output: Box::new(self.apply_type(output)),
+            },
             Type::Record(fs) => Type::Record(
                 fs.iter()
                     .map(|(n, t)| (n.clone(), self.apply_type(t)))
@@ -1751,6 +1763,8 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         }
         Type::Tuple(ts) => ts.iter().any(type_contains_infer),
         Type::DepTuple(cs) => cs.iter().any(|(_, t)| type_contains_infer(t)),
+        Type::Nominal(_, ts) => ts.iter().any(type_contains_infer),
+        Type::Split { input, output } => type_contains_infer(input) || type_contains_infer(output),
         Type::Record(fs) => fs.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Variant(tags, _) => tags.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Refinement(base, _) => type_contains_infer(base),
@@ -1860,6 +1874,13 @@ fn collect_type_fv(
                 with_binders(bound, name.clone(), |bnd| rest(later, bnd, visited, out));
             }
             rest(cs, bound, visited, out)
+        }
+        Type::Nominal(_, ts) => ts
+            .iter()
+            .for_each(|t| collect_type_fv(t, bound, visited, out)),
+        Type::Split { input, output } => {
+            collect_type_fv(input, bound, visited, out);
+            collect_type_fv(output, bound, visited, out);
         }
         Type::Record(fs) => fs
             .iter()
@@ -2342,6 +2363,11 @@ impl<'a> PiWalk<'a> {
                 }
                 self.shadowed.truncate(base);
             }
+            Type::Nominal(_, ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
+            Type::Split { input, output } => {
+                self.ty(input, depth);
+                self.ty(output, depth);
+            }
             Type::Record(fs) => fs.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
             Type::Variant(tags, _) => tags.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
             Type::History { value, domain, .. } => {
@@ -2540,6 +2566,10 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
                 .iter()
                 .enumerate()
                 .any(|(k, (_, t))| ty_scan(t, depth + k as u32, within, visited)),
+            Type::Nominal(_, ts) => ts.iter().any(|t| ty_scan(t, depth, within, visited)),
+            Type::Split { input, output } => {
+                ty_scan(input, depth, within, visited) || ty_scan(output, depth, within, visited)
+            }
             Type::Record(fs) => fs.iter().any(|(_, t)| ty_scan(t, depth, within, visited)),
             Type::Variant(tags, _) => tags.iter().any(|(_, t)| ty_scan(t, depth, within, visited)),
             Type::History { value, domain, .. } => {

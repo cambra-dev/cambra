@@ -610,6 +610,7 @@ conditional's reading unchanged.
 | Unreachable `match` arm | ``x = `a(1)``; ``case `a(v): `p(v)``; ``case `b(w): `p(w)`` | `w : Int@1`, the `` `p `` payload of the join | the payload binder's type | no value reaches it | [An unobservable arm payload is pinned to what its uses require](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require) |
 | Empty list literal | `box([1]) if c else box([])` | element `Int@1`, the other branch's element | the element type | no value reaches it | as an arm payload ([The empty literal names no element type](collections.md#the-empty-literal-names-no-element-type)) |
 | Lambda parameter | `(\x -> 1) if c else (\y -> y + 2)` | `x : Int`, the join's domain | the parameter's type | neither a value nor a demand reaches it | the variable remains, and the post-inference check reports `UnresolvedInfer` |
+| Nominal constructor | `Opt::some(1) if c else Opt::none` | `T : Int@1`, the other branch's argument | each type argument of the value it builds, `T` in `Opt::none : Opt(T)` | neither the payload nor a demand reaches it | the variable remains, an unresolved type at the use (`docs/chl-spec.md`, "Type parameters") |
 
 ##### The type of a position
 

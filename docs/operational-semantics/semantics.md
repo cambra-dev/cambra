@@ -594,7 +594,7 @@ tiling and still admit several injections between their terms, and the choice de
 each seed carries.
 [program-evolution.md](/src/ccl/design/program-evolution.md#the-agreed-region-is-the-region-a-structural-diff-pairs)
 specifies the one the compiler takes, and
-[Five refusals](/src/ccl/design/program-evolution.md#five-refusals) is what it refuses where the
+[Six refusals](/src/ccl/design/program-evolution.md#six-refusals) is what it refuses where the
 source does not determine it.
 
 **When the boundary is taken.** `y₁` is whatever the term held at the instant the swap ran.

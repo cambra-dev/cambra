@@ -197,7 +197,10 @@ Refinement predicates are terms and are hashed by `hash_rel` with the current te
 and free-variable policy. Their hashes are sorted before folding. Record and variant fields
 likewise contribute sorted hashes of their key/type pairs; variant openness also participates.
 Tuple fields remain positional. A `ChanDom` contributes its channel's spelling, not its uid or
-channel level. Function Pi-binder names are not hashed.
+channel level. Function Pi-binder names are not hashed. A nominal type contributes its
+declaration's identity, its module path and name, and its declaration's body: each constructor's
+name and parameter types. Two versions that declare one name with different constructors
+therefore hash differently wherever a value of the type appears.
 
 A function contributes its `FunKind` discriminant. A kind variable additionally contributes its
 resolved kind, but not its allocation identity. Sum binders contribute their count, kinds and

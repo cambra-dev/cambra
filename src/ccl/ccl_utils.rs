@@ -1270,6 +1270,13 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         | Type::Param(_)
         | Type::Txn => ty.clone(),
         Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(strip_refinements))),
+        Type::Nominal(decl, args) => {
+            Type::Nominal(decl.clone(), args.iter().map(strip_refinements).collect())
+        }
+        // Stripped, the two sides may agree, and then they are one argument.
+        Type::Split { input, output } => {
+            crate::ccl::nominal::split(strip_refinements(input), strip_refinements(output))
+        }
     }
 }
 

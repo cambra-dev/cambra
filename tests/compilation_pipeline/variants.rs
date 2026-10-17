@@ -452,6 +452,26 @@ fn an_unreachable_arm_payload_takes_its_type_from_the_join() {
     );
 }
 
+/// A variant inside a product joins component by component, with one tag or with two, and
+/// whichever arm runs.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::one_tag(
+    "(`circle(1), 2) if c else (`circle(5), 3)",
+    make_tuple(&[union("circle", Value::Int(1)), Value::Int(2)])
+)]
+#[case::two_tags(
+    "(`circle(1), 2) if c else (`dot(()), 3)",
+    make_tuple(&[union("circle", Value::Int(1)), Value::Int(2)])
+)]
+#[case::two_tags_second_arm(
+    "(`circle(1), 2) if not c else (`dot(()), 3)",
+    make_tuple(&[union("dot", Value::Unit), Value::Int(3)])
+)]
+fn a_product_of_variants_joins(#[case] join: &str, #[case] expected: Value) {
+    check_scalar(&format!("c = 1 > 0\n{join}\n"), expected);
+}
+
 /// A join that gives an unreachable payload a type its own reads reject is a type error.
 /// `w + w` admits no `Bool` and no tuple, so the pin keeps to what `+` accepts and the arms
 /// collide.

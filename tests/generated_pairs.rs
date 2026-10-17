@@ -1055,6 +1055,7 @@ fn shape(v: &Value) -> String {
             format!("({})", fields.join(", "))
         }
         Value::Variant { tag, payload } => format!("`{tag}({})", shape(payload)),
+        Value::Nominal { ty, ctor, payload } => format!("{ty}::{ctor}({})", shape(payload)),
         Value::Collection(c) => {
             let entries: std::collections::BTreeSet<String> = c
                 .entries()

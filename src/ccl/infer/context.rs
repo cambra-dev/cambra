@@ -446,6 +446,16 @@ impl InferCtx {
                     .map(|(n, t)| (n.clone(), self.normalize_annotation_in(t, telescope)))
                     .collect(),
             ),
+            Type::Nominal(decl, args) => Type::Nominal(
+                decl.clone(),
+                args.iter()
+                    .map(|t| self.normalize_annotation_in(t, telescope))
+                    .collect(),
+            ),
+            Type::Split { input, output } => Type::Split {
+                input: Box::new(self.normalize_annotation_in(input, telescope)),
+                output: Box::new(self.normalize_annotation_in(output, telescope)),
+            },
             Type::Record(fs) => Type::Record(
                 fs.iter()
                     .map(|(n, t)| (n.clone(), self.normalize_annotation_in(t, telescope)))

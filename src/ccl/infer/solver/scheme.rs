@@ -497,6 +497,16 @@ pub fn freshen_above(
                 .map(|t| freshen_above(lim, t, target, cache))
                 .collect(),
         ),
+        Type::Nominal(decl, args) => Type::Nominal(
+            decl.clone(),
+            args.iter()
+                .map(|t| freshen_above(lim, t, target, cache))
+                .collect(),
+        ),
+        Type::Split { input, output } => Type::Split {
+            input: Box::new(freshen_above(lim, input, target, cache)),
+            output: Box::new(freshen_above(lim, output, target, cache)),
+        },
         Type::Record(fs) => Type::Record(
             fs.iter()
                 .map(|(n, t)| (n.clone(), freshen_above(lim, t, target, cache)))
