@@ -253,7 +253,7 @@ fn an_empty_map_is_a_typed_empty_tile() {
     );
 }
 
-// A checked lookup on the empty map finds nothing. `` `none `` rather than a fault is the
+// A checked lookup on the empty map finds nothing. `Option::none` rather than a fault is the
 // whole difference between the two lookup forms, and the empty map is where it is sharpest.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -262,9 +262,9 @@ fn a_checked_lookup_on_the_empty_map_is_none() {
         indoc! {r#"
             m: Map(String, Int) = empty_map()
             match m["x"]?:
-                case `some(v):
+                case Option::some(v):
                     v
-                case `none:
+                case Option::none:
                     7
         "#},
         Value::Int(7),

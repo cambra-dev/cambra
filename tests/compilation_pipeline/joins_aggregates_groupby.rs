@@ -719,30 +719,30 @@ fn test_grouping_built_once(#[case] code: &str) {
 }
 
 /// The checked lookup `c[k]?` end to end: membership decided against the collection's
-/// domain, answered as the `` {`none | `some{𝑉}} `` sum the type promises.
+/// domain, answered as the `Option(𝑉)` the type promises.
 ///
 /// The absent case is the one worth pinning. Absence is **decided** here rather than read
 /// off an empty tile: an empty tile means "no rows known", which covers a key genuinely
-/// missing and a producer that has not converged, so reading `` `none `` off it would make
+/// missing and a producer that has not converged, so reading `Option::none` off it would make
 /// the answer depend on how far the source had run. `CheckedLookup` withholds until the
-/// domain is decided and only then answers `` `none ``.
+/// domain is decided and only then answers `Option::none`.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::map_present(
-    "m = map([(1, 10), (2, 20)])\nmatch m[1]?:\n    case `some(v):\n        v\n    case `none:\n        0",
+    "m = map([(1, 10), (2, 20)])\nmatch m[1]?:\n    case Option::some(v):\n        v\n    case Option::none:\n        0",
     Value::Int(10)
 )]
 #[case::map_absent(
-    "m = map([(1, 10), (2, 20)])\nmatch m[9]?:\n    case `some(v):\n        v\n    case `none:\n        0",
+    "m = map([(1, 10), (2, 20)])\nmatch m[9]?:\n    case Option::some(v):\n        v\n    case Option::none:\n        0",
     Value::Int(0)
 )]
 // A `Set(K)` is `Map(K, unit)`, so its lookup is membership as a value.
 #[case::set_present(
-    "s = set([1, 2, 3])\nmatch s[2]?:\n    case `some(_):\n        1\n    case `none:\n        0",
+    "s = set([1, 2, 3])\nmatch s[2]?:\n    case Option::some(_):\n        1\n    case Option::none:\n        0",
     Value::Int(1)
 )]
 #[case::set_absent(
-    "s = set([1, 2, 3])\nmatch s[9]?:\n    case `some(_):\n        1\n    case `none:\n        0",
+    "s = set([1, 2, 3])\nmatch s[9]?:\n    case Option::some(_):\n        1\n    case Option::none:\n        0",
     Value::Int(0)
 )]
 fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) {
@@ -824,9 +824,9 @@ fn a_product_key_decides_presence(#[case] key: &str, #[case] expected: Value) {
     let code = indoc! {r#"
         m = map([((1, 2), 10), ((3, 4), 20)])
         match m[KEY]?:
-            case `some(v):
+            case Option::some(v):
                 v
-            case `none:
+            case Option::none:
                 0
     "#}
     .replace("KEY", key);
@@ -902,7 +902,7 @@ fn record_types_in_two_field_orders_compare(#[case] right: &str) {
 }
 
 /// A group-by's groups are themselves collections, so a checked lookup on one would carry
-/// a collection as its `` `some `` payload — which nothing materializes.
+/// a collection as its `Option::some` payload — which nothing materializes.
 ///
 /// Rejected at **op-conversion**, not by the typing rule: the answer's *type* is fine, the
 /// key binder having discharged to the key
@@ -915,9 +915,9 @@ fn a_group_valued_lookup_is_rejected_by_name() {
         indoc! {r#"
             g = groupby([1, 1, 2], \x -> x)
             match g[1]?:
-                case `some(grp):
+                case Option::some(grp):
                     sum(grp)
-                case `none:
+                case Option::none:
                     0
         "#},
         "A collection-valued codomain is the usual reason",
@@ -964,9 +964,9 @@ fn checked_lookup_over_a_key_stream(#[case] tail: &str, #[case] expected: Value)
     let code = format!(
         "def or_zero(o: Option(Int)) => Int:\n\
          \x20   match o:\n\
-         \x20       case `some(v):\n\
+         \x20       case Option::some(v):\n\
          \x20           v\n\
-         \x20       case `none:\n\
+         \x20       case Option::none:\n\
          \x20           0\n\
          m = map([(1, 10), (2, 20)])\n{tail}"
     );

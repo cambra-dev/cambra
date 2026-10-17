@@ -212,7 +212,7 @@ module](#912-field-labels-and-tags-belong-to-a-module)), and a nominal type from
 and lowering refuses it until modules are implemented.
 
 > **Direction [Decided].** Postfix `!` joins the set. It unwraps an `Option` proven not to be
-> `none` ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
+> `Option::none` ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
 
 `:=` is the **mutation** operator (§4.3, §8.1) — it introduces and writes
 a mutable variable. It is *not* Python's walrus operator: it is an
@@ -1028,8 +1028,8 @@ An identifier cannot begin with a digit, so named and positional field syntax do
 A `FullMap(K, V)` accepts a key of type `K`; a refined present-key domain instead requires
 membership in that refinement. Proven lookup does not define an absent-key runtime result.
 
-Checked lookup returns `some` with the value when the key is present and `none` when absent.
-For a set, the value is unit. Presence can be established before the domain is final; absence
+Checked lookup returns `Option::some` with the value when the key is present and `Option::none`
+when absent. For a set, the value is unit. Presence can be established before the domain is final; absence
 requires the final domain. A live feed with no final domain may never answer an absent-key lookup.
 
 #### Subscript and unwrap syntax [Decided]
@@ -1076,8 +1076,8 @@ termination of its producer. A time-bounded view of a live feed or a transaction
 could establish such a domain even when the underlying source never ends. The language does
 not yet provide a general cut interface for this rule.
 
-An unpinned live feed still cannot establish absence. A provisional `none` followed by a
-correction would require incremental view maintenance, not an irrevocable Option answer.
+An unpinned live feed still cannot establish absence. A provisional `Option::none` followed by a
+correction would require incremental view maintenance, not an irrevocable answer.
 A timeout-based answer would depend on wall-clock timing. These alternatives do not change
 the current rule: a lookup decides absence only once the collection's domain is final.
 
@@ -1327,7 +1327,7 @@ Variants are **structural**, exactly as records are: a tag has no
 declaration and no owner. `` `some(1) `` has the one-tag type
 `` {`some{Int}} ``, and *width subtyping* — the dual of the record rule —
 lets it flow into any variant type whose tag set contains it, so the same
-value is usable as an `Option(Int)`. Two consequences worth stating
+value is usable as a ``{`some{Int} | `none}``. Two consequences worth stating
 outright:
 
 - There is **one flat space of tag names**. The same spelling means the
@@ -1359,12 +1359,11 @@ context.
 A constructor is an ordinary atom, so it takes a postfix chain:
 `` `some(r).x `` is the attribute `x` of `` `some(r) `` (§3.9).
 
-An annotation may write the arms out or use the `Option(T)` abbreviation, and a
-constructor flows into either:
+An annotation writes the arms out, and a constructor flows into any variant type whose tags
+include its own:
 
 ```python
 x: {`some{Int} | `none} = `some(1)
-y: Option(Int) = `some(1)
 z: {`ok{Int} | `err{String}} = `err("nope")
 ```
 
@@ -1374,14 +1373,13 @@ whatever term sits in the parens. A tag mismatch is therefore reported where the
 constructor meets a counterpart that lacks the tag — an annotation, a `match` arm's
 expected type, a join — rather than at the constructor.
 
-> **Direction [Decided] — `Option` is a nominal type.** `Option(T)` is a `type` declared in a std
-> module, with constructors `Option::some(T)` and `Option::none`
-> ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)), and the
-> method `Option::is_none` that a lookup's refinement tests
-> ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). It replaces the
-> built-in abbreviation above, so `` y: Option(Int) = `some(1) `` is a type error and
-> `y: Option(Int) = Option::some(1)` is the spelling. A structural variant with the same arms is a
-> different type.
+**`Option` is a nominal type, not a variant.** `Option(T)` is a `type` declared in a std module,
+with constructors `Option::some(T)` and `Option::none`
+([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)) and the method
+`Option::is_none` that a lookup's refinement tests
+([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). A structural
+variant with the same arms is a different type, so `` y: Option(Int) = `some(1) `` is a type
+error and `y: Option(Int) = Option::some(1)` is the spelling.
 
 ---
 
@@ -1778,7 +1776,7 @@ A **single** target binds the whole element; a **tuple / `->`** target
 destructures it, so a map iterates entries unpacked as `for k -> v in m:` (the
 north-star `storefront` rollup, §7.2). The keyed element carries its membership
 proof, so for a key from `for k -> v in m` (or `for k in s`) the refinement on `m[k]` excludes
-`none`, and `m[k]! : V` type-checks (§3.9). Reaching a map's keys or values as their own
+`Option::none`, and `m[k]! : V` type-checks (§3.9). Reaching a map's keys or values as their own
 collections is `m.keys()` / `m.values()` / `m.items()` (§6.3).
 
 > **Direction [Decided] — the element is a trait requirement.** `for x in c` places the built-in
@@ -2325,10 +2323,10 @@ treatment.
 
 **Capitalization distinguishes term from type.** Lowercase heads are
 terms; capitalized heads are types. Data *constructors* build values,
-so they are lowercase — `` `some ``/`` `none ``, `` `ok ``/`` `err `` — and
+so they are lowercase — `` `ok ``/`` `err ``, `Option::some` — and
 only the type (`Option(T)`) is capitalized. `Caps` means *type*, without
-exception (unlike ML and Rust, which capitalize constructors). Those
-constructors are **variant tags**, so they additionally carry the `` ` ``
+exception (unlike ML and Rust, which capitalize constructors). A
+**variant tag** additionally carries the `` ` ``
 prefix in every position (§6.5); the capitalization rule is
 what fixes their case, and the backtick is what marks them as tags rather
 than ordinary names. A nominal type's constructors are lowercase for the same reason, and take no
@@ -2727,19 +2725,13 @@ The rules, and what each one is doing:
 and ``{ `some{Int} | `none }`` are the same type, and an annotation written in
 either order compares equal to what inference produced.
 
-`Option(T)` is the canonical variant — ``{ `some{T} | `none }`` — and is
-what a partial lookup returns under the collections direction (§3.9,
-§6.3). It is a built-in *abbreviation* in the same category as `List(T)`, not a
-distinguished kind of type: nothing in the language privileges the spellings
-`some` and `none`, and writing the arms out gives the same type. `Result` is the
-same shape with `` `ok ``/`` `err `` and has no built-in spelling — write its
-arms out, or name them with a type alias (§6.7) at a fixed payload type.
-
-> **Direction [Decided].** `Option` becomes a nominal type declared in a std module, and stops
-> being an abbreviation of a structural variant
-> ([3.15 Variant constructors](#315-variant-constructors)). A sum that several modules share, such
-> as a `Result`, is declared the same way
-> ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+What a partial lookup returns (§3.9, §6.3) is `Option(T)`, a nominal type and not a variant
+([3.15 Variant constructors](#315-variant-constructors)): the variant language privileges no tag,
+so ``{ `some{T} | `none }`` is an ordinary variant type and a different type from `Option(T)`. A
+sum that several modules share, such as a `Result`, is declared as a nominal type the same way
+([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Within one
+module a sum such as ``{ `ok{T} | `err{E} }`` may be written as its arms, or named by a type alias
+(§6.7) at a fixed payload type.
 
 Variants are matched with `match`/`case` (§4.10). Destructuring one directly
 against a single-tag variant type, where the match cannot fail, is **[Decided]**
@@ -3400,7 +3392,7 @@ of built-in functions.
 All three are unary and take a collection-typed argument. Other aggregates
 (`count`, `avg`, `len`) are **[Planned]** but not yet recognised.
 
-Every aggregate's result is to become `Option(T)`, `` `none `` for an empty collection, as §3.9's
+Every aggregate's result is to become `Option(T)`, `Option::none` for an empty collection, as §3.9's
 optional lookup is **[Planned]**. A statically proven deref for a collection known to be non-empty
 goes with it, and is not designed yet. Until then `max` of an empty collection is not defined, and
 neither is `min` of one ([Partiality is not yet defined](#partiality-is-not-yet-defined-open)).

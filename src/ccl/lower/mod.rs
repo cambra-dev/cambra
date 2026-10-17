@@ -438,6 +438,12 @@ pub struct LoweringContext {
     /// method call anywhere names every type declaring its method.
     pub(super) associated_functions: Vec<nominal::AssociatedFunction>,
 
+    /// The members of compiler-provided declarations the module names, by binding name.
+    /// `nominal::bind_constructors` binds only these, so a module that names no member of
+    /// `Option` lowers as it would without it.
+    pub(super) builtin_members_used:
+        std::collections::BTreeMap<String, (Rc<crate::ccl::nominal::NominalDecl>, SmolStr)>,
+
     /// Shadow-depth counter keyed by surface spelling: how many enclosing local
     /// binders — loop targets, comprehension generators, lambda/`def` params —
     /// currently bind each name. The `transactional_vars` set is keyed by base
@@ -833,8 +839,13 @@ impl LoweringContext {
     }
 
     /// The nominal type the module declares under `name`.
+    /// The nominal type `name` names: one the module declares, or a compiler-provided one.
     pub(super) fn nominal_type(&self, name: &str) -> Option<Rc<crate::ccl::nominal::NominalDecl>> {
-        self.nominal_types.iter().find(|d| d.name == name).cloned()
+        self.nominal_types
+            .iter()
+            .find(|d| d.name == name)
+            .cloned()
+            .or_else(|| crate::ccl::nominal::builtin(name))
     }
 
     /// Whether `name` is a type parameter of a definition being lowered.

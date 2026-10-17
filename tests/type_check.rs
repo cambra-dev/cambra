@@ -5500,27 +5500,27 @@ sum([x + y for x in a for y in b])"
 // Lookup: `Option`, its constructors, and the subscript pair
 // ---------------------------------------------------------------------------
 
-/// `Option(T)` is the tagged variant `` `some(T) | `none `` — no new type constructor,
-/// just the `Variant` the surface-variants work landed. What this pins is the
-/// **abbreviation**: an `Option(𝑇)` annotation and the variant a `` `some ``/`` `none ``
-/// constructor builds are one type, so the constructors reach it with no rule of their
-/// own.
+/// `Option(T)` is the compiler-provided nominal type, built by `Option::some` and
+/// `Option::none` (`docs/chl-spec.md`, "3.15 Variant constructors"). A structural variant
+/// with the same arms is a different type, so a backtick constructor does not build one.
 #[test]
-fn option_annotation_abbreviates_the_tagged_variant() {
-    // Bounded, so the program keeps the narrower one-tag type it built; an exact
-    // annotation binds at `Option(Int)` and is a different claim.
+fn option_is_a_nominal_type() {
     assert_eq!(
-        infer_program("x <: Option(Int) = `some(1)\nx").to_string(),
-        "{`some{Int@1}}"
+        infer_program("x: Option(Int) = Option::some(1)\nx").to_string(),
+        "Option(Int)"
     );
     assert_eq!(
-        infer_program("x <: Option(Int) = `none\nx").to_string(),
-        "{`none}"
+        infer_program("x: Option(Int) = Option::none\nx").to_string(),
+        "Option(Int)"
     );
-    // The payload still flows: a `` `some(String) `` is not an `Option(Int)`.
+    // The payload still flows: an `Option::some(String)` is not an `Option(Int)`.
     assert!(
-        !infer_program_err("x <: Option(Int) = `some(\"a\")\nx").is_empty(),
-        "`some(String) must not satisfy Option(Int)"
+        !infer_program_err("x: Option(Int) = Option::some(\"a\")\nx").is_empty(),
+        "Option::some(String) must not satisfy Option(Int)"
+    );
+    assert!(
+        !infer_program_err("x: Option(Int) = `some(1)\nx").is_empty(),
+        "`some(1) must not satisfy Option(Int)"
     );
 }
 
@@ -5608,7 +5608,7 @@ fn a_checked_lookup_is_not_an_application() {
     // A key that is certainly absent still type-checks: presence is not a typing question.
     assert_eq!(
         infer_program(&format!("{m}m[9]?")).to_string(),
-        "{`none | `some{Int}}"
+        "Option(Int)"
     );
     // The proven form is the pair to it, and it still demands the membership its domain
     // states — the two are different rules, not one rule with a flag.
@@ -5631,7 +5631,7 @@ fn a_checked_lookup_is_not_an_application() {
 fn a_key_dependent_lookup_discharges_the_key_binder() {
     assert_eq!(
         infer_program("g = groupby([1, 2, 3], \\x -> x)\ng[1]?").to_string(),
-        "{`none | `some{({[0, 2] | __elem \u{25b7} [1, 2, 3] \u{25b7} (\u{3bb} x : Int \u{2192} x) == 1} \u{2907} Int)}}",
+        "Option(({[0, 2] | __elem \u{25b7} [1, 2, 3] \u{25b7} (\u{3bb} x : Int \u{2192} x) == 1} \u{2907} Int))",
         "the group's predicate must name the key it was looked up at"
     );
 }
@@ -5664,7 +5664,7 @@ fn checked_lookup_boundaries() {
             .codomain()
             .expect("f is a function")
             .to_string(),
-        "{`none | `some{Int}}"
+        "Option(Int)"
     );
 }
 /// A `Set(K)` is `Map(K, unit)`, so its checked lookup answers `Option(unit)` —
@@ -5675,7 +5675,7 @@ fn checked_lookup_boundaries() {
 fn checked_lookup_on_a_set_is_membership_as_a_value() {
     assert_eq!(
         infer_program("s = set([1, 2, 3])\ns[1]?").to_string(),
-        "{`none | `some}"
+        "Option(Unit)"
     );
     assert!(
         !infer_program_err("s = set([1, 2, 3])\ns[\"nope\"]?").is_empty(),
@@ -5699,7 +5699,7 @@ fn a_product_keys_a_collection() {
             m[(1, 2)]?
         "#})
         .to_string(),
-        "{`none | `some{Int}}"
+        "Option(Int)"
     );
     assert_eq!(
         infer_program(indoc! {r#"
@@ -5707,7 +5707,7 @@ fn a_product_keys_a_collection() {
             m[(a=1, b=2)]?
         "#})
         .to_string(),
-        "{`none | `some{Int}}"
+        "Option(Int)"
     );
     assert_eq!(
         infer_program(indoc! {r#"
@@ -5715,7 +5715,7 @@ fn a_product_keys_a_collection() {
             s[(1, 2)]?
         "#})
         .to_string(),
-        "{`none | `some}"
+        "Option(Unit)"
     );
     // The key still owes the collection's key type.
     assert!(
@@ -5737,7 +5737,7 @@ fn a_product_keys_a_collection() {
             m[(1, 2, 3)]?
         "#})
         .to_string(),
-        "{`none | `some{Int}}",
+        "Option(Int)",
         "a wider key types; it is the absent case at runtime"
     );
 }
@@ -5748,7 +5748,7 @@ fn a_product_keys_a_collection() {
 fn checked_lookup_on_a_map_answers_the_value() {
     assert_eq!(
         infer_program("m = map([(1, 10), (2, 20)])\nm[1]?").to_string(),
-        "{`none | `some{Int}}"
+        "Option(Int)"
     );
     assert!(
         !infer_program_err("m = map([(1, 10), (2, 20)])\nm[\"nope\"]?").is_empty(),

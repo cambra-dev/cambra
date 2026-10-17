@@ -3460,14 +3460,14 @@ fn a_variant_match_inside_a_block_releases_per_commit() {
     let value = final_mut_var_value(indoc! {r#"
         def or_zero(o: Option(Int)) => Int:
             match o:
-                case `some(v):
+                case Option::some(v):
                     v
-                case `none:
+                case Option::none:
                     0
         n: Mut(Int, Txn) := 0
         for r in [1, 2]:
             with begin():
-                n := n + or_zero(`some(r))
+                n := n + or_zero(Option::some(r))
         await_final(n)
     "#});
     assert_eq!(value, Value::Int(3));
@@ -3746,9 +3746,9 @@ fn a_keyed_write_reads_back_through_a_checked_lookup() {
                     m["c"] := 3
             final: Map(String, Int) = await_final(m)
             match final["c"]?:
-                case `some(v):
+                case Option::some(v):
                     v
-                case `none:
+                case Option::none:
                     0
         "#},
         Value::Int(3),
@@ -3771,9 +3771,9 @@ fn a_product_keys_a_mutable_collection() {
                     m[(r, r)] := r
             final: Map({Int, Int}, Int) = await_final(m)
             match final[(3, 3)]?:
-                case `some(v):
+                case Option::some(v):
                     v
-                case `none:
+                case Option::none:
                     0
         "#},
         Value::Int(3),
@@ -3798,16 +3798,16 @@ fn a_shared_key_component_keys_a_mutable_collection() {
                     m[(1, "BTC")] := r
             final: Map({Int, String}, Int) = await_final(m)
             match final[(1, "BTC")]?:
-                case `some(v):
+                case Option::some(v):
                     v
-                case `none:
+                case Option::none:
                     0
         "#},
         Value::Int(2),
     );
 }
 
-/// A key the mutable variable never held answers `` `none `` — the seed's keys and the written one
+/// A key the mutable variable never held answers `Option::none` — the seed's keys and the written one
 /// are what it has, and nothing else.
 #[test]
 fn a_checked_lookup_on_a_mut_var_answers_none_for_an_absent_key() {
@@ -3819,9 +3819,9 @@ fn a_checked_lookup_on_a_mut_var_answers_none_for_an_absent_key() {
                     m["c"] := 3
             final: Map(String, Int) = await_final(m)
             match final["zzz"]?:
-                case `some(v):
+                case Option::some(v):
                     v
-                case `none:
+                case Option::none:
                     0
         "#},
         Value::Int(0),
@@ -3841,9 +3841,9 @@ fn a_keyed_read_at_the_loop_item_reads_the_snapshot() {
     let value = final_mut_var_value(indoc! {r#"
         def or_zero(o: Option(Int)) => Int:
             match o:
-                case `some(v):
+                case Option::some(v):
                     v
-                case `none:
+                case Option::none:
                     0
         m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
         n: Mut(Int, Txn) := 0

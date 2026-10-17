@@ -328,28 +328,27 @@ fn test_match_as_an_assigned_value(#[case] code: &str, #[case] expected: Value) 
     check_scalar(code, expected);
 }
 
-/// `Option(T)` is a built-in *abbreviation* for `some(T) | none`, in the
-/// same category as `List(T)` — not a distinguished type, and its constructors
-/// are the ordinary `` `some `` / `` `none `` that no pass special-cases.
+/// `Option(T)` is the compiler-provided nominal type, built by `Option::some` and
+/// `Option::none` and taken apart by `match` arms naming them.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
     r"
-x: Option(Int) = `some(7)
+x: Option(Int) = Option::some(7)
 match x:
-    case `some(v):
+    case Option::some(v):
         v + 1
-    case `none:
+    case Option::none:
         0",
     Value::Int(8)
 )]
 #[case(
     r"
-x: Option(Int) = `none
+x: Option(Int) = Option::none
 match x:
-    case `some(v):
+    case Option::some(v):
         v + 1
-    case `none:
+    case Option::none:
         0",
     Value::Int(0)
 )]
@@ -1153,7 +1152,7 @@ fn test_pipe_is_still_logical_or(#[case] code: &str, #[case] expected: Value) {
 // Same tag on the seed and on every write: the arm set never grows.
 #[case(
     r"
-acc: Mut(Option(Int)) := `some(0)
+acc: Mut({`some{Int} | `none}) := `some(0)
 for i in [1, 2, 3]:
     acc := `some(i)
 acc",
@@ -1163,7 +1162,7 @@ acc",
 // space is the join and the emitted column has to carry both tags.
 #[case(
     r"
-acc: Mut(Option(Int)) := `none
+acc: Mut({`some{Int} | `none}) := `none
 for i in [1, 2, 3]:
     acc := `some(i)
 acc",
@@ -1172,7 +1171,7 @@ acc",
 // A conditional write choosing between the two tags per iteration.
 #[case(
     r"
-acc: Mut(Option(Int)) := `none
+acc: Mut({`some{Int} | `none}) := `none
 for i in [1, 2, 3]:
     acc := `some(i) if i > 2 else `none
 acc",
@@ -1182,7 +1181,7 @@ acc",
 // rather than the one the writes mostly used.
 #[case(
     r"
-acc: Mut(Option(Int)) := `some(0)
+acc: Mut({`some{Int} | `none}) := `some(0)
 for i in [1, 2, 3]:
     acc := `some(i) if i < 3 else `none
 acc",
@@ -1197,12 +1196,13 @@ for i in [1, 2, 3]:
 acc",
     union("some", Value::Int(3))
 )]
-// A written-down variant type rather than the `Option` abbreviation.
+// A nominal `Option` held in a mutable variable is one type, whatever its seed and
+// writes build, and is held as the same union.
 #[case(
     r"
-acc: Mut({`some{Int} | `none}) := `none
+acc: Mut(Option(Int)) := Option::none
 for i in [1, 2, 3]:
-    acc := `some(i)
+    acc := Option::some(i) if i > 2 else Option::none
 acc",
     union("some", Value::Int(3))
 )]
