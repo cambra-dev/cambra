@@ -1720,6 +1720,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::Comprehension { .. } => {
             unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
         }
+        TypedExprNode::DefGroup { .. } => {
+            unreachable!("a DefGroup reached coalesce; emission rewrites it into `Let`s")
+        }
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
@@ -1959,6 +1962,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 pin_unobservable_ctor_args(&expr.ty, ctx);
             }
             coalesce_node(payload, level, ctx);
+        }
+        TypedExprNode::Method { .. } => {
+            unreachable!("emission resolves every method; none reaches coalesce")
         }
         TypedExprNode::ExprStmt { expr: e, body } => {
             coalesce_node(e, level, ctx);

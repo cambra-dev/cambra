@@ -490,6 +490,7 @@ fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
             v
         }
         N::VariantCtor { payload, .. } | N::NominalCtor { payload, .. } => vec![payload],
+        N::Method { candidates, .. } => candidates.iter().map(|c| &c.function).collect(),
         N::Record(fields) => fields.iter().map(|(_, e)| e).collect(),
         N::Transact { keys, writers, .. } => {
             let mut v: Vec<&TypedExpr> = keys.iter().map(|k| &k.init).collect();
@@ -499,7 +500,7 @@ fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
             }
             v
         }
-        N::LetRec { bindings, body } => {
+        N::LetRec { bindings, body } | N::DefGroup { bindings, body } => {
             let mut v: Vec<&TypedExpr> = bindings.iter().map(|(_, def)| def).collect();
             v.push(body);
             v

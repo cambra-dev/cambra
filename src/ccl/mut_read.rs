@@ -258,6 +258,28 @@ fn spine(expr: Expr, muts: &Muts, open: &mut Open) -> Expr {
             )
         }
 
+        // An `impl` block's functions are a statement as a `let` is, each definition
+        // evaluated at it, and the body continues the same block.
+        TypedExprNode::DefGroup { bindings, body } => {
+            let mut minted = Minted::new();
+            let bindings = bindings
+                .into_iter()
+                .map(|(binding, def)| {
+                    let def = operand(def, muts, open, &mut minted);
+                    close_written(&def, open);
+                    (binding, def)
+                })
+                .collect();
+            let body = spine(*body, muts, open);
+            wrap(
+                minted,
+                rebuild(TypedExprNode::DefGroup {
+                    bindings,
+                    body: Box::new(body),
+                }),
+            )
+        }
+
         // The introduction is a spine statement like any other, and its body
         // continues the same block — with one more mutable variable in scope.
         TypedExprNode::MutDecl {
@@ -427,6 +449,7 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
         // reason a nested block is one: its statements' writes are not the
         // enclosing block's.
         TypedExprNode::Let { .. }
+        | TypedExprNode::DefGroup { .. }
         | TypedExprNode::ExprStmt { .. }
         | TypedExprNode::MutDecl { .. } => block(expr, muts),
 

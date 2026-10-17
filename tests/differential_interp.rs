@@ -189,6 +189,28 @@ fn two_types_sharing_a_constructor_name_taken_apart() {
     "#});
 }
 
+/// A method of one name on two types whose constructors share a name: the receiver's type
+/// chooses.
+#[test]
+fn a_method_of_two_types_sharing_a_constructor_name() {
+    agree(indoc! {r#"
+        type Money = Int
+        type Price = Int
+
+        impl Money:
+            def doubled(self) => Int:
+                self.extract() * 2
+
+        impl Price:
+            def doubled(self) => Int:
+                self.extract() * 20
+
+        out = test_sink()
+        for n in [1, 2]:
+            out << (Money::new(n).doubled(), Price::new(n).doubled())
+    "#});
+}
+
 /// A mutable variable holding a nominal value: its history's value type is the nominal
 /// type, through `mut_elim` and the store.
 #[test]
@@ -269,6 +291,40 @@ fn a_match_over_nominal_values_feeds_per_arm() {
                     out << r
                 case Shape::rect(w, h):
                     out << w * h
+    "#});
+}
+
+/// Associated functions, methods called on their receivers, an `impl` block, and
+/// `extract` as a method.
+#[test]
+fn methods_of_nominal_values() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+
+        type Price = Int
+
+        def Shape::size(self) => Int:
+            match self:
+                case Shape::circle(r):
+                    r
+                case Shape::rect(w, h):
+                    w * h
+
+        impl Price:
+            def cents(self) => Int:
+                self.extract()
+
+            def plus(self, n: Int) => Price:
+                Price::new(self.cents() + n)
+
+        def Price::of_cents(c: Int) => Price:
+            Price::new(c)
+
+        out = test_sink()
+        for n in [1, 2, 3]:
+            out << (Shape::rect(n, 2).size(), Price::of_cents(n).plus(10).cents())
     "#});
 }
 

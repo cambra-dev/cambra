@@ -18,14 +18,17 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use super::stmts::{is_builtin_type_name, lower_type_expr};
+use super::stmts::{is_builtin_type_name, is_mut_annotation, lower_type_expr};
 use super::{LoweringContext, LoweringError};
 use crate::ccl::nominal::{NominalCtor, NominalDecl};
 use crate::ccl::ty::{PolyParam, PolyType, TypeKind, TypeParam};
-use crate::ccl::{Expr, Lit, Pattern, PatternHead, Type, TypedBinding, TypedExprNode};
+use crate::ccl::{
+    Expr, Lit, MethodCandidate, Pattern, PatternHead, Type, TypedBinding, TypedExprNode,
+};
 use crate::chl_parser::ast::{
-    ArmPattern, ConstructorPattern, Expr as ChlExpr, MatchArm, QualifiedName, Span, Spanned,
-    Stmt as ChlStmt, TypeDecl, TypeDeclBody,
+    AnnotationMode, ArmPattern, ConstructorPattern, Expr as ChlExpr, ImplBlock, MatchArm, Param,
+    QualifiedName, Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeDecl,
+    TypeDeclBody, TypeParam as ChlTypeParam,
 };
 
 /// The name the function a declaration's member `name` declares is bound to, `Shape::rect`.
@@ -38,6 +41,71 @@ fn type_decls(stmts: &[Spanned<ChlStmt>]) -> impl Iterator<Item = (&TypeDecl, Sp
         ChlStmt::TypeDecl(decl) => Some((decl, s.span)),
         _ => None,
     })
+}
+
+/// A `def` declaring an associated function: `def N::f(…)`, or a `def f(…)` in `impl N(𝑃…):`.
+pub(super) struct AssociatedDef<'a> {
+    /// The type it belongs to: its qualifier, or the block's type.
+    pub owner: &'a Spanned<SmolStr>,
+    /// The qualifier a `def` in a block carries, `def M::f` in `impl N:`, which names no type
+    /// of its own.
+    pub stray_owner: Option<&'a Spanned<SmolStr>>,
+    pub name: &'a Spanned<SmolStr>,
+    pub type_params: &'a [ChlTypeParam],
+    pub params: &'a [Param],
+    pub output: Option<&'a Spanned<ChlExpr>>,
+    pub requires: &'a [Spanned<Requirement>],
+    pub body: &'a [Spanned<ChlStmt>],
+    /// The block declaring it, if it is in one.
+    pub block: Option<&'a ImplBlock>,
+    /// The `def`.
+    pub span: Span,
+}
+
+/// The associated functions `stmt` declares: the one `def N::f(…)` declares, and each `def` of
+/// an `impl` block, a `pub def` as its `def`.
+pub(super) fn associated_defs(stmt: &Spanned<ChlStmt>) -> impl Iterator<Item = AssociatedDef<'_>> {
+    fn view<'a>(def: &'a Spanned<ChlStmt>, block: Option<&'a ImplBlock>) -> AssociatedDef<'a> {
+        let def = match &def.node {
+            ChlStmt::Pub { stmt, .. } => stmt.as_ref(),
+            _ => def,
+        };
+        let ChlStmt::FunctionDef {
+            owner,
+            name,
+            type_params,
+            params,
+            output,
+            requires,
+            body,
+        } = &def.node
+        else {
+            unreachable!("the parser builds an `impl` block of `def`s")
+        };
+        let (owner, stray_owner) = match (block, owner) {
+            (Some(block), owner) => (&block.ty, owner.as_ref()),
+            (None, Some(owner)) => (owner, None),
+            (None, None) => unreachable!("a `def` outside a block is viewed with its owner"),
+        };
+        AssociatedDef {
+            owner,
+            stray_owner,
+            name,
+            type_params,
+            params,
+            output: output.as_ref(),
+            requires,
+            body,
+            block,
+            span: def.span,
+        }
+    }
+    let defs: Vec<_> = match &stmt.node {
+        ChlStmt::FunctionDef { owner: Some(_), .. } => vec![view(stmt, None)],
+        ChlStmt::Impl(block) => block.defs.iter().map(|d| view(d, Some(block))).collect(),
+        _ => Vec::new(),
+    };
+    defs.into_iter()
 }
 
 /// Declare the head of each `type` among the module's top-level `stmts`.
@@ -458,34 +526,42 @@ fn bind_function(
     ctx.tag_machinery(binding, span, label)
 }
 
-/// A name in a nominal type's namespace, which its constructors and the single-constructor
-/// form's `extract` share (`docs/chl-spec.md`, "Associated functions and methods").
+/// A name in a nominal type's namespace, which its constructors, the single-constructor
+/// form's `extract` and its associated functions share (`docs/chl-spec.md`, "Associated
+/// functions and methods").
 #[derive(Clone, Copy)]
 enum Member {
     /// A constructor, with its number of parameters.
     Constructor { arity: usize },
     /// The `extract` of the single-constructor form.
     Extract,
+    /// An associated function, with its number of value parameters.
+    Associated { arity: usize },
 }
 
 impl Member {
     /// The number of arguments a call of the member passes.
     fn arity(self) -> usize {
         match self {
-            Member::Constructor { arity } => arity,
+            Member::Constructor { arity } | Member::Associated { arity } => arity,
             Member::Extract => 1,
         }
     }
 }
 
-/// The member of `decl` named `name`, if it declares one.
-fn member(decl: &NominalDecl, name: &str) -> Option<Member> {
+/// The member of `decl` named `name`, if it declares one, with the span that declares it.
+fn member(decl: &NominalDecl, name: &str, ctx: &LoweringContext) -> Option<(Member, Span)> {
     if let Some(ctor) = decl.ctor(name) {
-        return Some(Member::Constructor {
-            arity: ctor.params.len(),
-        });
+        let arity = ctor.params.len();
+        return Some((Member::Constructor { arity }, ctor.span));
     }
-    (decl.declares_extract && name == "extract").then_some(Member::Extract)
+    if decl.declares_extract && name == "extract" {
+        return Some((Member::Extract, decl.span));
+    }
+    ctx.associated_functions
+        .iter()
+        .find(|f| *f.decl == *decl && f.name == name)
+        .map(|f| (Member::Associated { arity: f.arity }, f.span))
 }
 
 /// The declaration and member `q` names, `Shape::circle`.
@@ -506,11 +582,14 @@ fn resolve_member(
             ),
         ));
     };
-    match member(&decl, &q.name.node) {
-        Some(m) => Ok((decl, m)),
+    match member(&decl, &q.name.node, ctx) {
+        Some((m, _)) => Ok((decl, m)),
         None => Err(LoweringError::unsupported(
             span,
-            format!("`{}` declares no constructor `{}`", decl.name, q.name.node),
+            format!(
+                "`{}` declares no constructor or function `{}`",
+                decl.name, q.name.node
+            ),
         )),
     }
 }
@@ -862,4 +941,364 @@ pub(super) fn check_constructor_assignment(
     }
     let (pattern, binds) = constructor_arm_pattern(&decl, pattern, ctx);
     Ok(ConstructorAssignment { pattern, binds })
+}
+
+/// An associated function a module declares: `def N::f`, or a `def` in `impl N:`
+/// (`docs/chl-spec.md`, "Associated functions and methods").
+#[derive(Clone)]
+pub(crate) struct AssociatedFunction {
+    pub decl: Rc<NominalDecl>,
+    pub name: SmolStr,
+    /// Its number of value parameters.
+    pub arity: usize,
+    /// Whether its first value parameter is `self`, which makes it a method.
+    pub is_method: bool,
+    /// The `def` that declares it.
+    pub span: Span,
+}
+
+/// Record the associated functions among the module's top-level `stmts`, checking each
+/// against the type it names: the type is declared here, the name is free in the type's
+/// namespace, and the function declares a value parameter.
+pub(super) fn declare_associated_functions(
+    stmts: &[Spanned<ChlStmt>],
+    ctx: &mut LoweringContext,
+) -> Vec<LoweringError> {
+    stmts
+        .iter()
+        .flat_map(associated_defs)
+        .filter_map(|def| declare_one(&def, ctx).err())
+        .collect()
+}
+
+fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), LoweringError> {
+    let AssociatedDef {
+        owner,
+        name,
+        params,
+        block,
+        span,
+        ..
+    } = *def;
+    let name = &name.node;
+    if let Some(other) = def.stray_owner {
+        return Err(LoweringError::unsupported(
+            other.span,
+            format!(
+                "a `def` in `impl {0}:` belongs to `{0}` and names no type of its own; write \
+                 `def {name}(…)`",
+                owner.node
+            ),
+        ));
+    }
+    let Some(decl) = ctx.nominal_type(&owner.node) else {
+        return Err(LoweringError::unsupported(
+            owner.span,
+            format!(
+                "`{}` is not a nominal type this module declares, so `{}::{name}` has no \
+                 type to belong to",
+                owner.node, owner.node
+            ),
+        ));
+    };
+    if let Some(block) = block
+        && block.params.len() != decl.params.len()
+    {
+        return Err(LoweringError::unsupported(
+            block.ty.span,
+            format!(
+                "`{}` takes {} type parameter{}, and `impl {}` names {}",
+                decl.name,
+                decl.params.len(),
+                if decl.params.len() == 1 { "" } else { "s" },
+                decl.name,
+                block.params.len()
+            ),
+        ));
+    }
+    if let Some((_, first)) = member(&decl, name, ctx) {
+        return Err(LoweringError::unsupported(
+            span,
+            format!(
+                "`{}::{name}` is already declared; a type's constructors and associated \
+                 functions share one namespace",
+                decl.name
+            ),
+        )
+        .with_related(first, "first declared here"));
+    }
+    let Some(first) = params.first() else {
+        return Err(LoweringError::unsupported(
+            span,
+            format!(
+                "`{}::{name}` declares no parameters; a function of no argument is a constant, \
+                 and an associated value has no spelling yet",
+                decl.name
+            ),
+        ));
+    };
+    if let Some(p) = params
+        .iter()
+        .find(|p| p.annotation.as_ref().is_some_and(is_mut_annotation))
+    {
+        return Err(LoweringError::unsupported(
+            p.name_span,
+            format!(
+                "`{}::{name}` takes a `Mut` parameter `{}`; an associated function with a \
+                 pass-by-reference parameter is not supported yet",
+                decl.name, p.name
+            ),
+        ));
+    }
+    if let Some(p) = params.iter().skip(1).find(|p| p.name == "self") {
+        return Err(LoweringError::unsupported(
+            p.name_span,
+            format!(
+                "`self` of `{}::{name}` is not its first parameter; a method takes its \
+                 receiver first",
+                decl.name
+            ),
+        ));
+    }
+    let is_method = first.name == "self";
+    if is_method && let Some(annotation) = &first.annotation {
+        check_self_annotation(&decl, name, annotation, def)?;
+    }
+    if is_method && first.annotation.is_none() && !decl.params.is_empty() && block.is_none() {
+        return Err(LoweringError::unsupported(
+            first.name_span,
+            format!(
+                "`self` of `{0}::{name}` needs its type, since `{0}` takes type parameters: \
+                 `self: {0}(…)` over the function's own, or declare it in `impl {0}(…):`",
+                decl.name
+            ),
+        ));
+    }
+    ctx.associated_functions.push(AssociatedFunction {
+        decl,
+        name: name.clone(),
+        arity: params.len(),
+        is_method,
+        span,
+    });
+    Ok(())
+}
+
+/// Check the annotation on the `self` of `decl`'s method `name`: `self` is the declaration at
+/// type parameters (`docs/chl-spec.md`, "Associated functions and methods"). In an `impl` block
+/// and for a type without parameters it takes no annotation, and outside a block a
+/// parameterised type's `self` is the type applied to the function's own type parameters, each
+/// named once.
+fn check_self_annotation(
+    decl: &NominalDecl,
+    name: &str,
+    annotation: &TypeAnnotation,
+    def: &AssociatedDef,
+) -> Result<(), LoweringError> {
+    let qualified = format!("{}::{name}", decl.name);
+    if let Some(block) = def.block {
+        let params = block
+            .params
+            .iter()
+            .map(|p| p.node.as_str())
+            .collect::<Vec<_>>();
+        let ty = if params.is_empty() {
+            decl.name.to_string()
+        } else {
+            format!("{}({})", decl.name, params.join(", "))
+        };
+        return Err(LoweringError::unsupported(
+            annotation.ty.span,
+            format!(
+                "`self` of `{qualified}` is the `{ty}` the block declares functions of, and \
+                 takes no annotation"
+            ),
+        ));
+    }
+    if decl.params.is_empty() {
+        return Err(LoweringError::unsupported(
+            annotation.ty.span,
+            format!(
+                "`self` of `{qualified}` is a `{}`, and takes no annotation",
+                decl.name
+            ),
+        ));
+    }
+    let own: Vec<&str> = def.type_params.iter().map(|p| p.name.as_str()).collect();
+    let args = match &annotation.ty.node {
+        ChlExpr::Call { func, args } if matches!(&func.node, ChlExpr::Name(n) if *n == decl.name) => {
+            Some(args)
+        }
+        _ => None,
+    };
+    let at_own_params = args.is_some_and(|args| {
+        let names: Vec<&str> = args
+            .iter()
+            .filter_map(|a| match &a.node {
+                ChlExpr::Name(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        names.len() == args.len()
+            && names.len() == decl.params.len()
+            && names.iter().all(|n| own.contains(n))
+            && names.iter().collect::<HashSet<_>>().len() == names.len()
+    });
+    if annotation.mode != AnnotationMode::Exact || !at_own_params {
+        let params = decl
+            .params
+            .iter()
+            .map(|p| p.spelling.as_str())
+            .collect::<Vec<_>>();
+        return Err(LoweringError::unsupported(
+            annotation.ty.span,
+            format!(
+                "`self` of `{qualified}` is `{0}` at type parameters of the function's own, \
+                 each named once: `self: {0}({1})` for `def {0}::{name}({1}, self: …)`",
+                decl.name,
+                params.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Lower the associated function `def N::name(params)` of `decl` to its binding's name and
+/// value, as a `def` with type parameters is lowered: an `impl` block's parameters come
+/// first, and a method's `self` without an annotation is annotated with the declaration
+/// at those parameters (`docs/chl-spec.md`, "Associated functions and methods").
+pub(super) fn lower_associated_def(
+    decl: &Rc<NominalDecl>,
+    def: &AssociatedDef,
+    ctx: &mut LoweringContext,
+) -> Result<(String, Expr, Option<Type>), LoweringError> {
+    let impl_params = def.block.map_or(&[][..], |b| b.params.as_slice());
+    let AssociatedDef {
+        name,
+        type_params,
+        params,
+        output,
+        requires,
+        body,
+        span,
+        ..
+    } = *def;
+    let name = name.node.as_str();
+    let mut all_type_params: Vec<ChlTypeParam> = impl_params
+        .iter()
+        .map(|p| ChlTypeParam {
+            name: p.node.clone(),
+            name_span: p.span,
+            annotation: None,
+        })
+        .collect();
+    all_type_params.extend(type_params.iter().cloned());
+    let mut params = params.to_vec();
+    if let Some(first) = params.first_mut()
+        && first.name == "self"
+        && first.annotation.is_none()
+    {
+        let head = Spanned::new(first.name_span, ChlExpr::Name(decl.name.clone()));
+        let ty = if impl_params.is_empty() {
+            head
+        } else {
+            let args = impl_params
+                .iter()
+                .map(|p| Spanned::new(p.span, ChlExpr::Name(p.node.clone())))
+                .collect();
+            Spanned::new(
+                first.name_span,
+                ChlExpr::Call {
+                    func: Box::new(head),
+                    args,
+                },
+            )
+        };
+        first.annotation = Some(TypeAnnotation {
+            mode: AnnotationMode::Exact,
+            ty,
+        });
+    }
+    let (func, annotation) =
+        super::functions::lower_def(span, &all_type_params, &params, output, requires, body, ctx)?;
+    Ok((member_binding(decl, name), func, annotation))
+}
+
+/// Lower a method call `receiver.method(args)`: the application of a [`TypedExprNode::Method`]
+/// placeholder over every type that declares the method, to the receiver and the arguments
+/// (`src/ccl/design/nominal-types.md`, "Method calls").
+pub(super) fn lower_method_call(
+    receiver: &Spanned<ChlExpr>,
+    method: &Spanned<SmolStr>,
+    args: &[Spanned<ChlExpr>],
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    // A position is spelled as digits, which no method's name is.
+    if method.node.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(LoweringError::unsupported(
+            method.span,
+            format!(
+                "`.{0}(…)` calls a method, and `{0}` is a position, which names no method; the \
+                 function element {0} holds is called as `(t.{0})(…)`",
+                method.node
+            ),
+        ));
+    }
+    // Each type declaring the method, with the parameters the method takes after `self`.
+    let mut owners: Vec<(Rc<NominalDecl>, usize)> = ctx
+        .associated_functions
+        .iter()
+        .filter(|f| f.is_method && f.name == method.node)
+        .map(|f| (Rc::clone(&f.decl), f.arity - 1))
+        .collect();
+    if method.node == "extract" {
+        owners.extend(
+            ctx.nominal_types
+                .iter()
+                .filter(|d| d.declares_extract)
+                .map(|d| (Rc::clone(d), 0)),
+        );
+    }
+    if owners.is_empty() {
+        return Err(LoweringError::unsupported(
+            method.span,
+            format!(
+                "no type this module declares has a method `{0}`; the function a field holds \
+                 is called as `(r.{0})(…)`",
+                method.node
+            ),
+        ));
+    }
+    let candidates = owners
+        .into_iter()
+        .map(|(decl, params)| {
+            let reference = Expr::var(member_binding(&decl, &method.node));
+            let function = ctx.tag_image(reference, method.span);
+            MethodCandidate {
+                decl,
+                params,
+                function,
+            }
+        })
+        .collect();
+    let placeholder = ctx.tag_image(
+        Expr::new(TypedExprNode::Method {
+            name: method.node.to_string(),
+            args: args.len(),
+            candidates,
+        }),
+        method.span,
+    );
+    let receiver = super::lower_expr(receiver, ctx)?;
+    let argument = if args.is_empty() {
+        receiver
+    } else {
+        let mut parts = vec![receiver];
+        for a in args {
+            parts.push(super::lower_expr(a, ctx)?);
+        }
+        ctx.tag_machinery(Expr::tuple(parts), span, "lower.call_tuple")
+    };
+    Ok(Expr::apply(argument, placeholder))
 }

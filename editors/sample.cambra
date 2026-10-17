@@ -53,3 +53,7 @@ held <: {_ where _ > 0} = 1
 apply: Int => _ = inc
 
 type Price = Int
+
+impl Price:
+    def doubled(self) => Price:
+        Price::new(self.extract() * 2)

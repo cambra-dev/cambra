@@ -215,6 +215,9 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
         | TypedExprNode::Defer
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Lambda { .. } => true,
+        // An unresolved method stands for one of its candidate references, each an atom,
+        // and inference resolves it only where it is an application's function.
+        TypedExprNode::Method { .. } => true,
         // A comprehension is atomic when the term it encodes to is — which is
         // the unfiltered shape, one `Lambda`
         // ([`crate::ccl::comprehension::encodes_to_lambda`]). Deciding it on the
@@ -439,6 +442,9 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             let_chain(binds, rebuild(TypedExprNode::Record(out)))
         }
 
+        // The candidates are references, already atoms.
+        node @ TypedExprNode::Method { .. } => rebuild(node),
+
         TypedExprNode::VariantCtor { tag, payload } => {
             let (binds, payload) = atomize(*payload, muts);
             let_chain(
@@ -530,6 +536,15 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
                 }),
             )
         }
+
+        // Each definition is a function, a value with nothing to float out of it.
+        TypedExprNode::DefGroup { bindings, body } => rebuild(TypedExprNode::DefGroup {
+            bindings: bindings
+                .into_iter()
+                .map(|(b, def)| (b, normalize(def, muts)))
+                .collect(),
+            body: Box::new(normalize(*body, muts)),
+        }),
 
         TypedExprNode::MutDecl {
             binding,

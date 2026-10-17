@@ -3004,11 +3004,11 @@ Error: lowering error
     /// the same span whether or not the compile captures provenance:
     /// `compile_program` resolves the encoding's nodes through the table,
     /// [`compile_to`] through the comprehension phase's derivation log
-    /// ([`Blame::derive`]). `element` is raised under the generator's plumbing
-    /// and resolves to its source; `guard` is raised at the cast, the encoding's
+    /// ([`Blame::derive`]). `element` is raised at the element, whose binder the
+    /// generator typed before it; `guard` is raised at the cast, the encoding's
     /// root, which keeps the comprehension's id.
     #[rstest]
-    #[case::element("[x + \"a\" for x in [1, 2]]\n", 18, 24)]
+    #[case::element("[x + \"a\" for x in [1, 2]]\n", 1, 8)]
     #[case::guard("[x for x in [1, 2] if x]\n", 0, 24)]
     fn a_comprehension_error_resolves_alike_with_and_without_recording(
         #[case] code: &str,

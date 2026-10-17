@@ -72,6 +72,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Comprehension { .. } => {
             unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
         }
+        // Lowering builds a `Method` only as an application's function, which
+        // `emit_apply` resolves before emitting it.
+        TypedExprNode::Method { name, .. } => {
+            unreachable!("method `{name}` reached emission outside the application it resolves in")
+        }
         TypedExprNode::Lit(lit) => {
             // A literal's type is its singleton, `{Int | __elem == n}`, and the
             // three nodes of that `__elem == n` term are minted *here* — the
@@ -102,6 +107,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // use checks at its own types (`src/ccl/design/type-parameters.md`,
         // "Instantiation").
         TypedExprNode::Var(name) => {
+            emit_group_member_for(name, ctx)?;
             ctx.note_use(name);
             match ctx.scopes.lookup(name) {
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
@@ -330,6 +336,17 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         }
 
         TypedExprNode::LetRec { bindings, body } => emit_letrec(bindings, body, ctx)?,
+
+        TypedExprNode::DefGroup { bindings, body } => {
+            let (node, ty) = emit_def_group(
+                node_id,
+                std::mem::take(bindings),
+                std::mem::take(body.as_mut()),
+                ctx,
+            );
+            expr.node = node;
+            ty?
+        }
 
         TypedExprNode::For { target, iter, body } => emit_for(target, iter, body, ctx)?,
 
@@ -1055,6 +1072,24 @@ pub(super) fn emit_apply<C: Typing>(
         return emit_lookup_checked(function, &collection, &key, &key_ty, ctx);
     }
     let raw_arg_ty = ctx.subexpr(argument)?;
+    // A method call's function is resolved here, the argument now typed: the receiver's
+    // type picks the candidate that replaces the placeholder.
+    if matches!(function.node, TypedExprNode::Method { .. }) {
+        resolve_method(function, &raw_arg_ty, ctx)?;
+    }
+    // A lambda applied where it stands, `𝑎 ▷ (λ 𝑥 → body)`, binds `𝑥` to `𝑎` as
+    // `let 𝑥 = 𝑎 in body` does, so the argument reaches the parameter's slot before the
+    // body is emitted. A comprehension's generator is one: its element then reads the
+    // binder's type from the source, as a method call in it needs. The application edge
+    // below states the same relation again (`src/ccl/design/type-inference.md`, "A lambda
+    // applied where it stands binds its parameter first").
+    if let TypedExprNode::Lambda { param, .. } = &mut function.node
+        && param.user_annotation.is_none()
+        && matches!(param.ty, Type::Hole)
+    {
+        let slot = ctx.binding_slot(&mut param.ty);
+        ctx.require_sub(&read_through(&raw_arg_ty), &slot, &|| "Apply".to_string())?;
+    }
     // A function position is a value position, so a mutable variable mention there reads
     // (`src/ccl/design/mutability.md`, "A mutable variable read is an explicit operation").
     // Undereffed it meets the demand `fn_ty <: (x: d) ⇒ result` as a mismatch, the relation
@@ -1797,6 +1832,27 @@ pub(super) fn emit_let<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
+    let (scheme, defined) = emit_let_definition(binding, bound_expr, ctx)?;
+    let body_ty = ctx.scoped_let(binding, scheme, |ctx| ctx.subexpr(body))?;
+    // A failed definition has no definiens to discharge: the program is already
+    // rejected, and the RHS it would substitute did not type.
+    if !defined {
+        return Ok(body_ty);
+    }
+    // Lifting the body type out of the binder's scope must close it over the
+    // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
+    // story.
+    Ok(ctx.close_let_type(binding, bound_expr, body_ty))
+}
+
+/// [`emit_let`]'s definition: emit the right-hand side, reconcile the binding's annotation,
+/// and decide the scheme it is bound at. Returns the scheme and whether the right-hand side
+/// typed.
+fn emit_let_definition<C: Typing>(
+    binding: &mut TypedBinding,
+    bound_expr: &mut Expr,
+    ctx: &mut C,
+) -> Result<(LetScheme, bool), LocatedInferError> {
     let reads_before = ctx.poisoned_reads();
     // Emit the RHS at a deeper level so its locally-minted variables can be
     // generalized at the binding site (`scoped_let`). A polymorphic annotation is
@@ -1855,16 +1911,164 @@ pub(super) fn emit_let<C: Typing>(
     } else {
         LetScheme::Monomorphic
     };
-    let body_ty = ctx.scoped_let(binding, scheme, |ctx| ctx.subexpr(body))?;
-    // A failed definition has no definiens to discharge: the program is already
-    // rejected, and the RHS it would substitute did not type.
-    if !defined {
-        return Ok(body_ty);
+    Ok((scheme, defined))
+}
+
+/// Emit a [`DefGroup`](TypedExprNode::DefGroup), the functions of an `impl` block, and
+/// rewrite it into the `Let`s it means (`src/ccl/design/nominal-types.md`, "Associated
+/// functions"). Returns the node replacing the group and its type.
+///
+/// Each member is a `let`'s definition, emitted at the group's position and bound in the
+/// group's scope. The members are emitted in source order, except that a reference to one
+/// not yet emitted emits it first ([`emit_group_member_for`]), from wherever the reference
+/// stands. So each member is bound before the members whose definitions name it, which is
+/// the order of the `Let`s the group becomes. Which function a method call names is decided
+/// as its call is emitted, so this is the order of the calls the program makes.
+fn emit_def_group(
+    group_id: NodeId,
+    bindings: Vec<(TypedBinding, Expr)>,
+    mut body: Expr,
+    ctx: &mut InferCtx,
+) -> (TypedExprNode, Result<Type, LocatedInferError>) {
+    use super::context::GroupMember;
+    let members = bindings
+        .into_iter()
+        .map(|(binding, def)| GroupMember {
+            binding,
+            def: Some(def),
+            defined: false,
+        })
+        .collect::<Vec<_>>();
+    let n = members.len();
+    let entry = ctx.open_group(members);
+    let g = ctx.groups.len() - 1;
+    let emitted = (0..n)
+        .try_for_each(|at| {
+            if ctx.groups[g].done.contains(&at) {
+                return Ok(());
+            }
+            emit_group_member(g, at, ctx)
+        })
+        .and_then(|()| ctx.subexpr(&mut body));
+    let group = ctx.close_group(entry);
+    let mut members: Vec<Option<GroupMember>> = group.members.into_iter().map(Some).collect();
+    let body_ty = match emitted {
+        Ok(ty) => ty,
+        // The walk ends here; the tree is reported against as it stood.
+        Err(error) => {
+            let bindings = members
+                .into_iter()
+                .map(|m| {
+                    let m = m.expect("each member once");
+                    (m.binding, m.def.expect("no member is under emission"))
+                })
+                .collect();
+            return (
+                TypedExprNode::DefGroup {
+                    bindings,
+                    body: Box::new(body),
+                },
+                Err(error),
+            );
+        }
+    };
+    // Each `Let`'s type is its body's closed over its binder, innermost first, with the
+    // telescope holding the members bound outside it, as nested `let`s have.
+    let order = group.done;
+    let telescopes: Vec<_> = order
+        .iter()
+        .scan(ctx.telescope.clone(), |t, &at| {
+            let outside = t.clone();
+            *t = t.extended(
+                members[at]
+                    .as_ref()
+                    .expect("each member once")
+                    .binding
+                    .name
+                    .clone(),
+            );
+            Some(outside)
+        })
+        .collect();
+    let _recording = crate::ccl::provenance::enter(
+        group_id,
+        "infer.def_group",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    assert!(!order.is_empty(), "an `impl` block declares a function");
+    let mut acc = body;
+    let mut acc_ty = body_ty;
+    for (k, &at) in order.iter().enumerate().rev() {
+        let m = members[at].take().expect("each member once");
+        let def = m.def.expect("an emitted member has its definition");
+        if m.defined {
+            let saved = std::mem::replace(&mut ctx.telescope, telescopes[k].clone());
+            acc_ty = ctx.close_let_type(&m.binding, &def, acc_ty);
+            ctx.telescope = saved;
+        }
+        let node = TypedExprNode::Let {
+            binding: m.binding,
+            bound_expr: Box::new(def),
+            body: Box::new(acc),
+        };
+        if k == 0 {
+            return (node, Ok(acc_ty));
+        }
+        acc = Expr::new(node).with_ty(acc_ty.clone());
     }
-    // Lifting the body type out of the binder's scope must close it over the
-    // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
-    // story.
-    Ok(ctx.close_let_type(binding, bound_expr, body_ty))
+    unreachable!("the outermost `Let` is returned")
+}
+
+/// Emit member `at` of group `g` and bind it in the group's scope.
+fn emit_group_member(g: usize, at: usize, ctx: &mut InferCtx) -> Result<(), LocatedInferError> {
+    let member = &mut ctx.groups[g].members[at];
+    let mut binding = member.binding.clone();
+    let mut def = member.def.take().expect("a member is emitted once");
+    ctx.groups[g].in_progress.push(at);
+    // The definition is the node that binds the member, as a `let` is for a `let`: its rule
+    // blames what the binding raises.
+    let prev = ctx.enter_node(def.node_id());
+    let result = ctx.at_group(g, |ctx| {
+        let (scheme, defined) = emit_let_definition(&mut binding, &mut def, ctx)?;
+        ctx.bind_group_member(g, &binding, scheme);
+        Ok(defined)
+    });
+    ctx.leave_node(prev);
+    let group = &mut ctx.groups[g];
+    group.in_progress.pop();
+    let member = &mut group.members[at];
+    member.binding = binding;
+    member.def = Some(def);
+    member.defined = *result.as_ref().unwrap_or(&false);
+    // Emitted once either way: a definition that failed is not emitted again by a later
+    // reference, whose statement may have recovered from the failure.
+    group.done.push(at);
+    result.map(|_| ())
+}
+
+/// Before a reference to `name` is resolved: when `name` is a member of an open group that
+/// is not yet emitted, emit it, so the reference finds it bound. A member under emission is
+/// a cycle, which no definition reaches (`docs/chl-spec.md`, "Associated functions and
+/// methods").
+fn emit_group_member_for(name: &Name, ctx: &mut InferCtx) -> Result<(), LocatedInferError> {
+    let Some((g, at)) = ctx.groups.iter().enumerate().rev().find_map(|(g, group)| {
+        let at = group.members.iter().position(|m| m.binding.name == *name)?;
+        Some((g, at))
+    }) else {
+        return Ok(());
+    };
+    let group = &ctx.groups[g];
+    if group.done.contains(&at) {
+        return Ok(());
+    }
+    if let Some(from) = group.in_progress.iter().position(|&m| m == at) {
+        let names = group.in_progress[from..]
+            .iter()
+            .map(|&m| group.members[m].binding.name.base().to_string())
+            .collect();
+        return Err(ctx.raise(InferError::DefinitionCycle { names }));
+    }
+    emit_group_member(g, at, ctx)
 }
 
 /// What [`emit_let_bound`] binds a `let` at.
@@ -2597,6 +2801,144 @@ fn emit_nominal_scrutinee<C: Typing>(
         })?;
     }
     Ok(())
+}
+
+/// Replace the `Method` placeholder `function` with the candidate its receiver's type names
+/// (`src/ccl/design/nominal-types.md`, "Method calls").
+///
+/// The receiver is the argument, or the first component of the argument's tuple type. Its type is
+/// what the program has stated before the call: the type itself, or the bounds its
+/// variable has gathered so far. A later use does not decide it.
+fn resolve_method<C: Typing>(
+    function: &mut Expr,
+    arg_ty: &Type,
+    ctx: &mut C,
+) -> Result<(), LocatedInferError> {
+    let TypedExprNode::Method {
+        name,
+        args,
+        candidates,
+    } = &mut function.node
+    else {
+        unreachable!("`resolve_method` is called on a `Method`")
+    };
+    let receiver_ty = if *args > 0 {
+        first_component(arg_ty)
+    } else {
+        Some(arg_ty.clone())
+    };
+    let unresolved = |receiver| InferError::UnresolvedMethod {
+        method: name.clone(),
+        receiver,
+    };
+    let head = receiver_ty.map_or(Head::Unknown, |ty| nominal_head(&read_through(&ty)));
+    let decl = match head {
+        Head::Nominal(decl) => decl,
+        Head::Unknown => return Err(ctx.raise(unresolved(None))),
+        Head::Other(ty) => return Err(ctx.raise(unresolved(Some(ty)))),
+        Head::Two(a, b) => {
+            return Err(ctx.raise(InferError::AmbiguousReceiver {
+                method: name.clone(),
+                types: (a.name.to_string(), b.name.to_string()),
+            }));
+        }
+    };
+    let Some(at) = candidates.iter().position(|c| c.decl == decl) else {
+        return Err(ctx.raise(unresolved(Some(decl.applied_to_params()))));
+    };
+    let chosen = candidates.swap_remove(at);
+    if chosen.params != *args {
+        return Err(ctx.raise(InferError::MethodArity {
+            method: format!("{}::{name}", decl.name),
+            params: chosen.params,
+            args: *args,
+        }));
+    }
+    *function = chosen.function;
+    Ok(())
+}
+
+/// Visit each bound `var` has gathered so far, following variable-to-variable bounds, with
+/// refinements peeled. `f` sees every bound that is not a variable, and ends the walk with
+/// `Break`.
+fn for_each_gathered_bound<B>(
+    var: &std::rc::Rc<crate::ccl::InferVar>,
+    mut f: impl FnMut(&Type) -> std::ops::ControlFlow<B>,
+) -> Option<B> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![std::rc::Rc::clone(var)];
+    while let Some(v) = stack.pop() {
+        if !seen.insert(v.uid) {
+            continue;
+        }
+        let bounds = v.bounds.borrow();
+        for b in bounds.lower().iter().chain(bounds.upper().iter()) {
+            match b.ty.peel_refinements() {
+                Type::Infer(next) => stack.push(std::rc::Rc::clone(next)),
+                other => {
+                    if let std::ops::ControlFlow::Break(found) = f(other) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The first component of the tuple `ty` is: directly, or through the bounds its variable
+/// has gathered, as when the argument tuple is named by a binding. `None` where nothing
+/// states a tuple yet.
+fn first_component(ty: &Type) -> Option<Type> {
+    use std::ops::ControlFlow;
+    match ty.peel_refinements() {
+        Type::Tuple(elts) => elts.first().cloned(),
+        Type::Infer(var) => for_each_gathered_bound(var, |b| match b {
+            Type::Tuple(elts) => ControlFlow::Break(elts.first().cloned()),
+            _ => ControlFlow::Continue(()),
+        })
+        .flatten(),
+        _ => None,
+    }
+}
+
+/// What a receiver's type says about the nominal type it is.
+enum Head {
+    Nominal(std::rc::Rc<crate::ccl::nominal::NominalDecl>),
+    /// Nothing stated yet: a variable without a bound naming a type.
+    Unknown,
+    /// A type that is not nominal.
+    Other(Type),
+    /// Two nominal types, which have no join.
+    Two(
+        std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+        std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+    ),
+}
+
+/// The nominal type `ty` names: directly, or through the bounds its variable has
+/// gathered.
+fn nominal_head(ty: &Type) -> Head {
+    use std::ops::ControlFlow;
+    match ty.peel_refinements() {
+        Type::Nominal(decl, _) => Head::Nominal(decl.clone()),
+        Type::Infer(var) => {
+            let mut found: Option<std::rc::Rc<crate::ccl::nominal::NominalDecl>> = None;
+            let two = for_each_gathered_bound(var, |b| match (b, &found) {
+                (Type::Nominal(decl, _), Some(first)) if first != decl => {
+                    ControlFlow::Break(Head::Two(first.clone(), decl.clone()))
+                }
+                (Type::Nominal(decl, _), _) => {
+                    found = Some(decl.clone());
+                    ControlFlow::Continue(())
+                }
+                _ => ControlFlow::Continue(()),
+            });
+            two.unwrap_or_else(|| found.map_or(Head::Unknown, Head::Nominal))
+        }
+        Type::Hole | Type::SharedHole(_) => Head::Unknown,
+        other => Head::Other(other.clone()),
+    }
 }
 
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the

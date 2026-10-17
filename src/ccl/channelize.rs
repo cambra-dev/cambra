@@ -1273,6 +1273,12 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
             )
         }
+        TypedExprNode::DefGroup { .. } => {
+            unreachable!("a DefGroup reached channelize; inference rewrites it into `Let`s")
+        }
+        TypedExprNode::Method { .. } => {
+            unreachable!("a Method reached channelize; inference resolves every method")
+        }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
         TypedExprNode::MutDecl { .. } => {
@@ -1342,6 +1348,12 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
             unreachable!(
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
             )
+        }
+        TypedExprNode::DefGroup { .. } => {
+            unreachable!("a DefGroup reached channelize; inference rewrites it into `Let`s")
+        }
+        TypedExprNode::Method { .. } => {
+            unreachable!("a Method reached channelize; inference resolves every method")
         }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
@@ -2052,8 +2064,14 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             TypedExprNode::Comprehension { .. } => unreachable!(
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
             ),
+            TypedExprNode::DefGroup { .. } => {
+                unreachable!("a DefGroup reached channelize; inference rewrites it into `Let`s")
+            }
             TypedExprNode::MutDecl { .. } => {
                 unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
+            }
+            TypedExprNode::Method { .. } => {
+                unreachable!("a Method reached channelize; inference resolves every method")
             }
             TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
                 if !bound.iter().any(|b| b == name) {
@@ -2308,6 +2326,12 @@ fn extract_for_defer_impl(
             unreachable!(
                 "a Comprehension reached channelize; the comprehension phase eliminates it"
             )
+        }
+        TypedExprNode::DefGroup { .. } => {
+            unreachable!("a DefGroup reached channelize; inference rewrites it into `Let`s")
+        }
+        TypedExprNode::Method { .. } => {
+            unreachable!("a Method reached channelize; inference resolves every method")
         }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.

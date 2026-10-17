@@ -185,7 +185,7 @@
     },
     "keyword-other": {
       "name": "keyword.other.cambra",
-      "match": "\\b(?:def|where|and|or|not|forall|requires|type|import|use|as|pub|run|param|this)\\b"
+      "match": "\\b(?:def|where|and|or|not|forall|requires|type|impl|import|use|as|pub|run|param|this)\\b"
     },
     "builtin": {
       "name": "support.function.builtin.cambra",

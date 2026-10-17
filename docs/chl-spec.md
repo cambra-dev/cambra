@@ -4943,9 +4943,8 @@ with parser-level support that lowering rejects:
   or Unicode `[k ↦ v, …]` are superseded by the map-literal decision.
 - **Map comprehensions** — `[k -> v for …]` is a comprehension of pairs, and reading one as a
   `Map` is `map([k -> v for …])` ([3.12 Comprehensions](#312-comprehensions)).
-- **Nominal types** — a recursive `type` declaration, associated functions and methods,
-  `@RenamedFrom` on a type, and carrying a value of a nominal type over a reload are **[Decided]**
-  and unimplemented
+- **Nominal types** — a recursive `type` declaration, `@RenamedFrom` on a type, and carrying a
+  value of a nominal type over a reload are **[Decided]** and unimplemented
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
 - **The target syntax at large** — the mutation and transaction **core is implemented** (`:=`,
   `with begin():`, `Mut(…, Txn)` mutable variables, feeds — §8), now spelled in the canonical target

@@ -488,6 +488,19 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             }
         }
 
+        // `method(m; Shape::m, Box::m)`: the name, then each candidate.
+        TypedExprNode::Method {
+            name, candidates, ..
+        } => {
+            let cs: Vec<String> = candidates
+                .iter()
+                .map(|c| fmt(&c.function, Precedence::Lowest, opts))
+                .collect();
+            (
+                Precedence::Atom,
+                format!("method({name}; {})", cs.join(", ")),
+            )
+        }
         // Construction is CHL's `` `tag(payload) ``. The payload is always
         // rendered, including the nullary constructor's `unit`: this is a term,
         // and the `Unit`-valued expression sitting there is a real node — unlike
@@ -553,8 +566,14 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // Mutually recursive group: `letrec b₁ = e₁; …; bₙ = eₙ in body`,
         // bindings separated by `; `, with the `in` continuation on its own
         // line matching the `Let` rendering. Binding names carry ` : ty`
-        // when the declared type is known, like other typed binders.
-        TypedExprNode::LetRec { bindings, body } => {
+        // when the declared type is known, like other typed binders. An `impl`
+        // block's group renders the same way under `defs`.
+        TypedExprNode::LetRec { bindings, body } | TypedExprNode::DefGroup { bindings, body } => {
+            let keyword = if matches!(expr.node, TypedExprNode::LetRec { .. }) {
+                "letrec"
+            } else {
+                "defs"
+            };
             let binding_strs: Vec<_> = bindings
                 .iter()
                 .map(|(b, def)| {
@@ -573,7 +592,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             let body_str = fmt(body, Precedence::Lowest, opts);
             (
                 Precedence::Lowest,
-                format!("letrec {}\nin {body_str}", binding_strs.join("; ")),
+                format!("{keyword} {}\nin {body_str}", binding_strs.join("; ")),
             )
         }
 

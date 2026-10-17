@@ -529,6 +529,14 @@ fn hash_payload<'a>(
             decl.hash(h);
             ctor.hash(h);
         }
+        // The candidates' functions are children, reached by the scoped fold. Their
+        // declarations and parameter counts are left out: those are what the functions'
+        // names already say, and candidates that differ only there hash alike, which a hash
+        // may do.
+        N::Method { name, args, .. } => {
+            name.hash(h);
+            args.hash(h);
+        }
         // Field *names* are folded together with their values in `hash_rel`,
         // which is what keeps `(a: 1, b: 2)` distinct from `(a: 2, b: 1)` under
         // the order-insensitive fold. An [`Fold::Own`] fold has no children to
@@ -551,7 +559,7 @@ fn hash_payload<'a>(
         // covers the declaration's whole type-level content.
         N::MutDecl { binding, .. } => hash_binding(binding, env, wenv, free, fold, h),
         N::For { target, .. } => hash_binding(target, env, wenv, free, fold, h),
-        N::LetRec { bindings, .. } => {
+        N::LetRec { bindings, .. } | N::DefGroup { bindings, .. } => {
             bindings.len().hash(h);
             for (b, _) in bindings {
                 hash_binding(b, env, wenv, free, fold, h);

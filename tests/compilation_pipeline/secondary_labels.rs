@@ -100,10 +100,12 @@ fn labels(code: &str) -> (String, Vec<(String, &'static str)>) {
     "pick: forall (T) T => T = inc",
     &[("a + 1", "required here")],
 )]
+// A generator binds its element as a `let` binds its value, so the operator the element
+// fails is reported where it stands, as `x = "a"` then `x + 1` is.
 #[case::operator_reading_a_comprehension_element(
     "[x + 1 for x in [\"a\", \"b\"]]",
-    "[\"a\", \"b\"]",
-    &[("x + 1", "required here")],
+    "x + 1",
+    &[],
 )]
 #[case::value_bound_through_a_let(
     indoc! {"

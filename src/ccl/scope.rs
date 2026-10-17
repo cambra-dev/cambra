@@ -300,6 +300,11 @@ where
         N::UnaryOp(_, inner) => open(f, inner),
         N::Aggregate { input, .. } => open(f, input),
         N::VariantCtor { payload, .. } | N::NominalCtor { payload, .. } => open(f, payload),
+        N::Method { candidates, .. } => {
+            for c in candidates {
+                open(f, &c.function);
+            }
+        }
         N::List(elts)
         | N::Tuple(elts)
         | N::Compose(elts)
@@ -362,7 +367,7 @@ where
         }
 
         // Mutual recursion: the whole group is in scope throughout the group.
-        N::LetRec { bindings, body } => {
+        N::LetRec { bindings, body } | N::DefGroup { bindings, body } => {
             let group = Binders::Group(bindings);
             for (_, def) in bindings {
                 under(f, def, group);
@@ -568,6 +573,7 @@ where
         | N::Aggregate { .. }
         | N::VariantCtor { .. }
         | N::NominalCtor { .. }
+        | N::Method { .. }
         | N::List(_)
         | N::Tuple(_)
         | N::Record(_)
@@ -580,6 +586,7 @@ where
         | N::Let { .. }
         | N::MutDecl { .. }
         | N::LetRec { .. }
+        | N::DefGroup { .. }
         | N::For { .. }
         | N::Case { .. }
         | N::Comprehension { .. } => {}
@@ -654,8 +661,23 @@ mod tests {
                 "c",
                 var("pl"),
             ),
+            node(N::Method {
+                name: "m".into(),
+                args: 0,
+                candidates: vec![crate::ccl::MethodCandidate {
+                    decl: crate::ccl::nominal::NominalDecl::declared(
+                        "N".into(),
+                        Vec::new(),
+                        chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
+                        false,
+                    ),
+                    params: 0,
+                    function: var("N::m"),
+                }],
+            }),
             transact_one_key_one_writer(),
             TypedExpr::letrec(vec![(bind("f"), var("g")), (bind("g"), var("f"))], var("f")),
+            TypedExpr::def_group(vec![(bind("f"), var("g")), (bind("g"), var("a"))], var("f")),
             node(N::For {
                 target: bind("t"),
                 iter: Box::new(var("xs")),
@@ -788,8 +810,10 @@ mod tests {
         N::Case { .. } => "Case",
         N::VariantCtor { .. } => "VariantCtor",
         N::NominalCtor { .. } => "NominalCtor",
+        N::Method { .. } => "Method",
         N::Transact { .. } => "Transact",
         N::LetRec { .. } => "LetRec",
+        N::DefGroup { .. } => "DefGroup",
         N::For { .. } => "For",
         N::Tuple(_) => "Tuple",
         N::Record(_) => "Record",
