@@ -110,7 +110,7 @@ ci_solver() {
 # editor's toolchain: Node for VS Code, Neovim for Neovim. A machine without one
 # skips that editor's checkers, loudly; under CI a missing toolchain fails, for
 # the reason `ci_formal` gives. The VS Code client check downloads VS Code, so
-# it is `ci_vscode`, run on request rather than in the gate.
+# it is `ci_vscode`, which CI's `editors` job runs and the local gate does not.
 ci_editors() {
   local missing=""
   command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 || missing="${missing} node"
@@ -151,17 +151,19 @@ ci_editors() {
       nvim --headless -u NONE -i NONE -n --cmd 'set rtp^=editors/nvim' \
         -l editors/nvim/test/check_indent.lua editors/indent-cases.json || failed=1
       cargo build -q --bin cambra || exit 1
+      # `CARGO_TARGET_DIR` can move the target directory out of the checkout.
+      target="$(realpath "${CARGO_TARGET_DIR:-target}")" || exit 1
       nvim --headless -u NONE -i NONE -n --cmd 'set rtp^=editors/nvim' \
-        -l editors/nvim/test/check_lsp.lua "${PWD}/target/debug/cambra" || failed=1
+        -l editors/nvim/test/check_lsp.lua "${target}/debug/cambra" || failed=1
     fi
     exit "${failed}"
   )
 }
 # The language server through VS Code's client and the extension in
-# `editors/vscode/` (`editors/README.md`, "Language server checks"). Not part of
-# the full gate: the first run downloads VS Code, about 1 GB unpacked, into
-# `editors/vscode/.vscode-test/`. Run it as `./ci.sh vscode` after changing the
-# extension or the server's protocol behavior.
+# `editors/vscode/` (`editors/README.md`, "Language server checks"). CI's
+# `editors` job runs it; the local full gate does not, because the first run
+# downloads VS Code, about 1 GB unpacked, into `editors/vscode/.vscode-test/`.
+# The VS Code version is pinned, so the result changes only with a commit.
 ci_vscode() {
   if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
     echo "ci_vscode: node/npm not found — the VS Code client check needs them" >&2
@@ -169,7 +171,10 @@ ci_vscode() {
   fi
   (cd editors/vscode && npm ci --prefer-offline --no-audit --no-fund) || return 1
   cargo build -q --bin cambra || return 1
-  node editors/vscode/test/lsp/run.mjs "${PWD}/target/debug/cambra"
+  local target
+  target="$(realpath "${CARGO_TARGET_DIR:-target}")" || return 1
+  CAMBRA_VSCODE_VERSION="${CAMBRA_VSCODE_VERSION:-1.142.0}" \
+    node editors/vscode/test/lsp/run.mjs "${target}/debug/cambra"
 }
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \

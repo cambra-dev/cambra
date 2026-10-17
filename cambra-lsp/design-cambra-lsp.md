@@ -257,8 +257,13 @@ client library, which offers only UTF-16 positions and fails to start against a 
 answers with any other encoding. The client runs `<cambra.server.path> --lsp` over standard input
 and output for `cambra` documents with the scheme `file` or `untitled`; a selector by language
 alone would also attach to the `git:` documents of diff views. Changing `cambra.server.path`, or
-the command **Cambra: Restart Language Server**, stops the server and starts a new one. A binary
-that does not start is reported with an error naming the setting. `editors/README.md` describes
+the command **Cambra: Restart Language Server**, stops the server and starts a new one. Restarts
+run one at a time, a restart queued behind a later one is skipped, and edits to the setting take
+effect 500 ms after the last one. A binary that does not start is reported with an error naming the
+setting. In an untrusted workspace (Restricted Mode) the extension stays enabled, VS Code ignores
+the workspace's `cambra.server.path` (`capabilities.untrustedWorkspaces` in `package.json`), and the
+server runs from the user's home directory, so on Windows a bare `cambra` cannot resolve to a binary
+in the workspace folder. Trusting the workspace restarts the server. `editors/README.md` describes
 the setup.
 
 ## Testing
@@ -287,9 +292,9 @@ the setup.
   offset, and requires the two to agree, so a feature that computed a column without the session's
   encoding fails.
 - **Clients.** `./ci.sh editors` runs the server through Neovim's client
-  (`editors/nvim/test/check_lsp.lua`), and `./ci.sh vscode`, outside the full gate, through VS
-  Code's (`editors/vscode/test/lsp/`). Both check the handshake, diagnostics at the client's
-  columns, the outline, folds and edits on one file with a multi-byte character
+  (`editors/nvim/test/check_lsp.lua`), and `./ci.sh vscode`, in CI but outside the local full
+  gate, through VS Code's (`editors/vscode/test/lsp/`). Both check the handshake, diagnostics at
+  the client's columns, the outline, folds and edits on one file with a multi-byte character
   (`editors/README.md`, "Language server checks").
 - **Positions.** A seeded fuzz test in `cambra-lsp/src/document.rs` (`CAMBRA_FUZZ_SEED`,
   `CAMBRA_FUZZ_N`) builds texts mixing ASCII, multi-byte characters and all three line breaks,

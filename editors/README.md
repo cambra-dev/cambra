@@ -225,10 +225,9 @@ entry, and the extension's activation.
   runs without a window, through Chromium's headless Ozone platform, so it needs no display.
   `CAMBRA_VSCODE_SHOW=1` shows the window.
 
-`./ci.sh vscode` is not part of the full gate or of CI. Its first run downloads VS Code, about 1 GB
-unpacked, into `vscode/.vscode-test/`. `CAMBRA_VSCODE` names an installed VS Code to run instead,
-and `CAMBRA_VSCODE_VERSION` a version to download. Run it after changing `extension.js`, the
-extension's `package.json`, or how the server negotiates with a client.
+CI's `editors` job runs `./ci.sh vscode`; the local full gate does not. Its first run downloads VS
+Code, about 1 GB unpacked, into `vscode/.vscode-test/`. `ci_vscode` pins the version, and
+`CAMBRA_VSCODE_VERSION` overrides it. `CAMBRA_VSCODE` names an installed VS Code to run instead.
 
 ## VS Code
 
@@ -271,6 +270,10 @@ outline. The server's folding ranges replace VS Code's folding by indentation.
 
 The **Cambra** output channel also holds the server's own log messages. When the binary cannot be
 started, an error names `cambra.server.path`.
+
+In an untrusted workspace (Restricted Mode) highlighting and the language server keep working, and
+the server runs from the user's `cambra.server.path`, or `cambra` on `PATH`. A value the
+workspace's `.vscode/settings.json` sets takes effect once the workspace is trusted.
 
 Indentation follows [Indentation](#indentation). Typing `elif` or `else` and its `:` dedents the
 line one level, which lands it on its chain's level when the body above it sits at the level Enter

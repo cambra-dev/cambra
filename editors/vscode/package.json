@@ -16,6 +16,15 @@
     "Programming Languages"
   ],
   "main": "./extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "restrictedConfigurations": [
+        "cambra.server.path"
+      ],
+      "description": "In Restricted Mode a workspace's `cambra.server.path` is ignored: the language server is the binary the user setting names, or `cambra` on PATH."
+    }
+  },
   "contributes": {
     "languages": [
       {

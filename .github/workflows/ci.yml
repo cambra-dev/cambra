@@ -310,6 +310,12 @@ jobs:
       - name: Editor highlight check and indentation tests
         run: ./ci.sh editors
 
+      # Downloads the VS Code version `ci_vscode` pins on every run. Not cached:
+      # `.vscode-test/` unpacks to about 1 GB, which restores no faster than the
+      # download and would crowd the repository's Actions cache.
+      - name: Language server through VS Code's client
+        run: ./ci.sh vscode
+
   # The one required status check: ruleset "CI" requires the context `check`.
   # Keeping that name on a job that only collects results is what lets the gates
   # above be split, renamed, or added to without a ruleset edit.

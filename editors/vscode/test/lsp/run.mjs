@@ -7,7 +7,8 @@
 // the one at `$CAMBRA_VSCODE`, and starts it on a fresh profile with no other
 // extension installed. `suite.js` runs inside it and makes the checks
 // (editors/README.md, "Language server checks"). `$CAMBRA_VSCODE_VERSION`
-// picks the downloaded version; the default is the latest stable release.
+// picks the downloaded version; `./ci.sh vscode` pins it, and with it unset
+// this downloads the latest stable release.
 // On Linux VS Code runs with no window, through Chromium's headless Ozone
 // platform, so no display or Xvfb is needed; `CAMBRA_VSCODE_SHOW=1` opens the
 // window instead, to watch the check.
@@ -44,6 +45,10 @@ const workspace = join(scratch, "workspace");
 mkdirSync(workspace);
 const file = join(workspace, "check.cambra");
 writeFileSync(file, ['x = f(1]', 'y = "😀" $', "def g(a):", "    a", ""].join("\n"));
+
+// Any process a VS Code extension starts inherits this variable, and with it
+// set the VS Code binary runs as plain Node instead of opening the workbench.
+delete process.env.ELECTRON_RUN_AS_NODE;
 
 let status = 1;
 try {
