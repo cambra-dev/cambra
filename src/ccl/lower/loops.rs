@@ -963,17 +963,16 @@ fn body_has_bare_call(body: &[Spanned<ChlStmt>]) -> bool {
 }
 
 /// What a feed-only loop nested in a mutation loop holds that the compiler does not compile
-/// yet, if anything: a `yield`, a `match`, a filter that reads a name an enclosing loop binds
-/// or writes, or a source that reads such a name. The language accepts each, so the refusal is
-/// an internal error, a gap to close.
+/// yet, if anything: a `yield`, a `match`, or a filter or a source that reads a binding in the
+/// mutation loop's body or a mutable variable an enclosing loop writes. The language accepts
+/// each, so the refusal is an internal error, a gap to close.
 ///
 /// `source` and `body` are the lowered source and body of the loop over `iter_var`; in the
-/// body, a filter is a `Case` that feeds. A filter reads its own loop's variable, the `let`s
-/// its loop's body binds from what a filter may read, or what the scope around the mutation
-/// loop binds (`outer_bindings`), and a source only the last. A mutable variable the enclosing
-/// loops write (`written`) takes one value per position of theirs, as their variables do, so
-/// it counts as theirs even where `outer_bindings` holds it, and so does a `let` that reads
-/// one.
+/// body, a filter is a `Case` that feeds. A filter or a source may read a loop's variable
+/// (`is_loop_variable` for the loops around this one), what the scope around the mutation loop
+/// binds (`outer_bindings`), and a `let` the feed-only loops' bodies bind from those. A mutable
+/// variable the enclosing loops write (`written`) takes one value per position of theirs, so
+/// neither may read it, even where `outer_bindings` holds it, nor a `let` that reads it.
 fn nested_feed_only_gap(
     body_stmts: &[Spanned<ChlStmt>],
     iter_var: &str,
@@ -981,6 +980,7 @@ fn nested_feed_only_gap(
     body: &Expr,
     outer_bindings: &HashSet<String>,
     written: &[String],
+    is_loop_variable: &dyn Fn(&str) -> bool,
 ) -> Option<&'static str> {
     type Names = HashSet<crate::ccl::Name>;
     if for_body_has_yield(body_stmts) {
@@ -989,41 +989,64 @@ fn nested_feed_only_gap(
     if body_has_match(body_stmts) {
         return Some("a `match` in a feed-only loop nested in a mutation loop is not compiled yet");
     }
-    let enclosing = |n: &crate::ccl::Name| {
-        !outer_bindings.contains(n.base()) || written.iter().any(|w| w == n.base())
+    let is_written = |n: &crate::ccl::Name| written.iter().any(|w| w == n.base());
+    // A name the mutation loop's body binds or its loops write, as against one the feed-only
+    // loops bind (`lets`, `loops`) or the scope around the mutation loop binds.
+    let reads_mutation_scope = |e: &Expr, lets: &Names, loops: &Names| {
+        crate::ccl::ccl_utils::free_names(e).iter().any(|n| {
+            !lets.contains(n)
+                && !loops.contains(n)
+                && !is_loop_variable(n.base())
+                && (!outer_bindings.contains(n.base()) || is_written(n))
+        })
     };
-    let reads_enclosing = |e: &Expr, var: Option<&crate::ccl::Name>, lets: &Names| {
-        crate::ccl::ccl_utils::free_names(e)
+    // A filter reads nothing of the mutation loop's scope. `lets` are the `let`s the nest binds
+    // from what it may read; one the nest binds from a written variable is in `from_written`.
+    let filter_gap = |guard: &Expr, lets: &Names, from_written: &Names, loops: &Names| {
+        let reads = crate::ccl::ccl_utils::free_names(guard);
+        if reads
             .iter()
-            .any(|n| Some(n) != var && !lets.contains(n) && enclosing(n))
+            .any(|n| from_written.contains(n) || (!lets.contains(n) && is_written(n)))
+        {
+            Some(WRITTEN_FILTER_GAP)
+        } else if reads_mutation_scope(guard, lets, loops) {
+            Some(BINDING_FILTER_GAP)
+        } else {
+            None
+        }
     };
-    if reads_enclosing(source, None, &Names::new()) {
+    if reads_mutation_scope(source, &Names::new(), &Names::new()) {
         return Some(SOURCE_GAP);
     }
     fn feeds(expr: &Expr) -> bool {
         matches!(expr.node, TypedExprNode::Feed { .. }) || expr.any_child(feeds)
     }
-    /// The gap under `expr`, in the body of the loop over `var` whose `let`s so far that read
-    /// nothing enclosing are `lets`.
-    fn walk(
-        expr: &Expr,
-        var: &crate::ccl::Name,
-        lets: &mut Names,
-        reads_enclosing: &dyn Fn(&Expr, Option<&crate::ccl::Name>, &Names) -> bool,
-    ) -> Option<&'static str> {
+    struct Checks<'c> {
+        source: &'c dyn Fn(&Expr, &Names, &Names) -> bool,
+        filter: &'c dyn Fn(&Expr, &Names, &Names, &Names) -> Option<&'static str>,
+        written: &'c dyn Fn(&crate::ccl::Name) -> bool,
+    }
+    /// The `let`s the feed-only nest's bodies bind so far: `own` from what a filter may read,
+    /// `from_written` from a variable an enclosing loop writes.
+    #[derive(Clone, Default)]
+    struct Lets {
+        own: Names,
+        from_written: Names,
+    }
+    /// The gap under `expr`, beneath the loops `loops` of the feed-only nest.
+    fn walk(expr: &Expr, lets: &mut Lets, loops: &Names, checks: &Checks) -> Option<&'static str> {
         match &expr.node {
             TypedExprNode::Compose(elts) => match elts.split_last() {
                 Some((last, sources)) => match &last.node {
                     TypedExprNode::Lambda { param, body } => {
-                        if sources
-                            .iter()
-                            .any(|s| reads_enclosing(s, None, &Names::new()))
-                        {
+                        if sources.iter().any(|s| (checks.source)(s, &lets.own, loops)) {
                             return Some(SOURCE_GAP);
                         }
-                        walk(body, &param.name, &mut Names::new(), reads_enclosing)
+                        let mut loops = loops.clone();
+                        loops.insert(param.name.clone());
+                        walk(body, &mut lets.clone(), &loops, checks)
                     }
-                    _ => children(expr, var, lets, reads_enclosing),
+                    _ => children(expr, lets, loops, checks),
                 },
                 None => None,
             },
@@ -1031,46 +1054,58 @@ fn nested_feed_only_gap(
                 binding,
                 bound_expr,
                 body,
-            } => walk(bound_expr, var, lets, reads_enclosing).or_else(|| {
-                if !reads_enclosing(bound_expr, Some(var), lets) {
-                    lets.insert(binding.name.clone());
+            } => walk(bound_expr, lets, loops, checks).or_else(|| {
+                let reads = crate::ccl::ccl_utils::free_names(bound_expr);
+                if reads
+                    .iter()
+                    .any(|n| lets.from_written.contains(n) || (checks.written)(n))
+                {
+                    lets.from_written.insert(binding.name.clone());
+                } else if !(checks.source)(bound_expr, &lets.own, loops) {
+                    lets.own.insert(binding.name.clone());
                 }
-                walk(body, var, lets, reads_enclosing)
+                walk(body, lets, loops, checks)
             }),
             // An `if` statement that feeds is a filter; a value's `Case` is not.
             TypedExprNode::Case { branches, .. } if branches.iter().any(|b| feeds(&b.body)) => {
-                branches
-                    .iter()
-                    .find_map(|b| match reads_enclosing(&b.guard, Some(var), lets) {
-                        true => Some(FILTER_GAP),
-                        false => walk(&b.body, var, lets, reads_enclosing),
-                    })
+                branches.iter().find_map(|b| {
+                    (checks.filter)(&b.guard, &lets.own, &lets.from_written, loops)
+                        .or_else(|| walk(&b.body, lets, loops, checks))
+                })
             }
-            _ => children(expr, var, lets, reads_enclosing),
+            _ => children(expr, lets, loops, checks),
         }
     }
     fn children(
         expr: &Expr,
-        var: &crate::ccl::Name,
-        lets: &mut Names,
-        reads_enclosing: &dyn Fn(&Expr, Option<&crate::ccl::Name>, &Names) -> bool,
+        lets: &mut Lets,
+        loops: &Names,
+        checks: &Checks,
     ) -> Option<&'static str> {
         let mut found = None;
         expr.any_child(|c| {
-            found = walk(c, var, lets, reads_enclosing);
+            found = walk(c, lets, loops, checks);
             found.is_some()
         });
         found
     }
-    const SOURCE_GAP: &str = "a loop whose source reads what an enclosing loop binds or writes, \
-                              nested in a mutation loop and only feeding, is not compiled yet";
-    const FILTER_GAP: &str = "a filter that reads what an enclosing loop binds or writes, in a \
-                              feed-only loop nested in a mutation loop, is not compiled yet";
+    const SOURCE_GAP: &str = "a loop whose source reads a binding in the mutation loop's body or \
+                              a mutable variable an enclosing loop writes, nested in a mutation \
+                              loop and only feeding, is not compiled yet";
+    const WRITTEN_FILTER_GAP: &str = "a filter that reads a mutable variable an enclosing loop \
+                                      writes, in a feed-only loop nested in a mutation loop, is \
+                                      not compiled yet";
+    const BINDING_FILTER_GAP: &str = "a filter that reads a binding in the mutation loop's body, \
+                                      in a feed-only loop nested in it, is not compiled yet";
     walk(
         body,
-        &crate::ccl::Name::from(iter_var),
-        &mut Names::new(),
-        &reads_enclosing,
+        &mut Lets::default(),
+        &Names::from([crate::ccl::Name::from(iter_var)]),
+        &Checks {
+            source: &reads_mutation_scope,
+            filter: &filter_gap,
+            written: &is_written,
+        },
     )
 }
 
@@ -1169,6 +1204,7 @@ fn lower_nested_loop(
             &for_body,
             outer_bindings,
             acc_names,
+            &|n| ctx.is_shadowed(n),
         ) {
             return Err(LoweringError::internal(for_span, gap));
         }
@@ -1461,11 +1497,7 @@ fn lower_loop_body_chain_scoped(
                     // `D = Hole`: the domain is whatever writes it — an inner `for`, or
                     // the rest of this body — which the unified phase resolves exactly as
                     // it does for one declared before a top-level loop.
-                    let mut_ty = Type::History {
-                        value: Box::new(value_ty),
-                        domain: Box::new(Type::Hole),
-                        history_kind: crate::ccl::HistoryKind::Overwrite,
-                    };
+                    let mut_ty = Type::mutable(Type::Hole, value_ty);
                     let init = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                     ctx.tag_image(Expr::mut_decl(name, mut_ty, init, chain), stmt.span)
                 } else {
@@ -1931,30 +1963,30 @@ in guarded_let"
     }
 
     /// A feed-only loop nested in a mutation loop is refused with an internal error where it
-    /// holds what the compiler does not compile yet, and lowers where its filter reads only
-    /// its own variable, its body's `let`s of it, and what the scope around the mutation loop
-    /// binds and no loop writes.
+    /// holds what the compiler does not compile yet, and lowers where its filters read only
+    /// loop variables, what the scope around the mutation loop binds and no loop writes, and
+    /// the nest's `let`s of those.
     #[rstest::rstest]
     #[case::a_filter_reading_the_enclosing_loop(
         indoc::indoc! {"
             if j > i:
                 out << j
         "},
-        Some("a filter that reads what an enclosing loop binds or writes")
+        None
     )]
     #[case::a_filter_reading_a_binding_of_the_enclosing_loop(
         indoc::indoc! {"
             if j > m:
                 out << j
         "},
-        Some("a filter that reads what an enclosing loop binds or writes")
+        Some("a filter that reads a binding in the mutation loop's body")
     )]
     #[case::a_filter_reading_a_mutable_variable_the_enclosing_loop_writes(
         indoc::indoc! {"
             if j > t:
                 out << j
         "},
-        Some("a filter that reads what an enclosing loop binds or writes")
+        Some("a filter that reads a mutable variable an enclosing loop writes")
     )]
     #[case::a_filter_reading_a_binding_of_its_own_loop(
         indoc::indoc! {"
@@ -1970,7 +2002,7 @@ in guarded_let"
             if j > n:
                 out << j
         "},
-        Some("a filter that reads what an enclosing loop binds or writes")
+        None
     )]
     #[case::a_filter_reading_a_binding_that_reads_a_mutable_variable_the_enclosing_loop_writes(
         indoc::indoc! {"
@@ -1978,21 +2010,36 @@ in guarded_let"
             if j > n:
                 out << j
         "},
-        Some("a filter that reads what an enclosing loop binds or writes")
+        Some("a filter that reads a mutable variable an enclosing loop writes")
     )]
     #[case::a_source_reading_the_enclosing_loop(
         indoc::indoc! {"
             for k in [z for z in [1, 2] if z > j]:
                 out << k
         "},
-        Some("a loop whose source reads what an enclosing loop binds or writes")
+        None
+    )]
+    #[case::a_source_reading_a_binding_of_its_loop(
+        indoc::indoc! {"
+            n = j + 1
+            for k in [z for z in [11, 21] if z > n]:
+                out << k
+        "},
+        None
+    )]
+    #[case::a_source_reading_a_binding_of_the_mutation_loop(
+        indoc::indoc! {"
+            for k in [z for z in [5, 15] if z > m]:
+                out << k + j
+        "},
+        Some("a loop whose source reads a binding in the mutation loop's body or a mutable variable an enclosing loop writes")
     )]
     #[case::a_source_reading_a_mutable_variable_the_enclosing_loop_writes(
         indoc::indoc! {"
             for k in [z for z in [1, 2] if z > t]:
                 out << k + j
         "},
-        Some("a loop whose source reads what an enclosing loop binds or writes")
+        Some("a loop whose source reads a binding in the mutation loop's body or a mutable variable an enclosing loop writes")
     )]
     #[case::a_match(
         indoc::indoc! {"

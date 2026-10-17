@@ -848,14 +848,12 @@ fn a_per_iteration_binding_read_by_the_inner_loop() {
 
 /// A refinement on the **inner** source that reads the outer binder — a correlated
 /// filter, so the inner domain differs per outer row and is narrower than the collection
-/// it filters. Answers 8 once it compiles: 2+3, then 3, then nothing. Pinned as it fails;
-/// the cause and its fix are the vault issue `refinements-dependent-projection-of-a-refined-pair`.
-///
-/// The inner history's type depends on the enclosing parameter, which lambda elimination
-/// refuses.
+/// it filters: 2+3, then 3, then nothing. The inner history's type depends on the enclosing
+/// parameter, so it is a dependent function of it, and the nested writer's parameter is a
+/// dependent pair.
 #[test]
 fn a_correlated_filter_on_the_inner_source() {
-    check_compile_error(
+    check_scalar(
         indoc! {r"
             total := 0
             for x in [1, 2, 3]:
@@ -863,7 +861,7 @@ fn a_correlated_filter_on_the_inner_source() {
                     total += y
             total
         "},
-        "history type does not depend on the enclosing parameter",
+        Value::Int(8),
     );
 }
 

@@ -220,15 +220,26 @@ impl Printer {
                 codomain,
             } => self.fun(ty, name.as_ref(), fun_kind, domain, codomain),
             Type::History {
-                value,
-                domain,
-                history_kind: HistoryKind::Overwrite,
-            } => {
-                format!("Mut({}, {})", self.ty(value), self.ty(domain))
-            }
-            Type::History { value, .. } => {
-                format!("Feed({})", self.ty(value))
-            }
+                function,
+                history_kind,
+            } => match function.as_ref() {
+                // A value that reads its position has no spelling: `Mut` and `Feed` name
+                // one value type for every position.
+                Type::Fun {
+                    name: Some(key),
+                    codomain,
+                    ..
+                } if crate::ccl::subst::codomain_depends_on(key, codomain) => self.fallback(ty),
+                Type::Fun {
+                    domain, codomain, ..
+                } => match history_kind {
+                    HistoryKind::Overwrite => {
+                        format!("Mut({}, {})", self.ty(codomain), self.ty(domain))
+                    }
+                    _ => format!("Feed({})", self.ty(codomain)),
+                },
+                _ => self.fallback(ty),
+            },
             Type::Poly(poly) => self.poly(poly),
             Type::ChanDom(..) | Type::WitnessRef(_) | Type::BoundedHole(_) | Type::DepTuple(_) => {
                 self.fallback(ty)

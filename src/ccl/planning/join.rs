@@ -1205,7 +1205,7 @@ pub(super) fn try_hash_join_rewrite(
             .expect("convert_loop_join output must be function-typed"),
         codomain,
     );
-    *expr = compose(transformed, take(expr)).with_ty(result_ty);
+    *expr = ccl_utils::chain_typed(vec![transformed, take(expr)], result_ty);
     true
 }
 

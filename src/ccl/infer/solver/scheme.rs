@@ -237,6 +237,8 @@ pub struct FreshenCache {
     /// ([`TraitObligation::reset_for_specialization`]), and the rest of its
     /// assumptions are freshened with the clone. `None` for an instantiation.
     pub own_params: Option<Rc<[crate::ccl::ty::TypeParamId]>>,
+    /// An operator scheme's Pi binder → the name this instantiation gives it.
+    pub binders: HashMap<crate::ccl::Name, crate::ccl::Name>,
 }
 
 impl FreshenCache {
@@ -290,10 +292,15 @@ impl FreshenLevel {
 /// identified), seeding it with a copy of the original's bounds so any
 /// def-intrinsic forcing is preserved while use-site forcing lands on the fresh
 /// cell — decoupling instantiations (see [`FreshenCache::fun_kind_vars`]).
-fn freshen_fun_kind(fun_kind: &FunKind, cache: &mut FreshenCache) -> FunKind {
+fn freshen_fun_kind(
+    fun_kind: &FunKind,
+    lim: Level,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> FunKind {
     match fun_kind {
         FunKind::Compute | FunKind::Data(..) => fun_kind.clone(),
-        FunKind::Var(kv) => FunKind::Var(freshen_kind_var(kv, cache)),
+        FunKind::Var(kv) => FunKind::Var(freshen_kind_var(kv, lim, target, cache)),
     }
 }
 
@@ -303,7 +310,12 @@ fn freshen_fun_kind(fun_kind: &FunKind, cache: &mut FreshenCache) -> FunKind {
 /// Caching by `uid` is what keeps repeated occurrences of one `κ` in a single
 /// copy identified; the copy decouples *this* instantiation's pin from the
 /// definition's and from every sibling instantiation's.
-fn freshen_kind_var(kv: &Rc<FunKindVar>, cache: &mut FreshenCache) -> Rc<FunKindVar> {
+fn freshen_kind_var(
+    kv: &Rc<FunKindVar>,
+    lim: Level,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Rc<FunKindVar> {
     if let Some(f) = cache.fun_kind_vars.get(&kv.uid) {
         return f.clone();
     }
@@ -323,14 +335,17 @@ fn freshen_kind_var(kv: &Rc<FunKindVar>, cache: &mut FreshenCache) -> Rc<FunKind
     if kv.stamped() == crate::ccl::ty::KindPin::Data {
         f.stamp_data();
     }
-    for k in kv.lower() {
-        f.record(freshen_fun_kind(&k, cache), true);
+    // Each edge's substitution comes across freshened, as a copied bound's does.
+    for (k, edge) in kv.lower_edges() {
+        let edge = freshen_subst_payloads(lim, &edge, target, cache);
+        f.record_under(freshen_fun_kind(&k, lim, target, cache), true, edge);
     }
-    for k in kv.upper() {
-        f.record(freshen_fun_kind(&k, cache), false);
+    for (k, edge) in kv.upper_edges() {
+        let edge = freshen_subst_payloads(lim, &edge, target, cache);
+        f.record_under(freshen_fun_kind(&k, lim, target, cache), false, edge);
     }
     for src in kv.built_over().into_iter().rev() {
-        f.contributes_first(freshen_fun_kind(&src, cache));
+        f.contributes_first(freshen_fun_kind(&src, lim, target, cache));
     }
     // **The binders come across renamed**, after the edges that decide the arity. A
     // position the original has settled is named in the bounds being copied, and the copy
@@ -382,15 +397,18 @@ fn freshen_level(ty: &Type) -> Level {
     }
     // One walk, not `type_level` plus a second descent: `walk_children` already
     // reaches every structural position, so the only thing to add is the
-    // predicate it documents itself as skipping. `ChanDom` needs no arm — it has
-    // no children and is not an `Infer`, so it contributes 0, which is the same
-    // answer `type_level` gives it and for the same reason.
+    // predicate it documents itself as skipping. A `ChanDom` reports its stored
+    // introduction level, where `type_level` reports 0: a channel minted inside the
+    // definition is quantified, and [`freshen_above`] renames it. A history whose value
+    // reads its key holds one in a predicate, as the key binder's type, beside
+    // nothing else to freshen.
     let mut lvl = match ty {
         Type::Infer(v) => v.level(),
         // A declared parameter, in an annotation slot a clone copies, is a name the
         // solver never reads; normalization replaced it where the right-hand side was
         // emitted.
         Type::Param(param) => param.opened_at.unwrap_or(0),
+        Type::ChanDom(_, l) => l.0,
         _ => 0,
     };
     for r in ty.refinements() {
@@ -413,13 +431,10 @@ pub fn freshen_above(
     // The short-circuit asks [`freshen_level`], not `type_level`: a refinement's
     // predicate holds type slots whose quantified variables a low base hides, and
     // freshening has to copy them (see [`freshen_level`] for why the two levels
-    // are different questions). A `ChanDom` is exempt outright: it deliberately
-    // reports level 0 (its level must not trigger extrusion — see `type_level`),
-    // so its quantification is decided by the arm below from its *stored*
-    // introduction level. A `WitnessRef` is exempt for the same reason: it is a name
-    // holding no variable, so its level is 0 whether or not its binder is quantified, and
-    // what decides that is the cache the arm below reads.
-    if !matches!(ty, Type::ChanDom(..) | Type::WitnessRef(_)) && freshen_level(ty) <= lim {
+    // are different questions). A `WitnessRef` is exempt outright: it is a name holding
+    // no variable, so its level is 0 whether or not its binder is quantified, and what
+    // decides that is the cache the arm below reads.
+    if !matches!(ty, Type::WitnessRef(_)) && freshen_level(ty) <= lim {
         return ty.clone();
     }
     match ty {
@@ -465,8 +480,23 @@ pub fn freshen_above(
             domain: d,
             codomain: c,
         } => {
+            // An operator scheme's binder names are the template's, like its witnesses, so
+            // each instantiation names its own: two `box`es binding one name would put one
+            // binder at two scopes. Cache-consistent, so the functions a scheme names alike
+            // stay alike. A specialization clone keeps its definition's names; it stands
+            // where the definition stood ([`FreshenCache::site_telescope`]).
+            let name = match (name, &cache.site_telescope) {
+                (Some(n), Some(_)) => Some(
+                    cache
+                        .binders
+                        .entry(n.clone())
+                        .or_insert_with(|| crate::ccl::Name::fresh(n.base()))
+                        .clone(),
+                ),
+                _ => name.clone(),
+            };
             let out = Type::Fun {
-                name: name.clone(),
+                name,
                 fun_kind: match fun_kind {
                     // A sum's binder kinds carry type children — the scheme's quantified
                     // variables sit among the candidates — so they freshen like any
@@ -477,7 +507,7 @@ pub fn freshen_above(
                             .map(|w| w.map_types(|t| freshen_above(lim, t, target, cache)))
                             .collect(),
                     ))),
-                    other => freshen_fun_kind(other, cache),
+                    other => freshen_fun_kind(other, lim, target, cache),
                 },
                 domain: Box::new(freshen_above(lim, d, target, cache)),
                 codomain: Box::new(freshen_above(lim, c, target, cache)),
@@ -513,15 +543,9 @@ pub fn freshen_above(
         // Both children recurse (mirror `Fun`): freshening the `domain` is
         // what lets a `Mut` param's fresh domain var generalize, so each call
         // site instantiates its own domain (induction index vs. `Txn`).
-        Type::History {
-            value,
-            domain,
-            history_kind,
-        } => Type::history(
-            freshen_above(lim, domain, target, cache),
-            freshen_above(lim, value, target, cache),
-            *history_kind,
-        ),
+        Type::History { function, history_kind } => {
+            Type::history_over(freshen_above(lim, function, target, cache), *history_kind)
+        }
         // A witness reference names a binder, not a variable, so what freshening owes it
         // is the α-conversion its binder got. A written sum's binder is re-minted by
         // [`Type::alpha_convert_sum`] on the way out of the `Fun` arm; a kind variable's is
@@ -1010,62 +1034,27 @@ fn seed_pairings_go(
                 }
             }
         }
-        (
-            Type::History {
-                value: uv,
-                domain: ud,
-                ..
-            },
-            Type::History {
-                value: dv,
-                domain: dd,
-                ..
-            },
-        ) => {
-            seed_pairings_go(uv, dv, lim, out, seen);
-            seed_pairings_go(ud, dd, lim, out, seen);
+        // A feed handle reads through to its read view, its `function`, during coalescing
+        // (`dissolve_read_feeds`), so the use side may be the dissolved `Fun` where the
+        // definition still carries the `History`, or the other way round. Either way the
+        // functions pair.
+        (Type::History { function: uv, .. }, Type::History { function: dv, .. }) => {
+            seed_pairings_go(uv, dv, lim, out, seen)
         }
-        // A feed handle reads through to its read view `Fun(domain, value)`
-        // during coalescing (`dissolve_read_feeds`), so the use side may be
-        // the dissolved `Fun` where the definition still carries the
-        // `History` — or vice versa. Pair the corresponding slots.
-        (
-            Type::Fun {
-                domain: ud,
-                codomain: uc,
-                ..
-            },
-            Type::History {
-                value: dv,
-                domain: dd,
-                ..
-            },
-        ) => {
-            seed_pairings_go(ud, dd, lim, out, seen);
-            seed_pairings_go(uc, dv, lim, out, seen);
+        (Type::Fun { .. }, Type::History { function: dv, .. }) => {
+            seed_pairings_go(use_ty, dv, lim, out, seen)
         }
-        (
-            Type::History {
-                value: uv,
-                domain: ud,
-                ..
-            },
-            Type::Fun {
-                domain: dd,
-                codomain: dc,
-                ..
-            },
-        ) => {
-            seed_pairings_go(ud, dd, lim, out, seen);
-            seed_pairings_go(uv, dc, lim, out, seen);
+        (Type::History { function: uv, .. }, Type::Fun { .. }) => {
+            seed_pairings_go(uv, def_ty, lim, out, seen)
         }
         _ => {}
     }
 }
 
-/// Freshen the discharge payloads of a bound edge's substitution: each captured
-/// argument *term* has its type slots renamed through `cache`. Renames carry no
-/// term, so only [`crate::ccl::subst::Mapping::Discharge`] entries are touched.
+/// Freshen the payloads of a bound edge's substitution: each captured *term* has its type
+/// slots renamed through `cache`. Renames and an unkeyed join carry no term, so only
+/// [`crate::ccl::subst::Mapping::Discharge`] and keyed [`crate::ccl::subst::Mapping::Join`]
+/// entries are touched.
 fn freshen_subst_payloads(
     lim: Level,
     subst: &Subst,

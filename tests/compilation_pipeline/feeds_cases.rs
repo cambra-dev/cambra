@@ -949,7 +949,7 @@ for p in [1,2,3]:
     o << x
 x
         "#},
-        "open bound recorded",
+        "a feed whose rows depend on a mutable variable its loop writes is not supported yet",
     )
 }
 
@@ -966,7 +966,7 @@ for p in [1, 2, 3]:
     x += 1
 o
         "#},
-        "Barendregt violation: substitution range mentions binder",
+        "a feed whose rows depend on a mutable variable its loop writes is not supported yet",
     )
 }
 
@@ -986,32 +986,15 @@ for i in [1, 2, 3]:
     )
 }
 
-/// A feed's element type is the join of every contribution, and a feed inside a loop or a
-/// `def` contributes once per value of the binders between the target and the feed
-/// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its
-/// target"). Rows whose keys depend on such a binder have no join, so the program is refused
-/// naming it.
+/// A feed's element type is the join of every contribution, and a feed contributes once per
+/// value of the binders between the target and the feed (`src/ccl/design/type-inference.md`,
+/// "A contribution crosses the binders after its target"). Where the target's key determines
+/// a binder, a row reads it at the key (`differential_interp`,
+/// `rows_keyed_by_the_loops_around_the_feed`). Where it does not, rows whose keys depend on the
+/// binder have no join, so the program is refused naming it: a `def` parameter, and a target
+/// fed from two places, whose key does not say which place a row came from.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::filtered_by_the_loop_variable(indoc! {r#"
-    o = defer()
-    for r in [1, 2]:
-        o << [v for v in [1, 2, 3] if v > r]
-    o
-"#}, "`r`")]
-#[case::grouped_by_the_loop_variable(indoc! {r#"
-    o = defer()
-    for i in [1, 2]:
-        o << [sum(g) for g in groupby([1, 2, 3, 4], \e -> e // i)]
-    o
-"#}, "`i`")]
-#[case::through_a_let_of_the_loop_variable(indoc! {r#"
-    o = defer()
-    for r in [1, 2]:
-        k = r
-        o << [v for v in [1, 2, 3] if v > k]
-    o
-"#}, "`k`")]
 #[case::filtered_by_a_parameter(indoc! {r#"
     o = defer()
     def f(y):
@@ -1039,6 +1022,14 @@ for i in [1, 2, 3]:
             o << [z for z in [1, 2, 3]]
     o
 "#}, "`x`")]
+#[case::fed_from_two_loops(indoc! {r#"
+    o = defer()
+    for r in [1, 2]:
+        o << [v for v in [1, 2, 3] if v > r]
+    for q in [1]:
+        o << [v for v in [1, 2, 3] if v > q]
+    o
+"#}, "`r`")]
 // The loop writes `t`, so the filter reads it once per iteration, and the message spells the
 // read's binder as the variable it reads.
 #[case::filtered_by_a_mutable_variable_the_loop_writes(indoc! {r#"
@@ -1077,19 +1068,27 @@ fn a_contribution_with_no_join_is_reported_once() {
     );
 }
 
-/// Boxed rows whose keys vary with the loop variable do join, as a sum over every subtype
-/// of the row's domain, and inference accepts them. Lambda elimination does not: the row's
-/// filter stays on its domain on one side of the channel and not on the other. Pinned on that
-/// failure.
+/// A loop's position keys the rows of a target fed from one place. Fed from two, the target
+/// is refused as any join over the loop variable is, and the message names the other place.
 #[test]
-fn boxed_rows_whose_keys_vary_with_the_loop_reach_a_lowering_gap() {
-    check_compile_error(
-        indoc! {r#"
-            o = defer()
-            for r in [1, 2]:
-                o << box([v for v in [1, 2, 3] if v > r])
-            o
-        "#},
-        "post-lambda-elim produced an invalid tree",
+fn a_target_fed_from_two_places_names_the_other() {
+    let code = indoc! {r#"
+        o = defer()
+        for r in [1, 2]:
+            o << [v for v in [1, 2, 3] if v > r]
+        for q in [1]:
+            o << [v for v in [1, 2, 3] if v > q]
+        o
+    "#};
+    let sources = SourceMap::single("<two-places-test>", code);
+    let errs = match compile_program(&mut GlobalContext::default(), &sources, Box::new(|| {})) {
+        Ok(_) => panic!("rows keyed by a loop's position need a target fed from one place"),
+        Err(e) => e,
+    };
+    let rendered = render_errors(&errs, &sources);
+    assert!(
+        rendered.contains("this target is fed from more than one")
+            && rendered.contains("the target is also fed here"),
+        "{rendered}"
     );
 }

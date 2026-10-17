@@ -122,14 +122,15 @@ use crate::ccl::ccl_utils::compose_typed_or_hole;
 use crate::ccl::ccl_utils::{
     PredMemo, make_cast, walk_refined_predicates, walk_refined_predicates_mut,
 };
-use crate::ccl::feed_nest::{LoopFeed, indexed_nest, key_by_positions};
+use crate::ccl::feed_nest::{
+    LoopFeed, contribution_lambda, indexed_nest, key_by_positions, lifted_past,
+};
 use crate::ccl::{
     BaseType, BindingTransparency, Branch, Expr, FunKind, HistoryKind, Lit, Name, Pattern,
     PredicateId, Refinement, Type, TypedBinding, TypedExpr, TypedExprNode,
     ccl_utils::{count_free, synthesize_arm_predicate, typed_compose, unit_expr},
     letrec::check_letrec_causal,
     provenance::{self, Located, NodeId},
-    scope::{ScopedItem, for_each_scoped_item},
 };
 
 /// A **channel type**, which this pass is the one that erases: a nominal channel
@@ -838,6 +839,12 @@ impl ChannelizeCtx {
 /// (rather than leaving it for `simplify`) means no later pass needs to
 /// pattern-match `ExprStmt`.
 pub fn run(expr: Expr) -> Result<Expr, Located<DeferError>> {
+    // Keying a contribution builds a function type per level over the same predicates, so one
+    // memo serves every binder conversion of a predicate shared across them.
+    crate::ccl::subst::with_conversion_memo(|| run_memoized(expr))
+}
+
+fn run_memoized(expr: Expr) -> Result<Expr, Located<DeferError>> {
     let mut ctx = ChannelizeCtx::new();
     // Cluster channelization.  Walks the tree, processes `let d = Defer in …`
     // clusters, extracting feeds and building each defer's channel.
@@ -878,15 +885,8 @@ pub fn run(expr: Expr) -> Result<Expr, Located<DeferError>> {
 /// per-instantiation, freshened at `specialize_use`), so channel recording
 /// and lift-alias entries key on it, never on the term name.
 fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
-    match ty.peel_refinements() {
-        Type::History {
-            domain,
-            history_kind: HistoryKind::Append,
-            ..
-        } => match domain.peel_refinements() {
-            Type::ChanDom(n, l) => Some((n.clone(), *l)),
-            _ => None,
-        },
+    match ty.as_feed()?.0.peel_refinements() {
+        Type::ChanDom(n, l) => Some((n.clone(), *l)),
         _ => None,
     }
 }
@@ -898,12 +898,7 @@ fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
 fn channel_domain_of(ty: &Type) -> Option<Type> {
     match ty.peel_refinements() {
         Type::Fun { domain, .. } => Some((**domain).clone()),
-        Type::History {
-            domain,
-            history_kind: HistoryKind::Append,
-            ..
-        } => Some((**domain).clone()),
-        _ => None,
+        _ => ty.as_feed().map(|(domain, _)| domain.clone()),
     }
 }
 
@@ -974,26 +969,33 @@ fn erase_chan_domains_in_type(
     kinds: &HashMap<Name, FunKind>,
 ) -> bool {
     if let Type::History {
-        value,
-        domain,
+        function,
         history_kind: HistoryKind::Append,
     } = ty
     {
         // The handle names its channel, and the channel's assembled type is what says
         // whether the read view binds a witness. Read it before the domain is substituted:
         // afterwards the domain is a bare reference, and a reference carries no kind.
+        let Type::Fun {
+            name,
+            domain,
+            codomain: value,
+            ..
+        } = std::mem::replace(function.as_mut(), Type::Hole)
+        else {
+            unreachable!("a history's function is an unrefined function")
+        };
         let fun_kind = match domain.peel_refinements() {
             Type::ChanDom(n, _) => kinds.get(n).cloned(),
             _ => None,
         };
-        let domain = std::mem::replace(domain.as_mut(), Type::Hole);
-        let value = std::mem::replace(value.as_mut(), Type::Hole);
+        // A feed channel reads as a collection: erase History to its function, a data function
+        // keeping the function's binder.
         *ty = Type::Fun {
-            name: None,
-            // A feed channel reads as a collection: erase History → a data function.
+            name,
             fun_kind: fun_kind.unwrap_or(FunKind::Data(None)),
-            domain: Box::new(domain),
-            codomain: Box::new(value),
+            domain,
+            codomain: value,
         };
         erase_chan_domains_in_type(ty, map, kinds);
         return true;
@@ -1187,8 +1189,13 @@ fn erase_chan_domains(
                 &binding.name,
                 bound_expr.clone_preserving_ids(),
             );
+            // Only a domain naming the binder is rewritten. A `let` under a loop's position
+            // lambda can read the position, and a domain built from that loop names a binder
+            // after it, which a discharge passing under it would report as a capture.
             for dom in map.values_mut() {
-                *dom = discharge.apply_type(dom);
+                if crate::ccl::subst::type_free_vars(dom).contains(&binding.name) {
+                    *dom = discharge.apply_type(dom);
+                }
             }
         }
     } else {
@@ -1817,12 +1824,13 @@ fn channelize_cluster(
 /// mis-scoping a channel.
 #[cfg(debug_assertions)]
 fn assert_no_shadowed_captures(body: &Expr, channels: &HashMap<Name, Expr>) {
-    let mut channel_fvs: HashSet<Name> = HashSet::new();
-    for c in channels.values() {
-        collect_free_vars(c, &mut channel_fvs);
-    }
-    let mut body_fvs: HashSet<Name> = HashSet::new();
-    collect_free_vars(body, &mut body_fvs);
+    // Scope-aware in types too: a node's type stands where the node does, so a dependent
+    // type under a `let` names the `let`'s binder without capturing it.
+    let channel_fvs: HashSet<Name> = channels
+        .values()
+        .flat_map(crate::ccl::ccl_utils::free_names)
+        .collect();
+    let body_fvs = crate::ccl::ccl_utils::free_names(body);
     let protected: HashSet<Name> = channel_fvs.intersection(&body_fvs).cloned().collect();
     // An opaque binder, a mutable variable's read, is named by the types lifted past it
     // rather than discharged (`crate::ccl::BindingTransparency`), so a channel's type naming
@@ -1982,71 +1990,6 @@ fn emit_cluster_letrec(inner: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
     });
     cluster.ty = ty;
     cluster
-}
-
-/// Collect every free `Var` name in `expr` into `out`, under the binders
-/// [`for_each_scoped_item`] states for every node.
-///
-/// Also walks references hidden in **type positions** — every slot
-/// [`Expr::walk_type_slots`] reaches, `expr.ty`'s refinement predicates (a
-/// lambda's refined domain included) and the `user_annotation` predicates
-/// [`extract_for_defer`]'s filter-feed rewrite sets. A slot sits in its node's
-/// scope, so a name a type mentions is free only when no binder enclosing that
-/// node within `expr` binds it: `let k = 1 in let ys : {… | z > k} = … in …`
-/// has no free `k`.
-///
-/// Without the type positions, a channel that references an outer let-binding
-/// only through a refinement predicate would be missed by
-/// [`assert_no_shadowed_captures`], leaving a downstream `Let` shadow
-/// undetected and the channel silently reading the wrong value at the
-/// cluster bind site.
-///
-/// A `Feed`/`Define`/`MutWrite` target is not collected: [`extract_for_defer`]
-/// re-binds a `let` around an extracted feed that reads it, and a defer handle
-/// is not a binding to copy.
-fn collect_free_vars(expr: &Expr, out: &mut HashSet<Name>) {
-    fn rec(expr: &Expr, bound: &mut Vec<Name>, out: &mut HashSet<Name>) {
-        let mut in_types = HashSet::new();
-        expr.walk_type_slots(|ty| collect_free_vars_in_type(ty, &mut in_types));
-        out.extend(in_types.into_iter().filter(|n| !bound.contains(n)));
-        if let TypedExprNode::Var(name) = &expr.node
-            && !bound.contains(name)
-        {
-            out.insert(name.clone());
-        }
-        for_each_scoped_item(expr, &mut |item| {
-            if let ScopedItem::Child {
-                expr: child,
-                binders,
-            } = item
-            {
-                let depth = bound.len();
-                bound.extend(binders.iter().map(|b| b.name.clone()));
-                rec(child, bound, out);
-                bound.truncate(depth);
-            }
-        });
-    }
-    let mut bound = Vec::new();
-    rec(expr, &mut bound, out);
-}
-
-/// Walk `ty` for any [`Refinement`](crate::ccl::Refinement) predicate expressions and
-/// collect their free variables into `out`.  Structural recursion via
-/// [`Type::walk_children`] so every compound type variant (`Fun`,
-/// `Tuple`, `Record`, `Variant`) is covered uniformly.
-///
-/// `try_borrow().ok()` silently treats an actively-mutated predicate
-/// as "no references"; callers run between passes when no predicate
-/// is being walked elsewhere, so the under-count is safe in practice.
-fn collect_free_vars_in_type(ty: &Type, out: &mut HashSet<Name>) {
-    // Refinement predicates are themselves CCL expressions; recurse into them
-    // through `collect_free_vars` so their own type-position predicates and
-    // shadowing are handled consistently.
-    for refinement in ty.refinements() {
-        collect_free_vars(&refinement.predicate, out);
-    }
-    ty.walk_children(|child| collect_free_vars_in_type(child, out));
 }
 
 /// Collect every defer-target name referenced by a `Feed`/`Define`
@@ -2411,11 +2354,11 @@ fn extract_for_defer_impl(
                 // wrapped, or every channel drags in an unused binding — a whole
                 // history record, in the worst case (each `http_serve` reply re-emitting
                 // a mutable variable it never reads). The reference test is
-                // `collect_free_vars` rather than `count_free` because the
-                // binding may be referenced only through a `user_annotation` /
-                // refinement predicate (a filter-feed guard); `collect_free_vars`
-                // traverses those, so guard-referenced bindings are kept while
-                // dead ones are dropped. Inner lets wrap first as the walk
+                // [`free_reads`](crate::ccl::ccl_utils::free_reads): the binding may be
+                // referenced only through a `user_annotation` / refinement predicate (a
+                // filter-feed guard), which it traverses, so guard-referenced bindings are
+                // kept while dead ones are dropped, and a defer handle another feed in the
+                // channel writes is not a binding to copy. Inner lets wrap first as the walk
                 // unwinds, so a transitively-referenced binding is exposed as
                 // free here by the time this (outer) let checks.
                 for Contribution {
@@ -2424,9 +2367,7 @@ fn extract_for_defer_impl(
                     ..
                 } in feeds.iter_mut().skip(prev_len)
                 {
-                    let mut fvs = HashSet::new();
-                    collect_free_vars(feed, &mut fvs);
-                    if fvs.contains(&binding.name) {
+                    if crate::ccl::ccl_utils::free_reads(feed).contains(&binding.name) {
                         let _g = provenance::enter(
                             *feed_id,
                             "channelize.feed",
@@ -2436,27 +2377,10 @@ fn extract_for_defer_impl(
                         // would log a birth for a node no tree ever holds.
                         let placeholder = Expr::throwaway(TypedExprNode::Lit(Lit::Unit));
                         let original = std::mem::replace(feed, placeholder);
-                        // stamp the wrap at construction —
-                        // the let's type is its body's, closed over the binder
-                        // (the design §6.2 discharge) — there is no
-                        // re-derivation pass to fill a `Hole` in. The discharge
-                        // payload only feeds `apply_type`, so it is a *template*
-                        // rather than a tree node — it keeps its ids, and the
-                        // sibling is minted at the read inside `apply_type`.
-                        //
-                        // An opaque binder, a mutable variable's read, is not
-                        // discharged: a type lifted past it keeps the binder
-                        // (`crate::ccl::BindingTransparency`), and its definition
-                        // is a read no type may hold.
-                        let let_ty = if binding.transparency == BindingTransparency::Opaque {
-                            original.ty.clone()
-                        } else {
-                            crate::ccl::subst::Subst::discharge(
-                                &binding.name,
-                                bound_expr.clone_preserving_ids(),
-                            )
-                            .apply_type(&original.ty)
-                        };
+                        // Stamp the wrap at construction: the let's type is its body's
+                        // as it reads outside the binder ([`lifted_past`]), and no
+                        // re-derivation pass fills a `Hole` in.
+                        let let_ty = lifted_past(&binding, &bound_expr, &original.ty);
                         // The `Let` this walk is rebuilding keeps the original
                         // `bound_expr` in the body, and each extracted feed that
                         // captures the binder gets its own re-binding of the same
@@ -2550,8 +2474,10 @@ fn extract_for_defer_impl(
                     // companion channel's type is the lambda's codomain `v.ty`
                     // (the argument matches `param.ty`). Typed at construction.
                     // It binds one element, so it adds no position.
-                    let v_ty = v.ty.clone();
-                    let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
+                    // A value reading the element reads the argument.
+                    let v_ty =
+                        crate::ccl::subst::discharge_codomain(&param.name, &new_argument, &v.ty);
+                    let channel_lambda = contribution_lambda(&param, v, None);
                     let channel = Expr::apply(new_argument.clone(), channel_lambda).with_ty(v_ty);
                     feeds.push(Contribution {
                         value: channel,
@@ -2792,11 +2718,8 @@ fn extract_for_defer_impl(
                                         Refinement::born(Rc::new(pred_on_source));
                                     let mut refined_prefix = source_prefix.clone();
                                     refine_source_domain(&mut refined_prefix, refinement_struct);
-                                    let channel_lambda = Expr::lambda(
-                                        &param.name,
-                                        param.ty.clone(),
-                                        under_lets(&lets, value),
-                                    );
+                                    let channel_lambda =
+                                        contribution_lambda(&param, under_lets(&lets, value), None);
                                     // stamp the channel at
                                     // construction — `Fun(refined-domain,
                                     // value)` off the two elements' concrete
@@ -2866,7 +2789,7 @@ fn extract_for_defer_impl(
                             // a prefix that is itself a defer read carries its
                             // handle's rigid `ChanDom` domain, closed by the
                             // final `erase_chan_domains` substitution.
-                            let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
+                            let channel_lambda = contribution_lambda(&param, v, None);
                             let mut channel_elts = new_elts.clone();
                             channel_elts.push(channel_lambda);
                             // A single-element "compose" is just that
@@ -2961,14 +2884,9 @@ fn extract_for_defer_impl(
                 // it is the same collection-or-capability the lambda was — `Expr::lambda`
                 // stamps `Compute`, so the incoming kind is carried back on. Its binder is
                 // one more position the contribution is keyed by.
-                let wrapped = Expr::lambda(&param.name, param.ty.clone(), v);
-                let wrapped_ty = Type::fun_like(
-                    &ty,
-                    param.ty.clone(),
-                    wrapped.ty.codomain().expect("a lambda is a function"),
-                );
+                let wrapped = contribution_lambda(&param, v, Some(&ty));
                 feeds.push(Contribution {
-                    value: wrapped.with_ty(wrapped_ty),
+                    value: wrapped,
                     levels: levels + 1,
                     feed,
                 });
@@ -3385,16 +3303,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `collect_free_vars` — type-position refinement traversal
+    // `free_reads` — type-position refinement traversal
     // -----------------------------------------------------------------
 
-    /// `collect_free_vars` must descend into `user_annotation`
+    /// `free_reads` must descend into `user_annotation`
     /// refinement predicates.  Otherwise filter-feed channels (which
     /// stash a `Refinement(_, pred)` in `user_annotation`) hide their
     /// outer-let references from [`assert_no_shadowed_captures`], and a
     /// downstream shadow goes undetected.
     #[test]
-    fn collect_free_vars_descends_into_user_annotation_predicates() {
+    fn free_reads_descends_into_user_annotation_predicates() {
         // Build a trivial channel whose `user_annotation` carries a
         // predicate referencing `outer_n`:
         //   `Var("__chan")` with user_annotation = Fun(Refinement(Hole, pred(outer_n)), Hole)
@@ -3405,8 +3323,7 @@ mod tests {
             Type::Hole,
         ));
 
-        let mut free: HashSet<Name> = HashSet::new();
-        collect_free_vars(&annotated, &mut free);
+        let free = crate::ccl::ccl_utils::free_reads(&annotated);
         assert!(
             free.contains(&Name::raw("outer_n")),
             "user_annotation predicate reference should be collected: got {free:?}"
@@ -3418,10 +3335,10 @@ mod tests {
         );
     }
 
-    /// `collect_free_vars` must descend into `expr.ty` refinement
+    /// `free_reads` must descend into `expr.ty` refinement
     /// predicates (the type slot, not just `user_annotation`).
     #[test]
-    fn collect_free_vars_descends_into_ty_refinement_predicates() {
+    fn free_reads_descends_into_ty_refinement_predicates() {
         let pred = var("inner_k");
         let refinement = Refinement::born(Rc::new(pred));
         let typed = Expr::lit(Lit::Unit).with_ty(Type::Fun {
@@ -3430,8 +3347,7 @@ mod tests {
             domain: Box::new(Type::refined_one(Type::Hole, refinement)),
             codomain: Box::new(Type::Hole),
         });
-        let mut free: HashSet<Name> = HashSet::new();
-        collect_free_vars(&typed, &mut free);
+        let free = crate::ccl::ccl_utils::free_reads(&typed);
         assert!(
             free.contains(&Name::raw("inner_k")),
             "expr.ty predicate reference should be collected: got {free:?}"

@@ -1226,19 +1226,25 @@ fn a_group_by_under_a_loop_over_a_source_the_loop_filters() {
     );
 }
 
+/// A group-by under two loops whose key reads both binders: `[1, 2, 3]` keyed by `e // (i + j)`
+/// has two groups where `i + j` is 2 or 3, and one where it is 4.
+#[test]
+fn a_group_by_under_a_nest_whose_key_reads_both_loops() {
+    check_scalar(
+        indoc! {r#"
+            out = defer()
+            for i in [1, 2]:
+                for j in [1, 2]:
+                    out << sum([1 for g in groupby([1, 2, 3], \e -> e // (i + j))])
+            sum([v for v in out])
+        "#},
+        Value::Int(7),
+    );
+}
+
 /// A group-by under a loop whose key reads the loop's binder, in shapes the compiler does not
 /// compile yet. Each is refused as a compiler gap rather than reaching a later pass.
 #[rstest]
-#[case::reading_an_outer_loops_binder(
-    indoc! {r#"
-        out = defer()
-        for i in [1, 2]:
-            for j in [1, 2]:
-                out << sum([1 for g in groupby([1, 2, 3], \e -> e // (i + j))])
-        sum([v for v in out])
-    "#},
-    "reads an outer loop's binder under a nested loop"
-)]
 #[case::whose_key_is_not_a_scalar(
     indoc! {r#"
         out = defer()
