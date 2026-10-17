@@ -305,11 +305,14 @@ pub(super) fn insert_iterate_recurse(
 ///
 /// A variant's payload is a component the same way: `𝑐 ▷ variant_wrap(tag)` compiles `𝑐` with
 /// the input the wrap is given and wraps what it produces, so the rule looks through the wrap.
+/// A `box` planning left standing is the identity at runtime and compiles `𝑐` the same way,
+/// so the rule looks through it too: a per-row choice between boxed rows broadcasts each arm
+/// as `box(𝑐) ▷ const`.
 fn mark_component_source(component: &mut Expr, witnesses: &mut Witnesses) -> Result<(), String> {
     if let TypedExprNode::Apply { argument, function } = &mut component.node
         && matches!(
             function.node,
-            TypedExprNode::Builtin(Builtin::VariantWrap(_))
+            TypedExprNode::Builtin(Builtin::VariantWrap(_) | Builtin::Box)
         )
     {
         return mark_component_source(argument, witnesses);
