@@ -544,16 +544,19 @@ impl InferCtx {
         Some(Origin::Node(self.current_node_id))
     }
 
-    /// [`Typing::bind_annotation`], raising `mismatch` on a conflict.
+    /// [`Typing::bind_annotation`], raising `mismatch()` on a conflict.
     ///
-    /// `mismatch` renders the inferred type as read before the reconcile adds any
-    /// bound, so a report shows what was inferred rather than the partially modified
-    /// state a failed `constrain_subtype` leaves behind.
+    /// `mismatch` runs only on a conflict, after the failed `constrain_subtype` has left
+    /// whatever bounds it recorded, so a message it renders then can show them. A caller
+    /// whose message must show the inferred type as it stood before the edge renders it
+    /// first and hands over the result, as [`Typing::bind_poly_annotation`] does. Rendering
+    /// ahead costs a coalesce that resolves every predicate the inferred type carries, on
+    /// every ascription, and nearly every ascription holds.
     fn reconcile_annotation(
         &mut self,
         inferred: &Type,
         ann: &Type,
-        mismatch: InferError,
+        mismatch: impl FnOnce() -> InferError,
     ) -> Result<Type, LocatedInferError> {
         // Shared by *binder* annotations (trait call sites in the emit rules)
         // and *node* annotations (`emit_node`'s `user_annotation` tail) — the
@@ -637,7 +640,7 @@ impl InferCtx {
         self.cache.at(self.here(), self.here());
         if constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope).is_err() {
             let failure = self.cache.take_failure();
-            return Err(self.raise(mismatch).with_failure(failure));
+            return Err(self.raise(mismatch()).with_failure(failure));
         }
         // **A `SharedHole` naming a domain is an equation, not an ordering.** The edge
         // above is contravariant in the domain, so it leaves the shared variable *below*
@@ -674,7 +677,7 @@ impl InferCtx {
             self.cache.at(self.here(), self.here());
             if constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope).is_err() {
                 let failure = self.cache.take_failure();
-                return Err(self.raise(mismatch).with_failure(failure));
+                return Err(self.raise(mismatch()).with_failure(failure));
             }
         }
         Ok(ann_simple)
@@ -1464,7 +1467,9 @@ impl Typing for InferCtx {
     }
 
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {
-        let mismatch = InferError::AnnotationMismatch {
+        // Built only on failure: the message resolves the types inside every predicate the
+        // inferred type carries, on a copy of each, and nearly every ascription holds.
+        let mismatch = || InferError::AnnotationMismatch {
             annotation: Box::new(ann.clone()),
             inferred: Box::new(coalesce_for_error(inferred)),
         };
@@ -1492,7 +1497,9 @@ impl Typing for InferCtx {
                 inferred: Box::new(coalesce_for_error(inferred)),
             },
         };
-        self.reconcile_annotation(inferred, declared, mismatch)
+        // Rendered ahead of the edge: the polymorphic type a mismatch reports is the
+        // definition's, before the failed ascription adds its bounds to it.
+        self.reconcile_annotation(inferred, declared, || mismatch)
     }
 
     fn binding_slot(&mut self, slot: &mut Type) -> Type {
