@@ -208,63 +208,9 @@ impl<T> TagMap<T> {
         self.0.iter().map(|(_, v)| v)
     }
 
-    /// Whether both sums carry exactly the same tags.
-    pub fn same_tags<U>(&self, other: &TagMap<U>) -> bool {
-        self.len() == other.len() && self.keys().eq(other.keys())
-    }
-
     /// Rebuild with each arm mapped, preserving tags (and so canonical order).
     pub fn map<U>(&self, mut f: impl FnMut(&FieldKey, &T) -> U) -> TagMap<U> {
         TagMap(self.0.iter().map(|(k, v)| (k.clone(), f(k, v))).collect())
-    }
-
-    /// Pair arms by tag with `other`, visiting only tags both carry.
-    ///
-    /// The tag-keyed replacement for zipping two arm vectors positionally: it
-    /// cannot silently mispair when the two sums carry different tag sets.
-    pub fn zip_matching<'a, U>(
-        &'a self,
-        other: &'a TagMap<U>,
-    ) -> impl Iterator<Item = (&'a FieldKey, &'a T, &'a U)> {
-        self.iter()
-            .filter_map(move |(k, v)| other.get(k).map(|u| (k, v, u)))
-    }
-
-    /// Combine arm-wise with `other`, which must carry the **same** tags.
-    ///
-    /// The *total* counterpart of [`zip_matching`](Self::zip_matching): where that
-    /// one visits the intersection and is happy to skip, this lifts a binary
-    /// operation pointwise over a fixed arm set, so every tag must be present on
-    /// both sides for the result to be defined at every tag. Differing tag sets are
-    /// a caller bug rather than a case to absorb — the two sums would be describing
-    /// different value spaces, and there is no arm to combine with.
-    ///
-    /// This is why a *query* over two sums ([`same_tags`](Self::same_tags) plus a
-    /// conservative answer, as `Predicate::subsumes` does) and a *combination* of
-    /// two sums are guarded differently: a query can answer "no" when the arm sets
-    /// disagree, and a combination has no such fallback to give.
-    ///
-    /// # Panics
-    /// If the two sums do not carry the same tags. `op` names the caller for the
-    /// message.
-    pub fn zip_same_tags<U, V>(
-        &self,
-        other: &TagMap<U>,
-        op: &str,
-        mut f: impl FnMut(&T, &U) -> V,
-    ) -> TagMap<V> {
-        assert!(
-            self.same_tags(other),
-            "{op}: arm sets differ ({:?} vs {:?}); a pointwise combination of two \
-             sums is defined only over one arm set",
-            self.keys().collect::<Vec<_>>(),
-            other.keys().collect::<Vec<_>>()
-        );
-        TagMap(
-            self.zip_matching(other)
-                .map(|(k, v, u)| (k.clone(), f(v, u)))
-                .collect(),
-        )
     }
 }
 
@@ -5870,50 +5816,10 @@ mod tests {
         assert_eq!(m.position(&FieldKey::Index(10)), Some(10));
     }
 
-    /// `zip_matching` pairs by tag, so two sums with different tag sets cannot
-    /// be silently mispaired the way zipping two arm vectors would.
-    #[test]
-    fn tag_map_zip_matching_pairs_by_tag() {
-        let l = TagMap::from_arms(vec![(name("a"), 1), (name("b"), 2)]);
-        let r = TagMap::from_arms(vec![(name("b"), 20), (name("c"), 30)]);
-        let paired: Vec<_> = l
-            .zip_matching(&r)
-            .map(|(k, a, b)| (k.clone(), *a, *b))
-            .collect();
-        assert_eq!(paired, vec![(name("b"), 2, 20)], "only shared tags pair");
-        assert!(!l.same_tags(&r));
-        assert!(l.same_tags(&TagMap::from_arms(vec![(name("b"), ()), (name("a"), ())])));
-    }
-
     #[test]
     #[should_panic(expected = "duplicate tag")]
     fn tag_map_rejects_duplicate_tags() {
         let _ = TagMap::from_arms(vec![(name("a"), 1), (name("a"), 2)]);
-    }
-
-    /// `zip_same_tags` lifts a binary operation pointwise, pairing by tag and not
-    /// by position — so it stays correct when the two maps' canonical orders would
-    /// have mispaired arms had they been zipped as vectors.
-    #[test]
-    fn tag_map_zip_same_tags_is_pointwise_by_tag() {
-        let l = TagMap::from_arms(vec![(name("a"), 1), (name("b"), 2)]);
-        let r = TagMap::from_arms(vec![(name("b"), 20), (name("a"), 10)]);
-        let combined = l.zip_same_tags(&r, "test", |x, y| x + y);
-        assert_eq!(
-            combined,
-            TagMap::from_arms(vec![(name("a"), 11), (name("b"), 22)])
-        );
-    }
-
-    /// A missing arm has nothing to combine with, so it is a caller bug rather than
-    /// a case to absorb — unlike [`TagMap::zip_matching`], which skips it, and
-    /// unlike a *query* over two sums, which can answer conservatively.
-    #[test]
-    #[should_panic(expected = "arm sets differ")]
-    fn tag_map_zip_same_tags_rejects_differing_arm_sets() {
-        let l = TagMap::from_arms(vec![(name("a"), 1), (name("b"), 2)]);
-        let r = TagMap::from_arms(vec![(name("a"), 10)]);
-        let _ = l.zip_same_tags(&r, "test", |x, y| x + y);
     }
 
     /// A dependent function's refinement *stores* an index and *reads* as the

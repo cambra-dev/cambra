@@ -603,8 +603,8 @@ impl Predicate {
             (_, Predicate::Or(arms)) => {
                 Predicate::flatten_or(arms.iter().map(|a| self.intersect(a)).collect())
             }
-            // Union: intersect per arm. Pointwise over one arm set — see
-            // `TagMap::zip_same_tags`.
+            // Union: intersect tag by tag over every tag either names, and over the tags neither
+            // names (`zip_tags`).
             (Predicate::Union { tags: ps, rest: pr }, Predicate::Union { tags: qs, rest: qr }) => {
                 Predicate::zip_tags((ps, *pr), (qs, *qr), Predicate::intersect)
             }
@@ -642,8 +642,8 @@ impl Predicate {
                 }
                 res
             }
-            // Union: subtract per arm. Pointwise over one arm set — see
-            // `TagMap::zip_same_tags`.
+            // Union: subtract tag by tag over every tag either names, and over the tags neither
+            // names (`zip_tags`).
             (Predicate::Union { tags: ps, rest: pr }, Predicate::Union { tags: qs, rest: qr }) => {
                 Predicate::zip_tags((ps, *pr), (qs, *qr), Predicate::minus)
             }
@@ -684,8 +684,8 @@ impl Predicate {
                 new_arms.extend(arms.iter().cloned());
                 Predicate::flatten_or(new_arms)
             }
-            // Union: union per arm. Pointwise over one arm set — see
-            // `TagMap::zip_same_tags`.
+            // Union: union tag by tag over every tag either names, and over the tags neither
+            // names (`zip_tags`).
             (Predicate::Union { tags: ps, rest: pr }, Predicate::Union { tags: qs, rest: qr }) => {
                 Predicate::zip_tags((ps, *pr), (qs, *qr), Predicate::union)
             }
