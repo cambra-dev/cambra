@@ -105,9 +105,12 @@ ci_solver() {
 # scope or group from `editors/highlight-classes.json` (`editors/README.md`,
 # "Editor highlight check"). The same harness checks each editor's indentation
 # against `editors/indent-cases.json` (`editors/README.md`, "Indentation
-# tests"). Each checker needs its editor's toolchain: Node for VS Code, Neovim
-# for Neovim. A machine without one skips that editor's checkers, loudly; under
-# CI a missing toolchain fails, for the reason `ci_formal` gives.
+# tests"), and runs the language server through Neovim's client
+# (`editors/README.md`, "Language server checks"). Each checker needs its
+# editor's toolchain: Node for VS Code, Neovim for Neovim. A machine without one
+# skips that editor's checkers, loudly; under CI a missing toolchain fails, for
+# the reason `ci_formal` gives. The VS Code client check downloads VS Code, so
+# it is `ci_vscode`, which CI's `editors` job runs and the local gate does not.
 ci_editors() {
   local missing=""
   command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 || missing="${missing} node"
@@ -147,9 +150,31 @@ ci_editors() {
         editors/highlight-classes.json || failed=1
       nvim --headless -u NONE -i NONE -n --cmd 'set rtp^=editors/nvim' \
         -l editors/nvim/test/check_indent.lua editors/indent-cases.json || failed=1
+      cargo build -q --bin cambra || exit 1
+      # `CARGO_TARGET_DIR` can move the target directory out of the checkout.
+      target="$(realpath "${CARGO_TARGET_DIR:-target}")" || exit 1
+      nvim --headless -u NONE -i NONE -n --cmd 'set rtp^=editors/nvim' \
+        -l editors/nvim/test/check_lsp.lua "${target}/debug/cambra" || failed=1
     fi
     exit "${failed}"
   )
+}
+# The language server through VS Code's client and the extension in
+# `editors/vscode/` (`editors/README.md`, "Language server checks"). CI's
+# `editors` job runs it; the local full gate does not, because the first run
+# downloads VS Code, about 1 GB unpacked, into `editors/vscode/.vscode-test/`.
+# The VS Code version is pinned, so the result changes only with a commit.
+ci_vscode() {
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    echo "ci_vscode: node/npm not found — the VS Code client check needs them" >&2
+    return 1
+  fi
+  (cd editors/vscode && npm ci --prefer-offline --no-audit --no-fund) || return 1
+  cargo build -q --bin cambra || return 1
+  local target
+  target="$(realpath "${CARGO_TARGET_DIR:-target}")" || return 1
+  CAMBRA_VSCODE_VERSION="${CAMBRA_VSCODE_VERSION:-1.142.0}" \
+    node editors/vscode/test/lsp/run.mjs "${target}/debug/cambra"
 }
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
@@ -265,7 +290,12 @@ ci_fixtures() {
     exit "${drifted}"
   )
 }
-ci_shellcheck() { find . -name '*.sh' -not -path './.git/*' -exec shellcheck -a -o all {} +; }
+# Installed npm packages and the VS Code `ci_vscode` downloads are not the
+# repository's scripts.
+ci_shellcheck() {
+  find . -name '*.sh' -not -path './.git/*' -not -path '*/node_modules/*' \
+    -not -path '*/.vscode-test/*' -exec shellcheck -a -o all {} +
+}
 # Validate intra-repo doc references so they can't silently rot: Markdown
 # links/anchors (doc -> doc) and `<name>.md` citations in Rust comments
 # (code -> doc). Stdlib Python only; no Rust toolchain needed. Unit tests for
