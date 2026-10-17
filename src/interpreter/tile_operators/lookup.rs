@@ -8,8 +8,8 @@ use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::FieldKey,
     interpreter::{
-        ColumnValue, Consumer, Scheduler, Value, forwarding_consumer, shared_consumer,
-        tiling::FunctionGuard, tuple_field,
+        ColumnValue, Consumer, Scheduler, Value, shared_consumer, tiling::FunctionGuard,
+        tuple_field,
     },
 };
 
@@ -186,16 +186,8 @@ impl TileOperator for CheckedLookup {
             // scheduled to read it (see `shared_consumer`).
             LookupSource::Split { collection, keys } => {
                 let (shared, gate) = shared_consumer(consumer);
-                let keys = keys.subscribe(
-                    keys.tiling().universal_guard(),
-                    forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-                    scheduler,
-                );
-                let collection = collection.subscribe(
-                    collection.tiling().universal_guard(),
-                    forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-                    scheduler,
-                );
+                let keys = subscribe_forwarding(&mut **keys, &shared, scheduler);
+                let collection = subscribe_forwarding(&mut **collection, &shared, scheduler);
                 (ProducerSource::Split { collection, keys }, Some(gate))
             }
             // One input, carrying both operands, so there is nothing to share.

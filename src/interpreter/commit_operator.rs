@@ -56,11 +56,10 @@ use std::ops::Bound::{Excluded, Unbounded};
 use crate::ccl::F_WRITES;
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, CurryLevel, Extent, FunctionGuard, Gate, GatedConsumer, Path,
-    Position, Predicate, Scheduler, Tile, TileGuard, Tiling, Value, WakeupQueue,
-    forwarding_consumer, shared_consumer,
+    Position, Predicate, Scheduler, Tile, TileGuard, Tiling, Value, WakeupQueue, shared_consumer,
     tile_operators::{
         CycleSlot, CyclicSequencingProducer, Memo, ProducerBase, TileOperator, TileProducer,
-        materialize_collections, materialized_row,
+        materialize_collections, materialized_row, subscribe_forwarding,
     },
     tuple_field, uint_of_row,
 };
@@ -1828,17 +1827,7 @@ impl TileOperator for CommitOperator {
         // runtime has started ([`InductionStore::subscribe`] says the same).
         let seed_producers = std::mem::take(&mut self.seed_ops)
             .into_iter()
-            .map(|(key, mut op)| {
-                let g = op.tiling().universal_guard();
-                (
-                    key,
-                    op.subscribe(
-                        g,
-                        forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-                        scheduler,
-                    ),
-                )
-            })
+            .map(|(key, mut op)| (key, subscribe_forwarding(&mut *op, &consumer, scheduler)))
             .collect();
         let writer_producers = self
             .writer_inputs
@@ -1852,12 +1841,7 @@ impl TileOperator for CommitOperator {
                          being subscribed twice (the first subscribe takes the slot)"
                     )
                 });
-                let guard = input.tiling().universal_guard();
-                input.subscribe(
-                    guard,
-                    forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-                    scheduler,
-                )
+                subscribe_forwarding(&mut *input, &consumer, scheduler)
             })
             .collect::<Vec<_>>();
         let n = writer_producers.len();
@@ -2486,14 +2470,7 @@ impl TileOperator for InductionStore {
                  `body_input_setter` was never called, or this store is being subscribed \
                  twice (the first subscribe takes the slot)",
         );
-        let body_producer = {
-            let g = body_op.tiling().universal_guard();
-            body_op.subscribe(
-                g,
-                forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-                scheduler,
-            )
-        };
+        let body_producer = subscribe_forwarding(&mut *body_op, &consumer, scheduler);
         // A seed forwards, rather than being drained here: it is ordinary dataflow, so a
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
@@ -2501,17 +2478,7 @@ impl TileOperator for InductionStore {
         // runtime has started.
         let seed_producers = std::mem::take(&mut self.seed_ops)
             .into_iter()
-            .map(|(key, mut op)| {
-                let g = op.tiling().universal_guard();
-                (
-                    key,
-                    op.subscribe(
-                        g,
-                        forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-                        scheduler,
-                    ),
-                )
-            })
+            .map(|(key, mut op)| (key, subscribe_forwarding(&mut *op, &consumer, scheduler)))
             .collect();
         Box::new(InductionStoreProducer {
             base: ProducerBase::new(
@@ -3105,12 +3072,7 @@ impl TileOperator for StoreValueStream {
         // value, so kick once to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
         consumer.notify();
-        let g = self.store_op.tiling().universal_guard();
-        let store_producer = self.store_op.subscribe(
-            g,
-            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-            scheduler,
-        );
+        let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, scheduler);
         Box::new(StoreValueStreamProducer {
             base: ProducerBase::new(
                 StoreValueStreamProducer::alloc_id(),
@@ -3348,12 +3310,7 @@ impl TileOperator for StoreFinalRead {
         // re-pull when that happens. Kick once to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
         consumer.notify();
-        let g = self.store_op.tiling().universal_guard();
-        let store_producer = self.store_op.subscribe(
-            g,
-            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-            scheduler,
-        );
+        let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, scheduler);
         Box::new(StoreFinalReadProducer {
             base: ProducerBase::new(
                 StoreFinalReadProducer::alloc_id(),
@@ -3614,14 +3571,7 @@ impl TileOperator for StoreDenseRead {
         // read has. Kick once to start.
         let (consumer, gate) = shared_consumer(consumer);
         consumer.notify();
-        let store_producer = {
-            let g = self.store_op.tiling().universal_guard();
-            self.store_op.subscribe(
-                g,
-                forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-                scheduler,
-            )
-        };
+        let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, scheduler);
         Box::new(StoreDenseReadProducer {
             base: ProducerBase::new(
                 StoreDenseReadProducer::alloc_id(),
@@ -4077,18 +4027,8 @@ impl TileOperator for AsOf {
         // re-pulls until the cyclic store converges (the source's first pull may
         // only propose; later pulls commit and render).
         let (consumer, gate) = shared_consumer(consumer);
-        let tg = self.trigger.tiling().universal_guard();
-        let trigger = self.trigger.subscribe(
-            tg,
-            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-            scheduler,
-        );
-        let sg = self.source.tiling().universal_guard();
-        let source = self.source.subscribe(
-            sg,
-            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-            scheduler,
-        );
+        let trigger = subscribe_forwarding(&mut *self.trigger, &consumer, scheduler);
+        let source = subscribe_forwarding(&mut *self.source, &consumer, scheduler);
         let b_extent = match self.tiling() {
             Tiling::DataFunction { domain, .. } => domain.clone(),
             _ => unreachable!("AsOf tiles as a function"),
@@ -4806,25 +4746,11 @@ fn subscribe_driver_inputs(
     scheduler: &mut Scheduler,
 ) -> DriverInputs {
     let (consumer, gate) = shared_consumer(consumer);
-    let source_producer = {
-        let g = source_op.tiling().universal_guard();
-        source_op.subscribe(
-            g,
-            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-            scheduler,
-        )
-    };
+    let source_producer = subscribe_forwarding(source_op, &consumer, scheduler);
     // The store's progress changes what the drive renders — the next position it may
     // emit, and which rows it calls complete — so the store's wakes reach the drive's
     // consumer like the source's arrivals do.
-    let store_producer = {
-        let g = store_op.tiling().universal_guard();
-        store_op.subscribe(
-            g,
-            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-            scheduler,
-        )
-    };
+    let store_producer = subscribe_forwarding(store_op, &consumer, scheduler);
     DriverInputs {
         consumer,
         gate,
@@ -5045,20 +4971,14 @@ impl TileOperator for InductionDriver {
             scheduler,
         );
         let consumer = inputs.consumer;
-        let nested = self.nested.as_mut().map(|n| {
-            let mut sub = |op: &mut Box<dyn TileOperator>| {
-                let g = op.tiling().universal_guard();
-                op.subscribe(
-                    g,
-                    forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-                    scheduler,
-                )
-            };
-            NestedDrive {
-                body: n.body.clone(),
-                pairs: sub(&mut n.pairs),
-                reseeds: n.reseeds.iter_mut().map(&mut sub).collect(),
-            }
+        let nested = self.nested.as_mut().map(|n| NestedDrive {
+            body: n.body.clone(),
+            pairs: subscribe_forwarding(&mut *n.pairs, &consumer, scheduler),
+            reseeds: n
+                .reseeds
+                .iter_mut()
+                .map(|op| subscribe_forwarding(&mut **op, &consumer, scheduler))
+                .collect(),
         });
         Box::new(InductionDriverProducer {
             base: ProducerBase::new(
@@ -6474,12 +6394,7 @@ impl TileOperator for TransactWriter {
         // Forward the driver's notification to this writer's consumer: the driver
         // owns the transaction source, so a request arriving on a live source
         // reaches this writer, and through it the commit cycle, along this edge.
-        let dg = self.driver_op.tiling().universal_guard();
-        let driver_producer = self.driver_op.subscribe(
-            dg,
-            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
-            scheduler,
-        );
+        let driver_producer = subscribe_forwarding(&mut *self.driver_op, &consumer, scheduler);
         Box::new(TransactWriterProducer {
             base: ProducerBase::new(
                 TransactWriterProducer::alloc_id(),

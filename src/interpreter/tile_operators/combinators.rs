@@ -7,8 +7,7 @@ use std::iter::repeat_n;
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::{
-    ColumnValue, Consumer, Extent, Scheduler, Value, forwarding_consumer, shared_consumer,
-    tuple_field,
+    ColumnValue, Consumer, Extent, Scheduler, Value, shared_consumer, tuple_field,
 };
 
 /// Inverts a function operator, producing a lookup-function from codomain to domain.
@@ -854,16 +853,8 @@ impl TileOperator for Filter {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
-        let predicate_producer = self.predicate.subscribe(
-            self.predicate.tiling().universal_guard(),
-            forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-            scheduler,
-        );
-        let input_producer = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-            scheduler,
-        );
+        let predicate_producer = subscribe_forwarding(&mut *self.predicate, &shared, scheduler);
+        let input_producer = subscribe_forwarding(&mut *self.input, &shared, scheduler);
         Box::new(FilterProducer {
             base: ProducerBase::new(
                 FilterProducer::alloc_id(),
@@ -1494,16 +1485,8 @@ impl TileOperator for Product {
                 scheduler,
             )
             .sharing(gate),
-            outer: self.outer.subscribe(
-                self.outer.tiling().universal_guard(),
-                forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-                scheduler,
-            ),
-            inner: self.inner.subscribe(
-                self.inner.tiling().universal_guard(),
-                forwarding_consumer(&shared, &scheduler.wakeup_queue()),
-                scheduler,
-            ),
+            outer: subscribe_forwarding(&mut *self.outer, &shared, scheduler),
+            inner: subscribe_forwarding(&mut *self.inner, &shared, scheduler),
             level,
             empty_level,
             pair: self.tiling().deepest_values().clone(),
