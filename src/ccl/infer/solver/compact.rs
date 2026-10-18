@@ -848,7 +848,7 @@ pub struct CompactType {
     /// one position per argument. Two declarations at one position are two shapes, which
     /// [`shapes`](Self::shapes) counts and coalesce reports: a join of two nominal types is
     /// an error (`docs/chl-spec.md`, "A nominal type is opaque"). Each argument compacts
-    /// at the polarity [`Variance::polarity`](crate::ccl::nominal::Variance::polarity)
+    /// at the polarity [`Variance::polarity`](Variance::polarity)
     /// gives it.
     pub nominal: BTreeMap<Rc<NominalDecl>, Vec<CompactType>>,
     /// Two applications of one declaration met here whose arguments at an
@@ -1710,13 +1710,260 @@ fn fallback_allowed(pos: Position<'_>, st: &CompactState) -> bool {
     st.collapse && pos.parents.is_none()
 }
 
+/// The term binders free in a refinement that [`compact_go`]'s walk of `ty` can reach, at
+/// polarity `pol` and at a position `at` (`at.0`: the walk is at the position rather than
+/// along a bound chain; `at.1`: the position is invariant), spelled as a substitution
+/// arriving at `ty` would meet them: each bound's own substitution is applied first
+/// ([`Subst::image_of`]). It follows the bounds the walk follows and no others.
+///
+/// `None` where a sum's witnesses are involved, which a term substitution can reach
+/// through a kind, or where a cycle in the bounds renames along its way round.
+fn consulted_in(
+    ty: &Type,
+    pol: bool,
+    at: (bool, bool),
+    st: &mut CompactState,
+) -> Option<BTreeSet<Name>> {
+    let fresh = (true, false);
+    match ty {
+        Type::Refinement(inner, refinements) => {
+            let mut out = consulted_in(inner, pol, at, st)?;
+            for r in refinements {
+                out.extend(crate::ccl::subst::refinement_free_vars(r));
+            }
+            Some(out)
+        }
+        Type::Fun {
+            fun_kind,
+            domain,
+            codomain,
+            ..
+        } => {
+            if !fun_kind.binder_ids().is_empty() {
+                return None;
+            }
+            let mut out = consulted_in(domain, !pol, (true, fun_kind.resolved().is_data()), st)?;
+            out.extend(consulted_in(codomain, pol, fresh, st)?);
+            Some(out)
+        }
+        Type::Nominal(decl, args) => {
+            let mut out = BTreeSet::new();
+            for (t, v) in args.iter().zip(&decl.body().variances) {
+                match v {
+                    Variance::Bipolar => {
+                        let (input, output) = crate::ccl::nominal::sides(t);
+                        out.extend(consulted_in(input, !pol, fresh, st)?);
+                        out.extend(consulted_in(output, pol, fresh, st)?);
+                    }
+                    Variance::Invariant => {
+                        out.extend(consulted_in(t, pol, (true, true), st)?);
+                    }
+                    other => out.extend(consulted_in(t, other.polarity(pol), fresh, st)?),
+                }
+            }
+            Some(out)
+        }
+        Type::Infer(state) => consulted_below(state, pol, at, st).map(|names| (*names).clone()),
+        other => {
+            let mut out = Some(BTreeSet::new());
+            other.walk_children(|child| {
+                if let Some(names) = &mut out {
+                    match consulted_in(child, pol, fresh, st) {
+                        Some(more) => names.extend(more),
+                        None => out = None,
+                    }
+                }
+            });
+            out
+        }
+    }
+}
+
+/// [`consulted_in`] for a variable: its polarity-correct bounds, and its opposite ones
+/// where [`compact_go`] may read them, each through the bound's substitution. Memoized per
+/// walk as [`compact_go`] is, and for the same reason.
+fn consulted_below(
+    state: &Rc<crate::ccl::InferVar>,
+    pol: bool,
+    at: (bool, bool),
+    st: &mut CompactState,
+) -> Option<Rc<BTreeSet<Name>>> {
+    let key = (state.uid, pol, at.0, at.1);
+    if let Some(done) = st.consulted.get(&key) {
+        return done.clone();
+    }
+    let guard = (state.uid, pol);
+    if let Some(&entered) = st.consulting.get(&guard) {
+        st.consult_lowest_cut = st.consult_lowest_cut.min(entered);
+        // What the cycle reaches is already being collected, at the variable it returns
+        // to. Round identity edges a name comes back as itself; round any other, it comes
+        // back as its image, which that variable's names must then hold too
+        // ([`close_under_cycles`]).
+        let edges = &st.consult_edges[entered..];
+        if !edges.iter().all(Subst::is_id) {
+            st.consult_pending.push((entered, edges.to_vec()));
+        }
+        return Some(Rc::new(BTreeSet::new()));
+    }
+    if !crate::ccl::ty::FunKind::Var(Rc::clone(&state.fun_kind))
+        .binder_ids()
+        .is_empty()
+    {
+        return None;
+    }
+    let depth = st.consulting.len();
+    st.consulting.insert(guard, depth);
+    let outer_cut = std::mem::replace(&mut st.consult_lowest_cut, usize::MAX);
+    let (primary, opposite) = {
+        let b = state.bounds.borrow();
+        let (primary, opposite) = if pol {
+            (b.lower(), b.upper())
+        } else {
+            (b.upper(), b.lower())
+        };
+        (Rc::clone(primary), Rc::clone(opposite))
+    };
+    // `compact_go` reads the opposite side at a position, and below one along an invariant
+    // one; reading it wherever it might is what keeps this an over-approximation.
+    let read_opposite = st.collapse && (at.0 || (!pol && at.1));
+    let chain = (false, at.1);
+    let mut out = Some(BTreeSet::new());
+    let sides = primary
+        .iter()
+        .map(|b| (b, pol))
+        .chain(opposite.iter().filter(|_| read_opposite).map(|b| (b, !pol)));
+    for (b, side) in sides {
+        let edge = b.render_subst();
+        st.consult_edges.push(edge.clone());
+        let below = consulted_in(&b.ty, side, chain, st);
+        st.consult_edges.pop();
+        match (below, &mut out) {
+            (Some(names), Some(acc)) => acc.extend(edge.image_of(&names)),
+            _ => {
+                out = None;
+                break;
+            }
+        }
+    }
+    st.consulting.remove(&guard);
+    let cycles: Vec<Vec<Subst>> = {
+        let (back, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut st.consult_pending)
+            .into_iter()
+            .partition(|(entered, _)| *entered == depth);
+        st.consult_pending = rest;
+        back.into_iter().map(|(_, edges)| edges).collect()
+    };
+    if let Some(names) = &mut out
+        && !close_under_cycles(names, &cycles)
+    {
+        out = None;
+    }
+    let cut = st.consult_lowest_cut;
+    st.consult_lowest_cut = outer_cut.min(cut);
+    let out = out.map(Rc::new);
+    if cut >= depth {
+        st.consulted.insert(key, out.clone());
+    }
+    out
+}
+
+/// Extend `names`, a variable's consulted names, with their images round each of `cycles`:
+/// the edges, outermost first, of a walk from the variable back to itself. A name reaching
+/// the variable comes back up the cycle through each edge's image, last edge first, and is
+/// then consulted at the variable too. Iterated until nothing new arrives; `false` if that
+/// takes more rounds than [`CYCLE_CLOSURE_ROUNDS`], which leaves the names unknown.
+fn close_under_cycles(names: &mut BTreeSet<Name>, cycles: &[Vec<Subst>]) -> bool {
+    if cycles.is_empty() {
+        return true;
+    }
+    for _ in 0..CYCLE_CLOSURE_ROUNDS {
+        let mut grew = false;
+        for edges in cycles {
+            let arrived = edges
+                .iter()
+                .rev()
+                .fold(names.clone(), |below, edge| edge.image_of(&below));
+            for name in arrived {
+                grew |= names.insert(name);
+            }
+        }
+        if !grew {
+            return true;
+        }
+    }
+    false
+}
+
+/// How many rounds [`close_under_cycles`] runs before giving up. Each round only adds names
+/// the program spells, so the closure ends; the bound keeps the walk finite regardless.
+const CYCLE_CLOSURE_ROUNDS: usize = 64;
+
+/// [`CompactState::memo`]'s key: the variable, the polarity, the enclosing binders, whether
+/// the walk is at the position, and whether the position is invariant.
+type MemoKey = (InferVarId, bool, Vec<Option<Name>>, bool, bool);
+
+/// A revisit [`compact_go`] cut: the variable and polarity, how many variables were being
+/// expanded when it was entered, and whether the cut was a spurious cycle, along one bound
+/// chain, rather than a recursive one.
+#[derive(Clone, Copy)]
+struct Cut {
+    key: (InferVarId, bool),
+    entered: usize,
+    spurious: bool,
+}
+
+/// A memoized [`compact_go`] result, and the variables it cut as spurious cycles, which
+/// the path reusing it must hold on its bound chain. A reuse where the walk would cut more
+/// returns what that cut would have dropped as well; the dropped part is already on the
+/// path, and merging it again changes nothing.
+#[derive(Clone)]
+struct Memoized {
+    ty: CompactType,
+    cuts: Vec<(InferVarId, bool)>,
+}
+
+/// [`CompactState::consulted`]'s key: the variable, the polarity, whether the walk is at the
+/// position, and whether the position is invariant.
+type MemoKeyAt = (InferVarId, bool, bool, bool);
+
 /// Walk-wide state threaded through [`compact_go`]: the cycle-tracking tables.
 /// ([`Position`] stays a per-path argument — it is scoped to one variable's bound
 /// chain and reset across structural boundaries — and the substitution
 /// accumulator composes per edge.)
 struct CompactState {
-    /// Variables whose bounds are currently being walked, per polarity.
-    in_process: HashSet<(InferVarId, bool)>,
+    /// Variables whose bounds are currently being walked, per polarity, each with how
+    /// many were being walked when it was entered.
+    in_process: HashMap<(InferVarId, bool), usize>,
+    /// What each variable compacted to, for one reached again under the identity
+    /// substitution. Without it a variable is walked once per path that reaches it, and a
+    /// bound graph shares variables freely: constraining `?a <: ?b` copies `?a`'s lower
+    /// bounds onto `?b`, so `?b` reaches `?a`'s bounds twice, and each level of a nested
+    /// type doubles the walk.
+    ///
+    /// The result depends on the variable, the polarity, the binders the refinement
+    /// closing runs against, and two facts about the position: whether the walk is at it
+    /// ([`fallback_allowed`]) and whether it is invariant. It does not otherwise depend on
+    /// the path, except through the cycles it cut back to variables entered before it:
+    /// a result is reused only where each of those is again on the bound chain, so the
+    /// walk would cut it again ([`Memoized::cuts`]). `spec_key`'s walk keeps the same memo.
+    memo: HashMap<MemoKey, Memoized>,
+    /// The names a substitution could act on below each variable
+    /// ([`consulted_below`]), computed once per walk; `None` where that is not known.
+    consulted: HashMap<MemoKeyAt, Option<Rc<BTreeSet<Name>>>>,
+    /// [`consulted_below`]'s cycle guard: each variable being read, with how many were
+    /// being read when it was entered.
+    consulting: HashMap<(InferVarId, bool), usize>,
+    /// The substitution of the bound [`consulted_below`] is following out of the variable at
+    /// each depth.
+    consult_edges: Vec<Subst>,
+    /// The cycles [`consulted_below`] has cut through a non-identity edge, each with the
+    /// depth of the variable it returned to and the edges round it, until that variable's
+    /// names are closed under them ([`close_under_cycles`]).
+    consult_pending: Vec<(usize, Vec<Subst>)>,
+    /// [`lowest_cut`](Self::lowest_cut) for [`consulted_below`].
+    consult_lowest_cut: usize,
+    /// The revisits the walk has cut, since the variables being expanded were entered.
+    cuts: Vec<Cut>,
     /// Placeholder ids minted for genuinely recursive revisits.
     recursive: HashMap<(InferVarId, bool), InferVarId>,
     /// Barrier variables whose lower bounds are currently being joined. Keyed on the
@@ -1743,7 +1990,14 @@ struct CompactState {
 impl CompactState {
     fn new(collapse: bool) -> Self {
         CompactState {
-            in_process: HashSet::new(),
+            in_process: HashMap::new(),
+            memo: HashMap::new(),
+            cuts: Vec::new(),
+            consulted: HashMap::new(),
+            consulting: HashMap::new(),
+            consult_edges: Vec::new(),
+            consult_pending: Vec::new(),
+            consult_lowest_cut: usize::MAX,
             recursive: HashMap::new(),
             barriers_in_process: HashSet::new(),
             barrier_recursive: HashMap::new(),
@@ -2353,8 +2607,43 @@ fn compact_go(
         Type::Infer(state) => {
             let uid = state.uid;
             let key = (uid, pol);
-            if st.in_process.contains(&key) {
-                if pos.parents.is_some_and(|p| p.contains(uid)) {
+            let memo_key: MemoKey = (
+                uid,
+                pol,
+                st.scope.enclosing().to_vec(),
+                fallback_allowed(pos, st),
+                pos.invariant,
+            );
+            // A substitution that maps no name the walk below can reach leaves the walk as it
+            // is under the identity: a refinement it does not act on keeps its predicate
+            // (`Subst::force_refinement`), and a witness half is ruled out here.
+            let memoizable = subst_acc.is_id()
+                || (!subst_acc.has_witnesses()
+                    && consulted_below(state, pol, (memo_key.3, memo_key.4), st)
+                        .is_some_and(|names| !subst_acc.maps_any(&names)));
+            if memoizable
+                && let Some(done) = st.memo.get(&memo_key)
+                && done.cuts.iter().all(|cut| {
+                    st.in_process.contains_key(cut)
+                        && pos.parents.is_some_and(|p| p.contains(cut.0))
+                })
+            {
+                let done = done.clone();
+                st.cuts.extend(done.cuts.iter().map(|cut| Cut {
+                    key: *cut,
+                    entered: st.in_process[cut],
+                    spurious: true,
+                }));
+                return done.ty;
+            }
+            if let Some(&entered) = st.in_process.get(&key) {
+                let spurious = pos.parents.is_some_and(|p| p.contains(uid));
+                st.cuts.push(Cut {
+                    key,
+                    entered,
+                    spurious,
+                });
+                if spurious {
                     // Spurious cycle (a <: b and b <: a with no
                     // structural intermediary). Drop the bound.
                     return CompactType::empty();
@@ -2368,7 +2657,9 @@ fn compact_go(
                 let placeholder = *st.recursive.entry(key).or_insert_with(fresh_infer_var_id);
                 return CompactType::from_var(placeholder);
             }
-            st.in_process.insert(key);
+            let depth = st.in_process.len();
+            st.in_process.insert(key, depth);
+            let cuts_before = st.cuts.len();
             // **A variable states a binder correspondence too**, and it is the only thing
             // that states the one a join needs: two conditional arms are two sums recorded
             // below one variable's kind, each spelled in its own binder, and the kind is what
@@ -2593,12 +2884,30 @@ fn compact_go(
                 }
             }
             st.in_process.remove(&key);
+            // The cuts back to variables entered before this one are what the result
+            // assumes of the path; the others are its own business.
+            let mut assumed: Vec<Cut> = Vec::new();
+            for cut in st.cuts.drain(cuts_before..) {
+                if cut.entered < depth && !assumed.iter().any(|a| a.key == cut.key) {
+                    assumed.push(cut);
+                }
+            }
+            st.cuts.extend(assumed.iter().copied());
             // Recursive types: store the bound under the placeholder
             // variable and emit a reference.
             if let Some(rec_uid) = st.recursive.get(&key) {
                 let rec_uid = *rec_uid;
                 st.rec_vars.insert(rec_uid, bound);
                 return CompactType::from_var(rec_uid);
+            }
+            if memoizable && assumed.iter().all(|cut| cut.spurious) {
+                st.memo.insert(
+                    memo_key,
+                    Memoized {
+                        ty: bound.clone(),
+                        cuts: assumed.iter().map(|cut| cut.key).collect(),
+                    },
+                );
             }
             bound
         }
@@ -2613,6 +2922,32 @@ mod tests {
         CoalesceError, ConstrainCache, coalesce_compact, constrain_subtype, fresh_var,
     };
     use crate::ccl::{BaseType, Lit, Refinement, TypedExpr};
+
+    /// A name reaching a variable round a cycle comes back as its image through the cycle's
+    /// edges, last edge first, and the variable consults that image too, until nothing new
+    /// arrives.
+    #[test]
+    fn consulted_names_close_under_a_cycle_s_edges() {
+        let names = |ns: &[&str]| ns.iter().map(|n| Name::from(*n)).collect::<BTreeSet<_>>();
+        // Round two renames, `x` comes back as `z`: `y` is a name inside the cycle only.
+        let mut consulted = names(&["x"]);
+        let cycle = vec![Subst::rename("y", "z"), Subst::rename("x", "y")];
+        assert!(close_under_cycles(&mut consulted, &[cycle]));
+        assert_eq!(consulted, names(&["x", "z"]));
+        // What one cycle brings back, another carries on.
+        let mut consulted = names(&["x"]);
+        let cycles = [vec![Subst::rename("y", "z")], vec![Subst::rename("x", "y")]];
+        assert!(close_under_cycles(&mut consulted, &cycles));
+        assert_eq!(consulted, names(&["x", "y", "z"]));
+        // A discharge brings back its term's free names.
+        let mut consulted = names(&["a"]);
+        let cycle = vec![Subst::discharge(
+            "a",
+            TypedExpr::var("b").with_ty(Type::Base(BaseType::Int)),
+        )];
+        assert!(close_under_cycles(&mut consulted, &[cycle]));
+        assert_eq!(consulted, names(&["a", "b"]));
+    }
 
     /// A dependent tuple is an atom of the solver's lattice: two α-variants of
     /// `(a : Int) × {Int | __elem == a}` flowing into one variable compact to one atom, and

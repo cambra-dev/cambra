@@ -2241,3 +2241,32 @@ fn a_boxed_payload_reads_back_as_its_collection() {
         Value::Int(6),
     );
 }
+
+/// A chain of `.extract()` calls on a value nested six deep. Each call's result is read through
+/// every bound its variable has gathered, and constraining one variable below another copies
+/// the lower one's bounds onto it, so compaction reaches one variable along many paths: it
+/// reads each once per walk. Read once per path, each call in the chain took several times as
+/// long as the one before.
+#[test]
+fn a_chain_of_extracts_on_a_deeply_nested_value() {
+    let start = std::time::Instant::now();
+    check_scalar(
+        indoc! {"
+            type One(T) = T
+            c0 = 1
+            c1 = One::new(c0)
+            c2 = One::new(c1)
+            c3 = One::new(c2)
+            c4 = One::new(c3)
+            c5 = One::new(c4)
+            c6 = One::new(c5)
+            c6.extract().extract().extract().extract().extract().extract()
+        "},
+        Value::Int(1),
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "compiling took {:?}",
+        start.elapsed()
+    );
+}

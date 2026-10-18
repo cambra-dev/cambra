@@ -454,6 +454,36 @@ impl Subst {
         self.binders.keys()
     }
 
+    /// Whether this substitution renames or discharges any of `names`.
+    pub fn maps_any(&self, names: &BTreeSet<Binder>) -> bool {
+        self.binders.keys().any(|k| names.contains(k))
+    }
+
+    /// Whether this substitution has a witness half.
+    pub fn has_witnesses(&self) -> bool {
+        !self.witnesses.is_empty()
+    }
+
+    /// The names `names` become under this substitution: a renamed binder its target, a
+    /// discharged one the free names of its term, and any other itself. What a
+    /// substitution applied *after* this one can act on, of a term whose free names are
+    /// `names`.
+    pub fn image_of(&self, names: &BTreeSet<Binder>) -> BTreeSet<Binder> {
+        let mut out = BTreeSet::new();
+        for n in names {
+            match self.binders.get(n) {
+                Some(Mapping::Rename(to)) => {
+                    out.insert(to.clone());
+                }
+                Some(Mapping::Discharge(t)) => out.extend(expr_free_vars(t)),
+                None => {
+                    out.insert(n.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// Visit each discharge mapping's captured term mutably (renames have no
     /// term). For specialization freshening: a suspended discharge's term was
     /// captured at emit with the definition's inference variables in its type
@@ -1725,6 +1755,15 @@ pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
     with_binders(&mut bound, [Name::elem()], |bnd| {
         collect_expr_fv(&r.predicate, bnd, &mut visited, &mut out)
     });
+    out
+}
+
+/// The free term-variable names of `e`, those in its sub-expressions' type slots included.
+pub fn expr_free_vars(e: &TypedExpr) -> BTreeSet<Binder> {
+    let mut out = BTreeSet::new();
+    let mut bound = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    collect_expr_fv(e, &mut bound, &mut visited, &mut out);
     out
 }
 
