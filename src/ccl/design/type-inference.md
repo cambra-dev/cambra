@@ -573,16 +573,28 @@ those spellings. See `higher_order_dependent_application_discharges_the_binder` 
 
 ##### Compaction traversal cost
 
-`CompactState::in_process` prevents recursive re-entry while a variable is being visited; it is
-not a cache of completed results. The entry is removed when that visit returns. Reaching a
-position again can therefore repeat compaction, and each structural child can enable a new
-opposite-side read.
+`CompactState::in_process` prevents recursive re-entry while a variable is being visited, and
+its entry is removed when that visit returns. A bound graph shares variables freely:
+constraining `?a <: ?b` copies `?a`'s lower bounds onto `?b`, so `?b` reaches `?a`'s bounds
+twice, and each level of a nested type doubles the walk. `CompactState::memo` keeps what each
+variable compacted to, so a walk reads a variable once rather than once per path that reaches it.
 
-A result memo keyed only by variable identity and polarity would omit relevant inputs:
-`subst_acc` composes the substitutions on the path, and `st.scope` records the refinement
-scope. Reusing a result across different substitutions or scopes would conflate distinct readings.
-No such compaction result memo is implemented here. Memoization or interning would require its
-own correctness and performance checks; the traversal cost alone does not establish a safe key.
+A result depends on more than the variable, and the memo's key holds the rest: the polarity, the
+binders the refinement-closing runs against (`st.scope`), whether the walk is at the position
+(`fallback_allowed`), and whether the position is invariant. It also depends on the path's
+substitution, `subst_acc`, which the key leaves out. A result is stored and reused only where
+that substitution acts on none of the names the walk below the variable can reach
+(`consulted_below`), where it leaves the walk as the identity does. Those names are the free
+names of every refinement below the variable, each spelled through the substitutions of the
+bounds between, along the bounds `compact_go` follows: the polarity-correct side, the opposite
+side where it may be read, and a barrier variable's lowers. A cycle back through a renaming
+edge closes them under its images (`close_under_cycles`). A substitution with a witness half,
+or a variable whose names are not known, bypasses the memo.
+
+A result can also depend on the path through the cycles its walk cut back to variables entered
+before it. It is stored only where each such cut was spurious, and it records them
+(`Memoized::cuts`); it is reused only where each is again being walked and on the bound chain,
+so the walk would cut it again. A result naming a recursive placeholder is not stored.
 
 #### Binder-slot resolution
 

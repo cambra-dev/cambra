@@ -2238,3 +2238,43 @@ fn a_boxed_payload_reads_back_as_its_collection() {
         Value::Int(6),
     );
 }
+
+/// An instance function that recurses through a value nested six deep, reading its argument's
+/// `.extract()` twice at each level. Each call's result is read through every bound its
+/// variable has gathered, and constraining one variable below another copies the lower one's
+/// bounds onto it, so compaction reaches one variable along many paths: it reads each once per
+/// walk. And inlining binds a computed argument the body reads twice rather than copying it to
+/// each read. Either one per path doubled the cost at each level beyond the value's own
+/// doubling.
+#[test]
+fn an_instance_function_recursing_through_a_deeply_nested_value() {
+    let start = std::time::Instant::now();
+    check_scalar(
+        indoc! {"
+            type Circle = Int
+            type Two(T) = {T, T}
+            trait Area(S):
+                def area(s: S) => Int
+            impl Area(Circle):
+                def area(s):
+                    s.extract()
+            impl forall (T) Area(Two(T)) requires Area(T):
+                def area(s):
+                    summon(Area(_))::area(s.extract().0) + summon(Area(_))::area(s.extract().1)
+            c0 = Circle::new(1)
+            c1 = Two::new((c0, c0))
+            c2 = Two::new((c1, c1))
+            c3 = Two::new((c2, c2))
+            c4 = Two::new((c3, c3))
+            c5 = Two::new((c4, c4))
+            c6 = Two::new((c5, c5))
+            summon(Area(_))::area(c6)
+        "},
+        Value::Int(64),
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "compiling took {:?}",
+        start.elapsed()
+    );
+}

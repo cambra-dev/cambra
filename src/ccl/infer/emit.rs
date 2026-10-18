@@ -60,8 +60,15 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Loc
 /// The body of [`emit_node`]: the actual per-node constraint emission. See the
 /// wrapper for the `current_node_id` bookkeeping.
 fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
-    // Compute the label before the mutable borrow so Case can pass it to emit_case.
-    let label = symbolic(expr);
+    // Compute the label before the mutable borrow so Case can pass it to emit_case. Only
+    // the rules that read it pay for it: a label spells the node's whole subtree, so one per
+    // node is quadratic in the tree.
+    let label = match &expr.node {
+        TypedExprNode::Case { .. } | TypedExprNode::Feed { .. } | TypedExprNode::Define { .. } => {
+            symbolic(expr)
+        }
+        _ => String::new(),
+    };
     // The literal's own id, taken before the walk borrows the node — the node the
     // `Lit` rule records its singleton predicate against. See there.
     let node_id = expr.node_id();
@@ -292,7 +299,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // reading as a capability.
             debug_assert!(
                 has_ann || matches!(recorded_ty, Type::Fun { .. }),
-                "a Compose reached inference with no kind stamp: {label}"
+                "a Compose reached inference with no kind stamp (node {node_id:?})"
             );
             emit_compose(elts, &recorded_ty, ctx)?
         }
