@@ -11,7 +11,10 @@ use crate::ccl::ccl_utils::{PredMemo, canonical_cast_ty};
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::emit::read_through;
 use crate::ccl::infer::solver::barrier::EdgeReport;
-use crate::ccl::infer::solver::traits::{InstanceTable, TraitInstance};
+use crate::ccl::infer::solver::traits::{
+    Implementation, InstanceBody, InstanceTable, OperatorCall, Signature, TraitInstance,
+    function_over, replace_params,
+};
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
     compact_type, compact_type_polarity_only, constrain_subtype, constrain_subtype_in,
@@ -1797,6 +1800,9 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// The body of [`coalesce_node`]; see the wrapper for the per-error blame
 /// bookkeeping it is wrapped in.
 fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
+    if !ctx.discarding {
+        dispatch_operator(expr, ctx);
+    }
     // A trait function's call answered by an instance a module declares becomes a use of
     // the function the instance's `def` binds, before anything reads the node: the use then
     // specializes below, as any use of a generalized definition does. A walk whose types are
@@ -1810,7 +1816,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 return;
             }
             Ok(Some(instance)) => {
-                if !use_instance_function(expr, &instance, ctx) {
+                if instance.declared.is_some() && !use_instance_function(expr, &instance, ctx) {
                     return;
                 }
             }
@@ -2358,6 +2364,185 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_type_predicates(target, level, ctx);
         }
     }
+
+    // A compiler instance builds its function at the type the call resolved to, so it is
+    // chosen once that type is.
+    if matches!(expr.node, TypedExprNode::TraitFn { .. })
+        && !ctx.discarding
+        && let Ok(Some(instance)) = matching_instance(expr, ctx)
+    {
+        build_instance_function(expr, &instance);
+    }
+    if !ctx.discarding {
+        run_instance_primitive(expr);
+    }
+}
+
+/// Replace an arithmetic operator answered by an instance a module declares with the call of
+/// the instance's function the operator makes ([`OperatorCall`]): `a + b` is `add` of
+/// `(a, b)`. The walk then reaches the call's `TraitFn` as it reaches any trait function's,
+/// which becomes a use of the instance's function (`src/ccl/design/type-inference.md`, "An
+/// operator's instance"). An operator a compiler instance answers stays, and runs that
+/// instance's primitive ([`run_instance_primitive`]); a comparison calls no function.
+fn dispatch_operator(expr: &mut Expr, ctx: &CoalesceCtx) {
+    let (call, operands): (OperatorCall, Vec<&Expr>) = match &expr.node {
+        TypedExprNode::BinOp { left, op, right } => match OperatorCall::of_binop(*op) {
+            Some(call) => (call, vec![&**left, &**right]),
+            None => return,
+        },
+        TypedExprNode::UnaryOp(op, inner) => match OperatorCall::of_unary(*op) {
+            Some(call) => (call, vec![&**inner]),
+            None => return,
+        },
+        _ => return,
+    };
+    let Some(function) = call.function else {
+        return;
+    };
+    // Resolving the operands copies their refinements' predicates, so it waits for a
+    // declared instance to choose between.
+    if !ctx.instances.declares(&call.trait_) {
+        return;
+    }
+    let Ok(types) = operands
+        .iter()
+        .map(|e| resolve_var_type(&e.ty).map(|t| crate::ccl::ccl_utils::strip_refinements(&t)))
+        .collect::<Result<Vec<Type>, _>>()
+    else {
+        return;
+    };
+    let declared = ctx
+        .instances
+        .instances(&call.trait_)
+        .iter()
+        .any(|i| i.declared.is_some() && i.matches(&types));
+    if declared {
+        call_instance_function(expr, &call, function, types);
+    }
+}
+
+/// Bind `value` to a fresh name around the term `body` builds from a read of it.
+fn bind(value: Expr, body: impl FnOnce(Expr) -> Expr) -> Expr {
+    let name = Name::anf_temp();
+    let read = Expr::var(name.clone()).with_ty(value.ty.clone());
+    let body = body(read);
+    let ty = body.ty.clone();
+    Expr::let_bind(name, value, body).with_ty(ty)
+}
+
+/// Rewrite an operator a declared instance answers into the call its [`OperatorCall`]
+/// makes, at the operands' resolved `types`, keeping the node's identity and its type.
+fn call_instance_function(expr: &mut Expr, call: &OperatorCall, function: &str, types: Vec<Type>) {
+    let id = expr.node_id();
+    let ty = expr.ty.clone();
+    let _f = crate::ccl::provenance::enter(
+        id,
+        "infer.dispatch_operator",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    let mut operands = match std::mem::replace(&mut expr.node, TypedExprNode::Defer) {
+        TypedExprNode::BinOp { left, right, .. } => vec![*left, *right],
+        TypedExprNode::UnaryOp(_, inner) => vec![*inner],
+        _ => unreachable!("`dispatch_operator` rewrites an operator"),
+    };
+    let Signature {
+        params,
+        inputs,
+        output,
+        requires,
+    } = &call
+        .trait_
+        .function(function)
+        .expect("an operator calls a function its trait declares")
+        .signature;
+    debug_assert!(
+        params.is_empty() && requires.is_empty(),
+        "an operator's function has no type parameters and no requirements of its own"
+    );
+    // The signature at the operands' types, whose `Output` is the operator's own result.
+    let mut opened: HashMap<TypeParamId, Type> = call
+        .trait_
+        .operands
+        .iter()
+        .zip(&types)
+        .map(|(p, t)| (p.id, t.clone()))
+        .collect();
+    opened.extend(call.trait_.assocs.iter().map(|(_, p)| (p.id, ty.clone())));
+    let callee = Expr::new(TypedExprNode::TraitFn {
+        trait_: call.trait_.clone(),
+        function: function.into(),
+        operands: types,
+        assoc: Vec::new(),
+    })
+    .with_ty(replace_params(
+        &function_over(inputs, output.clone()),
+        &opened,
+    ));
+    let applied = |argument: Expr| Expr::apply(argument, callee).with_ty(ty.clone());
+    let called = match operands.len() {
+        1 => applied(operands.pop().expect("one operand")),
+        _ => {
+            let tuple_ty = Type::Tuple(operands.iter().map(|e| e.ty.clone()).collect());
+            bind(Expr::tuple(operands).with_ty(tuple_ty), applied)
+        }
+    };
+    *expr = Expr::preserve(id, called.node).with_ty(ty);
+}
+
+/// Make an operator a compiler instance answers run that instance's primitive: `+` of two
+/// strings is `Concat`.
+fn run_instance_primitive(expr: &mut Expr) {
+    let TypedExprNode::BinOp { left, op, right } = &mut expr.node else {
+        return;
+    };
+    let Some(call) = OperatorCall::of_binop(*op) else {
+        return;
+    };
+    let Some(function) = call.function else {
+        return;
+    };
+    let types = [
+        crate::ccl::ccl_utils::strip_refinements(&left.ty),
+        crate::ccl::ccl_utils::strip_refinements(&right.ty),
+    ];
+    let primitive = InstanceTable::builtin()
+        .instances(&call.trait_)
+        .iter()
+        .find(|i| i.matches(&types))
+        .and_then(|i| match i.implementation(function) {
+            Some(Implementation::Primitive(InstanceBody::Binary(primitive))) => Some(*primitive),
+            _ => None,
+        });
+    if let Some(primitive) = primitive {
+        *op = primitive;
+    }
+}
+
+/// Replace a `TraitFn` a compiler instance answers with the function the instance builds at
+/// the node's type, the signature at the call's types.
+fn build_instance_function(expr: &mut Expr, instance: &TraitInstance) {
+    let TypedExprNode::TraitFn {
+        trait_, function, ..
+    } = &expr.node
+    else {
+        unreachable!("`build_instance_function` is called on a `TraitFn`")
+    };
+    let Some(Implementation::Primitive(body)) = instance.implementation(function) else {
+        panic!(
+            "an instance of `{trait_}` the compiler provides runs a primitive for each function its trait declares"
+        )
+    };
+    let id = expr.node_id();
+    let built = {
+        let _f = crate::ccl::provenance::enter(
+            id,
+            "infer.dispatch_trait_fn",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        body.build(&expr.ty)
+    };
+    let Expr { node, ty, .. } = built;
+    *expr = Expr::preserve(id, node).with_ty(ty);
 }
 
 /// The instance a `TraitFn`'s operand types match (`src/ccl/design/type-inference.md`,
@@ -2429,8 +2614,8 @@ fn use_instance_function(expr: &mut Expr, instance: &TraitInstance, ctx: &mut Co
     else {
         unreachable!("`use_instance_function` is called on a `TraitFn`")
     };
-    let Some(binding) = instance.implementation(function) else {
-        panic!("an instance of `{trait_}` binds every function its trait declares")
+    let Some(Implementation::Binding(binding)) = instance.implementation(function) else {
+        panic!("a declared instance of `{trait_}` binds every function its trait declares")
     };
     let binding = binding.clone();
     let in_scope = ctx.scope.iter().any(|entry| match entry {

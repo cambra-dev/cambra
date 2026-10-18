@@ -1580,9 +1580,8 @@ fn elim_lambda_impl(
         // BinOp — desugar to Apply + Tuple, then apply the application rule.
         // a op b  ≡  (a, b) ▷ op_fn
         //
-        // The `String + String → Concat` rewrite is handled by
-        // [`crate::ccl::simplify::try_string_add_to_concat`] (which runs after
-        // lambda elimination), so it's not duplicated here.
+        // The operator is the one its instance runs: inference made `String + String`
+        // `Concat` when it chose the `Addable` row.
         TypedExprNode::BinOp { left, op, right } => {
             let left = *left;
             let right = *right;

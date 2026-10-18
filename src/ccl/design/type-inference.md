@@ -2954,18 +2954,18 @@ determining side from the determined one. An instance is one hyper-edge, and
 resolution is the search for a hyper-edge consistent with what inference has determined
 about the operand positions.
 
-The compiler's traits have `𝑁 ∈ {1, 2}`, `𝐴 ∈ {0, 1}` (`Output`, or nothing) and `𝐹 = 0`. A trait
-a module declares has any `𝑁`, `𝐴` and `𝐹` ([Trait functions](#trait-functions)).
+The compiler's traits have `𝑁 ∈ {1, 2}`, `𝐴 ∈ {0, 1}` (`Output`, or nothing) and `𝐹 ∈ {0, 1}`:
+each arithmetic trait associates the function its operator calls, `add` for `+`, and
+`Equatable`, `Orderable` and `AddableRefined` associate none. A trait a module declares has any
+`𝑁`, `𝐴` and `𝐹` ([Trait functions](#trait-functions)).
 
-An operator trait's `𝐹 = 0` is a gap rather than a decision. Its rows denote distinct
-functions: `Addable(String, String ⇝ String)` is concatenation and
-`Addable(Int, Int ⇝ Int)` is integer addition, and a trait that cannot associate a
-function cannot say which. The function is therefore recovered twice outside the trait:
-`simplify.rs` rewrites the `String` case to `Concat` (see
-[BinOp type rules](#binop-type-rules)), and the interpreter picks the machine operation
-from the operand column's runtime representation (`apply_binop_column`, in
-`src/interpreter/binop.rs`). The type system narrows to a row of types and then declines
-to name the code.
+An arithmetic trait's rows denote distinct functions: `Addable(String, String ⇝ String)` is
+concatenation and `Addable(Int, Int ⇝ Int)` is integer addition. Each compiler row states its
+function as a primitive (`InstanceBody`), and an operator a compiler row answers runs that
+primitive ([An operator's instance](#an-operators-instance)), so `+` on strings is `Concat` once
+coalescing has chosen the row. A primitive is one operation at every base its rows accept: `Add`
+at `Int` and at `UInt` is one primitive, and the interpreter runs it at the operand column's
+representation (`apply_binop_column`, in `src/interpreter/binop.rs`).
 
 Traits and instances are *data*, one representation for the compiler's and a module's alike.
 Every trait is a declaration (`TraitDecl`, held by `Trait`): its operands, its associated types
@@ -3317,6 +3317,24 @@ the trait's clause names (`TraitDecl::named`) are read only by each instance's f
 lowering gives the names at the instance's types, beside the names the instance's own clause
 binds.
 
+### An operator's instance
+
+An operator is emitted as it always was: `emit_binop` places its trait's obligation over its
+operands and types the result by the operator's `OperatorResult`. What runs is chosen at
+coalesce, from the operands' resolved types (`dispatch_operator`, `run_instance_primitive`):
+
+- **An arithmetic operator a declared instance answers becomes the call its `OperatorCall` makes.**
+  `a + b` is rewritten to `let t = (a, b) in t ▷ Addable::add`, a `TraitFn` at the resolved
+  operand types and typed by the trait's signature there, whose `Output` is the operator's own
+  result. The walk then dispatches the `TraitFn` as any trait function's
+  ([Trait functions](#trait-functions)), so the call specializes the instance's function. Only a
+  program that declares an instance of the trait resolves its operators' operand types here,
+  since resolving copies the refinements' predicates.
+- **An operator a compiler instance answers runs the instance's primitive.** The node stays, and
+  its operator becomes the row's (`InstanceBody::Binary`): `Concat` for two strings. A `TraitFn`
+  a compiler instance answers, `summon(Addable(_, _))::add(1, 2)`, becomes the primitive's function
+  (`build_instance_function`).
+
 ---
 
 ## 4.8 Dependent tuples
@@ -3545,8 +3563,8 @@ The operand variables of an arithmetic obligation are not equated. The trait rel
 determines which combinations are accepted; [Traits](#traits) owns resolution and
 generalization. Comparison traits have no associated result: the operator fixes `Bool`.
 
-String addition is an `Addable` instance during inference. The later simplification pass
-rewrites the typed addition to `Concat`; inference does not perform that rewrite.
+String addition is an `Addable` instance during inference, and coalescing makes it `Concat`, the
+instance's primitive ([An operator's instance](#an-operators-instance)).
 
 ### UnaryOp type rules
 

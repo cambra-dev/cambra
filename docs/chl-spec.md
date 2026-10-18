@@ -2994,11 +2994,12 @@ associated functions, so whatever name it takes is unavailable to every type dec
 - **A declared nominal type satisfies the traits its module declares instances of**
   ([Declaring an instance](#declaring-an-instance)), and no other. None is inherited from the
   constructors' parameter types: `type Price = {Int where _ >= 0}` is not `Addable` because `Int`
-  is. An instance of an operator's trait, which would give `==`, ordering and arithmetic on a
-  nominal type's values and make one a key of a `Set`, a `Map` or a `groupby`, is **[Planned]**;
-  until then those are errors on its values. Deriving an instance from the constructors, as with
-  Rust's `#[derive]`, is **[Open]**. The nominal builtins `Set`, `Map` and `FullMap` satisfy the
-  built-in instances of `Iterable`, which the compiler provides.
+  is. An instance of an arithmetic operator's trait defines the operator on its values. An
+  instance of `Equatable` or `Orderable`, which would let them be compared and make them keys of a
+  `Set`, a `Map` or a `groupby`, is **[Planned]**; until then those are errors on its values.
+  Deriving an instance from the constructors, as with Rust's `#[derive]`, is **[Open]**. The
+  nominal builtins `Set`, `Map` and `FullMap` satisfy the built-in instances of `Iterable`, which
+  the compiler provides.
 - **The type of a nominal value is fixed by the expression that produced it.** Every producer of a
   value names the same nominal type, so a method and a trait requirement resolve the same way
   wherever the value flows.
@@ -3290,21 +3291,29 @@ parameter of such a type that no call writes: each call passes the instance its 
 operand types. A module declares traits of its own ([Declaring a trait](#declaring-a-trait)), and a
 requirement names one as it names these, which are built in:
 
-| Trait | Required by | Operands | Associated type | Satisfied by |
-| --- | --- | --- | --- | --- |
-| `Addable` | `+` | 2 | `Output` | `Int`, `UInt`, `String` |
-| `Subtractable` | `-` | 2 | `Output` | `Int`, `UInt` |
-| `Multipliable` | `*` | 2 | `Output` | `Int`, `UInt` |
-| `Divisible` | `//` | 2 | `Output` | `Int`, `UInt` |
-| `Exponentiable` | `**` | 2 | `Output` | `Int`, `UInt` |
-| `Negatable` | unary `-` | 1 | `Output` | `Int` |
-| `Equatable` | `==`, `!=`, `in`, `not in` | 2 | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
-| `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | `Int`, `UInt`, `String`, `Bool`, and a tuple whose components are `Orderable` |
+| Trait | Required by | Operands | Associated type | Function | Satisfied by |
+| --- | --- | --- | --- | --- | --- |
+| `Addable` | `+` | 2 | `Output` | `add` | `Int`, `UInt`, `String` |
+| `Subtractable` | `-` | 2 | `Output` | `sub` | `Int`, `UInt` |
+| `Multipliable` | `*` | 2 | `Output` | `mul` | `Int`, `UInt` |
+| `Divisible` | `//` | 2 | `Output` | `div` | `Int`, `UInt` |
+| `Exponentiable` | `**` | 2 | `Output` | `pow` | `Int`, `UInt` |
+| `Negatable` | unary `-` | 1 | `Output` | `neg` | `Int` |
+| `Equatable` | `==`, `!=`, `in`, `not in` | 2 | none | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
+| `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | none | `Int`, `UInt`, `String`, `Bool`, and a tuple whose components are `Orderable` |
 
 `max` and `min` place `Orderable(T, T)` on their element type `T`. A binary trait is satisfied by
 two operands of one listed type. A tuple or record satisfies `Equatable` only against the same
 product, and a tuple satisfies `Orderable` only against a tuple of the same length
-([3.4 Comparisons](#34-comparisons)). A trait's `Output` is the type that satisfies it.
+([3.4 Comparisons](#34-comparisons)). A trait's `Output` is the type that satisfies it. A nominal
+type satisfies an arithmetic operator's trait where its module declares an instance
+([Declaring an instance](#declaring-an-instance)).
+
+- **An operator calls its trait's function.** `a + b` is `summon(Addable(_, _))::add(a, b)`, and
+  `-a` is `summon(Negatable(_))::neg(a)`. The compiler's instances run the built-in operation:
+  `add` of two strings joins them.
+- **A comparison calls no function.** `Equatable` and `Orderable` declare none, and an instance of
+  either is **[Planned]**.
 
 - **A named requirement binds its instance.** In `def total(S, s: S) => Int requires a: Area(S)`,
   `a` is the instance each call passes, and `a::area(s)` calls its `area`
@@ -3555,9 +3564,12 @@ impl forall (T) Area(Two(T)) requires a: Area(T):
   definition that summons, is resolved at its own types to the one visible instance that accepts
   them, and a call reads its function from that instance. An instance is declared at a module's
   top level.
-- An instance of an operator's trait is **[Planned]**. Each operator trait gains a function its
-  operator calls, `add` for `+`, so that `impl Addable(Money, Money, Output=Money)` defines `+` on
-  `Money`.
+- **An instance of an arithmetic operator's trait defines the operator.**
+  `impl Addable(Money, Money, Output=Money)` defines `add`, which `+` on two `Money` values calls,
+  and an instance may be over two types, `impl Addable(Money, Int, Output=Money)`. A `**`'s
+  exponent is a non-negative `Int` whichever instance answers it
+  ([3.3 Arithmetic and logical operators](#33-arithmetic-and-logical-operators)), so an instance
+  of `Exponentiable` names `Int` as its second operand.
 
 #### Traits and instances across modules
 
