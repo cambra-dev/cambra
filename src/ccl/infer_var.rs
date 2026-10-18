@@ -247,7 +247,9 @@ impl Bound {
     /// *post*-discharge context and cannot mention the discharged binders
     /// (debug-asserted). Falling to the identity *wholesale* would silently
     /// drop the rename part of a mixed composite, mis-naming binders in the
-    /// rendered content.
+    /// rendered content. An elimination the holder side performs does have an
+    /// inverse on what the content can say of the holder: its read-back
+    /// (`subst::Elim::ReadBack`).
     pub fn render_subst(&self) -> subst::Subst {
         if self.self_subst.is_id() {
             return self.ty_subst.clone();
@@ -282,7 +284,12 @@ impl Bound {
                          the untransported binders (post-discharge context)",
                     );
                 }
-                inv
+                // **An elimination's inverse is its read-back.** The content is in the frame
+                // the holder side eliminates into, where a witness the holder's function binds
+                // is `σᵢ(𝑐)`; in the holder's own frame it is the binder. `𝑐` is spelled in the
+                // content's frame, so the read-back goes ahead of the renames' inverse, which
+                // respells it as it respells the content.
+                subst::Subst::then(&self.self_subst.read_backs(), &inv)
             }
         };
         subst::Subst::then(&self.ty_subst, &inv)
@@ -589,7 +596,15 @@ pub(crate) trait TelescopeWalk {
 /// [`crate::ccl::TypedExprNode::Source`] node, so it is not a term variable and
 /// [`subst::type_free_vars`] does not report it.
 pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet<Name> {
-    subst::scope_gaps(&bound.ty, |n| {
+    // A witness the holder side eliminates is read back as the holder's binder, so the term it
+    // was projected from is not one of the bound's free names.
+    let read_back = bound.self_subst.read_backs();
+    let ty = if read_back.is_id() {
+        std::borrow::Cow::Borrowed(&bound.ty)
+    } else {
+        std::borrow::Cow::Owned(read_back.apply_type(&bound.ty))
+    };
+    subst::scope_gaps(&ty, |n| {
         telescope.contains(n)
             || bound.ty_subst.binders().any(|b| b == n)
             || bound.self_subst.binders().any(|b| b == n)
@@ -616,6 +631,21 @@ pub(crate) fn enforce_bound_scope(holder: &InferVar, side: &'static str, bound: 
     // the edge substitutions' domains, and a program source is not among them
     // because a source reference is a [`crate::ccl::TypedExprNode::Source`]
     // node rather than a variable.
+    // The witness half of the same invariant: a reference to a witness is free only on a
+    // variable placed under witness binders, since anywhere else it has left its binder.
+    if cfg!(debug_assertions) {
+        let free: Vec<_> = crate::ccl::ty::free_witness_refs(&bound.ty, &[])
+            .into_iter()
+            .filter(|w| !bound.ty_subst.maps_witness(w) && !holder.may_name_witness(w))
+            .collect();
+        assert!(
+            free.is_empty(),
+            "a bound naming witness(es) {free:?} free was recorded on ?{}, which no binder of \
+             theirs scopes over: `{}` ({side})",
+            holder.uid,
+            bound.ty,
+        );
+    }
     let gaps = bound_scope_gaps(&holder.telescope, bound);
     if let Some(open) = gaps.iter().next() {
         panic!(
@@ -683,15 +713,49 @@ pub struct InferVar {
     /// Whether the variable **names one data domain**: it was minted for a
     /// [`Type::SharedHole`] written as a function annotation's domain, which is how lowering
     /// claims that the positions annotated with that id are one domain. A data domain is
-    /// invariant, so the claim is an equation, and an invariant domain edge between this
-    /// variable and a domain is drawn in both directions
-    /// ([`domains_equate`](crate::ccl::infer::solver::constrain::domains_equate)).
-    ///
-    /// An unmarked variable at a domain may receive several domains deliberately — a
-    /// conditional collection's arms, a domain-generic consumer's parameter — so its edges
-    /// stay one-way. Set once, at minting, so the edge an equation takes does not depend on
-    /// when it is drawn.
+    /// invariant, so the claim is an equation: a function edge whose domain is this variable
+    /// draws its domain in both directions even while neither kind is known
+    /// (`constrain_go`'s invariant-domain arm). Set once, at minting, so the edge an equation
+    /// takes does not depend on when it is drawn.
     named_domain: std::cell::Cell<bool>,
+    /// **The witness binders this variable sits under**: the functions it was minted as a part
+    /// of, by their kind, or the one it copies was.
+    ///
+    /// A part of a function can name that function's witnesses free, and nothing else can —
+    /// anywhere else the reference would have left its binder — so a substitution's witness half
+    /// suspends only on a variable some scope here may bind the mapped witness for
+    /// ([`subst::Subst`]). Placed where the variable is minted, like the
+    /// [`telescope`](Self::telescope) the name half reads; [`enforce_bound_scope`] rejects a
+    /// bound naming a witness free that no scope here binds.
+    witness_scopes: RefCell<Vec<WitnessScope>>,
+}
+
+/// A function a variable is a part of, as what binds its witnesses: a funkind variable, whose
+/// binders exist once its arity does, or a written sum's binders.
+#[derive(Clone)]
+pub enum WitnessScope {
+    Kind(Rc<crate::ccl::ty::FunKindVar>),
+    Binders(Vec<crate::ccl::ty::WitnessId>),
+}
+
+impl WitnessScope {
+    /// The scope of a function of kind `kind`, where its kind may bind witnesses.
+    pub fn of_kind(kind: &crate::ccl::ty::FunKind) -> Option<Self> {
+        match kind {
+            crate::ccl::ty::FunKind::Var(k) => Some(WitnessScope::Kind(Rc::clone(k))),
+            crate::ccl::ty::FunKind::Data(Some(ws)) => {
+                Some(WitnessScope::Binders(ws.iter().map(|w| *w.id()).collect()))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn may_bind(&self, w: &crate::ccl::ty::WitnessId) -> bool {
+        match self {
+            WitnessScope::Kind(k) => k.may_bind(w),
+            WitnessScope::Binders(ws) => ws.contains(w),
+        }
+    }
 }
 
 thread_local! {
@@ -718,6 +782,52 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+thread_local! {
+    /// The memberships recorded on suspensions during the active inference run on this
+    /// thread, with the lifetime of [`ACTIVE_ARENA`] ([`SuspendedMembership`]).
+    static SUSPENDED_MEMBERSHIPS: RefCell<Vec<SuspendedMembership>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// A membership recorded on a **suspension** `𝑣‹𝑠›`: a fact about `𝑣` under `𝑠`, which no tree
+/// position holds, so the coalesce pass decides it on the suspension itself, under the witness
+/// context of the edge that recorded it (`src/ccl/design/type-inference.md`, "Membership is
+/// decided at materialization").
+pub(crate) struct SuspendedMembership {
+    pub var: Rc<InferVar>,
+    pub kind: crate::ccl::ty::TypeKind,
+    pub witnesses: crate::ccl::ty::WitnessContext,
+    pub origin: Option<Origin>,
+}
+
+/// Record a membership on a suspension, for the coalesce pass to decide.
+pub(crate) fn record_suspended_membership(m: SuspendedMembership) {
+    SUSPENDED_MEMBERSHIPS.with(|ms| ms.borrow_mut().push(m));
+}
+
+/// The memberships recorded on the suspension `original`, for an instantiation to record on
+/// its copy: a copy of a suspension stands at no tree position either, so the coalesce pass
+/// decides its kinds as it decides the original's.
+pub(crate) fn suspended_memberships_of(original: &InferVar) -> Vec<SuspendedMembership> {
+    SUSPENDED_MEMBERSHIPS.with(|ms| {
+        ms.borrow()
+            .iter()
+            .filter(|m| m.var.uid == original.uid)
+            .map(|m| SuspendedMembership {
+                var: Rc::clone(&m.var),
+                kind: m.kind.clone(),
+                witnesses: m.witnesses.clone(),
+                origin: m.origin,
+            })
+            .collect()
+    })
+}
+
+/// The memberships recorded on suspensions since [`arena_enter`].
+pub(crate) fn take_suspended_memberships() -> Vec<SuspendedMembership> {
+    SUSPENDED_MEMBERSHIPS.with(|ms| std::mem::take(&mut *ms.borrow_mut()))
+}
+
 /// Begin capturing every [`InferVar::fresh`] minted on this thread.
 ///
 /// Inference is non-reentrant: at most one arena may be active per thread at a
@@ -736,6 +846,7 @@ pub(crate) fn arena_enter() {
         *slot = Some(Vec::new());
     });
     BARRIER_ARENA.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    SUSPENDED_MEMBERSHIPS.with(|ms| ms.borrow_mut().clear());
 }
 
 /// Stop capturing and return every variable minted since [`arena_enter`], so
@@ -827,6 +938,7 @@ impl InferVar {
             watches: RefCell::new(Vec::new()),
             suspensions: RefCell::new(Vec::new()),
             named_domain: std::cell::Cell::new(false),
+            witness_scopes: RefCell::new(Vec::new()),
         });
         ACTIVE_ARENA.with(|slot| {
             if let Some(vars) = slot.borrow_mut().as_mut() {
@@ -846,6 +958,90 @@ impl InferVar {
         self.level.get()
     }
 
+    /// Whether a witness binder this variable sits under may bind `w`.
+    pub fn may_name_witness(&self, w: &crate::ccl::ty::WitnessId) -> bool {
+        self.witness_scopes.borrow().iter().any(|s| s.may_bind(w))
+    }
+
+    /// The funkind variables whose functions this variable is a part of.
+    pub fn witness_scope_kinds(&self) -> Vec<Rc<crate::ccl::ty::FunKindVar>> {
+        self.witness_scopes
+            .borrow()
+            .iter()
+            .filter_map(|s| match s {
+                WitnessScope::Kind(k) => Some(Rc::clone(k)),
+                WitnessScope::Binders(_) => None,
+            })
+            .collect()
+    }
+
+    /// Place a freshly minted variable under `scope`'s binders: it is a part of that function.
+    pub fn place_under(&self, scope: WitnessScope) {
+        self.witness_scopes.borrow_mut().push(scope);
+    }
+
+    /// Place every variable occurring in `ty` under the binders of a function of kind `kind`:
+    /// `ty` is a part of that function, as built by a pass that copies such a function's type
+    /// (an instantiation, an annotation's normalization).
+    pub fn place_parts_under(ty: &Type, kind: &crate::ccl::ty::FunKind) {
+        let Some(scope) = WitnessScope::of_kind(kind) else {
+            return;
+        };
+        fn go(ty: &Type, scope: &WitnessScope) {
+            if let Type::Infer(v) = ty {
+                v.place_under(scope.clone());
+            }
+            ty.walk_children(|c| go(c, scope));
+        }
+        go(ty, &scope);
+    }
+
+    /// Carry `original`'s placement onto `self`, a copy of it at the same position (a proxy,
+    /// a suspension).
+    pub fn inherit_witness_placement(&self, original: &InferVar) {
+        let scopes = original.witness_scopes.borrow().clone();
+        self.witness_scopes.borrow_mut().extend(scopes);
+    }
+
+    /// [`Self::inherit_witness_placement`] keeping only the scopes `keep` accepts: a copy under
+    /// a substitution that discharges a scope's binders has left that scope.
+    pub fn inherit_witness_placement_where(
+        &self,
+        original: &InferVar,
+        keep: impl Fn(&WitnessScope) -> bool,
+    ) {
+        let scopes: Vec<WitnessScope> = original
+            .witness_scopes
+            .borrow()
+            .iter()
+            .filter(|s| keep(s))
+            .cloned()
+            .collect();
+        self.witness_scopes.borrow_mut().extend(scopes);
+    }
+
+    /// [`Self::inherit_witness_placement`] for a copy whose kinds and witnesses were renamed
+    /// (a freshened copy): each scope through `kind` and `witness`.
+    pub fn inherit_witness_placement_renamed(
+        &self,
+        original: &InferVar,
+        kind: impl Fn(&Rc<crate::ccl::ty::FunKindVar>) -> Rc<crate::ccl::ty::FunKindVar>,
+        witness: impl Fn(&crate::ccl::ty::WitnessId) -> crate::ccl::ty::WitnessId,
+    ) {
+        let scopes: Vec<WitnessScope> = original
+            .witness_scopes
+            .borrow()
+            .iter()
+            .map(|s| match s {
+                WitnessScope::Kind(k) => WitnessScope::Kind(kind(k)),
+                WitnessScope::Binders(ws) => {
+                    WitnessScope::Binders(ws.iter().map(&witness).collect())
+                }
+            })
+            .collect();
+        self.witness_scopes.borrow_mut().extend(scopes);
+    }
+
     /// Whether the variable names one data domain ([`InferVar::named_domain`]).
     pub fn names_domain(&self) -> bool {
         self.named_domain.get()
@@ -855,7 +1051,6 @@ impl InferVar {
     pub(crate) fn mark_named_domain(&self) {
         self.named_domain.set(true);
     }
-
     /// Move the variable down to `level` if it sits above it. A monomorphic binding
     /// claims its right-hand side's variables this way
     /// ([`lower_levels`](crate::ccl::infer::solver::constrain::lower_levels)).

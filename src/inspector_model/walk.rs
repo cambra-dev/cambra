@@ -52,7 +52,7 @@ pub(super) fn predicate_children(expr: &Expr) -> Vec<&Expr> {
     // `collect_tree_ids` folds over — one function, so the shipped node table and
     // the shipped links cannot drift onto different id domains.
     let mut roots: Vec<&Expr> = Vec::new();
-    expr.walk_type_slots(|t| t.walk_quoted_terms(&mut |term| roots.push(term)));
+    expr.walk_quoted_terms(&mut |term| roots.push(term));
     let mut seen: HashSet<NodeId> = HashSet::new();
     roots.retain(|p| seen.insert(p.node_id()));
     roots
@@ -83,7 +83,7 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
             trait_, function, ..
         } => format!("TraitFn({trait_}::{function})"),
         LoadFrom(n) => format!("LoadFrom({n})"),
-        Realize(_) => "Realize".to_string(),
+        Realize { .. } => "Realize".to_string(),
         Transact { .. } => "Transact".to_string(),
         LetRec { .. } => "LetRec".to_string(),
         DefGroup { .. } => "DefGroup".to_string(),

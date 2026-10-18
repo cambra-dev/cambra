@@ -185,6 +185,113 @@ pub trait ScopeEnv {
     fn is_skip_smt(&self) -> bool;
 }
 
+/// The binders in scope where a query runs, each at the type the query assumes: the type it is
+/// bound at, and for a transparent `let` its definition as well ([`defined_as`]). The environment
+/// a pass walking a typed tree builds — inlining, and materialization deciding a membership — so a
+/// refinement inference discharged with a binder's facts is decided there with the same facts.
+///
+/// An opaque binder's type is kept past its scope: a type lifted past the binder keeps its name.
+/// A binder a walk does not track (a loop target, a pattern binder, a `letrec` group) contributes
+/// no assumption, which only weakens a query.
+#[derive(Default)]
+pub struct BinderScope {
+    frames: Vec<Frame>,
+    opaque_binders: HashMap<Name, Type>,
+}
+
+/// One binder in a [`BinderScope`]: the type it is bound at, and for a transparent `let` the
+/// definition that refines it. The refinement is computed when a query first reads the binder:
+/// most binders a walk enters are never queried, and [`defined_as`] normalizes the definition.
+struct Frame {
+    name: Name,
+    ty: Type,
+    definition: Option<crate::ccl::Expr>,
+    assumed: std::cell::OnceCell<Type>,
+}
+
+impl Frame {
+    /// The type a query assumes for the binder.
+    fn assumed(&self) -> &Type {
+        match &self.definition {
+            None => &self.ty,
+            Some(definition) => self
+                .assumed
+                .get_or_init(|| defined_as(self.ty.clone(), definition)),
+        }
+    }
+}
+
+impl BinderScope {
+    /// Enter `name`, bound at `ty`.
+    pub fn push(&mut self, name: &Name, ty: Type) {
+        self.frames.push(Frame {
+            name: name.clone(),
+            ty,
+            definition: None,
+            assumed: std::cell::OnceCell::new(),
+        });
+    }
+
+    /// Enter a `let`'s binder: at its definition where it is transparent, and recorded past its
+    /// scope where it is opaque.
+    pub fn push_let(&mut self, binding: &crate::ccl::TypedBinding, definition: &crate::ccl::Expr) {
+        match binding.transparency {
+            crate::ccl::BindingTransparency::Transparent => self.frames.push(Frame {
+                name: binding.name.clone(),
+                ty: binding.ty.clone(),
+                definition: Some(definition.clone_preserving_ids()),
+                assumed: std::cell::OnceCell::new(),
+            }),
+            crate::ccl::BindingTransparency::Opaque => {
+                self.opaque_binders
+                    .insert(binding.name.clone(), binding.ty.clone());
+                self.push(&binding.name, binding.ty.clone());
+            }
+        }
+    }
+
+    /// Leave the innermost binder.
+    pub fn pop(&mut self) {
+        self.frames.pop();
+    }
+
+    /// `f` under `name`, bound at `ty`.
+    pub fn under<R>(&mut self, name: &Name, ty: Type, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.push(name, ty);
+        let out = f(self);
+        self.pop();
+        out
+    }
+
+    /// `f` under a `let`'s binder ([`Self::push_let`]).
+    pub fn under_let<R>(
+        &mut self,
+        binding: &crate::ccl::TypedBinding,
+        definition: &crate::ccl::Expr,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.push_let(binding, definition);
+        let out = f(self);
+        self.pop();
+        out
+    }
+}
+
+impl ScopeEnv for BinderScope {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        self.frames
+            .iter()
+            .rev()
+            .find(|f| &f.name == name)
+            .map(Frame::assumed)
+            .or_else(|| self.opaque_binders.get(name))
+            .cloned()
+    }
+    fn is_skip_smt(&self) -> bool {
+        false
+    }
+}
+
 /// The empty scope: no name is bound, so every free name in a query is
 /// universally quantified with nothing assumed about it.
 pub struct NoScope;
