@@ -273,25 +273,19 @@ fn a_filtered_comprehension_drives_a_mutation_loop() {
     );
 }
 
-/// A filter over a same-domain conditional source is refused. It predates the dependent-sum
-/// work and involves no `box`, `Σ` or witness; it resembles `sums.rs`'s
-/// `a_filter_over_a_boxed_source_is_applied` without sharing its cause.
-///
-/// The filter's predicate holds its own copy of the source, so it holds the `Case`. Realization
-/// substitutes arm 𝑖 for a predicate's copy of a conditional source in leg 𝑖, finding the copy by
-/// the witness it names, and a same-domain unboxed conditional names none. Planning then lifts the
-/// predicate and realizes the copy with it, and the predicate applies the realized union at the
-/// element's index, which planning refuses (`src/ccl/design/optimization.md`, "Planning a lifted
-/// term"). The per-leg substitution would serve here too; what is missing is a way to find the
-/// copy without a witness.
-#[test]
-fn a_filter_over_a_same_domain_conditional_is_refused() {
-    check_compile_error(
-        indoc! {r"
-            c: Bool = True
-            sum([y for y in ([1, 5] if c else [3, 4]) if y > 2])"},
-        "applies a union of collections at its element",
-    );
+/// A filter over a same-domain conditional source is applied. The source is bound ahead of the
+/// comprehension and realized in its binding, so the filter's predicate reads the binder rather
+/// than holding a copy of the conditional, and restricts the realized union like any collection.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {r"
+    c: Bool = True
+    sum([y for y in ([1, 5] if c else [3, 4]) if y > 2])"}, Value::Int(5))]
+#[case(indoc! {r"
+    c: Bool = False
+    sum([y for y in ([1, 5] if c else [3, 4]) if y > 2])"}, Value::Int(7))]
+fn a_filter_over_a_same_domain_conditional_is_applied(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
 }
 
 /// A filter over a `++` source restricts the positional union of its operands' keys: bound ahead
@@ -334,16 +328,40 @@ fn a_filtered_inner_comprehension_over_the_outer_row_keeps_its_filter(
     check_scalar(program, Value::Int(total));
 }
 
-/// A filtered inner comprehension over a **projection of the outer row** does not compile.
-/// The filter reads the row while the collection it narrows is the projection, and no type
-/// relates the two, so the post-elimination type check rejects the program. Pinned as it
-/// fails; it answers 9.
+/// A filtered inner comprehension over a **projection of the outer row** keeps its filter. The
+/// filter reads the row only through the projection, so the chain the curry reduces to,
+/// `.xs ≫ map(id)`, states the narrowing on `map` over the row carried through `.xs`, and
+/// planning materializes it as a per-group filter.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn a_filtered_inner_comprehension_over_a_projected_row_does_not_compile() {
+#[case::bare_element(
+    "sum([sum([v for v in r.xs if v > 1]) for r in [(xs=[1, 2]), (xs=[3, 4])]])",
+    9
+)]
+#[case::element_function(
+    "sum([sum([v * 2 for v in r.xs if v > 1]) for r in [(xs=[1, 2]), (xs=[3, 4])]])",
+    18
+)]
+#[case::max(
+    "sum([max([v for v in r.xs if v > 1]) for r in [(xs=[1, 2]), (xs=[3, 4])]])",
+    6
+)]
+fn a_filtered_inner_comprehension_over_a_projected_row_keeps_its_filter(
+    #[case] program: &str,
+    #[case] total: i64,
+) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// A filter reading the outer row other than through the projection it narrows has no
+/// spelling as a filter on the projected values: the values alone do not say `r.lim`. It is
+/// refused by name rather than compiled without its filter.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_filter_reading_the_row_beside_its_projection_is_refused() {
     check_compile_error(
-        "sum([sum([v for v in r.xs if v > 1]) for r in [(xs=[1, 2]), (xs=[3, 4])]])",
-        "post-lambda-elim produced an invalid tree",
+        "sum([sum([v for v in r.xs if v > r.lim]) for r in [(xs=[1, 2], lim=1), (xs=[3, 4], lim=3)]])",
+        "a filter on an inner collection that planning cannot materialize",
     );
 }
 

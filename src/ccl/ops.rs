@@ -351,9 +351,9 @@ pub enum Builtin {
     /// TODO(witness-kind-var): what this term asserts is the witness *kind*,
     /// `SubtypesOf` against [`TypeKind::UIntRanges`](crate::ccl::ty::TypeKind::UIntRanges),
     /// and it exists because [`TypeKind`](crate::ccl::ty::TypeKind) has no variable to
-    /// leave that open. The absence is justified on
-    /// [`TypeKind::refuses`](crate::ccl::ty::TypeKind::refuses) by a premise the empty
-    /// literal breaks: membership is decidable from the classified type, so the only thing
+    /// leave that open. The absence is justified by the membership check at materialization
+    /// (`constrain::admits_resolved`) on a premise the empty literal breaks: membership is
+    /// decidable from the classified type, so the only thing
     /// inference can be missing is that type. `[]` has a classified type, and its kind is
     /// therefore decided as `UIntRanges`, while zero rows witness no kind at all. A
     /// type-kind variable retires this term.

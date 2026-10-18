@@ -138,6 +138,9 @@ pub(super) struct CoalesceCtx {
     /// the same name (the same shadowing discipline emission's `ScopeStack`
     /// applies).
     scope: Vec<ScopeEntry>,
+    /// The term binders in scope, at the types a refinement query assumes of them: what a
+    /// membership this walk decides reads ([`decide_memberships`]).
+    binders: crate::ccl::infer::solver::smt::BinderScope,
     /// The generalized bindings emission bound at their exact annotation
     /// ([`LetScheme::Generalized`](super::typing::LetScheme::Generalized)), whose
     /// specializations [`specialize_use`] pins one way.
@@ -504,6 +507,8 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         // spelling: the stored positional form and the in-flight named form are
         // one occurrence read at two moments.
         (Type::WitnessRef(_), Type::WitnessRef(_)) => true,
+        // A projection agrees with one quoting an equal term, by normal form.
+        (Type::WitnessProjection(a), Type::WitnessProjection(b)) => a == b,
         _ => false,
     }
 }
@@ -1411,6 +1416,7 @@ pub(super) fn coalesce_pass(
 ) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
         scope: Vec::new(),
+        binders: Default::default(),
         bound_at_annotation,
         current_node: expr.node_id(),
         failed_type_vars: HashMap::new(),
@@ -1701,14 +1707,58 @@ fn resolve_binder_slot(
     level: Level,
     ctx: &mut CoalesceCtx,
 ) {
-    match resolve_var_type(slot) {
+    let (resolved, pending) =
+        crate::ccl::infer::solver::coalesce::collecting_memberships(|| resolve_var_type(slot));
+    let label = label();
+    match resolved {
         Ok(ty) => *slot = ty,
         Err(err) => {
-            let label = label();
-            ctx.push_type_error(slot, map_coalesce_err(err, &label), label);
+            ctx.push_type_error(slot, map_coalesce_err(err, &label), label.clone());
         }
     }
     coalesce_type_predicates(slot, level, ctx);
+    decide_memberships(pending, level, ctx, &label);
+}
+
+/// Decide the memberships a materialization collected, now that the types they read are types
+/// with their predicates coalesced, under the binders in scope here.
+fn decide_memberships(
+    pending: Vec<crate::ccl::infer::solver::coalesce::PendingMembership>,
+    level: Level,
+    ctx: &mut CoalesceCtx,
+    label: &str,
+) {
+    for mut m in pending {
+        coalesce_type_predicates(&mut m.found, level, ctx);
+        let admitted = crate::ccl::infer::solver::constrain::admits_resolved(
+            &m.found,
+            &m.kind,
+            &m.witnesses,
+            &ResolvingScope(&ctx.binders),
+        );
+        if !admitted {
+            let err = CoalesceError::KindMismatch {
+                resolved: Box::new(m.found.clone()),
+                type_kind: m.kind,
+            };
+            ctx.push_type_error(&m.found, map_coalesce_err(err, label), label.to_string());
+        }
+    }
+}
+
+/// The coalesce walk's binders as a query reads them: a binder whose type is still an inference
+/// variable (a lambda's parameter, resolved from the lambda's domain after its body) answers
+/// with what that variable resolves to.
+struct ResolvingScope<'a>(&'a crate::ccl::infer::solver::smt::BinderScope);
+
+impl crate::ccl::infer::solver::smt::ScopeEnv for ResolvingScope<'_> {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        let ty = self.0.binder_type(name)?;
+        Some(resolve_var_type(&ty).unwrap_or(ty))
+    }
+    fn is_skip_smt(&self) -> bool {
+        false
+    }
 }
 
 /// Resolve expression and binder types while specializing generalized uses.
@@ -1803,7 +1853,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         // Born after inference, so nothing here resolves — but its child is an ordinary
         // term and still needs the walk.
-        TypedExprNode::Realize(value) => coalesce_node(value, level, ctx),
+        TypedExprNode::Realize { value, .. } => coalesce_node(value, level, ctx),
         TypedExprNode::BinOp { left, right, .. } => {
             coalesce_node(left, level, ctx);
             coalesce_node(right, level, ctx);
@@ -1820,7 +1870,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // The kind is still a variable here — the node's type is coalesced in the tail,
             // below — so what this function's binders correspond to is readable, and it is
             // what every type inside its body is written against.
+            ctx.binders.push(&param_name, param.ty.clone());
             with_shadows(ctx, [param_name], |ctx| coalesce_node(body, level, ctx));
+            ctx.binders.pop();
             ctx.lambda_params.pop();
             // `param.ty` is resolved from the lambda's coalesced domain in
             // the end-of-function block (it can't be coalesced standalone:
@@ -1866,7 +1918,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 ctx,
             );
             let binding_name = binding.name.clone();
+            ctx.binders.push_let(binding, bound_expr);
             with_shadows(ctx, [binding_name], |ctx| coalesce_node(body, level, ctx));
+            ctx.binders.pop();
         }
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")
@@ -1884,7 +1938,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             let name = binding.name.clone();
             resolve_binder_slot(&mut binding.ty, || format!("mutable `{name}`"), level, ctx);
             let binding_name = binding.name.clone();
+            ctx.binders.push(&binding_name, binding.ty.clone());
             with_shadows(ctx, [binding_name], |ctx| coalesce_node(body, level, ctx));
+            ctx.binders.pop();
         }
         TypedExprNode::List(elts)
         | TypedExprNode::Tuple(elts)
@@ -2152,7 +2208,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         return;
     }
     let label = symbolic(expr);
-    match resolve_var_type(&expr.ty) {
+    let (resolved, pending) =
+        crate::ccl::infer::solver::coalesce::collecting_memberships(|| resolve_var_type(&expr.ty));
+    match resolved {
         Ok(ty) => {
             // Log the graph read for the ordering-invariant check. The
             // var-laden `expr.ty` shares the live `InferVar`s, so the
@@ -2166,7 +2224,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         Err(err) => {
             let ty = expr.ty.clone();
-            ctx.push_type_error(&ty, map_coalesce_err(err, &label), label)
+            ctx.push_type_error(&ty, map_coalesce_err(err, &label), label.clone())
         }
     }
 
@@ -2287,6 +2345,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_type_predicates(target, level, ctx);
         }
     }
+    decide_memberships(pending, level, ctx, &label);
 }
 
 /// Coalesce refinement predicates embedded anywhere in `ty` (see the call
@@ -2361,6 +2420,16 @@ fn coalesce_type_predicates_go(
             // The base first: the binder below is bound to it, so it has to be the
             // materialized one.
             coalesce_type_predicates_go(inner, level, ctx, scope);
+            // A base that materialized refined (a determined projection's candidate is a
+            // filtered domain) contributes its refinements to this position's one set.
+            if matches!(**inner, Type::Refinement(..)) {
+                let Type::Refinement(base, own) = std::mem::replace(&mut **inner, Type::Hole)
+                else {
+                    unreachable!("matched a refinement above")
+                };
+                **inner = *base;
+                *refinements = own.union(refinements);
+            }
             // A handle clone, so `ctx` stays freely borrowable for the rebuild —
             // which re-enters this same memo through `coalesce_node` →
             // `coalesce_type_predicates`.
@@ -2427,12 +2496,29 @@ fn coalesce_type_predicates_go(
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates_go(t, level, ctx, scope)),
         Type::History { function, .. } => coalesce_type_predicates_go(function, level, ctx, scope),
+        // A projection quotes a term as a predicate does, so its slots resolve the same way
+        // and it leaves closed against the functions entered.
+        Type::WitnessProjection(p) => {
+            let memo = ctx.pred_memo.clone();
+            memo.rebuild(p, &(), |term| {
+                coalesce_node(term, level, ctx);
+                true
+            });
+            // A determined witness is its one candidate, the spelling `ty::unboxed_type` gives.
+            if let Some(sole) = p
+                .witness()
+                .and_then(crate::ccl::ty::Witness::sole_candidate)
+            {
+                *ty = sole;
+                return;
+            }
+            *p = scope.close_projection(p);
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::WitnessRef(_)
-        | Type::WitnessProjection(_)
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)

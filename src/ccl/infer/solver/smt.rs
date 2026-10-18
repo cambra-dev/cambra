@@ -185,6 +185,84 @@ pub trait ScopeEnv {
     fn is_skip_smt(&self) -> bool;
 }
 
+/// The binders in scope where a query runs, each at the type the query assumes: the type it is
+/// bound at, and for a transparent `let` its definition as well ([`defined_as`]). The environment
+/// a pass walking a typed tree builds — inlining, and materialization deciding a membership — so a
+/// refinement inference discharged with a binder's facts is decided there with the same facts.
+///
+/// An opaque binder's type is kept past its scope: a type lifted past the binder keeps its name.
+/// A binder a walk does not track (a loop target, a pattern binder, a `letrec` group) contributes
+/// no assumption, which only weakens a query.
+#[derive(Default)]
+pub struct BinderScope {
+    frames: Vec<(Name, Type)>,
+    opaque_binders: HashMap<Name, Type>,
+}
+
+impl BinderScope {
+    /// Enter `name`, bound at `ty`.
+    pub fn push(&mut self, name: &Name, ty: Type) {
+        self.frames.push((name.clone(), ty));
+    }
+
+    /// Enter a `let`'s binder: at its definition where it is transparent, and recorded past its
+    /// scope where it is opaque.
+    pub fn push_let(&mut self, binding: &crate::ccl::TypedBinding, definition: &crate::ccl::Expr) {
+        let assumed = match binding.transparency {
+            crate::ccl::BindingTransparency::Transparent => {
+                defined_as(binding.ty.clone(), definition)
+            }
+            crate::ccl::BindingTransparency::Opaque => {
+                self.opaque_binders
+                    .insert(binding.name.clone(), binding.ty.clone());
+                binding.ty.clone()
+            }
+        };
+        self.push(&binding.name, assumed);
+    }
+
+    /// Leave the innermost binder.
+    pub fn pop(&mut self) {
+        self.frames.pop();
+    }
+
+    /// `f` under `name`, bound at `ty`.
+    pub fn under<R>(&mut self, name: &Name, ty: Type, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.push(name, ty);
+        let out = f(self);
+        self.pop();
+        out
+    }
+
+    /// `f` under a `let`'s binder ([`Self::push_let`]).
+    pub fn under_let<R>(
+        &mut self,
+        binding: &crate::ccl::TypedBinding,
+        definition: &crate::ccl::Expr,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.push_let(binding, definition);
+        let out = f(self);
+        self.pop();
+        out
+    }
+}
+
+impl ScopeEnv for BinderScope {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        self.frames
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, ty)| ty)
+            .or_else(|| self.opaque_binders.get(name))
+            .cloned()
+    }
+    fn is_skip_smt(&self) -> bool {
+        false
+    }
+}
+
 /// The empty scope: no name is bound, so every free name in a query is
 /// universally quantified with nothing assumed about it.
 pub struct NoScope;

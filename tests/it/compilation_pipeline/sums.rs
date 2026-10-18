@@ -433,31 +433,108 @@ fn a_loop_over_a_sum_ranges_over_its_keys(#[case] code: &str, #[case] expected: 
     check_scalar(code, expected);
 }
 
-/// **A loop writing a mutable variable over a conditional is refused**, written in place or
-/// bound by a `let`. Realization copies a conditional into each consumer, and the copy a
-/// projection quotes is one it does not rewrite. A loop that only feeds a sink compiles.
+/// **A loop writing a mutable variable over a conditional ranges over the chosen arm's keys**,
+/// the conditional written in place, bound by a `let`, returned by a `def`, or chosen per row
+/// of an enclosing loop. The conditional is realized where it stands and the loop reads it
+/// through `unbox` (`src/ccl/design/collections.md`, "A `for` loop over a sum"). Chosen per row,
+/// the realized conditional is lambda-eliminated point-free, and the projection its consumers'
+/// types quote reads back to it by normal form (`src/ccl/design/type-inference.md`, "Predicates
+/// are compared by normal form").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case(indoc! {r"
+#[case::in_place(indoc! {r"
     c: Bool = True
     total := 0
     for x in (box([1, 2]) if c else box([1, 2, 3])):
         total += x
     total
-"})]
-#[case(indoc! {r"
-    c: Bool = True
+"}, Value::Int(3))]
+#[case::let_bound(indoc! {r"
+    c: Bool = False
     xs = box([1, 2]) if c else box([1, 2, 3])
     total := 0
     for x in xs:
         total += x
     total
-"})]
-fn a_loop_writing_over_a_conditional_is_refused(#[case] code: &str) {
-    check_compile_error(
-        code,
-        "a `for` loop writing a mutable variable over a conditional collection is not compiled yet",
-    );
+"}, Value::Int(6))]
+#[case::returned_by_a_def(indoc! {r"
+    def pick(c: Bool):
+        box([1, 2]) if c else box([1, 2, 3])
+    c: Bool = False
+    total := 0
+    for x in pick(c):
+        total += x
+    total
+"}, Value::Int(6))]
+#[case::two_loops_over_one(indoc! {r"
+    c: Bool = False
+    xs = box([1, 2]) if c else box([1, 2, 3])
+    total := 0
+    for x in xs:
+        total += x
+    n := 0
+    for y in xs:
+        n += 1
+    total * 10 + n
+"}, Value::Int(63))]
+#[case::nested(indoc! {r"
+    c: Bool = True
+    total := 0
+    for x in (box([1]) if c else box([1, 2])):
+        for y in (box([10]) if c else box([10, 20])):
+            total += x * y
+    total
+"}, Value::Int(10))]
+#[case::chosen_per_row(indoc! {r"
+    total := 0
+    for i in [1, 2]:
+        for q in (box([1, 2]) if i > 1 else box([3, 4, 5])):
+            total += q
+    total
+"}, Value::Int(15))]
+#[case::chosen_per_row_among_three(indoc! {r"
+    total := 0
+    for i in [1, 2, 3]:
+        for q in (box([1]) if i == 1 else box([1, 2]) if i == 2 else box([1, 2, 3])):
+            total += q * i
+    total
+"}, Value::Int(25))]
+fn a_loop_writing_over_a_conditional_ranges_over_the_chosen_keys(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+/// **A loop feeding a sink over a conditional chosen per row** is keyed by the row and the chosen
+/// arm's keys. The realized conditional is bound as a collection over the enclosing positions,
+/// a value `Case` fanned out over its input, and planning drives it with an `iterate` over those
+/// positions (`crate::ccl::planning` `is_iteration_bearing`).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::boxed(
+    indoc! {r#"
+        out = test_sink()
+        for i in [1, 2]:
+            for q in (box([1, 2]) if i > 1 else box([3, 4, 5])):
+                out << q * 10
+    "#},
+    "[(_0: 0, _1: 0) -> 30, (_0: 0, _1: 1) -> 40, (_0: 0, _1: 2) -> 50, (_0: 1, _1: 0) -> 10, (_0: 1, _1: 1) -> 20]"
+)]
+#[case::same_domain(
+    indoc! {r#"
+        out = test_sink()
+        for i in [1, 2]:
+            for q in ([1, 2] if i > 1 else [3, 4]):
+                out << q
+    "#},
+    "[(_0: 0, _1: 0) -> 3, (_0: 0, _1: 1) -> 4, (_0: 1, _1: 0) -> 1, (_0: 1, _1: 1) -> 2]"
+)]
+fn a_feed_over_a_conditional_chosen_per_row_is_keyed_by_its_arm(
+    #[case] code: &str,
+    #[case] expected: &str,
+) {
+    check_sink(code, expected);
 }
 
 /// Not yet compiled: jagged rows summed inside a `def`. The same expression at top level
@@ -476,4 +553,68 @@ fn a_def_body_summing_jagged_rows_does_not_compile() {
         "},
         Value::Int(6),
     );
+}
+
+/// **A comprehension over a boxed collection is not boxed** (`docs/chl-spec.md`, "7.5 `box`"):
+/// it is keyed like the box's collection, so two over one box join, and boxing it keeps the
+/// alternatives the source ranges over, which is what lets it meet the source's annotation.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::comprehensions_over_one_box_join(indoc! {r"
+    c: Bool = True
+    d: Bool = False
+    b = box([1, 2]) if c else box([1, 2, 3])
+    ys = [x * 2 for x in b] if d else [x * 3 for x in b]
+    sum(ys)
+"}, Value::Int(9))]
+#[case::a_boxed_comprehension_returns_as_its_sources_type(indoc! {r"
+    def doubled(xs: List(Int)) => List(Int):
+        box([x * 2 for x in xs])
+    sum(doubled(box([1, 2, 3])))
+"}, Value::Int(12))]
+#[case::a_boxed_comprehension_binds_as_its_sources_type(indoc! {r"
+    xs: List(Int) = box([1, 2, 3])
+    ys: List(Int) = box([x * 2 for x in xs])
+    sum(ys)
+"}, Value::Int(12))]
+#[case::boxed_branches_join(indoc! {r"
+    c: Bool = False
+    b1 = box([1, 2])
+    b2 = box([1, 2, 3])
+    sum(box([y for y in b1]) if c else box([z for z in b2]))
+"}, Value::Int(6))]
+#[case::a_filtered_box_is_a_collection(indoc! {r"
+    xs = box([1, 2, 3])
+    ys: Collection(Int) = box([x for x in xs if x > 1])
+    sum(ys)
+"}, Value::Int(5))]
+#[case::a_boxed_comprehension_over_a_map_is_a_map(indoc! {r#"
+    held = box(map([("btc", 2), ("eth", 1)]))
+    qty: Mut(Map(String, Int), Txn) := box([q * 10000 for q in held])
+    sum(await_final(qty))
+"#}, Value::Int(30000))]
+fn a_comprehension_over_a_box_is_keyed_like_it(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// The two spellings §7.5 refuses: comprehensions over two different boxes are keyed
+/// differently and do not join, and a filtered box has gaps, so it is no `List`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::comprehensions_over_two_boxes(indoc! {r"
+    c: Bool = False
+    b1 = box([1, 2])
+    b2 = box([1, 2, 3])
+    sum([y for y in b1] if c else [z for z in b2])
+"}, "Wrap each arm in `box`")]
+#[case::a_filtered_box_as_a_list(indoc! {r"
+    xs = box([1, 2, 3])
+    ys: List(Int) = box([x for x in xs if x > 1])
+    sum(ys)
+"}, "Type mismatch for collection annotation")]
+fn a_comprehension_over_a_box_is_refused_where_its_keys_do_not_fit(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
+    check_compile_error(code, needle);
 }

@@ -174,8 +174,12 @@ fn compose_sum_generators(expr: &mut Expr) {
     let TypedExprNode::Lambda { param, body } = &expr.node else {
         return;
     };
-    // The key ranges over a witness only in a lambda that is itself a collection over one.
-    if !matches!(param.ty.peel_refinements(), Type::WitnessRef(_)) {
+    // The key ranges over a witness only in a lambda that is itself a collection over one: a
+    // sum's own, or the one an unboxed source projects (`σ(𝑐)`).
+    if !matches!(
+        param.ty.peel_refinements(),
+        Type::WitnessRef(_) | Type::WitnessProjection(_)
+    ) {
         return;
     }
     let TypedExprNode::Apply {
@@ -328,7 +332,7 @@ fn operation_type(operands: &[&Expr], input: &Type, result: &Type) -> Type {
         changed
     }
     let mut stated = result.clone();
-    let changed = crate::ccl::ccl_utils::walk_refined_predicates_mut(
+    let changed = crate::ccl::ccl_utils::walk_quoted_terms_mut(
         &mut stated,
         &crate::ccl::ccl_utils::PredMemo::default(),
         &(),

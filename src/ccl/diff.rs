@@ -462,7 +462,7 @@ fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
             vec![]
         }
         N::Apply { function, argument } => vec![function, argument],
-        N::Realize(value) => vec![value],
+        N::Realize { value, .. } => vec![value],
         N::Cast { value, target } => {
             let mut children = vec![&**value];
             children.extend(cast_target_predicates(target));

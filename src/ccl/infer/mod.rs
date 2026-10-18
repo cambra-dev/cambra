@@ -191,6 +191,26 @@ fn blame_node_for_place(
         .unwrap_or_else(|| expr.node_id())
 }
 
+/// Why two functions' kinds do not relate, read off what each side's kind settled to.
+fn kind_mismatch_reason(lhs: &Type, rhs: &Type) -> &'static str {
+    use crate::ccl::ty::KindPin;
+    let pin = |t: &Type| t.peel_refinements().fun_kind_of().map(|k| k.resolved());
+    match (pin(lhs), pin(rhs)) {
+        (Some(KindPin::Plain), Some(KindPin::Sum(_)))
+        | (Some(KindPin::Sum(_)), Some(KindPin::Plain)) => {
+            "a plain collection and a sum met at one position — a collection over one domain \
+             does not stand in for a sum, and `box` makes a sum of a collection"
+        }
+        (Some(KindPin::Sum(a)), Some(KindPin::Sum(b))) if a != b => {
+            "two sums over different numbers of witnesses met at one position"
+        }
+        _ => {
+            "a compute function ⇒ and a data collection ⤇ met at one position — the two \
+             kinds are incomparable, so neither stands in for the other"
+        }
+    }
+}
+
 /// Resolve a (possibly variable-laden) [`Type`] to a concrete type for use
 /// in error messages. Falls back to [`Type::Hole`] if coalesce fails (which
 /// can happen for types with incompatible bounds that triggered the error).
@@ -269,11 +289,7 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             expected: Some(Box::new(coalesce_for_error(&required))),
         },
         ConstrainError::KindMismatch { lhs, rhs } => InferError::TypeMismatch {
-            ctx: format!(
-                "{ctx_label} (a compute function ⇒ and a data collection ⤇ met \
-                 at one position — the two kinds are incomparable, so neither \
-                 stands in for the other)"
-            ),
+            ctx: format!("{ctx_label} ({})", kind_mismatch_reason(&lhs, &rhs)),
             found: Box::new(coalesce_for_error(&lhs)),
             expected: Some(Box::new(coalesce_for_error(&rhs))),
         },

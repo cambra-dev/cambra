@@ -1394,7 +1394,6 @@ pub enum Phase {
 ///
 /// Both walks run at every boundary, from [`assert_unique_node_ids`].
 pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)> {
-    use crate::ccl::ty::Type;
     use std::collections::{HashMap, HashSet};
     use std::rc::Rc;
 
@@ -1404,24 +1403,22 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
         out.insert(e.node_id());
         e.walk_children(|c| ids_of(c, out));
     }
-    fn from_ty(t: &Type, acc: &mut HashMap<usize, HashSet<NodeId>>) {
-        t.walk_quoted_terms(&mut |term| {
-            let key = Rc::as_ptr(term) as usize;
-            if let std::collections::hash_map::Entry::Vacant(slot) = acc.entry(key) {
-                let mut s = HashSet::new();
-                ids_of(term, &mut s);
-                slot.insert(s);
-                // A predicate is an expression, so its own type slots are an
-                // expression walk's business rather than the type descent's. Once per
-                // term, like its ids: a term shared across type slots holds the same
-                // predicates in its own, and descending at every occurrence would walk
-                // the sharing out into a tree.
-                from_expr_ty(term, acc);
-            }
-        });
+    fn from_term(term: &Rc<Expr>, acc: &mut HashMap<usize, HashSet<NodeId>>) {
+        let key = Rc::as_ptr(term) as usize;
+        if let std::collections::hash_map::Entry::Vacant(slot) = acc.entry(key) {
+            let mut s = HashSet::new();
+            ids_of(term, &mut s);
+            slot.insert(s);
+            // A predicate is an expression, so its own type slots are an
+            // expression walk's business rather than the type descent's. Once per
+            // term, like its ids: a term shared across type slots holds the same
+            // predicates in its own, and descending at every occurrence would walk
+            // the sharing out into a tree.
+            from_expr_ty(term, acc);
+        }
     }
     fn from_expr_ty(e: &Expr, acc: &mut HashMap<usize, HashSet<NodeId>>) {
-        e.walk_type_slots(|t| from_ty(t, acc));
+        e.walk_quoted_terms(&mut |term| from_term(term, acc));
         e.walk_children(|c| from_expr_ty(c, acc));
     }
     let mut terms: HashMap<usize, HashSet<NodeId>> = HashMap::new();
@@ -1471,14 +1468,6 @@ pub(crate) fn collect_main_tree_ids(expr: &Expr) -> HashSet<NodeId> {
 /// Explanation and uniqueness are two questions with two answers; see
 /// `design/provenance.md`, "Walking the ids".
 pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
-    use crate::ccl::ty::Type;
-
-    fn from_ty(t: &Type, acc: &mut HashSet<NodeId>) {
-        // Every term the slot quotes, a refinement's predicate or a projection's sum,
-        // carries ids the projections must explain.
-        t.walk_quoted_terms(&mut |term| from_expr(term, acc));
-    }
-
     fn from_expr(e: &Expr, acc: &mut HashSet<NodeId>) {
         acc.insert(e.node_id());
         // Delegating to `walk_type_slots` is what keeps the two in step, and they
@@ -1488,7 +1477,9 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
         // `DanglingParent` against an id the input pane demonstrably holds.
         // `f: (Int => {Int where _ == 9}) = …` is the shape: the predicate rides
         // the `let` binder's annotation and nothing else.
-        e.walk_type_slots(|t| from_ty(t, acc));
+        // Every term the node quotes (a refinement's predicate, a projection's sum, the
+        // conditional a realization stages) carries ids the projections must explain.
+        e.walk_quoted_terms(&mut |term| from_expr(term, acc));
         e.walk_children(|c| from_expr(c, acc));
     }
 
@@ -2160,7 +2151,13 @@ fn run_passes(
     // a hoist from overtaking it. `recorded` is needed here (unlike `Uniquify`,
     // which mints nothing) because this pass mints the `Let`/`Var` nodes it
     // introduces.
+    //
+    // Under a `DerivationSession` in every compile, as comprehension lowering below is: a temp's
+    // read stands where its definition did and is minted under it, and an error inference raises
+    // at a generator reading one resolves through it to the source the program wrote.
+    let derivation = DerivationSession::install();
     expr = recorded(capture_provenance, Phase::Anf, || anf::run(expr));
+    blame.derive(&derivation.into_log(), Phase::Anf);
     debug!("A-normalized:\n{}", symbolic(&expr));
     if at_phase_output(Phase::Anf, &expr, stop, capture, panes) {
         return Ok(expr);
@@ -2220,8 +2217,15 @@ fn run_passes(
     // Monomorphization runs inside `infer` and is the only thing there that
     // mints or clones nodes, so this session *is* the pre-inference →
     // post-inference pane bridge.
+    // Once inference has settled each `unbox`'s argument, one over a plain collection is that
+    // collection, and `drop_plain_unboxes` drops it. Its predicate rebuilds are this session's
+    // copies.
     let infer_outcome = recorded(capture_provenance, Phase::Infer, || {
-        infer(&mut expr, ctx.inference_ctx())
+        let out = infer(&mut expr, ctx.inference_ctx());
+        if out.is_ok() {
+            drop_plain_unboxes(&mut expr);
+        }
+        out
     });
     // On failure, resolve each error's blame node to a source span here, against
     // the tree inference left: a node minted by monomorphization resolves through
@@ -2353,12 +2357,6 @@ fn run_passes(
     // silently absorbed into the outer block's read-your-writes env, dropping its
     // commit. Reject it before the phase strips the sites.
     check_transact_rejections(&expr, &txn_mut_vars, &blame)?;
-    mut_elim::refuse_loops_writing_over_conditionals(&expr).map_err(|message| {
-        vec![CompileError::Internal {
-            stage: "letrec",
-            message,
-        }]
-    })?;
 
     // The two rewrites the transactional slice runs before its own: both mint expression
     // nodes, so both sit inside the phase's recording — outside it their nodes reach the
@@ -2829,6 +2827,39 @@ fn compile_version(
     }
 
     Ok(program)
+}
+
+/// Replace every `unbox(𝑐)` whose argument binds no witness by `𝑐`, predicates included: a
+/// plain collection is the sum over no binders, and `unbox` of it is the collection
+/// (`src/ccl/design/collections.md`, "Typing").
+///
+/// One memo for the whole pass, so a predicate shared across type slots is rebuilt once and
+/// stays shared ([`crate::ccl::ccl_utils::PredMemo`]).
+fn drop_plain_unboxes(expr: &mut Expr) {
+    drop_plain_unboxes_in(expr, &crate::ccl::ccl_utils::PredMemo::new());
+}
+
+/// [`drop_plain_unboxes`] at or below `expr`; whether it dropped any.
+fn drop_plain_unboxes_in(expr: &mut Expr, memo: &crate::ccl::ccl_utils::PredMemo) -> bool {
+    let mut dropped = false;
+    expr.walk_type_slots_mut(|ty| {
+        dropped |=
+            crate::ccl::ccl_utils::walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+                drop_plain_unboxes_in(pred, memo)
+            });
+    });
+    expr.walk_children_mut(|child| dropped |= drop_plain_unboxes_in(child, memo));
+    if let crate::ccl::TypedExprNode::Apply { function, argument } = &mut expr.node
+        && matches!(
+            function.node,
+            crate::ccl::TypedExprNode::Builtin(crate::ccl::Builtin::Unbox)
+        )
+        && argument.ty.peel_refinements().sum().is_none()
+    {
+        *expr = std::mem::take(&mut **argument);
+        dropped = true;
+    }
+    dropped
 }
 
 #[cfg(test)]

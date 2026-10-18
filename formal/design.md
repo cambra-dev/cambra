@@ -12,7 +12,7 @@ The planned term-typing oracle checks admissibility: a type inferred by Rust mus
 for the term by the declarative typing judgment. It need not reproduce Rust's choice among
 several valid types. This oracle is not implemented; see [The typing oracle](#the-typing-oracle).
 
-The implemented oracles compare subtyping, polar merge, kind refusal, kind merge and coalescing.
+The implemented oracles compare subtyping, polar merge, kind membership, kind merge and coalescing.
 They compare each operation's verdict or result using its wire representation and model
 equivalence, rather than comparing complete inference runs.
 [The differential oracles](#the-differential-oracles) describes their inputs and exclusions.
@@ -24,7 +24,7 @@ equivalence, rather than comparing complete inference runs.
 | `constrain_subtype` | `Subtyping` / `subtypeCheck`; generated pairs in the modeled concrete fragment. | Reflexivity and transitivity for well-formed types; checker soundness and completeness. |
 | The Σ subtyping premise | `SigmaBelow` relates a candidate list, element types and a kind. No differential of the full Σ rule. | `sigma_below_iff_elementwise` and `swapped_premise_is_unsound` specify the kind-premise direction. Binder correspondence and sums nested in types are not modeled. |
 | `CompactType::merge` | `CompactTy.merge`; each generated fold step is compared. | Commutativity, idempotence, associativity and congruence; leastness and uniqueness for the induced absorption order. |
-| `TypeKind::refuses` | `refuses`; generated concrete types and kinds. | `not_admits_of_refuses`: refusal implies non-membership, not the converse. |
+| `admits_resolved` | `admitsCheck`; generated concrete types and kinds. | `admitsCheck_iff_admits`: the check decides `Admits`. |
 | `CompactTypeKind::merge` | `mergeTypeKind`; encodable generated fold steps are compared. | Commutativity, idempotence and join associativity. Meet associativity is checked over a finite universe, not proved generally. |
 | `coalesce_compact` | `coalesce`; generated compact bounds are materialized and compared. | Total result computation, well-formedness of successful results, and the conditional bound/leastness results described under [Materialization](#materialization-the-merge-is-a-bound-and-the-least-one). |
 | Term typing | `Term` / `HasTy`; no Rust term-typing differential yet. | Progress, preservation and refinement soundness for the pure-core fragment below. |

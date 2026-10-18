@@ -201,12 +201,14 @@ impl KindVarPool {
 /// that replays re-runs rather than cloning.
 pub fn maybe_kind_var_from(rng: &mut Rng, pool: &mut KindVarPool, t: Type) -> Type {
     match t {
+        // A sum's kind is its binders, which its domain names: replacing it would leave those
+        // references with no binder.
         Type::Fun {
             name,
-            fun_kind: _,
+            fun_kind,
             domain,
             codomain,
-        } if rng.chance(1, 2) => Type::Fun {
+        } if !matches!(fun_kind, FunKind::Data(Some(_))) && rng.chance(1, 2) => Type::Fun {
             name,
             fun_kind: FunKind::Var(pool.pick(rng)),
             domain,

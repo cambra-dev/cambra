@@ -674,11 +674,14 @@ pub(crate) fn predicate_term(term: &Expr) -> Expr {
 /// - an applied `cast` reads its value: `𝑎 ▷ cast(𝑣)` is `𝑎 ▷ 𝑣`, since a cast re-views a
 ///   collection's domain and leaves what it holds at a key;
 /// - every eliminated combinator applied to an argument reads back to the term it stands for:
-///   `id`, `const`, a `zip` pairing, `apply`, an operator, a chain, `curry`
+///   `id`, `const`, a `zip` pairing, `apply`, a binary or unary operator, a chain, `curry`
 ///   (`𝑥 ▷ (𝑓 ▷ curry)` is `λ 𝑦 → (𝑥, 𝑦) ▷ 𝑓`) and `uncurry`;
+/// - a value `Case` eliminated over its input, `𝑥 ▷ (⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ))`, reads back
+///   as `{ 𝑔ᵢ → 𝑥 ▷ 𝑒ᵢ }`, each guard its leg's first-match gate with the earlier guards peeled
+///   off ([`read_fan_out`]);
 /// - a staged form reads as what it stages, since an application only reaches keys in its
 ///   function's domain: `curry_over` as `curry` of its morphism; `𝑥 ▷ (𝑚 ▷ filter_values)`,
-///   `𝑥 ▷ (𝑝 ▷ iterate)` and `𝑥 ▷ (𝑐 ▷ map_domain)` as `𝑥`; `𝑎 ▷ (𝑓 ▷ strength_over)` as
+///   `𝑥 ▷ (𝑝 ▷ iterate)` and `𝑥 ▷ (𝑐 ▷ map_domain)` as `𝑥`, and a chain `iterate ≫ 𝑓` as `𝑓`; `𝑎 ▷ (𝑓 ▷ strength_over)` as
 ///   `λ 𝑘 → (𝑎, 𝑘 ▷ (𝑎 ▷ 𝑓))`; `𝑥 ▷ (𝑢 ▷ (𝑝 ▷ restrict))` as `𝑥`; and `𝑥 ▷ (𝑐 ▷ map(𝑔))` as
 ///   `(𝑥 ▷ 𝑐) ▷ 𝑔`;
 /// - a projection out of a tuple or record former reads the component.
@@ -702,6 +705,11 @@ fn normalize(mut e: Expr, fuel: &mut usize) -> Expr {
              either a reduction rule loops or the predicate outgrew the bound"
         )
     });
+    // A realization reads as the conditional it stages: its legs are that conditional's
+    // value, split by arm.
+    if let TypedExprNode::Realize { staged, .. } = &e.node {
+        return normalize(staged.clone_preserving_ids(), fuel);
+    }
     e.map_children(|c| normalize(c, fuel));
     reduce_head(e, fuel)
 }
@@ -720,7 +728,27 @@ fn reduce_head(e: Expr, fuel: &mut usize) -> Expr {
         TypedExprNode::Apply { argument, function } => {
             reduce_application(argument, function, &e.ty, fuel).unwrap_or(e)
         }
+        // A chain headed by planning's `iterate` is the rest of the chain: `iterate` maps each
+        // key to itself, as it does applied.
+        TypedExprNode::Compose(steps) if steps.len() > 1 && is_iterate(&steps[0]) => {
+            let rest: Vec<Expr> = steps[1..].iter().map(Expr::clone_preserving_ids).collect();
+            match <[Expr; 1]>::try_from(rest) {
+                Ok([only]) => only,
+                Err(rest) => Expr::throwaway(TypedExprNode::Compose(rest)).with_ty(e.ty.clone()),
+            }
+        }
         _ => e,
+    }
+}
+
+/// Whether `e` is planning's `iterate`, bare or over its predicate (`𝑝 ▷ iterate`).
+fn is_iterate(e: &Expr) -> bool {
+    match &e.node {
+        TypedExprNode::Builtin(Builtin::Iterate) => true,
+        TypedExprNode::Apply { function, .. } => {
+            matches!(function.node, TypedExprNode::Builtin(Builtin::Iterate))
+        }
+        _ => false,
     }
 }
 
@@ -758,7 +786,9 @@ fn reduce_application(
         TypedExprNode::Cast { value, .. } => {
             Some(applied(a(), value.clone_preserving_ids(), ty.clone(), fuel))
         }
-        TypedExprNode::Builtin(Builtin::Id) => Some(a()),
+        // `unbox` is the identity on the map: it re-types a sum's keys by its projected domain
+        // and changes no key or value.
+        TypedExprNode::Builtin(Builtin::Id | Builtin::Unbox) => Some(a()),
         TypedExprNode::Compose(steps) => Some(steps.iter().fold(a(), |acc, step| {
             applied(acc, step.clone_preserving_ids(), codomain(step), fuel)
         })),
@@ -767,12 +797,19 @@ fn reduce_application(
             function: combinator,
         } => match &combinator.node {
             TypedExprNode::Builtin(Builtin::Const) => Some(inner.clone_preserving_ids()),
+            // `zip` fans its input out to each component, of a tuple or of a record.
             TypedExprNode::Builtin(Builtin::Zip) => {
-                let (g, h) = pair(inner)?;
-                let (g_ty, h_ty) = (codomain(&g), codomain(&h));
-                let g = applied(a(), g, g_ty, fuel);
-                let h = applied(a(), h, h_ty, fuel);
-                Some(Expr::throwaway(TypedExprNode::Tuple(vec![g, h])).with_ty(ty.clone()))
+                let mut at = |f: &Expr| applied(a(), f.clone_preserving_ids(), codomain(f), fuel);
+                let node = match &inner.node {
+                    TypedExprNode::Tuple(parts) => {
+                        TypedExprNode::Tuple(parts.iter().map(&mut at).collect())
+                    }
+                    TypedExprNode::Record(fields) => TypedExprNode::Record(
+                        fields.iter().map(|(k, f)| (k.clone(), at(f))).collect(),
+                    ),
+                    _ => return None,
+                };
+                Some(Expr::throwaway(node).with_ty(ty.clone()))
             }
             // A staged form reads as what it stages. `curry_over` is `curry(𝑔)` with each
             // row's keys beside it, and `𝑚 ▷ filter_values` is the identity restricted to the
@@ -856,6 +893,9 @@ fn reduce_application(
             let (x, f) = pair(argument)?;
             Some(applied(x, f, ty.clone(), fuel))
         }
+        TypedExprNode::Builtin(Builtin::NotFn) => Some(unary(UnaryOpKind::Not, a(), ty)),
+        TypedExprNode::Builtin(Builtin::Neg) => Some(unary(UnaryOpKind::Neg, a(), ty)),
+        TypedExprNode::DisjointJoin(legs) => read_fan_out(argument, legs, ty, fuel),
         TypedExprNode::Builtin(Builtin::BinOp(op)) => {
             // A binary operation's argument is a pair, so one that is not a pair former
             // reads as its two components (tuple η).
@@ -894,6 +934,80 @@ fn reduce_application(
         },
         _ => None,
     }
+}
+
+/// `op operand`, built without an identity.
+fn unary(op: UnaryOpKind, operand: Expr, ty: &Type) -> Expr {
+    Expr::throwaway(TypedExprNode::UnaryOp(op, Box::new(operand))).with_ty(ty.clone())
+}
+
+/// `argument ▷ (⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ))` read back as the value `Case` lambda elimination
+/// built it from, `{ 𝑔ᵢ → argument ▷ 𝑒ᵢ }`; `None` for any other disjoint join.
+///
+/// Leg `𝑖` filters by the first-match predicate `π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`
+/// ([`synthesize_arm_predicate`]), so its guard `𝑔ᵢ` is `π̂ᵢ` with the earlier legs' guards
+/// peeled off, the last one outermost. A predicate that does not peel to the earlier guards is
+/// not this shape. An `elif` chain's trailing `Case` is eliminated inside its own leg, so it
+/// reads back nested, as it was written.
+fn read_fan_out(argument: &Expr, legs: &[Expr], ty: &Type, fuel: &mut usize) -> Option<Expr> {
+    let mut branches: Vec<Branch> = Vec::with_capacity(legs.len());
+    for leg in legs {
+        let TypedExprNode::Compose(steps) = &leg.node else {
+            return None;
+        };
+        let (filter, values) = steps.split_first()?;
+        let TypedExprNode::Apply {
+            argument: gate,
+            function,
+        } = &filter.node
+        else {
+            return None;
+        };
+        if !matches!(function.node, TypedExprNode::Builtin(Builtin::FilterValues)) {
+            return None;
+        }
+        let bool_ty = Type::Base(BaseType::Bool);
+        let mut guard = applied(
+            argument.clone_preserving_ids(),
+            gate.clone_preserving_ids(),
+            bool_ty,
+            fuel,
+        );
+        for earlier in branches.iter().rev() {
+            let TypedExprNode::BinOp {
+                left,
+                op: BinOpKind::BoolLogic(LogicKind::And),
+                right,
+            } = &guard.node
+            else {
+                return None;
+            };
+            match &right.node {
+                TypedExprNode::UnaryOp(UnaryOpKind::Not, negated)
+                    if crate::ccl::eq_term_modulo_ty_slots(negated, &earlier.guard) => {}
+                _ => return None,
+            }
+            guard = left.clone_preserving_ids();
+        }
+        let body = values
+            .iter()
+            .fold(argument.clone_preserving_ids(), |acc, step| {
+                let codomain = step.ty.codomain().unwrap_or(Type::Hole);
+                applied(acc, step.clone_preserving_ids(), codomain, fuel)
+            });
+        branches.push(Branch {
+            pattern: None,
+            guard,
+            body,
+        });
+    }
+    Some(
+        Expr::throwaway(TypedExprNode::Case {
+            scrutinee: None,
+            branches,
+        })
+        .with_ty(ty.clone()),
+    )
 }
 
 /// `body` with `replacement` for each free `x`, on terms alone: type slots are left as they
@@ -2988,6 +3102,35 @@ where
     changed
 }
 
+/// [`walk_refined_predicates_mut`] over every term `ty` quotes: each refinement's predicate
+/// and each witness projection's sum ([`Type::walk_quoted_terms`]).
+///
+/// For a rewrite that keeps a term's type, which a projection's term owes as a predicate
+/// does: substituting a binder's definition, simplifying, eliminating lambdas. A rewrite that
+/// changes a sum's type (erasing a determined `box`) takes the refinement-only walk and
+/// replaces the projection whole.
+pub fn walk_quoted_terms_mut<C, F>(
+    ty: &mut Type,
+    memo: &PredMemo<C>,
+    context: &C,
+    f: &mut F,
+) -> bool
+where
+    C: PartialEq + Clone,
+    F: FnMut(&mut Expr, &PredMemo<C>) -> bool,
+{
+    let mut changed = false;
+    match ty {
+        Type::Refinement(_, refinements) => refinements.rewrite_each(|_, refinement| {
+            changed |= memo.rebuild(refinement, context, |pred| f(pred, memo));
+        }),
+        Type::WitnessProjection(p) => changed |= memo.rebuild(p, context, |term| f(term, memo)),
+        _ => {}
+    }
+    ty.walk_children_mut(|child| changed |= walk_quoted_terms_mut(child, memo, context, f));
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3004,12 +3147,15 @@ mod tests {
                 Type::Base(BaseType::Int),
             ))
         };
-        Expr::new(TypedExprNode::Realize(Box::new(
-            Expr::new(TypedExprNode::Copair(vec![arm(2), arm(3)])).with_ty(Type::data_fun(
-                Type::UIntRange(2),
-                Type::Base(BaseType::Int),
-            )),
-        )))
+        Expr::new(TypedExprNode::Realize {
+            value: Box::new(
+                Expr::new(TypedExprNode::Copair(vec![arm(2), arm(3)])).with_ty(Type::data_fun(
+                    Type::UIntRange(2),
+                    Type::Base(BaseType::Int),
+                )),
+            ),
+            staged: Rc::new(arm(2)),
+        })
         .with_ty(Type::data_fun(
             Type::UIntRange(2),
             Type::Base(BaseType::Int),
@@ -3130,5 +3276,121 @@ mod tests {
         .with_ty(Type::Base(BaseType::Bool));
         let r = Refinement::born(Rc::new(pred));
         assert_eq!(discharge_transparent_lets(&r), r);
+    }
+
+    /// `x ▷ (gate₀ ▷ filter_values ≫ 10 ▷ const ⊔ gate₁ ▷ filter_values ≫ 20 ▷ const)`, the
+    /// fan-out lambda elimination writes for `{ x > 1 → 10; true → 20 }` over `x`, with
+    /// `second_gate` in place of the second leg's first-match predicate.
+    fn fan_out(second_gate: Expr) -> Expr {
+        let int = |n| Expr::lit(Lit::Int(n));
+        let constant = |e: Expr| Expr::apply(e, Expr::builtin(Builtin::Const));
+        let greater = Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Greater)));
+        let first_gate = Expr::compose(vec![
+            Expr::apply(
+                Expr::tuple(vec![Expr::builtin(Builtin::Id), constant(int(1))]),
+                Expr::builtin(Builtin::Zip),
+            ),
+            greater,
+        ]);
+        let leg = |gate: Expr, value: i64| {
+            Expr::compose(vec![
+                Expr::apply(gate, Expr::builtin(Builtin::FilterValues)),
+                constant(int(value)),
+            ])
+        };
+        let second_gate = match second_gate.node {
+            TypedExprNode::Lit(Lit::Unit) => Expr::compose(vec![
+                Expr::apply(
+                    Expr::tuple(vec![
+                        constant(Expr::lit(Lit::Bool(true))),
+                        Expr::compose(vec![first_gate.clone(), Expr::builtin(Builtin::NotFn)]),
+                    ]),
+                    Expr::builtin(Builtin::Zip),
+                ),
+                Expr::builtin(Builtin::BinOp(BinOpKind::BoolLogic(LogicKind::And))),
+            ]),
+            _ => second_gate,
+        };
+        Expr::apply(
+            Expr::var("x"),
+            Expr::disjoint_join(vec![leg(first_gate, 10), leg(second_gate, 20)]),
+        )
+    }
+
+    /// `{ x > 1 → 10; true → 20 }`, as the program wrote it.
+    fn per_row_case() -> Expr {
+        let branch = |guard: Expr, value: i64| Branch {
+            pattern: None,
+            guard,
+            body: Expr::lit(Lit::Int(value)),
+        };
+        let greater = Expr::binop(
+            Expr::var("x"),
+            BinOpKind::Compare(CompareKind::Greater),
+            Expr::lit(Lit::Int(1)),
+        );
+        Expr::new(TypedExprNode::Case {
+            scrutinee: None,
+            branches: vec![branch(greater, 10), branch(Expr::lit(Lit::Bool(true)), 20)],
+        })
+    }
+
+    /// A value `Case` lambda elimination fanned out over its input reads back as the `Case`,
+    /// its first-match predicates peeled to the guards the program wrote.
+    #[test]
+    fn a_fanned_out_case_reads_back_as_the_case() {
+        let fanned = normal_form(&fan_out(Expr::lit(Lit::Unit)));
+        assert!(
+            crate::ccl::eq_term_modulo_ty_slots(&fanned, &normal_form(&per_row_case())),
+            "{}",
+            crate::ccl::symbolic::symbolic(&fanned)
+        );
+    }
+
+    /// A disjoint join whose second leg's predicate is not the first-match conjunction over the
+    /// first leg's guard is not a `Case`'s fan-out, and stays as it is.
+    #[test]
+    fn a_disjoint_join_of_unrelated_filters_is_not_a_case() {
+        let fanned = normal_form(&fan_out(Expr::apply(
+            Expr::lit(Lit::Bool(true)),
+            Expr::builtin(Builtin::Const),
+        )));
+        assert!(
+            matches!(&fanned.node, TypedExprNode::Apply { function, .. }
+                if matches!(function.node, TypedExprNode::DisjointJoin(_))),
+            "{}",
+            crate::ccl::symbolic::symbolic(&fanned)
+        );
+    }
+
+    /// A chain headed by planning's `iterate` is the rest of the chain.
+    #[test]
+    fn an_iterate_led_chain_reads_as_its_tail() {
+        let collection = || Expr::var("xs");
+        for head in [
+            Expr::builtin(Builtin::Iterate),
+            Expr::apply(Expr::lit(Lit::Bool(true)), Expr::builtin(Builtin::Iterate)),
+        ] {
+            let chain = Expr::compose(vec![head, collection()]);
+            assert!(crate::ccl::eq_term_modulo_ty_slots(
+                &normal_form(&chain),
+                &normal_form(&collection())
+            ));
+        }
+    }
+
+    /// A unary operator morphism applied reads as the operator.
+    #[test]
+    fn a_unary_operator_morphism_reads_as_the_operator() {
+        for (builtin, op) in [
+            (Builtin::NotFn, UnaryOpKind::Not),
+            (Builtin::Neg, UnaryOpKind::Neg),
+        ] {
+            let applied = Expr::apply(Expr::var("x"), Expr::builtin(builtin));
+            assert!(crate::ccl::eq_term_modulo_ty_slots(
+                &normal_form(&applied),
+                &Expr::unary(op, Expr::var("x"))
+            ));
+        }
     }
 }

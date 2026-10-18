@@ -33,8 +33,7 @@ use crate::ccl::ccl_utils::{
     synthesize_arm_predicate, walk_refined_predicates, walk_refined_predicates_mut,
 };
 use crate::ccl::{
-    BaseType, BinOpKind, Builtin, Expr, FieldKey, LogicKind, Type, TypedExprNode, lambda_elim,
-    provenance,
+    BaseType, BinOpKind, Builtin, Expr, FieldKey, LogicKind, Type, TypedExprNode, provenance,
 };
 
 /// What realization decided about each witness it reached: erased, realized or materialized.
@@ -64,7 +63,6 @@ pub(super) fn realize_conditional_collections(
         realized,
         materialized,
     } = witnesses;
-    inline_conditional_bindings(expr);
     realize_and_erase_boxes(
         expr,
         erased,
@@ -88,7 +86,7 @@ pub(super) fn realize_conditional_collections(
     // conditional is the case that proves the distinction is needed — one candidate, two
     // legs — and instantiating its assertion breaks it.
     if !erased.is_empty() {
-        instantiate_erased_witnesses(expr, erased, &PredMemo::new());
+        instantiate_erased_witnesses(expr, erased, &PredMemo::new(), false);
     }
     // **And every determined sum the erasure did not name.** A consumer of a sum is a sum
     // over its *own* binder ([`crate::ccl::ty::FunKindVar::binder_ids`]), so erasing the
@@ -161,60 +159,6 @@ fn reject_rows_fixed_elsewhere(expr: &Expr) -> Result<(), String> {
         }
     });
     result
-}
-
-/// Give every consumer of a conditional collection binding its own copy of it, dropping the
-/// binding that shared it.
-///
-/// Realization needs the `Case` *below* the site that consumes it: it emits one leg per arm
-/// tuple across the site's witnesses, and each leg is the site with the `Case` replaced
-/// ([`realize`]). A `Case` sitting in a binding is above every site that reads it, so a site
-/// naming its witness finds nothing to realize and leaves the sum standing — which
-/// op-conversion rejects, since a witness has no extent. The two spellings of one program
-/// differ only in that placement, and the inline one already compiles.
-///
-/// It is also what lets the legs carry the site's demand. The restriction a filter places
-/// rides the consuming site's type, so two consumers of one binding own two different
-/// demands, and one shared set of legs can satisfy neither.
-///
-/// A same-domain conditional is copied too, though its witness is determined: its `Case` still
-/// realizes into one leg per arm. Realized in its binding instead, it leaves the `Case` standing
-/// in every type the binding's definition was discharged into. A filtered comprehension whose
-/// source is bound inside the comprehension's own scope is that case: the `let`'s type holds the
-/// `Case` in its predicate, and the post-planning check rejects the realized definition against
-/// it.
-fn inline_conditional_bindings(expr: &mut Expr) {
-    expr.walk_children_mut(inline_conditional_bindings);
-    let TypedExprNode::Let { bound_expr, .. } = &expr.node else {
-        return;
-    };
-    let is_conditional_collection = matches!(
-        bound_expr.node,
-        TypedExprNode::Case {
-            scrutinee: None,
-            ..
-        }
-    ) && collection_value_ty(&bound_expr.ty).is_some();
-    if !is_conditional_collection {
-        return;
-    }
-    let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        body,
-    } = std::mem::replace(&mut expr.node, TypedExprNode::Lit(crate::ccl::Lit::Unit))
-    else {
-        unreachable!("matched a Let above")
-    };
-    // Substitution reaches type slots and their predicates, which is required rather than
-    // thorough: the filter's predicate holds its own read of the binding, and a copy left
-    // naming a variable this rewrite just deleted would outlive it.
-    let _g = provenance::enter(
-        expr.node_id(),
-        "planning.inline_conditional",
-        provenance::Nature::Expansion,
-    );
-    *expr = lambda_elim::substitute(*body, &binding.name, &bound_expr);
 }
 
 /// The type each child of `expr` is expected to have, where the position says something the
@@ -330,6 +274,16 @@ fn realize_and_erase_boxes(
             provenance::Nature::Expansion,
         );
         changed |= realize(expr, realized);
+        // A realized sum over one candidate is that candidate's collection, as a determined
+        // `box` is, and is erased with it: every copy of its type, under whichever binder it
+        // carries there, then reads the one collection.
+        if let TypedExprNode::Realize { .. } = &expr.node
+            && let Some([first, ..]) = expr.ty.peel_refinements().sum()
+            && let Some(sole) = first.sole_candidate()
+            && !binds_an_undetermined_witness(&effective)
+        {
+            erased.insert(*first.id(), sole);
+        }
     }
     walk_children_with_demand(
         expr,
@@ -477,15 +431,22 @@ fn instantiate_erased_witnesses(
     expr: &mut Expr,
     erased: &std::collections::HashMap<crate::ccl::ty::WitnessId, Type>,
     memo: &PredMemo<()>,
+    in_predicate: bool,
 ) {
+    // **A conditional a predicate quotes stays whole**, as realization leaves it
+    // ([`realize_and_erase_boxes`]): its arms keep their `box`es, so their sums keep their
+    // binders, whichever of those binders the tree's realized copy erased.
+    if in_predicate && collection_value_ty(&expr.ty).is_some() && is_value_case(expr) {
+        return;
+    }
     expr.walk_type_slots_mut(|ty| {
         walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
-            instantiate_erased_witnesses(pred, erased, memo);
+            instantiate_erased_witnesses(pred, erased, memo, true);
             true
         });
         instantiate_erased_in_type(ty, erased);
     });
-    expr.walk_children_mut(|child| instantiate_erased_witnesses(child, erased, memo));
+    expr.walk_children_mut(|child| instantiate_erased_witnesses(child, erased, memo, in_predicate));
     // `unbox` of a collection whose witness is erased is that collection: its domain is the
     // candidate the projection now names.
     if let TypedExprNode::Apply { argument, function } = &mut expr.node
@@ -532,14 +493,30 @@ fn instantiate_erased_in_type(
     // **So is a projection of one.** `σ(𝑐)` names the witness through `𝑐`, whose own type binds
     // it, and erasing that witness leaves the candidate as the domain `𝑐` ranges over
     // (`src/ccl/design/collections.md`, "Projecting a sum's witness").
+    // A determined witness is its one candidate by any binder's name, so a projection of one
+    // is too: copies of one sum's type carry different binders, and the erased set names only
+    // the ones a `box` stated.
     if let Type::WitnessProjection(p) = ty
         && let Some(witness) = p.witness()
-        && let Some(sole) = erased.get(witness.id())
+        && let Some(sole) = erased
+            .get(witness.id())
+            .cloned()
+            .or_else(|| witness.sole_candidate())
     {
-        *ty = sole.clone();
+        *ty = sole;
         return;
     }
     ty.walk_children_mut(|child| instantiate_erased_in_type(child, erased));
+    // A candidate is a domain, possibly a filtered one, so instantiating a refined position's
+    // base can leave a refinement under a refinement; the position holds one set.
+    if let Type::Refinement(base, _) = ty
+        && matches!(**base, Type::Refinement(..))
+    {
+        let Type::Refinement(base, own) = std::mem::replace(ty, Type::Hole) else {
+            unreachable!("matched a refinement above")
+        };
+        *ty = Type::refined(*base, own);
+    }
 }
 
 /// The witness a collection type names, in **either spelling**.
@@ -715,26 +692,14 @@ fn is_value_case(expr: &Expr) -> bool {
     )
 }
 
-/// Realize the conditional collections a site chooses between, as its gated union.
+/// Realize a conditional collection where it stands, as the gated union of its arms.
 ///
-/// The design is `src/ccl/design/collections.md`, "Compiling a conditional collection".
-/// What this function decides:
-///
-/// - **Where the union goes.** It is an iteration *source*, so it belongs at the head of
-///   the pipeline consuming it — the outermost `Σ` binding the witness, not the `Case`.
-///   Rewriting the `Case` in place puts it at the head only for a sole generator; with a
-///   second the head is the product iterate above it, and a source stranded mid-chain is
-///   what op-conversion rejects (`zip requires an input operator`). The chain between site
-///   and `Case` is copied into every leg, filter predicates included, since they hold
-///   their own read of the source.
-/// - **Every witness of the site at once**, so the legs are the tuples of arms, gated by
-///   the conjunction of their path conditions and indexed by the product of their domains.
-///   One at a time leaves a union where a generator reads its collection at a projected
-///   index, which is a *fed* copairing — a shape op-conversion has no form for
-///   (`src/ccl/design/collections.md`, "A site's witnesses are compiled together").
-/// - **A witness-free conditional is realized at the `Case` itself**, the degenerate case:
-///   one choice, and substituting the arm for the conditional leaves the arm. Nothing above
-///   changes, so no [`TypedExprNode::Realize`] asserts anything.
+/// The design is `src/ccl/design/collections.md`, "Compiling a conditional collection". The
+/// site is a collection-valued value `Case`: every consumer reads it through `unbox`, over its
+/// projected domain, so no consumer names its witness and none is a site. The union replaces
+/// the `Case` under a [`TypedExprNode::Realize`] that asserts the `Case`'s type and stages the
+/// `Case` itself. A witness-free conditional is the degenerate case: substituting the arm for
+/// the conditional leaves the arm, and the union's own type is asserted.
 ///
 /// Returns whether this node was realized, which is load-bearing rather than bookkeeping: a
 /// `Case` inside a **refinement predicate** is rewritten through [`PredMemo::rebuild`],
@@ -747,12 +712,7 @@ fn realize(
     let Some(value_ty) = collection_value_ty(&expr.ty) else {
         return false;
     };
-    // **A binder is not a realization site.** The legs are copies of the site with the
-    // `Case` replaced, and each is gated from *outside* by its arm's path condition — so a
-    // binder standing between the guard's scope and the site would be copied into every leg
-    // while the guard stayed out, leaving the gate's reference unbound. Declining here
-    // leaves the body to realize, which keeps the binding where it was.
-    if matches!(expr.node, TypedExprNode::Let { .. }) {
+    if !is_value_case(expr) {
         return false;
     }
     // Each witness's own fan-out, in the order the site's binders nest. A witness whose
@@ -761,9 +721,6 @@ fn realize(
     // whole, and op-conversion rejects the surviving sum by name.
     let witnesses = witnesses_named_by(&expr.ty);
     let choices: Vec<Vec<ArmChoice>> = if witnesses.is_empty() {
-        if !is_value_case(expr) {
-            return false;
-        }
         let TypedExprNode::Case { branches, .. } = &expr.node else {
             unreachable!("is_value_case matched a Case")
         };
@@ -948,11 +905,20 @@ fn realize(
     // sum opened, the witness still named — and realizing that without an assertion shifts
     // the enclosing composition's domain from the witness to the union. The condition is
     // therefore about what the type *says*, not which constructor says it.
-    *expr = if mentions_witness {
-        Expr::new(TypedExprNode::Realize(Box::new(union))).with_ty(original)
+    // The realization stages the conditional it replaces, so a type quoting the conditional
+    // (a consumer's `σ₁(𝑐)`) and this node compare as one term: normal form reads a `Realize`
+    // as what it stages.
+    let staged = Rc::new(std::mem::take(expr));
+    let asserted = if mentions_witness {
+        original
     } else {
-        union
+        union.ty.clone()
     };
+    *expr = Expr::new(TypedExprNode::Realize {
+        value: Box::new(union),
+        staged,
+    })
+    .with_ty(asserted);
     true
 }
 
@@ -1034,7 +1000,7 @@ fn discharge_determined_witnesses(arm: Expr) -> Expr {
         "a witness `erase_determined_boxes` erased at one position of an arm was materialized at another"
     );
     if !erased.is_empty() {
-        instantiate_erased_witnesses(&mut arm, &erased, &PredMemo::new());
+        instantiate_erased_witnesses(&mut arm, &erased, &PredMemo::new(), false);
     }
     collapse_determined_sums(&mut arm, &materialized);
     arm
@@ -1097,7 +1063,7 @@ fn collapse_determined_sums(
     let mut determined = std::collections::HashMap::new();
     gather(expr, keep, &mut determined);
     if !determined.is_empty() {
-        instantiate_erased_witnesses(expr, &determined, &PredMemo::new());
+        instantiate_erased_witnesses(expr, &determined, &PredMemo::new(), false);
     }
 }
 
@@ -1505,76 +1471,9 @@ mod tests {
             expr.ty
         );
         assert!(
-            matches!(expr.node, TypedExprNode::Realize(_)),
+            matches!(expr.node, TypedExprNode::Realize { .. }),
             "the assertion is carried by a `Realize` node, got {:?}",
             expr.node
         );
-    }
-
-    /// **A conditional binding is copied into its consumer, whether or not its witness is
-    /// determined.**
-    ///
-    /// Both programs compute the same answer whether the binding was shared or copied, so the
-    /// placement itself is what gets asserted here. Copying puts the `Case` below the site that
-    /// consumes it, which is where [`realize`] needs it: the legs are copies of the site with
-    /// the `Case` replaced.
-    #[test]
-    fn a_conditional_binding_is_copied_into_its_consumer() {
-        let int = Type::Base(BaseType::Int);
-        // Each arm is **boxed**, as inference leaves it: two collections over distinct
-        // domains have no common type, so the arms of a conditional that types as a sum
-        // are one-candidate sums themselves. An unboxed arm is not merely unrealistic
-        // here — it is ill-typed.
-        let arm = |dom: u64| {
-            let coll = Type::data_fun(Type::UIntRange(dom), int.clone());
-            let aw = fresh_witness_binder_id();
-            let awit = Witness::bound_to(aw, TypeKind::Enumerated(vec![Type::UIntRange(dom)]));
-            let occurrence = Type::WitnessRef(*awit.id());
-            let boxed = Type::sum_binding(awit, Type::data_fun(occurrence, int.clone()));
-            Expr::apply(
-                Expr::new(TypedExprNode::Var(Name::from("xs"))).with_ty(coll.clone()),
-                Expr::builtin(Builtin::Box).with_ty(Type::fun(coll, boxed.clone())),
-            )
-            .with_ty(boxed)
-        };
-        let guard = |b: bool| Expr::lit(Lit::Bool(b)).with_ty(Type::Base(BaseType::Bool));
-        // `let x = (arm₀ if _ else arm₁) in x`, the conditional typed over `candidates`.
-        let bind_to = |candidates: Vec<Type>, arms: [u64; 2]| {
-            let w = fresh_witness_binder_id();
-            let wit = Witness::bound_to(w, TypeKind::Enumerated(candidates));
-            let occurrence = Type::WitnessRef(*wit.id());
-            let ty = Type::sum_binding(wit, Type::data_fun(occurrence, int.clone()));
-            Expr::let_bind(
-                "x",
-                Expr::new(TypedExprNode::Case {
-                    scrutinee: None,
-                    branches: arms
-                        .iter()
-                        .map(|d| Branch {
-                            pattern: None,
-                            guard: guard(true),
-                            body: arm(*d),
-                        })
-                        .collect(),
-                })
-                .with_ty(ty.clone()),
-                Expr::new(TypedExprNode::Var(Name::from("x"))).with_ty(ty.clone()),
-            )
-            .with_ty(ty)
-        };
-
-        // One candidate, two arms (a same-domain conditional), and two candidates.
-        for (candidates, arms) in [
-            (vec![Type::UIntRange(2)], [2, 2]),
-            (vec![Type::UIntRange(2), Type::UIntRange(3)], [2, 3]),
-        ] {
-            let mut copied = bind_to(candidates, arms);
-            inline_conditional_bindings(&mut copied);
-            assert!(
-                matches!(copied.node, TypedExprNode::Case { .. }),
-                "a consumer gets the conditional itself, not a name for it: {:?}",
-                copied.node
-            );
-        }
     }
 }

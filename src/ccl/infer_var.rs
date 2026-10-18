@@ -587,6 +587,21 @@ pub(crate) fn enforce_bound_scope(holder: &InferVar, side: &'static str, bound: 
     // the edge substitutions' domains, and a program source is not among them
     // because a source reference is a [`crate::ccl::TypedExprNode::Source`]
     // node rather than a variable.
+    // The witness half of the same invariant: a reference to a witness is free only on a
+    // variable placed under witness binders, since anywhere else it has left its binder.
+    if cfg!(debug_assertions) {
+        let free: Vec<_> = crate::ccl::ty::free_witness_refs(&bound.ty, &[])
+            .into_iter()
+            .filter(|w| !bound.ty_subst.maps_witness(w) && !holder.may_name_witness(w))
+            .collect();
+        assert!(
+            free.is_empty(),
+            "a bound naming witness(es) {free:?} free was recorded on ?{}, which no binder of \
+             theirs scopes over: `{}` ({side})",
+            holder.uid,
+            bound.ty,
+        );
+    }
     let gaps = bound_scope_gaps(&holder.telescope, bound);
     if let Some(open) = gaps.iter().next() {
         panic!(
@@ -651,6 +666,44 @@ pub struct InferVar {
     /// resolve apart. Severed at arena teardown with [`bounds`](Self::bounds): a held
     /// variable's bound holds this one.
     pub suspensions: RefCell<Vec<(subst::Subst, Rc<InferVar>)>>,
+    /// **The witness binders this variable sits under**: the functions it was minted as a part
+    /// of, by their kind, or the one it copies was.
+    ///
+    /// A part of a function can name that function's witnesses free, and nothing else can —
+    /// anywhere else the reference would have left its binder — so a substitution's witness half
+    /// suspends only on a variable some scope here may bind the mapped witness for
+    /// ([`subst::Subst`]). Placed where the variable is minted, like the
+    /// [`telescope`](Self::telescope) the name half reads; [`enforce_bound_scope`] rejects a
+    /// bound naming a witness free that no scope here binds.
+    witness_scopes: RefCell<Vec<WitnessScope>>,
+}
+
+/// A function a variable is a part of, as what binds its witnesses: a funkind variable, whose
+/// binders exist once its arity does, or a written sum's binders.
+#[derive(Clone)]
+pub enum WitnessScope {
+    Kind(Rc<crate::ccl::ty::FunKindVar>),
+    Binders(Vec<crate::ccl::ty::WitnessId>),
+}
+
+impl WitnessScope {
+    /// The scope of a function of kind `kind`, where its kind may bind witnesses.
+    pub fn of_kind(kind: &crate::ccl::ty::FunKind) -> Option<Self> {
+        match kind {
+            crate::ccl::ty::FunKind::Var(k) => Some(WitnessScope::Kind(Rc::clone(k))),
+            crate::ccl::ty::FunKind::Data(Some(ws)) => {
+                Some(WitnessScope::Binders(ws.iter().map(|w| *w.id()).collect()))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn may_bind(&self, w: &crate::ccl::ty::WitnessId) -> bool {
+        match self {
+            WitnessScope::Kind(k) => k.may_bind(w),
+            WitnessScope::Binders(ws) => ws.contains(w),
+        }
+    }
 }
 
 thread_local! {
@@ -762,6 +815,7 @@ impl InferVar {
             bounds: RefCell::new(InferBounds::default()),
             watches: RefCell::new(Vec::new()),
             suspensions: RefCell::new(Vec::new()),
+            witness_scopes: RefCell::new(Vec::new()),
         });
         ACTIVE_ARENA.with(|slot| {
             if let Some(vars) = slot.borrow_mut().as_mut() {
@@ -779,6 +833,90 @@ impl InferVar {
     /// The scope level the variable belongs to.
     pub fn level(&self) -> Level {
         self.level.get()
+    }
+
+    /// Whether a witness binder this variable sits under may bind `w`.
+    pub fn may_name_witness(&self, w: &crate::ccl::ty::WitnessId) -> bool {
+        self.witness_scopes.borrow().iter().any(|s| s.may_bind(w))
+    }
+
+    /// The funkind variables whose functions this variable is a part of.
+    pub fn witness_scope_kinds(&self) -> Vec<Rc<crate::ccl::ty::FunKindVar>> {
+        self.witness_scopes
+            .borrow()
+            .iter()
+            .filter_map(|s| match s {
+                WitnessScope::Kind(k) => Some(Rc::clone(k)),
+                WitnessScope::Binders(_) => None,
+            })
+            .collect()
+    }
+
+    /// Place a freshly minted variable under `scope`'s binders: it is a part of that function.
+    pub fn place_under(&self, scope: WitnessScope) {
+        self.witness_scopes.borrow_mut().push(scope);
+    }
+
+    /// Place every variable occurring in `ty` under the binders of a function of kind `kind`:
+    /// `ty` is a part of that function, as built by a pass that copies such a function's type
+    /// (an instantiation, an annotation's normalization).
+    pub fn place_parts_under(ty: &Type, kind: &crate::ccl::ty::FunKind) {
+        let Some(scope) = WitnessScope::of_kind(kind) else {
+            return;
+        };
+        fn go(ty: &Type, scope: &WitnessScope) {
+            if let Type::Infer(v) = ty {
+                v.place_under(scope.clone());
+            }
+            ty.walk_children(|c| go(c, scope));
+        }
+        go(ty, &scope);
+    }
+
+    /// Carry `original`'s placement onto `self`, a copy of it at the same position (a proxy,
+    /// a suspension).
+    pub fn inherit_witness_placement(&self, original: &InferVar) {
+        let scopes = original.witness_scopes.borrow().clone();
+        self.witness_scopes.borrow_mut().extend(scopes);
+    }
+
+    /// [`Self::inherit_witness_placement`] keeping only the scopes `keep` accepts: a copy under
+    /// a substitution that discharges a scope's binders has left that scope.
+    pub fn inherit_witness_placement_where(
+        &self,
+        original: &InferVar,
+        keep: impl Fn(&WitnessScope) -> bool,
+    ) {
+        let scopes: Vec<WitnessScope> = original
+            .witness_scopes
+            .borrow()
+            .iter()
+            .filter(|s| keep(s))
+            .cloned()
+            .collect();
+        self.witness_scopes.borrow_mut().extend(scopes);
+    }
+
+    /// [`Self::inherit_witness_placement`] for a copy whose kinds and witnesses were renamed
+    /// (a freshened copy): each scope through `kind` and `witness`.
+    pub fn inherit_witness_placement_renamed(
+        &self,
+        original: &InferVar,
+        kind: impl Fn(&Rc<crate::ccl::ty::FunKindVar>) -> Rc<crate::ccl::ty::FunKindVar>,
+        witness: impl Fn(&crate::ccl::ty::WitnessId) -> crate::ccl::ty::WitnessId,
+    ) {
+        let scopes: Vec<WitnessScope> = original
+            .witness_scopes
+            .borrow()
+            .iter()
+            .map(|s| match s {
+                WitnessScope::Kind(k) => WitnessScope::Kind(kind(k)),
+                WitnessScope::Binders(ws) => {
+                    WitnessScope::Binders(ws.iter().map(&witness).collect())
+                }
+            })
+            .collect();
+        self.witness_scopes.borrow_mut().extend(scopes);
     }
 
     /// Move the variable down to `level` if it sits above it. A monomorphic binding
