@@ -18,8 +18,8 @@ use smol_str::SmolStr;
 
 use super::*;
 use crate::ccl::infer::solver::traits::{
-    Assoc, DeclaredAt, InstanceHead, InstanceTable, Signature, Trait, TraitDecl, TraitFunction,
-    TraitInstance, entailed, replace_params, unify_all,
+    Assoc, DeclaredAt, InstanceHead, InstanceTable, ProductReading, Signature, Trait, TraitDecl,
+    TraitFunction, TraitInstance, entailed, replace_params, unify_all,
 };
 use crate::ccl::ty::{PolyParam, TraitRequirement, TypeKind, TypeParam, TypeParamId};
 use crate::ccl::{Expr, Name, Type, TypedBinding, TypedExprNode};
@@ -308,7 +308,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         functions,
         requires,
         named,
-        structural: false,
+        products: ProductReading::None,
     }))
 }
 

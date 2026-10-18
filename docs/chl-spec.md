@@ -860,9 +860,11 @@ beyond the [Boolean-operator rules](#35-short-circuit-not-and-or).
 
 Incompatible operand types produce a compile-time type error. Product equality is componentwise:
 two tuples or records must have the same shape, and every corresponding component must support
-equality. A wider record is not compared only on its shared fields. Products do not support the
-ordering comparators; collection elements are not product fields, so this rule does not provide
-collection equality.
+equality. A wider record is not compared only on its shared fields. A tuple orders
+lexicographically: by its first components, then, where they are equal, by its second, and so on,
+each component supporting the ordering comparators. A record does not order, since its fields have
+no order. Collection elements are not product fields, so these rules do not provide collection
+equality or order.
 
 `is` and `is not` are not operators. Membership `in` and `not in` are specified in
 [Membership expressions](#membership-expressions-decided).
@@ -3297,11 +3299,12 @@ requirement names one as it names these, which are built in:
 | `Exponentiable` | `**` | 2 | `Output` | `Int`, `UInt` |
 | `Negatable` | unary `-` | 1 | `Output` | `Int` |
 | `Equatable` | `==`, `!=`, `in`, `not in` | 2 | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
-| `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | `Int`, `UInt`, `String`, `Bool` |
+| `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | `Int`, `UInt`, `String`, `Bool`, and a tuple whose components are `Orderable` |
 
 `max` and `min` place `Orderable(T, T)` on their element type `T`. A binary trait is satisfied by
-two operands of one listed type, and a tuple or record satisfies `Equatable` only against the same
-product ([3.4 Comparisons](#34-comparisons)). A trait's `Output` is the type that satisfies it.
+two operands of one listed type. A tuple or record satisfies `Equatable` only against the same
+product, and a tuple satisfies `Orderable` only against a tuple of the same length
+([3.4 Comparisons](#34-comparisons)). A trait's `Output` is the type that satisfies it.
 
 - **A named requirement binds its instance.** In `def total(S, s: S) => Int requires a: Area(S)`,
   `a` is the instance each call passes, and `a::area(s)` calls its `area`
