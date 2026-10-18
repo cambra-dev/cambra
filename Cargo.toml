@@ -104,6 +104,8 @@ debug = false
 name = "dead_code_specialization_cost"
 [[test]]
 name = "scope_walk_allocations"
+[[test]]
+name = "nested_extract_allocations"
 # The differential oracle belongs to the formal gate, not to the suite. It runs
 # `formal/.lake/build/bin/subverdict` and refuses to skip under CI, so a job
 # that runs the suite would need the whole Lean toolchain to check something
