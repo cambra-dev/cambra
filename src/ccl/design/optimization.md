@@ -257,8 +257,9 @@ contains `binding`, `bound_expr`, and `body`; it has no `bound_ty` field.
 
 ### A generator over a sum composes with its source
 
-A comprehension over a Σ-typed collection lowers to a lambda that is itself a sum,
-`λ k : σ → (k ▷ 𝑆) ▷ 𝑓`, whose key ranges over the source's witness. Before elimination,
+A comprehension over a Σ-typed collection lowers to a lambda whose key ranges over the source's
+witness, `λ k : σ → (k ▷ 𝑆) ▷ 𝑓`. The witness is a reference `σ` where the lambda is itself a sum, and
+a projection `σ₁(𝑐)` where `𝑆` is the unboxed source `unbox(𝑐)`. Before elimination,
 `compose_sum_generators` rewrites each such generator to `𝑆 ≫ 𝑓` when `k` is free in neither `𝑆`
 nor `𝑓`. The composite takes its kind from `𝑆`, retaining its sum and using `𝑓`'s codomain.
 A filtered
@@ -275,10 +276,13 @@ Where `𝑓` reads nothing from the enclosing scope, elimination leaves `⟨𝑆
 elimination leaves `⟨𝑆, curry(𝑔)⟩ ≫ compose` with `𝑔` over `(𝑋, 𝑉)`, which `simplify` rewrites to
 `𝑆 ▷ strength_over ≫ map(𝑔)`. `strength_over : (𝐴 ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉) ⇒ (𝐴 ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ (𝐴, 𝑉))`
 pairs each input with each value of its own collection under that value's key, so the witness binds
-once, by the outer sum, and no dependent pair is needed. Operator conversion compiles it to
-`Product::per_row_values_at`, which pairs each row with the values of its own collection. Both rules
-are scoped to an `𝑆` whose values are a sum, because planning's recurrence recognition reads a
-history through the unrewritten form.
+once, by the outer sum, and no dependent pair is needed. An `𝑆` whose keys are a projection through
+its input, `(𝑥 : 𝐴) ⇒ (σ(𝑥 ▷ 𝑝) ⤇ 𝑉)`, keeps its binder, and `map(𝑔)` reads the projection by it.
+Operator conversion compiles `strength_over` to `Product::per_row_values_at`, which pairs each row
+with the values of its own collection. Both rules are scoped to a generator's source, a morphism to a sum or
+one ending in `unbox` (`over_a_witness`), because planning's recurrence recognition reads a history
+through the unrewritten form. A history over a projected domain has the type an unboxed source has,
+so the source is recognized by its last morphism.
 
 A correlated inner comprehension over a collection every row reads is the same shape with that
 collection constant: planning rewrites its `curry(𝑔)` to `const(𝐾) ▷ strength_over ≫ map(𝑔)`, where
@@ -487,17 +491,11 @@ predicate that aggregates a correlated or filtered comprehension,
 chain planning gives it anywhere else, and the refinement states the `cast` its source was written
 as.
 
-Realization leaves a conditional inside a refinement alone. Under leg 𝑖 a conditional source is its
-arm 𝑖, and planning substitutes that arm into each leg's predicates for a conditional that has a
-witness. A conditional still in a predicate when the predicate is lifted is realized with the
-lifted term. A lifted term that applies a union at its element, a realized conditional or a `++`,
-rather than iterating it, is refused (`refuse_a_union_applied_at_the_input`): the legs of a realized
-same-domain conditional, applied at one index, both answer, and `flat_merge` would reject the
-overlap at run time. A conditional chosen per row is not refused, since `filter_values` gates each
-of its legs on the element and one leg answers. A filter over a same-domain conditional source
-reaches this, because the filter's predicate holds its own copy of the source and the copy has no
-witness to substitute by (`a_filter_over_a_union_source_is_refused` in
-`tests/it/compilation_pipeline/comprehensions.rs`).
+Realization reaches a conditional inside a refinement as it reaches any other, where it stands.
+A filter whose predicate holds its own copy of a conditional source reads the realized copy, which
+answers at each key as the source does (`a_filter_over_a_same_domain_conditional_is_applied` in
+`tests/it/compilation_pipeline/comprehensions.rs`). A lifted term that applies a `++` at its
+element rather than iterating it is refused (`refuse_a_union_applied_at_the_input`).
 
 ### Per-group value filters
 
@@ -506,6 +504,10 @@ function, where that refinement depends on the function's input collection. The 
 iteration walk sees the function's own domain and cannot materialize this inner one.
 When each added predicate reads that input collection, planning converts the added
 conditions into a value predicate 𝑞 and inserts one `map(filter_values(𝑞))` before the function.
+A predicate reads the input by the function's binder or as the value the morphism before it
+carries there, `𝑝 ▷ 𝑒` ([A chain names each position](type-inference.md#a-chain-names-each-position)):
+`[v for v in r.xs if v > 1]` over rows `r` narrows `.xs ≫ map(id)`, whose type reads `r ▷ .xs`.
+The value predicate reads neither, since the filter is handed the values alone.
 The operator filters each group's elements independently. `reject_unmaterialized_narrowings`
 refuses a narrowing no per-group filter materializes, since operator conversion would compile the
 site without its filter.

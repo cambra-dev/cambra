@@ -111,10 +111,13 @@ impl PolyScheme {
     /// for each requirement: both are checked at every use, at the use's types
     /// (`src/ccl/design/type-parameters.md`, "Instantiation"). A variable minted for
     /// a parameter stands in `telescope`, the use site's, since a parameter has no
-    /// variable a copy could inherit a scope from.
+    /// variable a copy could inherit a scope from. Every other variable stands there too,
+    /// under the binders its original stood under inside the definition
+    /// ([`FreshenCache::use_telescope`]).
     pub fn instantiate_with_params(&self, current_level: Level, telescope: &Telescope) -> Instance {
         let mut cache = FreshenCache::new();
         cache.param_telescope = Some(telescope.clone());
+        cache.use_telescope = Some(telescope.clone());
         let at = FreshenLevel::At(current_level);
         let ty = freshen_above(self.level, &self.body, at, &mut cache);
         let requires = self
@@ -158,10 +161,10 @@ impl PolyScheme {
     /// program scope, so inheriting their (empty) telescopes would leave the
     /// instantiation's variables scope-free at a position that has scope, and
     /// a dependent refinement flowing into an operand variable would be an open
-    /// record. A *let*-generalized scheme keeps plain
-    /// [`instantiate`](Self::instantiate): its clone stands where the
-    /// definition stood, and the definition-site telescopes are the contract
-    /// (see `src/ccl/design/type-inference.md`, "Freshening and `SpecKey`").
+    /// record. A *let*-generalized scheme instantiates through
+    /// [`instantiate_with_params`](Self::instantiate_with_params), whose variables keep the
+    /// binders the definition's own stood under, entered after the use site's
+    /// ([`FreshenCache::use_telescope`]).
     pub fn instantiate_in(&self, current_level: Level, telescope: &Telescope) -> Type {
         let mut cache = FreshenCache::new();
         cache.site_telescope = Some(telescope.clone());
@@ -183,7 +186,8 @@ pub struct FreshenCache {
     /// When set, every variable this freshening mints takes *this* telescope
     /// instead of inheriting its original's — the operator-scheme
     /// instantiation mode ([`PolyScheme::instantiate_in`]). Unset for
-    /// specialization clones, which stand where their definition stood.
+    /// specialization clones, which stand where their definition stood or under the binders
+    /// their use entered ([`entered_binders`](Self::entered_binders)).
     pub site_telescope: Option<Telescope>,
     /// Original quantified var → its fresh replacement.
     pub vars: HashMap<InferVarId, Rc<InferVar>>,
@@ -232,6 +236,17 @@ pub struct FreshenCache {
     /// at instantiation. A parameter has no variable of its own whose telescope a
     /// copy could inherit.
     pub param_telescope: Option<Telescope>,
+    /// The scope a let-generalized binding's instantiation stands in: the use site's, which
+    /// holds the definition site's and every binder entered between the two. Each variable
+    /// minted stands there with the binders its original stood under inside the definition
+    /// entered after it, so an argument whose type reads a binder of the use site flows into
+    /// the instance ([`PolyScheme::instantiate_with_params`]).
+    pub use_telescope: Option<Telescope>,
+    /// The binders a specialization clone stands under besides its definition's: those
+    /// between the definition and the use that the use's instance reads, which the clone is
+    /// placed under (`infer::solve::specialize_use`). Each variable minted stands where its
+    /// original did with these entered.
+    pub entered_binders: Vec<crate::ccl::Name>,
     /// Obligation copies a specialization reset because they assumed one of the
     /// specialized binding's own type parameters
     /// ([`TraitObligation::reset_for_specialization`]). `specialize_use` redelivers
@@ -340,6 +355,15 @@ fn freshen_kind_var(
     if kv.stamped() == crate::ccl::ty::KindPin::Data {
         f.stamp_data();
     }
+    // **The binders come across renamed, before the edges.** A position the original has
+    // named is named in the bounds being copied, and the copy binds its own name there, so
+    // the rename has to be in the cache when those bounds are freshened. Every binder the
+    // original has named, arity known or not: a name is minted ahead of the arity
+    // ([`FunKindVar::binder_id_at`]).
+    let _ = kv.binder_ids();
+    for (i, from) in kv.named_binder_ids().into_iter().enumerate() {
+        cache.witnesses.insert(from, f.binder_id_at(i));
+    }
     // Each edge's substitution comes across freshened, as a copied bound's does.
     for (k, edge) in kv.lower_edges() {
         let edge = freshen_subst_payloads(lim, &edge, target, cache);
@@ -351,12 +375,6 @@ fn freshen_kind_var(
     }
     for src in kv.built_over().into_iter().rev() {
         f.contributes_first(freshen_fun_kind(&src, lim, target, cache));
-    }
-    // **The binders come across renamed**, after the edges that decide the arity. A
-    // position the original has settled is named in the bounds being copied, and the copy
-    // binds its own name there.
-    for (from, to) in kv.binder_ids().into_iter().zip(f.binder_ids()) {
-        cache.witnesses.insert(from, to);
     }
     // **And recorded on the copy**, not only in this walk's cache. The cache rewrites the
     // references this instantiation carries and is then gone; a reference written in the
@@ -419,6 +437,9 @@ fn freshen_level(ty: &Type) -> Level {
     };
     for r in ty.refinements() {
         lvl = lvl.max(predicate_level(&r.predicate));
+    }
+    if let Type::WitnessProjection(p) = ty {
+        lvl = lvl.max(predicate_level(&p.term));
     }
     ty.walk_children(|c| lvl = lvl.max(freshen_level(c)));
     lvl
@@ -518,6 +539,17 @@ pub fn freshen_above(
                 domain: Box::new(freshen_above(lim, d, target, cache)),
                 codomain: Box::new(freshen_above(lim, c, target, cache)),
             };
+            // The parts of a function whose kind may bind witnesses sit under those binders.
+            if let Type::Fun {
+                fun_kind,
+                domain,
+                codomain,
+                ..
+            } = &out
+            {
+                InferVar::place_parts_under(domain, fun_kind);
+                InferVar::place_parts_under(codomain, fun_kind);
+            }
             // A scheme binds its witnesses, so each instantiation owes itself its own —
             // `box`'s scheme is one sum, and sharing its binders would make every `box`
             // in a program name the one the scheme was written with, joining two
@@ -572,8 +604,19 @@ pub fn freshen_above(
         // [`Type::alpha_convert_sum`] on the way out of the `Fun` arm; a kind variable's is
         // re-minted with the variable ([`freshen_kind_var`]), and the cache is what carries
         // that rename to the references — in this type and in the bounds copied with it.
-        // Minted after inference, so no scheme reaches one.
-        Type::WitnessProjection(_) => ty.clone(),
+        // A projection quotes a term as a predicate does, and `unbox`'s stamped type quotes
+        // its own parameter, whose type holds the stamping's variables. Its slots freshen
+        // as a predicate's do, so a specialization's projection resolves against the
+        // clone's variables rather than sharing the definition's.
+        Type::WitnessProjection(p) => {
+            let _f = crate::ccl::provenance::copy_frame("infer.freshen_projection");
+            let mut term = (*p.term).clone();
+            freshen_expr_type_slots(&mut term, lim, target, cache);
+            Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(
+                Rc::new(term),
+                p.position,
+            ))
+        }
         Type::WitnessRef(w) => match cache.witnesses.get(w) {
             Some(fresh) => Type::WitnessRef(*fresh),
             None => ty.clone(),
@@ -679,10 +722,31 @@ pub fn freshen_above(
                     f
                 }
             };
-            let v = InferVar::fresh_over(
-                new_level,
-                cache.site_telescope.as_ref().unwrap_or(&tv.telescope),
-                fun_kind,
+            let telescope = match &cache.site_telescope {
+                Some(site) => site.clone(),
+                None => match &cache.use_telescope {
+                    Some(site) => {
+                        let mut inside: Vec<_> = tv.telescope.iter().cloned().collect();
+                        inside.reverse();
+                        site.rescoped(|_| false, inside)
+                    }
+                    None if cache.entered_binders.is_empty() => tv.telescope.clone(),
+                    None => tv
+                        .telescope
+                        .rescoped(|_| false, cache.entered_binders.iter().cloned()),
+                },
+            };
+            let v = InferVar::fresh_over(new_level, &telescope, fun_kind);
+            // The kinds the original sits under are this copy's kinds, whichever this walk
+            // reaches first: a variable copied before the function it is a part of would
+            // otherwise sit under the definition's kind, which nothing at the use relates to.
+            for k in tv.witness_scope_kinds() {
+                freshen_kind_var(&k, lim, target, cache);
+            }
+            v.inherit_witness_placement_renamed(
+                tv,
+                |k| cache.fun_kind_vars.get(&k.uid).cloned().unwrap_or_else(|| Rc::clone(k)),
+                |w| cache.witnesses.get(w).copied().unwrap_or(*w),
             );
             if tv.names_domain() {
                 v.mark_named_domain();
@@ -736,6 +800,34 @@ pub fn freshen_above(
                 s.set_lower(new_lows);
                 s.set_upper(new_ups);
                 s.type_kinds = new_kinds;
+            }
+            // A suspension's kinds are decided on it, and so on its copy
+            // ([`crate::ccl::infer_var::SuspendedMembership`]).
+            for m in crate::ccl::infer_var::suspended_memberships_of(tv) {
+                let kind = m.kind.map_children(|t| freshen_above(lim, t, target, cache));
+                let witnesses = m
+                    .witnesses
+                    .map_types(|t| freshen_above(lim, t, target, cache));
+                crate::ccl::infer_var::record_suspended_membership(
+                    crate::ccl::infer_var::SuspendedMembership {
+                        var: Rc::clone(&v),
+                        kind,
+                        witnesses,
+                        origin: m.origin,
+                    },
+                );
+            }
+            // And a membership recorded on a reading of the original, which only the original's
+            // suspensions reach: the copy reads the same way, and the kind is decided on that.
+            let readings: Vec<Rc<InferVar>> = tv
+                .suspensions
+                .borrow()
+                .iter()
+                .map(|(_, held)| Rc::clone(held))
+                .filter(|held| crate::ccl::infer_var::has_suspended_memberships(held))
+                .collect();
+            for held in readings {
+                freshen_above(lim, &Type::Infer(held), target, cache);
             }
             cache.relate_kind_copy(&tv.fun_kind, &v.fun_kind);
             let watches = tv.watches.borrow().clone();
@@ -1174,7 +1266,15 @@ fn freshen_subst_payloads(
 ) -> Subst {
     let mut subst = subst.clone();
     subst.for_each_discharge_term_mut(&mut |t| freshen_expr_type_slots(t, lim, target, cache));
-    subst
+    // The witness half comes across too: its binders and the kinds it eliminates are this
+    // instantiation's, and a discharge's type is freshened as any other type the bound carries.
+    let renames = cache.witnesses.clone();
+    let kinds = cache.fun_kind_vars.clone();
+    subst.map_witness_half(
+        |w| renames.get(w).copied().unwrap_or(*w),
+        |k| kinds.get(&k.uid).cloned().unwrap_or_else(|| Rc::clone(k)),
+        |t| freshen_above(lim, t, target, cache),
+    )
 }
 
 #[cfg(test)]

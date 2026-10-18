@@ -1245,6 +1245,11 @@ fn undischarged_index_hint(type_a: &Type, type_b: &Type) -> Option<String> {
         // index is not what went wrong).
         _ => return None,
     };
+    // A lookup's index is a value of the key type, never a function: a function on the other
+    // side is a collection the domain was required to belong to (a kind's sum), not an index.
+    if matches!(index.peel_refinements(), Type::Fun { .. }) {
+        return None;
+    }
     Some(format!(
         "hint: `{index}` is not known to lie in the collection's domain `{domain}`, so this \
          lookup is not provably total. A proven lookup needs an index whose type carries \
@@ -2223,7 +2228,7 @@ fn one_per_unfixed_width(expr: &Expr, open: Vec<LocatedInferError>) -> Vec<Locat
                     below |= self.go(value);
                     self.join_open_child(e, value);
                 }
-                TypedExprNode::Realize(value) => {
+                TypedExprNode::Realize { value, .. } => {
                     below |= self.go(value);
                     self.join_open_child(e, value);
                 }

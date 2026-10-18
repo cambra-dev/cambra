@@ -74,7 +74,18 @@ pub(super) fn insert_per_group_filters(
         "planning.per_group_filter",
         provenance::Nature::Machinery,
     );
-    let Some(site) = elts.iter().position(|e| per_group_filter_site(e).is_some()) else {
+    let chain_binder = match expr.ty.peel_refinements() {
+        Type::Fun { name, .. } => name.clone(),
+        _ => None,
+    };
+    let Some(site) = (0..elts.len()).position(|i| {
+        per_group_filter_site(
+            &elts[i],
+            carried_into(elts, i).as_ref(),
+            &positions_before(chain_binder.as_ref(), elts, i),
+        )
+        .is_some()
+    }) else {
         return Ok(());
     };
     // `site` is never 0: the morphism consumes a collection, so something upstream
@@ -85,7 +96,11 @@ pub(super) fn insert_per_group_filters(
     let TypedExprNode::Compose(elts) = &mut expr.node else {
         unreachable!("matched a Compose above")
     };
-    let Some((binder, site_codomain, value_predicate)) = per_group_filter_site(&elts[site]) else {
+    let carried = carried_into(elts, site);
+    let positions = positions_before(chain_binder.as_ref(), elts, site);
+    let Some((binder, site_codomain, value_predicate)) =
+        per_group_filter_site(&elts[site], carried.as_ref(), &positions)
+    else {
         unreachable!("position found it")
     };
     // The filter evaluates its predicate per value, so it is planned as a `restrict`'s
@@ -131,7 +146,11 @@ pub(super) fn insert_per_group_filters(
 
 /// The site's codomain and the value predicate to filter by, if `expr` is a per-group
 /// filter site. See [`insert_per_group_filters`] for the shape.
-fn per_group_filter_site(expr: &Expr) -> Option<(Name, Type, Expr)> {
+fn per_group_filter_site(
+    expr: &Expr,
+    carried: Option<&Expr>,
+    positions: &[Name],
+) -> Option<(Name, Type, Expr)> {
     let Narrowing {
         binder,
         opened,
@@ -143,7 +162,10 @@ fn per_group_filter_site(expr: &Expr) -> Option<(Name, Type, Expr)> {
     // it pairs with — the stages of a filter *pipeline* — have no counterpart here.
     let mut conjoined = None;
     for (r, _) in application_order(&added, &consumed) {
-        conjoined = combine_predicates(conjoined, Some(value_predicate(&r.predicate, &binder)?));
+        conjoined = combine_predicates(
+            conjoined,
+            Some(value_predicate(&r.predicate, &binder, carried, positions)?),
+        );
     }
     Some((binder, opened, conjoined?))
 }
@@ -231,18 +253,24 @@ fn is_per_group_filter(e: &Expr) -> bool {
 /// collection's extent with its refinements stripped, so compiling it would drop the filter
 /// and answer as though it were absent. Runs after [`insert_per_group_filters`] over the same
 /// positions it inspects: the elements of a composition after the first.
+///
+/// A site is rejected wherever its codomain claims a narrowing, not only where it has the shape
+/// [`narrowing`] matches: a codomain whose domain adds a refinement reading the site's input,
+/// over a base other than the one the site consumes, is a narrowing no operator performs either.
 pub(super) fn reject_unmaterialized_narrowings(expr: &Expr) -> Result<(), String> {
     if let TypedExprNode::Compose(elts) = &expr.node
-        && let Some(site) = elts
-            .iter()
-            .skip(1)
-            .find(|e| narrowing(e).is_some() && !is_per_group_filter(e))
+        && let Some(site) = elts.iter().skip(1).find(|e| {
+            (narrowing(e).is_some() || refines_by_its_input(e)) && !is_per_group_filter(e)
+        })
     {
+        let codomain = match &site.ty {
+            Type::Fun { codomain, .. } => open_codomain(&site.ty, codomain).to_string(),
+            _ => String::new(),
+        };
         return Err(format!(
             "a filter on an inner collection that planning cannot materialize is not \
-             supported yet: `{}` narrows the collection it is handed to {}",
+             supported yet: `{}` narrows the collection it is handed to {codomain}",
             symbolic(site),
-            narrowing(site).map_or_else(String::new, |n| n.opened.to_string())
         ));
     }
     let mut result = Ok(());
@@ -254,12 +282,103 @@ pub(super) fn reject_unmaterialized_narrowings(expr: &Expr) -> Result<(), String
     result
 }
 
-/// Strip `__elem ▷ (𝑔 ≫ 𝑞)` down to `𝑞`, the predicate on the collection's values.
+/// Whether `e`'s codomain is a collection whose domain carries a refinement that looks `e`'s
+/// input up at the key ([`looks_up_at_the_key`]), and that the collection `e` consumes does not carry: a
+/// filter of the input's values, whatever the two domains' bases are. A refinement reading the
+/// input as a value (a correlated filter, `{𝑣 : 𝐷 | 𝑣 > 𝑟}`) and a membership refinement are not
+/// filters of the input's values.
+fn refines_by_its_input(e: &Expr) -> bool {
+    let Type::Fun {
+        name: Some(binder),
+        domain,
+        codomain,
+        ..
+    } = &e.ty
+    else {
+        return false;
+    };
+    let consumed = domain.domain().map(|d| d.refinements().to_vec());
+    let Some(narrowed) = open_codomain(&e.ty, codomain).domain() else {
+        return false;
+    };
+    narrowed.refinements().iter().any(|r| {
+        !r.is_collection_membership()
+            && looks_up_at_the_key(&r.predicate, binder)
+            && !consumed.as_ref().is_some_and(|c| c.contains(r))
+    })
+}
+
+/// Whether `predicate` looks the collection `binder` names up at `__elem`: `__elem ▷ 𝑔`, or
+/// `__elem ▷ (𝑔 ≫ 𝑞)`. A predicate reading another collection there, whose filter reads `binder`
+/// as a value, is a correlated filter.
+fn looks_up_at_the_key(predicate: &Expr, binder: &Name) -> bool {
+    let is_binder = |e: &Expr| matches!(&e.node, TypedExprNode::Var(n) if n == binder);
+    if let TypedExprNode::Apply { argument, function } = &predicate.node
+        && matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
+        && (is_binder(function)
+            || matches!(&function.node, TypedExprNode::Compose(elts)
+                if elts.first().is_some_and(is_binder)))
+    {
+        return true;
+    }
+    let mut found = false;
+    predicate.walk_children(|child| found |= looks_up_at_the_key(child, binder));
+    found
+}
+
+/// The names of the positions a chain passes through before `elts[i]`: the chain's own binder
+/// and the binders of the morphisms before `i` (`src/ccl/design/type-inference.md`, "A chain
+/// names each position").
+fn positions_before(chain_binder: Option<&Name>, elts: &[Expr], i: usize) -> Vec<Name> {
+    chain_binder
+        .cloned()
+        .into_iter()
+        .chain(
+            elts[..i]
+                .iter()
+                .filter_map(|e| match e.ty.peel_refinements() {
+                    Type::Fun { name, .. } => name.clone(),
+                    _ => None,
+                }),
+        )
+        .collect()
+}
+
+/// The value the morphism before position `i` carries into it, `𝑝 ▷ 𝑒` for that morphism 𝑒 and
+/// its binder 𝑝: the other spelling of the site's input (`src/ccl/design/type-inference.md`,
+/// "A chain names each position"). Built only to compare against, so it reaches no tree.
+fn carried_into(elts: &[Expr], i: usize) -> Option<Expr> {
+    let before = elts.get(i.checked_sub(1)?)?;
+    let Type::Fun {
+        name: Some(p),
+        domain,
+        ..
+    } = before.ty.peel_refinements()
+    else {
+        return None;
+    };
+    let position = Expr::throwaway(TypedExprNode::Var(p.clone())).with_ty((**domain).clone());
+    Some(
+        Expr::throwaway(TypedExprNode::Apply {
+            argument: Box::new(position),
+            function: Box::new(before.clone_preserving_ids()),
+        })
+        .with_ty(Type::Hole),
+    )
+}
+
+/// Strip `__elem ▷ (𝑔 ≫ 𝑞)` down to `𝑞`, the predicate on the collection's values. The site's
+/// input is read by its binder 𝑔 or as the value `carried` into it.
 ///
 /// Returns `None` for any other shape, including a predicate that never dereferences
-/// `𝑔`: the rewrite is only sound when the collection being filtered is the one the
-/// predicate reads through.
-fn value_predicate(predicate: &Expr, binder: &Name) -> Option<Expr> {
+/// the site's input: the rewrite is only sound when the collection being filtered is the one
+/// the predicate reads through.
+fn value_predicate(
+    predicate: &Expr,
+    binder: &Name,
+    carried: Option<&Expr>,
+    positions: &[Name],
+) -> Option<Expr> {
     let TypedExprNode::Apply { argument, function } = &predicate.node else {
         return None;
     };
@@ -272,20 +391,29 @@ fn value_predicate(predicate: &Expr, binder: &Name) -> Option<Expr> {
     let [head, rest @ ..] = chain.as_slice() else {
         return None;
     };
-    if !matches!(&head.node, TypedExprNode::Var(n) if n == binder) {
+    let reads_input = matches!(&head.node, TypedExprNode::Var(n) if n == binder)
+        || carried.is_some_and(|c| crate::ccl::ty::eq_term_modulo_ty_slots(head, c));
+    if !reads_input {
         return None;
     }
-    match rest {
-        [] => None,
-        [only] => Some(only.clone()),
+    let q = match rest {
+        [] => return None,
+        [only] => only.clone(),
         many => {
             let ty = match (many.first()?.ty.domain(), many.last()?.ty.codomain()) {
                 (Some(d), Some(c)) => Type::fun(d, c),
                 _ => Type::Hole,
             };
-            Some(ccl_utils::chain_typed(many.to_vec(), ty))
+            ccl_utils::chain_typed(many.to_vec(), ty)
         }
-    }
+    };
+    // The filter is handed the values alone, so a value predicate reading the site's input,
+    // or any position of the chain before it, has nothing to read:
+    // `[v for v in r.xs if v > r.lim]`.
+    let reads_positions = std::iter::once(binder)
+        .chain(positions)
+        .any(|p| ccl_utils::is_free(p, &q));
+    (!reads_positions).then_some(q)
 }
 
 #[cfg(test)]
@@ -402,6 +530,25 @@ mod tests {
         insert_per_group_filters(&mut expr, &mut Default::default()).unwrap();
         assert_eq!(planned(&expr).0, None, "no filter was inserted");
         assert_eq!(expr, before, "the site is untouched");
+        let rejected = reject_unmaterialized_narrowings(&expr)
+            .expect_err("the narrowing no operator performs is rejected");
+        assert!(rejected.contains("cannot materialize"), "{rejected}");
+    }
+
+    /// A site whose codomain filters its input over a base other than the one it consumes
+    /// has no per-group filter, and is rejected rather than compiled without its filter.
+    #[test]
+    fn a_narrowing_over_another_base_is_rejected() {
+        let value = tuple_ty(vec![int_ty()]);
+        let binder = Name::from("g");
+        let mut added = RefinementSet::new();
+        added.insert(group_filter_predicate(&binder, "q1", value.clone()));
+        let unfiltered = collection(RefinementSet::new(), value.clone());
+        let elsewhere = Type::data_fun(Type::refined(Type::UIntRange(4), added), value);
+        let site = var("m").with_ty(Type::pi(binder, unfiltered.clone(), elsewhere));
+        let mut expr = Expr::compose(vec![var("u").with_ty(unfiltered), site]);
+        insert_per_group_filters(&mut expr, &mut Default::default()).unwrap();
+        assert_eq!(planned(&expr).0, None, "no filter was inserted");
         let rejected = reject_unmaterialized_narrowings(&expr)
             .expect_err("the narrowing no operator performs is rejected");
         assert!(rejected.contains("cannot materialize"), "{rejected}");

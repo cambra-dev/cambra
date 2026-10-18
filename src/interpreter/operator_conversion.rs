@@ -2432,8 +2432,21 @@ fn convert_impl_inner(
         // the sum denotes is that leg keyed by its own keys. Merging flat at the bound the
         // sum's type declares is that, where a tagged merge would show every key wearing its
         // leg's tag (`src/ccl/design/collections.md`, "Compiling a conditional collection").
-        TypedExprNode::Realize(value) => match &value.node {
-            TypedExprNode::Copair(operands) if expr.ty.witness_kind().is_some() => {
+        TypedExprNode::Realize { value, .. } => match &value.node {
+            // An opened sum, the function view `σ ⤇ V` a `Case` inside a predicate has after
+            // `lambda_elim`, carries no binder, so its kind is not here to bound the legs'
+            // keys, and converting the copairing as itself would key each row by its leg.
+            TypedExprNode::Copair(_)
+                if expr.ty.witness_kind().is_none() && expr.ty.is_witness_indexed() =>
+            {
+                unreachable!(
+                    "a realized copairing typed by an opened sum reached op-conversion, with no \
+                     witness kind to bound its legs' keys: {}",
+                    expr.ty
+                )
+            }
+            // Whether the sum survived or was erased to its one candidate's collection.
+            TypedExprNode::Copair(operands) => {
                 // A fed union merges one level above its input, where the arms split the
                 // input's rows. A realized leg is a whole collection per row, so that merge
                 // would put each leg's keys at the wrong level. No program feeds one: a
@@ -2446,7 +2459,10 @@ fn convert_impl_inner(
                     ));
                 }
                 let Extent::Function { domain, codomain } = ctx.extent_of(&expr.ty)? else {
-                    unreachable!("a sum converts to a function extent: {}", expr.ty)
+                    unreachable!(
+                        "a realized collection converts to a function extent: {}",
+                        expr.ty
+                    )
                 };
                 union_operand_ops(
                     operands,
@@ -2458,14 +2474,6 @@ fn convert_impl_inner(
                     ctx,
                 )
             }
-            // An opened sum, the function view `σ ⤇ V` a `Case` inside a predicate has after
-            // `lambda_elim`, carries no binder, so its kind is not here to bound the legs'
-            // keys, and converting the copairing as itself would key each row by its leg.
-            TypedExprNode::Copair(_) if expr.ty.is_witness_indexed() => unreachable!(
-                "a realized copairing typed by an opened sum reached op-conversion, with no \
-                 witness kind to bound its legs' keys: {}",
-                expr.ty
-            ),
             _ => convert_impl(value, input, ctx),
         },
 
@@ -2891,6 +2899,16 @@ fn convert_impl_inner(
                             expr.ty
                         ))
                     })?;
+                    // A witness ranging over every type bounds no key type, so there is nothing
+                    // to re-view the keys at: they keep the extent the input gives them, which
+                    // is the value's own.
+                    if let Some(Type::WitnessProjection(p)) =
+                        unboxed.domain().as_ref().map(Type::peel_refinements)
+                        && p.witness()
+                            .is_some_and(|w| matches!(w.type_kind(), crate::ccl::TypeKind::Type))
+                    {
+                        return Ok(input);
+                    }
                     let Extent::Function { domain, .. } = ctx.extent_of(&unboxed)? else {
                         unreachable!("an unboxed sum converts to a function extent: {unboxed}")
                     };

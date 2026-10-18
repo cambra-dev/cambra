@@ -176,13 +176,13 @@ one.
 
 Collection iteration uses ordinary function nodes in two shapes. A single-generator comprehension
 such as `[f(x) for x in xs]` becomes an outer lambda over an iteration position:
-`λ __iter_record → __iter_record ▷ xs ▷ (λ x → f(x))`. The first application reads the
-source at that position; the second maps its element through the body. Multiple generators nest
+`λ __iter_record → __iter_record ▷ (xs ▷ unbox) ▷ (λ x → f(x))`. The first application reads the
+source at that position, through `unbox`; the second maps its element through the body. Multiple generators nest
 those application and lambda pairs, with a product of source domains for the outer parameter.
 `ccl/comprehension.rs` builds both, and the `__iter_record` binder it mints is a `Synthetic`:
 α-uniquification has already run, so a raw spelling would shadow its twin in a nested
 comprehension. A feed-only or yield-only statement loop without loop-carried mutation uses
-`xs ≫ (λ x → body)` (`Expr::for_loop`, `lower/loops.rs`), built at lowering. Both forms use existing
+`xs ▷ unbox ≫ (λ x → body)` (`lower/loops.rs`), built at lowering. Both forms use existing
 function nodes; mutation and transaction loops instead retain a structured `For`. `lambda_elim`
 removes the lambdas and produces point-free combinators; operator conversion builds the dataflow
 operators. See [lambda elimination](optimization.md#lambda-elimination-ccllambda_elimrs) and the

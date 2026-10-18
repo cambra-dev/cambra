@@ -599,7 +599,9 @@ pub(super) fn wrap_with_iterate(
     // well-typed pipeline for the same final domain; the order is planning's to
     // choose, which is what lets the refinement set itself stay unordered.
     let site_ty = body.ty.clone();
-    let mut source = make_iterate(trivially_true_predicate(base.clone()));
+    // A projected domain is enumerated from the collection it projects, not from its
+    // key bound: `unbox(𝑡) ▷ map_domain`, the keys `𝑡` holds.
+    let mut source = domain_keys(base, ctx)?;
     for (r, elem_ty) in crate::ccl::application_order(domain_ty.refinements(), base) {
         let position = domain_ty
             .refinements()
@@ -724,6 +726,10 @@ fn all_witnesses_realized(
 ///    curried `Apply`, …) — op-conversion's catch-all arm rejects
 ///    `input=Some`.  Plus value-position `Tuple` / `Record` literals
 ///    (also reject `input=Some`).
+///    A disjoint join is a source too, except a value `Case`'s fan-out over its
+///    input, `⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ)`: its legs read the element stream fed to
+///    the join, so one standing at a site needs an `iterate` over its domain. A `let`
+///    binding a conditional chosen per row binds that shape.
 /// 3. `Var` references bound to a **collection** ([`FunKind::Data`]) —
 ///    op-conversion's `Var` arm returns its bound op directly under
 ///    `input=None`, and that bound op was itself iterate-wrapped at its
@@ -732,6 +738,9 @@ fn all_witnesses_realized(
 pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
     let head = head_of(expr);
     match &head.node {
+        // A value `Case` fanned out over its input reads the stream it is fed, as one leg led
+        // by `filter_values` does; standing at a site, nothing feeds it.
+        TypedExprNode::DisjointJoin(legs) if legs.iter().all(is_filter_values_led) => false,
         TypedExprNode::Copair(_)
         | TypedExprNode::DisjointJoin(_)
         | TypedExprNode::Tuple(_)
@@ -747,6 +756,8 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
         {
             true
         }
+        // A realization is the union it holds, gated legs and all.
+        TypedExprNode::Realize { value, .. } => is_iteration_bearing(value),
         // `unbox(𝑐)` is `𝑐`'s value over the domain its witness names, keys and all, so it
         // iterates exactly when `𝑐` does: an `iterate` over its projected domain would
         // enumerate the witness's whole bound (`src/ccl/design/collections.md`, "A projection
@@ -782,6 +793,120 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
             // rejects `input=Some`, so wrapping would break compilation.
             None => true,
         },
+        _ => false,
+    }
+}
+
+/// Whether `leg`'s head filters the element stream it is fed (`π̂ ▷ filter_values`).
+fn is_filter_values_led(leg: &Expr) -> bool {
+    matches!(&head_of(leg).node, TypedExprNode::Apply { function, .. }
+        if builtin_at_function_position(function) == Some(Builtin::FilterValues))
+}
+
+/// `unbox(𝑡) ▷ map_domain`, the keys of the sum `𝑡`, over its projected domain.
+fn keys_of(term: &Expr, ctx: &mut PlanningCtx) -> Result<Expr, String> {
+    let stamp = crate::ccl::ty::unbox_type(&term.ty)
+        .ok_or_else(|| format!("a projected value has a sum type, got {}", term.ty))?;
+    let (copy, quoted) = {
+        let _frame = provenance::copy_frame("planning.projected_keys");
+        (term.clone(), Rc::new(term.clone()))
+    };
+    // The copy is a term lifted out of a type into the tree, so it is planned as every such
+    // term is (`src/ccl/design/optimization.md`, "Planning a lifted term"): a conditional it
+    // quoted is realized, and its legs iterated.
+    let copy = plan_lifted(copy, PlanningPhase::MarkIterationSites, ctx)?;
+    let unboxed_ty = crate::ccl::ty::unboxed_type(&term.ty, &quoted)
+        .ok_or_else(|| format!("a projected value has a sum type, got {}", term.ty))?;
+    let unboxed =
+        Expr::apply(copy, Expr::builtin(Builtin::Unbox).with_ty(stamp)).with_ty(unboxed_ty.clone());
+    let keys = unboxed_ty
+        .domain()
+        .ok_or_else(|| format!("an unboxed collection is a function, got {unboxed_ty}"))?;
+    let key_set = Type::data_fun(keys.clone(), keys);
+    Ok(Expr::apply(
+        unboxed,
+        Expr::builtin(Builtin::MapDomain).with_ty(Type::fun(unboxed_ty, key_set.clone())),
+    )
+    .with_ty(key_set))
+}
+
+/// The keys a domain ranges over, as an iteration source.
+///
+/// A static domain is its extent, `iterate(true)`. A projected one is the keys of the sum it
+/// projects ([`keys_of`]). A product reaching either kind of component is its components'
+/// keys in turn: the first component's keys, each later one's as a family over them, and
+/// `uncurry` back to the one level of tuple keys the domain states. An all-static product
+/// keeps its one extent.
+fn domain_keys(base: &Type, ctx: &mut PlanningCtx) -> Result<Expr, String> {
+    match base {
+        Type::WitnessProjection(p) => keys_of(&p.term, ctx),
+        Type::Tuple(components) if components.iter().any(has_projected_keys) => {
+            let Some((first, rest)) = components.split_first() else {
+                return Ok(make_iterate(trivially_true_predicate(base.clone())));
+            };
+            // The keys of the prefix, as a key set over the prefix: one component, then each
+            // next one's keys as a family over it, uncurried and flattened back to one level.
+            let mut keys = domain_keys(first, ctx)?;
+            let mut prefix = first.clone();
+            for (k, next) in rest.iter().enumerate() {
+                let inner = domain_keys(next, ctx)?;
+                let inner_ty = inner.ty.clone();
+                let family = apply_primitive(
+                    inner,
+                    Builtin::Const,
+                    Type::fun(prefix.clone(), inner_ty.clone()),
+                );
+                let nested = typed_compose(vec![keys, family])
+                    .with_ty(Type::data_fun(prefix.clone(), inner_ty));
+                let paired = Type::Tuple(vec![prefix.clone(), next.clone()]);
+                let mut flat = apply_primitive(
+                    nested,
+                    Builtin::Uncurry,
+                    Type::data_fun(paired.clone(), next.clone()),
+                );
+                let widened = Type::Tuple(components[..k + 2].to_vec());
+                // From the third component on, the prefix is itself a tuple, which the pair
+                // nests; flattening its field re-addresses the rows over one tuple.
+                if k > 0 {
+                    let indices = Expr::list(vec![
+                        Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int)),
+                    ])
+                    .with_ty(Type::data_fun(
+                        Type::index_range(1),
+                        Type::Base(BaseType::Int),
+                    ));
+                    let flatten = apply_primitive(
+                        indices,
+                        Builtin::FlattenDomain,
+                        Type::fun(
+                            Type::data_fun(paired.clone(), next.clone()),
+                            Type::data_fun(widened.clone(), next.clone()),
+                        ),
+                    );
+                    flat = apply_function(
+                        flat,
+                        flatten,
+                        Type::data_fun(widened.clone(), next.clone()),
+                    );
+                }
+                keys = apply_primitive(
+                    flat,
+                    Builtin::MapDomain,
+                    Type::data_fun(widened.clone(), widened.clone()),
+                );
+                prefix = widened;
+            }
+            Ok(keys)
+        }
+        _ => Ok(make_iterate(trivially_true_predicate(base.clone()))),
+    }
+}
+
+/// Whether a domain has a component whose keys only a collection holds.
+fn has_projected_keys(ty: &Type) -> bool {
+    match ty.peel_refinements() {
+        Type::WitnessProjection(_) => true,
+        Type::Tuple(cs) => cs.iter().any(has_projected_keys),
         _ => false,
     }
 }

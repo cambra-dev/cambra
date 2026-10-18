@@ -442,7 +442,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // `target` is the only place the type is visible, so render it inline.
         // `Realize` renders as `realize(value)`: born after inference, so its target is
         // always `expr.ty` and inlining it would duplicate what callers already suffix.
-        TypedExprNode::Realize(value) => (
+        TypedExprNode::Realize { value, .. } => (
             Precedence::Atom,
             format!("realize({})", fmt(value, Precedence::Lowest, opts)),
         ),

@@ -438,6 +438,101 @@ pub fn spec_key(ty: &Type) -> SpecKey {
     }
 }
 
+/// A binder's kind into `acc`: its children as types, at the kind's polarity, and its shape.
+fn key_type_kind(
+    type_kind: &crate::ccl::ty::TypeKind,
+    pol: bool,
+    subst_acc: &Subst,
+    ctx: &mut KeyCtx,
+    acc: &mut KeyView,
+) {
+    for child in type_kind.children() {
+        acc.union(key_go(child, pol, subst_acc, ctx));
+    }
+    let shape = type_kind.map_children(|_| Type::Hole);
+    if !acc.type_kinds.contains(&shape) {
+        acc.type_kinds.push(shape);
+    }
+}
+
+/// What the binder at `position` of a kind **variable** ranges over, keyed into `acc`, by the
+/// relations `compact`'s `var_binder_kind` reads — **change the two together**: the source
+/// that owns the position, else every kind below, else the demands above, read and not
+/// continued through. Whether anything answered.
+fn key_var_binder(
+    k: &Rc<crate::ccl::ty::FunKindVar>,
+    position: usize,
+    pol: bool,
+    subst_acc: &Subst,
+    ctx: &mut KeyCtx,
+    seen: &mut Vec<crate::ccl::ty::FunKindVarId>,
+    acc: &mut KeyView,
+) -> bool {
+    if seen.contains(&k.uid) {
+        return false;
+    }
+    seen.push(k.uid);
+    let mut offset = 0;
+    for src in k.built_over() {
+        let n = src.arity().unwrap_or(0);
+        if position < offset + n {
+            return key_kind_at(
+                &src,
+                position - offset,
+                pol,
+                true,
+                subst_acc,
+                ctx,
+                seen,
+                acc,
+            );
+        }
+        offset += n;
+    }
+    let mut answered = false;
+    for (f, edge) in k.lower_edges() {
+        let inner = Subst::then(&edge, subst_acc);
+        answered |= key_kind_at(&f, position, pol, true, &inner, ctx, seen, acc);
+    }
+    if !answered {
+        for (f, edge) in k.upper_edges() {
+            let inner = Subst::then(&edge, subst_acc);
+            answered |= key_kind_at(&f, position, pol, false, &inner, ctx, seen, acc);
+        }
+    }
+    answered
+}
+
+/// [`key_var_binder`]'s question of one kind, concrete or variable, as `compact`'s `kind_at`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the mirror of `kind_at`, plus the key's sink"
+)]
+fn key_kind_at(
+    f: &crate::ccl::ty::FunKind,
+    position: usize,
+    pol: bool,
+    through: bool,
+    subst_acc: &Subst,
+    ctx: &mut KeyCtx,
+    seen: &mut Vec<crate::ccl::ty::FunKindVarId>,
+    acc: &mut KeyView,
+) -> bool {
+    match f {
+        crate::ccl::ty::FunKind::Var(v) if through => {
+            key_var_binder(v, position, pol, subst_acc, ctx, seen, acc)
+        }
+        crate::ccl::ty::FunKind::Var(_) => false,
+        other => match other.witnesses().get(position) {
+            Some(w) => {
+                key_type_kind(&w.type_kind(), pol, subst_acc, ctx, acc);
+                true
+            }
+            None => false,
+        },
+    }
+}
+
 fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView {
     match ty {
         // `BoundedHole` is a *pre-inference* annotation marker: `normalize_annotation`
@@ -572,14 +667,21 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             // both recurse here at this polarity — the same no-flip `compact_go` uses, since
             // neither is a domain position — and what the kind adds beyond its children is
             // which kind it is.
-            for w in fun_kind.witnesses() {
-                let type_kind = w.type_kind();
-                for child in type_kind.children() {
-                    acc.union(key_go(child, pol, subst_acc, ctx));
+            //
+            // **A variable's binders key as what reaches them**, as `compact_go` ranges them
+            // (`var_binder_kind`): two uses whose sums differ only in what a variable kind's
+            // positions range over compile to clones over different domains, so a key
+            // reading a variable as ranging over nothing shares one clone between them.
+            match fun_kind {
+                crate::ccl::ty::FunKind::Var(v) => {
+                    for position in 0..v.arity().unwrap_or(0) {
+                        key_var_binder(v, position, pol, subst_acc, ctx, &mut Vec::new(), &mut acc);
+                    }
                 }
-                let shape = type_kind.map_children(|_| Type::Hole);
-                if !acc.type_kinds.contains(&shape) {
-                    acc.type_kinds.push(shape);
+                stated => {
+                    for w in stated.witnesses() {
+                        key_type_kind(&w.type_kind(), pol, subst_acc, ctx, &mut acc);
+                    }
                 }
             }
             acc

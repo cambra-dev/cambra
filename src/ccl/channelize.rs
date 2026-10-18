@@ -1469,7 +1469,7 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
         | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Apply { .. }
-        | TypedExprNode::Realize(_)
+        | TypedExprNode::Realize { .. }
         | TypedExprNode::Cast { .. }
         | TypedExprNode::BinOp { .. }
         | TypedExprNode::UnaryOp(..)
@@ -1549,7 +1549,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Apply { .. }
-        | TypedExprNode::Realize(_)
+        | TypedExprNode::Realize { .. }
         | TypedExprNode::Cast { .. }
         | TypedExprNode::BinOp { .. }
         | TypedExprNode::UnaryOp(..)
@@ -2189,7 +2189,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(function, bound, out);
                 rec(argument, bound, out);
             }
-            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => {
+            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize { value, .. } => {
                 rec(value, bound, out)
             }
             TypedExprNode::Begin { body } => rec(body, bound, out),
@@ -2682,13 +2682,16 @@ fn extract_for_defer_impl(
             }
         }
         // `realize` wraps a pure value exactly as `cast` does; recurse and keep `target`.
-        TypedExprNode::Realize(value) => TypedExprNode::Realize(Box::new(extract_for_defer(
-            *value,
-            defer_name,
-            feeds,
-            define,
-            in_inner_scope,
-        )?)),
+        TypedExprNode::Realize { value, staged } => TypedExprNode::Realize {
+            value: Box::new(extract_for_defer(
+                *value,
+                defer_name,
+                feeds,
+                define,
+                in_inner_scope,
+            )?),
+            staged,
+        },
         // `cast` wraps a pure value; recurse into it and keep `target`.
         TypedExprNode::Cast { value, target } => TypedExprNode::Cast {
             value: Box::new(extract_for_defer(
