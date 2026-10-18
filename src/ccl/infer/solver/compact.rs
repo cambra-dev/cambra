@@ -2638,10 +2638,26 @@ fn compact_go(
             // A substitution that maps no name the walk below can reach leaves the walk as it
             // is under the identity: a refinement it does not act on keeps its predicate
             // (`Subst::force_refinement`), and a witness half is ruled out here.
+            let below = if subst_acc.is_id() || subst_acc.has_witnesses() {
+                None
+            } else {
+                consulted_below(state, pol, (memo_key.3, memo_key.4), st)
+            };
             let memoizable = subst_acc.is_id()
-                || (!subst_acc.has_witnesses()
-                    && consulted_below(state, pol, (memo_key.3, memo_key.4), st)
-                        .is_some_and(|names| !subst_acc.maps_any(&names)));
+                || below
+                    .as_ref()
+                    .is_some_and(|names| !subst_acc.maps_any(names));
+            // Below this variable the walk reads only the entries for the names it can reach,
+            // so it carries only those: the substitution accumulates an entry per binder on
+            // the path, and the walk composes it at every bound.
+            let pruned;
+            let subst_acc = match &below {
+                Some(names) => {
+                    pruned = subst_acc.restricted_to(names);
+                    &pruned
+                }
+                None => subst_acc,
+            };
             if memoizable
                 && let Some(done) = st.memo.get(&memo_key)
                 && done.cuts.iter().all(|cut| {

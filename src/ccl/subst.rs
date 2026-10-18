@@ -110,28 +110,26 @@ pub type Binder = Name;
 /// what lets [`Subst::invert`] and [`Subst::split_renames`] be exact by
 /// construction: inversion legality is type-enforced, and "the rename part"
 /// means precisely the entries constructed as correspondences.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Mapping {
     /// `binder ↦ other binder` — a correspondence between frames. Invertible.
     Rename(Binder),
     /// `binder ↦ term` — plug a term in for the binder. No inverse.
-    /// (Boxed: a term is much larger than a binder name.)
     ///
-    /// **Considered and deferred: `Rc<TypedExpr>`.** The payload is a template,
-    /// never a tree node and cloned afresh at every read ([`Mapping::as_expr`]),
-    /// so sharing it is sound. The solver copies substitutions constantly
-    /// (`Bound::render_subst`, [`Subst::then`], `compact`, `constrain`): with a
-    /// `Box` each of those ~28 sites deep-copies the payload tree, with an `Rc`
-    /// they are refcount bumps.
+    /// The payload is shared: it is a template, never a tree node, and is cloned afresh at
+    /// every read ([`Mapping::as_expr`] / [`as_expr_preserving`](Mapping::as_expr_preserving)),
+    /// which is where a sibling is minted, once per occurrence filled. So a copy of the
+    /// substitution copies no term and mints nothing. Minting on a copy would record a
+    /// `Copy` against a type-domain term the provenance table never saw, which the pane fold
+    /// reports as [`Leak::DanglingParent`](crate::ccl::provenance::Leak::DanglingParent). And
+    /// the solver copies substitutions constantly (`Bound::render_subst`, [`Subst::then`],
+    /// `compact`, `constrain`), while a payload grows with the `let`s nested around it.
     ///
-    /// One trap if it is ever done: [`Subst::for_each_discharge_term_mut`] would
-    /// become `Rc::make_mut`, which copies out through `TypedExpr`'s freshening
-    /// `Clone`. `freshen_subst_payloads` clones the `Subst` while the source
-    /// `Bound` is still alive, so the payload is **always** shared at that point
-    /// and it would freshen every time. The fix is to stop mutating in place —
-    /// map to a new `Rc` per payload instead. See the vault's
-    /// `freshening-clone-report`.
-    Discharge(Box<TypedExpr>),
+    /// [`Subst::for_each_discharge_term_mut`] replaces the `Rc` rather than mutating
+    /// through `Rc::make_mut`: the payload is shared with the substitution it was copied
+    /// from, and `TypedExpr`'s `Clone` freshens, so a copy-on-write would freshen at every
+    /// visit.
+    Discharge(Rc<TypedExpr>),
     /// `binder ↦ σ(term)`, with `σ` not yet applied: a discharge composed with a later
     /// substitution ([`Subst::then`]). Applying `σ` into the term at composition copies
     /// every definiens it reaches into it, and a chain of `let`s whose definientia read the
@@ -159,35 +157,6 @@ pub enum WitnessMapping {
     /// ([`open_pi_binder`]), and it happens wherever the binding sum is found rather than
     /// only at the root — a type slot reached from outside may still hold the whole sum.
     Discharge(Type),
-}
-
-/// Hand-written so that **copying a substitution does not duplicate its terms**
-/// — the one place `TypedExpr`'s freshening `Clone` is deliberately opted out
-/// of, and the reason it can be opted out of exactly here.
-///
-/// A `Discharge` payload is a **template**, not a tree node. It is cloned again
-/// at every read ([`Mapping::as_expr`] / [`as_expr_preserving`]), and *that*
-/// read is where the sibling gets minted, once per occurrence actually filled.
-/// So copying the map itself must mint nothing: the template is never in a tree,
-/// and no two nodes can end up sharing an id because of it.
-///
-/// Without this, every `Subst` copy inherits the freshening and re-mints its
-/// payloads. The solver copies substitutions constantly — `Bound::render_subst`,
-/// [`Subst::then`], `compact`, `constrain` — and a bound edge's payloads are **type-domain**
-/// terms whose ids are outside the recorded id domain, so each such copy records
-/// a `Copy` against an origin the table never saw and the pane fold reports it as
-/// [`Leak::DanglingParent`](crate::ccl::provenance::Leak::DanglingParent). Measured on
-/// `generator_pipeline`: 200 of them between the first two panes.
-///
-/// [`as_expr_preserving`]: Mapping::as_expr_preserving
-impl Clone for Mapping {
-    fn clone(&self) -> Self {
-        match self {
-            Mapping::Rename(b) => Mapping::Rename(b.clone()),
-            Mapping::Discharge(t) => Mapping::Discharge(Box::new(t.clone_preserving_ids())),
-            Mapping::Deferred(t, under) => Mapping::Deferred(Rc::clone(t), Rc::clone(under)),
-        }
-    }
 }
 
 /// A substitution must never leave a **typed** occurrence holding an untyped
@@ -474,7 +443,7 @@ impl Subst {
         let binder = binder.into();
         debug_assert_no_pi_bound(&binder);
         let mut m = BTreeMap::new();
-        m.insert(binder, Mapping::Discharge(Box::new(term)));
+        m.insert(binder, Mapping::Discharge(Rc::new(term)));
         Subst::of_binders(m)
     }
 
@@ -523,7 +492,11 @@ impl Subst {
     pub fn for_each_discharge_term_mut(&mut self, f: &mut impl FnMut(&mut TypedExpr)) {
         for m in self.binders.values_mut() {
             match m {
-                Mapping::Discharge(t) => f(t),
+                Mapping::Discharge(t) => {
+                    let mut term = t.clone_preserving_ids();
+                    f(&mut term);
+                    *t = Rc::new(term);
+                }
                 // A new `Rc` per payload rather than `Rc::make_mut`: the payload is shared
                 // with the substitution it was copied from, and `TypedExpr`'s `Clone`
                 // freshens, so a copy-on-write would freshen at every visit.
@@ -678,14 +651,12 @@ impl Subst {
                     None => Mapping::Rename(to.clone()),
                 },
                 Some(Mapping::Discharge(t)) => match b.acting_on(&expr_free_vars(t)) {
-                    None => Mapping::Discharge(Box::new(t.clone_preserving_ids())),
-                    Some(under) => {
-                        Mapping::Deferred(Rc::new(t.clone_preserving_ids()), Rc::new(under))
-                    }
+                    None => Mapping::Discharge(Rc::clone(t)),
+                    Some(under) => Mapping::Deferred(Rc::clone(t), Rc::new(under)),
                 },
                 Some(Mapping::Deferred(t, under)) => {
                     match Subst::then(under, b).acting_on(&expr_free_vars(t)) {
-                        None => Mapping::Discharge(Box::new(t.clone_preserving_ids())),
+                        None => Mapping::Discharge(Rc::clone(t)),
                         Some(composed) => Mapping::Deferred(Rc::clone(t), Rc::new(composed)),
                     }
                 }
@@ -1160,7 +1131,7 @@ impl Subst {
         let live: BTreeMap<Binder, Mapping> = env
             .iter()
             .filter(|(name, _)| live_names.contains(*name))
-            .map(|(name, term)| (name.clone(), Mapping::Discharge(Box::new(term.clone()))))
+            .map(|(name, term)| (name.clone(), Mapping::Discharge(Rc::new(term.clone()))))
             .collect();
         Subst::of_binders(live).rewrite_expr(&mut e);
         e
@@ -1186,7 +1157,7 @@ impl Subst {
                         .as_ref()
                         .is_some_and(|a| is_free_in_type(name, a))
             })
-            .map(|(name, term)| (name.clone(), Mapping::Discharge(Box::new(term.clone()))))
+            .map(|(name, term)| (name.clone(), Mapping::Discharge(Rc::new(term.clone()))))
             .collect();
         if live.is_empty() {
             return;
@@ -2741,7 +2712,7 @@ pub fn discharge_codomain(binder: &Name, argument: &TypedExpr, codomain: &Type) 
     }
     let opened = if references_enclosing_function(codomain) {
         open_pi_binder(
-            &Mapping::Discharge(Box::new(argument.clone_preserving_ids())),
+            &Mapping::Discharge(Rc::new(argument.clone_preserving_ids())),
             codomain,
         )
     } else {
@@ -2897,6 +2868,22 @@ mod tests {
             untouched.binders.get(&Name::from("c2")),
             Some(Mapping::Discharge(_))
         ));
+    }
+
+    /// A copy of a substitution shares its discharge payloads: the solver copies
+    /// substitutions at every bound it reads, and a payload grows with the `let`s nested
+    /// around it.
+    #[test]
+    fn a_copied_substitution_shares_its_payloads() {
+        let sigma = Subst::discharge("x", TypedExpr::tuple(vec![int(1), int(2)]));
+        let copy = sigma.clone();
+        let (Some(Mapping::Discharge(a)), Some(Mapping::Discharge(b))) = (
+            sigma.binders.get(&Name::from("x")),
+            copy.binders.get(&Name::from("x")),
+        ) else {
+            panic!("a discharge stays a discharge when copied");
+        };
+        assert!(Rc::ptr_eq(a, b));
     }
 
     // The identity substitution is a perfect structural no-op.
@@ -3857,7 +3844,7 @@ mod locally_nameless_tests {
         assert_eq!(open_pi_binder(&Mapping::Rename(k.clone()), &closed), inner);
 
         let applied = open_pi_binder(
-            &Mapping::Discharge(Box::new(TypedExpr::lit(Lit::Int(5)))),
+            &Mapping::Discharge(Rc::new(TypedExpr::lit(Lit::Int(5)))),
             &closed,
         );
         let Type::Fun { domain, .. } = &applied else {
