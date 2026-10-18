@@ -320,8 +320,10 @@ and display walks follow the same layout and polarities.
 
 A nominal type offers its declaration as its head (`traits::offered`), which only a declared
 instance accepts ([type-inference.md, "What the tables hold"](type-inference.md#what-the-tables-hold)).
-No operator trait has a declared instance, so `==`, ordering and arithmetic on a nominal value are
-rejected where the operator is applied.
+Arithmetic on a nominal value calls its instance's function
+([type-inference.md, "An operator's instance"](type-inference.md#an-operators-instance)); without
+an instance, the operator is rejected where it is applied. No comparison trait has a declared
+instance, so `==` and ordering on a nominal value are rejected.
 
 Lowering declares a module's traits after its types and before their associated functions, and
 its instances after those (`lower::traits`). An instance's `def`s lower where its `impl` stands,

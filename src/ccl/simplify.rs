@@ -45,7 +45,6 @@
 //! | Product eta | `⟨f ≫ .0, f ≫ .1⟩` | `f` | ✗ (collapses) |
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` | ✓ |
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
-//! | String add-to-concat | `Arithmetic(Add) : (String,String)→String` | `Concat` | ✓ |
 //! | ANF morphism binding | `let x = 𝑚 in 𝑏` (`x` an ANF temp, `𝑚` a morphism, used once) | `𝑏[x := 𝑚]` | ✓ |
 
 use crate::ccl::ccl_utils::{
@@ -53,10 +52,7 @@ use crate::ccl::ccl_utils::{
 };
 use crate::ccl::lambda_elim::{id, strength_over, zip_pair};
 use crate::ccl::ty::FunKind;
-use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, Builtin, Expr, Name, ProjKey, Type, TypedExpr,
-    TypedExprNode,
-};
+use crate::ccl::{Builtin, Expr, Name, ProjKey, Type, TypedExpr, TypedExprNode};
 
 // ---------------------------------------------------------------------------
 // Simplification pass
@@ -227,50 +223,6 @@ fn take(expr: &mut Expr) -> Expr {
     std::mem::take(expr)
 }
 
-/// Whether `ty` is `String`, **ignoring refinements**. A refined string
-/// (`{String | __elem == "a"}`, the singleton a literal carries) is still a string,
-/// and which runtime operator `+` dispatches to is a question about the base.
-fn is_string(ty: &Type) -> bool {
-    crate::ccl::ccl_utils::strip_refinements(ty) == Type::Base(BaseType::String)
-}
-
-/// Rewrite `String + String` from `Arithmetic(Add)` to `Concat`.
-///
-/// Inference intentionally leaves the operator as `Add` (see
-/// [`crate::ccl::infer`]); this pass retargets the runtime dispatch.  Doing it
-/// here — rather than in [`crate::ccl::lambda_elim`] — guarantees every BinOp
-/// is visited regardless of how it ended up wrapped: a constant-body lambda
-/// lifted to `Apply(BinOp(...), Const)` no longer hides the operator from
-/// rewriting, and a BinOp inside a lambda body that has been desugared to
-/// `Apply(Tuple, Builtin(BinOp(Add)))` is rewritten via its `Builtin` head.
-fn try_string_add_to_concat(expr: &mut Expr) -> bool {
-    match &mut expr.node {
-        // Pre-lambda-elim form: a raw BinOp node still in the tree.
-        TypedExprNode::BinOp { left, op, .. }
-            if *op == BinOpKind::Arithmetic(ArithmeticKind::Add) && is_string(&left.ty) =>
-        {
-            *op = BinOpKind::Concat;
-            true
-        }
-        // Post-lambda-elim form: `BinOp(Add, ...)` was desugared to
-        // `Apply(Tuple, Builtin(BinOp(Add)))`.  The function's type captures
-        // the operand types: `Fun(Tuple([String, String]), String)`.
-        TypedExprNode::Builtin(Builtin::BinOp(op))
-            if *op == BinOpKind::Arithmetic(ArithmeticKind::Add) =>
-        {
-            if let Type::Fun { domain: arg_ty, .. } = &expr.ty
-                && let Type::Tuple(elts) = arg_ty.as_ref()
-                && elts.first().is_some_and(is_string)
-            {
-                *op = BinOpKind::Concat;
-                return true;
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
 /// Apply all simplification rules at the root of `expr`.
 ///
 /// Rules are tried in a fixed order; each pass may enable earlier rules in the
@@ -294,11 +246,6 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
     // `try_map_domain_of_iteration` does for the steps after its source.
     changed |= ruled_keeping_iteration("simplify.compose_identity", expr, try_compose_identity);
     changed |= ruled_keeping_iteration("simplify.flatten_compose", expr, try_flatten_compose);
-    changed |= ruled_keeping_iteration(
-        "simplify.string_add_to_concat",
-        expr,
-        try_string_add_to_concat,
-    );
     changed |= ruled_keeping_iteration("simplify.partial_lookup", expr, try_partial_lookup);
     changed |= ruled_keeping_iteration(
         "simplify.compose_constant_function",
@@ -364,9 +311,8 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
 ///   it records nothing, so wrapping every *attempt* rather than every *firing*
 ///   costs one push/pop and no log entry. Nothing here needs to know whether the
 ///   rule fired, which is why the `bool` return is not consulted.
-/// * A rule that mutates in place without minting (`try_string_add_to_concat`'s
-///   `*op = BinOpKind::Concat`) is likewise a preserve — the node keeps its
-///   identity, so its provenance is the self-edge it already had.
+/// * A rule that mutates a node in place without minting is likewise a preserve —
+///   the node keeps its identity, so its provenance is the self-edge it already had.
 /// * A rule that replaces the slot wholesale (`*expr = Expr::compose(flat)`)
 ///   mints, and those mints record `expr`'s pre-rule id as their parent.
 /// * A rule that promotes an existing child into the slot
@@ -3155,51 +3101,5 @@ mod tests {
         // After product_beta: ⟨f0 ≫ id, f1 ≫ id⟩
         // After compose identity: ⟨f0, f1⟩
         assert_eq!(simplified, zip1);
-    }
-
-    /// `String + String` as a raw `BinOp` is rewritten to `Concat`.  This is
-    /// the form left behind by lambda elimination's constant short-circuit
-    /// when the lambda body doesn't reference its parameter.
-    #[test]
-    fn simplify_string_add_to_concat_binop_form() {
-        let s_ty = Type::Base(BaseType::String);
-        let lhs = Expr::lit(Lit::String("a".into())).with_ty(s_ty.clone());
-        let rhs = Expr::lit(Lit::String("b".into())).with_ty(s_ty.clone());
-        let expr =
-            Expr::binop(lhs, BinOpKind::Arithmetic(ArithmeticKind::Add), rhs).with_ty(s_ty.clone());
-        let simplified = simplify(expr);
-        let TypedExprNode::BinOp { op, .. } = simplified.node else {
-            panic!("expected BinOp, got {:?}", simplified.node);
-        };
-        assert_eq!(op, BinOpKind::Concat);
-    }
-
-    /// `String + String` desugared to `Builtin(BinOp(Add))` (the form lambda
-    /// elimination produces inside lambda bodies that reference their
-    /// parameter) is also rewritten to `Concat`.
-    #[test]
-    fn simplify_string_add_to_concat_builtin_form() {
-        let s_ty = Type::Base(BaseType::String);
-        let arg_ty = Type::Tuple(vec![s_ty.clone(), s_ty.clone()]);
-        let fn_ty = fun_ty(arg_ty, s_ty);
-        let mut expr = Expr::builtin(Builtin::BinOp(BinOpKind::Arithmetic(ArithmeticKind::Add)))
-            .with_ty(fn_ty);
-        // simplify rewrites the inner op in place; call directly to avoid
-        // packing it into an enclosing Apply just for the test.
-        assert!(try_string_add_to_concat(&mut expr));
-        let TypedExprNode::Builtin(Builtin::BinOp(op)) = &expr.node else {
-            panic!("expected Builtin(BinOp), got {:?}", expr.node);
-        };
-        assert_eq!(*op, BinOpKind::Concat);
-    }
-
-    /// `Int + Int` as a `Builtin(BinOp(Add))` is left untouched.
-    #[test]
-    fn simplify_int_add_builtin_unchanged() {
-        let arg_ty = Type::Tuple(vec![int_ty(), int_ty()]);
-        let fn_ty = fun_ty(arg_ty, int_ty());
-        let mut expr = Expr::builtin(Builtin::BinOp(BinOpKind::Arithmetic(ArithmeticKind::Add)))
-            .with_ty(fn_ty);
-        assert!(!try_string_add_to_concat(&mut expr));
     }
 }

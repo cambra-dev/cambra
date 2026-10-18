@@ -450,9 +450,40 @@ fn describe(v: &Value) -> Option<String> {
     })
 }
 
-/// The traits `body` declares, and the instances `body` declares of them.
+/// The compiler's traits and their functions, each with the operand its parameters are at.
+const BUILTIN_FUNCTIONS: &[(&str, &str, &[usize])] = &[
+    ("Addable", "add", &[0, 1]),
+    ("Subtractable", "sub", &[0, 1]),
+    ("Multipliable", "mul", &[0, 1]),
+    ("Divisible", "div", &[0, 1]),
+    ("Exponentiable", "pow", &[0, 1]),
+    ("Negatable", "neg", &[0]),
+];
+
+/// The function of an operator's trait an arithmetic operator calls (`docs/chl-spec.md`,
+/// "Trait requirements"). `^+` calls none: its trait declares none.
+fn arithmetic_function(op: BinOp) -> Option<(&'static str, &'static str)> {
+    Some(match op {
+        BinOp::Add => ("Addable", "add"),
+        BinOp::Sub => ("Subtractable", "sub"),
+        BinOp::Mul => ("Multipliable", "mul"),
+        BinOp::FloorDiv => ("Divisible", "div"),
+        BinOp::Pow => ("Exponentiable", "pow"),
+        _ => return None,
+    })
+}
+
+/// The traits `body` declares, the compiler's, and the instances `body` declares of them.
 fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
-    let mut functions = BTreeMap::new();
+    let mut functions: BTreeMap<(String, String), Vec<Option<usize>>> = BUILTIN_FUNCTIONS
+        .iter()
+        .map(|(t, f, params)| {
+            (
+                (t.to_string(), f.to_string()),
+                params.iter().map(|p| Some(*p)).collect(),
+            )
+        })
+        .collect();
     let mut named = BTreeMap::new();
     for stmt in body {
         let Stmt::TraitDecl(decl) = &stmt.node else {
@@ -1227,7 +1258,8 @@ impl Interp {
                 };
                 let current = self.read_mut(&name, &cell)?;
                 let rhs = self.eval(value)?;
-                let updated = binop(
+                // The operator is the one `x := x op e` applies, an instance's included.
+                let updated = self.arithmetic(
                     match op {
                         AugOp::Add => BinOp::Add,
                         AugOp::Sub => BinOp::Sub,
@@ -1618,6 +1650,9 @@ impl Interp {
         let (instance, bound) = match admitting.as_slice() {
             [(one, Tells::Yes)] => (one.bound.clone(), format!("{}::{function}", one.bound)),
             [] => {
+                if let Some(answer) = builtin_function(trait_, function, &values) {
+                    return answer;
+                }
                 return err(format!(
                     "no instance of `{trait_}` admits the arguments of `{trait_}::{function}`"
                 ));
@@ -1646,6 +1681,28 @@ impl Interp {
         let answer = self.call_with_values(&bound, &f, values);
         self.running_instances.pop();
         answer
+    }
+
+    /// Whether a module declares an instance of `trait_` that may admit `values`, the
+    /// arguments of its function `function`.
+    fn declares_instance_for(&self, trait_: &str, function: &str, values: &[Value]) -> bool {
+        self.traits
+            .functions
+            .get(&(trait_.to_string(), function.to_string()))
+            .is_some_and(|params| !self.traits.admitting(trait_, params, values).is_empty())
+    }
+
+    /// `l op r` for an arithmetic operator: the call of its trait's function, which an
+    /// instance a module declares answers when one admits the operands, and the compiler's
+    /// otherwise.
+    fn arithmetic(&mut self, op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
+        if let Some((trait_, function)) = arithmetic_function(op)
+            && !any_pending([&l, &r])
+            && self.declares_instance_for(trait_, function, &[l.clone(), r.clone()])
+        {
+            return self.dispatch(trait_, function, vec![l, r]);
+        }
+        binop(op, l, r)
     }
 
     /// `l op r` for a comparison (`docs/chl-spec.md`, "3.4 Comparisons"): equal values are the
@@ -2424,6 +2481,11 @@ impl Interp {
 
             Expr::UnaryOp { op, operand } => {
                 let v = self.eval(operand)?;
+                if let UnaryOp::Neg = op
+                    && self.declares_instance_for("Negatable", "neg", std::slice::from_ref(&v))
+                {
+                    return self.dispatch("Negatable", "neg", vec![v]);
+                }
                 match (op, v) {
                     (_, Value::Pending) => Ok(Value::Pending),
                     (UnaryOp::Neg, Value::Int(i)) => i
@@ -2437,7 +2499,7 @@ impl Interp {
 
             Expr::BinOp { op, left, right } => {
                 let (l, r) = (self.eval(left)?, self.eval(right)?);
-                binop(*op, l, r)
+                self.arithmetic(*op, l, r)
             }
 
             Expr::Compare {
@@ -3099,6 +3161,34 @@ fn binop(op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
     }
 }
 
+/// A compiler instance's function at `values`, or `None` for a function no compiler instance
+/// of an operator's trait has at them.
+fn builtin_function(
+    trait_: &str,
+    function: &str,
+    values: &[Value],
+) -> Option<Result<Value, Error>> {
+    let pair = |values: &[Value]| match values {
+        [l, r] => Some((l.clone(), r.clone())),
+        _ => None,
+    };
+    Some(match (trait_, function) {
+        ("Addable", "add") => pair(values).map(|(l, r)| binop(BinOp::Add, l, r))?,
+        ("Subtractable", "sub") => pair(values).map(|(l, r)| binop(BinOp::Sub, l, r))?,
+        ("Multipliable", "mul") => pair(values).map(|(l, r)| binop(BinOp::Mul, l, r))?,
+        ("Divisible", "div") => pair(values).map(|(l, r)| binop(BinOp::FloorDiv, l, r))?,
+        ("Exponentiable", "pow") => pair(values).map(|(l, r)| binop(BinOp::Pow, l, r))?,
+        ("Negatable", "neg") => match values {
+            [Value::Int(i)] => i
+                .checked_neg()
+                .map(Value::Int)
+                .ok_or_else(|| Error(format!("-({i}) is not defined"))),
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3355,6 +3445,27 @@ mod tests {
             out << summon(Scales(_, _))::times(3, Vec2::new((1, 2))).extract().1
         "#});
         assert_eq!(v.to_string(), "[() -> 6]");
+    }
+
+    /// An arithmetic operator on nominal values calls its instance's function
+    /// (`docs/chl-spec.md`, "Declaring an instance").
+    #[test]
+    fn an_operator_on_nominal_values() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Money = Int
+            impl Addable(Money, Money):
+                Output = Money
+                def add(x, other):
+                    Money::new(x.extract() + other.extract())
+            impl Negatable(Money):
+                Output = Money
+                def neg(x):
+                    Money::new(0 - x.extract())
+            m = Money::new(1) + Money::new(2)
+            out << (m.extract(), (-m).extract(), summon(Addable(_, _))::add(1, 2))
+        "#});
+        assert_eq!(v.to_string(), "[() -> (_0: 3, _1: -3, _2: 3)]");
     }
 
     /// A tuple orders lexicographically by position, and `max` reads it so.
