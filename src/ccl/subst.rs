@@ -605,6 +605,19 @@ impl Subst {
         })
     }
 
+    /// This substitution's entries for `names`, without its witness mappings.
+    pub fn restricted_to(&self, names: &BTreeSet<Binder>) -> Subst {
+        Subst {
+            binders: self
+                .binders
+                .iter()
+                .filter(|(k, _)| names.contains(*k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            witnesses: BTreeMap::new(),
+        }
+    }
+
     /// The part of this substitution that acts on a term whose free names are `names`: its
     /// entries for those names, and its witness mappings. `None` when that part is the
     /// identity, so the term is its own image.
