@@ -805,7 +805,17 @@ pub(super) fn lower_middle_stmt(
             // see `src/ccl/design/program-evolution.md`, "Which variable a load
             // site addresses". It is a spelling here, not a reference, which is
             // why it never goes through `lower_expr`.
-            let val = ctx.tag_image(Expr::load_from(source.node.as_str()), source.span);
+            // The load produces a value of the declared type: what the predecessor holds is
+            // checked against it at reload, so it is the value's type, not only a bound the
+            // binding places on it. A bounded annotation states the same type as a bound.
+            let produced = match &annotation_ty {
+                Type::BoundedHole(t) => (**t).clone(),
+                t => t.clone(),
+            };
+            let val = ctx.tag_image(
+                Expr::load_from(source.node.as_str()).with_ty(produced),
+                source.span,
+            );
             Ok(ctx.tag_image(
                 Expr::let_bind_annotated(name, val, body, annotation_ty),
                 stmt.span,

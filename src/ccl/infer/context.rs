@@ -1938,12 +1938,21 @@ impl Typing for InferCtx {
         t: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError> {
-        let d = self.fresh();
-        let c = self.fresh();
+        // The parts of whatever function `t` is, a sum's included: under the binders of the
+        // demand's kind, which the edge relates to `t`'s.
+        let kind = crate::ccl::ty::FunKind::fresh_var();
+        let d = self.fresh_part(&kind);
+        let c = self.fresh_part(&kind);
         // Destructuring is kind-agnostic — see `Type::fun_eliminated`. Stamping
         // the demand `Compute` would make "what is this function's domain?" reject
         // every collection.
-        self.require_sub(t, &Type::fun_eliminated(d.clone(), c.clone()), at)?;
+        let shape = Type::Fun {
+            name: None,
+            fun_kind: kind,
+            domain: Box::new(d.clone()),
+            codomain: Box::new(c.clone()),
+        };
+        self.require_sub(t, &shape, at)?;
         Ok((d, c))
     }
 
@@ -2034,16 +2043,17 @@ impl Typing for InferCtx {
         // global-freshness discipline (reusing a function's own binder as the
         // expected binder would violate it).
         let x = Name::solver_arg();
-        let d = self.fresh();
-        let result = self.fresh();
         // **The demand adopts the kind the node declared**, where there is one. Minting a
         // second variable describes one consumption twice; see [`Typing::apply`].
-        let expected = match kind {
-            Some(k @ crate::ccl::ty::FunKind::Var(_)) => {
-                Type::pi_kinded(x.clone(), d.clone(), result.clone(), k.clone())
-            }
-            _ => Type::pi_eliminated(&x, d.clone(), result.clone()),
+        let demand_kind = match kind {
+            Some(k @ crate::ccl::ty::FunKind::Var(_)) => k.clone(),
+            _ => crate::ccl::ty::FunKind::fresh_var(),
         };
+        // Parts of the function applied, a sum's included.
+        let d = self.fresh_part(&demand_kind);
+        // The codomain stands under the binder, so it is minted where the binder is in scope.
+        let result = self.scoped(&x, &d, |ctx| ctx.fresh_part(&demand_kind));
+        let expected = Type::pi_kinded(x.clone(), d.clone(), result.clone(), demand_kind);
         self.require_sub(fn_ty, &expected, at)?;
         self.constrain_argument(arg_ty, &expected, at)?;
         // The application's type is `result` with the binder discharged to the

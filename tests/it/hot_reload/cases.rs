@@ -1745,7 +1745,7 @@ fn a_loaded_collection_is_transformed_into_its_replacement() {
     let v2 = indoc! {r#"
         @LoadFrom(qty)
         held <: Map(String, Int)
-        qty_units: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+        qty_units: Mut(Map(String, Int), Txn) := box([q * 10000 for q in held])
         for c in [1]:
             with begin():
                 qty_units["xrp"] := 70000
@@ -1780,22 +1780,12 @@ fn a_loaded_collection_is_transformed_into_its_replacement() {
     );
 }
 
-/// A rebuilt collection needs the bounded annotation, and an exact one is
-/// refused.
-///
-/// The refusal is a limitation, not a rule: `[q for q in held]` denotes `held`,
-/// over the same domain and at the same element type, and carrying `held` whole
-/// under the same exact annotation is accepted
-/// ([`a_map_valued_variable_carries_whole`]). What differs is that a
-/// comprehension hands back a collection at the witness it opened, while the
-/// target's annotation binds a witness of its own, and the two are compared
-/// rather than solved against each other.
-///
-/// Pinned so that repairing it fails here: solving the target's domain binder
-/// against the witness its initializer carries accepts both forms, and this
-/// test is what says so.
+/// A rebuilt collection is a plain collection over the witness the loaded one carries
+/// (`docs/chl-spec.md`, "7.4 `box`"), so it does not initialize a variable annotated with a
+/// sum until it is boxed, whichever annotation the load has
+/// ([`a_loaded_collection_is_transformed_into_its_replacement`] boxes it).
 #[test]
-fn an_exact_annotation_on_a_rebuilt_collection_is_refused() {
+fn a_rebuilt_collection_initializes_a_sum_only_boxed() {
     let v1 = indoc! {r#"
         qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
         for c in [1]:
@@ -1804,7 +1794,7 @@ fn an_exact_annotation_on_a_rebuilt_collection_is_refused() {
         await_final(qty)
     "#};
     // The identity comprehension, so the rejection cannot be read as a
-    // disagreement about the value or its type.
+    // disagreement about the value.
     let v2 = indoc! {r#"
         @LoadFrom(qty)
         held: Map(String, Int)
@@ -1818,11 +1808,12 @@ fn an_exact_annotation_on_a_rebuilt_collection_is_refused() {
     let errors = live
         .reload_text(&mut ctx, MAIN_BRANCH, v2, &no_main)
         .err()
-        .expect("an exact annotation on a rebuilt collection does not compile today");
+        .expect("an unboxed comprehension does not initialize a sum");
     let rendered = format!("{errors:?}");
     assert!(
-        rendered.contains("initializer of mutable `qty_units`"),
-        "the two domains are compared at the initializer: {rendered}",
+        rendered.contains("initializer of mutable `qty_units`")
+            && rendered.contains("a plain collection and a sum"),
+        "the initializer is refused for the kinds it joins: {rendered}",
     );
 }
 
@@ -1852,7 +1843,7 @@ fn a_loaded_record_valued_collection_is_transformed_into_its_replacement() {
     let v2 = indoc! {r#"
         @LoadFrom(qty)
         held <: Map(String, {units: Int, lot: Int})
-        qty_units: Mut(Map(String, {units: Int, lot: Int}), Txn) := [(units=q.units * 10000, lot=q.lot) for q in held]
+        qty_units: Mut(Map(String, {units: Int, lot: Int}), Txn) := box([(units=q.units * 10000, lot=q.lot) for q in held])
         for c in [1]:
             with begin():
                 qty_units["xrp"] := (units=70000, lot=1)
@@ -1910,7 +1901,7 @@ fn a_collection_load_naming_nothing_is_refused() {
     let v2 = indoc! {r#"
         @LoadFrom(nonesuch)
         held <: Map(String, Int)
-        qty_units: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+        qty_units: Mut(Map(String, Int), Txn) := box([q * 10000 for q in held])
         await_final(qty_units)
     "#};
     let mut ctx = GlobalContext::default();
@@ -1963,7 +1954,7 @@ fn a_bounded_annotation_does_not_weaken_a_collections_shape_check() {
     let v2 = indoc! {r#"
         @LoadFrom(qty)
         held <: Map(String, String)
-        labels: Mut(Map(String, String), Txn) := [q + "!" for q in held]
+        labels: Mut(Map(String, String), Txn) := box([q + "!" for q in held])
         await_final(labels)
     "#};
     let mut ctx = GlobalContext::default();
@@ -4586,19 +4577,12 @@ fn a_reload_does_not_seed_an_accumulator_from_a_released_in_full_binding() {
     );
 }
 
-/// An exact annotation on a loaded collection rejects a comprehension over it, and the
-/// report names what differs.
-///
-/// The two domains render alike: what separates them is a binder identity a domain holds
-/// and `Display` does not print. An inequality between them therefore says nothing — it
-/// shows one type twice — so the comparison that exposed it is the report, and its two
-/// sides differ structurally, which is what the identical-rendering note quotes.
-///
-/// The rejection itself is the annotation mode's: the bounded `held <: Map(K, V)` leaves
-/// the domain to be inferred and compiles, as
-/// [`a_loaded_collection_is_transformed_into_its_replacement`] pins.
+/// An exact annotation on a loaded collection transforms as the bounded one does
+/// ([`a_loaded_collection_is_transformed_into_its_replacement`]). The comprehension is over
+/// the witness `held` carries, and boxing it ranges over that witness, which the exact
+/// annotation's kind admits (`docs/chl-spec.md`, "7.4 `box`").
 #[test]
-fn an_exact_annotation_on_a_loaded_collection_names_what_differs() {
+fn an_exact_annotation_on_a_loaded_collection_is_transformed() {
     let v1 = indoc! {r#"
         qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
         for c in [1]:
@@ -4611,25 +4595,23 @@ fn an_exact_annotation_on_a_loaded_collection_names_what_differs() {
     let v2 = indoc! {r#"
         @LoadFrom(qty)
         held: Map(String, Int)
-        qty_units: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+        qty_units: Mut(Map(String, Int), Txn) := box([q * 10000 for q in held])
         await_final(qty_units)
     "#};
     let mut ctx = GlobalContext::default();
     let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     let _ = drive_main_map(&mut ctx, &mut live);
 
-    let rendered = match live.reload_text(&mut ctx, MAIN_BRANCH, v2, &no_main) {
-        Ok(_) => panic!("an exact annotation pins the domain, so the comprehension is rejected"),
-        Err(errors) => format!("{errors:?}"),
-    };
-    assert!(
-        rendered.contains("First structural difference"),
-        "the report quotes where the two sides diverge rather than asserting an \
-         inequality between two types it prints alike, got {rendered}",
-    );
-    assert!(
-        rendered.contains("WitnessRef("),
-        "and the divergence it quotes is the binder identity, got {rendered}",
+    live.reload_text(&mut ctx, MAIN_BRANCH, v2, &no_main)
+        .expect("the migration is a declaration, and the compiler takes it");
+    assert_eq!(
+        drive_main_map(&mut ctx, &mut live),
+        vec![
+            ("btc".to_string(), 20000),
+            ("eth".to_string(), 10000),
+            ("sol".to_string(), 30000),
+        ],
+        "every quantity the retired version held is scaled",
     );
 }
 

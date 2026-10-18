@@ -213,8 +213,17 @@ fn tagged_for_loop(
     ctx: &mut LoweringContext,
 ) -> Expr {
     let lambda = ctx.tag_image(Expr::lambda(iter_var, Type::Hole, body), for_span);
+    // A loop is a generator, so it reads its source as a comprehension does: through
+    // `unbox`, which is the source itself for a plain collection and the witness the value
+    // carries for a sum.
+    let unbox = ctx.tag_machinery(
+        Expr::builtin(crate::ccl::Builtin::Unbox),
+        for_span,
+        "lower.loop_source",
+    );
+    let read = ctx.tag_machinery(Expr::apply(source, unbox), for_span, "lower.loop_source");
     ctx.tag_image(
-        Expr::compose(vec![source, lambda])
+        Expr::compose(vec![read, lambda])
             .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
         for_span,
     )
@@ -1842,7 +1851,7 @@ def doubles(xs):
 doubles",
         "\
 let doubles : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ≫ (λ x → feed(__result_0, x * 2)); __result_0
+in xs ▷ unbox ≫ (λ x → feed(__result_0, x * 2)); __result_0
 in doubles"
     )]
     // Multi-param generator: captures outer parameter. Uncurried params
@@ -1855,7 +1864,7 @@ def add_to(xs, n):
 add_to",
         "\
 let add_to : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
-in __arg_tuple_1.0 ≫ (λ x → feed(__result_0, x + __arg_tuple_1.1)); __result_0
+in __arg_tuple_1.0 ▷ unbox ≫ (λ x → feed(__result_0, x + __arg_tuple_1.1)); __result_0
 in add_to"
     )]
     // Generator with if-guard: guard becomes a Case in the For body.
@@ -1868,7 +1877,7 @@ def positives(xs):
 positives",
         "\
 let positives : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ≫ (λ x → { x > 0 → feed(__result_0, x); true → unit }); __result_0
+in xs ▷ unbox ≫ (λ x → { x > 0 → feed(__result_0, x); true → unit }); __result_0
 in positives"
     )]
     // Nested for-loops: inner iter independent of outer loop variable.
@@ -1881,7 +1890,7 @@ def cross(xs, ys):
 cross",
         "\
 let cross : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
-in __arg_tuple_1.0 ≫ (λ x → __arg_tuple_1.1 ≫ (λ y → feed(__result_0, x + y))); __result_0
+in __arg_tuple_1.0 ▷ unbox ≫ (λ x → __arg_tuple_1.1 ▷ unbox ≫ (λ y → feed(__result_0, x + y))); __result_0
 in cross"
     )]
     // Three-level nested for.
@@ -1895,7 +1904,7 @@ def triple(xs, ys, zs):
 triple",
         "\
 let triple : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
-in __arg_tuple_1.0 ≫ (λ x → __arg_tuple_1.1 ≫ (λ y → __arg_tuple_1.2 ≫ (λ z → feed(__result_0, x + y + z)))); __result_0
+in __arg_tuple_1.0 ▷ unbox ≫ (λ x → __arg_tuple_1.1 ▷ unbox ≫ (λ y → __arg_tuple_1.2 ▷ unbox ≫ (λ z → feed(__result_0, x + y + z)))); __result_0
 in triple"
     )]
     // Guard before inner for: Case wraps the nested For node.
@@ -1909,7 +1918,7 @@ def cross_filtered(xs, ys):
 cross_filtered",
         "\
 let cross_filtered : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
-in __arg_tuple_1.0 ≫ (λ x → { x > 0 → __arg_tuple_1.1 ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
+in __arg_tuple_1.0 ▷ unbox ≫ (λ x → { x > 0 → __arg_tuple_1.1 ▷ unbox ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
 in cross_filtered"
     )]
     // Let-binding in generator body: y is a fresh local per iteration.
@@ -1922,7 +1931,7 @@ def with_let(xs):
 with_let",
         "\
 let with_let : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ≫ (λ x → let y = x + 1
+in xs ▷ unbox ≫ (λ x → let y = x + 1
 in feed(__result_0, y * 2)); __result_0
 in with_let"
     )]
@@ -1936,7 +1945,7 @@ def shadow(xs):
 shadow",
         "\
 let shadow : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ≫ (λ x → let x = x + 1
+in xs ▷ unbox ≫ (λ x → let x = x + 1
 in feed(__result_0, x)); __result_0
 in shadow"
     )]
@@ -1950,7 +1959,7 @@ def dep(xss):
 dep",
         "\
 let dep : (_ ⇒ _) = λ xss → let __result_0 = defer
-in xss ≫ (λ xs → xs ≫ (λ x → feed(__result_0, x))); __result_0
+in xss ▷ unbox ≫ (λ xs → xs ▷ unbox ≫ (λ x → feed(__result_0, x))); __result_0
 in dep"
     )]
     // Let inside an if-guard body.
@@ -1964,7 +1973,7 @@ def guarded_let(xs):
 guarded_let",
         "\
 let guarded_let : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ≫ (λ x → { x > 0 → let y = x * 2
+in xs ▷ unbox ≫ (λ x → { x > 0 → let y = x * 2
 in feed(__result_0, y); true → unit }); __result_0
 in guarded_let"
     )]

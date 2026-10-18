@@ -4015,26 +4015,42 @@ by the program. Where the choice is meaningful to the reader, a variant (§6.5) 
 arms and `match` dispatches on them; `box` is for the case where the alternatives need
 no names.
 
+**A comprehension over a boxed collection is not boxed.** It reads the collection the box
+holds, so its result is a collection keyed like that one: by the keys of whichever alternative
+the box holds. Two comprehensions over the same box are keyed alike, so they join and combine
+position by position:
+
+```python
+b = box([1, 2]) if c else box([1, 2, 3])
+ys = [x * 2 for x in b] if d else [x * 3 for x in b]   # ✅ both keyed like `b`
+```
+
+To keep a result as a box — to join it with another box, or to return it where an abstract
+collection type is expected — box it. The new box ranges over the alternatives the source box
+does, so it satisfies every annotation the source satisfies:
+
+```python
+def doubled(xs: List(Int)) => List(Int):
+    box([x * 2 for x in xs])                            # ✅ a list wherever `xs` is one
+```
+
 **Box each branch's result, not something inside it.**
 
 ```python
-box([y for y in xs if y > 1]) if c else box(ys)              # ✅
-[y for y in box(xs) if y > 1] if c else [z for z in box(ys)]  # ❌
+box([y for y in xs if y > 1]) if c else box(ys)                # ✅
+box([y for y in b1]) if c else box([z for z in b2])            # ✅
+[y for y in b1] if c else [z for z in b2]                      # ❌
 ```
 
-Both spellings box something, and both branches of the second are boxed values — a
-comprehension over a boxed collection is boxed in turn, over the same alternatives. What
-separates them is where the **filter** sits. Boxed inside, the filter is part of the
-alternative that branch records, and the two branches join. Boxed outside, the filter
-applies to whichever alternative was taken and so is not part of any of them, and two
-such values do not join. Dropping the filter makes the second spelling type-check, which
-is what identifies it as the cause.
+The branches of the third spelling are keyed like two different boxes, `b1` and `b2`, and two
+collections keyed differently do not join. Boxing each branch records which keys it has, and
+the boxes join.
 
-**An abstract collection type needs `box` too.** `List(T)` and `Collection(T)` say
-nothing about which collection they are, so a value reaches one only by being boxed:
-`x: List(Int) = box([1, 2, 3])` binds, and `x: List(Int) = [1, 2, 3]` is an error. That
-is the same requirement as above rather than an alternative to it — the annotation keeps
-the elements and forgets which collection it was, and with it any proven lookup (§3.9).
+**An abstract collection type needs `box` too.** `List(T)` and `Collection(T)` say nothing
+about which collection they are, so a value reaches one only by being boxed:
+`x: List(Int) = box([1, 2, 3])` binds, and `x: List(Int) = [1, 2, 3]` is an error. A
+filtered box is not a `List(T)`, because a filtered range of positions has gaps:
+`box([x for x in xs if x > 1])` is a `Collection(Int)`.
 
 ---
 

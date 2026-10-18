@@ -60,8 +60,10 @@ through the same table.
 ## Generator functions and feed-only loops
 
 A feed-only or yield-only `for` loop without loop-carried mutation lowers to a composition of its
-source and an iteration lambda: `source ≫ (λ x → body)`. The composition carries a data-function
-annotation. A loop that feeds an existing defer handle needs no result binding. A loop with `yield`
+source's read and an iteration lambda: `source ▷ unbox ≫ (λ x → body)`. A loop is a generator, so
+it reads its source as a comprehension does, through `unbox`
+([Projecting a sum's witness](collections.md#projecting-a-sums-witness)). The composition carries
+a data-function annotation. A loop that feeds an existing defer handle needs no result binding. A loop with `yield`
 creates a result defer handle and replaces each `yield 𝑒` with a feed to that handle:
 
 ```text
@@ -75,7 +77,7 @@ lowers to the shape:
 ```text
 let f = λ xs →
     let __result_0 = defer
-    in xs ≫ (λ x → feed(__result_0, x * 2)); __result_0
+    in xs ▷ unbox ≫ (λ x → feed(__result_0, x * 2)); __result_0
 in body
 ```
 

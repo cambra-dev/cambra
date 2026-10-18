@@ -17,6 +17,8 @@ mod type_gen;
 use cambra::ccl::infer::solver::compact::{
     AtomKey, CompactType, CompactTypeKind, KindPin, compact_type,
 };
+use cambra::ccl::infer::solver::constrain::admits_resolved;
+use cambra::ccl::infer::solver::smt::NoScope;
 use cambra::ccl::infer::solver::{
     CoalesceError, CompactGraph, ConstrainCache, coalesce_compact, constrain_subtype,
 };
@@ -753,8 +755,8 @@ fn tk_json(k: &TypeKind) -> Option<String> {
     })
 }
 
-/// A kind over generated types, weighted toward the two arms that decide. The other two refuse
-/// nothing and so agree by construction — generating them checks that both sides know it.
+/// A kind over generated types, weighted toward the arms whose answer reads the type: the
+/// universe admits everything, so generating it checks only that both sides know it.
 fn gen_type_kind(rng: &mut Rng) -> TypeKind {
     match rng.below(10) {
         0 => TypeKind::Type,
@@ -768,10 +770,10 @@ fn gen_type_kind(rng: &mut Rng) -> TypeKind {
     }
 }
 
-fn refuses_cases(seed: u64, n: usize) -> (Vec<String>, usize) {
+fn admits_cases(seed: u64, n: usize) -> (Vec<String>, usize) {
     let mut rng = Rng::new(seed);
     let mut cases = Vec::with_capacity(n);
-    let mut refused = 0usize;
+    let mut admitted = 0usize;
     while cases.len() < n {
         let kind = gen_type_kind(&mut rng);
         let named = rng.chance(1, 2);
@@ -782,40 +784,41 @@ fn refuses_cases(seed: u64, n: usize) -> (Vec<String>, usize) {
             TypeKind::SubtypesOf(p) if named => (**p).clone(),
             _ => gen_ty(&mut rng, 2, Fragment::Modelled),
         };
+        // Enter the model's concrete fragment, which is closed, as the subtyping differential
+        // does.
+        let (kind, ty) = (kind.map_children(close_all), close_all(&ty));
         let (Some(k), Some(t)) = (tk_json(&kind), ty_json(&ty)) else {
             panic!(
-                "generator produced a refusal case outside the wire schema \
+                "generator produced a membership case outside the wire schema \
                  (seed {seed}, case {}): {kind:?} / {ty:?}",
                 cases.len()
             );
         };
-        let got = kind.refuses(&ty);
-        refused += usize::from(got);
+        let got = admits_resolved(&ty, &kind, &[], &NoScope);
+        admitted += usize::from(got);
         cases.push(format!(
-            r#"{{"op":"refuses","kind":{k},"ty":{t},"got":{got}}}"#
+            r#"{{"op":"admits","kind":{k},"ty":{t},"got":{got}}}"#
         ));
     }
-    (cases, refused)
+    (cases, admitted)
 }
 
-/// `TypeKind::refuses` against the model's, on the concrete fragment.
-///
-/// `Ty` carries no `Infer` and no `Hole`, so what the wire can express of
-/// `Type::holds_an_unresolved_position` is its refinement disjunct — which is the one that
-/// decides real cases anyway, a refined range being the thing the range test exists to refuse.
+/// `admits_resolved`, the membership check at materialization, against the model's
+/// `admitsCheck`, on the concrete fragment. `Ty` carries no inference variable, the one thing the
+/// check abstains on, so each case is a decision on both sides.
 ///
 /// Half the subjects are drawn from the kind's own parameter or candidates. A sampler that only
 /// ever asks about an unrelated type checks one of the two answers, and the refusing one is
 /// already the easy side.
 #[test]
-fn differential_refuses_vs_lean_model() {
-    let Some(oracle) = oracle_or_skip("differential_refuses_vs_lean_model") else {
+fn differential_admits_vs_lean_model() {
+    let Some(oracle) = oracle_or_skip("differential_admits_vs_lean_model") else {
         return;
     };
     let seed: u64 = env_or("CAMBRA_DIFF_SEED", 0x5EED);
     let n: usize = env_or("CAMBRA_DIFF_N", 4000);
 
-    let (cases, refused) = refuses_cases(seed, n);
+    let (cases, admitted) = admits_cases(seed, n);
 
     let verdicts = ask_oracle(oracle, &cases);
     let mismatches: Vec<String> = verdicts
@@ -825,7 +828,7 @@ fn differential_refuses_vs_lean_model() {
         .map(|(v, case)| format!("{v}\n  case: {case}"))
         .collect();
     eprintln!(
-        "refuses differential: {} cases (seed {seed}), rust refused {refused}, {} mismatches",
+        "admits differential: {} cases (seed {seed}), rust admitted {admitted}, {} mismatches",
         cases.len(),
         mismatches.len()
     );
@@ -838,13 +841,13 @@ fn differential_refuses_vs_lean_model() {
     );
     // Both answers, or the sweep is checking one of them.
     assert!(
-        refused > cases.len() / 20 && refused < cases.len() - cases.len() / 20,
-        "one-sided sweep: {refused} of {} refused (seed {seed})",
+        admitted > cases.len() / 20 && admitted < cases.len() - cases.len() / 20,
+        "one-sided sweep: {admitted} of {} admitted (seed {seed})",
         cases.len()
     );
     assert!(
         mismatches.is_empty(),
-        "{} refuses mismatches (seed {seed}, n {n}); first 5:\n{}",
+        "{} admits mismatches (seed {seed}, n {n}); first 5:\n{}",
         mismatches.len(),
         mismatches[..mismatches.len().min(5)].join("\n")
     );
@@ -1106,12 +1109,12 @@ fn two_uniquified_binders_that_render_alike_encode_apart() {
 }
 
 #[test]
-fn harness_refuses_generator_stays_in_wire_fragment() {
+fn harness_admits_generator_stays_in_wire_fragment() {
     for seed in [0x5EED, 1, 0xC0A1] {
-        let (cases, refused) = refuses_cases(seed, 4000);
+        let (cases, admitted) = admits_cases(seed, 4000);
         assert_eq!(cases.len(), 4000);
         assert!(
-            refused > 200 && refused < 3800,
+            admitted > 200 && admitted < 3800,
             "one-sided sweep, seed {seed}"
         );
     }
@@ -1131,8 +1134,8 @@ fn harness_dump_writes_one_line_per_case() {
     let mut bytes = Vec::new();
     let path = std::path::Path::new("cases.jsonl");
     write_dump_case(&mut bytes, path, r#"{"op":"sub"}"#);
-    write_dump_case(&mut bytes, path, r#"{"op":"refuses"}"#);
-    assert_eq!(bytes, b"{\"op\":\"sub\"}\n{\"op\":\"refuses\"}\n");
+    write_dump_case(&mut bytes, path, r#"{"op":"admits"}"#);
+    assert_eq!(bytes, b"{\"op\":\"sub\"}\n{\"op\":\"admits\"}\n");
 }
 
 #[test]

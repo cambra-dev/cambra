@@ -41,8 +41,6 @@
 //! records resolve an error to a span whether or not the compile captures
 //! provenance.
 
-use std::rc::Rc;
-
 use crate::ccl::{
     BinOpKind, Expr, Generator, LogicKind, Name, SharedHoleMint, Type, TypedBinding, TypedExprNode,
     anf,
@@ -155,19 +153,6 @@ impl Rewrite<'_> {
 /// shape it will take. Stated here, beside [`encode`], which is what decides it.
 pub fn encodes_to_lambda(generators: &[Generator]) -> bool {
     generators.iter().all(|g| g.guards.is_empty())
-}
-
-/// The [`Type::SharedHole`] a source annotation uses to *name* its domain, if it
-/// does. Only a name is adoptable: a `Hole` domain is anonymous (nothing else can
-/// refer to it) and a concrete one is already settled.
-fn named_data_domain(ann: &Type) -> Option<Type> {
-    match ann {
-        Type::Fun { domain, .. } => match domain.as_ref() {
-            d @ Type::SharedHole(_) => Some(d.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 /// `e` rebuilt at `id`, its type slot and annotation carried over.
@@ -316,19 +301,10 @@ fn encode(
     // of its source's, and a *multi-generator* one's is a product of all of them.
     // Those keep their `Hole` and stay ordered by the argument edge alone.
     //
-    // A source that already *names* its domain keeps that name — a nested
-    // comprehension, whose own annotation carries the id minted here. Adopting it
-    // says the stronger thing (these two iterate one domain) where minting a second
-    // id would overwrite the annotation carrying it. A `groupby` source names no
-    // domain: its key binder states the keys directly, as membership in what its key
-    // morphism produces, so there is nothing for a second position to share.
-    let iter_dom = (single_gen && pred_op.is_none()).then(|| {
-        gen_sources[0]
-            .user_annotation
-            .as_ref()
-            .and_then(named_data_domain)
-            .unwrap_or_else(|| holes.fresh())
-    });
+    // The position shared is the source **read**, `unbox(source)`, not the source: a sum's
+    // own domain is its binder, and the read's is the witness the value carries, so a name
+    // the source's annotation carries is not the read's.
+    let iter_dom = (single_gen && pred_op.is_none()).then(|| holes.fresh());
     // **The result is a collection built over its sources.** Each generator's source gets
     // a kind of its own and the result records that it is built over it: a comprehension
     // binds one index position per index position of each source, which is a
@@ -336,11 +312,9 @@ fn encode(
     // something else — that they are one kind — which conflates two sources into one
     // index, and leaves the second index to be recovered from the shape of the domain
     // tuple by whatever walks it.
-    let result_kind = FunKind::fresh_data();
-    let FunKind::Var(result_kv) = &result_kind else {
-        unreachable!("fresh_data is a kind variable")
-    };
-    let result_kv = Rc::clone(result_kv);
+    // Every source is read through `unbox`, whose result is plain data, so the result is.
+    let result_kind = FunKind::Data(None);
+    let unbox = |source: Expr| Expr::apply(source, Expr::builtin(crate::ccl::Builtin::Unbox));
     let mut body_expr: Expr = element;
     for (i, (binding, source)) in gen_bindings
         .iter()
@@ -370,72 +344,25 @@ fn encode(
         // The two branches differ in where the kind comes from, and in whether the shared
         // domain still has to be stamped: an annotation naming a domain is where the id
         // came from, and re-stamping would discard it.
-        let source = match source.user_annotation.as_ref().and_then(Type::fun_kind) {
-            Some(annotated) => {
-                result_kv.contributes_first(annotated.clone());
-                // An annotation states a kind, a domain, or both, and only the domain
-                // decides whether the id is already there. A source whose annotation
-                // states the kind alone leaves `domain: Hole`, so `named_data_domain`
-                // found no id to adopt and the shared one minted above still has to reach
-                // it — without that the two domains are ordered by the argument edge and
-                // nothing says they are one, which is what lets the two readings of one
-                // invariant position diverge.
-                //
-                // The test is the annotation's shape, `Type::data_fun(Hole, Hole)`, and
-                // not `groupby` in particular: a comprehension can iterate a `groupby`,
-                // the `set` / `map` re-keying constructors (`lower_rekeyed`), or a
-                // conditional comprehension's arm, each annotated that way. The equation
-                // holds for all of them, an unfiltered single-generator comprehension's
-                // domain being its source's domain whatever shape the source has.
-                match (&iter_dom, source.user_annotation.clone()) {
-                    (
-                        Some(shared),
-                        Some(Type::Fun {
-                            name,
-                            fun_kind,
-                            domain,
-                            codomain,
-                        }),
-                    ) if matches!(*domain, Type::Hole) => source.with_user_annotation(Type::Fun {
-                        name,
-                        fun_kind,
-                        domain: Box::new(shared.clone()),
-                        codomain,
-                    }),
-                    _ => source,
-                }
-            }
-            None => {
-                assert!(
-                    source.user_annotation.is_none(),
-                    "a generator source's annotation is a function type, found {:?}",
-                    source.user_annotation
-                );
-                let src_kind = FunKind::fresh_data();
-                let src_dom = iter_dom.clone().unwrap_or(Type::Hole);
-                result_kv.contributes_first(src_kind.clone());
-                source.with_user_annotation(Type::Fun {
-                    name: None,
-                    fun_kind: src_kind,
-                    domain: Box::new(src_dom),
-                    codomain: Box::new(Type::Hole),
-                })
-            }
+        let read = unbox(source);
+        // Named, so a source whose element reads its key (a group-by's group) keeps that
+        // dependence under a binder: the annotation's codomain is minted where the key is in
+        // scope.
+        let read = match &iter_dom {
+            Some(shared) => read.with_user_annotation(Type::Fun {
+                name: Some(Name::fresh("__src_k")),
+                fun_kind: FunKind::Data(None),
+                domain: Box::new(shared.clone()),
+                codomain: Box::new(Type::Hole),
+            }),
+            None => read,
         };
-        let indexed_source = Expr::apply(idx_arg, source);
+        let indexed_source = Expr::apply(idx_arg, read);
         let per_elem = per_element_lambda(binding, body_expr);
         body_expr = Expr::apply(indexed_source, per_elem);
     }
-    // One contribution per generator, which is what makes position *i* of the result the
-    // position `source_of` resolves it to.
-    assert_eq!(
-        result_kv.built_over().len(),
-        gen_bindings.len(),
-        "a comprehension is built over one kind per generator"
-    );
-
     // ---- Step 4: attach the restriction ---------------------------------------
-    if let Some(pred_op) = pred_op {
+    let core = if let Some(pred_op) = pred_op {
         // Non-equality or multi-guard: loop-join restriction predicate.
         // The refinement's element is the implicit REFINEMENT_BINDER (the
         // record over which the correlation vector ranges); the predicate is a
@@ -448,7 +375,7 @@ fn encode(
             .rev()
         {
             pred_expr = Expr::apply(
-                Expr::apply(make_idx_arg(Name::elem(), i), pred_source),
+                Expr::apply(make_idx_arg(Name::elem(), i), unbox(pred_source)),
                 per_element_lambda(binding, pred_expr),
             );
         }
@@ -474,7 +401,7 @@ fn encode(
                 codomain: Box::new(Type::Hole),
             });
         let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole, result_kind);
-        at_id(make_cast(unrefined_lambda, target_ty), comprehension_id)
+        make_cast(unrefined_lambda, target_ty)
     } else {
         // A comprehension is a **data collection** (a map over its source's
         // domain): stamp it `Data` by provenance. The `data_fun(_, _)` annotation
@@ -483,15 +410,14 @@ fn encode(
         // comprehension is data-by-construction, not by a domain guess. (The
         // filtered branch above stamps its own lambda the same way, under a cast
         // whose `refined_data_fun` target then refines the domain.)
-        let lambda =
-            Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
-                name: None,
-                fun_kind: result_kind,
-                domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
-                codomain: Box::new(Type::Hole),
-            });
-        at_id(lambda, comprehension_id)
-    }
+        Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
+            name: None,
+            fun_kind: result_kind,
+            domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
+            codomain: Box::new(Type::Hole),
+        })
+    };
+    at_id(core, comprehension_id)
 }
 
 /// `λ target → body` at a generator's binder.
@@ -538,47 +464,47 @@ mod tests {
     // source at the index position its parameter names.
     #[case(
         "[x for x in [10, 20]]",
-        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ __anf\nin __anf ▷ (λ x → x)"
+        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → x)"
     )]
     // Constant element: the generator variable is unused.
     #[case(
         "[42 for x in [10, 20]]",
-        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ __anf\nin __anf ▷ (λ x → 42)"
+        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → 42)"
     )]
     // BinOp element.
     #[case(
         "[x + 2 for x in [10, 20]]",
-        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ __anf\nin __anf ▷ (λ x → x + 2)"
+        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → x + 2)"
     )]
     // Outer capture: `y` comes from an enclosing let binding.
     #[case(
         "y = 5\n[x + y for x in [10, 20]]",
-        "let y = 5\nin λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ __anf\nin __anf ▷ (λ x → x + y)"
+        "let y = 5\nin λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → x + y)"
     )]
     // Nested: the inner comprehension is the outer one's source, encoded first.
     #[case(
         "[y for y in [x for x in [10, 20]]]",
-        "λ __iter_record → let __anf = __iter_record ▷ (λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ __anf\nin __anf ▷ (λ x → x))\nin __anf ▷ (λ y → y)"
+        "λ __iter_record → let __anf = __iter_record ▷ ((λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → x)) ▷ unbox)\nin __anf ▷ (λ y → y)"
     )]
     // A guard puts the lambda under a `cast` whose target refines the domain by
     // the guard over the source — and nothing inside is hoisted, the two copies
     // of the source having to stay equal.
     #[case(
         "[x for x in [10, 20] if x > 10]",
-        "cast(({_ | __elem ▷ [10, 20] ▷ (λ x → x > 10)} ⤇ _), λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x))"
+        "cast(({_ | __elem ▷ ([10, 20] ▷ unbox) ▷ (λ x → x > 10)} ⤇ _), λ __iter_record → __iter_record ▷ ([10, 20] ▷ unbox) ▷ (λ x → x))"
     )]
     // Two generators and an equality guard: the product is indexed positionally,
     // and the equality in the refinement is what join planning reads for a hash
     // join.
     #[case(
         "[x + y for x in [1, 2] for y in [3, 4] if x == y]",
-        "cast(({_ | __elem.0 ▷ [1, 2] ▷ (λ x → __elem.1 ▷ [3, 4] ▷ (λ y → x == y))} ⤇ _), λ __iter_record → __iter_record.0 ▷ [1, 2] ▷ (λ x → __iter_record.1 ▷ [3, 4] ▷ (λ y → x + y)))"
+        "cast(({_ | __elem.0 ▷ ([1, 2] ▷ unbox) ▷ (λ x → __elem.1 ▷ ([3, 4] ▷ unbox) ▷ (λ y → x == y))} ⤇ _), λ __iter_record → __iter_record.0 ▷ ([1, 2] ▷ unbox) ▷ (λ x → __iter_record.1 ▷ ([3, 4] ▷ unbox) ▷ (λ y → x + y)))"
     )]
     // A per-element conditional stays a value `Case` in the per-element lambda,
     // which lambda elimination compiles over the element stream.
     #[case(
         "[x if x > 1 else 0 for x in [1, 2]]",
-        "λ __iter_record → let __anf = [1, 2]\nin let __anf = __iter_record ▷ __anf\nin __anf ▷ (λ x → { x > 1 → x; true → 0 })"
+        "λ __iter_record → let __anf = [1, 2]\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → { x > 1 → x; true → 0 })"
     )]
     fn the_encoding(#[case] code: &str, #[case] expected: &str) {
         assert_eq!(encoded(code), expected);
