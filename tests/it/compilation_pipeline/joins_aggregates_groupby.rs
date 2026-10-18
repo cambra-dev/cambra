@@ -1436,35 +1436,20 @@ fn a_groupby_over_a_bound_comprehension_of_records() {
     );
 }
 
-/// Two per-group collections over one bound grouping, held in a record. The control for
-/// [`two_inline_groupings_held_in_a_record`].
-#[test]
-fn two_per_group_collections_over_one_bound_grouping_held_in_a_record() {
-    check_tile(
-        &per_region_record(indoc! {r#"
-            gs = groupby(sales, \r -> r.region)
-            a = [sum([s.amount for s in g]) for g in gs]
-            b = [sum([s.qty for s in g]) for g in gs]
-        "#}),
-        expected_per_region_record(),
-    );
-}
-
-/// The same two collections, each calling `groupby(sales, …)` inline, reach a `subst` defect: the
-/// `__gb_k` key binder of one grouping appears in a substitution that passes under the other.
-/// Summing the two collections instead of holding them compiles and answers 347. A let-bound
-/// grouping held in a tuple panics at the same check on the same binder
-/// (`a_let_bound_partition_component_reaches_a_subst_defect` in `records.rs`).
-#[test]
-#[should_panic(expected = "Barendregt violation: substitution range mentions binder")]
-fn two_inline_groupings_held_in_a_record() {
-    check_tile(
-        &per_region_record(indoc! {r#"
-            a = [sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]
-            b = [sum([s.qty for s in g]) for g in groupby(sales, \r -> r.region)]
-        "#}),
-        expected_per_region_record(),
-    );
+/// Two per-group collections held in a record, over one bound grouping or each calling
+/// `groupby(sales, …)` inline.
+#[rstest]
+#[case::one_bound_grouping(indoc! {r#"
+    gs = groupby(sales, \r -> r.region)
+    a = [sum([s.amount for s in g]) for g in gs]
+    b = [sum([s.qty for s in g]) for g in gs]
+    "#})]
+#[case::two_inline_groupings(indoc! {r#"
+    a = [sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]
+    b = [sum([s.qty for s in g]) for g in groupby(sales, \r -> r.region)]
+    "#})]
+fn two_per_group_collections_held_in_a_record(#[case] bindings: &str) {
+    check_tile(&per_region_record(bindings), expected_per_region_record());
 }
 
 /// [`sales_program`] with `bindings`, answering the record `(a=a, b=b)`.
