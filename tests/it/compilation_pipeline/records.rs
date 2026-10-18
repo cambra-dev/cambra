@@ -411,31 +411,14 @@ fn test_computed_collection_component(#[case] code: &str, #[case] expected: Valu
 ///
 /// Held rather than read back: reading a partition's entries takes
 /// `for k -> v in g`, which this version does not lower. What is pinned is that
-/// holding one compiles and leaves its siblings readable.
+/// holding one compiles and leaves its siblings readable, bound by a `let` or not.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::record_field(r"r = (n=1, g=groupby([1, 1, 2], \x -> x)); r.n", Value::Int(1))]
 #[case::tuple_component(r"t = (groupby([1, 1, 2], \x -> x), 7); t.1", Value::Int(7))]
+#[case::let_bound(r"g = groupby([1, 1, 2], \x -> x); t = (g, 7); t.1", Value::Int(7))]
 fn a_partition_is_a_product_component_like_any_other(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
-}
-
-/// A `let`-bound partition held as a component reaches a `subst` defect.
-///
-/// The inline case above compiles, so a product can hold a two-level collection. What
-/// this one trips is the key binder `groupby` mints, which `subst` reports as
-/// escaping its scope when the `let` is substituted through — a defect in
-/// substitution rather than in how a product holds a component.
-///
-/// Pinned rather than ignored, so the error it reaches is a ledger entry: whoever
-/// fixes `subst` sees this case turn from a pinned panic into a passing one.
-#[test]
-#[should_panic(expected = "Barendregt violation: substitution range mentions binder")]
-fn a_let_bound_partition_component_reaches_a_subst_defect() {
-    check_scalar(
-        r"g = groupby([1, 1, 2], \x -> x); t = (g, 7); t.1",
-        Value::Int(7),
-    );
 }
 
 /// A filtered component keeps the domain it binds rather than the extent it was
