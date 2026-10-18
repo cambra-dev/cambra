@@ -2273,6 +2273,9 @@ fn expand_requirement(
 ) -> Result<(), LoweringError> {
     let unsatisfiable = |args: &[Type]| unsatisfiable_requirement(&trait_, args, span);
     if trait_.is_structural() && args.iter().any(is_product) {
+        if !args.iter().all(|a| trait_.admits_product(a)) {
+            return Err(unsatisfiable(&args));
+        }
         use crate::ccl::infer::solver::traits::{product_fields, product_shape};
         // The trait's product rule is the one instance a product satisfies it by, so a
         // requirement between products of one shape states it of each field's components,

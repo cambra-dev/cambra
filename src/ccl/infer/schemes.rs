@@ -557,8 +557,8 @@ mod tests {
     /// Closes `type-checker-traits-comparability` (P3) in the project vault.
     #[test]
     fn max_over_a_non_orderable_codomain_is_rejected() {
-        // Aggregate { input: λx → (1, 2), kind: Max }. The input stands in for a
-        // data collection of tuples (what `max` really consumes), so it carries
+        // Aggregate { input: λx → (a=1, b=2), kind: Max }. The input stands in for a
+        // data collection of records (what `max` really consumes), so it carries
         // the `data_fun` provenance stamp lowering puts on a collection — without
         // it, the bare lambda is a `Compute` capability and `max`'s `Data` demand
         // rejects it on *kind* before the codomain orderability under test.
@@ -569,14 +569,14 @@ mod tests {
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
             },
-            body: Box::new(TypedExpr::new(TypedExprNode::Tuple(vec![
-                lit_int(1),
-                lit_int(2),
+            body: Box::new(TypedExpr::new(TypedExprNode::Record(vec![
+                ("a".into(), lit_int(1)),
+                ("b".into(), lit_int(2)),
             ]))),
         })
         .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole));
         let mut e = TypedExpr::aggregate(lam, AggregateKind::Max);
-        let errs = run_inference(&mut e).expect_err("a tuple codomain is not orderable");
+        let errs = run_inference(&mut e).expect_err("a record codomain is not orderable");
         assert!(
             errs.iter().any(|e| matches!(
                 e,

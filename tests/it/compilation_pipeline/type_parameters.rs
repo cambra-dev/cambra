@@ -459,7 +459,7 @@ fn a_nested_member_bounded_by_the_enclosing_parameter() {
     indoc! {"
         def larger(T, a: T, b: T) => T requires Orderable(T, T):
             b if a < b else a
-        larger((1, 2), (3, 4))
+        larger((x=1, y=2), (x=3, y=4))
     "},
     "No Orderable instance",
 )]

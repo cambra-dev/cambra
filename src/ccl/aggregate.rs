@@ -71,6 +71,14 @@ impl AggregateKind {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => Some(Extent::Base(BaseType::Int)),
             (AggregateKind::Max, Extent::Base(b)) => Some(Extent::Base(b.clone())),
             (AggregateKind::Min, Extent::Base(b)) => Some(Extent::Base(b.clone())),
+            // A tuple's extreme is lexicographic, seeded by each position's.
+            (AggregateKind::Max | AggregateKind::Min, e @ Extent::Record(fields))
+                if fields
+                    .values()
+                    .all(|f| self.output_extent(f).as_ref() == Some(f)) =>
+            {
+                Some(e.clone())
+            }
             // `Drain` folds any element type to `unit`.
             (AggregateKind::Drain, _) => Some(Extent::Base(BaseType::Unit)),
             // `Sole` yields an element of the group, so the extent is unchanged.
@@ -85,15 +93,21 @@ impl AggregateKind {
     /// accumulator before the first batch of values arrives.
     pub fn initial_accumulator(&self, accumulator: &Tiling) -> Tile {
         let seed = self.seed(accumulator);
-        // **Presence is in-band exactly when the fold is total.** A total aggregate has an
-        // identity of the element type to seed with, so its accumulator is a column of one;
-        // a partial one has none, and its length is what carries presence. The two halves
-        // are written in different arms, so a new partial aggregate seeding a value —
-        // making its own empty group indistinguishable from a group of one — is caught here.
-        assert_eq!(
-            seed.is_empty(),
-            self.is_partial(),
-            "an accumulator seed is empty exactly for a partial aggregate: {self:?}"
+        // **Presence is in-band exactly when the fold has an identity at the element type.**
+        // Such an aggregate seeds it, so its accumulator is a column of one; a partial one has
+        // none by its law, and its length carries presence. A partial aggregate seeding a
+        // value, which makes its own empty group indistinguishable from a group of one, is
+        // caught here. `Max` and `Min` at a type with no least or greatest value have no
+        // identity either. Until they return `Option(T)` (`docs/chl-spec.md`, "7.1
+        // Aggregates"), their first element seeds them, and their extreme of an empty
+        // collection is not defined.
+        assert!(
+            !(self.is_partial() && !seed.is_empty()),
+            "a partial aggregate seeds no value: {self:?}"
+        );
+        assert!(
+            !seed.is_empty() || self.is_partial() || self.identity(&accumulator.extent()).is_none(),
+            "an aggregate with an identity seeds it: {self:?}"
         );
         seed
     }
@@ -105,11 +119,23 @@ impl AggregateKind {
         if self.is_partial() {
             return accumulator.empty_at_no_rows();
         }
-        Tile::Scalar(self.scalar_seed(&accumulator.extent()))
+        let extent = accumulator.extent();
+        // Interim, until `max` and `min` return `Option(T)` (`docs/chl-spec.md`, "7.1
+        // Aggregates"): an extreme with no identity at the element type starts from no
+        // value, and its first element seeds it ([`accumulate`](Self::accumulate)).
+        Tile::Scalar(
+            self.identity(&extent)
+                .unwrap_or_else(|| ColumnValue::from_values(Vec::new(), &extent)),
+        )
     }
 
-    fn scalar_seed(&self, accumulator_extent: &Extent) -> ColumnValue {
-        match (self, accumulator_extent) {
+    /// The identity of this fold at `accumulator_extent`, the value its accumulator starts
+    /// from, where there is one. `Min` over `String` has none, since no string is greatest, and
+    /// neither has an extreme over a tuple holding one. Until `max` and `min` return
+    /// `Option(T)` (`docs/chl-spec.md`, "7.1 Aggregates"), such an extreme is seeded by its
+    /// first element instead.
+    fn identity(&self, accumulator_extent: &Extent) -> Option<ColumnValue> {
+        Some(match (self, accumulator_extent) {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![0]),
             (AggregateKind::Max, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![i64::MIN]),
             (AggregateKind::Min, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![i64::MAX]),
@@ -124,11 +150,22 @@ impl AggregateKind {
                 ColumnValue::Bools(vec![false; 1])
             }
             (AggregateKind::Min, Extent::Base(BaseType::Bool)) => ColumnValue::Bools(vec![true; 1]),
+            // A tuple's identity is each position's, lexicographically least for `Max` and
+            // greatest for `Min`.
+            (AggregateKind::Max | AggregateKind::Min, Extent::Record(fields)) => {
+                ColumnValue::Records(
+                    fields
+                        .iter()
+                        .map(|(name, f)| Some((name.clone(), self.identity(f)?)))
+                        .collect::<Option<_>>()?,
+                )
+            }
             // The single `unit` a drained group collapses to; further elements
             // fold in as no-ops (see `accumulate`).
             (AggregateKind::Drain, Extent::Base(BaseType::Unit)) => ColumnValue::Units(1),
+            (AggregateKind::Min, Extent::Base(BaseType::String)) => return None,
             _ => panic!("No identity for {self:?} over {accumulator_extent:?}"),
-        }
+        })
     }
 
     /// Fold rows `start..end` of `values` into `accumulator` in place.
@@ -156,9 +193,24 @@ impl AggregateKind {
             }
             return;
         }
-        let (Tile::Scalar(accumulator), Tile::Scalar(values)) = (accumulator, values) else {
-            panic!("{self:?} reduces a column, so its accumulator and values are columns");
+        // A fold over no rows leaves the accumulator as it is, held value or none.
+        if start == end {
+            return;
+        }
+        let values = as_column(values).unwrap_or_else(|| {
+            panic!("{self:?} reduces a column, so its values are a column, got {values:?}")
+        });
+        let Tile::Scalar(accumulator) = accumulator else {
+            panic!("{self:?} reduces a column, so its accumulator is a column");
         };
+        let mut start = start;
+        // Interim, until `max` and `min` return `Option(T)`: an extreme with no identity
+        // starts from no value, and the first element is the one held.
+        if accumulator.is_empty() {
+            *accumulator = values.select_indices(std::iter::once(start), 1);
+            start += 1;
+        }
+        let values = &values;
         match (self, accumulator, values) {
             (AggregateKind::Sum, ColumnValue::Ints(acc), ColumnValue::Ints(vs)) => {
                 acc[0] += vs[start..end].iter().sum::<i64>()
@@ -184,10 +236,38 @@ impl AggregateKind {
             (AggregateKind::Min, ColumnValue::UInts(acc), ColumnValue::UInts(vs)) => {
                 accumulate_min(acc, &vs[start..end]);
             }
+            (AggregateKind::Min, ColumnValue::Strings(acc), ColumnValue::Strings(vs)) => {
+                accumulate_min(acc, &vs[start..end]);
+            }
             // `False < True`, so the minimum is whether every element is `True`.
             (AggregateKind::Min, ColumnValue::Bools(acc), ColumnValue::Bools(vs)) => {
                 if (start..end).any(|i| !vs[i]) {
                     acc[0] = false;
+                }
+            }
+            // A tuple's extreme, lexicographically: the row the batch holds beyond the one
+            // held, if any.
+            (
+                kind @ (AggregateKind::Max | AggregateKind::Min),
+                acc @ ColumnValue::Records(_),
+                vs @ ColumnValue::Records(_),
+            ) => {
+                let beyond = if *kind == AggregateKind::Max {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                };
+                let mut held = acc.index_at(0);
+                let mut chosen = None;
+                for i in start..end {
+                    let v = vs.index_at(i);
+                    if crate::interpreter::compare_values(&v, &held) == Some(beyond) {
+                        held = v;
+                        chosen = Some(i);
+                    }
+                }
+                if let Some(i) = chosen {
+                    *acc = vs.select_indices(std::iter::once(i), 1);
                 }
             }
             // `Drain`: the accumulator already holds the single `unit` the group
@@ -196,6 +276,26 @@ impl AggregateKind {
             (AggregateKind::Drain, ColumnValue::Units(_), _) => {}
             _ => panic!("Invalid accumulate"),
         };
+    }
+
+    /// Whether `accumulator` holds no value yet, which is how an extreme with no identity
+    /// stands before its first element. Interim, until `max` and `min` return `Option(T)`
+    /// (`docs/chl-spec.md`, "7.1 Aggregates"). A partial fold's empty accumulator is a value,
+    /// its identity.
+    pub fn awaits_first_element(&self, accumulator: &Tile) -> bool {
+        !self.is_partial() && accumulator.rows() == 0
+    }
+
+    /// Stop at the extreme of a complete, empty collection, which has no value. Interim, as
+    /// `//` by zero stops: `max` and `min` are to return `Option::none` there
+    /// (`docs/chl-spec.md`, "7.1 Aggregates").
+    pub fn no_extreme_of_nothing(&self) -> ! {
+        let name = match self {
+            AggregateKind::Max => "max",
+            AggregateKind::Min => "min",
+            other => unreachable!("{other:?} has an identity, so it has a value at no elements"),
+        };
+        panic!("`{name}` of an empty collection has no value")
     }
 
     /// Convert accumulator state into output state.
@@ -216,10 +316,29 @@ impl AggregateKind {
             | (AggregateKind::Max, ColumnValue::Bools(_))
             | (AggregateKind::Min, ColumnValue::Ints(_))
             | (AggregateKind::Min, ColumnValue::UInts(_))
+            | (AggregateKind::Min, ColumnValue::Strings(_))
             | (AggregateKind::Min, ColumnValue::Bools(_))
+            | (AggregateKind::Max | AggregateKind::Min, ColumnValue::Records(_))
             | (AggregateKind::Drain, ColumnValue::Units(_)) => accumulator,
             _ => panic!("Invalid accumulate"),
         }
+    }
+}
+
+/// The column `tile` is: a scalar's, or the column of records a record of scalar fields holding
+/// a cell at every row is. A tuple element reaches a fold as either.
+fn as_column(tile: &Tile) -> Option<ColumnValue> {
+    match tile {
+        Tile::Scalar(column) => Some(column.clone()),
+        Tile::Record { fields, absent } if absent.values().all(|a| a.is_empty()) => {
+            Some(ColumnValue::Records(
+                fields
+                    .iter()
+                    .map(|(name, field)| Some((name.clone(), as_column(field)?)))
+                    .collect::<Option<_>>()?,
+            ))
+        }
+        _ => None,
     }
 }
 
