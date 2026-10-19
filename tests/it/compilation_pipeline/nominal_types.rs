@@ -1,5 +1,5 @@
 //! Nominal types: `type` declarations and their constructors (`docs/chl-spec.md`,
-//! "6.8 Nominal types and methods [Decided]").
+//! "6.8 Nominal types and methods").
 //!
 //! A nominal value is held as its constructor's name and argument, so a program whose
 //! value is one observes the tagged value the constructor built.
@@ -2161,7 +2161,7 @@ fn option_errors_name_what_is_wrong() {
 
 /// A nullary constructor's type argument is determined by the use, and a join with a
 /// sibling of the same type is one: `Opt::none` joined with `Opt::some(1)` is an `Opt(Int)`,
-/// whichever arm it is (`docs/chl-spec.md`, "6.8 Nominal types and methods \[Decided\]").
+/// whichever arm it is (`docs/chl-spec.md`, "6.8 Nominal types and methods").
 #[rstest_log::rstest]
 #[case::the_value_arm_first("Opt::some(1) if c else Opt::none", ctor("some", Value::Int(1)))]
 #[case::the_nullary_arm_first("Opt::none if c else Opt::some(1)", ctor("none", Value::Unit))]

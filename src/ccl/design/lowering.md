@@ -304,7 +304,7 @@ expression, and reports one `LoweringError::Unsupported` per construct. `lower_s
 when it reports, so no statement walker or expression arm has a rule for these forms. The arms that
 must name `Expr::Qualified` or `AssignTarget::Qualified` are `unreachable!`. A path with a
 capitalized qualifier segment, `Price::discounted`, is refused as a method reference rather than as
-module syntax ([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and methods [Decided]").
+module syntax ([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and methods").
 
 A module that uses module syntax therefore reports only those refusals, and none of the lowering
 errors its other statements would raise.
