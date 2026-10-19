@@ -1382,3 +1382,141 @@ fn a_group_by_under_a_loop_over_a_source_the_loop_filters() {
 fn a_group_by_under_a_loop_not_compiled_yet(#[case] code: &str, #[case] gap: &str) {
     check_compile_error(code, gap);
 }
+
+/// A per-group count whose body does not read the row, `sum([1 for s in g])`, fails operator
+/// conversion: the comprehension's iteration binder `__iter_record` (`src/ccl/comprehension.rs`)
+/// reaches `src/interpreter/operator_conversion.rs` as a free variable after lambda elimination.
+/// A body that reads the row compiles (`a_binop_pairs_two_projections_at_the_grouped_row`).
+#[test]
+#[should_panic(expected = "unrecognised Var(__iter_record) in λ-free CCL")]
+fn a_per_group_count_that_ignores_the_row() {
+    check_tile(
+        &per_region_program("sum([1 for s in g])"),
+        per_region(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
+    );
+}
+
+/// A `groupby` over an inline comprehension of records groups its rows. The control for
+/// [`a_groupby_over_a_bound_comprehension_of_records`].
+#[test]
+fn a_groupby_over_an_inline_comprehension_of_records() {
+    check_tile(
+        indoc! {r#"
+            sales = [
+                (region="west", amount=100, qty=2),
+                (region="west", amount=200, qty=4),
+                (region="north", amount=40, qty=1),
+            ]
+            [sum([s.amount for s in g]) for g in groupby([s for s in sales], \r -> r.region)]
+        "#},
+        per_region(Tile::Scalar(ColumnValue::Ints(vec![40, 300]))),
+    );
+}
+
+/// The same comprehension bound to a name first does not compile: the post-lambda-elim type
+/// check rejects the collection domain of the grouping.
+#[test]
+#[should_panic(
+    expected = "post-lambda-elim produced an invalid tree: [Type mismatch for collection domain"
+)]
+fn a_groupby_over_a_bound_comprehension_of_records() {
+    check_tile(
+        indoc! {r#"
+            sales = [
+                (region="west", amount=100, qty=2),
+                (region="west", amount=200, qty=4),
+                (region="north", amount=40, qty=1),
+            ]
+            rows = [s for s in sales]
+            [sum([s.amount for s in g]) for g in groupby(rows, \r -> r.region)]
+        "#},
+        per_region(Tile::Scalar(ColumnValue::Ints(vec![40, 300]))),
+    );
+}
+
+/// Two per-group collections over one bound grouping, held in a record. The control for
+/// [`two_inline_groupings_held_in_a_record`].
+#[test]
+fn two_per_group_collections_over_one_bound_grouping_held_in_a_record() {
+    check_tile(
+        &per_region_record(
+            "gs = groupby(sales, \\r -> r.region)\n\
+             a = [sum([s.amount for s in g]) for g in gs]\n\
+             b = [sum([s.qty for s in g]) for g in gs]",
+        ),
+        expected_per_region_record(),
+    );
+}
+
+/// The same two collections, each calling `groupby(sales, …)` inline, reach a `subst` defect: the
+/// `__gb_k` key binder of one grouping appears in a substitution that passes under the other.
+/// Summing the two collections instead of holding them compiles and answers 347.
+#[test]
+#[should_panic(expected = "Barendregt violation: substitution range mentions binder")]
+fn two_inline_groupings_held_in_a_record() {
+    check_tile(
+        &per_region_record(
+            "a = [sum([s.amount for s in g]) for g in groupby(sales, \\r -> r.region)]\n\
+             b = [sum([s.qty for s in g]) for g in groupby(sales, \\r -> r.region)]",
+        ),
+        expected_per_region_record(),
+    );
+}
+
+/// [`per_region_program`]'s `sales`, then `bindings`, answering the record `(a=a, b=b)`.
+fn per_region_record(bindings: &str) -> String {
+    formatdoc! {r#"
+        sales = [
+            (region="west", amount=100, qty=2),
+            (region="west", amount=200, qty=4),
+            (region="north", amount=40, qty=1),
+        ]
+        {bindings}
+        (a=a, b=b)
+    "#}
+}
+
+/// The per-region amount and quantity sums of [`per_region_record`], as `(a=…, b=…)`.
+fn expected_per_region_record() -> Tile {
+    Tile::record(
+        [
+            (
+                "a",
+                per_region(Tile::Scalar(ColumnValue::Ints(vec![40, 300]))),
+            ),
+            ("b", per_region(Tile::Scalar(ColumnValue::Ints(vec![1, 6])))),
+        ]
+        .into_iter()
+        .map(|(name, tile)| (SmolStr::from(name), tile))
+        .collect(),
+    )
+}
+
+/// A nested `for` over a group's rows, `[r for g in groupby(xs, \s -> s) for r in g]`, overflows
+/// the compiler's stack. Iterating `[x for x in g]` instead of `g` overflows the same way.
+///
+/// A stack overflow aborts the whole test process rather than unwinding, so the program runs in
+/// a `cambra` child process and the assertion reads its exit status and stderr.
+#[test]
+#[should_panic(expected = "has overflowed its stack")]
+fn a_nested_for_over_a_groups_rows() {
+    let path = std::env::temp_dir().join(format!(
+        "cambra_nested_for_over_a_group_{}.cambra",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        "xs = [1, 2]\n[r for g in groupby(xs, \\s -> s) for r in g]\n",
+    )
+    .expect("the program file is written");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cambra"))
+        .arg(&path)
+        .output()
+        .expect("the cambra binary spawns");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        output.status.success(),
+        "the program runs to completion; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
