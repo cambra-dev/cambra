@@ -6,7 +6,7 @@ use log::trace;
 use crate::{
     ccl::Type,
     interpreter::{
-        ColumnValue, DataSourceDomainExtentImpl, Extent, Value,
+        BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, Value,
         producer_releases::ProducerReleases, tiling::Predicate,
     },
 };
@@ -18,8 +18,6 @@ pub struct TestDataSource {
     name: String,
     output_type: Type,
     output_extent: Extent,
-    /// The extent of each domain key (element type): always [`Extent::Base(BaseType::UInt)`].
-    element_extent: Extent,
     yield_predicate: Predicate,
     has_data: bool,
     data: HashMap<Value, Value>,
@@ -28,12 +26,10 @@ pub struct TestDataSource {
 
 impl TestDataSource {
     pub fn new(name: &str, output_type: Type, output_extent: Extent) -> Self {
-        use crate::interpreter::BaseType;
         Self {
             name: name.to_string(),
             output_type,
             output_extent,
-            element_extent: Extent::Base(BaseType::UInt),
             yield_predicate: Predicate::False,
             has_data: false,
             data: HashMap::new(),
@@ -95,12 +91,12 @@ impl DataSourceDomainExtentImpl for TestDataSource {
                 .filter(|k| !key_matches_predicate(k, filter))
                 .cloned()
                 .collect(),
-            &self.element_extent,
+            &self.element_extent(),
         )
     }
 
     fn element_extent(&self) -> Extent {
-        self.element_extent.clone()
+        Extent::Base(BaseType::UInt)
     }
 
     fn get(&self, mut keys: ColumnValue) -> ColumnValue {
