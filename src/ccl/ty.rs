@@ -1035,9 +1035,7 @@ pub enum Type {
     Base(BaseType),
     /// A finite index range `[0, n)`, used as the domain of list types.
     ///
-    /// Emitted by `lower_list_comp` to annotate the outer lambda's parameter
-    /// with the exact length of the source list. `compile_ccl::extent_of` maps
-    /// it directly to `Extent::UIntRange { start: 0, end: n }`.
+    /// `OpConversionContext::extent_of` maps it to the extent `[0, n)`.
     UIntRange(u64),
     /// A function type. When `name` is `None` it is the ordinary
     /// non-dependent function type `domain ⇒ codomain`. When `name` is `Some(x)` it

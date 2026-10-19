@@ -4,10 +4,10 @@
 //! [`compile_program`]:
 //!
 //! ```text
-//! Python source
-//!   → ccl::lower    (Python AST → CCL Expr)
+//! CHL source
+//!   → ccl::lower    (CHL AST → CCL Expr)
 //!   → ccl::infer    (type inference; annotates Lambda param_ty)
-//!   → compile_ccl   (CCL Expr → dataflow operators)
+//!   → operator_conversion (CCL Expr → dataflow operators)
 //!   → subscribe()   (operator evaluation)
 //! ```
 //!
@@ -92,7 +92,7 @@ pub(crate) fn peak_held_values(code: &str) -> HashMap<String, usize> {
 }
 
 /// Lower `code` through the CCL pipeline (parse → `ccl::lower` → `ccl::infer`
-/// → `compile_ccl` → subscribe → get) and return the resulting [`Tile`].
+/// → `operator_conversion` → subscribe → get) and return the resulting [`Tile`].
 pub(crate) fn run_pipeline(code: &str) -> Tile {
     let mut ctx = GlobalContext::default();
     run_pipeline_with_ctx(&mut ctx, code).1
