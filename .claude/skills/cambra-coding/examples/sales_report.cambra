@@ -1,0 +1,78 @@
+# A sales report over in-memory data: the query half of CHL.
+#
+# Shows: records, variant tags, `map`, an `Option` lookup, a nominal type with a method, a refined
+# parameter, a join, `groupby` and a generator.
+#
+# Result: (by_customer: Function [ "ada" -> 1215, "bo" -> 1500 ], largest: 1500)
+
+# A record value is `(field=value)`. Braces are type syntax only: `{name: String}` is the type of
+# `(name="ada")`. A tag (`gold) is a variant arm; it needs no declaration.
+customers = [
+    (id=1, name="ada", tier=`gold),
+    (id=2, name="bo", tier=`basic),
+    (id=3, name="cy", tier=`basic),
+]
+orders = [
+    (customer=1, sku="pen", qty=3),
+    (customer=1, sku="ink", qty=1),
+    (customer=2, sku="pen", qty=10),
+    (customer=3, sku="cap", qty=2),
+    (customer=9, sku="pen", qty=1),
+]
+
+# A list of pairs is still a list: `map(…)` re-keys it by each pair's first component.
+prices = map(["pen" -> 150, "ink" -> 900])
+
+# A nominal type. `type N = R` declares one constructor, `N::new(r)`, and `n.extract()`.
+# `type Shape:` with one constructor per line declares several. A value of either is matched with
+# `case Shape::circle(r):` arms.
+type Cents = Int
+
+# An associated function whose first parameter is `self` is a method: `c.percent_off(10)`.
+# `=>` states the result type. `pct`'s annotation is a refinement: a caller must pass an `Int`
+# the compiler can prove is in range, or the call is rejected at compile time.
+def Cents::percent_off(self, pct: {Int where 0 <= _ and _ <= 100}) => Cents:
+    Cents::new(self.extract() * (100 - pct) // 100)
+
+def unit_price(sku: String) => Cents:
+    # `prices[sku]` is an `Option(Int)`: the key may be absent. There is no `m.get(k)`, no `k in m`
+    # and no `None`; `Option` is a nominal type, matched by its constructors. The last statement of
+    # a body is its value. There is no `return`: an `if`/`else`, `match` or `try` whose every branch
+    # ends in a value is how a function chooses its result.
+    match prices[sku]:
+        case Option::some(p):
+            Cents::new(p)
+        case Option::none:
+            Cents::new(0)
+
+def discount(tier) => {Int where 0 <= _ and _ <= 100}:
+    match tier:
+        case `gold: 10
+        case `basic: 0
+
+# A comprehension is the query language: two `for` clauses with an equality guard compile to a
+# hash join. Order 9 matches no customer and drops out. The result is a bag: nothing about it is
+# ordered, so no code may depend on which line comes first.
+lines = [
+    (name=c.name, total=unit_price(o.sku).percent_off(discount(c.tier)).extract() * o.qty)
+    for c in customers
+    for o in orders
+    if c.id == o.customer
+]
+
+# A guard filters. cy's only line is unpriced, so cy drops out here.
+paid = [l for l in lines if l.total > 0]
+
+# `groupby(c, key)` maps each key to its group. A comprehension over it keeps the keys, so this is a
+# map from name to that customer's revenue, not a list.
+by_customer = [sum([l.total for l in g]) for g in groupby(paid, \l -> l.name)]
+
+# A `def` containing `yield` is a generator: its result is the bag of what it yields. Today the body
+# must be one top-level `for`.
+def large(xs):
+    for x in xs:
+        if x.total >= 1000:
+            yield x.total
+
+# A program's value is its last expression.
+(by_customer=by_customer, largest=max(large(lines)))

@@ -298,6 +298,44 @@ When planning, include updates to the appropriate docs to reflect the changes; v
 
 The inspector crate has its own pinned-expectation suite (the golden wire fixtures) with a re-bless procedure; see `web/CLAUDE.md` before touching anything that moves it. Anything that changes `Display for Type`, or that shifts how many `NodeId`s a phase mints, moves the whole corpus.
 
+### Keeping the cambra-coding skill current
+
+`tests/programs/skill_examples.rs` runs every program in `.claude/skills/cambra-coding/examples/`
+and fails when one stops compiling or answering as its header says. When a change breaks one,
+update the example and its comments in the same change. Also update the skill when you:
+- implement or drop a `[Planned]`/`[Decided]` CHL feature (`return`, `in`, `while`, recursion,
+  `with t = begin()`, `@Discard`, structured HTTP requests) — `references/python-habits.md` lists
+  each as missing, with its diagnostic;
+- change the transaction read rule, the capability rules, or the reload refusals — the skill's
+  "The model" and `references/reload.md` state them for authors, and the example comments quote
+  inferred contracts.
+- add, rename or remove a builtin, a std module or a library function (`SURFACE_BUILTINS` in
+  `chl-parser/src/builtins.rs`, `stdlib/`, sources and sinks such as `http_serve`) — the skill
+  tells authors what exists, and `references/python-habits.md` lists what is missing;
+- change the grammar, a keyword, or a lowering refusal's wording — the habits table quotes each
+  diagnostic, and the skill's rows go stale silently.
+
+The skill is user-facing: agents read it to write CHL, and its readers can't see the compiler's
+source. When you change it:
+- **State the language, not this compiler's defects.** A known compiler bug, a crash, a hang, a
+  slow compile, or the shape that works around one does not go in the skill or its examples. Track
+  it as an issue in the vault, and fix the compiler. An example that hits one is replaced, not
+  annotated.
+- **Say what is missing plainly.** Name a feature that doesn't exist and what to write instead.
+  Don't promise a `[Planned]` design or describe one as if it worked.
+- **Check every claim against main.** Run each habit and copy its diagnostic verbatim from the
+  output; don't paraphrase it or write it from the source. The example programs run under
+  `tests/programs/skill_examples.rs`.
+- **Keep answers in the skill.** A spec link backs a rule; it doesn't replace stating the rule. A
+  pointer into compiler source or the tests serves a reader who has this repository, so state the
+  answer first and give the pointer only as a fallback.
+- **Keep it short.** Add a rule where an author would otherwise write the wrong program. Correct or
+  delete a stale row; don't add a second row beside it.
+
+`.claude/hooks/chl-skill-check.py` reminds an agent of these rules and the list above, once per session, when an Edit or
+Write touches the CHL surface: `chl-parser/src/`, `stdlib/`, `src/ccl/lower/` or
+`docs/chl-spec.md`.
+
 ### Compact instructions
 
 When you are using compact, focus on test output and code changes.

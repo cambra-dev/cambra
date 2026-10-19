@@ -1,0 +1,84 @@
+# An HTTP inventory service: state shared between routes, transactions, exceptions and replies.
+#
+# Exchange, in order:
+#   POST /reserve pen -> "reserved pen"       POST /restock ink -> "restocked ink"
+#   POST /reserve pen -> "sold out: pen"      POST /restock cap -> "unknown cap"
+#   POST /reserve ink -> "sold out: ink"      POST /reserve ink -> "reserved ink"
+#   POST /reserve cap -> "sold out: cap"      GET  /last        -> "ink"
+#
+# Run it, then `curl -X POST -d pen localhost:8080/reserve`.
+
+# `http_serve(port, method, path)` stands alone on the right of a top-level `=`, with string
+# constants for arguments. It returns the requests, a live source whose elements are request bodies
+# (`String`), and the responses, a feed. There are no status codes, headers or structured requests.
+reserve_reqs, reserve_resps = http_serve("8080", "POST", "/reserve")
+restock_reqs, restock_resps = http_serve("8080", "POST", "/restock")
+last_reqs, last_resps = http_serve("8080", "GET", "/last")
+
+# State shared between loops is a transactional mutable variable. `Txn` is never inferred: sharing
+# is spelled out. A map annotation takes `box(map(…))`, since a literal is a positional collection
+# until it is boxed.
+stock: Mut(Map(String, Int), Txn) := box(map(["pen" -> 1, "ink" -> 0]))
+last_sold: Mut(String, Txn) := "(none)"
+
+type OutOfStock = {sku: String}
+
+# A function may read and write `Txn` variables, and its type states it. The contract inferred for
+# `take` requires `Transaction` and `ReadTxn` of `stock`, and causes `WriteTxn` of `stock` and
+# `Raise(OutOfStock)`. Only a `with begin():` body supplies a `Transaction`, so every call of `take`
+# sits inside a block, and its writes join that block's transaction.
+def take(sku: String):
+    match stock[sku]:
+        case Option::some(n):
+            if n > 0:
+                # A map is written one key at a time.
+                stock[sku] := n - 1
+                n - 1
+            else:
+                raise OutOfStock::new(sku=sku)
+        case Option::none:
+            raise OutOfStock::new(sku=sku)
+
+# `raise` ends its path: `last_sold` is written only where `take` returned. An exception that
+# escaped a block would abort it, committing none of its writes; this one is caught inside, so the
+# contract inferred for `reserve` has no `Raise`.
+def reserve(sku: String) => String:
+    try:
+        take(sku)
+        last_sold := sku
+        "reserved " + sku
+    except OutOfStock:
+        "sold out: " + sku
+
+# Each iteration of a request loop answers the request it is bound to. Iterations run in any order
+# and may run concurrently: the blocks of one loop commit in an order the runtime picks, and every
+# read inside a block sees one snapshot plus that block's own writes.
+#
+# A block on the right of `=` is the value of its last statement. Every path through it commits,
+# and the binding outlives the block, so the reply is computed inside and fed once, after. A name
+# bound by a plain statement inside a block is not visible after it.
+for sku in reserve_reqs:
+    reply = with begin():
+        reserve(sku)
+    reserve_resps << reply
+
+for sku in restock_reqs:
+    reply = with begin():
+        match stock[sku]:
+            case Option::some(n):
+                stock[sku] := n + 5
+                "restocked " + sku
+            case Option::none:
+                "unknown " + sku
+    restock_resps << reply
+
+# A `Txn` variable is read only inside a block; a bare `last_sold` here would be refused. A block
+# that only reads is still a transaction and reads at its own place in the commit order. A `<<`
+# inside a block is sent only if the block commits. Under a guard with no `else`
+# (`if n > 0: …`), a path that fails the guard writes nothing and sends nothing.
+for req in last_reqs:
+    with begin():
+        last_resps << last_sold
+
+# A program with any sink produces only its sinks. A trailing expression here would be discarded
+# without a diagnostic, so a value is observed by replying with it.

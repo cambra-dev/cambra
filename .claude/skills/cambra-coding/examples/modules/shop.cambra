@@ -1,0 +1,19 @@
+# The root module: the file the engine runs (`cambra shop.cambra`). A root file's name starts with a
+# lowercase letter, as every module path segment does.
+#
+# Result: 702. eu holds 101 + 251 - 10 = 342, and us holds 105 + 255 = 360.
+#
+# Run the root to test the program. `cambra check ledger.cambra` checks one module alone and prints
+# its interface.
+
+# `as` names the run; the name is the run's identity, its state included.
+run ledger(fee=1) as eu
+run ledger(fee=5) as us
+
+for r in [10]:
+    with begin():
+        eu::refund(r)
+
+# `await_final(x)` is the value of `x` once every block that may write it has finished. It is the
+# only read of a final `Txn` value, it stands outside every block, and nothing names `x` after it.
+await_final(eu::balance) + await_final(us::balance)
