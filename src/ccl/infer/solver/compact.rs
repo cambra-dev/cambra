@@ -2214,14 +2214,12 @@ fn compact_go(
                 ..CompactType::value()
             }
         }
-        // Each argument is a new position, compacted at the polarity its variance gives
-        // it, and an invariant one at this polarity, as a history's children are, read as
-        // an invariant position is ([`Position::invariant`]). A bipolar argument is two
-        // sides, its input compacted where the polarity flips and its output where it
-        // does not (`NominalDecl::sided_args`).
         Type::Split { .. } => {
             unreachable!("a split argument stands only in a nominal type, which reads its sides")
         }
+        // Each side of the arguments (`NominalDecl::sided_args`) is a new position, compacted
+        // at the polarity its variance gives it. An invariant side is read as an invariant
+        // position is ([`Position::invariant`]).
         Type::Nominal(decl, args) => {
             let mut sides = Vec::new();
             for (t, v) in decl.sided_args(args) {

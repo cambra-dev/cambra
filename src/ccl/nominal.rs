@@ -145,6 +145,18 @@ pub fn sides(arg: &Type) -> (&Type, &Type) {
     }
 }
 
+/// The variance of each side of an argument of variance `v`: a bipolar argument's input
+/// side, contravariant, then its output side, covariant ([`sides`]), and any other argument's
+/// one side at `v`.
+fn side_variances(v: Variance) -> &'static [Variance] {
+    match v {
+        Variance::Bipolar => &[Variance::Contravariant, Variance::Covariant],
+        Variance::Covariant => &[Variance::Covariant],
+        Variance::Contravariant => &[Variance::Contravariant],
+        Variance::Invariant => &[Variance::Invariant],
+    }
+}
+
 /// The argument of a bipolar parameter whose sides are `input` and `output`: one type where
 /// they agree, a [`Type::Split`] otherwise.
 pub fn split(input: Type, output: Type) -> Type {
@@ -257,24 +269,32 @@ impl NominalDecl {
         self.body()
             .variances
             .iter()
-            .flat_map(|v| match v {
-                Variance::Bipolar => vec![Variance::Contravariant, Variance::Covariant],
-                other => vec![*other],
-            })
+            .flat_map(|v| side_variances(*v))
+            .copied()
             .collect()
     }
 
     /// The sides of an application's arguments, each with its variance, in the
     /// [`sided_variances`](Self::sided_variances) layout.
-    pub fn sided_args<'a>(&self, args: &'a [Type]) -> Vec<(&'a Type, Variance)> {
-        use Variance::{Bipolar, Contravariant, Covariant};
+    pub fn sided_args<'a>(
+        &'a self,
+        args: &'a [Type],
+    ) -> impl Iterator<Item = (&'a Type, Variance)> + 'a {
         let variances = &self.body().variances;
         debug_assert_eq!(args.len(), variances.len(), "one argument per parameter");
-        let sided = |(t, v): (&'a Type, &Variance)| match v {
-            Bipolar => vec![(sides(t).0, Contravariant), (sides(t).1, Covariant)],
-            other => vec![(t, *other)],
-        };
-        args.iter().zip(variances).flat_map(sided).collect()
+        args.iter().zip(variances).flat_map(|(t, v)| {
+            let sided = match v {
+                Variance::Bipolar => {
+                    let (input, output) = sides(t);
+                    [Some(input), Some(output)]
+                }
+                _ => [Some(t), None],
+            };
+            sided
+                .into_iter()
+                .flatten()
+                .zip(side_variances(*v).iter().copied())
+        })
     }
 
     /// The constructor named `name`.
@@ -502,6 +522,31 @@ mod tests {
         decl.define(vec![ctor])
             .map_err(|p| p.spelling.to_string())?;
         Ok(decl.body().variances[0])
+    }
+
+    /// A bipolar argument spreads into its input side, contravariant, then its output side,
+    /// covariant: the layout compaction and specialization keying both write.
+    #[test]
+    fn a_bipolar_argument_spreads_into_its_input_then_its_output() {
+        let t = TypeParam::declared("T");
+        let span = Span::new(FileId::ROOT, 0, 0);
+        let decl = NominalDecl::declared("N".into(), vec![t.clone()], span, false);
+        let params = vec![(None, Type::fun(Type::Param(t.clone()), Type::Param(t)))];
+        let ctor = NominalCtor {
+            name: "c".into(),
+            span,
+            params,
+        };
+        decl.define(vec![ctor]).expect("`T` is bipolar");
+        let (input, output) = (int(), Type::Base(BaseType::Bool));
+        let arg = split(input.clone(), output.clone());
+        let sided: Vec<_> = decl.sided_args(std::slice::from_ref(&arg)).collect();
+        let expected = [
+            (&input, Variance::Contravariant),
+            (&output, Variance::Covariant),
+        ];
+        assert_eq!(sided, expected);
+        assert_eq!(decl.sided_variances(), expected.map(|(_, v)| v));
     }
 
     #[test]
