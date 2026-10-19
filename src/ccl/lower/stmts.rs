@@ -1734,12 +1734,8 @@ fn is_product(ty: &Type) -> bool {
 
 /// Whether one of the type parameters `params` occurs in `ty`.
 fn mentions_param(ty: &Type, params: &[crate::ccl::ty::TypeParamId]) -> bool {
-    if let Type::Param(p) = ty
-        && params.contains(&p.id)
-    {
-        return true;
-    }
-    ty.any_child(|c| mentions_param(c, params))
+    matches!(ty, Type::Param(p) if params.contains(&p.id))
+        || ty.any_child(|c| mentions_param(c, params))
 }
 
 /// Push the requirement `trait_(args, assoc)` onto `out`, reading one over products of

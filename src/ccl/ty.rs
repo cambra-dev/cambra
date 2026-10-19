@@ -3719,9 +3719,8 @@ impl Type {
     /// Return `true` if `f` returns `true` for any direct child [`Type`]. Mirrors
     /// [`TypedExpr::any_child`].
     ///
-    /// Short-circuits the recursive predicate cheaply: once a match is found,
-    /// `walk_children` still finishes iterating remaining siblings but does
-    /// not invoke `f` on them.
+    /// Calls `f` on the children in [`Type::walk_children`] order until one returns `true`;
+    /// the remaining children are visited without calling `f`.
     pub fn any_child(&self, mut f: impl FnMut(&Type) -> bool) -> bool {
         let mut found = false;
         self.walk_children(|t| {
@@ -4968,12 +4967,8 @@ pub fn application_order<'a>(
 /// comprehension that form is inside the inner one's lowering rather than at this site.
 fn dependency_order(refinements: &[Refinement]) -> Vec<&Refinement> {
     fn reads_narrowed_by(ty: &Type, earlier: &Refinement) -> bool {
-        if let Type::Refinement(_, set) = ty
-            && set.contains(earlier)
-        {
-            return true;
-        }
-        ty.any_child(|child| reads_narrowed_by(child, earlier))
+        matches!(ty, Type::Refinement(_, set) if set.contains(earlier))
+            || ty.any_child(|child| reads_narrowed_by(child, earlier))
     }
     fn predicate_reads(pred: &TypedExpr, earlier: &Refinement) -> bool {
         let mut found = false;

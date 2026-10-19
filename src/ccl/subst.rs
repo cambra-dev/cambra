@@ -1735,7 +1735,9 @@ pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
 ///
 /// A [`Type::BoundedHole`] answers for its bound, which [`Type::walk_children`] visits. The
 /// variant occurs in annotation position only and is normalized away before solving; one
-/// that reaches a check at all is reported as `UnresolvedBoundedHole`, not by this test.
+/// that reaches a check is reported as
+/// [`InferError::UnresolvedBoundedHole`](crate::ccl::infer::InferError::UnresolvedBoundedHole),
+/// not by this test.
 pub fn type_contains_infer(ty: &Type) -> bool {
     matches!(ty, Type::Infer(_)) || ty.any_child(type_contains_infer)
 }
