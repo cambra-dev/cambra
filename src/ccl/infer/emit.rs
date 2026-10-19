@@ -260,10 +260,23 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             emit_nominal_ctor(decl, ctor, payload, ctx)?
         }
 
-        TypedExprNode::Source(name) => match ctx.sources.get(name) {
-            Some(t) => t.clone(),
-            None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
-        },
+        // A projected source is minted by projection pruning, after inference. Its type is
+        // read off the registered one, so this check verifies the paths against it.
+        TypedExprNode::Source(name, paths) => {
+            let Some(registered) = ctx.sources.get(name) else {
+                return Err(ctx.raise(InferError::UnboundVariable(name.to_string())));
+            };
+            match projected_source_type(registered, paths) {
+                Ok(ty) => ty,
+                Err((key, found)) => {
+                    return Err(ctx.raise(InferError::MissingField {
+                        key,
+                        found: Box::new(found),
+                        at: format!("source({name})"),
+                    }));
+                }
+            }
+        }
 
         // `@LoadFrom(x)` is typed by its context. The value it denotes belongs to
         // the retired version of the program, which this compilation cannot see:
@@ -3357,6 +3370,61 @@ fn enclosing_component(parameter: &Type) -> Type {
         panic!("a nested `Transact`'s parameter is the (enclosing, position) pair: {parameter}")
     };
     parts[0].clone()
+}
+
+/// The type of a source read for `paths`: the registered `Fun(DataSource(𝑆), 𝑉)` with 𝑉
+/// replaced by the type at the end of the one path, or by the tuple of the types at the ends of
+/// several. An empty list is the registered type. The error is the key a path steps through
+/// that the type it steps from does not carry, with that type.
+fn projected_source_type(
+    registered: &Type,
+    paths: &[Vec<ProjKey>],
+) -> Result<Type, (FieldKey, Type)> {
+    let Type::Fun {
+        domain, codomain, ..
+    } = registered
+    else {
+        return Ok(registered.clone());
+    };
+    if paths.is_empty() {
+        return Ok(registered.clone());
+    }
+    let mut leaves = Vec::new();
+    for path in paths {
+        let mut ty = (**codomain).clone();
+        for key in path {
+            ty = field_of(&ty, key)?;
+        }
+        leaves.push(ty);
+    }
+    let value = match leaves.as_slice() {
+        [only] => only.clone(),
+        _ => Type::Tuple(leaves),
+    };
+    Ok(Type::fun_like(registered, (**domain).clone(), value))
+}
+
+/// The type of the field `key` of a tuple or a record of type `ty`.
+fn field_of(ty: &Type, key: &ProjKey) -> Result<Type, (FieldKey, Type)> {
+    let found = match (ty.peel_refinements(), key) {
+        (Type::Tuple(fields), ProjKey::Index(i)) => fields.get(*i),
+        (Type::Record(fields), ProjKey::Field(name)) => {
+            fields.iter().find(|(n, _)| n == name).map(|(_, t)| t)
+        }
+        (Type::Tuple(fields), ProjKey::Field(name)) => name
+            .name()
+            .strip_prefix('_')
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|i| fields.get(i)),
+        _ => None,
+    };
+    found.cloned().ok_or_else(|| {
+        let key = match key {
+            ProjKey::Index(i) => FieldKey::Index(*i),
+            ProjKey::Field(name) => FieldKey::Name(name.clone()),
+        };
+        (key, ty.clone())
+    })
 }
 
 #[cfg(test)]

@@ -996,7 +996,7 @@ impl fmt::Display for Builtin {
 ///
 /// Supports both positional tuple fields (`.0`, `.1`, …) and named record
 /// fields (`.name`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ProjKey {
     /// Integer-indexed tuple projection: `.0`, `.1`, …
     Index(usize),
@@ -1013,6 +1013,25 @@ impl fmt::Display for ProjKey {
             ProjKey::Index(n) => write!(f, "{n}"),
             ProjKey::Field(name) => write!(f, "{name}"),
         }
+    }
+}
+
+/// Renders the paths of a [`TypedExprNode::Source`](crate::ccl::TypedExprNode::Source) as its
+/// second argument: a path is its keys joined by `.`, and the argument is the path itself for
+/// one path, or the list for several: `1`, `1.0`, `[0, 2]`.
+pub fn source_projection_label(paths: &[Vec<ProjKey>]) -> String {
+    let path = |keys: &Vec<ProjKey>| {
+        keys.iter()
+            .map(ProjKey::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    match paths {
+        [only] => path(only),
+        paths => format!(
+            "[{}]",
+            paths.iter().map(path).collect::<Vec<_>>().join(", ")
+        ),
     }
 }
 

@@ -321,7 +321,6 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
         expr,
         try_map_domain_of_iteration,
     );
-
     // Rules that may discard or restructure sub-expressions.  Equationally
     // valid only on pure CCC morphisms, so they must not touch a sub-tree
     // containing an `iterate` source (dropping it strands the iteration — a
@@ -979,7 +978,7 @@ fn preserves_domain(expr: &Expr) -> bool {
         TypedExprNode::Proj(_)
         | TypedExprNode::Lit(_)
         | TypedExprNode::List(_)
-        | TypedExprNode::Source(_)
+        | TypedExprNode::Source(..)
         | TypedExprNode::Var(_) => true,
         _ => false,
     }
@@ -2274,7 +2273,7 @@ mod tests {
     fn map_domain_drops_every_value_step_after_the_iteration() {
         let doubled = || var("double").with_ty(fun_ty(int_ty(), int_ty()));
         let source = || {
-            Expr::new(TypedExprNode::Source("testsource1".into()))
+            Expr::new(TypedExprNode::Source("testsource1".into(), Vec::new()))
                 .with_ty(fun_ty(positions(), int_ty()))
         };
         let tails = [

@@ -322,7 +322,10 @@ pub(super) fn lower_call(
                 // perform.
                 ctx.io_site
                     .get_or_insert(func.span.join(args.last().map_or(func.span, |a| a.span)));
-                return Ok(Expr::new(TypedExprNode::Source(name.to_string())));
+                return Ok(Expr::new(TypedExprNode::Source(
+                    name.to_string(),
+                    Vec::new(),
+                )));
             }
             // For zero-argument calls, only registered sources are allowed.
             if args.is_empty() {

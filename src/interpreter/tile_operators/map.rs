@@ -3,6 +3,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use super::*;
 use crate::interpreter::operator_graph::value;
+use crate::interpreter::{FieldPath, tuple_field};
 use crate::{
     interpreter::{
         ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Scheduler, Value,
@@ -883,6 +884,37 @@ impl TileProducer for MapResultToConstProducer {
         }
     }
 }
+/// The extent of the leaves at `paths` of a source's values, given the extent of the values: the
+/// values' own for no paths, one leaf's extent for one, and for several the record of their
+/// extents under the component names of a tuple.
+fn projected_extent(paths: &[FieldPath], values: Extent) -> Extent {
+    if paths.is_empty() {
+        return values;
+    }
+    let leaf = |path: &FieldPath| {
+        let mut extent = &values;
+        for field in path {
+            let Extent::Record(fields) = extent else {
+                panic!("cannot step to field {field} of a source whose values are {extent}")
+            };
+            extent = fields
+                .get(field)
+                .unwrap_or_else(|| panic!("the source's values have no field {field}"));
+        }
+        extent.clone()
+    };
+    match paths {
+        [path] => leaf(path),
+        paths => Extent::Record(
+            paths
+                .iter()
+                .enumerate()
+                .map(|(n, path)| (tuple_field(n), leaf(path)))
+                .collect(),
+        ),
+    }
+}
+
 /// Produces a `DataFunction` tile that maps each domain element of a data
 /// source to its corresponding output value.
 ///
@@ -897,7 +929,12 @@ pub struct MapResultWithSource {
     input: Box<dyn TileOperator>,
     /// The data source providing both domain keys and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-    /// Output tiling: `DataFunction { domain: DataSourceDomain, codomain: Scalar(output_value_extent) }`.
+    /// The paths to the leaves of the source's values this reads, none for the whole value
+    /// ([`DataSourceDomainExtentImpl::get_fields`]).
+    fields: Vec<FieldPath>,
+    /// Output tiling:
+    /// `DataFunction { domain: DataSourceDomain, codomain: Scalar(output_value_extent) }`,
+    /// where the extent is that of the leaves at `fields` of the value ([`projected_extent`]).
     base: OperatorBase,
 }
 
@@ -910,8 +947,18 @@ impl MapResultWithSource {
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
         input: Box<dyn TileOperator>,
     ) -> Self {
+        Self::projecting(source, input, Vec::new())
+    }
+
+    /// [`new`](Self::new) reading only the leaves at `fields` of the source's values: the whole
+    /// value for none, that leaf alone for one, and the tuple of them for several.
+    pub fn projecting(
+        source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        input: Box<dyn TileOperator>,
+        fields: Vec<FieldPath>,
+    ) -> Self {
         let source_domain_extent = Extent::DataSourceDomain(source.clone());
-        let output_extent = source.borrow().output_value_extent();
+        let output_extent = projected_extent(&fields, source.borrow().output_value_extent());
         let tiling = change_tiling_result(input.tiling(), move |codomain_extent| {
             assert_eq!(source_domain_extent, *codomain_extent);
             Tiling::Scalar(output_extent)
@@ -920,6 +967,7 @@ impl MapResultWithSource {
             base: OperatorBase::new(tiling),
             input,
             source: source.clone(),
+            fields,
         }
     }
 }
@@ -951,6 +999,7 @@ impl TileOperator for MapResultWithSource {
             ),
             input,
             self.source.clone(),
+            self.fields.clone(),
             self.input.result_correlation(),
         ))
     }
@@ -962,6 +1011,9 @@ struct MapResultWithSourceProducer {
     input: Box<dyn TileProducer>,
     /// The data source used for both domain enumeration and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+    /// The paths to the leaves of the source's values this reads
+    /// ([`MapResultWithSource::projecting`]).
+    fields: Vec<FieldPath>,
     /// A correlation between the result values and some piece of the domain of the input tile.
     /// We need this in order to translate domain obsolete guards into releases of the underlying
     /// source.
@@ -1024,12 +1076,14 @@ impl MapResultWithSourceProducer {
         base: ProducerBase,
         input: Box<dyn TileProducer>,
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        fields: Vec<FieldPath>,
         result_correlation: Option<Vec<TilePathStep>>,
     ) -> Self {
         let result = Self {
             base,
             input,
             source,
+            fields,
             result_correlation,
             last_nested_input: None,
         };
@@ -1117,8 +1171,9 @@ impl TileProducer for MapResultWithSourceProducer {
             self.last_nested_input = HeldBeneathKeys::of(&input_tile);
         }
         let source = self.source.borrow();
+        let fields = &self.fields;
         process_tile_result(self.tiling(), input_tile, move |codomain| {
-            source.get(codomain)
+            source.get_fields(codomain, fields)
         })
     }
 
@@ -1874,6 +1929,7 @@ mod tests {
             ProducerBase::unowned(MapResultWithSourceProducer::alloc_id(), &out_tiling),
             Box::new(TestTileProducer::new(input, in_tiling)),
             as_domain,
+            Vec::new(),
             Some(vec![TilePathStep::Codomain]),
         );
         let _ = producer.get(producer.tiling().universal_guard());

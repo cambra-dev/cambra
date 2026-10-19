@@ -278,6 +278,9 @@ pub trait DataSink: Send + Sync {
     fn process(&self, tile: &Tile);
 }
 
+/// The field names that lead through nested records to a leaf of a source's values.
+pub type FieldPath = Vec<SmolStr>;
+
 pub trait DataSourceDomainExtentImpl {
     fn get_id(&self) -> &str;
     fn check_for_new_data(&mut self) -> bool;
@@ -296,6 +299,43 @@ pub trait DataSourceDomainExtentImpl {
     /// element to its corresponding output value when building a
     /// `DataFunction { domain, codomain: Scalar(output_values) }` tile.
     fn get(&self, keys: ColumnValue) -> ColumnValue;
+    /// Returns the leaves at `paths` of the output value of each domain key, for a source whose
+    /// values are records. A path is the field names to step through nested records.
+    ///
+    /// No paths is the whole value, as [`get`](Self::get). One path is that leaf's column.
+    /// Several are a column of records whose component 𝑛 is the leaf at `paths[𝑛]`, so the
+    /// values are the tuple of those leaves in that order. Each is the column that projecting
+    /// `get`'s result along the path gives. A source overrides it to read the leaves alone,
+    /// where `get` builds the whole record of every key. Used by
+    /// [`crate::interpreter::tile_operators::MapResultWithSource`] for a projected source read.
+    fn get_fields(&self, keys: ColumnValue, paths: &[FieldPath]) -> ColumnValue {
+        let values = self.get(keys);
+        if paths.is_empty() {
+            return values;
+        }
+        let leaf = |path: &FieldPath| {
+            let mut column = &values;
+            for field in path {
+                let ColumnValue::Records(record) = column else {
+                    panic!("cannot step to field {field} of source values {column:?}")
+                };
+                column = record
+                    .get(field)
+                    .unwrap_or_else(|| panic!("the source's values have no field {field}"));
+            }
+            column.clone()
+        };
+        match paths {
+            [path] => leaf(path),
+            paths => ColumnValue::Records(
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(n, path)| (crate::interpreter::tuple_field(n), leaf(path)))
+                    .collect(),
+            ),
+        }
+    }
     /// Returns the [`Extent`] of each output value produced by this source.
     /// Used to type the codomain of [`crate::interpreter::tile_operators::MapResultWithSource`].
     fn output_value_extent(&self) -> Extent;

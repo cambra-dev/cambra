@@ -1727,7 +1727,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
-        | TypedExprNode::Source(_)
+        | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Proj(_) => {}
         TypedExprNode::Apply { function, argument } => {

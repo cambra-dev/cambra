@@ -11,6 +11,8 @@
 //!   ([`iterate::insert_iterate_markers`]) and its per-site strategy dispatch.
 //! - [`join`] — the hash/loop-join cluster (the specialised iteration
 //!   strategy folded into the walk).
+//! - [`projection_pruning`] — the last rewrite: a source whose chain reads
+//!   only some fields of its records is asked for those fields.
 //!
 //! Hash-join planning is just one *specialised* strategy folded in at a site,
 //! not the whole job (hence `planning`, not `join_plan`).
@@ -44,6 +46,7 @@ mod join;
 mod loops;
 mod per_group_filter;
 mod predicates;
+mod projection_pruning;
 
 // Preserve the `crate::ccl::planning::…` paths that other modules' doc-comments
 // and prose reference (design docs link `insert_iterate_markers`; `ccl_utils` /
@@ -142,7 +145,13 @@ pub fn run(mut expr: Expr) -> Result<Expr, String> {
     // the `Apply(_, Iterate)` / `Apply(_, Restrict)` markers just inserted,
     // so the only rules that fire here are the always-safe cleanups (plus
     // any reduction of a fully marker-free sub-tree, which is sound).
-    let expr = simplify(expr);
+    let mut expr = simplify(expr);
+    // Projection pruning runs after the final `simplify`, on the planned tree. Every rewrite
+    // above matches a source in the shape it has when the source is read whole, and pruning
+    // retypes the source from the record to the leaves its chain reads. It follows the
+    // point-free chain heads planning leaves, so it needs the identities and nested
+    // compositions the last `simplify` removes.
+    projection_pruning::run(&mut expr);
     // Live cross-endpoint reads are recognized earlier, in
     // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
     // such read is already an `as_of` join — nothing to do at planning time.

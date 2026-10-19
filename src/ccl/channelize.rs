@@ -1317,7 +1317,7 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
+        | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Apply { .. }
         | TypedExprNode::Realize(_)
@@ -1393,7 +1393,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
+        | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Apply { .. }
         | TypedExprNode::Realize(_)
@@ -2192,7 +2192,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
-            | TypedExprNode::Source(_)
+            | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer => {}
             TypedExprNode::Error => crate::unexpected_error_node!(),
@@ -3136,7 +3136,7 @@ fn extract_for_defer_impl(
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
+        | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Defer) => node,
         TypedExprNode::Error => crate::unexpected_error_node!(),
