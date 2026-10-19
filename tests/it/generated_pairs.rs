@@ -110,6 +110,7 @@ const LIVE: &[&str] = &[
     "terminal_read_after_guard",
     "terminal_read_guard",
     "ternary_branch",
+    "three_loop_feed_writing_every_loop",
     "tuple_component",
     "two_feed_sites",
     "txn_guard",
@@ -713,15 +714,29 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             out << t + sum(ch)
         "#}},
-        Skeleton { name: "four_loop_feed_writing_every_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+        Skeleton { name: "three_loop_feed_writing_every_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            t := 0
+            ch = defer()
+            for i in [1, 2]:
+                for b in [10, 20]:
+                    for q in [1, 2]:
+                        t += q
+                        ch << {}
+            out = test_sink()
+            out << t + sum(ch)
+        "#}},
+        // Four loops that all write `t`, so the feed's key splices twice. The record hole keeps
+        // the row to two cells, as each takes seconds to classify.
+        Skeleton { name: "four_loop_feed_writing_every_loop", hole: Ty::Rec, scope: &[], body: indoc! {r#"
             t := 0
             ch = defer()
             for i in [1, 2]:
                 for b in [10, 20]:
                     for c in [100, 200]:
                         for q in [1, 2]:
+                            r = {}
                             t += q
-                            ch << {}
+                            ch << r.a + r.b
             out = test_sink()
             out << t + sum(ch)
         "#}},
