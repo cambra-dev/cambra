@@ -536,3 +536,90 @@ fn a_retired_route_answers_a_request_it_had_accepted() {
         "the same answer the address gives once the route is gone",
     );
 }
+
+/// Compile `code`, POST `body` to `path` on `port`, and return the reply body, failing after five
+/// seconds without one.
+fn post_once(code: &str, port: u16, path: &'static str, body: &'static str) -> String {
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut ctx = GlobalContext::default();
+    let sources = SourceMap::single("<test>", code);
+    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let _ = tx.send(http_post(port, path, body));
+    });
+    drive_until(&mut ctx, &rx, Duration::from_secs(5))
+}
+
+/// A reply fed in the loop body, after a block that writes a mutable variable, answers each
+/// request.
+#[test]
+fn a_reply_after_a_writing_block_answers_the_request() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        reqs, resps = http_serve("{port}", "POST", "/hit")
+        hits: Mut(Int, Txn) := 0
+        for req in reqs:
+            with begin():
+                hits := hits + 1
+            resps << "ok\n"
+    "#};
+    assert_eq!(post_once(&code, port, "/hit", "x"), "ok\n");
+}
+
+/// A reply fed inside the block that writes a mutable variable never answers the request.
+///
+/// `docs/chl-spec.md`, "8.4 Feeds are the second form of mutability" admits a reply inside a
+/// block, sequenced after the commit and indexed by commit tick. The same in-block feed over a
+/// `stdin()` loop into a `defer()` replies (`progress_feed_inside_tx` in
+/// `tests/it/compilation_pipeline/transactions.rs` covers the literal-list loop), and the reply
+/// moved after the block answers (the sibling above).
+// `drive_until`'s timeout fails the test rather than hanging it, so `--ignored` reports the
+// defect in five seconds.
+#[test]
+#[ignore = "hangs: a reply fed inside a writing block never answers its HTTP request"]
+fn a_reply_inside_a_writing_block_answers_the_request() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        reqs, resps = http_serve("{port}", "POST", "/hit")
+        hits: Mut(Int, Txn) := 0
+        for req in reqs:
+            with begin():
+                hits := hits + 1
+                resps << "ok\n"
+    "#};
+    assert_eq!(post_once(&code, port, "/hit", "x"), "ok\n");
+}
+
+/// An `Int` fed to a response feed compiles and never answers the request. The response sink
+/// replies only to a `String` codomain (`HttpServerSharedState::process` in
+/// `src/interpreter/http_server.rs` logs and drops any other).
+///
+/// `docs/chl-spec.md`, "7.4 Sources" states that feeds into the responses sink become the
+/// response bodies and puts no type on them; its Open direction sketches a bare serializable
+/// value answered as a 200 carrying it. Neither text calls for a type error, so the correct
+/// behaviour is a reply. The wire serialization of a non-`String` body is open there, so this
+/// asserts that a reply arrives and not its body.
+// `drive_until`'s timeout fails the test rather than hanging it, so `--ignored` reports the
+// defect in five seconds.
+#[test]
+#[ignore = "hangs: an Int fed to an HTTP response feed never answers its request"]
+fn an_int_fed_to_a_response_feed_answers_the_request() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        reqs, resps = http_serve("{port}", "GET", "/n")
+        for req in reqs:
+            resps << 42
+    "#};
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut ctx = GlobalContext::default();
+    let sources = SourceMap::single("<test>", &code);
+    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let _ = tx.send(http_get(port, "/n"));
+    });
+    drive_until(&mut ctx, &rx, Duration::from_secs(5));
+}
