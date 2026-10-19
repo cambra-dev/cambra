@@ -18,8 +18,7 @@ pub struct TestDataSource {
     name: String,
     output_type: Type,
     output_extent: Extent,
-    /// The extent of each domain key (element type).
-    /// Defaults to [`Extent::Base(BaseType::UInt)`]; call [`set_element_extent`] to override.
+    /// The extent of each domain key (element type): always [`Extent::Base(BaseType::UInt)`].
     element_extent: Extent,
     yield_predicate: Predicate,
     has_data: bool,
@@ -40,12 +39,6 @@ impl TestDataSource {
             data: HashMap::new(),
             releases: ProducerReleases::default(),
         }
-    }
-
-    /// Override the element extent (type of domain keys).
-    /// Needed only when the domain may be empty; non-empty domains infer the type from the first key.
-    pub fn set_element_extent(&mut self, extent: Extent) {
-        self.element_extent = extent;
     }
 
     /// Set the yield predicate, describing the region of domain values currently available.

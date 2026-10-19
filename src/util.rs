@@ -252,25 +252,6 @@ impl<K: Eq + std::hash::Hash + std::fmt::Debug, V> ScopeStack<K, V> {
     {
         self.scopes.iter().rev().find_map(|s| s.get(name))
     }
-
-    pub fn fmt_scopes(&self) -> String
-    where
-        K: std::fmt::Display,
-        V: std::fmt::Display,
-    {
-        self.scopes
-            .iter()
-            .rev()
-            .map(|scope| {
-                let bindings: Vec<String> = scope
-                    .iter()
-                    .map(|(name, value)| format!("{name}: {value}"))
-                    .collect();
-                format!("{{{}}}", bindings.join(", "))
-            })
-            .collect::<Vec<String>>()
-            .join(" , ")
-    }
 }
 
 impl<K, V> Drop for ScopeStack<K, V> {

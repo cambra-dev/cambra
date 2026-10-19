@@ -4,7 +4,7 @@
 use smol_str::SmolStr;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use intervalsets::{Bounding, Interval, IntervalSet, MaybeEmpty};
+use intervalsets::{Interval, IntervalSet};
 
 use crate::ccl::TagMap;
 use crate::interpreter::{HasDifference, Predicate, Tile};
@@ -483,28 +483,6 @@ impl Extent {
         }
     }
 
-    /// If this is a `UIntRange` whose remaining set is a single contiguous
-    /// range starting at `0` (i.e. `[0, n)`), return `n`.
-    ///
-    /// Used to convert a compile-time extent back to a CCL `Type::UIntRange(n)`.
-    pub fn as_uint_range_size(&self) -> Option<u64> {
-        if let Extent::UIntRange(set) = self {
-            if set.is_empty() {
-                return Some(0);
-            }
-            let intervals = set.intervals();
-            if intervals.len() == 1 {
-                let iv = &intervals[0];
-                if iv.lval() == Some(&0) {
-                    // Discrete intervals are normalized to closed bounds,
-                    // so the right bound is n-1 and n = rval + 1.
-                    return iv.rval().map(|r| r + 1);
-                }
-            }
-        }
-        None
-    }
-
     /// Create a function extent from domain and codomain
     pub fn function(domain: Extent, codomain: Extent) -> Self {
         Extent::Function {
@@ -516,11 +494,6 @@ impl Extent {
     /// Create a record extent from field extents
     pub fn record(fields: HashMap<SmolStr, Extent>) -> Self {
         Extent::Record(fields)
-    }
-
-    /// Create a restricted record extent: an [`Extent::Restricted`] wrapping an [`Extent::Record`].
-    pub fn restricted_record(fields: HashMap<SmolStr, Extent>) -> Self {
-        Extent::restricted(Extent::Record(fields))
     }
 
     /// Wrap any extent in an [`Extent::Restricted`] with a fresh [`Restriction`].
