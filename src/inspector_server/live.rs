@@ -215,12 +215,18 @@ impl LiveServer {
                 .parse::<tiny_http::Header>()
                 .expect("a derived accept key is a valid header value"),
         );
+        // Count the client as watching before replying to its handshake. The
+        // driver records probe readings only while someone is watching, and
+        // sends a frame only once a reading has data. If the count came after
+        // the reply, the client could send input that the driver processes
+        // before it knows anyone is watching. That input would go unrecorded,
+        // and an idle program would never send the client a frame.
+        let watcher = Watcher::enter(&self.channel.watchers);
         let socket = request.upgrade("websocket", response);
         let websocket =
             WebSocket::from_raw_socket(socket, Role::Server, Some(WebSocketConfig::default()));
         let (wake, woken) = sync_channel(1);
         let latest = Arc::clone(&self.channel.latest);
-        let watcher = Watcher::enter(&self.channel.watchers);
         let heartbeat = self.heartbeat;
         thread::Builder::new()
             .name("cambra-live-writer".to_string())
