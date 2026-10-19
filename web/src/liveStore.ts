@@ -89,8 +89,10 @@ export interface LiveState {
   status: LiveStatus;
   /**
    * The `main` version the cached entries came from. A frame of another
-   * version clears them rather than merging two versions' operators: an entry
-   * left under an id the new version reused would read as its value.
+   * version clears them. A frame names only live producers and `applyFrame`
+   * merges it into the cache, so without the clear an operator the reload tore
+   * down would keep its entry forever, and `nodes` would outgrow the operator
+   * count.
    */
   version: number;
   /** Latest rows per operator node. Bounded by the operator count, and does not grow over time. */

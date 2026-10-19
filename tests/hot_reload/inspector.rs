@@ -52,25 +52,15 @@ fn control(port: u16, path: &str, body: &str) -> String {
     )
 }
 
-/// The snapshot once it describes `want`, or a failure after five seconds.
+/// The served snapshot, once the driver has followed every control request
+/// answered before this call.
 ///
-/// Polled because the control port answers inside the driver's pass and the
-/// payload is replaced right after it, so a request racing the reply can still
-/// be served the version before.
-fn snapshot_at(port: u16, want: u64) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let served = snapshot(port);
-        if version(&served) == want {
-            return served;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the served payload stayed at version {} after `main` reached {want}",
-            version(&served)
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+/// The driver answers one control request per pass and runs `follow` right
+/// after it (`poll_control`, `src/main.rs`), so the reply to a further request
+/// arrives on a later pass, after that `follow`. `/branches` only reads.
+fn settled_snapshot(inspect: u16, control_port: u16) -> Value {
+    control(control_port, "/branches", "");
+    snapshot(inspect)
 }
 
 /// Wait until the inspector on `port` accepts a connection.
@@ -135,8 +125,7 @@ fn the_served_payload_follows_a_reload_of_main_and_no_other_branch() {
         "[\"B\" + line for line in stdin()]\n",
     );
     assert!(created.starts_with("created `b@1`"), "{created}");
-    thread::sleep(Duration::from_millis(200));
-    let after_branch = snapshot(inspect);
+    let after_branch = settled_snapshot(inspect, launched.control);
     assert_eq!(
         version(&after_branch),
         1,
@@ -150,7 +139,12 @@ fn the_served_payload_follows_a_reload_of_main_and_no_other_branch() {
         "[\"C\" + line for line in stdin()]\n",
     );
     assert!(reloaded.starts_with("reloaded"), "{reloaded}");
-    let second = snapshot_at(inspect, 2);
+    let second = settled_snapshot(inspect, launched.control);
+    assert_eq!(
+        version(&second),
+        2,
+        "the reload moved the payload to version 2"
+    );
     assert!(
         !operator_ids(&second).is_subset(&operator_ids(&first)),
         "the reload rebuilt an operator, so the new payload names an id the first did not",
@@ -200,4 +194,31 @@ fn probe_frames_follow_a_reload_of_main_after_the_payload_does() {
         2,
         "a frame named version 2 before `/api/snapshot` served it"
     );
+}
+
+/// A reload of `main` publishes a frame of the new version even when no flow
+/// follows it: until one does, the newest frame names the old version's source
+/// anchors, and a client connecting is handed it. The new version holds no
+/// constant, so with nothing on `stdin` none of its operators takes a reading
+/// that carries rows.
+#[test]
+fn a_reload_of_main_publishes_a_frame_before_any_input() {
+    let inspect = reserve_test_port();
+    let launched = launch_under_control_with(
+        "[\"A\" + line for line in stdin()]\n",
+        &[format!("--inspect={inspect}")],
+    );
+    await_inspector(inspect);
+    let mut socket = connect_live(inspect);
+
+    let reloaded = control(launched.control, "/reload", "[line for line in stdin()]\n");
+    assert!(reloaded.starts_with("reloaded"), "{reloaded}");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert_eq!(
+        next_frame_version(&mut socket, deadline),
+        2,
+        "the first frame after a reload with no input names the new version"
+    );
+    assert_eq!(version(&snapshot(inspect)), 2);
 }

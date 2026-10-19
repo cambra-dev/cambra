@@ -96,7 +96,9 @@ The driver compares `main`'s version with the one it follows after each control-
 change it renders the new version's payload into the served snapshot (`ServedSnapshot::replace`),
 re-derives each source's anchors (`source_nodes`), and stamps later frames with the new version
 (`LiveChannel::follow`), in that order. A frame stamped before the payload is installed would send a
-client to refetch the previous one.
+client to refetch the previous one. While probing is on, the same pass publishes a frame whether or
+not any flow arrived. Until then the newest frame carries the previous version's stamp and source
+anchors, and a client that connects is handed it.
 A request in flight finishes on the payload it started with, and the replacement does not wait for
 it, so a client that stops reading cannot stall the driver.
 
@@ -106,8 +108,10 @@ frame after the reload names them.
 
 A client holding a payload of a lower version than a frame's refetches `/api/snapshot` and redraws
 every pane (`followReloads`, `web/src/main.ts`). Its cached readings and source windows are dropped
-on the version change rather than merged, because an entry under an id the new version reused would
-read as that version's value. A tag is kept only if the new payload has an anchor node with the tag's
+on the version change rather than merged. `NodeId`s come from a process-global counter, so no id
+names two operators across versions. A frame names only live producers and `applyFrame` merges it
+into the cache, so without the drop an entry for an operator the reload tore down would stay forever
+and the cache would outgrow the operator count. A tag is kept only if the new payload has an anchor node with the tag's
 span, the same source text under it and the same label (`resolveTag`). Any other tag is dropped: an
 edit above a construct shifts its bytes and an edit inside it changes its text.
 

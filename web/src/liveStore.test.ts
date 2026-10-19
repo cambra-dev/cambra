@@ -71,9 +71,9 @@ describe("applyFrame", () => {
     expect(state.nodes.get(10)?.probes[0]?.changedAt).toBe(1);
   });
 
-  // A reload rebuilds operators under fresh ids and may hand an old id's
-  // number to nothing, so entries from the version before it are dropped
-  // rather than left to read as the new version's.
+  // A reload rebuilds operators under fresh ids, and no later frame names the
+  // ids it tore down. Merging would keep their entries forever, so a frame of
+  // another version drops every entry from the version before it.
   it("drops every cached entry when a frame names another version", () => {
     const sourced: LiveFrame = {
       ...frame(1, [[10, '"a"']]),

@@ -418,7 +418,7 @@ pub struct Meta {
     /// name where the kind belongs.
     pub payload_kind: String,
     /// Which version of the `main` branch this payload describes: the branch
-    /// table's version number (`LiveProgram::version`), which starts at `1`.
+    /// table's version number (`LiveProgram::program`), which starts at `1`.
     ///
     /// `0` for a payload no run produced — `--inspect-only`, `--dump-snapshot`
     /// and a degraded payload — which is every committed fixture. Distinct from

@@ -227,8 +227,11 @@ struct Inspection {
     /// own.
     source_node_ids: HashMap<String, Vec<NodeId>>,
     /// [`ProbeTable::flows`] at the last publish. Zero again whenever probing
-    /// switches, because each switch starts a fresh table or none.
-    published_through: u64,
+    /// switches, because each switch starts a fresh table or none. `None` from
+    /// [`follow`](Self::follow) taking up a new version until the next
+    /// [`publish`](Self::publish) with probing on, which sends a frame whatever
+    /// `flows` reads; a switch keeps it `None`.
+    published_through: Option<u64>,
 }
 
 impl Inspection {
@@ -247,7 +250,7 @@ impl Inspection {
             following,
             probes,
             source_node_ids,
-            published_through: 0,
+            published_through: Some(0),
         }
     }
 
@@ -257,10 +260,12 @@ impl Inspection {
     /// fresh ids for every operator it rebuilt, so the payload, the anchors and
     /// the frame stamp move together. The frame stamp moves last: a frame naming
     /// a version the server cannot yet answer `/api/snapshot` with would send a
-    /// client to refetch the old one. Another branch's reload changes nothing
-    /// here, and neither does deleting `main`: the panes keep describing the last
-    /// version it ran (`src/inspector_model/design.md`, "A reload of main is
-    /// followed").
+    /// client to refetch the old one. The pass's `publish` sends a frame whether
+    /// or not a flow arrived: until then the newest frame carries the old
+    /// version's stamp and source anchors, and a client that connects is handed
+    /// it. Another branch's reload changes nothing here, and neither does
+    /// deleting `main`: the panes keep describing the last version it ran
+    /// (`src/inspector_model/design.md`, "A reload of main is followed").
     fn follow(&mut self, live: &LiveProgram) {
         let Some((version, program)) = live.program(MAIN_BRANCH) else {
             return;
@@ -272,6 +277,7 @@ impl Inspection {
         self.source_node_ids = source_nodes(&program.operator_graph);
         self.channel.follow(version);
         self.following = version;
+        self.published_through = None;
     }
 
     /// Switch probing to match whether a client is connected, and sample the
@@ -287,7 +293,9 @@ impl Inspection {
                 self.probes.disable();
                 self.channel.forget_frame();
             }
-            self.published_through = 0;
+            if self.published_through.is_some() {
+                self.published_through = Some(0);
+            }
         }
         if !watched {
             return Vec::new();
@@ -296,7 +304,7 @@ impl Inspection {
     }
 
     /// Publish a frame if some probe took a reading that carried rows since the
-    /// last publish.
+    /// last publish, or if `main`'s version changed since it.
     ///
     /// The driver polls on a 10ms timer, and a poll that delivers nothing
     /// still takes an empty reading from every producer it pulls. Gating on
@@ -305,10 +313,10 @@ impl Inspection {
     /// nothing.
     fn publish(&mut self, sources: &[SourceWindow]) {
         let flows = self.probes.with_table(ProbeTable::flows);
-        let Some(flows) = flows.filter(|&flows| flows != self.published_through) else {
+        let Some(flows) = flows.filter(|&flows| Some(flows) != self.published_through) else {
             return;
         };
-        self.published_through = flows;
+        self.published_through = Some(flows);
         self.probes
             .with_table(|table| self.channel.publish_probes(table, sources));
     }
