@@ -1035,7 +1035,8 @@ pub enum Type {
     Base(BaseType),
     /// A finite index range `[0, n)`, used as the domain of list types.
     ///
-    /// `OpConversionContext::extent_of` maps it to the extent `[0, n)`.
+    /// [`OpConversionContext::extent_of`](crate::interpreter::operator_conversion::OpConversionContext::extent_of)
+    /// maps it to the extent `[0, n)`.
     UIntRange(u64),
     /// A function type. When `name` is `None` it is the ordinary
     /// non-dependent function type `domain ⇒ codomain`. When `name` is `Some(x)` it

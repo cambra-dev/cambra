@@ -1165,14 +1165,14 @@ fn decided_positions_tile(rows: &[Vec<Position>], domain: &Extent, complete: Pre
 
 /// Fold `key` over an **ascending** sequence of `query_positions` in a single
 /// O(changes + queries) pass — the incremental form of [`fold_changelog_key`],
-/// so a full-stream reader folding every tick is linear, not O(changes ×
-/// queries) (a per-tick [`fold_changelog_key`] each re-scans the whole log). Both
+/// so a full-stream reader folding every position is linear, not O(changes ×
+/// queries) (a per-position [`fold_changelog_key`] each re-scans the whole log). Both
 /// changelog readers ([`StoreValueStream`], [`StoreDenseRead`]) share it.
 ///
 /// Result element `i` is the fold at `query_positions[i]` under the carry policy: the
-/// latest write ≤ the tick (`carry_forward: true`, an accumulator carried across
-/// ticks that did not write `key`), or the exact-tick delta (`carry_forward:
-/// false`, a reply tap — `None` where the tick did not write `key`). Requires
+/// latest write ≤ the position (`carry_forward: true`, an accumulator carried across
+/// positions that did not write `key`), or the exact-position delta (`carry_forward:
+/// false`, a reply tap — `None` where the position did not write `key`). Requires
 /// `changes` ascending (the render invariant) and `query_positions` ascending; the
 /// cursor advances monotonically and never rewinds.
 pub fn fold_changelog_key_ascending(

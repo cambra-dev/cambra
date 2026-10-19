@@ -4,10 +4,10 @@
 //!
 //! ```text
 //! CHL source
-//!   → ccl::lower    (CHL AST → CCL Expr)
-//!   → ccl::infer    (type inference; annotates Lambda param_ty)
+//!   → ccl::lower          (CHL AST → CCL Expr)
+//!   → ccl::infer          (type inference; annotates Lambda param_ty)
 //!   → operator_conversion (CCL Expr → dataflow operators)
-//!   → subscribe()   (operator evaluation)
+//!   → subscribe()         (operator evaluation)
 //! ```
 //!
 //! Unlike the unit tests in each module, these tests validate the composition
