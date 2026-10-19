@@ -242,7 +242,7 @@ history's payload uses. A split argument extrudes each side at its own polarity.
 ### Compaction and coalescing
 
 `CompactType::nominal` maps each declaration at a position to its arguments' **sides**: one per
-argument, and two for a bipolar one, its input then its output (`NominalDecl::sided_variances`).
+argument, and two for a bipolar one, its input then its output (`NominalDecl::sided_args`).
 Two contributions of one declaration merge side by side, a contravariant side at the flipped
 polarity, so a join meets the input sides and joins the output sides. An invariant argument is
 compacted as a data domain is, both sides merged however the walk reaches it, and two that differ

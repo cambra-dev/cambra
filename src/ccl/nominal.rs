@@ -264,6 +264,19 @@ impl NominalDecl {
             .collect()
     }
 
+    /// The sides of an application's arguments, each with its variance, in the
+    /// [`sided_variances`](Self::sided_variances) layout.
+    pub fn sided_args<'a>(&self, args: &'a [Type]) -> Vec<(&'a Type, Variance)> {
+        use Variance::{Bipolar, Contravariant, Covariant};
+        let variances = &self.body().variances;
+        debug_assert_eq!(args.len(), variances.len(), "one argument per parameter");
+        let sided = |(t, v): (&'a Type, &Variance)| match v {
+            Bipolar => vec![(sides(t).0, Contravariant), (sides(t).1, Covariant)],
+            other => vec![(t, *other)],
+        };
+        args.iter().zip(variances).flat_map(sided).collect()
+    }
+
     /// The constructor named `name`.
     pub fn ctor(&self, name: &str) -> Option<&NominalCtor> {
         self.body().ctors.iter().find(|c| c.name == name)

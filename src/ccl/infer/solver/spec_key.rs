@@ -99,7 +99,8 @@ struct KeyView {
     /// other. Each maps to `(value, domain)`.
     history: BTreeMap<HistoryKind, (Box<KeyView>, Box<KeyView>)>,
     /// Nominal contributions, keyed by declaration so two nominal types at one
-    /// position stay distinguishable. Each maps to its arguments in order.
+    /// position stay distinguishable. Each maps to its arguments' sides
+    /// (`NominalDecl::sided_args`).
     nominal: BTreeMap<Rc<crate::ccl::nominal::NominalDecl>, Vec<KeyView>>,
 }
 
@@ -521,17 +522,11 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         }
         // A contravariant argument flips, as a function's domain does; an invariant one
         // keys at this polarity, as a history's children do. A bipolar one keys both its
-        // sides, as compaction holds them (`NominalDecl::sided_variances`).
+        // sides, as compaction holds them (`NominalDecl::sided_args`).
         Type::Nominal(decl, args) => {
             let mut sides = Vec::new();
-            for (t, v) in args.iter().zip(&decl.body().variances) {
-                if *v == crate::ccl::nominal::Variance::Bipolar {
-                    let (input, output) = crate::ccl::nominal::sides(t);
-                    sides.push(key_go(input, !pol, subst_acc, ctx));
-                    sides.push(key_go(output, pol, subst_acc, ctx));
-                } else {
-                    sides.push(key_go(t, v.polarity(pol), subst_acc, ctx));
-                }
+            for (t, v) in decl.sided_args(args) {
+                sides.push(key_go(t, v.polarity(pol), subst_acc, ctx));
             }
             let args = sides;
             KeyView {

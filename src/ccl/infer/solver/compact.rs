@@ -884,10 +884,10 @@ pub struct CompactType {
     /// onto each child's variables, and compaction only needs a deterministic
     /// materialization, not a second polarity analysis.
     pub history_slot: Option<(Box<CompactType>, Box<CompactType>, HistoryKind)>,
-    /// Nominal contributions, keyed by declaration: each declaration with its arguments,
-    /// one position per argument. Two declarations at one position are two shapes, which
+    /// Nominal contributions, keyed by declaration: each declaration with its arguments'
+    /// sides (`NominalDecl::sided_args`). Two declarations at one position are two shapes, which
     /// [`shapes`](Self::shapes) counts and coalesce reports: a join of two nominal types is
-    /// an error (`docs/chl-spec.md`, "A nominal type is opaque"). Each argument compacts
+    /// an error (`docs/chl-spec.md`, "A nominal type is opaque"). Each side compacts
     /// at the polarity [`Variance::polarity`](crate::ccl::nominal::Variance::polarity)
     /// gives it.
     pub nominal: BTreeMap<Rc<NominalDecl>, Vec<CompactType>>,
@@ -2218,27 +2218,18 @@ fn compact_go(
         // it, and an invariant one at this polarity, as a history's children are, read as
         // an invariant position is ([`Position::invariant`]). A bipolar argument is two
         // sides, its input compacted where the polarity flips and its output where it
-        // does not (`NominalDecl::sided_variances`).
+        // does not (`NominalDecl::sided_args`).
         Type::Split { .. } => {
             unreachable!("a split argument stands only in a nominal type, which reads its sides")
         }
         Type::Nominal(decl, args) => {
             let mut sides = Vec::new();
-            for (t, v) in args.iter().zip(&decl.body().variances) {
-                match v {
-                    crate::ccl::nominal::Variance::Bipolar => {
-                        let (input, output) = crate::ccl::nominal::sides(t);
-                        sides.push(compact_go(input, !pol, subst_acc, Position::default(), st));
-                        sides.push(compact_go(output, pol, subst_acc, Position::default(), st));
-                    }
-                    crate::ccl::nominal::Variance::Invariant => {
-                        sides.push(compact_go(t, pol, subst_acc, Position::invariant(), st));
-                    }
-                    other => {
-                        let pol = other.polarity(pol);
-                        sides.push(compact_go(t, pol, subst_acc, Position::default(), st));
-                    }
-                }
+            for (t, v) in decl.sided_args(args) {
+                let pos = match v {
+                    crate::ccl::nominal::Variance::Invariant => Position::invariant(),
+                    _ => Position::default(),
+                };
+                sides.push(compact_go(t, v.polarity(pol), subst_acc, pos, st));
             }
             let args = sides;
             CompactType {
@@ -2652,6 +2643,26 @@ mod tests {
             produced_fields.contains_key(&FieldKey::Name(SmolStr::from("b"))),
             "the field the demand omits survives: {produced_fields:?}"
         );
+    }
+
+    /// A bipolar argument compacts as two sides, its input then its output: here a record
+    /// of two fields, then one of one.
+    #[test]
+    fn a_bipolar_argument_compacts_its_input_side_first() {
+        let t = crate::ccl::TypeParam::declared("T");
+        let span = chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0);
+        let decl = NominalDecl::declared("Cell".into(), vec![t.clone()], span, false);
+        let params = vec![(None, Type::fun(Type::Param(t.clone()), Type::Param(t)))];
+        let name = "cell".into();
+        let ctor = crate::ccl::nominal::NominalCtor { name, span, params };
+        decl.define(vec![ctor]).expect("`T` is bipolar");
+        let field = |f: &str| (f.into(), Type::Base(BaseType::Int));
+        let input = Box::new(Type::Record(vec![field("a"), field("b")]));
+        let output = Box::new(Type::Record(vec![field("a")]));
+        let arg = Type::Nominal(decl.clone(), vec![Type::Split { input, output }]);
+        let sides = &compact_type(&arg).term.nominal[&decl];
+        let width = |s: &CompactType| s.rec.as_ref().expect("a record").len();
+        assert_eq!((width(&sides[0]), width(&sides[1])), (2, 1));
     }
 
     /// `CompactVariant::meet_openness`'s one-side-open case, which the negative merge
