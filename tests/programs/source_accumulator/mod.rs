@@ -6,7 +6,7 @@
 //! accumulator settles at EOF rather than on a `TestDataSource` the program
 //! never sees.
 //!
-//! Its operator graph is what `tests/inspector_goldens.rs` asserts: the loop's
+//! Its operator graph is what `tests/it/inspector_goldens.rs` asserts: the loop's
 //! induction extent is the source's domain, so two `IterateExtent`s iterate
 //! stdin's domain. One heads the chain that reads the source's values, and one
 //! triggers the `StoreDenseRead` that folds the accumulator over the same extent.

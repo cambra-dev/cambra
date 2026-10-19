@@ -6,7 +6,7 @@
 //!
 //! Also the inspector corpus's `Letrec` program. The induction phase's
 //! substituted read-your-writes values and the `step_view` scaffolding clones
-//! carry freshened, unique `NodeId`s, which `tests/inspector_goldens.rs`
+//! carry freshened, unique `NodeId`s, which `tests/it/inspector_goldens.rs`
 //! asserts as a dense `post-inference → post-channelize` window — so a change
 //! to this program's shape re-targets that assertion.
 

@@ -71,7 +71,7 @@ Three questions decide a reload:
 
 > **Status: [Decided].** Parsing is pinned by the tests in `src/control_port.rs`
 > (`every_branch_verb_parses_by_position`, `a_malformed_name_or_path_answers_404`) and each verb's
-> reply by `tests/hot_reload/branching.rs`.
+> reply by `tests/it/hot_reload/branching.rs`.
 
 `--control` (default 8081, `--control=PORT` to change it) serves the verbs below. Dispatch is on the
 path. `/reload` and the `/branch` forms that create or delete change what runs, so they require
@@ -212,7 +212,7 @@ decided, the one built-in rule is that the last branch in the table cannot be de
 ## The branch table
 
 > **Status: [Decided].** `LiveProgram` holds one `Branch` per entry and a tombstone per deleted
-> name. Pinned by these cases in `tests/hot_reload/branching.rs`:
+> name. Pinned by these cases in `tests/it/hot_reload/branching.rs`:
 > `branch_and_reload_creates_a_branch_forked_from_its_parent`,
 > `a_refused_branch_and_reload_leaves_no_entry`, `a_parents_reload_leaves_its_child_untouched`,
 > `a_childs_reload_keeps_its_own_accumulated_value`, `list_and_info_report_versions_and_origin`,
@@ -406,7 +406,7 @@ to no branch.
 > a kept fan-out starts at `FanOutShared::released`, the intersection over every live slot, not at
 > the slot of the reader it replaces, so any lagging slot holds it down. A rebuilt store over a kept
 > iteration resumes one past `FanOut::released_position`, read off the same intersection, and folds
-> the positions between a second time. `tests/hot_reload/fanout_lag.rs` pins the form of this one
+> the positions between a second time. `tests/it/hot_reload/fanout_lag.rs` pins the form of this one
 > version reaches on its own. Branch-and-reload reaches it a second way: within one version an
 > iteration input has one reader, and a branch that keeps the iteration and rebuilds the store adds
 > a second slot. `LiveProgram::check` refuses a reload or a creation that keeps an iteration whose

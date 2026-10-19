@@ -78,14 +78,14 @@ containing `{PORT}` receives a freshly reserved port for each compile.
 Run a selected driver in release mode to avoid measuring debug-only checks:
 
 ```bash
-cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
+cargo test --release --test it -- --ignored --nocapture gallery_compile_timing
 ```
 
 To select one program and change the repetition count:
 
 ```bash
 CAMBRA_TIMING_ONLY=storefront CAMBRA_PERF_REPS=9 \
-  cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
+  cargo test --release --test it -- --ignored --nocapture gallery_compile_timing
 ```
 
 Successful rows are sorted slowest first. A returned compiler error or caught panic stops that
@@ -97,8 +97,8 @@ To compare provenance recording costs, alternate configurations on the same mach
 
 ```bash
 for i in 1 2 3; do
-  CAMBRA_PROVENANCE=1 cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
-  CAMBRA_PROVENANCE=0 cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
+  CAMBRA_PROVENANCE=1 cargo test --release --test it -- --ignored --nocapture gallery_compile_timing
+  CAMBRA_PROVENANCE=0 cargo test --release --test it -- --ignored --nocapture gallery_compile_timing
 done
 ```
 
@@ -107,8 +107,9 @@ This changes provenance recording, not every snapshot or operator-graph cost.
 ## Adding to this table
 
 Add a source and `mod.rs` under `tests/programs/<name>/`, register its module in
-[tests/programs/main.rs](../tests/programs/main.rs), and add a row to [Programs](#programs).
-Registration makes its tests part of `cargo test --test programs`.
+[tests/programs/mod.rs](../tests/programs/mod.rs), and add a row to [Programs](#programs).
+Registration makes its tests part of the `it` test binary, under `programs::`:
+`cargo test --test it programs::`.
 
 [common/mod.rs](../tests/programs/common/mod.rs) owns pipeline and subprocess helpers,
 including `expect_scalar`, `expect_compile_error` and `expect_scalar_currently_buggy`.
@@ -123,10 +124,10 @@ The inspector uses the same sources rather than a separate example corpus.
 snapshot fixtures. Its fixture names remain stable even when the source names differ.
 
 `every_gallery_program_produces_a_valid_payload` in
-[tests/inspector_goldens.rs](../tests/inspector_goldens.rs) enumerates gallery sources and checks
-their snapshot structure, including failed compilations. Pane-coverage tests need no manifest entry
-unless they also require a committed full-wire fixture. Runtime results and rejections remain the
-program tests' responsibility.
+[tests/it/inspector_goldens.rs](../tests/it/inspector_goldens.rs) enumerates gallery sources and
+checks their snapshot structure, including failed compilations. Pane-coverage tests need no manifest
+entry unless they also require a committed full-wire fixture. Runtime results and rejections remain
+the program tests' responsibility.
 
 ## North-star programs and corpus policy
 
@@ -166,8 +167,8 @@ plan and the full dependency map.
 | [inner_join](../tests/programs/inner_join/) | INNER JOIN of users × orders on user-id | hash-join (`if x.id == y.fk`), record fields, multi-source comp | ✅ working | The lowering planner sees the equality filter and lowers to a keyed lookup. |
 | [http_greeter](../tests/programs/http_greeter/) | Three HTTP endpoints sharing a `prefix` let | `http_serve`, `<<` feed, deferred output, multi-route on one port | ✅ working (sink) | Real HTTP roundtrip — test fires three requests on a background thread while the main thread drives the scheduler. Source uses `{PORT}` placeholder. |
 | [streaming_echo](../tests/programs/streaming_echo/) | Prefix each stdin line with "> " | `stdin()` source, list comprehension | ✅ working | Tested via subprocess so the real OS stdin file descriptor is exercised; substring-matched against captured stdout. |
-| [source_accumulator](../tests/programs/source_accumulator/) | Collect every stdin line into a loop-carried mutable variable | `stdin()` source, `:=` mutation operator, `for` loop | ✅ working | Returns `"hello;world;"` for two piped lines. The gallery's one program joining a store to a data source: the loop's induction extent is the source's domain, so the accumulator read compiles to a `StoreDenseRead` whose trigger iterates that source: a second `IterateExtent` over its domain, which `tests/inspector_goldens.rs` asserts. |
-| [for_accumulator](../tests/programs/for_accumulator/) | Sum 1..5 into a loop-carried mutable variable | `:=` mutation operator, `for` loop | ✅ working | Returns `15`. The natural imperative shape for "fold". Also the inspector's `Letrec` program: the induction phase's substituted reads and `step_view` scaffolding clones carry freshened, unique `NodeId`s, which `tests/inspector_goldens.rs` asserts as a dense channelize window. |
+| [source_accumulator](../tests/programs/source_accumulator/) | Collect every stdin line into a loop-carried mutable variable | `stdin()` source, `:=` mutation operator, `for` loop | ✅ working | Returns `"hello;world;"` for two piped lines. The gallery's one program joining a store to a data source: the loop's induction extent is the source's domain, so the accumulator read compiles to a `StoreDenseRead` whose trigger iterates that source: a second `IterateExtent` over its domain, which `tests/it/inspector_goldens.rs` asserts. |
+| [for_accumulator](../tests/programs/for_accumulator/) | Sum 1..5 into a loop-carried mutable variable | `:=` mutation operator, `for` loop | ✅ working | Returns `15`. The natural imperative shape for "fold". Also the inspector's `Letrec` program: the induction phase's substituted reads and `step_view` scaffolding clones carry freshened, unique `NodeId`s, which `tests/it/inspector_goldens.rs` asserts as a dense channelize window. |
 | [while_counter](../tests/programs/while_counter/) | Count up with a while loop | `while`, mutability | 🚧 blocked | While-loop lowering is not yet implemented. Currently rejected at lowering. |
 | [reachability](../tests/programs/reachability/) | Transitive closure (recursive query) | self-referential binding, `Set(T)` dedup-by-type, `++`, hash-join in a cycle | 🚧 blocked | North-star recursive query. Parse-blocked on record-term syntax `(src=1, dst=2)`; then `Set(T)` + the self-referential (recursive) binding. |
 | [fanout](../tests/programs/fanout/) | Polymorphic sink constructor (fan-out pipe head) | `Feed(_)` type, `<<` feed, annotation-only forward decl, element polymorphism | 🚧 blocked | `Feed(_)` annotation unsupported; the forward declaration doesn't parse. Not Unix `tee` — returns the writable *head*. |
@@ -175,7 +176,7 @@ plan and the full dependency map.
 | [discount_contract](../tests/programs/discount_contract/) | Function contract via boundary asserts | `assert` preconditions + postcondition, lift to CCL refinements, call-site discharge | 🚧 blocked | The CHL contract surface (see [the function-contracts Direction note](chl-spec.md#6-types-informal-sketch)). Parse-blocked on `assert`; behind it, the lift itself. Expected `75` once working. |
 | [nonneg_inventory](../tests/programs/nonneg_inventory/) | Stock reservation against a refined store | `Mut(Map(String, {Int where _ >= 0}), Txn)` value refinement, map literal `[k -> v]`, guarded decrement discharging it, `match`/`Option` | 🚧 blocked | The storefront's oversell invariant in isolation — deleting the guard must be a type error. Parse-blocked on `requires Transaction`; behind it, `Map(…)` as an annotation and the map lookup. |
 | [ledger_balance](../tests/programs/ledger_balance/) | Deposit ledger + time-pinned `/balance` view | feed written inside transactions, transaction time on feed elements, `restrict(\e -> e.time < txn.current_time())`, `sum` | 🚧 blocked | Lifts `txn_kv`'s `/stats` idiom from request streams to feeds — `e.time` comes from the feed's transaction-time domain, not the feeder. Lex-blocked on the `\` lambda. |
-| [hot_reload](../tests/programs/hot_reload/) | Replace a running guestbook with an edited version of itself | `http_serve`, `:=` mutation across a reload, the control port's `/reload` | ✅ working | Two sources (`program.cambra`, `reloaded.cambra` — the diff edits the accumulating loop). The store is rebuilt and resumes from the value it held, so the entries already signed stand and the new rule governs from here. The feature's own suite is [tests/hot_reload.rs](../tests/hot_reload.rs). |
+| [hot_reload](../tests/programs/hot_reload/) | Replace a running guestbook with an edited version of itself | `http_serve`, `:=` mutation across a reload, the control port's `/reload` | ✅ working | Two sources (`program.cambra`, `reloaded.cambra` — the diff edits the accumulating loop). The store is rebuilt and resumes from the value it held, so the entries already signed stand and the new rule governs from here. The feature's own suite is [tests/it/hot_reload.rs](../tests/it/hot_reload.rs). |
 | [storefront](../tests/programs/storefront/) | **North-star app**: transactional orders + inventory + contract-checked pricing + time-indexed revenue views, in V0 and V1 | everything the four rows above pin, plus type aliases (`Dollars`/`Qty`/`ItemPricing`/`SKU`), record refinements, a value-dependent key type, `FullMap` total lookups, `static assert`, HTTP-lib validation derived from handler types, `groupby` rollup iterated as `key -> g` entry pairs, map comprehension `[k -> v for …]`, status-code response constructors (`http.ok`/`http.not_found`/`http.conflict`, via `import http`), map-valued `/stats` response, version upgrade | 🚧 blocked | Two sources (`v0.cambra`, `v1.cambra` — the diff is the budgeted-flash-sale upgrade) under one orchestrating test; its `mod.rs` documents the full dependency list. See [the corpus policy above](#north-star-programs-and-corpus-policy). Parse-blocked on the membership `in` of `SKU`'s predicate. |
 
 ## Known issues surfaced by these programs

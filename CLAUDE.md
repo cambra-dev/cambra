@@ -150,7 +150,7 @@ Avoid comments that describe the history of the codebase.  Comments should expla
 
 A test's CHL (or any embedded source) program must read as the program it is. Write
 multi-line programs with `indoc! {r#"…"#}` (already used in
-`tests/compilation_pipeline/transactions.rs` and `tests/chl_parser_roundtrip.rs`),
+`tests/it/compilation_pipeline/transactions.rs` and `tests/it/chl_parser_roundtrip.rs`),
 **never** as a single string with embedded `\n`: escaped newlines hide the
 indentation an off-side-rule language depends on, and a one-line diff on such a case
 touches the whole program.

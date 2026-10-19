@@ -73,7 +73,7 @@ element `Int`.
 An empty literal can have incompatible use sites. Failure to satisfy all recorded bounds is
 returned as a type error, not asserted as an internal invariant. The regression
 `an_empty_literal_read_at_two_types_is_a_type_error` in
-[the collection pipeline tests](../../../tests/compilation_pipeline/scalars_collections.rs)
+[the collection pipeline tests](../../../tests/it/compilation_pipeline/scalars_collections.rs)
 covers conflicting `List(Int)` and `List(String)` annotations.
 
 The pass selects syntactically empty `List` nodes, not every unresolved collection element type.
@@ -513,7 +513,7 @@ the `let`-bound spelling of it reaches runtime instead and fails in
 `ColumnValue::transform_by_map`, which has no union-key case — the
 `an_inline_union_generator_beside_a_second_generator` and
 `a_let_bound_union_generator_beside_a_second_generator` tests in
-`tests/compilation_pipeline/scalars_collections.rs`. Compiling a site's witnesses together
+`tests/it/compilation_pipeline/scalars_collections.rs`. Compiling a site's witnesses together
 is what keeps every generator's domain a plain range, so no union is ever read at an index.
 A tagged fed copairing, demultiplexing the input by tag and re-tagging each arm's output, is
 what would let the legs be per conditional rather than per arm tuple.

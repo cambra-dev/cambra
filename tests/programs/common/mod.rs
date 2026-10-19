@@ -78,7 +78,7 @@ use cambra::{
     },
 };
 
-use crate::panic_message::panic_message;
+use super::panic_message::panic_message;
 
 // ---------------------------------------------------------------------------
 // Scalar programs

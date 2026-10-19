@@ -2,7 +2,7 @@
 "
 " The keyword lists mirror `KEYWORDS` in chl-parser/src/lexer.rs and the
 " builtin list mirrors `SURFACE_BUILTINS` in chl-parser/src/builtins.rs;
-" tests/editor_grammars.rs fails when they differ. Each keyword class is one
+" tests/it/editor_grammars.rs fails when they differ. Each keyword class is one
 " `syn keyword` line and the builtins are one `syn match` line, so that test can
 " read them back.
 

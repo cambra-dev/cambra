@@ -3,7 +3,7 @@
 //!
 //! The transact phase substitutes the read-your-writes snapshot at both sites,
 //! and the substituted copies must carry freshened, unique `NodeId`s —
-//! `tests/inspector_goldens.rs` asserts the dense window that produces.
+//! `tests/it/inspector_goldens.rs` asserts the dense window that produces.
 
 use super::common::expect_scalar;
 

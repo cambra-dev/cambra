@@ -1,0 +1,56 @@
+//! Integration tests for the demo program gallery.
+//!
+//! Each subdirectory is one demo program: a `program.cambra` source plus a
+//! `mod.rs` containing the program's `#[test]` function(s).  Shared
+//! pipeline / HTTP-client glue lives in `common/`.
+//!
+//! To add a new program: create `tests/programs/<name>/` with a
+//! `program.cambra` and a `mod.rs`, then add a `mod <name>;` line below.
+//! Every `mod.rs`'s `#[test]` items are part of the `it` integration test
+//! binary, under `programs::` (`cargo test --test it programs::`).
+//!
+//! `compile_timing.rs` is the gallery's ignored compile-time driver rather than
+//! a program: it discovers the `.cambra` files itself, so a new program needs
+//! no line there.
+//!
+//! For the human-facing gallery, see `docs/demo-programs.md`.
+
+mod common;
+mod compile_timing;
+use crate::panic_message;
+use crate::quiet_panics;
+use crate::serving;
+
+mod arithmetic;
+mod defer_generators;
+mod defer_lift;
+mod discount_contract;
+mod fanout;
+mod filter_and_aggregate;
+mod for_accumulator;
+mod generator_pipeline;
+mod groupby_filtered_rollup;
+mod groupby_rollup;
+mod hot_reload;
+mod http_accumulator;
+mod http_counter;
+mod http_greeter;
+mod inner_join;
+mod join_then_groupby;
+mod ledger_balance;
+mod list_comp;
+mod list_min;
+mod nonneg_inventory;
+mod polymorphic;
+mod prefix_lines;
+mod reachability;
+mod refinement;
+mod source_accumulator;
+mod source_shared;
+mod storefront;
+mod streaming_echo;
+mod txn_kv;
+mod txn_multi_read;
+mod type_error;
+mod udf_closure;
+mod while_counter;

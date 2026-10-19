@@ -1,0 +1,1477 @@
+//! The differential: what the compiler computes against what the differential interpreter
+//! says the program means.
+//!
+//! Both sides are observed the same way — through a sink — so the comparison is over what
+//! each sink received, not over a returned value. Agreement is **keyed and unordered**: a
+//! collection's keys are part of its value (a filter keeps its survivors' positions, a
+//! group-by is keyed by the group key), and the order entries arrive in is not.
+//!
+//! A case the two are known to disagree on pins both answers, so a change to either side
+//! fails the pin.
+
+use crate::differential;
+
+use chl_interp::{Collection, Value};
+use differential::{Compiled, run_compiled, run_interpreted};
+use indoc::indoc;
+use rstest::rstest;
+
+/// What sink `out` observed under the compiler, for a program it compiles and completes.
+fn compiled(source: &str) -> Value {
+    match run_compiled(source) {
+        Compiled::Value(v) => v,
+        other => panic!("the compiled program produced no value: {other}"),
+    }
+}
+
+/// What sink `out` observed under the differential interpreter.
+fn interpreted(source: &str) -> Value {
+    run_interpreted(source).expect("the interpreter ran")
+}
+
+/// Assert the two sides agree on `source`.
+fn agree(source: &str) {
+    let (c, i) = (compiled(source), interpreted(source));
+    assert_eq!(
+        c, i,
+        "compiler and interpreter disagree\n  compiled:    {c}\n  interpreted: {i}\n  program:\n{source}"
+    );
+}
+
+#[test]
+fn a_scalar_feed() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << 1 + 2
+    "#});
+}
+
+#[test]
+fn arithmetic() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << (2 + 3) * 4 - 1
+    "#});
+}
+
+#[test]
+fn a_let_binding() {
+    agree(indoc! {r#"
+        x = 7
+        y = x * 3
+        out = test_sink()
+        out << y
+    "#});
+}
+
+#[test]
+fn a_loop_contributes_per_iteration() {
+    agree(indoc! {r#"
+        out = test_sink()
+        for x in [1, 2, 3]:
+            out << x * 10
+    "#});
+}
+
+#[test]
+fn a_record_feed() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << (a=1, b=2)
+    "#});
+}
+
+#[test]
+fn a_string_feed() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << "hi"
+    "#});
+}
+
+#[test]
+fn a_bool_feed() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << 1 < 2
+    "#});
+}
+
+#[test]
+fn a_variant_feed() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << `some(1)
+    "#});
+}
+
+/// A nominal value is held as its constructor's name and argument
+/// (`docs/chl-spec.md`, "A nominal type is opaque").
+#[test]
+fn a_nominal_constructor_feed() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+            empty
+
+        out = test_sink()
+        out << Shape::circle(2)
+        out << Shape::rect(3, 4)
+        out << Shape::empty
+    "#});
+}
+
+/// A loop builds a nominal value per iteration.
+#[test]
+fn nominal_values_fed_from_a_loop() {
+    agree(indoc! {r#"
+        type Price = Int
+
+        out = test_sink()
+        for p in [1, 2, 3]:
+            out << Price::new(p)
+    "#});
+}
+
+/// A constructor called through a `def` and per loop iteration, and a parameterised one at
+/// two instantiations.
+#[test]
+fn nominal_values_built_in_a_loop() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+
+        type Box(T):
+            boxed(T)
+
+        def square(n: Int) => Shape:
+            Shape::rect(n, n)
+
+        out = test_sink()
+        for r in [1, 2]:
+            out << (square(r), Box::boxed(r), Box::boxed("x"))
+    "#});
+}
+
+/// Two declarations' constructors of one name build values of two types: every
+/// single-constructor form's constructor is `new`.
+#[test]
+fn two_types_share_a_constructor_name() {
+    agree(indoc! {r#"
+        type Money = Int
+        type Price = Int
+
+        out = test_sink()
+        for n in [1, 2]:
+            out << (Money::new(n), Price::new(n * 10))
+    "#});
+}
+
+/// A `match` and a destructuring assignment take apart values of two types whose
+/// constructors share a name.
+#[test]
+fn two_types_sharing_a_constructor_name_taken_apart() {
+    agree(indoc! {r#"
+        type Money = Int
+        type Price = Int
+
+        out = test_sink()
+        for n in [1, 2]:
+            Price::new(p) = Price::new(n * 10)
+            out << p
+        for n in [3, 4]:
+            match Money::new(n):
+                case Money::new(m):
+                    out << m
+    "#});
+}
+
+/// A method of one name on two types whose constructors share a name: the receiver's type
+/// chooses.
+#[test]
+fn a_method_of_two_types_sharing_a_constructor_name() {
+    agree(indoc! {r#"
+        type Money = Int
+        type Price = Int
+
+        impl Money:
+            def doubled(self) => Int:
+                self.extract() * 2
+
+        impl Price:
+            def doubled(self) => Int:
+                self.extract() * 20
+
+        out = test_sink()
+        for n in [1, 2]:
+            out << (Money::new(n).doubled(), Price::new(n).doubled())
+    "#});
+}
+
+/// A mutable variable holding a nominal value: its history's value type is the nominal
+/// type, through `mut_elim` and the store.
+#[test]
+fn a_mutable_variable_of_a_nominal_type() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            empty
+
+        s: Mut(Shape) := Shape::empty
+        for r in [1, 2, 3]:
+            s := Shape::circle(r)
+        out = test_sink()
+        out << s
+    "#});
+}
+
+/// A `match` over constructors, a destructuring assignment and `extract`, per loop
+/// iteration.
+#[test]
+fn nominal_values_taken_apart() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+            empty
+
+        type Price = Int
+
+        def area(s: Shape) => Int:
+            match s:
+                case Shape::circle(r):
+                    r * r * 3
+                case Shape::rect(w, h):
+                    w * h
+                case Shape::empty:
+                    0
+
+        out = test_sink()
+        for n in [1, 2, 3]:
+            Price::new(c) = Price::new(n * 10)
+            out << (area(Shape::rect(n, n + 1)) + area(Shape::circle(n)), c + Price::extract(Price::new(n)))
+    "#});
+}
+
+/// Destructuring assignments of a constructor of several parameters in loop bodies, one
+/// feeding and one accumulating into a mutable variable.
+#[test]
+fn nominal_values_destructured_in_loops() {
+    agree(indoc! {r#"
+        type Pair:
+            pair(Int, Int)
+
+        out = test_sink()
+        total := 0
+        for p in [Pair::pair(1, 2), Pair::pair(3, 4)]:
+            Pair::pair(a, _) = p
+            out << a
+        for p in [Pair::pair(5, 6), Pair::pair(7, 8)]:
+            Pair::pair(a, b) = p
+            total := total + a * b
+        out << total
+    "#});
+}
+
+/// A loop over nominal values whose body is a `match`, each arm feeding.
+#[test]
+fn a_match_over_nominal_values_feeds_per_arm() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+
+        out = test_sink()
+        for s in [Shape::circle(1), Shape::rect(2, 3), Shape::circle(4)]:
+            match s:
+                case Shape::circle(r):
+                    out << r
+                case Shape::rect(w, h):
+                    out << w * h
+    "#});
+}
+
+/// Associated functions, methods called on their receivers, an `impl` block, and
+/// `extract` as a method.
+#[test]
+fn methods_of_nominal_values() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+
+        type Price = Int
+
+        def Shape::size(self) => Int:
+            match self:
+                case Shape::circle(r):
+                    r
+                case Shape::rect(w, h):
+                    w * h
+
+        impl Price:
+            def cents(self) => Int:
+                self.extract()
+
+            def plus(self, n: Int) => Price:
+                Price::new(self.cents() + n)
+
+        def Price::of_cents(c: Int) => Price:
+            Price::new(c)
+
+        out = test_sink()
+        for n in [1, 2, 3]:
+            out << (Shape::rect(n, 2).size(), Price::of_cents(n).plus(10).cents())
+    "#});
+}
+
+/// A collection fed at a site that does not iterate is one element, under that site's one key
+/// (`docs/chl-spec.md`, "3.7 Feed operator `<<`").
+#[test]
+fn a_collection_feed_is_one_element() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << [x * 2 for x in [1, 2, 3]]
+    "#});
+}
+
+// These fold a comprehension's result to a scalar before it reaches a sink. They reach the
+// comprehension, filter, group-by and field-access machinery through that route.
+
+#[test]
+fn a_comprehension_with_a_filter() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << sum([x * 2 for x in [1, 2, 3, 4] if x > 2])
+    "#});
+}
+
+#[test]
+fn a_record_field_in_a_comprehension() {
+    agree(indoc! {r#"
+        sales = [
+            (region="east", amount=1),
+            (region="west", amount=2),
+        ]
+        out = test_sink()
+        out << sum([s.amount for s in sales])
+    "#});
+}
+
+#[test]
+fn a_groupby_rollup() {
+    agree(indoc! {r#"
+        sales = [
+            (region="east", amount=1),
+            (region="west", amount=2),
+            (region="east", amount=3),
+        ]
+        out = test_sink()
+        out << sum([sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)])
+    "#});
+}
+
+/// A comprehension inside a loop that reads the loop variable: the correlated case.
+#[test]
+fn a_correlated_comprehension() {
+    agree(indoc! {r#"
+        out = test_sink()
+        for x in [1, 2, 3]:
+            out << sum([y * x for y in [1, 2]])
+    "#});
+}
+
+#[test]
+fn a_chained_comparison() {
+    agree(indoc! {r#"
+        out = test_sink()
+        n = 2
+        out << 1 < n < 3
+    "#});
+}
+
+#[test]
+fn an_annotated_binding() {
+    agree(indoc! {r#"
+        x: Int = 7
+        out = test_sink()
+        out << x + 1
+    "#});
+}
+
+#[test]
+fn an_augmented_write_in_a_loop() {
+    agree(indoc! {r#"
+        acc := 0
+        for i in [1, 2, 3]:
+            acc += i
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// A filter reading both binders of a nested loop, inside the loop's write. The filter's
+/// predicate and its rows reach each enclosing position separately, so a pull can hold rows
+/// whose answers have not arrived.
+#[test]
+fn a_filter_reading_both_nested_binders() {
+    agree(indoc! {r#"
+        acc := 0
+        for i in [1, 2]:
+            for q in [1, 2, 3]:
+                acc := acc + sum([z * i * q for z in [1, 2, 3] if z > i - q])
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// The forms a nested loop's write reads its two binders through, read through a sink so the
+/// scheduler drives the nest a position at a time. The filters are the forms the nest's own
+/// tests (`tests/it/compilation_pipeline/nested_loops.rs`) do not reach: a filter's predicate
+/// and its rows arrive at each enclosing position separately.
+#[rstest]
+#[case::a_filter_on_the_outer_binder("sum([z for z in [1, 2, 3] if z > i])")]
+#[case::a_filter_on_the_inner_binder_beside_an_outer_body(
+    "sum([z * i for z in [1, 2, 3] if z > q])"
+)]
+#[case::a_filter_on_both_binders_beside_a_closed_body("sum([z for z in [1, 2, 3] if z > i - q])")]
+#[case::a_ternary_on_both_binders("(i if q > 1 else q)")]
+#[case::a_power_of_the_outer_binder("i ** 2 + q")]
+#[case::a_nested_comprehension_reading_both_binders(
+    "sum([sum([w * z * i for w in [1, 2]]) for z in [1, 2] if z >= q - 1])"
+)]
+fn a_nested_write_reads_its_binders(#[case] term: &str) {
+    agree(&format!(
+        indoc! {r#"
+            acc := 0
+            for i in [1, 2]:
+                for q in [1, 2, 3]:
+                    acc := acc + {}
+            out = test_sink()
+            out << acc
+        "#},
+        term
+    ));
+}
+
+/// A feed under nested loops is keyed by the position of every loop around it
+/// (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"), whether the loops
+/// only feed or the outer one carries a mutable variable.
+#[rstest]
+#[case::two_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            out << i + j
+"#})]
+#[case::three_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            for k in [100, 200]:
+                out << i + j + k
+"#})]
+#[case::a_filtered_inner_loop(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            if j > i * 10:
+                out << i + j
+"#})]
+#[case::a_binding_between_the_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        m = i * 100
+        for j in [10, 20]:
+            out << m + j
+"#})]
+#[case::feeds_at_two_depths(indoc! {r#"
+    o = defer()
+    for i in [1, 2]:
+        o << i
+        for j in [10, 20]:
+            o << i + j
+    out = test_sink()
+    out << sum(o)
+"#})]
+#[case::a_constant_value(indoc! {r#"
+    o = defer()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            o << 7
+    out = test_sink()
+    out << sum(o)
+"#})]
+#[case::a_feed_only_loop_in_an_accumulator_loop(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for i in [1, 2]:
+        t += i
+        for j in [10, 20]:
+            out << j + i
+"#})]
+#[case::a_filtered_feed_only_loop_in_an_accumulator_loop(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for i in [1, 2]:
+        t += i
+        for j in [10, 20]:
+            if j > 10:
+                out << j + t
+"#})]
+#[case::two_feed_only_loops_in_an_accumulator_loop(indoc! {r#"
+    t := 0
+    o = defer()
+    for i in [1, 2]:
+        t += i
+        for j in [10, 20]:
+            o << j
+            m = j + t
+            for k in [1, 2]:
+                o << m + k
+    out = test_sink()
+    out << t + sum(o)
+"#})]
+#[case::a_feed_under_three_accumulator_loops(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            for k in [1, 2]:
+                t += k
+                out << t + i + j
+"#})]
+fn a_feed_under_nested_loops(#[case] source: &str) {
+    agree(source);
+}
+
+/// Rows filtered on a mutable variable no loop around the feed writes. The filter reads the
+/// variable through one binding ahead of the outermost such loop, so every row is typed by the
+/// same value (`crate::ccl::mut_read`, "A loop reads what it does not write once").
+#[rstest]
+#[case::under_one_loop(indoc! {r#"
+    out = test_sink()
+    t := 1
+    for r in [1, 2]:
+        out << [v for v in [1, 2, 3] if v > t]
+"#})]
+#[case::under_two_loops(indoc! {r#"
+    out = test_sink()
+    t := 1
+    for r in [1, 2]:
+        for s in [1, 2]:
+            out << [v for v in [1, 2, 3] if v > t]
+"#})]
+#[case::in_a_loop_writing_another_variable(indoc! {r#"
+    out = test_sink()
+    t := 1
+    n := 0
+    for r in [1, 2]:
+        n += r
+        out << [v for v in [1, 2, 3] if v > t]
+"#})]
+fn rows_filtered_on_a_mutable_variable_the_loop_does_not_write(#[case] source: &str) {
+    agree(source);
+}
+
+/// A group-by under a loop whose key reads the loop's binder. The groups' keys differ per
+/// iteration, so the group-by is a dependent family: for each loop position, the keys the
+/// key function produces there (`src/ccl/design/type-inference.md`, "4.8 Dependent
+/// tuples").
+#[rstest]
+#[case::every_key_is_the_binder(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([sum([s for s in g]) for g in groupby([1, 1, 2], \e -> i)])
+"#})]
+#[case::the_group_count_varies(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([1 for g in groupby([1, 2, 3], \e -> e // i)])
+"#})]
+#[case::each_group_aggregated(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([sum(g) for g in groupby([1, 1, 2], \e -> i)])
+"#})]
+#[case::the_group_and_the_binder_both_read(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2, 3]:
+        out << sum([max(g) * i for g in groupby([1, 2, 3, 4], \e -> e // i)])
+"#})]
+fn a_group_by_whose_key_reads_the_loop_binder(#[case] source: &str) {
+    agree(source);
+}
+
+/// A two-clause comprehension whose value reads neither binder.
+#[test]
+fn a_constant_two_clause_comprehension() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << sum([7 for i in [1, 2] for q in [10, 20]])
+    "#});
+}
+
+/// A loop over a map literal. The map is a collection keyed by its keys, and its value at a key
+/// is the one pair whose key it is, read through a `const` whose type depends on that key.
+#[test]
+fn a_loop_over_a_map_literal() {
+    agree(indoc! {r#"
+        out = test_sink()
+        for q in map([("a", 1), ("b", 2)]):
+            out << q
+    "#});
+}
+
+/// A mutable variable the inner loop's body introduces, restarting at its seed at every
+/// position of both loops, beside an accumulator both loops carry.
+#[test]
+fn a_mutable_variable_introduced_in_a_nested_loops_body() {
+    agree(indoc! {r#"
+        acc := 0
+        for i in [1, 2]:
+            for q in [1, 2, 3]:
+                y := sum([z for z in [1, 2, 3] if z > i - q])
+                y += i * q
+                acc += y
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// Group keys compared through the loop key, rather than folded away by an aggregate.
+/// Inference panics: the group key binder `__gb_k` escapes into a bound outside its scope.
+/// Pinned at the interpreter's answer and the compiler's panic.
+#[test]
+#[should_panic(expected = "open bound recorded")]
+fn a_loop_over_groups_panics_in_inference() {
+    let source = indoc! {r#"
+        sales = [
+            (region="east", amount=1),
+            (region="west", amount=2),
+            (region="east", amount=3),
+        ]
+        out = test_sink()
+        for g in groupby(sales, \r -> r.region):
+            out << sum([s.amount for s in g])
+    "#};
+    assert_eq!(
+        interpreted(source).to_string(),
+        r#"["east" -> 4, "west" -> 2]"#
+    );
+    compiled(source);
+}
+
+/// A site that never fires still makes the channel a union, because the tagging is fixed
+/// by the program text.
+#[test]
+fn an_untaken_feed_site_still_tags_the_channel() {
+    agree(indoc! {r#"
+        out = test_sink()
+        for x in [1, 2]:
+            out << x
+        for y in [x for x in [1] if x > 5]:
+            out << y
+    "#});
+}
+
+// ---------------------------------------------------------------------------
+// The rest of the constructs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_match_on_a_variant() {
+    agree(indoc! {r#"
+        x = `some(7)
+        y = match x:
+            case `some(v):
+                v + 1
+            case `none:
+                0
+        out = test_sink()
+        out << y
+    "#});
+}
+
+#[test]
+fn a_match_selecting_the_payload_less_arm() {
+    agree(indoc! {r#"
+        x = `none
+        y = match x:
+            case `some(v):
+                v + 1
+            case `none:
+                0
+        out = test_sink()
+        out << y
+    "#});
+}
+
+#[test]
+fn a_user_function() {
+    agree(indoc! {r#"
+        def double(n):
+            n * 2
+
+        out = test_sink()
+        out << double(21)
+    "#});
+}
+
+#[test]
+fn a_function_closing_over_an_outer_binding() {
+    agree(indoc! {r#"
+        base = 10
+
+        def bump(n):
+            n + base
+
+        out = test_sink()
+        out << bump(3)
+    "#});
+}
+
+#[test]
+fn a_mutation_loop_accumulator() {
+    agree(indoc! {r#"
+        acc := 0
+        for i in [1, 2, 3, 4, 5]:
+            acc := acc + i
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+#[test]
+fn a_tuple_and_its_components() {
+    agree(indoc! {r#"
+        out = test_sink()
+        t = (3, 4)
+        out << t.0 + t.1
+    "#});
+}
+
+#[test]
+fn max_over_a_comprehension() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << max([x * x for x in [1, 2, 3]])
+    "#});
+}
+
+/// `min` of an empty collection has no value under `docs/chl-spec.md`, "7.1 Aggregates", so the
+/// interpreter refuses it. The filter keeps the element type `Int` while emptying the group.
+#[test]
+fn min_of_an_empty_collection_is_refused_by_the_interpreter() {
+    let result = run_interpreted(indoc! {r#"
+        out = test_sink()
+        out << min([x for x in [1, 2, 3] if x > 5])
+    "#});
+    assert!(
+        result.is_err(),
+        "the interpreter produced a value: {result:?}"
+    );
+}
+
+#[test]
+fn min_over_a_comprehension() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << min([x * x for x in [-3, 2, 4]])
+    "#});
+}
+
+#[test]
+fn a_collection_union_folded_to_a_scalar() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << sum([1, 2] ++ [3, 4])
+    "#});
+}
+
+#[test]
+fn an_if_else_in_expression_position() {
+    agree(indoc! {r#"
+        out = test_sink()
+        n = 5
+        out << (n * 2 if n > 3 else 0)
+    "#});
+}
+
+#[test]
+fn a_generator_pipeline() {
+    agree(indoc! {r#"
+        def positives(xs):
+            for x in xs:
+                if x > 0:
+                    yield x
+
+        def squared(xs):
+            for x in xs:
+                yield x * x
+
+        out = test_sink()
+        out << max(squared(positives([-3, 4, -1, 2, 5, -7])))
+    "#});
+}
+
+#[test]
+fn a_defer_channel_read_back() {
+    agree(indoc! {r#"
+        ch = defer()
+        for x in [1, 2, 3]:
+            ch << x * 2
+        out = test_sink()
+        out << sum(ch)
+    "#});
+}
+
+/// A checked lookup answers `` `some `` for a key the map has and `` `none `` for one it
+/// lacks.
+#[test]
+fn a_checked_lookup_on_a_map() {
+    agree(indoc! {r#"
+        m = map([("a", 1)])
+        r = m["a"]?
+        s = m["b"]?
+        out = test_sink()
+        out << r
+        out << s
+    "#});
+}
+
+/// A function body ending in `if`/`else` denotes its taken branch's value.
+#[test]
+fn a_function_ending_in_a_conditional() {
+    agree(indoc! {r#"
+        def sign(n):
+            if n > 0:
+                1
+            else:
+                0
+        out = test_sink()
+        out << sign(5) + sign(-5)
+    "#});
+}
+
+#[test]
+fn a_function_ending_in_a_match() {
+    agree(indoc! {r#"
+        def f(v):
+            match v:
+                case `some(x):
+                    x
+                case `none:
+                    0
+        out = test_sink()
+        out << f(`some(4))
+    "#});
+}
+
+/// A call resolves its function where the caller was defined, so a later `def` of the same
+/// name does not reach it.
+#[test]
+fn a_function_is_resolved_where_its_caller_is_defined() {
+    agree(indoc! {r#"
+        def g(n):
+            n + 1
+        def f(n):
+            g(n)
+        def g(n):
+            n + 100
+        out = test_sink()
+        out << f(0)
+    "#});
+}
+
+/// A parameter named like a channel shadows it.
+#[test]
+fn a_parameter_shadows_a_channel() {
+    agree(indoc! {r#"
+        ch = defer()
+        out = test_sink()
+        for c in [1]:
+            ch << c
+        def h(ch):
+            ch + 1
+        out << h(10)
+    "#});
+}
+
+/// A loop over a filtered comprehension runs at its survivors' positions, and each
+/// contribution is keyed by the position its element had.
+#[test]
+fn a_filter_keeps_its_survivors_positions() {
+    agree(indoc! {r#"
+        out = test_sink()
+        for y in [x for x in [1, 2, 3, 4] if x > 2]:
+            out << y
+    "#});
+}
+
+// ---------------------------------------------------------------------------
+// Transactions. A block is one commit record, at the next commit time or none at all, and
+// a reply fed inside it is indexed by that commit time rather than by the iteration.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_in_block_reply_per_commit() {
+    agree(indoc! {r#"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [10, 20, 30]:
+            with begin():
+                pool := pool - r
+                out << pool
+    "#});
+}
+
+/// A guard no path takes is a denial: no write, no reply, no commit time.
+///
+/// Agreement compares commit times by rank, which cannot see a single reply's time, so the
+/// compiled side's raw time is pinned too.
+#[test]
+fn a_denied_block_takes_no_commit_time() {
+    let source = indoc! {r#"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [70, 50]:
+            with begin():
+                if pool >= r:
+                    pool := pool - r
+                    out << pool
+    "#};
+    agree(source);
+    assert_eq!(compiled(source).to_string(), "[t1 -> 30]");
+}
+
+/// Commit times are dense: the denied iteration leaves no gap.
+///
+/// Agreement compares commit times by rank, which cannot see a gap, so the compiled side's
+/// raw times are pinned too.
+#[test]
+fn commit_times_are_dense_across_a_denial() {
+    let source = indoc! {r#"
+        out = test_sink()
+        q: Mut(Int, Txn) := 0
+        for r in [0, 1, 2]:
+            with begin():
+                if r != 0:
+                    q := r + 1
+                    out << q
+    "#};
+    agree(source);
+    assert_eq!(compiled(source).to_string(), "[t1 -> 2, t2 -> 3]");
+}
+
+#[test]
+fn a_terminal_read_of_a_transactional_store() {
+    agree(indoc! {r#"
+        pool: Mut(Int, Txn) := 100
+        for r in [10, 20, 30]:
+            with begin():
+                pool := pool - r
+        out = test_sink()
+        out << await_final(pool)
+    "#});
+}
+
+/// A loop whose body overwrites an accumulator with a value that reads neither the
+/// accumulator nor the loop item. The decision is a constant, so the snapshot scaffold and
+/// the source term are both gone by recognition and the writer's extent is all that is left
+/// of its source.
+#[test]
+fn a_loop_overwriting_an_accumulator_with_a_constant() {
+    agree(indoc! {r#"
+        acc := 1
+        for i in [1, 2]:
+            acc := 7
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// A constant write beside an accumulating one. The decision reads `b` and the item, so it is
+/// not constant, and the loop's one writer keeps its snapshot.
+#[test]
+fn a_constant_and_an_accumulating_writer_in_one_loop() {
+    agree(indoc! {r#"
+        a := 1
+        b := 0
+        for i in [1, 2, 3]:
+            a := 7
+            b := b + i
+        out = test_sink()
+        out << a * 100 + b
+    "#});
+}
+
+/// A constant reached through a local binding in the body is still a constant decision.
+#[test]
+fn a_constant_overwrite_through_a_local() {
+    agree(indoc! {r#"
+        acc := 1
+        for i in [1, 2]:
+            y = 3
+            acc := y
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// A constant written through a `Mut` parameter: inlining leaves the constant decision a
+/// write in the loop body would have.
+#[test]
+fn a_constant_overwrite_through_a_mut_parameter() {
+    agree(indoc! {r#"
+        def fw(c: Mut(Int)):
+            c := 5
+        c := 0
+        for x in [1, 2]:
+            fw(c)
+        out = test_sink()
+        out << c
+    "#});
+}
+
+/// Two accumulators, both written constantly, so the loop's one writer reads no snapshot.
+#[test]
+fn two_accumulators_both_written_with_constants() {
+    agree(indoc! {r#"
+        a := 1
+        b := 10
+        for i in [1, 2]:
+            a := 7
+            b := 9
+        out = test_sink()
+        out << a + b
+    "#});
+}
+
+/// The same overwrite over a source filtered to nothing. The writer's extent is then a
+/// declared superset of the positions the source has; the extent's refinement becomes a
+/// `restrict` on the source, so no position survives and the accumulator keeps its seed
+/// rather than taking the write.
+#[test]
+fn a_constant_overwrite_over_an_empty_filtered_source() {
+    agree(indoc! {r#"
+        acc := 1
+        for i in [z for z in [1, 2] if z > 9]:
+            acc := 7
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// Filtered to one survivor out of three: the loop body runs once, at the surviving
+/// position, and the sink is keyed by it. A writer reading every declared position would
+/// feed three.
+#[test]
+fn a_constant_overwrite_over_a_filtered_source_runs_once_per_survivor() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 1
+        for i in [z for z in [1, 2, 3] if z > 2]:
+            acc := 7
+            out << acc
+    "#});
+}
+
+/// The transactional half: a `with begin():` block whose write reads nothing, over a source
+/// filtered to nothing. No block runs, so no commit lands and the terminal read is the seed.
+#[test]
+fn a_constant_transactional_write_over_an_empty_filtered_source() {
+    agree(indoc! {r#"
+        pool: Mut(Int, Txn) := 100
+        for r in [z for z in [1, 2] if z > 9]:
+            with begin():
+                pool := 7
+        out = test_sink()
+        out << await_final(pool)
+    "#});
+}
+
+/// The same write over a source filtered to two survivors of three: a block runs once per
+/// survivor, keyed by its own commit, and none runs at the filtered position.
+#[test]
+fn a_constant_transactional_write_runs_once_per_survivor() {
+    agree(indoc! {r#"
+        pool: Mut(Int, Txn) := 100
+        out = test_sink()
+        for r in [z for z in [1, 2, 3] if z != 2]:
+            with begin():
+                pool := 7
+                out << 7
+    "#});
+}
+
+/// A terminal read inside a conditional's test. The test compiles to a refinement predicate
+/// on the branch domain, so the read sits in a type slot rather than in the term, and loop
+/// recognition's rewrite of transactional reads has to reach it there.
+#[test]
+fn a_terminal_read_in_a_conditional_test() {
+    agree(indoc! {r#"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [1, 2]:
+            with begin():
+                pool := pool - r
+        out << (1 if await_final(pool) > 90 else 0)
+    "#});
+}
+
+/// The same read with threshold 98: the seed (100) and the value between the commits (99)
+/// clear it, and the final value (97) does not. So the two sides agree on the other branch only
+/// when the predicate reads the final value, and a dropped predicate disagrees too.
+#[test]
+fn a_terminal_read_in_a_conditional_test_not_taken() {
+    agree(indoc! {r#"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [1, 2]:
+            with begin():
+                pool := pool - r
+        out << (1 if await_final(pool) > 98 else 0)
+    "#});
+}
+
+/// Read-your-writes: a read after a write in the same block sees it.
+#[test]
+fn read_your_writes_within_a_block() {
+    agree(indoc! {r#"
+        out = test_sink()
+        n: Mut(Int, Txn) := 1
+        for i in [1, 2]:
+            with begin():
+                n := n * 10
+                out << n + 1
+    "#});
+}
+
+#[test]
+fn two_stores_written_in_one_block() {
+    agree(indoc! {r#"
+        out = test_sink()
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 100
+        for x in [1, 2]:
+            with begin():
+                a := a + x
+                b := b - x
+                out << a * 1000 + b
+    "#});
+}
+
+/// Two writer sites on one store. Their commits are unordered (`docs/chl-spec.md`, "8.5
+/// Ordering and concurrency"), so the interpreter refuses to judge the program; the compiler
+/// picks an order, and this checks only that it runs the program to completion.
+#[test]
+fn two_writer_sites_on_one_store_are_not_judged() {
+    let source = indoc! {r#"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [10]:
+            with begin():
+                pool := pool - r
+                out << pool
+        for r in [5]:
+            with begin():
+                pool := pool - r
+                out << pool
+    "#};
+    compiled(source);
+    let refusal = run_interpreted(source).expect_err("the interpreter refuses");
+    assert!(refusal.contains("more than one `with` block"), "{refusal}");
+}
+
+/// Two stores, each written by its own loop. The two sides number commits differently, and a
+/// reply channel's keys have type `Txn`, so the comparison matches them by commit order.
+#[test]
+fn two_writer_sites_on_two_stores_agree_up_to_commit_time_numbering() {
+    agree(indoc! {r#"
+        out = test_sink()
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                a := a + r
+        for r in [10, 20]:
+            with begin():
+                b := b + r
+                out << b
+    "#});
+}
+
+#[test]
+fn a_function_writing_through_a_mut_parameter() {
+    agree(indoc! {r#"
+        def bump(c: Mut(Int)):
+            c += 1
+
+        n := 1
+        bump(n)
+        bump(n)
+        out = test_sink()
+        out << n
+    "#});
+}
+
+/// A function captures the values of free names at its definition (`docs/chl-spec.md`, "4.1
+/// `def` — function definition"), so a later write to a captured mutable variable does not
+/// reach it. The compiler reads the variable's latest value instead. Pinned at both answers.
+#[test]
+fn a_captured_mutable_variable_is_read_late() {
+    let source = indoc! {r#"
+        c := 1
+
+        def f(n):
+            n + c
+
+        c := 5
+        out = test_sink()
+        out << f(0)
+    "#};
+    assert_eq!(compiled(source).to_string(), "[() -> 5]");
+    assert_eq!(interpreted(source).to_string(), "[() -> 1]");
+}
+
+/// A user function named like a builtin shadows it: the nearest binding wins
+/// (`docs/chl-spec.md`, "3.2 Names"). The compiler calls the builtin. Pinned at both answers.
+#[test]
+fn a_user_function_named_like_a_builtin_is_ignored() {
+    let source = indoc! {r#"
+        def sum(xs):
+            7
+
+        out = test_sink()
+        out << sum([1, 2])
+    "#};
+    assert_eq!(compiled(source).to_string(), "[() -> 3]");
+    assert_eq!(interpreted(source).to_string(), "[() -> 7]");
+}
+
+/// A channel fed from two places is a union of them, so its keys are tagged by which
+/// place fed them. One site leaves the keys bare, which is why every single-site case
+/// above compares without tags.
+#[test]
+fn two_feed_sites_tag_their_keys() {
+    agree(indoc! {r#"
+        out = test_sink()
+        for x in [1, 2]:
+            out << x
+        for y in [10, 20]:
+            out << y
+    "#});
+}
+
+/// Aggregating a mutable collection that a keyed write has touched.
+#[test]
+fn aggregating_a_keyed_written_store() {
+    agree(indoc! {r#"
+        m: Mut(Map(String, Int)) := box(map([("a", 1)]))
+        for k in ["b", "c"]:
+            m[k] := 9
+        out = test_sink()
+        out << sum(m)
+    "#});
+}
+
+/// The same store, aggregated without a keyed write, agrees.
+#[test]
+fn a_seeded_mutable_collection_aggregates() {
+    agree(indoc! {r#"
+        m: Mut(Map(String, Int)) := box(map([("a", 1), ("b", 2)]))
+        out = test_sink()
+        out << sum(m)
+    "#});
+}
+
+/// The comprehension binder keeps division in the runtime rather than constant folding it.
+#[rstest::rstest]
+#[case("7", "2", 3)]
+#[case("-7", "2", -4)]
+#[case("7", "-2", -4)]
+#[case("-7", "-2", 3)]
+#[case("6", "-2", -3)]
+#[case("0", "-2", 0)]
+#[case("-9223372036854775807 - 1", "3", -3_074_457_345_618_258_603)]
+#[case("1", "-9223372036854775807 - 1", -1)]
+fn signed_floor_division_agrees(
+    #[case] dividend: &str,
+    #[case] divisor: &str,
+    #[case] expected: i64,
+) {
+    let source = format!(
+        indoc! {r#"
+        out = test_sink()
+        out << sum([x // ({divisor}) for x in [{dividend}]])
+    "#},
+        divisor = divisor,
+        dividend = dividend
+    );
+    let expected = Value::Collection(Collection::from_entries(vec![(
+        Value::Unit,
+        Value::Int(expected),
+    )]));
+    assert_eq!(compiled(&source), expected);
+    assert_eq!(interpreted(&source), expected);
+}
+
+/// A constant whole-collection write in a loop body replaces the collection at each iteration.
+#[test]
+fn a_constant_whole_collection_write_in_a_loop() {
+    agree(indoc! {r#"
+        out = test_sink()
+        c := [1, 2]
+        for i in [1, 2]:
+            c := [3, 4]
+        out << sum(c)
+    "#});
+}
+
+/// The same write through a `Mut` parameter, to a map.
+#[test]
+fn a_constant_whole_map_write_through_a_mut_parameter() {
+    agree(indoc! {r#"
+        def put(m: Mut(Map(Int, Int))):
+            m := box(map([(5, 50), (6, 60)]))
+        m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))
+        for x in [3, 4]:
+            put(m)
+        out = test_sink()
+        out << sum(m)
+    "#});
+}
+
+// A filter becomes a refinement on the comprehension's domain, so a filter that reads a
+// binding puts it in a type. These hold the passes after inference to the binding the type
+// names (`src/ccl/design/mutability.md`, "A read is named while inference runs").
+
+/// A filter reading a `let` binding, which every channel the binding reaches carries in its
+/// type.
+#[test]
+fn a_filter_reads_a_let_binding() {
+    agree(indoc! {r#"
+        out = test_sink()
+        k = 1
+        ys = [z for z in [1, 2, 3] if z > k]
+        out << sum(ys)
+    "#});
+}
+
+#[test]
+fn a_filter_reads_a_mutable_variable() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 1
+        ys = [z for z in [1, 2, 3] if z > acc]
+        out << sum(ys)
+    "#});
+}
+
+/// Two filters read one mutable variable on either side of a write, so the two types they
+/// put it in denote different values.
+#[test]
+fn filters_read_a_mutable_variable_on_either_side_of_a_write() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 1
+        ys = [z for z in [1, 2, 3] if z > acc]
+        acc := 2
+        out << sum([w for w in ys if w > acc])
+    "#});
+}
+
+/// A filter reading a copy of a mutable variable, which the types spell as the copy.
+#[test]
+fn a_filter_reads_a_copy_of_a_mutable_variable() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 1
+        k = acc
+        ys = [z for z in [1, 2, 3] if z > k]
+        out << sum(ys)
+    "#});
+}
+
+/// A filter reading a mutable variable the same loop body then writes.
+#[test]
+fn a_filter_reads_a_mutable_variable_its_loop_writes() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 1
+        for i in [1, 2]:
+            ys = [z for z in [1, 2, 3] if z > acc]
+            acc := acc + sum(ys)
+        out << acc
+    "#});
+}
+
+/// A filter passing a mutable variable to a function, which inlining puts in the type.
+#[test]
+fn a_filter_passes_a_mutable_variable_to_a_function() {
+    agree(indoc! {r#"
+        def twice(n):
+            n * 2
+
+        out = test_sink()
+        acc := 1
+        ys = [z for z in [1, 2, 3] if z > twice(acc)]
+        out << sum(ys)
+    "#});
+}
+
+/// A group-by key reading a mutable variable: the key rides the group-by's own refinement.
+#[test]
+fn a_groupby_key_reads_a_mutable_variable() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 2
+        out << sum([sum(g) for g in groupby([1, 2, 3, 4], \v -> v // acc)])
+    "#});
+}
+
+/// A function returning a filtered collection, called with a mutable variable, which the
+/// call reads at its position.
+#[test]
+fn a_filter_reads_a_mutable_argument() {
+    agree(indoc! {r#"
+        def above(xs, t):
+            [x for x in xs if x > t]
+
+        out = test_sink()
+        acc := 1
+        ys = above([1, 2, 3], acc)
+        acc := 5
+        out << sum(ys) + acc
+    "#});
+}
+
+/// A filter reading a transactional mutable variable the same transaction then writes.
+#[test]
+fn a_filter_reads_a_mutable_variable_its_transaction_writes() {
+    agree(indoc! {r#"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [1, 2]:
+            with begin():
+                pool := sum([z2 for z2 in [1, 2, 3] if z2 > pool])
+                out << pool
+    "#});
+}
+
+/// Rows filtered on a mutable variable, fed right after the loop that writes it. The filter
+/// reads the variable's final value through a binder of its own, which the channel's type keeps
+/// rather than discharging: discharged, it would put the loop's history in the type.
+#[test]
+fn a_filter_reads_a_mutable_variable_after_the_loop_that_writes_it() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 0
+        for r in [1, 2]:
+            acc += r
+        out << [z for z in [1, 2, 3, 4] if z > acc]
+    "#});
+}

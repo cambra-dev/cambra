@@ -7,7 +7,7 @@
 //! inspector's `paneLinks` carry non-identity edges in both the
 //! `pre-inference → post-inference` and `post-inference → post-channelize`
 //! windows, pinned whole by the `polymorphic` snapshot fixture and asserted
-//! structurally by `tests/inspector_goldens.rs`.
+//! structurally by `tests/it/inspector_goldens.rs`.
 
 use super::common::expect_scalar;
 

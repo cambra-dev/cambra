@@ -26,7 +26,7 @@ what a program means without consulting the compiler it is compared against.
 | Path | Role | Design docs |
 | --- | --- | --- |
 | `chl-parser/` | Parser for the Cambra High-level Language: lexer, grammar, AST, and error recovery. | [design-chl-parser.md](../chl-parser/design-chl-parser.md) |
-| `chl-interp/` | Differential interpreter for CHL: what `tests/differential_interp.rs` and `tests/generated_pairs.rs` compare the compiler against. | — |
+| `chl-interp/` | Differential interpreter for CHL: what `tests/it/differential_interp.rs` and `tests/it/generated_pairs.rs` compare the compiler against. | — |
 
 ## Operational semantics
 

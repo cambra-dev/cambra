@@ -109,7 +109,7 @@ fn strip_type_slots(pred: &mut Expr) -> bool {
 /// Collected over the whole tree before anything is rewritten, and matched by
 /// [`Refinement`]'s own structural equality rather than by position or by
 /// predicate `Rc`. Either alternative splits predicate sharing, which
-/// `tests/predicate_sharing.rs` guards: one predicate term rides many type slots,
+/// `tests/it/predicate_sharing.rs` guards: one predicate term rides many type slots,
 /// so a rule that exempts it at one slot and rewrites it at another leaves the
 /// origin term and the rewritten one both live and structurally equal, which is
 /// the split.

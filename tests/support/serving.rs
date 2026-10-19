@@ -1,8 +1,8 @@
 //! Running a program a test talks to, and talking to it.
 //!
-//! Compiled into every test binary that drives a program rather than evaluating
-//! one: the gallery (`tests/programs/main.rs`) and the hot-reload suite
-//! (`tests/hot_reload.rs`). It holds what both need — a compiled sink program, a
+//! Shared by the suites that drive a program rather than evaluating one: the
+//! gallery (`tests/programs/mod.rs`) and the hot-reload suite
+//! (`tests/it/hot_reload.rs`). It holds what both need — a compiled sink program, a
 //! scheduler pump, and an HTTP client built on `TcpStream` so no client crate
 //! becomes a dev dependency. The gallery's own expectation helpers
 //! (`expect_scalar` and its siblings) stay in `tests/programs/common/mod.rs`,
@@ -35,8 +35,7 @@ use cambra::{
 /// The caller must keep the returned context alive (and drive its scheduler
 /// via [`drive_until`]) for the duration of the test — sinks are only
 /// serviced while the scheduler is running.
-// The gallery binary's: a suite that replaces a version wants `start_sink`.
-#[allow(dead_code)]
+// The gallery's: a suite that replaces a version wants `start_sink`.
 pub fn compile_sink(source: &str) -> GlobalContext {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -60,7 +59,7 @@ pub fn start_sink(source: &str) -> (GlobalContext, LiveProgram) {
 }
 
 /// Port allocation for the `{PORT}` placeholder in sink programs.  Lives in the
-/// library, behind `test-helpers`, so this crate and `tests/http_server.rs`
+/// library, behind `test-helpers`, so this crate and `tests/it/http_server.rs`
 /// share one implementation — see [`reserve_test_port`] for why the naive
 /// "bind `:0` and close" allocator is not safe here.
 pub use cambra::interpreter::http_server::reserve_test_port;

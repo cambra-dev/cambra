@@ -7,7 +7,7 @@
 //! held rather than restarting, so the entries already signed stand as they were
 //! and the new rule governs from here.
 //!
-//! The feature's own suite is `tests/hot_reload.rs`, which covers the guard
+//! The feature's own suite is `tests/it/hot_reload.rs`, which covers the guard
 //! table across the induction, transactional and `stdin` domains. This entry is
 //! the demonstration.
 

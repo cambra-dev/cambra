@@ -436,7 +436,7 @@ boundary and is rejected.
 records. A record extent uses `MakeRecord`; a function extent uses `zip_arms_named_at`, which
 pairs the components over their ambient iteration. `Transact` is intercepted at its enclosing `Let`
 and compiled as a shared history store. End-to-end cases are in
-`tests/compilation_pipeline/`.
+`tests/it/compilation_pipeline/`.
 See [Operator Conversion](../../interpreter/design-operators.md#operator-conversion-interpreteroperator_conversionrs)
 for the operator-level contracts.
 

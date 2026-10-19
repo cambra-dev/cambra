@@ -273,7 +273,7 @@ pub enum Token {
 /// spellings that lex as something other than [`Token::Ident`].
 ///
 /// The editor grammars under `editors/` list the same spellings, and
-/// `tests/editor_grammars.rs` fails when either grammar differs from this
+/// `tests/it/editor_grammars.rs` fails when either grammar differs from this
 /// table. `True` and `False` are listed here although the grammars highlight
 /// them as constants rather than as keywords. It is public for the planned
 /// language server (`editors/README.md`).
@@ -354,7 +354,7 @@ pub enum HighlightClass {
 }
 
 impl HighlightClass {
-    /// Every class, in declaration order. `tests/editor_grammars.rs` requires
+    /// Every class, in declaration order. `tests/it/editor_grammars.rs` requires
     /// `editors/highlight-classes.json` to name exactly these.
     pub const ALL: &[HighlightClass] = &[
         HighlightClass::Comment,
@@ -1889,7 +1889,7 @@ mod tests {
     /// The editor sample contains every keyword and symbol spelling, so a new
     /// one is checked against both grammars as soon as it exists. Literals and
     /// identifiers are covered by `sample_covers_every_highlight_class` in
-    /// `tests/editor_grammars.rs`.
+    /// `tests/it/editor_grammars.rs`.
     #[test]
     fn editor_sample_contains_every_token_spelling() {
         use strum::IntoEnumIterator;

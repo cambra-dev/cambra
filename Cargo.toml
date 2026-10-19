@@ -94,6 +94,17 @@ debug-assertions = false
 overflow-checks = false
 # No one runs a debugger on this tree: 11G with full debug info, 2.7G without.
 debug = false
+
+# Every top-level `tests/*.rs` is a test binary of its own, linking the whole library,
+# so each is declared here with the reason it cannot be a module of `tests/it/main.rs`;
+# `tests/it/test_layout.rs` fails on one that is not.
+#
+# `alloc_probe` installs a counting `#[global_allocator]`, and an allocator is
+# per-process, so each binary that measures allocations is its own target.
+[[test]]
+name = "dead_code_specialization_cost"
+[[test]]
+name = "scope_walk_allocations"
 # The differential oracle belongs to the formal gate, not to the suite. It runs
 # `formal/.lake/build/bin/subverdict` and refuses to skip under CI, so a job
 # that runs the suite would need the whole Lean toolchain to check something

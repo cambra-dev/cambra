@@ -5451,7 +5451,7 @@ fn union_operand_ops(
         // each arm the rows carrying its own, and re-tag the outputs; no operator does
         // that. Programs reach here — a union-domained collection read at a projected
         // index, which is what a `++` generator beside a second generator lowers to
-        // (`tests/compilation_pipeline/scalars_collections.rs`,
+        // (`tests/it/compilation_pipeline/scalars_collections.rs`,
         // `an_inline_union_generator_beside_a_second_generator`). So this names the missing
         // capability rather than compiling the operation as the one it is not. The
         // `Apply(Tuple, Copair)` form is the one nothing builds: it requires a `++`

@@ -298,7 +298,7 @@ impl Drop for SharedHttpServer {
 /// locks the open file description (`flock`, not a per-process `fcntl` lock), so
 /// the second `File::create` of the same path contends with the first exactly as
 /// another process would.  That property is what
-/// `tests/reserve_port.rs` pins: were it to lapse, this allocator would go back
+/// `tests/it/reserve_port.rs` pins: were it to lapse, this allocator would go back
 /// to handing one port to two callers, and the flakiness would return unchanged.
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn reserve_test_port() -> u16 {

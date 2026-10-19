@@ -324,7 +324,7 @@ place `equiv` is deliberately coarser than `CompactFun`'s derived `PartialEq`, w
 `Vec` positionally: `union_domains` deduplicates the alternatives and their only readers are a
 `Data` slot's refusal to hold more than one and a `Compute` slot's commutative meet-fold at
 coalesce, so their order carries no information. That the order is unobservable downstream is what
-`tests/constraint_order_fuzz.rs` checks, by comparing coalesced outcomes across arrival
+`tests/it/constraint_order_fuzz.rs` checks, by comparing coalesced outcomes across arrival
 orders. -/
 
 /-! ## The merge -/

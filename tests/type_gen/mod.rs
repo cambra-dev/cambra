@@ -2,12 +2,10 @@
 //! fuzz the solver. Deterministic and dependency-free, so a failing case
 //! replays from its seed.
 //!
-//! Three test binaries include it — the differential oracles, the
-//! constraint-order fuzz, and the subtype-transitivity fuzz — and each uses only
-//! part of it, so every item is `allow(dead_code)`: `mod type_gen;` compiles the
-//! whole module into each one, and the order fuzz does not generate leaves and
-//! predicates directly the way the edit-driven harnesses do.
-#![allow(dead_code)]
+//! Two test binaries include it: `it`, for the constraint-order fuzz and the
+//! subtype-transitivity fuzz, and `differential_oracle`. Each compiles the whole
+//! module and leaves some items unused; those items carry an `allow(dead_code)`
+//! naming the binary that uses them.
 
 use std::rc::Rc;
 
@@ -222,6 +220,8 @@ pub fn maybe_kind_var_from(rng: &mut Rng, pool: &mut KindVarPool, t: Type) -> Ty
 
 /// [`maybe_kind_var_from`] with a pool of its own, so the variable is fresh — for
 /// a harness whose cases are independent and share nothing.
+// Used by `differential_oracle` only.
+#[allow(dead_code)]
 pub fn maybe_kind_var(rng: &mut Rng, t: Type) -> Type {
     maybe_kind_var_from(rng, &mut KindVarPool::new(), t)
 }
@@ -237,8 +237,12 @@ pub fn maybe_kind_var(rng: &mut Rng, t: Type) -> Type {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Fragment {
     /// Everything the model's `Ty` expresses, and nothing else.
+    // Constructed by `differential_oracle` only.
+    #[allow(dead_code)]
     Modelled,
     /// The above plus dependent sums.
+    // Constructed by `it` only.
+    #[allow(dead_code)]
     WithSums,
 }
 
@@ -382,6 +386,8 @@ pub fn edit(rng: &mut Rng, t: &Type, fragment: Fragment) -> Type {
 /// A plausible subtype-partner for `t`, biased toward *accepted* edges so
 /// transitivity chains form at a workable rate: clones, directed edits, and
 /// domain/codomain-level edits that exercise contravariance.
+// Used by `it` only.
+#[allow(dead_code)]
 pub fn partner(rng: &mut Rng, t: &Type, fragment: Fragment) -> Type {
     match rng.below(8) {
         0 | 1 => t.clone(),

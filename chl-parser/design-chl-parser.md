@@ -60,7 +60,7 @@ by an identifier. `raw_tokens` runs Logos and these two checks once for both `to
 `highlight`.
 
 `KEYWORDS` lists every keyword spelling with its token. The editor grammars under `editors/` list
-the same spellings, and `tests/editor_grammars.rs` fails when they differ
+the same spellings, and `tests/it/editor_grammars.rs` fails when they differ
 ([editors/README.md](../editors/README.md#highlight-classes)).
 
 `highlight` maps source to highlight spans: each logos token's `HighlightClass` from
@@ -197,7 +197,7 @@ table records names and call shapes, not meaning. Each consumer keeps three deci
   ([src/ccl/design/lowering.md, "Builtin calls"](../src/ccl/design/lowering.md#builtin-calls)).
   The interpreter lets the nearest binding win
   ([chl-spec.md, "3.2 Names"](../docs/chl-spec.md#32-names)).
-  `a_user_function_named_like_a_builtin_is_ignored` in `tests/differential_interp.rs` pins the
+  `a_user_function_named_like_a_builtin_is_ignored` in `tests/it/differential_interp.rs` pins the
   difference.
 
 The kind says which construct recognizes the call:
@@ -620,10 +620,10 @@ The grammar does not specify a portable maximum nesting depth.
   - A seeded mutation fuzzer (`CAMBRA_FUZZ_SEED`, `CAMBRA_FUZZ_N`) checks the invariants under
     [Lexer recovery](#lexer-recovery) on mutated sources, and that `parse_module` reports the
     lexer's errors first.
-- **Integration tests** in `tests/chl_parser_roundtrip.rs` parse
+- **Integration tests** in `tests/it/chl_parser_roundtrip.rs` parse
   representative CHL programs (joined comprehensions, defer/feed patterns,
   function definitions with `yield`, multi-line bracketed expressions, …) and
   assert the AST shape only at the level required to catch regressions.
 
 Run with `cargo test -p chl-parser` for the unit tests and
-`cargo test --test chl_parser_roundtrip` for the integration tests.
+`cargo test --test it chl_parser_roundtrip::` for the integration tests.

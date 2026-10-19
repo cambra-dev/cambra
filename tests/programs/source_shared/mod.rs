@@ -7,7 +7,7 @@
 //! neither reaches the sharing this program is here for. The wire side is
 //! pinned by the `source_shared` snapshot fixture and by
 //! `a_source_read_twice_is_one_node_attributed_to_both_reads` in
-//! `tests/inspector_goldens.rs`.
+//! `tests/it/inspector_goldens.rs`.
 //!
 //! Tested through a subprocess for the same reason `streaming_echo` is: the
 //! in-process path would have to replace the real `StdinDataSource` and so

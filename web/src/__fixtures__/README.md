@@ -7,12 +7,12 @@ payload drifts from the TypeScript wire types in `../types.ts`, these tests
 break. The corpus lives in `../../../scripts/fixtures.manifest`: which program
 each fixture is dumped from, and a comment per row saying what that row pins. It
 is shared by `regen-fixtures.sh`, the ci.sh drift gate, and the cargo golden
-tests (`tests/inspector_goldens.rs`), so a row and the thing it describes move
+tests (`tests/it/inspector_goldens.rs`), so a row and the thing it describes move
 together.
 
 Every fixture is the full live wire. A program too large or too volatile to pin
 byte-for-byte gets no fixture at all and a structural assertion over a fresh dump
-instead, in `tests/inspector_goldens.rs`.
+instead, in `tests/it/inspector_goldens.rs`.
 
 A successful **live** payload carries one entry of `panes` per declared pane, in
 pipeline order — `pre-inference` (kind `holes`), then `post-inference` (kind

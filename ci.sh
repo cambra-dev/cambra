@@ -246,7 +246,7 @@ ci_web() {
 # committed copies. The fix on an intended wire change is the script itself:
 #   web/scripts/regen-fixtures.sh   # then commit the diff
 # (Cross-process dump determinism — the property this gate relies on — is
-# pinned corpus-wide by tests/inspector_goldens.rs under ci_test.)
+# pinned corpus-wide by tests/it/inspector_goldens.rs under ci_test.)
 ci_fixtures() {
   (
     tmp="$(mktemp -d)"
