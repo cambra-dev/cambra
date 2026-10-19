@@ -590,6 +590,53 @@ fn test_a_projection_after_a_source_is_read_from_the_source() {
     );
 }
 
+/// Two projections of the values of one source are read from the source together:
+/// `source3() ≫ ((.2, .0) ▷ zip)` becomes `source(source3, [2, 0])`, which reads the fields in the
+/// order the program names them. The source holds triples `(3k, 6k, 9k)`, so the sum of
+/// `b.2 - b.0` over the eight keys is `6 * (0 + … + 7)`.
+#[test_log::test]
+fn test_two_projections_of_a_source_are_read_from_the_source_together() {
+    let code = "sum([b.2 - b.0 for b in source3()])";
+    let mut ctx = GlobalContext::default();
+    let triples = Rc::new(RefCell::new(TestDataSource::new(
+        "source3",
+        Type::Tuple(vec![Type::Base(BaseType::Int); 3]),
+        Extent::Record(HashMap::from(
+            [0, 1, 2].map(|n| (tuple_field(n), Extent::Base(BaseType::Int))),
+        )),
+    )));
+    ctx.register_source(triples.clone());
+    let rows: Vec<(Value, Value)> = (0..8u64)
+        .map(|k| {
+            (
+                Value::UInt(k),
+                Value::Record(HashMap::from([0, 1, 2].map(|n| {
+                    (tuple_field(n), Value::Int((k * (n as u64 + 1) * 3) as i64))
+                }))),
+            )
+        })
+        .collect();
+    triples.borrow_mut().add_data(&rows);
+    triples.borrow_mut().set_yield_predicate(Predicate::True);
+    let map = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
+    let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
+    assert!(
+        algebra.contains("source(source3, [2, 0])"),
+        "the source is read for the two fields in the order the program names them: {algebra}"
+    );
+
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    ctx.scheduler().check_for_notifications();
+    let result = producer.get(producer.tiling().universal_guard());
+    let expected: i64 = (0..8i64).map(|k| k * 9 - k * 3).sum();
+    assert_eq!(
+        result,
+        Tile::Scalar(ColumnValue::from_ints(vec![expected])),
+        "the sum of b.2 - b.0 over the eight keys"
+    );
+}
+
 /// A *conditional* induction write over an async source: `if i > 15: x := x + i`.
 /// An async (`DataSourceDomain`) extent routes to the changelog induction store.
 /// The writer decision is *carry-complete*

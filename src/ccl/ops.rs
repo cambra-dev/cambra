@@ -1016,6 +1016,21 @@ impl fmt::Display for ProjKey {
     }
 }
 
+/// Renders the projection of a [`TypedExprNode::Source`](crate::ccl::TypedExprNode::Source) as
+/// its second argument: `1` for one key, `[0, 2]` for several.
+pub fn source_projection_label(keys: &[ProjKey]) -> String {
+    match keys {
+        [key] => key.to_string(),
+        keys => format!(
+            "[{}]",
+            keys.iter()
+                .map(ProjKey::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

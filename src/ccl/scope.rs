@@ -706,7 +706,7 @@ mod tests {
                 value: Box::new(var("mv")),
             }),
             node(N::Proj(ProjKey::Index(0))),
-            node(N::Source("src".into(), None)),
+            node(N::Source("src".into(), Vec::new())),
             node(N::LoadFrom("load_from_var".into())),
             node(N::Defer),
             node(N::Error),

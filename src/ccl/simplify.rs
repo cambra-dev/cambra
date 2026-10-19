@@ -47,6 +47,7 @@
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
 //! | String add-to-concat | `Arithmetic(Add) : (String,String)→String` | `Concat` | ✓ |
 //! | Source projection | `source(𝑆) ≫ .𝑘` | `source(𝑆, 𝑘)` | ✓ |
+//! | Source projection of two fields | `source(𝑆) ≫ ((.𝑖, .𝑗) ▷ zip)` | `source(𝑆, [𝑖, 𝑗])` | ✓ |
 //! | ANF morphism binding | `let x = 𝑚 in 𝑏` (`x` an ANF temp, `𝑚` a morphism, used once) | `𝑏[x := 𝑚]` | ✓ |
 
 use crate::ccl::ccl_utils::{
@@ -323,6 +324,11 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
         try_map_domain_of_iteration,
     );
     changed |= ruled_keeping_iteration("simplify.source_projection", expr, try_source_projection);
+    changed |= ruled_keeping_iteration(
+        "simplify.source_projection_zip",
+        expr,
+        try_source_projection_zip,
+    );
 
     // Rules that may discard or restructure sub-expressions.  Equationally
     // valid only on pure CCC morphisms, so they must not touch a sub-tree
@@ -873,8 +879,12 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
 ///
 /// A source whose values are records yields a record for every key, and a program that
 /// reads field `𝑘` of it discards the rest. The projected source states the field it reads, so
-/// the reader fetches that field alone. `source(𝑆)` is the source read whole, and the rule
-/// leaves a source that already names a projection alone.
+/// the reader fetches that field alone. `source(𝑆)` is the source read whole.
+///
+/// A source that already names keys is left alone. Its keys are a flat list of fields, which
+/// cannot name a field of a field, so `source(𝑆, 𝑘) ≫ .𝑥` (a projection of a nested record
+/// field, reachable for a source whose values hold records) stays as it is and the reader
+/// fetches field 𝑘 whole. Pushing it down needs keys that are paths.
 ///
 /// Both sides keep the source and no `iterate` sits inside either, so the rule relocates
 /// nothing.
@@ -893,19 +903,62 @@ fn try_source_projection(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
         |left, right| {
-            matches!(&left.node, TypedExprNode::Source(_, None))
+            matches!(&left.node, TypedExprNode::Source(_, keys) if keys.is_empty())
                 && matches!(&right.node, TypedExprNode::Proj(_))
                 && projected_type(left, right).is_some()
         },
         |left, right, _mint_kind| {
             let ty = projected_type(&left, &right).expect("detect checked the type resolves");
-            let (TypedExprNode::Source(name, None), TypedExprNode::Proj(key)) =
+            let (TypedExprNode::Source(name, _), TypedExprNode::Proj(key)) =
                 (left.node, right.node)
             else {
                 unreachable!("detect matched a source and a projection")
             };
-            let mut source = Expr::new(TypedExprNode::Source(name, Some(key)));
+            let mut source = Expr::new(TypedExprNode::Source(name, vec![key]));
             source.ty = ty;
+            vec![source]
+        },
+    )
+}
+
+/// Projection of several of a source's fields at once:
+/// `source(𝑆) ≫ ((.𝑖, .𝑗) ▷ zip)  ⟹  source(𝑆, [𝑖, 𝑗])`.
+///
+/// The right side zips two projections of the source's values, which pairs the two fields of
+/// each value under that value's key. The source reads both fields in one pass over its keys
+/// and yields the pair itself. The rewritten node has the type of the zip, so the pair keeps
+/// the type it had. Like [`try_source_projection`], it fires only on resolved types, which
+/// every term has once `simplify` runs from `lambda_elim` and `planning`.
+fn try_source_projection_zip(expr: &mut Expr) -> bool {
+    fn projected_keys(function: &Expr) -> Option<[ProjKey; 2]> {
+        let (left, right) = as_zip(function)?;
+        match (&left.node, &right.node) {
+            (TypedExprNode::Proj(i), TypedExprNode::Proj(j)) => Some([i.clone(), j.clone()]),
+            _ => None,
+        }
+    }
+    try_pairwise_in_compose(
+        expr,
+        |left, right| {
+            matches!(&left.node, TypedExprNode::Source(_, keys) if keys.is_empty())
+                && projected_keys(right).is_some()
+                && !right.ty.is_unresolved()
+                && !left.ty.is_unresolved()
+        },
+        |left, right, _mint_kind| {
+            let keys = projected_keys(&right).expect("detect checked the zip of projections");
+            let TypedExprNode::Source(name, _) = left.node else {
+                unreachable!("detect matched a whole source")
+            };
+            let mut source = Expr::new(TypedExprNode::Source(name, keys.to_vec()));
+            source.ty = Type::fun_like_or_hole(
+                &left.ty,
+                &left.ty.domain().expect("a source is a function"),
+                &right
+                    .ty
+                    .codomain()
+                    .expect("a zip of functions is a function"),
+            );
             vec![source]
         },
     )
@@ -2280,13 +2333,52 @@ mod tests {
 
     /// `source(testsource1)`, the pairs it holds keyed by position: `[0, 3) ⤇ (Int, Int)`.
     fn pair_source(projection: Option<ProjKey>, values: Type) -> Expr {
-        Expr::new(TypedExprNode::Source("testsource1".into(), projection))
-            .with_ty(Type::data_fun(positions(), values))
+        Expr::new(TypedExprNode::Source(
+            "testsource1".into(),
+            projection.into_iter().collect(),
+        ))
+        .with_ty(Type::data_fun(positions(), values))
     }
 
     /// The projection morphism `.𝑘` on pairs, `(Int, Int) ⇒ Int`.
     fn project(key: ProjKey) -> Expr {
         Expr::new(TypedExprNode::Proj(key)).with_ty(fun_ty(pair_ty(), int_ty()))
+    }
+
+    /// The zip of two projections of pairs, `(.𝑖, .𝑗) ▷ zip`, the function `(Int, Int) ⇒ (Int, Int)`.
+    fn project_both(first: ProjKey, second: ProjKey) -> Expr {
+        zip_pair(project(first), project(second), &FunKind::Compute)
+    }
+
+    /// The zip of two projections that follows a source is read from the source:
+    /// `source(𝑆) ≫ ((.𝑖, .𝑗) ▷ zip)` is `source(𝑆, [𝑖, 𝑗])`, typed with the pair of the fields'
+    /// values, in the order the projections name them.
+    #[test]
+    fn a_zip_of_projections_after_a_source_is_read_from_the_source() {
+        for (first, second) in [(0, 1), (1, 0), (1, 1)] {
+            let keys = vec![ProjKey::Index(first), ProjKey::Index(second)];
+            let term = Expr::compose(vec![
+                pair_source(None, pair_ty()),
+                project_both(keys[0].clone(), keys[1].clone()),
+            ])
+            .with_ty(Type::data_fun(positions(), pair_ty()));
+            let want = Expr::new(TypedExprNode::Source("testsource1".into(), keys))
+                .with_ty(Type::data_fun(positions(), pair_ty()));
+            assert_eq!(simplify(term), want, "({first}, {second})");
+        }
+    }
+
+    /// A zip of anything but two projections, such as a projection beside a function, is left
+    /// alone.
+    #[test]
+    fn a_zip_that_is_not_of_two_projections_is_not_read_from_the_source() {
+        let double = var("double").with_ty(fun_ty(pair_ty(), int_ty()));
+        let term = Expr::compose(vec![
+            pair_source(None, pair_ty()),
+            zip_pair(project(ProjKey::Index(0)), double, &FunKind::Compute),
+        ])
+        .with_ty(Type::data_fun(positions(), pair_ty()));
+        assert_eq!(simplify(term.clone()), term);
     }
 
     /// A projection that follows a source is read from the source: `source(𝑆) ≫ .𝑘` is
@@ -2330,7 +2422,7 @@ mod tests {
     #[test]
     fn a_source_read_whole_or_already_projected_is_not_projected_again() {
         let double = || var("double").with_ty(fun_ty(int_ty(), int_ty()));
-        let int_source = Expr::new(TypedExprNode::Source("testsource1".into(), None))
+        let int_source = Expr::new(TypedExprNode::Source("testsource1".into(), Vec::new()))
             .with_ty(Type::data_fun(positions(), int_ty()));
         let term = Expr::compose(vec![int_source, double()])
             .with_ty(Type::data_fun(positions(), int_ty()));
@@ -2338,6 +2430,19 @@ mod tests {
 
         let projected = pair_source(Some(ProjKey::Index(0)), int_ty());
         assert_eq!(simplify(projected.clone()), projected);
+    }
+
+    /// A projection of a field of a field is not folded into the source's keys: the keys name
+    /// fields of the source's values, not paths into them. `source(𝑆, 0) ≫ .1`, where field 0
+    /// is itself a pair, keeps both steps.
+    #[test]
+    fn a_projection_of_a_projected_source_is_left_alone() {
+        let term = Expr::compose(vec![
+            pair_source(Some(ProjKey::Index(0)), pair_ty()),
+            project(ProjKey::Index(1)),
+        ])
+        .with_ty(Type::data_fun(positions(), int_ty()));
+        assert_eq!(simplify(term.clone()), term);
     }
 
     // ---- `try_map_domain_of_iteration` ------------------------------------------------
@@ -2387,7 +2492,7 @@ mod tests {
     fn map_domain_drops_every_value_step_after_the_iteration() {
         let doubled = || var("double").with_ty(fun_ty(int_ty(), int_ty()));
         let source = || {
-            Expr::new(TypedExprNode::Source("testsource1".into(), None))
+            Expr::new(TypedExprNode::Source("testsource1".into(), Vec::new()))
                 .with_ty(fun_ty(positions(), int_ty()))
         };
         let tails = [

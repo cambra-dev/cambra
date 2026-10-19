@@ -2988,12 +2988,13 @@ fn convert_impl_inner(
         TypedExprNode::Source(name, projection) => {
             let input = expect_input(input, &format!("Source({name})"))?;
             let source = ctx.get_source(name)?;
-            let field = projection.as_ref().map(|key| match key {
+            let field = |key: &ProjKey| match key {
                 ProjKey::Index(n) => tuple_field(*n),
                 ProjKey::Field(name) => name.clone(),
-            });
+            };
+            let fields = projection.iter().map(field).collect();
             Ok(Box::new(MapResultWithSource::projecting(
-                source, input, field,
+                source, input, fields,
             )))
         }
 
@@ -5828,7 +5829,7 @@ mod recomputability_tests {
     use crate::ccl::{Lit, TypedExpr};
 
     fn source(name: &str) -> TypedExpr {
-        TypedExpr::new(TypedExprNode::Source(name.to_string(), None))
+        TypedExpr::new(TypedExprNode::Source(name.to_string(), Vec::new()))
     }
 
     #[test]

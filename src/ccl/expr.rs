@@ -688,12 +688,14 @@ pub enum TypedExprNode {
     /// via the source registry; [`crate::interpreter::operator_conversion`] compiles it to
     /// the appropriate reader operator.
     ///
-    /// The second field is the **projection**: `None` reads every field of a source's values,
-    /// and `Some(k)` reads field `k` of them alone, which makes the node's values that field's
-    /// type. `simplify` introduces it where a projection of the source's values follows the
-    /// source (`source(𝑆) ≫ .𝑘 ⟹ source(𝑆, 𝑘)`), so a source whose values are records is read
-    /// for the field a program uses.
-    Source(String, Option<ProjKey>),
+    /// The second field is the **projection**, a list of keys: an empty list reads every field of a source's
+    /// values. A non-empty list reads those fields: one key makes the node's
+    /// values that field's type; two or more make them the tuple of the fields' types, in the
+    /// order of `keys`. `simplify` introduces it where projections of the source's values follow
+    /// the source (`source(𝑆) ≫ .𝑘 ⟹ source(𝑆, 𝑘)`,
+    /// `source(𝑆) ≫ ((.𝑖, .𝑗) ▷ zip) ⟹ source(𝑆, [𝑖, 𝑗])`), so a source whose values are
+    /// records is read for the fields a program uses.
+    Source(String, Vec<ProjKey>),
 
     /// The value the retired version of this program held for the mutable
     /// variable `x`, written `@LoadFrom(x)` on a declaration in the source.

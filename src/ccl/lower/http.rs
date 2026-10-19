@@ -163,7 +163,7 @@ pub(super) fn lower_http_serve(
         }
     };
     let requests_expr = ctx.tag_machinery(
-        Expr::new(TypedExprNode::Source(source_name.clone(), None)),
+        Expr::new(TypedExprNode::Source(source_name.clone(), Vec::new())),
         span,
         "lower.http_serve",
     );

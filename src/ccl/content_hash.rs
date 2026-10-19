@@ -483,11 +483,7 @@ fn hash_payload<'a>(
         N::Builtin(b) => b.hash(h),
         N::Source(s, projection) => {
             s.hash(h);
-            match projection {
-                None => {}
-                Some(ProjKey::Index(i)) => i.hash(h),
-                Some(ProjKey::Field(f)) => f.hash(h),
-            }
+            projection.hash(h);
         }
         // The spelling is the whole content: which variable it addresses is decided
         // by where the node sits, and the enclosing structure a reader hashes

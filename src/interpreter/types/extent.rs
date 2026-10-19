@@ -296,18 +296,40 @@ pub trait DataSourceDomainExtentImpl {
     /// element to its corresponding output value when building a
     /// `DataFunction { domain, codomain: Scalar(output_values) }` tile.
     fn get(&self, keys: ColumnValue) -> ColumnValue;
-    /// Returns field `field` of the output value of each domain key, for a source whose values
+    /// Returns the `fields` of the output value of each domain key, for a source whose values
     /// are records.
     ///
-    /// The same column as projecting [`get`](Self::get)'s result to `field`. A source overrides it
-    /// to read that field alone, where `get` builds the whole record of every key. Used by
+    /// No fields is the whole value, as [`get`](Self::get). One field is that field's column.
+    /// Several are a column of records whose component 𝑛 is `fields[𝑛]`, so the values are the
+    /// tuple of those fields in that order. Each is the column that projecting `get`'s result
+    /// gives. A source overrides it to read the fields alone, where `get` builds the whole
+    /// record of every key. Used by
     /// [`crate::interpreter::tile_operators::MapResultWithSource`] for a projected source read.
-    fn get_field(&self, keys: ColumnValue, field: &str) -> ColumnValue {
-        match self.get(keys) {
-            ColumnValue::Records(mut fields) => fields
+    fn get_fields(&self, keys: ColumnValue, fields: &[SmolStr]) -> ColumnValue {
+        let values = self.get(keys);
+        if fields.is_empty() {
+            return values;
+        }
+        let ColumnValue::Records(mut record) = values else {
+            panic!("cannot read fields {fields:?} of source values that are not records")
+        };
+        let column = |field: &SmolStr| {
+            record
+                .get(field)
+                .unwrap_or_else(|| panic!("the source's values have no field {field}"))
+                .clone()
+        };
+        match fields {
+            [field] => record
                 .remove(field)
                 .unwrap_or_else(|| panic!("the source's values have no field {field}")),
-            values => panic!("cannot read field {field} of source values {values:?}"),
+            fields => ColumnValue::Records(
+                fields
+                    .iter()
+                    .enumerate()
+                    .map(|(n, field)| (crate::interpreter::tuple_field(n), column(field)))
+                    .collect(),
+            ),
         }
     }
     /// Returns the [`Extent`] of each output value produced by this source.

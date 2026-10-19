@@ -258,14 +258,16 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             emit_nominal_ctor(decl, ctor, payload, ctx)?
         }
 
-        TypedExprNode::Source(name, projection) => match (ctx.sources.get(name), projection) {
-            (None, _) => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
-            (Some(t), None) => t.clone(),
-            // A projected source is minted by `simplify`, after inference, with the type of the
-            // projection stamped on it, so the recorded type is the node's type. Its name still
-            // has to be a registered source.
-            (Some(_), Some(_)) => expr.ty.clone(),
-        },
+        TypedExprNode::Source(name, projection) => {
+            match (ctx.sources.get(name), projection.is_empty()) {
+                (None, _) => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
+                (Some(t), true) => t.clone(),
+                // A projected source is minted by `simplify`, after inference, with the type of the
+                // projection stamped on it, so the recorded type is the node's type. Its name still
+                // has to be a registered source.
+                (Some(_), false) => expr.ty.clone(),
+            }
+        }
 
         // `@LoadFrom(x)` is typed by its context. The value it denotes belongs to
         // the retired version of the program, which this compilation cannot see:
