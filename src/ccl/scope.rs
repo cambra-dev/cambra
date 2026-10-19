@@ -279,7 +279,7 @@ where
         N::Lit(_)
         | N::Builtin(_)
         | N::Proj(_)
-        | N::Source(_)
+        | N::Source(..)
         | N::LoadFrom(_)
         | N::Defer
         | N::Error => {}
@@ -561,7 +561,7 @@ where
         N::Lit(_)
         | N::Builtin(_)
         | N::Proj(_)
-        | N::Source(_)
+        | N::Source(..)
         | N::LoadFrom(_)
         | N::Defer
         | N::Error
@@ -706,7 +706,7 @@ mod tests {
                 value: Box::new(var("mv")),
             }),
             node(N::Proj(ProjKey::Index(0))),
-            node(N::Source("src".into())),
+            node(N::Source("src".into(), None)),
             node(N::LoadFrom("load_from_var".into())),
             node(N::Defer),
             node(N::Error),
@@ -826,7 +826,7 @@ mod tests {
         N::Define { .. } => "Define",
         N::MutWrite { .. } => "MutWrite",
         N::Proj(_) => "Proj",
-        N::Source(_) => "Source",
+        N::Source(..) => "Source",
         N::LoadFrom(_) => "LoadFrom",
         N::Defer => "Defer",
         N::Error => "Error",

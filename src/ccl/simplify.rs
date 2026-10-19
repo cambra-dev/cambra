@@ -46,6 +46,7 @@
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` | ✓ |
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
 //! | String add-to-concat | `Arithmetic(Add) : (String,String)→String` | `Concat` | ✓ |
+//! | Source projection | `source(𝑆) ≫ .𝑘` | `source(𝑆, 𝑘)` | ✓ |
 //! | ANF morphism binding | `let x = 𝑚 in 𝑏` (`x` an ANF temp, `𝑚` a morphism, used once) | `𝑏[x := 𝑚]` | ✓ |
 
 use crate::ccl::ccl_utils::{
@@ -321,6 +322,7 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
         expr,
         try_map_domain_of_iteration,
     );
+    changed |= ruled_keeping_iteration("simplify.source_projection", expr, try_source_projection);
 
     // Rules that may discard or restructure sub-expressions.  Equationally
     // valid only on pure CCC morphisms, so they must not touch a sub-tree
@@ -867,6 +869,48 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
     )
 }
 
+/// Projection of a source's values: `source(𝑆) ≫ .𝑘  ⟹  source(𝑆, 𝑘)`.
+///
+/// A source whose values are records yields a record for every key, and a program that
+/// reads field `𝑘` of it discards the rest. The projected source states the field it reads, so
+/// the reader fetches that field alone. `source(𝑆)` is the source read whole, and the rule
+/// leaves a source that already names a projection alone.
+///
+/// Both sides keep the source and no `iterate` sits inside either, so the rule relocates
+/// nothing.
+///
+/// The rewritten node's type is built from the types of the source and of the projection, so
+/// the rule fires only where both are resolved. The pattern exists only after inference has
+/// resolved every type (`simplify` runs from `lambda_elim` and `planning`), so an unresolved
+/// type here is not a case this pass meets. A term that did carry one is left unrewritten, as
+/// `simplify` is documented safe at any point of the pipeline.
+fn try_source_projection(expr: &mut Expr) -> bool {
+    fn projected_type(source: &Expr, projection: &Expr) -> Option<Type> {
+        let (domain, codomain) = (source.ty.domain()?, projection.ty.codomain()?);
+        let ty = Type::fun_like_or_hole(&source.ty, &domain, &codomain);
+        (!ty.is_unresolved()).then_some(ty)
+    }
+    try_pairwise_in_compose(
+        expr,
+        |left, right| {
+            matches!(&left.node, TypedExprNode::Source(_, None))
+                && matches!(&right.node, TypedExprNode::Proj(_))
+                && projected_type(left, right).is_some()
+        },
+        |left, right, _mint_kind| {
+            let ty = projected_type(&left, &right).expect("detect checked the type resolves");
+            let (TypedExprNode::Source(name, None), TypedExprNode::Proj(key)) =
+                (left.node, right.node)
+            else {
+                unreachable!("detect matched a source and a projection")
+            };
+            let mut source = Expr::new(TypedExprNode::Source(name, Some(key)));
+            source.ty = ty;
+            vec![source]
+        },
+    )
+}
+
 /// Composition with a curried function of the enclosing value, through **strength**:
 /// `⟨𝑆, curry(𝑔)⟩ ≫ compose  ⟹  𝑆 ▷ strength_over ≫ map(𝑔)`.
 ///
@@ -979,7 +1023,7 @@ fn preserves_domain(expr: &Expr) -> bool {
         TypedExprNode::Proj(_)
         | TypedExprNode::Lit(_)
         | TypedExprNode::List(_)
-        | TypedExprNode::Source(_)
+        | TypedExprNode::Source(..)
         | TypedExprNode::Var(_) => true,
         _ => false,
     }
@@ -1747,7 +1791,7 @@ mod tests {
         apply_primitive, make_iterate, make_restrict, trivially_true_predicate,
     };
     use crate::ccl::lambda_elim::{curry_at, zip_pair};
-    use crate::ccl::{BaseType, Expr, FieldKey, Lit, Name};
+    use crate::ccl::{BaseType, Expr, FieldKey, Lit, Name, ProjKey};
 
     fn var(s: &str) -> Expr {
         Expr::var(s)
@@ -2227,6 +2271,75 @@ mod tests {
         );
     }
 
+    // ---- `try_source_projection` ------------------------------------------------------
+
+    /// A pair of integers, the values of the sources below.
+    fn pair_ty() -> Type {
+        Type::Tuple(vec![int_ty(), int_ty()])
+    }
+
+    /// `source(testsource1)`, the pairs it holds keyed by position: `[0, 3) ⤇ (Int, Int)`.
+    fn pair_source(projection: Option<ProjKey>, values: Type) -> Expr {
+        Expr::new(TypedExprNode::Source("testsource1".into(), projection))
+            .with_ty(Type::data_fun(positions(), values))
+    }
+
+    /// The projection morphism `.𝑘` on pairs, `(Int, Int) ⇒ Int`.
+    fn project(key: ProjKey) -> Expr {
+        Expr::new(TypedExprNode::Proj(key)).with_ty(fun_ty(pair_ty(), int_ty()))
+    }
+
+    /// A projection that follows a source is read from the source: `source(𝑆) ≫ .𝑘` is
+    /// `source(𝑆, 𝑘)`, typed with the field's values, for an index and for a field name.
+    #[test]
+    fn a_projection_after_a_source_is_read_from_the_source() {
+        for key in [ProjKey::Index(1), ProjKey::Field("_1".into())] {
+            let term = Expr::compose(vec![pair_source(None, pair_ty()), project(key.clone())])
+                .with_ty(Type::data_fun(positions(), int_ty()));
+            assert_eq!(
+                simplify(term),
+                pair_source(Some(key.clone()), int_ty()),
+                "{key:?}"
+            );
+        }
+    }
+
+    /// The projection leaves the steps around it where they are, so `.0 ≫ source(𝑆) ≫ .1 ≫ 𝑓`
+    /// keeps its head and its tail.
+    #[test]
+    fn a_source_projection_keeps_the_steps_around_it() {
+        let double = || var("double").with_ty(fun_ty(int_ty(), int_ty()));
+        let keys = || var("keys").with_ty(Type::data_fun(positions(), positions()));
+        let term = Expr::compose(vec![
+            keys(),
+            pair_source(None, pair_ty()),
+            project(ProjKey::Index(1)),
+            double(),
+        ])
+        .with_ty(Type::data_fun(positions(), int_ty()));
+        let want = Expr::compose(vec![
+            keys(),
+            pair_source(Some(ProjKey::Index(1)), int_ty()),
+            double(),
+        ])
+        .with_ty(Type::data_fun(positions(), int_ty()));
+        assert_eq!(simplify(term), want);
+    }
+
+    /// A step that is not a projection, or a source that is already projected, is left alone.
+    #[test]
+    fn a_source_read_whole_or_already_projected_is_not_projected_again() {
+        let double = || var("double").with_ty(fun_ty(int_ty(), int_ty()));
+        let int_source = Expr::new(TypedExprNode::Source("testsource1".into(), None))
+            .with_ty(Type::data_fun(positions(), int_ty()));
+        let term = Expr::compose(vec![int_source, double()])
+            .with_ty(Type::data_fun(positions(), int_ty()));
+        assert_eq!(simplify(term.clone()), term);
+
+        let projected = pair_source(Some(ProjKey::Index(0)), int_ty());
+        assert_eq!(simplify(projected.clone()), projected);
+    }
+
     // ---- `try_map_domain_of_iteration` ------------------------------------------------
 
     /// The positions `[0, 3)`, the domain every collection below ranges over.
@@ -2274,7 +2387,7 @@ mod tests {
     fn map_domain_drops_every_value_step_after_the_iteration() {
         let doubled = || var("double").with_ty(fun_ty(int_ty(), int_ty()));
         let source = || {
-            Expr::new(TypedExprNode::Source("testsource1".into()))
+            Expr::new(TypedExprNode::Source("testsource1".into(), None))
                 .with_ty(fun_ty(positions(), int_ty()))
         };
         let tails = [

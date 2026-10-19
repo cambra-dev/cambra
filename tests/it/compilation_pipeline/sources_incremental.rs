@@ -522,6 +522,74 @@ fn test_incremental_global_aggregate() {
     );
 }
 
+/// A projection of a source's values is read from the source.
+///
+/// `source3` holds pairs `(p + 12, p)`. The join key is its second field and the sum reads its
+/// first, so every use of the source is followed by a projection: `source(source3) ≫ .1` and
+/// `source(source3) ≫ .0` plan as `source(source3, 1)` and `source(source3, 0)`, and the
+/// source returns that field alone. The answer is the sum of `a + (a + 12)` over the twelve
+/// values `a` of `source2`, which is `2 * 66 + 12 * 12`.
+#[test_log::test]
+fn test_a_projection_after_a_source_is_read_from_the_source() {
+    let code = "sum([a + b.0 for a in source2() for b in source3() if a == b.1])";
+    let mut ctx = GlobalContext::default();
+    let ints = Rc::new(RefCell::new(TestDataSource::new(
+        "source2",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    let pairs = Rc::new(RefCell::new(TestDataSource::new(
+        "source3",
+        Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)]),
+        Extent::Record(HashMap::from([
+            (tuple_field(0), Extent::Base(BaseType::Int)),
+            (tuple_field(1), Extent::Base(BaseType::Int)),
+        ])),
+    )));
+    ctx.register_source(ints.clone());
+    ctx.register_source(pairs.clone());
+    let int_rows: Vec<(Value, Value)> = (0..12u64)
+        .map(|i| (Value::UInt(i), Value::Int(((i * 5) % 12) as i64)))
+        .collect();
+    let pair_rows: Vec<(Value, Value)> = (0..12u64)
+        .map(|i| {
+            let second = ((i * 7) % 12) as i64;
+            (
+                Value::UInt(i),
+                Value::Record(HashMap::from([
+                    (tuple_field(0), Value::Int(second + 12)),
+                    (tuple_field(1), Value::Int(second)),
+                ])),
+            )
+        })
+        .collect();
+    ints.borrow_mut().add_data(&int_rows);
+    pairs.borrow_mut().add_data(&pair_rows);
+    for source in [&ints, &pairs] {
+        source.borrow_mut().set_yield_predicate(Predicate::True);
+    }
+    let map = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
+    let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
+    assert!(
+        algebra.contains("source(source3, 1)") && algebra.contains("source(source3, 0)"),
+        "both reads of source3 name the field they use: {algebra}"
+    );
+    assert!(
+        !algebra.contains("source(source3) "),
+        "no read of source3 is left whole: {algebra}"
+    );
+
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    ctx.scheduler().check_for_notifications();
+    let result = producer.get(producer.tiling().universal_guard());
+    assert_eq!(
+        result,
+        Tile::Scalar(ColumnValue::from_ints(vec![2 * 66 + 12 * 12])),
+        "the sum of a + b.0 over the twelve matches"
+    );
+}
+
 /// A *conditional* induction write over an async source: `if i > 15: x := x + i`.
 /// An async (`DataSourceDomain`) extent routes to the changelog induction store.
 /// The writer decision is *carry-complete*

@@ -11,8 +11,8 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, BindingTransparency, Branch, Builtin, Expr, Lit, LogicKind, Type,
-    TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BinOpKind, BindingTransparency, Branch, Builtin, Expr, Lit, LogicKind, ProjKey,
+    Type, TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -622,7 +622,13 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             },
         ),
 
-        TypedExprNode::Source(name) => (Precedence::Atom, format!("source({name})")),
+        TypedExprNode::Source(name, None) => (Precedence::Atom, format!("source({name})")),
+        TypedExprNode::Source(name, Some(ProjKey::Index(i))) => {
+            (Precedence::Atom, format!("source({name}, {i})"))
+        }
+        TypedExprNode::Source(name, Some(ProjKey::Field(f))) => {
+            (Precedence::Atom, format!("source({name}, {f})"))
+        }
 
         // N-ary compose: render as `f₀ ≫ f₁ ≫ … ≫ fₙ₋₁` at Compose precedence.
         // Left element at Compose (left-associative); each subsequent element

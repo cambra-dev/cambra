@@ -5,7 +5,7 @@
 //! produces a wire value.
 
 use crate::ccl::provenance::NodeId;
-use crate::ccl::{Expr, TypedExprNode};
+use crate::ccl::{Expr, ProjKey, TypedExprNode};
 use std::collections::HashSet;
 
 /// Every refinement predicate riding one of `expr`'s own type slots, once each,
@@ -92,7 +92,9 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         Tuple(_) => "Tuple".to_string(),
         Proj(k) => format!("Proj({k:?})"),
         Record(_) => "Record".to_string(),
-        Source(s) => format!("Source({s})"),
+        Source(s, None) => format!("Source({s})"),
+        Source(s, Some(ProjKey::Index(i))) => format!("Source({s}, {i})"),
+        Source(s, Some(ProjKey::Field(f))) => format!("Source({s}, {f})"),
         Compose(_) => "Compose".to_string(),
         // Two operations, not one with a mode: a copairing lands on the
         // operands' coproduct, a disjoint join on their shared domain. The

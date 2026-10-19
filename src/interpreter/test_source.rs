@@ -124,6 +124,27 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         )
     }
 
+    fn get_field(&self, mut keys: ColumnValue, field: &str) -> ColumnValue {
+        let Extent::Record(fields) = &self.output_extent else {
+            panic!("cannot read field {field} of a source whose values are not records")
+        };
+        let extent = fields
+            .get(field)
+            .unwrap_or_else(|| panic!("the source's values have no field {field}"));
+        ColumnValue::from_values(
+            keys.drain_to_value_iter()
+                .map(|key| match self.data.get(&key) {
+                    Some(Value::Record(record)) => record
+                        .get(field)
+                        .unwrap_or_else(|| panic!("the record {key:?} has no field {field}"))
+                        .clone(),
+                    other => panic!("key {key:?} holds {other:?} in TestDataSource, not a record"),
+                })
+                .collect(),
+            extent,
+        )
+    }
+
     fn output_value_extent(&self) -> Extent {
         self.output_extent.clone()
     }
@@ -179,6 +200,44 @@ mod tests {
     use crate::ccl::Type;
     use crate::interpreter::{BaseType, tiling::Predicate};
     use test_log::test;
+
+    /// `get_field` returns the column that projecting `get`'s records to the field gives, for
+    /// each field of a source whose values are pairs, and is not the default's detour through
+    /// whole records: the override reads the field alone.
+    #[test]
+    fn get_field_is_the_projection_of_get() {
+        use crate::interpreter::tuple_field;
+        let mut source = TestDataSource::new(
+            "pairs",
+            Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)]),
+            Extent::Record(HashMap::from([
+                (tuple_field(0), Extent::Base(BaseType::Int)),
+                (tuple_field(1), Extent::Base(BaseType::Int)),
+            ])),
+        );
+        let pair = |first: i64, second: i64| {
+            Value::Record(HashMap::from([
+                (tuple_field(0), Value::Int(first)),
+                (tuple_field(1), Value::Int(second)),
+            ]))
+        };
+        source.add_data(&[
+            (Value::UInt(0), pair(10, 1)),
+            (Value::UInt(1), pair(20, 2)),
+            (Value::UInt(2), pair(30, 3)),
+        ]);
+        let keys = || ColumnValue::UInts(vec![2, 0, 1]);
+        let ColumnValue::Records(whole) = source.get(keys()) else {
+            panic!("a source of pairs yields records")
+        };
+        for field in [tuple_field(0), tuple_field(1)] {
+            assert_eq!(source.get_field(keys(), &field), whole[&field], "{field}");
+        }
+        assert_eq!(
+            source.get_field(keys(), "_1"),
+            ColumnValue::Ints(vec![3, 1, 2])
+        );
+    }
 
     #[test]
     fn test_datasource_release_same_producer_accumulation() {

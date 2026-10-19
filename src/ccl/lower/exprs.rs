@@ -301,7 +301,7 @@ pub(super) fn lower_call(
         )
         | None => {
             if ctx.sources.contains_key(name) {
-                return Ok(Expr::new(TypedExprNode::Source(name.to_string())));
+                return Ok(Expr::new(TypedExprNode::Source(name.to_string(), None)));
             }
             // For zero-argument calls, only registered sources are allowed.
             if args.is_empty() {

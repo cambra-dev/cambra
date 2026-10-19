@@ -811,7 +811,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // which left these unchecked).
         TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
-        | TypedExprNode::Source(_)
+        | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_) => expr.ty.clone(),
 
         TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, ctx)?,

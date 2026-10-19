@@ -897,7 +897,11 @@ pub struct MapResultWithSource {
     input: Box<dyn TileOperator>,
     /// The data source providing both domain keys and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-    /// Output tiling: `DataFunction { domain: DataSourceDomain, codomain: Scalar(output_value_extent) }`.
+    /// The field of the source's record values this reads, where it reads one: the output is
+    /// that field's column alone. `None` reads the whole value.
+    projection: Option<SmolStr>,
+    /// Output tiling: `DataFunction { domain: DataSourceDomain, codomain: Scalar(output_value_extent) }`,
+    /// where the extent is the projected field's when there is a projection.
     base: OperatorBase,
 }
 
@@ -910,8 +914,26 @@ impl MapResultWithSource {
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
         input: Box<dyn TileOperator>,
     ) -> Self {
+        Self::projecting(source, input, None)
+    }
+
+    /// [`new`](Self::new) reading only `field` of the source's record values, or the whole
+    /// value for `None`.
+    pub fn projecting(
+        source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        input: Box<dyn TileOperator>,
+        projection: Option<SmolStr>,
+    ) -> Self {
         let source_domain_extent = Extent::DataSourceDomain(source.clone());
-        let output_extent = source.borrow().output_value_extent();
+        let output_extent = match (&projection, source.borrow().output_value_extent()) {
+            (None, extent) => extent,
+            (Some(field), Extent::Record(mut fields)) => fields
+                .remove(field)
+                .unwrap_or_else(|| panic!("the source's values have no field {field}")),
+            (Some(field), extent) => {
+                panic!("cannot read field {field} of a source whose values are {extent}")
+            }
+        };
         let tiling = change_tiling_result(input.tiling(), move |codomain_extent| {
             assert_eq!(source_domain_extent, *codomain_extent);
             Tiling::Scalar(output_extent)
@@ -920,6 +942,7 @@ impl MapResultWithSource {
             base: OperatorBase::new(tiling),
             input,
             source: source.clone(),
+            projection,
         }
     }
 }
@@ -951,6 +974,7 @@ impl TileOperator for MapResultWithSource {
             ),
             input,
             self.source.clone(),
+            self.projection.clone(),
             self.input.result_correlation(),
         ))
     }
@@ -962,6 +986,8 @@ struct MapResultWithSourceProducer {
     input: Box<dyn TileProducer>,
     /// The data source used for both domain enumeration and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+    /// The field of the source's record values this reads ([`MapResultWithSource::projecting`]).
+    projection: Option<SmolStr>,
     /// A correlation between the result values and some piece of the domain of the input tile.
     /// We need this in order to translate domain obsolete guards into releases of the underlying
     /// source.
@@ -1024,12 +1050,14 @@ impl MapResultWithSourceProducer {
         base: ProducerBase,
         input: Box<dyn TileProducer>,
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        projection: Option<SmolStr>,
         result_correlation: Option<Vec<TilePathStep>>,
     ) -> Self {
         let result = Self {
             base,
             input,
             source,
+            projection,
             result_correlation,
             last_nested_input: None,
         };
@@ -1117,9 +1145,15 @@ impl TileProducer for MapResultWithSourceProducer {
             self.last_nested_input = HeldBeneathKeys::of(&input_tile);
         }
         let source = self.source.borrow();
-        process_tile_result(self.tiling(), input_tile, move |codomain| {
-            source.get(codomain)
-        })
+        let projection = &self.projection;
+        process_tile_result(
+            self.tiling(),
+            input_tile,
+            move |codomain| match projection {
+                None => source.get(codomain),
+                Some(field) => source.get_field(codomain, field),
+            },
+        )
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1874,6 +1908,7 @@ mod tests {
             ProducerBase::unowned(MapResultWithSourceProducer::alloc_id(), &out_tiling),
             Box::new(TestTileProducer::new(input, in_tiling)),
             as_domain,
+            None,
             Some(vec![TilePathStep::Codomain]),
         );
         let _ = producer.get(producer.tiling().universal_guard());

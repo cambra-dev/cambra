@@ -296,6 +296,20 @@ pub trait DataSourceDomainExtentImpl {
     /// element to its corresponding output value when building a
     /// `DataFunction { domain, codomain: Scalar(output_values) }` tile.
     fn get(&self, keys: ColumnValue) -> ColumnValue;
+    /// Returns field `field` of the output value of each domain key, for a source whose values
+    /// are records.
+    ///
+    /// The same column as projecting [`get`](Self::get)'s result to `field`. A source overrides it
+    /// to read that field alone, where `get` builds the whole record of every key. Used by
+    /// [`crate::interpreter::tile_operators::MapResultWithSource`] for a projected source read.
+    fn get_field(&self, keys: ColumnValue, field: &str) -> ColumnValue {
+        match self.get(keys) {
+            ColumnValue::Records(mut fields) => fields
+                .remove(field)
+                .unwrap_or_else(|| panic!("the source's values have no field {field}")),
+            values => panic!("cannot read field {field} of source values {values:?}"),
+        }
+    }
     /// Returns the [`Extent`] of each output value produced by this source.
     /// Used to type the codomain of [`crate::interpreter::tile_operators::MapResultWithSource`].
     fn output_value_extent(&self) -> Extent;

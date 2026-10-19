@@ -2985,10 +2985,16 @@ fn convert_impl_inner(
         }
 
         // Data source: produces MapResultWithSource(IterateExtent(domain), source).
-        TypedExprNode::Source(name) => {
+        TypedExprNode::Source(name, projection) => {
             let input = expect_input(input, &format!("Source({name})"))?;
             let source = ctx.get_source(name)?;
-            Ok(Box::new(MapResultWithSource::new(source, input)))
+            let field = projection.as_ref().map(|key| match key {
+                ProjKey::Index(n) => tuple_field(*n),
+                ProjKey::Field(name) => name.clone(),
+            });
+            Ok(Box::new(MapResultWithSource::projecting(
+                source, input, field,
+            )))
         }
 
         // `@LoadFrom(x)`: the value the retired version held, as a constant.
@@ -3935,7 +3941,7 @@ fn writer_sources(expr: &Expr) -> HashMap<NodeId, Vec<&Expr>> {
 /// declares it — the store folds a source, and a rebuilt store folding the suffix
 /// holds a different value.
 pub fn reads_a_source(node: &TypedExprNode) -> bool {
-    matches!(node, TypedExprNode::Source(_))
+    matches!(node, TypedExprNode::Source(..))
 }
 
 /// A term that is the `@LoadFrom` leaf itself, which is what makes every term
@@ -5822,7 +5828,7 @@ mod recomputability_tests {
     use crate::ccl::{Lit, TypedExpr};
 
     fn source(name: &str) -> TypedExpr {
-        TypedExpr::new(TypedExprNode::Source(name.to_string()))
+        TypedExpr::new(TypedExprNode::Source(name.to_string(), None))
     }
 
     #[test]

@@ -468,6 +468,15 @@ registered zero-argument source calls and records the source name in the node. I
 a data function type with a nominal `DataSource(name)` domain and the registered element type.
 Operator conversion resolves that domain to the registered source extent and reader.
 
+The node is `Source(name, projection)`. `None` reads each value whole. `Some(𝑘)` reads field 𝑘 of
+values that are records or tuples, and the node's type is the data function from `DataSource(name)`
+to that field's type. Lowering and inference make whole reads. `simplify` makes projected reads
+with the rule `source(𝑆) ≫ .𝑘 ⟹ source(𝑆, 𝑘)`, after inference, with the projection's type stamped
+on the node, so inference and the post-planning check take the recorded type of a projected
+source. Operator conversion reads it with `MapResultWithSource::projecting`, which asks the source
+for that field's column through `DataSourceDomainExtentImpl::get_field`. A source overrides
+`get_field` to read the field alone; the default projects the result of `get`.
+
 `GlobalContext` coordinates the lowering, inference, and conversion registries. The lowering
 registry makes names available while constructing the tree; `compile_program` registers sources
 with inference and conversion after lowering has discovered them. The conversion registry

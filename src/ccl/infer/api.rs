@@ -3747,7 +3747,7 @@ mod tests {
             domain: Box::new(Type::DataSource("mystream".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
         };
-        let mut expr = Expr::new(TypedExprNode::Source("mystream".into()));
+        let mut expr = Expr::new(TypedExprNode::Source("mystream".into(), None));
         assert_eq!(infer(&mut expr, &mut ctx), Ok(source_ty));
     }
 
@@ -3755,7 +3755,21 @@ mod tests {
     #[test]
     fn test_infer_source_unregistered_is_unbound() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::new(TypedExprNode::Source("ghost".into()));
+        let mut expr = Expr::new(TypedExprNode::Source("ghost".into(), None));
+        assert_eq!(
+            infer_bare(&mut expr, &mut ctx),
+            Err(vec![InferError::UnboundVariable("ghost".into())])
+        );
+    }
+
+    /// A projected `Expr::Source` whose name was never registered is unbound as well.
+    #[test]
+    fn test_infer_projected_source_unregistered_is_unbound() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::new(TypedExprNode::Source(
+            "ghost".into(),
+            Some(crate::ccl::ProjKey::Index(1)),
+        ));
         assert_eq!(
             infer_bare(&mut expr, &mut ctx),
             Err(vec![InferError::UnboundVariable("ghost".into())])
@@ -3782,8 +3796,8 @@ mod tests {
             codomain: Box::new(Type::Base(BaseType::String)),
         };
 
-        let mut e1 = Expr::new(TypedExprNode::Source("ints".into()));
-        let mut e2 = Expr::new(TypedExprNode::Source("strs".into()));
+        let mut e1 = Expr::new(TypedExprNode::Source("ints".into(), None));
+        let mut e2 = Expr::new(TypedExprNode::Source("strs".into(), None));
         assert_eq!(infer(&mut e1, &mut ctx), Ok(int_ty));
         assert_eq!(infer(&mut e2, &mut ctx), Ok(str_ty));
     }
