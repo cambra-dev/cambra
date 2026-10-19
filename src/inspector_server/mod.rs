@@ -33,7 +33,7 @@ pub mod live;
 mod serve;
 pub mod wire_check;
 
-pub use serve::{serve, serve_compiled, snapshot_body_pretty};
+pub use serve::{ServedSnapshot, serve, serve_compiled, snapshot_body_pretty};
 
 use crate::ccl::context::CompiledProgram;
 use crate::inspector_model::InspectedProgram;
@@ -48,8 +48,15 @@ use crate::inspector_model::InspectedProgram;
 /// surface it via `expect` rather than leaking a `serde_json::Error` into the
 /// signature the server wants.
 pub fn snapshot_json(compiled: &CompiledProgram, name: &str) -> String {
+    snapshot_json_at_version(compiled, name, 0)
+}
+
+/// [`snapshot_json`] for a running program: `meta.version` is `version`, the
+/// branch version `compiled` is running as.
+pub fn snapshot_json_at_version(compiled: &CompiledProgram, name: &str, version: u64) -> String {
     let inspected = InspectedProgram::new(compiled);
-    let payload = inspected.build_payload(name);
+    let mut payload = inspected.build_payload(name);
+    payload.meta.version = version;
     serde_json::to_string(&payload).expect("snapshot payload serializes")
 }
 

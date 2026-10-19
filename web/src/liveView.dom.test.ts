@@ -40,6 +40,7 @@ function probe(overrides: Partial<LiveProbe> = {}): LiveProbe {
 
 function frame(overrides: Partial<LiveFrame> = {}): LiveFrame {
   return {
+    version: 0,
     published: 3,
     final: false,
     nodes: [{ nodeId: 202, probes: [probe()] }],

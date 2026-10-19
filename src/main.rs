@@ -7,7 +7,7 @@ use cambra::{
     },
     chl_parser::SourceMap,
     control_port::{ControlPort, service},
-    inspector_server::{live::LiveChannel, serve_compiled},
+    inspector_server::{ServedSnapshot, live::LiveChannel, serve_compiled},
     interpreter::{
         ColumnValue, Consumer, Scheduler,
         operator_graph::source_nodes,
@@ -96,16 +96,19 @@ fn run_program(
 
     // Serve the panes from the same compile that is about to be driven, so a
     // click in a pane names a node the running graph actually built. A reload
-    // replaces neither the panes nor `source_node_ids` below: see
-    // `src/inspector_model/design.md`, "A reload is not followed".
+    // of `main` replaces both through `Inspection::follow`: see
+    // `src/inspector_model/design.md`, "A reload of main is followed".
     let mut inspection = match inspect_port {
         Some(port) => {
-            let program = live
+            let (version, program) = live
                 .program(MAIN_BRANCH)
                 .expect("the process starts with `main`");
-            match serve_compiled(program, src_name, port) {
-                Ok(channel) => Some(Inspection::new(
+            match serve_compiled(program, src_name, port, version) {
+                Ok((channel, snapshot)) => Some(Inspection::new(
                     channel,
+                    snapshot,
+                    src_name,
+                    version,
                     ctx.scheduler().probes().clone(),
                     source_nodes(&program.operator_graph),
                 )),
@@ -134,6 +137,9 @@ fn run_program(
     // without pause must not be able to starve it of its turn.
     loop {
         poll_control(control.as_ref(), &mut ctx, &mut live, &main_consumer);
+        if let Some(inspection) = inspection.as_mut() {
+            inspection.follow(&live);
+        }
         // Sampled between the poll and the delivery. The poll takes this pass's
         // arrivals into the source buffers; the delivery is where a sink pulls
         // them, and both the delivery and a `main` pull are where a `Memo`
@@ -209,28 +215,69 @@ fn tile_is_empty(tile: &Tile) -> bool {
 /// is. See `src/inspector_model/design.md`, "Probing follows the live route".
 struct Inspection {
     channel: LiveChannel,
+    /// The `/api/snapshot` body, replaced whenever `main`'s version changes.
+    snapshot: ServedSnapshot,
+    /// The program's name, which every payload rendered for it carries.
+    name: String,
+    /// The `main` version the snapshot, the anchors and the frames describe.
+    following: u64,
     probes: ProbeSlot,
     /// The `IterateExtent`s over each source, which is where a click on its
-    /// window resolves. A reload does not update these: see
-    /// `src/inspector_model/design.md`, "A reload is not followed".
+    /// window resolves. Re-derived with the snapshot: every compile mints its
+    /// own.
     source_node_ids: HashMap<String, Vec<NodeId>>,
     /// [`ProbeTable::flows`] at the last publish. Zero again whenever probing
-    /// switches, because each switch starts a fresh table or none.
-    published_through: u64,
+    /// switches, because each switch starts a fresh table or none. `None` from
+    /// [`follow`](Self::follow) taking up a new version until the next
+    /// [`publish`](Self::publish) with probing on, which sends a frame whatever
+    /// `flows` reads; a switch keeps it `None`.
+    published_through: Option<u64>,
 }
 
 impl Inspection {
     fn new(
         channel: LiveChannel,
+        snapshot: ServedSnapshot,
+        name: &str,
+        following: u64,
         probes: ProbeSlot,
         source_node_ids: HashMap<String, Vec<NodeId>>,
     ) -> Self {
         Self {
             channel,
+            snapshot,
+            name: name.to_string(),
+            following,
             probes,
             source_node_ids,
-            published_through: 0,
+            published_through: Some(0),
         }
+    }
+
+    /// Describe the version `main` now runs, if a reload changed it.
+    ///
+    /// Everything the inspector ships is named by `NodeId`, and a reload mints
+    /// fresh ids for every operator it rebuilt, so the payload, the anchors and
+    /// the frame stamp move together. The frame stamp moves last: a frame naming
+    /// a version the server cannot yet answer `/api/snapshot` with would send a
+    /// client to refetch the old one. The pass's `publish` sends a frame whether
+    /// or not a flow arrived: until then the newest frame carries the old
+    /// version's stamp and source anchors, and a client that connects is handed
+    /// it. Another branch's reload changes nothing here, and neither does
+    /// deleting `main`: the panes keep describing the last version it ran
+    /// (`src/inspector_model/design.md`, "A reload of main is followed").
+    fn follow(&mut self, live: &LiveProgram) {
+        let Some((version, program)) = live.program(MAIN_BRANCH) else {
+            return;
+        };
+        if version == self.following {
+            return;
+        }
+        self.snapshot.replace(program, &self.name, version);
+        self.source_node_ids = source_nodes(&program.operator_graph);
+        self.channel.follow(version);
+        self.following = version;
+        self.published_through = None;
     }
 
     /// Switch probing to match whether a client is connected, and sample the
@@ -246,7 +293,9 @@ impl Inspection {
                 self.probes.disable();
                 self.channel.forget_frame();
             }
-            self.published_through = 0;
+            if self.published_through.is_some() {
+                self.published_through = Some(0);
+            }
         }
         if !watched {
             return Vec::new();
@@ -255,7 +304,7 @@ impl Inspection {
     }
 
     /// Publish a frame if some probe took a reading that carried rows since the
-    /// last publish.
+    /// last publish, or if `main`'s version changed since it.
     ///
     /// The driver polls on a 10ms timer, and a poll that delivers nothing
     /// still takes an empty reading from every producer it pulls. Gating on
@@ -264,10 +313,10 @@ impl Inspection {
     /// nothing.
     fn publish(&mut self, sources: &[SourceWindow]) {
         let flows = self.probes.with_table(ProbeTable::flows);
-        let Some(flows) = flows.filter(|&flows| flows != self.published_through) else {
+        let Some(flows) = flows.filter(|&flows| Some(flows) != self.published_through) else {
             return;
         };
-        self.published_through = flows;
+        self.published_through = Some(flows);
         self.probes
             .with_table(|table| self.channel.publish_probes(table, sources));
     }
