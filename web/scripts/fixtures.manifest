@@ -4,7 +4,7 @@
 # Single source of truth for which programs have committed snapshot fixtures
 # (web/src/__fixtures__/<fixture>.snapshot.json). Read by BOTH
 # regen-fixtures.sh (the regen/fix path and the ci.sh drift gate) and the cargo
-# golden tests (tests/inspector_goldens.rs), so the two can never disagree
+# golden tests (tests/it/inspector_goldens.rs), so the two can never disagree
 # about the corpus. Keep it bounded — every entry adds regen churn.
 #
 # The programs are the demo gallery's (`tests/programs/<name>/program.cambra`,
@@ -18,14 +18,14 @@
 #
 # Every fixture is the full wire. A fixture is a whole payload document, and a
 # corpus program whose payload is too large to commit whole belongs in
-# tests/inspector_goldens.rs as a structural assertion over a fresh dump
+# tests/it/inspector_goldens.rs as a structural assertion over a fresh dump
 # instead — which is where `txn_multi_read`, `for_accumulator`,
 # `source_accumulator` and `inner_join` live. The first three hold a store, so
 # their bytes would re-bless on every change to how a store is built; a join's
 # payload is larger than any fixture here.
 #
 # A program added for backend coverage alone needs NO row here: ratchet 5 of
-# tests/inspector_goldens.rs already walks every gallery source through the
+# tests/it/inspector_goldens.rs already walks every gallery source through the
 # wire validator.
 #
 # What each row is for. A fixture earns its place by pinning a shape no other

@@ -487,7 +487,7 @@ fn test_collection_param_consumed(#[case] code: &str, #[case] expected: Value) {
 #[case("1 + 2 * (3 - 4)", Value::Int(-1))]
 #[case("7 // 2", Value::Int(3))]
 // `^+` computes the sum `+` computes; the two differ only in the result type
-// (`tests/type_check.rs`, `refining_addition_records_the_sum`), and op-conversion
+// (`tests/it/type_check.rs`, `refining_addition_records_the_sum`), and op-conversion
 // maps both to the one runtime addition.
 #[case("2 ^+ 3", Value::Int(5))]
 #[case("1 ^+ 2 * 3 - 4", Value::Int(3))]

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `web/src/__fixtures__/*.snapshot.json` are full `/api/snapshot` payloads for the
 corpus in `scripts/fixtures.manifest` — shared by the regen script, the
-`ci_fixtures` byte gate, and `tests/inspector_goldens.rs`. Re-bless via:
+`ci_fixtures` byte gate, and `tests/it/inspector_goldens.rs`. Re-bless via:
 
 ```bash
 web/scripts/regen-fixtures.sh   # from the repo root

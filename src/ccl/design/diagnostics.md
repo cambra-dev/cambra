@@ -52,7 +52,7 @@ write, which lowers to a different term than the one the checker holds.
   and the operators `nand`, `nor` and `xnor` among them.
 
 `a_written_type_prints_as_an_annotation_that_lowers_back` (`ccl/chl_print.rs`) checks the rows
-marked "yes", and `tests/compilation_pipeline/chl_types.rs` checks each row end to end.
+marked "yes", and `tests/it/compilation_pipeline/chl_types.rs` checks each row end to end.
 
 ---
 

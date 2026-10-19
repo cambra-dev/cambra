@@ -906,7 +906,7 @@ fn record_types_in_two_field_orders_compare(#[case] right: &str) {
 ///
 /// Rejected at **op-conversion**, not by the typing rule: the answer's *type* is fine, the
 /// key binder having discharged to the key
-/// (`tests/type_check.rs`'s `a_key_dependent_lookup_discharges_the_key_binder`), and it is
+/// (`tests/it/type_check.rs`'s `a_key_dependent_lookup_discharges_the_key_binder`), and it is
 /// the tiling that has no shape for it. The pipeline test earns its place beside the typing
 /// one: this is the whole program failing, and at the layer that owns the reason.
 #[test]
@@ -974,7 +974,7 @@ fn checked_lookup_over_a_key_stream(#[case] tail: &str, #[case] expected: Value)
 }
 
 /// A keyed annotation on a group-by, **compiled and run**. The annotation tests in
-/// `tests/type_check.rs` pin what one types as; these pin that an annotated program
+/// `tests/it/type_check.rs` pin what one types as; these pin that an annotated program
 /// produces a value, which no type test sees.
 ///
 /// `FullMap(_, _)` with the key elided is the only form a group-by satisfies — its domain

@@ -641,7 +641,7 @@ values at the keys its `input` carries. That input descends from an `IterateExte
 source, because inference admits no literal of a `source(name)` type and iteration is the only
 origin of such a key. The `IterateExtent` holds no input and its tiling names the source, so it is
 where a path from the source starts. Neither operator states an edge for its read of the source.
-`tests/inspector_goldens.rs` pins the descent (`a_source_read_descends_from_an_iteration_of_that_source`).
+`tests/it/inspector_goldens.rs` pins the descent (`a_source_read_descends_from_an_iteration_of_that_source`).
 
 **Serialization.** `src/inspector_model/design.md`, "A node on the wire" owns the payload shape. An
 operator node ships its label, its tiling, and its `inputs`; a boundary node ships no tiling,

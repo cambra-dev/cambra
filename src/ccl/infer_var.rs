@@ -856,7 +856,7 @@ mod tests {
     /// An opaque binder covers a reference wherever it stands, including on a
     /// holder minted before the binder was entered — the mutable-variable write
     /// whose contribution names a read binder
-    /// (`tests/compilation_pipeline/mutability.rs`,
+    /// (`tests/it/compilation_pipeline/mutability.rs`,
     /// `snapshot_write_to_an_unannotated_mut_var`).
     #[test]
     fn an_opaque_binder_covers_a_reference_on_a_holder_minted_before_it() {

@@ -4048,7 +4048,7 @@ mod annotation_kinds {
     /// The consequence is what a `match` must handle. Under the exact form the binder
     /// carries `` `none ``, so a `match` on `` `some `` alone is non-exhaustive for it;
     /// under the bounded form there is no `` `none `` to handle. The end-to-end values
-    /// are in `tests/compilation_pipeline/variants.rs`.
+    /// are in `tests/it/compilation_pipeline/variants.rs`.
     #[test]
     fn exact_widens_a_variants_tags_and_bounded_does_not() {
         assert_eq!(
@@ -4490,7 +4490,7 @@ fn the_alpha_variant_join_is_arrival_order_independent() {
 /// size bound. And a binder that cannot be eliminated should widen the type to
 /// the unrefined base rather than leave the name dangling — a `:=` definiens is
 /// the live case, held back from the discharge by `InferCtx::close_let_type` and
-/// reported by `check_scope_valid` (`tests/compilation_pipeline/transactions.rs`,
+/// reported by `check_scope_valid` (`tests/it/compilation_pipeline/transactions.rs`,
 /// `TODO(refined-txn-body)`).
 ///
 /// Tuple-parameter substitution has a separate constraint: lambda elimination

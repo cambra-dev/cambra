@@ -133,17 +133,9 @@
 //! while another branch lags (`src/ccl/design/program-evolution.md`, "The branch
 //! table").
 
-// `tests/it/main.rs` mounts this file with `#[path]`, which makes it resolve child
-// modules as a `mod.rs` does: relative to `tests/`, not to a directory named after
-// this file. So each `mod` names its path.
-#[path = "hot_reload/branching.rs"]
 mod branching;
-#[path = "hot_reload/cases.rs"]
 mod cases;
-#[path = "hot_reload/fanout_lag.rs"]
 mod fanout_lag;
-#[path = "hot_reload/harness.rs"]
 mod harness;
-#[path = "hot_reload/inspector.rs"]
 mod inspector;
 use crate::serving;

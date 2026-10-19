@@ -1990,7 +1990,7 @@ where
 /// One handle (or clones of it, which are the same memo) across the *whole* tree
 /// walk. A fresh memo per node re-shares only within that node and splits across
 /// the tree — the bug this type exists to prevent. Guarded end-to-end by
-/// `tests/predicate_sharing.rs` and, per phase, by asserting
+/// `tests/it/predicate_sharing.rs` and, per phase, by asserting
 /// [`distinct_predicate_rcs`] does not grow across a rewrite-only pass.
 pub struct PredMemo<C = ()>(Rc<RefCell<MemoStore<C>>>);
 
@@ -2274,7 +2274,7 @@ impl TermMemo {
 /// entry: the result's length is the sharing metric ([`distinct_predicate_rcs`]),
 /// while [`Refinement`]'s own structural `PartialEq` lets a caller ask the
 /// sharper question — whether two of those *distinct* `Rc`s denote the same
-/// refinement, i.e. whether sharing was split (see `tests/predicate_sharing.rs`).
+/// refinement, i.e. whether sharing was split (see `tests/it/predicate_sharing.rs`).
 pub fn reachable_refinements(expr: &Expr) -> Vec<Refinement> {
     fn in_type(ty: &Type, out: &mut Vec<Refinement>, seen: &mut HashSet<PredicateId>) {
         if let Type::Refinement(_, refinements) = ty {
@@ -2309,7 +2309,7 @@ pub fn reachable_refinements(expr: &Expr) -> Vec<Refinement> {
 ///
 /// A count is a *necessary* check, not a sufficient one — it cannot see a split
 /// that a pass pairs with an equal-sized collapse elsewhere. The end-to-end
-/// guard in `tests/predicate_sharing.rs` closes that by asserting no two
+/// guard in `tests/it/predicate_sharing.rs` closes that by asserting no two
 /// distinct `Rc`s are structurally equal, which names the defect directly.
 pub fn distinct_predicate_rcs(expr: &Expr) -> usize {
     reachable_refinements(expr).len()

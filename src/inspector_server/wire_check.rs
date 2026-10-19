@@ -2,7 +2,7 @@
 //!
 //! The `/api/snapshot` half mirrors the frontend's `validateSnapshot`
 //! (`web/src/wireValidate.ts`), so the transport, the server and
-//! `tests/inspector_goldens.rs` check the contract the frontend reads. The two
+//! `tests/it/inspector_goldens.rs` check the contract the frontend reads. The two
 //! cannot share code, so each language carries its own validator.
 //!
 //! The `/api/live` half, [`assert_probe_frame_shape`], has no TypeScript twin.
@@ -10,7 +10,7 @@
 //! `inspector_model::frame`'s golden test compares against the committed
 //! fixture `web/src/__fixtures__/probe_frame.json`.
 //!
-//! **Public, not `#[cfg(test)]`.** `tests/inspector_goldens.rs` is a separate
+//! **Public, not `#[cfg(test)]`.** `tests/it/inspector_goldens.rs` is a separate
 //! crate linking the library as a consumer does, so a `#[cfg(test)]` item is
 //! invisible to it — and the committed golden corpus is the payload set that
 //! most needs validating, being the one the frontend reads. Gating this behind a

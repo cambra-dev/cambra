@@ -3780,7 +3780,7 @@ pub struct Refinement {
     /// through [`crate::ccl::ccl_utils::walk_refined_predicates_mut`] /
     /// [`crate::ccl::ccl_utils::PredMemo`], which preserve the sharing across a
     /// pass. Use [`Refinement::born`] only for a genuinely *new* predicate.
-    /// Guarded by `tests/predicate_sharing.rs`.
+    /// Guarded by `tests/it/predicate_sharing.rs`.
     pub predicate: Rc<TypedExpr>,
 }
 

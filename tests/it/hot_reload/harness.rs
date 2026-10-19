@@ -2,7 +2,7 @@
 //!
 //! Split from [`cases`](super::cases) because it is the larger half — a running
 //! program, a control port and a swap are more setup than any one case's
-//! assertion. See `tests/hot_reload.rs` for what the programs are and what a
+//! assertion. See `tests/it/hot_reload.rs` for what the programs are and what a
 //! reload may do to them.
 
 use std::{
@@ -897,7 +897,7 @@ impl OneFile for LiveProgram {
 
 pub(crate) fn source(name: &str, port: u16) -> String {
     let text = match name {
-        "guestbook" => include_str!("../programs/hot_reload/program.cambra"),
+        "guestbook" => include_str!("../../programs/hot_reload/program.cambra"),
         "bump-over-source" => fixtures::BUMP_OVER_SOURCE,
         "bump-over-source-reseeded" => fixtures::BUMP_OVER_SOURCE_RESEEDED,
         "record-accumulator" => fixtures::RECORD_ACCUMULATOR,
@@ -909,7 +909,7 @@ pub(crate) fn source(name: &str, port: u16) -> String {
         "guestbook-drops-route" => fixtures::GUESTBOOK_DROPS_ROUTE,
         "guestbook-drops-state" => fixtures::GUESTBOOK_DROPS_STATE,
         "guestbook-retypes-state" => fixtures::GUESTBOOK_RETYPES_STATE,
-        "guestbook-stateful-edit" => include_str!("../programs/hot_reload/reloaded.cambra"),
+        "guestbook-stateful-edit" => include_str!("../../programs/hot_reload/reloaded.cambra"),
         "guestbook-stateless-edit" => fixtures::GUESTBOOK_STATELESS_EDIT,
         "latest-write" => fixtures::LATEST_WRITE,
         "latest-write-writer-edit" => fixtures::LATEST_WRITE_WRITER_EDIT,

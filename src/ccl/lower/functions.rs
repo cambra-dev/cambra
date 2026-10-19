@@ -608,7 +608,7 @@ mod tests {
     /// parameter itself is not among them and a reference to it is an ordinary
     /// unbound variable — pinned end to end by `type_scope_self` and
     /// `type_annotation_naming_a_parameter_is_unbound` in
-    /// `tests/compilation_pipeline/type_annotations.rs`.
+    /// `tests/it/compilation_pipeline/type_annotations.rs`.
     #[rstest]
     // An enclosing `let` binding: in scope, and discharged to its definiens as
     // the type leaves that scope.

@@ -2,10 +2,10 @@
 //!
 //! Every test binary statically links the whole library, so each one costs a copy of it
 //! on disk and a link after any `src/` edit; the tests that can share a process share
-//! this binary, each `tests/*.rs` file a module of it. The ones that cannot share a
-//! process are separate `[[test]]` targets in `Cargo.toml`: the two that install
-//! `alloc_probe`'s counting `#[global_allocator]` (an allocator is per-process), and
-//! `differential_oracle`, which needs the Lean toolchain.
+//! this binary, each file under `tests/it/` a module of it. The tests that cannot share a
+//! process are top-level `tests/*.rs` files, each its own binary and each declared as a
+//! `[[test]]` in `Cargo.toml` with the reason; [`test_layout`] fails on a top-level file
+//! that is not, and on a module file no `mod` line names.
 
 // Support modules the test modules share, mounted once: a file loaded as two
 // modules of one crate is two copies of it (`clippy::duplicate_mod`).
@@ -20,41 +20,27 @@ mod serving;
 #[path = "../type_gen/mod.rs"]
 mod type_gen;
 
-#[path = "../chl_parser_roundtrip.rs"]
 mod chl_parser_roundtrip;
-#[path = "../cli_driver_convergence.rs"]
 mod cli_driver_convergence;
-#[path = "../compilation_pipeline.rs"]
 mod compilation_pipeline;
-#[path = "../constraint_order_fuzz.rs"]
 mod constraint_order_fuzz;
-#[path = "../differential_interp.rs"]
 mod differential_interp;
-#[path = "../editor_grammars.rs"]
 mod editor_grammars;
-#[path = "../generated_pairs.rs"]
 mod generated_pairs;
-#[path = "../hot_reload.rs"]
 mod hot_reload;
-#[path = "../http_server.rs"]
 mod http_server;
-#[path = "../inference_variants.rs"]
 mod inference_variants;
-#[path = "../inspector_goldens.rs"]
 mod inspector_goldens;
-#[path = "../loop_body_binding_cost.rs"]
 mod loop_body_binding_cost;
-#[path = "../predicate_sharing.rs"]
 mod predicate_sharing;
-#[path = "../predicate_sharing_review.rs"]
 mod predicate_sharing_review;
-#[path = "../programs/main.rs"]
+// The gallery stays at `tests/programs/`: its `program.cambra` paths are read at run time
+// and recorded in the inspector's golden fixtures. Its root is `mod.rs` rather than
+// `main.rs`, which autodiscovery would build as a binary of its own.
+#[path = "../programs/mod.rs"]
 mod programs;
-#[path = "../reserve_port.rs"]
 mod reserve_port;
-#[path = "../subtype_transitivity_fuzz.rs"]
 mod subtype_transitivity_fuzz;
-#[path = "../test_sink.rs"]
+mod test_layout;
 mod test_sink;
-#[path = "../type_check.rs"]
 mod type_check;

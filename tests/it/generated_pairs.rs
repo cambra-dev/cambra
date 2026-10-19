@@ -49,7 +49,7 @@ use panic_message::panic_message;
 /// `live_rows_agree`.
 ///
 /// `function_body` is not here: its `rows_sum` cell does not compile
-/// (`a_def_body_summing_jagged_rows_does_not_compile`, in `tests/compilation_pipeline/sums.rs`).
+/// (`a_def_body_summing_jagged_rows_does_not_compile`, in `tests/it/compilation_pipeline/sums.rs`).
 const LIVE: &[&str] = &[
     "aggregate_arg",
     "binop_operand",

@@ -3638,7 +3638,7 @@ fn a_one_entry_seed_reaches_a_transactional_keyed_write() {
 ///
 /// Two adjacent shapes are absent. A constant whole-collection write through a parameter
 /// (`m := box(map(…))`) is not keyed; `a_constant_whole_map_write_through_a_mut_parameter` in
-/// `tests/differential_interp.rs` covers it. Transactional pass-by-reference is refused at
+/// `tests/it/differential_interp.rs` covers it. Transactional pass-by-reference is refused at
 /// lowering: a `with begin():` block takes writes, bindings, guards and feeds, not a call.
 #[test]
 fn a_keyed_write_through_a_mut_parameter() {
@@ -3759,7 +3759,7 @@ fn a_keyed_write_reads_back_through_a_checked_lookup() {
 /// back at one.
 ///
 /// What the transactional path adds over the immutable cases
-/// (`tests/compilation_pipeline/joins_aggregates_groupby.rs`'s `a_product_keys_a_collection`)
+/// (`tests/it/compilation_pipeline/joins_aggregates_groupby.rs`'s `a_product_keys_a_collection`)
 /// is that the key is a per-row product built from the loop binder rather than a literal.
 #[test]
 fn a_product_keys_a_mutable_collection() {

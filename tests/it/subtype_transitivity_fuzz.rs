@@ -12,7 +12,7 @@
 //! same property of the *declarative* relation; this checks the implementation,
 //! which is the half a proof about a model cannot reach.
 //!
-//! `tests/constraint_order_fuzz.rs` fuzzes the same defect class one level up: an
+//! `tests/it/constraint_order_fuzz.rs` fuzzes the same defect class one level up: an
 //! answer that depends on the order constraints arrive in.
 //!
 //! Seeded and dependency-free, so a failure replays — `CAMBRA_FUZZ_SEED` picks the

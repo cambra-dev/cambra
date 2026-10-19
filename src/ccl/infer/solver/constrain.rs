@@ -3166,7 +3166,7 @@ mod tests {
     // dereffed by the rule that emits it (`emit::emit_value_read`), so `Mut(V) <: V` is not
     // a subtyping fact. That `cnt + 1` yields `Int` rather than leaving a `Mut` on an
     // inference variable is pinned where it is decided,
-    // `a_mut_var_read_yields_its_value_in_a_value_position` in `tests/type_check.rs`.
+    // `a_mut_var_read_yields_its_value_in_a_value_position` in `tests/it/type_check.rs`.
 
     #[test]
     fn mut_meets_mut_invariantly() {

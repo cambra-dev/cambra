@@ -3220,7 +3220,7 @@ mod tests {
         // a shared variable at coalesce.
         //
         // The one-way `arg <: domain` rule that puts them there is what the
-        // `IncompatibleBounds` tests in `tests/type_check.rs` cover, joining two types
+        // `IncompatibleBounds` tests in `tests/it/type_check.rs` cover, joining two types
         // without an operator in the way.
         let mut expr = double_apply_lambda(Type::Base(BaseType::Int), Type::Base(BaseType::String));
         let mut ctx = TypeInferenceContext::new();

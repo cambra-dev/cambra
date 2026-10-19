@@ -36,7 +36,7 @@ use crate::ccl::{
 /// `let __hist = Transact{…} in <reads off __hist.field>`. An unrecognized
 /// group is a compile-time panic (no silent fallback) — the phases and this
 /// recognizer are co-designed against the point-free normal forms, exercised
-/// end-to-end by the induction suite (`tests/compilation_pipeline/mutability.rs`),
+/// end-to-end by the induction suite (`tests/it/compilation_pipeline/mutability.rs`),
 /// so a mismatch is a bug here, not in the program.
 ///
 /// Running post-elim is what retires the pointful/point-free double

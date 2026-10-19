@@ -21,8 +21,6 @@ license = "Apache-2.0"
 description = "A programming language with a dependently-typed functional core and streaming-dataflow execution"
 repository = "https://github.com/cambra-dev/cambra"
 readme = "README.md"
-# The `[[test]]` targets below list every integration test binary.
-autotests = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -97,12 +95,10 @@ overflow-checks = false
 # No one runs a debugger on this tree: 11G with full debug info, 2.7G without.
 debug = false
 
-# The integration tests are one binary (`tests/it/main.rs`) plus the few that cannot
-# share a process, listed below. Autodiscovery would also build every `tests/*.rs` as
-# its own binary, hence `autotests = false`. Cargo infers each target's file from its
-# name: `tests/<name>.rs` or `tests/<name>/main.rs`.
-[[test]]
-name = "it"
+# Every top-level `tests/*.rs` is a test binary of its own, linking the whole library,
+# so each is declared here with the reason it cannot be a module of `tests/it/main.rs`;
+# `tests/it/test_layout.rs` fails on one that is not.
+#
 # `alloc_probe` installs a counting `#[global_allocator]`, and an allocator is
 # per-process, so each binary that measures allocations is its own target.
 [[test]]

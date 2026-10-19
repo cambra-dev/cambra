@@ -1235,7 +1235,7 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
 /// collections opens both sums while typing one body, and one site carries both:
 /// `Σ (σ₄ : 𝐾₄). Σ (σ₇ : 𝐾₇). ((σ₄, σ₇) ⤇ Int)`. Typing is pinned by
 /// `two_conditional_sources_keep_their_witnesses_apart` and
-/// `a_nested_sum_is_consumed_by_an_aggregate` (both in `tests/type_check.rs`); this is the
+/// `a_nested_sum_is_consumed_by_an_aggregate` (both in `tests/it/type_check.rs`); this is the
 /// compilation.
 ///
 /// Realization takes both witnesses at once, so the legs are the four **combinations**, each

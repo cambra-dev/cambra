@@ -847,7 +847,7 @@ fn an_introduction_in_a_loop_carrying_only_transactional_writes_is_rejected() {
 
 /// A `for` nested in a mutation loop that neither feeds nor writes a mutable variable declared
 /// outside it has no recurrence to fold and contributes nothing, and is refused at lowering.
-/// One that feeds is a feed-only loop (`tests/differential_interp.rs`).
+/// One that feeds is a feed-only loop (`tests/it/differential_interp.rs`).
 #[rstest]
 #[case::binds_only(indoc! {r#"
     t := 0
@@ -1782,7 +1782,7 @@ acc",
 }
 
 // A nested `for` compiles to a nested recurrence — one inner `Transact` per position of the
-// loop around it — and `tests/compilation_pipeline/nested_loops.rs` is where that lives.
+// loop around it — and `tests/it/compilation_pipeline/nested_loops.rs` is where that lives.
 // A `:=` *between* the loops is the case this file's sequential-mutable-variable
 // reasoning turns on, and it is pinned there as
 // `a_mutable_variable_may_be_introduced_between_the_loops`.

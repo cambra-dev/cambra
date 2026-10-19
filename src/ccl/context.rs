@@ -1601,7 +1601,7 @@ pub(crate) fn provenance_capture_enabled() -> bool {
 /// `fold_induction_loop` call in `transact_phase` (a commit decision reading
 /// another loop's accumulator) and `flatten_spine`'s value-position writer hoist
 /// both sat outside it. With this on, the corpus is every program the caller
-/// compiles — point it at `tests/compilation_pipeline` and the gate covers the
+/// compiles — point it at `tests/it/compilation_pipeline` and the gate covers the
 /// whole suite instead of the programs `corpus()` lists.
 ///
 /// Off by default because it folds the table twice per compile, which is

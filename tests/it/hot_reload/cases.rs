@@ -1,4 +1,4 @@
-//! One case per row of the guard table in `tests/hot_reload.rs`.
+//! One case per row of the guard table in `tests/it/hot_reload.rs`.
 
 use std::{sync::mpsc, thread, time::Duration};
 

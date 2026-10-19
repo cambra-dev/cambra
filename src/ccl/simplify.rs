@@ -93,7 +93,7 @@ use crate::ccl::{
 /// so it is tempting to protect it the same way — dropping a cast looks like a
 /// "filter silently dropped" hazard.  It is not, and adding the guard
 /// regresses real reductions (refinement: `test_new_compile::case_27` in
-/// `tests/compilation_pipeline.rs`).  No rule matches a `Cast` node (the
+/// `tests/it/compilation_pipeline.rs`).  No rule matches a `Cast` node (the
 /// simplify rules operate on `Apply`/`Compose`), so none collapses `cast(v)`
 /// to `v` directly; a rule only *drops a sub-tree containing a cast* when that
 /// sub-tree is extensionally dead — a tuple arm a later `Proj` discards

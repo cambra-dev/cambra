@@ -23,7 +23,7 @@ highlighted. The lexer assigns the classes: `highlight_class` and `highlight` in
 `chl-parser/src/lexer.rs`.
 
 The keyword lists match `KEYWORDS` in `chl-parser/src/lexer.rs`. The test
-`tests/editor_grammars.rs` reads the `keyword-control`, `keyword-other` and `constant-boolean`
+`tests/it/editor_grammars.rs` reads the `keyword-control`, `keyword-other` and `constant-boolean`
 rules from the TextMate grammar and the `syn keyword` lines from the Vim syntax file, and fails when
 either differs from the lexer. Keep each keyword class on one rule so the test can read it.
 
@@ -50,8 +50,8 @@ The builtin names are the spellings in `SURFACE_BUILTINS` in `chl-parser/src/bui
 row of it: the functions, the transaction marker `begin`, the sink declarations `http_serve` and
 `test_sink`, and the source `stdin`. Each is a name the compiler resolves by its spelling, which is
 what the class marks; a row's kind says where the name is accepted, not whether it is a builtin.
-`tests/editor_grammars.rs` reads the TextMate `builtin` rule and the Vim `syn match cambraBuiltin`
-line, and fails when either differs from the table.
+`tests/it/editor_grammars.rs` reads the TextMate `builtin` rule and the Vim
+`syn match cambraBuiltin` line, and fails when either differs from the table.
 
 Highlighting is by spelling. A user binding that shadows a builtin, such as a parameter named
 `max`, and a field or keyword argument spelled like one, such as `r.max`, are colored as the
@@ -131,7 +131,7 @@ The check has three parts:
 A checker that finds no span to check fails, and so does `./ci.sh editors` when it finds no
 `.cambra` file.
 
-Two sets of tests keep the corpus complete. `tests/editor_grammars.rs` requires
+Two sets of tests keep the corpus complete. `tests/it/editor_grammars.rs` requires
 `highlight-classes.json` to name exactly `HighlightClass::ALL`, and `sample.cambra` to parse and to
 produce every class. The tests in `chl-parser/src/lexer.rs` require `sample.cambra` to contain every
 escape in `ESCAPES` and the spelling of every keyword and operator or punctuation `Token` variant.
@@ -198,9 +198,9 @@ A case an editor gets wrong carries that editor's name in `expected_failures`, w
 instead. The checker fails when such a case gets `indent`, so a fixed limit loses its marker. Every
 Enter limit listed under [VS Code](#vs-code) has a case marked `vscode`; no case is marked `nvim`.
 
-`next` is the text of the line Enter opens and `rest` the lines after it. `tests/editor_grammars.rs`
-requires each case's `lines`, `next` at `indent`, and `rest` to form a program `parse_module`
-accepts.
+`next` is the text of the line Enter opens and `rest` the lines after it.
+`tests/it/editor_grammars.rs` requires each case's `lines`, `next` at `indent`, and `rest` to form a
+program `parse_module` accepts.
 
 ## Language server checks
 

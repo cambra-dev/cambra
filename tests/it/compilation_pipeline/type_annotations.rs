@@ -716,7 +716,7 @@ fn a_field_read_of_the_parameter_and_of_a_record_in_scope() {
 
 /// A record equality in the *body* is accepted, and the refinement above it is what
 /// the program then fails: `Equatable` reads a product componentwise
-/// (`tests/type_check.rs`, `products_are_equatable_componentwise`), so `t == t` is an
+/// (`tests/it/type_check.rs`, `products_are_equatable_componentwise`), so `t == t` is an
 /// ordinary `Bool`, and a `Bool` carries no singleton for `Bool@true` to match.
 ///
 /// A refinement is discharged by matching the predicate rather than by proving it, so

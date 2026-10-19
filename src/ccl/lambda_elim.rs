@@ -2528,7 +2528,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                 // the node's type, so this type quotes a term that a
                 // structurally-equal predicate elsewhere on the tree — one riding
                 // a node the pass reached by another route — need not quote. That
-                // is the sharing split `tests/predicate_sharing.rs` guards
+                // is the sharing split `tests/it/predicate_sharing.rs` guards
                 // against, and the discharge has to quote the eliminated term:
                 // the post-pass check reconstructs this node from the tree it is
                 // handed, which holds only that one. Whether the two ever diverge

@@ -381,7 +381,7 @@ fn coalesce_type_kind(
             // materializes as `Σ (σ : [A, B]). …` or `Σ (σ : [B, A]). …`, and `Type`
             // compares candidates positionally, so those are two types. Sorted by rendering,
             // the same key planning uses to order a refinement set. Found by
-            // `tests/constraint_order_fuzz.rs`.
+            // `tests/it/constraint_order_fuzz.rs`.
             out.sort_by_cached_key(|t| t.to_string());
             Ok(crate::ccl::ty::TypeKind::Enumerated(out))
         }
@@ -465,7 +465,7 @@ fn coalesce_compact_go(
             // the pair being reported was never the conflict the report claimed.
             //
             // The least id, for an answer that does not depend on which contribution the
-            // lattice happened to store first (`tests/constraint_order_fuzz.rs`).
+            // lattice happened to store first (`tests/it/constraint_order_fuzz.rs`).
             None => *seen.iter().min().expect("seen is non-empty"),
         };
         atoms.push(Type::WitnessRef(resolved));

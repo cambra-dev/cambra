@@ -979,9 +979,9 @@ is why dispatch on the sequencing domain is load-bearing (not an optimization):
 loop depends only on program start, which — being a single event — imposes no order among the blocks it
 triggers (the spec's ordering model), so their commit order is unconstrained. The engine realizes that
 freedom through its serialization choice (`drain_start`); any serialization the model admits is a
-correct outcome. This is why the batch programs in `tests/compilation_pipeline/transactions.rs` pass
-only because their bodies are commutative — they add no edge that distinguishes their commit order, so
-they are effectively engine tests.
+correct outcome. This is why the batch programs in `tests/it/compilation_pipeline/transactions.rs`
+pass only because their bodies are commutative — they add no edge that distinguishes their commit
+order, so they are effectively engine tests.
 
 **Open / under-specified.** Two genuine model questions remain: the merge order of a feed `++`-union
 across multiple feeders (or several feeds in one body), and the multi-writer commit-stream merge order

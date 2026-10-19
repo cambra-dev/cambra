@@ -57,7 +57,7 @@ inspected is the compiler:
 - The **transport and delivery vehicle** is `src/inspector_server/`: it turns
   the model into JSON (`snapshot_json`), serves it over HTTP (`serve.rs`), and
   embeds the built frontend bundle. `wire_check.rs` is the structural validator
-  both those tests and `tests/inspector_goldens.rs` assert the wire against.
+  both those tests and `tests/it/inspector_goldens.rs` assert the wire against.
 
 ```
 browser ──HTTP──> cambra --inspect-only ──> inspector_server ──> inspector_model ──> compile_program
@@ -127,14 +127,14 @@ fixtures (see the README in the web frontend's `__fixtures__` directory).
 A dump is always the whole payload. `scripts/fixtures.manifest` maps each
 committed fixture to the gallery program it is dumped from, and a program whose
 payload is too large to commit is asserted structurally in
-`tests/inspector_goldens.rs` instead of being pinned as a document.
+`tests/it/inspector_goldens.rs` instead of being pinned as a document.
 
 ## Testing
 
 **Backend (Rust):** `cargo test -p cambra` — the model and provenance substrate
 (`src/inspector_model/`), the JSON shape and server bodies
 (`src/inspector_server/`), and the golden corpus
-(`tests/inspector_goldens.rs`).
+(`tests/it/inspector_goldens.rs`).
 
 **Frontend (TypeScript):** see [`web/README.md`](../web/README.md). In short, from
 `web/`: `npm run typecheck`, `npm run test` (vitest), `npm run build`.

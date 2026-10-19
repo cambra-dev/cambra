@@ -1371,9 +1371,9 @@ mod tests {
     }
 
     /// End-to-end coverage: `test_filter_over_a_projected_component` in
-    /// `tests/compilation_pipeline/records.rs` for a filtered component, and
+    /// `tests/it/compilation_pipeline/records.rs` for a filtered component, and
     /// `a_conditionally_fed_output_answers_the_requests_its_guard_admits` in
-    /// `tests/http_server.rs` for the same shape as a program output.
+    /// `tests/it/http_server.rs` for the same shape as a program output.
     #[rstest]
     #[case::collection(data_fun_ty(Type::UIntRange(3), int_ty()), true)]
     #[case::compute_function(fun_ty(Type::UIntRange(3), int_ty()), false)]

@@ -62,7 +62,7 @@ pub(super) fn realize_conditional_collections(
     // every type still says `Σ`. A type asserting an indeterminacy the term no longer has
     // is not a harmless leftover: the domain it presents at a consuming site is a witness,
     // which has no extent, so `planning::iterate` cannot build an iteration source for it
-    // and drops the site's refinements with it (`tests/compilation_pipeline/sums.rs`).
+    // and drops the site's refinements with it (`tests/it/compilation_pipeline/sums.rs`).
     //
     // Safe under exactly the precondition `unbox` already checks — one candidate, so the
     // witness stands for a domain that is *known* — and applied to exactly the binders it
@@ -246,7 +246,7 @@ fn undetermined_witness(ty: &Type) -> bool {
 /// The mutable writes and feeds merge terms into one variable as well, and have no arm. A `:=`
 /// overwrite and a `<<=` feed of jagged rows compile, since each writes a whole list literal
 /// whose elements this walk reaches. Two `<<` appends of rows at differing domains and a keyed
-/// write of one do not compile; `tests/compilation_pipeline/sums.rs` pins both failures.
+/// write of one do not compile; `tests/it/compilation_pipeline/sums.rs` pins both failures.
 fn child_demand(expr: &Expr, effective: &Type) -> Option<Type> {
     match &expr.node {
         TypedExprNode::Apply { function, .. }

@@ -373,7 +373,7 @@ describe("a graph that reads a source", () => {
 
 describe("a back edge and a late one", () => {
   // No committed fixture carries either: the programs that hold a store are
-  // asserted structurally in `tests/inspector_goldens.rs` rather than pinned
+  // asserted structurally in `tests/it/inspector_goldens.rs` rather than pinned
   // whole. So the shapes are built by hand, after the ones
   // `assert_store_edge_shapes` pins on the Rust side.
   const op = (

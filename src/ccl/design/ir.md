@@ -293,7 +293,7 @@ generator beside another generator reaches this rejection. The let-bound spellin
 and fails in union-key lookup instead. The respective tests are
 `an_inline_union_generator_beside_a_second_generator` and
 `a_let_bound_union_generator_beside_a_second_generator` in
-`tests/compilation_pipeline/scalars_collections.rs`.
+`tests/it/compilation_pipeline/scalars_collections.rs`.
 
 ### The program's outputs are a trailing `Record`
 

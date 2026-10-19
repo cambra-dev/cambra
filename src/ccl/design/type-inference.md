@@ -78,7 +78,7 @@ idempotent. Resolution also incorporates information from constructed collection
 The order-independence fuzz test compares a baseline with eight shuffled orders for each of 2,000
 generated constraint sets by default; `CAMBRA_FUZZ_N` configures the set count. This is evidence
 from coverage, not a proof for all inputs (`solving_is_independent_of_constraint_arrival_order` in
-`tests/constraint_order_fuzz.rs`). A separate test,
+`tests/it/constraint_order_fuzz.rs`). A separate test,
 `a_shared_kind_var_resolves_the_same_way_in_every_order`, checks all 24 permutations of one
 four-constraint case, demonstrating delayed kind propagation for that case rather than proving
 the general property.
@@ -526,7 +526,7 @@ For example, a grouping key can have singleton `Int@1` below it and `Int` above 
 demand alone loses the singleton. The negative-position merge retains the contribution needed for
 the invariant data domain. Tests include `a_negative_position_meets_both_sides` in
 `infer/solver/compact.rs` and `a_groupby_over_a_singleton_element_literal` in
-`tests/compilation_pipeline/joins_aggregates_groupby.rs`.
+`tests/it/compilation_pipeline/joins_aggregates_groupby.rs`.
 
 This resolves one position. Relating two spellings of an invariant domain is a separate constraint;
 see [A shared hole naming a domain states an equation](#a-shared-hole-naming-a-domain-states-an-equation).
@@ -569,7 +569,7 @@ would revisit nested types more often and would also reach compute-function para
 The higher-order dependent-application case can present data domains whose predicates differ
 only in the spelling of a discharged binder. Structural refinement comparison does not identify
 those spellings. See `higher_order_dependent_application_discharges_the_binder` in
-`tests/type_check.rs`.
+`tests/it/type_check.rs`.
 
 ##### Compaction traversal cost
 
@@ -1021,7 +1021,7 @@ A concrete call can expose incompatible domain alternatives and be rejected. Ove
 source collection, the domains are already concrete in the definition, so the same conflict need
 not wait for a call. See [The domain join needs `box`](#the-domain-join-needs-box).
 
-Regression coverage is in `tests/type_check.rs` and `infer/solve.rs`, including
+Regression coverage is in `tests/it/type_check.rs` and `infer/solve.rs`, including
 `a_dead_definitions_calls_splice_no_specialization`,
 `a_definition_whose_use_failed_is_checked_alone_once`, and
 `one_defect_does_not_multiply_by_the_enclosing_specialization_count`.
@@ -1201,7 +1201,7 @@ base type. Splitting one predicate into several equivalent allocations can make 
 copy.
 
 The [memo context rules](#predicate-memo-contexts) specify when a rebuild may be reused.
-`tests/predicate_sharing.rs` checks for equal predicates at distinct allocations after inference.
+`tests/it/predicate_sharing.rs` checks for equal predicates at distinct allocations after inference.
 Its programs use distinct authored filters, so an equal group identifies a split rather than two
 independently authored equal predicates. `distinct_predicate_rcs` supports allocation-count checks;
 neither check proves global interning or measures downstream compilation cost.
@@ -2816,7 +2816,7 @@ for the extent of the assertion.
   `Σ (𝑇 : [Int, String]). 𝑇`. Supporting such packages would require introduction
   and consumer typing rules as well as an appropriate representation.
 - Inference success does not imply runtime compilation support. Current examples and
-  named rejections are in `tests/compilation_pipeline/sums.rs` and
+  named rejections are in `tests/it/compilation_pipeline/sums.rs` and
   [Compiling a conditional collection](collections.md#compiling-a-conditional-collection).
   Jagged collections and comprehensions over witness-domained collections are supported.
   A `for` loop over a sum is rejected before constructing its history, including
@@ -3021,7 +3021,7 @@ Two problems look like they want an obligation of their own, and are not:
   A syntactic strip cannot stand in for any of this: `strip_refinements` returns a `Type::Infer` untouched, so it covers a *literal* seed and nothing else — `x := r.a` would type the mutable variable as `{Int | __elem == 0}`. A second strip, on `MutWrite`'s *target*, buys diagnostic ordering by weakening a check that should hold; the constraint is instead skipped outright when the target is not a mutable variable, and `check_mut_write_targets` owns that diagnosis.
 * **A projection's domain** resolving to its open-product *demand* rather than to the value flowing in. Replacing the codomain with a field-selection rule does not fix this, because the demand is load-bearing *inference*: `λ 𝑟 → 𝑟.x` infers `{x: ?} ⇒ ?` from that demand alone, and restoring it as a bound puts the narrow record back on the domain. The problem is that a negative position resolves to its demand, which is the same thing the opposite-polarity fallback exists for — see [Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass).
 
-A **mutable variable** keeps its extent because nothing strips it. A seed contributes verbatim, so `c := [v for v in xs if 𝑝]` types as the filtered collection it is. That shape then fails downstream: it does not terminate in join planning's `insert_iterate_markers`, while everything before it completes (inference, the post-letrec `typecheck`, group-by recognition, `simplify`). A loop body's write computed from the collection's own value, such as `c := [v + 𝑖 for v in c]`, does not finish compiling either. A constant whole-collection write (`c := [3, 4]`) and a keyed write (`m[𝑘] := 𝑣`) compile (`tests/differential_interp.rs`). The non-terminating cases are planning bugs to fix alongside mutable-collection support, not restrictions to encode in the type system.
+A **mutable variable** keeps its extent because nothing strips it. A seed contributes verbatim, so `c := [v for v in xs if 𝑝]` types as the filtered collection it is. That shape then fails downstream: it does not terminate in join planning's `insert_iterate_markers`, while everything before it completes (inference, the post-letrec `typecheck`, group-by recognition, `simplify`). A loop body's write computed from the collection's own value, such as `c := [v + 𝑖 for v in c]`, does not finish compiling either. A constant whole-collection write (`c := [3, 4]`) and a keyed write (`m[𝑘] := 𝑣`) compile (`tests/it/differential_interp.rs`). The non-terminating cases are planning bugs to fix alongside mutable-collection support, not restrictions to encode in the type system.
 
 ### Delivery: the watch follows the edge
 
@@ -3494,7 +3494,7 @@ filter_against(`pair((0, 1)))
 recorded on a variable whose telescope contains `tagged` but not `p`. Inference does not
 return a typed error or reach the post-inference scope check for this program.
 `arm_dependent_filter_result_panics_when_recording_an_escaping_bound` in
-`tests/type_check.rs` pins this outcome in debug and no-assertions builds. The result needs
+`tests/it/type_check.rs` pins this outcome in debug and no-assertions builds. The result needs
 its dependency expressed in terms of values available outside the arm.
 
 One proposed construction is a result predicate that performs the same match. In

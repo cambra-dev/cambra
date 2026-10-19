@@ -11,7 +11,7 @@
 # will, by design.
 #
 # The corpus (fixture -> program mapping) lives in fixtures.manifest next to
-# this script — shared with the cargo golden tests (tests/inspector_goldens.rs)
+# this script — shared with the cargo golden tests (tests/it/inspector_goldens.rs)
 # so the regen path and the tests can never disagree about the corpus. A row is two
 # words and nothing else, so the two parsers have nothing to disagree about.
 #

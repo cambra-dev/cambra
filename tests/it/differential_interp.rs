@@ -429,7 +429,7 @@ fn a_filter_reading_both_nested_binders() {
 
 /// The forms a nested loop's write reads its two binders through, read through a sink so the
 /// scheduler drives the nest a position at a time. The filters are the forms the nest's own
-/// tests (`tests/compilation_pipeline/nested_loops.rs`) do not reach: a filter's predicate
+/// tests (`tests/it/compilation_pipeline/nested_loops.rs`) do not reach: a filter's predicate
 /// and its rows arrive at each enclosing position separately.
 #[rstest]
 #[case::a_filter_on_the_outer_binder("sum([z for z in [1, 2, 3] if z > i])")]
