@@ -133,9 +133,9 @@
 //! while another branch lags (`src/ccl/design/program-evolution.md`, "The branch
 //! table").
 
-// A test binary's crate root resolves child modules relative to `tests/`, not to
-// a directory named after this file, so each `mod` names its path. `common` is
-// the gallery's HTTP and scheduler glue, compiled into this binary too.
+// `tests/it/main.rs` mounts this file with `#[path]`, which makes it resolve child
+// modules as a `mod.rs` does: relative to `tests/`, not to a directory named after
+// this file. So each `mod` names its path.
 #[path = "hot_reload/branching.rs"]
 mod branching;
 #[path = "hot_reload/cases.rs"]

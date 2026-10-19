@@ -1,7 +1,7 @@
 //! Running a program a test talks to, and talking to it.
 //!
-//! Compiled into every test binary that drives a program rather than evaluating
-//! one: the gallery (`tests/programs/main.rs`) and the hot-reload suite
+//! Shared by the suites that drive a program rather than evaluating one: the
+//! gallery (`tests/programs/main.rs`) and the hot-reload suite
 //! (`tests/hot_reload.rs`). It holds what both need — a compiled sink program, a
 //! scheduler pump, and an HTTP client built on `TcpStream` so no client crate
 //! becomes a dev dependency. The gallery's own expectation helpers
@@ -35,8 +35,7 @@ use cambra::{
 /// The caller must keep the returned context alive (and drive its scheduler
 /// via [`drive_until`]) for the duration of the test — sinks are only
 /// serviced while the scheduler is running.
-// The gallery binary's: a suite that replaces a version wants `start_sink`.
-#[allow(dead_code)]
+// The gallery's: a suite that replaces a version wants `start_sink`.
 pub fn compile_sink(source: &str) -> GlobalContext {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});

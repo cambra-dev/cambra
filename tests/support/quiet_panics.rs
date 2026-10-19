@@ -26,7 +26,8 @@ pub fn quietly<T>(body: impl FnOnce() -> T) -> T {
             }
         }));
     });
-    // Restored on unwind too, so a panic that escapes `body` leaves the thread loud.
+    // Restored on unwind too, so the thread's later panics print. A panic that escapes
+    // `body` is itself silent: the hook ran inside `body`, before the unwind.
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {

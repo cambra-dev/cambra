@@ -158,19 +158,14 @@ fn time_gallery<T>(
         "no gallery program's label contains {ONLY_ENV}={only:?}"
     );
 
-    // A rejected program panics inside a phase or returns errors; either way
-    // the row carries the reason, so the hook only adds a backtrace between two
-    // table rows.
-    let mut rows: Vec<(String, usize, Outcome)> = quiet_panics::quietly(|| {
-        programs
-            .iter()
-            .map(|(label, path)| {
-                let source = fs::read_to_string(path).expect("read program source");
-                let outcome = best_compile(label, &source, reps, &mut compile);
-                (label.clone(), source.lines().count(), outcome)
-            })
-            .collect()
-    });
+    let mut rows: Vec<(String, usize, Outcome)> = programs
+        .iter()
+        .map(|(label, path)| {
+            let source = fs::read_to_string(path).expect("read program source");
+            let outcome = best_compile(label, &source, reps, &mut compile);
+            (label.clone(), source.lines().count(), outcome)
+        })
+        .collect();
 
     // Slowest first: the table is read top-down for what compilation costs, and
     // the rejected programs have no cost to rank, so they sit at the bottom.
@@ -235,7 +230,12 @@ fn best_compile<T>(
         text
     };
     for _ in 0..reps.get() {
-        match panic::catch_unwind(AssertUnwindSafe(|| compile(&fresh))) {
+        // A rejected program panics inside a phase or returns errors; either way
+        // the row carries the reason, so the hook only adds a backtrace between
+        // two table rows.
+        let attempt =
+            quiet_panics::quietly(|| panic::catch_unwind(AssertUnwindSafe(|| compile(&fresh))));
+        match attempt {
             Ok(Ok(Measured { span, product })) => {
                 best = best.min(span);
                 std::hint::black_box(&product);

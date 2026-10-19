@@ -1,9 +1,9 @@
 //! Every integration test that can share a process, as one test binary.
 //!
-//! Each `tests/*.rs` file used to be its own binary, and every binary statically links
-//! the whole library: ~30 copies of it on disk, and ~30 links after any `src/` edit. The
-//! files keep their places and become modules here. The ones that cannot share a
-//! process stay separate `[[test]]` targets in `Cargo.toml`: the two that install
+//! Every test binary statically links the whole library, so each one costs a copy of it
+//! on disk and a link after any `src/` edit; the tests that can share a process share
+//! this binary, each `tests/*.rs` file a module of it. The ones that cannot share a
+//! process are separate `[[test]]` targets in `Cargo.toml`: the two that install
 //! `alloc_probe`'s counting `#[global_allocator]` (an allocator is per-process), and
 //! `differential_oracle`, which needs the Lean toolchain.
 

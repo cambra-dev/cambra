@@ -98,19 +98,17 @@ overflow-checks = false
 debug = false
 
 # The integration tests are one binary (`tests/it/main.rs`) plus the few that cannot
-# share a process, listed below; autodiscovery (`autotests = false`) would also build
-# every `tests/*.rs` as its own binary.
+# share a process, listed below. Autodiscovery would also build every `tests/*.rs` as
+# its own binary, hence `autotests = false`. Cargo infers each target's file from its
+# name: `tests/<name>.rs` or `tests/<name>/main.rs`.
 [[test]]
 name = "it"
-path = "tests/it/main.rs"
 # `alloc_probe` installs a counting `#[global_allocator]`, and an allocator is
 # per-process, so each binary that measures allocations is its own target.
 [[test]]
 name = "dead_code_specialization_cost"
-path = "tests/dead_code_specialization_cost.rs"
 [[test]]
 name = "scope_walk_allocations"
-path = "tests/scope_walk_allocations.rs"
 # The differential oracle belongs to the formal gate, not to the suite. It runs
 # `formal/.lake/build/bin/subverdict` and refuses to skip under CI, so a job
 # that runs the suite would need the whole Lean toolchain to check something
@@ -119,5 +117,4 @@ path = "tests/scope_walk_allocations.rs"
 # `ci_formal` runs, still names it explicitly and builds it.
 [[test]]
 name = "differential_oracle"
-path = "tests/differential_oracle.rs"
 test = false

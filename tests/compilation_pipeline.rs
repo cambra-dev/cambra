@@ -13,14 +13,13 @@
 //! Unlike the unit tests in each module, these tests validate the composition
 //! of all passes together.
 //!
-//! This is a single test binary split into themed modules. Shared fixtures
-//! (`run_pipeline`, `check_tile`, `make_int_list`, …) live in [`helpers`] and
-//! are reached from each themed module via `use self::helpers::*;`.
+//! The tests are split into themed modules. Shared fixtures (`run_pipeline`,
+//! `check_tile`, `make_int_list`, …) live in [`helpers`] and are reached from each
+//! themed module via `use super::helpers::*;`.
 
-// The crate root of a test binary resolves child modules relative to the
-// directory containing this file (`tests/`), not a `compilation_pipeline/`
-// subdirectory named after it. `#[path]` points each module at its file under
-// `tests/compilation_pipeline/` so the whole split stays in one test binary.
+// `tests/it/main.rs` mounts this file with `#[path]`, which makes it resolve child
+// modules as a `mod.rs` does: relative to `tests/`, not to a `compilation_pipeline/`
+// directory named after this file. So each `mod` names its path.
 #[path = "compilation_pipeline/helpers.rs"]
 mod helpers;
 
@@ -69,5 +68,5 @@ mod type_parameters;
 #[path = "compilation_pipeline/variants.rs"]
 mod variants;
 
-// Shared with the other test binaries that catch a panic, so it lives under `tests/support/`.
+// Shared with the other suites that catch a panic, so it lives under `tests/support/`.
 use crate::panic_message;
