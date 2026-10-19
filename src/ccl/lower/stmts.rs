@@ -1739,9 +1739,7 @@ fn mentions_param(ty: &Type, params: &[crate::ccl::ty::TypeParamId]) -> bool {
     {
         return true;
     }
-    let mut found = false;
-    ty.walk_children(|c| found |= mentions_param(c, params));
-    found
+    ty.any_child(|c| mentions_param(c, params))
 }
 
 /// Push the requirement `trait_(args, assoc)` onto `out`, reading one over products of

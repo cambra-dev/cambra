@@ -385,9 +385,7 @@ fn lower_parameter_type(
 ) -> Result<Type, LoweringError> {
     let lowered = lower_type_expr(ty, ctx)?;
     fn has_hole(ty: &Type) -> bool {
-        let mut found = matches!(ty, Type::Hole | Type::BoundedHole(_));
-        ty.walk_children(|c| found |= has_hole(c));
-        found
+        matches!(ty, Type::Hole | Type::BoundedHole(_)) || ty.any_child(has_hole)
     }
     if has_hole(&lowered) {
         return Err(LoweringError::unsupported(

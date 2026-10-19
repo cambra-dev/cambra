@@ -1623,11 +1623,7 @@ fn has_output_variable(ty: &Type, pol: bool) -> bool {
             .zip(&decl.body().variances)
             .any(|(t, v)| has_output_variable(t, v.polarity(pol))),
         Type::Refinement(base, _) => has_output_variable(base, pol),
-        other => {
-            let mut found = false;
-            other.walk_children(|child| found |= has_output_variable(child, pol));
-            found
-        }
+        other => other.any_child(|child| has_output_variable(child, pol)),
     }
 }
 

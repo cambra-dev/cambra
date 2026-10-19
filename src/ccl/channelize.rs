@@ -1015,12 +1015,7 @@ fn erase_chan_domains_in_type(
 /// Whether `ty`'s own structure holds a type satisfying `hit`. Refinement predicates are
 /// not walked, which is the reach of [`erase_chan_domains_in_type`].
 fn structure_holds_type(ty: &Type, hit: &dyn Fn(&Type) -> bool) -> bool {
-    if hit(ty) {
-        return true;
-    }
-    let mut found = false;
-    ty.walk_children(|c| found |= structure_holds_type(c, hit));
-    found
+    hit(ty) || ty.any_child(|c| structure_holds_type(c, hit))
 }
 
 /// Whether any refinement predicate reachable from `ty` holds a type satisfying `hit` in
