@@ -52,6 +52,7 @@ use crate::ccl::Label;
 use std::collections::HashMap;
 
 use crate::ccl::feed_nest::LoopFeed;
+use crate::ccl::opaque_output;
 use crate::ccl::{
     BaseType, BindingTransparency, Branch, Builtin, Expr, F_WRITES, HistoryKind, Lit, Name, Type,
     TypedBinding, TypedExprNode,
@@ -150,7 +151,9 @@ pub fn run(expr: Expr) -> Expr {
     // needs to know whether it is inside a loop body — where the guard-`Case` is
     // the recurrence's — so it is its own walk rather than an arm of the one
     // below.
-    let expr = flatten_spine(push_bindings_into_writing_cases(expr));
+    let expr = flatten_spine(push_bindings_into_writing_cases(peel_effectful_outputs(
+        expr,
+    )));
     let mut out = rewrite(expr);
     // The rewrite turns every mutable read/write into an ordinary recurrence
     // read/commit at the mutable variable's *value* type, but the transient history
@@ -178,6 +181,23 @@ pub fn run(expr: Expr) -> Expr {
         "letrec phase post-condition violated: a history survived the phase"
     );
     out
+}
+
+/// Replace each `let __output : 𝑇 = body in __output` by `body` where `body`
+/// holds a `MutWrite`, a `For`, or a `Feed` ([`opaque_output::output_body`]).
+///
+/// Inlining a writer leaves its body under that binding at the call site, so
+/// the body's statements sit in the definiens of `__output` and not on the
+/// spine. [`flatten_spine`] and [`transform_chain`] read effects off the spine
+/// only: a write left in the definiens is scoped to it and never reaches the
+/// statements after the call. A binding over a `body` with none of the three
+/// stays, since nothing in this phase reads into it.
+fn peel_effectful_outputs(mut expr: Expr) -> Expr {
+    expr.map_children(peel_effectful_outputs);
+    match opaque_output::output_body(&expr) {
+        Some(body) if contains_marker(body) || body_has_feed(body) => opaque_output::peel(expr),
+        _ => expr,
+    }
 }
 
 /// Whether the subtree still contains a pre-phase marker node.

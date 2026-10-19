@@ -599,6 +599,7 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         | Type::WitnessRef(_)
         | Type::Txn
         | Type::Hole
+        | Type::OpaqueHole(_)
         | Type::SharedHole(_)
         | Type::Param(_)
         | Type::Infer(_) => Ok(()),
@@ -877,14 +878,6 @@ pub(super) fn emit_lambda<C: Typing>(
     // function returning a `Mut`, whose reference would escape to where its writer set
     // is no longer statically known. Dereffing here would silently accept that program
     // by turning the escape into a read.
-    //
-    // The body's closing runs under the binder, where the codomain stands. The Pi
-    // below binds the parameter in the codomain, so a refinement naming the
-    // parameter closes against the telescope of the variable Emit's closing mints.
-    // Minting it after the scope pops leaves the parameter out of that telescope,
-    // and the body bound naming it is an open bound there
-    // (`infer_var::enforce_bound_scope`). See `src/ccl/design/type-inference.md`,
-    // "A lambda's codomain drops the body's opaque binders".
     let body_ty = ctx.scoped(&param.name, &param_simple, |ctx| {
         let body_ty = ctx.subexpr(body)?;
         // …and the same reason it is not dereffed here is why the *reported* codomain is
@@ -892,15 +885,10 @@ pub(super) fn emit_lambda<C: Typing>(
         // A statement's type is its continuation's, and `emit_expr_stmt` derefs it; without
         // this, inserting a statement before the escape hides the handle from rule 2 —
         // `λ c → (c += 1; c)` would pass where `λ c → c` is rejected.
-        let body_ty = match denoted_expr(body).ty.mut_value_type() {
+        Ok(match denoted_expr(body).ty.mut_value_type() {
             Some(_) => denoted_expr(body).ty.clone(),
             None => body_ty,
-        };
-        // An opaque binder the body introduced stands for one value per call, so a
-        // refinement naming it says nothing about the function's result and is
-        // dropped here (`Typing::close_body_type`). This is the lift out of the
-        // body's scope, the counterpart of a `let`'s `close_let_type`.
-        ctx.close_body_type(body_ty)
+        })
     })?;
 
     // Emit a *named* Pi: the parameter binds in the codomain, so a refinement
@@ -1569,7 +1557,16 @@ pub(super) fn read_through(ty: &Type) -> Type {
 /// mutable variable it declared is the same escape as one that returns a parameter. Each of
 /// these nodes reports its continuation's value, and none of them is a place a
 /// handle stops being one.
+///
+/// The `let __output : 𝑇 = body in __output` binding [`opaque_output`] puts at a lambda's
+/// tail denotes `body`, so the walk continues into `body` rather than stopping at the
+/// `__output` read, whose type is the definiens' already-dereffed value.
+///
+/// [`opaque_output`]: crate::ccl::opaque_output
 fn denoted_expr(e: &Expr) -> &Expr {
+    if let Some(body) = crate::ccl::opaque_output::output_body(e) {
+        return denoted_expr(body);
+    }
     match &e.node {
         TypedExprNode::Let { body, .. }
         | TypedExprNode::MutDecl { body, .. }

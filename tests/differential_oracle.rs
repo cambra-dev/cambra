@@ -696,6 +696,7 @@ fn differential_coalesce_vs_lean_model() {
         let graph = CompactGraph {
             term: acc.clone(),
             rec_vars: std::collections::BTreeMap::new(),
+            opaque_upper_violations: Vec::new(),
         };
         let (Some(ct), Some(got)) = (cty_json(&acc), coalesce_outcome(&coalesce_compact(&graph)))
         else {

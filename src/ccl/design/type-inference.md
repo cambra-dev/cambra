@@ -2106,29 +2106,29 @@ from the tree it receives, not from a pre-transformation quoted term.
 
 #### A lambda's codomain drops the body's opaque binders
 
-An opaque binder the body introduced stands for one value per call, so a refinement naming it says
-nothing about the function's result: it would relate the results of `f(1)` and `f(2)` through one
-`r`. `Typing::close_body_type` drops such a refinement and reports the base type, a supertype, so
-every result the function produces still inhabits the codomain. A binder still in lexical scope
-where the lambda's rule runs was introduced outside the body and denotes one value for the whole
-function, so it stays; what is dropped are the binders whose scope closed inside the body.
+A lambda whose body binds an opaque variable reports the body's type with every refinement dropped
+as its codomain. An opaque binder the body introduced stands for one value per call, so a refinement
+naming it would relate the results of `f(1)` and `f(2)` through one `r`. The dropped type is a
+supertype of the body's, so every result the function produces inhabits the codomain.
 
-Emission drops on a second variable rather than on the body's own, so the body node keeps the type
-its own rule gave it. `body_ty <: codomain` is an ordinary edge, so what reaches the body's type
-still reaches the codomain, call-site bounds included, and the edge's closure deposits the body's
-concrete lower bounds on the codomain variable directly, following variable-to-variable edges on the
-way. The refinements to drop therefore sit on that variable's own lower bounds, and no later arrival
-can name one: a refinement naming an opaque binder is recorded where the binder is in scope, which
-is inside the body the rule has just finished emitting.
+`opaque_output::run` runs before inference and rewrites such a lambda to
+`λ 𝑥 → let __output : 𝐻 = body in __output`, where `𝐻` is a fresh `Type::OpaqueHole`. Inference
+records each edge into the hole as a lower bound and each edge out of it as an upper bound, and
+closes neither against the other. Compaction resolves the hole to the join of its lower bounds with
+every refinement dropped, then checks each upper bound against that resolution
+(`check_opaque_uppers` in `solver/compact.rs`). A failed check surfaces as the constraint error it
+raised. The drop covers every refinement in the join, including one that names no opaque binder.
 
-That variable is minted under the lambda's parameter binder, where the codomain stands: the Pi binds
-the parameter in the codomain, so a body refinement naming the parameter closes against the
-variable's telescope. Minting it after the parameter's scope closes leaves the parameter out of that
-telescope, and the same refinement is then an open bound on it.
+Because an upper bound is not closed against the lower bounds, a demand on the codomain does not
+narrow a variable inside the body. A conflict between the two surfaces at compaction.
 
-A demand on the codomain is met by what flows out of the body rather than narrowing a variable
-inside it. `def f(x) => 𝑇` with an unannotated `x` whose body introduces an opaque binder bounds `x`
-from its call sites alone; a conflict with `𝑇` surfaces when those bounds reach the codomain.
+`opaque_output::run` leaves a lambda unwrapped in two cases. Its body binds no opaque variable, or
+its body is `let 𝑦 : 𝑇 = body in 𝑦` with a user annotation `𝑇`, the lowering of a `=> 𝑇` output
+annotation. An annotated `let` with any other continuation annotates only its definiens, so the
+lambda is wrapped. The search for an opaque binder stops at a nested lambda, which receives its own
+`__output`. An unwrapped lambda's codomain keeps the body's refinements, so a refinement naming a
+binder bound outside the function stays (`a_function_s_codomain_drops_its_body_s_opaque_binders`,
+case `bound_outside`, in `tests/it/type_check.rs`).
 
 #### Discharge is application
 

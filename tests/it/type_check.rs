@@ -24,7 +24,7 @@ use cambra::ccl::{
         lit_singleton,
     },
     lower::{LoweringContext, lower_stmts},
-    uniquify,
+    opaque_output, uniquify,
 };
 use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
@@ -73,8 +73,12 @@ fn arm_dependent_filter_result_panics_when_recording_an_escaping_bound() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Lower `stmts` and α-uniquify — the pipeline's prefix to `infer`
-/// (`ccl::context` runs `uniquify::run` immediately before it).
+/// Lower `stmts`, α-uniquify, lower comprehensions, and bind opaque outputs — the
+/// pipeline's prefix to `infer`, in `ccl::context`'s order.
+///
+/// `opaque_output::run` is what drops a lambda body's opaque binders from the
+/// lambda's codomain, so a harness without it infers codomains that name binders
+/// out of scope.
 ///
 /// Every test in this file that infers from CHL source goes through here, so
 /// inference sees the α-unique binders its own invariants are stated over: the
@@ -87,7 +91,7 @@ fn lower_uniquified(module: &chl_ast::Module, lctx: &mut LoweringContext) -> Exp
     let expr = lower_stmts(module, lctx)
         .into_result()
         .expect("lowering failed");
-    comprehension::run(uniquify::run(expr), lctx.shared_holes())
+    opaque_output::run(comprehension::run(uniquify::run(expr), lctx.shared_holes()))
 }
 
 /// Parse Python module code, lower to CCL, run type inference, and return the

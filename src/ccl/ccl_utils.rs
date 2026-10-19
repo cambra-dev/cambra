@@ -67,42 +67,6 @@ pub(crate) fn spelled_in_a_type(expr: &Expr, name: &Name) -> bool {
     found
 }
 
-/// `ty` with every refinement whose predicate names a binder `escaped` reports
-/// dropped, at every depth — the position keeps its base type and claims nothing
-/// about it.
-///
-/// Dropping rather than rewriting is what a position with no discharge available
-/// can do: a refinement naming a binder that is out of scope where the type now
-/// stands states a restriction nothing can decide, and a restriction nothing can
-/// decide is weaker than no restriction at all. The result is a supertype of
-/// `ty`, so a value of `ty` still inhabits it.
-pub(crate) fn drop_refinements_naming(ty: &Type, escaped: &dyn Fn(&Name) -> bool) -> Type {
-    let mut out = ty.clone();
-    drop_refinements_naming_in_place(&mut out, escaped);
-    out
-}
-
-fn drop_refinements_naming_in_place(ty: &mut Type, escaped: &dyn Fn(&Name) -> bool) {
-    // Children first: `walk_children_mut` on a `Refinement` yields its base, and
-    // the collapse below replaces the whole node once that base is settled.
-    ty.walk_children_mut(|child| drop_refinements_naming_in_place(child, escaped));
-    let Type::Refinement(base, refinements) = ty else {
-        return;
-    };
-    let mut kept = RefinementSet::new();
-    for r in refinements.iter() {
-        if !crate::ccl::subst::refinement_free_vars(r)
-            .iter()
-            .any(escaped)
-        {
-            kept.insert(r.clone());
-        }
-    }
-    if kept.len() != refinements.len() {
-        *ty = Type::refined((**base).clone(), kept);
-    }
-}
-
 /// A `Unit` literal stamped with `Base(Unit)` — the value of a mutable write, and
 /// of the `true` arm a `match` without a `case _:` gains.
 pub(crate) fn unit_expr() -> Expr {
@@ -1276,6 +1240,7 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         | Type::UIntRange(_)
         | Type::Hole
         | Type::SharedHole(_)
+        | Type::OpaqueHole(_)
         | Type::Infer(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)

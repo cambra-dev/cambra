@@ -199,6 +199,7 @@ pub(crate) const PANES: [PaneSpec; 7] = [
             Phase::Anf,
             Phase::MutRead,
             Phase::Comprehension,
+            Phase::OpaqueOutput,
             Phase::Infer,
         ],
         gated: true,

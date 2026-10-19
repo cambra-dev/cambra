@@ -147,6 +147,7 @@ fn blame_node_for_place(
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
+            | Type::OpaqueHole(_)
             | Type::SharedHole(_)
             | Type::DataSource(_)
             | Type::ChanDom(_, _)
@@ -415,6 +416,7 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             "a witness reference escaped its binder at {ctx_label}: {details} (a \
              `WitnessRef` denotes \"whichever domain\", so outside its sum it denotes nothing)"
         )),
+        CoalesceError::OpaqueUpperBound { error } => map_constrain_err(*error, ctx_label),
         CoalesceError::KindConflict { details } => InferError::Unsupported(format!(
             "one function was required to be both a compute function ⇒ and a data collection ⤇ \
              at {}: {} (the two kinds are incomparable, so no function is both)",

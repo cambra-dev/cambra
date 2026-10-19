@@ -14,7 +14,9 @@ use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::TraitRequirement;
 use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId};
-use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr};
+use crate::ccl::{
+    Bound, InferVar, InferVarId, Level, OpaqueHoleId, OpaqueHoleVar, Refinement, Type, TypedExpr,
+};
 
 // ---------------------------------------------------------------------------
 // Polymorphic schemes
@@ -185,6 +187,9 @@ pub struct FreshenCache {
     pub site_telescope: Option<Telescope>,
     /// Original quantified var → its fresh replacement.
     pub vars: HashMap<InferVarId, Rc<InferVar>>,
+    /// Original opaque hole → its fresh replacement, for the same reason as
+    /// [`vars`](Self::vars).
+    pub opaque_holes: HashMap<OpaqueHoleId, Rc<OpaqueHoleVar>>,
     /// Original quantified channel-domain name → its rename. Seeded by
     /// `specialize_use` with use-site pairings; unpaired names mint fresh.
     pub chan_doms: HashMap<crate::ccl::Name, crate::ccl::Name>,
@@ -387,6 +392,7 @@ fn freshen_level(ty: &Type) -> Level {
     // answer `type_level` gives it and for the same reason.
     let mut lvl = match ty {
         Type::Infer(v) => v.level(),
+        Type::OpaqueHole(hole) => hole.level(),
         // A declared parameter, in an annotation slot a clone copies, is a name the
         // solver never reads; normalization replaced it where the right-hand side was
         // emitted.
@@ -701,6 +707,33 @@ pub fn freshen_above(
             freshen_watches(lim, tv, &v, target, cache);
             Type::Infer(v)
         }
+        // Freshens like `Infer`, over what an opaque hole carries: its level and its
+        // lower and upper bounds. It has no telescope, kind or watches to copy.
+        Type::OpaqueHole(hole) => {
+            if let Some(existing) = cache.opaque_holes.get(&hole.uid) {
+                return Type::OpaqueHole(Rc::clone(existing));
+            }
+            // Registered before the bounds are copied, so a bound that reaches this
+            // hole again resolves to the copy.
+            let fresh =
+                OpaqueHoleVar::fresh(target.level_of(hole.level()), Vec::new(), Vec::new());
+            cache.opaque_holes.insert(hole.uid, Rc::clone(&fresh));
+
+            // Snapshot bounds before recursing, as the `Infer` arm does.
+            let lows = hole.lowers.borrow().clone();
+            let ups = hole.uppers.borrow().clone();
+            let mut freshen_bound = |b: &Bound| Bound {
+                origin: b.origin,
+                self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
+                ty: freshen_above(lim, &b.ty, target, cache),
+                ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
+            };
+            let new_lows: Vec<_> = lows.iter().map(&mut freshen_bound).collect();
+            let new_ups: Vec<_> = ups.iter().map(&mut freshen_bound).collect();
+            *fresh.lowers.borrow_mut() = new_lows;
+            *fresh.uppers.borrow_mut() = new_ups;
+            Type::OpaqueHole(fresh)
+        }
     }
 }
 
@@ -931,12 +964,19 @@ pub fn seed_chan_dom_pairings(
     seed_pairings_go(use_ty, def_ty, lim, out, &mut seen);
 }
 
+/// A type holding bounds that [`seed_pairings_go`] descends through, once each.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum BoundHolder {
+    Var(InferVarId),
+    Hole(OpaqueHoleId),
+}
+
 fn seed_pairings_go(
     use_ty: &Type,
     def_ty: &Type,
     lim: Level,
     out: &mut HashMap<crate::ccl::Name, crate::ccl::Name>,
-    seen: &mut std::collections::HashSet<InferVarId>,
+    seen: &mut std::collections::HashSet<BoundHolder>,
 ) {
     fn peel(ty: &Type) -> &Type {
         match ty {
@@ -950,7 +990,7 @@ fn seed_pairings_go(
     // the cyclic bound graph). The use side is resolved; a placeholder var
     // there has no bounds and pairs nothing.
     if let Type::Infer(dv) = peel(def_ty) {
-        if seen.insert(dv.uid) {
+        if seen.insert(BoundHolder::Var(dv.uid)) {
             let (lows, ups) = {
                 let s = dv.bounds.borrow();
                 (Rc::clone(s.lower()), Rc::clone(s.upper()))
@@ -962,12 +1002,33 @@ fn seed_pairings_go(
         return;
     }
     if let Type::Infer(uv) = peel(use_ty) {
-        if seen.insert(uv.uid) {
+        if seen.insert(BoundHolder::Var(uv.uid)) {
             let (lows, ups) = {
                 let s = uv.bounds.borrow();
                 (Rc::clone(s.lower()), Rc::clone(s.upper()))
             };
             for b in lows.iter().chain(ups.iter()) {
+                seed_pairings_go(&b.ty, def_ty, lim, out, seen);
+            }
+        }
+        return;
+    }
+    // An opaque hole resolves to the join of its lower bounds, so those carry its
+    // structure on either side. Its upper bounds are checks against that join and
+    // add no position to pair.
+    if let Type::OpaqueHole(dh) = peel(def_ty) {
+        if seen.insert(BoundHolder::Hole(dh.uid)) {
+            let lows = dh.lowers.borrow().clone();
+            for b in &lows {
+                seed_pairings_go(use_ty, &b.ty, lim, out, seen);
+            }
+        }
+        return;
+    }
+    if let Type::OpaqueHole(uh) = peel(use_ty) {
+        if seen.insert(BoundHolder::Hole(uh.uid)) {
+            let lows = uh.lowers.borrow().clone();
+            for b in &lows {
                 seed_pairings_go(&b.ty, def_ty, lim, out, seen);
             }
         }

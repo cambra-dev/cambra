@@ -13,6 +13,9 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::{RefinementScope, Subst};
+use crate::ccl::{OpaqueHoleId, OpaqueHoleVar};
+
+use super::constrain::{ConstrainCache, ConstrainError, constrain_opaque_upper};
 use crate::ccl::{
     BaseType, HistoryKind, InferVarId, Name, Openness, RefinementSet, Type, fresh_infer_var_id,
 };
@@ -946,6 +949,39 @@ impl CompactType {
         }
     }
 
+    /// Replace every refinement set at every depth with the empty one, keeping
+    /// each slot's `None` (no contribution) as `None`.
+    fn strip_refinements(&mut self) {
+        if let Some(r) = &mut self.refinements {
+            *r = RefinementSet::default();
+        }
+        for t in self.rec.iter_mut().flat_map(|rec| rec.values_mut()) {
+            t.strip_refinements();
+        }
+        for t in self.var.iter_mut().flat_map(|v| v.tags.values_mut()) {
+            t.strip_refinements();
+        }
+        if let Some(f) = &mut self.fun {
+            f.domain.strip_refinements();
+            f.codomain.strip_refinements();
+            if let Some(CombinedDomains(pair)) = &mut f.combined {
+                pair.0.strip_refinements();
+                pair.1.strip_refinements();
+            }
+        }
+        if let Some((value, domain, _)) = &mut self.history_slot {
+            value.strip_refinements();
+            domain.strip_refinements();
+        }
+        for t in self.nominal.values_mut().flatten() {
+            t.strip_refinements();
+        }
+        if let Some((_, a, b)) = &mut self.nominal_conflict {
+            a.strip_refinements();
+            b.strip_refinements();
+        }
+    }
+
     /// [`CompactType::merge`], reachable from the integration tests.
     ///
     /// The merge is `pub(super)` because it is the bound fold's step and nothing
@@ -1401,6 +1437,11 @@ impl CompactType {
 pub struct CompactGraph {
     pub term: CompactType,
     pub rec_vars: BTreeMap<InferVarId, CompactType>,
+    /// The failed checks of an opaque hole's upper bounds against its resolution, one
+    /// per failing bound (the `OpaqueHole` arm of [`compact_go`]). Surfaced by
+    /// `coalesce_compact` as an `OpaqueUpperBound` error, as `rec_vars` is surfaced
+    /// as a `RecursiveType` one.
+    pub opaque_upper_violations: Vec<ConstrainError>,
 }
 
 /// Walk a `Type`, transitively expanding variable bounds at the
@@ -1437,6 +1478,8 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
         rec_vars: BTreeMap::new(),
         collapse,
         scope: RefinementScope::default(),
+        checked_opaque_holes: HashSet::new(),
+        opaque_upper_violations: Vec::new(),
     };
     let term = compact_go(ty, true, &Subst::id(), Position::default(), &mut st);
     debug_assert!(
@@ -1447,6 +1490,7 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
     CompactGraph {
         term,
         rec_vars: st.rec_vars,
+        opaque_upper_violations: st.opaque_upper_violations,
     }
 }
 
@@ -1652,6 +1696,57 @@ struct CompactState {
     /// function meeting at one variable spell one refinement one way. `key_go` threads
     /// the same type, so a key and a compacted type agree.
     scope: RefinementScope,
+    /// Opaque holes whose upper bounds this walk has checked. A hole is checked once
+    /// per walk however many times the walk reaches it.
+    checked_opaque_holes: HashSet<OpaqueHoleId>,
+    /// See [`CompactGraph::opaque_upper_violations`].
+    opaque_upper_violations: Vec<ConstrainError>,
+}
+
+/// The resolution of an opaque hole, under `subst_acc`, as a [`CompactType`]: the join
+/// of its lower bounds with every refinement dropped.
+fn join_opaque_lowers(
+    hole: &OpaqueHoleVar,
+    subst_acc: &Subst,
+    st: &mut CompactState,
+) -> CompactType {
+    let lowers = hole.lowers.borrow().clone();
+    let mut joined = CompactType::empty();
+    for b in &lowers {
+        let inner_acc = Subst::then(&b.render_subst(), subst_acc);
+        let bc = compact_go(&b.ty, true, &inner_acc, Position::default(), st);
+        joined = CompactType::merge(true, joined, bc);
+    }
+    joined.strip_refinements();
+    joined
+}
+
+/// Check each of `hole`'s upper bounds against the hole's resolution, recording every
+/// failure in [`CompactState::opaque_upper_violations`].
+///
+/// The resolution is materialized in the hole's own context (no `subst_acc`), because
+/// each upper bound's morphisms are spelled there. The check is `constrain`, so it
+/// records bounds on any variable it reaches. A resolution that does not materialize is
+/// not checked: the same join is what the hole's position compacts to, so coalescing
+/// that position reports it.
+fn check_opaque_uppers(hole: &OpaqueHoleVar, st: &mut CompactState) {
+    if !st.checked_opaque_holes.insert(hole.uid) {
+        return;
+    }
+    let uppers = hole.uppers.borrow().clone();
+    if uppers.is_empty() {
+        return;
+    }
+    let own = join_opaque_lowers(hole, &Subst::id(), st);
+    let Ok(resolved) = super::coalesce::coalesce_position(&own, true) else {
+        return;
+    };
+    let mut cache = ConstrainCache::new();
+    for upper in &uppers {
+        if let Err(err) = constrain_opaque_upper(&resolved, upper, &mut cache) {
+            st.opaque_upper_violations.push(err);
+        }
+    }
 }
 
 /// What the binder at `position` of a kind **variable** ranges over, derived here from the
@@ -2183,6 +2278,15 @@ fn compact_go(
                 nominal: BTreeMap::from([(decl.clone(), args)]),
                 ..CompactType::value()
             }
+        }
+        // The join of the hole's lower bounds with every refinement dropped: the
+        // narrowest unrefined type above each of them. The bounds are joined at
+        // positive polarity at either polarity of the reference, because the hole
+        // denotes the value its lowers produce. A refinement in a lower bound can name
+        // an opaque binder the hole sits outside of, which is why none survives.
+        Type::OpaqueHole(hole) => {
+            check_opaque_uppers(hole, st);
+            join_opaque_lowers(hole, subst_acc, st)
         }
         Type::Infer(state) => {
             let uid = state.uid;
@@ -2979,6 +3083,7 @@ mod tests {
         CompactGraph {
             term,
             rec_vars: BTreeMap::new(),
+            opaque_upper_violations: Vec::new(),
         }
     }
 

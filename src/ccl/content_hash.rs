@@ -262,7 +262,7 @@ fn hash_type<'a>(
         // that differ only in how many holes were minted before this one are
         // the same program here. The discriminant, hashed above, still
         // separates a shared hole from a plain one.
-        T::Txn | T::Hole | T::SharedHole(_) | T::Infer(_) => {}
+        T::Txn | T::Hole | T::OpaqueHole(_) | T::SharedHole(_) | T::Infer(_) => {}
         // A bounded annotation's ceiling is content, not an identity: `x <: Int`
         // and `x <: Str` state different obligations. The discriminant separates
         // it from a plain `Hole`.

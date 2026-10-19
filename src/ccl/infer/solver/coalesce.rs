@@ -117,6 +117,15 @@ pub enum CoalesceError {
         /// What the position was materializing, and which binder had no scope.
         details: String,
     },
+    /// An opaque hole's resolution, the join of its lower bounds with every refinement
+    /// dropped, failed the subtype check against one of its upper bounds. Raised at
+    /// compaction, the first point where every lower bound has arrived, and carried to
+    /// here on [`CompactGraph::opaque_upper_violations`].
+    OpaqueUpperBound {
+        /// The failed check. Boxed because [`ConstrainError`] is larger than every
+        /// other variant here.
+        error: Box<super::constrain::ConstrainError>,
+    },
 }
 
 /// Distinguishes a partial tuple (Index keys) from a partial record
@@ -320,6 +329,11 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
     if !graph.rec_vars.is_empty() {
         return Err(CoalesceError::RecursiveType {
             details: format!("{} recursive variable(s) in graph", graph.rec_vars.len()),
+        });
+    }
+    if let Some(error) = graph.opaque_upper_violations.first() {
+        return Err(CoalesceError::OpaqueUpperBound {
+            error: Box::new(error.clone()),
         });
     }
     coalesce_compact_go(&graph.term, true, &[])
@@ -988,6 +1002,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
+            opaque_upper_violations: Vec::new(),
         };
         assert_eq!(
             coalesce_compact(&graph).unwrap(),
@@ -1028,6 +1043,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
+            opaque_upper_violations: Vec::new(),
         };
         assert!(matches!(
             coalesce_compact(&graph),
@@ -1057,6 +1073,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
+            opaque_upper_violations: Vec::new(),
         };
         assert!(matches!(
             coalesce_compact(&graph),
@@ -1119,6 +1136,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
+            opaque_upper_violations: Vec::new(),
         };
         let t = coalesce_compact(&graph).unwrap();
         assert!(matches!(t, Type::Infer(_)), "expected Infer, got {t:?}");

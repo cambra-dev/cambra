@@ -26,7 +26,7 @@ use super::emit::{
     emit_unary, emit_variant_ctor, paths_are_canonical, projected_source_type,
 };
 use super::schemes::OperatorSchemes;
-use super::typing::{LetScheme, Typing, escaped_opaque_binders};
+use super::typing::{LetScheme, Typing};
 use super::{lit_base, map_constrain_err};
 use crate::ccl::infer::solver::traits::{Assoc, Trait, offered_base};
 use crate::util::ScopeStack;
@@ -518,19 +518,6 @@ impl Typing for CheckCtx {
         // outlives the scope ([`CheckCtx::opaque_binders`], recorded by `scoped_let` on the
         // way in).
         crate::ccl::ccl_utils::closed_let_type(binding, bound_expr, body_ty)
-    }
-
-    fn close_body_type(&mut self, body_ty: Type) -> Result<Type, LocatedInferError> {
-        // Check reads resolved types, so the drop is the structural rewrite itself.
-        let escaped =
-            escaped_opaque_binders(&self.opaque_binders, |n| self.scopes.lookup(n).is_some());
-        if escaped.is_empty() {
-            return Ok(body_ty);
-        }
-        Ok(crate::ccl::ccl_utils::drop_refinements_naming(
-            &body_ty,
-            &|n| escaped.contains(n),
-        ))
     }
 
     fn bind_annotation(&mut self, _inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {

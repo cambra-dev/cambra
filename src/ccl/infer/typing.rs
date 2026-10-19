@@ -9,25 +9,6 @@ use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{Expr, Name, Type, TypedBinding};
-use std::collections::{BTreeSet, HashMap};
-
-/// The [opaque](crate::ccl::BindingTransparency::Opaque) binders whose lexical
-/// scope has already closed at the current position: recorded as opaque, and no
-/// longer answered by `in_scope`.
-///
-/// Both modes keep the same two pieces of state — a map of every opaque binder
-/// entered, which only grows, and the lexical scope, which does not — so the
-/// question [`Typing::close_body_type`] asks is answered once here.
-pub(super) fn escaped_opaque_binders(
-    opaque_binders: &HashMap<Name, Type>,
-    in_scope: impl Fn(&Name) -> bool,
-) -> BTreeSet<Name> {
-    opaque_binders
-        .keys()
-        .filter(|n| !in_scope(n))
-        .cloned()
-        .collect()
-}
 
 /// How a `let` binds its name over the body ([`Typing::scoped_let`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,23 +291,6 @@ pub(super) trait Typing {
     /// the binder's name still in it, and the binder's own type is what a later
     /// query learns about that name.
     fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type;
-
-    /// Lift a lambda body's type to the function's codomain, dropping every
-    /// refinement that names an [opaque](crate::ccl::BindingTransparency::Opaque)
-    /// binder the body introduced.
-    ///
-    /// A `let` keeps such a binder's name in the type it lifts, because the name
-    /// denotes one value and what it means outlives the scope
-    /// ([`close_let_type`](Self::close_let_type)). A function's codomain cannot:
-    /// the binder stands for one value per *call*, so a refinement naming it
-    /// would relate the results of two calls through one name. The codomain
-    /// reports the base type instead, a supertype, so every result the function
-    /// produces still inhabits it. A binder still in lexical scope where this
-    /// runs was introduced outside the body and stays.
-    ///
-    /// See `src/ccl/design/type-inference.md`, "A lambda's codomain drops the
-    /// body's opaque binders", for what the two modes each do.
-    fn close_body_type(&mut self, body_ty: Type) -> Result<Type, LocatedInferError>;
 
     /// Reconcile a binder's inferred type with its user annotation. In Emit
     /// mode this records the **one-way** obligation `inferred <: ann` —

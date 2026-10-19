@@ -528,6 +528,8 @@ complete phase order. The following table states which representation a diff obs
 | `Uniquify` | Binder identities made distinct. Hashing ignores the fresh uid component. |
 | `Anf` | Compound operands named by fresh bindings before inference. |
 | `MutRead` | Mutable reads named so refinements can reference immutable bindings. |
+| `Comprehension` | Comprehensions lowered to the `cast`/`λ`/`▷` encoding. |
+| `OpaqueOutput` | Each lambda body binding an opaque variable bound to `__output` under an opaque-hole annotation. |
 | `Infer` | Types inferred and definitions specialized; mutable-read naming has been undone. |
 | `Inline` | Capability bindings inlined and calls beta-reduced. |
 | `Transact` / `Letrec` | Intermediate transaction/induction history rewrites. |

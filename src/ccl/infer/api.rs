@@ -1787,9 +1787,13 @@ fn collect_type_errors(
         // A `SharedHole` is a `Hole` with an identity, and just as transient:
         // `normalize_annotation` resolves both. A survivor means the annotation
         // never reached normalization, which is the same compiler bug either way.
-        Type::Hole | Type::SharedHole(_) => errors.push(InferError::UnresolvedHole {
-            at: context_sym.to_string(),
-        }),
+        //
+        // OpaqueHole is handled the same way.
+        Type::Hole | Type::OpaqueHole(_) | Type::SharedHole(_) => {
+            errors.push(InferError::UnresolvedHole {
+                at: context_sym.to_string(),
+            })
+        }
         // A bounded annotation inference never normalized. Reported at every
         // strictness, exactly like `Hole`: both are lowering markers whose whole
         // contract is that inference consumes them.

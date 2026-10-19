@@ -17,6 +17,7 @@ use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::ccl::infer::{TypeInferenceContext, infer};
 use cambra::ccl::load::LoadedProgram;
 use cambra::ccl::lower::{LoweringContext, lower_stmts};
+use cambra::ccl::opaque_output;
 use cambra::ccl::symbolic::symbolic;
 use cambra::ccl::uniquify;
 use cambra::ccl::{BaseType, Expr, Lit, Refinement, Type, TypedExprNode};
@@ -24,8 +25,9 @@ use cambra::chl_parser;
 use cambra::chl_parser::FileId;
 use std::rc::Rc;
 
-/// Parse → lower → uniquify → infer `code` (the pipeline prefix through type
-/// inference; comprehensions over literals need no source registration).
+/// Parse → lower → uniquify → comprehension → opaque output → infer `code` (the
+/// pipeline prefix through type inference; comprehensions over literals need no
+/// source registration).
 fn infer_source(code: &str) -> Expr {
     let module = chl_parser::parse_module(FileId::ROOT, code)
         .value
@@ -34,7 +36,7 @@ fn infer_source(code: &str) -> Expr {
     let mut expr = lower_stmts(&module, &mut lctx)
         .value
         .expect("lowering should succeed");
-    expr = comprehension::run(uniquify::run(expr), lctx.shared_holes());
+    expr = opaque_output::run(comprehension::run(uniquify::run(expr), lctx.shared_holes()));
     let mut ictx = TypeInferenceContext::new();
     infer(&mut expr, &mut ictx).expect("inference should succeed");
     expr
