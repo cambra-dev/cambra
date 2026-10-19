@@ -154,13 +154,6 @@ impl SinkConsumer {
     pub fn detach(&mut self) {
         *self.producer.borrow_mut() = None;
     }
-
-    /// Call `f` with the sink's current producer, if it has been set.
-    pub fn with_producer<F: FnOnce(&dyn TileProducer)>(&self, f: F) {
-        if let Some(ref prod) = *self.producer.borrow() {
-            f(prod.as_ref());
-        }
-    }
 }
 
 impl Consumer for SinkConsumer {
