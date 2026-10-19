@@ -277,6 +277,16 @@ When planning, include updates to the appropriate docs to reflect the changes; v
 
 The inspector crate has its own pinned-expectation suite (the golden wire fixtures) with a re-bless procedure; see `web/CLAUDE.md` before touching anything that moves it. Anything that changes `Display for Type`, or that shifts how many `NodeId`s a phase mints, moves the whole corpus.
 
+### Keeping the cambra-coding skill current
+
+Update `.claude/skills/cambra-coding/` in the same change when you:
+- implement or drop a `[Planned]`/`[Decided]` CHL feature (modules, `return`, `in`, `while`,
+  keyword calls, `with t = begin()`, `@Discard`, structured HTTP requests);
+- change where `with begin():` may sit, the transaction read rule, or the reload refusals —
+  `references/state.md` states them for authors;
+- rename, block, or unblock a gallery program in the skill's imitate table;
+- change the `--dump-snapshot` wire shape — `scripts/check_program.py` parses it.
+
 ### Compact instructions
 
 When you are using compact, focus on test output and code changes.
