@@ -1,7 +1,7 @@
 # Nominal types
 
 How the compiler implements
-[chl-spec.md, "6.8 Nominal types and methods [Decided]"](../../../docs/chl-spec.md#68-nominal-types-and-methods-decided).
+[chl-spec.md, "6.8 Nominal types and methods"](../../../docs/chl-spec.md#68-nominal-types-and-methods).
 
 A `type` declaration lowers to a `NominalDecl` (`ccl/nominal.rs`), and an application of it is
 `Type::Nominal(decl, args)`. Inference relates two applications of one declaration argument by

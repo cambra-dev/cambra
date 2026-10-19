@@ -164,11 +164,11 @@ reserved for future use.
 `match` and `case` introduce tag dispatch over a variant (§4.10).
 
 `type` declares a nominal type, `impl` its associated functions, `instance` an instance of a
-trait, and `trait` a trait ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided),
+trait, and `trait` a trait ([6.8 Nominal types and methods](#68-nominal-types-and-methods),
 [Declaring a trait](#declaring-a-trait), [Declaring an instance](#declaring-an-instance)).
 
-`forall` begins a polymorphic type (**[Planned]**,
-[Polymorphic type annotations](#polymorphic-type-annotations)), and in a `requires` clause a
+`forall` begins a polymorphic type
+([Polymorphic type annotations](#polymorphic-type-annotations)), and in a `requires` clause a
 requirement at every value of a type ([Family parameters](#family-parameters)).
 `requires` begins a `requires` clause and `causes` a `causes` clause, which end a `def` signature
 or a function type, and `only` and `nothing` bound one
@@ -214,10 +214,9 @@ surface level.
 (`cart::total`, [9.6 Qualified references](#96-qualified-references)), a module from its label or
 tag (`r.mod2::f1`, `` mod2::`some ``, [9.12 Field labels and tags belong to a
 module](#912-field-labels-and-tags-belong-to-a-module)), a nominal type from its method
-(`Price::discounted`, [6.8 Nominal types and methods
-[Decided]](#68-nominal-types-and-methods-decided)), and an instance of a trait from its function
-(`a::area`, `summon(Area(_))::area`, [Summoning an instance](#summoning-an-instance)). A qualified
-name parses wherever a name does.
+(`Price::discounted`, [6.8 Nominal types and methods](#68-nominal-types-and-methods)), and an
+instance of a trait from its function (`a::area`, `summon(Area(_))::area`,
+[Summoning an instance](#summoning-an-instance)). A qualified name parses wherever a name does.
 
 Postfix `!` unwraps an `Option` proven not to be `Option::none`
 ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). `!=` is one token,
@@ -442,7 +441,7 @@ prefix names the block's transaction, which a program uses only before `::` (§8
 > `c[i] = v` (**[Tentative]**, §6.3 — this would relax the no-subscript-target rule above). A
 > `type` declaration, a `def` whose name is qualified by a type (`def Price::discounted(…)`), and
 > `@RenamedFrom` on either a `type` or one of its constructors are **[Decided]**, with their grammar
-> in [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided).
+> in [6.8 Nominal types and methods](#68-nominal-types-and-methods).
 > (`mut_assign_stmt` and `with_stmt` above are already implemented — §4.3, §8; they are in the
 > grammar, not this list.)
 
@@ -474,7 +473,7 @@ noted:
 | 15 | `*` `//` | multiplicative |
 | 16 | unary `-` | prefix |
 | 17 | `**` | exponentiation; *right*-associative. It **straddles** the unary `-` at 16 rather than sitting under it — see below |
-| 18 | postfix: `f(args)`, `x[i]`, `x.attr`, `x.0`, `summon(T)::f` | left-fold. The method call `x.m(args)` ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)) and the unwrap `e!` ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)) join this level (**[Decided]**) |
+| 18 | postfix: `f(args)`, `x[i]`, `x.attr`, `x.0`, `x.m(args)`, `summon(T)::f` | left-fold. `x.m(args)` is the method call ([6.8 Nominal types and methods](#68-nominal-types-and-methods)). The unwrap `e!` ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)) joins this level (**[Decided]**) |
 | 19 | atom | literal, name, `(...)`, `[...]`, `{...}`, comprehension |
 
 `**` binds tighter than the unary `-` on its left and looser than the one on
@@ -1241,7 +1240,7 @@ _[_] : {m: Map(K, V), k: K} => {Option(V) where _.is_none() == (k not in m.keys(
 _!   : {Option(T) where not _.is_none()} => T
 ```
 
-`Option` is a nominal type ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
+`Option` is a nominal type ([6.8 Nominal types and methods](#68-nominal-types-and-methods)),
 so presence is stated by a term predicate over it rather than by a subtype naming one constructor.
 `is_none` is a method of `Option` declared with it, and the predicate calls it because a nominal
 type has no `==`. A lookup into a `Set` has the same type at `Option(unit)`. A lookup into an
@@ -1259,11 +1258,11 @@ is a type error at `!`, not a runtime unwrap failure. `!` has postfix precedence
 
 A direct call `c(k)` remains function application, not an optional membership test.
 
-#### Method calls [Decided]
+#### Method calls
 
 `x.m(args)` calls a method of `x`'s type. Calling a function stored in a field takes parentheses
 around the projection: `(r.f)(args)`. See
-[Nominal types and methods](#68-nominal-types-and-methods-decided).
+[Nominal types and methods](#68-nominal-types-and-methods).
 
 #### Absence at a cut [Open]
 
@@ -1305,8 +1304,8 @@ unambiguous: the first `->` closes the binder list, and the rest is the body.
 
 A capitalized lambda binder is an error. A capitalized name is a type, bound only by an alias
 ([6.7 Type-alias statements](#67-type-alias-statements)), a `def`'s type parameter, or a
-polymorphic type `forall (T) V` (**[Planned]**,
-[Polymorphic type annotations](#polymorphic-type-annotations)).
+polymorphic type `forall (T) V`
+([Polymorphic type annotations](#polymorphic-type-annotations)).
 
 ### 3.11 List, tuple, record literals
 
@@ -1354,8 +1353,9 @@ Both return concrete data functions over the present keys. A sum annotation requ
 for example `m: Map(Int, Int) = box(map([1 -> 10, 2 -> 20]))`.
 `list(...)` is not a builtin; `box([1, 2])` can satisfy a `List(Int)` annotation.
 
-Repeated set elements produce one key. Duplicate keys in a constant map are a compile-time error;
-see [Re-keying is explicit](#re-keying-is-explicit-decided).
+Repeated set elements produce one key. A map with a duplicate key compiles, and the program panics
+when it builds that key's entry (`sole: 2 elements under one key`). The panic is a defect:
+[A duplicate key is a process fault today](../src/ccl/design/collections.md#a-duplicate-key-is-a-process-fault-today).
 
 #### Empty forms
 
@@ -1389,8 +1389,9 @@ error pointing at `map([…])`, and a keyed lookup on a list of pairs does not m
 ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), so a literal
 reaches one of their types only as the argument of a function that answers it.
 
-The constant-map rule rejects duplicate keys at compile time, applying the immutable
-non-overlap rule described under [Collection types](#63-direction-collection-types-decided).
+Rejecting the duplicate keys of a constant map at compile time, by the immutable non-overlap rule
+of [Collection types](#63-direction-collection-types-decided), is the decided rule. Today such a
+map compiles and panics at run time ([Keyed constructors](#keyed-constructors)).
 Mutable or fed collections instead use their declared merge law. The key type must support
 equality; general discharge through contextual parameters remains planned.
 
@@ -1545,7 +1546,7 @@ outright:
 > ([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
 > Within one file this changes nothing. A sum shared across modules is declared as a nominal type,
 > whose constructors belong to the type rather than to a module
-> ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+> ([6.8 Nominal types and methods](#68-nominal-types-and-methods)).
 
 This is the polymorphic-variant model, and the **backtick** plays the role
 capitalization plays in languages that capitalize constructors. Tags are
@@ -1574,7 +1575,7 @@ expected type, a join — rather than at the constructor.
 
 **`Option` is a nominal type, not a variant.** `Option(T)` is a `type` declared in a std module,
 with constructors `Option::some(T)` and `Option::none`
-([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)) and the method
+([6.8 Nominal types and methods](#68-nominal-types-and-methods)) and the method
 `Option::is_none` that a lookup's refinement tests
 ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). A structural
 variant with the same arms is a different type, so `` y: Option(Int) = `some(1) `` is a type
@@ -1616,7 +1617,7 @@ type annotation:
 
 ```python
 def f(x: Int, y):
-    return x + y
+    x + y
 ```
 
 Annotation types are arbitrary expressions evaluated in the
@@ -1632,7 +1633,7 @@ the annotated output type.
 
 ```python
 def f(x: Int, y: Int) => Int:
-    return x + y
+    x + y
 ```
 
 A function whose body contains a `yield` expression anywhere is a
@@ -1641,7 +1642,8 @@ rest of this section apply to **non-generator** functions, whose body
 must produce a value explicitly.
 
 A non-generator function's body is a non-empty block whose last contributing statement supplies its
-result. That statement may be an expression, `return`, a terminal `if`, `match` or `try`, or a
+result. That statement may be an expression, `return` (**[Planned]**,
+[4.8 `return`](#48-return)), a terminal `if`, `match` or `try`, or a
 value-producing `with begin():` block (**[Decided]**). Each follows the
 [block-value rule](#a-block-is-also-the-value-it-computes).
 
@@ -1695,8 +1697,9 @@ The body is otherwise an ordinary statement block: assignments
 introduce bindings, `for` loops iterate, `if`/`elif`/`else` selects a
 branch, and so on. The function has no explicit return value — its
 result is the bag of yields. (A bare `return` with no operand
-is permitted as an early exit; `return e` with a value is rejected
-inside a generator.)
+is to be permitted as an early exit, and `return e` with a value
+rejected inside a generator; lowering refuses every `return` today,
+[4.8 `return`](#48-return).)
 
 The returned collection participates in any downstream comprehension,
 aggregate, or feed just like a list literal would. The key difference
@@ -1864,7 +1867,7 @@ the pattern it is matched against. `(x=x2)` therefore binds field `x` to
 the name `x2`; `(x=x)` is the same-name case and has no shorthand.
 
 A **constructor** pattern mirrors a call of a nominal type's constructor
-([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)): one pattern
+([6.8 Nominal types and methods](#68-nominal-types-and-methods)): one pattern
 per declared parameter, in order, so `Shape::rect(w, h)` binds `rect`'s two parameters. `type_path`
 is the type's name, qualified as anywhere else (`shop::Shape`). A constructor that declares no
 parameters takes no parentheses, `Option::none`.
@@ -2165,6 +2168,10 @@ return                # equivalent to `return ()`
 return expression
 ```
 
+**[Planned]** — `return` parses, and lowering refuses it in every position (``last statement must
+be a bare expression, if/else, or for/yield generator loop``). A function body ends in its value as
+a bare expression statement ([4.1 `def` — function definition](#41-def--function-definition)).
+
 `return e` supplies a function result; bare `return` supplies unit. It does not perform an
 early exit. It must be the final contributing statement of the function body or of each branch
 of a terminal `if`/`else`. Further contributing statements after `return` are rejected.
@@ -2234,7 +2241,7 @@ scrutinee; the scrutinee is still checked for name resolution and type correctne
 > **Direction [Decided] — matching a nominal type.** An arm may name a constructor of a nominal
 > type, `case Shape::rect(w, h):`, with one binder per declared parameter
 > ([4.3.1 Destructuring patterns](#431-destructuring-patterns),
-> [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). The
+> [6.8 Nominal types and methods](#68-nominal-types-and-methods)). The
 > constructors are the tags the arms partition, so every rule above holds with "constructor" for
 > "tag": each constructor is handled by one arm, and `case _:` covers the rest. The arms of one
 > `match` name constructors of one type, and that type is the scrutinee's type, so a constructor
@@ -2469,7 +2476,7 @@ form `{T where p(_)}` (§6.4) is writable in annotation position.
 > draws its cut points) need elaboration. A recurring contract is factored into a nominal type
 > whose constructor's parameter type carries the refinement, `type Price = {Int where _ >= 0}`,
 > so every construction discharges it and no function repeats it
-> ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+> ([6.8 Nominal types and methods](#68-nominal-types-and-methods)).
 > Pinned by `discount_contract` (the mechanism in
 > isolation), `nonneg_inventory` (data refinement plus guarded
 > discharge), and `storefront` (both combined, plus the codomain lift
@@ -2494,7 +2501,7 @@ prefix in every position (§6.5); the capitalization rule is
 what fixes their case, and the backtick is what marks them as tags rather
 than ordinary names. A nominal type's constructors are lowercase for the same reason, and take no
 backtick: they are declared names, reached through their type as `Option::some`
-([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+([6.8 Nominal types and methods](#68-nominal-types-and-methods)).
 
 **Application is shared across levels.** `f(args)` is application
 whether `f` is a value or a type constructor: `split(line)` and `ok(v)`
@@ -2513,7 +2520,7 @@ name is a structural **alias** — `Item = {price: Int, cost: Int}` —
 interchangeable with the type it names, and specified in §6.7.
 
 A `type` declaration is **nominal**, `type Price = {amount: Int}`, and is
-specified in [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided).
+specified in [6.8 Nominal types and methods](#68-nominal-types-and-methods).
 
 ### Two annotation forms: exact and bounded
 
@@ -2739,7 +2746,7 @@ of a constructor into an unboxed term.
   belong to [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
 
 **`Set`, `Map` and `FullMap` are nominal builtins [Decided].** Each is a nominal type
-([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)) that the
+([6.8 Nominal types and methods](#68-nominal-types-and-methods)) that the
 compiler provides, so `Set(K)` and `Map(K, unit)` are distinct types. Nothing relates one of the
 three to a structural collection type: none widens to `Collection`, and the methods `keys`,
 `values` and `items` are the written route. `FullMap` has every operation `Map` has, and differs
@@ -2757,7 +2764,7 @@ A builtin differs from a declared nominal type in four ways:
 - **Associated values.** `Set::empty` and `Map::empty` are values of the builtin, whose type
   parameters are determined by their use ([Type parameters](#type-parameters)). A declared type
   has no spelling for an associated value
-  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+  ([6.8 Nominal types and methods](#68-nominal-types-and-methods)).
 - **Trait instances.** All three satisfy `Iterable` through instances the compiler provides
   ([Trait requirements](#trait-requirements)). A declared type satisfies the traits its module
   declares instances of ([Declaring an instance](#declaring-an-instance)).
@@ -2907,7 +2914,7 @@ a nominal type and not a variant
 ([3.15 Variant constructors](#315-variant-constructors)): the variant language privileges no tag,
 so ``{ `some{T} | `none }`` is an ordinary variant type and a different type from `Option(T)`. A
 sum that several modules share, such as a `Result`, is declared as a nominal type the same way
-([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Within one
+([6.8 Nominal types and methods](#68-nominal-types-and-methods)). Within one
 module a sum such as ``{ `ok{T} | `err{E} }`` may be written as its arms, or named by a type alias
 (§6.7) at a fixed payload type.
 
@@ -3014,7 +3021,7 @@ The rules, and what each one is doing:
   (§2.2) and not a new statement form. What separates it from a value binding is
   the **case of the name**: `Caps` means type, without exception (§6.1). A
   `type` keyword is not involved; that spelling belongs to the nominal
-  declaration ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
+  declaration ([6.8 Nominal types and methods](#68-nominal-types-and-methods)),
   which an alias is not.
 - **An alias names an existing type; it does not make a new one.** The alias and
   its right-hand side are the same type, interchangeable in every position, with
@@ -3062,10 +3069,19 @@ polymorphic type, not a type constructor
 
 The north-star `storefront` exercises four aliases, two of them refined.
 
-### 6.8 Nominal types and methods [Decided]
+### 6.8 Nominal types and methods
 
 A `type` declaration binds a capitalized name to a new **nominal** type by listing its
-**constructors**:
+**constructors**. Declarations, constructors, type parameters and their variance, associated
+functions, methods and `impl` blocks compile (`tests/it/compilation_pipeline/nominal_types.rs`).
+A recursive type, `@RenamedFrom`, and a nominal value carried over a reload are **[Decided]**, as
+are the parts the section marks.
+
+Today the compiler provides `Option` as a nominal type, with the constructors `Option::some` and
+`Option::none`, so a program that declares `type Option(T)` is rejected
+(`` `Option` is a built-in type and cannot be given another meaning ``). The examples below
+declare it as the std module will ([6.5 Variants](#65-variants)); a program that compiles names
+its own type, such as `Maybe(T)`.
 
 ```python
 type Option(T):
@@ -3100,7 +3116,8 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
 
 `type_path` is in [Associated functions and methods](#associated-functions-and-methods), and
 `@RenamedFrom` on a type and on a constructor is
-[Reloading a nominal type](#reloading-a-nominal-type).
+[Reloading a nominal type](#reloading-a-nominal-type). `@RenamedFrom` is **[Decided]**: the
+parser rejects it on a type and on a constructor line.
 
 - **A `type` is declared at a module's top level, once.** A `type` inside a `def`, a loop or any
   other block is an error, and so is a second binding of its name in the module, public or private,
@@ -3115,8 +3132,10 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
   ([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
 - **Constructors are lowercase and take no backtick.** They are declared names that belong to their
   type, reached as `Shape::circle`, or `shop::Shape::circle` from a module that imports `shop`.
-- **A parameter type may name the type being declared and the module's other types**, so recursive
-  and mutually recursive types are written directly:
+- **A parameter type may name the module's other types**, declared before or after it. Naming the
+  type being declared, directly or through another type, writes a recursive or mutually recursive
+  type, which is **[Decided]**. Lowering rejects one today (``a recursive nominal type is not
+  supported yet``):
 
   ```python
   type Tree:
@@ -3146,9 +3165,10 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
   - **A parameter inside another nominal type takes that type's parameter variance**, composed by
     the same rule. `T` in `wrap(Option(T))` is covariant, and the builtins' variances are listed in
     [6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided).
-  - **A recursive declaration's variance is the least fixpoint.** Every parameter starts with no
-    variance. Each round computes the variance of every occurrence, reading a recursive occurrence
-    at the previous round's answer, and the rounds repeat until no answer changes.
+  - **A recursive declaration's variance is the least fixpoint** (**[Decided]**, with recursive
+    types). Every parameter starts with no variance. Each round computes the variance of every
+    occurrence, reading a recursive occurrence at the previous round's answer, and the rounds
+    repeat until no answer changes.
     `type Stream(T): cons(T, Stream(T))` settles at covariant. In
     `type Ping(T): p(T, Ping(T) => Int)`, the direct `T` gives covariant and the next round adds
     contravariant through the domain, so `T` settles at invariant.
@@ -4027,7 +4047,7 @@ first("a", "b")   # T = String
   > the result, and each use determines it from the type the use requires. `Map::empty` has type
   > `forall (K, V) Map(K, V)`, so `m: Map(String, Int) = Map::empty` determines `K` and `V`, and
   > `Option::none` is the same case
-  > ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). A use that
+  > ([6.8 Nominal types and methods](#68-nominal-types-and-methods)). A use that
   > determines none is an unresolved-type error at the use, as an unannotated `empty_map()` is
   > today ([3.11 List, tuple, record literals](#311-list-tuple-record-literals)).
 - **A type parameter is opaque in the body.** A value of type `T` supports what `T`'s bound and the
@@ -4544,7 +4564,7 @@ instance forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatabl
 
 #### Traits and instances across modules [Decided]
 
-A trait is a member of its module ([9. Modules [Decided]](#9-modules-decided)), and an instance
+A trait is a member of its module ([9. Modules](#9-modules)), and an instance
 belongs to the whole program.
 
 - **`pub trait` exports a trait** with its functions and associated types, and `pub` is refused on a
@@ -4687,8 +4707,7 @@ The north-star programs additionally assume non-aggregate built-ins —
 > nothing decides between them — one of the two names has to go. Both
 > are written in **method** position, as is `catalog.keys()`. A method
 > call resolves among the methods of a
-> nominal type ([6.8 Nominal types and methods
-> [Decided]](#68-nominal-types-and-methods-decided)). `Set`, `Map` and
+> nominal type ([6.8 Nominal types and methods](#68-nominal-types-and-methods)). `Set`, `Map` and
 > `FullMap` are nominal, so `catalog.keys()` resolves; `List` and
 > `Collection` are structural, so `orders.filter(…)` on one names no
 > method, and a trait's function is read from an instance
@@ -4707,7 +4726,7 @@ distinct key, where each element is itself the group of `c`-elements
 sharing that key.
 
 ```python
-[ sum([s.amount for s in g]) for g in groupby(sales, lambda r: r.region) ]
+[ sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region) ]
 ```
 
 The standard pattern (above) — group, then aggregate per group — is
@@ -5814,7 +5833,7 @@ pub held: Int
   `extract` in the single-constructor form. `pub` on an associated function's `def`, including one
   in an `impl` block, exports it, and one without `pub` is reached only from its own module, in
   either spelling
-  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). An associated
+  ([6.8 Nominal types and methods](#68-nominal-types-and-methods)). An associated
   function binds no module-level name, so the bound-once rule above does not apply to it.
 - Types need not be annotated on public members. An unannotated member's contract is its inferred
   type ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
@@ -6093,7 +6112,7 @@ nothing.
   unqualified.
 - A sum or product that several modules share is declared as a nominal type. The constructors of a
   constructor list belong to the type and their parameter names are not labels
-  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)), so another
+  ([6.8 Nominal types and methods](#68-nominal-types-and-methods)), so another
   module writes `Shape::circle(1)` with no qualified tag or label. `Option` is such a type, in a
   std module ([9.16 The std root](#916-the-std-root)). A record in the single-constructor form
   `type N = R` keeps its labels, which belong to the declaring module like any other:
@@ -6102,7 +6121,7 @@ nothing.
   of an HTTP request body.
 
 A module's type members are its type aliases and its nominal types
-([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Exporting an
+([6.8 Nominal types and methods](#68-nominal-types-and-methods)). Exporting an
 alias exports a spelling for a structural type, and the user's type is the same type. Exporting a
 nominal type exports the type itself: `mod::Price` is one type in every module that names it, and
 distinct from every other type of its shape.
@@ -6325,7 +6344,7 @@ pub def now() => Instant:
 ```
 
 **[Decided]** — `Option` is a `type` declared in a std module, and is in the prelude
-([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Builtin
+([6.8 Nominal types and methods](#68-nominal-types-and-methods)). Builtin
 operations that answer an `Option`, the lookup `c[k]` and the unwrap `e!`
 ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)), refer to that
 declaration. `Set`, `Map` and `FullMap` stay compiler builtins, as nominal types with no
@@ -6625,21 +6644,15 @@ with parser-level support that lowering rejects:
 - **Recursion** — self-reference in `def` is not yet wired through;
   self-referential *value* bindings get the explicit `rec` form
   (**[Decided]**, §4.3).
-- **Imports / multiple files** — modules, imports, runs, and parameters
-  are specified in [9. Modules](#9-modules).
-- **Classes / `try`** — not in the language. `with` **is** a keyword
+- **Classes** — not in the language; a `type` declares a nominal type
+  ([6.8 Nominal types and methods](#68-nominal-types-and-methods)). `with` **is** a keyword
   (§1.6), but only for transaction blocks `with begin():` (§8.2); it does
   not carry Python's general context-manager meaning.
 - **Float arithmetic** — no `f64` type at the surface.
 - **String operations** beyond `+` concatenation.
-- **Surface refinement type syntax** — refinement types (§6) are
-  inferred today only via built-ins like `groupby`; the decided
-  surface form is `{T where p(_)}` (**[Decided]**, §6.4), not yet in
-  the grammar. `where` is already **lexed** and reserved (§1.6); what is
-  missing is the brace-form production and `_` in term position inside the
-  predicate. Function contracts are written either as those annotations or as
-  `assert`s lifted to refinements (**[Decided]**, §6) — `assert` is likewise not
-  yet a statement.
+- **`assert` contracts** — a function contract is written as refinement annotations
+  ([6.4 Refinement syntax](#64-refinement-syntax), implemented) or as `assert`s lifted to
+  refinements (**[Decided]**, §6). `assert` is not a statement yet.
 - **Pattern matching** beyond a `match` arm's single tag — `match` / `case`
   tag dispatch over a variant is implemented (§4.10), in both the indented and
   the one-line form, but patterns are shallow: no nesting, no literal patterns,
@@ -6648,11 +6661,6 @@ with parser-level support that lowering rejects:
   patterns in assignment targets and binders (a `match` arm's tag or constructor pattern is §4.10),
   a pattern in a constructor pattern's parameter, and per-component annotations with `:` binding
   tighter than `,` (**[Decided]**, §4.3.1).
-- **Unit values do not run** — the type surface is settled (`{}` for the type,
-  `()` for the value, §6.6) and both typecheck, but a unit-valued program
-  output cannot be materialized by the interpreter: it has no column
-  representation, so `x = ()` compiles and then fails at runtime. This is a
-  runtime gap, not a surface one.
 - **The term-level delimiter migration** — record values are `(f=1, …)`, and `{…}` no longer
   denotes a term-level value (it is record-type / tuple-type / unit syntax,
   [2.4 Atoms](#24-atoms)). The map literal `[k -> v, …]` parses, and `map([…])` is the only reading
@@ -6661,9 +6669,9 @@ with parser-level support that lowering rejects:
   or Unicode `[k ↦ v, …]` are superseded by the map-literal decision.
 - **Map comprehensions** — `[k -> v for …]` is a comprehension of pairs, and reading one as a
   `Map` is `map([k -> v for …])` ([3.12 Comprehensions](#312-comprehensions)).
-- **Nominal types** — a recursive `type` declaration, `@RenamedFrom` on a type, and carrying a
-  value of a nominal type over a reload are **[Decided]** and unimplemented
-  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+- **Nominal types** — a recursive `type` declaration, `@RenamedFrom` on a type or a constructor,
+  and carrying a value of a nominal type over a reload are **[Decided]** and unimplemented
+  ([6.8 Nominal types and methods](#68-nominal-types-and-methods)).
 - **The target syntax at large** — the mutation and transaction **core is implemented** (`:=`,
   `with begin():`, `Mut(…, Txn)` mutable variables, feeds — §8), now spelled in the canonical target
   syntax: parenthesised type application (`Mut(V, Txn)`, `List(T)`) and capitalized primitive names
@@ -6671,10 +6679,9 @@ with parser-level support that lowering rejects:
   annotation position (§6.1), and variants writable in all three positions — type, term and pattern
   (§6.5, §3.15, §4.10). The remaining **Direction** notes are unimplemented: `rec` bindings (§4.3),
   destructuring patterns ([4.3.1 Destructuring patterns](#431-destructuring-patterns)), membership
-  `in` ([3.4 Comparisons](#34-comparisons)), refinements
-  ([6.4 Refinement syntax](#64-refinement-syntax)), the `Feed(_)` forward-declaration surface (§3.7,
-  §6.2), and transactions-as-contextual-parameters (§8.7). The north-star programs pin the target;
-  the sequencing is tracked
+  `in` ([3.4 Comparisons](#34-comparisons)), and naming a transaction, `with txn = begin():`
+  ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)). The
+  north-star programs pin the target.
 
 When each lands, this spec will be updated alongside the lowering and
 the demo programs.
