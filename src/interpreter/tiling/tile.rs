@@ -1583,13 +1583,7 @@ impl Tile {
         Some(codomain.innermost_depth().map_or(0, |below| below + 1))
     }
 
-    /// The innermost collection of this chain ([`Self::innermost_depth`]).
-    pub fn innermost_level(&self) -> Option<&Tile> {
-        let depth = self.innermost_depth()?;
-        Some(self.values_at(CurryLevel::new(depth)))
-    }
-
-    /// [`Self::innermost_level`], to write through.
+    /// The innermost collection of this chain ([`Self::innermost_depth`]), to write through.
     pub fn innermost_level_mut(&mut self) -> Option<&mut Tile> {
         let depth = self.innermost_depth()?;
         Some(self.values_at_mut(CurryLevel::new(depth)))
