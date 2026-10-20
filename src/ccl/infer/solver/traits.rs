@@ -1709,7 +1709,7 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                 | Type::Base(_)
                 | Type::UIntRange(_)
                 | Type::Hole
-                | Type::OpaqueHole(_)
+                | Type::BarrierVar(_)
                 | Type::SharedHole(_)
                 | Type::DataSource(_)
                 | Type::ChanDom(_, _)

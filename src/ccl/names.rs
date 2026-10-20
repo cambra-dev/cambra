@@ -129,7 +129,7 @@ pub enum SyntheticKind {
     /// read at, which the generator sources are then indexed by.
     IterRecord,
     /// The binder [`crate::ccl::opaque_output`] mints for a lambda's result,
-    /// annotated with an opaque hole.
+    /// annotated with a barrier variable.
     Output,
 }
 
@@ -477,7 +477,7 @@ impl Name {
         Self::synthetic(SyntheticKind::MutRead)
     }
 
-    /// The binder for a lambda's result under an opaque-hole annotation
+    /// The binder for a lambda's result under a barrier-variable annotation
     /// ([`crate::ccl::opaque_output`]).
     pub fn output() -> Self {
         Self::synthetic(SyntheticKind::Output)

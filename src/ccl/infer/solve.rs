@@ -1056,7 +1056,7 @@ fn for_each_positioned_var(
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
-        | Type::OpaqueHole(_)
+        | Type::BarrierVar(_)
         | Type::SharedHole(_)
         | Type::Param(_)
         | Type::WitnessRef(_)
@@ -2387,7 +2387,7 @@ fn coalesce_type_predicates_go(
         }
         // A hole survives coalescing only in a slot whose resolution failed, as an
         // `Infer` does, and `resolve_binder_slot` has already reported that failure.
-        Type::OpaqueHole(_)
+        Type::BarrierVar(_)
         | Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)

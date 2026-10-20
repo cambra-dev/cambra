@@ -599,7 +599,7 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         | Type::WitnessRef(_)
         | Type::Txn
         | Type::Hole
-        | Type::OpaqueHole(_)
+        | Type::BarrierVar(_)
         | Type::SharedHole(_)
         | Type::Param(_)
         | Type::Infer(_) => Ok(()),

@@ -2112,11 +2112,11 @@ naming it would relate the results of `f(1)` and `f(2)` through one `r`. The dro
 supertype of the body's, so every result the function produces inhabits the codomain.
 
 `opaque_output::run` runs before inference and rewrites such a lambda to
-`λ 𝑥 → let __output : 𝐻 = body in __output`, where `𝐻` is a fresh `Type::OpaqueHole`. Inference
+`λ 𝑥 → let __output : 𝐻 = body in __output`, where `𝐻` is a fresh `Type::BarrierVar`. Inference
 records each edge into the hole as a lower bound and each edge out of it as an upper bound, and
 closes neither against the other. Compaction resolves the hole to the join of its lower bounds with
 every refinement dropped, then checks each upper bound against that resolution
-(`check_opaque_uppers` in `solver/compact.rs`). A failed check surfaces as the constraint error it
+(`check_barrier_uppers` in `solver/compact.rs`). A failed check surfaces as the constraint error it
 raised. The drop covers every refinement in the join, including one that names no opaque binder.
 
 Because an upper bound is not closed against the lower bounds, a demand on the codomain does not

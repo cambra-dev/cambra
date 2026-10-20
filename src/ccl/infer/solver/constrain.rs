@@ -439,9 +439,9 @@ pub fn constrain_subtype_in(
     constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache, scope)
 }
 
-/// Check an opaque hole's upper bound against `resolved`, the type the hole resolved to:
+/// Check a barrier variable's upper bound against `resolved`, the type the variable resolved to:
 /// `resolved‹upper.self_subst› <: upper.ty‹upper.ty_subst›`, the edge the bound recorded
-/// with `resolved` in the hole's place.
+/// with `resolved` in the variable's place.
 pub(super) fn constrain_opaque_upper(
     resolved: &Type,
     upper: &Bound,
@@ -1511,21 +1511,21 @@ fn constrain_go_impl(
         }
         // Record the upper edge in native form (`H‹sl› <: rhs‹sr›`), as the
         // `(Type::Infer(_), _)` arm below does. It is not closed against the lowers:
-        // compaction checks each upper against the hole's resolution, which needs every
+        // compaction checks each upper against the variable's resolution, which needs every
         // lower to have arrived.
-        (Type::OpaqueHole(hole), _) => {
+        (Type::BarrierVar(barrier), _) => {
             let bound =
                 Bound::edge(sl.clone(), rhs.clone(), sr.clone()).with_origin(cache.origins.1);
-            hole.uppers.borrow_mut().push(bound);
+            barrier.uppers.borrow_mut().push(bound);
             Ok(())
         }
         // Record the lower edge in native form (`lhs‹sl› <: H‹sr›`), as the
         // `(_, Type::Infer(_))` arm below does, and likewise not closed against the
         // uppers.
-        (_, Type::OpaqueHole(hole)) => {
+        (_, Type::BarrierVar(barrier)) => {
             let bound =
                 Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
-            hole.lowers.borrow_mut().push(bound);
+            barrier.lowers.borrow_mut().push(bound);
             Ok(())
         }
         // There is deliberately **no deref arm here.** A mutable variable mention that denotes
@@ -2003,10 +2003,10 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
             )
         }
-        // A hole minted under a generalized `let` reaches a lower-level variable
-        // inside a function type (`extrude_reaches_an_opaque_hole_*` in
+        // A barrier variable minted under a generalized `let` reaches a lower-level variable
+        // inside a function type (`extrude_reaches_a_barrier_var_*` in
         // `tests/it/compilation_pipeline/type_annotations.rs`).
-        Type::OpaqueHole(_) => unimplemented!("extruding an OpaqueHole"),
+        Type::BarrierVar(_) => unimplemented!("extruding a BarrierVar"),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)

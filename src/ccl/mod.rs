@@ -76,7 +76,7 @@ pub(crate) use ty::eq_term_modulo_ty_slots;
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn reset_all_id_counters() {
     reset_infer_var_counter();
-    reset_opaque_hole_counter();
+    reset_barrier_var_counter();
     reset_fun_kind_var_counter();
 }
 

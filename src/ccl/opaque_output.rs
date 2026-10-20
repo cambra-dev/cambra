@@ -1,4 +1,4 @@
-//! Binding a lambda's result under an [`OpaqueHole`](crate::ccl::Type::OpaqueHole)
+//! Binding a lambda's result under an [`BarrierVar`](crate::ccl::Type::BarrierVar)
 //! annotation when the body binds an opaque variable.
 //!
 //! [`run`] is the phase, between [`crate::ccl::comprehension`] and
@@ -6,12 +6,12 @@
 //! an [opaque](crate::ccl::BindingTransparency::Opaque) variable to
 //!
 //! ```text
-//! λ x → let __output : ⟨opaque hole⟩ = body in __output
+//! λ x → let __output : ⟨barrier variable⟩ = body in __output
 //! ```
 //!
-//! The annotation is a fresh `Type::OpaqueHole` per lambda. An opaque binder
+//! The annotation is a fresh `Type::BarrierVar` per lambda. An opaque binder
 //! withholds its definiens, so a type leaving its scope cannot read the binder
-//! back as anything else. The hole is the slot at which the body's type leaves
+//! back as anything else. The barrier variable is the slot at which the body's type leaves
 //! the scope of every opaque binder inside it.
 //!
 //! A lambda is left alone in two cases:
@@ -26,7 +26,7 @@
 //!   `__output`.
 
 use crate::ccl::{
-    BindingTransparency, Expr, Name, OpaqueHoleVar, Type, TypedBinding, TypedExprNode,
+    BarrierVar, BindingTransparency, Expr, Name, Type, TypedBinding, TypedExprNode,
     provenance::{self, Nature},
 };
 
@@ -112,13 +112,13 @@ pub fn peel(expr: Expr) -> Expr {
     *bound_expr
 }
 
-/// `let __output : ⟨opaque hole⟩ = body in __output`.
+/// `let __output : ⟨barrier variable⟩ = body in __output`.
 fn wrap(body: Expr) -> Expr {
     let output = Name::output();
     // Minted at level 0: before inference no scope levels exist. Normalizing the
-    // annotation replaces it with a fresh hole at its scope's level.
-    let hole = Type::OpaqueHole(OpaqueHoleVar::fresh(0, Vec::new(), Vec::new()));
-    let binding = TypedBinding::new_annotated(output.clone(), hole);
+    // annotation replaces it with a fresh barrier variable at its scope's level.
+    let barrier = Type::BarrierVar(BarrierVar::fresh(0, Vec::new(), Vec::new()));
+    let binding = TypedBinding::new_annotated(output.clone(), barrier);
     Expr::let_in(binding, body, Expr::var(output))
 }
 
@@ -145,7 +145,7 @@ mod tests {
         body
     }
 
-    /// Whether `expr` is `let __output : ⟨opaque hole⟩ = _ in __output`.
+    /// Whether `expr` is `let __output : ⟨barrier variable⟩ = _ in __output`.
     fn is_output_wrap(expr: &Expr) -> bool {
         let TypedExprNode::Let {
             binding,
@@ -155,7 +155,7 @@ mod tests {
         else {
             return false;
         };
-        matches!(binding.user_annotation, Some(Type::OpaqueHole(_)))
+        matches!(binding.user_annotation, Some(Type::BarrierVar(_)))
             && matches!(&tail.node, TypedExprNode::Var(n) if *n == binding.name)
             && matches!(
                 &binding.name,
@@ -237,10 +237,10 @@ mod tests {
         let TypedExprNode::Tuple(items) = &out.node else {
             panic!("the root stays a tuple");
         };
-        let hole = |e: &Expr| match &body_of(e).node {
+        let barrier = |e: &Expr| match &body_of(e).node {
             TypedExprNode::Let { binding, .. } => binding.user_annotation.clone(),
             _ => None,
         };
-        assert_ne!(hole(&items[0]), hole(&items[1]));
+        assert_ne!(barrier(&items[0]), barrier(&items[1]));
     }
 }

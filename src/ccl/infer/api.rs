@@ -1788,8 +1788,8 @@ fn collect_type_errors(
         // `normalize_annotation` resolves both. A survivor means the annotation
         // never reached normalization, which is the same compiler bug either way.
         //
-        // OpaqueHole is handled the same way.
-        Type::Hole | Type::OpaqueHole(_) | Type::SharedHole(_) => {
+        // BarrierVar is handled the same way.
+        Type::Hole | Type::BarrierVar(_) | Type::SharedHole(_) => {
             errors.push(InferError::UnresolvedHole {
                 at: context_sym.to_string(),
             })

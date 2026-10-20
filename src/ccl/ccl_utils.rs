@@ -1240,7 +1240,7 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         | Type::UIntRange(_)
         | Type::Hole
         | Type::SharedHole(_)
-        | Type::OpaqueHole(_)
+        | Type::BarrierVar(_)
         | Type::Infer(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)

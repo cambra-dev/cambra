@@ -997,11 +997,11 @@ a == b
     )
 }
 
-/// TODO: Extrude an opaque hole. `f`'s codomain hole is minted under `g`'s
+/// TODO: Extrude a barrier variable. `f`'s codomain barrier variable is minted under `g`'s
 /// generalized body and reaches the lower-level variable `h` inside `f`'s
 /// function type, where `extrude` has no arm for it.
 #[test]
-fn extrude_reaches_an_opaque_hole_returned_from_a_nested_def() {
+fn extrude_reaches_a_barrier_var_returned_from_a_nested_def() {
     check_compile_error(
         indoc! {r#"
 def g(z):
@@ -1012,15 +1012,15 @@ def g(z):
 h = g(1)
 h(2)
         "#},
-        "not implemented: extruding an OpaqueHole",
+        "not implemented: extruding a BarrierVar",
     )
 }
 
-/// TODO: Extrude an opaque hole. The same gap as
-/// `extrude_reaches_an_opaque_hole_returned_from_a_nested_def`, with the nested
+/// TODO: Extrude a barrier variable. The same gap as
+/// `extrude_reaches_a_barrier_var_returned_from_a_nested_def`, with the nested
 /// `f` passed to `g`'s parameter rather than returned.
 #[test]
-fn extrude_reaches_an_opaque_hole_passed_to_a_parameter() {
+fn extrude_reaches_a_barrier_var_passed_to_a_parameter() {
     check_compile_error(
         indoc! {r#"
 def k(f):
@@ -1032,7 +1032,7 @@ def g(h):
     h(f)
 g(k)
         "#},
-        "not implemented: extruding an OpaqueHole",
+        "not implemented: extruding a BarrierVar",
     )
 }
 
@@ -1080,7 +1080,7 @@ a == b
 }
 
 /// Reading a mutable variable introduces an opaque binder inside the body, so the
-/// body's type reaches the codomain through an opaque hole; the refinement it drops
+/// body's type reaches the codomain through a barrier variable; the refinement it drops
 /// names the parameter as well as that binder
 /// (`src/ccl/design/type-inference.md`, "A lambda's codomain drops the body's
 /// opaque binders").

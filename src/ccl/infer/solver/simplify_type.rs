@@ -158,7 +158,7 @@ pub fn simplify_type_pinning(cty: CompactGraph, pinned: &BTreeSet<InferVarId>) -
     CompactGraph {
         term: simplify_reconstruct(cty.term, &var_subst),
         rec_vars: new_rec_vars,
-        opaque_upper_violations: cty.opaque_upper_violations,
+        barrier_upper_violations: cty.barrier_upper_violations,
     }
 }
 
@@ -467,7 +467,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
-            opaque_upper_violations: Vec::new(),
+            barrier_upper_violations: Vec::new(),
         };
 
         let simplified = simplify_type(graph);
@@ -500,7 +500,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
-            opaque_upper_violations: Vec::new(),
+            barrier_upper_violations: Vec::new(),
         };
 
         let simplified = simplify_type(graph);
@@ -536,7 +536,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
-            opaque_upper_violations: Vec::new(),
+            barrier_upper_violations: Vec::new(),
         };
 
         let simplified = simplify_type(graph);
@@ -569,7 +569,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
-            opaque_upper_violations: Vec::new(),
+            barrier_upper_violations: Vec::new(),
         };
 
         let simplified = simplify_type(graph);

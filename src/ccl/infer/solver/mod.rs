@@ -75,7 +75,7 @@ pub use spec_key::{SpecKey, spec_key};
 pub fn type_level(ty: &Type) -> Level {
     match ty {
         Type::Infer(v) => v.level(),
-        Type::OpaqueHole(hole) => hole.level(),
+        Type::BarrierVar(barrier) => barrier.level(),
         // A bounded annotation's level is its bound's: the variable it becomes is
         // minted at the *use* level by `normalize_annotation`, so the bound is all
         // there is to report here.

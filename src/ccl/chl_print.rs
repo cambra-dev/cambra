@@ -151,7 +151,7 @@ impl Printer {
             Type::Txn => "Txn".to_string(),
             Type::Hole => "_".to_string(),
             // A variable has an identity `_` would drop: two occurrences are one type.
-            Type::SharedHole(_) | Type::OpaqueHole(_) | Type::Infer(_) => self.fallback(ty),
+            Type::SharedHole(_) | Type::BarrierVar(_) | Type::Infer(_) => self.fallback(ty),
             Type::Param(p) => match self.joins.iter().find(|(id, _)| *id == p.id) {
                 Some((_, text)) => text.clone(),
                 None => p.spelling.to_string(),

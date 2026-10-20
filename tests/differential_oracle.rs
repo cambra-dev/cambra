@@ -653,10 +653,10 @@ fn coalesce_outcome(r: &Result<Type, CoalesceError>) -> Option<String> {
                 CoalesceError::KindConflict { .. } => "KindConflict",
                 // Three rejections the model has no counterpart for: a kind edge whose two
                 // sides state incomparable kinds, a witness whose binder is not in scope
-                // where the reference materialized, and an opaque hole whose resolution
+                // where the reference materialized, and a barrier variable whose resolution
                 // fails one of its upper bounds. None is reachable from the fragment this
                 // oracle serializes — a sum leaves it at `ty_json`, and every graph here
-                // carries no `opaque_upper_violations` — so report no verdict rather than
+                // carries no `barrier_upper_violations` — so report no verdict rather than
                 // inventing a wire name.
                 CoalesceError::KindMismatch { .. }
                 | CoalesceError::WitnessScope { .. }
@@ -700,7 +700,7 @@ fn differential_coalesce_vs_lean_model() {
         let graph = CompactGraph {
             term: acc.clone(),
             rec_vars: std::collections::BTreeMap::new(),
-            opaque_upper_violations: Vec::new(),
+            barrier_upper_violations: Vec::new(),
         };
         let (Some(ct), Some(got)) = (cty_json(&acc), coalesce_outcome(&coalesce_compact(&graph)))
         else {

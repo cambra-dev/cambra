@@ -13,7 +13,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::{RefinementScope, Subst};
-use crate::ccl::{OpaqueHoleId, OpaqueHoleVar};
+use crate::ccl::{BarrierVar, BarrierVarId};
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_opaque_upper};
 use crate::ccl::{
@@ -1437,11 +1437,11 @@ impl CompactType {
 pub struct CompactGraph {
     pub term: CompactType,
     pub rec_vars: BTreeMap<InferVarId, CompactType>,
-    /// The failed checks of an opaque hole's upper bounds against its resolution, one
-    /// per failing bound (the `OpaqueHole` arm of [`compact_go`]). Surfaced by
+    /// The failed checks of a barrier variable's upper bounds against its resolution, one
+    /// per failing bound (the `BarrierVar` arm of [`compact_go`]). Surfaced by
     /// `coalesce_compact` as an `OpaqueUpperBound` error, as `rec_vars` is surfaced
     /// as a `RecursiveType` one.
-    pub opaque_upper_violations: Vec<ConstrainError>,
+    pub barrier_upper_violations: Vec<ConstrainError>,
 }
 
 /// Walk a `Type`, transitively expanding variable bounds at the
@@ -1478,8 +1478,8 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
         rec_vars: BTreeMap::new(),
         collapse,
         scope: RefinementScope::default(),
-        checked_opaque_holes: HashSet::new(),
-        opaque_upper_violations: Vec::new(),
+        checked_barrier_vars: HashSet::new(),
+        barrier_upper_violations: Vec::new(),
     };
     let term = compact_go(ty, true, &Subst::id(), Position::default(), &mut st);
     debug_assert!(
@@ -1490,7 +1490,7 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
     CompactGraph {
         term,
         rec_vars: st.rec_vars,
-        opaque_upper_violations: st.opaque_upper_violations,
+        barrier_upper_violations: st.barrier_upper_violations,
     }
 }
 
@@ -1696,21 +1696,21 @@ struct CompactState {
     /// function meeting at one variable spell one refinement one way. `key_go` threads
     /// the same type, so a key and a compacted type agree.
     scope: RefinementScope,
-    /// Opaque holes whose upper bounds this walk has checked. A hole is checked once
+    /// Barrier variables whose upper bounds this walk has checked. A variable is checked once
     /// per walk however many times the walk reaches it.
-    checked_opaque_holes: HashSet<OpaqueHoleId>,
-    /// See [`CompactGraph::opaque_upper_violations`].
-    opaque_upper_violations: Vec<ConstrainError>,
+    checked_barrier_vars: HashSet<BarrierVarId>,
+    /// See [`CompactGraph::barrier_upper_violations`].
+    barrier_upper_violations: Vec<ConstrainError>,
 }
 
-/// The resolution of an opaque hole, under `subst_acc`, as a [`CompactType`]: the join
+/// The resolution of a barrier variable, under `subst_acc`, as a [`CompactType`]: the join
 /// of its lower bounds with every refinement dropped.
-fn join_opaque_lowers(
-    hole: &OpaqueHoleVar,
+fn join_barrier_lowers(
+    barrier: &BarrierVar,
     subst_acc: &Subst,
     st: &mut CompactState,
 ) -> CompactType {
-    let lowers = hole.lowers.borrow().clone();
+    let lowers = barrier.lowers.borrow().clone();
     let mut joined = CompactType::empty();
     for b in &lowers {
         let inner_acc = Subst::then(&b.render_subst(), subst_acc);
@@ -1721,30 +1721,30 @@ fn join_opaque_lowers(
     joined
 }
 
-/// Check each of `hole`'s upper bounds against the hole's resolution, recording every
-/// failure in [`CompactState::opaque_upper_violations`].
+/// Check each of `barrier`'s upper bounds against the variable's resolution, recording every
+/// failure in [`CompactState::barrier_upper_violations`].
 ///
-/// The resolution is materialized in the hole's own context (no `subst_acc`), because
+/// The resolution is materialized in the variable's own context (no `subst_acc`), because
 /// each upper bound's morphisms are spelled there. The check is `constrain`, so it
 /// records bounds on any variable it reaches. A resolution that does not materialize is
-/// not checked: the same join is what the hole's position compacts to, so coalescing
+/// not checked: the same join is what the variable's position compacts to, so coalescing
 /// that position reports it.
-fn check_opaque_uppers(hole: &OpaqueHoleVar, st: &mut CompactState) {
-    if !st.checked_opaque_holes.insert(hole.uid) {
+fn check_barrier_uppers(barrier: &BarrierVar, st: &mut CompactState) {
+    if !st.checked_barrier_vars.insert(barrier.uid) {
         return;
     }
-    let uppers = hole.uppers.borrow().clone();
+    let uppers = barrier.uppers.borrow().clone();
     if uppers.is_empty() {
         return;
     }
-    let own = join_opaque_lowers(hole, &Subst::id(), st);
+    let own = join_barrier_lowers(barrier, &Subst::id(), st);
     let Ok(resolved) = super::coalesce::coalesce_position(&own, true) else {
         return;
     };
     let mut cache = ConstrainCache::new();
     for upper in &uppers {
         if let Err(err) = constrain_opaque_upper(&resolved, upper, &mut cache) {
-            st.opaque_upper_violations.push(err);
+            st.barrier_upper_violations.push(err);
         }
     }
 }
@@ -2279,14 +2279,14 @@ fn compact_go(
                 ..CompactType::value()
             }
         }
-        // The join of the hole's lower bounds with every refinement dropped: the
+        // The join of the barrier variable's lower bounds with every refinement dropped: the
         // narrowest unrefined type above each of them. The bounds are joined at
-        // positive polarity at either polarity of the reference, because the hole
+        // positive polarity at either polarity of the reference, because the barrier variable
         // denotes the value its lowers produce. A refinement in a lower bound can name
-        // an opaque binder the hole sits outside of, which is why none survives.
-        Type::OpaqueHole(hole) => {
-            check_opaque_uppers(hole, st);
-            join_opaque_lowers(hole, subst_acc, st)
+        // an opaque binder the barrier variable sits outside of, which is why none survives.
+        Type::BarrierVar(barrier) => {
+            check_barrier_uppers(barrier, st);
+            join_barrier_lowers(barrier, subst_acc, st)
         }
         Type::Infer(state) => {
             let uid = state.uid;
@@ -3083,7 +3083,7 @@ mod tests {
         CompactGraph {
             term,
             rec_vars: BTreeMap::new(),
-            opaque_upper_violations: Vec::new(),
+            barrier_upper_violations: Vec::new(),
         }
     }
 

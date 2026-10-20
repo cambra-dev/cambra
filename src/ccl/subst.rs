@@ -1209,7 +1209,7 @@ impl Subst {
             // A type parameter names no term binder; its bound is a child of the
             // `Poly` that declares it, reached by the arm below.
             | Type::Param(_)
-            | Type::OpaqueHole(_)
+            | Type::BarrierVar(_)
             | Type::Infer(_) => {}
             Type::Poly(poly) => Rc::make_mut(poly)
                 .types_mut()
@@ -1531,7 +1531,7 @@ impl Subst {
             | Type::Hole
             | Type::SharedHole(_)
             | Type::Param(_)
-            | Type::OpaqueHole(_)
+            | Type::BarrierVar(_)
             | Type::Infer(_) => ty.clone(),
             Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(|t| self.apply_type_inner(t)))),
 
@@ -1741,7 +1741,7 @@ pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
 /// [`InferError::UnresolvedBoundedHole`](crate::ccl::infer::InferError::UnresolvedBoundedHole),
 /// not by this test.
 pub fn type_contains_infer(ty: &Type) -> bool {
-    matches!(ty, Type::Infer(_) | Type::OpaqueHole(_)) || ty.any_child(type_contains_infer)
+    matches!(ty, Type::Infer(_) | Type::BarrierVar(_)) || ty.any_child(type_contains_infer)
 }
 
 /// Insert each of `names` into `bound` for the duration of `f`, restoring the
@@ -1786,7 +1786,7 @@ fn collect_type_fv(
         | Type::WitnessRef(_)
         // So is a type parameter; its bound is a child of the `Poly` below.
         | Type::Param(_)
-        | Type::OpaqueHole(_)
+        | Type::BarrierVar(_)
         | Type::Infer(_) => {}
         Type::Poly(poly) => {
             for t in poly.types() {
@@ -2300,7 +2300,7 @@ impl<'a> PiWalk<'a> {
             | Type::Hole
             | Type::SharedHole(_)
             | Type::Param(_)
-            | Type::OpaqueHole(_)
+            | Type::BarrierVar(_)
             | Type::Infer(_) => {}
             Type::Poly(poly) => Rc::make_mut(poly)
                 .types_mut()
@@ -2516,7 +2516,7 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
             | Type::ChanDom(..)
             | Type::Txn
             | Type::Hole
-            | Type::OpaqueHole(_)
+            | Type::BarrierVar(_)
             | Type::SharedHole(_)
             | Type::Param(_)
             | Type::Infer(_) => false,

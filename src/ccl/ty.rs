@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use smol_str::SmolStr;
 
 use crate::ccl::{
-    BaseType, InferVar, Label, Lit, OpaqueHoleVar, ProjKey, TypedExpr, TypedExprNode, ccl_utils,
+    BarrierVar, BaseType, InferVar, Label, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils,
     symbolic,
 };
 
@@ -1168,9 +1168,9 @@ pub enum Type {
     /// See `src/ccl/design/type-inference.md`, "Annotation kinds: exact and bounded".
     BoundedHole(Box<Type>),
     /// Unresolved type that needs to hide opaque variables from the
-    /// outer scope, identified by a unique [`crate::ccl::OpaqueHoleId`].
+    /// outer scope, identified by a unique [`crate::ccl::BarrierVarId`].
     /// Gathers its lower bounds.
-    OpaqueHole(Rc<OpaqueHoleVar>),
+    BarrierVar(Rc<BarrierVar>),
     /// Unresolved type variable, identified by a unique [`crate::ccl::InferVarId`].
     ///
     /// Created during inference by the inference pass
@@ -1911,7 +1911,7 @@ impl TypeKind {
                     | Type::Infer(_)
                     | Type::Hole
                     | Type::SharedHole(_)
-                    | Type::OpaqueHole(_)
+                    | Type::BarrierVar(_)
             ),
             // **Membership here is subtyping**, which belongs to the solver: constraint time
             // draws the edge (`super::infer::solver::constrain`, `constrain_type_kinds`)
@@ -2301,7 +2301,7 @@ fn fmt_type(
         // The mirror of `BoundedHole`'s `<:𝑇`. Rendered by identity like
         // `Infer`'s `?N`, never by reading `lowers`, which may be cyclic or
         // mutably borrowed.
-        Type::OpaqueHole(var) => write!(f, ":>{}", var.uid),
+        Type::BarrierVar(var) => write!(f, ":>{}", var.uid),
         Type::UIntRange(0) => write!(f, "∅"),
         Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
         // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
@@ -3499,7 +3499,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
-            | Type::OpaqueHole(_)
+            | Type::BarrierVar(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -3542,7 +3542,7 @@ impl Type {
                 | Type::Hole
                 | Type::SharedHole(_)
                 | Type::BoundedHole(_)
-                | Type::OpaqueHole(_)
+                | Type::BarrierVar(_)
                 | Type::Refinement(..)
         ) || self.any_child(Type::holds_an_unresolved_position)
     }
@@ -3588,7 +3588,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
-            | Type::OpaqueHole(_)
+            | Type::BarrierVar(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -3660,7 +3660,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
-            | Type::OpaqueHole(_)
+            | Type::BarrierVar(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)

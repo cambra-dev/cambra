@@ -147,7 +147,7 @@ fn blame_node_for_place(
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
-            | Type::OpaqueHole(_)
+            | Type::BarrierVar(_)
             | Type::SharedHole(_)
             | Type::DataSource(_)
             | Type::ChanDom(_, _)

@@ -15,7 +15,7 @@ use crate::ccl::subst::Subst;
 use crate::ccl::ty::TraitRequirement;
 use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId};
 use crate::ccl::{
-    Bound, InferVar, InferVarId, Level, OpaqueHoleId, OpaqueHoleVar, Refinement, Type, TypedExpr,
+    BarrierVar, BarrierVarId, Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr,
 };
 
 // ---------------------------------------------------------------------------
@@ -187,9 +187,9 @@ pub struct FreshenCache {
     pub site_telescope: Option<Telescope>,
     /// Original quantified var → its fresh replacement.
     pub vars: HashMap<InferVarId, Rc<InferVar>>,
-    /// Original opaque hole → its fresh replacement, for the same reason as
+    /// Original barrier variable → its fresh replacement, for the same reason as
     /// [`vars`](Self::vars).
-    pub opaque_holes: HashMap<OpaqueHoleId, Rc<OpaqueHoleVar>>,
+    pub barrier_vars: HashMap<BarrierVarId, Rc<BarrierVar>>,
     /// Original quantified channel-domain name → its rename. Seeded by
     /// `specialize_use` with use-site pairings; unpaired names mint fresh.
     pub chan_doms: HashMap<crate::ccl::Name, crate::ccl::Name>,
@@ -392,7 +392,7 @@ fn freshen_level(ty: &Type) -> Level {
     // answer `type_level` gives it and for the same reason.
     let mut lvl = match ty {
         Type::Infer(v) => v.level(),
-        Type::OpaqueHole(hole) => hole.level(),
+        Type::BarrierVar(barrier) => barrier.level(),
         // A declared parameter, in an annotation slot a clone copies, is a name the
         // solver never reads; normalization replaced it where the right-hand side was
         // emitted.
@@ -707,21 +707,21 @@ pub fn freshen_above(
             freshen_watches(lim, tv, &v, target, cache);
             Type::Infer(v)
         }
-        // Freshens like `Infer`, over what an opaque hole carries: its level and its
+        // Freshens like `Infer`, over what a barrier variable carries: its level and its
         // lower and upper bounds. It has no telescope, kind or watches to copy.
-        Type::OpaqueHole(hole) => {
-            if let Some(existing) = cache.opaque_holes.get(&hole.uid) {
-                return Type::OpaqueHole(Rc::clone(existing));
+        Type::BarrierVar(barrier) => {
+            if let Some(existing) = cache.barrier_vars.get(&barrier.uid) {
+                return Type::BarrierVar(Rc::clone(existing));
             }
             // Registered before the bounds are copied, so a bound that reaches this
-            // hole again resolves to the copy.
+            // barrier variable again resolves to the copy.
             let fresh =
-                OpaqueHoleVar::fresh(target.level_of(hole.level()), Vec::new(), Vec::new());
-            cache.opaque_holes.insert(hole.uid, Rc::clone(&fresh));
+                BarrierVar::fresh(target.level_of(barrier.level()), Vec::new(), Vec::new());
+            cache.barrier_vars.insert(barrier.uid, Rc::clone(&fresh));
 
             // Snapshot bounds before recursing, as the `Infer` arm does.
-            let lows = hole.lowers.borrow().clone();
-            let ups = hole.uppers.borrow().clone();
+            let lows = barrier.lowers.borrow().clone();
+            let ups = barrier.uppers.borrow().clone();
             let mut freshen_bound = |b: &Bound| Bound {
                 origin: b.origin,
                 self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
@@ -732,7 +732,7 @@ pub fn freshen_above(
             let new_ups: Vec<_> = ups.iter().map(&mut freshen_bound).collect();
             *fresh.lowers.borrow_mut() = new_lows;
             *fresh.uppers.borrow_mut() = new_ups;
-            Type::OpaqueHole(fresh)
+            Type::BarrierVar(fresh)
         }
     }
 }
@@ -968,7 +968,7 @@ pub fn seed_chan_dom_pairings(
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum BoundHolder {
     Var(InferVarId),
-    Hole(OpaqueHoleId),
+    Hole(BarrierVarId),
 }
 
 fn seed_pairings_go(
@@ -1013,10 +1013,10 @@ fn seed_pairings_go(
         }
         return;
     }
-    // An opaque hole resolves to the join of its lower bounds, so those carry its
+    // A barrier variable resolves to the join of its lower bounds, so those carry its
     // structure on either side. Its upper bounds are checks against that join and
     // add no position to pair.
-    if let Type::OpaqueHole(dh) = peel(def_ty) {
+    if let Type::BarrierVar(dh) = peel(def_ty) {
         if seen.insert(BoundHolder::Hole(dh.uid)) {
             let lows = dh.lowers.borrow().clone();
             for b in &lows {
@@ -1025,7 +1025,7 @@ fn seed_pairings_go(
         }
         return;
     }
-    if let Type::OpaqueHole(uh) = peel(use_ty) {
+    if let Type::BarrierVar(uh) = peel(use_ty) {
         if seen.insert(BoundHolder::Hole(uh.uid)) {
             let lows = uh.lowers.borrow().clone();
             for b in &lows {

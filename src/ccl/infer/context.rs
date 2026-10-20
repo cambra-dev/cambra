@@ -18,7 +18,7 @@ use std::rc::Rc;
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{
-    BindingTransparency, Expr, InferVar, Level, Lit, Name, OpaqueHoleVar, Refinement, Type,
+    BarrierVar, BindingTransparency, Expr, InferVar, Level, Lit, Name, Refinement, Type,
     TypedBinding, TypedExpr, TypedExprNode,
 };
 use crate::util::ScopeStack;
@@ -466,7 +466,7 @@ impl InferCtx {
 
     /// Normalize a user annotation / source type into a solver-ready
     /// `Type`: every `Hole` becomes a fresh inference variable and every
-    /// `OpaqueHole` a fresh opaque hole, both at the current level. Everything
+    /// `BarrierVar` a fresh barrier variable, both at the current level. Everything
     /// else — including existing `Infer` vars, the structural variants the
     /// solver operates on, and `Refinement` wrappers (refinements ride the
     /// lattice as refinements) — is kept, recursing to normalize nested holes.
@@ -487,16 +487,16 @@ impl InferCtx {
             // A `Hole` annotation means "infer this" → fresh variable, at
             // the current lexical position (it carries the live telescope).
             Type::Hole => Type::Infer(InferVar::fresh_in(self.level, telescope)),
-            // An opaque hole is the same "infer this" at the current level, so a
+            // A barrier variable is the same "infer this" at the current level, so a
             // generalized `let` around it quantifies it and each instantiation
-            // freshens its own copy. The hole `opaque_output` writes is minted
+            // freshens its own copy. The barrier variable `opaque_output` writes is minted
             // before any level exists and gathers its bounds only here, on the copy.
-            Type::OpaqueHole(hole) => {
+            Type::BarrierVar(barrier) => {
                 debug_assert!(
-                    hole.lowers.borrow().is_empty() && hole.uppers.borrow().is_empty(),
-                    "an annotation's opaque hole carries no bounds before normalization"
+                    barrier.lowers.borrow().is_empty() && barrier.uppers.borrow().is_empty(),
+                    "an annotation's barrier variable carries no bounds before normalization"
                 );
-                Type::OpaqueHole(OpaqueHoleVar::fresh(self.level, Vec::new(), Vec::new()))
+                Type::BarrierVar(BarrierVar::fresh(self.level, Vec::new(), Vec::new()))
             }
             // A `SharedHole` means "infer this, and it is the same one as that":
             // the *first* occurrence of an id mints the variable and every later

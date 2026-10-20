@@ -85,33 +85,33 @@ pub fn reset_infer_var_counter() {
     INFER_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
 
-/// Identity of a [`Type::OpaqueHole`](crate::ccl::Type::OpaqueHole), the
-/// counterpart of [`InferVarId`] for [`OpaqueHoleVar`].
+/// Identity of a [`Type::BarrierVar`](crate::ccl::Type::BarrierVar), the
+/// counterpart of [`InferVarId`] for [`BarrierVar`].
 ///
 /// The inner `u32` is `pub(crate)` for the same reason as [`InferVarId`]'s: use
-/// [`fresh_opaque_hole_id`] to mint one.
+/// [`fresh_barrier_var_id`] to mint one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct OpaqueHoleId(pub(crate) u32);
+pub struct BarrierVarId(pub(crate) u32);
 
-impl fmt::Display for OpaqueHoleId {
+impl fmt::Display for BarrierVarId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-/// Global counter for [`OpaqueHoleId`] allocation.
-static OPAQUE_HOLE_COUNTER: AtomicU32 = AtomicU32::new(0);
+/// Global counter for [`BarrierVarId`] allocation.
+static BARRIER_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// Allocate a fresh, globally-unique [`OpaqueHoleId`].
-pub(crate) fn fresh_opaque_hole_id() -> OpaqueHoleId {
-    OpaqueHoleId(OPAQUE_HOLE_COUNTER.fetch_add(1, Ordering::Relaxed))
+/// Allocate a fresh, globally-unique [`BarrierVarId`].
+pub(crate) fn fresh_barrier_var_id() -> BarrierVarId {
+    BarrierVarId(BARRIER_VAR_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Reset the opaque-hole counter to zero. Test-only, under the same
+/// Reset the barrier-variable counter to zero. Test-only, under the same
 /// concurrency caveat as [`reset_infer_var_counter`].
 #[cfg(any(test, feature = "test-helpers"))]
-pub fn reset_opaque_hole_counter() {
-    OPAQUE_HOLE_COUNTER.store(0, Ordering::Relaxed);
+pub fn reset_barrier_var_counter() {
+    BARRIER_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
 
 /// Polymorphism scope level. Larger = more deeply nested. We currently keep
@@ -784,55 +784,55 @@ impl fmt::Debug for InferVar {
 
 /// An unresolved type that hides opaque variables from the outer scope,
 /// gathering its lower and upper bounds. Carried by
-/// [`Type::OpaqueHole`](crate::ccl::Type::OpaqueHole).
+/// [`Type::BarrierVar`](crate::ccl::Type::BarrierVar).
 ///
 /// Identity follows [`InferVar`]: equality, hashing and `Debug` read only the
 /// immutable `uid`, never `lowers` or `uppers`, so [`Type`](crate::ccl::Type) keeps
 /// deriving `PartialEq`/`Eq`/`Hash`/`Debug` while the bounds are cyclic or
 /// mutably borrowed.
-pub struct OpaqueHoleVar {
+pub struct BarrierVar {
     /// Stable, globally-unique identity.
-    pub uid: OpaqueHoleId,
-    /// Scope level the hole belongs to, with the meaning of [`InferVar`]'s: a
-    /// generalized `let` quantifies a hole minted above its level.
+    pub uid: BarrierVarId,
+    /// Scope level the variable belongs to, with the meaning of [`InferVar`]'s: a
+    /// generalized `let` quantifies a barrier variable minted above its level.
     level: std::cell::Cell<Level>,
-    /// The gathered lower bounds. The hole resolves to their join with every
-    /// refinement dropped (the `OpaqueHole` arm of `solver::compact::compact_go`).
+    /// The gathered lower bounds. The variable resolves to their join with every
+    /// refinement dropped (the `BarrierVar` arm of `solver::compact::compact_go`).
     pub lowers: RefCell<Vec<Bound>>,
     /// The gathered upper bounds. Each is checked against the resolution from
     /// `lowers` at compaction, not closed against the lowers as they arrive.
     pub uppers: RefCell<Vec<Bound>>,
 }
 
-impl OpaqueHoleVar {
-    /// Mint a fresh opaque hole at `level` over `lowers` and `uppers`.
-    pub fn fresh(level: Level, lowers: Vec<Bound>, uppers: Vec<Bound>) -> Rc<OpaqueHoleVar> {
-        Rc::new(OpaqueHoleVar {
-            uid: fresh_opaque_hole_id(),
+impl BarrierVar {
+    /// Mint a fresh barrier variable at `level` over `lowers` and `uppers`.
+    pub fn fresh(level: Level, lowers: Vec<Bound>, uppers: Vec<Bound>) -> Rc<BarrierVar> {
+        Rc::new(BarrierVar {
+            uid: fresh_barrier_var_id(),
             level: std::cell::Cell::new(level),
             lowers: RefCell::new(lowers),
             uppers: RefCell::new(uppers),
         })
     }
 
-    /// The scope level the hole belongs to.
+    /// The scope level the variable belongs to.
     pub fn level(&self) -> Level {
         self.level.get()
     }
 }
 
-impl PartialEq for OpaqueHoleVar {
+impl PartialEq for BarrierVar {
     fn eq(&self, other: &Self) -> bool {
         self.uid == other.uid
     }
 }
-impl Eq for OpaqueHoleVar {}
-impl std::hash::Hash for OpaqueHoleVar {
+impl Eq for BarrierVar {}
+impl std::hash::Hash for BarrierVar {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.uid.hash(state);
     }
 }
-impl fmt::Debug for OpaqueHoleVar {
+impl fmt::Debug for BarrierVar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, ":>{}", self.uid)
     }

@@ -1320,7 +1320,7 @@ pub enum Phase {
     Comprehension,
     /// Result binding ([`crate::ccl::opaque_output`]): binding the body of each
     /// lambda that binds an opaque variable to `__output`, annotated with an
-    /// opaque hole. Runs on the comprehension-lowered pre-inference tree, so the
+    /// barrier variable. Runs on the comprehension-lowered pre-inference tree, so the
     /// lambdas of a comprehension's encoding are rewritten too.
     OpaqueOutput,
     /// Type inference ([`crate::ccl::infer`]): the phase that bridges the
@@ -2202,7 +2202,7 @@ fn run_passes(
         return Ok(expr);
     }
 
-    // Bind each lambda's result under an opaque-hole annotation where the body
+    // Bind each lambda's result under a barrier-variable annotation where the body
     // binds an opaque variable (`crate::ccl::opaque_output`). After
     // comprehension lowering, so the encoding's lambdas are covered. `recorded`
     // because the pass mints the `Let`/`Var` pair per lambda it rewrites.
