@@ -9,8 +9,8 @@ use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
 use crate::ccl::subst::Subst;
 use crate::ccl::{
     BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, F_WRITES, FieldKey, Lit,
-    LogicKind, Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedExprNode,
-    UnaryOpKind, V_ABORT, V_COMMIT, V_FIRED, V_IDLE,
+    LogicKind, Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedBinding,
+    TypedExprNode, UnaryOpKind, V_ABORT, V_COMMIT, V_FIRED, V_IDLE,
 };
 
 /// The `commit` selector field of the **intermediate** decision record the two
@@ -663,6 +663,37 @@ fn discharge_transparent_lets_in_term(e: &Expr) -> Expr {
         return body;
     }
     out
+}
+
+/// The type of `let binding = bound_expr in body`, from `body_ty`: the body's type lifted out
+/// of the binder's scope by discharging `[binding ↦ bound_expr]`
+/// (`src/ccl/design/type-inference.md`, "`let` binders and scope exit"). An opaque binder
+/// carries no definiens to discharge, so its name stays in the lifted type.
+///
+/// The post-pass check reconstructs a `let`'s type with this, and [`Expr::let_in`] and
+/// [`Expr::let_in_preserving`] stamp it, so a `let` a pass builds through them carries the type
+/// the check expects.
+pub(crate) fn closed_let_type(binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type {
+    if binding.transparency == BindingTransparency::Opaque
+        || !crate::ccl::subst::type_free_vars(&body_ty).contains(&binding.name)
+    {
+        return body_ty;
+    }
+    // A type-level discharge. The template keeps its ids because a template is not a tree
+    // node — it is cloned again at every read, and that read is where the sibling is minted.
+    Subst::discharge(&binding.name, bound_expr.clone_preserving_ids()).apply_type(&body_ty)
+}
+
+/// Rename `binding` to a fresh binder of its kind ([`Name::refreshed`]) and rewrite the reads
+/// of it in `body`, the scope it binds, in terms and in type slots alike. A rewrite that moves
+/// a `let` binder into a scope another copy of it may already bind takes this step
+/// (`src/ccl/design/ir.md`, "Structured names and α-uniquification (Barendregt convention)").
+pub(crate) fn refresh_let_binder(binding: &mut TypedBinding, mut body: Expr) -> Expr {
+    let fresh = binding.name.refreshed();
+    let old = std::mem::replace(&mut binding.name, fresh.clone());
+    let read = Expr::var(fresh).with_ty(binding.ty.clone());
+    Subst::discharge_in_place(&mut body, &old, &read);
+    body
 }
 
 /// Debug-only invariant: no refinement predicate embedded in `ty` contains an

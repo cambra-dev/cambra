@@ -56,7 +56,8 @@ use crate::ccl::{
     BaseType, BindingTransparency, Branch, Builtin, Expr, F_WRITES, HistoryKind, Lit, Name, Type,
     TypedBinding, TypedExprNode,
     ccl_utils::{
-        COMMIT_SELECTOR, strip_refinements, synthesize_arm_predicate, typed_compose, unit_expr,
+        COMMIT_SELECTOR, refresh_let_binder, strip_refinements, synthesize_arm_predicate,
+        typed_compose, unit_expr,
     },
     letrec::check_letrec_causal,
     provenance::{self, NodeId, RecordingGuard, RewriteLabel},
@@ -2761,12 +2762,7 @@ fn freshen_bindings(mut e: Expr) -> Expr {
             unreachable!("guarded above")
         };
         let value = freshen_bindings(*bound_expr);
-        let fresh = Name::fresh(binding.name.base());
-        let old = std::mem::replace(&mut binding.name, fresh.clone());
-        let renamed = Subst::discharge_env_in_place(
-            *body,
-            &HashMap::from([(old, tvar(&fresh, binding.ty.clone()))]),
-        );
+        let renamed = refresh_let_binder(&mut binding, *body);
         return Expr::let_in(binding, value, freshen_bindings(renamed));
     }
     e.walk_children_mut(|c| *c = freshen_bindings(std::mem::take(c)));
@@ -2790,12 +2786,7 @@ fn freshen_chain(e: Expr, depth: usize) -> Expr {
     else {
         unreachable!("freshen_chain is given the chain `wrap_reads` just built");
     };
-    let fresh = Name::fresh(binding.name.base());
-    let old = std::mem::replace(&mut binding.name, fresh.clone());
-    let renamed = Subst::discharge_env_in_place(
-        *body,
-        &HashMap::from([(old, tvar(&fresh, binding.ty.clone()))]),
-    );
+    let renamed = refresh_let_binder(&mut binding, *body);
     Expr::let_in(binding, *bound_expr, freshen_chain(renamed, depth - 1))
 }
 

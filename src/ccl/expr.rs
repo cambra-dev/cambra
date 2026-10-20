@@ -1400,9 +1400,10 @@ impl TypedExpr {
     /// [`TypedBinding`] (a synthesized mutable variable, a rebuilt spine slot).
     ///
     /// As with [`expr_stmt`](Self::expr_stmt), the node's type is its body's: a
-    /// `let` evaluates to its continuation.
+    /// `let` evaluates to its continuation, its type lifted out of the binder's scope
+    /// ([`closed_let_type`](crate::ccl::ccl_utils::closed_let_type)).
     pub fn let_in(binding: TypedBinding, def: Self, body: Self) -> Self {
-        let ty = body.ty.clone();
+        let ty = crate::ccl::ccl_utils::closed_let_type(&binding, &def, body.ty.clone());
         Self::new(TypedExprNode::Let {
             binding,
             bound_expr: Box::new(def),
@@ -1420,7 +1421,7 @@ impl TypedExpr {
         def: Self,
         body: Self,
     ) -> Self {
-        let ty = body.ty.clone();
+        let ty = crate::ccl::ccl_utils::closed_let_type(&binding, &def, body.ty.clone());
         Self::preserve(
             node_id,
             TypedExprNode::Let {
