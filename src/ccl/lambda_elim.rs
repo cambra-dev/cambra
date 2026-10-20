@@ -1727,6 +1727,29 @@ fn elim_lambda_impl(
         // eliminated definition's type wherever the history's type does not depend on the
         // enclosing parameter; a history whose type does would be a dependent function,
         // which these references would not say.
+        //
+        // A group of one binding its definition does not reference is a `let`, and is
+        // eliminated as one: `channelize` binds every channel in a group, including the
+        // channel a loop's iteration declares and fills, whose type can depend on the
+        // enclosing parameter (`{Unit | __p.1 > 1} ⤇ Int`, a feed under a condition).
+        TypedExprNode::LetRec { mut bindings, body }
+            if bindings.len() == 1
+                && !crate::ccl::ccl_utils::free_names(&bindings[0].1)
+                    .contains(&bindings[0].0.name) =>
+        {
+            let (binding, def) = bindings.pop().expect("one binding");
+            let as_let = TypedExpr {
+                ty: body.ty.clone(),
+                node: TypedExprNode::Let {
+                    binding,
+                    bound_expr: Box::new(def),
+                    body,
+                },
+                user_annotation: None,
+                node_id: body_id,
+            };
+            elim_lambda_kinded(ctx, param, param_ty, as_let, fun_kind)
+        }
         TypedExprNode::LetRec { bindings, body } => {
             let calls: Vec<(Name, Expr)> = bindings
                 .iter()

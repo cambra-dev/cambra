@@ -3183,9 +3183,8 @@ impl Type {
     /// ([`Type::mut_value_type`]); a feed channel reads as the whole collection it has
     /// accumulated, the data function `domain ⤇ value` ([`Type::as_feed`]). Anything else
     /// is its own read view, which makes this idempotent. Emit's `read_through` is the
-    /// value deref alone and stops at a channel, where the solver's transparent-read rule
-    /// reads through instead; this is the post-inference counterpart, with no solver left
-    /// to defer to.
+    /// deref a reader applies while inference runs; this is the post-inference
+    /// counterpart, with no solver left to defer to.
     ///
     /// **No read view carries a Σ.** [`Type::History`] has no binder slot, so the channel
     /// case builds its function with [`Type::data_fun`] and a consumer reading binders off

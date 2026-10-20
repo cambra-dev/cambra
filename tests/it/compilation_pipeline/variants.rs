@@ -1764,7 +1764,7 @@ fn test_match_arm_reading_its_payload_in_a_loop(#[case] code: &str, #[case] expe
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(indoc! {"
-    o = defer()
+    o: Feed(_)
     for m in [`a(2), `b(3), `a(5)]:
         match m:
             case `a(n):
@@ -1775,7 +1775,7 @@ fn test_match_arm_reading_its_payload_in_a_loop(#[case] code: &str, #[case] expe
 // The `case _:` fallback feeds too, so the fan-out spans a tagged arm and the
 // default one.
 #[case(indoc! {"
-    o = defer()
+    o: Feed(_)
     for m in [`a(2), `b(3), `a(5)]:
         match m:
             case `a(n):
@@ -1797,7 +1797,7 @@ fn test_feed_inside_a_match_arm_fans_out_per_arm(#[case] code: &str, #[case] exp
 #[case("acc", Value::Int(3))]
 fn test_feed_and_accumulator_in_one_match(#[case] tail: &str, #[case] expected: Value) {
     let loop_program = indoc! {"
-        o = defer()
+        o: Feed(_)
         acc := 0
         for m in [`a(2), `b(3), `a(5)]:
             match m:
@@ -1816,7 +1816,7 @@ fn test_feed_and_accumulator_in_one_match(#[case] tail: &str, #[case] expected: 
 fn test_every_arm_feeds_beside_an_accumulator() {
     check_scalar(
         indoc! {"
-            o = defer()
+            o: Feed(_)
             acc := 0
             for m in [`a(2), `b(3), `a(5)]:
                 match m:
@@ -1837,7 +1837,7 @@ fn test_every_arm_feeds_beside_an_accumulator() {
 fn test_a_tap_value_reads_the_accumulator() {
     check_scalar(
         indoc! {"
-            o = defer()
+            o: Feed(_)
             acc := 0
             for m in [`a(2), `b(3), `a(5)]:
                 match m:
@@ -1861,7 +1861,7 @@ fn test_a_tap_value_reads_the_accumulator() {
 #[case("acc", Value::Int(3))]
 fn test_a_tap_value_reads_its_payload(#[case] tail: &str, #[case] expected: Value) {
     let loop_program = indoc! {"
-        o = defer()
+        o: Feed(_)
         acc := 0
         for m in [`a(2), `b(3), `a(5)]:
             match m:
@@ -1885,7 +1885,7 @@ fn test_a_tap_value_reads_its_payload(#[case] tail: &str, #[case] expected: Valu
 fn test_a_tap_value_reads_its_payload_and_the_accumulator() {
     check_scalar(
         indoc! {"
-            o = defer()
+            o: Feed(_)
             acc := 0
             for m in [`a(2), `b(3), `a(5)]:
                 match m:
@@ -1906,7 +1906,7 @@ fn test_a_tap_value_reads_its_payload_and_the_accumulator() {
 #[case("errors", Value::Int(1))]
 fn test_a_match_in_a_loop_partitions_a_tagged_stream(#[case] tail: &str, #[case] expected: Value) {
     let loop_program = indoc! {"
-        out = defer()
+        out: Feed(_)
         errors := 0
         for msg in [`data(10), `error(404), `data(20)]:
             match msg:

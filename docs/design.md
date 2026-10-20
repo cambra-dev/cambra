@@ -99,7 +99,7 @@ data to it using `d << data`. Generators (`yield`) are syntax sugar over feeds:
 a function with `yield`s has a hidden result-collection variable, and each
 `yield` translates exactly to a feed append into that collection — so the
 compiler query-plans generators and feeds uniformly.
-Today, a feed variable is introduced as `out = defer()` or arrives from a builtin like `http_serve`; a new syntactic form `out: Feed(_)` is designed but **not yet implemented**. 
+A feed is declared with no value, `out: Feed(_)`, or arrives from a builtin like `http_serve`.
 
 The APIs of library sources and sinks are **[Open]**.
 
@@ -215,7 +215,7 @@ The connections between the layers above and the capabilities Cambra claims:
 | Transactions: `with begin():` over `Mut(V, Txn)` variables | Implemented (single deny-guard conditionals only; handle form and `abort()` still landing) |
 | Aggregates | `sum`, `max`, `min` implemented; `count`/`avg`/`len` **[Planned]** |
 | Refinement typing | Machinery implemented (internal); surface syntax **[Decided]** |
-| Feed channels | Via `defer()` / `http_serve` implemented; `Feed(_)` declarations designed, not yet |
+| Feed channels | `Feed(_)` declarations, `Feed(_)` parameters and `http_serve` implemented |
 | Contextual parameters (`requires` / `given` / `summon`) | **[Decided]** |
 | `rec` fixpoint bindings | **[Decided]** |
 | Collections-as-functions model | **[Decided]** — one representation (the data function `D ⤇ V`), five surface kinds; `Array`/`List`/`Collection` types implemented, `Map`/`Set` types and the operation layer landing (see [src/ccl/design/collections.md](../src/ccl/design/collections.md)) |

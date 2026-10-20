@@ -69,6 +69,16 @@ fn is_causal_builtin(b: &Builtin) -> bool {
     matches!(b, Builtin::GetPrevSeq | Builtin::GetPrevTxn)
 }
 
+/// Whether any binding of the group applies a `get_prev_*` guard, so the group carries
+/// recurrent state. A guard-free group is a channel cluster, which `channelize` emits.
+pub fn group_has_causal(bindings: &[(TypedBinding, TypedExpr)]) -> bool {
+    fn uses_causal(e: &TypedExpr) -> bool {
+        matches!(&e.node, TypedExprNode::Builtin(b) if is_causal_builtin(b))
+            || e.any_child(uses_causal)
+    }
+    bindings.iter().any(|(_, def)| uses_causal(def))
+}
+
 /// Check the causality well-formedness condition for a letrec binding
 /// group (see the module docs): the subgraph of *non-causal* reference edges
 /// must be acyclic, self-loops included. Returns one error per non-causal

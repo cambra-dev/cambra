@@ -29,14 +29,13 @@ function, the binding carries a tuple of parameter annotations, with `Type::Hole
 positions. A `def` output annotation inserts an annotated binding for `__output` inside the lambda
 body. Its refinement predicate can therefore refer to function parameters.
 
-A function with a `Mut(…)` parameter uses named, curried lambdas instead. A mutable write must keep
-the parameter name as its target; a tuple projection cannot be a `MutWrite` target. Calls to these
-functions use successive applications, so inlining can substitute the caller's mutable variable at
-each named binder before lambda elimination. `Mut(…)` parameter annotations stamp history types
-with inferred domains; a transactional `Mut(…, Txn)` parameter fixes its domain to `Txn`.
-`Feed(…)` parameter annotations are recognized only within this multi-parameter, `Mut`-curried
-chain. Ordinary parameter/type-annotation lowering rejects `Feed(…)` as an unknown type
-application (`tests/programs/fanout/mod.rs`). Other parameters retain their annotations.
+A function with a `Mut(…)` or `Feed(…)` parameter uses named, curried lambdas instead. A mutable
+write and a feed each keep the parameter name as their target; a tuple projection cannot be a
+`MutWrite` or `Feed` target. Calls to these functions use successive applications, so inlining can
+substitute the caller's mutable variable or channel at each named binder before lambda elimination.
+`Mut(…)` and `Feed(…)` parameter annotations stamp history types with inferred domains; a
+transactional `Mut(…, Txn)` parameter fixes its domain to `Txn`. Other parameters retain their
+annotations.
 
 The ordinary tuple shape prevents syntactic multi-argument functions from producing a nested
 lambda chain that `lambda_elim` would turn into `curry`. Explicitly nested lambdas can still
@@ -132,23 +131,29 @@ as an alias of its channel through the inline pass's tuple-projection rule (the 
 ([mutability.md, "`Feed` is a CCL type"](mutability.md#feed-is-a-ccl-type);
 [chl-spec.md, "A deferred collection inside a data structure [Open]"](../../../docs/chl-spec.md#a-deferred-collection-inside-a-data-structure-open)).
 
-## Deferred collection operators — `defer` / `<<` / `<<=`
+## Feed declarations and operators — `x: Feed(V)` / `<<` / `<<=`
 
-Deferred collection syntax initially produces `Defer`, `Feed`, and `Define` nodes. A defer binding
-requires at least one feed or exactly one define; no contribution reports `NoFeedOrDefine`, and
-mixing the forms is an error. Feed and define expressions have type `Unit`.
+Feed syntax initially produces `Defer`, `Feed`, and `Define` nodes. A feed is given its value by
+at least one `<<` or exactly one `<<=`; a feed with neither reports `NoFeedOrDefine`, and mixing
+the two is an error. Feed and define expressions have type `Unit`.
 
 | CHL | Lowered role |
 |---|---|
-| `x = defer()` | Bind a `Defer` handle |
+| `x: Feed(V)` | Bind a `Defer` handle |
 | `x << value` | Add a `Feed(x, value)` contribution |
 | `x <<= value` | Add the sole `Define(x, value)` contribution |
 
-`x = defer()` becomes `let x = defer in body`. A feed or define in statement position is sequenced
-through `ExprStmt`. A top-level `𝑝 = http_serve(port, method, path)` binds `𝑝` to the tuple
-`(Source(requests), responses)`, where `responses` names a `Defer` that a `let` around the
-statement binds. Both names are minted from the route, and `responses` is the sink's name for
-compilation, so the program's sink record reads the channel whatever `𝑝` binds.
+`x: Feed(V)` becomes `let x : Feed(V) = Defer in body`, the `Defer` imaging the annotation
+(`feed_declaration` in `lower/stmts.rs`). A declaration with any other annotation is refused, since
+only a feed is introduced with no value. A feed or define in statement position is sequenced through
+`ExprStmt`. A function of several parameters substitutes a projection of its argument tuple for each
+parameter, but binds one its body feeds to that projection (`uncurry_params`), since a feed targets
+a name. Inlining folds a projection of a tuple literal holding a feed handle to its element, so the
+binding becomes an alias of the handle the caller passed. A top-level
+`𝑝 = http_serve(port, method, path)` binds `𝑝` to the tuple `(Source(requests), responses)`, where
+`responses` names a `Defer` that a `let` around the statement binds. Both names are minted from the
+route, and `responses` is the sink's name for compilation, so the program's sink record reads the
+channel whatever `𝑝` binds.
 
 `out = test_sink()` binds a response `Defer` to a `TestSink` registered by the test through
 `GlobalContext::register_test_sink`. This form exists only under `cfg(test)` or the `test-helpers`
@@ -162,14 +167,16 @@ blocks reject them because the program's sink record reads only top-level bindin
 loops, so channelization handles them like feeds from other expressions. It eliminates `Defer`,
 `Feed`, `Define`, and `ExprStmt` before downstream passes run.
 
-For each cluster of consecutive defer bindings, channelization extracts its feeds or define from
-the cluster body and builds a channel expression for each handle. Multiple feeds combine with
-`Copair` (`++`), whose contributions occupy distinct index sets. Feeds inside iteration retain
-their iteration context. A multi-arm feeding `Case` inside a loop produces a refined-source
-channel for each feeding arm. A guarded feeding `Case` outside iteration can use a one-shot lift;
-a scrutinee-pattern feeding `Case` there is rejected. The cluster becomes a mutually scoped
-`Feed`-kind `LetRec`. Recognition later orders an acyclic group as `Let` bindings; an unguarded
-cycle between channels is rejected.
+For each cluster of consecutive defer bindings, channelization extracts its feeds or define from the
+cluster body and builds a channel expression for each handle. Multiple feeds combine with `Copair`
+(`++`), whose contributions occupy distinct index sets. Feeds inside iteration retain their
+iteration context. An extracted feed takes a copy of each binding it reads in the scope it leaves: a
+`let`, or a channel group, which is what a feed declared beneath the extracted one, as in a loop
+body, has become by then. A recurrence group is not copied. A multi-arm feeding `Case` inside a loop
+produces a refined-source channel for each feeding arm. A guarded feeding `Case` outside iteration
+can use a one-shot lift; a scrutinee-pattern feeding `Case` there is rejected. The cluster becomes a
+mutually scoped `Feed`-kind `LetRec`. Recognition later orders an acyclic group as `Let` bindings;
+an unguarded cycle between channels is rejected.
 
 `channelize` also lifts defer-returning bindings and substitutes aliases that carry defer handles.
 It drops the `ExprStmt` nodes after their feed contributions have been extracted. The

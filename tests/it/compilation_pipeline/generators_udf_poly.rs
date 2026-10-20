@@ -750,7 +750,7 @@ fn alias_of_a_monomorphic_binding_is_monomorphic() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::a_feed(indoc! {r#"
-    out = defer()
+    out: Feed(_)
     def put(x):
         out << x
         x

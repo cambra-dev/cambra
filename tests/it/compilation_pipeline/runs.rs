@@ -742,7 +742,7 @@ fn a_parameter_takes_a_polymorphic_function() {
 #[timeout(Duration::from_secs(10))]
 fn a_module_feeds_a_runs_feed(#[case] root: &str, #[case] expected: i64) {
     let audit = indoc! {"
-        pub events = defer()
+        pub events: Feed(_)
         pub total = sum([e for e in events])
     "};
     check_program_scalar(&program(root, &[("audit", audit)]), Value::Int(expected));

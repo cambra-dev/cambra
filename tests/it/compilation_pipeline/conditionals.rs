@@ -489,7 +489,7 @@ c: Bool = False
 // `if c: d << v1 else: d << v2` (outside any loop) has no iteration source, so
 // each feeding arm becomes a gated one-shot lift `λ __unused : {Unit | π̂ᵢ} → vᵢ`
 // over the `Unit` driver. The channel union publishes exactly the selected arm's
-// value (empty when no arm fires — a naturally-partial feed). A `defer()` read
+// value (empty when no arm fires — a naturally-partial feed). A read of the feed
 // surfaces the channel.
 // ---------------------------------------------------------------------------
 
@@ -498,7 +498,7 @@ c: Bool = False
 // if/else — the selected arm's value is fed.
 #[case(r"
 c: Bool = True
-x = defer()
+x: Feed(_)
 if c:
     x << 1
 else:
@@ -506,7 +506,7 @@ else:
 x", vec![1])]
 #[case(r"
 c: Bool = False
-x = defer()
+x: Feed(_)
 if c:
     x << 1
 else:
@@ -516,7 +516,7 @@ x", vec![2])]
 #[case(
     r"
 n: Int = 1
-x = defer()
+x: Feed(_)
 if n == 1:
     x << 10
 elif n == 2:
@@ -529,7 +529,7 @@ x",
 #[case(
     r"
 n: Int = 2
-x = defer()
+x: Feed(_)
 if n == 1:
     x << 10
 elif n == 2:
@@ -542,7 +542,7 @@ x",
 #[case(
     r"
 n: Int = 9
-x = defer()
+x: Feed(_)
 if n == 1:
     x << 10
 elif n == 2:
@@ -571,7 +571,7 @@ fn test_conditional_feed(#[case] code: &str, #[case] expected: Vec<i64>) {
 // n=0 → else fires (42); the `100 // n` arm is not pulled.
 #[case(r"
 n: Int = 0
-x = defer()
+x: Feed(_)
 if n != 0:
     x << 100 // n
 else:
@@ -580,7 +580,7 @@ x", vec![42])]
 // n=5 → the partial arm fires and evaluates normally (100 // 5 = 20).
 #[case(r"
 n: Int = 5
-x = defer()
+x: Feed(_)
 if n != 0:
     x << 100 // n
 else:
@@ -1425,7 +1425,7 @@ fn a_feed_from_a_loop_over_a_conditional_collection(#[case] cond: &str, #[case] 
         &formatdoc! {r"
             c: Bool = {cond}
             x = box([1, 2]) if c else box([1, 2, 3])
-            o = defer()
+            o: Feed(_)
             for e in x:
                 o << e
             sum(o)"},

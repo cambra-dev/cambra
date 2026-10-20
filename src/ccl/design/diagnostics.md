@@ -43,7 +43,7 @@ write, which lowers to a different term than the one the checker holds.
   error is raised (`coalesce_for_error`), while their variables still hold their bounds. A function
   whose type names no kind is marked.
 - **A sum over named alternatives is a `Box`** of each alternative, as `box` built it
-  ([chl-spec.md, "7.5 `box`"](../../../docs/chl-spec.md#75-box)).
+  ([chl-spec.md, "7.4 `box`"](../../../docs/chl-spec.md#74-box)).
 - **A refinement is written with `where`**, its predicate in CHL. A literal's type is its
   singleton, `{Int where _ == 5}`. Two refinements of one type are two `where`s, since a refinement
   holding `p and q` is a different refinement from the two.

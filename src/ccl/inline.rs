@@ -855,6 +855,27 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
                 user_annotation,
             };
             expr.map_children(|c| inline_impl(c, channels));
+            // **A projection of a tuple literal holding a feed handle** is the element it
+            // lands on. Beta reduction leaves this shape where a function of several
+            // parameters is called with a handle: the parameter the body feeds is bound to a
+            // projection of the argument tuple (`uncurry_params`), which becomes the alias
+            // `channelize` follows, and a projection of another parameter would otherwise
+            // read the tuple, so a channel fed it would read itself. The element is moved
+            // rather than copied, so it is computed once either way.
+            if let Some(element) = projection_landing(&expr, |base| {
+                let mut held = Vec::new();
+                collect_var_elements(base, &mut held);
+                (matches!(base.node, TypedExprNode::Tuple(_))
+                    && held.iter().any(|n| channels.contains(n)))
+                .then_some(base)
+            }) {
+                let _g = provenance::enter(
+                    expr.node_id,
+                    "inline.tuple_projection",
+                    provenance::Nature::Machinery,
+                );
+                return element.clone();
+            }
             return expr;
         }
     };

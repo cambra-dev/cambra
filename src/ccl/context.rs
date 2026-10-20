@@ -256,7 +256,7 @@ impl CompileError {
             CompileError::Load(e) => ("loading error", e.span()),
             CompileError::Lower(e) => ("lowering error", e.span()),
             CompileError::Infer { span, .. } => ("type inference error", *span),
-            CompileError::ChannelizeDefers { span, .. } => ("deferred collection error", *span),
+            CompileError::ChannelizeDefers { span, .. } => ("feed error", *span),
             CompileError::Unsupported { span, .. } => ("unsupported program", *span),
         };
         let related = self.related().map_or(&[][..], Vec::as_slice);
@@ -2537,6 +2537,8 @@ fn run_passes(
     // commit. Reject it before the phase strips the sites.
     check_transact_rejections(&expr, &txn_mut_vars, &blame)?;
     mut_elim::check_no_loop_over_a_sum(&expr).map_err(|e| blame.unsupported(e, Some(&expr)))?;
+    mut_elim::check_iteration_channel_feeds(&expr)
+        .map_err(|e| blame.unsupported(e, Some(&expr)))?;
 
     // The two rewrites the transactional slice runs before its own: both mint expression
     // nodes, so both sit inside the phase's recording — outside it their nodes reach the
@@ -3344,9 +3346,9 @@ Error: lowering error
         "await_final(a)",
         1
     )]
-    #[case::deferred_collection_defined_twice(
+    #[case::feed_defined_twice(
         indoc::indoc! {"
-            x = defer()
+            x: Feed(_)
             x <<= [1]
             x <<= [2]
             x
@@ -3354,9 +3356,9 @@ Error: lowering error
         "x <<= [2]",
         0
     )]
-    #[case::deferred_collection_defined_in_a_loop(
+    #[case::feed_defined_in_a_loop(
         indoc::indoc! {"
-            x = defer()
+            x: Feed(_)
             for i in [1, 2]:
                 x <<= [i]
             x
@@ -3364,9 +3366,9 @@ Error: lowering error
         "x <<= [i]",
         0
     )]
-    #[case::deferred_collection_fed_and_defined(
+    #[case::feed_fed_and_defined(
         indoc::indoc! {"
-            x = defer()
+            x: Feed(_)
             x << 1
             x <<= [2]
             x
@@ -3374,12 +3376,12 @@ Error: lowering error
         "x <<= [2]",
         0
     )]
-    #[case::deferred_collection_never_fed(
+    #[case::feed_never_fed(
         indoc::indoc! {"
-            x = defer()
+            x: Feed(_)
             x
         "},
-        "x = defer()",
+        "x: Feed(_)",
         0
     )]
     fn a_rejection_after_lowering_points_at_its_source(

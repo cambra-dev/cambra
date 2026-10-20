@@ -1207,6 +1207,89 @@ pub(crate) fn check_no_loop_over_a_sum(expr: &Expr) -> Result<(), provenance::Lo
     result
 }
 
+/// Refuse a feed a loop body declares that the iteration feeds in two places: the two
+/// collections it builds would be unioned, and a union of collections that vary with the
+/// iteration is not supported, as `[x] ++ [x * 10]` in a loop body is not. One place may sit
+/// under a condition or in an inner loop. A loop's iteration is a `For`'s body or, for a loop
+/// that writes no mutable variable, the body of a function a `Compose` applies to each
+/// element. Runs on the inlined tree ahead of [`run`], so a feed a called function makes
+/// stands where the call does.
+pub(crate) fn check_iteration_channel_feeds(
+    expr: &Expr,
+) -> Result<(), provenance::Located<String>> {
+    let iterations: Vec<&Expr> = match &expr.node {
+        TypedExprNode::For { body, .. } => vec![body],
+        TypedExprNode::Compose(elts) => elts
+            .iter()
+            .filter_map(|elt| match &elt.node {
+                TypedExprNode::Lambda { body, .. } => Some(&**body),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for body in iterations {
+        let mut declared = Vec::new();
+        declared_channels(body, &mut declared);
+        for channel in &declared {
+            let mut feeds = Vec::new();
+            feeds_into(body, channel, &mut feeds);
+            if let [_, second, ..] = feeds.as_slice() {
+                return Err(provenance::Located::new(
+                    format!(
+                        "`{}`, which the loop's body declares, is fed in two places in one \
+                         iteration, which unions two collections that vary with the iteration; \
+                         that union is not supported yet, as `[a] ++ [b]` in a loop body is not",
+                        channel.base()
+                    ),
+                    *second,
+                ));
+            }
+        }
+    }
+    let mut result = Ok(());
+    expr.walk_children(|child| {
+        if result.is_ok() {
+            result = check_iteration_channel_feeds(child);
+        }
+    });
+    result
+}
+
+/// Every name a statement of the iteration `body` declares a feed by, `h: Feed(_)`: a `let`
+/// of a `Defer` on its spine. A feed a value of the iteration makes and returns, as an inlined
+/// generator's result is, stands inside the `let` that binds the value instead, and is
+/// `channelize`'s defer-returning lift to resolve.
+fn declared_channels(body: &Expr, out: &mut Vec<Name>) {
+    let mut at = body;
+    loop {
+        match &at.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                if matches!(bound_expr.node, TypedExprNode::Defer) {
+                    out.push(binding.name.clone());
+                }
+                at = body;
+            }
+            TypedExprNode::ExprStmt { body, .. } | TypedExprNode::LetType { body, .. } => at = body,
+            _ => return,
+        }
+    }
+}
+
+/// Each feed into `channel` in `expr`.
+fn feeds_into(expr: &Expr, channel: &Name, out: &mut Vec<NodeId>) {
+    if let TypedExprNode::Feed { name, .. } = &expr.node
+        && name == channel
+    {
+        out.push(expr.node_id());
+    }
+    expr.walk_children(|child| feeds_into(child, channel, out));
+}
+
 /// Destructure a (possibly refinement- or `Mut`-wrapped) function type.
 ///
 /// A `Mut`-typed collection used as a loop source (`xs := [..]; for i in
@@ -2285,7 +2368,22 @@ fn transform_chain(
             let mut b = b;
             Subst::discharge_env_in_binder(&mut b, env);
             let bound = Subst::discharge_env_in_place(*bound_expr, env);
+            let collected = feeds.len();
             let rest = transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
+            let bound = if matches!(bound.node, TypedExprNode::Defer) {
+                let mut own = Vec::new();
+                let mut i = collected;
+                while i < feeds.len() {
+                    if feeds[i].defer == b.name {
+                        own.push(feeds.remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                iteration_channel(&b, bound, own, path, &rest)
+            } else {
+                bound
+            };
             Expr::let_in_preserving(stmt_id, b, bound, rest)
         }
         TypedExprNode::Let {
@@ -2641,6 +2739,142 @@ fn transform_chain(
 /// One loop-body binding kept by [`transform_chain`]: the `Let` node it came in
 /// on, its binder, and its value.
 type PrefixBinding = (NodeId, TypedBinding, Expr);
+
+/// The value of a channel a loop body declares, `let 𝑐₀ = Defer in feed(𝑐₀, 𝑣₁); …; 𝑐₀`:
+/// the channel with every feed the iteration makes into it.
+///
+/// Any other feed in a loop body rides the decision as a tap and is hoisted out of the loop
+/// ([`hoist_feeds`]), outside this channel's scope. The channel belongs to one iteration, so
+/// its feeds stay in it. `own` are those feeds, collected by [`transform_chain`] at the
+/// decision record `rest` ends in; each is closed over the bindings `rest` introduces before
+/// it moves to the channel's binding, as a branch's feeds are closed over the branch's
+/// ([`close_feeds_over_prefix`]). `channelize` merges `𝑐₀` into the binder this value is
+/// bound to (its defer-returning lift).
+///
+/// A feed that fires on `path`, the declaration's own, feeds the channel each iteration; one
+/// under a condition of its own feeds it where that condition holds ([`gated_feed`]).
+fn iteration_channel(
+    channel: &TypedBinding,
+    defer: Expr,
+    own: Vec<FeedSite>,
+    path: &Expr,
+    rest: &Expr,
+) -> Expr {
+    let (prefix, scope) = decision_scope(rest);
+    let mut own = own;
+    for f in &mut own {
+        f.value = scope.close(std::mem::take(&mut f.value));
+        if f.fire != *path {
+            f.fire = scope.close(std::mem::take(&mut f.fire));
+        }
+    }
+    close_feeds_over_prefix(&prefix, &mut own);
+    let inner = Name::fresh_like(&channel.name);
+    let mut body = tvar(&inner, channel.ty.clone());
+    for f in own.into_iter().rev() {
+        let _g = f.site.enter(FEED_LABEL, provenance::Nature::Expansion);
+        let conditional = f.fire != *path;
+        let feed = if f.levels == 0 {
+            let mut feed = Expr::feed(inner.clone(), f.value);
+            feed.ty = Type::Base(BaseType::Unit);
+            if conditional {
+                gated_feed(f.fire, feed)
+            } else {
+                feed
+            }
+        } else {
+            // An inner loop's whole tap collection, the only feed into this channel
+            // ([`check_iteration_channel_feeds`]), so it is the channel's value outright,
+            // with the condition the loop runs under, if any, restricting its domain.
+            let mut view = crate::ccl::feed_nest::flatten_nested_contribution(f.value, f.levels);
+            if conditional {
+                crate::ccl::channelize::refine_source_domain(
+                    &mut view,
+                    crate::ccl::Refinement::born(std::rc::Rc::new(f.fire)),
+                );
+            }
+            let mut define = Expr::define(inner.clone(), view);
+            define.ty = Type::Base(BaseType::Unit);
+            define
+        };
+        body = Expr::expr_stmt(feed, body);
+    }
+    let ty = body.ty.clone();
+    Expr::let_in(binding(inner, channel.ty.clone()), defer, body).with_ty(ty)
+}
+
+/// `{ fire → feed; true → () }`: a feed that fires on a condition of its own within the
+/// iteration, which `channelize` turns into a gated one-shot contribution.
+fn gated_feed(fire: Expr, feed: Expr) -> Expr {
+    let unit_ty = Type::Base(BaseType::Unit);
+    let mut otherwise = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
+    otherwise.ty = Type::Base(BaseType::Bool);
+    let mut unit = Expr::lit(Lit::Unit);
+    unit.ty = unit_ty.clone();
+    let mut case = Expr::new(TypedExprNode::Case {
+        scrutinee: None,
+        branches: vec![
+            Branch {
+                pattern: None,
+                guard: fire,
+                body: feed,
+            },
+            Branch {
+                pattern: None,
+                guard: otherwise,
+                body: unit,
+            },
+        ],
+    });
+    case.ty = unit_ty;
+    case
+}
+
+/// The bindings a decision's `let*` prefix introduces and its scope beneath them, as
+/// [`decision_writes`] reads them, without taking the decision apart.
+fn decision_scope(dec: &Expr) -> (Vec<PrefixBinding>, BranchScope) {
+    let mut prefix: Vec<PrefixBinding> = Vec::new();
+    let mut scope = BranchScope::default();
+    let mut record = dec;
+    loop {
+        match &record.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } if scope.groups.is_empty() => {
+                prefix.push((
+                    record.node_id,
+                    binding.clone(),
+                    bound_expr.clone_preserving_ids(),
+                ));
+                record = body;
+            }
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                let bound = Subst::discharge_env_in_place(
+                    bound_expr.clone_preserving_ids(),
+                    &scope.beneath,
+                );
+                scope.beneath.insert(binding.name.clone(), bound);
+                record = body;
+            }
+            TypedExprNode::LetRec { bindings, body } => {
+                scope.groups.push(
+                    bindings
+                        .iter()
+                        .map(|(b, e)| (b.clone(), e.clone_preserving_ids()))
+                        .collect(),
+                );
+                record = body;
+            }
+            _ => return (prefix, scope),
+        }
+    }
+}
 
 /// Sink a decision's `let*` prefix to the regions that read it — one copy of the
 /// **bindings** per region, where inlining makes one copy of their **values** per

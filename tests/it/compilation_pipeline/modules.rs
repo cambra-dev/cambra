@@ -831,11 +831,11 @@ fn importing_a_module_that_performs_io_is_refused(#[case] audit: &str, #[case] i
 "})]
 #[case::mutable_variable("total := 0\n")]
 #[case::defined_output(indoc! {"
-    out = defer()
+    out: Feed(Int)
     out <<= [1]
 "})]
-#[case::a_feed("pub events = defer()\n")]
-#[case::an_annotated_feed("pub events: Feed(Int) = defer()\n")]
+#[case::a_feed("pub events: Feed(_)\n")]
+#[case::a_feed_of_a_written_type("pub events: Feed(Int)\n")]
 #[timeout(Duration::from_secs(10))]
 fn importing_a_module_that_declares_state_is_refused(#[case] library: &str) {
     let errors = compile_errors(&program(
@@ -884,6 +884,34 @@ fn an_imported_function_writes_the_callers_state(
         await_final(a) * 1000 + await_final(b)
     "};
     check_program_scalar(&program(&root, &[("bank", bank)]), Value::Int(60_030));
+}
+
+/// A module's function with a `Feed` parameter takes the curried shape too, and one that feeds
+/// an unannotated parameter the tupled one: a call by qualified name and through `use` feeds the
+/// caller's feed.
+#[rstest]
+#[case::qualified("import logs\n", "logs::note", "logs::note_twice")]
+#[case::used("import logs use note, note_twice\n", "note", "note_twice")]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_function_feeds_the_callers_feed(
+    #[case] import: &str,
+    #[case] note: &str,
+    #[case] note_twice: &str,
+) {
+    let logs = indoc! {"
+        pub def note(o: Feed(Int), x: Int):
+            o << x
+        pub def note_twice(o, x):
+            o << x
+            o << x * 10
+    "};
+    let root = formatdoc! {"
+        {import}out: Feed(_)
+        {note}(out, 1)
+        {note_twice}(out, 2)
+        sum(out)
+    "};
+    check_program_scalar(&program(&root, &[("logs", logs)]), Value::Int(23));
 }
 
 /// A loop passes its induction variable to another module's functions with a `Mut`

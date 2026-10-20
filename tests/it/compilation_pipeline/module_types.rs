@@ -49,7 +49,7 @@ const RELAY: &str = indoc! {"
 
 /// A module that publishes a feed and its total.
 const AUDIT: &str = indoc! {"
-    pub events = defer()
+    pub events: Feed(_)
     pub total = sum([e for e in events])
 "};
 

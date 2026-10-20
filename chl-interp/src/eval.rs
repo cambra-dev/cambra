@@ -70,16 +70,15 @@ struct MutCell {
 
 /// What a name is bound to. Every binding form lives in [`Interp::scopes`], so a function
 /// or a channel is shadowed and captured by the same rules a value is: names resolve
-/// statically (`docs/chl-spec.md`, "3.2 Names"). A channel's state is keyed by its name, so
-/// a program declares each channel name once.
+/// statically (`docs/chl-spec.md`, "3.2 Names").
 #[derive(Clone)]
 enum Slot {
     Val(Value),
     Mut(Rc<RefCell<MutCell>>),
     Fn(Rc<Function>),
-    /// A channel `defer()` or `test_sink()` opened; its state is in [`Interp::channels`]
-    /// under the same name.
-    Chan,
+    /// A channel a feed declaration or `test_sink()` opened; its state is in [`Interp::channels`]
+    /// under this key ([`Interp::channel_key`]).
+    Chan(String),
     /// The instance a requirement names, `a` in `requires a: Area(S)`, by its trait, bound
     /// under `a::` so that no value's name reaches it. `a::f` dispatches through the trait
     /// by its arguments, as `summon(Area(_))::f` does (`docs/chl-spec.md`, "Summoning an
@@ -110,13 +109,13 @@ struct TxnFrame {
     /// variable the block does not write is an as-of read.
     writes: BTreeSet<String>,
     /// Replies fed inside the block, held until the block commits and its commit time is known.
-    replies: Vec<(String, usize, Value)>,
+    replies: Vec<(String, Site, Value)>,
     /// Whether the block wrote or replied speculatively, which leaves whether it commits
     /// undecided.
     uncertain: bool,
 }
 
-/// An open channel: what `defer()` or `test_sink()` made.
+/// An open channel: what a feed declaration or `test_sink()` made.
 ///
 /// A feed nests: `target << value` appends `value` as one element (`docs/chl-spec.md`, "3.7
 /// Feed operator `<<`"), keyed by its site's iteration domain (`docs/chl-spec.md`, "8.4 Feeds
@@ -125,8 +124,10 @@ struct TxnFrame {
 /// under the key `x` was drawn from.
 #[derive(Default)]
 struct Channel {
+    /// The name its declaration binds, which a sink reports under.
+    name: String,
     /// Contributions: the feed site that made each, its key, and its value.
-    fed: Vec<(usize, Value, Value)>,
+    fed: Vec<(Site, Value, Value)>,
     /// The value a `<<=` defined the channel as.
     defined: Option<Value>,
     /// Every feed site naming this channel, in source order.
@@ -134,9 +135,18 @@ struct Channel {
     /// A channel fed from more than one place is a union (`++`) of those places
     /// (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"), and its keys are
     /// tagged by which one. The tagging is a property of the program text, so a site that
-    /// never fires still counts.
-    sites: Vec<usize>,
+    /// never fires still counts. A site reached through a call joins when it first fires.
+    sites: Vec<Site>,
+    /// How many calls and comprehension elements were running where the channel was
+    /// declared, below which a feed's calls make its site ([`Site`]).
+    calls_at: usize,
 }
+
+/// Where a contribution comes from: the source position of each call between the channel's
+/// declaration and the feed, outermost first, then the feed's own. A feed in a function a
+/// program calls twice is two sites, as the compiler's two inlined copies of it are, and the
+/// order of sites is the order of their copies in the program.
+type Site = Vec<usize>;
 
 impl Channel {
     /// The channel's contents, if this pass made them final: no contribution is pending.
@@ -153,8 +163,9 @@ impl Channel {
 pub(crate) struct Interp {
     /// Lexical scopes, innermost last.
     scopes: Vec<Scope>,
+    /// The open channels, by [`Interp::channel_key`].
     channels: BTreeMap<String, Channel>,
-    /// The channels a `test_sink()` opened, which are what `run` answers with.
+    /// The channels a `test_sink()` opened, by key, which are what `run` answers with.
     observed: BTreeSet<String>,
     /// Feed sites per channel name, collected from the program text before it runs.
     feed_sites: BTreeMap<String, Vec<usize>>,
@@ -182,6 +193,9 @@ pub(crate) struct Interp {
     txn: Option<TxnFrame>,
     /// The keys of the loops enclosing the current statement, outermost first.
     loop_keys: Vec<Value>,
+    /// The calls and comprehension elements running, outermost first, each by its source
+    /// position, the key it runs under ([`Self::at_position`]), and whether it is a call.
+    calls: Vec<(usize, Value, bool)>,
     /// How many mutable cells the program has made, which stamps each cell's
     /// [`MutCell::born`].
     cells_made: u64,
@@ -693,6 +707,7 @@ impl Interp {
             lost: None,
             txn: None,
             loop_keys: Vec::new(),
+            calls: Vec::new(),
             types: Rc::default(),
             traits: Rc::default(),
             instance_functions: BTreeMap::new(),
@@ -734,6 +749,24 @@ impl Interp {
     /// The key a feed or a yield contributes under: the enclosing loops' keys.
     fn site_key(&self) -> Value {
         tuple_key(&self.loop_keys)
+    }
+
+    /// Run `f` as the call at source position `at`, which keys a channel the call declares
+    /// ([`Self::channel_key`]).
+    fn at_call<T>(&mut self, at: usize, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.calls.push((at, self.site_key(), true));
+        let out = f(self);
+        self.calls.pop();
+        out
+    }
+
+    /// Run `f` as a comprehension's element at source position `at` under `key`, the
+    /// comprehension's key.
+    fn at_position<T>(&mut self, at: usize, key: Value, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.calls.push((at, key, false));
+        let out = f(self);
+        self.calls.pop();
+        out
     }
 
     /// Run `f` speculatively: whether it runs at all depends on a pending value.
@@ -811,8 +844,8 @@ pub fn run(source: &str) -> Result<Observations, Error> {
             return interp
                 .channels
                 .iter()
-                .filter(|(name, _)| interp.observed.contains(*name))
-                .map(|(name, channel)| Ok((name.clone(), channel_value(channel)?)))
+                .filter(|(key, _)| interp.observed.contains(*key))
+                .map(|(_, channel)| Ok((channel.name.clone(), channel_value(channel)?)))
                 .collect();
         }
         if let Some(why) = interp.lost {
@@ -830,7 +863,12 @@ pub fn run(source: &str) -> Result<Observations, Error> {
             }
         }
         if completed.is_empty() {
-            let waited: Vec<String> = interp.waited_on.iter().map(|n| format!("`{n}`")).collect();
+            let waited: BTreeSet<String> = interp
+                .waited_on
+                .iter()
+                .map(|key| format!("`{}`", interp.channels[key].name))
+                .collect();
+            let waited: Vec<String> = waited.into_iter().collect();
             return err(format!(
                 "no read of {} can be answered: the contents of each depend on a read of one \
                  of them, a cycle, which is not judgeable",
@@ -1190,6 +1228,62 @@ impl Interp {
         }
     }
 
+    /// Where the channel `name`, declared at source position `at`, keeps its state.
+    ///
+    /// A declaration in a loop body or a function body runs once per iteration or call, and
+    /// each run opens a channel of its own (`docs/chl-spec.md`, "Declaring a feed"). So a
+    /// channel is keyed by its declaration, the calls running and the keys of the loops around
+    /// each. A pass keys a channel the same way whichever branches it runs speculatively, which
+    /// an earlier pass's [`Self::finals`] rely on.
+    fn channel_key(&self, name: &str, at: usize) -> String {
+        let mut key = format!("{name}@{at}");
+        for (at, under, _) in &self.calls {
+            key.push_str(&format!(" in @{at}[{under}]"));
+        }
+        key.push_str(&format!(" [{}]", self.site_key()));
+        key
+    }
+
+    /// Bind `name` to a new channel declared at source position `at`, which the program's
+    /// output reports when `observed`.
+    fn declare_channel(&mut self, name: String, at: usize, observed: bool) -> Result<(), Error> {
+        let key = self.channel_key(&name, at);
+        if self.channels.contains_key(&key) {
+            // A lambda a builtin applies runs once per element under one key.
+            return err(format!(
+                "`{name}` is declared again at one position of the loops, comprehensions and \
+                 calls around it, which the interpreter cannot tell apart"
+            ));
+        }
+        let sites = self
+            .feed_sites
+            .get(&name)
+            .map(|at| at.iter().map(|&at| vec![at]).collect())
+            .unwrap_or_default();
+        self.channels.insert(
+            key.clone(),
+            Channel {
+                name: name.clone(),
+                sites,
+                calls_at: self.calls.len(),
+                ..Channel::default()
+            },
+        );
+        self.bind(name, Slot::Chan(key.clone()));
+        if observed {
+            self.observed.insert(key);
+        }
+        Ok(())
+    }
+
+    /// The key of the channel `name` resolves to, if it resolves to one.
+    fn channel_of(&self, name: &str) -> Option<String> {
+        match self.slot(name)? {
+            Slot::Chan(key) => Some(key.clone()),
+            _ => None,
+        }
+    }
+
     fn exec_stmt(&mut self, stmt: &Spanned<Stmt>) -> Result<Option<Value>, Error> {
         match &stmt.node {
             // `out = test_sink()` declares a sink; any other assignment binds a value. An
@@ -1229,30 +1323,27 @@ impl Interp {
             }
             Stmt::Assign { target, value, .. } => {
                 let name = name_of(target)?;
-                let is_sink = is_zero_arg_call(&value.node, SurfaceBuiltin::TestSink);
-                if is_sink || is_zero_arg_call(&value.node, SurfaceBuiltin::Defer) {
-                    if self.channels.contains_key(&name) {
-                        return err(format!(
-                            "`{name}` is declared as a channel twice, and a channel's state is \
-                             keyed by its name"
-                        ));
-                    }
-                    let sites = self.feed_sites.get(&name).cloned().unwrap_or_default();
-                    self.channels.insert(
-                        name.clone(),
-                        Channel {
-                            sites,
-                            ..Channel::default()
-                        },
-                    );
-                    self.bind(name.clone(), Slot::Chan);
-                    if is_sink {
-                        self.observed.insert(name);
-                    }
+                if is_zero_arg_call(&value.node, SurfaceBuiltin::TestSink) {
+                    self.declare_channel(name, stmt.span.start, true)?;
                     return Ok(None);
                 }
                 let slot = self.binding_of(value)?;
                 self.bind(name, slot);
+                Ok(None)
+            }
+
+            // `out: Feed(T)` declares a channel. The annotation's argument states a type,
+            // which nothing here reads.
+            Stmt::Declare { target, annotation } => {
+                let name = name_of(target)?;
+                let is_feed = matches!(&annotation.ty.node, Expr::Call { func, .. }
+                    if matches!(&func.node, Expr::Name(n) if n.as_str() == "Feed"));
+                if !is_feed {
+                    return err(format!(
+                        "`{name}` is declared with no value, which only a feed is"
+                    ));
+                }
+                self.declare_channel(name, stmt.span.start, false)?;
                 Ok(None)
             }
 
@@ -1348,14 +1439,14 @@ impl Interp {
             Stmt::Define { target, value } => {
                 let name = name_of(target)?;
                 let v = self.eval(value)?;
-                if !matches!(self.slot(&name), Some(Slot::Chan)) {
+                let Some(key) = self.channel_of(&name) else {
                     self.bind(name, Slot::Val(v));
                     return Ok(None);
-                }
+                };
                 let speculating = self.speculating > 0;
                 let channel = self
                     .channels
-                    .get_mut(&name)
+                    .get_mut(&key)
                     .expect("a channel slot names an open channel");
                 // A `<<=` that may not run, or one after one that may not have, leaves the
                 // channel's value undecided rather than defined twice.
@@ -2144,10 +2235,9 @@ impl Interp {
         let Expr::Name(name) = &target.node else {
             return err("a feed's target is a name");
         };
-        let name = name.to_string();
-        if !matches!(self.slot(&name), Some(Slot::Chan)) {
+        let Some(channel) = self.channel_of(name) else {
             return err(format!("`{name}` is not a channel"));
-        }
+        };
         let contributed = self.eval(value)?;
         // A contribution that may not happen is pending whatever its value.
         let speculating = self.speculating > 0;
@@ -2156,27 +2246,48 @@ impl Interp {
         } else {
             contributed
         };
-        // The feed's source position identifies the site: two `<<` in one program are two
-        // places whatever they write.
-        let site = value.span.start;
+        // The feed's source position and the calls it is reached through identify the site:
+        // two `<<` in one program are two places whatever they write, and so is one `<<`
+        // reached through two calls.
+        let site = self.feed_site(&channel, value.span.start);
         if let Some(frame) = self.txn.as_mut() {
             // A reply rides its block's commit, so it is indexed by commit time, not by
             // the iteration that produced it. The commit time is not known until the block
             // commits, so the reply waits here.
-            frame.replies.push((name, site, contributed));
+            frame.replies.push((channel, site, contributed));
             frame.uncertain |= speculating;
             return Ok(());
         }
         let key = self.site_key();
-        self.contribute(&name).push((site, key, contributed));
+        self.contribute(&channel).push((site, key, contributed));
         Ok(())
     }
 
-    /// The contributions of the open channel `name`.
-    fn contribute(&mut self, name: &str) -> &mut Vec<(usize, Value, Value)> {
+    /// The site of a feed at source position `at` into the open channel `key` ([`Site`]),
+    /// which the channel's sites take in when it first fires.
+    fn feed_site(&mut self, key: &str, at: usize) -> Site {
+        let channel = self
+            .channels
+            .get_mut(key)
+            .expect("a contribution names an open channel");
+        let mut site: Site = self.calls[channel.calls_at..]
+            .iter()
+            .filter(|(_, _, call)| *call)
+            .map(|(at, _, _)| *at)
+            .collect();
+        site.push(at);
+        if !channel.sites.contains(&site) {
+            channel.sites.push(site.clone());
+            channel.sites.sort();
+        }
+        site
+    }
+
+    /// The contributions of the open channel `key`.
+    fn contribute(&mut self, key: &str) -> &mut Vec<(Site, Value, Value)> {
         &mut self
             .channels
-            .get_mut(name)
+            .get_mut(key)
             .expect("a contribution names an open channel")
             .fed
     }
@@ -2369,7 +2480,7 @@ fn channel_value(channel: &Channel) -> Result<Value, Error> {
         let key = if channel.sites.len() > 1 {
             let Some(tag) = channel.sites.iter().position(|s| s == site) else {
                 return err(format!(
-                    "the feed at {site} fired but was not collected from the program text"
+                    "the feed at {site:?} fired but was not collected from the program text"
                 ));
             };
             Value::Variant {
@@ -2553,7 +2664,9 @@ impl Interp {
                 receiver,
                 method,
                 args,
-            } => self.call_method(receiver, &method.node, args),
+            } => self.at_call(e.span.start, |me| {
+                me.call_method(receiver, &method.node, args)
+            }),
 
             // A constructor that declares no parameters is a value, held as its name.
             Expr::Qualified(q) => {
@@ -2579,10 +2692,10 @@ impl Interp {
                 }
                 // The read denotes the whole collection: its final contents once an earlier pass
                 // completed it, and pending until then.
-                Some(Slot::Chan) => match self.finals.get(n.as_str()) {
+                Some(Slot::Chan(key)) => match self.finals.get(key) {
                     Some(v) => Ok(v.clone()),
                     None => {
-                        self.waited_on.insert(n.to_string());
+                        self.waited_on.insert(key.clone());
                         Ok(Value::Pending)
                     }
                 },
@@ -2838,7 +2951,7 @@ impl Interp {
             // of the branch they take.
             Expr::Block(stmt) => self.branch_value(stmt, false),
 
-            Expr::Call { func, args } => self.call(func, args),
+            Expr::Call { func, args } => self.at_call(e.span.start, |me| me.call(func, args)),
 
             other => err(format!("unsupported expression: {other:?}")),
         }
@@ -2990,7 +3103,6 @@ impl Interp {
             Some(
                 SurfaceBuiltin::Set
                 | SurfaceBuiltin::EmptyMap
-                | SurfaceBuiltin::Defer
                 | SurfaceBuiltin::Begin
                 | SurfaceBuiltin::HttpServe
                 | SurfaceBuiltin::TestSink
@@ -3112,6 +3224,11 @@ impl Interp {
             Expr::Name(n) if let Some(Slot::Fn(function)) = self.slot(n) => {
                 Ok(Slot::Fn(function.clone()))
             }
+            // A channel handle is a value like any other (`docs/chl-spec.md`, "Declaring a
+            // feed"): binding one names the same channel.
+            Expr::Name(n) if let Some(Slot::Chan(key)) = self.slot(n) => {
+                Ok(Slot::Chan(key.clone()))
+            }
             // A function of an instance: the function that calls it with its arguments
             // (`docs/chl-spec.md`, "Summoning an instance").
             _ if let Some((trait_, function)) = self.instance_function(e)? => {
@@ -3214,8 +3331,9 @@ impl Interp {
     ) -> Result<(), Error> {
         match clauses.split_first() {
             None => {
-                let v = self.eval(element)?;
-                out.push((tuple_key(keys), v));
+                let key = tuple_key(keys);
+                let v = self.at_position(element.span.start, key.clone(), |me| me.eval(element))?;
+                out.push((key, v));
                 Ok(())
             }
             Some((CompClause::If(guard), rest)) => match self.eval(guard)? {
@@ -3954,20 +4072,28 @@ mod tests {
         assert_eq!(out(&program("(1, 5), (2, 6)")).to_string(), "[() -> 56]");
     }
 
-    /// A channel's state is keyed by its name, so a second declaration of the name is refused
-    /// rather than sharing the first's state.
+    /// A declaration opens a channel each time it runs: one per call and one per iteration,
+    /// apart from a channel of the same name elsewhere.
     #[test]
-    fn a_channel_declared_twice_is_refused() {
-        let e = refused(indoc! {r#"
-            ch = defer()
-            def f(n):
-                ch = defer()
-                ch << n
-                0
+    fn a_declaration_opens_a_channel_each_time_it_runs() {
+        let program = indoc! {r#"
+            ch: Feed(_)
+            ch << 100
+            def tens(x):
+                ch: Feed(_)
+                ch << x * 10
+                sum(ch)
             out = test_sink()
-            out << f(1)
-        "#});
-        assert!(e.contains("declared as a channel twice"), "{e}");
+            for x in [1, 2]:
+                h: Feed(_)
+                h << x
+                out << tens(x) + sum(h) + sum(ch)
+            out << sum([tens(x) for x in [3, 4]])
+        "#};
+        assert_eq!(
+            out(program).to_string(),
+            "[`0(0) -> 111, `0(1) -> 122, `1(()) -> 70]"
+        );
     }
 
     /// A branch ending in a nested `if`/`else` denotes that `if`'s taken branch.
@@ -3988,11 +4114,27 @@ mod tests {
         assert_eq!(v.to_string(), "[() -> 1]");
     }
 
+    /// A feed reached through two calls of one function is two sites, so the channel is the
+    /// union of what each call feeds, as the compiler's inlined copies make it.
+    #[test]
+    fn a_feed_reached_through_two_calls_is_two_sites() {
+        let v = out(indoc! {r#"
+            def g(o, x):
+                o << x
+            h: Feed(_)
+            g(h, 4)
+            g(h, 3)
+            out = test_sink()
+            out << sum(h)
+        "#});
+        assert_eq!(v.to_string(), "[() -> 7]");
+    }
+
     /// A feed that never runs adds nothing, so a read before it sees the whole collection.
     #[test]
     fn a_channel_read_before_a_feed_that_never_runs_is_the_whole_collection() {
         let v = out(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             out = test_sink()
             out << sum(ch)
             if 1 > 2:
@@ -4023,7 +4165,7 @@ mod tests {
     #[test]
     fn a_channel_read_before_its_define_runs_sees_it() {
         let v = out(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             out = test_sink()
             out << sum(ch)
             ch <<= [1, 2]
@@ -4034,7 +4176,7 @@ mod tests {
     #[test]
     fn a_channel_read_before_its_feeds_run_sees_them() {
         let v = out(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             out = test_sink()
             out << sum(ch)
             for x in [1, 2, 3]:
@@ -4048,7 +4190,7 @@ mod tests {
     #[test]
     fn a_channel_read_sees_a_feed_in_a_function_called_later() {
         let v = out(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             def push(n):
                 ch << n
                 0
@@ -4064,7 +4206,7 @@ mod tests {
     #[test]
     fn a_channel_fed_from_a_read_of_itself_is_refused() {
         let e = refused(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             ch << sum(ch)
             out = test_sink()
             out << 1
@@ -4077,7 +4219,7 @@ mod tests {
     #[test]
     fn a_cycle_through_a_mutable_variable_is_refused() {
         let e = refused(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             x := sum(ch)
             ch << x
             out = test_sink()
@@ -4090,7 +4232,7 @@ mod tests {
     #[test]
     fn a_cycle_through_a_branch_is_refused() {
         let e = refused(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             if sum(ch) > 0:
                 ch << 1
             out = test_sink()
@@ -4104,8 +4246,8 @@ mod tests {
     #[test]
     fn reads_that_depend_on_each_other_through_a_mutable_variable_resolve_in_order() {
         let v = out(indoc! {r#"
-            a = defer()
-            b = defer()
+            a: Feed(_)
+            b: Feed(_)
             out = test_sink()
             out << sum(b)
             x := sum(a)
@@ -4120,7 +4262,7 @@ mod tests {
     #[test]
     fn a_branch_on_a_channel_read_decides_a_later_read_of_a_mutable_variable() {
         let v = out(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             x := 1
             out = test_sink()
             if sum(ch) > 3:

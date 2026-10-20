@@ -514,7 +514,7 @@ parameters — deferred to that design.)
 ### `Feed` is a CCL type
 
 `Type::History { value: 𝑉, domain: 𝐷, history_kind: HistoryKind::Append }` (displayed
-`feed(𝐷 ⤇ 𝑉)`) — the type of a feed handle: what an `out = defer()` introduces, what
+`feed(𝐷 ⤇ 𝑉)`) — the type of a feed handle: what an `out: Feed(_)` declaration introduces, what
 `http_serve`'s response half returns, what a defer-mediating UDF parameter (`λ out → out << e`)
 carries. It is the same `Type::History` variant a mutable variable uses, under the `Append` kind;
 unlike an overwrite variable it reads as its whole collection `𝐷 ⤇ 𝑉`, not a scalar deref. A
@@ -527,8 +527,33 @@ before `channelize` runs. A handle in any other tuple, one holding a computed va
 a loop body, or one passed to a function, never reaches its channel, and `channelize` reports the
 deferred binding as having no feed or define, or as a cycle through it
 ([chl-spec.md, "A deferred collection inside a data structure [Open]"](../../../docs/chl-spec.md#a-deferred-collection-inside-a-data-structure-open)).
-`channelize` eliminates every feed-typed term when it resolves channels, so no history type
-survives to planning.
+A feed handle reaching a deferred binding no cluster took is refused by `channelize`
+(`check_unrouted_feeds`) rather than dropped with the statement it stands in. `channelize`
+eliminates every feed-typed term when it resolves channels, so no history type survives to
+planning.
+
+#### A feed read is a deref, and a feed is below its collection
+
+A feed is read the way a mutable variable is: the rule that emits a position consuming a value
+derefs a feed operand to its collection (`infer::emit::emit_value_read`). An operator operand, a
+loop source, an aggregate, a function position, a `<<` payload and a `<<=` value are such
+positions. A position that passes its value along leaves a feed the handle it is
+(`infer::emit::read_mut`): a `let` initializer, an argument, a tuple element or record field, a
+statement's continuation, and a function's result.
+
+Feeds are not second-class, so a feed can reach a reader as an inference variable, as a call's
+result does. For that case the relation holds `Feed(𝐷, 𝑉) <: 𝐷 ⤇ 𝑉`: a feed is below the
+collection it reads as. Nothing else is below a feed, so feeding a collection is a type error in
+inference (`NotAFeed`), wherever the collection came from: `x = [1, 2]; x << 3`,
+`x: Feed(Int) = [1, 2]`, or a collection passed to a parameter the function feeds. A `<<` on a
+parameter bounds the parameter's variable by a feed, so an argument meets a feed demand there
+and a collection demand where the parameter is only read, and an unconstrained parameter passes
+the handle through (`def f(x): x`).
+
+Coalescing follows the same order (`dissolve_read_feeds`). At a negative position the meet of a
+feed and its collection is the feed, so a parameter the body both feeds and reads, or feeds and
+returns, is a feed. At a positive position the join of a feed and a non-feed is above the feed's
+read view.
 
 ### `Txn` is a CCL type
 
@@ -801,7 +826,16 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
    enclosing position in the form a nested comprehension lowers to. A tap holds a collection
    level per loop around its feed, which `mut_elim` counts as it builds the tap; the hoist
    uncurries those levels into the tuple key and feeds each value through a loop over the
-   result, `for x in tap: defer << x`, so a `Feed` appends one element wherever it stands.
+   result, `for x in tap: defer << x`, so a `Feed` appends one element wherever it stands. A
+   channel the loop body declares belongs to one iteration, so its feeds are not routed: its
+   binding in the writer body becomes `let 𝑐₀ = Defer in feed(𝑐₀, 𝑣); 𝑐₀`, the value closed
+   over the bindings it reads (`iteration_channel`). A feed under a condition of its own is
+   gated, `{𝑝 → feed(𝑐₀, 𝑣); true → ()}`, which `channelize` lifts over a `{Unit | 𝑝}` driver.
+   An inner loop's tap is the channel's whole value, `𝑐₀ <<= 𝑡`, its domain restricted by the
+   condition the inner loop runs under. An iteration feeds such a channel from one place
+   (`check_iteration_channel_feeds`): two would union two collections that vary with the
+   iteration, which the compiler does not build yet. `lambda_elim` eliminates the channel's one-binding
+   group as the `let` it is, since its type can name the enclosing parameter.
 5. **Routes loops and rewrites reads**: a `For` whose body writes a `Mut` variable bound outside it is
    an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
    `Compose([iter, λ target → body])`, with feeds/yields already routed in step 4 — so a generator

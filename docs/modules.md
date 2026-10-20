@@ -335,16 +335,16 @@ public and private, so that `m::hidden` can say the member is private and point 
 The interface holds no contract. A module's check infers its members' contracts (`check_module`),
 and `cambra check` prints them with the interface (`Interface::written`).
 
-A `def` with a `Mut` parameter lowers as a curried chain, and its call sites must match
-(`LoweringContext::mut_param_fns`). The interface carries that shape so a user's call site lowers
+A `def` with a `Mut(…)` or `Feed(…)` parameter lowers as a curried chain, and its call sites
+must match (`LoweringContext::history_param_fns`). The interface carries that shape so a user's call site lowers
 correctly: a qualified callee reads it from the member, and a `use` name of such a `def` is
-registered in `mut_param_fns` when its module begins lowering.
+registered in `history_param_fns` when its module begins lowering.
 
 Each module is lowered with fresh block state. Every spelling-keyed map in `LoweringContext`
-(`transactional_vars`, `type_aliases`, `mut_param_fns`, `shadow_depth`, `nominal_types`,
+(`transactional_vars`, `type_aliases`, `history_param_fns`, `shadow_depth`, `nominal_types`,
 `associated_functions`, `used_nominal`) covers one module. The
 entries a module seeds from interfaces and from its parameters' Module types, `Txn` members in
-`transactional_vars` and `Mut`-parameter functions in `mut_param_fns`, are keyed by qualified
+`transactional_vars` and `Mut`- and `Feed`-parameter functions in `history_param_fns`, are keyed by qualified
 spelling. The out-of-block read gate and the `MutWrite` shape then apply to `eu::stock` and
 `audit::stock` exactly as they apply to `stock` inside its own module.
 

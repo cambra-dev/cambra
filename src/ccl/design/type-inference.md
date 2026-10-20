@@ -922,11 +922,11 @@ the coalesce walk asks whether the name resolves to a specialization frame (`loo
 
 A `let` that `scoped_let` does not generalize is bound at its type as seen from the binding's level
 (`lower_levels` in `infer/solver/constrain.rs`): every variable the type reaches moves down to that
-level, transitively through bounds and kinds, and a `defer`'s channel name is at that level too. The
-right-hand side is emitted one level up, where a generalized sibling's is, so without the move the
-sibling's scheme would quantify the binding's variables and each of the sibling's uses would get a
-disconnected copy: beside `out = defer()`, every call of `def put(x): out << x` would feed a
-channel of its own. Bound at its own level, the binding is one type every use shares, the
+level, transitively through bounds and kinds, and a declared feed's channel name is at that level
+too. The right-hand side is emitted one level up, where a generalized sibling's is, so without the
+move the sibling's scheme would quantify the binding's variables and each of the sibling's uses
+would get a disconnected copy: beside `out: Feed(_)`, every call of `def put(x): out << x` would
+feed a channel of its own. Bound at its own level, the binding is one type every use shares, the
 sibling's included, and a type parameter reaching it escapes
 ([type-parameters.md, "Levels"](type-parameters.md#levels)).
 
@@ -1677,9 +1677,8 @@ scheme cutoff, so freshening does not copy every history indiscriminately.
 | Relation | Behavior |
 | --- | --- |
 | Histories of the same kind | Constrain both value types and both domains in both directions. |
-| Append history against a non-history consumer | Compare its reconstructed data-function read view with the consumer. |
-| Function against an append-history demand | Compare the function with the demanded channel read view; this supports materialized read views during specialization. |
-| Other non-append shape against an append-history demand | Return `NotAFeed`; a scalar or overwrite handle cannot acquire feed capability. |
+| Append history against a non-history consumer | Compare its reconstructed data-function read view with the consumer: a feed is below the collection it reads as. |
+| Non-append shape against an append-history demand | Return `NotAFeed`; a scalar, a collection or an overwrite handle cannot acquire feed capability. |
 
 The invariant child constraints run under identity substitutions, not the Pi discharges accumulated
 outside the handle. Transporting non-invertible discharges in both directions can make incompatible
@@ -1688,10 +1687,12 @@ value is not discharged across the handle by this rule. Feed-through-UDF support
 by that limitation.
 
 Overwrite histories have no transparent subtype dereference: expression typing emits their value
-reads explicitly. A function-shaped value can satisfy the append-history read-view relation, so
-that relation alone does not validate every write target; `channelize` also checks genuine misuse
-of plain collections. The reverse cross-kind direction need not report `NotAFeed`: that error is
-the append-demand arm's diagnostic. Both directions still reject equating the two capabilities.
+reads explicitly. A feed read is explicit too wherever the operand is typed as a feed
+(`emit_value_read`); the append read-view row reads a feed that reaches its reader as an inference
+variable, as a call's result does (`src/ccl/design/mutability.md`, "A feed read is a deref, and a
+feed is below its collection"). The reverse cross-kind direction need not report `NotAFeed`: that
+error is the append-demand arm's diagnostic. Both directions still reject equating the two
+capabilities.
 
 Invariant histories require these solver treatments:
 
@@ -1701,9 +1702,13 @@ Invariant histories require these solver treatments:
 - Compaction stores kind, value, and domain in `CompactType::history_slot`. Materialization and
   simplification visit the children at the same polarity; the constraints have already propagated
   information in both directions.
-- `dissolve_read_feeds` replaces an append-history contribution by its channel function when the
-  position also has atom, product, variant, or function contributions. A lone feed or an overwrite
-  history retains its constructor. The replacement preserves positional refinements.
+- `dissolve_read_feeds` settles an append-history contribution against the position's others by
+  the order a feed sits below its read view. At a positive position it replaces the feed by its
+  channel function when the position also has atom, product, variant, function, or variable
+  contributions; the replacement preserves positional refinements. At a negative position the meet
+  of a feed and a function is the feed, so the function contribution is dropped and the feed kept,
+  which leaves a parameter the body feeds and reads (or returns) a feed. A lone feed or an
+  overwrite history retains its constructor.
 
 These are history-specific rules. Data-function domains also have an
 [invariance contract](#data-domains-are-invariant); histories are not the only invariant position.

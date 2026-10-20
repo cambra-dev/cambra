@@ -698,7 +698,7 @@ fn a_reply_after_a_writing_block_answers_the_request() {
 ///
 /// `docs/chl-spec.md`, "8.4 Feeds are the second form of mutability" admits a reply inside a
 /// block, sequenced after the commit and indexed by commit tick. The same in-block feed over a
-/// `stdin()` loop into a `defer()` replies (`progress_feed_inside_tx` in
+/// `stdin()` loop into a declared feed replies (`progress_feed_inside_tx` in
 /// `tests/it/compilation_pipeline/transactions.rs` covers the literal-list loop), and the reply
 /// moved after the block answers (the sibling above).
 // Pinned on the failure rather than deferred: an `#[ignore]` reports the same green whether the

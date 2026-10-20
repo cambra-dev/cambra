@@ -196,6 +196,10 @@ pub enum DeferError {
     /// cannot be gated by a boolean predicate, so it is rejected rather than
     /// miscompiled. The payload names the defer.
     PartialFeedCaseUnsupported(Name),
+    /// A feed or define whose target is a feed handle no deferred binding's cluster reached,
+    /// as one taken out of a data structure (`docs/chl-spec.md`, "A deferred collection inside
+    /// a data structure \[Open\]"). The payload names the target.
+    UnreachedFeedHandle(Name),
 }
 
 impl fmt::Display for DeferError {
@@ -215,7 +219,8 @@ impl DeferError {
             | DeferError::NestedDefinition(name)
             | DeferError::UnboundDeferHandle(name)
             | DeferError::MutuallyRecursiveCycle(name)
-            | DeferError::PartialFeedCaseUnsupported(name) => name,
+            | DeferError::PartialFeedCaseUnsupported(name)
+            | DeferError::UnreachedFeedHandle(name) => name,
         }
     }
 
@@ -240,6 +245,11 @@ impl DeferError {
                 "{subject} is fed from some but not all branches of a multi-way conditional; \
                  this shape is not supported yet"
             ),
+            DeferError::UnreachedFeedHandle(_) => "this feeds a feed taken out of a data \
+                 structure, which this compiler does not follow back to the feed's \
+                 declaration, so what it is fed would be lost; a feed reaches its declaration \
+                 out of a tuple literal whose every element is a literal, a source or a feed"
+                .into(),
         }
     }
 }
@@ -829,17 +839,22 @@ impl ChannelizeCtx {
 /// pattern-match `ExprStmt`.
 pub fn run(expr: Expr) -> Result<Expr, Located<DeferError>> {
     check_predicate_defers(&expr, &mut HashSet::new())?;
+    let mut bound = HashMap::new();
+    feed_bindings(&expr, &mut bound);
     let mut ctx = ChannelizeCtx::new();
     // Cluster channelization.  Walks the tree, processes `let d = Defer in …`
     // clusters, extracting feeds and building each defer's channel.
     //
-    // Defer-mediating UDFs (`def g(out): out << e`, `def f(n): x = defer();
+    // Defer-mediating UDFs (`def g(out): out << e`, `def f(n): x: Feed(_);
     // …; x`) never reach here: `inline` beta-reduces every such function at its
     // call site *before* this pass (it runs pre-channelize — see the `inline`
     // module docs), leaving only the flattened `let d = Defer in …` chains this
     // walk handles. The former Phase-1 chain rewriter and the call-site smart
     // walker that existed for the un-inlined higher-order case are retired.
     let rewritten = channelize_expr(expr, &mut ctx)?;
+    let mut binders = HashSet::new();
+    all_binders(&rewritten, &mut binders);
+    check_unrouted_feeds(&rewritten, &bound, &binders)?;
     let mut rewritten = drop_expr_stmts(rewritten);
     assert_no_defer_residue(&rewritten)?;
     // With nominal channel domains, every consumer of a defer read typed
@@ -1259,6 +1274,117 @@ pub(crate) fn refine_source_domain(source: &mut Expr, refinement: Refinement) {
          its filter refinement would be silently dropped",
         source.ty
     );
+}
+
+/// What a `let` binds, as far as feeding it goes, read before any cluster is rewritten: a
+/// cluster replaces its `Defer` with the channel it assembles, which is no feed.
+enum Bound {
+    /// Another binding's value, `log = out`.
+    Alias(Name),
+    /// A feed handle: a `Defer`, or a value of a feed type.
+    Feed,
+    /// Any other value.
+    Other,
+}
+
+/// Record what each `let` in `expr` binds ([`Bound`]).
+fn feed_bindings(expr: &Expr, out: &mut HashMap<Name, Bound>) {
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        ..
+    } = &expr.node
+    {
+        let bound = match &bound_expr.node {
+            TypedExprNode::Var(name) => Bound::Alias(name.clone()),
+            TypedExprNode::Defer => Bound::Feed,
+            _ if bound_expr.ty.as_feed().is_some() => Bound::Feed,
+            _ => Bound::Other,
+        };
+        out.insert(binding.name.clone(), bound);
+    }
+    expr.walk_children(|child| feed_bindings(child, out));
+}
+
+/// What `name` is bound to, through the aliases between: `None` for a name no `let` binds.
+fn bound_through_aliases<'a>(name: &Name, bound: &'a HashMap<Name, Bound>) -> Option<&'a Bound> {
+    let mut seen = HashSet::new();
+    let mut at = bound.get(name)?;
+    while let Bound::Alias(next) = at {
+        if !seen.insert(next) {
+            return None;
+        }
+        at = bound.get(next)?;
+    }
+    Some(at)
+}
+
+/// Refuse a feed or define every cluster has passed over, which [`drop_expr_stmts`] would
+/// otherwise drop with the statement it stands in, and its contribution with it: one into a
+/// feed taken out of a data structure.
+///
+/// Inference has made every target a feed, so a target bound to anything else is a compiler
+/// bug. A target a binder other than a `let` binds is a parameter of a function nothing
+/// calls, which never runs.
+fn check_unrouted_feeds(
+    expr: &Expr,
+    bound: &HashMap<Name, Bound>,
+    binders: &HashSet<Name>,
+) -> Result<(), Located<DeferError>> {
+    if let TypedExprNode::Feed { name, .. } | TypedExprNode::Define { name, .. } = &expr.node {
+        match bound_through_aliases(name, bound) {
+            Some(Bound::Feed) => {
+                return Err(Located::new(
+                    DeferError::UnreachedFeedHandle(name.clone()),
+                    expr.node_id,
+                ));
+            }
+            Some(Bound::Other) => unreachable!(
+                "`{name}` is fed, and inference typed it as a feed, but its `let` binds a value \
+                 of another type"
+            ),
+            None if !binders.contains(name) => {
+                unreachable!(
+                    "`{name}` is fed, and inference typed it as a feed, but nothing binds it"
+                )
+            }
+            Some(Bound::Alias(_)) | None => {}
+        }
+    }
+    let mut found = Ok(());
+    expr.walk_children(|child| {
+        if found.is_ok() {
+            found = check_unrouted_feeds(child, bound, binders);
+        }
+    });
+    found
+}
+
+/// Every name a binder in `expr` binds, of any kind.
+fn all_binders(expr: &Expr, out: &mut HashSet<Name>) {
+    match &expr.node {
+        TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
+            out.insert(binding.name.clone());
+        }
+        TypedExprNode::Lambda { param, .. } => {
+            out.insert(param.name.clone());
+        }
+        TypedExprNode::For { target, .. } => {
+            out.insert(target.name.clone());
+        }
+        TypedExprNode::LetRec { bindings, .. } => {
+            out.extend(bindings.iter().map(|(b, _)| b.name.clone()));
+        }
+        TypedExprNode::Case { branches, .. } => {
+            out.extend(
+                branches
+                    .iter()
+                    .filter_map(|br| br.pattern.as_ref().map(|p| p.binding.name.clone())),
+            );
+        }
+        _ => {}
+    }
+    expr.walk_children(|child| all_binders(child, out));
 }
 
 /// Collapse every `ExprStmt(e, b)` to `b`, recursing structurally.
@@ -3170,12 +3296,51 @@ fn extract_for_defer_impl(
         // so extraction finds them there; binding bodies carry no feeds but
         // are walked for totality. Binder shadowing of `defer_name` is
         // impossible post-uniquify.
+        //
+        // A channel group, which this pass has already made of a channel declared under
+        // the one being extracted (in a loop body, say), binds a value as a `Let` does. So a
+        // feed extracted from the continuation that reads it takes a copy of it, as the `Let`
+        // arm above re-binds a binding around the feeds that read it. A recurrence group is
+        // not copied: a copy would be a second recurrence.
         TypedExprNode::LetRec { mut bindings, body } => {
             for (_, def) in bindings.iter_mut() {
                 let taken = std::mem::take(def);
                 *def = extract_for_defer(taken, defer_name, feeds, define, in_inner_scope)?;
             }
+            let prev_len = feeds.len();
             let body = extract_for_defer(*body, defer_name, feeds, define, in_inner_scope)?;
+            let channels = !crate::ccl::letrec::group_has_causal(&bindings);
+            for Contribution {
+                value: feed,
+                feed: feed_id,
+                ..
+            } in feeds.iter_mut().skip(prev_len)
+            {
+                let mut fvs = HashSet::new();
+                collect_free_vars(feed, &mut fvs);
+                if !channels || !bindings.iter().any(|(b, _)| fvs.contains(&b.name)) {
+                    continue;
+                }
+                // A group is not discharged out of a type the way a `let` is, its
+                // bindings being recursive, so the contribution's type must not read them.
+                let mut ty_fvs = HashSet::new();
+                collect_free_vars_in_type(&feed.ty, &mut ty_fvs);
+                assert!(
+                    !bindings.iter().any(|(b, _)| ty_fvs.contains(&b.name)),
+                    "a contribution's type reads a `letrec` binding it is extracted from under: {}",
+                    feed.ty
+                );
+                let _g =
+                    provenance::enter(*feed_id, "channelize.feed", provenance::Nature::Expansion);
+                let placeholder = Expr::throwaway(TypedExprNode::Lit(Lit::Unit));
+                let original = std::mem::replace(feed, placeholder);
+                let ty = original.ty.clone();
+                *feed = Expr::new(TypedExprNode::LetRec {
+                    bindings: bindings.clone(),
+                    body: Box::new(original),
+                })
+                .with_ty(ty);
+            }
             TypedExprNode::LetRec {
                 bindings,
                 body: Box::new(body),
@@ -3367,9 +3532,9 @@ mod tests {
     #[test]
     fn run_three_defer_cluster_becomes_letrec_group() {
         // ```
-        // a = defer()
-        // b = defer()
-        // c = defer()
+        // a: Feed(_)
+        // b: Feed(_)
+        // c: Feed(_)
         // a <<= b
         // b <<= c
         // c <<= [0, 1]

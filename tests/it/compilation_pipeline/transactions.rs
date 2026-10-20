@@ -696,7 +696,7 @@ fn test_compound_txn_mut_var_field() {
 fn progress_feed_inside_tx() {
     check_tile(
         indoc! {r#"
-            out = defer()
+            out: Feed(_)
             pool: Mut(Int, Txn) := 100
             for r in [10, 20, 30]:
                 with begin():
@@ -721,7 +721,7 @@ fn progress_feed_grant_deny() {
     let (ast, tile) = run_pipeline_with_ctx(
         &mut ctx,
         indoc! {r#"
-            out = defer()
+            out: Feed(_)
             pool: Mut(Int, Txn) := 100
             for r in [70, 50]:
                 with begin():
@@ -743,7 +743,7 @@ fn reply_union_over_two_sites_is_keyed_by_commit_time() {
     let (ast, _) = run_pipeline_with_ctx(
         &mut ctx,
         indoc! {r#"
-            out = defer()
+            out: Feed(_)
             pool: Mut(Int, Txn) := 100
             for r in [10, 20]:
                 with begin():
@@ -810,8 +810,8 @@ fn string_valued_store() {
 fn two_reply_feeds_one_transaction() {
     check_collection_tile(
         indoc! {r#"
-            outa = defer()
-            outb = defer()
+            outa: Feed(_)
+            outb: Feed(_)
             a: Mut(Int, Txn) := 0
             b: Mut(Int, Txn) := 0
             for x in [1, 2, 3]:
@@ -854,7 +854,7 @@ fn reply_feed_under_one_route_does_not_overfire() {
         indoc! {r#"
             a: Mut(Int, Txn) := 0
             b: Mut(Int, Txn) := 0
-            out = defer()
+            out: Feed(_)
             for x in [1, 2, 3]:
                 with begin():
                     if x >= 2:
@@ -883,7 +883,7 @@ fn both_arms_feed_in_committing_block() {
     check_tile(
         indoc! {r#"
             a: Mut(Int, Txn) := 0
-            out = defer()
+            out: Feed(_)
             for x in [1, 2, 3]:
                 with begin():
                     if x >= 2:
@@ -923,7 +923,7 @@ fn ryw_of_conditionally_written_key_after_case() {
     check_tile(
         indoc! {r#"
             a: Mut(Int, Txn) := 0
-            out = defer()
+            out: Feed(_)
             for x in [1, 2, 3]:
                 with begin():
                     if x >= 2:
@@ -951,7 +951,7 @@ fn ryw_of_conditionally_written_key_after_case() {
 fn conditional_reply_in_readonly_block() {
     check_tile(
         indoc! {r#"
-            resp = defer()
+            resp: Feed(_)
             pool: Mut(Int, Txn) := 100
             for r in [1, 2, 3]:
                 with begin():
@@ -976,7 +976,7 @@ fn conditional_reply_in_readonly_block() {
 fn conditional_if_else_reply_in_readonly_block() {
     check_tile(
         indoc! {r#"
-            resp = defer()
+            resp: Feed(_)
             pool := 100
             for r in [1, 2, 3]:
                 with begin():
@@ -1051,7 +1051,7 @@ fn multi_writer_single_defer_feed() {
     // values are schedule-dependent, but both draws commit exactly once and the
     // pool is conserved (final 70).
     let tile = run_pipeline(indoc! {r#"
-            out = defer()
+            out: Feed(_)
             pool: Mut(Int, Txn) := 100
             for r in [10]:
                 with begin():
@@ -1074,7 +1074,7 @@ fn three_writers_single_defer_feed() {
     // conflict on `pool`); the invariant is one commit per draw and conservation
     // (final 40 = 100 − 10 − 20 − 30).
     let tile = run_pipeline(indoc! {r#"
-            out = defer()
+            out: Feed(_)
             pool: Mut(Int, Txn) := 100
             for r in [10]:
                 with begin():
@@ -1173,7 +1173,7 @@ fn sustained_contention_conserves_pool() {
 #[test]
 fn await_final_and_as_of_read_the_same_mut_var() {
     let code = indoc! {r#"
-        out = defer()
+        out: Feed(_)
         pool: Mut(Int, Txn) := 100
         for r in [10, 20]:
             with begin():
@@ -1207,7 +1207,7 @@ fn await_final_and_as_of_read_the_same_mut_var() {
 fn await_final_broadcast_over_a_reading_loop_stays_final() {
     check_tile(
         indoc! {r#"
-            out = defer()
+            out: Feed(_)
             pool: Mut(Int, Txn) := 100
             for r in [10, 20]:
                 with begin():
@@ -1231,7 +1231,7 @@ fn await_final_broadcast_over_a_reading_loop_stays_final() {
 fn await_final_bound_then_read_in_a_feed_loop_stays_final() {
     check_tile(
         indoc! {r#"
-            out = defer()
+            out: Feed(_)
             pool: Mut(Int, Txn) := 100
             for r in [10]:
                 with begin():
@@ -1465,7 +1465,7 @@ fn by_ref_pass_after_await_final_rejected() {
 fn await_final_inside_a_block_rejected() {
     check_compile_error(
         indoc! {r#"
-            out = defer()
+            out: Feed(_)
             pool: Mut(Int, Txn) := 100
             for r in [10]:
                 with begin():
@@ -1551,8 +1551,8 @@ fn an_unknown_decorator_rejected() {
     );
 }
 
-/// A declaration carries an annotation and no value only under `@LoadFrom`,
-/// which is what supplies the value. A bare one stays a parse error.
+/// A declaration with no value introduces a feed. Any other type needs its value, and
+/// a mutable variable its first one.
 #[test]
 fn a_bare_annotation_without_a_value_rejected() {
     check_compile_error(
@@ -1560,7 +1560,22 @@ fn a_bare_annotation_without_a_value_rejected() {
             n: Int
             n
         "#},
-        "parse error",
+        "`n` is declared with no value, which only a feed is: declare it `n: Feed(T)`",
+    );
+    check_compile_error(
+        indoc! {r#"
+            n: Mut(Int)
+            n
+        "#},
+        "a mutable variable is introduced with its first value: `n: Mut(…) := e`",
+    );
+    check_compile_error(
+        indoc! {r#"
+            out <: Feed(Int)
+            out << 1
+            out
+        "#},
+        "`out <: Feed(…)` bounds a feed by its own type",
     );
 }
 
@@ -1898,7 +1913,7 @@ fn registers_written_in_one_block_share_a_store() {
 #[test]
 fn mut_vars_read_together_share_a_store() {
     let code = indoc! {r#"
-        out = defer()
+        out: Feed(_)
         a: Mut(Int, Txn) := 0
         b: Mut(Int, Txn) := 0
         for x in [1, 2]:
@@ -1948,7 +1963,7 @@ fn a_mut_var_read_by_a_writing_block_joins_its_store() {
 #[test]
 fn a_mut_var_no_block_writes_is_not_a_store_key() {
     let code = indoc! {r#"
-        out = defer()
+        out: Feed(_)
         lim: Mut(Int, Txn) := 5
         tot: Mut(Int, Txn) := 0
         for x in [1, 2]:
@@ -1969,7 +1984,7 @@ fn a_mut_var_no_block_writes_is_not_a_store_key() {
 #[test]
 fn a_defer_fed_inside_a_store_is_consumed_inside_it() {
     let code = indoc! {r#"
-        out = defer()
+        out: Feed(_)
         a: Mut(Int, Txn) := 0
         for x in [1, 2]:
             with begin():
@@ -1992,7 +2007,7 @@ fn a_defer_fed_inside_a_store_is_consumed_inside_it() {
 #[test]
 fn a_defer_fed_by_a_read_only_block_is_consumed_inside_its_store() {
     let code = indoc! {r#"
-        out = defer()
+        out: Feed(_)
         a: Mut(Int, Txn) := 0
         for x in [1, 2]:
             with begin():
@@ -2394,7 +2409,7 @@ fn live_reply_combines_request_and_store() {
     use std::rc::Rc;
 
     let code = indoc! {r#"
-        resps = defer()
+        resps: Feed(_)
         store: Mut(Int, Txn) := 0
         for r in [10, 20, 30]:
             with begin():
@@ -2723,7 +2738,7 @@ fn by_ref_txn_write_without_block_rejected() {
 fn txn_writer_called_inside_block_rejected() {
     check_compile_error(
         indoc! {r#"
-            out = defer()
+            out: Feed(_)
             pool: Mut(Int, Txn) := 100
             def do_it(p: Mut(Int, Txn)):
                 with begin():
@@ -2828,7 +2843,7 @@ fn like_named_comprehension_var_does_not_panic() {
 fn like_named_loop_var_is_not_a_store_read() {
     check_tile(
         indoc! {r#"
-            out = defer()
+            out: Feed(_)
             store: Mut(Int, Txn) := 0
             for store in [1, 2, 3]:
                 out << store + 1
@@ -2848,7 +2863,7 @@ fn like_named_loop_var_is_not_a_store_read() {
 fn mixed_txn_and_induction_reply_reads_accumulator() {
     check_tile(
         indoc! {r#"
-            resps = defer()
+            resps: Feed(_)
             store: Mut(Int, Txn) := 0
             cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
@@ -2892,7 +2907,7 @@ fn mixed_txn_and_induction_store_accumulates() {
 fn mixed_txn_and_induction_write_inside_block() {
     check_tile(
         indoc! {r#"
-            resps = defer()
+            resps: Feed(_)
             store: Mut(Int, Txn) := 0
             cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
@@ -3043,7 +3058,7 @@ fn commit_decision_reads_cross_loop_accumulator_broadcast() {
             cnt := 0
             for i in [1, 2, 3]:
                 cnt := cnt + 1
-            out = defer()
+            out: Feed(_)
             pool: Mut(Int, Txn) := 100
             for r in [10, 20]:
                 with begin():
@@ -3071,7 +3086,7 @@ fn broadcast_read_races_a_second_writer() {
             cnt := 0
             for i in [1, 2, 3]:
                 cnt := cnt + 1
-            out = defer()
+            out: Feed(_)
             pool: Mut(Int, Txn) := 100
             for r in [10]:
                 with begin():
@@ -3102,7 +3117,7 @@ fn broadcast_off_async_source_sibling_loop() {
         cnt := 0
         for x in src():
             cnt := cnt + 1
-        out = defer()
+        out: Feed(_)
         pool: Mut(Int, Txn) := 100
         for r in [10]:
             with begin():
@@ -3156,7 +3171,7 @@ fn broadcast_off_async_source_sibling_loop() {
 fn commit_decision_reads_induction_accumulator_with_reply() {
     check_tile(
         indoc! {r#"
-            resps = defer()
+            resps: Feed(_)
             store: Mut(Int, Txn) := 0
             cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
@@ -3182,7 +3197,7 @@ fn commit_decision_reads_induction_accumulator_with_reply() {
 fn commit_gated_reply_reading_induction_counter() {
     check_tile(
         indoc! {r#"
-            resps = defer()
+            resps: Feed(_)
             pool: Mut(Int, Txn) := 100
             cnt: Mut(Int) := 0
             for r in [70, 50, 20]:
@@ -3207,7 +3222,7 @@ fn commit_gated_reply_reading_induction_counter() {
 fn commit_ordered_reply_reading_induction_counter() {
     check_tile(
         indoc! {r#"
-            resps = defer()
+            resps: Feed(_)
             store: Mut(Int, Txn) := 0
             cnt: Mut(Int) := 0
             for r in [10, 20, 30]:
@@ -3232,7 +3247,7 @@ fn commit_ordered_reply_reading_induction_counter() {
 fn in_block_reply_with_deny_is_dense() {
     check_tile(
         indoc! {r#"
-            resp = defer()
+            resp: Feed(_)
             q: Mut(Int, Txn) := 0
             for r in [0, 1, 2]:
                 with begin():
@@ -3266,7 +3281,7 @@ fn live_read_progresses_past_deny() {
     use cambra::interpreter::sort_function_by_domain;
 
     let code = indoc! {r#"
-        resps = defer()
+        resps: Feed(_)
         total: Mut(Int, Txn) := 0
         for r in [10, 0, 20]:
             with begin():
@@ -3912,7 +3927,7 @@ fn a_checked_lookup_of_an_absent_key_in_a_read_only_block_answers_none() {
     check_scalar(
         indoc! {r#"
             m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
-            out = defer()
+            out: Feed(_)
             for r in [1, 2, 1]:
                 with begin():
                     out << (match m[r]?:
@@ -4080,7 +4095,7 @@ fn match_dispatch_inside_a_transaction_block() {
 fn match_arm_reply_inside_a_transaction_block() {
     check_scalar(
         indoc! {"
-            resp = defer()
+            resp: Feed(_)
             bal: Mut(Int, Txn) := 0
             for m in [`dep(10), `wd(3)]:
                 with begin():

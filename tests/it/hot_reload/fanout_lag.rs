@@ -52,7 +52,7 @@ fn feed(source: &str, reads_n: bool, mark: &str) -> String {
     let second = if reads_n { "n + y" } else { "y" };
     format!(
         indoc! {r#"
-            out = defer()
+            out: Feed(_)
             n := ""
             for x in {source}:
                 n := n + x
