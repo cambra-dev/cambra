@@ -255,23 +255,29 @@ fn apply_one(op: crate::scalar_ops::BinOpKind, left: &Lit, right: &Lit) -> Optio
         (rt::BinOpKind::Concat, Lit::String(l), Lit::String(r)) => Some(Lit::String(
             rt::zip_concat(vec![l.as_str().into()], &[r.as_str().into()]).pop()?,
         )),
-        (rt::BinOpKind::Compare(c), Lit::Int(l), Lit::Int(r)) => {
-            Some(Lit::Bool(rt::zip_compare(c, vec![*l], &[*r]).get(0)?))
-        }
+        (rt::BinOpKind::Compare(c), Lit::Int(l), Lit::Int(r)) => Some(Lit::Bool(
+            rt::zip_compare(c, vec![*l], &[*r]).first().copied()?,
+        )),
         (rt::BinOpKind::Compare(c), Lit::String(l), Lit::String(r)) => Some(Lit::Bool(
-            rt::zip_compare(c, vec![l.as_str()], &[r.as_str()]).get(0)?,
+            rt::zip_compare(c, vec![l.as_str()], &[r.as_str()])
+                .first()
+                .copied()?,
         )),
         (rt::BinOpKind::Compare(c), Lit::Bool(l), Lit::Bool(r)) => Some(Lit::Bool(
-            rt::zip_bool_compare(c, bits(*l), &bits(*r)).get(0)?,
+            rt::zip_bool_compare(c, bits(*l), &bits(*r))
+                .first()
+                .copied()?,
         )),
         (rt::BinOpKind::BoolLogic(g), Lit::Bool(l), Lit::Bool(r)) => Some(Lit::Bool(
-            rt::zip_bool_logic(g, bits(*l), &bits(*r)).get(0)?,
+            rt::zip_bool_logic(g, bits(*l), &bits(*r))
+                .first()
+                .copied()?,
         )),
         _ => None,
     }
 }
 
-/// A one-position `BitVec`, the column shape the boolean kernels take.
-fn bits(b: bool) -> bit_vec::BitVec {
-    bit_vec::BitVec::from_elem(1, b)
+/// A one-position `Vec<bool>`, the column shape the boolean kernels take.
+fn bits(b: bool) -> Vec<bool> {
+    vec![b; 1]
 }

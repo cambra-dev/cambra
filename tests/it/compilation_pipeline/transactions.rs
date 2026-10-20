@@ -24,7 +24,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use bit_set::BitSet;
-use bit_vec::BitVec;
 use cambra::ccl::Type;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program, render_errors};
 use cambra::interpreter::{
@@ -765,7 +764,7 @@ fn bool_valued_store() {
                     flag := True
             await_final(flag)
         "#},
-        Tile::Scalar(ColumnValue::Bools(BitVec::from_elem(1, true))),
+        Tile::Scalar(ColumnValue::Bools(vec![true; 1])),
     );
 }
 

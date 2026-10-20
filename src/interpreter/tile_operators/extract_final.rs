@@ -5,7 +5,6 @@ use crate::{
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
-use bit_vec::BitVec;
 
 // ---------------------------------------------------------------------------
 // ExtractFinal / ExtractFinalProducer
@@ -275,7 +274,11 @@ impl TileProducer for ExtractFinalProducer {
                 // value at this position. The source is terminal and this is its last
                 // position, so what it holds is the whole collection.
                 let mut sub = *codomain;
-                sub.retain_rows(&BitVec::from_fn(domain.len(), |i| i == final_idx));
+                sub.retain_rows(
+                    &(0..domain.len())
+                        .map(|i| i == final_idx)
+                        .collect::<Vec<bool>>(),
+                );
                 let Tile::DataFunction {
                     domain_predicate, ..
                 } = &mut sub

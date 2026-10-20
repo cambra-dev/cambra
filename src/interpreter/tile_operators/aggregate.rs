@@ -1,5 +1,4 @@
 use bit_set::BitSet;
-use bit_vec::BitVec;
 use log::trace;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -97,7 +96,7 @@ impl AggregateProducer {
                 Tile::Aggregation {
                     kind: *kind,
                     accumulator: Box::new(kind.initial_accumulator(acc_tiling)),
-                    terminal: ColumnValue::Bools(BitVec::from_elem(1, false)),
+                    terminal: ColumnValue::Bools(vec![false; 1]),
                 },
             ),
             other => panic!("AggregateProducer created with non-Aggregation tiling: {other:?}"),
@@ -151,7 +150,7 @@ impl TileProducer for AggregateProducer {
             panic!("Accumulator must be Aggregation tile")
         };
         self.kind.accumulate(accumulator, &values, 0, values.rows());
-        terminal.set(0, is_terminal);
+        terminal[0] = is_terminal;
         self.accumulator.clone()
     }
 
@@ -382,7 +381,7 @@ impl TileProducer for MapExtractAggregateProducer {
         };
         // Emit only the elements whose aggregation is terminal.
         let mask = terminal
-            .as_bitvec()
+            .as_bools()
             .unwrap_or_else(|| panic!("Expected bools"));
         *slot = self.kind.extract(*accumulator);
         // One bool per accumulator, so the mask is over the innermost collection's keys.
@@ -725,7 +724,7 @@ impl TileProducer for MapAggregateProducer {
         // contiguously, which is what rebuilding the offsets assumes.
         entries.sort_by(|a, b| compare_paths(&a.0, &b.0));
 
-        let terminal: BitVec = entries
+        let terminal: Vec<bool> = entries
             .iter()
             .map(|(path, _)| complete.contains_path(path))
             .collect();
@@ -1142,7 +1141,7 @@ mod tests {
         };
         assert_eq!(
             terminal,
-            &ColumnValue::Bools(BitVec::from_elem(1, true)),
+            &ColumnValue::Bools(vec![true; 1]),
             "the any-level rule settles the group: {out:?}"
         );
         let Tile::DataFunction {

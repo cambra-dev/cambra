@@ -243,7 +243,7 @@ mod tests {
         let aggregation = || Tile::Aggregation {
             kind: crate::ccl::AggregateKind::Sum,
             accumulator: ints(vec![6]),
-            terminal: ColumnValue::Bools(bit_vec::BitVec::from_elem(1, true)),
+            terminal: ColumnValue::Bools(vec![true; 1]),
         };
         let store = crate::interpreter::commit_operator::full_store_tiling(
             crate::interpreter::Extent::Base(crate::interpreter::BaseType::UInt),

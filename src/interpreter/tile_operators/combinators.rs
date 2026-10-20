@@ -1,5 +1,4 @@
 use bit_set::BitSet;
-use bit_vec::BitVec;
 use log::trace;
 use std::collections::HashMap;
 use std::iter::repeat_n;
@@ -228,17 +227,13 @@ fn converse_collection(input_tile: Tile) -> (Tile, Vec<(Value, Value)>) {
                         ColumnValue::Strings(v) => {
                             converse_group_by_key(v, &codomain, &domain, domain_predicate, &deleted)
                         }
-                        ColumnValue::Bools(bv) => {
-                            // Materialise as Vec<bool> so the element type is PartialOrd.
-                            let v: Vec<bool> = bv.iter().collect();
-                            converse_group_by_key(
-                                &v,
-                                &codomain,
-                                &domain,
-                                domain_predicate,
-                                &deleted,
-                            )
-                        }
+                        ColumnValue::Bools(bv) => converse_group_by_key(
+                            bv,
+                            &codomain,
+                            &domain,
+                            domain_predicate,
+                            &deleted,
+                        ),
                         ColumnValue::Variants(v) => {
                             // Value is PartialOrd; pass the inner vec directly.
                             converse_group_by_key(v, &codomain, &domain, domain_predicate, &deleted)
@@ -904,7 +899,7 @@ impl TileProducer for FilterProducer {
                     };
                     let func_result = f.apply(domain.clone());
                     let mask = func_result
-                        .as_bitvec()
+                        .as_bools()
                         .unwrap_or_else(|| panic!("Expected boolean mask"));
                     let mut output = input;
                     output.mark_deleted(mask);
@@ -936,7 +931,7 @@ impl TileProducer for FilterProducer {
                 }
                 let pred_column = scalar_tile_to_column_value(pred.deepest_values().clone());
                 let answers = pred_column
-                    .as_bitvec()
+                    .as_bools()
                     .unwrap_or_else(|| panic!("Expected bools"));
                 debug_assert_eq!(
                     pred_keys.len(),
@@ -995,7 +990,7 @@ fn retain_answered(
     level: CurryLevel,
     input_paths: &[Vec<Value>],
     pred_paths: &[Vec<Value>],
-    answers: &BitVec,
+    answers: &[bool],
 ) {
     let answer_at: HashMap<&[Value], bool> = pred_paths
         .iter()
@@ -1006,11 +1001,11 @@ fn retain_answered(
         unreachable!("the masked level is a collection")
     };
     let deleted = deleted.clone();
-    let mut keep = BitVec::from_elem(input_paths.len(), false);
+    let mut keep = vec![false; input_paths.len()];
     let mut withheld: Vec<&[Value]> = Vec::new();
     for (i, path) in input_paths.iter().enumerate() {
         match answer_at.get(path.as_slice()) {
-            Some(&answer) => keep.set(i, answer),
+            Some(&answer) => keep[i] = answer,
             None => {
                 // The filter releases both sides by what it hands on, so a key the input
                 // still holds, deleted or not, is one the predicate has not let go of.
@@ -1152,7 +1147,7 @@ impl TileProducer for RestrictProducer {
             } => {
                 let pred_bools = scalar_tile_to_column_value(*codomain);
                 let mask = pred_bools
-                    .as_bitvec()
+                    .as_bools()
                     .unwrap_or_else(|| panic!("Restrict: expected boolean predicate values"));
                 // Build identity: each surviving key maps to itself.
                 let as_data = domain.clone();
@@ -1227,9 +1222,9 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling, second: Paired) -> 
             groups.row_run(i)
         })
         .collect();
-    let mut kept = BitVec::from_elem(outer_keys.len(), false);
+    let mut kept = vec![false; outer_keys.len()];
     for r in &paired {
-        kept.set(*r, true);
+        kept[*r] = true;
     }
     let mut emitted = outer.clone();
     emitted.retain_keys(&kept);
@@ -1712,7 +1707,7 @@ mod tests {
     /// The predicate both cases filter by: two levels over the keys `1 ↦ [10, 20]` and
     /// `2 ↦ [10, 30]`, keeping `(1, 10)` and `(2, 30)`.
     fn per_row_predicate() -> TestTileProducer {
-        let mask: BitVec = [true, false, false, true].into_iter().collect();
+        let mask: Vec<bool> = [true, false, false, true].into_iter().collect();
         TestTileProducer::new(
             outer(level(
                 &[0, 2],
@@ -1822,7 +1817,7 @@ mod tests {
         let product = |rows: &[u64], inner: Tile| {
             Tile::data_function(uints(rows), Box::new(inner), Predicate::True, BitSet::new())
         };
-        let mask: BitVec = [true, false, false, true].into_iter().collect();
+        let mask: Vec<bool> = [true, false, false, true].into_iter().collect();
         let predicate = TestTileProducer::new(
             product(
                 &[2, 3],

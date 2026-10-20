@@ -5,7 +5,6 @@ use smol_str::SmolStr;
 use std::{collections::HashMap, fmt};
 
 use bit_set::BitSet;
-use bit_vec::BitVec;
 
 use super::curry_level::CurryLevel;
 use crate::{
@@ -223,7 +222,7 @@ impl Tiling {
             ),
             Tiling::Aggregation { kind, accumulator } => Tile::Aggregation {
                 kind: *kind,
-                terminal: ColumnValue::Bools(BitVec::new()),
+                terminal: ColumnValue::Bools(Vec::new()),
                 accumulator: Box::new(accumulator.empty_at_no_rows()),
             },
             // An empty store: every key's changelog empty, frontier undecided, live,
