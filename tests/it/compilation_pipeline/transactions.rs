@@ -3892,7 +3892,7 @@ fn a_keyed_write_commits_a_computed_value_at_a_computed_key() {
     );
 }
 
-/// A checked lookup of a key the map-valued mutable variable does not hold answers `` `none ``
+/// A checked lookup of a key the map-valued mutable variable does not hold answers `Option::none`
 /// inside a read-only block: key `2` is absent, and every position replies.
 ///
 /// `m` has no writer, so every transaction reads its seed and the replies are independent of
@@ -3906,8 +3906,8 @@ fn a_checked_lookup_of_an_absent_key_in_a_read_only_block_answers_none() {
             for r in [1, 2, 1]:
                 with begin():
                     out << (match m[r]?:
-                        case `some(v): v
-                        case `none: 0)
+                        case Option::some(v): v
+                        case Option::none: 0)
             sum(out)
         "#},
         Value::Int(20),
@@ -3917,7 +3917,7 @@ fn a_checked_lookup_of_an_absent_key_in_a_read_only_block_answers_none() {
 /// A checked lookup of an absent key inside a block that writes stalls: the program quiesces
 /// without a final value of `n`, so `await_final(n)` never reaches a terminal tile.
 ///
-/// The block writes `n`, not `m`. The same lookup in a read-only block answers `` `none ``
+/// The block writes `n`, not `m`. The same lookup in a read-only block answers `Option::none`
 /// (the sibling above), and a lookup of a present key in a writing block commits
 /// (`a_keyed_read_at_the_loop_item_reads_the_snapshot`). Feeding the lookup out of the block
 /// instead of writing it stalls the same way: over a `[1, 2, 1]` loop with seed `{1: 10}`, the
@@ -3931,9 +3931,9 @@ fn a_checked_lookup_of_an_absent_key_in_a_writing_block() {
         indoc! {r#"
             def or_zero(o: Option(Int)) => Int:
                 match o:
-                    case `some(v):
+                    case Option::some(v):
                         v
-                    case `none:
+                    case Option::none:
                         0
             m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
             n: Mut(Int, Txn) := 0
@@ -3953,9 +3953,9 @@ fn a_counter_over_an_induction_map_at_a_present_key() {
     let value = final_mut_var_value(indoc! {r#"
         def or_zero(o: Option(Int)) => Int:
             match o:
-                case `some(v):
+                case Option::some(v):
                     v
-                case `none:
+                case Option::none:
                     0
         m: Mut(Map(Int, Int)) := box(map([(3, 0)]))
         for r in [3, 3]:
@@ -3974,9 +3974,9 @@ fn a_counter_over_an_induction_map_at_an_absent_key() {
     let value = final_mut_var_value(indoc! {r#"
         def or_zero(o: Option(Int)) => Int:
             match o:
-                case `some(v):
+                case Option::some(v):
                     v
-                case `none:
+                case Option::none:
                     0
         m: Mut(Map(Int, Int)) := box(map([(1, 10)]))
         for r in [3, 3]:
