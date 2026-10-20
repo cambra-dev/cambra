@@ -481,7 +481,7 @@ snapshots: `infer/solve` (`mono.specialize`,
 `mono.coalesce_let`), `infer/emit` (`infer.lit_singleton`), `infer/context`
 (`infer.require_trait`), `infer/solver/scheme` (`infer.freshen_predicate`),
 `infer/solver/traits` (`infer.freshen_obligation`), `inline`
-(`inline.alias`, `inline.udf`, `inline.beta`), `mut_elim` (`letrec.loop`,
+(`inline.alias`, `inline.udf`, `inline.beta`, `inline.split`), `mut_elim` (`letrec.loop`,
 `letrec.accumulator`, `letrec.feed`, `letrec.bare_write`,
 `letrec.hoist_writer_body`, `letrec.terminalize_write`),
 `transact_phase` (strip, unwrap block, writer, commit record, history binding,
