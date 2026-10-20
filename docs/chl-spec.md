@@ -1596,13 +1596,13 @@ a, b = pair
 (x, (y, z)), w = nested
 ```
 
-is supported at any nesting depth.
+is supported at any nesting depth, with or without parentheses around the pattern. A tuple
+expression keeps its parentheses. `value` is evaluated in the scope before the statement, so
+`b, a = (a, b)` exchanges the two names.
 
 > **Direction [Tentative].** Destructuring targets generalize: any
 > tuple-yielding expression can be destructured wherever a target
-> appears — assignment and `for` binders alike. Today's grammar special-cases
-> the `reqs, resps = http_serve(…)` statement form (§7.4); that is an
-> implementation restriction, not a design one. The decided pattern
+> appears, `for` binders included. The decided pattern
 > surface is §4.3.1.
 
 **No assignment-as-expression** — neither `=` nor `:=` is an expression
@@ -3810,19 +3810,19 @@ responses ([10. Sinks](#10-sinks)).
 | Call | Source | Domain |
 |---|---|---|
 | `stdin()` | Process standard input | One element per line of UTF-8 text. |
-| `http_serve(port, method, path)` | HTTP server, a source and a sink | Returns a `(requests, responses)` 2-tuple. The requests source yields request bodies; the responses sink is a deferred collection to feed. Must be assigned at top level via tuple destructuring (see below). |
+| `http_serve(port, method, path)` | HTTP server, a source and a sink | Returns a `(requests, responses)` 2-tuple. The requests source yields request bodies; the responses sink is a deferred collection to feed. Called only as the whole right-hand side of a top-level `=` (see below). |
 
 Additional sources may be pre-registered by the host embedding (testing,
 demos, etc.).
 
-`http_serve` has a special-cased statement form:
+`http_serve` opens its route when the program starts, so a call is the
+whole right-hand side of a `=` in the top-level block, and its three
+arguments are string literals. The target is any pattern (§4.3), and a
+tuple pattern names the two sides:
 
 ```python
 reqs, resps = http_serve(port, method, path)
 ```
-
-This pattern (`identifier-tuple = http_serve(string, string, string)`)
-must appear in the top-level block. It binds two names:
 
 - the `reqs` side is a streaming source: each element is the
   body of one incoming request to `(method, path)` on `port`.
@@ -3870,10 +3870,7 @@ unique across the program.
 > same library design. So does the typing of the response sink
 > itself: a *deferred keyed collection* — supporting both
 > `resps[req.id] = …` and a feed form `resps << …` — that needs CCL
-> and CHL definitions. The `(requests, responses)`
-> tuple-destructuring form above is what's implemented today,
-> special-cased to `http_serve` only as an implementation matter
-> (§4.3 Direction).
+> and CHL definitions.
 >
 > **Request validation derived from the handler's type**, in the same
 > **[Open]** design. A request is untrusted input, so the endpoint is a

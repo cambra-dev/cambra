@@ -51,6 +51,15 @@
 //! `const(x)` wrappers, which would otherwise require special
 //! recognition downstream.
 //!
+//! # Tuple projections
+//!
+//! A projection chain `𝑡.𝑖…` of a `let`-bound tuple literal that lands on a literal, a source, a
+//! `Var` bound to a `Defer`, or a tuple of those is replaced by a copy of the element, and a
+//! tuple `let` that nothing reads afterwards is dropped. `channelize` resolves a feed handle
+//! through `Var` aliases only, and runs before [`crate::ccl::simplify`] folds literal
+//! projections, so this is what lets `o = t.1` over `t = (1, out)` feed `out`. A projection
+//! standing directly on a literal is left to `simplify`.
+//!
 //! This pass runs **before** [`crate::ccl::channelize`] (so the unified
 //! letrec phase can route an in-loop feed against inlined writers, and a
 //! defer-mediating UDF reaches its call site before channelize routes it), so it
@@ -77,6 +86,7 @@ use crate::ccl::{
 };
 
 use crate::ccl::infer::solver::smt::{NoScope, SmtError, smt_sub};
+use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -96,7 +106,7 @@ use crate::ccl::infer::solver::smt::{NoScope, SmtError, smt_sub};
 /// are *not* folded here — `crate::ccl::simplify` handles that rewrite as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_capability_lambdas(expr: Expr) -> Expr {
-    let expr = inline_impl(expr);
+    let expr = inline_impl(expr, &mut HashSet::new());
     let expr = beta_reduce_variable_arguments(expr);
     inline_list_element_reads(expr, &PredMemo::new()).0
 }
@@ -608,7 +618,23 @@ fn anf_chain_builds_a_product(e: &Expr) -> bool {
 /// routes them through the defer-aware [`crate::ccl::subst::Subst`] engine,
 /// which renames a fed-to handle when a defer-mediating UDF is inlined. The
 /// defer-returning lift itself lives in `channelize::lift_defer`.
-fn inline_impl(expr: Expr) -> Expr {
+///
+/// `channels` holds the names the walk has met bound to a `Defer`: the feed handles
+/// `channelize` resolves, which [`project_bound_tuple`] may copy out of a tuple. Names are
+/// unique by this pass, and a binder encloses every mention of its name, so the walk, which
+/// visits a node before its children, records a channel before reaching any tuple that holds
+/// it. A defer-mediating function's parameter is replaced by the caller's handle when the
+/// function is inlined, so the handles a tuple holds by then are channel names.
+fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        ..
+    } = &expr.node
+        && matches!(bound_expr.node, TypedExprNode::Defer)
+    {
+        channels.insert(binding.name.clone());
+    }
     // Carry `node_id` through every rebuild: reconstructing a node with
     // inlined children is a Preserve (the same node, same identity), so the
     // input id must flow onto the rebuilt `Expr` rather than being re-minted.
@@ -625,8 +651,8 @@ fn inline_impl(expr: Expr) -> Expr {
             bound_expr,
             body,
         } => {
-            let bound_expr = inline_impl(*bound_expr);
-            let body = inline_impl(*body);
+            let bound_expr = inline_impl(*bound_expr, channels);
+            let body = inline_impl(*body, channels);
 
             // Alias: `let y = x` is pure α-renaming — substitute y → x in body
             // and drop the Let.  This must run before lambda_elim so that the
@@ -703,7 +729,7 @@ fn inline_impl(expr: Expr) -> Expr {
                 // inside a refinement predicate, an `Rc` no term walk rebuilds.
                 // Leave the binding standing.
                 return match unplaced {
-                    None => inline_impl(body),
+                    None => inline_impl(body, channels),
                     Some(bound_expr) => Expr {
                         node_id,
                         node: TypedExprNode::Let {
@@ -751,7 +777,7 @@ fn inline_impl(expr: Expr) -> Expr {
                 // the substitution and land between the projection and the
                 // former again, one level in.
                 let former = flatten_anf_bindings(bound_expr);
-                return inline_impl(substitute(body, &binding.name, &former));
+                return inline_impl(substitute(body, &binding.name, &former), channels);
             }
 
             if !binder_spelled_in_a_type && should_inline(&bound_expr.ty) {
@@ -768,19 +794,46 @@ fn inline_impl(expr: Expr) -> Expr {
                 // expanding a defer-returning UDF) are eligible for the alias
                 // and lift rewrites on the second pass.
                 let _g = provenance::enter(node_id, "inline.udf", provenance::Nature::Expansion);
-                return inline_impl(inline_and_beta_reduce(
-                    body,
-                    &binding.name,
-                    &bound_expr,
-                    // One memo for the whole `[name ↦ lambda]` rewrite, so a
-                    // predicate rebuilt at one node is re-pointed at (not
-                    // re-derived for) its occurrences on every other node this
-                    // sweep touches. Scoped to *this* rewrite, not the `inline`
-                    // pass: a different binder's rewrite maps the same origin
-                    // `Rc` to a different result.
-                    &PredMemo::new(),
-                ));
+                return inline_impl(
+                    inline_and_beta_reduce(
+                        body,
+                        &binding.name,
+                        &bound_expr,
+                        // One memo for the whole `[name ↦ lambda]` rewrite, so a
+                        // predicate rebuilt at one node is re-pointed at (not
+                        // re-derived for) its occurrences on every other node this
+                        // sweep touches. Scoped to *this* rewrite, not the `inline`
+                        // pass: a different binder's rewrite maps the same origin
+                        // `Rc` to a different result.
+                        &PredMemo::new(),
+                    ),
+                    channels,
+                );
             }
+
+            // **A projection of a bound tuple literal** reads the element it lands on, when
+            // that element is made of references and literals (`project_bound_tuple`). A
+            // tuple nothing reads afterwards goes with its last projection, and the pass runs
+            // over the body again to collapse the aliases the rewrite made.
+            let body = if let TypedExprNode::Tuple(_) = &bound_expr.node {
+                let _g = provenance::enter(
+                    node_id,
+                    "inline.tuple_projection",
+                    provenance::Nature::Machinery,
+                );
+                match project_bound_tuple(body, &binding.name, &bound_expr, channels) {
+                    (body, true)
+                        if count_free(&binding.name, &body) == 0
+                            && !crate::ccl::subst::type_free_vars(&ty).contains(&binding.name) =>
+                    {
+                        return inline_impl(body, channels);
+                    }
+                    (body, true) => inline_impl(body, channels),
+                    (body, false) => body,
+                }
+            } else {
+                body
+            };
             TypedExprNode::Let {
                 binding,
                 bound_expr: Box::new(bound_expr),
@@ -795,9 +848,12 @@ fn inline_impl(expr: Expr) -> Expr {
         // preventing two same-named `__result` defers from coexisting in
         // `channelize`. Re-running `inline_impl` on the wrapping `Let`
         // triggers the defer lift on the new binding.
-        TypedExprNode::Compose(terms) => {
-            TypedExprNode::Compose(terms.into_iter().map(inline_impl).collect())
-        }
+        TypedExprNode::Compose(terms) => TypedExprNode::Compose(
+            terms
+                .into_iter()
+                .map(|t| inline_impl(t, channels))
+                .collect(),
+        ),
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
 
@@ -810,7 +866,7 @@ fn inline_impl(expr: Expr) -> Expr {
                 ty,
                 user_annotation,
             };
-            expr.map_children(inline_impl);
+            expr.map_children(|c| inline_impl(c, channels));
             return expr;
         }
     };
@@ -844,6 +900,99 @@ fn is_shared_computation(argument: &Expr, param: &Name, body: &Expr) -> bool {
 fn bind_argument(mut param: TypedBinding, argument: Expr, body: Expr) -> Expr {
     let body = refresh_let_binder(&mut param, body);
     Expr::let_in(param, argument, body)
+}
+
+/// `body` with each projection chain `𝑡.𝑖…` of `name` that lands on a [copyable](is_copyable)
+/// element of `tuple` replaced by a copy of that element, and whether any was.
+///
+/// `channelize` resolves a feed handle through `Var` aliases only, so `o = t.1` over
+/// `t = (1, out)` has to become the alias `o = out`. The literals and sources beside a handle
+/// fold too, so that the tuple's `let` can go: a tuple holding a feed handle, read by a feed into
+/// that handle, reads to `channelize` as a channel depending on itself. A nested tuple landed on
+/// is bound by its own `let` in turn, which is how `(b, o) = t.1` reaches `o`.
+///
+/// A channel name `body` rebinds is left projected, as the alias rule leaves such a `let`. A
+/// `body` that rebinds `name` itself is left whole.
+fn project_bound_tuple(
+    mut body: Expr,
+    name: &Name,
+    tuple: &Expr,
+    channels: &HashSet<Name>,
+) -> (Expr, bool) {
+    fn walk(e: &mut Expr, name: &Name, tuple: &Expr, readable: &HashSet<Name>) -> bool {
+        if let Some(element) = projection_landing(e, |base| {
+            matches!(&base.node, TypedExprNode::Var(n) if n == name).then_some(tuple)
+        }) && is_copyable(element, &|n| readable.contains(n))
+        {
+            *e = element.clone();
+            return true;
+        }
+        let mut changed = false;
+        e.walk_children_mut(|c| changed |= walk(c, name, tuple, readable));
+        changed
+    }
+    if is_let_bound(name, &body) {
+        return (body, false);
+    }
+    let mut elements = Vec::new();
+    collect_var_elements(tuple, &mut elements);
+    let readable: HashSet<Name> = elements
+        .into_iter()
+        .filter(|n| channels.contains(n) && !is_let_bound(n, &body))
+        .collect();
+    let changed = walk(&mut body, name, tuple, &readable);
+    (body, changed)
+}
+
+/// The element a projection chain `𝑏.𝑖.𝑗…` lands on, where `tuple_of` answers the tuple literal
+/// the chain's base `𝑏` stands for.
+fn projection_landing<'a>(
+    e: &'a Expr,
+    tuple_of: impl FnOnce(&'a Expr) -> Option<&'a Expr>,
+) -> Option<&'a Expr> {
+    let mut path = Vec::new();
+    let mut cur = e;
+    while let TypedExprNode::Apply { argument, function } = &cur.node
+        && let TypedExprNode::Proj(crate::ccl::ProjKey::Index(i)) = &function.node
+    {
+        path.push(*i);
+        cur = argument;
+    }
+    if path.is_empty() {
+        return None;
+    }
+    let mut element = tuple_of(cur)?;
+    for i in path.into_iter().rev() {
+        let TypedExprNode::Tuple(elts) = &element.node else {
+            return None;
+        };
+        element = elts.get(i)?;
+    }
+    Some(element)
+}
+
+/// Whether `e` is a literal, a source, a `Var` whose name `readable` accepts, or a tuple of such.
+///
+/// A copy of one denotes what the projection did and performs no computation. Any other `Var`
+/// stays projected: an A-normalization temp's readers decide whether the inline pass moves its
+/// definiens, and a tuple element reading a mutable variable is a read performed where it is
+/// written (`src/ccl/design/mutability.md`, "A read is performed where it is written").
+fn is_copyable(e: &Expr, readable: &dyn Fn(&Name) -> bool) -> bool {
+    match &e.node {
+        TypedExprNode::Lit(_) | TypedExprNode::Source(..) => true,
+        TypedExprNode::Var(n) => readable(n),
+        TypedExprNode::Tuple(elts) => elts.iter().all(|e| is_copyable(e, readable)),
+        _ => false,
+    }
+}
+
+/// Every name a `Var` element of `tuple` reads, nested tuples included.
+fn collect_var_elements(tuple: &Expr, out: &mut Vec<Name>) {
+    match &tuple.node {
+        TypedExprNode::Var(n) => out.push(n.clone()),
+        TypedExprNode::Tuple(elts) => elts.iter().for_each(|e| collect_var_elements(e, out)),
+        _ => {}
+    }
 }
 
 /// Substitute `lambda` at every free occurrence of `name` in `expr`, and
