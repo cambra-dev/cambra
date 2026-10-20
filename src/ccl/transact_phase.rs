@@ -1337,18 +1337,11 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
         ),
         // A read-only block is a `Let`/`ExprStmt`(feed) chain ending in `Unit`;
         // any other terminal is unexpected — sequence it defensively before rest.
-        other => {
+        _ => {
             let ty = rest.ty.clone();
             // A freshly-synthesized defensive sequencing wrapper.
             Expr::new(TypedExprNode::ExprStmt {
-                expr: Box::new(Expr {
-                    node: other,
-                    ty: block.ty,
-                    user_annotation: block.user_annotation,
-                    // TODO(preserve): hand-rolled preserve — fold into
-                    // `Expr::preserve`.
-                    node_id: block.node_id,
-                }),
+                expr: Box::new(block),
                 body: Box::new(rest),
             })
             .with_ty(ty)
@@ -3928,5 +3921,17 @@ mod tests {
             Ok(()),
             "the emitted transaction letrec must be guarded"
         );
+    }
+
+    #[test]
+    fn splice_block_unexpected_terminal_keeps_its_node() {
+        let int = Type::Base(BaseType::Int);
+        let terminal = Expr::new(TypedExprNode::Lit(Lit::Int(1))).with_ty(int.clone());
+        let id = terminal.node_id();
+        let out = splice_block(terminal, Expr::new(TypedExprNode::Lit(Lit::Unit)));
+        let TypedExprNode::ExprStmt { expr, .. } = out.node else {
+            panic!("splice_block sequences an unexpected terminal before `rest`")
+        };
+        assert_eq!((expr.node_id(), expr.ty), (id, int));
     }
 }

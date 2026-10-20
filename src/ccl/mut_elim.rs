@@ -374,19 +374,10 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Ex
             *def,
             hoist_writer_body(binding, *cont, body),
         ),
-        // A bare writer terminal: its value is `unit`. This rebuilds the *same
-        // logical write* at a new spine position, so carry the input node's id
-        // (a preserve, not a mint) — freshening would sever the write's source
-        // span and duplicate the id if the original ever also survived.
-        TypedExprNode::MutWrite { name, key, value } => {
-            let write = Expr {
-                node: TypedExprNode::MutWrite { name, key, value },
-                ty: writer_body.ty,
-                user_annotation: writer_body.user_annotation,
-                // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
-                node_id: writer_body.node_id,
-            };
-            Expr::expr_stmt(write, Expr::let_in(binding, unit_expr(), body))
+        // A bare writer terminal: its value is `unit`. The write itself moves to
+        // a new spine position, keeping its id, source span and provenance.
+        TypedExprNode::MutWrite { .. } => {
+            Expr::expr_stmt(writer_body, Expr::let_in(binding, unit_expr(), body))
         }
         // A writing `Case` in terminal position. Its writes are conditional, so
         // the arms above cannot lift them out; the binding and the continuation
@@ -394,37 +385,21 @@ fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Ex
         // pattern-match reads a `Let`'s bound expression directly and so misses
         // the shape where a binding sits between the `Let` and the `Case` — a
         // `match` whose scrutinee A-normalization named, for one.
-        node @ TypedExprNode::Case { .. } => {
-            let case = Expr {
-                node,
-                ty: writer_body.ty,
-                user_annotation: writer_body.user_annotation,
-                // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
-                node_id: writer_body.node_id,
-            };
-            push_binding_into_branches(&binding.name, case, body)
-        }
+        TypedExprNode::Case { .. } => push_binding_into_branches(&binding.name, writer_body, body),
         // A pure terminal value: bind it directly.
-        node => {
-            let terminal = Expr {
-                node,
-                ty: writer_body.ty,
-                user_annotation: writer_body.user_annotation,
-                // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
-                node_id: writer_body.node_id,
-            };
+        _ => {
             // The arms above cover every node kind [`spine_writes_mut`] admits,
             // and `flatten_spine` re-runs on whatever this returns. A writing
-            // terminal reaching this arm is rebuilt unchanged, so that recursion
+            // terminal reaching this arm comes back unchanged, so that recursion
             // never converges — the divergence between the two is a hang, not a
             // wrong tree.
             debug_assert!(
-                !spine_writes_mut(&terminal),
+                !spine_writes_mut(&writer_body),
                 "hoist_writer_body has no arm for a writing {:?}, which `flatten_spine` \
                  would re-hoist unchanged forever",
-                std::mem::discriminant(&terminal.node)
+                std::mem::discriminant(&writer_body.node)
             );
-            Expr::let_in(binding, terminal, body)
+            Expr::let_in(binding, writer_body, body)
         }
     }
 }

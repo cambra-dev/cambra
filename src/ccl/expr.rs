@@ -1098,11 +1098,10 @@ impl TypedExpr {
     /// `src` is some *other* node — is this constructor's shape, and the one where
     /// a stray `node_id: NodeId::fresh()` hides: a preserve and a mint differ by
     /// one token in otherwise identical five-line literals. Those sites are marked
-    /// `TODO(preserve)` and are greppable: thirteen across five files —
-    /// `channelize` (eight), `mut_elim` (two), and one each in `transact_phase`,
-    /// `subst`, and `lambda_elim`. Eleven are this reach-for-another-id shape; the
-    /// two in `subst` and `lambda_elim` ask a different question, whether their
-    /// rebuild should mint or preserve at all.
+    /// `TODO(preserve)` and are greppable: ten across four files — `channelize`
+    /// (seven) and one each in `feed_nest`, `subst`, and `lambda_elim`. Eight are
+    /// this reach-for-another-id shape; the two in `subst` and `lambda_elim` ask a
+    /// different question, whether their rebuild should mint or preserve at all.
     ///
     /// **A field-wise rebuild** — `let TypedExpr { node, ty, user_annotation,
     /// node_id } = expr;` then rebuilding with one child swapped — is *not* this
