@@ -67,13 +67,13 @@ impl LoweringContext {
     /// (`docs/modules.md`, "The module interface").
     pub(crate) fn begin_module(&mut self, scope: ModuleScope) {
         self.type_aliases.clear();
-        self.mut_param_fns.clear();
+        self.history_param_fns.clear();
         self.declared_sinks.clear();
         self.parameters.clear();
         // A `use` type name is in scope throughout its module. One whose module
         // has errors of its own names no type, and stands for any. A `use` name
-        // for a function with a `Mut` parameter takes the curried call shape the
-        // function was lowered with.
+        // for a function with a `Mut` or `Feed` parameter takes the curried call shape
+        // the function was lowered with.
         for (name, used) in &scope.uses {
             match &used.reached {
                 Reached::Type(ty) => {
@@ -84,7 +84,7 @@ impl LoweringContext {
                     }
                 }
                 Reached::Value(Some(reference)) if reference.mut_param => {
-                    self.register_mut_param_fn(name.as_str());
+                    self.register_history_param_fn(name.as_str());
                 }
                 Reached::Value(_) => {}
             }

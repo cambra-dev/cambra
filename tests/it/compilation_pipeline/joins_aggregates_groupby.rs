@@ -1302,7 +1302,7 @@ fn a_group_by_whose_key_computes_with_a_collection(#[case] source: &str, #[case]
 fn a_group_by_under_a_loop_over_a_source_the_loop_filters() {
     check_scalar(
         indoc! {r#"
-            out = defer()
+            out: Feed(Int)
             for i in [1, 2]:
                 out << sum([1 for g in groupby([x for x in [1, 2, 3] if x > i], \e -> e // i)])
             sum([v for v in out])
@@ -1316,7 +1316,7 @@ fn a_group_by_under_a_loop_over_a_source_the_loop_filters() {
 #[rstest]
 #[case::reading_an_outer_loops_binder(
     indoc! {r#"
-        out = defer()
+        out: Feed(_)
         for i in [1, 2]:
             for j in [1, 2]:
                 out << sum([1 for g in groupby([1, 2, 3], \e -> e // (i + j))])
@@ -1326,7 +1326,7 @@ fn a_group_by_under_a_loop_over_a_source_the_loop_filters() {
 )]
 #[case::whose_key_is_not_a_scalar(
     indoc! {r#"
-        out = defer()
+        out: Feed(_)
         for i in [1, 2]:
             out << sum([1 for g in groupby([1, 2, 3], \e -> (e // i, e))])
         sum([v for v in out])

@@ -193,7 +193,8 @@ impl Refusals {
             }
             ChlStmt::LoadFrom {
                 target, annotation, ..
-            } => {
+            }
+            | ChlStmt::Declare { target, annotation } => {
                 self.target(target);
                 self.annotation(Some(annotation));
             }

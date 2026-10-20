@@ -31,7 +31,7 @@ symbols:
   function doubled 1:1-3:20 (name 1:5-1:12)
   function squared 5:1-7:20 (name 5:5-5:12)
   variable readings 9:1-9:24 (name 9:1-9:9)
-  variable totals 11:1-11:17 (name 11:1-11:7)
+  variable totals 11:1-11:16 (name 11:1-11:7)
 folds:
   1-3
   2-3
@@ -68,9 +68,6 @@ folds:
   9-15
 == tests/programs/fanout/program.cambra
 diagnostics:
-  10:15-11:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '=', or ':='
-    10:5-10:15 while parsing statement
-    10:8-10:15 while parsing expression
 symbols:
   function fanout 9:1-14:6 (name 9:5-9:11)
   variable log 16:1-16:34 (name 16:1-16:4)
@@ -200,10 +197,8 @@ folds:
   20-25
 == tests/programs/ledger_balance/program.cambra
 diagnostics:
-  10:28-11:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '=', or ':='
-    10:1-10:28 while parsing statement
-    10:9-10:28 while parsing expression
 symbols:
+  variable ledger 10:1-10:28 (name 10:1-10:7)
   module std::http 12:1-12:17 (name 12:8-12:17)
   variable deposit_reqs 14:1-14:69 (name 14:1-14:13)
   variable deposit_resps 14:1-14:69 (name 14:15-14:28)
@@ -259,11 +254,9 @@ diagnostics:
   16:5-16:15 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
     16:1-16:4 while parsing statement
     16:1-16:4 while parsing expression
-  25:38-26:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '=', or ':='
-    25:1-25:38 while parsing statement
-    25:13-25:38 while parsing expression
 symbols:
   variable edges 8:1-13:2 (name 8:1-8:6)
+  variable reach_feed 25:1-25:38 (name 25:1-25:11)
 folds:
   1-6 comment
   8-12
@@ -304,9 +297,6 @@ diagnostics:
     62:5-62:11 while parsing expression
   76:14-76:18 found 'with', expected 'if', or 'match'
     76:5-76:13 while parsing statement
-  86:82-87:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '=', or ':='
-    86:1-86:82 while parsing statement
-    86:9-86:82 while parsing expression
 symbols:
   variable Dollars 30:1-30:14 (name 30:1-30:8)
   variable Qty 31:1-31:25 (name 31:1-31:4)
@@ -323,6 +313,7 @@ symbols:
   variable stats_resps 57:1-57:66 (name 57:15-57:26)
   function quote 59:1-63:6 (name 59:5-59:10)
   function reserve 65:1-71:14 (name 65:5-65:12)
+  variable orders 86:1-86:82 (name 86:1-86:7)
 folds:
   1-27 comment
   34-37
@@ -355,9 +346,6 @@ diagnostics:
     75:5-75:11 while parsing expression
   89:14-89:18 found 'with', expected 'if', or 'match'
     89:5-89:13 while parsing statement
-  99:82-100:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', '=', or ':='
-    99:1-99:82 while parsing statement
-    99:9-99:82 while parsing expression
 symbols:
   variable Dollars 27:1-27:14 (name 27:1-27:8)
   variable Qty 28:1-28:25 (name 28:1-28:4)
@@ -375,6 +363,7 @@ symbols:
   function is_promo_spent 60:1-64:52 (name 60:5-60:19)
   function quote 66:1-76:6 (name 66:5-66:10)
   function reserve 78:1-84:14 (name 78:5-78:12)
+  variable orders 99:1-99:82 (name 99:1-99:7)
 folds:
   1-24 comment
   31-34
@@ -433,7 +422,7 @@ folds:
 == tests/programs/txn_multi_read/program.cambra
 diagnostics:
 symbols:
-  variable out 1:1-1:14 (name 1:1-1:4)
+  variable out 1:1-1:13 (name 1:1-1:4)
   variable pool 2:1-2:27 (name 2:1-2:5)
 folds:
   3-6
@@ -481,7 +470,7 @@ symbols:
   variable reqs 16:1-16:48 (name 16:1-16:5)
   variable resps 16:1-16:48 (name 16:7-16:12)
   variable total 18:1-19:21 (name 19:1-19:6)
-  variable events 21:1-21:17 (name 21:1-21:7)
+  variable events 21:1-21:16 (name 21:1-21:7)
   function bump 25:1-34:29 (name 25:5-25:9)
   function evens 36:1-38:16 (name 36:5-36:10)
   variable opaque 47:1-47:16 (name 47:1-47:7)

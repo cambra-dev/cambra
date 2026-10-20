@@ -3163,7 +3163,7 @@ else:
 // as a feed history `feed(δ ⤇ value)`, feeds contribute `Fun(δ, elem)` channel
 // shapes into it, defines set the whole collection outright, and reads discharge
 // transparently through the handle as that collection. A channel's *domain* is a
-// rigid nominal `Type::ChanDom(d)` minted at the `let d = defer()` site, so
+// rigid nominal `Type::ChanDom(d)` minted at the `let d: Feed(_)` site, so
 // reads type concretely against that name at inference (no `Infer` residue);
 // `channelize` later substitutes the assembled channel domain for `ChanDom`.
 
@@ -3186,7 +3186,7 @@ fn feed_value(ty: &Type) -> &Type {
 fn test_defined_defer_is_feed_of_collection() {
     // `<<=` sets the whole channel; its RHS must be a collection (a `Fun`),
     // so the feed's element type is the collection's element.
-    let ty = infer_program("x = defer()\nx <<= [1,2,3]\nx");
+    let ty = infer_program("x: Feed(_)\nx <<= [1,2,3]\nx");
     assert_eq!(*feed_value(&ty), int());
 }
 
@@ -3194,7 +3194,7 @@ fn test_defined_defer_is_feed_of_collection() {
 fn test_scalar_define_is_rejected() {
     // A scalar `<<=` RHS is disallowed — `<<=` only accepts collections
     // (`Fun`s), so an `Int` fails to align with the channel's collection type.
-    let errs = infer_program_err("x = defer()\nx <<= 1\nx");
+    let errs = infer_program_err("x: Feed(_)\nx <<= 1\nx");
     assert!(
         !errs.is_empty(),
         "a scalar defined into a feed channel must be a type error"
@@ -3203,13 +3203,13 @@ fn test_scalar_define_is_rejected() {
 
 #[test]
 fn test_fed_defer_is_feed_of_channel() {
-    let ty = infer_program("x = defer()\n[x << i for i in [1,2,3]]\nx");
+    let ty = infer_program("x: Feed(_)\n[x << i for i in [1,2,3]]\nx");
     assert_eq!(*feed_value(&ty), int());
 }
 
 #[test]
 fn test_scalar_feeds_join_in_channel() {
-    let ty = infer_program("x = defer()\nx << 1\nx << 2\nx");
+    let ty = infer_program("x: Feed(_)\nx << 1\nx << 2\nx");
     assert_eq!(*feed_value(&ty), int());
 }
 
@@ -3217,13 +3217,13 @@ fn test_scalar_feeds_join_in_channel() {
 fn test_defined_defer_reads_through_aggregate() {
     // A collection define sets the channel outright; `sum` reads the handle as
     // that collection and aggregates it to a scalar.
-    assert_eq!(infer_program("x = defer()\nx <<= [1,2,3]\nsum(x)"), int());
+    assert_eq!(infer_program("x: Feed(_)\nx <<= [1,2,3]\nsum(x)"), int());
 }
 
 #[test]
 fn test_fed_defer_reads_through_aggregate() {
     // `sum` consumes the feed handle as its read view `(α ⤇ γ)`.
-    assert_eq!(infer_program("x = defer()\nx << 1\nx << 2\nsum(x)"), int());
+    assert_eq!(infer_program("x: Feed(_)\nx << 1\nx << 2\nsum(x)"), int());
 }
 
 #[test]
@@ -3231,13 +3231,13 @@ fn test_defer_chain_flattens_feeds() {
     // `x <<= y` sets x's channel to y's whole read view. A feed reads through to
     // that view, so x gets y's collection directly (a single feed layer, not
     // nested); channelize later binds x to y's channel.
-    let ty = infer_program("x = defer()\ny = defer()\nx <<= y\ny <<= [0, 1]\nx");
+    let ty = infer_program("x: Feed(_)\ny: Feed(_)\nx <<= y\ny <<= [0, 1]\nx");
     assert_eq!(*feed_value(&ty), int());
 }
 
 #[test]
 fn test_heterogeneous_feeds_error() {
-    let errs = infer_program_err("x = defer()\nx << 1\nx << \"s\"\nx");
+    let errs = infer_program_err("x: Feed(_)\nx << 1\nx << \"s\"\nx");
     assert!(
         !errs.is_empty(),
         "Int and String feeds into one defer must collide"
@@ -3255,7 +3255,7 @@ fn test_feed_through_param_flows_back_to_caller() {
 def g(c):
   c << "s"
   c
-x = defer()
+x: Feed(_)
 g(x)
 x << 1
 x"#,
@@ -3274,7 +3274,7 @@ fn test_feed_through_param_compatible_types_ok() {
 def g(c):
   c << 100
   c
-x = defer()
+x: Feed(_)
 g(x)
 x << 1
 x"#,
@@ -3317,7 +3317,7 @@ fn test_generalized_defer_function_specializes_per_element_type() {
     let ty = infer_program(
         r#"
 def make(v):
-  x = defer()
+  x: Feed(_)
   x << v
   x
 a = make(1)

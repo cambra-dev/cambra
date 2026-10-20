@@ -9,15 +9,17 @@
 //! This isolates the storefront's revenue view: without the `restrict`, the
 //! aggregate is only defined when the feed closes — for a server, never.
 //!
-//! **Currently blocked at parsing.**  The `\` lambda now lexes; the next
-//! unsupported construct is the `Feed(...)` annotation-only forward
-//! declaration (an annotation with no initialiser).  Behind it: feed elements
-//! carrying transaction time, `restrict`/`sum` over a feed, and structured
-//! requests.  This pins the `Feed(...)` forward-declaration parse failure.
+//! **Currently blocked at `import std::http`.**  The std root has no `http`
+//! module yet.  Behind it: feed elements carrying transaction time,
+//! `restrict`/`sum` over a feed, and structured requests.  This pins the missing
+//! module.
 
 use super::common::expect_compile_error;
 
 #[test]
-fn ledger_balance_currently_blocked_at_parsing() {
-    expect_compile_error(include_str!("program.cambra"), "Feed({amount: Int})");
+fn ledger_balance_currently_blocked_at_import() {
+    expect_compile_error(
+        include_str!("program.cambra"),
+        "no module `std::http`: the std root has no module `http`",
+    );
 }

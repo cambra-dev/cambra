@@ -514,7 +514,7 @@ parameters — deferred to that design.)
 ### `Feed` is a CCL type
 
 `Type::History { value: 𝑉, domain: 𝐷, history_kind: HistoryKind::Append }` (displayed
-`feed(𝐷 ⤇ 𝑉)`) — the type of a feed handle: what an `out = defer()` introduces, what
+`feed(𝐷 ⤇ 𝑉)`) — the type of a feed handle: what an `out: Feed(_)` declaration introduces, what
 `http_serve`'s response half returns, what a defer-mediating UDF parameter (`λ out → out << e`)
 carries. It is the same `Type::History` variant a mutable variable uses, under the `Append` kind;
 unlike an overwrite variable it reads as its whole collection `𝐷 ⤇ 𝑉`, not a scalar deref. Feed

@@ -265,7 +265,7 @@ impl ProgramLowering<'_> {
             ast,
             &chain,
             std::mem::take(&mut ctx.parameters),
-            |name| ctx.is_mut_param_fn(name),
+            |name| ctx.is_history_param_fn(name),
             unimportable,
         );
         Some(LoweredModule {

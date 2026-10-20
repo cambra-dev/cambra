@@ -106,7 +106,7 @@ use super::panic_message::panic_message;
 #[case::source("b = stdin()", "Source(stdin, String)")]
 #[case::feed(
     indoc! {"
-        b = defer()
+        b: Feed(_)
         b << 1
     "},
     "Feed({Int where _ == 1})"

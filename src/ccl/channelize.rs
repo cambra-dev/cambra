@@ -843,7 +843,7 @@ pub fn run(expr: Expr) -> Result<Expr, Located<DeferError>> {
     // Cluster channelization.  Walks the tree, processes `let d = Defer in …`
     // clusters, extracting feeds and building each defer's channel.
     //
-    // Defer-mediating UDFs (`def g(out): out << e`, `def f(n): x = defer();
+    // Defer-mediating UDFs (`def g(out): out << e`, `def f(n): x: Feed(_);
     // …; x`) never reach here: `inline` beta-reduces every such function at its
     // call site *before* this pass (it runs pre-channelize — see the `inline`
     // module docs), leaving only the flattened `let d = Defer in …` chains this
@@ -3406,9 +3406,9 @@ mod tests {
     #[test]
     fn run_three_defer_cluster_becomes_letrec_group() {
         // ```
-        // a = defer()
-        // b = defer()
-        // c = defer()
+        // a: Feed(_)
+        // b: Feed(_)
+        // c: Feed(_)
         // a <<= b
         // b <<= c
         // c <<= [0, 1]

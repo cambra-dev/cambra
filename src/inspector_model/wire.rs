@@ -1812,7 +1812,7 @@ x
     //
     // These pin which source construct maps to which IR node, over two programs
     // whose lowering produces synthetic wrapper chains: a `yield` generator and
-    // a `defer()`/`<<` feed pipeline. They mirror the manual web-validation
+    // a feed declaration/`<<` feed pipeline. They mirror the manual web-validation
     // gallery programs (`tests/programs/defer_lift/`, `generator_pipeline/`) but
     // inline the source so the flow is exercised without the front end.
     //
@@ -1831,7 +1831,7 @@ max(squared([1, 2, 3, 4]))
 
     const DEFER_SRC: &str = "\
 readings = [1, 2, 3, 4]
-totals = defer()
+totals: Feed(_)
 totals << sum(readings)
 for x in readings:
     totals << x
@@ -1947,10 +1947,10 @@ max(totals)
 
     /// DEFER: the **copaired fan-in** carries a source span.
     ///
-    /// `Copair` is the node the `defer()`/`<<`/`for`-feed plumbing fans into,
+    /// `Copair` is the node the declaration/`<<`/`for`-feed plumbing fans into,
     /// tagged `via: Channelize, nature: Expansion`. It is indexed at the
-    /// `totals = defer()` statement — the declaration the feeds fan into — so a
-    /// consumer clicking the `defer()` site reaches it. Distinct from the feed
+    /// `totals: Feed(_)` statement — the declaration the feeds fan into — so a
+    /// consumer clicking the declaration's `Feed(_)` reaches it. Distinct from the feed
     /// plumbing (`Lambda(__unused)`, the `Compose` over the feed body), tagged
     /// `nature: Machinery`, which carries no span by design.
     ///
@@ -1972,10 +1972,10 @@ max(totals)
 
         // Copairing, not a disjoint join: the arms land on their coproduct, and
         // nothing asserts the two feeds cover disjoint parts of one domain.
-        let defer_site = at(nth_span(prog.sources(), "defer()", 0));
+        let defer_site = at(nth_span(prog.sources(), "Feed(_)", 0));
         assert!(
             defer_site.iter().any(|l| l.contains("Copair")),
-            "the `defer()` declaration reaches the copaired fan-in; got {defer_site:?}"
+            "the feed declaration reaches the copaired fan-in; got {defer_site:?}"
         );
 
         // The fed value the user wrote still maps to its own aggregate, and the

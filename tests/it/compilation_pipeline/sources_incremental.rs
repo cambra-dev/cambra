@@ -851,7 +851,7 @@ x";
 #[test_log::test]
 fn test_incremental_tap_loop() {
     let code = "\
-o = defer()
+o: Feed(_)
 cnt := 0
 for i in source1():
     cnt := cnt + 1
@@ -1499,7 +1499,7 @@ fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64], laps: usize) 
 #[test_log::test]
 fn test_filtered_rows_of_a_live_induction_source_are_released() {
     let code = indoc! {"
-        out = defer()
+        out: Feed(_)
         x := 0
         for i in [z for z in source1() if z > 99]:
             x := x + i
@@ -1518,7 +1518,7 @@ fn test_filtered_rows_of_a_live_induction_source_are_released() {
 #[test_log::test]
 fn test_a_feed_releases_the_positions_it_does_not_fire_at() {
     let code = indoc! {"
-        out = defer()
+        out: Feed(_)
         x := 0
         for i in source1():
             x := x + i

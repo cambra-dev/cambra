@@ -249,7 +249,7 @@ fn a_filter_over_a_box_that_already_carries_one() {
 )]
 #[case(
     indoc! {r"
-        x = defer()
+        x: Feed(_)
         x <<= [box([1]), box([2, 3])]
         sum([max(r) for r in x])
     "},
@@ -374,7 +374,7 @@ fn a_row_read_from_a_mutable_variable_at_a_jagged_position_is_unsupported() {
 #[timeout(Duration::from_secs(10))]
 #[case::two_appends(
     indoc! {r"
-        x = defer()
+        x: Feed(_)
         x << box([1])
         x << box([2, 3])
         sum([sum(r) for r in x])

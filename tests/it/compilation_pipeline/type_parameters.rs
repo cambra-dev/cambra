@@ -527,7 +527,7 @@ fn requirement_errors(#[case] code: &str, #[case] needle: &str) {
 // binding's variables sit at its level").
 #[case::parameter_escapes_into_a_sibling_feed(
     indoc! {"
-        out = defer()
+        out: Feed(_)
         def put(T, x: T) => T:
             out << x
             x

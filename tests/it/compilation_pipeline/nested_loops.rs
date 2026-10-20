@@ -475,7 +475,7 @@ fn a_nested_loop_inside_a_generator_yields_per_outer_row() {
 fn a_feed_inside_a_nest_taps_every_innermost_position() {
     check_scalar(
         indoc! {r"
-            out = defer()
+            out: Feed(_)
             total := 0
             for x in [1, 2]:
                 for y in [10, 20]:
@@ -1151,7 +1151,7 @@ fn an_inner_loop_may_write_a_variable_it_never_reads() {
 #[case::a_feed_after_the_inner_loop(
     indoc! {r"
         s := 0
-        o = defer()
+        o: Feed(_)
         for x in [1, 2]:
             if x > 1:
                 for y in [10, 20]:
