@@ -2587,7 +2587,7 @@ mod tests {
     }
 
     /// The handle-target forms resolve their target by name; an unbound target is
-    /// an `UnboundVariable`, as for a `Var` use.
+    /// an `UnboundVariable`, as for a `Var` use, blamed on the target-form node.
     #[test]
     fn test_infer_unbound_handle_target() {
         let cases = [
@@ -2597,12 +2597,15 @@ mod tests {
         ];
         for mut expr in cases {
             let mut ctx = TypeInferenceContext::new();
-            let result = infer_bare(&mut expr, &mut ctx);
+            let target_form = expr.node_id();
+            let errors = infer(&mut expr, &mut ctx).expect_err("`ghost` is unbound");
+            assert_eq!(errors.len(), 1, "{expr:?}");
             assert_eq!(
-                result,
-                Err(vec![InferError::UnboundVariable("ghost".into())]),
+                errors[0].error,
+                InferError::UnboundVariable("ghost".into()),
                 "{expr:?}"
             );
+            assert_eq!(errors[0].node_id, target_form, "{expr:?}");
         }
     }
 
