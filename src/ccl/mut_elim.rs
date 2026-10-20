@@ -2341,13 +2341,9 @@ fn transform_chain(
         }
         // A statement-position guard-`Case` (`if p: acc += e`, lowered by
         // `lower_loop_body_chain` to `{gᵢ → branch; true → carry}`): merge its
-        // branches into one writer decision, built by `conditional_decision`. It
-        // commits where a writing branch's first-match guard holds, and at every
-        // position when an unconditional write changed the carry; each
-        // accumulator's write is a first-match value-`Case` over the writing
-        // branches whose trailing arm is the carry, or the carry alone when no
-        // branch writes. One writer over the full source, so no restricted
-        // per-leg sources and no cyclic desync, which a multi-leg realization over
+        // branches into one commit-gated writer decision over the full source
+        // (see `conditional_decision`). One writer, so no restricted per-leg
+        // sources and no cyclic desync, which a multi-leg realization over
         // per-leg restricted sources could not avoid.
         TypedExprNode::ExprStmt { expr: effect, body }
             if matches!(
@@ -2932,16 +2928,19 @@ fn decision_writes(dec: Expr) -> (BranchWrites, BranchScope) {
 /// *writing* branches (first-match predicate + write set each) and the entering
 /// accumulator `snapshot`.
 ///
-/// One uniform, **carry-complete** shape covers every arity — one conditional
-/// write, `if/else`-both-write, `elif`-with-writes, and the pure-guard carry:
+/// One **carry-complete** shape covers every arity — one conditional write,
+/// `if/else`-both-write, `elif`-with-writes, and the pure-guard carry:
 ///
 /// - `commit = ⋁ⱼ ĝⱼ` — the disjunction of the writing branches' first-match
-///   guards (`false` when nothing writes). This gates the *sparse* changelog: a
-///   position no writing guard admits records no change (the `InductionStore`
-///   inherits the value), so a run of carries costs nothing.
-/// - `writesᵢ = Case[ĝ₀ → w₀ᵢ; …; ĝₙ → wₙᵢ; true → snapshotᵢ]` — a per-accumulator
+///   guards, plus a `true` disjunct when an unconditional write changed the carry
+///   (`false` when nothing writes and the carry is unchanged). This gates the
+///   *sparse* changelog: a position `commit` does not admit records no change (the
+///   `InductionStore` inherits the value), so a run of carries costs nothing.
+/// - `writesᵢ = Case[ĝ₀ → w₀ᵢ; …; ĝₙ → wₙᵢ; true → carryᵢ]` — a per-accumulator
 ///   first-match value-`Case` whose trailing `true` arm is the **carry** (the
-///   entering accumulator). The carry arm makes the write value *total at every
+///   accumulator after any unconditional write, or the entering `snapshotᵢ` when
+///   there is none). With no writing branch, `writesᵢ` is `carryᵢ` alone, without
+///   a `Case`. The carry arm makes the write value *total at every
 ///   position*: `lambda_elim` compiles this `Case` as a union of domain-restricts
 ///   (`⧺ⱼ wⱼᵢ ↾ π̂ⱼ`), so a **partial op** (`//`, `%`) in a write value is only
 ///   evaluated at the positions its guard admits — never at a carried position.
