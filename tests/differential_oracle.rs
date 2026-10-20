@@ -651,12 +651,16 @@ fn coalesce_outcome(r: &Result<Type, CoalesceError>) -> Option<String> {
                 CoalesceError::RecursiveType { .. } => "RecursiveType",
                 CoalesceError::DomainJoinConflict { .. } => "DomainJoinConflict",
                 CoalesceError::KindConflict { .. } => "KindConflict",
-                // Two rejections the model has no counterpart for: a kind edge whose two
-                // sides state incomparable kinds, and a witness whose binder is not in
-                // scope where the reference materialized. Neither is reachable from the
-                // fragment this oracle serializes — a sum leaves it at `ty_json` — so
-                // report no verdict rather than inventing a wire name.
-                CoalesceError::KindMismatch { .. } | CoalesceError::WitnessScope { .. } => {
+                // Three rejections the model has no counterpart for: a kind edge whose two
+                // sides state incomparable kinds, a witness whose binder is not in scope
+                // where the reference materialized, and an opaque hole whose resolution
+                // fails one of its upper bounds. None is reachable from the fragment this
+                // oracle serializes — a sum leaves it at `ty_json`, and every graph here
+                // carries no `opaque_upper_violations` — so report no verdict rather than
+                // inventing a wire name.
+                CoalesceError::KindMismatch { .. }
+                | CoalesceError::WitnessScope { .. }
+                | CoalesceError::OpaqueUpperBound { .. } => {
                     return None;
                 }
             };

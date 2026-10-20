@@ -122,8 +122,9 @@ pub enum CoalesceError {
     /// compaction, the first point where every lower bound has arrived, and carried to
     /// here on [`CompactGraph::opaque_upper_violations`].
     OpaqueUpperBound {
-        /// The failed check. Boxed because [`ConstrainError`] is larger than every
-        /// other variant here.
+        /// The failed check. Boxed because
+        /// [`ConstrainError`](super::constrain::ConstrainError) is larger than every other
+        /// variant here.
         error: Box<super::constrain::ConstrainError>,
     },
 }
