@@ -317,10 +317,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // monomorphic defer binding; for a feed-typed lambda param it
         // returns the param type verbatim.
         TypedExprNode::Feed { name, value } => {
-            let target_ty = match ctx.instantiate_binding(name) {
-                None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
-                Some(ty) => ty,
-            };
+            let target_ty = ctx.instantiate_binding(name)?;
             emit_feed(&target_ty, value, &label, ctx).map_err(|e| {
                 e.with_escape_target(EscapeTarget::Feed {
                     channel: name.to_string(),
@@ -329,10 +326,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         }
 
         TypedExprNode::Define { name, value } => {
-            let target_ty = match ctx.instantiate_binding(name) {
-                None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
-                Some(ty) => ty,
-            };
+            let target_ty = ctx.instantiate_binding(name)?;
             emit_define(&target_ty, value, &label, ctx)?
         }
 
@@ -369,10 +363,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // lowering produces (a polymorphic init would under-constrain the
         // write and surface as `UnresolvedInfer`).
         TypedExprNode::MutWrite { name, key, value } => {
-            let var_ty = match ctx.instantiate_binding(name) {
-                None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
-                Some(ty) => ty,
-            };
+            let var_ty = ctx.instantiate_binding(name)?;
             // The written value flows into the mutable variable's *value* type, not
             // the `Mut` handle itself — which is what a write means: it updates `V`.
             // Nothing would deref it on the way in, since the relation holds no

@@ -2713,6 +2713,26 @@ mod tests {
         assert_eq!(result, Err(vec![InferError::UnboundVariable("y".into())]));
     }
 
+    /// The handle-target forms resolve their target by name; an unbound target is
+    /// an `UnboundVariable`, as for a `Var` use.
+    #[test]
+    fn test_infer_unbound_handle_target() {
+        let cases = [
+            Expr::feed("ghost", Expr::lit(Lit::Int(1))),
+            Expr::define("ghost", Expr::lit(Lit::Int(1))),
+            Expr::mut_write("ghost", Expr::lit(Lit::Int(1))),
+        ];
+        for mut expr in cases {
+            let mut ctx = TypeInferenceContext::new();
+            let result = infer_bare(&mut expr, &mut ctx);
+            assert_eq!(
+                result,
+                Err(vec![InferError::UnboundVariable("ghost".into())]),
+                "{expr:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_infer_cannot_infer_param() {
         let mut ctx = TypeInferenceContext::new();
