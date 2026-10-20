@@ -1109,19 +1109,26 @@ fn a_tuple_of_a_collection_and_a_fold_over_each_group() {
     );
 }
 
-/// A comprehension over `sales` grouped by region, with `body` reading each group `g`.
-///
-/// `qty > 2` keeps only west's `amount=200` row, so the filtered per-region sums are north `0`
-/// and west `200`, and the unfiltered ones are north `40` and west `300`.
-fn per_region_program(body: &str) -> String {
+/// Three `sales` rows over two regions, then `rest`.
+fn sales_program(rest: &str) -> String {
     formatdoc! {r#"
         sales = [
             (region="west", amount=100, qty=2),
             (region="west", amount=200, qty=4),
             (region="north", amount=40, qty=1),
         ]
-        [{body} for g in groupby(sales, \r -> r.region)]
+        {rest}
     "#}
+}
+
+/// A comprehension over `sales` grouped by region, with `body` reading each group `g`.
+///
+/// `qty > 2` keeps only west's `amount=200` row, so the filtered per-region sums are north `0`
+/// and west `200`, and the unfiltered ones are north `40` and west `300`.
+fn per_region_program(body: &str) -> String {
+    sales_program(&format!(
+        r"[{body} for g in groupby(sales, \r -> r.region)]"
+    ))
 }
 
 /// A per-region collection over [`per_region_program`]'s keys, `north` then `west`.
@@ -1277,40 +1284,20 @@ fn a_per_group_count_that_ignores_the_row() {
     );
 }
 
-/// A `groupby` over an inline comprehension of records groups its rows. The control for
-/// [`a_groupby_over_a_bound_comprehension_of_records`].
-#[test]
-fn a_groupby_over_an_inline_comprehension_of_records() {
-    check_tile(
-        indoc! {r#"
-            sales = [
-                (region="west", amount=100, qty=2),
-                (region="west", amount=200, qty=4),
-                (region="north", amount=40, qty=1),
-            ]
-            [sum([s.amount for s in g]) for g in groupby([s for s in sales], \r -> r.region)]
-        "#},
-        per_region(Tile::Scalar(ColumnValue::Ints(vec![40, 300]))),
-    );
-}
-
-/// The same comprehension bound to a name first does not compile: the post-lambda-elim type
-/// check rejects the collection domain of the grouping.
+/// A `groupby` over a comprehension of records bound to a name first does not compile: the
+/// post-lambda-elim type check rejects the collection domain of the grouping. The same
+/// comprehension written inline as the `groupby` source compiles, which the `groupby_source` row
+/// of `tests/it/generated_pairs.rs` holds for its `rec_comp` and `rec_filtered` fillers.
 #[test]
 #[should_panic(
     expected = "post-lambda-elim produced an invalid tree: [Type mismatch for collection domain"
 )]
 fn a_groupby_over_a_bound_comprehension_of_records() {
     check_tile(
-        indoc! {r#"
-            sales = [
-                (region="west", amount=100, qty=2),
-                (region="west", amount=200, qty=4),
-                (region="north", amount=40, qty=1),
-            ]
+        &sales_program(indoc! {r#"
             rows = [s for s in sales]
             [sum([s.amount for s in g]) for g in groupby(rows, \r -> r.region)]
-        "#},
+        "#}),
         per_region(Tile::Scalar(ColumnValue::Ints(vec![40, 300]))),
     );
 }
@@ -1320,41 +1307,35 @@ fn a_groupby_over_a_bound_comprehension_of_records() {
 #[test]
 fn two_per_group_collections_over_one_bound_grouping_held_in_a_record() {
     check_tile(
-        &per_region_record(
-            "gs = groupby(sales, \\r -> r.region)\n\
-             a = [sum([s.amount for s in g]) for g in gs]\n\
-             b = [sum([s.qty for s in g]) for g in gs]",
-        ),
+        &per_region_record(indoc! {r#"
+            gs = groupby(sales, \r -> r.region)
+            a = [sum([s.amount for s in g]) for g in gs]
+            b = [sum([s.qty for s in g]) for g in gs]
+        "#}),
         expected_per_region_record(),
     );
 }
 
 /// The same two collections, each calling `groupby(sales, …)` inline, reach a `subst` defect: the
 /// `__gb_k` key binder of one grouping appears in a substitution that passes under the other.
-/// Summing the two collections instead of holding them compiles and answers 347.
+/// Summing the two collections instead of holding them compiles and answers 347. A let-bound
+/// grouping held in a tuple panics at the same check on the same binder
+/// (`a_let_bound_partition_component_reaches_a_subst_defect` in `records.rs`).
 #[test]
 #[should_panic(expected = "Barendregt violation: substitution range mentions binder")]
 fn two_inline_groupings_held_in_a_record() {
     check_tile(
-        &per_region_record(
-            "a = [sum([s.amount for s in g]) for g in groupby(sales, \\r -> r.region)]\n\
-             b = [sum([s.qty for s in g]) for g in groupby(sales, \\r -> r.region)]",
-        ),
+        &per_region_record(indoc! {r#"
+            a = [sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]
+            b = [sum([s.qty for s in g]) for g in groupby(sales, \r -> r.region)]
+        "#}),
         expected_per_region_record(),
     );
 }
 
-/// [`per_region_program`]'s `sales`, then `bindings`, answering the record `(a=a, b=b)`.
+/// [`sales_program`] with `bindings`, answering the record `(a=a, b=b)`.
 fn per_region_record(bindings: &str) -> String {
-    formatdoc! {r#"
-        sales = [
-            (region="west", amount=100, qty=2),
-            (region="west", amount=200, qty=4),
-            (region="north", amount=40, qty=1),
-        ]
-        {bindings}
-        (a=a, b=b)
-    "#}
+    sales_program(&format!("{bindings}(a=a, b=b)"))
 }
 
 /// The per-region amount and quantity sums of [`per_region_record`], as `(a=…, b=…)`.

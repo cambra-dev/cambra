@@ -537,9 +537,9 @@ fn a_retired_route_answers_a_request_it_had_accepted() {
     );
 }
 
-/// Compile `code`, POST `body` to `path` on `port`, and return the reply body, failing after five
+/// Compile `code`, send one request with `request`, and return the reply body, failing after five
 /// seconds without one.
-fn post_once(code: &str, port: u16, path: &'static str, body: &'static str) -> String {
+fn reply_to(code: &str, request: impl FnOnce() -> String + Send + 'static) -> String {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut ctx = GlobalContext::default();
     let sources = SourceMap::single("<test>", code);
@@ -547,7 +547,7 @@ fn post_once(code: &str, port: u16, path: &'static str, body: &'static str) -> S
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
-        let _ = tx.send(http_post(port, path, body));
+        let _ = tx.send(request());
     });
     drive_until(&mut ctx, &rx, Duration::from_secs(5))
 }
@@ -565,7 +565,10 @@ fn a_reply_after_a_writing_block_answers_the_request() {
                 hits := hits + 1
             resps << "ok\n"
     "#};
-    assert_eq!(post_once(&code, port, "/hit", "x"), "ok\n");
+    assert_eq!(
+        reply_to(&code, move || http_post(port, "/hit", "x")),
+        "ok\n"
+    );
 }
 
 /// A reply fed inside the block that writes a mutable variable never answers the request.
@@ -589,7 +592,10 @@ fn a_reply_inside_a_writing_block_answers_the_request() {
                 hits := hits + 1
                 resps << "ok\n"
     "#};
-    assert_eq!(post_once(&code, port, "/hit", "x"), "ok\n");
+    assert_eq!(
+        reply_to(&code, move || http_post(port, "/hit", "x")),
+        "ok\n"
+    );
 }
 
 /// An `Int` fed to a response feed compiles and never answers the request. The response sink
@@ -612,14 +618,5 @@ fn an_int_fed_to_a_response_feed_answers_the_request() {
         for req in reqs:
             resps << 42
     "#};
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let mut ctx = GlobalContext::default();
-    let sources = SourceMap::single("<test>", &code);
-    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
-
-    let (tx, rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        let _ = tx.send(http_get(port, "/n"));
-    });
-    drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    reply_to(&code, move || http_get(port, "/n"));
 }

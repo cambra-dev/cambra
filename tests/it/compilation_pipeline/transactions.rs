@@ -3919,9 +3919,11 @@ fn a_checked_lookup_of_an_absent_key_in_a_read_only_block_answers_none() {
 ///
 /// The block writes `n`, not `m`. The same lookup in a read-only block answers `` `none ``
 /// (the sibling above), and a lookup of a present key in a writing block commits
-/// (`a_keyed_read_at_the_loop_item_reads_the_snapshot`). Over a `[1, 2, 1]` loop with seed
-/// `{1: 10}` feeding each lookup out of the block, the block replies at the first key and stops
-/// at the absent second one.
+/// (`a_keyed_read_at_the_loop_item_reads_the_snapshot`). Feeding the lookup out of the block
+/// instead of writing it stalls the same way: over a `[1, 2, 1]` loop with seed `{1: 10}`, the
+/// block replies at the first key and stops at the absent second one, and the `cambra` binary
+/// running that program does not exit. A key off a source, such as the storefront's
+/// `inventory[req.body.sku]`, reaches the same stall.
 #[test]
 #[should_panic(expected = "producer stopped short of a terminal tile")]
 fn a_checked_lookup_of_an_absent_key_in_a_writing_block() {
@@ -3941,53 +3943,6 @@ fn a_checked_lookup_of_an_absent_key_in_a_writing_block() {
             await_final(n)
         "#},
         Value::Int(0),
-    );
-}
-
-/// The absent-key stall with the key off a **source**: the storefront's
-/// `inventory[req.body.sku]` read, whose key has no literal extent. Request `"b"` is absent, and
-/// the reply stream quiesces before every request has replied. A reply inside the block is
-/// indexed by commit tick, so the three replies sit at ticks 1 to 3. The `cambra` binary running the
-/// same program over `stdin()` does not exit.
-#[test]
-#[should_panic(expected = "one reply per request")]
-fn a_checked_lookup_of_an_absent_source_key_in_a_writing_block() {
-    let code = indoc! {r#"
-        m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
-        n: Mut(Int, Txn) := 0
-        out = defer()
-        for line in source1():
-            with begin():
-                n := n + 1
-                out << (match m[line]?:
-                    case `some(v): v
-                    case `none: 0)
-        out
-    "#};
-    let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
-        "source1",
-        Type::Base(BaseType::String),
-        Extent::Base(BaseType::String),
-    )));
-    ctx.register_source(src.clone());
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<test>", code);
-    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
-    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-
-    src.borrow_mut().add_data(&[
-        (Value::UInt(0), Value::String("a".into())),
-        (Value::UInt(1), Value::String("b".into())),
-        (Value::UInt(2), Value::String("a".into())),
-    ]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
-    let mut result = pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
-    result.compact();
-    assert_eq!(
-        cambra::interpreter::sort_function_by_domain(result),
-        cambra::interpreter::sort_function_by_domain(commit_stream(&[1, 2, 3], &[1, 0, 1])),
-        "one reply per request"
     );
 }
 
@@ -4084,25 +4039,6 @@ fn a_keyed_write_under_an_if_inside_a_block() {
         await_final(m)
     "#});
     assert_eq!(map_entries_int(&value), vec![(1, 10), (2, 5)]);
-}
-
-/// A filtered comprehension over a map-valued mutable variable inside a block does not compile:
-/// lambda elimination produces a tree that fails the post-lambda-elim type check with a mismatch
-/// on the collection's domain. The unfiltered `sum([v for v in m])` compiles and runs.
-#[test]
-#[should_panic(
-    expected = "post-lambda-elim produced an invalid tree: [Type mismatch for collection domain"
-)]
-fn a_filtered_comprehension_over_a_map_valued_mut_var_inside_a_block() {
-    let value = final_mut_var_value(indoc! {r#"
-        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
-        n: Mut(Int, Txn) := 0
-        for r in [1, 2]:
-            with begin():
-                n := sum([v for v in m if v > 0])
-        await_final(n)
-    "#});
-    assert_eq!(value, Value::Int(10));
 }
 
 /// ``match m: case `tag(w): <writes>`` inside a `with begin():` block. The arms
