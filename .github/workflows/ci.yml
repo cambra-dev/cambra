@@ -79,17 +79,20 @@ jobs:
       # diffs against the merge-base with main, so a docs-only PR stacked on
       # code PRs runs the gates; on main it diffs against the commit before the
       # push. Both come from git history, which the full fetch above provides.
-      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
         id: filter
         if: success() || failure()
         with:
+          # A file is code only if it matches every pattern, so each negation
+          # excludes its files. Under the default `some` one match is enough,
+          # and every file matches some negation (a `.md` file matches
+          # `!LICENSE`), so every change would count as code.
+          predicate-quantifier: 'every'
           filters: |
             code:
               - '!**/*.md'
               - '!LICENSE'
               - '!docs/**'
-              # Catch-all: run for everything else
-              - '**'
 
   # Lints the crate with `--all-targets` in debug — the baseline pass. Its own
   # job because each clippy configuration is a distinct fingerprint: cargo
