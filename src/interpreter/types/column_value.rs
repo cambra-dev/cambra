@@ -613,7 +613,7 @@ impl ColumnValue {
                 Box::new(iter::repeat_n(Value::Unit, count))
             }
             ColumnValue::Bools(v) => {
-                // Vec<bool>::take gives us ownership so we can return a 'static iterator.
+                // `mem::take` moves the elements out so the iterator can be 'static.
                 Box::new(take(v).into_iter().map(Value::Bool))
             }
             ColumnValue::Ints(v) => Box::new(take(v).into_iter().map(Value::Int)),
@@ -1139,13 +1139,11 @@ mod tests {
     #[test]
     fn test_retain_vec_keep_some() {
         // mask: keep indices 0 and 2, drop index 1.
-        // Order is unspecified; sort to compare.
         let mut v = vec![10, 20, 30];
         let mut mask = vec![false; 3];
         mask[0] = true;
         mask[2] = true;
         retain_vec(&mut v, &mask);
-        v.sort();
         assert_eq!(v, vec![10, 30]);
     }
 
@@ -1154,8 +1152,27 @@ mod tests {
         let mut v = vec![1, 2, 3];
         let mask = vec![true; 3];
         retain_vec(&mut v, &mask);
-        v.sort();
         assert_eq!(v, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_retain_vec_keeps_source_order() {
+        // A kept element after a dropped one moves left past it, so a swap-with-end
+        // algorithm would return `[40, 20]` here.
+        let mut v = vec![10, 20, 30, 40];
+        retain_vec(&mut v, &[false, true, false, true]);
+        assert_eq!(v, vec![20, 40]);
+    }
+
+    #[test]
+    fn test_retain_bools_preserves_order() {
+        // Mask `[F, T, T]` once returned `[v2, v1]`.
+        let mut col = ColumnValue::Bools(vec![true, false, true]);
+        col.retain(&[false, true, true]);
+        assert_eq!(col, ColumnValue::Bools(vec![false, true]));
+        let mut col = ColumnValue::Bools(vec![true, false, false, true, false, true]);
+        col.retain(&[true, false, true, false, true, true]);
+        assert_eq!(col, ColumnValue::Bools(vec![true, false, false, true]));
     }
 
     #[test]

@@ -84,17 +84,17 @@ fn compare_records(
         let Some(r) = right.get(&field) else {
             continue;
         };
-        let mut field_eq = match apply_binop_column(BinOpKind::Compare(op), l, r) {
+        let field_eq = match apply_binop_column(BinOpKind::Compare(op), l, r) {
             ColumnValue::Bools(b) => b,
             other => unreachable!("a comparison yields a Bool column, got {other:?}"),
         };
         // A nested product reports the length of one of its own fields, so a recursive
-        // comparison can answer for fewer positions than `rows`. Both sides shrink to what
-        // arrived: the element-wise `and`/`or` below zip, so unequal lengths would truncate silently, and padding would invent positions.
+        // comparison can answer for fewer positions than `rows`. `acc` shrinks to what
+        // arrived: zipping `acc` with a shorter `field_eq` leaves the tail of `acc` unchanged
+        // rather than dropping it, and padding would invent positions.
         if field_eq.len() < acc.len() {
             acc.truncate(field_eq.len());
         }
-        field_eq.truncate(acc.len());
         match op {
             CompareKind::Equals => acc.iter_mut().zip(&field_eq).for_each(|(a, &b)| *a &= b),
             CompareKind::NotEquals => acc.iter_mut().zip(&field_eq).for_each(|(a, &b)| *a |= b),
@@ -187,8 +187,8 @@ mod tests {
             other => panic!("expected Ints, got {other:?}"),
         }
 
-        // Bool ops must not panic on unequal lengths (Vec<bool> set ops assert
-        // equal length); they align to the common prefix instead.
+        // Bool ops must not panic on unequal lengths; the kernels combine the
+        // common prefix and drop the rest.
         match apply_binop_column(
             BinOpKind::Compare(CompareKind::Less),
             ColumnValue::Bools(vec![false; 3]),
