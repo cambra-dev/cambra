@@ -1514,7 +1514,7 @@ fn transform_loop(
 
     // A conditional induction write (`if p: total += x`) lowers to a
     // statement-position guard-`Case`; `transform_chain` merges its branches into
-    // one always-commit decision with a per-accumulator value-`Case` write set
+    // one commit-gated decision with a per-accumulator value-`Case` write set
     // (see its `Case` arm). So the conditional case folds through the SAME
     // single-writer path as a plain loop — one writer over the full source, no
     // per-leg restricted sources — which recognition packages as a single-writer
@@ -2341,14 +2341,14 @@ fn transform_chain(
         }
         // A statement-position guard-`Case` (`if p: acc += e`, lowered by
         // `lower_loop_body_chain` to `{gᵢ → branch; true → carry}`): merge its
-        // branches into a single always-commit decision whose write set is a
-        // per-accumulator first-match value-`Case`. A non-writing (carry) branch
-        // contributes the accumulator's snapshot, so `commit: true` writing the
-        // unchanged value is a no-op — the conditional change rides the *values*
-        // (each value-`Case` compiles via the C-form at `lambda_elim`), not a
-        // per-position commit gate. One writer over the full source, so no
-        // restricted per-leg sources and no cyclic desync, which a multi-leg
-        // realization over per-leg restricted sources could not avoid.
+        // branches into one writer decision, built by `conditional_decision`. It
+        // commits where a writing branch's first-match guard holds, and at every
+        // position when an unconditional write changed the carry; each
+        // accumulator's write is a first-match value-`Case` over the writing
+        // branches whose trailing arm is the carry, or the carry alone when no
+        // branch writes. One writer over the full source, so no restricted
+        // per-leg sources and no cyclic desync, which a multi-leg realization over
+        // per-leg restricted sources could not avoid.
         TypedExprNode::ExprStmt { expr: effect, body }
             if matches!(
                 &effect.node,
@@ -2432,25 +2432,17 @@ fn transform_chain(
                 // A write advances the read-your-writes environment by *inlining*
                 // the written value (point-free over `__p`), not binding a `let` —
                 // the same substitution model `transact_phase::walk_block` uses.
-                // Inlining keeps every captured value self-contained: an
-                // unconditional write followed by a statement-`Case` leaves no dead
-                // `let` wrapping the decision (which would break the value-`Case`
-                // C-form compilation of the write set), and a feed reached after a
-                // write can be hoisted without stranding a branch-local binder.
+                // Inlining keeps every captured value (a later write, the write set,
+                // a feed value) self-contained. A `let`-bound name would escape the
+                // writer lambda whose decision body reads it (via `decision_writes`).
+                // When a statement-`Case` follows the write, a dead `let` wrapping
+                // the decision would break the value-`Case` C-form compilation of
+                // the write set. A feed reached after a write could not be hoisted
+                // to the top decision record without stranding a branch-local
+                // binder. The shared inlined normal form is what lets induction and
+                // transaction writers recognize identically.
                 TypedExprNode::MutWrite { name, value, .. } => {
-                    // Advance the read-your-writes environment by *inlining* the
-                    // written value (point-free over `__p`), not binding a `let` —
-                    // the same substitution model `transact_phase::walk_block` uses.
-                    // This keeps every captured value (a later write, the write set,
-                    // a feed value) self-contained, so a feed reached after a write
-                    // can be hoisted to the top decision record without stranding a
-                    // branch-local `let` binder (`fresh` unbound at the top). The
-                    // shared inlined normal form is what lets induction and
-                    // transaction writers recognize identically.
                     let val = Subst::discharge_env_in_place(*value, env);
-                    // The value is inlined into `env`, not `let`-bound: a writer's
-                    // decision body reads it (via `decision_writes`), and a
-                    // `let`-bound name would escape the writer lambda.
                     env.insert(name.clone(), val);
                     transform_chain(*body, env, accs, writes_ty, entering, path, feeds)
                 }
