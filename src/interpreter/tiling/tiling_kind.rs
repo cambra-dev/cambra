@@ -222,7 +222,7 @@ impl Tiling {
             ),
             Tiling::Aggregation { kind, accumulator } => Tile::Aggregation {
                 kind: *kind,
-                terminal: ColumnValue::Bools(Vec::new()),
+                terminal: ColumnValue::Bools(Vec::new().into()),
                 accumulator: Box::new(accumulator.empty_at_no_rows()),
             },
             // An empty store: every key's changelog empty, frontier undecided, live,

@@ -959,7 +959,7 @@ impl TileProducer for VariantIsProducer {
         };
         Tile::data_function(
             out_domain,
-            Box::new(Tile::Scalar(ColumnValue::Bools(answers))),
+            Box::new(Tile::Scalar(ColumnValue::Bools(answers.into()))),
             domain_predicate,
             BitSet::new(),
         )
@@ -1045,7 +1045,10 @@ mod tests {
     fn commit_abort_scrutinee() -> FixedOp {
         let tile = Tile::Scalar(ColumnValue::positional_union(
             &[0, 1, 0],
-            vec![ColumnValue::Ints(vec![10, 30]), ColumnValue::Units(1)],
+            vec![
+                ColumnValue::Ints(vec![10, 30].into()),
+                ColumnValue::Units(1),
+            ],
         ));
         let tiling = Tiling::Scalar(Extent::Union(TagMap::from_positional(vec![
             Extent::Base(BaseType::Int),
@@ -1071,7 +1074,10 @@ mod tests {
             panic!("expected Function, got {tile:?}");
         };
         assert_eq!(domain, ColumnValue::from_uints(vec![0, 2]));
-        assert_eq!(*codomain, Tile::Scalar(ColumnValue::Ints(vec![10, 30])));
+        assert_eq!(
+            *codomain,
+            Tile::Scalar(ColumnValue::Ints(vec![10, 30].into()))
+        );
     }
 
     /// ``VariantProject(`abort)`` narrows to the tag-1 sub-domain (position 1) and
@@ -1138,7 +1144,7 @@ mod tests {
         assert_eq!(domain, ColumnValue::from_uints(vec![]));
         assert_eq!(
             *codomain,
-            Tile::Scalar(ColumnValue::Ints(vec![])),
+            Tile::Scalar(ColumnValue::Ints(vec![].into())),
             "the empty values are shaped by the declared arm extent (Int), not \
              by the tag that happened to be present"
         );
@@ -1156,8 +1162,8 @@ mod tests {
         let tile = Tile::Scalar(ColumnValue::positional_union(
             &[0, 1, 0, 1],
             vec![
-                ColumnValue::Ints(vec![10, 30]),
-                ColumnValue::Ints(vec![20, 40]),
+                ColumnValue::Ints(vec![10, 30].into()),
+                ColumnValue::Ints(vec![20, 40].into()),
             ],
         ));
         let tiling = Tiling::Scalar(Extent::Union(TagMap::from_positional(vec![
@@ -1199,7 +1205,7 @@ mod tests {
         assert_eq!(domain, ColumnValue::from_uints(vec![0, 1, 2, 3]));
         assert_eq!(
             *codomain,
-            Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))
+            Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40].into()))
         );
     }
 
@@ -1218,7 +1224,10 @@ mod tests {
             ColumnValue::from_uints(vec![10, 11, 12]),
             Box::new(Tile::Scalar(ColumnValue::positional_union(
                 &[0, 1, 0],
-                vec![ColumnValue::Ints(vec![100, 120]), ColumnValue::Units(1)],
+                vec![
+                    ColumnValue::Ints(vec![100, 120].into()),
+                    ColumnValue::Units(1),
+                ],
             ))),
             Predicate::True,
             BitSet::new(),
@@ -1251,7 +1260,7 @@ mod tests {
         // The outer element stream (e.g. `x.time`) over the *same* keys.
         let outer_tile = Tile::data_function(
             ColumnValue::from_uints(vec![10, 11, 12]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3].into()))),
             Predicate::True,
             BitSet::new(),
         );
@@ -1291,10 +1300,13 @@ mod tests {
         let Tile::Record { fields, .. } = *codomain else {
             panic!("expected Record values, got {codomain:?}");
         };
-        assert_eq!(fields["_0"], Tile::Scalar(ColumnValue::Ints(vec![1, 3])));
+        assert_eq!(
+            fields["_0"],
+            Tile::Scalar(ColumnValue::Ints(vec![1, 3].into()))
+        );
         assert_eq!(
             fields["_1"],
-            Tile::Scalar(ColumnValue::Ints(vec![100, 120]))
+            Tile::Scalar(ColumnValue::Ints(vec![100, 120].into()))
         );
     }
 
@@ -1323,7 +1335,7 @@ mod tests {
                 ColumnValue::from_uints(vec![0, 1]),
                 Box::new(Tile::Scalar(ColumnValue::Union(TagMap::from_arms(vec![(
                     FieldKey::Index(0),
-                    UnionArm::new(vec![0, 1], ColumnValue::Ints(vec![10, 20])),
+                    UnionArm::new(vec![0, 1], ColumnValue::Ints(vec![10, 20].into())),
                 )])))),
                 Predicate::False,
                 BitSet::new(),
@@ -1371,7 +1383,7 @@ mod tests {
         let (spy, released) = ReleaseSpy::new(
             Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20].into()))),
                 Predicate::False,
                 BitSet::new(),
             ),

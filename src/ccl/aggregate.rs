@@ -110,20 +110,28 @@ impl AggregateKind {
 
     fn scalar_seed(&self, accumulator_extent: &Extent) -> ColumnValue {
         match (self, accumulator_extent) {
-            (AggregateKind::Sum, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![0]),
-            (AggregateKind::Max, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![i64::MIN]),
-            (AggregateKind::Min, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![i64::MAX]),
-            (AggregateKind::Max, Extent::Base(BaseType::UInt)) => ColumnValue::UInts(vec![0]),
+            (AggregateKind::Sum, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![0].into()),
+            (AggregateKind::Max, Extent::Base(BaseType::Int)) => {
+                ColumnValue::Ints(vec![i64::MIN].into())
+            }
+            (AggregateKind::Min, Extent::Base(BaseType::Int)) => {
+                ColumnValue::Ints(vec![i64::MAX].into())
+            }
+            (AggregateKind::Max, Extent::Base(BaseType::UInt)) => {
+                ColumnValue::UInts(vec![0].into())
+            }
             (AggregateKind::Min, Extent::Base(BaseType::UInt)) => {
-                ColumnValue::UInts(vec![u64::MAX])
+                ColumnValue::UInts(vec![u64::MAX].into())
             }
             (AggregateKind::Max, Extent::Base(BaseType::String)) => {
-                ColumnValue::Strings(vec![SmolStr::default()])
+                ColumnValue::Strings(vec![SmolStr::default()].into())
             }
             (AggregateKind::Max, Extent::Base(BaseType::Bool)) => {
-                ColumnValue::Bools(vec![false; 1])
+                ColumnValue::Bools(vec![false; 1].into())
             }
-            (AggregateKind::Min, Extent::Base(BaseType::Bool)) => ColumnValue::Bools(vec![true; 1]),
+            (AggregateKind::Min, Extent::Base(BaseType::Bool)) => {
+                ColumnValue::Bools(vec![true; 1].into())
+            }
             // The single `unit` a drained group collapses to; further elements
             // fold in as no-ops (see `accumulate`).
             (AggregateKind::Drain, Extent::Base(BaseType::Unit)) => ColumnValue::Units(1),

@@ -478,7 +478,10 @@ mod tests {
             panic!("a collection's collection values open to a level")
         };
         assert_eq!(row_starts, vec![0, 2, 3]);
-        assert_eq!(*codomain, Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4])));
+        assert_eq!(
+            *codomain,
+            Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4].into()))
+        );
     }
 
     /// A record holding a collection opens into a record of its fields' tiles, the collection
@@ -493,7 +496,7 @@ mod tests {
             ),
         ]));
         let cells = ColumnValue::Records(HashMap::from([
-            ("a".into(), ColumnValue::Ints(vec![5, 6])),
+            ("a".into(), ColumnValue::Ints(vec![5, 6].into())),
             (
                 "b".into(),
                 ColumnValue::Variants(vec![
@@ -508,7 +511,10 @@ mod tests {
         let Tile::Record { fields, .. } = open_checked(&cells, &extent) else {
             panic!("a record holding a collection opens to a record of tiles")
         };
-        assert_eq!(fields["a"], Tile::Scalar(ColumnValue::Ints(vec![5, 6])));
+        assert_eq!(
+            fields["a"],
+            Tile::Scalar(ColumnValue::Ints(vec![5, 6].into()))
+        );
         assert!(fields["b"].is_data_function());
     }
 }

@@ -49,7 +49,7 @@ use super::helpers::*;
 )]
 #[case(
     "[x + y for x in [1, 1] for y in [2, 2, 3] if x + 1 == y]",
-    ColumnValue::Ints(vec![3, 3, 3, 3])
+    ColumnValue::Ints(vec![3, 3, 3, 3].into())
 )]
 #[case(
     "[x for x in [y for y in ['a', 'b', 'c', 'd'] if y != 'b'] if x < 'c']",
@@ -84,11 +84,11 @@ use super::helpers::*;
 )]
 #[case(
     "a = [1,2]; b = [10, 20]; [x + y for x in a for y in b]",
-    ColumnValue::Ints(vec![11, 21, 12, 22])
+    ColumnValue::Ints(vec![11, 21, 12, 22].into())
 )]
 #[case(
     "a = [1,2]; b = [10, 20]; [x + y for x in a for y in b if x == y // 10]",
-    ColumnValue::Ints(vec![11, 22])
+    ColumnValue::Ints(vec![11, 22].into())
 )]
 // Probe for a suspicious `zip`-substitution in the optimizer that
 // `case_27` of `test_new_compile` (above) hinted at: under inference's
@@ -100,7 +100,7 @@ use super::helpers::*;
 // `[(1,1), (3,2)] ▷ filter → [(1,1)] → [2]`.
 #[case(
     "[a + b for a in [1, 3] for b in [1, 2, 3] if a == b]",
-    ColumnValue::Ints(vec![2, 6])
+    ColumnValue::Ints(vec![2, 6].into())
 )]
 fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
     let result = sort_function_by_domain(run_pipeline(code));
@@ -142,11 +142,11 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 #[case(
     "[sum(x) for x in groupby([2,3,4,5], \\x -> x // 2)]",
-    Tile::data_function(ColumnValue::Ints(vec![1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 9]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::Ints(vec![1, 2].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 9].into()))), Predicate::True, BitSet::new())
 )]
 #[case(
     "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], \\x -> x // 2)]",
-    Tile::data_function(ColumnValue::Ints(vec![6, 7]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![25, 29]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::Ints(vec![6, 7].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![25, 29].into()))), Predicate::True, BitSet::new())
 )]
 // A filter over an **unmapped** source, keyed by the identity. `case_2` above filters too,
 // but its comprehension maps (`y + 10`) and its key computes (`x // 2`), and either is
@@ -156,7 +156,7 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
 // source at the incomparable kind at the post-planning wall.
 #[case(
     "[sum(x) for x in groupby([x for x in [1,2,3] if x > 1], \\x -> x)]",
-    Tile::data_function(ColumnValue::Ints(vec![2, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::Ints(vec![2, 3].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3].into()))), Predicate::True, BitSet::new())
 )]
 fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -170,15 +170,15 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 #[timeout(Duration::from_secs(30))]
 #[case(
     "[sum(x) for x in groupby([1], \\x -> x)]",
-    Tile::data_function(ColumnValue::Ints(vec![1]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::Ints(vec![1].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1].into()))), Predicate::True, BitSet::new())
 )]
 #[case(
     "[sum(x) for x in groupby([1, 1], \\x -> x)]",
-    Tile::data_function(ColumnValue::Ints(vec![1]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::Ints(vec![1].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2].into()))), Predicate::True, BitSet::new())
 )]
 #[case(
     "[sum(x) for x in groupby([1, 2], \\x -> x)]",
-    Tile::data_function(ColumnValue::Ints(vec![1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::Ints(vec![1, 2].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2].into()))), Predicate::True, BitSet::new())
 )]
 fn a_groupby_over_a_singleton_element_literal(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -224,13 +224,13 @@ fn check_set_keys(code: &str, sorted_keys: ColumnValue, n: usize) {
 
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[case("set([1,2,2,3])", ColumnValue::Ints(vec![1, 2, 3]), 3)]
-#[case("set([3,1,2,1,3])", ColumnValue::Ints(vec![1, 2, 3]), 3)]
+#[case("set([1,2,2,3])", ColumnValue::Ints(vec![1, 2, 3].into()), 3)]
+#[case("set([3,1,2,1,3])", ColumnValue::Ints(vec![1, 2, 3].into()), 3)]
 #[case("set(['a','b','a'])", ColumnValue::strings(&["a", "b"]), 2)]
 // A literal whose elements share one singleton type keys like any other
 // ([`a_groupby_over_a_singleton_element_literal`] carries the group-by it is built on).
-#[case("set([1])", ColumnValue::Ints(vec![1]), 1)]
-#[case("set([1, 1])", ColumnValue::Ints(vec![1]), 1)]
+#[case("set([1])", ColumnValue::Ints(vec![1].into()), 1)]
+#[case("set([1, 1])", ColumnValue::Ints(vec![1].into()), 1)]
 fn test_set(#[case] code: &str, #[case] sorted_keys: ColumnValue, #[case] n: usize) {
     check_set_keys(code, sorted_keys, n);
 }
@@ -323,18 +323,18 @@ fn a_bare_groupby_tail_is_driven() {
 #[case(
     "1",
     "1:{Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}",
-    Tile::Scalar(ColumnValue::Ints(vec![1]))
+    Tile::Scalar(ColumnValue::Ints(vec![1].into()))
 )]
 // Closed arithmetic reaches op conversion as the literal it computes, a whole chain of it
 // in one planning pass (`src/ccl/planning/const_fold.rs`), so what these two pin is a
 // symbolic form with no operator left in it. The cases below keep `add`, `eq` and `gt`
 // because a binder is among their operands; `mul` is pinned at run time by
 // `scalars_collections.rs`'s `arithmetic_and_comparison_on_computed_operands`.
-#[case("1 + 2", "3:Int", Tile::Scalar(ColumnValue::Ints(vec![3])))]
+#[case("1 + 2", "3:Int", Tile::Scalar(ColumnValue::Ints(vec![3].into())))]
 #[case(
     "1 + 2 - 3 * 4",
     "-9:Int",
-    Tile::Scalar(ColumnValue::Ints(vec![-9]))
+    Tile::Scalar(ColumnValue::Ints(vec![-9].into()))
 )]
 #[case(
     "[1,2,3]",
@@ -366,20 +366,20 @@ fn a_bare_groupby_tail_is_driven() {
 #[case(
     "[x for x in [False,True] if x]",
     "iterate ▷ ([false, true] ▷ restrict) ≫ cast([false, true]):({[0, 1] | __elem ▷ [false, true]} ⤇ Bool)",
-    Tile::data_function(ColumnValue::UInts(vec![1]), Box::new(Tile::Scalar(ColumnValue::Bools(vec![true; 1]))), Predicate::True, BitSet::new()),
+    Tile::data_function(ColumnValue::UInts(vec![1].into()), Box::new(Tile::Scalar(ColumnValue::Bools(vec![true; 1].into()))), Predicate::True, BitSet::new()),
 )]
 #[case(
     "[x + 10 for x in [1,2,3] if x == 2]",
     "iterate ▷ (([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq) ▷ restrict) ≫ cast([1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add):({[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq)} ⤇ Int)",
-    Tile::data_function(ColumnValue::UInts(vec![1]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![12]))), Predicate::True, BitSet::new()),
+    Tile::data_function(ColumnValue::UInts(vec![1].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![12].into()))), Predicate::True, BitSet::new()),
 )]
 #[case(
     "[x + y for x in [1,2,3] for y in [10,20]]",
     "iterate ≫ (.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:(([0, 2], [0, 1]) ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
-            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1])),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![11, 21, 12, 22, 13, 23]))), Predicate::Record(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2].into())),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1].into())),
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![11, 21, 12, 22, 13, 23].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
         ])), BitSet::new())
@@ -388,11 +388,11 @@ fn a_bare_groupby_tail_is_driven() {
     "[(x, y) for x in [1,2,3] for y in [10,20]]",
     "iterate ≫ (.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip:(([0, 2], [0, 1]) ⤇ (Int, Int))",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
-            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1])),
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2].into())),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1].into())),
         ])), Box::new( Tile::record(HashMap::from([
-            ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 20, 10, 20, 10, 20]))),
-            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 2, 3, 3]))),
+            ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 20, 10, 20, 10, 20].into()))),
+            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 2, 3, 3].into()))),
         ]))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
@@ -402,9 +402,9 @@ fn a_bare_groupby_tail_is_driven() {
     "[x for x in [1,2,3] for y in [10,20]]",
     "iterate ≫ .0 ≫ [1, 2, 3]:(([0, 2], [0, 1]) ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
-            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1])),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 2, 3, 3]))), Predicate::Record(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2].into())),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1].into())),
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 2, 3, 3].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
         ])), BitSet::new())
@@ -413,9 +413,9 @@ fn a_bare_groupby_tail_is_driven() {
     "[x + y for x in [1,2,3] if x == 2 for y in [10,20] if y == 10]",
     "iterate ▷ ((((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add):({([0, 2], [0, 1]) | __elem ▷ (((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![1])),
-            ("_1".into(), ColumnValue::UInts(vec![0])),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![12]))), Predicate::Record(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![1].into())),
+            ("_1".into(), ColumnValue::UInts(vec![0].into())),
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![12].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
         ])), BitSet::new())
@@ -447,14 +447,14 @@ fn a_bare_groupby_tail_is_driven() {
 #[case(
     "[(x, x) for x in [(x, x) for x in [1,2,3]]]",
     "iterate ≫ [1, 2, 3] ≫ (id, id) ▷ zip ≫ (id, id) ▷ zip:([0, 2] ⤇ ((Int, Int), (Int, Int)))",
-    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::record(HashMap::from([
+    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2].into()), Box::new(Tile::record(HashMap::from([
             ("_1".into(), Tile::record(HashMap::from([
-                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
-                ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3].into()))),
+                ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3].into()))),
             ]))),
             ("_0".into(), Tile::record(HashMap::from([
-                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
-                ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3].into()))),
+                ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3].into()))),
             ]))),
         ]))), Predicate::True, BitSet::new())
 )]
@@ -462,8 +462,8 @@ fn a_bare_groupby_tail_is_driven() {
     "[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]",
     "iterate ≫ (.0 ≫ [\"a\", \"b\"], .1 ≫ [\"c\", \"d\", \"e\"]) ▷ zip ≫ concat:(([0, 1], [0, 2]) ⤇ String)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![0, 0, 0, 1, 1, 1])),
-            ("_1".into(), ColumnValue::UInts(vec![0, 1, 2, 0, 1, 2])),
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 0, 1, 1, 1].into())),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 2, 0, 1, 2].into())),
         ])), Box::new(Tile::Scalar(ColumnValue::strings(&["ac", "ad", "ae", "bc", "bd", "be"]))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
@@ -474,7 +474,7 @@ fn a_bare_groupby_tail_is_driven() {
     "iterate ▷ ((source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add):({source(testsource1) | __elem ▷ (source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt)} ⤇ Int)",
     make_int_list(&[10, 20])
 )]
-#[case("sum([1,2,3])", "(iterate ≫ [1, 2, 3]) ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]
+#[case("sum([1,2,3])", "(iterate ≫ [1, 2, 3]) ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6].into())))]
 // The result is **data** (`⤇`): a comprehension over a `groupby` is a
 // collection keyed by the group key, and elimination now carries that kind
 // across instead of rebuilding the type as a bare combinator `⇒`.
@@ -488,14 +488,14 @@ fn a_bare_groupby_tail_is_driven() {
     // morphism inside it stays **pointful** — planning point-frees the predicates it
     // reifies into a `Restrict`, and this one it never reaches.
     "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:({Int | __elem ▷ (([1, 2, 3, 4] ≫ (λ y : Int → y // 2)) ▷ collection_contains)} ⤇ Int)",
-    Tile::data_function(ColumnValue::Ints(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))), Predicate::True, BitSet::new()))]
+    Tile::data_function(ColumnValue::Ints(vec![0, 1, 2].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4].into()))), Predicate::True, BitSet::new()))]
 #[case(
     "[x + y for x in [1,2,3] for y in [2,3,4,5] if x == y]",
     "(iterate ≫ [1, 2, 3] ≫ (iterate ≫ [2, 3, 4, 5]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add):({([0, 2], [0, 3]) | __elem ▷ ((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ eq)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![1, 2])),
-            ("_1".into(), ColumnValue::UInts(vec![0, 1])),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6]))), Predicate::Record(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![1, 2].into())),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1].into())),
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
         ])), BitSet::new())
@@ -504,9 +504,9 @@ fn a_bare_groupby_tail_is_driven() {
     "[x + y for x in [1,2,3] for y in [2,3,4,5] if y == x]",
     "(iterate ≫ [1, 2, 3] ≫ (iterate ≫ [2, 3, 4, 5]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add):({([0, 2], [0, 3]) | __elem ▷ ((.1 ≫ [2, 3, 4, 5], .0 ≫ [1, 2, 3]) ▷ zip ≫ eq)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![1, 2])),
-            ("_1".into(), ColumnValue::UInts(vec![0, 1])),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6]))), Predicate::Record(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![1, 2].into())),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1].into())),
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
         ])), BitSet::new())
@@ -515,9 +515,9 @@ fn a_bare_groupby_tail_is_driven() {
     "[x + y + 1 for x in [1,2,3] for y in [2,3,4,5] if y - 2 == x + 2]",
     "(iterate ≫ ([1, 2, 3], 2 ▷ const) ▷ zip ≫ add ≫ (iterate ≫ ([2, 3, 4, 5], 2 ▷ const) ▷ zip ≫ sub) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast(((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add, 1 ▷ const) ▷ zip ≫ add):({([0, 2], [0, 3]) | __elem ▷ (((.1 ≫ [2, 3, 4, 5], 2 ▷ const) ▷ zip ≫ sub, (.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![0])),
-            ("_1".into(), ColumnValue::UInts(vec![3])),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))), Predicate::Record(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0].into())),
+            ("_1".into(), ColumnValue::UInts(vec![3].into())),
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![7].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
         ])), BitSet::new())
@@ -526,10 +526,10 @@ fn a_bare_groupby_tail_is_driven() {
     "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == y and y == z]",
     "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ (((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![0])),
-            ("_1".into(), ColumnValue::UInts(vec![0])),
-            ("_2".into(), ColumnValue::UInts(vec![0])),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))), Predicate::Record(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0].into())),
+            ("_1".into(), ColumnValue::UInts(vec![0].into())),
+            ("_2".into(), ColumnValue::UInts(vec![0].into())),
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
             ("_2".into(), Predicate::True),
@@ -541,10 +541,10 @@ fn a_bare_groupby_tail_is_driven() {
     "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z]",
     "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2, 3] ≫ (iterate ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ (((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![0])),
-            ("_1".into(), ColumnValue::UInts(vec![0])),
-            ("_2".into(), ColumnValue::UInts(vec![0])),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))), Predicate::Record(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0].into())),
+            ("_1".into(), ColumnValue::UInts(vec![0].into())),
+            ("_2".into(), ColumnValue::UInts(vec![0].into())),
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
             ("_2".into(), Predicate::True),
@@ -554,12 +554,12 @@ fn a_bare_groupby_tail_is_driven() {
     "[x + y for x in [2] for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]",
     "(iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ add):({([0, 0], {([0, 1], [0, 2]) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) | __elem ▷ ((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ eq)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_0".into(), ColumnValue::UInts(vec![0].into())),
             ("_1".into(), ColumnValue::Records(HashMap::from([
-                ("_0".into(), ColumnValue::UInts(vec![0])),
-                ("_1".into(), ColumnValue::UInts(vec![0])),
+                ("_0".into(), ColumnValue::UInts(vec![0].into())),
+                ("_1".into(), ColumnValue::UInts(vec![0].into())),
             ]))),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![4]))), Predicate::Record(HashMap::from([
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![4].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
         ])), BitSet::new())
@@ -568,10 +568,10 @@ fn a_bare_groupby_tail_is_driven() {
     "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and x + 1 == y]",
     "((iterate ≫ [1] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .1 ≫ [1, 2, 3] ≫ (iterate ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ ([0] ▷ flatten_domain) ▷ map_domain ▷ (((.0 ≫ ([1], 1 ▷ const) ▷ zip ≫ add, .2 ≫ [1, 2]) ▷ zip ≫ eq) ▷ restrict) ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ ((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], 1 ▷ const) ▷ zip ≫ add, .1 ≫ [1, 2]) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![])),
-            ("_1".into(), ColumnValue::UInts(vec![])),
-            ("_2".into(), ColumnValue::UInts(vec![])),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))), Predicate::Record(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![].into())),
+            ("_1".into(), ColumnValue::UInts(vec![].into())),
+            ("_2".into(), ColumnValue::UInts(vec![].into())),
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
             ("_2".into(), Predicate::True),
@@ -581,10 +581,10 @@ fn a_bare_groupby_tail_is_driven() {
     "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and y < 2]",
     "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2, 3] ≫ (iterate ▷ ((([1, 2], 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ ((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, (.1 ≫ [1, 2], 2 ▷ const) ▷ zip ≫ lt) ▷ zip ≫ and)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![0])),
-            ("_1".into(), ColumnValue::UInts(vec![0])),
-            ("_2".into(), ColumnValue::UInts(vec![0])),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))), Predicate::Record(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0].into())),
+            ("_1".into(), ColumnValue::UInts(vec![0].into())),
+            ("_2".into(), ColumnValue::UInts(vec![0].into())),
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
             ("_2".into(), Predicate::True),
@@ -594,10 +594,10 @@ fn a_bare_groupby_tail_is_driven() {
     "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and x + y == z + 1]",
     "iterate ▷ (((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ ((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ Int)",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![0])),
-            ("_1".into(), ColumnValue::UInts(vec![0])),
-            ("_2".into(), ColumnValue::UInts(vec![0])),
-        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))), Predicate::Record(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0].into())),
+            ("_1".into(), ColumnValue::UInts(vec![0].into())),
+            ("_2".into(), ColumnValue::UInts(vec![0].into())),
+        ])), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3].into()))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
             ("_2".into(), Predicate::True),
@@ -612,12 +612,12 @@ fn a_bare_groupby_tail_is_driven() {
     "[(x , z) for x in [1,2,3] for y in [(3, 30), (2, 20), (1, 10)] for z in [20, 10, 30] if z == y.1 and y.0 == x]",
     "(iterate ≫ [1, 2, 3] ≫ ((iterate ≫ [(3, 30), (2, 20), (1, 10)] ≫ .1 ≫ (iterate ≫ [20, 10, 30]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [(3, 30), (2, 20), (1, 10)] ≫ .0) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .2 ≫ [20, 10, 30]) ▷ zip):({([0, 2], [0, 2], [0, 2]) | __elem ▷ (((.2 ≫ [20, 10, 30], .1 ≫ [(3, 30), (2, 20), (1, 10)] ≫ .1) ▷ zip ≫ eq, (.1 ≫ [(3, 30), (2, 20), (1, 10)] ≫ .0, .0 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ (Int, Int))",
     Tile::data_function(ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(vec![0, 1, 2])),
-            ("_1".into(), ColumnValue::UInts(vec![2, 1, 0])),
-            ("_2".into(), ColumnValue::UInts(vec![1, 0, 2])),
+            ("_0".into(), ColumnValue::UInts(vec![0, 1, 2].into())),
+            ("_1".into(), ColumnValue::UInts(vec![2, 1, 0].into())),
+            ("_2".into(), ColumnValue::UInts(vec![1, 0, 2].into())),
         ])), Box::new(Tile::record(HashMap::from([
-            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
-            ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
+            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3].into()))),
+            ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30].into()))),
         ]))), Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
@@ -1061,8 +1061,14 @@ fn a_tuple_of_folds_pairs_at_the_group() {
         Tile::data_function(
             ColumnValue::strings(&["east", "west"]),
             Box::new(Tile::record(HashMap::from([
-                ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![50, 300]))),
-                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 6]))),
+                (
+                    "_0".into(),
+                    Tile::Scalar(ColumnValue::Ints(vec![50, 300].into())),
+                ),
+                (
+                    "_1".into(),
+                    Tile::Scalar(ColumnValue::Ints(vec![1, 6].into())),
+                ),
             ]))),
             Predicate::True,
             BitSet::new(),
@@ -1095,12 +1101,15 @@ fn a_tuple_of_a_collection_and_a_fold_over_each_group() {
                     Tile::grouped(
                         vec![0, 1],
                         ColumnValue::from_uints(vec![1, 0, 2]),
-                        Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4]))),
+                        Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4].into()))),
                         Predicate::True,
                         BitSet::new(),
                     ),
                 ),
-                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![50, 300]))),
+                (
+                    "_1".into(),
+                    Tile::Scalar(ColumnValue::Ints(vec![50, 300].into())),
+                ),
             ]))),
             Predicate::True,
             BitSet::new(),
@@ -1141,7 +1150,7 @@ fn per_region_product(fields: &[(&str, [i64; 2])]) -> Tile {
             .map(|(name, column)| {
                 (
                     SmolStr::from(*name),
-                    Tile::Scalar(ColumnValue::Ints(column.to_vec())),
+                    Tile::Scalar(ColumnValue::Ints(column.to_vec().into())),
                 )
             })
             .collect(),
@@ -1154,7 +1163,7 @@ fn per_region_product(fields: &[(&str, [i64; 2])]) -> Tile {
 fn a_bare_filtered_per_group_aggregate_keeps_its_filter() {
     check_tile(
         &per_region_program("sum([s.amount for s in g if s.qty > 2])"),
-        per_region(Tile::Scalar(ColumnValue::Ints(vec![0, 200]))),
+        per_region(Tile::Scalar(ColumnValue::Ints(vec![0, 200].into()))),
     );
 }
 

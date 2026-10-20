@@ -804,7 +804,7 @@ pub(crate) fn one_key_store(
         state: Box::new(Tile::record(HashMap::from([(
             SmolStr::from(key),
             Tile::data_function(
-                ColumnValue::UInts(positions),
+                ColumnValue::UInts(positions.into()),
                 Box::new(Tile::Scalar(values)),
                 Predicate::False,
                 BitSet::new(),
@@ -814,7 +814,7 @@ pub(crate) fn one_key_store(
             SmolStr::from(key),
             Tile::Scalar(ColumnValue::Units(0)),
         )]))),
-        decided: Box::new(one_row_decided(ColumnValue::UInts(decided))),
+        decided: Box::new(one_row_decided(ColumnValue::UInts(decided.into()))),
         frontier: Box::new(one_row_decided(ColumnValue::UInts(
             watermark.into_iter().collect(),
         ))),
@@ -838,7 +838,7 @@ mod tests {
     }
 
     fn uints(values: &[u64]) -> ColumnValue {
-        ColumnValue::UInts(values.to_vec())
+        ColumnValue::UInts(values.to_vec().into())
     }
 
     fn collection(domain: &[u64], values: &[&str], deleted: &[usize]) -> Tile {

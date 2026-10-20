@@ -211,7 +211,7 @@ pub fn check_compile_error(code: &str, needle: &str) {
 pub(crate) fn make_int_list(v: &[i64]) -> Tile {
     Tile::data_function(
         ColumnValue::uints_from_rows(0..v.len()),
-        Box::new(Tile::Scalar(ColumnValue::Ints(v.into()))),
+        Box::new(Tile::Scalar(ColumnValue::Ints(v.to_vec().into()))),
         Predicate::True,
         BitSet::new(),
     )

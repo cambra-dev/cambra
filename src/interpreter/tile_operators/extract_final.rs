@@ -396,7 +396,7 @@ mod tests {
         fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1, 2]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30].into()))),
                 Predicate::False,
                 bit_set::BitSet::new(),
             )

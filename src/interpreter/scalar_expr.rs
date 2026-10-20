@@ -519,7 +519,7 @@ mod tests {
         let ColumnValue::Bools(bits) = column else {
             panic!("expected a Bool column, got {column:?}")
         };
-        bits
+        bits.into_vec()
     }
 
     #[test]
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(fused.codomain, Extent::Base(BaseType::Bool));
         let out = fused
             .program
-            .eval(&ColumnValue::Ints(vec![100, 600, 1499, 1500, 2000]));
+            .eval(&ColumnValue::Ints(vec![100, 600, 1499, 1500, 2000].into()));
         assert_eq!(bools(out), [false, true, true, false, false]);
     }
 
@@ -547,8 +547,8 @@ mod tests {
         ];
         let fused = fuse_prefix(&chain, &int()).unwrap();
         assert_eq!(
-            fused.program.eval(&ColumnValue::Ints(vec![1, 2, 3])),
-            ColumnValue::Ints(vec![2, 6, 12])
+            fused.program.eval(&ColumnValue::Ints(vec![1, 2, 3].into())),
+            ColumnValue::Ints(vec![2, 6, 12].into())
         );
     }
 
@@ -569,8 +569,8 @@ mod tests {
         // The input, the constant, the sum and the product.
         assert_eq!(fused.program.instrs.len(), 4, "{}", fused.program);
         assert_eq!(
-            fused.program.eval(&ColumnValue::Ints(vec![1, 2, 3])),
-            ColumnValue::Ints(vec![4, 9, 16])
+            fused.program.eval(&ColumnValue::Ints(vec![1, 2, 3].into())),
+            ColumnValue::Ints(vec![4, 9, 16].into())
         );
     }
 
@@ -616,7 +616,7 @@ mod tests {
                     tuple_field(0),
                     ColumnValue::Ints((0..n as i64).map(|i| i % 2).collect()),
                 ),
-                (tuple_field(1), ColumnValue::Ints(vec![2; n])),
+                (tuple_field(1), ColumnValue::Ints(vec![2; n].into())),
             ]
             .into_iter()
             .collect(),
@@ -631,10 +631,10 @@ mod tests {
         let sub = binop(BinOpKind::Arithmetic(ArithmeticKind::Sub));
         let left = vec![zip(vec![constant(7), id()]), sub.clone()];
         let right = vec![zip(vec![id(), constant(7)]), sub];
-        let input = || ColumnValue::Ints(vec![1, 10]);
+        let input = || ColumnValue::Ints(vec![1, 10].into());
         let eval = |chain: &[Expr]| fuse_prefix(chain, &int()).unwrap().program.eval(&input());
-        assert_eq!(eval(&left), ColumnValue::Ints(vec![6, -3]));
-        assert_eq!(eval(&right), ColumnValue::Ints(vec![-6, 3]));
+        assert_eq!(eval(&left), ColumnValue::Ints(vec![6, -3].into()));
+        assert_eq!(eval(&right), ColumnValue::Ints(vec![-6, 3].into()));
     }
 
     #[test]
@@ -649,13 +649,16 @@ mod tests {
         let fused = fuse_prefix(&chain, &record).unwrap();
         let input = ColumnValue::Records(
             [
-                (tuple_field(0), ColumnValue::Ints(vec![1, 2])),
-                (tuple_field(1), ColumnValue::Ints(vec![10, 20])),
+                (tuple_field(0), ColumnValue::Ints(vec![1, 2].into())),
+                (tuple_field(1), ColumnValue::Ints(vec![10, 20].into())),
             ]
             .into_iter()
             .collect(),
         );
-        assert_eq!(fused.program.eval(&input), ColumnValue::Ints(vec![11, 22]));
+        assert_eq!(
+            fused.program.eval(&input),
+            ColumnValue::Ints(vec![11, 22].into())
+        );
     }
 
     /// Fusing one operation would replace one operator with one.
@@ -667,8 +670,8 @@ mod tests {
         let fused = fuse_prefix(&[zip(vec![id(), constant(1)]), add], &int()).unwrap();
         assert_eq!(fused.consumed, 2);
         assert_eq!(
-            fused.program.eval(&ColumnValue::Ints(vec![1, 2])),
-            ColumnValue::Ints(vec![2, 3])
+            fused.program.eval(&ColumnValue::Ints(vec![1, 2].into())),
+            ColumnValue::Ints(vec![2, 3].into())
         );
         assert!(fuse_prefix(&[Expr::builtin(Builtin::Neg)], &int()).is_none());
         let bools = Extent::Base(BaseType::Bool);
@@ -690,16 +693,20 @@ mod tests {
         let fused = fuse_prefix(&chain, &int()).expect("two operations");
         assert_eq!(fused.consumed, 2);
         assert_eq!(
-            fused.program.eval(&ColumnValue::Ints(vec![1, -2, 3])),
-            ColumnValue::Ints(vec![1, -2, 3])
+            fused
+                .program
+                .eval(&ColumnValue::Ints(vec![1, -2, 3].into())),
+            ColumnValue::Ints(vec![1, -2, 3].into())
         );
         let bools = Extent::Base(BaseType::Bool);
         let chain = vec![Expr::builtin(Builtin::NotFn), Expr::builtin(Builtin::NotFn)];
         let fused = fuse_prefix(&chain, &bools).expect("two operations");
         let input = vec![true, false, true];
         assert_eq!(
-            fused.program.eval(&ColumnValue::Bools(input.clone())),
-            ColumnValue::Bools(input)
+            fused
+                .program
+                .eval(&ColumnValue::Bools(input.clone().into())),
+            ColumnValue::Bools(input.into())
         );
     }
 
@@ -754,8 +761,8 @@ mod tests {
         let abandoned = fuse_prefix(&abandoned, &int()).unwrap().program;
         assert_eq!(abandoned, plain);
         assert_eq!(
-            plain.eval(&ColumnValue::Ints(vec![1, 2])),
-            ColumnValue::Ints(vec![2, 3])
+            plain.eval(&ColumnValue::Ints(vec![1, 2].into())),
+            ColumnValue::Ints(vec![2, 3].into())
         );
     }
 
@@ -822,8 +829,10 @@ mod tests {
         let fused = fuse_prefix(&chain, &Extent::Base(BaseType::Bool)).unwrap();
         let input: Vec<bool> = (0..2 * BLOCK_ROWS + 5).map(|i| i % 3 == 0).collect();
         assert_eq!(
-            fused.program.eval(&ColumnValue::Bools(input.clone())),
-            ColumnValue::Bools(input)
+            fused
+                .program
+                .eval(&ColumnValue::Bools(input.clone().into())),
+            ColumnValue::Bools(input.into())
         );
     }
 

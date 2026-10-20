@@ -7048,9 +7048,15 @@ mod tests {
         let (name_ticks, name_values) = tile.store_changelog("name").expect("a key");
         let (count_ticks, count_values) = tile.store_changelog("count").expect("a key");
         assert!(name_ticks.is_empty(), "nothing wrote `name` after its seed");
-        assert_eq!(*name_values, Tile::Scalar(ColumnValue::Strings(Vec::new())));
+        assert_eq!(
+            *name_values,
+            Tile::Scalar(ColumnValue::Strings(Vec::new().into()))
+        );
         assert_eq!(*count_ticks, ColumnValue::from_uints(vec![1]));
-        assert_eq!(*count_values, Tile::Scalar(ColumnValue::Ints(vec![1])));
+        assert_eq!(
+            *count_values,
+            Tile::Scalar(ColumnValue::Ints(vec![1].into()))
+        );
         let Tile::Store { seed, .. } = &tile else {
             panic!("a render is a store: {tile:?}")
         };
@@ -7059,9 +7065,12 @@ mod tests {
         };
         assert_eq!(
             seeds["name"],
-            Tile::Scalar(ColumnValue::Strings(vec!["a".into()]))
+            Tile::Scalar(ColumnValue::Strings(vec!["a".into()].into()))
         );
-        assert_eq!(seeds["count"], Tile::Scalar(ColumnValue::Ints(vec![0])));
+        assert_eq!(
+            seeds["count"],
+            Tile::Scalar(ColumnValue::Ints(vec![0].into()))
+        );
     }
 
     /// Position-driven induction: `x := 0; for i in [1,2,3,4]: if i > 2: x += i`.
@@ -9810,7 +9819,7 @@ mod tests {
             None
         );
         assert_eq!(
-            store_frontier(&Tile::Scalar(ColumnValue::Ints(vec![1]))),
+            store_frontier(&Tile::Scalar(ColumnValue::Ints(vec![1].into()))),
             None
         );
     }
@@ -10634,7 +10643,7 @@ mod tests {
                 Box::new(Tile::grouped(
                     vec![0, 1],
                     ColumnValue::from_uints(vec![0, 0]),
-                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8].into()))),
                     Predicate::False,
                     BitSet::new(),
                 )),

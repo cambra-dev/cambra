@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn release_extent_bounded_intervals_predicate() {
         // Release {2, 3} ∪ {7} from [0, 9].
-        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3, 7]));
+        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3, 7].into()));
         let mut extent = Extent::uint_range(10);
         release_extent(&mut extent, &p, "");
         let s = uint_range_set(&extent);
@@ -507,8 +507,9 @@ mod tests {
     /// extent: `[0, 3] ∪ {7}`.
     #[test]
     fn release_extent_prefix_and_point_predicate() {
-        let p = Predicate::at_or_below(Value::UInt(3))
-            .union(&Predicate::from_column_value(&ColumnValue::UInts(vec![7])));
+        let p = Predicate::at_or_below(Value::UInt(3)).union(&Predicate::from_column_value(
+            &ColumnValue::UInts(vec![7].into()),
+        ));
 
         let mut extent = Extent::uint_range(10); // [0, 9]
         release_extent(&mut extent, &p, "");

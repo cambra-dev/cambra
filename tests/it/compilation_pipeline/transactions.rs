@@ -291,7 +291,7 @@ fn check_compile_error(code: &str, needle: &str) {
     1020
 )]
 fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected].into())));
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +426,7 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
     61403
 )]
 fn test_multi_variable_transactions(#[case] code: &str, #[case] expected: i64) {
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected].into())));
 }
 
 // ---------------------------------------------------------------------------
@@ -439,8 +439,8 @@ fn test_multi_variable_transactions(#[case] code: &str, #[case] expected: i64) {
 /// *committed* transaction, so a denied commit contributes no tick.
 fn commit_stream(ticks: &[u64], values: &[i64]) -> Tile {
     Tile::data_function(
-        ColumnValue::UInts(ticks.to_vec()),
-        Box::new(Tile::Scalar(ColumnValue::Ints(values.to_vec()))),
+        ColumnValue::UInts(ticks.to_vec().into()),
+        Box::new(Tile::Scalar(ColumnValue::Ints(values.to_vec().into()))),
         Predicate::True,
         BitSet::new(),
     )
@@ -597,7 +597,7 @@ fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
     8
 )]
 fn a_sum_inside_a_product_enters_its_declared_sum(#[case] code: &str, #[case] expected: i64) {
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected].into())));
 }
 
 /// The same shape over a **one-key** map does not compile: the map's key domain acquires a second
@@ -635,7 +635,7 @@ fn a_one_key_map_inside_a_product_does_not_compile() {
                     s := (a=s.a + 1, b=box(map([("z", 3)])))
             await_final(s).a
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![8])),
+        Tile::Scalar(ColumnValue::Ints(vec![8].into())),
     );
 }
 
@@ -764,7 +764,7 @@ fn bool_valued_store() {
                     flag := True
             await_final(flag)
         "#},
-        Tile::Scalar(ColumnValue::Bools(vec![true; 1])),
+        Tile::Scalar(ColumnValue::Bools(vec![true; 1].into())),
     );
 }
 
@@ -779,7 +779,7 @@ fn string_valued_store() {
                     name := "bob"
             await_final(name)
         "#},
-        Tile::Scalar(ColumnValue::Strings(vec![SmolStr::new("bob")])),
+        Tile::Scalar(ColumnValue::Strings(vec![SmolStr::new("bob")].into())),
     );
 }
 
@@ -815,14 +815,14 @@ fn two_reply_feeds_one_transaction() {
         // collection of pairs, which is what zipping the two would have made.
         Tile::tuple(vec![
             Tile::data_function(
-                ColumnValue::UInts(vec![1, 2, 3]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6]))),
+                ColumnValue::UInts(vec![1, 2, 3].into()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6].into()))),
                 Predicate::True,
                 BitSet::new(),
             ),
             Tile::data_function(
-                ColumnValue::UInts(vec![1, 2, 3]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 14]))),
+                ColumnValue::UInts(vec![1, 2, 3].into()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 14].into()))),
                 Predicate::True,
                 BitSet::new(),
             ),
@@ -854,8 +854,8 @@ fn reply_feed_under_one_route_does_not_overfire() {
             out
         "#},
         Tile::data_function(
-            ColumnValue::UInts(vec![2, 3]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            ColumnValue::UInts(vec![2, 3].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3].into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -890,9 +890,12 @@ fn both_arms_feed_in_committing_block() {
         Tile::data_function(
             ColumnValue::positional_union(
                 &[0, 0, 1],
-                vec![ColumnValue::UInts(vec![2, 3]), ColumnValue::UInts(vec![1])],
+                vec![
+                    ColumnValue::UInts(vec![2, 3].into()),
+                    ColumnValue::UInts(vec![1].into()),
+                ],
             ),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0].into()))),
             Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
@@ -921,8 +924,8 @@ fn ryw_of_conditionally_written_key_after_case() {
             out
         "#},
         Tile::data_function(
-            ColumnValue::UInts(vec![1, 2, 3]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 10, 20]))),
+            ColumnValue::UInts(vec![1, 2, 3].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 10, 20].into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -949,8 +952,8 @@ fn conditional_reply_in_readonly_block() {
             resp
         "#},
         Tile::data_function(
-            ColumnValue::UInts(vec![1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 100]))),
+            ColumnValue::UInts(vec![1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 100].into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -978,9 +981,12 @@ fn conditional_if_else_reply_in_readonly_block() {
         Tile::data_function(
             ColumnValue::positional_union(
                 &[0, 0, 1],
-                vec![ColumnValue::UInts(vec![1, 2]), ColumnValue::UInts(vec![0])],
+                vec![
+                    ColumnValue::UInts(vec![1, 2].into()),
+                    ColumnValue::UInts(vec![0].into()),
+                ],
             ),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0].into()))),
             Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
@@ -1140,7 +1146,7 @@ fn sustained_contention_conserves_pool() {
                 pool := pool - r
         await_final(pool)
     "};
-    check_tile(&code, Tile::Scalar(ColumnValue::Ints(vec![980])));
+    check_tile(&code, Tile::Scalar(ColumnValue::Ints(vec![980].into())));
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,7 +1183,7 @@ fn await_final_and_as_of_read_the_same_mut_var() {
     // 100 − 10 − 20 = 70, and it is the *completed* value, not a sample of it.
     assert_eq!(
         fields.get("_1"),
-        Some(&Tile::Scalar(ColumnValue::Ints(vec![70])))
+        Some(&Tile::Scalar(ColumnValue::Ints(vec![70].into())))
     );
     assert!(
         fields.get("_0").is_some_and(|t| !t.is_empty()),
@@ -1248,7 +1254,7 @@ fn await_final_bound_then_computed_with() {
             final = await_final(pool)
             final * 2
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![80])),
+        Tile::Scalar(ColumnValue::Ints(vec![80].into())),
     );
 }
 
@@ -1266,7 +1272,7 @@ fn await_final_of_an_all_deny_history_is_the_seed() {
                         pool := pool - r
             await_final(pool)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![5])),
+        Tile::Scalar(ColumnValue::Ints(vec![5].into())),
     );
 }
 
@@ -1280,7 +1286,7 @@ fn await_final_of_a_writer_free_mut_var_is_the_seed() {
             pool: Mut(Int, Txn) := 100
             await_final(pool)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![100])),
+        Tile::Scalar(ColumnValue::Ints(vec![100].into())),
     );
 }
 
@@ -1299,7 +1305,7 @@ fn await_final_mixes_a_writer_free_mut_var_with_a_written_one() {
                     pool := pool - r
             await_final(pool) * 100 + await_final(spare)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![9007])),
+        Tile::Scalar(ColumnValue::Ints(vec![9007].into())),
     );
 }
 
@@ -1364,7 +1370,7 @@ fn await_final_permits_a_later_block_on_another_mut_var() {
                     b := b + r
             fa * 100 + await_final(b)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![9005])),
+        Tile::Scalar(ColumnValue::Ints(vec![9005].into())),
     );
 }
 
@@ -1386,7 +1392,7 @@ fn await_final_permits_a_later_writer_source_binding() {
                     b := b + r
             fa * 100 + await_final(b)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![9003])),
+        Tile::Scalar(ColumnValue::Ints(vec![9003].into())),
     );
 }
 
@@ -1405,7 +1411,7 @@ fn induction_accumulator_seeded_from_an_await() {
                 x := x + i
             x
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![73])),
+        Tile::Scalar(ColumnValue::Ints(vec![73].into())),
     );
 }
 
@@ -1630,7 +1636,7 @@ fn a_mut_var_seeded_from_another_store_s_final_value() {
         await_final(b)
     "#};
     assert_eq!(commit_stores(code), vec!["Txn[a]", "Txn[b]"]);
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![3])));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![3].into())));
 }
 
 /// Phase separation through a writer's **iteration source** rather than a seed: the
@@ -1653,7 +1659,7 @@ fn a_writer_source_computed_from_another_store_s_final_value() {
         await_final(b)
     "#};
     assert_eq!(commit_stores(code), vec!["Txn[a]", "Txn[b]"]);
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![183])));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![183].into())));
 }
 
 /// A refusal, and what reaching one takes: the await must reach a writer of its **own**
@@ -1851,8 +1857,11 @@ fn unrelated_mut_vars_get_separate_stores() {
     check_tile(
         code,
         Tile::record(std::collections::HashMap::from([
-            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
-            ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![30]))),
+            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3].into()))),
+            (
+                "_1".into(),
+                Tile::Scalar(ColumnValue::Ints(vec![30].into())),
+            ),
         ])),
     );
 }
@@ -1872,7 +1881,7 @@ fn registers_written_in_one_block_share_a_store() {
         await_final(a) * 100 + await_final(b)
     "#};
     assert_eq!(commit_stores(code), vec!["Txn[a,b]"]);
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![297])));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![297].into())));
 }
 
 /// **Snapshot consistency** holds a store together too, and writes alone do not show it:
@@ -1920,7 +1929,7 @@ fn a_mut_var_read_by_a_writing_block_joins_its_store() {
         await_final(total)
     "#};
     assert_eq!(commit_stores(code), vec!["Txn[total,limit]"]);
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![10])));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![10].into())));
 }
 
 /// A mutable variable **no block writes** is not a store key. Nothing can advance it, so its
@@ -1967,7 +1976,7 @@ fn a_defer_fed_inside_a_store_is_consumed_inside_it() {
         t = sum(out)
         t
     "#};
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![4])));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![4].into())));
 }
 
 /// The same, for the feed of a **read-only** block. That block is unwrapped onto the
@@ -2019,8 +2028,11 @@ fn a_cross_domain_read_coexists_with_a_second_store() {
     check_tile(
         code,
         Tile::record(std::collections::HashMap::from([
-            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
-            ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![30]))),
+            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3].into()))),
+            (
+                "_1".into(),
+                Tile::Scalar(ColumnValue::Ints(vec![30].into())),
+            ),
         ])),
     );
 }
@@ -2046,7 +2058,7 @@ fn a_cross_domain_read_carries_across_the_positions_that_did_not_write_it() {
         await_final(a)
     "#};
     assert_eq!(commit_stores(code), vec!["[0, 3][cnt]", "Txn[a]"]);
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![3])));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![3].into())));
 }
 
 /// **Phase separation through a writer's iteration source.** The extent of `b`'s block
@@ -2070,7 +2082,7 @@ fn a_writer_source_may_be_computed_from_an_earlier_store_s_await() {
         await_final(b)
     "#};
     assert_eq!(commit_stores(code), vec!["Txn[a]", "Txn[b]"]);
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![183])));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![183].into())));
 }
 
 /// A cross-domain accumulator that itself **depends on an await** does not go
@@ -2100,7 +2112,7 @@ fn a_cross_domain_accumulator_depending_on_an_await_nests_inside_that_store() {
         await_final(b)
     "#};
     assert_eq!(commit_stores(code), vec!["Txn[a]", "[0, 1][acc]", "Txn[b]"]);
-    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![92])));
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![92].into())));
 }
 
 /// A finite mutable variable completes even though an unrelated one never does.
@@ -2152,7 +2164,7 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     };
     assert_eq!(
         fields.get("_0"),
-        Some(&Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        Some(&Tile::Scalar(ColumnValue::Ints(vec![3].into()))),
         "the finite mutable variable's completion read must settle; got {result:?}"
     );
     assert!(
@@ -2213,7 +2225,7 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     };
     assert_eq!(
         fields.get("_0"),
-        Some(&Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        Some(&Tile::Scalar(ColumnValue::Ints(vec![3].into()))),
         "`a`'s writers have all drained, so its completion read must settle even though \
          its store-mate `b` is still committing; got {result:?}"
     );
@@ -2266,7 +2278,7 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
     let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
     assert_eq!(
         result,
-        Tile::Scalar(ColumnValue::Ints(vec![100])),
+        Tile::Scalar(ColumnValue::Ints(vec![100].into())),
         "nothing writes `limit`, so its terminal read is its initializer even though \
          `total`'s live writer keeps the store open; got {result:?}"
     );
@@ -2473,7 +2485,7 @@ fn tx_if_else_routes_across_keys() {
                         b := b + x
             await_final(a) + await_final(b)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![6])),
+        Tile::Scalar(ColumnValue::Ints(vec![6].into())),
     );
 }
 
@@ -2499,7 +2511,7 @@ fn tx_if_else_absolute_writes_route_across_keys() {
                         b := 6
             await_final(a) + await_final(b)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![11])),
+        Tile::Scalar(ColumnValue::Ints(vec![11].into())),
     );
 }
 
@@ -2521,7 +2533,7 @@ fn tx_if_elif_first_match() {
                         a := a + 1
             await_final(a)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![4])),
+        Tile::Scalar(ColumnValue::Ints(vec![4].into())),
     );
 }
 
@@ -2542,7 +2554,7 @@ fn tx_if_elif_leading_deny() {
                         a := a + 1
             await_final(a)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![4])),
+        Tile::Scalar(ColumnValue::Ints(vec![4].into())),
     );
 }
 
@@ -2565,7 +2577,7 @@ fn multiple_if_guards_route_independently() {
                         b := b + r
             await_final(a)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![5])),
+        Tile::Scalar(ColumnValue::Ints(vec![5].into())),
     );
 }
 
@@ -2803,7 +2815,7 @@ fn like_named_comprehension_var_does_not_panic() {
                     store := store - sum([store for store in [1, 2, 3]])
             await_final(store)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![94])),
+        Tile::Scalar(ColumnValue::Ints(vec![94].into())),
     );
 }
 
@@ -2867,7 +2879,7 @@ fn mixed_txn_and_induction_store_accumulates() {
                 cnt := cnt + 1
             await_final(store)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![60])),
+        Tile::Scalar(ColumnValue::Ints(vec![60].into())),
     );
 }
 
@@ -2910,7 +2922,7 @@ fn mixed_txn_and_induction_write_inside_block_store_accumulates() {
                     cnt := cnt + 1
             await_final(store)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![60])),
+        Tile::Scalar(ColumnValue::Ints(vec![60].into())),
     );
 }
 
@@ -2936,7 +2948,7 @@ fn induction_write_in_block_leaves_no_read_of_its_accumulator() {
                 cnt := cnt + 1
             cnt
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![4])),
+        Tile::Scalar(ColumnValue::Ints(vec![4].into())),
     );
 }
 
@@ -2961,7 +2973,7 @@ fn two_txn_loops_lifting_writes_to_one_accumulator() {
                     cnt := cnt + 1
             await_final(store)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![10])),
+        Tile::Scalar(ColumnValue::Ints(vec![10].into())),
     );
 }
 
@@ -2986,7 +2998,7 @@ fn induction_write_reads_a_binding_made_after_the_write() {
                     cnt2 := cnt2 + y
             cnt2
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![60])),
+        Tile::Scalar(ColumnValue::Ints(vec![60].into())),
     );
 }
 
@@ -3008,7 +3020,7 @@ fn commit_decision_reads_induction_accumulator() {
                     store := store + cnt
             await_final(store)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![6])),
+        Tile::Scalar(ColumnValue::Ints(vec![6].into())),
     );
 }
 
@@ -3350,7 +3362,7 @@ fn cross_function_transfer_conserves_total() {
             transfer(a, b, 30)
             await_final(a) + await_final(b)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![100])),
+        Tile::Scalar(ColumnValue::Ints(vec![100].into())),
     );
 }
 
@@ -3373,7 +3385,7 @@ fn heterogeneous_multi_key_store_reads_string_key() {
                     label := "seen"
             await_final(label)
         "#},
-        Tile::Scalar(ColumnValue::Strings(vec![SmolStr::new("seen")])),
+        Tile::Scalar(ColumnValue::Strings(vec![SmolStr::new("seen")].into())),
     );
 }
 
@@ -3411,7 +3423,7 @@ fn txn_off_path_guarded_division_does_not_fault() {
                         d := d - 3
             await_final(acc)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![33])),
+        Tile::Scalar(ColumnValue::Ints(vec![33].into())),
     );
 }
 
@@ -3440,7 +3452,7 @@ fn interleaved_two_writer_commit_abort_through_store() {
                         pool := pool - r
             await_final(pool)
         "#},
-        Tile::Scalar(ColumnValue::Ints(vec![70])),
+        Tile::Scalar(ColumnValue::Ints(vec![70].into())),
     );
 }
 
@@ -3990,6 +4002,6 @@ fn a_transactional_variable_seeds_from_a_long_loops_result(#[case] n: i64, #[cas
             "#},
             items = items,
         ),
-        Tile::Scalar(ColumnValue::Ints(vec![expect])),
+        Tile::Scalar(ColumnValue::Ints(vec![expect].into())),
     );
 }

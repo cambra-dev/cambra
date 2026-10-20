@@ -189,7 +189,7 @@ impl UIntStreamBuffer {
                 ),
             }
         }
-        ColumnValue::UInts(indices)
+        ColumnValue::UInts(indices.into())
     }
 
     /// Record where producers registering from now on start: the intersection

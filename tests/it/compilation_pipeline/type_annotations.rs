@@ -1033,8 +1033,8 @@ ys = [i for i in xs if i > 1]
 ys
         "#},
         Tile::data_function(
-            ColumnValue::UInts(vec![1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            ColumnValue::UInts(vec![1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3].into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -1053,10 +1053,10 @@ ys
         "#},
         Tile::data_function(
             ColumnValue::Records(HashMap::from([
-                ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1])),
-                ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1])),
+                ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1].into())),
+                ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1].into())),
             ])),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![9, 10, 10, 11]))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![9, 10, 10, 11].into()))),
             Predicate::Record(HashMap::from([
                 ("_0".into(), Predicate::True),
                 ("_1".into(), Predicate::True),

@@ -276,14 +276,14 @@ mod tests {
         let mut probes = ProbeTable::with_defaults();
         let node = NodeId::fresh();
         let partial = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             Box::new(Tile::Scalar(strings(&["a", "b"]))),
             Predicate::at_or_below(CellValue::UInt(1)),
             BitSet::new(),
         );
         probes.observe(Some(node), 1, "IterateExtent#1", &partial, &released(None));
         let terminal = Tile::data_function(
-            ColumnValue::UInts(Vec::new()),
+            ColumnValue::UInts(Vec::new().into()),
             Box::new(Tile::Scalar(strings(&[]))),
             Predicate::True,
             BitSet::new(),
@@ -351,7 +351,7 @@ mod tests {
                 1,
                 "FanIn#1",
                 &Tile::data_function(
-                    ColumnValue::UInts(vec![0]),
+                    ColumnValue::UInts(vec![0].into()),
                     Box::new(Tile::record(fields)),
                     Predicate::True,
                     BitSet::new(),
@@ -385,7 +385,7 @@ mod tests {
             vec![ids[0]],
             "stdin",
             1,
-            &ColumnValue::UInts(vec![1]),
+            &ColumnValue::UInts(vec![1].into()),
             &strings(&["b"]),
         );
 

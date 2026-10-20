@@ -1240,11 +1240,11 @@ mod tests {
         );
         let (fn_spy, released) = ReleaseSpy::new(
             Tile::data_function(
-                ColumnValue::UInts(vec![0]),
+                ColumnValue::UInts(vec![0].into()),
                 Box::new(Tile::grouped(
                     vec![0],
-                    ColumnValue::UInts(vec![1]),
-                    Box::new(Tile::Scalar(ColumnValue::UInts(vec![1]))),
+                    ColumnValue::UInts(vec![1].into()),
+                    Box::new(Tile::Scalar(ColumnValue::UInts(vec![1].into()))),
                     Predicate::False,
                     BitSet::new(),
                 )),
@@ -1256,7 +1256,7 @@ mod tests {
         let input = TestTileProducer::new(
             Tile::data_function(
                 ColumnValue::from_uints(vec![0]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1].into()))),
                 Predicate::True,
                 BitSet::new(),
             ),
@@ -1308,11 +1308,11 @@ mod tests {
 
         // Create a DataFunction tile
         let two_level_fn_tile = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             Box::new(Tile::grouped(
                 vec![0, 2],
-                ColumnValue::UInts(vec![10, 20, 30]),
-                Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200, 300]))),
+                ColumnValue::UInts(vec![10, 20, 30].into()),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200, 300].into()))),
                 Predicate::False,
                 BitSet::new(),
             )),
@@ -1330,8 +1330,8 @@ mod tests {
 
         // Create a DataFunction tile with unsorted domain
         let one_level_fn_tile = Tile::data_function(
-            ColumnValue::UInts(vec![2, 0, 1]),
-            Box::new(Tile::Scalar(ColumnValue::UInts(vec![1, 0, 1]))),
+            ColumnValue::UInts(vec![2, 0, 1].into()),
+            Box::new(Tile::Scalar(ColumnValue::UInts(vec![1, 0, 1].into()))),
             Predicate::True,
             BitSet::new(),
         );
@@ -1438,13 +1438,13 @@ mod tests {
     ///   `input` (i.e. {0}), should be true in the output domain_predicate.
     #[test]
     fn map_result_producer_two_levels_domain_predicate() {
-        let f_pred = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
+        let f_pred = Predicate::from_column_value(&ColumnValue::UInts(vec![0].into()));
         let two_level_fn_tile = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             Box::new(Tile::grouped(
                 vec![0, 1],
-                ColumnValue::UInts(vec![10, 20]),
-                Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200]))),
+                ColumnValue::UInts(vec![10, 20].into()),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200].into()))),
                 Predicate::False,
                 BitSet::new(),
             )),
@@ -1460,8 +1460,8 @@ mod tests {
         );
 
         let one_level_fn_tile = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1, 2, 3]),
-            Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1, 2, 3]))),
+            ColumnValue::UInts(vec![0, 1, 2, 3].into()),
+            Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1, 2, 3].into()))),
             Predicate::True,
             BitSet::new(),
         );
@@ -1514,11 +1514,11 @@ mod tests {
     #[test]
     fn map_result_producer_two_levels_domain_predicate_both_true() {
         let two_level_fn_tile = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             Box::new(Tile::grouped(
                 vec![0, 1],
-                ColumnValue::UInts(vec![10, 20]),
-                Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200]))),
+                ColumnValue::UInts(vec![10, 20].into()),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200].into()))),
                 Predicate::False,
                 BitSet::new(),
             )),
@@ -1533,8 +1533,8 @@ mod tests {
             ),
         );
         let one_level_fn_tile = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
-            Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1]))),
+            ColumnValue::UInts(vec![0, 1].into()),
+            Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1].into()))),
             Predicate::True,
             BitSet::new(),
         );
@@ -1590,15 +1590,15 @@ mod tests {
         let out_tiling = Tiling::data_function(uint(), value_tiling);
         // f = {5 ↦ (n: 1, xs: [7 ↦ 70])}, complete at every level.
         let f = Tile::data_function(
-            ColumnValue::UInts(vec![5]),
+            ColumnValue::UInts(vec![5].into()),
             Box::new(Tile::record(HashMap::from([
-                ("n".into(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                ("n".into(), Tile::Scalar(ColumnValue::Ints(vec![1].into()))),
                 (
                     "xs".into(),
                     Tile::grouped(
                         vec![0],
-                        ColumnValue::UInts(vec![7]),
-                        Box::new(Tile::Scalar(ColumnValue::UInts(vec![70]))),
+                        ColumnValue::UInts(vec![7].into()),
+                        Box::new(Tile::Scalar(ColumnValue::UInts(vec![70].into()))),
                         Predicate::True,
                         BitSet::new(),
                     ),
@@ -1611,8 +1611,8 @@ mod tests {
         let input_at = |keys: Vec<u64>, upto: u64| {
             let n = keys.len();
             Tile::data_function(
-                ColumnValue::UInts(keys),
-                Box::new(Tile::Scalar(ColumnValue::UInts(vec![5; n]))),
+                ColumnValue::UInts(keys.into()),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![5; n].into()))),
                 Predicate::at_or_below(Value::UInt(upto)),
                 BitSet::new(),
             )
@@ -1676,11 +1676,11 @@ mod tests {
         );
         // Outer row 0 is open; its inner rows 0 and 1 (arguments 5 and 6) are complete.
         let input = Tile::data_function(
-            ColumnValue::UInts(vec![0]),
+            ColumnValue::UInts(vec![0].into()),
             Box::new(Tile::grouped(
                 vec![0],
-                ColumnValue::UInts(vec![0, 1]),
-                Box::new(Tile::Scalar(ColumnValue::UInts(vec![5, 6]))),
+                ColumnValue::UInts(vec![0, 1].into()),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![5, 6].into()))),
                 Predicate::qualified(
                     Predicate::point(Value::UInt(0)),
                     Predicate::at_or_below(Value::UInt(1)),
@@ -1692,10 +1692,10 @@ mod tests {
         );
         let f_at = |keys: Vec<u64>| {
             let vals: Vec<i64> = keys.iter().map(|k| *k as i64 * 10).collect();
-            let pred = Predicate::from_column_value(&ColumnValue::UInts(keys.clone()));
+            let pred = Predicate::from_column_value(&ColumnValue::UInts(keys.clone().into()));
             Tile::data_function(
-                ColumnValue::UInts(keys),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
+                ColumnValue::UInts(keys.into()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vals.into()))),
                 pred,
                 BitSet::new(),
             )
@@ -1736,11 +1736,11 @@ mod tests {
         let in_tiling =
             Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
         let groups = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             Box::new(Tile::grouped(
                 vec![0, 1],
-                ColumnValue::UInts(vec![0, 1, 2]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+                ColumnValue::UInts(vec![0, 1, 2].into()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3].into()))),
                 Predicate::True,
                 BitSet::new(),
             )),
@@ -1761,7 +1761,7 @@ mod tests {
             base: ProducerBase::unowned(MapResultToConstProducer::alloc_id(), operator.tiling()),
             input: Box::new(TestTileProducer::new(groups, in_tiling)),
             constant: Box::new(TestTileProducer::new(
-                Tile::Scalar(ColumnValue::Ints(vec![7])),
+                Tile::Scalar(ColumnValue::Ints(vec![7].into())),
                 Tiling::Scalar(int()),
             )),
             mode: MapResultToConstMode::Replace,
@@ -1771,8 +1771,8 @@ mod tests {
         assert_eq!(
             out,
             Tile::data_function(
-                ColumnValue::UInts(vec![0, 1]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 7]))),
+                ColumnValue::UInts(vec![0, 1].into()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 7].into()))),
                 Predicate::True,
                 BitSet::new(),
             )
@@ -1839,8 +1839,8 @@ mod tests {
         // Key 0 is filtered out (deleted); every other key is live.
         let input_at = |keys: Vec<u64>, vals: Vec<i64>, upto: u64| {
             Tile::data_function(
-                ColumnValue::UInts(keys),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
+                ColumnValue::UInts(keys.into()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vals.into()))),
                 Predicate::at_or_below(Value::UInt(upto)),
                 BitSet::from_iter([0usize]),
             )
@@ -1857,7 +1857,7 @@ mod tests {
             base: ProducerBase::unowned(MapResultToConstProducer::alloc_id(), &out_tiling),
             input: Box::new(input),
             constant: Box::new(TestTileProducer::new(
-                Tile::Scalar(ColumnValue::Ints(vec![])),
+                Tile::Scalar(ColumnValue::Ints(vec![].into())),
                 c_tiling,
             )),
             mode: MapResultToConstMode::Replace,
@@ -1903,11 +1903,11 @@ mod tests {
         );
         // Outer rows 0 and 1 are complete; each holds source key 10.
         let input = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             Box::new(Tile::grouped(
                 vec![0, 1],
-                ColumnValue::UInts(vec![10, 10]),
-                Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 10]))),
+                ColumnValue::UInts(vec![10, 10].into()),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 10].into()))),
                 inner_stated,
                 BitSet::new(),
             )),
@@ -1934,7 +1934,7 @@ mod tests {
         if one_guard {
             producer.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
                 TileGuard::Function(FunctionGuard::Domain(Predicate::qualified(
-                    Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1])),
+                    Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1].into())),
                     Predicate::point(Value::UInt(10)),
                 ))),
             ))));

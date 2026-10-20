@@ -6271,13 +6271,13 @@ mod variant_ctor_tests {
         let stream_tile = Tile::data_function(
             ColumnValue::from_uints(vec![0, 1]),
             Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
-                ("time".into(), ColumnValue::Ints(vec![10, 20])),
+                ("time".into(), ColumnValue::Ints(vec![10, 20].into())),
                 (
                     "decision".into(),
                     // Both rows carry `commit`, so the arm owns rows 0 and 1.
                     ColumnValue::Union(TagMap::from_arms(vec![(
                         FieldKey::Name("commit".into()),
-                        UnionArm::new(vec![0, 1], ColumnValue::Ints(vec![1, 2])),
+                        UnionArm::new(vec![0, 1], ColumnValue::Ints(vec![1, 2].into())),
                     )])),
                 ),
             ])))),
@@ -6310,9 +6310,12 @@ mod variant_ctor_tests {
         // payload (1, 2) — proving the by-key co-iteration.
         assert_eq!(
             fields["out_t"],
-            Tile::Scalar(ColumnValue::Ints(vec![10, 20]))
+            Tile::Scalar(ColumnValue::Ints(vec![10, 20].into()))
         );
-        assert_eq!(fields["out_w"], Tile::Scalar(ColumnValue::Ints(vec![1, 2])));
+        assert_eq!(
+            fields["out_w"],
+            Tile::Scalar(ColumnValue::Ints(vec![1, 2].into()))
+        );
     }
 
     /// **In-lambda `VariantCtor` composes** — the writer-decision shape. A
@@ -6400,7 +6403,7 @@ mod variant_ctor_tests {
         let stream_op: Box<dyn TileOperator> = Box::new(FixedStreamOp {
             tile: Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1]))),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1].into()))),
                 Predicate::True,
                 BitSet::new(),
             ),

@@ -709,8 +709,8 @@ mod tests {
         }
         Tile::grouped(
             starts,
-            ColumnValue::UInts(positions),
-            Box::new(Tile::Scalar(ColumnValue::Ints(elements))),
+            ColumnValue::UInts(positions.into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(elements.into()))),
             crate::interpreter::Predicate::True,
             bit_set::BitSet::new(),
         )
@@ -724,7 +724,7 @@ mod tests {
         // Row 0 is `{a: [1, 2]}`, row 1 is `{a: [3]}`.
         let level = Tile::grouped(
             vec![0, 1],
-            ColumnValue::Strings(vec!["a".into(), "a".into()]),
+            ColumnValue::Strings(vec!["a".into(), "a".into()].into()),
             Box::new(int_lists(&[&[1, 2], &[3]])),
             crate::interpreter::Predicate::True,
             bit_set::BitSet::new(),
@@ -735,7 +735,7 @@ mod tests {
             // does not.
             (
                 tuple_field(1),
-                Tile::Scalar(ColumnValue::Strings(vec!["a".into(), "b".into()])),
+                Tile::Scalar(ColumnValue::Strings(vec!["a".into(), "b".into()].into())),
             ),
             (tuple_field(2), int_lists(&[&[7], &[8, 9]])),
         ]));
@@ -755,7 +755,7 @@ mod tests {
         assert_eq!(row_starts, vec![0, 1]);
         assert_eq!(
             domain,
-            ColumnValue::Strings(vec!["a".into(), "a".into(), "b".into()])
+            ColumnValue::Strings(vec!["a".into(), "a".into(), "b".into()].into())
         );
         assert_eq!(*codomain, int_lists(&[&[7], &[3], &[8, 9]]));
     }
@@ -767,8 +767,8 @@ mod tests {
     fn apply_tile_writes_its_key_in_every_row() {
         let level = Tile::grouped(
             vec![0, 2],
-            ColumnValue::Strings(vec!["a".into(), "b".into(), "a".into()]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            ColumnValue::Strings(vec!["a".into(), "b".into(), "a".into()].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3].into()))),
             crate::interpreter::Predicate::True,
             bit_set::BitSet::new(),
         );
@@ -777,11 +777,11 @@ mod tests {
             // Row 0 writes `b`, which it holds; row 1 writes `c`, which it does not.
             (
                 tuple_field(1),
-                Tile::Scalar(ColumnValue::Strings(vec!["b".into(), "c".into()])),
+                Tile::Scalar(ColumnValue::Strings(vec!["b".into(), "c".into()].into())),
             ),
             (
                 tuple_field(2),
-                Tile::Scalar(ColumnValue::Ints(vec![20, 30])),
+                Tile::Scalar(ColumnValue::Ints(vec![20, 30].into())),
             ),
         ]));
         let Tile::DataFunction {
@@ -796,11 +796,11 @@ mod tests {
         assert_eq!(row_starts, vec![0, 2]);
         assert_eq!(
             domain,
-            ColumnValue::Strings(vec!["a".into(), "b".into(), "a".into(), "c".into()])
+            ColumnValue::Strings(vec!["a".into(), "b".into(), "a".into(), "c".into()].into())
         );
         assert_eq!(
             *codomain,
-            Tile::Scalar(ColumnValue::Ints(vec![1, 20, 3, 30]))
+            Tile::Scalar(ColumnValue::Ints(vec![1, 20, 3, 30].into()))
         );
     }
 }

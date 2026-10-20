@@ -24,7 +24,7 @@ x := 0
 for i in [1, 2, 3]:
     x += i
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![6]))
+    Tile::Scalar(ColumnValue::Ints(vec![6].into()))
 )]
 // A mutable variable seeded from a **computed** expression rather than a literal.
 //
@@ -41,7 +41,7 @@ x := r.a
 for i in [1, 2, 3]:
     x += i
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![6]))
+    Tile::Scalar(ColumnValue::Ints(vec![6].into()))
 )]
 // The same seed with **no writes at all**. The join has one member, so the mutable variable
 // keeps its seed's refinement — and that is correct, since it really does hold that
@@ -51,7 +51,7 @@ x"#,
 r = (a=7, b=9)
 x := r.a
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![7]))
+    Tile::Scalar(ColumnValue::Ints(vec![7].into()))
 )]
 // A mutable variable whose only write goes **through a `Mut` parameter**. The write is not
 // lexically visible at `x`, so the join needs the call itself to contribute: passing a
@@ -71,7 +71,7 @@ x := 0
 for i in [1, 2, 3]:
   fw(x)
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![3]))
+    Tile::Scalar(ColumnValue::Ints(vec![3].into()))
 )]
 // The same contribution at an argument position that is **not the first**. A call is
 // curried, and `apply` types each application as a fresh variable, so the type of the
@@ -87,7 +87,7 @@ x := 0
 for i in [1, 2, 3]:
   fw(2, x)
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![6]))
+    Tile::Scalar(ColumnValue::Ints(vec![6].into()))
 )]
 // Two mutable variables in one call: every argument position is walked, not just one.
 #[case(
@@ -101,8 +101,8 @@ for i in [1, 2, 3]:
   fw(x, y)
 (x, y)"#,
     Tile::record(HashMap::from([
-        ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
-        ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
+        ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3].into()))),
+        ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![6].into()))),
     ]))
 )]
 // A mutable variable reaching its writer through *two* calls. The inner call's contribution is
@@ -118,7 +118,7 @@ x := 0
 for i in [1, 2, 3]:
   outer(7, x)
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![3]))
+    Tile::Scalar(ColumnValue::Ints(vec![3].into()))
 )]
 // The `:=` operator marks mutability syntactically — a bare `x := 0` induction
 // accumulator (no `Mut(…)` annotation) written with `x := x + i`.
@@ -128,7 +128,7 @@ x := 0
 for i in [1, 2, 3]:
     x := x + i
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![6]))
+    Tile::Scalar(ColumnValue::Ints(vec![6].into()))
 )]
 // The accumulator's value type can be spelled concretely: `Mut(Int)`
 // annotates the binding at `Int` (checked against init and updates).
@@ -138,7 +138,7 @@ x: Mut(Int) := 0
 for i in [1, 2, 3]:
     x += i
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![6]))
+    Tile::Scalar(ColumnValue::Ints(vec![6].into()))
 )]
 #[case(
     r#"
@@ -146,7 +146,7 @@ x := 0
 for i in []:
     x += 1
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![0]))
+    Tile::Scalar(ColumnValue::Ints(vec![0].into()))
 )]
 #[case(
     r#"
@@ -154,7 +154,7 @@ x := 0
 for i in [1, 2, 3]:
     x := x + i + 1
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![9]))
+    Tile::Scalar(ColumnValue::Ints(vec![9].into()))
 )]
 #[case(
     r#"
@@ -184,10 +184,10 @@ o"#,
         // variant 1; indices 4-5 (loop2 running sums) → variant 2.
         ColumnValue::positional_union(&[0, 1, 1, 1, 2, 2], vec![
             ColumnValue::Units(1),
-            ColumnValue::UInts(vec![0, 1, 2]),
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1, 2].into()),
+            ColumnValue::UInts(vec![0, 1].into()),
         ]),
-        Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 3, 6, 10, 15]))),
+        Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 3, 6, 10, 15].into()))),
         Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])),
         BitSet::new(),
     ))]
@@ -202,7 +202,7 @@ for i in [1, 2, 3]:
     y = x + 1
     x := y * 2
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![14]))
+    Tile::Scalar(ColumnValue::Ints(vec![14].into()))
 )]
 // As above, but `y` depends on `i` so the source list survives.  This
 // gives a Compose `[1,2,3] ≫ (let y = … in (y, 2) ▷ mul)` — the let is
@@ -216,7 +216,7 @@ for i in [1, 2, 3]:
     y = x + i
     x := y * 2
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![22]))
+    Tile::Scalar(ColumnValue::Ints(vec![22].into()))
 )]
 #[case(
     r#"
@@ -227,9 +227,9 @@ for i in [1, 2, 3]:
     x := x * i
 (x, y, x + y)"#,
     Tile::record(HashMap::from([
-        ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
-        ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
-        ("_2".into(), Tile::Scalar(ColumnValue::Ints(vec![12]))),
+        ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![6].into()))),
+        ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![6].into()))),
+        ("_2".into(), Tile::Scalar(ColumnValue::Ints(vec![12].into()))),
     ]))
 )]
 // Multi-accumulator mutation loop combined with a feed.  Per-iter values:
@@ -283,9 +283,9 @@ for i in [1, 2, 3]:
     o << x + 100
 o"#,
     Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 1, 1, 1], vec![
-                ColumnValue::UInts(vec![0, 1, 2]),
-                ColumnValue::UInts(vec![0, 1, 2]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6, 101, 103, 106]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
+                ColumnValue::UInts(vec![0, 1, 2].into()),
+                ColumnValue::UInts(vec![0, 1, 2].into()),
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6, 101, 103, 106].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
 )]
 // Feeds in every part of the loop body: a pre-loop feed, an in-loop
 // pre-mutation feed (which sees the previous-iteration accumulator
@@ -306,9 +306,9 @@ for i in [1, 2, 3]:
 o"#,
     Tile::data_function(ColumnValue::positional_union(&[0, 1, 1, 1, 2, 2, 2], vec![
                 ColumnValue::Units(1),
-                ColumnValue::UInts(vec![0, 1, 2]),
-                ColumnValue::UInts(vec![0, 1, 2]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0, 1, 3, 10, 30, 60]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new())
+                ColumnValue::UInts(vec![0, 1, 2].into()),
+                ColumnValue::UInts(vec![0, 1, 2].into()),
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0, 1, 3, 10, 30, 60].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new())
 )]
 // Pass-by-reference `Mut` param, driven by a loop: `bump(c)` writes its
 // pass-by-ref mutable variable on each iteration. `bump(cnt)` inlines to `MutWrite(cnt,
@@ -322,7 +322,7 @@ cnt: Mut(Int) := 0
 for x in [1, 2, 3]:
     bump(cnt)
 cnt"#,
-    Tile::Scalar(ColumnValue::Ints(vec![3]))
+    Tile::Scalar(ColumnValue::Ints(vec![3].into()))
 )]
 // The same pass-by-ref writer applied once, outside any loop: the inlined
 // `MutWrite(cnt, cnt + 1)` normalizes to a shadowing `let`, so `cnt` reads 1.
@@ -333,7 +333,7 @@ def bump(c: Mut(Int)):
 cnt: Mut(Int) := 0
 bump(cnt)
 cnt"#,
-    Tile::Scalar(ColumnValue::Ints(vec![1]))
+    Tile::Scalar(ColumnValue::Ints(vec![1].into()))
 )]
 // Two independent mutation loops of *different* domain lengths, both read in
 // one trailing expression. `a` accumulates over [0,1] (→ 2), `b` over [0,2]
@@ -349,7 +349,7 @@ for x in [1, 2]:
 for x in [1, 2, 3]:
     b += 1
 a * 1000 + b"#,
-    Tile::Scalar(ColumnValue::Ints(vec![2103]))
+    Tile::Scalar(ColumnValue::Ints(vec![2103].into()))
 )]
 // As above, but the longer loop reads the shorter loop's final mutable-variable value:
 // `b += a` broadcasts `a` (= 2) across [0,2]: 100 → 102 → 104 → 106.
@@ -364,7 +364,7 @@ for x in [1, 2]:
 for x in [1, 2, 3]:
     b += a
 a * 1000 + b"#,
-    Tile::Scalar(ColumnValue::Ints(vec![2106]))
+    Tile::Scalar(ColumnValue::Ints(vec![2106].into()))
 )]
 // A pass-by-ref writer whose body is *two* statements, applied once outside a
 // loop. Inlining splices `ExprStmt(ExprStmt(cnt := cnt+1, cnt := cnt+2), cnt)`;
@@ -377,7 +377,7 @@ def bump2(c: Mut(Int)):
 cnt: Mut(Int) := 0
 bump2(cnt)
 cnt"#,
-    Tile::Scalar(ColumnValue::Ints(vec![3]))
+    Tile::Scalar(ColumnValue::Ints(vec![3].into()))
 )]
 // A pass-by-ref writer applied in *value* position (`y = bump(cnt)`). Inlining
 // binds `y` to a bare `MutWrite`; flat-spine normalization hoists the write onto
@@ -389,7 +389,7 @@ def bump(c: Mut(Int)):
 cnt: Mut(Int) := 0
 y = bump(cnt)
 cnt"#,
-    Tile::Scalar(ColumnValue::Ints(vec![1]))
+    Tile::Scalar(ColumnValue::Ints(vec![1].into()))
 )]
 // A top-level mutable write followed by a read: the terminal-write path shadows
 // `cnt` so the read observes the advanced value.
@@ -398,7 +398,7 @@ cnt"#,
 cnt := 0
 cnt += 1
 cnt"#,
-    Tile::Scalar(ColumnValue::Ints(vec![1]))
+    Tile::Scalar(ColumnValue::Ints(vec![1].into()))
 )]
 // I1(b): a non-`Mut` annotated local (`y: Int = …`) inside a mutation-loop
 // body lowers as an ordinary per-iteration annotated `let`, not rejected.
@@ -410,7 +410,7 @@ for i in [1, 2, 3]:
     y: Int = i * 2
     acc += y
 acc"#,
-    Tile::Scalar(ColumnValue::Ints(vec![12]))
+    Tile::Scalar(ColumnValue::Ints(vec![12].into()))
 )]
 // A nested loop's accumulator is carried through both levels, so the overwrite reads what
 // the position before it left whichever level that position sat at: 0 →11→32→44→66.
@@ -421,7 +421,7 @@ for i in [1, 2]:
     for j in [10, 20]:
         x := x + i + j
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![66]))
+    Tile::Scalar(ColumnValue::Ints(vec![66].into()))
 )]
 // A **conditional feed** riding an accumulator loop: the `o << i` fires only on
 // the guard's route, so the tap stream carries just the fired positions (loop
@@ -437,7 +437,7 @@ for i in [10, 20, 30]:
     if i > 15:
         o << i
 o"#,
-    Tile::data_function(ColumnValue::from_uints(vec![1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 30]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::from_uints(vec![1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 30].into()))), Predicate::True, BitSet::new())
 )]
 // A **conditional write** with an unconditional feed after it: `cnt` increments
 // only when `i > 15`, and `o << cnt` fires every position. The post-`if` feed
@@ -453,7 +453,7 @@ for i in [10, 20, 30]:
         cnt := cnt + 1
     o << cnt
 o"#,
-    Tile::data_function(ColumnValue::positional_union(&[0, 0, 1], vec![ColumnValue::from_uints(vec![1, 2]), ColumnValue::from_uints(vec![0])]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 0]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
+    Tile::data_function(ColumnValue::positional_union(&[0, 0, 1], vec![ColumnValue::from_uints(vec![1, 2]), ColumnValue::from_uints(vec![0])]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 0].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
 )]
 // A full `if/else` write with a trailing feed: each position takes exactly one
 // arm (`i < 2` → `x += i`, else `x += 100`) and feeds the post-arm `x`. The two
@@ -470,7 +470,7 @@ for i in [0, 1, 2, 3]:
         x := x + 100
     o << x
 o"#,
-    Tile::data_function(ColumnValue::positional_union(&[0, 0, 1, 1], vec![ColumnValue::from_uints(vec![0, 1]), ColumnValue::from_uints(vec![2, 3])]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 101, 201]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
+    Tile::data_function(ColumnValue::positional_union(&[0, 0, 1, 1], vec![ColumnValue::from_uints(vec![0, 1]), ColumnValue::from_uints(vec![2, 3])]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 101, 201].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
 )]
 // A `mut` accumulator over a **filtered** source. `restrict` keeps an element at
 // its original position, so `kept`'s domain is the subset `{1, 2}` of the
@@ -485,7 +485,7 @@ o"#,
         for l in kept:
             n := n + 1
         n"#},
-    Tile::Scalar(ColumnValue::Ints(vec![2]))
+    Tile::Scalar(ColumnValue::Ints(vec![2].into()))
 )]
 // The same source un-bound, so planning materializes the filter at the loop's own
 // iteration site rather than at a `let`.
@@ -495,7 +495,7 @@ o"#,
         for l in [x for x in [1, 2, 3] if x > 1]:
             n := n + 1
         n"#},
-    Tile::Scalar(ColumnValue::Ints(vec![2]))
+    Tile::Scalar(ColumnValue::Ints(vec![2].into()))
 )]
 // A filter with an **interior** gap that keeps position 0: the domain is
 // `{0, 2, 4}`, so the driver's next position is neither its predecessor's
@@ -507,7 +507,7 @@ o"#,
         for l in kept:
             n := n + l
         n"#},
-    Tile::Scalar(ColumnValue::Ints(vec![9]))
+    Tile::Scalar(ColumnValue::Ints(vec![9].into()))
 )]
 // A filter that keeps nothing: the loop runs zero iterations over a non-empty
 // extent and the read falls back to the seed. Distinct from an empty extent —
@@ -521,7 +521,7 @@ o"#,
         for l in kept:
             n := n + 1
         n"#},
-    Tile::Scalar(ColumnValue::Ints(vec![0]))
+    Tile::Scalar(ColumnValue::Ints(vec![0].into()))
 )]
 // A feed inside a filtered loop: the tap fires once per *iterated* position, so
 // its stream is keyed by the source's positions (2, 3, 4) rather than by a count
@@ -535,7 +535,7 @@ o"#,
             n := n + l
             o << n
         o"#},
-    Tile::data_function(ColumnValue::UInts(vec![2, 3, 4]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 7, 12]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![2, 3, 4].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 7, 12].into()))), Predicate::True, BitSet::new())
 )]
 // The same nest with a feed after the write. A `<<` appends at the site it is written, so
 // the channel is keyed by the **position pair** the nest names — one value per innermost
@@ -554,7 +554,7 @@ o"#,
             ("_0".into(), ColumnValue::from_uints(vec![0, 0, 1, 1])),
             ("_1".into(), ColumnValue::from_uints(vec![0, 1, 0, 1])),
         ])),
-        Box::new(Tile::Scalar(ColumnValue::Ints(vec![11, 32, 44, 66]))),
+        Box::new(Tile::Scalar(ColumnValue::Ints(vec![11, 32, 44, 66].into()))),
         Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
@@ -1156,7 +1156,7 @@ fn a_refinement_may_depend_on_a_read(#[case] code: &str, #[case] expected: Vec<i
         code,
         Tile::data_function(
             ColumnValue::uints_from_rows(0..expected.len()),
-            Box::new(Tile::Scalar(ColumnValue::Ints(expected))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(expected.into()))),
             Predicate::True,
             BitSet::new(),
         ),

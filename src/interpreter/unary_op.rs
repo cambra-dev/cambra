@@ -58,17 +58,21 @@ mod tests {
     /// The call appends to the caller's column, which the caller has cleared for reuse.
     #[test]
     fn a_unary_result_is_appended_to_the_callers_column() {
-        let mut out = ColumnValue::Ints(vec![7; 4]);
+        let mut out = ColumnValue::Ints(vec![7; 4].into());
         out.clear();
-        apply_unaryop_into(UnaryOpKind::Neg, &ColumnValue::Ints(vec![1, -2]), &mut out);
-        assert_eq!(out, ColumnValue::Ints(vec![-1, 2]));
-        let mut out = ColumnValue::Bools(vec![true; 4]);
+        apply_unaryop_into(
+            UnaryOpKind::Neg,
+            &ColumnValue::Ints(vec![1, -2].into()),
+            &mut out,
+        );
+        assert_eq!(out, ColumnValue::Ints(vec![-1, 2].into()));
+        let mut out = ColumnValue::Bools(vec![true; 4].into());
         out.clear();
         apply_unaryop_into(
             UnaryOpKind::Not,
-            &ColumnValue::Bools(vec![true, false]),
+            &ColumnValue::Bools(vec![true, false].into()),
             &mut out,
         );
-        assert_eq!(out, ColumnValue::Bools(vec![false, true]));
+        assert_eq!(out, ColumnValue::Bools(vec![false, true].into()));
     }
 }

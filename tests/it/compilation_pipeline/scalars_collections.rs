@@ -48,7 +48,7 @@ fn test_type_annotation_forms(#[case] code: &str, #[case] expected: Value) {
 // type to name "nothing here" with (CHL spec, "6.6 The empty product is unit").
 // `pin_empty_list_element` makes it, after the constraints are in — which is what leaves
 // `empty_list_takes_its_element_type_from_the_use_site` free to name another element type.
-#[case("[]", Tile::data_function(ColumnValue::UInts(vec![]), Box::new(Tile::Scalar(ColumnValue::Units(0))), Predicate::True, BitSet::new()))]
+#[case("[]", Tile::data_function(ColumnValue::UInts(vec![].into()), Box::new(Tile::Scalar(ColumnValue::Units(0))), Predicate::True, BitSet::new()))]
 #[case("[1, 2]", make_int_list(&[1, 2]))]
 // A `List(_)` annotation lowers the wildcard to a `Hole` element type
 // (inferred), so the annotation is accepted and unifies with the list literal.
@@ -228,7 +228,7 @@ fn an_empty_map_answers_a_set_annotation() {
     check_tile(
         "s: Set(String) = empty_map()\ns",
         Tile::data_function(
-            ColumnValue::Strings(vec![]),
+            ColumnValue::Strings(vec![].into()),
             Box::new(Tile::Scalar(ColumnValue::Units(0))),
             Predicate::True,
             BitSet::new(),
@@ -245,8 +245,8 @@ fn an_empty_map_is_a_typed_empty_tile() {
     check_tile(
         "m: Map(String, Int) = empty_map()\nm",
         Tile::data_function(
-            ColumnValue::Strings(vec![]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            ColumnValue::Strings(vec![].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![].into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -662,29 +662,29 @@ fn arithmetic_and_comparison_on_computed_operands(#[case] code: &str, #[case] ex
 #[case(
     "[1, 2, 3] ++ [4, 5]",
     Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 1, 1], vec![
-                ColumnValue::UInts(vec![0, 1, 2]),
-                ColumnValue::UInts(vec![0, 1]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4, 5]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+                ColumnValue::UInts(vec![0, 1, 2].into()),
+                ColumnValue::UInts(vec![0, 1].into()),
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4, 5].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 #[case(
     "x = [1, 2]; x ++ x ++ x",
     Tile::data_function(ColumnValue::positional_union(&[0, 0, 1, 1, 2, 2], vec![
-                ColumnValue::UInts(vec![0, 1]),
-                ColumnValue::UInts(vec![0, 1]),
-                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::UInts(vec![0, 1].into()),
+                ColumnValue::UInts(vec![0, 1].into()),
+                ColumnValue::UInts(vec![0, 1].into()),
 
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 1, 2, 1, 2]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 1, 2, 1, 2].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
 #[case(
     "x = [1, 2]; y = x ++ x ++ x; y",
     Tile::data_function(ColumnValue::positional_union(&[0, 0, 1, 1, 2, 2], vec![
-                ColumnValue::UInts(vec![0, 1]),
-                ColumnValue::UInts(vec![0, 1]),
-                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::UInts(vec![0, 1].into()),
+                ColumnValue::UInts(vec![0, 1].into()),
+                ColumnValue::UInts(vec![0, 1].into()),
 
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 1, 2, 1, 2]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
-#[case("sum([1] ++ [2])", Tile::Scalar(ColumnValue::Ints(vec![3])))]
-#[case("sum([1 for y in [1] ++ [2]])", Tile::Scalar(ColumnValue::Ints(vec![2])))]
-#[case("sum([1 for y in [1] ++ [2] ++ [3]])", Tile::Scalar(ColumnValue::Ints(vec![3])))]
-#[case("sum([1] ++ [2] ++ [3])", Tile::Scalar(ColumnValue::Ints(vec![6])))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 1, 2, 1, 2].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
+#[case("sum([1] ++ [2])", Tile::Scalar(ColumnValue::Ints(vec![3].into())))]
+#[case("sum([1 for y in [1] ++ [2]])", Tile::Scalar(ColumnValue::Ints(vec![2].into())))]
+#[case("sum([1 for y in [1] ++ [2] ++ [3]])", Tile::Scalar(ColumnValue::Ints(vec![3].into())))]
+#[case("sum([1] ++ [2] ++ [3])", Tile::Scalar(ColumnValue::Ints(vec![6].into())))]
 fn test_unions(#[case] code: &str, #[case] expected: Tile) {
     let result = run_pipeline(code);
     assert_eq!(result, expected);

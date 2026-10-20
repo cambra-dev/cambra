@@ -74,11 +74,11 @@ fn test_comp_with_record_body() {
     let tile = sort_function_by_domain(run_pipeline("[(n=x, doubled=x * 2) for x in [1, 2, 3]]"));
     assert_eq!(
         extract_record_field(tile.clone(), "n"),
-        ColumnValue::Ints(vec![1, 2, 3]),
+        ColumnValue::Ints(vec![1, 2, 3].into()),
     );
     assert_eq!(
         extract_record_field(tile, "doubled"),
-        ColumnValue::Ints(vec![2, 4, 6]),
+        ColumnValue::Ints(vec![2, 4, 6].into()),
     );
 }
 
@@ -91,11 +91,11 @@ fn test_comp_with_record_body() {
 )]
 #[case(
     r#"[r.y for r in [(x=1, y="a"), (x=2, y="b"), (x=3, y="c")]]"#,
-    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Strings(vec![
+    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2].into()), Box::new(Tile::Scalar(ColumnValue::Strings(vec![
             "a".into(),
             "b".into(),
             "c".into(),
-        ]))), Predicate::True, BitSet::new())
+        ].into()))), Predicate::True, BitSet::new())
 )]
 fn test_comp_over_record_list(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -161,11 +161,11 @@ fn test_hash_join_record_body() {
     // matched pairs: (2,2) and (3,3)
     assert_eq!(
         extract_record_field(tile.clone(), "left"),
-        ColumnValue::Ints(vec![2, 3])
+        ColumnValue::Ints(vec![2, 3].into())
     );
     assert_eq!(
         extract_record_field(tile, "right"),
-        ColumnValue::Ints(vec![2, 3])
+        ColumnValue::Ints(vec![2, 3].into())
     );
 }
 
@@ -362,16 +362,19 @@ fn test_list_of_records_holding_collections() {
     check_tile(
         "xs = [(a=1, b=[1, 2]), (a=3, b=[4, 5])]; xs",
         Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             Box::new(Tile::record(
                 [
-                    ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 3]))),
+                    (
+                        "a".into(),
+                        Tile::Scalar(ColumnValue::Ints(vec![1, 3].into())),
+                    ),
                     (
                         "b".into(),
                         Tile::grouped(
                             vec![0, 2],
-                            ColumnValue::UInts(vec![0, 1, 0, 1]),
-                            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4, 5]))),
+                            ColumnValue::UInts(vec![0, 1, 0, 1].into()),
+                            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4, 5].into()))),
                             Predicate::True,
                             BitSet::new(),
                         ),
@@ -451,12 +454,12 @@ fn test_a_filtered_component_keeps_the_domain_it_binds() {
         "r = (n=1, xs=[y for y in [1, 2, 3] if y > 2]); r",
         Tile::record(
             [
-                ("n".into(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                ("n".into(), Tile::Scalar(ColumnValue::Ints(vec![1].into()))),
                 (
                     "xs".into(),
                     Tile::data_function(
-                        ColumnValue::UInts(vec![2]),
-                        Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),
+                        ColumnValue::UInts(vec![2].into()),
+                        Box::new(Tile::Scalar(ColumnValue::Ints(vec![3].into()))),
                         Predicate::True,
                         BitSet::new(),
                     ),

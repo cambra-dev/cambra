@@ -390,7 +390,7 @@ mod tests {
             Some(NodeId::fresh()),
             1,
             "MapResultWithSource#1",
-            &Tile::Scalar(ColumnValue::Strings(vec!["hello".into()])),
+            &Tile::Scalar(ColumnValue::Strings(vec!["hello".into()].into())),
             &unreleased(),
         );
         probes
@@ -528,7 +528,7 @@ mod tests {
                     Some(ids[i]),
                     i,
                     "P#1",
-                    &Tile::Scalar(ColumnValue::Strings(vec!["v".into()])),
+                    &Tile::Scalar(ColumnValue::Strings(vec!["v".into()].into())),
                     &unreleased(),
                 );
             }
@@ -703,7 +703,7 @@ mod tests {
             "stdin",
             2,
             &ColumnValue::from_uints(vec![0, 1]),
-            &ColumnValue::Strings(vec!["a".into(), "b".into()]),
+            &ColumnValue::Strings(vec!["a".into(), "b".into()].into()),
         );
         let channel = live.channel();
         thread::spawn(move || {
@@ -754,7 +754,7 @@ mod tests {
                     Some(node),
                     1,
                     "P#1",
-                    &Tile::Scalar(ColumnValue::Strings(vec![big.clone().into()])),
+                    &Tile::Scalar(ColumnValue::Strings(vec![big.clone().into()].into())),
                     &unreleased(),
                 );
                 channel.publish_probes(&probes, &[]);

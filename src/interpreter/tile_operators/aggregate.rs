@@ -96,7 +96,7 @@ impl AggregateProducer {
                 Tile::Aggregation {
                     kind: *kind,
                     accumulator: Box::new(kind.initial_accumulator(acc_tiling)),
-                    terminal: ColumnValue::Bools(vec![false; 1]),
+                    terminal: ColumnValue::Bools(vec![false; 1].into()),
                 },
             ),
             other => panic!("AggregateProducer created with non-Aggregation tiling: {other:?}"),
@@ -737,7 +737,7 @@ impl TileProducer for MapAggregateProducer {
         let aggregation = Tile::Aggregation {
             kind: self.kind,
             accumulator: Box::new(accumulator),
-            terminal: ColumnValue::Bools(terminal),
+            terminal: ColumnValue::Bools(terminal.into()),
         };
         let mut paths: Vec<&[Value]> = entries.iter().map(|(path, _)| path.as_slice()).collect();
         paths.extend(
@@ -818,7 +818,7 @@ mod tests {
     fn int_function(domain: Vec<u64>, values: Vec<i64>) -> Tile {
         Tile::data_function(
             ColumnValue::from_uints(domain),
-            Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(values.into()))),
             Predicate::True,
             BitSet::new(),
         )
@@ -849,7 +849,7 @@ mod tests {
         };
         assert_eq!(
             *accumulator,
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![30])))
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![30].into())))
         );
 
         producer.release(tiling.universal_guard());
@@ -908,11 +908,11 @@ mod tests {
         );
         // Keys 1 and 2, each with two values: 1 -> [10, 20], 2 -> [30, 40].
         let tile = Tile::data_function(
-            ColumnValue::Ints(vec![1, 2]),
+            ColumnValue::Ints(vec![1, 2].into()),
             Box::new(Tile::grouped(
                 vec![0, 2],
-                ColumnValue::Ints(vec![0, 1, 0, 1]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))),
+                ColumnValue::Ints(vec![0, 1, 0, 1].into()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40].into()))),
                 Predicate::False,
                 BitSet::new(),
             )),
@@ -992,11 +992,11 @@ mod tests {
         );
         // Key 1 holds its whole group; key 2 has delivered the first of its two.
         let tile = Tile::data_function(
-            ColumnValue::Ints(vec![1, 2]),
+            ColumnValue::Ints(vec![1, 2].into()),
             Box::new(Tile::grouped(
                 vec![0, 2],
-                ColumnValue::Ints(vec![0, 1, 0]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
+                ColumnValue::Ints(vec![0, 1, 0].into()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30].into()))),
                 Predicate::False,
                 BitSet::new(),
             )),
@@ -1053,7 +1053,7 @@ mod tests {
             Box::new(Tile::grouped(
                 vec![0],
                 ColumnValue::from_uints(vec![0, 2, 1]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 120, 110]))),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 120, 110].into()))),
                 Predicate::False,
                 BitSet::new(),
             )),
@@ -1082,7 +1082,7 @@ mod tests {
         };
         assert_eq!(
             **accumulator,
-            Tile::Scalar(ColumnValue::Ints(vec![330])),
+            Tile::Scalar(ColumnValue::Ints(vec![330].into())),
             "each element counted once"
         );
     }
@@ -1107,7 +1107,7 @@ mod tests {
                 Box::new(Tile::grouped(
                     vec![0],
                     ColumnValue::from_uints(vec![0, 1]),
-                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20].into()))),
                     Predicate::False,
                     BitSet::new(),
                 )),
@@ -1141,7 +1141,7 @@ mod tests {
         };
         assert_eq!(
             terminal,
-            &ColumnValue::Bools(vec![true; 1]),
+            &ColumnValue::Bools(vec![true; 1].into()),
             "the any-level rule settles the group: {out:?}"
         );
         let Tile::DataFunction {

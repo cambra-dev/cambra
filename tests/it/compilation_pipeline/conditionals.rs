@@ -56,7 +56,7 @@ fn codomain_ints(tile: &Tile) -> Vec<i64> {
     let Tile::Scalar(ColumnValue::Ints(v)) = codomain.as_ref() else {
         panic!("expected an Ints scalar codomain, got {codomain:?}");
     };
-    let mut v = v.clone();
+    let mut v = v.to_vec();
     v.sort_unstable();
     v
 }

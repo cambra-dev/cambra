@@ -1,6 +1,7 @@
 #![warn(unused_qualifications)]
 
 pub mod ccl;
+pub mod column_storage;
 // The parser is its own crate; re-exported so `cambra::chl_parser` and
 // `crate::chl_parser` name it.
 pub use chl_parser;

@@ -24,8 +24,8 @@ pub fn binop_output_extent(op: &BinOpKind) -> Extent {
 pub fn binop_result_column(op: BinOpKind, left: &ColumnValue) -> ColumnValue {
     match op {
         BinOpKind::Arithmetic(_) => left.empty_like(),
-        BinOpKind::Concat => ColumnValue::Strings(Vec::new()),
-        BinOpKind::BoolLogic(_) | BinOpKind::Compare(_) => ColumnValue::Bools(Vec::new()),
+        BinOpKind::Concat => ColumnValue::Strings(Vec::new().into()),
+        BinOpKind::BoolLogic(_) | BinOpKind::Compare(_) => ColumnValue::Bools(Vec::new().into()),
     }
 }
 
@@ -185,7 +185,7 @@ fn compare_records(
         let Some(r) = right.get(field) else {
             continue;
         };
-        let mut field_eq = ColumnValue::Bools(Vec::new());
+        let mut field_eq = ColumnValue::Bools(Vec::new().into());
         apply_binop_into(BinOpKind::Compare(op), l, r, &mut field_eq);
         let ColumnValue::Bools(field_eq) = field_eq else {
             unreachable!("a comparison yields a Bool column")
@@ -221,8 +221,8 @@ mod tests {
         let cmp = |op: CompareKind, l: bool, r: bool| -> bool {
             let result = apply_binop_column(
                 BinOpKind::Compare(op),
-                &ColumnValue::Bools(vec![l; 1]),
-                &ColumnValue::Bools(vec![r; 1]),
+                &ColumnValue::Bools(vec![l; 1].into()),
+                &ColumnValue::Bools(vec![r; 1].into()),
             );
             match result {
                 ColumnValue::Bools(v) => v[0],
@@ -269,9 +269,16 @@ mod tests {
             ["a", "b", "c"]
                 .into_iter()
                 .map(SmolStr::new)
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>()
+                .into(),
         );
-        let r = ColumnValue::Strings(["1", "2"].into_iter().map(SmolStr::new).collect::<Vec<_>>());
+        let r = ColumnValue::Strings(
+            ["1", "2"]
+                .into_iter()
+                .map(SmolStr::new)
+                .collect::<Vec<_>>()
+                .into(),
+        );
         match apply_binop_column(BinOpKind::Concat, &l, &r) {
             ColumnValue::Strings(v) => {
                 assert_eq!(v, vec![SmolStr::new("a1"), SmolStr::new("b2")]);
@@ -282,8 +289,8 @@ mod tests {
         // Arithmetic: `r` longer than `l` → result is the 1-element prefix.
         match apply_binop_column(
             BinOpKind::Arithmetic(ArithmeticKind::Add),
-            &ColumnValue::Ints(vec![10]),
-            &ColumnValue::Ints(vec![1, 2, 3]),
+            &ColumnValue::Ints(vec![10].into()),
+            &ColumnValue::Ints(vec![1, 2, 3].into()),
         ) {
             ColumnValue::Ints(v) => assert_eq!(v, vec![11]),
             other => panic!("expected Ints, got {other:?}"),
@@ -293,8 +300,8 @@ mod tests {
         // common prefix and drop the rest.
         match apply_binop_column(
             BinOpKind::Compare(CompareKind::Less),
-            &ColumnValue::Bools(vec![false; 3]),
-            &ColumnValue::Bools(vec![true; 1]),
+            &ColumnValue::Bools(vec![false; 3].into()),
+            &ColumnValue::Bools(vec![true; 1].into()),
         ) {
             ColumnValue::Bools(v) => {
                 assert_eq!(v.len(), 1);
@@ -304,8 +311,8 @@ mod tests {
         }
         match apply_binop_column(
             BinOpKind::BoolLogic(LogicKind::And),
-            &ColumnValue::Bools(vec![true; 1]),
-            &ColumnValue::Bools(vec![true; 4]),
+            &ColumnValue::Bools(vec![true; 1].into()),
+            &ColumnValue::Bools(vec![true; 4].into()),
         ) {
             ColumnValue::Bools(v) => {
                 assert_eq!(v.len(), 1);
@@ -321,8 +328,8 @@ mod tests {
         let len: usize = 1000000;
         let lv: Vec<i64> = (0..(len as i64)).collect();
         let rv: Vec<i64> = (0..(len as i64)).collect();
-        let l = ColumnValue::Ints(lv.clone());
-        let r = ColumnValue::Ints(rv.clone());
+        let l = ColumnValue::Ints(lv.clone().into());
+        let r = ColumnValue::Ints(rv.clone().into());
 
         let options = microbench::Options::default().time(Duration::new(1, 0));
         microbench::bench(&options, "native_iter", || {
@@ -416,34 +423,34 @@ mod tests {
     #[test]
     fn a_result_is_appended_to_the_callers_column() {
         let add = BinOpKind::Arithmetic(ArithmeticKind::Add);
-        let mut out = ColumnValue::Ints(vec![99; 8]);
+        let mut out = ColumnValue::Ints(vec![99; 8].into());
         out.clear();
         apply_binop_into(
             add,
-            &ColumnValue::Ints(vec![1, 2, 3]),
-            &ColumnValue::Ints(vec![10, 20]),
+            &ColumnValue::Ints(vec![1, 2, 3].into()),
+            &ColumnValue::Ints(vec![10, 20].into()),
             &mut out,
         );
-        assert_eq!(out, ColumnValue::Ints(vec![11, 22]));
+        assert_eq!(out, ColumnValue::Ints(vec![11, 22].into()));
         apply_binop_into(
             add,
-            &ColumnValue::Ints(vec![1]),
-            &ColumnValue::Ints(vec![10]),
+            &ColumnValue::Ints(vec![1].into()),
+            &ColumnValue::Ints(vec![10].into()),
             &mut out,
         );
-        assert_eq!(out, ColumnValue::Ints(vec![11, 22, 11]));
+        assert_eq!(out, ColumnValue::Ints(vec![11, 22, 11].into()));
     }
 
     /// A comparison reads integers and writes a `Bool` column.
     #[test]
     fn a_comparison_writes_a_bool_column() {
-        let mut out = ColumnValue::Bools(Vec::new());
+        let mut out = ColumnValue::Bools(Vec::new().into());
         apply_binop_into(
             BinOpKind::Compare(CompareKind::Greater),
-            &ColumnValue::Ints(vec![1, 5, 9]),
-            &ColumnValue::Ints(vec![4, 4, 4]),
+            &ColumnValue::Ints(vec![1, 5, 9].into()),
+            &ColumnValue::Ints(vec![4, 4, 4].into()),
             &mut out,
         );
-        assert_eq!(out, ColumnValue::Bools(vec![false, true, true]));
+        assert_eq!(out, ColumnValue::Bools(vec![false, true, true].into()));
     }
 }

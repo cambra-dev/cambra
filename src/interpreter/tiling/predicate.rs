@@ -1565,7 +1565,7 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
         let (sorted_d, sorted_c): (Vec<K>, Vec<i64>) = pairs.into_iter().unzip();
         Tile::data_function(
             mk_domain(sorted_d),
-            Box::new(Tile::Scalar(ColumnValue::Ints(sorted_c))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(sorted_c.into()))),
             domain_predicate,
             BitSet::new(),
         )
@@ -1589,17 +1589,21 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
         } if row_starts.len() == 1 && !codomain.is_data_function() => {
             match (*codomain, domain) {
                 (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Ints(dom)) => {
-                    sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::Ints)
+                    sort_and_rebuild(dom.into_vec(), cod_ints.into_vec(), domain_predicate, |v| {
+                        ColumnValue::Ints(v.into())
+                    })
                 }
                 (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::UInts(dom)) => {
-                    sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::UInts)
+                    sort_and_rebuild(dom.into_vec(), cod_ints.into_vec(), domain_predicate, |v| {
+                        ColumnValue::UInts(v.into())
+                    })
                 }
                 (
                     Tile::Scalar(ColumnValue::Ints(cod_ints)),
                     ref r @ ColumnValue::Records(ref fields),
                 ) => sort_and_rebuild(
                     r.clone().drain_to_value_iter().collect(),
-                    cod_ints,
+                    cod_ints.into_vec(),
                     domain_predicate,
                     |v| ColumnValue::from_values(v, &record_cv_to_extent(fields)),
                 ),
@@ -1627,7 +1631,7 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
                     domain.debug_assert_union_invariants();
                     Tile::data_function(
                         domain,
-                        Box::new(Tile::Scalar(ColumnValue::Ints(sorted_cod))),
+                        Box::new(Tile::Scalar(ColumnValue::Ints(sorted_cod.into()))),
                         domain_predicate,
                         BitSet::new(),
                     )
@@ -1714,7 +1718,7 @@ mod tests {
     #[test]
     fn predicate_as_bool_nonempty_intervals_is_none() {
         // A non-trivial interval set has no boolean representation.
-        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3]));
+        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3].into()));
         assert_eq!(p.as_bool(), None);
     }
 
@@ -2000,7 +2004,7 @@ mod tests {
 
         let unqualified = [
             Predicate::below(u(1)),
-            Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1])),
+            Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1].into())),
         ];
         assert_eq!(
             complete_pairs(&unqualified),
@@ -2217,14 +2221,14 @@ mod tests {
     #[test]
     fn from_column_value_empty_ints_is_false() {
         assert_eq!(
-            Predicate::from_column_value(&ColumnValue::Ints(vec![])),
+            Predicate::from_column_value(&ColumnValue::Ints(vec![].into())),
             Predicate::False
         );
     }
 
     #[test]
     fn from_column_value_single_int() {
-        let p = Predicate::from_column_value(&ColumnValue::Ints(vec![7]));
+        let p = Predicate::from_column_value(&ColumnValue::Ints(vec![7].into()));
         let Predicate::Intervals(s) = p else {
             panic!("expected Intervals");
         };
@@ -2236,7 +2240,7 @@ mod tests {
 
     #[test]
     fn from_column_value_multiple_ints_contains_all() {
-        let p = Predicate::from_column_value(&ColumnValue::Ints(vec![1, 3, 5]));
+        let p = Predicate::from_column_value(&ColumnValue::Ints(vec![1, 3, 5].into()));
         let Predicate::Intervals(s) = p else {
             panic!("expected Intervals");
         };
@@ -2249,7 +2253,7 @@ mod tests {
 
     #[test]
     fn from_column_value_uints() {
-        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 2]));
+        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 2].into()));
         let Predicate::Intervals(s) = p else {
             panic!("expected Intervals");
         };
@@ -2260,7 +2264,7 @@ mod tests {
 
     #[test]
     fn from_column_value_compact() {
-        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1, 2, 5, 6, 7]));
+        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1, 2, 5, 6, 7].into()));
         let Predicate::Intervals(s) = p else {
             panic!("expected Intervals");
         };
@@ -2270,7 +2274,7 @@ mod tests {
     #[test]
     fn from_column_value_empty_uints_is_false() {
         assert_eq!(
-            Predicate::from_column_value(&ColumnValue::UInts(vec![])),
+            Predicate::from_column_value(&ColumnValue::UInts(vec![].into())),
             Predicate::False
         );
     }
@@ -2282,7 +2286,7 @@ mod tests {
         bv[1] = false;
         // Both values are the whole of `Bool`, which has one spelling.
         assert_eq!(
-            Predicate::from_column_value(&ColumnValue::Bools(bv)),
+            Predicate::from_column_value(&ColumnValue::Bools(bv.into())),
             Predicate::True
         );
     }
@@ -2290,7 +2294,7 @@ mod tests {
     #[test]
     fn from_column_value_bools_only_true() {
         let bv = vec![true; 3];
-        let p = Predicate::from_column_value(&ColumnValue::Bools(bv));
+        let p = Predicate::from_column_value(&ColumnValue::Bools(bv.into()));
         let Predicate::Intervals(s) = p else {
             panic!("expected Intervals");
         };
@@ -2301,7 +2305,7 @@ mod tests {
     #[test]
     fn from_column_value_empty_bools_is_false() {
         assert_eq!(
-            Predicate::from_column_value(&ColumnValue::Bools(Vec::new())),
+            Predicate::from_column_value(&ColumnValue::Bools(Vec::new().into())),
             Predicate::False
         );
     }
@@ -2463,8 +2467,8 @@ mod tests {
 
     fn pairs(outer: &[u64], inner: &[u64]) -> ColumnValue {
         ColumnValue::Records(HashMap::from([
-            ("_0".into(), ColumnValue::UInts(outer.to_vec())),
-            ("_1".into(), ColumnValue::UInts(inner.to_vec())),
+            ("_0".into(), ColumnValue::UInts(outer.to_vec().into())),
+            ("_1".into(), ColumnValue::UInts(inner.to_vec().into())),
         ]))
     }
 
@@ -2632,7 +2636,7 @@ mod tests {
     #[test]
     fn union_at_or_below_with_intervals_lhs() {
         // [0, 3] ∪ {7} → Intervals containing both 0, 3, and 7; but not 4 or 6.
-        let intervals = Predicate::from_column_value(&ColumnValue::UInts(vec![7]));
+        let intervals = Predicate::from_column_value(&ColumnValue::UInts(vec![7].into()));
         let result = Predicate::at_or_below(Value::UInt(3)).union(&intervals);
         assert!(intervals_contains(&result, Value::UInt(0)), "0 in [0,3]");
         assert!(intervals_contains(&result, Value::UInt(3)), "3 in [0,3]");
@@ -2649,7 +2653,7 @@ mod tests {
     #[test]
     fn union_at_or_below_with_intervals_rhs() {
         // {7} ∪ [0, 3] — commutative, same outcome.
-        let intervals = Predicate::from_column_value(&ColumnValue::UInts(vec![7]));
+        let intervals = Predicate::from_column_value(&ColumnValue::UInts(vec![7].into()));
         let result = intervals.union(&Predicate::at_or_below(Value::UInt(3)));
         assert!(intervals_contains(&result, Value::UInt(3)));
         assert!(!intervals_contains(&result, Value::UInt(4)));
@@ -2660,8 +2664,8 @@ mod tests {
     #[test]
     fn union_disjoint_interval_sets() {
         // {1, 2} ∪ {5, 6} → values 1, 2, 5, 6 present; 3, 4 absent.
-        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2]));
-        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![5, 6]));
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2].into()));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![5, 6].into()));
         let result = a.union(&b);
         for v in [1u64, 2, 5, 6] {
             assert!(
@@ -2680,8 +2684,8 @@ mod tests {
     #[test]
     fn union_overlapping_interval_sets_merges() {
         // {2, 3, 4} ∪ {3, 4, 5} → {2, 3, 4, 5}, all present.
-        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3, 4]));
-        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 4, 5]));
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3, 4].into()));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 4, 5].into()));
         let result = a.union(&b);
         for v in [2u64, 3, 4, 5] {
             assert!(intervals_contains(&result, Value::UInt(v)));
@@ -2696,7 +2700,7 @@ mod tests {
     #[test]
     fn union_below_a_value_with_that_value_is_the_bound() {
         let u0 = Value::UInt(0);
-        let point = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
+        let point = Predicate::from_column_value(&ColumnValue::UInts(vec![0].into()));
         let joined = Predicate::below(u0.clone()).union(&point);
         assert_eq!(
             joined,
@@ -2991,21 +2995,21 @@ mod tests {
     #[test]
     fn subsumes_at_or_below_subsumes_contained_interval_set() {
         // [0,10] ⊇ {3,7}: both points are <= 10.
-        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 7]));
+        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 7].into()));
         assert!(Predicate::at_or_below(Value::UInt(10)).subsumes(&s));
     }
 
     #[test]
     fn subsumes_at_or_below_does_not_subsume_escaping_interval_set() {
         // [0,5] ⊉ {3,7}: 7 > 5.
-        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 7]));
+        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 7].into()));
         assert!(!Predicate::at_or_below(Value::UInt(5)).subsumes(&s));
     }
 
     #[test]
     fn subsumes_interval_set_does_not_subsume_at_or_below() {
         // {3,7} ⊉ [0,10]: the prefix holds 0, which the set does not.
-        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 7]));
+        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 7].into()));
         assert!(!s.subsumes(&Predicate::at_or_below(Value::UInt(10))));
     }
 
@@ -3013,24 +3017,24 @@ mod tests {
     #[test]
     fn subsumes_interval_superset_subsumes_subset() {
         // {1,2,3,4} ⊇ {2,3}.
-        let big = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4]));
-        let small = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3]));
+        let big = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4].into()));
+        let small = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3].into()));
         assert!(big.subsumes(&small));
         assert!(!small.subsumes(&big));
     }
 
     #[test]
     fn subsumes_equal_interval_sets() {
-        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3]));
-        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3]));
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3].into()));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3].into()));
         assert!(a.subsumes(&b));
         assert!(b.subsumes(&a));
     }
 
     #[test]
     fn subsumes_disjoint_interval_sets_neither_subsumes() {
-        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2]));
-        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 4]));
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2].into()));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 4].into()));
         assert!(!a.subsumes(&b));
         assert!(!b.subsumes(&a));
     }
@@ -3175,8 +3179,8 @@ mod tests {
     #[test]
     fn minus_intervals_minus_overlapping_intervals_removes_overlap() {
         // {[1,5]} ∖ {[2,3]} = {[1,1]} ∪ {[4,5]}
-        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4, 5]));
-        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3]));
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4, 5].into()));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3].into()));
         let result = a.minus(&b);
         assert!(result.contains(&Value::UInt(1)));
         assert!(!result.contains(&Value::UInt(2)));
@@ -3188,16 +3192,16 @@ mod tests {
     #[test]
     fn minus_intervals_minus_superset_is_false() {
         // {[1,2]} ∖ {[1,3]} = ∅
-        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2]));
-        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3]));
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2].into()));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3].into()));
         assert_eq!(a.minus(&b), Predicate::False);
     }
 
     #[test]
     fn minus_intervals_minus_disjoint_is_unchanged() {
         // {[1,3]} ∖ {[5,7]} = {[1,3]}
-        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3]));
-        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![5, 6, 7]));
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3].into()));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![5, 6, 7].into()));
         let result = a.minus(&b);
         assert!(result.contains(&Value::UInt(1)));
         assert!(result.contains(&Value::UInt(3)));
@@ -3207,7 +3211,7 @@ mod tests {
     #[test]
     fn minus_intervals_minus_at_or_below() {
         // {[1,5]} ∖ (-∞,3] = {[4,5]}
-        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4, 5]));
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4, 5].into()));
         let result = a.minus(&Predicate::at_or_below(Value::UInt(3)));
         assert!(!result.contains(&Value::UInt(1)));
         assert!(!result.contains(&Value::UInt(3)));
@@ -3219,7 +3223,7 @@ mod tests {
     #[test]
     fn minus_at_or_below_minus_intervals_removes_overlap() {
         // (-∞,10] ∖ {[3,5]} = (-∞,2] ∪ {[6,10]}
-        let intervals = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 4, 5]));
+        let intervals = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 4, 5].into()));
         let result = Predicate::at_or_below(Value::UInt(10)).minus(&intervals);
         assert!(result.contains(&Value::UInt(1)));
         assert!(!result.contains(&Value::UInt(3)));
@@ -3258,7 +3262,7 @@ mod tests {
     #[test]
     fn minus_true_minus_intervals_is_complement() {
         // U ∖ {[0,5]} = (5,∞)
-        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1, 2, 3, 4, 5]));
+        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1, 2, 3, 4, 5].into()));
         let result = Predicate::True.minus(&s);
         assert!(!result.contains(&Value::UInt(3)));
         assert!(result.contains(&Value::UInt(100)));
@@ -3274,14 +3278,14 @@ mod tests {
         let a = record_pred(&[
             (
                 "a",
-                Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3])),
+                Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3].into())),
             ),
             ("b", Predicate::True),
         ]);
         let b = record_pred(&[
             (
                 "a",
-                Predicate::from_column_value(&ColumnValue::UInts(vec![2])),
+                Predicate::from_column_value(&ColumnValue::UInts(vec![2].into())),
             ),
             ("b", Predicate::False),
         ]);
@@ -3292,7 +3296,7 @@ mod tests {
     /// not hold survives — including a row that agrees with it in some fields but not all.
     #[test]
     fn minus_record_minus_record_keeps_the_rows_the_subtrahend_never_held() {
-        let pt = |k: u64| Predicate::from_column_value(&ColumnValue::UInts(vec![k]));
+        let pt = |k: u64| Predicate::from_column_value(&ColumnValue::UInts(vec![k].into()));
         let pair = |x: u64, y: u64| {
             Value::Record(
                 [("a".into(), Value::UInt(x)), ("b".into(), Value::UInt(y))]
@@ -3314,7 +3318,7 @@ mod tests {
     /// into several does not stay fragmented where it need not.
     #[test]
     fn union_of_two_records_differing_in_one_field_is_one_record() {
-        let pt = |k: u64| Predicate::from_column_value(&ColumnValue::UInts(vec![k]));
+        let pt = |k: u64| Predicate::from_column_value(&ColumnValue::UInts(vec![k].into()));
         let left = record_pred(&[("a", pt(0)), ("b", Predicate::True)]);
         let right = record_pred(&[("a", pt(1)), ("b", Predicate::True)]);
         assert_eq!(
@@ -3327,10 +3331,12 @@ mod tests {
     fn minus_or_distributes_over_arms() {
         // Or([{1,2}, {4,5}]) ∖ {2} = Or([{1}, {4,5}])
         let or_pred = Predicate::Or(vec![
-            Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2])),
-            Predicate::from_column_value(&ColumnValue::UInts(vec![4, 5])),
+            Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2].into())),
+            Predicate::from_column_value(&ColumnValue::UInts(vec![4, 5].into())),
         ]);
-        let result = or_pred.minus(&Predicate::from_column_value(&ColumnValue::UInts(vec![2])));
+        let result = or_pred.minus(&Predicate::from_column_value(&ColumnValue::UInts(
+            vec![2].into(),
+        )));
         assert!(result.contains(&Value::UInt(1)));
         assert!(!result.contains(&Value::UInt(2)));
         assert!(result.contains(&Value::UInt(4)));
@@ -3340,10 +3346,10 @@ mod tests {
     #[test]
     fn minus_p_minus_or_subtracts_all_arms() {
         // {[1,5]} ∖ Or([{2}, {4}]) = {1,3,5}
-        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4, 5]));
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4, 5].into()));
         let or_b = Predicate::Or(vec![
-            Predicate::from_column_value(&ColumnValue::UInts(vec![2])),
-            Predicate::from_column_value(&ColumnValue::UInts(vec![4])),
+            Predicate::from_column_value(&ColumnValue::UInts(vec![2].into())),
+            Predicate::from_column_value(&ColumnValue::UInts(vec![4].into())),
         ]);
         let result = a.minus(&or_b);
         assert!(result.contains(&Value::UInt(1)));
@@ -3377,11 +3383,11 @@ mod tests {
     }
 
     fn int_intervals(values: &[i64]) -> Predicate {
-        Predicate::from_column_value(&ColumnValue::Ints(values.to_vec()))
+        Predicate::from_column_value(&ColumnValue::Ints(values.to_vec().into()))
     }
 
     fn uint_intervals(values: &[u64]) -> Predicate {
-        Predicate::from_column_value(&ColumnValue::UInts(values.to_vec()))
+        Predicate::from_column_value(&ColumnValue::UInts(values.to_vec().into()))
     }
 
     #[test]
@@ -3566,7 +3572,7 @@ mod tests {
         // A column naming one tag and a statement over both combine without a tag-set match.
         let column = Predicate::from_column_value(&ColumnValue::positional_union(
             &[0],
-            vec![ColumnValue::Ints(vec![1])],
+            vec![ColumnValue::Ints(vec![1].into())],
         ));
         let statement = union_pred(int_intervals(&[1, 2]), Predicate::True);
         assert!(statement.subsumes(&column));
@@ -3604,7 +3610,10 @@ mod tests {
     fn union_from_column_value_empty_tags_is_false() {
         let cv = ColumnValue::positional_union(
             &[],
-            vec![ColumnValue::Ints(vec![]), ColumnValue::Bools(Vec::new())],
+            vec![
+                ColumnValue::Ints(vec![].into()),
+                ColumnValue::Bools(Vec::new().into()),
+            ],
         );
         assert_eq!(Predicate::from_column_value(&cv), Predicate::False);
     }
@@ -3613,7 +3622,10 @@ mod tests {
     fn union_from_column_value_builds_per_variant_predicate() {
         let cv = ColumnValue::positional_union(
             &[0, 1, 0],
-            vec![ColumnValue::Ints(vec![1, 3]), ColumnValue::Ints(vec![7])],
+            vec![
+                ColumnValue::Ints(vec![1, 3].into()),
+                ColumnValue::Ints(vec![7].into()),
+            ],
         );
         let pred = Predicate::from_column_value(&cv);
         assert!(matches!(pred, Predicate::Union { ref tags, .. } if tags.len() == 2));
@@ -3837,14 +3849,14 @@ mod tests {
         use super::super::interval_sets::test_support::Lcg;
         let unsigned = |v: Vec<u64>| {
             assert_eq!(
-                Predicate::from_column_value(&ColumnValue::UInts(v.clone())),
+                Predicate::from_column_value(&ColumnValue::UInts(v.clone().into())),
                 vec_to_predicate(&v),
                 "{v:?}"
             );
         };
         let signed = |v: Vec<i64>| {
             assert_eq!(
-                Predicate::from_column_value(&ColumnValue::Ints(v.clone())),
+                Predicate::from_column_value(&ColumnValue::Ints(v.clone().into())),
                 vec_to_predicate(&v),
                 "{v:?}"
             );
@@ -3865,7 +3877,7 @@ mod tests {
         signed(vec![i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1, 0, -1]);
         unsigned(vec![]);
         assert_eq!(
-            Predicate::from_column_value(&ColumnValue::UInts(vec![])),
+            Predicate::from_column_value(&ColumnValue::UInts(vec![].into())),
             Predicate::False
         );
     }

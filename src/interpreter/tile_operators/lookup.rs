@@ -606,11 +606,11 @@ mod tests {
     /// comprehension's key binder arrives: the rows final, the groups beneath them whole.
     fn grouped_keys() -> (Tile, Tiling) {
         let tile = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             Box::new(Tile::grouped(
                 vec![0, 2],
-                ColumnValue::UInts(vec![0, 1, 0, 1]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 9, 2, 10]))),
+                ColumnValue::UInts(vec![0, 1, 0, 1].into()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 9, 2, 10].into()))),
                 Predicate::False,
                 BitSet::new(),
             )),
@@ -625,8 +625,8 @@ mod tests {
     /// The map `{1: 10, 2: 20}`, with its domain decided or not.
     fn collection(decided: bool) -> (Tile, Tiling) {
         let tile = Tile::data_function(
-            ColumnValue::Ints(vec![1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+            ColumnValue::Ints(vec![1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20].into()))),
             if decided {
                 Predicate::True
             } else {
@@ -656,9 +656,9 @@ mod tests {
         let mut lookup = lookup_over(grouped_keys(), collection(true));
         let out = lookup.get(lookup.tiling().universal_guard());
         let levels = out.key_levels();
-        assert_eq!(*levels[0].1, ColumnValue::UInts(vec![0, 1]));
+        assert_eq!(*levels[0].1, ColumnValue::UInts(vec![0, 1].into()));
         assert_eq!(*levels[1].0, vec![0, 2]);
-        assert_eq!(*levels[1].1, ColumnValue::UInts(vec![0, 1, 0, 1]));
+        assert_eq!(*levels[1].1, ColumnValue::UInts(vec![0, 1, 0, 1].into()));
         assert_eq!(
             scalar_tile_to_column_value(out.deepest_values().clone()),
             ColumnValue::from_values(
@@ -684,11 +684,11 @@ mod tests {
         let levels = out.key_levels();
         assert_eq!(
             *levels[0].1,
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             "both rows stand"
         );
         assert_eq!(*levels[1].0, vec![0, 1], "one key each");
-        assert_eq!(*levels[1].1, ColumnValue::UInts(vec![0, 0]));
+        assert_eq!(*levels[1].1, ColumnValue::UInts(vec![0, 0].into()));
         assert_eq!(
             scalar_tile_to_column_value(out.deepest_values().clone()),
             ColumnValue::from_values(
@@ -756,8 +756,8 @@ mod tests {
     #[test]
     fn an_undecided_key_in_a_flat_stream_leaves_only_its_row_open() {
         let keys = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 9]))),
+            ColumnValue::UInts(vec![0, 1].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 9].into()))),
             Predicate::True,
             BitSet::new(),
         );
@@ -772,7 +772,7 @@ mod tests {
         else {
             panic!("the answer tiles as a collection: {out:?}")
         };
-        assert_eq!(*domain, ColumnValue::UInts(vec![0]));
+        assert_eq!(*domain, ColumnValue::UInts(vec![0].into()));
         assert!(domain_predicate.contains(&Value::UInt(0)));
         assert!(!domain_predicate.contains(&Value::UInt(1)));
     }

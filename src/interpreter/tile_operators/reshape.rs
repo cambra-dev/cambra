@@ -619,15 +619,15 @@ mod tests {
             (
                 tuple_field(0),
                 ColumnValue::Records(HashMap::from([
-                    (tuple_field(0), ColumnValue::Ints(vec![10, 20])),
-                    (tuple_field(1), ColumnValue::Ints(vec![30, 40])),
+                    (tuple_field(0), ColumnValue::Ints(vec![10, 20].into())),
+                    (tuple_field(1), ColumnValue::Ints(vec![30, 40].into())),
                 ])),
             ),
             (
                 tuple_field(1),
                 ColumnValue::Records(HashMap::from([(
                     tuple_field(0),
-                    ColumnValue::Ints(vec![50, 60]),
+                    ColumnValue::Ints(vec![50, 60].into()),
                 )])),
             ),
         ]);
@@ -647,15 +647,15 @@ mod tests {
             .collect();
         assert_eq!(
             flat_domain[&tuple_field(0)],
-            ColumnValue::Ints(vec![10, 20])
+            ColumnValue::Ints(vec![10, 20].into())
         );
         assert_eq!(
             flat_domain[&tuple_field(1)],
-            ColumnValue::Ints(vec![30, 40])
+            ColumnValue::Ints(vec![30, 40].into())
         );
         assert_eq!(
             flat_domain[&tuple_field(2)],
-            ColumnValue::Ints(vec![50, 60])
+            ColumnValue::Ints(vec![50, 60].into())
         );
 
         assert_eq!(
@@ -782,19 +782,19 @@ mod tests {
                 (
                     tuple_field(0),
                     ColumnValue::Records(HashMap::from([
-                        (tuple_field(0), ColumnValue::Ints(vec![10, 20])),
-                        (tuple_field(1), ColumnValue::Ints(vec![30, 40])),
+                        (tuple_field(0), ColumnValue::Ints(vec![10, 20].into())),
+                        (tuple_field(1), ColumnValue::Ints(vec![30, 40].into())),
                     ])),
                 ),
                 (
                     tuple_field(1),
                     ColumnValue::Records(HashMap::from([(
                         tuple_field(0),
-                        ColumnValue::Ints(vec![50, 60]),
+                        ColumnValue::Ints(vec![50, 60].into()),
                     )])),
                 ),
             ])),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0]))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0].into()))),
             Predicate::True,
             BitSet::new(),
         );
@@ -816,9 +816,18 @@ mod tests {
         let ColumnValue::Records(cols) = domain else {
             panic!("expected record keys");
         };
-        assert_eq!(cols[&tuple_field(0)], ColumnValue::Ints(vec![10, 20]));
-        assert_eq!(cols[&tuple_field(1)], ColumnValue::Ints(vec![30, 40]));
-        assert_eq!(cols[&tuple_field(2)], ColumnValue::Ints(vec![50, 60]));
+        assert_eq!(
+            cols[&tuple_field(0)],
+            ColumnValue::Ints(vec![10, 20].into())
+        );
+        assert_eq!(
+            cols[&tuple_field(1)],
+            ColumnValue::Ints(vec![30, 40].into())
+        );
+        assert_eq!(
+            cols[&tuple_field(2)],
+            ColumnValue::Ints(vec![50, 60].into())
+        );
         assert_eq!(domain_predicate, Predicate::True);
     }
 
@@ -851,12 +860,12 @@ mod tests {
                     tuple_field(0),
                     ColumnValue::Records(HashMap::from([(
                         tuple_field(0),
-                        ColumnValue::Ints(vec![10, 20]),
+                        ColumnValue::Ints(vec![10, 20].into()),
                     )])),
                 ),
-                (tuple_field(1), ColumnValue::Ints(vec![99, 88])),
+                (tuple_field(1), ColumnValue::Ints(vec![99, 88].into())),
             ])),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0]))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0].into()))),
             Predicate::True,
             BitSet::new(),
         );
@@ -879,8 +888,14 @@ mod tests {
         let ColumnValue::Records(cols) = domain else {
             panic!("expected Records domain");
         };
-        assert_eq!(cols[&tuple_field(0)], ColumnValue::Ints(vec![10, 20]));
-        assert_eq!(cols[&tuple_field(1)], ColumnValue::Ints(vec![99, 88]));
+        assert_eq!(
+            cols[&tuple_field(0)],
+            ColumnValue::Ints(vec![10, 20].into())
+        );
+        assert_eq!(
+            cols[&tuple_field(1)],
+            ColumnValue::Ints(vec![99, 88].into())
+        );
     }
 
     // ── PermuteRecordDomainProducer ───────────────────────────────────────────
@@ -897,11 +912,11 @@ mod tests {
         );
         let tile = Tile::data_function(
             ColumnValue::Records(HashMap::from([
-                (tuple_field(0), ColumnValue::Ints(vec![1, 2])),
-                (tuple_field(1), ColumnValue::Ints(vec![3, 4])),
-                (tuple_field(2), ColumnValue::Ints(vec![5, 6])),
+                (tuple_field(0), ColumnValue::Ints(vec![1, 2].into())),
+                (tuple_field(1), ColumnValue::Ints(vec![3, 4].into())),
+                (tuple_field(2), ColumnValue::Ints(vec![5, 6].into())),
             ])),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0]))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0].into()))),
             Predicate::True,
             BitSet::new(),
         );
@@ -930,9 +945,9 @@ mod tests {
         let ColumnValue::Records(cols) = domain else {
             panic!("expected Records domain");
         };
-        assert_eq!(cols[&tuple_field(0)], ColumnValue::Ints(vec![5, 6]));
-        assert_eq!(cols[&tuple_field(1)], ColumnValue::Ints(vec![1, 2]));
-        assert_eq!(cols[&tuple_field(2)], ColumnValue::Ints(vec![3, 4]));
+        assert_eq!(cols[&tuple_field(0)], ColumnValue::Ints(vec![5, 6].into()));
+        assert_eq!(cols[&tuple_field(1)], ColumnValue::Ints(vec![1, 2].into()));
+        assert_eq!(cols[&tuple_field(2)], ColumnValue::Ints(vec![3, 4].into()));
     }
 
     /// `PermuteRecordDomainProducer::get_impl` with identity permutation leaves domain unchanged.
@@ -955,9 +970,9 @@ mod tests {
         let ColumnValue::Records(cols) = domain else {
             panic!("expected Records domain");
         };
-        assert_eq!(cols[&tuple_field(0)], ColumnValue::Ints(vec![1, 2]));
-        assert_eq!(cols[&tuple_field(1)], ColumnValue::Ints(vec![3, 4]));
-        assert_eq!(cols[&tuple_field(2)], ColumnValue::Ints(vec![5, 6]));
+        assert_eq!(cols[&tuple_field(0)], ColumnValue::Ints(vec![1, 2].into()));
+        assert_eq!(cols[&tuple_field(1)], ColumnValue::Ints(vec![3, 4].into()));
+        assert_eq!(cols[&tuple_field(2)], ColumnValue::Ints(vec![5, 6].into()));
     }
 
     /// `PermuteRecordDomainProducer::get_impl` permutes a `Record` domain predicate.

@@ -8,6 +8,8 @@ use std::ops::Range;
 
 use smol_str::SmolStr;
 
+use crate::column_storage::Storage;
+
 use super::{BaseType, Extent, RowIndex, Value, row_index, uint_of_row};
 use crate::ccl::{FieldKey, TagMap};
 
@@ -73,10 +75,10 @@ fn overwrite_from<T: Clone>(dest: &mut Vec<T>, src: &[T]) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnValue {
     Units(usize),
-    Ints(Vec<i64>),
-    UInts(Vec<u64>),
-    Strings(Vec<SmolStr>),
-    Bools(Vec<bool>),
+    Ints(Storage<i64>),
+    UInts(Storage<u64>),
+    Strings(Storage<SmolStr>),
+    Bools(Storage<bool>),
     Variants(Vec<Value>),
     FunctionBindings {
         inputs: Box<ColumnValue>,
@@ -275,14 +277,16 @@ impl ColumnValue {
     }
 
     /// Repeat a single-element `ColumnValue` to the given length.
+    ///
+    /// A flat column repeats as a constant, which stores the value once; see [`Storage`].
     pub fn repeat(&self, n: usize) -> ColumnValue {
         assert_eq!(self.len(), 1, "repeat requires single-element ColumnValue");
         match self {
             ColumnValue::Units(_) => ColumnValue::Units(n),
-            ColumnValue::Bools(v) => ColumnValue::Bools(vec![v[0]; n]),
-            ColumnValue::Ints(v) => ColumnValue::Ints(vec![v[0]; n]),
-            ColumnValue::UInts(v) => ColumnValue::UInts(vec![v[0]; n]),
-            ColumnValue::Strings(v) => ColumnValue::Strings(vec![v[0].clone(); n]),
+            ColumnValue::Bools(v) => ColumnValue::Bools(Storage::constant(v[0], n)),
+            ColumnValue::Ints(v) => ColumnValue::Ints(Storage::constant(v[0], n)),
+            ColumnValue::UInts(v) => ColumnValue::UInts(Storage::constant(v[0], n)),
+            ColumnValue::Strings(v) => ColumnValue::Strings(Storage::constant(v[0].clone(), n)),
             ColumnValue::Variants(v) => ColumnValue::Variants(vec![v[0].clone(); n]),
             ColumnValue::Records(r) => {
                 ColumnValue::Records(r.iter().map(|(k, v)| (k.clone(), v.repeat(n))).collect())
@@ -311,10 +315,10 @@ impl ColumnValue {
     /// The rows in `range`, copied into a column of their own.
     pub fn slice(&self, range: Range<usize>) -> ColumnValue {
         match self {
-            ColumnValue::Ints(v) => ColumnValue::Ints(v[range].to_vec()),
-            ColumnValue::UInts(v) => ColumnValue::UInts(v[range].to_vec()),
-            ColumnValue::Strings(v) => ColumnValue::Strings(v[range].to_vec()),
-            ColumnValue::Bools(v) => ColumnValue::Bools(v[range].to_vec()),
+            ColumnValue::Ints(v) => ColumnValue::Ints(v[range].to_vec().into()),
+            ColumnValue::UInts(v) => ColumnValue::UInts(v[range].to_vec().into()),
+            ColumnValue::Strings(v) => ColumnValue::Strings(v[range].to_vec().into()),
+            ColumnValue::Bools(v) => ColumnValue::Bools(v[range].to_vec().into()),
             ColumnValue::Records(r) => ColumnValue::Records(
                 r.iter()
                     .map(|(k, v)| (k.clone(), v.slice(range.clone())))
@@ -676,10 +680,10 @@ impl ColumnValue {
             // e.g. a `` `abort(unit) `` (`Unit` payload) variant value fanned through a
             // `Memo`. Keep the representation canonical here.
             Value::Unit => ColumnValue::Units(1),
-            Value::Bool(b) => ColumnValue::Bools(vec![b; 1]),
-            Value::Int(i) => ColumnValue::Ints(vec![i]),
-            Value::UInt(i) => ColumnValue::UInts(vec![i]),
-            Value::String(s) => ColumnValue::Strings(vec![s]),
+            Value::Bool(b) => ColumnValue::Bools(vec![b; 1].into()),
+            Value::Int(i) => ColumnValue::Ints(vec![i].into()),
+            Value::UInt(i) => ColumnValue::UInts(vec![i].into()),
+            Value::String(s) => ColumnValue::Strings(vec![s].into()),
             Value::Record(fields) => ColumnValue::Records(
                 fields
                     .into_iter()
@@ -746,12 +750,12 @@ impl ColumnValue {
 
     /// Create a `ColumnValue` from a `Vec<i64>`.
     pub fn from_ints(values: Vec<i64>) -> Self {
-        ColumnValue::Ints(values)
+        ColumnValue::Ints(values.into())
     }
 
     /// Create a `ColumnValue` from a `Vec<u64>`.
     pub fn from_uints(values: Vec<u64>) -> Self {
-        ColumnValue::UInts(values)
+        ColumnValue::UInts(values.into())
     }
 
     /// Create a `UInts` column carrying the numbers of `rows` (see [`Value::uint_from_row`]).
@@ -829,10 +833,10 @@ impl ColumnValue {
     pub fn empty_like(&self) -> ColumnValue {
         match self {
             ColumnValue::Units(_) => ColumnValue::Units(0),
-            ColumnValue::Ints(_) => ColumnValue::Ints(Vec::new()),
-            ColumnValue::UInts(_) => ColumnValue::UInts(Vec::new()),
-            ColumnValue::Strings(_) => ColumnValue::Strings(Vec::new()),
-            ColumnValue::Bools(_) => ColumnValue::Bools(Vec::new()),
+            ColumnValue::Ints(_) => ColumnValue::Ints(Vec::new().into()),
+            ColumnValue::UInts(_) => ColumnValue::UInts(Vec::new().into()),
+            ColumnValue::Strings(_) => ColumnValue::Strings(Vec::new().into()),
+            ColumnValue::Bools(_) => ColumnValue::Bools(Vec::new().into()),
             ColumnValue::Variants(_) => ColumnValue::Variants(Vec::new()),
             ColumnValue::FunctionBindings { inputs, outputs } => {
                 ColumnValue::function_bindings(inputs.empty_like(), outputs.empty_like())
@@ -1107,7 +1111,7 @@ mod tests {
         let one = ColumnValue::Union(TagMap::from_arms(vec![
             (
                 commit.clone(),
-                UnionArm::new(vec![], ColumnValue::Ints(vec![])),
+                UnionArm::new(vec![], ColumnValue::Ints(vec![].into())),
             ),
             (abort.clone(), UnionArm::new(vec![0], ColumnValue::Units(1))),
         ]));
@@ -1129,7 +1133,7 @@ mod tests {
             "an arm that did not occur stays empty rather than being dropped — a \
              dropped arm is a narrower column, which a downstream merge cannot pair"
         );
-        assert_eq!(commit_arm.values(), &ColumnValue::Ints(vec![]));
+        assert_eq!(commit_arm.values(), &ColumnValue::Ints(vec![].into()));
 
         // Every row really does read back as the broadcast value.
         for row in 0..3 {
@@ -1153,7 +1157,7 @@ mod tests {
             ),
             (
                 FieldKey::Name("commit".into()),
-                UnionArm::new(vec![0, 2], ColumnValue::Ints(vec![10, 30])),
+                UnionArm::new(vec![0, 2], ColumnValue::Ints(vec![10, 30].into())),
             ),
         ]))
     }
@@ -1220,15 +1224,15 @@ mod tests {
         // Row 0: a[0]=1, b[0]=3 | Row 1: a[0]=1, b[1]=4
         // Row 2: a[1]=2, b[0]=3 | Row 3: a[1]=2, b[1]=4
         let data = HashMap::from([
-            ("a".into(), ColumnValue::Ints(vec![1, 2])),
-            ("b".into(), ColumnValue::Ints(vec![3, 4])),
+            ("a".into(), ColumnValue::Ints(vec![1, 2].into())),
+            ("b".into(), ColumnValue::Ints(vec![3, 4].into())),
         ]);
         let result = ColumnValue::cartesian_product(data);
         assert_eq!(
             result,
             ColumnValue::Records(HashMap::from([
-                ("a".into(), ColumnValue::Ints(vec![1, 1, 2, 2])),
-                ("b".into(), ColumnValue::Ints(vec![3, 4, 3, 4])),
+                ("a".into(), ColumnValue::Ints(vec![1, 1, 2, 2].into())),
+                ("b".into(), ColumnValue::Ints(vec![3, 4, 3, 4].into())),
             ]))
         );
     }
@@ -1272,12 +1276,15 @@ mod tests {
     #[test]
     fn test_retain_bools_preserves_order() {
         // Mask `[F, T, T]` once returned `[v2, v1]`.
-        let mut col = ColumnValue::Bools(vec![true, false, true]);
+        let mut col = ColumnValue::Bools(vec![true, false, true].into());
         col.retain(&[false, true, true]);
-        assert_eq!(col, ColumnValue::Bools(vec![false, true]));
-        let mut col = ColumnValue::Bools(vec![true, false, false, true, false, true]);
+        assert_eq!(col, ColumnValue::Bools(vec![false, true].into()));
+        let mut col = ColumnValue::Bools(vec![true, false, false, true, false, true].into());
         col.retain(&[true, false, true, false, true, true]);
-        assert_eq!(col, ColumnValue::Bools(vec![true, false, false, true]));
+        assert_eq!(
+            col,
+            ColumnValue::Bools(vec![true, false, false, true].into())
+        );
     }
 
     #[test]
@@ -1308,7 +1315,7 @@ mod tests {
                 }
                 (
                     FieldKey::Index(t),
-                    UnionArm::new(arm_rows, ColumnValue::Ints(values)),
+                    UnionArm::new(arm_rows, ColumnValue::Ints(values.into())),
                 )
             })
             .collect();
@@ -1417,7 +1424,7 @@ mod tests {
         let mut a = ColumnValue::Union(TagMap::from_arms(vec![
             (
                 commit.clone(),
-                UnionArm::new(vec![0, 2], ColumnValue::Ints(vec![1, 2])),
+                UnionArm::new(vec![0, 2], ColumnValue::Ints(vec![1, 2].into())),
             ),
             (abort.clone(), UnionArm::new(vec![1], ColumnValue::Units(1))),
         ]));
@@ -1425,7 +1432,7 @@ mod tests {
         let b = ColumnValue::Union(TagMap::from_arms(vec![
             (
                 commit.clone(),
-                UnionArm::new(vec![1], ColumnValue::Ints(vec![3])),
+                UnionArm::new(vec![1], ColumnValue::Ints(vec![3].into())),
             ),
             (abort.clone(), UnionArm::new(vec![0], ColumnValue::Units(1))),
         ]));
@@ -1440,7 +1447,7 @@ mod tests {
         assert_eq!(arms.get(&abort).unwrap().rows(), [1, 3]);
         assert_eq!(
             *arms.get(&commit).unwrap().values(),
-            ColumnValue::Ints(vec![1, 2, 3])
+            ColumnValue::Ints(vec![1, 2, 3].into())
         );
         assert_eq!(*arms.get(&abort).unwrap().values(), ColumnValue::Units(2));
         // Row-wise read-back: a row's arm gives its tag, and its position within
@@ -1477,11 +1484,11 @@ mod tests {
         let b_tag = FieldKey::Name("b".into());
         let mut a = ColumnValue::Union(TagMap::from_arms(vec![(
             a_tag.clone(),
-            UnionArm::new(vec![0], ColumnValue::Ints(vec![1])),
+            UnionArm::new(vec![0], ColumnValue::Ints(vec![1].into())),
         )]));
         let b = ColumnValue::Union(TagMap::from_arms(vec![(
             b_tag.clone(),
-            UnionArm::new(vec![0], ColumnValue::Ints(vec![2])),
+            UnionArm::new(vec![0], ColumnValue::Ints(vec![2].into())),
         )]));
         a.append(b);
         a.debug_assert_union_invariants();
@@ -1524,50 +1531,75 @@ mod tests {
     /// a like-for-like column concatenation rather than a mismatched-variant panic.
     #[test]
     fn union_arm_empty_like_keeps_payload_shape() {
-        let arm = UnionArm::new(vec![0], ColumnValue::Ints(vec![7]));
+        let arm = UnionArm::new(vec![0], ColumnValue::Ints(vec![7].into()));
         let empty = arm.empty_like();
         assert!(empty.is_empty());
-        assert_eq!(*empty.values(), ColumnValue::Ints(Vec::new()));
+        assert_eq!(*empty.values(), ColumnValue::Ints(Vec::new().into()));
         // The shape matching is the point: appending into it must not panic.
         let mut acc = empty.values().clone();
-        acc.append(ColumnValue::Ints(vec![7]));
-        assert_eq!(acc, ColumnValue::Ints(vec![7]));
+        acc.append(ColumnValue::Ints(vec![7].into()));
+        assert_eq!(acc, ColumnValue::Ints(vec![7].into()));
     }
 
     #[test]
     fn slice_into_reuses_a_column_of_the_same_shape_and_replaces_any_other() {
-        let source = ColumnValue::Ints(vec![1, 2, 3, 4]);
-        let mut out = ColumnValue::Ints(Vec::with_capacity(16));
+        let source = ColumnValue::Ints(vec![1, 2, 3, 4].into());
+        let mut out = ColumnValue::Ints(Vec::with_capacity(16).into());
         let buffer = match &out {
             ColumnValue::Ints(v) => v.as_ptr(),
             _ => unreachable!(),
         };
         source.slice_into(1..3, &mut out);
-        assert_eq!(out, ColumnValue::Ints(vec![2, 3]));
+        assert_eq!(out, ColumnValue::Ints(vec![2, 3].into()));
         assert!(matches!(&out, ColumnValue::Ints(v) if v.as_ptr() == buffer));
         let mut other = ColumnValue::Units(0);
         source.slice_into(0..2, &mut other);
-        assert_eq!(other, ColumnValue::Ints(vec![1, 2]));
+        assert_eq!(other, ColumnValue::Ints(vec![1, 2].into()));
     }
 
     #[test]
     fn extend_from_appends_without_consuming() {
-        let mut column = ColumnValue::Bools(vec![true]);
-        let more = ColumnValue::Bools(vec![false, true]);
+        let mut column = ColumnValue::Bools(vec![true].into());
+        let more = ColumnValue::Bools(vec![false, true].into());
         column.extend_from(&more);
-        assert_eq!(column, ColumnValue::Bools(vec![true, false, true]));
-        assert_eq!(more, ColumnValue::Bools(vec![false, true]));
+        assert_eq!(column, ColumnValue::Bools(vec![true, false, true].into()));
+        assert_eq!(more, ColumnValue::Bools(vec![false, true].into()));
     }
 
     /// A slice written over a column that already holds other rows replaces them, whether the
     /// new rows are fewer, as many or more.
     #[test]
     fn slice_into_overwrites_the_rows_the_column_holds() {
-        let source = ColumnValue::Strings(["a", "b", "c", "d", "e"].map(SmolStr::new).to_vec());
-        let mut out = ColumnValue::Strings(["x", "y", "z"].map(SmolStr::new).to_vec());
+        let source =
+            ColumnValue::Strings(["a", "b", "c", "d", "e"].map(SmolStr::new).to_vec().into());
+        let mut out = ColumnValue::Strings(["x", "y", "z"].map(SmolStr::new).to_vec().into());
         for range in [0..2, 1..4, 0..5, 3..3, 2..3] {
             source.slice_into(range.clone(), &mut out);
             assert_eq!(out, source.slice(range.clone()), "{range:?}");
         }
+    }
+
+    /// A repeated value is stored once and reads like the column of copies.
+    #[test]
+    fn repeat_stores_a_flat_value_once() {
+        let repeated = ColumnValue::Ints(vec![7].into()).repeat(1_000_000);
+        let ColumnValue::Ints(storage) = &repeated else {
+            unreachable!()
+        };
+        assert!(storage.is_constant());
+        assert_eq!(repeated.len(), 1_000_000);
+        assert_eq!(repeated.index_at(999_999), Value::Int(7));
+        // It equals the column of copies, however each is stored.
+        assert_eq!(
+            ColumnValue::Strings(vec!["a".into()].into()).repeat(3),
+            ColumnValue::Strings(vec!["a".into(); 3].into())
+        );
+        // Code that wants a `Vec` expands it once.
+        let mut expanded = ColumnValue::Bools(vec![true].into()).repeat(4);
+        expanded.append(ColumnValue::Bools(vec![false].into()));
+        assert_eq!(
+            expanded,
+            ColumnValue::Bools(vec![true, true, true, true, false].into())
+        );
     }
 }

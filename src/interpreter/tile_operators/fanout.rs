@@ -1359,8 +1359,8 @@ mod tests {
     /// it — so the tile is not the whole function and the input is not drained.
     fn one_row(key: u64, value: i64) -> Tile {
         Tile::data_function(
-            ColumnValue::UInts(vec![key]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![value]))),
+            ColumnValue::UInts(vec![key].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![value].into()))),
             Predicate::at_or_below(Value::UInt(key)),
             BitSet::new(),
         )
@@ -1577,8 +1577,10 @@ mod tests {
     #[test]
     fn memo_holds_one_value_across_repeated_pulls() {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
-        let (upstream, _released) =
-            QuietSpy::new(Tile::Scalar(ColumnValue::Ints(vec![-5])), tiling.clone());
+        let (upstream, _released) = QuietSpy::new(
+            Tile::Scalar(ColumnValue::Ints(vec![-5].into())),
+            tiling.clone(),
+        );
         let mut memo = MemoProducer {
             base: ProducerBase::unowned(MemoProducer::alloc_id(), &tiling),
             input: Box::new(upstream),
@@ -1596,7 +1598,7 @@ mod tests {
             let tile = memo.get(tiling.universal_guard());
             assert_eq!(
                 tile,
-                Tile::Scalar(ColumnValue::Ints(vec![-5])),
+                Tile::Scalar(ColumnValue::Ints(vec![-5].into())),
                 "pull {pull}: the cache holds the one drained value, not one copy per pull"
             );
         }

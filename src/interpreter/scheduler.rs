@@ -649,7 +649,7 @@ mod tests {
                     true => vec![2],
                     false => Vec::new(),
                 };
-                Tile::Scalar(ColumnValue::Ints(values))
+                Tile::Scalar(ColumnValue::Ints(values.into()))
             }
             fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
         }
@@ -661,9 +661,9 @@ mod tests {
             queue: scheduler.wakeup_queue(),
         };
         let tile = pull_laps(&mut scheduler, &mut producer, 8, |t| {
-            *t == Tile::Scalar(ColumnValue::Ints(vec![2]))
+            *t == Tile::Scalar(ColumnValue::Ints(vec![2].into()))
         });
-        assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![2])));
+        assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![2].into())));
     }
 
     /// A source with new data, and a consumer that counts its notifications.

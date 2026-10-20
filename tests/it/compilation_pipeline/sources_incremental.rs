@@ -142,8 +142,8 @@ fn test_source_filter_nonterminal() {
     assert_eq!(
         sort_function_by_domain(tile),
         sort_function_by_domain(Tile::data_function(
-            ColumnValue::UInts(vec![0]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+            ColumnValue::UInts(vec![0].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10].into()))),
             Predicate::False,
             BitSet::new()
         ))
@@ -490,7 +490,7 @@ fn test_incremental_global_aggregate() {
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
         result,
-        Tile::Scalar(ColumnValue::Ints(vec![])),
+        Tile::Scalar(ColumnValue::Ints(vec![].into())),
         "should produce no output before source is done (after first batch)"
     );
 
@@ -501,7 +501,7 @@ fn test_incremental_global_aggregate() {
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
         result,
-        Tile::Scalar(ColumnValue::Ints(vec![])),
+        Tile::Scalar(ColumnValue::Ints(vec![].into())),
         "should produce no output before source is done (after second batch)"
     );
 
@@ -512,7 +512,7 @@ fn test_incremental_global_aggregate() {
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
         result,
-        Tile::Scalar(ColumnValue::Ints(vec![60])),
+        Tile::Scalar(ColumnValue::Ints(vec![60].into())),
         "should emit final sum once source is terminal"
     );
 
@@ -832,11 +832,11 @@ x";
         .set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
 
-    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+    let empty = Tile::Scalar(ColumnValue::Ints(vec![].into()));
     let result = pull_laps(ctx.scheduler(), &mut *producer, 4, |t| *t != empty);
     assert_eq!(
         result,
-        Tile::Scalar(ColumnValue::Ints(vec![50])),
+        Tile::Scalar(ColumnValue::Ints(vec![50].into())),
         "conditional induction over an async source must honor the guard (20 + 30), not sum all (60)"
     );
 }
@@ -885,7 +885,7 @@ o";
         sort_function_by_domain(result),
         Tile::data_function(
             ColumnValue::from_uints(vec![0, 1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3].into()))),
             Predicate::True,
             BitSet::new()
         ),
@@ -931,7 +931,7 @@ x";
     // rather than a single pull because the cycle's pull granularity is
     // an internal detail — what we care about is "no premature output",
     // which any number of pre-terminal pulls should satisfy.
-    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+    let empty = Tile::Scalar(ColumnValue::Ints(vec![].into()));
 
     // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
     test_source.borrow_mut().add_data(&[
@@ -973,7 +973,7 @@ x";
     let result = pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
     assert_eq!(
         result,
-        Tile::Scalar(ColumnValue::Ints(vec![60])),
+        Tile::Scalar(ColumnValue::Ints(vec![60].into())),
         "should emit final accumulator once source is terminal"
     );
 
@@ -1007,7 +1007,7 @@ await_final(pool)";
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+    let empty = Tile::Scalar(ColumnValue::Ints(vec![].into()));
 
     test_source.borrow_mut().add_data(&[
         (Value::UInt(0), Value::Int(10)),
@@ -1031,7 +1031,7 @@ await_final(pool)";
     ctx.scheduler().check_for_notifications();
     assert_eq!(
         pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
-        Tile::Scalar(ColumnValue::Ints(vec![100])),
+        Tile::Scalar(ColumnValue::Ints(vec![100].into())),
     );
 }
 
@@ -1057,7 +1057,7 @@ x";
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+    let empty = Tile::Scalar(ColumnValue::Ints(vec![].into()));
 
     test_source.borrow_mut().add_data(&[
         (Value::UInt(0), Value::Int(10)),
@@ -1076,7 +1076,7 @@ x";
     ctx.scheduler().check_for_notifications();
     assert_eq!(
         pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
-        Tile::Scalar(ColumnValue::Ints(vec![7])),
+        Tile::Scalar(ColumnValue::Ints(vec![7].into())),
     );
     assert_eq!(
         test_source.borrow().get_released_predicate(),
@@ -1104,7 +1104,7 @@ x";
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
-    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+    let empty = Tile::Scalar(ColumnValue::Ints(vec![].into()));
 
     test_source
         .borrow_mut()
@@ -1112,7 +1112,7 @@ x";
     ctx.scheduler().check_for_notifications();
     assert_eq!(
         pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
-        Tile::Scalar(ColumnValue::Ints(vec![0])),
+        Tile::Scalar(ColumnValue::Ints(vec![0].into())),
     );
 }
 
@@ -1150,8 +1150,8 @@ fn test_incremental_aggregates() {
     assert_eq!(
         result,
         Tile::data_function(
-            ColumnValue::Ints(vec![]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            ColumnValue::Ints(vec![].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![].into()))),
             Predicate::False,
             BitSet::new()
         )
@@ -1165,8 +1165,8 @@ fn test_incremental_aggregates() {
     assert_eq!(
         result,
         Tile::data_function(
-            ColumnValue::Ints(vec![]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            ColumnValue::Ints(vec![].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![].into()))),
             Predicate::False,
             BitSet::new()
         )
@@ -1180,8 +1180,8 @@ fn test_incremental_aggregates() {
     assert_eq!(
         sort_function_by_domain(result),
         sort_function_by_domain(Tile::data_function(
-            ColumnValue::Ints(vec![1, 2, 3]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 20, 30]))),
+            ColumnValue::Ints(vec![1, 2, 3].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 20, 30].into()))),
             Predicate::True,
             BitSet::new()
         ))
@@ -1235,7 +1235,7 @@ fn test_source_backed_collection_component(#[case] code: &str, #[case] expected:
 
     let mut tile = producer.get(producer.tiling().universal_guard());
     tile.compact();
-    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected].into())));
 }
 
 /// A collection component **grows**: rows reach it as the source delivers them,
@@ -1282,8 +1282,8 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
 
     let expected = |keys: Vec<u64>, vals: Vec<i64>, done: bool| {
         sort_function_by_domain(Tile::data_function(
-            ColumnValue::UInts(keys),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
+            ColumnValue::UInts(keys.into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vals.into()))),
             if done {
                 Predicate::True
             } else {
@@ -1348,8 +1348,8 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
 
     let delivered = |keys: Vec<u64>, vals: Vec<i64>| {
         sort_function_by_domain(Tile::data_function(
-            ColumnValue::UInts(keys),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
+            ColumnValue::UInts(keys.into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vals.into()))),
             Predicate::False,
             BitSet::new(),
         ))
@@ -1532,7 +1532,7 @@ fn run_in_batches_seeing(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<T
 fn a_record_valued_lookup_is_restated_under_each_streamed_row(#[case] tail: &str) {
     let code = format!("rs = [(n=1, xs=[7, 8])]\n{tail}");
     let tile = run_in_batches(&code, &[(&[(0, 1)], 0), (&[(1, 1)], 1)]);
-    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![30])));
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![30].into())));
 }
 
 /// A constant broadcast over a filtered stream, where the constant comes from a loop that
@@ -1561,8 +1561,8 @@ fn a_constant_arm_waits_for_its_constant_after_a_filtered_batch(#[case] code: &s
     assert_eq!(
         sort_function_by_domain(tile),
         Tile::data_function(
-            ColumnValue::UInts(vec![1]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![6]))),
+            ColumnValue::UInts(vec![1].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![6].into()))),
             Predicate::True,
             BitSet::new(),
         )
@@ -1583,8 +1583,8 @@ fn a_group_arriving_below_one_held_is_not_released_early() {
     assert_eq!(
         sort_function_by_domain(tile),
         sort_function_by_domain(Tile::data_function(
-            ColumnValue::Ints(vec![1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+            ColumnValue::Ints(vec![1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20].into()))),
             Predicate::True,
             BitSet::new(),
         ))
@@ -1598,7 +1598,7 @@ fn innermost_ints(tile: &Tile) -> Vec<i64> {
         panic!("Ints beneath every level, got {tile:?}")
     };
     values.sort();
-    values
+    values.into_vec()
 }
 
 /// A comprehension over a source nested in one over a list, with the source read in the
@@ -1652,7 +1652,7 @@ fn a_totalled_nest_over_a_streamed_source_answers_at_the_close(
     #[case] expected: i64,
 ) {
     let tile = run_in_batches(code, &[(&[(0, 1)], 0), (&[(1, 2)], 1)]);
-    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected].into())));
 }
 
 /// A collection per row paired against a streamed source keeps each row's values as they
@@ -1724,7 +1724,7 @@ fn a_collection_per_row_released_as_it_is_read() {
             panic!("of Ints, got {codomain:?}")
         };
         values.sort();
-        (values, tile.is_terminal())
+        (values.into_vec(), tile.is_terminal())
     };
     let never: fn(&Tile) -> bool = |_| false;
     assert_eq!(
@@ -1783,7 +1783,7 @@ fn a_mut_loop_runs_in_order_over_positions_that_arrive_out_of_order(
     #[case] expected: i64,
 ) {
     let tile = run_in_batches(code, &[(&[(0, 1)], 0), (&[(1, 2)], 1)]);
-    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected].into())));
 }
 
 /// A **correlated lookup into a streamed collection**: each row's group of keys waits on a
@@ -1817,5 +1817,5 @@ fn a_correlated_lookup_answers_the_keys_its_collection_has_decided(
         vec![first]
     };
     let tile = run_in_batches(code, &batches);
-    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected].into())));
 }

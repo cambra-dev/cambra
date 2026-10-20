@@ -922,8 +922,10 @@ mod tests {
         let mut logs = Vec::new();
         let mut inputs: Vec<Box<dyn TileProducer>> = Vec::new();
         for _ in 0..2 {
-            let (spy, log) =
-                ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
+            let (spy, log) = ReleaseSpy::new(
+                Tile::Scalar(ColumnValue::Ints(vec![1].into())),
+                tiling.clone(),
+            );
             logs.push(log);
             inputs.push(Box::new(spy));
         }
@@ -948,7 +950,10 @@ mod tests {
     #[test]
     fn make_record_does_not_forward_an_empty_release() {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
-        let (spy, log) = ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
+        let (spy, log) = ReleaseSpy::new(
+            Tile::Scalar(ColumnValue::Ints(vec![1].into())),
+            tiling.clone(),
+        );
         let out_tiling = Tiling::Record([(tuple_field(0), tiling.clone())].into_iter().collect());
         let mut producer = MakeRecordProducer {
             base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
@@ -978,8 +983,10 @@ mod tests {
         let mut logs = Vec::new();
         let mut inputs: Vec<Box<dyn TileProducer>> = Vec::new();
         for _ in 0..2 {
-            let (spy, log) =
-                ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
+            let (spy, log) = ReleaseSpy::new(
+                Tile::Scalar(ColumnValue::Ints(vec![1].into())),
+                tiling.clone(),
+            );
             logs.push(log);
             inputs.push(Box::new(spy));
         }
@@ -1085,7 +1092,7 @@ mod tests {
     fn select_field_releases_finished_rows_and_every_other_field() {
         let input_tiling = record_under_a_level();
         let (spy, log) = ReleaseSpy::new(
-            Tile::Scalar(ColumnValue::Ints(vec![])),
+            Tile::Scalar(ColumnValue::Ints(vec![].into())),
             input_tiling.clone(),
         );
         let output_tiling = select_field_tiling(&input_tiling, "a");
@@ -1147,8 +1154,8 @@ mod tests {
         let mut deleted = BitSet::new();
         deleted.insert(1);
         Tile::data_function(
-            ColumnValue::UInts(vec![0, 1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 12]))),
+            ColumnValue::UInts(vec![0, 1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 12].into()))),
             Predicate::False,
             deleted,
         )
@@ -1200,16 +1207,16 @@ mod tests {
         let input_tiling = Tiling::data_function(uint(), row_tiling);
         let field_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
         let input = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             Box::new(Tile::Record {
                 fields: HashMap::from([
-                    ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![5]))),
+                    ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![5].into()))),
                     (
                         "b".into(),
                         Tile::grouped(
                             vec![0, 1],
-                            ColumnValue::UInts(vec![0, 0]),
-                            Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
+                            ColumnValue::UInts(vec![0, 0].into()),
+                            Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8].into()))),
                             Predicate::False,
                             BitSet::new(),
                         ),
@@ -1233,8 +1240,8 @@ mod tests {
         else {
             panic!("the field is a collection: {out:?}")
         };
-        assert_eq!(*domain, ColumnValue::UInts(vec![1]));
-        assert_eq!(**codomain, Tile::Scalar(ColumnValue::Ints(vec![5])));
+        assert_eq!(*domain, ColumnValue::UInts(vec![1].into()));
+        assert_eq!(**codomain, Tile::Scalar(ColumnValue::Ints(vec![5].into())));
     }
 
     /// Each input's deleted row is dropped from what `Zip` emits, so each input is released
@@ -1295,16 +1302,16 @@ mod tests {
             Tiling::Scalar(Extent::Base(BaseType::UInt)),
         );
         let tile_a = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 11, 12]))),
+            ColumnValue::UInts(vec![0, 1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 11, 12].into()))),
             // Non-terminal: branch A has emitted [0, 1, 2] but its
             // upstream hasn't yet signaled "no more".
             Predicate::False,
             BitSet::new(),
         );
         let tile_b = Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
-            Box::new(Tile::Scalar(ColumnValue::UInts(vec![20, 21]))),
+            ColumnValue::UInts(vec![0, 1].into()),
+            Box::new(Tile::Scalar(ColumnValue::UInts(vec![20, 21].into()))),
             Predicate::False,
             BitSet::new(),
         );
@@ -1352,12 +1359,12 @@ mod tests {
         };
         assert_eq!(
             scalar_tile_to_column_value(field_tiles.get("a").unwrap().clone()),
-            ColumnValue::UInts(vec![10, 11]),
+            ColumnValue::UInts(vec![10, 11].into()),
             "branch a's values should be filtered to positions [0, 1]",
         );
         assert_eq!(
             scalar_tile_to_column_value(field_tiles.get("b").unwrap().clone()),
-            ColumnValue::UInts(vec![20, 21]),
+            ColumnValue::UInts(vec![20, 21].into()),
             "branch b's values should remain [0, 1] (already its full presence)",
         );
     }
@@ -1374,7 +1381,7 @@ mod tests {
             Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
         let arm0 = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![5]))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![5].into()))),
             Predicate::False,
             BitSet::new(),
         );
@@ -1383,7 +1390,7 @@ mod tests {
             Box::new(Tile::grouped(
                 vec![0],
                 ColumnValue::from_uints(vec![3]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![30]))),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![30].into()))),
                 Predicate::False,
                 BitSet::new(),
             )),

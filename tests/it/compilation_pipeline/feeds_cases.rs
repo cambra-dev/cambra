@@ -17,7 +17,7 @@ use super::helpers::*;
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::feed_list("x = defer(); x <<= [1,2,3]; x", make_int_list(&[1, 2, 3]))]
-#[case::feed_scalar_to_defer("x = defer(); x << 1; x", Tile::data_function(ColumnValue::Units(1), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))), Predicate::True, BitSet::new()))]
+#[case::feed_scalar_to_defer("x = defer(); x << 1; x", Tile::data_function(ColumnValue::Units(1), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1].into()))), Predicate::True, BitSet::new()))]
 // An accumulator spelled like the tap its own loop's feed rides. The regression
 // these pin: a tap was named `to_<defer>_<n>`, which is a spelling user code can
 // write, and the tap and the accumulator share one decision record — so the
@@ -31,7 +31,7 @@ o = defer()
 for l in [1, 2, 3]:
     to_o_0 := to_o_0 + l
     o << l * 100
-to_o_0"#, Tile::Scalar(ColumnValue::Ints(vec![6])))]
+to_o_0"#, Tile::Scalar(ColumnValue::Ints(vec![6].into())))]
 // The same for a tap's `__fire` companion, which shares the record too.
 #[case::accumulator_spelled_like_its_taps_fire_gate(
 r#"to_o_0__fire := 0
@@ -40,7 +40,7 @@ for l in [1, 2, 3]:
     to_o_0__fire := to_o_0__fire + l
     if l > 1:
         o << l * 100
-to_o_0__fire"#, Tile::Scalar(ColumnValue::Ints(vec![6])))]
+to_o_0__fire"#, Tile::Scalar(ColumnValue::Ints(vec![6].into())))]
 #[case::feed_in_comprehension("x = defer(); [x << i for i in [1,2,3]]; x", make_int_list(&[1, 2, 3]))]
 #[case::feed_in_for_loop(
 r#"x = defer()
@@ -110,7 +110,7 @@ x"#,
     Tile::data_function(ColumnValue::positional_union(&[0, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 #[case::scalar_and_loop_feeds(
 r#"x = defer()
 x << 1
@@ -119,8 +119,8 @@ for i in [1, 2, 3]:
 x"#,
     Tile::data_function(ColumnValue::positional_union(&[0, 1, 1, 1], vec![
                 ColumnValue::Units(1),
-                ColumnValue::UInts(vec![0, 1, 2])
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+                ColumnValue::UInts(vec![0, 1, 2].into())
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 3].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 // Three feed sites: locks down N-ary union construction beyond N=2.
 #[case::three_feeds(
 r#"x = defer()
@@ -132,7 +132,7 @@ x"#,
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
 // Identical feed values still produce distinct variant tags.
 #[case::identical_feeds(
 r#"x = defer()
@@ -142,7 +142,7 @@ x"#,
     Tile::data_function(ColumnValue::positional_union(&[0, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 #[case::feed_via_alias(
 r#"
 x = defer()
@@ -194,8 +194,8 @@ for i in [1,2,3]:
   y << i
 y"#, Tile::data_function(ColumnValue::positional_union(&[0, 1, 1, 1], vec![
                 ColumnValue::Units(1),
-                ColumnValue::UInts(vec![0, 1, 2])
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+                ColumnValue::UInts(vec![0, 1, 2].into())
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 1, 2, 3].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 #[case::multiple_func_feeds(
 r#"
 def f(n):
@@ -211,8 +211,8 @@ for i in [1,2,3]:
 y"#, Tile::data_function(ColumnValue::positional_union(&[0, 1, 2, 2, 2], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
-                ColumnValue::UInts(vec![0, 1, 2])
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
+                ColumnValue::UInts(vec![0, 1, 2].into())
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
 #[case::union_of_complex_defers(
 r#"
 def f(n):
@@ -229,14 +229,14 @@ y ++ y"#, Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 0, 0, 1, 
                 ColumnValue::positional_union(&[0, 1, 2, 2, 2], vec![
                         ColumnValue::Units(1),
                         ColumnValue::Units(1),
-                        ColumnValue::UInts(vec![0, 1, 2]),
+                        ColumnValue::UInts(vec![0, 1, 2].into()),
                     ]),
                 ColumnValue::positional_union(&[0, 1, 2, 2, 2], vec![
                         ColumnValue::Units(1),
                         ColumnValue::Units(1),
-                        ColumnValue::UInts(vec![0, 1, 2]),
+                        ColumnValue::UInts(vec![0, 1, 2].into()),
                     ]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3, 10, 100, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3, 10, 100, 1, 2, 3].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![
             Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
@@ -261,9 +261,9 @@ for i in [1, 2, 3]:
     o << x * 10
 o"#,
     Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 1, 1, 1], vec![
-                ColumnValue::UInts(vec![0, 1, 2]),
-                ColumnValue::UInts(vec![0, 1, 2]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 20, 40, 60]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
+                ColumnValue::UInts(vec![0, 1, 2].into()),
+                ColumnValue::UInts(vec![0, 1, 2].into()),
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 20, 40, 60].into()))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
 )]
 // Pass-by-reference writer that *feeds before it writes*: `o << c` precedes
 // `c += 1` in the writer body, inlined per iteration. The Feed-headed spliced
@@ -332,9 +332,12 @@ d"#;
         Tile::data_function(
             ColumnValue::positional_union(
                 &[0, 1],
-                vec![ColumnValue::UInts(vec![0]), ColumnValue::UInts(vec![1])],
+                vec![
+                    ColumnValue::UInts(vec![0].into()),
+                    ColumnValue::UInts(vec![1].into()),
+                ],
             ),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 40]))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 40].into()))),
             Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
@@ -366,11 +369,11 @@ o"#;
             ColumnValue::positional_union(
                 &[0, 0, 1, 1],
                 vec![
-                    ColumnValue::UInts(vec![0, 1]),
-                    ColumnValue::UInts(vec![2, 3]),
+                    ColumnValue::UInts(vec![0, 1].into()),
+                    ColumnValue::UInts(vec![2, 3].into()),
                 ],
             ),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 100, 100]))),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 100, 100].into()))),
             Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
@@ -507,8 +510,8 @@ fn two_defers_fed_from_complementary_match_arms(
     check_tile(
         &code,
         Tile::data_function(
-            ColumnValue::UInts(domain.to_vec()),
-            Box::new(Tile::Scalar(ColumnValue::Ints(codomain.to_vec()))),
+            ColumnValue::UInts(domain.to_vec().into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(codomain.to_vec().into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -541,8 +544,8 @@ fn two_defers_fed_from_complementary_if_arms(
     check_tile(
         &code,
         Tile::data_function(
-            ColumnValue::UInts(domain.to_vec()),
-            Box::new(Tile::Scalar(ColumnValue::Ints(codomain.to_vec()))),
+            ColumnValue::UInts(domain.to_vec().into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(codomain.to_vec().into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -579,8 +582,8 @@ fn a_default_arm_feeds_its_own_defer(
     check_tile(
         &code,
         Tile::data_function(
-            ColumnValue::UInts(domain.to_vec()),
-            Box::new(Tile::Scalar(ColumnValue::Ints(codomain.to_vec()))),
+            ColumnValue::UInts(domain.to_vec().into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(codomain.to_vec().into()))),
             Predicate::True,
             BitSet::new(),
         ),

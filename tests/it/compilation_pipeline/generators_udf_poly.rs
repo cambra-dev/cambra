@@ -152,7 +152,7 @@ def positives(xs):
         if x > n:
             yield x
 positives([-1, 2, -3, 4])"#,
-    Tile::data_function(ColumnValue::UInts(vec![1, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 4]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![1, 3].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 4].into()))), Predicate::True, BitSet::new())
 )]
 fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -448,8 +448,8 @@ fn test_filter_udf_through_poly_wrapper() {
     check_tile(
         code,
         Tile::data_function(
-            ColumnValue::UInts(vec![1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            ColumnValue::UInts(vec![1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3].into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -467,8 +467,8 @@ fn test_predicate_udf_used_inside_poly_wrapper_filter() {
     check_tile(
         code,
         Tile::data_function(
-            ColumnValue::UInts(vec![1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            ColumnValue::UInts(vec![1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3].into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -521,7 +521,7 @@ def doubles(xs):
     for x in xs:
         yield x * 2
 doubles(add_one([1, 2, 3]))"#,
-    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6, 8]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6, 8].into()))), Predicate::True, BitSet::new())
 )]
 // sum(doubles(add_one([1,2,3]))) == 18
 #[case(
@@ -532,7 +532,7 @@ def doubles(xs):
     for x in xs:
         yield x * 2
 sum(doubles(add_one([1, 2, 3])))"#,
-    Tile::Scalar(ColumnValue::Ints(vec![18]))
+    Tile::Scalar(ColumnValue::Ints(vec![18].into()))
 )]
 fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -562,8 +562,8 @@ fn a_parameter_iterated_as_a_collection_resolves_data() {
     check_tile(
         "f = \\xs -> [x for x in xs if x > 1]\nf([1, 2, 3])",
         Tile::data_function(
-            ColumnValue::UInts(vec![1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            ColumnValue::UInts(vec![1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3].into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -584,8 +584,8 @@ fn destructuring_a_collection_does_not_demand_a_capability() {
     check_tile(
         "[x for x in [1, 2, 3] if x > 1]",
         Tile::data_function(
-            ColumnValue::UInts(vec![1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            ColumnValue::UInts(vec![1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3].into()))),
             Predicate::True,
             BitSet::new(),
         ),

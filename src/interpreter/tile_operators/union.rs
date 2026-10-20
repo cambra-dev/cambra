@@ -697,8 +697,8 @@ mod tests {
 
     fn int_function_tile() -> Tile {
         Tile::data_function(
-            ColumnValue::Ints(vec![1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+            ColumnValue::Ints(vec![1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20].into()))),
             Predicate::True,
             BitSet::new(),
         )
@@ -883,7 +883,7 @@ mod tests {
         assert_eq!(domain, ColumnValue::from_uints(vec![0, 1, 2, 3]));
         assert_eq!(
             *codomain,
-            Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))
+            Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40].into()))
         );
     }
 
@@ -935,7 +935,7 @@ mod tests {
         );
         assert_eq!(
             *codomain,
-            Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))
+            Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40].into()))
         );
     }
 
@@ -1128,8 +1128,8 @@ mod tests {
     fn union_producer_release_union_pred_routes_to_correct_inputs() {
         let (mut producer, log0, log1) = make_union_producer_with_spies();
 
-        let pred0 = Predicate::from_column_value(&ColumnValue::Ints(vec![1, 2]));
-        let pred1 = Predicate::from_column_value(&ColumnValue::Ints(vec![3, 4]));
+        let pred0 = Predicate::from_column_value(&ColumnValue::Ints(vec![1, 2].into()));
+        let pred1 = Predicate::from_column_value(&ColumnValue::Ints(vec![3, 4].into()));
         let guard = TileGuard::Function(FunctionGuard::Domain(Predicate::tagged(
             TagMap::from_positional(vec![pred0.clone(), pred1.clone()]),
             false,
@@ -1161,11 +1161,11 @@ mod tests {
         let uint = || Extent::Base(BaseType::UInt);
         let arm = |key: u64, inner: u64, inner_pred: Predicate, outer: Predicate| {
             Tile::data_function(
-                ColumnValue::UInts(vec![key]),
+                ColumnValue::UInts(vec![key].into()),
                 Box::new(Tile::grouped(
                     vec![0],
-                    ColumnValue::UInts(vec![inner]),
-                    Box::new(Tile::Scalar(ColumnValue::UInts(vec![inner]))),
+                    ColumnValue::UInts(vec![inner].into()),
+                    Box::new(Tile::Scalar(ColumnValue::UInts(vec![inner].into()))),
                     inner_pred,
                     BitSet::new(),
                 )),
@@ -1211,7 +1211,7 @@ mod tests {
             Box::new(Tile::grouped(
                 vec![0],
                 ColumnValue::from_uints(vec![0]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10].into()))),
                 Predicate::True,
                 BitSet::new(),
             )),

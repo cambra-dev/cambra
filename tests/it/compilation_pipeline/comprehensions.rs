@@ -57,21 +57,21 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
 #[case("[y.0 for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
 #[case(
     "[(y, 100) for y in [(10, 'a'), (20, 'b')]]",
-    Tile::data_function(ColumnValue::UInts(vec![0, 1]), Box::new(Tile::record(HashMap::from([
+    Tile::data_function(ColumnValue::UInts(vec![0, 1].into()), Box::new(Tile::record(HashMap::from([
             (
                 tuple_field(0),
                 Tile::Scalar(ColumnValue::Records(HashMap::from([
-                    (tuple_field(0), ColumnValue::Ints(vec![10, 20])),
+                    (tuple_field(0), ColumnValue::Ints(vec![10, 20].into())),
                     (
                         tuple_field(1),
                         ColumnValue::Strings(vec![
                             "a".into(),
                             "b".into(),
-                        ]),
+                        ].into()),
                     ),
                 ]))),
             ),
-            (tuple_field(1), Tile::Scalar(ColumnValue::Ints(vec![100, 100]))),
+            (tuple_field(1), Tile::Scalar(ColumnValue::Ints(vec![100, 100].into()))),
         ]))), Predicate::True, BitSet::new())
 )]
 fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: Tile) {
@@ -89,11 +89,11 @@ fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: Tile) {
 #[case("[x for x in [1, 2, 3] if x > 10]", make_int_list(&[]))]
 #[case(
     "[x for x in [1, 2, 3] if x == 2]",
-    Tile::data_function(ColumnValue::UInts(vec![1]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![1].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2].into()))), Predicate::True, BitSet::new())
 )]
 #[case(
     "[x for x in [1, 2, 3, 4, 5] if x > 1 if x < 5]",
-    Tile::data_function(ColumnValue::UInts(vec![1, 2, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![1, 2, 3].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4].into()))), Predicate::True, BitSet::new())
 )]
 fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -176,8 +176,8 @@ fn test_udf_used_inside_filter_predicate() {
     check_tile(
         code,
         Tile::data_function(
-            ColumnValue::UInts(vec![1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            ColumnValue::UInts(vec![1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3].into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -195,8 +195,8 @@ fn test_udf_containing_filter() {
     check_tile(
         code,
         Tile::data_function(
-            ColumnValue::UInts(vec![1, 2]),
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            ColumnValue::UInts(vec![1, 2].into()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3].into()))),
             Predicate::True,
             BitSet::new(),
         ),
@@ -220,7 +220,7 @@ fn test_generator_expressions(#[case] code: &str, #[case] expected: Tile) {
 #[timeout(Duration::from_secs(10))]
 #[case(
     "(x for x in [1, 2, 3, 4, 5] if x > 2)",
-    Tile::data_function(ColumnValue::UInts(vec![2, 3, 4]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 4, 5]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![2, 3, 4].into()), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 4, 5].into()))), Predicate::True, BitSet::new())
 )]
 fn test_generator_expression_filtered(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -628,11 +628,11 @@ fn a_correlated_inner_comprehension_without_an_aggregate() {
     check_tile(
         "[[v * r for v in [1, 2]] for r in [1, 2]]",
         Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             Box::new(Tile::grouped(
                 vec![0, 2],
-                ColumnValue::UInts(vec![0, 1, 0, 1]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 2, 4]))),
+                ColumnValue::UInts(vec![0, 1, 0, 1].into()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 2, 4].into()))),
                 Predicate::False,
                 BitSet::new(),
             )),
@@ -851,16 +851,16 @@ fn a_correlated_comprehension_nests_without_an_aggregate() {
     check_tile(
         "[[[v * r * q for v in [1, 2]] for r in [1, 2]] for q in [1, 2]]",
         Tile::data_function(
-            ColumnValue::UInts(vec![0, 1]),
+            ColumnValue::UInts(vec![0, 1].into()),
             Box::new(Tile::grouped(
                 vec![0, 2],
-                ColumnValue::UInts(vec![0, 1, 0, 1]),
+                ColumnValue::UInts(vec![0, 1, 0, 1].into()),
                 Box::new(Tile::grouped(
                     vec![0, 2, 4, 6],
-                    ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1, 0, 1]),
-                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![
-                        1, 2, 2, 4, 2, 4, 4, 8,
-                    ]))),
+                    ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1, 0, 1].into()),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(
+                        vec![1, 2, 2, 4, 2, 4, 4, 8].into(),
+                    ))),
                     Predicate::False,
                     BitSet::new(),
                 )),

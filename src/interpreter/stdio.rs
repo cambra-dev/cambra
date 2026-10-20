@@ -205,7 +205,7 @@ mod tests {
             source.add(line.into());
         }
         // Mark indices 1 and 2 as obsolete; live window [0,4] minus {1,2} = {0,3,4}.
-        let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2]));
+        let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2].into()));
         source.buf.releases.record("p", &filter);
 
         let result = source.get_elements("p");
@@ -224,7 +224,7 @@ mod tests {
         source.buf.release_index(1);
 
         // Mark index 3 as obsolete; live window [2,4] minus {3} = {2,4}.
-        let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![3]));
+        let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![3].into()));
         source.buf.releases.record("p", &filter);
 
         let result = source.get_elements("p");
@@ -237,7 +237,7 @@ mod tests {
     fn test_get_elements_intervals_empty_buffer_returns_empty() {
         let mut source = StdinDataSource::new();
         // No lines added; start_idx == ready_size == 0.
-        let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
+        let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![0].into()));
         source.buf.releases.record("p", &filter);
 
         let result = source.get_elements("p");

@@ -1240,15 +1240,15 @@ pub(crate) mod test_helpers {
             // a complete key with an empty field need not pass: this is the check's input.
             Tile::DataFunction {
                 row_starts: vec![0],
-                domain: ColumnValue::UInts(vec![0]),
+                domain: ColumnValue::UInts(vec![0].into()),
                 codomain: Box::new(Tile::record(HashMap::from([
                     ("n".into(), Tile::Scalar(n)),
                     (
                         "xs".into(),
                         Tile::grouped(
                             vec![0],
-                            ColumnValue::UInts(vec![]),
-                            Box::new(Tile::Scalar(ColumnValue::UInts(vec![]))),
+                            ColumnValue::UInts(vec![].into()),
+                            Box::new(Tile::Scalar(ColumnValue::UInts(vec![].into()))),
                             Predicate::False,
                             BitSet::new(),
                         ),
@@ -1258,8 +1258,8 @@ pub(crate) mod test_helpers {
                 deleted: BitSet::new(),
             }
         };
-        let last = with_n(ColumnValue::Ints(vec![]));
-        let result = with_n(ColumnValue::Ints(vec![5]));
+        let last = with_n(ColumnValue::Ints(vec![].into()));
+        let result = with_n(ColumnValue::Ints(vec![5].into()));
         let violation = super::completeness_violation(
             "a_record_field",
             &last,
@@ -1399,7 +1399,7 @@ mod tests {
         impl_producer_base!();
 
         fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-            Tile::Scalar(ColumnValue::Ints(vec![7]))
+            Tile::Scalar(ColumnValue::Ints(vec![7].into()))
         }
 
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
