@@ -13,7 +13,7 @@ use super::*;
 
 /// A statement that declares a sink.
 pub(super) enum SinkDecl {
-    /// `requests, responses = http_serve(port, method, path)`.
+    /// `𝑝 = http_serve(port, method, path)`, for any pattern `𝑝`.
     Http(Box<HttpServeDecl>),
     /// `name = test_sink()`.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -32,6 +32,13 @@ impl SinkDecl {
 }
 
 /// The sink `target = value` declares, if it declares one.
+///
+/// `http_serve` is recognized by `value` alone, since its tuple is taken apart by an
+/// ordinary pattern; `test_sink` names its sink after `target`.
+#[cfg_attr(
+    not(any(test, feature = "test-helpers")),
+    allow(unused_variables, reason = "only `test_sink` reads the target")
+)]
 pub(super) fn sink_declaration(
     target: &Spanned<AssignTarget>,
     value: &Spanned<ChlExpr>,
@@ -40,7 +47,7 @@ pub(super) fn sink_declaration(
     if let Some(name) = test_sink_name(target, value) {
         return Some(SinkDecl::Test { name });
     }
-    http_serve_decl(target, value).map(|decl| SinkDecl::Http(Box::new(decl)))
+    http_serve_decl(value).map(|decl| SinkDecl::Http(Box::new(decl)))
 }
 
 /// The refusal for a sink declared outside the top-level block.

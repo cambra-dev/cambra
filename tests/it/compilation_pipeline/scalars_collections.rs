@@ -392,13 +392,28 @@ fn an_element_with_no_result_is_rejected(#[case] code: &str) {
 ///
 /// Replacing `expr.node` with a `Lit` mints nothing; substituting a tuple, a record or a
 /// variant copies nodes, and a copy needs minted `NodeId`s and a recording
-/// (`src/ccl/planning/const_fold.rs`, "What does not fold").
+/// (`src/ccl/planning/const_fold.rs`, "What does not fold"). A record shows it: a bound tuple
+/// literal's positions reach the element already folded, by the inline pass's tuple-projection
+/// rule (the module docs of `src/ccl/inline.rs`), as
+/// `an_element_read_from_a_bound_tuple_literal_folds` pins.
 #[test]
 #[should_panic(expected = "constant folding did not reduce this one")]
 fn an_element_built_from_a_compound_constant_is_rejected() {
     run_pipeline(indoc! {r"
-        p = (1, 2)
-        sum([p.0 + p.1])"});
+        p = (a=1, b=2)
+        sum([p.a + p.b])"});
+}
+
+/// A projection of a bound tuple literal that lands on a literal is that literal by the time
+/// constant folding runs, so the element folds.
+#[test]
+fn an_element_read_from_a_bound_tuple_literal_folds() {
+    check_scalar(
+        indoc! {r"
+            p = (1, 2)
+            sum([p.0 + p.1])"},
+        Value::Int(3),
+    );
 }
 
 /// The `discharged` guard skips the whole **subtree**, so an unrelated downstream `^+`
@@ -796,6 +811,125 @@ fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
 #[case("t = ((1, 2), 3); t.0.1", Value::Int(2))]
 fn test_tuples(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+// A tuple pattern binds each name to its position, with or without parentheses, at any depth.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("a, b = (1, 2); a * 10 + b", Value::Int(12))]
+#[case("(a, b) = (1, 2); a * 10 + b", Value::Int(12))]
+#[case("(a, (b, c)) = (1, (2, 3)); a * 100 + b * 10 + c", Value::Int(123))]
+#[case("a, (b, c) = (1, (2, 3)); a * 100 + b * 10 + c", Value::Int(123))]
+// Every element is read before any name binds, so a swap reads the old values.
+#[case("a, b = (1, 2); b, a = (a, b); a * 10 + b", Value::Int(21))]
+// A value that is not a tuple literal is taken apart by projection.
+#[case(
+    "t = (1, (2, 3)); a, (b, c) = t; a * 100 + b * 10 + c",
+    Value::Int(123)
+)]
+#[case(
+    indoc! {"
+        def f(n):
+            (n, n + 1)
+        a, b = f(5)
+        a * 10 + b
+    "},
+    Value::Int(56),
+)]
+// A feed handle read out of a tuple is the channel it names, whether the tuple is taken apart
+// where it is written or bound to a name first.
+#[case("out = defer(); o, k = (out, 3); o << k; sum(out)", Value::Int(3))]
+#[case(
+    "out = defer(); t = (1, (2, out)); o = t.1.1; o << t.0; sum(out)",
+    Value::Int(1)
+)]
+#[case(
+    "out = defer(); t = (1, (2, out)); a, (b, o) = t; o << a + b; sum(out)",
+    Value::Int(3)
+)]
+// A pattern binds in a loop body, a function body and a transaction block as at the top level.
+#[case(
+    indoc! {"
+        t := 0
+        for x in [1, 2]:
+            a, b = (x, x * 10)
+            t += a + b
+        t
+    "},
+    Value::Int(33)
+)]
+#[case(
+    indoc! {"
+        out = defer()
+        for x in [1, 2]:
+            a, b = (x, 10)
+            out << a * b
+        sum(out)
+    "},
+    Value::Int(30)
+)]
+#[case(
+    indoc! {"
+        def f(p):
+            a, b = p
+            a * 10 + b
+        f((1, 2))
+    "},
+    Value::Int(12)
+)]
+// A constructor pattern takes its component apart.
+#[case(
+    indoc! {"
+        type Price = Int
+        (Price::new(p), q) = (Price::new(3), 4)
+        p * 10 + q
+    "},
+    Value::Int(34)
+)]
+fn test_tuple_patterns(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A tuple pattern taking apart a value that is no tuple is refused, naming the projection of
+/// the component it takes, which the program never wrote.
+#[test]
+fn a_tuple_pattern_over_a_scalar_names_its_projection() {
+    check_compile_error("a, b = 5\na\n", "Type mismatch for projection `.0`");
+}
+
+/// A name a destructuring pattern binds is a binding like any other to a loop's mutation
+/// check: a loop rebinding with `=` a name a pattern bound above it, and a pattern in a loop
+/// binding a name bound above, are each refused and point at `:=` (`docs/chl-spec.md`,
+/// "4.6 `for` — iteration").
+#[rstest]
+#[case::bound_above_by_a_tuple_pattern(indoc! {"
+    a, b = (0, 0)
+    for x in [1, 2]:
+        a = x
+    a
+"})]
+#[case::rebound_by_a_tuple_pattern(indoc! {"
+    a = 0
+    for x in [1, 2]:
+        a, b = (x, x)
+    a
+"})]
+#[case::bound_above_by_a_constructor_pattern(indoc! {"
+    type P = Int
+    P::new(a) = P::new(0)
+    for x in [1, 2]:
+        a = x
+    a
+"})]
+#[case::rebound_by_a_constructor_pattern(indoc! {"
+    type P = Int
+    a = 0
+    for x in [1, 2]:
+        P::new(a) = P::new(x)
+    a
+"})]
+fn a_pattern_s_names_are_a_loop_s_outer_bindings(#[case] code: &str) {
+    check_compile_error(code, "assignment to `a` is mutation");
 }
 
 // A conditional collection consumed by `sum` (`sum([1,2] if c else [1,2,3])`)

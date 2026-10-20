@@ -311,6 +311,128 @@ fn test_http_serve_echo_with_outer_let() {
     assert_eq!(response, "Echo: world");
 }
 
+/// `http_serve` returns a tuple, which a parenthesised pattern takes apart as well as a bare one.
+#[rstest]
+fn test_http_serve_with_a_parenthesised_pattern() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        (requests, responses) = http_serve("{port}", "POST", "/echo")
+        for req in requests:
+            responses << "Echo: " + req
+    "#};
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let resp = http_post(port, "/echo", "world");
+        tx.send(resp).unwrap();
+    });
+
+    let response = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(response, "Echo: world");
+}
+
+/// Lower `template` with a free port in place of `PORT`, and answer the lowering errors'
+/// debug renderings.
+fn http_serve_lowering_errors(template: &str) -> Vec<String> {
+    let code = template.replace("PORT", &reserve_test_port().to_string());
+    let mut ctx = LoweringContext::default();
+    let module = chl_parser::parse_module(FileId::ROOT, &code)
+        .into_result()
+        .expect("parse failed");
+    let result = lower_stmts(&module, &mut ctx);
+    result.errors.iter().map(|e| format!("{e:?}")).collect()
+}
+
+/// The tuple `http_serve` returns can be bound to one name and taken apart later.
+#[rstest]
+fn test_http_serve_bound_to_one_name() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        route = http_serve("{port}", "POST", "/echo")
+        requests, responses = route
+        for req in requests:
+            responses << "Echo: " + req
+    "#};
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let resp = http_post(port, "/echo", "world");
+        tx.send(resp).unwrap();
+    });
+
+    let response = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(response, "Echo: world");
+}
+
+/// A route whose responses the program never feeds is refused, and the error names the call
+/// rather than the name its response channel is bound under.
+#[test]
+fn a_route_whose_responses_are_never_fed_names_the_call() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        requests, responses = http_serve("{port}", "POST", "/e")
+        1
+    "#};
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let Err(errors) = compile_program(&mut ctx, &loaded, consumer) else {
+        panic!("a route whose responses are never fed compiled");
+    };
+    let rendered = cambra::ccl::context::render_errors(&errors, loaded.sources());
+    let expected = format!(
+        "the response channel of `http_serve(\"{port}\", \"POST\", \"/e\")` has no feed or define"
+    );
+    assert!(
+        rendered.contains(&expected),
+        "expected {expected:?} in:\n{rendered}"
+    );
+}
+
+/// Two routes whose paths differ only in a character no identifier holds are two routes.
+#[test]
+fn paths_differing_only_in_punctuation_are_two_routes() {
+    let errors = http_serve_lowering_errors(indoc! {r#"
+        reqs1, resps1 = http_serve("PORT", "GET", "/a-b")
+        for req in reqs1:
+            resps1 << "dash"
+        reqs2, resps2 = http_serve("PORT", "GET", "/a_b")
+        for req in reqs2:
+            resps2 << "underscore"
+    "#});
+    assert!(
+        errors.is_empty(),
+        "expected no lowering errors, got: {errors:?}"
+    );
+}
+
+/// A call of `http_serve` inside an expression opens no route, and says where the call goes.
+#[test]
+fn test_http_serve_inside_an_expression_is_error() {
+    let errors = http_serve_lowering_errors(indoc! {r#"
+        requests = http_serve("PORT", "POST", "/echo").0
+        0
+    "#});
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("only supported as the whole right-hand side of a top-level `=`")),
+        "expected the expression-position refusal, got: {errors:?}",
+    );
+}
+
 /// `http_serve` inside an if/else branch is rejected at lowering time.
 #[test]
 fn test_http_serve_in_if_branch_is_error() {

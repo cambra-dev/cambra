@@ -496,8 +496,8 @@ introduction every write targets. The discipline:
 One structural check after inference enforces the two rules. The real fault line is the **merge law**,
 not `Feed`-vs-`Mut`. *Append-only* mutability merges commutatively — a feed by `++`, and (at
 runtime) a `Txn` mutable variable by the commit operator's timestamped merge — so multiple writers are
-already the semantics and aliasing is benign; that is why `Feed` stays first-class (it
-is returned in `http_serve`'s tuple). *Last-write-wins* mutability instead needs a **resolvable
+already the semantics and aliasing is benign; that is why a feed handle may be aliased and
+returned (`http_serve` returns one in its tuple). *Last-write-wins* mutability instead needs a **resolvable
 writer set** — but that requirement is fundamental only for an **induction** accumulator, which
 compiles to a single-writer `InductionStore` changelog. A `Txn` mutable variable already tolerates an open writer set (its
 sites merge their commit streams by time), so applying the uniform second-class discipline to it is
@@ -517,10 +517,18 @@ parameters — deferred to that design.)
 `feed(𝐷 ⤇ 𝑉)`) — the type of a feed handle: what an `out = defer()` introduces, what
 `http_serve`'s response half returns, what a defer-mediating UDF parameter (`λ out → out << e`)
 carries. It is the same `Type::History` variant a mutable variable uses, under the `Append` kind;
-unlike an overwrite variable it reads as its whole collection `𝐷 ⤇ 𝑉`, not a scalar deref. Feed
-handles are fully first-class — returnable and tuple-packable — because feed aliasing is benign
-(multiple feeders union by `++`). `channelize` eliminates every feed-typed term when it resolves
-channels, so no history type survives to planning.
+unlike an overwrite variable it reads as its whole collection `𝐷 ⤇ 𝑉`, not a scalar deref. A
+handle may be returned and aliased, since feed aliasing is benign (multiple feeders union by `++`),
+and `channelize` resolves a handle through `Var` aliases only. A handle in a tuple reaches it as
+one only through the inline pass's tuple-projection rule (the module docs of `src/ccl/inline.rs`):
+projected out of a `let`-bound tuple literal whose every element is a literal, a source or a
+handle, so that every projection is replaced by its element and the tuple's binding is dropped
+before `channelize` runs. A handle in any other tuple, one holding a computed value, one built in
+a loop body, or one passed to a function, never reaches its channel, and `channelize` reports the
+deferred binding as having no feed or define, or as a cycle through it
+([chl-spec.md, "A deferred collection inside a data structure [Open]"](../../../docs/chl-spec.md#a-deferred-collection-inside-a-data-structure-open)).
+`channelize` eliminates every feed-typed term when it resolves channels, so no history type
+survives to planning.
 
 ### `Txn` is a CCL type
 

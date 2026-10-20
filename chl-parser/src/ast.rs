@@ -793,6 +793,34 @@ pub enum AssignTarget {
     Constructor(ConstructorPattern),
 }
 
+impl AssignTarget {
+    /// The names the target binds, in the order written: a name, each name a tuple
+    /// pattern's components bind, and each binder of a constructor pattern. A keyed write
+    /// and another module's variable bind none.
+    pub fn bound_names(&self) -> Vec<&SmolStr> {
+        let mut names = Vec::new();
+        self.collect_bound_names(&mut names);
+        names
+    }
+
+    fn collect_bound_names<'a>(&'a self, names: &mut Vec<&'a SmolStr>) {
+        match self {
+            AssignTarget::Name(name) => names.push(name),
+            AssignTarget::Tuple(components) => components
+                .iter()
+                .for_each(|c| c.node.collect_bound_names(names)),
+            AssignTarget::Constructor(pattern) => names.extend(
+                pattern
+                    .binders
+                    .iter()
+                    .flatten()
+                    .filter_map(|binder| binder.node.as_ref()),
+            ),
+            AssignTarget::Subscript { .. } | AssignTarget::Qualified(_) => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------

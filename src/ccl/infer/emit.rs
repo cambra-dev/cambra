@@ -1158,8 +1158,14 @@ pub(super) fn emit_apply<C: Typing>(
         .as_ref()
         .and_then(Type::fun_kind)
         .cloned();
+    // A tuple's projection names itself, since a tuple pattern applies one the program
+    // never wrote.
+    let context = match &function.node {
+        TypedExprNode::Proj(key @ ProjKey::Index(_)) => format!("projection `.{key}`"),
+        _ => "Apply".to_string(),
+    };
     let applied = ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), &|| {
-        "Apply".to_string()
+        context.clone()
     });
     if applied.is_ok() && matches!(function.node, TypedExprNode::TraitFn { .. }) {
         ctx.bind_instance_function_called(function.node_id())?;

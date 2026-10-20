@@ -423,6 +423,10 @@ pub struct LoweringContext {
     /// statement (`docs/chl-spec.md`, "9.9 Running").
     pub(super) http_route_sites: HashMap<String, (Span, Option<(RunPath, Span)>)>,
 
+    /// How a diagnostic names each deferred collection lowering binds under a name it
+    /// mints, by that name: `the response channel of `http_serve("8080", "POST", "/e")``.
+    pub(super) minted_channels: HashMap<String, String>,
+
     /// What this pass may do with an `http_serve` naming a route the registry does
     /// not already hold.
     pub(super) endpoints: Endpoints,
@@ -1208,6 +1212,11 @@ impl LoweringContext {
     pub(super) fn fresh_ignored_payload(&mut self) -> String {
         self.mint_synthetic_id("__match_payload")
     }
+
+    /// A fresh name for a value a tuple pattern takes apart, or for one of its components.
+    pub(super) fn fresh_tuple_payload(&mut self) -> String {
+        self.mint_synthetic_id("__tuple_payload")
+    }
 }
 
 /// Prefix for synthetic parameter names representing the tupled domain of a
@@ -1215,13 +1224,43 @@ impl LoweringContext {
 /// a unique id (see [`LoweringContext::fresh_tuple_arg`]).
 const TUPLE_ARG_PREFIX: &str = "__arg_tuple";
 
+impl LoweringContext {
+    /// How a diagnostic names the deferred binding `name`: the call a minted channel stands
+    /// for, or the binding the program wrote, `deferred binding 'out'`.
+    pub fn deferred_subject(&self, name: &Name) -> String {
+        match self.minted_channels.get(name.base()) {
+            Some(spelled) => spelled.clone(),
+            None => format!("deferred binding '{}'", name.base()),
+        }
+    }
+}
+
 /// Return the canonical data-source name for the requests side of
 /// `http_serve(port, method, path)`.
-///
 pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String {
-    // Sanitise path for use inside a Rust/CCL identifier.
-    let path_id = path.replace(['/', '-', '.'], "_");
-    format!("__http_requests_{port}_{method}_{path_id}")
+    format!("__http_requests_{}", http_route_id(port, method, path))
+}
+
+/// The name the response channel of `http_serve(port, method, path)` is bound under, and the
+/// field of the program's sink record that carries it.
+pub(super) fn http_responses_sink_name(port: &str, method: &str, path: &str) -> String {
+    format!("__http_responses_{}", http_route_id(port, method, path))
+}
+
+/// The part of a name minted for `http_serve(port, method, path)` that identifies its route,
+/// one identifier for each route and a different one for every other: each argument keeps
+/// its ASCII letters and digits and writes every other character as its code point in hex
+/// between two `_`, `_` included, and `_s_`, which no code point spells, separates them.
+fn http_route_id(port: &str, method: &str, path: &str) -> String {
+    let id = |part: &str| -> String {
+        part.chars()
+            .map(|c| match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' => c.to_string(),
+                _ => format!("_{:x}_", u32::from(c)),
+            })
+            .collect()
+    };
+    [id(port), id(method), id(path)].join("_s_")
 }
 
 // ---------------------------------------------------------------------------

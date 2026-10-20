@@ -405,7 +405,7 @@ pub_stmt        ::= "pub" statement
 block           ::= NEWLINE INDENT statement+ DEDENT
 ```
 
-`assign_target` is a bare name or a nested tuple of names — **no
+`assign_target` is a bare name, a constructor pattern, or a nested tuple of those — **no
 subscript or attribute targets** (`xs[0] = x` and `obj.f = x` are not
 valid). Every binding LHS is therefore a static pattern: which names a
 statement introduces is decidable from the syntax alone, without any
@@ -1595,21 +1595,21 @@ executes, so it can be the source of an unbounded stream (e.g. when
 | `target op= value` | Compound mutation — `target := target op value`, for `op` ∈ `+ - * //`. The target **must** be a mutable variable (one introduced with `:=`); a `+=` to an immutable binding is a type error, not a silent rebind. |
 | `target <<= value` | Resolves a previously-deferred name to `value` (§4.4). |
 
-`target` is an `AssignTarget`: a bare name or a (nested) tuple of bare
-names. Tuple destructuring:
+`target` is an `AssignTarget`: a bare name, a constructor pattern (§4.3.1), or a (nested)
+tuple of those. Tuple destructuring:
 
 ```python
 a, b = pair
 (x, (y, z)), w = nested
 ```
 
-is supported at any nesting depth.
+is supported at any nesting depth, with or without parentheses around the pattern. A tuple
+expression keeps its parentheses. `value` is evaluated in the scope before the statement, so
+`b, a = (a, b)` exchanges the two names.
 
 > **Direction [Tentative].** Destructuring targets generalize: any
 > tuple-yielding expression can be destructured wherever a target
-> appears — assignment and `for` binders alike. Today's grammar special-cases
-> the `reqs, resps = http_serve(…)` statement form (§7.4); that is an
-> implementation restriction, not a design one. The decided pattern
+> appears, `for` binders included. The decided pattern
 > surface is §4.3.1.
 
 **No assignment-as-expression** — neither `=` nor `:=` is an expression
@@ -1748,7 +1748,8 @@ a type that declares one constructor (`Price::new(r) = p`).
 
 Today's grammar accepts the tuple forms, unannotated, with the
 annotation restricted to the whole target (`ann_assign_stmt`, §2.2), and a constructor pattern on
-the left of `=`; record, variant, and wildcard patterns, a constructor pattern in a `for` binder,
+the left of `=`, alone or as a component of a tuple pattern (`(Price::new(p), q) = …`); record,
+variant, and wildcard patterns, a constructor pattern in a `for` binder,
 and per-component annotations are all unimplemented.
 
 ### 4.4 Define statement `<<=`
@@ -3840,6 +3841,20 @@ defer must be tied off later with `<<=` or fed via `<<`.
 > wrapper: a feed target is introduced by an annotation-only forward
 > declaration `h: Feed(_)` rather than by a call (§3.7, §6.2).
 
+#### A deferred collection inside a data structure [Open]
+
+A feed handle is a value: `http_serve` returns one as half of a tuple (§7.4), and a program can
+put one in a tuple of its own, pass that tuple to a function, or build it in a loop body, then
+feed the handle wherever it lands. A deferred collection's contributions are gathered where it
+is declared, and a handle that travels inside another value can reach a feed from code its
+declaration does not enclose, or be copied so that two places feed it at once. What such a
+program means is open. Giving it a meaning needs a mechanism that follows where a handle goes,
+such as an effect system or affine or linear types for feed handles.
+
+Until then, a handle in a data structure has a meaning in one shape: a tuple literal bound by
+`=`, each of whose elements is a literal, a source or a feed handle, taken apart by projection
+or a tuple pattern (§4.3.1), as `requests, responses = http_serve(…)` is.
+
 ### 7.4 Sources
 
 Sources are built-in functions registered at compile time. A source
@@ -3850,21 +3865,21 @@ responses ([10. Sinks](#10-sinks)).
 | Call | Source | Domain |
 |---|---|---|
 | `stdin()` | Process standard input | One element per line of UTF-8 text. |
-| `http_serve(port, method, path)` | HTTP server, a source and a sink | Returns a `(requests, responses)` 2-tuple. The requests source yields request bodies; the responses sink is a deferred collection to feed. Must be assigned at top level via tuple destructuring (see below). |
+| `http_serve(port, method, path)` | HTTP server, a source and a sink | Returns a `(requests, responses)` 2-tuple. The requests source yields request bodies; the responses sink is a deferred collection to feed. Called only as the whole right-hand side of a top-level `=` (see below). |
 
 Additional sources may be pre-registered by the host embedding (testing,
 demos, etc.).
 
-`http_serve` has a special-cased statement form:
+`http_serve` opens its route when the program starts, so a call is the
+whole right-hand side of a `=` in the top-level block, and its three
+arguments are string constants ([9.19 Constants](#919-constants)): a module
+takes its route's address from a `const param`, and each run serves the
+address its arguments give. The target is any pattern (§4.3), and a tuple
+pattern names the two sides:
 
 ```python
 reqs, resps = http_serve(port, method, path)
 ```
-
-This pattern (`identifier-tuple = http_serve(string, string, string)`)
-must appear in the top-level block. Each argument is a string constant
-([9.19 Constants](#919-constants)), so a module takes its route's address from a `const param`
-and each run serves the address its arguments give. It binds two names:
 
 - the `reqs` side is a streaming source: each element is the
   body of one incoming request to `(method, path)` on `port`.
@@ -3912,10 +3927,7 @@ unique across the program, across all its runs.
 > same library design. So does the typing of the response sink
 > itself: a *deferred keyed collection* — supporting both
 > `resps[req.id] = …` and a feed form `resps << …` — that needs CCL
-> and CHL definitions. The `(requests, responses)`
-> tuple-destructuring form above is what's implemented today,
-> special-cased to `http_serve` only as an implementation matter
-> (§4.3 Direction).
+> and CHL definitions.
 >
 > **Request validation derived from the handler's type**, in the same
 > **[Open]** design. A request is untrusted input, so the endpoint is a

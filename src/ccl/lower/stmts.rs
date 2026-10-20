@@ -683,16 +683,26 @@ pub(super) fn lower_middle_stmt(
     match &stmt.node {
         // A statement that declares a sink binds a name the program's sink record reads, so it
         // is lowered only here, at the top level.
-        ChlStmt::Assign { target, value, .. }
-            if let Some(decl) = sink_declaration(target, value) =>
-        {
+        ChlStmt::Assign {
+            target,
+            value,
+            transparency,
+        } if let Some(decl) = sink_declaration(target, value) => {
             if !is_top_level {
                 return Err(sink_not_top_level(&decl, stmt.span));
             }
             match decl {
                 #[cfg(any(test, feature = "test-helpers"))]
                 SinkDecl::Test { name } => lower_test_sink(name, stmt.span, body, ctx),
-                SinkDecl::Http(decl) => lower_http_serve(*decl, stmt.span, value.span, body, ctx),
+                SinkDecl::Http(decl) => lower_http_serve(
+                    *decl,
+                    target,
+                    *transparency,
+                    stmt.span,
+                    value.span,
+                    body,
+                    ctx,
+                ),
             }
         }
         // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a
@@ -1202,8 +1212,9 @@ pub(super) fn lower_middle_stmt(
     }
 }
 
-/// Collect simple-name targets from assignment / function-def statements
-/// into `names`. Used to build `outer_bindings` for mutation checks.
+/// Collect the names assignment and function-def statements bind into `names`, every name
+/// a destructuring pattern binds included. Used to build `outer_bindings` for mutation
+/// checks.
 ///
 /// A type alias binds no value and so contributes no name: nothing a mutation
 /// check asks about can be answered by a type.
@@ -1217,9 +1228,7 @@ pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet
             | ChlStmt::MutAssign { target, .. }
             | ChlStmt::LoadFrom { target, .. }
             | ChlStmt::Define { target, .. } => {
-                if let AssignTarget::Name(id) = &target.node {
-                    names.insert(id.as_str().to_string());
-                }
+                names.extend(target.node.bound_names().into_iter().map(|n| n.to_string()));
             }
             ChlStmt::FunctionDef { name, .. } => {
                 names.insert(name.node.as_str().to_string());
@@ -1229,12 +1238,6 @@ pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet
     }
 }
 
-/// Extract a simple variable name from a CHL assignment target.
-///
-/// Returns the name when the target is an [`AssignTarget::Name`], or
-/// [`LoweringError::Unsupported`] for tuple-destructuring patterns (which
-/// lowering does not yet support — the `http_serve` 2-tuple case is handled
-/// separately via [`sink_declaration`]).
 /// What the target of an `=` assignment binds: one name, or the names a constructor
 /// pattern takes a value apart into (`docs/chl-spec.md`, "4.3.1 Destructuring patterns").
 ///
@@ -1247,6 +1250,87 @@ pub(super) enum AssignmentBindings {
         transparency: BindingTransparency,
     },
     Constructor(Box<nominal::ConstructorAssignment>),
+    /// `𝑝₀, …, 𝑝ₙ = 𝑣`: each component pattern binds its position of the tuple.
+    Tuple(TupleAssignment),
+}
+
+/// A tuple pattern checked for an assignment, ready to take a value apart.
+///
+/// Its names are minted in [`AssignmentBindings::of`] so that
+/// [`names`](AssignmentBindings::names) lists every binder before the value is lowered.
+pub(super) struct TupleAssignment {
+    /// Binds the whole value, when it is not a tuple literal, for each component to project.
+    payload: String,
+    /// One per component, binding that component's value for its pattern to take apart.
+    components: Vec<String>,
+    /// The component patterns, in order.
+    elements: Vec<AssignmentBindings>,
+    transparency: BindingTransparency,
+}
+
+impl TupleAssignment {
+    /// The bindings `value` means, in order.
+    ///
+    /// Every component's value is bound to a minted name before any name of the pattern binds,
+    /// so `b, a = (a, b)` reads the old `a` and `b`. A tuple literal under the pattern binds each
+    /// element directly, at every depth of nesting, so the statement builds no tuple it only
+    /// takes apart. Any other value is bound once and each component reads its projection `.𝑖`.
+    fn bindings(
+        self,
+        value: Expr,
+        span: Span,
+        ctx: &mut LoweringContext,
+    ) -> Vec<(String, Expr, BindingTransparency)> {
+        let mut out = Vec::new();
+        let mut leaves = Vec::new();
+        self.split(value, span, ctx, &mut out, &mut leaves);
+        for (pattern, read) in leaves {
+            out.extend(pattern.bindings(read, span, ctx));
+        }
+        out
+    }
+
+    /// Push onto `minted` the binding of each component's value, and onto `leaves` each
+    /// component pattern that is not a tuple with the read of the name its value is under.
+    fn split(
+        self,
+        value: Expr,
+        span: Span,
+        ctx: &mut LoweringContext,
+        minted: &mut Vec<(String, Expr, BindingTransparency)>,
+        leaves: &mut Vec<(AssignmentBindings, Expr)>,
+    ) {
+        let label = "lower.tuple_assignment";
+        let TupleAssignment {
+            payload,
+            components,
+            elements,
+            transparency,
+        } = self;
+        let values = match value.node {
+            TypedExprNode::Tuple(values) if values.len() == elements.len() => values,
+            node => {
+                minted.push((payload.clone(), Expr { node, ..value }, transparency));
+                (0..elements.len())
+                    .map(|i| {
+                        let read = ctx.tag_machinery(Expr::var(payload.as_str()), span, label);
+                        let proj = ctx.tag_machinery(Expr::proj_index(i), span, label);
+                        ctx.tag_machinery(Expr::apply(read, proj), span, label)
+                    })
+                    .collect()
+            }
+        };
+        for ((element, component), value) in elements.into_iter().zip(components).zip(values) {
+            match element {
+                AssignmentBindings::Tuple(inner) => inner.split(value, span, ctx, minted, leaves),
+                leaf => {
+                    minted.push((component.clone(), value, transparency));
+                    let read = ctx.tag_machinery(Expr::var(component.as_str()), span, label);
+                    leaves.push((leaf, read));
+                }
+            }
+        }
+    }
 }
 
 impl AssignmentBindings {
@@ -1261,6 +1345,18 @@ impl AssignmentBindings {
             AssignTarget::Constructor(pattern) => AssignmentBindings::Constructor(Box::new(
                 nominal::check_constructor_assignment(pattern, span, ctx)?,
             )),
+            AssignTarget::Tuple(elts) => {
+                let elements = elts
+                    .iter()
+                    .map(|e| AssignmentBindings::of(e, transparency, span, ctx))
+                    .collect::<Result<Vec<_>, _>>()?;
+                AssignmentBindings::Tuple(TupleAssignment {
+                    payload: ctx.fresh_tuple_payload(),
+                    components: elements.iter().map(|_| ctx.fresh_tuple_payload()).collect(),
+                    elements,
+                    transparency: binding_transparency(transparency),
+                })
+            }
             _ => AssignmentBindings::Name {
                 name: extract_name_target(target, "assignment")?,
                 transparency: binding_transparency(transparency),
@@ -1275,6 +1371,10 @@ impl AssignmentBindings {
         match self {
             AssignmentBindings::Name { name, .. } => vec![name.clone()],
             AssignmentBindings::Constructor(a) => a.names(),
+            AssignmentBindings::Tuple(t) => std::iter::once(t.payload.clone())
+                .chain(t.components.iter().cloned())
+                .chain(t.elements.iter().flat_map(AssignmentBindings::names))
+                .collect(),
         }
     }
 
@@ -1293,6 +1393,7 @@ impl AssignmentBindings {
                 .into_iter()
                 .map(|(name, value)| (name, value, BindingTransparency::Transparent))
                 .collect(),
+            AssignmentBindings::Tuple(t) => t.bindings(value, span, ctx),
         }
     }
 
@@ -3179,13 +3280,6 @@ fn pre_declare_type_alias<'a>(
 /// binding of the name is refused at its own span. A second declaration is
 /// [`LoweringContext::register_sink_binding`]'s to refuse.
 fn sink_rebindings(stmts: &[Spanned<ChlStmt>], sinks: &HashSet<&str>) -> Vec<LoweringError> {
-    fn target_names<'a>(t: &'a AssignTarget, out: &mut Vec<&'a str>) {
-        match t {
-            AssignTarget::Name(n) => out.push(n.as_str()),
-            AssignTarget::Tuple(elts) => elts.iter().for_each(|e| target_names(&e.node, out)),
-            _ => {}
-        }
-    }
     let mut errors = Vec::new();
     for stmt in stmts {
         let mut bound = Vec::new();
@@ -3194,7 +3288,9 @@ fn sink_rebindings(stmts: &[Spanned<ChlStmt>], sinks: &HashSet<&str>) -> Vec<Low
             ChlStmt::Assign { target, .. }
             | ChlStmt::AnnAssign { target, .. }
             | ChlStmt::MutAssign { target, .. }
-            | ChlStmt::LoadFrom { target, .. } => target_names(&target.node, &mut bound),
+            | ChlStmt::LoadFrom { target, .. } => {
+                bound.extend(target.node.bound_names().into_iter().map(SmolStr::as_str))
+            }
             ChlStmt::FunctionDef { name, .. } => bound.push(name.node.as_str()),
             _ => {}
         }
