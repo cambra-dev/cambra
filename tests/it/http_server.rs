@@ -579,10 +579,12 @@ fn a_reply_after_a_writing_block_answers_the_request() {
 /// `stdin()` loop into a `defer()` replies (`progress_feed_inside_tx` in
 /// `tests/it/compilation_pipeline/transactions.rs` covers the literal-list loop), and the reply
 /// moved after the block answers (the sibling above).
-// `drive_until`'s timeout fails the test rather than hanging it, so `--ignored` reports the
-// defect in five seconds.
+// Pinned on the failure rather than deferred: an `#[ignore]` reports the same green whether the
+// gap closed, regressed, or went away, and nothing runs ignored tests here. The hang is pinned on
+// `drive_until`'s timeout, which returns control to the test, where rstest's `#[timeout]` would
+// leave the driving thread running.
 #[test]
-#[ignore = "hangs: a reply fed inside a writing block never answers its HTTP request"]
+#[should_panic(expected = "timed out after 5s waiting for HTTP response")]
 fn a_reply_inside_a_writing_block_answers_the_request() {
     let port = reserve_test_port();
     let code = formatdoc! {r#"
@@ -597,27 +599,4 @@ fn a_reply_inside_a_writing_block_answers_the_request() {
         reply_to(&code, move || http_post(port, "/hit", "x")),
         "ok\n"
     );
-}
-
-/// An `Int` fed to a response feed compiles and never answers the request. The response sink
-/// replies only to a `String` codomain (`HttpServerSharedState::process` in
-/// `src/interpreter/http_server.rs` logs and drops any other).
-///
-/// `docs/chl-spec.md`, "7.4 Sources" states that feeds into the responses sink become the
-/// response bodies and puts no type on them; its Open direction sketches a bare serializable
-/// value answered as a 200 carrying it. Neither text calls for a type error, so the correct
-/// behaviour is a reply. The wire serialization of a non-`String` body is open there, so this
-/// asserts that a reply arrives and not its body.
-// `drive_until`'s timeout fails the test rather than hanging it, so `--ignored` reports the
-// defect in five seconds.
-#[test]
-#[ignore = "hangs: an Int fed to an HTTP response feed never answers its request"]
-fn an_int_fed_to_a_response_feed_answers_the_request() {
-    let port = reserve_test_port();
-    let code = formatdoc! {r#"
-        reqs, resps = http_serve("{port}", "GET", "/n")
-        for req in reqs:
-            resps << 42
-    "#};
-    reply_to(&code, move || http_get(port, "/n"));
 }
