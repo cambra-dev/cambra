@@ -149,105 +149,111 @@ pub enum LogicKind {
     Xnor,
 }
 
+// Every kernel below reads two operand slices of one length and appends one result per row to
+// `out`. The caller owns `out`: it clears the rows it does not want to keep and reserves room
+// for the new ones, and the kernel writes each result once into that room, so no result memory
+// is initialized before the kernel writes it. `apply_binop_into` fixes the length at the
+// operands' common prefix.
+
 // Performance note: trying to factor this futher to avoid repeating the zip/iter logic
 // slows it down by ~15%
 pub(crate) fn zip_arithmetic<
     T: IntPow + IntFloorDiv + AddAssign<T> + SubAssign<T> + MulAssign<T>,
 >(
     op: ArithmeticKind,
-    mut l: Vec<T>,
+    l: &[T],
     r: &[T],
-) -> Vec<T> {
-    // Combine only co-present positions — element-wise over the common
-    // prefix, `min(l.len(), r.len())`. `zip` already stops at the shorter
-    // side, but it leaves a *longer* `l`'s tail untouched and returns it, so
-    // without this truncate `l op r` with `r` shorter would emit `l`'s surplus
-    // verbatim. That misfires when `r` is a value that has not yet converged
-    // (e.g. a sibling induction loop's still-empty final read): the result
-    // would fabricate `l`'s tail and read as terminal instead of waiting.
-    // (Sibling half of this invariant: `MapResultToConstProducer` emits an
-    // empty non-terminal tile rather than broadcasting an absent constant.)
-    l.truncate(r.len());
+    out: &mut Vec<T>,
+) {
+    debug_assert_eq!(
+        l.len(),
+        r.len(),
+        "zip_arithmetic: the operands have one length"
+    );
+    let rows = l.iter().zip(r);
     match op {
-        ArithmeticKind::Add => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a += *b),
-        ArithmeticKind::Sub => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a -= *b),
-        ArithmeticKind::Mul => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a *= *b),
-        ArithmeticKind::FloorDiv => l
-            .iter_mut()
-            .zip(r.iter())
-            .for_each(|(a, b)| *a = a.floor_div(*b)),
-        ArithmeticKind::Pow => l
-            .iter_mut()
-            .zip(r.iter())
-            .for_each(|(a, b)| *a = a.int_pow(*b)),
-    };
-    l
+        ArithmeticKind::Add => out.extend(rows.map(|(&a, &b)| {
+            let mut x = a;
+            x += b;
+            x
+        })),
+        ArithmeticKind::Sub => out.extend(rows.map(|(&a, &b)| {
+            let mut x = a;
+            x -= b;
+            x
+        })),
+        ArithmeticKind::Mul => out.extend(rows.map(|(&a, &b)| {
+            let mut x = a;
+            x *= b;
+            x
+        })),
+        ArithmeticKind::FloorDiv => out.extend(rows.map(|(&a, &b)| a.floor_div(b))),
+        ArithmeticKind::Pow => out.extend(rows.map(|(&a, &b)| a.int_pow(b))),
+    }
 }
 
-pub(crate) fn zip_concat(mut l: Vec<SmolStr>, r: &[SmolStr]) -> Vec<SmolStr> {
-    // Combine only co-present positions — see `zip_arithmetic`. Without this,
-    // `l ++ r` with `r` shorter would return `l`'s surplus tail verbatim,
-    // fabricating values for positions the other operand has not yet reached
-    // (e.g. a still-converging sibling read) and reading terminal too early.
-    l.truncate(r.len());
-    l.iter_mut().zip(r.iter()).for_each(|(a, b)| {
-        *a = {
-            let mut builder = SmolStrBuilder::new();
-            builder.push_str(a);
-            builder.push_str(b);
-            builder.finish()
-        }
-    });
-    l
+pub(crate) fn zip_concat(l: &[SmolStr], r: &[SmolStr], out: &mut Vec<SmolStr>) {
+    debug_assert_eq!(l.len(), r.len(), "zip_concat: the operands have one length");
+    out.extend(l.iter().zip(r).map(|(a, b)| {
+        let mut builder = SmolStrBuilder::new();
+        builder.push_str(a);
+        builder.push_str(b);
+        builder.finish()
+    }));
 }
 
 pub(crate) fn zip_compare<T: PartialEq + PartialOrd>(
     op: CompareKind,
-    l: Vec<T>,
+    l: &[T],
     r: &[T],
-) -> Vec<bool> {
+    out: &mut Vec<bool>,
+) {
+    debug_assert_eq!(
+        l.len(),
+        r.len(),
+        "zip_compare: the operands have one length"
+    );
+    let rows = l.iter().zip(r);
     match op {
-        CompareKind::Equals => l.iter().zip(r.iter()).map(|(a, b)| a == b).collect(),
-        CompareKind::NotEquals => l.iter().zip(r.iter()).map(|(a, b)| a != b).collect(),
-        CompareKind::Less => l.iter().zip(r.iter()).map(|(a, b)| a < b).collect(),
-        CompareKind::LessOrEq => l.iter().zip(r.iter()).map(|(a, b)| a <= b).collect(),
-        CompareKind::Greater => l.iter().zip(r.iter()).map(|(a, b)| a > b).collect(),
-        CompareKind::GreaterOrEq => l.iter().zip(r.iter()).map(|(a, b)| a >= b).collect(),
+        CompareKind::Equals => out.extend(rows.map(|(a, b)| a == b)),
+        CompareKind::NotEquals => out.extend(rows.map(|(a, b)| a != b)),
+        CompareKind::Less => out.extend(rows.map(|(a, b)| a < b)),
+        CompareKind::LessOrEq => out.extend(rows.map(|(a, b)| a <= b)),
+        CompareKind::Greater => out.extend(rows.map(|(a, b)| a > b)),
+        CompareKind::GreaterOrEq => out.extend(rows.map(|(a, b)| a >= b)),
     }
 }
 
-/// Combine `l` with `r` element by element in place, over the common-prefix length of the two.
-///
-/// A still-converging operand (one side ahead of the other — the co-presence case
-/// `zip_arithmetic` handles by truncation) is cut to the shorter length, so unequal lengths
-/// do not panic.
 #[inline]
-fn zip_bools_with(mut l: Vec<bool>, r: &[bool], f: impl Fn(bool, bool) -> bool) -> Vec<bool> {
-    l.truncate(r.len());
-    l.iter_mut().zip(r).for_each(|(a, &b)| *a = f(*a, b));
-    l
+fn zip_bools_with(l: &[bool], r: &[bool], out: &mut Vec<bool>, f: impl Fn(bool, bool) -> bool) {
+    debug_assert_eq!(
+        l.len(),
+        r.len(),
+        "zip_bools_with: the operands have one length"
+    );
+    out.extend(l.iter().zip(r).map(|(&a, &b)| f(a, b)));
 }
 
-pub(crate) fn zip_bool_compare(op: CompareKind, l: Vec<bool>, r: &[bool]) -> Vec<bool> {
+pub(crate) fn zip_bool_compare(op: CompareKind, l: &[bool], r: &[bool], out: &mut Vec<bool>) {
     // Boolean ordering: false < true.
     match op {
-        CompareKind::Equals => zip_bools_with(l, r, |a, b| a == b),
-        CompareKind::NotEquals => zip_bools_with(l, r, |a, b| a != b),
-        CompareKind::Less => zip_bools_with(l, r, |a, b| !a & b),
-        CompareKind::LessOrEq => zip_bools_with(l, r, |a, b| a <= b),
-        CompareKind::Greater => zip_bools_with(l, r, |a, b| a & !b),
-        CompareKind::GreaterOrEq => zip_bools_with(l, r, |a, b| a >= b),
+        CompareKind::Equals => zip_bools_with(l, r, out, |a, b| a == b),
+        CompareKind::NotEquals => zip_bools_with(l, r, out, |a, b| a != b),
+        CompareKind::Less => zip_bools_with(l, r, out, |a, b| !a & b),
+        CompareKind::LessOrEq => zip_bools_with(l, r, out, |a, b| a <= b),
+        CompareKind::Greater => zip_bools_with(l, r, out, |a, b| a & !b),
+        CompareKind::GreaterOrEq => zip_bools_with(l, r, out, |a, b| a >= b),
     }
 }
 
-pub(crate) fn zip_bool_logic(op: LogicKind, l: Vec<bool>, r: &[bool]) -> Vec<bool> {
+pub(crate) fn zip_bool_logic(op: LogicKind, l: &[bool], r: &[bool], out: &mut Vec<bool>) {
     match op {
-        LogicKind::And => zip_bools_with(l, r, |a, b| a & b),
-        LogicKind::Nand => zip_bools_with(l, r, |a, b| !(a & b)),
-        LogicKind::Or => zip_bools_with(l, r, |a, b| a | b),
-        LogicKind::Nor => zip_bools_with(l, r, |a, b| !(a | b)),
-        LogicKind::Xor => zip_bools_with(l, r, |a, b| a ^ b),
-        LogicKind::Xnor => zip_bools_with(l, r, |a, b| a == b),
+        LogicKind::And => zip_bools_with(l, r, out, |a, b| a & b),
+        LogicKind::Nand => zip_bools_with(l, r, out, |a, b| !(a & b)),
+        LogicKind::Or => zip_bools_with(l, r, out, |a, b| a | b),
+        LogicKind::Nor => zip_bools_with(l, r, out, |a, b| !(a | b)),
+        LogicKind::Xor => zip_bools_with(l, r, out, |a, b| a ^ b),
+        LogicKind::Xnor => zip_bools_with(l, r, out, |a, b| a == b),
     }
 }
 
@@ -276,13 +282,12 @@ mod tests {
             (1, i64::MIN, -1),
             (-1, i64::MIN, 0),
         ];
-        let left = cases.iter().map(|&(a, _, _)| a).collect();
+        let left: Vec<i64> = cases.iter().map(|&(a, _, _)| a).collect();
         let right: Vec<_> = cases.iter().map(|&(_, b, _)| b).collect();
         let expected: Vec<_> = cases.iter().map(|&(_, _, q)| q).collect();
-        assert_eq!(
-            zip_arithmetic(ArithmeticKind::FloorDiv, left, &right),
-            expected
-        );
+        let mut out = Vec::new();
+        zip_arithmetic(ArithmeticKind::FloorDiv, &left, &right, &mut out);
+        assert_eq!(out, expected);
     }
 
     #[test]
@@ -305,31 +310,36 @@ mod tests {
 
     #[test]
     fn floor_division_unsigned() {
-        assert_eq!(
-            zip_arithmetic(
-                ArithmeticKind::FloorDiv,
-                vec![0_u64, 7, u64::MAX],
-                &[2, 2, 1]
-            ),
-            vec![0, 3, u64::MAX]
+        let mut out = Vec::new();
+        zip_arithmetic(
+            ArithmeticKind::FloorDiv,
+            &[0_u64, 7, u64::MAX],
+            &[2, 2, 1],
+            &mut out,
         );
+        assert_eq!(out, [0, 3, u64::MAX]);
     }
 
     #[test]
     #[should_panic(expected = "divide by zero")]
     fn floor_division_zero_divisor_panics() {
-        zip_arithmetic(ArithmeticKind::FloorDiv, vec![1_i64], &[0]);
+        zip_arithmetic(ArithmeticKind::FloorDiv, &[1_i64], &[0], &mut Vec::new());
     }
 
     #[test]
     #[should_panic(expected = "divide by zero")]
     fn floor_division_unsigned_zero_divisor_panics() {
-        zip_arithmetic(ArithmeticKind::FloorDiv, vec![1_u64], &[0]);
+        zip_arithmetic(ArithmeticKind::FloorDiv, &[1_u64], &[0], &mut Vec::new());
     }
 
     #[test]
     #[should_panic(expected = "divide with overflow")]
     fn floor_division_unrepresentable_quotient_panics() {
-        zip_arithmetic(ArithmeticKind::FloorDiv, vec![i64::MIN], &[-1]);
+        zip_arithmetic(
+            ArithmeticKind::FloorDiv,
+            &[i64::MIN],
+            &[-1],
+            &mut Vec::new(),
+        );
     }
 }

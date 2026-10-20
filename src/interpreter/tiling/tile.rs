@@ -539,9 +539,8 @@ impl Tile {
                 // different rows, each its own accumulator, so they follow one another.
                 if whole {
                     s_kind.accumulate(s_acc, &o_acc, 0, o_acc.rows());
-                    let taken = std::mem::replace(s_term, ColumnValue::Units(0));
                     *s_term =
-                        apply_binop_column(BinOpKind::BoolLogic(LogicKind::Or), taken, &o_term);
+                        apply_binop_column(BinOpKind::BoolLogic(LogicKind::Or), s_term, &o_term);
                 } else {
                     s_acc.merge_part(*o_acc, false);
                     s_term.append(o_term);
