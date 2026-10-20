@@ -288,6 +288,28 @@ class TestDocProseCitations(CheckerCase):
         )
 
 
+class TestClaudeDirectory(CheckerCase):
+    """The committed parts of `.claude/` are docs like any other; its uncommitted
+    `worktrees/` holds whole checkouts and is never read."""
+
+    def test_skill_link_is_checked(self):
+        self.assertOneProblem(
+            {".claude/skills/s/SKILL.md": "[spec](../../../gone.md)\n"},
+            "link target does not exist",
+        )
+
+    def test_worktree_copies_are_skipped(self):
+        # A copy under `worktrees/` would make `d.md` ambiguous, and its broken
+        # link would be reported.
+        self.assertClean(
+            {
+                "a.md": "see `d.md`, \"Usage\"\n",
+                "d.md": "# Usage\n",
+                ".claude/worktrees/w/d.md": "# Usage\n[x](gone.md)\n",
+            }
+        )
+
+
 class TestOptOut(CheckerCase):
     """`doc-refs-ignore` is honored by every check — prose that illustrates the
     reference syntax needs it as much as a migration note does."""

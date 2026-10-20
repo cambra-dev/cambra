@@ -37,7 +37,12 @@ from typing import NamedTuple
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Directories that are not source-of-truth for references.
-SKIP_DIRS = {".git", "target", ".claude", "node_modules", ".vscode-test"}
+SKIP_DIRS = {".git", ".jj", "target", "node_modules", ".vscode-test"}
+
+# Directories under `.claude/` that are not committed. The committed ones (`skills/`, `hooks/`) are
+# checked like any other doc; `worktrees/` holds whole checkouts, whose files would make every path
+# suffix ambiguous.
+SKIP_PATHS = {Path(".claude/worktrees")}
 
 # Link targets that are external / non-file and never checked.
 EXTERNAL_SCHEME = re.compile(r"^(https?:|mailto:|tel:|ftp:|#!)", re.IGNORECASE)
@@ -125,7 +130,11 @@ class Repo:
         while stack:
             for p in sorted(stack.pop().iterdir()):
                 if p.is_dir():
-                    if p.name not in SKIP_DIRS and not p.is_symlink():
+                    if (
+                        p.name not in SKIP_DIRS
+                        and p.relative_to(root) not in SKIP_PATHS
+                        and not p.is_symlink()
+                    ):
                         stack.append(p)
                     continue
                 self.files.append(p.relative_to(root))

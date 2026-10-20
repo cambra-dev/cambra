@@ -8,10 +8,11 @@ description: Write or revise prose in a design doc, a doc comment, or a code com
 The reader arrives to look one thing up and already knows they need it. Lead with the claim and
 stop.
 
-The rules are in CLAUDE.md, "Prose style: specifications, not blog posts". This skill is what to do
-at the keyboard: the transformations, the voice to avoid, and the exemplars to imitate. None of it
-is a metric — a sentence is not better for being short, and a document is not conforming for
-containing no banned words.
+The rules are
+[Prose style: specifications, not blog posts](../../../CLAUDE.md#prose-style-specifications-not-blog-posts).
+This skill is what to do at the keyboard: the transformations, the voice to avoid, and the
+exemplars to imitate. None of it is a metric — a sentence is not better for being short, and a
+document is not conforming for containing no banned words.
 
 ## Imitate these, not the nearest paragraph
 
@@ -52,12 +53,13 @@ stand.
 an objection nobody raised, or that reassures the reader two sections agree with each other, is
 arguing. Cut it or turn it into a stated invariant.
 
-One shape reads like argument and stays: the approach that looks right and does not work. CLAUDE.md,
-"Code Comments" permits it, because a reader who reaches for that approach needs to know where it
-fails. `ir.md`, "`Copair` and `DisjointJoin` — two collection-combining operations, not one" is the
-model — a `Case` fan-out assembled as a copairing would carry a `Variant` domain that every consumer
-then has to undo, which is a fact about the alternative. The line: naming what breaks is a claim,
-naming what is better is a judgment. Keep the first, cut the second.
+One shape reads like argument and stays: the approach that looks right and does not work.
+[Code Comments](../../../CLAUDE.md#code-comments) permits it, because a reader who reaches for that
+approach needs to know where it fails. `ir.md`, "`Copair` and `DisjointJoin` — two
+collection-combining operations, not one" is the model — a `Case` fan-out assembled as a copairing
+would carry a `Variant` domain that every consumer then has to undo, which is a fact about the
+alternative. The line: naming what breaks is a claim, naming what is better is a judgment. Keep the
+first, cut the second.
 
 ## Invented vocabulary
 
@@ -144,9 +146,11 @@ length exercise.
 
 ## Read it back
 
-CLAUDE.md's rules are the checklist; re-read against them rather than against a restatement here.
-Two questions are not on that list, because no rule encodes them, and they decide whether a passage
-reads as specification:
+The rules in
+[Prose style: specifications, not blog posts](../../../CLAUDE.md#prose-style-specifications-not-blog-posts)
+are the checklist; re-read against them rather than against a restatement here. Two questions are
+not on that list, because no rule encodes them, and they decide whether a passage reads as
+specification:
 
 - **Does this repeat what the document already said?** Repetition across sections is the largest
   source of length here, and the hardest thing to see while writing.
@@ -154,14 +158,15 @@ reads as specification:
 
 ## Comments specifically
 
-Comments inherit the rules, plus the constraint in CLAUDE.md, "Code Comments": explain why, not
-history. Two failure modes are specific to comments:
+Comments inherit the rules, plus the constraint in [Code Comments](../../../CLAUDE.md#code-comments):
+explain why, not history. Two failure modes are specific to comments:
 
 - **The narrated walkthrough.** A comment that recounts what the following lines do in order
   duplicates the code. Say what invariant the block maintains and why it is not type-enforced.
 - **The essay above a small function.** When a doc comment outgrows its item, the content usually
-  belongs in the module's design doc, with the comment citing the heading. See CLAUDE.md,
-  "Referencing docs and sections" for the citable form.
+  belongs in the module's design doc, with the comment citing the heading. See
+  [Referencing docs and sections](../../../CLAUDE.md#referencing-docs-and-sections) for the citable
+  form.
 
 ## Editing existing prose
 
