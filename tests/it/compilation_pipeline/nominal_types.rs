@@ -2001,6 +2001,164 @@ fn a_method_delegates_to_another_types_same_named_method() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The compiler-provided `Option`
+// ---------------------------------------------------------------------------
+
+/// `Option(T)` is a nominal type the compiler provides, built by `Option::some` and
+/// `Option::none` and taken apart by arms naming them.
+#[test]
+fn option_is_built_and_matched_by_its_constructors() {
+    check_scalar(
+        indoc! {r#"
+            def or_zero(o: Option(Int)) => Int:
+                match o:
+                    case Option::some(v):
+                        v
+                    case Option::none:
+                        0
+
+            wrap = Option::some
+            or_zero(Option::some(4)) + or_zero(Option::none) + or_zero(wrap(3))
+        "#},
+        Value::Int(7),
+    );
+}
+
+/// A checked lookup answers an `Option` of the value type.
+#[test]
+fn a_checked_lookup_answers_an_option() {
+    check_scalar(
+        indoc! {r#"
+            m = map([(1, 10), (2, 20)])
+            a: Option(Int) = m[1]?
+            match a:
+                case Option::some(v):
+                    v
+                case Option::none:
+                    0
+        "#},
+        Value::Int(10),
+    );
+}
+
+/// `Option::is_none` is a method the compiler provides with `Option`.
+#[test]
+fn option_declares_is_none() {
+    check_scalar(
+        indoc! {r#"
+            m = map([(1, 10)])
+            (m[2]?.is_none(), Option::is_none(m[1]?))
+        "#},
+        make_tuple(&[Value::Bool(true), Value::Bool(false)]),
+    );
+}
+
+/// `.is_none()` as an `if` condition: the `match` it is puts a value-selecting `Case`'s form in
+/// the gate predicate of each of the `if`'s arms.
+#[rstest_log::rstest]
+#[case::absent("1 if m[2]?.is_none() else 0", Value::Int(1))]
+#[case::present("1 if m[1]?.is_none() else 0", Value::Int(0))]
+#[case::elif(
+    "5 if m[1]?.is_none() else (7 if m[4]?.is_none() else 9)",
+    Value::Int(7)
+)]
+#[case::conjunction("1 if m[2]?.is_none() and 2 > 1 else 0", Value::Int(1))]
+#[case::per_element(
+    "sum([100 if m[k]?.is_none() else k for k in [1, 2, 3]])",
+    Value::Int(104)
+)]
+fn is_none_as_a_condition(#[case] tail: &str, #[case] expected: Value) {
+    check_scalar(&format!("m = map([(1, 10), (3, 30)])\n{tail}"), expected);
+}
+
+/// A type declaring its own `is_none` keeps it beside `Option`'s: each `.is_none()` call
+/// resolves by its receiver's type.
+#[test]
+fn a_type_s_own_is_none_beside_option_s() {
+    check_scalar(
+        indoc! {r#"
+            type Light:
+                on
+                off
+
+            def Light::is_none(self) => Bool:
+                match self:
+                    case Light::on:
+                        False
+                    case Light::off:
+                        True
+
+            m = map([(1, 10)])
+            (Light::off.is_none(), m[1]?.is_none(), Light::on.is_none(), m[2]?.is_none())
+        "#},
+        make_tuple(&[
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true),
+        ]),
+    );
+}
+
+#[test]
+fn option_errors_name_what_is_wrong() {
+    for (src, needle) in [
+        (
+            indoc! {r#"
+                x: Option(Int) = `some(1)
+                x
+            "#},
+            "annotated as Option(Int), but inferred as {`some{Int where _ == 1}}",
+        ),
+        (
+            indoc! {r#"
+                x: Option(Int) = `some(1)
+                x
+            "#},
+            "hint: `Option` is a nominal type, not a variant: build one with `Option::some(v)`",
+        ),
+        (
+            indoc! {r#"
+                m = map([(1, 10)])
+                match m[1]?:
+                    case `some(v):
+                        v
+                    case `none:
+                        0
+            "#},
+            "and match one with `case Option::some(v):` and `case Option::none:`",
+        ),
+        (
+            indoc! {r#"
+                type Option(T):
+                    some(T)
+
+                1
+            "#},
+            "`Option` is a built-in type and cannot be given another meaning",
+        ),
+        (
+            indoc! {r#"
+                def Option::get(T, self: Option(T), d: T) => T:
+                    d
+
+                1
+            "#},
+            "`Option` is a built-in type, so this module declares no associated function of it",
+        ),
+        (
+            indoc! {r#"
+                x: Option = Option::none
+                x
+            "#},
+            "`Option` takes 1 type argument, got 0",
+        ),
+    ] {
+        check_compile_error(src, needle);
+    }
+}
+
 /// A nullary constructor's type argument is determined by the use, and a join with a
 /// sibling of the same type is one: `Opt::none` joined with `Opt::some(1)` is an `Opt(Int)`,
 /// whichever arm it is (`docs/chl-spec.md`, "6.8 Nominal types and methods \[Decided\]").

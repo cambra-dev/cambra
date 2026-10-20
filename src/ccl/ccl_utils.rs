@@ -744,8 +744,28 @@ pub(crate) fn debug_assert_no_iteration_markers_in_type(ty: &Type) {
 /// would *need* one. Both say the same thing about a predicate — it is denotational — and
 /// only together do they close the gap, since a term needing iteration and carrying no
 /// marker passes the first check and miscompiles.
+///
+/// A value-selecting `Case`'s form, `(⊎ᵢ armᵢ, default) ▷ final_or_default` or the bare
+/// `(⊎ᵢ armᵢ) ▷ final_or_default` of an exhaustive tag partition, is not one: its union is
+/// the stream `final_or_default` reads one value from, not a collection the predicate sweeps.
+/// A `match` used as an `if` condition puts one in the gate predicate of each arm.
 #[cfg(debug_assertions)]
 fn expr_needs_iteration(e: &Expr) -> bool {
+    if let TypedExprNode::Apply { argument, function } = &e.node
+        && is_builtin(function, Builtin::FinalOrDefault)
+    {
+        let (stream, default) = match &argument.node {
+            TypedExprNode::Tuple(elts) => match elts.as_slice() {
+                [stream, default] => (stream, Some(default)),
+                _ => (&**argument, None),
+            },
+            _ => (&**argument, None),
+        };
+        if let TypedExprNode::Copair(arms) = &stream.node {
+            return arms.iter().any(expr_needs_iteration)
+                || default.is_some_and(expr_needs_iteration);
+        }
+    }
     matches!(e.node, TypedExprNode::Realize(_) | TypedExprNode::Copair(_))
         || e.fold_children(false, |acc, c| acc || expr_needs_iteration(c))
 }

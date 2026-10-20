@@ -497,23 +497,74 @@ fn for_each_block<'a>(e: &'a Spanned<Expr>, bodies: Bodies, f: &mut dyn FnMut(&'
 enum Member {
     /// A constructor, with its number of parameters.
     Constructor(usize),
+    /// A method the compiler provides.
+    Builtin(BuiltinMethod),
+}
+
+/// A method the compiler provides with a declaration, rather than one its source declares.
+#[derive(Clone, Copy)]
+enum BuiltinMethod {
     /// The `extract` of the single-constructor form.
     Extract,
+    /// `Option::is_none`, which the compiler provides with `Option` (`bind_is_none` in
+    /// `src/ccl/lower/nominal.rs`).
+    IsNone,
 }
+
+impl BuiltinMethod {
+    /// The name the method is called by.
+    fn name(self) -> &'static str {
+        match self {
+            BuiltinMethod::Extract => "extract",
+            BuiltinMethod::IsNone => "is_none",
+        }
+    }
+
+    /// The method applied to a value built by the constructor `ctor` from `payload`.
+    fn apply(self, ctor: &str, payload: &Value) -> Value {
+        match self {
+            BuiltinMethod::Extract => payload.clone(),
+            BuiltinMethod::IsNone => Value::Bool(ctor == "none"),
+        }
+    }
+}
+
+/// The compiler-provided `Option` (`docs/chl-spec.md`, "9.16 The std root"), the type of a
+/// checked lookup's answer. The compiler's declaration is `option` in `src/ccl/nominal.rs`.
+const OPTION: &str = "Option";
 
 /// What the module declares of one nominal type.
 #[derive(Default)]
 struct TypeMembers {
-    /// Its constructors, and the single-constructor form's `extract`, by name.
+    /// Its constructors and the methods the compiler provides, by name.
     members: BTreeMap<String, Member>,
-    /// Its methods: the associated functions whose first parameter is `self`, and `extract`.
+    /// Its methods: the associated functions whose first parameter is `self`, and the methods
+    /// the compiler provides.
     methods: BTreeSet<String>,
 }
 
+impl TypeMembers {
+    /// Add the method `method` the compiler provides.
+    fn add_builtin(&mut self, method: BuiltinMethod) {
+        self.members
+            .insert(method.name().to_string(), Member::Builtin(method));
+        self.methods.insert(method.name().to_string());
+    }
+}
+
 /// What `body` declares of each nominal type, by the type's name: each `type` declaration's
-/// members, and the methods the associated functions of the type declare.
+/// members, the methods the associated functions of the type declare, and the
+/// compiler-provided `Option`'s constructors and `is_none`.
 fn collect_types(body: &[Spanned<Stmt>]) -> BTreeMap<String, TypeMembers> {
-    let mut out: BTreeMap<String, TypeMembers> = BTreeMap::new();
+    let mut option = TypeMembers {
+        members: BTreeMap::from([
+            ("none".to_string(), Member::Constructor(0)),
+            ("some".to_string(), Member::Constructor(1)),
+        ]),
+        methods: BTreeSet::new(),
+    };
+    option.add_builtin(BuiltinMethod::IsNone);
+    let mut out = BTreeMap::from([(OPTION.to_string(), option)]);
     let mut add_function = |ty: &str, name: &str, params: &[chl_parser::ast::Param]| {
         if params.first().is_some_and(|p| p.name == "self") {
             out.entry(ty.to_string())
@@ -548,8 +599,7 @@ fn collect_types(body: &[Spanned<Stmt>]) -> BTreeMap<String, TypeMembers> {
         match &decl.body {
             TypeDeclBody::Single(_) => {
                 ty.members.insert("new".into(), Member::Constructor(1));
-                ty.members.insert("extract".into(), Member::Extract);
-                ty.methods.insert("extract".into());
+                ty.add_builtin(BuiltinMethod::Extract);
             }
             TypeDeclBody::Constructors(ctors) => {
                 for ctor in ctors {
@@ -1130,7 +1180,7 @@ impl Interp {
         args: &[Spanned<Expr>],
     ) -> Result<Value, Error> {
         let v = self.eval(receiver)?;
-        let Value::Nominal { ty, payload, .. } = &v else {
+        let Value::Nominal { ty, ctor, payload } = &v else {
             return match v {
                 Value::Pending => Ok(Value::Pending),
                 other => err(format!(
@@ -1139,16 +1189,18 @@ impl Interp {
             };
         };
         // A nominal value names its type, which is the one whose method this is.
-        let declares = self
+        let Some(members) = self
             .types
             .get(ty.as_str())
-            .is_some_and(|t| t.methods.contains(method));
-        if !declares {
+            .filter(|t| t.methods.contains(method))
+        else {
             return err(format!("`{ty}` declares no method `{method}`"));
-        }
+        };
         let bound = format!("{ty}::{method}");
-        if method == "extract" && self.slot(&bound).is_none() {
-            return Ok((**payload).clone());
+        if self.slot(&bound).is_none()
+            && let Some(Member::Builtin(builtin)) = members.members.get(method)
+        {
+            return Ok(builtin.apply(ctor, payload));
         }
         let Some(Slot::Fn(function)) = self.slot(&bound) else {
             return err(format!("`{bound}` is not bound"));
@@ -1185,7 +1237,7 @@ impl Interp {
     fn constructor_arity(&self, q: &QualifiedName) -> Result<usize, Error> {
         match self.member(q)? {
             Member::Constructor(arity) => Ok(arity),
-            Member::Extract => err(format!(
+            Member::Builtin(_) => err(format!(
                 "`{}` as a function value is not supported",
                 q.name.node
             )),
@@ -1204,19 +1256,21 @@ impl Interp {
                 return self.call_user(&bound, &function, args);
             }
         }
-        // `N::extract(n)` is the payload of `n`'s one constructor `new`.
-        if let Member::Extract = self.member(q)? {
+        // `N::extract(n)` is the payload of `n`'s one constructor `new`, and
+        // `Option::is_none(o)` whether `o` is `none`.
+        if let Member::Builtin(method) = self.member(q)? {
+            let name = method.name();
             let [arg] = args else {
-                return err("`extract` takes one argument");
+                return err(format!("`{name}` takes one argument"));
             };
             return match self.eval(arg)? {
                 Value::Pending => Ok(Value::Pending),
-                Value::Nominal { ty, payload, .. }
+                Value::Nominal { ty, ctor, payload }
                     if q.qualifier.last().is_some_and(|t| t.node == ty) =>
                 {
-                    Ok(*payload)
+                    Ok(method.apply(&ctor, &payload))
                 }
-                other => err(format!("`extract` takes a nominal value, got {other}")),
+                other => err(format!("`{name}` takes a nominal value, got {other}")),
             };
         }
         let arity = self.constructor_arity(q)?;
@@ -1940,8 +1994,8 @@ impl Interp {
                 Ok(Value::Record(fields))
             }
 
-            // `c[k]` is the entry at `k`; the checked `c[k]?` answers `` `some(v) `` for an
-            // entry and `` `none `` where there is none (`docs/chl-spec.md`, "3.9 Subscript
+            // `c[k]` is the entry at `k`; the checked `c[k]?` answers `Option::some(v)` for an
+            // entry and `Option::none` where there is none (`docs/chl-spec.md`, "3.9 Subscript
             // and attribute access").
             Expr::Subscript {
                 target,
@@ -1959,12 +2013,14 @@ impl Interp {
                         match (found, *checked) {
                             (Some((_, v)), false) => Ok(v.clone()),
                             (None, false) => err(format!("no entry at key {k}")),
-                            (Some((_, v)), true) => Ok(Value::Variant {
-                                tag: "some".to_string(),
+                            (Some((_, v)), true) => Ok(Value::Nominal {
+                                ty: OPTION.to_string(),
+                                ctor: "some".to_string(),
                                 payload: Box::new(v.clone()),
                             }),
-                            (None, true) => Ok(Value::Variant {
-                                tag: "none".to_string(),
+                            (None, true) => Ok(Value::Nominal {
+                                ty: OPTION.to_string(),
+                                ctor: "none".to_string(),
                                 payload: Box::new(Value::Unit),
                             }),
                         }

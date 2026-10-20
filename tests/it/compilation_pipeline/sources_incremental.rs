@@ -1530,9 +1530,9 @@ fn a_correlated_lookup_answers_the_keys_its_collection_has_decided(
     let code = indoc::indoc! {r"
         def or_zero(o: Option(Int)) => Int:
             match o:
-                case `some(v):
+                case Option::some(v):
                     v
-                case `none:
+                case Option::none:
                     0
         m = map([(x, x) for x in source1()])
         sum([sum([or_zero(m[k]?) * r for k in [10, 3]]) for r in [1, 2]])

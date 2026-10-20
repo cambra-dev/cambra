@@ -17,7 +17,68 @@ use chl_parser::ast::Span;
 use smol_str::SmolStr;
 
 use crate::ccl::ccl_utils::strip_refinements;
-use crate::ccl::{BaseType, FieldKey, FunKind, Type, TypeKind, TypeParam, TypeParamId};
+use crate::ccl::{
+    BaseType, FieldKey, FunKind, Type, TypeKind, TypeParam, TypeParamId, V_NONE, V_SOME,
+};
+
+/// The name the compiler-provided `Option` declaration binds.
+pub const OPTION: &str = "Option";
+
+/// The path of the module the compiler-provided declarations belong to.
+const STD: &str = "std";
+
+thread_local! {
+    /// `Option`, built once per thread. Its identity is its path, `std::Option`, so this
+    /// is a cache: any two builds compare equal.
+    static OPTION_DECL: Rc<NominalDecl> = option_declaration();
+}
+
+/// `type Option(T): none, some(T)` in `std`, with the constructor names [`V_NONE`] and
+/// [`V_SOME`] that the runtime builds when it answers a checked lookup.
+fn option_declaration() -> Rc<NominalDecl> {
+    let span = Span::new(chl_parser::FileId::ROOT, 0, 0);
+    let t = TypeParam::declared("T");
+    let decl = NominalDecl::declared_in(
+        vec![SmolStr::new_static(STD)],
+        OPTION.into(),
+        vec![Rc::clone(&t)],
+        span,
+        false,
+    );
+    decl.define(vec![
+        NominalCtor {
+            name: V_NONE.into(),
+            span,
+            params: Vec::new(),
+        },
+        NominalCtor {
+            name: V_SOME.into(),
+            span,
+            params: vec![(None, Type::Param(t))],
+        },
+    ])
+    .expect("`some` names `T`");
+    decl
+}
+
+/// The compiler-provided `Option(T)` (`docs/chl-spec.md`, "9.16 The std root"), which the
+/// checked lookup answers and `Option(T)` in an annotation names.
+///
+/// It has no source, so its spans are empty, at the start of the root file. Lowering
+/// refuses every program that would point a diagnostic at one: a declaration of the name
+/// `Option`, and an associated function of it.
+///
+/// Its method `is_none` is built by lowering (`bind_is_none` in `src/ccl/lower/nominal.rs`).
+/// The interpreter declares the same members (`collect_types` in `chl-interp/src/eval.rs`),
+/// and `option_values` in `tests/it/differential_interp.rs` checks that the two agree.
+pub fn option() -> Rc<NominalDecl> {
+    OPTION_DECL.with(Rc::clone)
+}
+
+/// The compiler-provided declaration `name` names, if any.
+pub fn builtin(name: &str) -> Option<Rc<NominalDecl>> {
+    (name == OPTION).then(option)
+}
 
 /// A declared nominal type, identified by the path of the module that declares it and its
 /// name (`docs/chl-spec.md`, "Nominal type identity"). Equality, ordering and hashing are by
@@ -262,6 +323,11 @@ impl NominalDecl {
                 other => vec![*other],
             })
             .collect()
+    }
+
+    /// Whether the compiler provides the declaration ([`builtin`]).
+    pub fn is_builtin(&self) -> bool {
+        builtin(&self.name).is_some_and(|b| *b == *self)
     }
 
     /// The constructor named `name`.
