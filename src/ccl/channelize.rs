@@ -2955,22 +2955,13 @@ fn extract_for_defer_impl(
                             node_id: elt_node_id,
                         });
                     }
-                    other => {
-                        let elt = TypedExpr {
-                            node: other,
-                            ty: elt_ty,
-                            user_annotation: elt_user_ann,
-                            // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
-                            node_id: elt_node_id,
-                        };
-                        new_elts.push(extract_for_defer(
-                            elt,
-                            defer_name,
-                            feeds,
-                            define,
-                            in_inner_scope,
-                        )?);
-                    }
+                    _ => new_elts.push(extract_for_defer(
+                        elt,
+                        defer_name,
+                        feeds,
+                        define,
+                        in_inner_scope,
+                    )?),
                 }
             }
             TypedExprNode::Compose(new_elts)

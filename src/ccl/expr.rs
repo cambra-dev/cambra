@@ -1097,11 +1097,7 @@ impl TypedExpr {
     /// **Reaching into another node for its id** — `node_id: src.node_id`, where
     /// `src` is some *other* node — is this constructor's shape, and the one where
     /// a stray `node_id: NodeId::fresh()` hides: a preserve and a mint differ by
-    /// one token in otherwise identical five-line literals. Those sites are marked
-    /// `TODO(preserve)` and are greppable: ten across four files — `channelize`
-    /// (seven) and one each in `feed_nest`, `subst`, and `lambda_elim`. Eight are
-    /// this reach-for-another-id shape; the two in `subst` and `lambda_elim` ask a
-    /// different question, whether their rebuild should mint or preserve at all.
+    /// one token in otherwise identical five-line literals.
     ///
     /// **A field-wise rebuild** — `let TypedExpr { node, ty, user_annotation,
     /// node_id } = expr;` then rebuilding with one child swapped — is *not* this
@@ -1118,6 +1114,10 @@ impl TypedExpr {
     /// taking a caller-supplied id — is neither, and has its own primitive:
     /// [`clone_at`](Self::clone_at), whose one caller is
     /// [`crate::ccl::subst`]'s `as_expr_preserving`.
+    ///
+    /// Nine rebuilds still carry a `TODO(preserve)` marker: `channelize` (six) and
+    /// one each in `feed_nest`, `subst`, and `lambda_elim`; the two in `subst` and
+    /// `lambda_elim` ask whether their rebuild should mint or preserve at all.
     pub(crate) fn preserve(node_id: NodeId, node: TypedExprNode) -> Self {
         TypedExpr {
             node,
