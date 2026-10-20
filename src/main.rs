@@ -146,6 +146,11 @@ fn run_program(
         // releases its input from inside `get_impl`. A window read before the
         // poll misses the arrivals, and one read after the delivery or the pull
         // reports what the pass consumed.
+        //
+        // The poll also has to come before `before_pull`'s `is_watched` check.
+        // `LiveServer::accept` counts a client as watching before replying to its
+        // handshake, so any input the client sends is taken in by a poll that
+        // precedes a check already seeing the count, and is recorded.
         let delivery = ctx.scheduler().poll_sources();
         let sources = match inspection.as_mut() {
             Some(inspection) => inspection.before_pull(ctx.scheduler()),

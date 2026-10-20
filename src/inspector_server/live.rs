@@ -808,6 +808,22 @@ mod tests {
         );
     }
 
+    /// The client is counted before the handshake reply, so input it sends
+    /// once the handshake completes reaches a driver that already sees it
+    /// watching (`run_program`, `src/main.rs`).
+    #[test]
+    fn a_client_is_watching_once_its_handshake_completes() {
+        let live = Arc::new(LiveServer::start());
+        let channel = live.channel();
+        let port = serve_live(Arc::clone(&live));
+        let socket = connect(port);
+        assert!(
+            channel.is_watched(),
+            "watching with no wait after the handshake"
+        );
+        drop(socket);
+    }
+
     /// A writer cannot read its socket, so its heartbeat is how it learns the
     /// client has gone. Without one, a connection to a finished run held its
     /// thread and socket until the process exited, because nothing would
@@ -818,10 +834,6 @@ mod tests {
         let channel = live.channel();
         let port = serve_live(Arc::clone(&live));
         let socket = connect(port);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !channel.is_watched() && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
         assert!(channel.is_watched(), "a connected client is watching");
 
         drop(socket);
