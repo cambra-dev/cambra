@@ -1237,95 +1237,29 @@ pub struct CompiledProgram {
     /// checks, not release validation. See `src/ccl/design/provenance.md`,
     /// "Lowering attribution" and "The lowering fold".
     pub lowering_projection: SourceProjection,
-    /// The **pre-inference** IR snapshot — the inspector's upstream (source-shaped,
-    /// pre-monomorphization) pane, captured right after `uniquify` and before
-    /// `anf`.
-    ///
-    /// It is source-shaped (lambdas intact, Defer/Feed/Define still present),
-    /// **un-A-normalized** (compound terms still sit in operand position), and
-    /// **untyped** — every node's `ty` is a `Hole`/`Infer`. The inspector renders
-    /// those holes; the resolved downstream type is stitched in from
-    /// [`post_inference_ir`](Self::post_inference_ir) via shared/remapped
-    /// `NodeId`s.
-    ///
-    /// The snapshot sits above `anf` rather than below it so its ids resolve
-    /// against the [`lowering_projection`](Self::lowering_projection), which
-    /// covers what lowering produced and nothing `anf` mints. The `Let`/`Var`
-    /// pairs `anf` names are explained instead by the pane pair below, whose
-    /// phase set carries [`Phase::Anf`] alongside [`Phase::Infer`].
-    ///
-    /// Monomorphization runs *inside* `infer`, freshening cloned ids, so this
-    /// snapshot holds the pre-mono **originals**; every ordinary node that
-    /// survives `anf` keeps its id identical across the pair.
+    /// Snapshot after uniquification and before A-normalization and inference.
+    /// IDs are preserved; types remain unresolved. See `src/ccl/design/provenance.md`,
+    /// "Retained snapshots".
     pub pre_inference_ir: Expr,
-    /// The post-inference IR snapshot — the program inspector's anchor.
-    ///
-    /// This is `expr` captured **right after `infer`/`typecheck` and before
-    /// `inline::inline_capability_lambdas` consumes it**: fully typed, but
-    /// still *source-shaped* (lambdas intact, not yet point-free — `inline`,
-    /// `lambda_elim`, and `planning` have not run).
-    ///
-    /// Distinct from [`ast`](Self::ast), which holds `join_planned` (the
-    /// *post-planning* tree): `lambda_elim`/`planning` re-mint every `NodeId`,
-    /// so `ast`'s ids don't resolve against the lowering projection, and it is
-    /// execution-shaped (point-free, fused) — the wrong tree for a source-level
-    /// view. The inspector anchors here instead.
+    /// Typed snapshot after inference checks and before inlining, with lambdas intact.
+    /// Distinct from the planned `ast`; see `src/ccl/design/provenance.md`,
+    /// "Retained snapshots".
     pub post_inference_ir: Expr,
-    /// The post-channelize IR snapshot — the inspector's **downstream** pane, one
-    /// pipeline phase *below* [`post_inference_ir`](Self::post_inference_ir).
-    ///
-    /// This is `expr` captured **right after `channelize`** (which now runs
-    /// after `infer`/`inline`/`transact`/`letrec`): fully typed and structurally
-    /// final for the source view — no Defer/Feed/Define nodes remain, and the
-    /// channelization artifacts (`Compose` wrapper chains, `Copair`
-    /// fan-ins) are present. Because monomorphization ran earlier (inside
-    /// `infer`), this tree is post-mono like [`post_inference_ir`](Self::post_inference_ir).
-    ///
-    /// Every id preserved through inline/transact/letrec/channelize is shared with
-    /// [`post_inference_ir`](Self::post_inference_ir).
+    /// Snapshot after Inline, Transact, Letrec and Channelize.
+    /// Channelization has eliminated Defer/Feed/Define; surviving IDs remain shared
+    /// with earlier snapshots. See `src/ccl/design/provenance.md`, "Retained snapshots".
     pub post_channelize_ir: Expr,
-    /// The post-as-of-read IR snapshot, taken after
-    /// [`transact_phase::rewrite_as_of_reads`](crate::ccl::transact_phase::rewrite_as_of_reads).
-    ///
-    /// Distinct from [`post_channelize_ir`](Self::post_channelize_ir) because
-    /// that rewrite runs between the two: on a program with a fed-out mutable
-    /// read the trees differ, and on every other program they agree node for
-    /// node. Isolating it is what lets the pair ending here gate that one
-    /// rewrite rather than fold it in with lambda elimination.
+    /// Snapshot after `transact_phase::rewrite_as_of_reads`. Its separate boundary
+    /// lets the pair isolate AsOfRead from lambda elimination.
     pub post_as_of_read_ir: Expr,
-    /// The post-lambda-elim IR snapshot, taken after
-    /// [`lambda_elim::run`](crate::ccl::lambda_elim::run).
-    ///
-    /// The pass re-mints nearly every pass-through node, so almost no id here is
-    /// shared with the pane before it and the pair's relation falls to the
-    /// parents walk rather than to shared ids. That is what the pair measures.
+    /// Snapshot after lambda elimination. Re-minted pass-through nodes require
+    /// recorded ancestry rather than identity self-edges.
     pub post_lambda_elim_ir: Expr,
-    /// The compile's provenance record: `NodeId → { parents, blame, rule }`, one
-    /// row per node a phase produced, written by the recorder as those phases run
-    /// ([`crate::ccl::provenance`]).
-    ///
-    /// One table covers the whole compile, because a row's key is a
-    /// process-unique `NodeId` and needs no phase set to disambiguate it; a row's
-    /// `via` is what a fold between two panes restricts by. The phases that record are
-    /// [`Phase::Infer`] (everything monomorphization mints inside `infer`, which
-    /// bridges the pre-inference ⇄ post-inference panes) and [`Phase::Inline`],
-    /// [`Phase::Transact`], [`Phase::Letrec`], [`Phase::Channelize`] (the phases
-    /// between the post-inference and post-channelize snapshots) — see [`PANES`],
-    /// which declares which phases each pane pair folds.
-    ///
-    /// Rows exist only for nodes a recording produced, so an untouched node has
-    /// none — it was never rewritten. Refinement-predicate interiors are rows
-    /// like any other: `collect_tree_ids` enumerates them, so the fold must
-    /// explain them, and `PredMemo::rebuild` records a derived predicate against
-    /// the one it was built from. Planning raising a predicate back into the main
-    /// tree keeps the predicate's own parentage; see `design/provenance.md`,
-    /// "Operator conversion".
-    ///
-    /// Empty when capture is switched off — no phase scope is opened then, so
-    /// every flush is a no-op — see [`provenance_capture_enabled`]. This is the
-    /// authoritative provenance surface:
-    /// [`materialize_panes`](Self::materialize_panes) folds it for each pane
-    /// pair.
+    /// Compile-wide rows keyed by produced NodeId, with parents, blame and tag.
+    /// `PANES` determines each fold's phase filter. Predicate products use the
+    /// same representation. Empty when ordinary capture is disabled and no audit
+    /// records rows; see `provenance_capture_enabled` and
+    /// `src/ccl/design/provenance.md`, "Gate and audit coverage".
     pub(crate) provenance_table: ProvenanceTable,
     /// The static structure of the operator graph.
     ///
@@ -1386,96 +1320,47 @@ impl CompiledProgram {
     }
 }
 
-/// The compiler phase that rewrote a node — a
-/// [`RewriteTag`](crate::ccl::provenance::RewriteTag)'s `via` column.
+/// Compiler stages used for stopping, snapshot capture and rewrite tags.
 ///
-/// Minimal on purpose: only the phases that *mint or restructure* expression
-/// nodes (and therefore need to record why a node exists) appear here.
-///
-/// **Declaration order is pipeline order**, and the derived [`Ord`] is therefore
-/// the order [`compile_program`] runs them in. That is what makes a phase
-/// *range* meaningful: [`ProvenanceTable::deaths`] takes two phases and reads
-/// every phase between them, so a variant declared out of pipeline order would
-/// silently put the wrong phases inside a caller's range. Adding a phase means
-/// declaring it at the point it runs.
-///
-/// `Phase` and [`crate::ccl::names::SyntheticKind`] (which tracks *binder*
-/// provenance: `Pair`, `Mono`, `SolverArg`, …) are deliberately separate enums,
-/// neither wrapping the other — one tags `NodeId`s (expression nodes), the other
-/// tags `Uid`s (binders), and merging them would put a binder-role payload on
-/// the column that names a phase.
+/// Declaration order is pipeline order. Range queries such as
+/// `ProvenanceTable::deaths` rely on it; insert new stages where they run.
+/// Unlike `SyntheticKind`, which classifies binder roles, this enum identifies
+/// compilation stages. Not every stage necessarily writes a provenance row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub enum Phase {
     /// Lowering CHL source into CCL.
     Lower,
-    /// The 1:1 binder rename in [`crate::ccl::uniquify`]. **Never
-    /// constructed**: `uniquify` preserves every node id but those of the
-    /// `LetType` nodes it removes, and mints none, so it has nothing to record.
-    /// The variant exists so the axis covers every phase.
+    /// Binder uniquification. Preserves remaining node IDs, removes LetType nodes
+    /// and does not mint expression nodes, so normal compilation writes no rows.
     Uniquify,
-    /// A-normalization ([`crate::ccl::anf`]): naming every compound
-    /// sub-expression via a fresh `Let`, so only atomic terms occupy operand
-    /// positions from here on. Runs on the α-uniquified pre-inference tree,
-    /// so this is the phase that mints the new `Let`/`Var` nodes it needs.
+    /// A-normalization, which names compound operands with fresh Let/Var nodes
+    /// before inference. See `crate::ccl::anf`.
     Anf,
-    /// Read naming ([`crate::ccl::mut_read`]): binding the value each block's
-    /// mutable-variable reads denote to an immutable variable, one per read
-    /// segment. Runs on the A-normalized pre-inference tree, adopting the
-    /// binding A-normalization already gave each read it could move and minting
-    /// one for the position it could not.
+    /// Mutable-read naming and resolution. Read naming runs before inference;
+    /// later read resolution also uses this tag. See `crate::ccl::mut_read`.
     MutRead,
-    /// Comprehension lowering ([`crate::ccl::comprehension`]): the surface
-    /// `Comprehension` node to the `cast`/`λ`/`▷` encoding. Runs on the
-    /// A-normalized, read-named pre-inference tree, which is the point of
-    /// placing it here: the encoding is a refined cast, and A-normalization
-    /// leaves one exactly as it finds it, so a comprehension born at lowering
-    /// reached inference un-normalized.
+    /// Encode surface comprehensions after A-normalization and read naming.
+    /// This order keeps their refined-cast encoding from bypassing normalization.
     Comprehension,
-    /// Result binding ([`crate::ccl::opaque_output`]): binding the body of each
-    /// lambda that binds an opaque variable to `__output`, annotated with an
-    /// barrier variable. Runs on the comprehension-lowered pre-inference tree, so the
-    /// lambdas of a comprehension's encoding are rewritten too.
+    /// Bind opaque-dependent lambda results under a barrier-variable annotation.
+    /// Runs after comprehension lowering to include its generated lambdas.
+    /// See `crate::ccl::opaque_output`.
     OpaqueOutput,
-    /// Type inference ([`crate::ccl::infer`]): the phase that bridges the
-    /// pre-inference and post-inference panes. Monomorphization is what mints
-    /// inside it — cloning a generalized definition's subtree once per distinct
-    /// resolved type — and inference is the recorded span, since a scope covers
-    /// the whole call and nothing inside it opens a narrower one.
+    /// Type inference, including monomorphization, singleton predicates and other
+    /// inference products. The scope covers the inference call.
     Infer,
-    /// UDF inlining + beta-reduction ([`crate::ccl::inline`]): the phase that
-    /// runs between the post-inference and post-channelize snapshots. Mostly
-    /// id-preserving (a rebuilt node carries its input id); its genuine
-    /// deviations are the fan-out clones at multi-use call sites (`Copy`s) and
-    /// the wrappers/redexes it drops (`Transform` discards).
+    /// UDF inlining and beta reduction. Copies receive fresh IDs; unchanged
+    /// material can preserve IDs. Runs before transaction lowering.
     Inline,
-    /// The transaction slice of the unified mutability phase
-    /// ([`crate::ccl::transact_phase::run`]): stripping `with begin():` writer
-    /// sites and assembling the `get_prev_txn`-guarded `LetRec` (histories,
-    /// commit records, taps). Runs between the post-inference and post-channelize
-    /// snapshots (after `Inline`, before `Channelize`).
+    /// Transaction lowering by `transact_phase::run`, before induction lowering.
     Transact,
-    /// The induction slice of the unified mutability phase
-    /// ([`crate::ccl::mut_elim::run`]): folding direct-mirror `For`/`MutWrite`
-    /// loops into guarded `LetRec` induction histories. Runs between the
-    /// post-inference and post-channelize snapshots (after `Transact`, before
-    /// `Channelize`).
+    /// Induction-loop lowering by `mut_elim::run`, before channelization.
     Letrec,
-    /// Channelization ([`crate::ccl::channelize`]): channelizing
-    /// `Defer`/`Feed`/`Define` into collection unions and contribution records.
-    /// Mostly a 1:1 transform (ids preserved), but its channelization machinery
-    /// synthesizes new nodes (channel unions, contribution records, floated
-    /// lambdas, DI wrappers) that are tagged `{via: Channelize, nature: Machinery}`.
+    /// Eliminate Defer/Feed/Define through channel construction, recording new
+    /// products while preserving IDs for unchanged material.
     Channelize,
-    /// The as-of-read rewrite
-    /// ([`crate::ccl::transact_phase::rewrite_as_of_reads`]): turning a
-    /// read-only reply that reads a mutable variable out of its block into an
-    /// outer-indexed as-of join.
-    ///
-    /// Its code lives in `transact_phase`, but a phase is declared where the
-    /// rewrite *runs*, not where its code sits — this one runs after
-    /// `Channelize` and before `LambdaElim`. Reusing [`Transact`](Self::Transact)
-    /// for it would put one phase on both sides of the post-channelize pane, and
-    /// a fold restricting by that phase would resolve straight past it.
+    /// Fed-out mutable-read rewriting after Channelize. It has a separate tag
+    /// from Transact because the two runs lie on opposite sides of a pane boundary.
     AsOfRead,
     /// Lambda elimination: synthesizing point-free combinators (`Compose`,
     /// `Zip`, `Id`) from explicit lambdas.
@@ -1483,13 +1368,8 @@ pub enum Phase {
     /// Join/dataflow planning: hash-join and restrict scaffolding, clause
     /// fusion, refinement-predicate compilation.
     Planning,
-    /// Operator conversion: building the dataflow operator graph from the
-    /// planned tree.
-    ///
-    /// The one phase whose products are not expression nodes. An operator
-    /// carries a [`NodeId`](crate::ccl::provenance::NodeId) like any other
-    /// artifact, and conversion mints no expression nodes, so the rows this
-    /// phase writes key on ids disjoint from every pane above it.
+    /// Convert the planned expression tree into operators. Products use NodeIds
+    /// from the same domain; the output pane enumerates the operator graph.
     Convert,
 }
 
@@ -1705,70 +1585,30 @@ fn provenance_audit_span() -> Option<String> {
     std::env::var(PROVENANCE_AUDIT_ENV).ok()
 }
 
-/// Whether an audit's live set admits refinement-predicate interiors. **On by
-/// default**; `=0` narrows it to [`collect_main_tree_ids`]'s `walk_children`
-/// domain.
-///
-/// The default matches what the shipped gate folds: [`materialize_panes`] takes
-/// every pane's live set with [`collect_tree_ids`], which is predicate-inclusive.
-/// An audit measuring the *narrower* set therefore reports edges the gate does
-/// not — a recorded predicate rebuild's parents are input-tree predicate
-/// interiors, which the narrow set omits from the input side, so those edges
-/// dangle as [`Leak::DanglingParent`] with nothing actually unrecorded. Defaulting
-/// to the narrow set made the plain invocation report ~166 folds of noise on
-/// the pipeline corpus and buried real defects in it.
-///
-/// [`materialize_panes`]: CompiledProgram::materialize_panes
+/// Include predicate interiors in audit ID sets unless the variable is exactly
+/// `0`. Narrow enumeration can create dangling-parent reports for recorded
+/// predicate inputs omitted from the set; it is not the normal pane domain.
 fn provenance_predicates_live() -> bool {
     !std::env::var(PROVENANCE_PREDICATES_ENV).is_ok_and(|v| v == "0")
 }
 
-/// Whether [`compile_program`] opens the per-phase recorder scopes that fill
-/// [`CompiledProgram::provenance_table`]. On by default.
-///
-/// The switch changes only whether a scope is opened; every recording hook is
-/// already a no-op outside one (`RECORDING_STACK` empty / no ambient phase).
-///
-/// A [`ProvenanceAudit`] span opens its own scope, so naming one turns pane
-/// capture off.
+/// Enable ordinary per-phase table capture unless CAMBRA_PROVENANCE is `0`
+/// or an audit variable is set. Recordings can still capture events without
+/// phase scopes; lowering and derivation logs remain independent.
 pub(crate) fn provenance_capture_enabled() -> bool {
     !std::env::var(PROVENANCE_ENV).is_ok_and(|v| v == "0") && provenance_audit_span().is_none()
 }
 
-/// Whether every compile folds every pane pair and gates the leak classes,
-/// rather than only the programs a test asks about.
-///
-/// **What this buys.** The always-on gate is
-/// `pane_pair_folds_have_no_structural_leaks`, whose corpus is the handful
-/// of programs listed in `corpus()`. That is a *sample*, and a recording gap in
-/// a shape the sample misses is invisible: the unrecorded
-/// `fold_induction_loop` call in `transact_phase` (a commit decision reading
-/// another loop's accumulator) and `flatten_spine`'s value-position writer hoist
-/// both sat outside it. With this on, the corpus is every program the caller
-/// compiles — point it at `tests/it/compilation_pipeline` and the gate covers the
-/// whole suite instead of the programs `corpus()` lists.
-///
-/// Off by default because it folds the table twice per compile, which is
-/// superlinear work the ordinary pipeline does not need; CI turns it on. It is
-/// **not** a substitute for the sampled gate, which stays always-on so a plain
-/// `cargo test` still fails on the common shapes.
-///
-/// Requires capture: with `CAMBRA_PROVENANCE=0`, or under an audit span (which
-/// takes the phase scopes for itself), the table is empty and every output node
-/// would read as unrecorded. Both are honoured rather than asserted, so a run
-/// can name one without also having to unset this.
+/// Enable per-compile pane checking when the gate variable is set to a value
+/// other than `0` and ordinary capture is enabled. Otherwise only explicit
+/// callers, including corpus tests, materialize and check pairs.
+/// `gate_leaks` itself asserts only in debug/test builds.
 fn provenance_gate_every_compile() -> bool {
     std::env::var(PROVENANCE_GATE_ENV).is_ok_and(|v| v != "0") && provenance_capture_enabled()
 }
 
-/// Run `f` with `phase` installed as the recorder's ambient phase, so every row a
-/// recording inside it writes is tagged with that phase. With `capture` false this
-/// is exactly `f()` — no scope, and every construction hook stays a no-op.
-///
-/// The phase identity lives in the *data* — the row's `RewriteTag`, completed
-/// from the scope when a guard drops — which is why one helper covers every phase
-/// regardless of its signature: the phases here are free functions of four
-/// different shapes and nothing is threaded through them.
+/// Run `f` under the supplied phase when capture is enabled, otherwise call it
+/// without installing a scope. Recording hooks can still feed other active sinks.
 fn recorded<R>(capture: bool, phase: Phase, f: impl FnOnce() -> R) -> R {
     if !capture {
         return f();
@@ -1777,41 +1617,21 @@ fn recorded<R>(capture: bool, phase: Phase, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// A driver-capture audit over one span of the pipeline: install a phase recorder at
-/// the input pane, fold at the output pane, and print what the capture explains.
-///
-/// Opt-in by naming a span in `CAMBRA_PROVENANCE_AUDIT` — the spans opened below
-/// are `full`, `letrec` and `mutelim` — so the whole test suite can run either
-/// way. It is a **measurement**, not a gate: nothing declares a fate, so every
-/// genuinely-dead input id reaches the audit through the fold's death
-/// collection, which it counts apart from the [`Leak`]s that really are
-/// recording bugs.
-///
-/// A span survives gating when its enclosing pair bundles more phases than the
-/// span does: the `letrec` and `mutelim` spans below each isolate a phase inside
-/// the `post-inference → post-channelize` pair. See
-/// `src/ccl/design/provenance.md`, "What gating every pair does not retire".
+/// Optional measurement over a named pipeline span. Reports counts rather than
+/// asserting leak freedom. One nominal phase tags the span's rows; normal
+/// phase scopes are disabled. See `src/ccl/design/provenance.md`,
+/// "Gate and audit coverage" and "What gating every pair does not retire".
 struct ProvenanceAudit {
     span: &'static str,
     state: Option<(PhaseScope, HashSet<NodeId>)>,
 }
 
 impl ProvenanceAudit {
-    /// The `via` an audit's rows carry. A span covers several phases under one
-    /// scope, so no single phase is the truthful answer; the tag is nominal, and
-    /// naming it once keeps the scope's tag and the phases the fold restricts by
-    /// from disagreeing about which nominal phase it is.
+    /// Nominal grouping tag shared by the audit's scope and fold filter.
+    /// It does not identify the actual phase of each recorded rewrite.
     const AUDIT_VIA: Phase = Phase::Planning;
 
-    /// The audit's live set: [`collect_main_tree_ids`]'s `walk_children` domain,
-    /// or — when [`provenance_predicates_live`] says so — [`collect_tree_ids`]'s
-    /// predicate-inclusive domain.
-    ///
-    /// Both arms are real and differ: the narrow one is *not* the id domain any
-    /// more. `collect_tree_ids` became predicate-inclusive, which briefly made
-    /// this switch inert (both arms computing the same set) and its own doc
-    /// comment false. Keeping a named narrow walk is what makes the comparison
-    /// measurable rather than a no-op.
+    /// Select predicate-inclusive or main-tree-only audit IDs.
     fn live_ids(expr: &Expr) -> HashSet<NodeId> {
         if provenance_predicates_live() {
             collect_tree_ids(expr)
@@ -1820,10 +1640,8 @@ impl ProvenanceAudit {
         }
     }
 
-    /// Open the audit if [`provenance_audit_span`] names this `span`. Spans are
-    /// mutually exclusive because a phase scope is per-thread and non-reentrant;
-    /// naming them lets a run narrow the measurement to the phases under study
-    /// instead of the whole tail of the pipeline.
+    /// Open only for the selected name. Audit spans must not overlap on this
+    /// thread because their phase scopes are non-reentrant.
     fn start(span: &str, name: &'static str, input: &Expr) -> Self {
         let on = provenance_audit_span().is_some_and(|w| w == span);
         ProvenanceAudit {
@@ -2094,11 +1912,8 @@ fn run_frontend(
     // `Error` placeholders, so they are skipped when anything earlier failed.
     let mut errors: Vec<CompileError> = Vec::new();
 
-    // The node table spans the **whole compile**, not a phase: its rows are keyed
-    // by `NodeId`, which is unique for the life of the process, so every phase
-    // session's flushes mirror into one table with no possibility of collision.
-    // Installed before the first session opens (the lowering one) and drained
-    // below; every early return drops it, clearing the slot.
+    // Keep the table across phase scopes and possible audits. Early returns drop
+    // the session and clear its thread-local slot.
     let table_session = record.then(TableSession::install);
 
     // Loading's errors come first: every file's parse errors, then modules with
@@ -2871,7 +2686,7 @@ fn run_passes(
             message,
         }]
     })?;
-    // The last instrumented pane: see the span's own note at `ProvenanceAudit::start`.
+    // The full audit ends at planning; conversion has a separate gated pair.
     audit.finish(&join_planned);
     // Planning is the one phase that introduces `iterate` / `restrict` /
     // `Compose` staging, so re-checking its output catches a malformed tile
@@ -3187,8 +3002,7 @@ fn compile_version(
         source_producers,
     };
 
-    // Every compile its own gate — see `provenance_gate_every_compile` for why this
-    // is opt-in and what it covers that the sampled gate does not.
+    // Optionally check the compiled program's selected pane pairs.
     if provenance_gate_every_compile() {
         for pair in program.materialize_panes().gated_pane_pairs() {
             gate_leaks(&pair.leaks, &pair.name);
