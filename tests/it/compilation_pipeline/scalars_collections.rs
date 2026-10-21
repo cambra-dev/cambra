@@ -932,6 +932,150 @@ fn a_pattern_s_names_are_a_loop_s_outer_bindings(#[case] code: &str) {
     check_compile_error(code, "assignment to `a` is mutation");
 }
 
+/// The wildcard binds nothing, so a loop's `_ = …` rebinds nothing a pattern above bound.
+#[test]
+fn a_wildcard_is_no_outer_binding_of_a_loop() {
+    check_scalar(
+        indoc! {"
+            a, _ = (1, 2)
+            for x in [1, 2]:
+                _ = x
+            a
+        "},
+        Value::Int(1),
+    );
+}
+
+/// `_ := e` declares no mutable variable, so a loop body may hold one, and the call it binds
+/// still writes through its `Mut` parameter.
+#[test]
+fn a_mutable_assignment_to_the_wildcard_declares_nothing() {
+    check_scalar(
+        indoc! {"
+            def bump(c: Mut(Int)):
+                c += 1
+            x := 0
+            _ := 0
+            for i in [1, 2, 3]:
+                _ := bump(x)
+            x
+        "},
+        Value::Int(3),
+    );
+}
+
+/// A pattern binds each name once, at every binder.
+#[rstest]
+#[case::assignment("a, a = (1, 2)\na")]
+#[case::for_binder("total := 0\nfor a, a in [(1, 2)]:\n    total += a\ntotal")]
+#[case::comprehension("sum([a for a, a in [(1, 2)]])")]
+#[case::under_a_constructor("type P = Int\nsum([a for (a, P::new(a)) in [(1, P::new(2))]])")]
+fn a_pattern_binding_a_name_twice_is_refused(#[case] code: &str) {
+    check_compile_error(code, "`a` is bound twice in this pattern");
+}
+
+// A `for` binder and a comprehension binder take a pattern, with or without parentheses, at any
+// depth, and `_` binds nothing.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    indoc! {"
+        total := 0
+        for (a, b) in [(1, 10), (2, 20)]:
+            total += a * b
+        total
+    "},
+    Value::Int(50)
+)]
+#[case(
+    indoc! {"
+        out: Feed(_)
+        for k -> v in [(1, 10), (2, 20)]:
+            out << k + v
+        sum(out)
+    "},
+    Value::Int(33)
+)]
+#[case(
+    indoc! {"
+        total := 0
+        for _ in [7, 8, 9]:
+            total += 1
+        total
+    "},
+    Value::Int(3)
+)]
+#[case(
+    indoc! {"
+        def pair_sums(ps):
+            for (a, b) in ps:
+                yield a + b
+        sum(pair_sums([(1, 2), (3, 4)]))
+    "},
+    Value::Int(10)
+)]
+// A pattern's names are the loop's, so `a` shadows the mutable variable it spells over the
+// body and leaves it unwritten.
+#[case(
+    indoc! {"
+        a := 100
+        total := 0
+        for a, (_, c) in [(1, (5, 10)), (2, (6, 20))]:
+            total += a + c
+        total + a
+    "},
+    Value::Int(133)
+)]
+#[case("sum([a * b for (a, b) in [(1, 10), (2, 20)]])", Value::Int(50))]
+#[case(
+    "sum([k + v for k -> v in [(1, 10), (2, 20)] if k > 1])",
+    Value::Int(22)
+)]
+#[case("sum([a * b for a, b in [(1, 10), (2, 20)]])", Value::Int(50))]
+#[case("sum([1 for _ in [7, 8, 9]])", Value::Int(3))]
+// A later generator rebinding a pattern's name shadows it there.
+#[case(
+    "ys = [100, 200]; sum([a + b for (a, b) in [(1, 10)] for a in ys])",
+    Value::Int(320)
+)]
+#[case("_, b = (1, 2); b", Value::Int(2))]
+// A type with one constructor matches every value, so its constructor pattern is a binder.
+#[case(
+    indoc! {"
+        type Price = {Int where _ >= 0}
+        total := 0
+        for Price::new(c) in [Price::new(3), Price::new(4)]:
+            total += c
+        total
+    "},
+    Value::Int(7)
+)]
+#[case(
+    indoc! {"
+        type Price = {Int where _ >= 0}
+        sum([c for Price::new(c) in [Price::new(3), Price::new(4)] if c > 3])
+    "},
+    Value::Int(4)
+)]
+// A pattern binder on an inner loop and on an inner generator, whose guard reads both binders.
+#[case(
+    indoc! {"
+        total := 0
+        for x in [1, 2]:
+            for (a, b) in [(1, 10), (2, 20)]:
+                total += a * b + x
+        total
+    "},
+    Value::Int(106)
+)]
+#[case(
+    "sum([a * b + c for c in [1, 2] for (a, b) in [(1, 10), (2, 20)] if a < c])",
+    Value::Int(12)
+)]
+fn test_binder_patterns(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 // A conditional collection consumed by `sum` (`sum([1,2] if c else [1,2,3])`)
 // type-checks as a Σ (the consumer's kind variable pinned by it) and *compiles* via
 // value-`Case` fan-out — see `conditionals.rs` for the end-to-end

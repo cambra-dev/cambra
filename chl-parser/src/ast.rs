@@ -802,8 +802,8 @@ pub enum AssignTarget {
 
 impl AssignTarget {
     /// The names the target binds, in the order written: a name, each name a tuple
-    /// pattern's components bind, and each binder of a constructor pattern. A keyed write
-    /// and another module's variable bind none.
+    /// pattern's components bind, and each binder of a constructor pattern. The wildcard
+    /// `_`, a keyed write and another module's variable bind none.
     pub fn bound_names(&self) -> Vec<&SmolStr> {
         let mut names = Vec::new();
         self.collect_bound_names(&mut names);
@@ -812,7 +812,8 @@ impl AssignTarget {
 
     fn collect_bound_names<'a>(&'a self, names: &mut Vec<&'a SmolStr>) {
         match self {
-            AssignTarget::Name(name) => names.push(name),
+            AssignTarget::Name(name) if name != "_" => names.push(name),
+            AssignTarget::Name(_) => {}
             AssignTarget::Tuple(components) => components
                 .iter()
                 .for_each(|c| c.node.collect_bound_names(names)),

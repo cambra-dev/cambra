@@ -1254,6 +1254,24 @@ impl Interp {
         }
     }
 
+    /// Bind each name the pattern `target` binds to its position of `value`, `_` excepted.
+    fn bind_pattern(&mut self, target: &Spanned<AssignTarget>, value: Value) -> Result<(), Error> {
+        let names = target.node.bound_names();
+        if let Some(twice) = names
+            .iter()
+            .enumerate()
+            .find_map(|(i, n)| names[..i].contains(n).then_some(n))
+        {
+            return err(format!("`{twice}` is bound twice in this pattern"));
+        }
+        for (n, v) in tuple_binds(target, value)? {
+            if n != "_" {
+                self.bind(n, Slot::Val(v));
+            }
+        }
+        Ok(())
+    }
+
     /// Where the channel `name`, declared at source position `at`, keeps its state.
     ///
     /// A declaration in a loop body or a function body runs once per iteration or call, and
@@ -1342,9 +1360,7 @@ impl Interp {
                 ..
             } => {
                 let v = self.eval(value)?;
-                for (n, v) in tuple_binds(target, v)? {
-                    self.bind(n, Slot::Val(v));
-                }
+                self.bind_pattern(target, v)?;
                 Ok(None)
             }
             Stmt::Assign { target, value, .. } => {
@@ -1625,10 +1641,6 @@ impl Interp {
             Stmt::For {
                 target, iter, body, ..
             } => {
-                let name = match &target.node {
-                    AssignTarget::Name(n) => n.to_string(),
-                    other => return err(format!("unsupported loop target: {other:?}")),
-                };
                 let source = self.eval(iter)?;
                 // A pending collection has pending keys and elements, so the body runs once,
                 // speculatively, over a pending element under a pending key.
@@ -1636,7 +1648,7 @@ impl Interp {
                     return self.speculate(|me| {
                         me.loop_keys.push(Value::Pending);
                         let ran = me.scoped(|me| {
-                            me.bind(name, Slot::Val(Value::Pending));
+                            me.bind_pattern(target, Value::Pending)?;
                             me.exec_block(body)
                         });
                         me.loop_keys.pop();
@@ -1673,7 +1685,7 @@ impl Interp {
                     // this body lands under the position its element came from.
                     self.loop_keys.push(key);
                     ran = self.scoped(|me| {
-                        me.bind(name.clone(), Slot::Val(elem));
+                        me.bind_pattern(target, elem)?;
                         me.exec_block(body)
                     });
                     self.loop_keys.pop();
@@ -3375,10 +3387,6 @@ impl Interp {
                 _ => err("a comprehension guard is a boolean"),
             },
             Some((CompClause::For { target, iter }, rest)) => {
-                let name = match &target.node {
-                    AssignTarget::Name(n) => n.to_string(),
-                    other => return err(format!("unsupported comprehension target: {other:?}")),
-                };
                 let c = match self.eval(iter)? {
                     Value::Collection(c) => c,
                     // A pending source has pending bindings, so the rest runs once,
@@ -3387,7 +3395,7 @@ impl Interp {
                         keys.push(Value::Pending);
                         let walked = self.speculate(|me| {
                             me.scoped(|me| {
-                                me.bind(name.clone(), Slot::Val(Value::Pending));
+                                me.bind_pattern(target, Value::Pending)?;
                                 me.comprehend(rest, element, keys, out)
                             })
                         });
@@ -3401,7 +3409,7 @@ impl Interp {
                 for (key, elem) in c.entries().to_vec() {
                     keys.push(key);
                     let walked = self.scoped(|me| {
-                        me.bind(name.clone(), Slot::Val(elem));
+                        me.bind_pattern(target, elem)?;
                         me.comprehend(rest, element, keys, out)
                     });
                     keys.pop();
@@ -3860,6 +3868,45 @@ mod tests {
             out << 2 ** (0 - 3)
         "#});
         assert!(e.contains("is not defined"), "{e}");
+    }
+
+    /// A `for` binder and a comprehension binder take a pattern as an assignment does.
+    #[test]
+    fn a_binder_pattern_binds_each_position() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            for k -> (_, v) in [(1, (0, 10)), (2, (0, 20))]:
+                out << k + v
+            out << sum([a * b for a, b in [(1, 10), (2, 20)]])
+        "#});
+        assert_eq!(v.to_string(), "[`0(0) -> 11, `0(1) -> 22, `1(()) -> 50]");
+    }
+
+    /// A pattern binds each name once, at every binder.
+    #[test]
+    fn a_pattern_binding_a_name_twice_is_refused() {
+        for body in [
+            "a, a = (1, 2)\nout << a",
+            "for a, a in [(1, 2)]:\n    out << a",
+            "out << sum([a for a, a in [(1, 2)]])",
+        ] {
+            let e = refused(&format!("out = test_sink()\n{body}\n"));
+            assert!(e.contains("`a` is bound twice"), "{body}: {e}");
+        }
+    }
+
+    /// A `for` binder takes a constructor pattern apart, as the compiler does.
+    #[test]
+    fn a_for_binder_takes_a_constructor_apart() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Price = Int
+            total := 0
+            for Price::new(c) in [Price::new(3), Price::new(4)]:
+                total += c
+            out << total
+        "#});
+        assert_eq!(v.to_string(), "[() -> 7]");
     }
 
     /// A tuple pattern binds each name to its position, reading every element before any name
