@@ -704,19 +704,31 @@ pub fn freshen_above(
                 s.type_kinds = new_kinds;
             }
             cache.relate_kind_copy(&tv.fun_kind, &v.fun_kind);
-            freshen_watches(lim, tv, &v, target, cache);
+            let watches = tv.watches.borrow().clone();
+            freshen_watches(
+                lim,
+                watches,
+                &|copy, pos| copy.watch(&Type::Infer(Rc::clone(&v)), pos),
+                target,
+                cache,
+            );
             Type::Infer(v)
         }
-        // Freshens like `Infer`, over what a barrier variable carries: its level and its
-        // lower and upper bounds. It has no telescope, kind or watches to copy.
+        // Freshens like `Infer`, over what a barrier variable carries: its opaque
+        // binders, its lower and upper bounds, and its watches. Its level is read from
+        // the bounds, so the copy's follows from the freshened ones. It has no telescope
+        // or kind to copy.
         Type::BarrierVar(barrier) => {
             if let Some(existing) = cache.barrier_vars.get(&barrier.uid) {
                 return Type::BarrierVar(Rc::clone(existing));
             }
             // Registered before the bounds are copied, so a bound that reaches this
             // barrier variable again resolves to the copy.
-            let fresh =
-                BarrierVar::fresh(target.level_of(barrier.level()), Vec::new(), Vec::new());
+            let fresh = BarrierVar::fresh(
+                Rc::clone(&barrier.opaque),
+                Vec::new(),
+                Vec::new(),
+            );
             cache.barrier_vars.insert(barrier.uid, Rc::clone(&fresh));
 
             // Snapshot bounds before recursing, as the `Infer` arm does.
@@ -732,6 +744,16 @@ pub fn freshen_above(
             let new_ups: Vec<_> = ups.iter().map(&mut freshen_bound).collect();
             *fresh.lowers.borrow_mut() = new_lows;
             *fresh.uppers.borrow_mut() = new_ups;
+            // A barrier variable is never an operand, so the copy records the watch
+            // without `TraitObligation::watch`, which would make it one.
+            let watches = barrier.watches.borrow().clone();
+            freshen_watches(
+                lim,
+                watches,
+                &|copy, pos| fresh.watches.borrow_mut().push((Rc::clone(copy), pos)),
+                target,
+                cache,
+            );
             Type::BarrierVar(fresh)
         }
     }
@@ -809,7 +831,8 @@ impl FreshenCache {
     }
 }
 
-/// Copy `tv`'s trait obligations onto its freshened counterpart `v`.
+/// Copy the trait obligations in `watches`, a variable's watch list, onto its freshened
+/// counterpart: `attach` records the watch of each copy on it.
 ///
 /// Runs *after* the bounds write-back, so an obligation reached through a bound has
 /// already had its variables freshened into the cache and the copy's watches line up
@@ -824,22 +847,21 @@ impl FreshenCache {
 /// operands.
 fn freshen_watches(
     lim: Level,
-    tv: &Rc<InferVar>,
-    v: &Rc<InferVar>,
+    watches: Vec<(Rc<TraitObligation>, u8)>,
+    attach: &dyn Fn(&Rc<TraitObligation>, u8),
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) {
-    let watches = tv.watches.borrow().clone();
     for (obligation, pos) in watches {
         if let Some(existing) = cache.obligations.get(&obligation.uid) {
-            existing.watch(&Type::Infer(Rc::clone(v)), pos);
+            attach(existing, pos);
             continue;
         }
         // Phase 1: a copy carrying the original's candidate set, with the output
         // position still pointing at the definition's — enough to be reachable.
         let copy = TraitObligation::new_from(&obligation);
         cache.obligations.insert(obligation.uid, Rc::clone(&copy));
-        copy.watch(&Type::Infer(Rc::clone(v)), pos);
+        attach(&copy, pos);
         // A specialization clone turns the binding's own type parameters, the ones
         // one level above the cutoff, into variables; an assumption about one of
         // them no longer describes the copy. The parameters are told apart by identity:

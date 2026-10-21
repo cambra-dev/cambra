@@ -67,7 +67,9 @@ pub use ty::*;
 //   - `arena_enter` / `arena_exit` are used by `infer.rs`;
 //   - `fresh_infer_var_id` is used by `solver`;
 //   - `eq_term_modulo_ty_slots` is used by `subst.rs`.
-pub(crate) use infer_var::{arena_enter, arena_exit, fresh_infer_var_id};
+pub(crate) use infer_var::{
+    arena_barrier_vars, arena_enter, arena_exit, barrier_arena_exit, fresh_infer_var_id,
+};
 pub(crate) use ty::eq_term_modulo_ty_slots;
 
 /// Reset all IDs allocated by ccl module counters. Test-only convenience for

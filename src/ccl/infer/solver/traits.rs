@@ -76,8 +76,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId, Name,
-    Refinement, RefinementSet, RefinementTemplate, Type, TypedExpr, provenance,
+    ArithmeticKind, BarrierVar, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId,
+    Name, Refinement, RefinementSet, RefinementTemplate, Type, TypedExpr, provenance,
 };
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
@@ -1325,10 +1325,15 @@ pub fn clear_watch_log() {
 ///
 /// A variable's lower bounds are written in exactly four places, and delivery is
 /// wired into every one: `constrain_go`'s two variable arms (`notify_lower` for a
-/// concrete contribution, `link_watches` for a var-var edge), `extrude`'s proxy
-/// seeding (`copy_watches`), and `freshen_above`'s clone (`freshen_watches`). Each is
-/// load-bearing — `a_concrete_operand_reaches_its_obligation` has a case per
-/// mechanism, confirmed by deleting the mechanism and watching only its case fail.
+/// concrete contribution, `link_watches` for a var-var edge, `link_barrier_watches`
+/// for a barrier variable), `extrude`'s proxy seeding (`copy_watches`), and
+/// `freshen_above`'s clone (`freshen_watches`). A barrier variable flowing into a
+/// watched variable carries the watches itself, so its lower bounds are delivery sites
+/// too: `constrain_go`'s barrier lower-bound arm (`notify_barrier_lower`) and the
+/// copies `extrude` and `freshen_above` make of it, which copy its watches.
+/// `a_concrete_operand_reaches_its_obligation` has a case per mechanism, confirmed by
+/// deleting the mechanism and watching only its case fail; no case reaches a barrier
+/// variable's copies with a watch on it.
 ///
 /// That the list is closed is an argument about today's code, not a property the
 /// compiler enforces, and a missed delivery is quiet: an obligation that never
@@ -2173,7 +2178,7 @@ pub(super) fn link_watches(
     // offered — it arrived before the edge existed. A type parameter is replayed
     // with the bases: missing one would leave an operator on an unbounded parameter
     // unchecked.
-    let (known, params, below) = {
+    let (known, params, below, barriers_below) = {
         let bounds = lower.bounds.borrow();
         let known: Vec<(BaseType, Option<crate::ccl::infer_var::Origin>)> = bounds
             .lower()
@@ -2194,7 +2199,15 @@ pub(super) fn link_watches(
                 _ => None,
             })
             .collect();
-        (known, params, below)
+        let barriers_below: Vec<Rc<BarrierVar>> = bounds
+            .lower()
+            .iter()
+            .filter_map(|b| match &b.ty {
+                Type::BarrierVar(barrier) => Some(Rc::clone(barrier)),
+                _ => None,
+            })
+            .collect();
+        (known, params, below, barriers_below)
     };
     for (obligation, pos) in &added {
         for (base, origin) in &known {
@@ -2210,6 +2223,67 @@ pub(super) fn link_watches(
     // Transitivity: anything flowing into `lower` flows into `upper` too.
     for v in below {
         link_watches(&v, lower, cache)?;
+    }
+    for barrier in barriers_below {
+        link_barrier_watches(&barrier, lower, cache)?;
+    }
+    Ok(())
+}
+
+/// Propagate `upper`'s obligations to the barrier variable `lower` when the edge
+/// `lower <: upper` is recorded, and deliver `lower`'s lower bounds to the obligations
+/// it gains.
+///
+/// A barrier variable's lower bounds are not closed against `upper`: the edge sits in
+/// `upper`'s lower bounds, and `upper` resolves through the barrier variable's
+/// resolution. That resolution has the base of a lower bound, because dropping
+/// refinements leaves the base, so a lower bound's base is what narrows `upper`'s
+/// obligations. Lower bounds arriving after the edge are delivered by
+/// [`notify_barrier_lower`].
+pub(super) fn link_barrier_watches(
+    lower: &Rc<BarrierVar>,
+    upper: &Rc<InferVar>,
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
+    let incoming = upper.watches.borrow().clone();
+    let added: Vec<(Rc<TraitObligation>, u8)> = {
+        let mut watches = lower.watches.borrow_mut();
+        incoming
+            .into_iter()
+            .filter(|(ob, pos)| {
+                let fresh = !watches.iter().any(|(o, p)| o.uid == ob.uid && p == pos);
+                if fresh {
+                    watches.push((Rc::clone(ob), *pos));
+                }
+                fresh
+            })
+            .collect()
+    };
+    if added.is_empty() {
+        return Ok(());
+    }
+    // Snapshot: a delivery re-enters `constrain_go`, which can add a lower bound here.
+    let lowers = lower.lowers.borrow().clone();
+    for (obligation, pos) in &added {
+        for bound in &lowers {
+            deliver(obligation, *pos, &bound.ty, bound.origin, cache)?;
+        }
+    }
+    Ok(())
+}
+
+/// Deliver a lower bound of the barrier variable `barrier` to every obligation watching
+/// it: the counterpart of [`notify_lower`] for the barrier variable's lower-bound arm in
+/// `constrain_go`.
+pub(super) fn notify_barrier_lower(
+    barrier: &Rc<BarrierVar>,
+    contribution: &Type,
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
+    // Snapshot: a deposit re-enters `constrain_go`, which can append watches.
+    let watches = barrier.watches.borrow().clone();
+    for (obligation, pos) in watches {
+        deliver(&obligation, pos, contribution, None, cache)?;
     }
     Ok(())
 }

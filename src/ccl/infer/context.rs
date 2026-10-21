@@ -487,16 +487,20 @@ impl InferCtx {
             // A `Hole` annotation means "infer this" → fresh variable, at
             // the current lexical position (it carries the live telescope).
             Type::Hole => Type::Infer(InferVar::fresh_in(self.level, telescope)),
-            // A barrier variable is the same "infer this" at the current level, so a
-            // generalized `let` around it quantifies it and each instantiation
-            // freshens its own copy. The barrier variable `opaque_output` writes is minted
-            // before any level exists and gathers its bounds only here, on the copy.
+            // A barrier variable is the same "infer this": each annotation gets its own
+            // copy, which gathers the bounds. Its level is the maximum level of those
+            // bounds (`BarrierVar::level`), so a generalized `let` quantifies it exactly
+            // when a bound reaches above the `let`'s level.
             Type::BarrierVar(barrier) => {
                 debug_assert!(
                     barrier.lowers.borrow().is_empty() && barrier.uppers.borrow().is_empty(),
                     "an annotation's barrier variable carries no bounds before normalization"
                 );
-                Type::BarrierVar(BarrierVar::fresh(self.level, Vec::new(), Vec::new()))
+                Type::BarrierVar(BarrierVar::fresh(
+                    Rc::clone(&barrier.opaque),
+                    Vec::new(),
+                    Vec::new(),
+                ))
             }
             // A `SharedHole` means "infer this, and it is the same one as that":
             // the *first* occurrence of an id mints the variable and every later

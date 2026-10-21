@@ -52,11 +52,14 @@ fn is_significant_context(label: &str) -> bool {
     label.contains("let ") || label.contains("λ ") || label.contains('\n')
 }
 
-/// Push `new_err` onto `errors`, deduplicating [`InferError::IncompatibleBounds`].
+/// Push `new_err` onto `errors`, deduplicating [`InferError::IncompatibleBounds`] and
+/// [`InferError::OpaqueEscape`].
 ///
 /// If an existing error has the same `(polarity, conflicting)` key, `label` is
 /// appended to its context vec (when it passes [`is_significant_context`])
-/// instead of pushing a duplicate.  All other error kinds are pushed as-is.
+/// instead of pushing a duplicate. An `OpaqueEscape` naming the same binders as an
+/// existing one is dropped: each specialization of a function copies its barrier
+/// variable, and every copy reports it. All other error kinds are pushed as-is.
 ///
 /// `blame` is the node whose rule raised `new_err`. A merged
 /// `IncompatibleBounds` keeps the *first* contributing node: a bounds conflict
@@ -71,6 +74,13 @@ fn push_coalesce_err(
     label: String,
     blame: NodeId,
 ) {
+    if let InferError::OpaqueEscape { names, .. } = &new_err
+        && errors.iter().any(
+            |e| matches!(&e.error, InferError::OpaqueEscape { names: seen, .. } if seen == names),
+        )
+    {
+        return;
+    }
     if let InferError::IncompatibleBounds {
         polarity: p,
         conflicting: ref c,
@@ -1377,6 +1387,43 @@ fn obligation_choices(v: &crate::ccl::infer_var::InferVar) -> Option<Vec<crate::
     Some(candidates)
 }
 
+/// Run [`solve_barrier_vars`](crate::ccl::infer::solver::barrier::solve_barrier_vars) and push
+/// each failure onto `errors`, blamed on the node its bound came from, or on `fallback` for a
+/// bound written in a polymorphic type or recorded with no origin. `label` renders the blamed
+/// node for the error's message.
+pub(super) fn push_barrier_failures(
+    errors: &mut Vec<LocatedInferError>,
+    fallback: NodeId,
+    label: impl Fn(NodeId) -> String,
+) {
+    use crate::ccl::infer::solver::barrier::{BarrierFailure, solve_barrier_vars};
+    use crate::ccl::infer_var::Origin;
+    let blame = |origin: Option<Origin>| match origin {
+        Some(Origin::Node(node)) => node,
+        Some(Origin::Written(_)) | None => fallback,
+    };
+    for failure in solve_barrier_vars() {
+        let (error, node) = match failure {
+            BarrierFailure::Escape {
+                names,
+                resolved,
+                origin,
+            } => (
+                InferError::OpaqueEscape {
+                    names,
+                    ty: Box::new(resolved),
+                },
+                blame(origin),
+            ),
+            BarrierFailure::Upper { error, origin } => {
+                let node = blame(origin);
+                (map_constrain_err(error, &label(node)), node)
+            }
+        };
+        push_coalesce_err(errors, error, String::new(), node);
+    }
+}
+
 pub(super) fn coalesce_pass(
     expr: &mut Expr,
     bound_at_annotation: std::collections::HashSet<Name>,
@@ -2672,6 +2719,12 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
             obligation.redeliver(&mut cache)
         })
     });
+    // The pin added bounds to the clone's copies of the definition's barrier variables,
+    // and the walk below compacts them, so they are checked first.
+    if pinned.is_ok() {
+        let label = symbolic(use_expr);
+        push_barrier_failures(&mut ctx.errors, use_expr.node_id(), |_| label.clone());
+    }
     if let Err(e) = &pinned {
         let e = e.clone();
         // Blamed on the use site, which is the node whose demanded type the pin

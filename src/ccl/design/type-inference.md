@@ -2106,26 +2106,53 @@ from the tree it receives, not from a pre-transformation quoted term.
 
 #### A lambda's codomain drops the body's opaque binders
 
-A lambda whose body binds an opaque variable reports the body's type with every refinement dropped
-as its codomain. An opaque binder the body introduced stands for one value per call, so a refinement
-naming it would relate the results of `f(1)` and `f(2)` through one `r`. The dropped type is a
-supertype of the body's, so every result the function produces inhabits the codomain.
+A lambda whose body binds an opaque variable reports as its codomain the body's type with every
+refinement at a positive position dropped. An opaque binder the body introduced stands for one value
+per call, so a refinement naming it would relate the results of `f(1)` and `f(2)` through one `r`.
+The dropped type is a supertype of the body's, so every result the function produces inhabits the
+codomain. The drop covers every refinement at a positive position, including one that names no
+opaque binder.
+
+A refinement at a negative position, such as the domain of a returned function, is kept: dropping
+it widens what the codomain accepts, so the codomain would not be a supertype of the body's type. A
+kept refinement that names an opaque binder the body introduced can be neither kept nor dropped, and
+inference rejects the lambda with `InferError::OpaqueEscape`, which asks for a result annotation
+that names no such binder (`return_opaque_annotated_function_from_unannotated_function` in
+`tests/it/compilation_pipeline/type_annotations.rs`).
 
 `opaque_output::run` runs before inference and rewrites such a lambda to
-`λ 𝑥 → let __output : 𝐻 = body in __output`, where `𝐻` is a fresh `Type::BarrierVar`. Inference
-records each edge into the hole as a lower bound and each edge out of it as an upper bound, and
-closes neither against the other. Compaction resolves the hole to the join of its lower bounds with
-every refinement dropped, then checks each upper bound against that resolution
-(`check_barrier_uppers` in `solver/compact.rs`). A failed check surfaces as the constraint error it
-raised. The drop covers every refinement in the join, including one that names no opaque binder.
+`λ 𝑥 → let __output : 𝐻 = body in __output`, where `𝐻` is a fresh `Type::BarrierVar` recording
+the opaque binders the body binds. Inference records each edge into the hole from a type other
+than an inference variable as a lower bound and each such edge out of it as an upper bound, and
+closes neither against the other. An edge between the hole and an inference variable is recorded on
+the inference variable. The hole resolves to
+the join of its lower bounds with the refinements at positive positions dropped
+(`CompactType::resolve_barrier_refinements` in `solver/compact.rs`).
+
+`solver::barrier::solve_barrier_vars` checks each barrier variable against its resolution. It
+reports the escape above, or checks each upper bound against the resolution; a failed check surfaces
+as the constraint error it raised, blamed on the node that recorded the bound. A check is a
+`constrain`, so it adds bounds to the variables it reaches, other barrier variables' lower bounds
+included. The phase therefore repeats until a round checks nothing, and each variable records what
+it was last checked against (`BarrierVar::checked`), so an unchanged resolution has only its newly
+arrived upper bounds checked. The phase runs once after emission and again after each
+specialization pin in `solve::specialize_use`, which gives the clone's copies of the barrier
+variables new bounds. Both runs precede every compaction that reads the bounds they add, so
+compaction reads a barrier variable's lower bounds and changes nothing
+(`return_unrefined_function_from_function` in `tests/it/compilation_pipeline/type_annotations.rs`).
 
 Because an upper bound is not closed against the lower bounds, a demand on the codomain does not
-narrow a variable inside the body. A conflict between the two surfaces at compaction.
+narrow a variable inside the body. A conflict between the two surfaces when the phase checks the
+upper bound.
 
 `opaque_output::run` leaves a lambda unwrapped in two cases. Its body binds no opaque variable, or
-its body is `let 𝑦 : 𝑇 = body in 𝑦` with a user annotation `𝑇`, the lowering of a `=> 𝑇` output
-annotation. An annotated `let` with any other continuation annotates only its definiens, so the
-lambda is wrapped. The search for an opaque binder stops at a nested lambda, which receives its own
+its body is `let 𝑦 : 𝑇 = body in 𝑦` with a concrete user annotation `𝑇`, the lowering of a `=> 𝑇`
+output annotation. A concrete annotation holds no `_`, inference variable, or barrier variable at
+any depth. An annotation holding one leaves part of the codomain to inference, so the lambda is
+wrapped around the annotated `let`
+(`dont_discharge_opaques_out_of_fun_bodies_with_a_hole_codomain` in
+`tests/it/compilation_pipeline/type_annotations.rs`). An annotated `let` with any other
+continuation annotates only its definiens, so the lambda is wrapped. The search for an opaque binder stops at a nested lambda, which receives its own
 `__output`. An unwrapped lambda's codomain keeps the body's refinements, so a refinement naming a
 binder bound outside the function stays (`a_function_s_codomain_drops_its_body_s_opaque_binders`,
 case `bound_outside`, in `tests/it/type_check.rs`).
@@ -3051,13 +3078,20 @@ A variable's lower bounds are written in exactly four places, and delivery is wi
 
 * `constrain_go`'s concrete arm — delivers the contribution directly.
 * `constrain_go`'s var-var arm — propagates the watch *downward*, toward the variables feeding the watched one, and delivers what they already know.
+* `constrain_go`'s arm for a barrier variable as the lower bound — propagates the watch to the barrier variable (`link_barrier_watches`) and delivers its lower bounds.
 * `extrude`'s proxy seeding, and `freshen_above`'s clone — both seed bounds by direct writes rather than through `constrain_go`.
+
+A barrier variable's lower bounds are not closed against the variable it flows into, so the
+barrier variable holds the watches it receives (`BarrierVar::watches`) and delivers each lower bound
+recorded afterwards (`notify_barrier_lower`). Its resolution has the base of a lower bound, so the
+base a lower bound offers is the base the watched variable resolves to. `extrude` and
+`freshen_above` copy a barrier variable's watches with it.
 
 `link_watches` replays what the lower variable already carries when it links an obligation to it: its
 bases, and its type parameters, so an operator on an unbounded parameter is refused whichever edge
 arrives first.
 
-That the list is closed is an argument about today's code, not something the compiler enforces, and a missed delivery is quiet: the obligation never narrows, so a type is left undetermined and surfaces phases later on an interior node. `verify_narrowing_is_complete` checks the argument instead of trusting it — after emission, every watched operand is resolved against the completed graph, and a resolved base must already have narrowed its obligation. `a_concrete_operand_reaches_its_obligation` covers the four writers, a case per mechanism.
+That the list is closed is an argument about today's code, not something the compiler enforces, and a missed delivery is quiet: the obligation never narrows, so a type is left undetermined and surfaces phases later on an interior node. `verify_narrowing_is_complete` checks the argument instead of trusting it — after emission, every watched operand is resolved against the completed graph, and a resolved base must already have narrowed its obligation. `a_concrete_operand_reaches_its_obligation` has a case per mechanism, except the barrier-variable copies, which no case reaches with a watch on them.
 
 ### Requirements are generalized
 

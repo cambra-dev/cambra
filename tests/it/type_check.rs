@@ -583,9 +583,11 @@ fn a_generalized_function_instantiates_its_operator_requirements() {
 // An obligation is resolved by *delivery*: a concrete type reaching an operand
 // variable has to reach the obligation watching it. Production code writes a
 // variable's lower bounds in exactly four places — `constrain_go`'s two variable
-// arms, `extrude`'s proxy seeding, and `freshen_above`'s clone — and there is a case
-// per mechanism below, each confirmed to discriminate by deleting the mechanism it
-// names and watching only its own case fail.
+// arms, `extrude`'s proxy seeding, and `freshen_above`'s clone — and a barrier
+// variable's in two: `constrain_go`'s barrier lower-bound arm, and the copies
+// `extrude` and `freshen_above` make. There is a case per mechanism below, each
+// confirmed to discriminate by deleting the mechanism it names and watching only its
+// own case fail. No case reaches a barrier variable's copies with a watch on it.
 //
 // A missed delivery leaves a type *undetermined* rather than wrong, so it reads as an
 // ordinary under-determined program rather than an error — which is why these assert
@@ -616,6 +618,33 @@ fn a_generalized_function_instantiates_its_operator_requirements() {
 #[case::through_a_freshened_instantiation(indoc! {r#"
     k = \a, b -> a + b
     k(k(1, 2), 3)
+"#})]
+// A barrier variable: `f(1)` types as `f`'s codomain barrier variable, an edge into
+// `a`'s variable, which feeds the `==` operand. The barrier variable's `Int` lower bound
+// is not closed against the operand variable, so the watch follows the edge down to the
+// barrier variable and is offered its lower bounds there. Two mechanisms carry it, the
+// lower-bound arm's link and `link_watches`'s walk, and the case fails only with both
+// removed.
+#[case::through_a_barrier_variable(indoc! {r#"
+    def f(x):
+        r ^= x;
+        r ^+ 0
+    a = f(1)
+    b = f(2)
+    a == b
+"#})]
+// A barrier variable whose lower bound arrives after it is watched: `g`'s codomain barrier
+// variable takes `f(s)`'s barrier variable as a lower bound only when
+// `solve_barrier_vars` checks the inner one's upper bounds, after `g(1) == g(2)` has
+// linked the watch.
+#[case::through_a_barrier_variable_bounded_after_the_watch(indoc! {r#"
+    def g(y):
+        s ^= y
+        def f(x):
+            r ^= x
+            r ^+ 0
+        f(s)
+    g(1) == g(2)
 "#})]
 fn a_concrete_operand_reaches_its_obligation(#[case] code: &str) {
     // The wall, not the root type: a missed delivery can leave an *interior* node

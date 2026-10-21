@@ -9,21 +9,27 @@
 //! λ x → let __output : ⟨barrier variable⟩ = body in __output
 //! ```
 //!
-//! The annotation is a fresh `Type::BarrierVar` per lambda. An opaque binder
-//! withholds its definiens, so a type leaving its scope cannot read the binder
-//! back as anything else. The barrier variable is the slot at which the body's type leaves
-//! the scope of every opaque binder inside it.
+//! The annotation is a fresh `Type::BarrierVar` per lambda, which records the
+//! opaque binders the body binds. An opaque binder withholds its definiens, so a
+//! type leaving its scope cannot read the binder back as anything else. The
+//! barrier variable is the slot at which the body's type leaves the scope of
+//! every opaque binder inside it.
 //!
 //! A lambda is left alone in two cases:
 //!
-//! - **Its body is an annotated `let` whose continuation is its own binder**,
-//!   `let 𝑦 : 𝑇 = body in 𝑦`: a `=> 𝑇` output annotation's lowering, or this
-//!   pass's own wrap. The annotation states the type the result is read at. An
-//!   annotated `let` with any other continuation annotates only its definiens,
-//!   so the lambda is wrapped.
+//! - **Its body is an annotated `let` whose continuation is its own binder and
+//!   whose annotation is concrete**, `let 𝑦 : 𝑇 = body in 𝑦` where `𝑇` holds no
+//!   position left to inference: a `=> 𝑇` output annotation's lowering. `𝑇`
+//!   states the whole type the result is read at. An annotation holding a `_`
+//!   leaves part of that type to inference, which can read an opaque binder
+//!   into it, so the lambda is wrapped around the annotated `let`. An annotated
+//!   `let` with any other continuation annotates only its definiens, so the
+//!   lambda is wrapped.
 //! - **Its body binds no opaque variable.** The search stops at a nested lambda,
 //!   whose own opaque binders this pass hides behind that lambda's own
 //!   `__output`.
+
+use std::rc::Rc;
 
 use crate::ccl::{
     BarrierVar, BindingTransparency, Expr, Name, Type, TypedBinding, TypedExprNode,
@@ -42,16 +48,22 @@ pub fn run(expr: Expr) -> Expr {
 fn rewrite(mut expr: Expr) -> Expr {
     expr.map_children(rewrite);
     if let TypedExprNode::Lambda { body, .. } = &mut expr.node
-        && !is_annotated_result(body)
-        && binds_opaque(body)
+        && !has_concrete_result_annotation(body)
     {
-        **body = wrap(std::mem::take(body));
+        let mut opaque = Vec::new();
+        opaque_binders(body, &mut opaque);
+        if !opaque.is_empty() {
+            **body = wrap(std::mem::take(body), opaque.into());
+        }
     }
     expr
 }
 
 /// Whether `expr` is `let 𝑦 : 𝑇 = body in 𝑦` with a user annotation `𝑇`.
-fn is_annotated_result(expr: &Expr) -> bool {
+///
+/// [`crate::ccl::anf`] keeps this shape at a lambda's tail, which is what lets
+/// this pass find a `=> 𝑇` annotation there.
+pub fn is_annotated_result(expr: &Expr) -> bool {
     matches!(
         &expr.node,
         TypedExprNode::Let { binding, body, .. }
@@ -60,20 +72,47 @@ fn is_annotated_result(expr: &Expr) -> bool {
     )
 }
 
-/// Whether `expr` binds an opaque variable outside every lambda nested in it.
-fn binds_opaque(expr: &Expr) -> bool {
+/// Whether `expr` is `let 𝑦 : 𝑇 = body in 𝑦` with a user annotation `𝑇` that
+/// holds no position left to inference.
+fn has_concrete_result_annotation(expr: &Expr) -> bool {
     match &expr.node {
-        TypedExprNode::Lambda { .. } => false,
+        TypedExprNode::Let { binding, .. } if is_annotated_result(expr) => {
+            binding.user_annotation.as_ref().is_some_and(is_concrete)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `ty` holds no position inference fills: no `_`, inference variable,
+/// or barrier variable at any depth. A refinement's base is searched and its
+/// predicate is not: the predicate's own type slots are not part of `ty`.
+fn is_concrete(ty: &Type) -> bool {
+    if matches!(
+        ty,
+        Type::Hole
+            | Type::SharedHole(_)
+            | Type::BoundedHole(_)
+            | Type::Infer(_)
+            | Type::BarrierVar(_)
+    ) {
+        return false;
+    }
+    let mut concrete = true;
+    ty.walk_children(|child| concrete &= is_concrete(child));
+    concrete
+}
+
+/// Push onto `out` each opaque variable `expr` binds outside every lambda nested in it.
+fn opaque_binders(expr: &Expr, out: &mut Vec<Name>) {
+    match &expr.node {
+        TypedExprNode::Lambda { .. } => {}
         TypedExprNode::Let { binding, .. }
             if binding.transparency == BindingTransparency::Opaque =>
         {
-            true
+            out.push(binding.name.clone());
+            expr.walk_children(|child| opaque_binders(child, out));
         }
-        _ => {
-            let mut found = false;
-            expr.walk_children(|child| found = found || binds_opaque(child));
-            found
-        }
+        _ => expr.walk_children(|child| opaque_binders(child, out)),
     }
 }
 
@@ -112,12 +151,13 @@ pub fn peel(expr: Expr) -> Expr {
     *bound_expr
 }
 
-/// `let __output : ⟨barrier variable⟩ = body in __output`.
-fn wrap(body: Expr) -> Expr {
+/// `let __output : ⟨barrier variable⟩ = body in __output`, where the barrier variable
+/// sits outside the binders `opaque`.
+fn wrap(body: Expr, opaque: Rc<[Name]>) -> Expr {
     let output = Name::output();
-    // Minted at level 0: before inference no scope levels exist. Normalizing the
-    // annotation replaces it with a fresh barrier variable at its scope's level.
-    let barrier = Type::BarrierVar(BarrierVar::fresh(0, Vec::new(), Vec::new()));
+    // Minted without bounds: normalizing the annotation replaces it with a fresh
+    // barrier variable, which gathers the bounds during inference.
+    let barrier = Type::BarrierVar(BarrierVar::fresh(opaque, Vec::new(), Vec::new()));
     let binding = TypedBinding::new_annotated(output.clone(), barrier);
     Expr::let_in(binding, body, Expr::var(output))
 }
@@ -199,6 +239,29 @@ mod tests {
             panic!("the body stays a let");
         };
         assert_eq!(binding.user_annotation, Some(Type::Base(BaseType::Int)));
+    }
+
+    /// `λ x → let y : (Int, _) = (let r ^= 1 in r) in y`: the `_` is left to
+    /// inference, so the annotation does not state the whole result type and
+    /// the lambda is wrapped around the annotated `let`.
+    #[test]
+    fn an_annotated_let_body_holding_a_hole_is_wrapped() {
+        let y = Name::fresh("y");
+        let r = Name::fresh("r");
+        let annotation = Type::Tuple(vec![Type::Base(BaseType::Int), Type::Hole]);
+        let body = Expr::let_in(
+            TypedBinding::new_annotated(y.clone(), annotation.clone()),
+            opaque_let(&r, Expr::var(r.clone())),
+            Expr::var(y),
+        );
+        let out = run(lambda(body));
+        let wrapped = body_of(&out);
+        assert!(is_output_wrap(wrapped));
+        let inner = output_body(wrapped).expect("the wrap binds __output");
+        let TypedExprNode::Let { binding, .. } = &inner.node else {
+            panic!("the annotated let stays inside the wrap");
+        };
+        assert_eq!(binding.user_annotation, Some(annotation));
     }
 
     /// `λ x → let y : Int = 1 in (let r ^= 1 in r)`: the annotation covers only

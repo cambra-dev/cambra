@@ -12,10 +12,9 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
+use crate::ccl::BarrierVar;
 use crate::ccl::subst::{RefinementScope, Subst};
-use crate::ccl::{BarrierVar, BarrierVarId};
 
-use super::constrain::{ConstrainCache, ConstrainError, constrain_opaque_upper};
 use crate::ccl::{
     BaseType, HistoryKind, InferVarId, Name, Openness, RefinementSet, Type, fresh_infer_var_id,
 };
@@ -949,36 +948,76 @@ impl CompactType {
         }
     }
 
-    /// Replace every refinement set at every depth with the empty one, keeping
-    /// each slot's `None` (no contribution) as `None`.
-    fn strip_refinements(&mut self) {
-        if let Some(r) = &mut self.refinements {
-            *r = RefinementSet::default();
+    /// Resolve the refinements of a barrier variable's join at polarity `pol`: drop every
+    /// refinement set at a positive position, keeping each slot's `None` (no contribution)
+    /// as `None`, and keep every one at a negative position. Push onto `escaped` each name
+    /// of `opaque` a kept refinement names.
+    ///
+    /// Dropping a refinement at a positive position widens what the type promises, so the
+    /// result is a supertype of the join. At a negative position it widens what the type
+    /// accepts, which is unsound, so the refinement is kept; one naming an opaque binder
+    /// can be neither kept nor dropped. Each child is visited at the polarity
+    /// [`compact_go`] compacts it at.
+    fn resolve_barrier_refinements(&mut self, pol: bool, opaque: &[Name], escaped: &mut Vec<Name>) {
+        match &mut self.refinements {
+            Some(r) if pol => *r = RefinementSet::default(),
+            Some(r) => {
+                for refinement in r.iter() {
+                    let named = crate::ccl::ccl_utils::free_names(&refinement.predicate);
+                    for name in opaque {
+                        if named.contains(name) && !escaped.contains(name) {
+                            escaped.push(name.clone());
+                        }
+                    }
+                }
+            }
+            None => {}
         }
+        let mut visit =
+            |t: &mut CompactType, pol: bool| t.resolve_barrier_refinements(pol, opaque, escaped);
         for t in self.rec.iter_mut().flat_map(|rec| rec.values_mut()) {
-            t.strip_refinements();
+            visit(t, pol);
         }
         for t in self.var.iter_mut().flat_map(|v| v.tags.values_mut()) {
-            t.strip_refinements();
+            visit(t, pol);
         }
         if let Some(f) = &mut self.fun {
-            f.domain.strip_refinements();
-            f.codomain.strip_refinements();
+            visit(&mut f.domain, !pol);
+            visit(&mut f.codomain, pol);
             if let Some(CombinedDomains(pair)) = &mut f.combined {
-                pair.0.strip_refinements();
-                pair.1.strip_refinements();
+                visit(&mut pair.0, !pol);
+                visit(&mut pair.1, !pol);
             }
         }
         if let Some((value, domain, _)) = &mut self.history_slot {
-            value.strip_refinements();
-            domain.strip_refinements();
+            visit(value, pol);
+            visit(domain, pol);
         }
-        for t in self.nominal.values_mut().flatten() {
-            t.strip_refinements();
+        for (decl, args) in &mut self.nominal {
+            let mut args = args.iter_mut();
+            for v in &decl.body().variances {
+                match v {
+                    crate::ccl::nominal::Variance::Bipolar => {
+                        args.next().into_iter().for_each(|t| visit(t, !pol));
+                        args.next().into_iter().for_each(|t| visit(t, pol));
+                    }
+                    crate::ccl::nominal::Variance::Invariant => {
+                        args.next().into_iter().for_each(|t| visit(t, pol));
+                    }
+                    other => {
+                        let pol = other.polarity(pol);
+                        args.next().into_iter().for_each(|t| visit(t, pol));
+                    }
+                }
+            }
+            debug_assert!(
+                args.next().is_none(),
+                "a nominal contribution carries one position per variance, two per bipolar one"
+            );
         }
         if let Some((_, a, b)) = &mut self.nominal_conflict {
-            a.strip_refinements();
-            b.strip_refinements();
+            visit(a, pol);
+            visit(b, pol);
         }
     }
 
@@ -1437,11 +1476,6 @@ impl CompactType {
 pub struct CompactGraph {
     pub term: CompactType,
     pub rec_vars: BTreeMap<InferVarId, CompactType>,
-    /// The failed checks of a barrier variable's upper bounds against its resolution, one
-    /// per failing bound (the `BarrierVar` arm of [`compact_go`]). Surfaced by
-    /// `coalesce_compact` as an `OpaqueUpperBound` error, as `rec_vars` is surfaced
-    /// as a `RecursiveType` one.
-    pub barrier_upper_violations: Vec<ConstrainError>,
 }
 
 /// Walk a `Type`, transitively expanding variable bounds at the
@@ -1472,15 +1506,7 @@ pub fn compact_type_polarity_only(ty: &Type) -> CompactGraph {
 }
 
 fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
-    let mut st = CompactState {
-        in_process: HashSet::new(),
-        recursive: HashMap::new(),
-        rec_vars: BTreeMap::new(),
-        collapse,
-        scope: RefinementScope::default(),
-        checked_barrier_vars: HashSet::new(),
-        barrier_upper_violations: Vec::new(),
-    };
+    let mut st = CompactState::new(collapse);
     let term = compact_go(ty, true, &Subst::id(), Position::default(), &mut st);
     debug_assert!(
         refinement_slot_present(&term) && st.rec_vars.values().all(refinement_slot_present),
@@ -1490,7 +1516,6 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
     CompactGraph {
         term,
         rec_vars: st.rec_vars,
-        barrier_upper_violations: st.barrier_upper_violations,
     }
 }
 
@@ -1696,20 +1721,28 @@ struct CompactState {
     /// function meeting at one variable spell one refinement one way. `key_go` threads
     /// the same type, so a key and a compacted type agree.
     scope: RefinementScope,
-    /// Barrier variables whose upper bounds this walk has checked. A variable is checked once
-    /// per walk however many times the walk reaches it.
-    checked_barrier_vars: HashSet<BarrierVarId>,
-    /// See [`CompactGraph::barrier_upper_violations`].
-    barrier_upper_violations: Vec<ConstrainError>,
+}
+
+impl CompactState {
+    fn new(collapse: bool) -> Self {
+        CompactState {
+            in_process: HashSet::new(),
+            recursive: HashMap::new(),
+            rec_vars: BTreeMap::new(),
+            collapse,
+            scope: RefinementScope::default(),
+        }
+    }
 }
 
 /// The resolution of a barrier variable, under `subst_acc`, as a [`CompactType`]: the join
-/// of its lower bounds with every refinement dropped.
+/// of its lower bounds with the refinements at its positive positions dropped, and the
+/// opaque binders the refinements kept at its negative positions name.
 fn join_barrier_lowers(
     barrier: &BarrierVar,
     subst_acc: &Subst,
     st: &mut CompactState,
-) -> CompactType {
+) -> (CompactType, Vec<Name>) {
     let lowers = barrier.lowers.borrow().clone();
     let mut joined = CompactType::empty();
     for b in &lowers {
@@ -1717,36 +1750,16 @@ fn join_barrier_lowers(
         let bc = compact_go(&b.ty, true, &inner_acc, Position::default(), st);
         joined = CompactType::merge(true, joined, bc);
     }
-    joined.strip_refinements();
-    joined
+    let mut escaped = Vec::new();
+    joined.resolve_barrier_refinements(true, &barrier.opaque, &mut escaped);
+    (joined, escaped)
 }
 
-/// Check each of `barrier`'s upper bounds against the variable's resolution, recording every
-/// failure in [`CompactState::barrier_upper_violations`].
-///
-/// The resolution is materialized in the variable's own context (no `subst_acc`), because
-/// each upper bound's morphisms are spelled there. The check is `constrain`, so it
-/// records bounds on any variable it reaches. A resolution that does not materialize is
-/// not checked: the same join is what the variable's position compacts to, so coalescing
-/// that position reports it.
-fn check_barrier_uppers(barrier: &BarrierVar, st: &mut CompactState) {
-    if !st.checked_barrier_vars.insert(barrier.uid) {
-        return;
-    }
-    let uppers = barrier.uppers.borrow().clone();
-    if uppers.is_empty() {
-        return;
-    }
-    let own = join_barrier_lowers(barrier, &Subst::id(), st);
-    let Ok(resolved) = super::coalesce::coalesce_position(&own, true) else {
-        return;
-    };
-    let mut cache = ConstrainCache::new();
-    for upper in &uppers {
-        if let Err(err) = constrain_opaque_upper(&resolved, upper, &mut cache) {
-            st.barrier_upper_violations.push(err);
-        }
-    }
+/// The resolution of `barrier` in its own context, and the opaque binders it names at a
+/// negative position: what `super::barrier::solve_barrier_vars` checks the upper bounds
+/// against. A walk of its own, so it reads the graph as it stands and changes nothing.
+pub(super) fn barrier_resolution(barrier: &BarrierVar) -> (CompactType, Vec<Name>) {
+    join_barrier_lowers(barrier, &Subst::id(), &mut CompactState::new(true))
 }
 
 /// What the binder at `position` of a kind **variable** ranges over, derived here from the
@@ -2279,15 +2292,15 @@ fn compact_go(
                 ..CompactType::value()
             }
         }
-        // The join of the barrier variable's lower bounds with every refinement dropped: the
-        // narrowest unrefined type above each of them. The bounds are joined at
-        // positive polarity at either polarity of the reference, because the barrier variable
-        // denotes the value its lowers produce. A refinement in a lower bound can name
-        // an opaque binder the barrier variable sits outside of, which is why none survives.
-        Type::BarrierVar(barrier) => {
-            check_barrier_uppers(barrier, st);
-            join_barrier_lowers(barrier, subst_acc, st)
-        }
+        // The join of the barrier variable's lower bounds with the refinements at its
+        // positive positions dropped: the narrowest type above each of them that promises
+        // nothing about an opaque binder the barrier variable sits outside of. The bounds
+        // are joined at positive polarity at either polarity of the reference, because the
+        // barrier variable denotes the value its lowers produce. A refinement at a negative
+        // position is kept, and `solve_barrier_vars` reports one naming such a binder. The
+        // upper bounds are not read here: `solve_barrier_vars` checks them before any
+        // compaction, so this walk leaves the graph as it found it.
+        Type::BarrierVar(barrier) => join_barrier_lowers(barrier, subst_acc, st).0,
         Type::Infer(state) => {
             let uid = state.uid;
             let key = (uid, pol);
@@ -3083,7 +3096,6 @@ mod tests {
         CompactGraph {
             term,
             rec_vars: BTreeMap::new(),
-            barrier_upper_violations: Vec::new(),
         }
     }
 

@@ -897,7 +897,26 @@ a = f(1)
 b: {Int where _ == a} = f(2)
 a == b
         "#},
-        "Type mismatch for f: expected {Int | __elem == a}, found Int",
+        "in a == b: expected {Int | __elem == a}, found Int",
+    )
+}
+
+/// A `_` output annotation leaves the codomain to inference, so it is not
+/// concrete and `f`'s result still passes through a barrier variable that drops
+/// the refinement naming `r`, as in
+/// `dont_discharge_opaques_out_of_fun_bodies_with_an_unannotated_codomain`.
+#[test]
+fn dont_discharge_opaques_out_of_fun_bodies_with_a_hole_codomain() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => _:
+    r ^= x;
+    r ^+ 0
+a = f(1)
+b: {Int where _ == a} = f(2)
+a == b
+        "#},
+        "in a == b: expected {Int | __elem == a}, found Int",
     )
 }
 
@@ -993,16 +1012,15 @@ a = f(1)
 b: {Int where _ == a} = f(1)
 a == b
         "#},
-        "Type mismatch for f: expected {Int | __elem == a}, found Int",
+        "in a == b: expected {Int | __elem == a}, found Int",
     )
 }
 
-/// TODO: Extrude a barrier variable. `f`'s codomain barrier variable is minted under `g`'s
-/// generalized body and reaches the lower-level variable `h` inside `f`'s
-/// function type, where `extrude` has no arm for it.
+/// `f`'s codomain barrier variable is minted under `g`'s generalized body and reaches
+/// the lower-level variable `h` inside `f`'s function type.
 #[test]
-fn extrude_reaches_a_barrier_var_returned_from_a_nested_def() {
-    check_compile_error(
+fn barrier_var_returned_from_a_nested_def() {
+    check_scalar(
         indoc! {r#"
 def g(z):
     def f(x):
@@ -1012,16 +1030,15 @@ def g(z):
 h = g(1)
 h(2)
         "#},
-        "not implemented: extruding a BarrierVar",
+        Value::Int(3),
     )
 }
 
-/// TODO: Extrude a barrier variable. The same gap as
-/// `extrude_reaches_a_barrier_var_returned_from_a_nested_def`, with the nested
-/// `f` passed to `g`'s parameter rather than returned.
+/// `barrier_var_returned_from_a_nested_def` with the nested `f` passed to `g`'s
+/// parameter rather than returned.
 #[test]
-fn extrude_reaches_a_barrier_var_passed_to_a_parameter() {
-    check_compile_error(
+fn barrier_var_passed_to_a_parameter() {
+    check_scalar(
         indoc! {r#"
 def k(f):
     f(1)
@@ -1032,12 +1049,13 @@ def g(h):
     h(f)
 g(k)
         "#},
-        "not implemented: extruding a BarrierVar",
+        Value::Int(1),
     )
 }
 
-/// TODO: support this program. Expect to fix by removing the special
-/// opaque-handling rules from inline.
+/// `k`'s domain refinement names the opaque variable `r`, so `f`'s
+/// barrier var is refused, as in
+/// `return_opaque_annotated_function_from_unannotated_function`.
 #[test]
 fn complex_refined_program_post_inline_failure() {
     check_compile_error(
@@ -1054,7 +1072,7 @@ def h(z):
     g(z) + p(z)
 h(7)
         "#},
-        "post-inline produced an invalid tree",
+        "this function's result type ({Int | __elem == r} ⇒ Int) refines a parameter by `r`",
     )
 }
 
@@ -1714,8 +1732,11 @@ y ^+ 1
     )
 }
 
-/// The refined `y ^+ 1` in `zs` triggers a post-inference check
-/// failure.
+/// The refined `y ^+ 1` in `zs` keeps its refinement through lambda
+/// elimination, which rewrites the refinement's free variable and so changes
+/// the node's type. With `debug_assertions` on, lambda elimination's own
+/// type-preservation assertion reports this. Without them, the
+/// post-lambda-elim check does.
 #[test]
 fn refined_op_in_nested_comprehension_not_supported() {
     check_compile_error(
@@ -1724,7 +1745,11 @@ ys = [i for i in [1,2]]
 zs = [y ^+ 1 for y in ys]
 zs
         "#},
-        "post-inference produced an invalid tree",
+        if cfg!(debug_assertions) {
+            "lambda elimination changed a node's type"
+        } else {
+            "post-lambda-elim produced an invalid tree"
+        },
     )
 }
 
@@ -1741,6 +1766,183 @@ def f(x: Int):
     (r ^+ 0, 1)
 a = f(1)
 a.0
+        "#},
+        Value::Int(1),
+    )
+}
+
+/// `k`'s domain refinement names no opaque variable, so the barrier
+/// var's solution keeps it: a refinement at a negative position of the
+/// solution is kept, and dropping it would accept `-5`.
+#[test]
+fn return_refined_function_from_function() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int):
+    r ^= x
+    def k(y: {Int where _ > 0}):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "Type mismatch for -5 ▷ f1: expected {Int | __elem > 0}, found Int@-5",
+    )
+}
+
+#[test]
+fn return_opaque_annotated_function_from_annotated_function() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => ({Int where _ > 0} => Int):
+    r ^= x
+    def k(y: {Int where _ > 0 and r == r}):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "──── Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
+    )
+}
+
+#[test]
+fn return_opaque_unannotated_function_from_annotated_function() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => ({Int where _ > 0} => Int):
+    r ^= x
+    def k(y: Int):
+        r
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "──── Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
+    )
+}
+
+/// `k`'s domain refinement names the opaque variable `r`, so inference
+/// refuses to solve the barrier var: keeping the refinement brings `r`
+/// out of its scope, and dropping it is unsound. A codomain annotation
+/// on `f` that does not name `r` resolves the refusal
+/// (`return_opaque_annotated_function_from_annotated_function`), so the
+/// message suggests one.
+#[test]
+fn return_opaque_annotated_function_from_unannotated_function() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int):
+    r ^= x
+    def k(y: {Int where _ > 0 and r == r}):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "this function's result type ({Int | __elem > 0 and r == r} ⇒ Int) refines a parameter by `r`, which the function body binds opaquely; annotate the function's result type with a type that does not name `r`",
+    )
+}
+
+/// This represents a user's incorrect response to the suggestion in
+/// the error given by
+/// `return_opaque_annotated_function_from_unannotated_function`. Here,
+/// the added codomain for `f` is not a subtype of `f`'s actual body
+/// type, and type inference rejects it.
+#[test]
+fn return_opaque_annotated_function_from_unannotated_function_bad_fix() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => (Int => Int):
+    r ^= x
+    def k(y: {Int where _ > 0 and r == r}):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "────── Annotation mismatch: annotated as Int => Int, but inferred as {Int where _ > 0 and r == r} => {Int where _ > 0 and r == r}",
+    )
+}
+
+/// This represents a user's correct response to the suggestion in the
+/// error given by
+/// `return_opaque_annotated_function_from_unannotated_function`. Here,
+/// the added codomain for `f` is a subtype of `f`'s actual body type,
+/// and in fact precisely describes it but without mentioning `r`.
+///
+/// Because `f` successfully types, type inference can continue to
+/// fail on the application `f1(-5)`, where an argument is encountered
+/// that does not satisfy the new annotation.
+#[test]
+fn return_opaque_annotated_function_from_unannotated_function_good_fix() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => ({Int where _ > 0} => {Int where _ > 0}):
+    r ^= x
+    def k(y: {Int where _ > 0 and r == r}):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "──── Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
+    )
+}
+
+/// `f`'s barrier variable is checked against the use `f1(-5)` before compaction, so
+/// `y` is solved before the walk reads it. If the `^=` is replaced with `=`, then no
+/// barrier var is introduced.
+#[test]
+fn return_unrefined_function_from_function() {
+    check_scalar(
+        indoc! {r#"
+def f(x: Int):
+    r ^= x
+    def k(y):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        Value::Int(-5),
+    )
+}
+
+/// TODO: solve relevant base types before running an SMT check, and
+/// provide a better error message when an SMT check can't run.
+///
+/// The failure message this test pins is unhelpful: it looks like the
+/// quoted types do match, and should pass an SMT check. What's really
+/// happening is that the SMT check is refusing to run at all because
+/// `x`'s base type (and thus SMT encoding sort) is not yet known when
+/// the SMT check is called for.
+#[test]
+fn unsettled_base_type_auto_fails_smt_check() {
+    check_compile_error(
+        indoc! {r#"
+def f(x) => ({Int where _ > 0} => Int):
+    def k(y: {Int where _ > 0 and x == x}):
+        1
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "Annotation mismatch: annotated as {Int where _ > 0} => Int, but inferred as {Int where _ > 0 and x == x} => {Int where _ == 1}",
+    )
+}
+
+#[test]
+fn barrier_var_with_sub_barrier_var() {
+    check_scalar(
+        indoc! {r#"
+def f(x):
+    r ^= x
+    r ^+ 0
+def g(y):
+    s ^= y
+    f(s)
+g(1)
         "#},
         Value::Int(1),
     )

@@ -60,6 +60,15 @@
 //! is not discharged, so a chain holding a read is peeled and re-sealed one
 //! level out.
 //!
+//! **An annotated result keeps its chain in its definiens.** In `let 𝑦 : 𝑇 =
+//! body in 𝑦`, the shape a `=> 𝑇` output annotation lowers to, the binder is
+//! bound at `𝑇` rather than at its definiens, so no type names a binder sealed
+//! inside `body` and nothing needs peeling. Peeling would also move the chain
+//! ahead of the annotation, and [`crate::ccl::opaque_output`] recognizes the
+//! annotation only as the outermost term of a lambda body
+//! ([`crate::ccl::opaque_output::is_annotated_result`]). The `Lambda` arm of
+//! [`normalize`] asserts the shape survives.
+//!
 //! A **handle** position holds the variable rather than its value, so the
 //! mention there is not a read and stays where it stands
 //! ([`atomize_handle`]).
@@ -170,6 +179,7 @@ use crate::ccl::{
     Branch, Expr, Name, TypedBinding, TypedExprNode,
     ccl_utils::is_free,
     mut_scope::{Muts, is_mut_var, under_param, with},
+    opaque_output::is_annotated_result,
     provenance::{self, Nature},
     subst::Subst,
 };
@@ -255,6 +265,7 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
         out.user_annotation = annotation.clone();
         out
     };
+    let annotated_result = is_annotated_result(&e);
     match e.node {
         // A comprehension is still in surface form here —
         // `crate::ccl::comprehension` turns it into the `cast`/`λ`/`▷`
@@ -325,8 +336,16 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
 
         TypedExprNode::Lambda { param, body } => {
             let inner = under_param(muts, &param);
+            let annotated = is_annotated_result(&body);
+            let body = normalize(*body, &inner);
+            debug_assert!(
+                !annotated || is_annotated_result(&body),
+                "anf: a lambda body's output annotation must stay its outermost term, \
+                 got a {}",
+                body.node.kind_name()
+            );
             rebuild(TypedExprNode::Lambda {
-                body: Box::new(normalize(*body, &inner)),
+                body: Box::new(body),
                 param,
             })
         }
@@ -514,13 +533,19 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
         // A read sealed in the definiens moves ahead of the `let` ([`peel`]): the
         // binding's type is refined by its definiens, and a read binder sealed
         // inside it is opaque, so the type would name a binder out of scope at
-        // every use.
+        // every use. An annotated result is bound at its annotation, so its
+        // chain stays in the definiens (module docs).
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
         } => {
-            let (binds, bound_expr) = peel(normalize(*bound_expr, muts), muts);
+            let bound_expr = normalize(*bound_expr, muts);
+            let (binds, bound_expr) = if annotated_result {
+                (Vec::new(), bound_expr)
+            } else {
+                peel(bound_expr, muts)
+            };
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Let {
@@ -1165,6 +1190,44 @@ mod tests {
         assert!(
             s.find("= x").unwrap() < s.find("▷ f").unwrap(),
             "the read is performed before the call: {s}"
+        );
+    }
+
+    /// `λ p → let y : Int = (x, x ▷ f) in y`: the read of `x` is named ahead of
+    /// the call inside `y`'s definiens, and the annotated `let` stays the
+    /// lambda body's outermost term.
+    #[test]
+    fn a_read_stays_inside_an_annotated_result() {
+        let x = Name::fresh("x");
+        let y = Name::fresh("y");
+        let call = Expr::apply(Expr::var(x.clone()), var("f"));
+        let body = Expr::let_in(
+            TypedBinding::new_annotated(y.clone(), Type::Base(BaseType::Int)),
+            Expr::tuple(vec![Expr::var(x.clone()), call]),
+            Expr::var(y),
+        );
+        let out = run(accumulator(
+            &x,
+            Expr::lambda(Name::fresh("p"), Type::Hole, body),
+        ));
+        let TypedExprNode::MutDecl { body, .. } = &out.node else {
+            panic!("expected the MutDecl, got {}", out.node.kind_name());
+        };
+        let TypedExprNode::Lambda { body, .. } = &body.node else {
+            panic!("expected the Lambda, got {}", body.node.kind_name());
+        };
+        assert!(
+            is_annotated_result(body),
+            "the annotation stays outermost: {}",
+            symbolic(body)
+        );
+        let TypedExprNode::Let { bound_expr, .. } = &body.node else {
+            unreachable!("an annotated result is a Let")
+        };
+        let s = symbolic(bound_expr);
+        assert!(
+            s.contains("__anf = x") && s.find("= x").unwrap() < s.find("▷ f").unwrap(),
+            "the read is named ahead of the call, inside the definiens: {s}"
         );
     }
 

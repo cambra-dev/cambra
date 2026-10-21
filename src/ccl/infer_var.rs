@@ -643,6 +643,15 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+thread_local! {
+    /// Every [`BarrierVar`] minted during the active inference run on this thread,
+    /// with the lifetime and single-slot discipline of [`ACTIVE_ARENA`]. `None`
+    /// outside any inference run, in which case [`BarrierVar::fresh`] records
+    /// nowhere: `opaque_output` mints its placeholders before inference starts.
+    static BARRIER_ARENA: RefCell<Option<Vec<Rc<BarrierVar>>>> =
+        const { RefCell::new(None) };
+}
+
 /// Begin capturing every [`InferVar::fresh`] minted on this thread.
 ///
 /// Inference is non-reentrant: at most one arena may be active per thread at a
@@ -660,6 +669,7 @@ pub(crate) fn arena_enter() {
         );
         *slot = Some(Vec::new());
     });
+    BARRIER_ARENA.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
 }
 
 /// Stop capturing and return every variable minted since [`arena_enter`], so
@@ -668,6 +678,19 @@ pub(crate) fn arena_enter() {
 /// makes unreachable in practice).
 pub(crate) fn arena_exit() -> Vec<Rc<InferVar>> {
     ACTIVE_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+}
+
+/// Stop capturing barrier variables and return every one minted since
+/// [`arena_enter`], so the caller can clear their bounds.
+pub(crate) fn barrier_arena_exit() -> Vec<Rc<BarrierVar>> {
+    BARRIER_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+}
+
+/// Every barrier variable minted so far this run, *without* ending the arena: the
+/// enumeration `solver::barrier::solve_barrier_vars` checks. A snapshot, so a
+/// caller may mint more while iterating it.
+pub(crate) fn arena_barrier_vars() -> Vec<Rc<BarrierVar>> {
+    BARRIER_ARENA.with(|slot| slot.borrow().clone().unwrap_or_default())
 }
 
 /// Every variable minted so far this run, *without* ending the arena.
@@ -793,31 +816,86 @@ impl fmt::Debug for InferVar {
 pub struct BarrierVar {
     /// Stable, globally-unique identity.
     pub uid: BarrierVarId,
-    /// Scope level the variable belongs to, with the meaning of [`InferVar`]'s: a
-    /// generalized `let` quantifies a barrier variable minted above its level.
-    level: std::cell::Cell<Level>,
-    /// The gathered lower bounds. The variable resolves to their join with every
-    /// refinement dropped (the `BarrierVar` arm of `solver::compact::compact_go`).
+    /// Set while [`BarrierVar::level`] reads this variable's bounds, so a bound that
+    /// reaches the variable again contributes 0 instead of recursing.
+    reading_level: std::cell::Cell<bool>,
+    /// The opaque binders the variable sits outside of: those the lambda body it
+    /// annotates binds. A refinement naming one cannot be read outside the body.
+    pub opaque: Rc<[Name]>,
+    /// The gathered lower bounds. The variable resolves to their join with the
+    /// refinements at its positive positions dropped (the `BarrierVar` arm of
+    /// `solver::compact::compact_go`).
     pub lowers: RefCell<Vec<Bound>>,
     /// The gathered upper bounds. Each is checked against the resolution from
-    /// `lowers` at compaction, not closed against the lowers as they arrive.
+    /// `lowers` by `solver::barrier::solve_barrier_vars`, not closed against the
+    /// lowers as they arrive.
     pub uppers: RefCell<Vec<Bound>>,
+    /// Trait obligations watching an inference variable this barrier variable is a lower
+    /// bound of, with the operand position each watches. Every lower bound recorded here
+    /// is delivered to them (`notify_barrier_lower` in `src/ccl/infer/solver/traits.rs`):
+    /// the resolution's base is a lower bound's base, so the watched variable resolves to
+    /// it. Severed at arena teardown, as [`InferVar::watches`] is.
+    pub watches: RefCell<Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>>,
+    /// What `solver::barrier::solve_barrier_vars` last checked: `None` before the
+    /// first check. Severed at arena teardown with the bounds, since the resolution
+    /// holds types that can reach this variable.
+    pub checked: RefCell<Option<BarrierCheck>>,
+}
+
+/// The state [`BarrierVar::checked`] records after a check of a barrier variable.
+#[derive(Debug, Clone)]
+pub enum BarrierCheck {
+    /// `resolution` was checked against the first `uppers` upper bounds, each
+    /// successfully. `resolution` is `None` when there was nothing to check it
+    /// against, or when it did not materialize.
+    Passed {
+        resolution: Option<Type>,
+        uppers: usize,
+    },
+    /// The check reported an error. A failed variable is not checked again: a
+    /// re-check would report the same failure.
+    Failed,
 }
 
 impl BarrierVar {
-    /// Mint a fresh barrier variable at `level` over `lowers` and `uppers`.
-    pub fn fresh(level: Level, lowers: Vec<Bound>, uppers: Vec<Bound>) -> Rc<BarrierVar> {
-        Rc::new(BarrierVar {
+    /// Mint a fresh barrier variable outside the binders `opaque`, over `lowers` and
+    /// `uppers`.
+    pub fn fresh(opaque: Rc<[Name]>, lowers: Vec<Bound>, uppers: Vec<Bound>) -> Rc<BarrierVar> {
+        let barrier = Rc::new(BarrierVar {
             uid: fresh_barrier_var_id(),
-            level: std::cell::Cell::new(level),
+            reading_level: std::cell::Cell::new(false),
+            opaque,
             lowers: RefCell::new(lowers),
             uppers: RefCell::new(uppers),
-        })
+            watches: RefCell::new(Vec::new()),
+            checked: RefCell::new(None),
+        });
+        BARRIER_ARENA.with(|slot| {
+            if let Some(arena) = slot.borrow_mut().as_mut() {
+                arena.push(Rc::clone(&barrier));
+            }
+        });
+        barrier
     }
 
-    /// The scope level the variable belongs to.
+    /// The scope level the variable belongs to, with the meaning of [`InferVar`]'s: a
+    /// generalized `let` quantifies a barrier variable above its level. It is the
+    /// maximum [`type_level`](crate::ccl::infer::solver::type_level) of the bounding
+    /// types in `lowers` and `uppers`, and 0 when both are empty.
     pub fn level(&self) -> Level {
-        self.level.get()
+        if self.reading_level.replace(true) {
+            return 0;
+        }
+        let level = self
+            .lowers
+            .borrow()
+            .iter()
+            .chain(self.uppers.borrow().iter())
+            .map(|b| crate::ccl::infer::solver::type_level(&b.ty))
+            .max()
+            .unwrap_or(0);
+        self.reading_level.set(false);
+        level
     }
 }
 

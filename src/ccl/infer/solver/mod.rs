@@ -41,6 +41,7 @@
 
 use crate::ccl::{BaseType, InferVar, Level, Type};
 
+pub mod barrier;
 pub mod coalesce;
 pub mod compact;
 pub mod constrain;
