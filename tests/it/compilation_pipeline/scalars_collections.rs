@@ -860,6 +860,86 @@ fn test_tuple_patterns(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
+// A `for` binder and a comprehension binder take a pattern, with or without parentheses, at any
+// depth, and `_` binds nothing.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    indoc! {"
+        total := 0
+        for (a, b) in [(1, 10), (2, 20)]:
+            total += a * b
+        total
+    "},
+    Value::Int(50)
+)]
+#[case(
+    indoc! {"
+        out: Feed(_)
+        for k -> v in [(1, 10), (2, 20)]:
+            out << k + v
+        sum(out)
+    "},
+    Value::Int(33)
+)]
+#[case(
+    indoc! {"
+        total := 0
+        for _ in [7, 8, 9]:
+            total += 1
+        total
+    "},
+    Value::Int(3)
+)]
+#[case(
+    indoc! {"
+        def pair_sums(ps):
+            for (a, b) in ps:
+                yield a + b
+        sum(pair_sums([(1, 2), (3, 4)]))
+    "},
+    Value::Int(10)
+)]
+// A pattern's names are the loop's, so `a` shadows the mutable variable it spells over the
+// body and leaves it unwritten.
+#[case(
+    indoc! {"
+        a := 100
+        total := 0
+        for a, (_, c) in [(1, (5, 10)), (2, (6, 20))]:
+            total += a + c
+        total + a
+    "},
+    Value::Int(133)
+)]
+#[case("sum([a * b for (a, b) in [(1, 10), (2, 20)]])", Value::Int(50))]
+#[case(
+    "sum([k + v for k -> v in [(1, 10), (2, 20)] if k > 1])",
+    Value::Int(22)
+)]
+#[case("sum([a * b for a, b in [(1, 10), (2, 20)]])", Value::Int(50))]
+#[case("sum([1 for _ in [7, 8, 9]])", Value::Int(3))]
+// A later generator rebinding a pattern's name shadows it there.
+#[case(
+    "ys = [100, 200]; sum([a + b for (a, b) in [(1, 10)] for a in ys])",
+    Value::Int(320)
+)]
+#[case("_, b = (1, 2); b", Value::Int(2))]
+// A type with one constructor matches every value, so its constructor pattern is a binder.
+#[case(
+    indoc! {"
+        type Price = {Int where _ >= 0}
+        total := 0
+        for Price::new(c) in [Price::new(3), Price::new(4)]:
+            total += c
+        total
+    "},
+    Value::Int(7)
+)]
+fn test_binder_patterns(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 // A conditional collection consumed by `sum` (`sum([1,2] if c else [1,2,3])`)
 // type-checks as a Σ (the consumer's kind variable pinned by it) and *compiles* via
 // value-`Case` fan-out — see `conditionals.rs` for the end-to-end

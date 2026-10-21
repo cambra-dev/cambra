@@ -1228,6 +1228,14 @@ fn lower_expr_inner(
             if ctx.in_refinement_predicate && name == "_" {
                 return Ok(Expr::var(Name::elem()));
             }
+            // Anywhere else `_` is the pattern that binds nothing (`docs/chl-spec.md`, "4.3.1
+            // Destructuring patterns"), so no value is bound under it to read.
+            if name == WILDCARD {
+                return Err(LoweringError::unsupported(
+                    expr.span,
+                    "`_` binds nothing, so it reads no value: bind the value to a name to read it",
+                ));
+            }
             // A transactional mutable variable may be read only inside a `with begin():`
             // block, which pins a snapshot-consistent view (all txn reads in one
             // block observe one commit snapshot). Inside a transaction

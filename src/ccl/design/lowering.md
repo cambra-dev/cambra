@@ -129,6 +129,14 @@ once to a minted name, and component `𝑖` reads its projection `.𝑖`. A feed
 a bound tuple literal reaches `channelize` as an alias of its channel through the inline pass's
 tuple-projection rule (the module docs of `src/ccl/inline.rs`).
 
+A `for` binder that is a pattern or `_` lowers as the loop over a minted name whose body starts
+with the assignment `𝑝 = 𝑒` (`ForPattern` in `lower/loops.rs`), so every loop site lowers a binder
+that is one name. The pattern's names leave the body's mutation scope: they shadow a like-named
+outer binding, as a plain loop variable does. A comprehension binder that is a tuple binds a
+minted name, and each name in the tuple reads its projection of it in the binder's guards, the
+generators after it and the element (`lower_clauses` in `lower/comprehension.rs`). `_` binds a
+minted name that nothing reads.
+
 ## Feed declarations and operators — `x: Feed(V)` / `<<` / `<<=`
 
 Feed syntax initially produces `Defer`, `Feed`, and `Define` nodes. A defer binding requires at

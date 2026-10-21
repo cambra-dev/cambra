@@ -1,4 +1,4 @@
-# Outside a refinement, "_" is just a normal variable name
+# Outside a refinement, "_" is the pattern that binds nothing, so reading it is an error.
 
 _ = 1
 
