@@ -55,6 +55,6 @@ If there are Critical or Important findings, attempt to produce an illustrative,
 
 ## Example Triggers
 
-- "Review the head commit against docs/design.md"
-- "Give me a staff review of HEAD~2.. using docs/design.md"
+- "Review the head commit against `docs/design.md`, the design doc."
+- "Give me a staff review of HEAD~2.. using `docs/design.md` as the reference."
 - "Review branch feature-x"
