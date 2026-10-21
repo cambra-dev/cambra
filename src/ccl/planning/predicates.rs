@@ -187,9 +187,11 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
 /// η-expands to `λ __elem → bare` and lambda-eliminates to point-free.
 ///
 /// The fast path returns `p` as it stands, and lambda elimination leaves predicates alone, so
-/// `p` can still hold a lambda: a group-by's key domain states
-/// `__elem ▷ ((c ≫ λ 𝑒 → key) ▷ collection_contains)`. A `p` holding a `defer`, from a
-/// generator called in the key, runs [`eliminate_lifted`] on itself, which channelizes it.
+/// `p` can still hold a lambda. The one predicate of that shape is a membership refinement, a
+/// group-by's key domain `__elem ▷ ((c ≫ λ 𝑒 → key) ▷ collection_contains)`, which is carried
+/// and never executed: an iteration site enumerates the collection's image instead
+/// (`iterate::membership_keys`). A `p` holding a `defer`, from a generator called in the key,
+/// runs [`eliminate_lifted`] on itself, which channelizes it.
 ///
 /// The function is a **collection**: it yields one `Bool` per element of what the refinement
 /// refines, and the runtime `Restrict` evaluates it over the extent
