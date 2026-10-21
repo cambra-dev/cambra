@@ -502,10 +502,11 @@ pub(super) fn lower_def_declared(
     body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<(Expr, Option<Type>), LoweringError> {
-    let func = lower_function_body(fn_span, params, output, body, ctx)?;
+    let mut func = lower_function_body(fn_span, params, output, body, ctx)?;
     if declared.is_empty() && requires.is_empty() {
         return Ok((func, None));
     }
+    close_definition_domains(&mut func, &requires);
     // Every type parameter is determined by a call's arguments: it appears in a
     // value parameter's annotation, or it is the associated type of a requirement
     // whose operands are determined (`docs/chl-spec.md`, "Type parameters").
@@ -551,6 +552,25 @@ pub(super) fn lower_def_declared(
         body: Type::Hole,
     }));
     Ok((func, Some(poly)))
+}
+
+/// Close the data-function domains of `func`'s annotations that name a type parameter
+/// occurring more than once in the definition, its annotations and `requires` together
+/// ([`close_shared_domains`](super::stmts::close_shared_domains)).
+fn close_definition_domains(func: &mut Expr, requires: &[Rc<crate::ccl::ty::TraitRequirement>]) {
+    use super::stmts::{ParamCounts, close_shared_domains, count_type_params, requirement_types};
+    fn count(e: &Expr, counts: &mut ParamCounts) {
+        e.walk_type_slots(|t| count_type_params(t, counts));
+        e.walk_children(|c| count(c, counts));
+    }
+    fn close(e: &mut Expr, counts: &ParamCounts) {
+        e.walk_type_slots_mut(|t| close_shared_domains(t, counts));
+        e.walk_children_mut(|c| close(c, counts));
+    }
+    let mut counts = ParamCounts::new();
+    count(func, &mut counts);
+    requirement_types(requires).for_each(|t| count_type_params(t, &mut counts));
+    close(func, &counts);
 }
 
 /// The type parameters the annotations on `func`'s parameters name: the binders of

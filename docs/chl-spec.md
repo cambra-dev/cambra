@@ -197,7 +197,7 @@ surface level.
 ### 1.8 Operators and punctuation
 
 ```
-+  -  *  **  //  ++  ->  =>
++  -  *  **  //  ++  ->  =>  |=>
 &  |  ^
 == != <  <= >  >=
 =  += -= *= //=
@@ -259,6 +259,10 @@ from its return-type annotation — `def f(x: Int) => Int:` (§4.1), which
 type inference checks against the body's value. It is also a general type
 operator inside an expression: `T => U` is a function type, writable in
 any annotation position (§6).
+
+`|=>` is the data-function-type arrow: `D |=> V` is a collection over the domain `D`, writable
+wherever `T => U` is
+([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)).
 
 `` ` `` (backtick) prefixes a **variant tag**, in every position — type, term,
 and pattern: `` `none ``, `` `some(1) ``, ``{ `some{Int} | `none }`` (§3.15,
@@ -452,7 +456,7 @@ noted:
 | Level | Operator(s) | Notes |
 |---:|---|---|
 | 1 | `\x -> …` (lambda), `yield` | prefix forms; non-associative |
-| 2 | `=>` | function type; *right*-associative — the codomain is the whole expression to its right ([1.8 Operators and punctuation](#18-operators-and-punctuation)) |
+| 2 | `=>`, `\|=>` | function type and data-function type; *right*-associative — the codomain is the whole expression to its right ([1.8 Operators and punctuation](#18-operators-and-punctuation)) |
 | 3 | `<<` | feed operator (right-associative is not meaningful — see [3.7 Feed operator `<<`](#37-feed-operator-)) |
 | 4 | `->` | pair; non-associative — `a -> b -> c` is a parse error. The value admits a lambda, the key does not ([2.4 Atoms](#24-atoms)) |
 | 5 | `e₁ if cond else e₂` | ternary; *right*-associative |
@@ -2282,8 +2286,9 @@ marked one carries its status per "How to read this document".)
   argument (§3.8): an n-parameter function's domain is the
   corresponding tuple type, and a keyword-argument function's domain
   is a record type — `{x: T, y: U} ⇒ V`. Surface syntax uses the `=>`
-  function. Whether the function is a collection or a callable capability
-  is inferred, never written (§6.3).
+  function. A `def` or a lambda is a callable capability, and a comprehension or a literal is a
+  collection: the construct decides, and an annotation states it.
+- `D |=> V` — data-function type: a collection over the domain `D` (§6.3).
 - `Module{name: T, Name <: U, …}` — the type of a module's public members,
   through which one module is passed to another (**[Decided]**,
   [9.8 Module types](#98-module-types)).
@@ -2586,6 +2591,21 @@ to the same representation. `Array` and `FullMap` have explicit domains; the oth
 dependent sums. Introducing one of those sums from a concrete collection requires `box`.
 Existing sums can widen under the sum-kind relation; that relation is not automatic insertion
 of a constructor into an unboxed term.
+
+**A data-function type `D |=> V`** is a collection over `D` with values of type `V`. A `FullMap`
+is always a plain collection: `FullMap(K, V)` is the type `K |=> V` is for a written `K`, and
+`FullMap(_, V)` admits no sum.
+
+- **A domain left to inference admits a sum.** A sum is a collection whose domain is its
+  witness, so `_ |=> V`, or `D |=> V` for a type parameter `D` written nowhere else in its
+  definition, accepts a plain collection and a `List`, `Collection` or boxed value alike. It is
+  an inferred annotation, so it admits more than `Collection(V)`, which is exact and requires
+  `box`.
+- **A written domain names a plain collection.** `String |=> Int` is a collection over every
+  `String`, and no sum is one.
+- **A type parameter shared by several positions names one domain.** In
+  `def both(D, a: D |=> Int, b: D |=> Int)`, `a` and `b` are plain collections over the same
+  domain: a sum's witness cannot stand outside its sum, and two different domains are refused.
 
 #### Collection operations
 

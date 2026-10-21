@@ -9,9 +9,9 @@
 //! the CHL expression that lowers to it.
 //!
 //! Some of what it writes has no annotation syntax: a `Box`, a source's rows, a
-//! dependent `FullMap(k: …, …)`, an index range written as `{UInt where _ < n}`. What the
-//! notation has no form for at all is written in the checker's notation between `‹…›`,
-//! never dropped.
+//! dependent function `(k: …) |=> …` or `(x: …) => …`, an index range written as
+//! `{UInt where _ < n}`. What the notation has no form for at all is written in the
+//! checker's notation between `‹…›`, never dropped.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -255,8 +255,7 @@ impl Printer {
             return self.sum(ty, witnesses, domain, codomain);
         }
         // A function whose codomain names its binder: CHL writes the binder only in a
-        // `def`'s signature, so a type spells it as the key of a `FullMap` or the
-        // parameter of a function.
+        // `def`'s signature, so a type spells it as the parameter of the arrow.
         let dependent = name.filter(|n| crate::ccl::subst::codomain_depends_on(n, codomain));
         // The domain is written only where the form shows it: `Array` and `Source` name
         // theirs by a length and a source.
@@ -280,22 +279,14 @@ impl Printer {
         }
         self.binders.pop();
         let binder = binder.map(|(_, s)| s).unwrap_or_default();
-        if is_data {
-            match (dependent, domain) {
-                (Some(_), _) => format!("FullMap({binder}: {dom}, {cod})"),
-                (None, Type::UIntRange(n)) => format!("Array({n}, {cod})"),
-                (None, Type::DataSource(source)) => format!("Source({source}, {cod})"),
-                (None, _) => format!("FullMap({dom}, {cod})"),
-            }
-        } else {
-            let dom = match domain {
-                Type::Fun { .. } => format!("({dom})"),
-                _ => dom,
-            };
-            match dependent {
-                Some(_) => format!("({binder}: {dom}) => {cod}"),
-                None => format!("{dom} => {cod}"),
-            }
+        let arrow = if is_data { "|=>" } else { "=>" };
+        match (dependent, domain) {
+            (None, Type::UIntRange(n)) if is_data => format!("Array({n}, {cod})"),
+            (None, Type::DataSource(source)) if is_data => format!("Source({source}, {cod})"),
+            (Some(_), _) => format!("({binder}: {dom}) {arrow} {cod}"),
+            // An arrow is right-associative, so a function domain is parenthesized.
+            (None, Type::Fun { .. }) => format!("({dom}) {arrow} {cod}"),
+            (None, _) => format!("{dom} {arrow} {cod}"),
         }
     }
 
@@ -696,7 +687,13 @@ mod tests {
     #[case("Map(String, Int)", "Map(String, Int)")]
     #[case("Set(Int)", "Set(Int)")]
     #[case("Collection(Int)", "Collection(Int)")]
-    #[case("FullMap(Int, String)", "FullMap(Int, String)")]
+    #[case("FullMap(Int, String)", "Int |=> String")]
+    #[case("Int |=> String", "Int |=> String")]
+    #[case("_ |=> Int", "_ |=> Int")]
+    #[case("(Int |=> Int) |=> Int", "(Int |=> Int) |=> Int")]
+    #[case("Int => Int |=> Int", "Int => Int |=> Int")]
+    #[case("Int |=> Int => Int", "Int |=> Int => Int")]
+    #[case("forall (D, T) (D |=> T) => T", "forall (D, T) (D |=> T) => T")]
     #[case("forall (T) {T, T} => T", "forall (T) {T, T} => T")]
     #[case(
         "forall (T, U <: {at: Int}) {T, U} => T",

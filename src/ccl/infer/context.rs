@@ -727,6 +727,11 @@ impl InferCtx {
                                     .collect(),
                             )))
                         }
+                        // A kind the annotation left to inference is a fresh one per
+                        // occurrence, as a `Hole` is a fresh type.
+                        crate::ccl::ty::FunKind::Var(v) if v.is_hole() => {
+                            crate::ccl::ty::FunKind::fresh_data()
+                        }
                         other => other.clone(),
                     },
                     domain: Box::new(self.normalize_domain(d, telescope)),

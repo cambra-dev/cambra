@@ -714,7 +714,7 @@ fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
         pick: forall (T) T => T = keep
         1
     "},
-    "inferred as forall (A) (n: A) => FullMap({UInt where _ < 2 and ys[_].0 > n}, {Int, Int}) requires Orderable(Int, A)",
+    "inferred as forall (A) (n: A) => {UInt where _ < 2 and ys[_].0 > n} |=> {Int, Int} requires Orderable(Int, A)",
 )]
 // A variable of the enclosing scope is one type, not a parameter.
 #[case::enclosing_scope_variable(
