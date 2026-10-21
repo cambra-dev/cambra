@@ -1485,11 +1485,13 @@ pub enum Contract {
 }
 
 impl Contract {
-    /// The contract written in CHL.
-    pub fn written(&self) -> String {
+    /// The contract written in CHL, as the module at `home` writes it.
+    pub fn written(&self, home: &[smol_str::SmolStr]) -> String {
         match self {
-            Contract::Scheme(scheme) => crate::ccl::chl_print::chl_inferred_poly(scheme),
-            Contract::Type(ty) => crate::ccl::chl_print::chl_type(ty),
+            Contract::Scheme(scheme) => {
+                crate::ccl::chl_print::chl_inferred_poly_in(scheme, Some(home))
+            }
+            Contract::Type(ty) => crate::ccl::chl_print::chl_type_in(ty, home),
         }
     }
 

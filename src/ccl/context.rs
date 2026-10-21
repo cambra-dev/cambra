@@ -2322,7 +2322,10 @@ fn check_modules(
         let mut wanted = HashSet::new();
         if contracts_of == Some(check.file) {
             for binding in tree.chain_binders() {
-                if binding.name.home().is_none() && check.interface.is_public(binding.name.base()) {
+                let base = binding.name.base();
+                if binding.name.home().is_none()
+                    && (check.interface.is_public(base) || check.interface.is_public_function(base))
+                {
                     wanted.insert(binding.name.clone());
                 }
             }

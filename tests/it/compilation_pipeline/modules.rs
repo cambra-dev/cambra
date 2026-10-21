@@ -1014,47 +1014,9 @@ fn an_unsupported_library_statement_is_refused(#[case] library: &str, #[case] ne
     );
 }
 
-/// A nominal type, an associated function and an `impl` block are refused in every module
-/// but the root, imported or run, each once.
-#[rstest]
-#[case::a_type("type Price = Int\n", "a nominal type in a module other than the root")]
-#[case::an_associated_function(
-    indoc! {"
-        type Price = Int
-        def Price::doubled(self) => Int:
-            self.extract() * 2
-    "},
-    "an associated function in a module other than the root"
-)]
-#[case::an_impl_block(
-    indoc! {"
-        type Price = Int
-        impl Price:
-            def doubled(self) => Int:
-                self.extract() * 2
-    "},
-    "an `impl` block in a module other than the root"
-)]
-#[timeout(Duration::from_secs(10))]
-fn a_nominal_type_outside_the_root_is_refused(
-    #[values("import shop", "run shop as s")] statement: &str,
-    #[case] shop: &str,
-    #[case] needle: &str,
-) {
-    let root = formatdoc! {"
-        {statement}
-        1
-    "};
-    let errors = compile_errors(&program(&root, &[("shop", shop)]));
-    assert_eq!(errors.matches(needle).count(), 1, "{errors}");
-    assert!(
-        !errors.contains("imported module holds value bindings"),
-        "{errors}"
-    );
-}
-
 /// A reference or a `use` item into a module with errors of its own reports
-/// nothing more: the module's errors account for it.
+/// nothing more: the module's errors account for it, and so does a method call on a value
+/// read from it.
 #[rstest]
 #[case::qualified(indoc! {"
     import lib
@@ -1063,6 +1025,10 @@ fn a_nominal_type_outside_the_root_is_refused(
 #[case::used(indoc! {"
     import lib use missing
     missing
+"})]
+#[case::method_call(indoc! {"
+    import lib
+    lib::missing.missing()
 "})]
 #[timeout(Duration::from_secs(10))]
 fn a_reference_into_a_module_with_errors_adds_no_error(#[case] root: &str) {

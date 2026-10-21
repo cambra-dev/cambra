@@ -14,6 +14,8 @@ pub struct Interface {
     pub(super) members: HashMap<SmolStr, Member>,
     /// Every top-level type alias, by spelling, public and private alike.
     pub(super) types: HashMap<SmolStr, TypeMember>,
+    /// Every nominal type the module declares, by name, public and private alike.
+    pub(in crate::ccl::lower) nominal: HashMap<SmolStr, NominalMember>,
     /// Every top-level member bound to a module, by spelling, public and
     /// private alike.
     pub(super) modules: HashMap<SmolStr, ModuleBinding>,
@@ -267,6 +269,97 @@ pub struct TypeMember {
     pub declared: Span,
 }
 
+/// One nominal type a module declares (`docs/chl-spec.md`, "9.5 Visibility"). Its
+/// constructors, and the `new` and `extract` of the single-constructor form, are public
+/// when the type is.
+#[derive(Debug, Clone)]
+pub struct NominalMember {
+    pub decl: Rc<crate::ccl::nominal::NominalDecl>,
+    pub public: bool,
+    /// The `type` statement.
+    pub declared: Span,
+    /// Its associated functions, by name.
+    pub functions: HashMap<SmolStr, AssociatedMember>,
+}
+
+impl NominalMember {
+    /// The declaration as `cambra check` prints it: written as its module writes it, with
+    /// the variance of each type parameter, which is part of the type's interface
+    /// (`docs/chl-spec.md`, "6.8 Nominal types and methods \[Decided\]"), and the type
+    /// parameters of its module whose arguments tell its instances apart
+    /// (`docs/chl-spec.md`, "Nominal type identity").
+    fn written(&self) -> String {
+        use crate::ccl::nominal::Variance;
+        let decl = &self.decl;
+        let chl_type = |ty: &Type| crate::ccl::chl_print::chl_type_in(ty, &decl.module);
+        let body = decl.body();
+        let params: Vec<&str> = decl.params.iter().map(|p| p.spelling.as_str()).collect();
+        let head = match params.as_slice() {
+            [] => decl.name.to_string(),
+            params => format!("{}({})", decl.name, params.join(", ")),
+        };
+        let mut notes: Vec<String> = decl
+            .params
+            .iter()
+            .zip(&body.variances)
+            .map(|(p, v)| {
+                let v = match v {
+                    Variance::Covariant => "covariant",
+                    Variance::Contravariant => "contravariant",
+                    Variance::Bipolar | Variance::Invariant => "invariant",
+                };
+                format!("{v} in {}", p.spelling)
+            })
+            .collect();
+        let implicit: Vec<&str> = decl
+            .implicit()
+            .iter()
+            .map(|p| p.spelling.as_str())
+            .collect();
+        if !implicit.is_empty() {
+            notes.push(format!("one type per argument of {}", implicit.join(", ")));
+        }
+        let note = match notes.as_slice() {
+            [] => String::new(),
+            notes => format!("  # {}", notes.join("; ")),
+        };
+        if decl.declares_extract {
+            let [ctor] = body.ctors.as_slice() else {
+                unreachable!("the single-constructor form declares one constructor")
+            };
+            return format!("pub type {head} = {}{note}", chl_type(&ctor.payload()));
+        }
+        let mut lines = vec![format!("pub type {head}:{note}")];
+        for ctor in &body.ctors {
+            let params: Vec<String> = ctor
+                .params
+                .iter()
+                .map(|(name, ty)| match name {
+                    Some(name) => format!("{name}: {}", chl_type(ty)),
+                    None => chl_type(ty),
+                })
+                .collect();
+            lines.push(match params.as_slice() {
+                [] => format!("    {}", ctor.name),
+                params => format!("    {}({})", ctor.name, params.join(", ")),
+            });
+        }
+        lines.join("\n")
+    }
+}
+
+/// One associated function of a [`NominalMember`].
+#[derive(Debug, Clone)]
+pub struct AssociatedMember {
+    pub public: bool,
+    /// The `def`.
+    pub declared: Span,
+    /// Its number of value parameters, `self` included.
+    pub arity: usize,
+    /// Whether its first value parameter is `self`.
+    pub is_method: bool,
+}
+
 /// A reference to another module's member: the member spelled through its
 /// qualifier, and whether calls to it take a curried shape.
 #[derive(Debug, Clone)]
@@ -300,6 +393,17 @@ impl Interface {
         self.members.get(name).is_some_and(|member| member.public)
     }
 
+    /// Whether `binding`, `Price::discounted`, is a public associated function of a public
+    /// nominal type the module declares.
+    pub fn is_public_function(&self, binding: &str) -> bool {
+        let Some((ty, function)) = binding.split_once("::") else {
+            return false;
+        };
+        self.nominal.get(ty).is_some_and(|member| {
+            member.public && member.functions.get(function).is_some_and(|f| f.public)
+        })
+    }
+
     /// The interface as `cambra check` prints it (`docs/chl-spec.md`, "9.14
     /// Checking a module on its own"): each parameter, then each public member
     /// in the order declared, a value with its contract from `contracts`, by
@@ -307,8 +411,8 @@ impl Interface {
     ///
     /// # Panics
     ///
-    /// If `contracts` lacks a public value member's: every one is a binder of the
-    /// module's check tree.
+    /// If `contracts` lacks a public value member's or associated function's: every
+    /// one is a binder of the module's check tree.
     pub fn written(&self, contracts: &HashMap<SmolStr, Contract>) -> String {
         let mut lines = vec![format!("module {}", self.module)];
         for parameter in &self.parameters {
@@ -341,7 +445,7 @@ impl Interface {
                     Some(arity) => contract.uncurried(arity),
                     None => contract.clone(),
                 };
-                let line = format!("pub {name}: {}", contract.written());
+                let line = format!("pub {name}: {}", contract.written(self.module.segments()));
                 members.push((member.declared, line));
             }
         }
@@ -354,6 +458,28 @@ impl Interface {
             if member.public {
                 let line = format!("pub {name} = {}", member.module);
                 members.push((member.declared, line));
+            }
+        }
+        for (name, member) in &self.nominal {
+            if !member.public {
+                continue;
+            }
+            members.push((member.declared, member.written()));
+            for (function_name, function) in &member.functions {
+                if function.public {
+                    let binding = format!("{name}::{function_name}");
+                    let contract = contracts.get(binding.as_str()).unwrap_or_else(|| {
+                        panic!(
+                            "module `{}`'s check found the public `{binding}`",
+                            self.module
+                        )
+                    });
+                    let line = format!(
+                        "pub {binding}: {}",
+                        contract.written(self.module.segments())
+                    );
+                    members.push((function.declared, line));
+                }
             }
         }
         members.sort_by_key(|(span, _)| span.start);
@@ -373,6 +499,7 @@ impl Interface {
             module,
             members: HashMap::new(),
             types: HashMap::new(),
+            nominal: HashMap::new(),
             modules: HashMap::new(),
             parameters: Vec::new(),
             unimportable: Some(why),
@@ -452,11 +579,78 @@ impl Interface {
             module,
             members,
             types,
+            nominal: nominal_members(ast, ctx),
             modules,
             parameters,
             unimportable,
         }
     }
+}
+
+/// The nominal types `ast`, a module whose lowering left `ctx`, declares, with their
+/// associated functions. Lowering reads statements with `pub` taken off, so whether each is
+/// public is read off `ast`.
+fn nominal_members(ast: &ChlModule, ctx: &LoweringContext) -> HashMap<SmolStr, NominalMember> {
+    let public_types: HashMap<SmolStr, (bool, Span)> = top_level_nominal_types(&ast.body)
+        .into_iter()
+        .map(|ty| (ty.name, (ty.public, ty.span)))
+        .collect();
+    let public_functions = public_associated_functions(&ast.body);
+    let mut nominal: HashMap<SmolStr, NominalMember> = ctx
+        .nominal_types
+        .iter()
+        .map(|decl| {
+            let (public, declared) = public_types[&decl.name];
+            (
+                decl.name.clone(),
+                NominalMember {
+                    decl: Rc::clone(decl),
+                    public,
+                    declared,
+                    functions: HashMap::new(),
+                },
+            )
+        })
+        .collect();
+    for function in &ctx.associated_functions {
+        let owner = nominal
+            .get_mut(&function.decl.name)
+            .expect("an associated function's type is one its module declares");
+        owner.functions.insert(
+            function.name.clone(),
+            AssociatedMember {
+                public: public_functions.contains(&function.span),
+                declared: function.span,
+                arity: function.arity,
+                is_method: function.is_method,
+            },
+        );
+    }
+    nominal
+}
+
+/// The `def` of each public associated function among `stmts`, a module's top level: a
+/// `pub def N::f`, and each `pub def` of an `impl` block.
+fn public_associated_functions(stmts: &[Spanned<ChlStmt>]) -> HashSet<Span> {
+    let mut public = HashSet::new();
+    for stmt in stmts {
+        match &stmt.node {
+            ChlStmt::Pub { stmt: def, .. }
+                if matches!(def.node, ChlStmt::FunctionDef { owner: Some(_), .. }) =>
+            {
+                public.insert(def.span);
+            }
+            ChlStmt::Impl(block) => {
+                for def in &block.defs {
+                    if let ChlStmt::Pub { stmt: inner, .. } = &def.node {
+                        public.insert(inner.span);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    public
 }
 
 /// The type each top-level `LetType` on `chain`'s spine declares, by spelling.
@@ -623,6 +817,18 @@ impl Interface {
         let mut missing = Vec::new();
         for entry in &ty.types {
             let name = &entry.name;
+            // A nominal type is a type member, as an alias is.
+            if let Some(nominal) = self.nominal.get(name) {
+                if !nominal.public {
+                    missing.push(format!("`{name}` is private to module `{module}`"));
+                } else if !nominal.decl.params.is_empty() {
+                    missing.push(format!(
+                        "`{name}` in module `{module}` takes type arguments, and the entry names \
+                         a type"
+                    ));
+                }
+                continue;
+            }
             match self.types.get(name) {
                 Some(member) if !member.public => {
                     missing.push(format!("`{name}` is private to module `{module}`"));

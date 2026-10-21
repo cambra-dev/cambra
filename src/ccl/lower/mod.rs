@@ -459,6 +459,11 @@ pub struct LoweringContext {
     /// [`Type::Nominal`] naming its declaration. Declared only at the top level, so never
     /// snapshotted.
     pub(super) nominal_types: Vec<Rc<NominalDecl>>,
+    /// The nominal types other modules declare that the module's `use` names name, by
+    /// `use` name: the instance reached, and how the module spells the qualifier its
+    /// members' bindings are reached through.
+    pub(super) used_nominal:
+        HashMap<SmolStr, (modules::NominalMember, crate::ccl::names::QualifiedName)>,
 
     /// The associated functions the module declares, recorded before anything lowers so a
     /// method call anywhere names every type declaring its method.
@@ -1060,6 +1065,11 @@ impl LoweringContext {
             .iter()
             .find(|d| d.name == name)
             .cloned()
+            .or_else(|| {
+                self.used_nominal
+                    .get(name)
+                    .map(|(found, _)| Rc::clone(&found.decl))
+            })
             .or_else(|| crate::ccl::nominal::builtin(name))
     }
 
@@ -1801,8 +1811,7 @@ fn use_name_members(
 /// since the import would reach the run's state (`docs/chl-spec.md`, "9.7
 /// Importing asserts no IO and no state"), an expression statement, and,
 /// not supported yet, anything but a value binding, a `def`, a type alias, an
-/// `import`, or `pass`. A nominal type and its associated functions are
-/// lowering's to refuse, in every module but the root.
+/// `import`, `pass`, a nominal type, or an `impl` block.
 pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<LoweringError> {
     stmts
         .iter()
@@ -1812,8 +1821,6 @@ pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<Lowe
                 other => other,
             };
             let message = match inner {
-                // Lowering refuses a nominal type and its associated functions in every
-                // module but the root (`module_nominal_refusals`).
                 ChlStmt::Assign { .. }
                 | ChlStmt::AnnAssign { .. }
                 | ChlStmt::FunctionDef { .. }
@@ -1839,7 +1846,7 @@ pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<Lowe
                 ),
                 _ => {
                     "this statement at an imported module's top level is not supported yet: an \
-                     imported module holds value bindings, `def`s and type aliases"
+                     imported module holds value bindings, `def`s, type aliases and nominal types"
                 }
             };
             Some(LoweringError::unsupported(stmt.span, message))

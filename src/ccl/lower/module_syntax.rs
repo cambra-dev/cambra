@@ -3,14 +3,15 @@
 //!
 //! [`refuse_module_syntax`] finds every such construct in a module, at any
 //! depth, and the module lowers nothing when it finds one. It refuses
-//! `@RenamedFrom`, `@Discard`, `pub` on anything but a value binding, a `def`
-//! or a type alias, a write to another module's member, a method reference, and
-//! a type a module qualifies. A qualified value, type, label, or tag reaches
+//! `@RenamedFrom`, `@Discard`, `pub` on a mutable variable, a write to another
+//! module's member, and a method named through an attribute's qualifier,
+//! `x.mod::Price::discounted`. A qualified value, type, label, or tag reaches
 //! lowering, which resolves it against the module's names that denote a module
-//! (`super::modules`), and so does a name qualified by one type, `Shape::circle`,
-//! which lowering resolves among the module's nominal types. Lowering therefore
-//! sees a top-level [`ChlStmt::Import`], [`ChlStmt::Run`], [`ChlStmt::Param`],
-//! and [`ChlStmt::Pub`] on a binding, and no other module statement.
+//! (`super::modules`), and so does a name qualified by a type, `Shape::circle`
+//! or `shop::Shape::circle`, which lowering resolves among the nominal types the
+//! module reaches. Lowering therefore sees a top-level [`ChlStmt::Import`],
+//! [`ChlStmt::Run`], [`ChlStmt::Param`], and [`ChlStmt::Pub`] on a binding or a
+//! declaration, and no other module statement.
 //!
 //! The walk also collects every binder the module writes, for the rule that no
 //! binder takes the spelling of a name that denotes a module
@@ -155,7 +156,8 @@ impl Refusals {
                     ChlStmt::MutAssign { .. } | ChlStmt::LoadFrom { .. } => {
                         self.refuse(*keyword, "a public mutable variable is not supported yet")
                     }
-                    // `pub` on any other statement is a parse error.
+                    // `pub` on a `type` exports it, and on any other statement it is a
+                    // parse error.
                     _ => {}
                 }
                 // The statement `pub` marks is checked as any other.
@@ -248,7 +250,13 @@ impl Refusals {
                 self.expr(context);
                 self.stmts(body);
             }
-            ChlStmt::Impl(block) => self.stmts(&block.defs),
+            // A block's `def`s stand at the block's own depth, so `pub` marks one at a
+            // module's top level (`docs/chl-spec.md`, "Associated functions and methods").
+            ChlStmt::Impl(block) => {
+                for def in &block.defs {
+                    self.stmt(def);
+                }
+            }
             ChlStmt::TypeDecl(decl) => match &decl.body {
                 TypeDeclBody::Constructors(ctors) => {
                     for ctor in ctors {
@@ -346,26 +354,12 @@ impl Refusals {
         }
     }
 
-    /// A constructor pattern's binders, and its type, which a module may not qualify yet,
-    /// as in `shop::Shape::circle(r)`.
+    /// A constructor pattern's binders.
     fn constructor_pattern(&mut self, pattern: &ConstructorPattern) {
         for binder in pattern.binders.iter().flatten() {
             if let Some(name) = &binder.node {
                 self.binders.push((name.clone(), binder.span));
             }
-        }
-        if let [first, .., last] = pattern.type_path.as_slice() {
-            self.refuse(
-                first.span.join(last.span),
-                format!(
-                    "the qualified type `{}` is not supported yet: a type is named only in the \
-                     module that declares it",
-                    spell(
-                        &pattern.type_path[..pattern.type_path.len() - 1],
-                        &last.node
-                    )
-                ),
-            );
         }
     }
 
@@ -405,7 +399,7 @@ impl Refusals {
 
     fn expr(&mut self, expr: &Spanned<ChlExpr>) {
         match &expr.node {
-            // A name qualified by one type is a member of that type, which lowering
+            // A name qualified by a type is a member of that type, which lowering
             // resolves (`lower::nominal`).
             ChlExpr::Qualified(q) if super::nominal::names_a_type_member(q) => {}
             ChlExpr::MethodCall { receiver, args, .. } => {
@@ -563,7 +557,7 @@ mod tests {
     #[test]
     fn pub_on_a_mutable_variable_is_refused_at_its_keyword() {
         let refused = refusals(indoc! {"
-            pub stock := mod::Price::zero
+            pub stock := x.mod::Price::zero
             stock
         "});
         assert_eq!(refused.len(), 2, "{refused:#?}");
@@ -608,12 +602,12 @@ mod tests {
         assert_eq!(names, ["a", "b", "f", "x", "y", "g", "z", "w", "v"]);
     }
 
-    /// A capitalized qualifier segment is a type, so the path names one of its
-    /// methods rather than a module member. A name qualified by one type alone, as
-    /// `Price::discounted`, is left to lowering, which resolves it among the module's
-    /// nominal types.
+    /// A name qualified by a type, `Price::discounted` or `mod::Price::discounted`, is
+    /// left to lowering, which resolves it among the nominal types the module reaches. A
+    /// type in an attribute's qualifier, `x.mod::Price::discounted`, is refused as a
+    /// method reference.
     #[test]
-    fn a_capitalized_qualifier_is_refused_as_a_method_reference() {
+    fn a_type_in_an_attributes_qualifier_is_refused_as_a_method_reference() {
         let refused = refusals(indoc! {"
             e = Price::discounted
             f = mod::Price::discounted
@@ -626,16 +620,10 @@ mod tests {
             .collect();
         assert_eq!(
             refused,
-            [
-                (
-                    "mod::Price::discounted",
-                    "the method reference `mod::Price::discounted` is not supported yet"
-                ),
-                (
-                    "mod::Price::discounted",
-                    "the method reference `mod::Price::discounted` is not supported yet"
-                ),
-            ]
+            [(
+                "mod::Price::discounted",
+                "the method reference `mod::Price::discounted` is not supported yet"
+            )]
         );
     }
 
@@ -737,7 +725,7 @@ mod tests {
     #[test]
     fn a_run_argument_is_checked() {
         assert_eq!(
-            refused_spans("run storefront(audit=mod::Price::discounted)\n"),
+            refused_spans("run storefront(audit=x.mod::Price::discounted)\n"),
             ["mod::Price::discounted"]
         );
     }

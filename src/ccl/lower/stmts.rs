@@ -28,15 +28,10 @@ pub(super) fn lower_chain_recovering(
     errors: &mut Vec<LoweringError>,
 ) -> Option<Expr> {
     let stmts = &module.body[..];
-    // The nominal-type passes run for the root alone (`lower_stmts_recovering`), so a
-    // module's own declaration would lower as though it were never declared.
-    let nominal = module_nominal_refusals(stmts);
-    if !nominal.is_empty() {
-        errors.extend(nominal);
+    if !declare_top_level_types(stmts, ctx, errors) {
         return None;
     }
     let outer_bindings = HashSet::new();
-    errors.extend(pre_declare_module_types(stmts, ctx));
     pre_register_txn_decls(stmts, ctx);
     let span = match (stmts.first(), stmts.last()) {
         (Some(first), Some(last)) => first.span.join(last.span),
@@ -68,6 +63,10 @@ pub(super) fn lower_chain_recovering(
         .map(DeclaredSink::binding)
         .collect();
     errors.extend(sink_rebindings(stmts, &declared));
+    let body = nominal::bind_constructors(body, ctx);
+    let (associated, reached_types) = nominal::associated_reach(&body, ctx);
+    nominal::settle_implicit(&reached_types, ctx);
+    errors.extend(associated);
     Some(body)
 }
 
@@ -83,25 +82,34 @@ fn value_parameters_first(stmts: &[Spanned<ChlStmt>]) -> Vec<Spanned<ChlStmt>> {
     parameters.into_iter().chain(rest).collect()
 }
 
-/// One error per nominal `type` declaration, associated `def` and `impl` block of a module
-/// other than the root, where lowering does not support them yet (`docs/chl-spec.md`, "9.12
-/// Field labels and tags belong to a module").
-fn module_nominal_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<LoweringError> {
-    stmts
-        .iter()
-        .filter_map(|stmt| {
-            let what = match &stmt.node {
-                ChlStmt::TypeDecl(_) => "a nominal type",
-                ChlStmt::FunctionDef { owner: Some(_), .. } => "an associated function",
-                ChlStmt::Impl(_) => "an `impl` block",
-                _ => return None,
-            };
-            Some(LoweringError::unsupported(
-                stmt.span,
-                format!("{what} in a module other than the root is not supported yet"),
-            ))
-        })
-        .collect()
+/// Declare the types a module's top-level `stmts` declare, its nominal types and its type
+/// aliases, before its statements lower. A nominal type's head is declared before the
+/// aliases, which may name it, and its constructors after them, since a constructor's
+/// parameter type may name an alias. Answers `false` when a nominal declaration is in
+/// error, which leaves the module unlowered, as a module-syntax refusal does: every use of
+/// the type would otherwise report again.
+fn declare_top_level_types(
+    stmts: &[Spanned<ChlStmt>],
+    ctx: &mut LoweringContext,
+    errors: &mut Vec<LoweringError>,
+) -> bool {
+    let declared = nominal::declare_nominal_types(stmts, ctx);
+    if !declared.is_empty() {
+        errors.extend(declared);
+        return false;
+    }
+    errors.extend(pre_declare_module_types(stmts, ctx));
+    let defined = nominal::define_nominal_types(stmts, ctx);
+    if !defined.is_empty() {
+        errors.extend(defined);
+        return false;
+    }
+    let associated = nominal::declare_associated_functions(stmts, ctx);
+    if !associated.is_empty() {
+        errors.extend(associated);
+        return false;
+    }
+    true
 }
 
 /// Top-level statement-iteration with per-statement error recovery.
@@ -141,25 +149,7 @@ pub(super) fn lower_stmts_recovering(
     // reason: an annotation below an alias is lowered before it. They go first
     // because `pre_register_txn_decls` lowers the `Mut(V, Txn)` annotations it
     // scans — see [`with_block_type_aliases`] for the constraint.
-    //
-    // A nominal type's head is declared before the aliases, which may name it, and its
-    // constructors after them, since a constructor's parameter type may name an alias.
-    // A declaration error leaves the module unlowered, as a module-syntax refusal does:
-    // every use of the type would otherwise report again.
-    let declared = nominal::declare_nominal_types(stmts, ctx);
-    if !declared.is_empty() {
-        errors.extend(declared);
-        return None;
-    }
-    errors.extend(pre_declare_module_types(stmts, ctx));
-    let defined = nominal::define_nominal_types(stmts, ctx);
-    if !defined.is_empty() {
-        errors.extend(defined);
-        return None;
-    }
-    let associated = nominal::declare_associated_functions(stmts, ctx);
-    if !associated.is_empty() {
-        errors.extend(associated);
+    if !declare_top_level_types(stmts, ctx, errors) {
         return None;
     }
     pre_register_txn_decls(stmts, ctx);
@@ -219,7 +209,9 @@ pub(super) fn lower_stmts_recovering(
             }
         });
     let body = nominal::bind_constructors(body, ctx);
-
+    let (associated, reached_types) = nominal::associated_reach(&body, ctx);
+    nominal::settle_implicit(&reached_types, ctx);
+    errors.extend(associated);
     Some(body)
 }
 
@@ -2105,6 +2097,9 @@ pub(super) fn lower_type_expr_or_poly(
         // A type member of another module (`docs/chl-spec.md`, "9.6 Qualified
         // references"). One whose module has errors of its own names no type, and
         // stands for any.
+        ChlExpr::Qualified(q) if let Some(decl) = qualified_nominal(q, annotation.span, ctx)? => {
+            nominal_application(annotation.span, decl, &[], ctx)
+        }
         ChlExpr::Qualified(q) => match ctx.type_member(q, annotation.span)? {
             Some(AliasType::Type(ty)) => Ok(ty),
             Some(AliasType::Module(_)) => Err(module_type_as_value_type(
@@ -2118,6 +2113,11 @@ pub(super) fn lower_type_expr_or_poly(
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).
         ChlExpr::Call { func, args } => {
+            if let ChlExpr::Qualified(q) = &func.node
+                && let Some(decl) = qualified_nominal(q, func.span, ctx)?
+            {
+                return nominal_application(annotation.span, decl, args, ctx);
+            }
             let head = type_ctor_head(func)?;
             match ctx.nominal_type(head) {
                 Some(decl) => nominal_application(annotation.span, decl, args, ctx),
@@ -2900,6 +2900,25 @@ fn name_type(id: &str) -> Option<Type> {
         "_" => Some(Type::Hole),
         _ => None,
     }
+}
+
+/// The nominal type `q` names, `shop::Price`, when the module its qualifier names declares
+/// one by that name. `None` leaves `q` to name a type alias, or to report why it names
+/// nothing.
+fn qualified_nominal(
+    q: &chl_parser::ast::QualifiedName,
+    span: Span,
+    ctx: &LoweringContext,
+) -> Result<Option<Rc<NominalDecl>>, LoweringError> {
+    let Ok(qualifier) = ctx.qualifier_of(q, span, "type") else {
+        return Ok(None);
+    };
+    if !qualifier.declares_nominal(&q.name.node) {
+        return Ok(None);
+    }
+    let mut path = q.qualifier.clone();
+    path.push(q.name.clone());
+    Ok(nominal::resolve_type(&path, ctx)?.map(|named| named.decl))
 }
 
 /// A nominal type applied to its arguments, one per type parameter.

@@ -154,8 +154,8 @@ pub fn run(expr: Expr) -> Expr {
 ///
 /// `home` is the imported module or the run whose top-level binders are minted
 /// with it as their [`Name::home`]. A top-level binder is one on the module's
-/// spine, the chain of `let`, `MutDecl`, statement, and `LetType` bodies from
-/// the root of `expr`.
+/// spine, the chain of `let`, `MutDecl`, statement, `LetType`, and `DefGroup`
+/// bodies from the root of `expr`.
 pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>, home: Option<Home>) -> Expr {
     debug_assert!(
         scope.values().all(|name| !name.is_raw()),
@@ -230,8 +230,9 @@ struct Uniquifier {
     /// ([`run_in`]).
     home: Option<Arc<Home>>,
     /// Whether the node being entered is on the module's spine, the chain of
-    /// `let`, `MutDecl`, statement, and `LetType` bodies from the root, where a
-    /// `let` or a `MutDecl` binds a member of the module. Each node clears it on
+    /// `let`, `MutDecl`, statement, `LetType`, and `DefGroup` bodies from the
+    /// root, where a `let`, a `MutDecl` or a `DefGroup` binds a member of the
+    /// module. Each node clears it on
     /// entry, and a top-level one of those sets it again for its body.
     top_level: bool,
     /// Lexical environment: source spelling → stack of minted names, the
@@ -276,6 +277,7 @@ struct Uniquifier {
 impl Uniquifier {
     fn expr(&mut self, e: &mut Expr) {
         let top_level = std::mem::replace(&mut self.top_level, false);
+        let group = matches!(e.node, TypedExprNode::DefGroup { .. });
         // Anchor-borne types first: `ty` is a lowering `Hole` almost
         // everywhere, but user annotations (and a few stamped types) can
         // carry refinement predicates whose free variables live in the
@@ -388,18 +390,27 @@ impl Uniquifier {
             // Mutual recursion: mint *all* group binders before walking any
             // binding body, so a reference to any group name — in any body or
             // in the letrec body — resolves to its group binder.
+            //
+            // An `impl` block's group stands on its module's spine, so at the top level its
+            // functions are members of the module and take its home.
             TypedExprNode::LetRec { bindings, body }
             | TypedExprNode::DefGroup { bindings, body } => {
+                let home = if group && top_level {
+                    self.home.clone()
+                } else {
+                    None
+                };
                 let bases: Vec<Option<String>> = bindings
                     .iter_mut()
                     .map(|(b, _)| {
                         self.binding_tys(b);
-                        self.bind(b)
+                        self.bind_in(b, home.clone())
                     })
                     .collect();
                 for (_, def) in bindings.iter_mut() {
                     self.expr(def);
                 }
+                self.top_level = group && top_level;
                 self.expr(body);
                 for base in bases.into_iter().rev() {
                     self.unbind(base);

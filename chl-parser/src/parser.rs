@@ -239,6 +239,7 @@ where
                 value,
             });
         let paren_record = record_field
+            .clone()
             .separated_by(just(Token::Comma))
             .at_least(1)
             .allow_trailing()
@@ -620,12 +621,50 @@ where
         .boxed();
 
         // ---- Postfix: call, subscript, attribute ---------------------
-        let call_arg_list = bracketed_expr
+        // A call's arguments: expressions, or `name=value` fields, which build the record the
+        // call's parentheses construct (`docs/chl-spec.md`, "3.8 Function calls"), so
+        // `f(x=1, y=2)` is `f((x=1, y=2))`. A field's name may carry the module its label
+        // belongs to, `shop::amount=3`. Mixing the two is open, and an error.
+        let call_arg = record_field
             .clone()
+            .map(CallArg::Named)
+            .or(bracketed_expr.clone().map(CallArg::Positional));
+        let call_arg_list = call_arg
             .separated_by(just(Token::Comma))
             .allow_trailing()
             .collect::<Vec<_>>()
-            .delimited_by(just(Token::LParen), just(Token::RParen));
+            .delimited_by(just(Token::LParen), just(Token::RParen))
+            .validate(|args: Vec<CallArg>, e, emitter| {
+                let named = args
+                    .iter()
+                    .filter(|a| matches!(a, CallArg::Named(_)))
+                    .count();
+                if named == 0 {
+                    return args
+                        .into_iter()
+                        .map(|a| match a {
+                            CallArg::Positional(expr) => expr,
+                            CallArg::Named(_) => unreachable!("counted no named argument"),
+                        })
+                        .collect();
+                }
+                if named < args.len() {
+                    emitter.emit(Rich::custom(
+                        e.span(),
+                        "a call's arguments are all positional or all named; mixing them is \
+                         not supported",
+                    ));
+                    return vec![Spanned::new(e.span(), Expr::Error)];
+                }
+                let fields = args
+                    .into_iter()
+                    .map(|a| match a {
+                        CallArg::Named(field) => field,
+                        CallArg::Positional(_) => unreachable!("every argument is named"),
+                    })
+                    .collect();
+                vec![Spanned::new(e.span(), Expr::Record(fields))]
+            });
         let call_args = call_arg_list.clone().map(PostfixOp::Call);
         // A subscript index is a comma-separated list: a single element is
         // the index itself (`xs[0]`); several become a tuple (`Mut(Int, Txn)`
@@ -1167,6 +1206,14 @@ enum GroupTail {
 enum PayloadBracket {
     Paren(Spanned<Expr>),
     Brace(Spanned<Expr>, bool),
+}
+
+/// One argument of a call, as written: an expression, or a `name=value` field of the
+/// record argument.
+#[derive(Clone)]
+enum CallArg {
+    Positional(Spanned<Expr>),
+    Named(RecordField),
 }
 
 /// Intermediate type used by the postfix-chain fold.
@@ -3150,6 +3197,46 @@ mod tests {
             }
             other => panic!("expected Attribute, got {other:?}"),
         }
+    }
+
+    /// A call whose arguments are named passes the record they build, so `f(x=1, y=2)` is
+    /// `f((x=1, y=2))`, and a name may carry its label's module. `==` is a comparison, not a
+    /// name. Mixing named and positional arguments is an error.
+    #[test]
+    fn named_call_arguments_build_the_record_argument() {
+        let Expr::Call { args, .. } = parse_e("f(x=1, shop::y=2)").node else {
+            panic!("expected a call")
+        };
+        let [arg] = args.as_slice() else {
+            panic!("expected one argument, got {args:?}")
+        };
+        let Expr::Record(fields) = &arg.node else {
+            panic!("expected a record argument, got {:?}", arg.node)
+        };
+        let names: Vec<(Vec<&str>, &str)> = fields
+            .iter()
+            .map(|f| {
+                (
+                    f.qualifier.iter().map(|q| q.node.as_str()).collect(),
+                    f.name.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(names, [(vec![], "x"), (vec!["shop"], "y")]);
+
+        let Expr::Call { args, .. } = parse_e("f(x == 1)").node else {
+            panic!("expected a call")
+        };
+        assert!(matches!(args[0].node, Expr::Compare { .. }));
+
+        let result = parse_expr("f(1, x=2)");
+        assert!(
+            result.errors[0]
+                .to_string()
+                .contains("a call's arguments are all positional or all named"),
+            "{:?}",
+            result.errors
+        );
     }
 
     #[test]

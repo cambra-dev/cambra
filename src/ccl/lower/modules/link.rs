@@ -19,14 +19,16 @@ pub fn is_module_body(expr: &Expr) -> bool {
 }
 
 /// The rest of the module below `expr`, when `expr` stands on a module's spine:
-/// the body of a `let`, a mutable variable, a statement, a type alias, or a
-/// `run`. A module's top level is the chain of these bodies from the root.
+/// the body of a `let`, a mutable variable, a statement, a type alias, an `impl`
+/// block's group of functions, or a `run`. A module's top level is the chain of
+/// these bodies from the root.
 pub(super) fn spine_body(expr: &Expr) -> Option<&Expr> {
     match &expr.node {
         TypedExprNode::Let { body, .. }
         | TypedExprNode::MutDecl { body, .. }
         | TypedExprNode::ExprStmt { body, .. }
         | TypedExprNode::LetType { body, .. }
+        | TypedExprNode::DefGroup { body, .. }
         | TypedExprNode::Run { body, .. } => Some(body.as_ref()),
         _ => None,
     }
@@ -39,6 +41,7 @@ pub(super) fn spine_body_mut(expr: &mut Expr) -> Option<&mut Expr> {
         | TypedExprNode::MutDecl { body, .. }
         | TypedExprNode::ExprStmt { body, .. }
         | TypedExprNode::LetType { body, .. }
+        | TypedExprNode::DefGroup { body, .. }
         | TypedExprNode::Run { body, .. } => Some(body.as_mut()),
         _ => None,
     }
@@ -49,10 +52,14 @@ pub(super) fn spine(chain: &Expr) -> (Vec<&Name>, &Expr) {
     let mut binders = Vec::new();
     let mut at = chain;
     while let Some(body) = spine_body(at) {
-        if let TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } =
-            &at.node
-        {
-            binders.push(&binding.name);
+        match &at.node {
+            TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
+                binders.push(&binding.name);
+            }
+            TypedExprNode::DefGroup { bindings, .. } => {
+                binders.extend(bindings.iter().map(|(binding, _)| &binding.name));
+            }
+            _ => {}
         }
         at = body;
     }
@@ -73,10 +80,12 @@ pub fn fill_module_body(mut chain: Expr, body: Expr) -> Expr {
 /// copied too, once per predicate, so a term several slots share stays one term. A copy of
 /// a chain shares its predicates with the module's, and uniquifying rebuilds each with the
 /// ids it had, so two runs of the module in one tree would hold two predicates of one id.
-/// The first copy in a tree keeps the module's ([`ProgramLowering::holding_predicates`]).
-/// Copied in the chain's copy frame, a predicate's nodes are copies of the module's, as the
-/// chain's are. `copies` holds each predicate copied, with the original, which keeps its
-/// address from being reused while it keys the map.
+/// The first copy in a tree keeps the module's, which the declarations of its nominal types
+/// share, so a predicate inference reads off a declaration is one the tree holds
+/// ([`ProgramLowering::holding_predicates`]). Copied in the chain's copy frame, a
+/// predicate's nodes are copies of the module's, as the chain's are.
+/// `copies` holds each predicate copied, with the original, which keeps its address from
+/// being reused while it keys the map.
 fn copy_predicates(
     expr: &mut Expr,
     copies: &mut HashMap<crate::ccl::PredicateId, (Rc<Expr>, Rc<Expr>)>,
@@ -674,8 +683,8 @@ impl<'a> ProgramLowering<'a> {
     ) -> Option<Created> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
         let raised = self.errors.len();
-        // The first copy of a module in a tree holds the module's own predicates,
-        // and each later copy copies them.
+        // The first copy of a module in a tree holds the module's own predicates, which
+        // a nominal type's declaration shares, and each later copy copies them.
         let first = self.holding_predicates.insert(file);
         let mut chain = {
             let _copy = crate::ccl::provenance::copy_frame("link.run");

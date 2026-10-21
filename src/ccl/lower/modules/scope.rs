@@ -39,6 +39,9 @@ pub enum Reached {
     /// The type or Module type the alias names, spelled through its qualifier
     /// ([`reroot`]).
     Type(Option<AliasType>),
+    /// A nominal type, as the instance the qualifier reaches, with how the module
+    /// spells that qualifier, which its members' bindings are reached through.
+    Nominal(Option<(NominalMember, QualifiedName)>),
 }
 
 /// What a name that denotes a module reaches: an import name, a run name, a
@@ -118,6 +121,10 @@ impl LoweringContext {
     /// (`docs/modules.md`, "The module interface").
     pub(crate) fn begin_module(&mut self, scope: ModuleScope) {
         self.type_aliases.clear();
+        self.used_nominal.clear();
+        self.nominal_types.clear();
+        self.associated_functions.clear();
+        self.builtin_members_used.clear();
         self.mut_param_fns.clear();
         self.declared_sinks.clear();
         self.parameters.clear();
@@ -139,7 +146,10 @@ impl LoweringContext {
                 Reached::Value(Some(reference)) if reference.mut_param => {
                     self.register_mut_param_fn(name.as_str());
                 }
-                Reached::Value(_) => {}
+                Reached::Value(_) | Reached::Nominal(None) => {}
+                Reached::Nominal(Some(found)) => {
+                    self.used_nominal.insert(name.clone(), found.clone());
+                }
             }
         }
         self.module = scope;
@@ -361,7 +371,7 @@ impl LoweringContext {
     }
 
     /// The module `q`'s qualifier names, for a reference to a `what` at `span`.
-    pub(super) fn qualifier_of(
+    pub(in crate::ccl::lower) fn qualifier_of(
         &self,
         q: &ParserQualifiedName,
         span: Span,
@@ -586,6 +596,24 @@ impl Qualifier {
             return Ok(None);
         };
         let module = &interface.module;
+        // A nominal type is a type member too, which a Module type's entry takes as the type
+        // it is (`docs/chl-spec.md`, "9.6 Qualified references").
+        if interface.nominal.contains_key(member)
+            && let Some(nominal) = self.reach_nominal(name, member, span)?
+        {
+            if !nominal.decl.params.is_empty() {
+                return Err(LoweringError::unsupported(
+                    span,
+                    format!(
+                        "`{name}::{member}` takes type arguments, so it names no type on its own"
+                    ),
+                ));
+            }
+            return Ok(Some(AliasType::Type(Type::Nominal(
+                nominal.decl,
+                Vec::new(),
+            ))));
+        }
         let Some(found) = interface.types.get(member) else {
             return Err(LoweringError::unsupported(
                 span,
@@ -630,6 +658,69 @@ impl Qualifier {
             )),
             None => Ok(None),
         }
+    }
+
+    /// Whether the module this reaches declares a nominal type `member`. A module reached
+    /// through a Module type declares none: its type members are abstract.
+    pub(in crate::ccl::lower) fn declares_nominal(&self, member: &str) -> bool {
+        self.view.is_none()
+            && self
+                .reachable()
+                .is_some_and(|interface| interface.nominal.contains_key(member))
+    }
+
+    /// The public nominal type `member` of the module this reaches through the qualifier
+    /// `name`, or `None` when the module has errors of its own, which are reported where
+    /// they stand.
+    pub(in crate::ccl::lower) fn reach_nominal(
+        &self,
+        name: &QualifiedName,
+        member: &str,
+        span: Span,
+    ) -> Result<Option<NominalMember>, LoweringError> {
+        if self.view.is_some() {
+            return Err(LoweringError::unsupported(
+                span,
+                format!(
+                    "`{name}::{member}` is a type member of a Module type, which declares no \
+                     constructors or functions"
+                ),
+            ));
+        }
+        let Some(interface) = self.reachable() else {
+            return Ok(None);
+        };
+        let Some(found) = interface.nominal.get(member) else {
+            return Err(LoweringError::unsupported(
+                span,
+                format!(
+                    "module `{}` declares no nominal type `{member}`",
+                    interface.module
+                ),
+            ));
+        };
+        if !found.public {
+            return Err(LoweringError::unsupported(
+                span,
+                format!("`{member}` is private to module `{}`", interface.module),
+            )
+            .with_related(found.declared, "declared here without `pub`"));
+        }
+        let mut found = found.clone();
+        found.decl = self.instance(&found.decl);
+        Ok(Some(found))
+    }
+
+    /// `decl`, a nominal type of the module this reaches, as the instance this
+    /// reaches: its implicit arguments are the types the run or shared import gives
+    /// its module's type parameters ([`NominalDecl::substituted`]).
+    pub(in crate::ccl::lower) fn instance(
+        &self,
+        decl: &Rc<crate::ccl::nominal::NominalDecl>,
+    ) -> Rc<crate::ccl::nominal::NominalDecl> {
+        let mut decl = Rc::clone(decl);
+        substitute_decl(&mut decl, &self.types);
+        decl
     }
 
     /// The type member at `path` below the module this reaches, through the
@@ -739,7 +830,7 @@ impl Qualifier {
 
     /// The interface whose members a reference reaches, or `None` when the module
     /// has errors of its own or performs IO, each reported where it stands.
-    pub(super) fn reachable(&self) -> Option<&Interface> {
+    pub(in crate::ccl::lower) fn reachable(&self) -> Option<&Interface> {
         self.interface.as_deref().filter(|interface| {
             interface.unimportable.is_none() || self.kind != QualifierKind::Import
         })
@@ -946,6 +1037,14 @@ pub(super) fn module_scope(
         };
         let reached = if module.is_some() {
             Ok(Reached::Value(None))
+        } else if qualifier.declares_nominal(&item.name.node) {
+            qualifier
+                .reach_nominal(
+                    &QualifiedName::new(qualifier_name.clone()),
+                    &item.name.node,
+                    item.name.span,
+                )
+                .map(|found| Reached::Nominal(found.map(|found| (found, qualifier.name.clone()))))
         } else if chl_parser::ast::is_type_name(&item.name.node) {
             qualifier
                 .reach_type(
