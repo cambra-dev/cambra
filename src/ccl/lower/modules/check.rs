@@ -24,7 +24,7 @@ pub struct TypeCheck {
 pub(super) fn type_checks(
     checked: Vec<(Span, Type, TypeEntryForm)>,
     spelling: &QualifiedName,
-    types: &HashMap<TypeParamId, Type>,
+    types: &Arguments,
 ) -> Vec<TypeCheck> {
     let written = |ty: &Type| {
         let mut ty = reroot(ty, spelling);
@@ -182,6 +182,33 @@ impl<'a> ProgramLowering<'a> {
     /// ([`ProgramLowering::nested`]).
     pub(super) fn check(&mut self, file: FileId, ctx: &mut LoweringContext) -> Option<ModuleCheck> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
+        // The shared imports it reaches, each after the ones it reaches.
+        let mut reached = HashSet::new();
+        let mut pending: Vec<SharedImport> = self.program.ast(file).map_or_else(Vec::new, |ast| {
+            ast.body
+                .iter()
+                .filter_map(|stmt| Some(self.imports.get(&stmt.span)?.shared.clone()))
+                .collect()
+        });
+        while let Some(shared) = pending.pop() {
+            if reached.insert(shared.clone()) {
+                pending.extend(
+                    self.shared_reached
+                        .get(&shared)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        // The tree holds the module's own predicates, and each shared import's copy holds its
+        // module's, so a run the module creates of any of them copies its own.
+        self.holding_predicates.clear();
+        self.holding_predicates.insert(file);
+        let shared_modules: Vec<FileId> = reached
+            .iter()
+            .filter_map(|shared| self.program.file_of(&shared.module))
+            .collect();
+        self.holding_predicates.extend(shared_modules);
         let mut chain = {
             let _copy = crate::ccl::provenance::copy_frame("check.module");
             lowered.chain.clone()
@@ -241,10 +268,32 @@ impl<'a> ProgramLowering<'a> {
         let chain = checked_by(chain, &QualifiedName::new("import"), &imports, ctx);
         let mut qualified = self.shared_names(&lowered.scope);
         self.checking = true;
-        let chain = self.expand_runs(chain, &RunPath::default(), &mut qualified, &modules, ctx);
+        let chain = self.expand_runs(
+            chain,
+            &RunPath::default(),
+            &mut qualified,
+            &modules,
+            &HashMap::new(),
+            ctx,
+        );
         self.checking = false;
         let scope = use_names(&lowered.scope, qualified);
-        let chain = uniquify::run_in(chain, &raw_scope(&scope), None);
+        let mut chain = uniquify::run_in(chain, &raw_scope(&scope), None);
+        // Each of the module's own `const` parameters reads a value known only by its type,
+        // bound just above it, which the parameter stands for in every predicate and which
+        // a read of it is known to be ([`settle_const_params`]). The parameter's own `let`
+        // cannot name the parameter in its annotation, which is outside its scope.
+        let mut own = HashMap::new();
+        for parameter in &lowered.interface.parameters {
+            let Some(constant) = parameter.constant() else {
+                continue;
+            };
+            let (binder, atom) =
+                read_through_atom(&mut chain, &parameter.name, parameter.declared, ctx);
+            own.insert(constant.param.id, atom);
+            let term = ConstTerm::Param(constant.param.clone());
+            self.const_values.insert(binder, (term, parameter.declared));
+        }
         // A module's chain ends at its placeholder, and the root's at its last
         // statement.
         let mut tree = if lowered.as_root {
@@ -254,24 +303,6 @@ impl<'a> ProgramLowering<'a> {
             let tail = ctx.tag_machinery(Expr::lit(Lit::Unit), span, "check.module");
             fill_module_body(chain, tail)
         };
-        // The shared imports it reaches, each after the ones it reaches.
-        let mut reached = HashSet::new();
-        let mut pending: Vec<SharedImport> = self.program.ast(file).map_or_else(Vec::new, |ast| {
-            ast.body
-                .iter()
-                .filter_map(|stmt| Some(self.imports.get(&stmt.span)?.shared.clone()))
-                .collect()
-        });
-        while let Some(shared) = pending.pop() {
-            if reached.insert(shared.clone()) {
-                pending.extend(
-                    self.shared_reached
-                        .get(&shared)
-                        .cloned()
-                        .unwrap_or_default(),
-                );
-            }
-        }
         {
             let _copy = crate::ccl::provenance::copy_frame("check.module");
             for (shared, chain) in self.shared_chains.iter().rev() {
@@ -282,6 +313,7 @@ impl<'a> ProgramLowering<'a> {
         }
         let copies = self.method_copies.clone();
         add_method_copies(&mut tree, &copies, ctx);
+        settle_const_params(&mut tree, &self.const_values, &own, ctx);
         Some(ModuleCheck {
             module: lowered.interface.module.clone(),
             file,
@@ -432,4 +464,55 @@ pub(super) fn opaque_members(
             opaque_members(inner, params);
         }
     }
+}
+
+/// `chain`, a module's check chain after uniquification, with a `let` of a new binder,
+/// spelled as its top-level parameter `parameter`, of a value known only by the parameter's
+/// annotation, bound above the parameter's `let`. Returns the parameter's binder and the
+/// new one.
+fn read_through_atom(
+    chain: &mut Expr,
+    parameter: &str,
+    declared: Span,
+    ctx: &mut LoweringContext,
+) -> (Name, Name) {
+    const LABEL: &str = "check.const_param";
+    let mut at = chain;
+    loop {
+        if let TypedExprNode::Let { binding, .. } = &at.node
+            && binding.name.home().is_none()
+            && binding.name.base() == parameter
+        {
+            break;
+        }
+        at = spine_body_mut(at)
+            .unwrap_or_else(|| panic!("the check binds the parameter `{parameter}`"));
+    }
+    let id = at.node_id();
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = std::mem::take(at).node
+    else {
+        unreachable!("matched a `let` above");
+    };
+    let atom = Name::fresh_like(&binding.name);
+    let value = ctx.tag_machinery(Expr::new(TypedExprNode::Abstract), declared, LABEL);
+    let parameter_binder = binding.name.clone();
+    let annotation = binding.user_annotation.clone();
+    let inner = Expr::preserve(
+        id,
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        },
+    );
+    let outer = match annotation {
+        Some(ty) => Expr::let_bind_annotated(atom.clone(), value, inner, ty),
+        None => Expr::let_bind(atom.clone(), value, inner),
+    };
+    *at = ctx.tag_machinery(outer, declared, LABEL);
+    (parameter_binder, atom)
 }

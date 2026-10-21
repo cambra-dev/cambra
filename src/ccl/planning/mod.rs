@@ -57,6 +57,7 @@ use conditionals::Witnesses;
 // `fn_of_bare_predicate` is only reached from `iterate`/`predicates`'s own
 // imports today, so its re-export exists purely to keep the documented path
 // resolvable — hence the `allow`.
+pub(crate) use const_fold::eval_binop;
 pub(crate) use iterate::insert_iterate_markers;
 pub(crate) use loops::plan_loops;
 pub(crate) use predicates::compile_refinement_predicates;

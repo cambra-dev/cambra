@@ -10,8 +10,9 @@
 //! (`super::modules`), and so does a name qualified by a type, `Shape::circle`
 //! or `shop::Shape::circle`, which lowering resolves among the nominal types the
 //! module reaches. Lowering therefore sees a top-level [`ChlStmt::Import`],
-//! [`ChlStmt::Run`], [`ChlStmt::Param`], and [`ChlStmt::Pub`] on a binding or a
-//! declaration, and no other module statement.
+//! [`ChlStmt::Run`], [`ChlStmt::Param`], [`ChlStmt::Pub`] on a binding or a
+//! declaration, and `const` on a binding or a value parameter, and no other module
+//! statement.
 //!
 //! The walk also collects every binder the module writes, for the rule that no
 //! binder takes the spelling of a name that denotes a module
@@ -128,6 +129,7 @@ impl Refusals {
                 name,
                 annotation,
                 default,
+                constant,
             } => {
                 if annotation.is_none() && !is_type_name(&name.node) {
                     // A value parameter states its type, if only as `_`, so a module says
@@ -137,6 +139,18 @@ impl Refusals {
                         format!(
                             "the parameter `{0}` has no annotation: write its type, `param {0}: \
                              Int`, or `param {0}: _` to infer it from the module's uses",
+                            name.node
+                        ),
+                    );
+                }
+                if let Some(keyword) = constant
+                    && is_type_name(&name.node)
+                {
+                    self.refuse(
+                        *keyword,
+                        format!(
+                            "`{}` is a type parameter, which is fixed at link time already; \
+                             `const` marks a value parameter",
                             name.node
                         ),
                     );

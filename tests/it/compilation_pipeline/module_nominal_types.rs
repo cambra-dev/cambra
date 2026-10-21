@@ -517,10 +517,10 @@ const INNER: &str = indoc! {"
     pub n = 2
 "};
 
-/// An associated function reaches nothing an import or a run gives its module, so every
-/// copy of it is one function: no state, no feed, no value parameter, no member of a
-/// Module-typed parameter, and no member of a run, directly or through the module's
-/// bindings.
+/// An associated function reaches nothing an import or a run gives its module but a `const`
+/// parameter, so every copy of it is one function: no state, no feed, no value parameter
+/// without `const`, no member of a Module-typed parameter, and no member of a run, directly
+/// or through the module's bindings.
 #[rstest]
 #[case::state(
     indoc! {"
@@ -554,7 +554,7 @@ const INNER: &str = indoc! {"
             plus(self.extract())
     "},
     "import shop\n",
-    "reads `n`, a value parameter of its module, through `plus` → `limit`;"
+    "reads `n`, a value parameter of its module without `const`, through `plus` → `limit`;"
 )]
 #[case::run_member(
     indoc! {"

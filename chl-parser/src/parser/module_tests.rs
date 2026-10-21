@@ -192,6 +192,7 @@ fn a_value_parameter_takes_an_exact_type_and_a_default() {
         name,
         annotation,
         default,
+        constant: None,
     } = only_stmt("param region: String = \"us\"\n")
     else {
         panic!("expected a param");
@@ -223,6 +224,7 @@ fn a_type_parameter_takes_a_bound_and_a_default_type() {
         name,
         annotation,
         default,
+        constant: None,
     } = only_stmt("param Receipt <: {id: String} = stripe::Receipt\n")
     else {
         panic!("expected a param");
@@ -232,6 +234,58 @@ fn a_type_parameter_takes_a_bound_and_a_default_type() {
     assert_eq!(annotation.mode, AnnotationMode::Bounded);
     assert!(matches!(annotation.ty.node, Expr::BraceRecord(_)));
     assert!(matches!(default.map(|d| d.node), Some(Expr::Qualified(_))));
+}
+
+// ---- const ----------------------------------------------------------------
+
+#[test]
+fn const_marks_a_parameter() {
+    let Stmt::Param {
+        name,
+        constant: Some(keyword),
+        ..
+    } = only_stmt("const param max_rate: Int\n")
+    else {
+        panic!("expected a const param");
+    };
+    assert_eq!(name.node, "max_rate");
+    assert_eq!(keyword.as_range(), 0..5);
+}
+
+/// `const` marks only a parameter: a binding is a constant when its definition is one.
+#[test]
+fn const_stands_only_on_a_param() {
+    for (src, needle) in [
+        (
+            "const limit = 10\n",
+            "`const` marks a parameter, `const param x: T`",
+        ),
+        (
+            "const limit: Int = 10\n",
+            "`const` marks a parameter, `const param x: T`",
+        ),
+        (
+            "const pub x = 1\n",
+            "`const` marks a parameter, `const param x: T`",
+        ),
+        ("const const param x: Int\n", "`const` is written once"),
+        (
+            "const x := 1\n",
+            "`const` marks a parameter: `const param x: T`",
+        ),
+    ] {
+        assert_error(src, needle);
+    }
+}
+
+/// `const` on a statement that does not parse adds no error to the statement's own.
+#[test]
+fn const_on_a_broken_statement_reports_the_statement() {
+    let errors = errors("const x = )\n");
+    assert!(
+        errors.iter().all(|e| !e.contains("`const`")),
+        "expected only the statement's error, got {errors:#?}"
+    );
 }
 
 #[test]

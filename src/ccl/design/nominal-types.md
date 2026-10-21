@@ -26,12 +26,17 @@ which is empty, and another module's at that module's path. A declaration has no
 implicit arguments are types, which have none, so the solver keys its nominal contributions by
 declaration in a `DeclMap`, which finds a key by equality and keeps its entries in insertion order.
 
-The implicit parameters are the type parameters of the declaring module that the type reaches,
-recorded once the module lowers (`NominalDecl::implicit`). The module's own code names the
-declaration with each standing for itself. The type arguments an import or a run passes make an
-instance whose implicit arguments are theirs (`NominalDecl::substituted`), sharing the declaration's
-body, so two imports or runs given different arguments hold two types ([modules.md, "Nominal types
-across modules"](../../../docs/modules.md#nominal-types-across-modules)).
+The implicit parameters are the type parameters and the `const` parameters of the declaring module
+that the type reaches, recorded once the module lowers (`NominalDecl::implicit` and
+`NominalDecl::implicit_consts`). The module's own code names the declaration with each standing for
+itself. The arguments an import or a run passes make an instance whose implicit arguments are
+theirs, sharing the declaration's body, so two imports or runs given different arguments hold two
+types ([modules.md, "Nominal types across
+modules"](../../../docs/modules.md#nominal-types-across-modules)). A type argument is a `Type`
+(`NominalDecl::substituted`). A `const` argument is a `ConstTerm`, a term over the `const`
+parameters of the module that wrote the `import` or `run`, kept in normal form, so it is a value
+once linking has given those parameters theirs (`NominalDecl::substituted_consts`,
+`src/ccl/constant.rs`).
 
 A `NominalDecl` holds its name, its type parameters, and its body, set once by `define`:
 
@@ -97,7 +102,8 @@ A type name resolves after the base types and the aliases in scope. `N` and `N(�
 ### Constructors
 
 A constructor that declares parameters is a function. `bind_constructors` binds each one around
-the whole module, under the name `N::c`:
+the whole module, under the name `N::c`, or, for a declaration whose refinements read a `const`
+parameter, below that parameter's `let` (`below_last_let`), where the name is in scope:
 
 ```
 let N::c : forall (𝑃…) _ = λ __ctor_arg : payload → N::c(__ctor_arg) in …
@@ -105,9 +111,19 @@ let N::c : forall (𝑃…) _ = λ __ctor_arg : payload → N::c(__ctor_arg) in 
 
 The lambda's parameter carries the payload as an annotation. A call therefore checks its argument
 against the declared parameter type, refinements included, by the rule every annotated parameter
-follows. A parameterised declaration's constructor is polymorphic through the `Poly` annotation,
-whose parameters are the declaration's own. `N::c` in an expression is a reference to the binding,
-and `N::c(𝑎…)` applies it as a call to a `def` is applied (`exprs::apply_named`).
+follows.
+
+A refinement in a constructor's parameter type names only `_` and constants ([chl-spec.md, "9.19
+Constants"](../../../docs/chl-spec.md#919-constants)). `lower_parameter_type` replaces each constant
+binding it names, and each constant of another module, by its term (`predicate_term`), so the
+parameter type reads only the module's `const` parameters, and refuses any other name. In a copy of
+the module, linking replaces each of those by the term its import or run gives it
+(`settle_const_params`, [modules.md, "Linking"](../../../docs/modules.md#linking)), so
+`type Capped = {Int where _ <= limit}` under `limit = max_rate * 2` checks `Capped::new(3)` against
+`{Int | __elem <= 10}` in a run given `max_rate=5`. A parameterised declaration's constructor is
+polymorphic through the `Poly` annotation, whose parameters are the declaration's own. `N::c` in
+an expression is a reference to the binding, and `N::c(𝑎…)` applies it as a call to a `def` is
+applied (`exprs::apply_named`).
 
 A constructor that declares no parameters is a value. `N::c` lowers to the nominal constructor
 over `unit` where it is named, and needs no binding.
@@ -176,10 +192,11 @@ type parameters, each named once. An associated function stands at a module's to
 with a `Mut` parameter is refused.
 
 `associated_reach` refuses an associated function that reaches the module's state, a source, a value
-parameter, a member of a Module-typed parameter, or a member of a run the module declares, through
-the module's bindings and functions: the copies of the module whose arguments the type does not tell
-apart share the type, so their copies of the function must be one function. A type parameter it
-reaches the same way joins the type's identity instead (`settle_implicit`).
+parameter without `const`, a member of a Module-typed parameter, or a member of a run the module
+declares, through the module's bindings and functions: the copies of the module whose arguments the
+type does not tell apart share the type, so their copies of the function must be one function. A
+type parameter or a `const` parameter it reaches the same way joins the type's identity instead
+(`settle_implicit`).
 
 ### Method calls
 
@@ -268,7 +285,9 @@ scrutinee is constrained below the declaration at fresh arguments, and each arm'
 constructor's payload at those arguments. The payload keeps the declaration's refinements, typed
 as an annotation's predicates are: every value of the type was built by a constructor, whose
 function discharged them. So `Price::new(c) = p` gives `c` the type `{Int where _ >= 0}` for
-`type Price = {Int where _ >= 0}`.
+`type Price = {Int where _ >= 0}`. A refinement that reads a `const` parameter is left out
+(`NominalCtor::destructured`): the declaration's copy of it names the parameter as the module
+spells it, which only the constructor's function, bound where the name is in scope, resolves.
 
 ### Subtyping
 
@@ -342,6 +361,9 @@ refinements, so it refuses every variable whose type mentions a nominal type
 - A recursive declaration, one whose constructors' parameter types reach the declaration itself.
   Its representation would be an infinite type. Lowering refuses it at the declaration.
 - An associated function with a `Mut` parameter. Lowering refuses it at the parameter.
-- A refinement in a constructor's parameter type that names a module binding. The constructor
-  functions are bound outside the whole module, where no module binding is in scope, so lowering
-  refuses a parameter type with a free name.
+- A refinement in a constructor's parameter type that names a binding other than a constant, or a
+  constant whose value is a tuple, a record or a list, which a predicate does not hold yet. Lowering
+  refuses it at the parameter type. A `const` parameter's value is known only once an import or a
+  run gives it, so linking refuses a run that gives a tuple, a record or a list to one such a
+  refinement reads
+  ([modules.md, "Linking"](../../../docs/modules.md#linking)).

@@ -14,7 +14,7 @@ use super::*;
 /// A statement that declares a sink.
 pub(super) enum SinkDecl {
     /// `requests, responses = http_serve(port, method, path)`.
-    Http(HttpServeDecl),
+    Http(Box<HttpServeDecl>),
     /// `name = test_sink()`.
     #[cfg(any(test, feature = "test-helpers"))]
     Test { name: String },
@@ -40,7 +40,7 @@ pub(super) fn sink_declaration(
     if let Some(name) = test_sink_name(target, value) {
         return Some(SinkDecl::Test { name });
     }
-    http_serve_decl(target, value).map(SinkDecl::Http)
+    http_serve_decl(target, value).map(|decl| SinkDecl::Http(Box::new(decl)))
 }
 
 /// The refusal for a sink declared outside the top-level block.

@@ -64,8 +64,8 @@ pub(super) fn lower_chain_recovering(
         .collect();
     errors.extend(sink_rebindings(stmts, &declared));
     let body = nominal::bind_constructors(body, ctx);
-    let (associated, reached_types) = nominal::associated_reach(&body, ctx);
-    nominal::settle_implicit(&reached_types, ctx);
+    let (associated, reached_by) = nominal::associated_reach(&body, ctx);
+    nominal::settle_implicit(&reached_by, ctx);
     errors.extend(associated);
     Some(body)
 }
@@ -93,12 +93,16 @@ fn declare_top_level_types(
     ctx: &mut LoweringContext,
     errors: &mut Vec<LoweringError>,
 ) -> bool {
+    ctx.constants = constants::ModuleConstants::of(stmts);
     let declared = nominal::declare_nominal_types(stmts, ctx);
     if !declared.is_empty() {
         errors.extend(declared);
         return false;
     }
     errors.extend(pre_declare_module_types(stmts, ctx));
+    // A constructor's refinement reads the terms of the constants it names, and the
+    // interface records which public members are constants.
+    ctx.settle_constants();
     let defined = nominal::define_nominal_types(stmts, ctx);
     if !defined.is_empty() {
         errors.extend(defined);
@@ -209,8 +213,8 @@ pub(super) fn lower_stmts_recovering(
             }
         });
     let body = nominal::bind_constructors(body, ctx);
-    let (associated, reached_types) = nominal::associated_reach(&body, ctx);
-    nominal::settle_implicit(&reached_types, ctx);
+    let (associated, reached_by) = nominal::associated_reach(&body, ctx);
+    nominal::settle_implicit(&reached_by, ctx);
     errors.extend(associated);
     Some(body)
 }
@@ -669,7 +673,7 @@ pub(super) fn lower_middle_stmt(
             match decl {
                 #[cfg(any(test, feature = "test-helpers"))]
                 SinkDecl::Test { name } => lower_test_sink(name, stmt.span, body, ctx),
-                SinkDecl::Http(decl) => lower_http_serve(decl, stmt.span, value.span, body, ctx),
+                SinkDecl::Http(decl) => lower_http_serve(*decl, stmt.span, value.span, body, ctx),
             }
         }
         // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a
@@ -1065,6 +1069,7 @@ pub(super) fn lower_middle_stmt(
             name,
             annotation,
             default,
+            constant,
         } => {
             // A Module-typed parameter binds a `let` per value its Module type
             // names, each run binding it to the argument's member
@@ -1079,6 +1084,16 @@ pub(super) fn lower_middle_stmt(
                 .iter()
                 .find(|p| p.name == name.node && p.module().is_some())
             {
+                if let Some(keyword) = constant {
+                    return Err(LoweringError::unsupported(
+                        *keyword,
+                        format!(
+                            "`{}` is of Module type, which is fixed at link time already; \
+                             `const` marks a value parameter",
+                            name.node
+                        ),
+                    ));
+                }
                 let lets = parameter.entry_lets();
                 return Ok(lets.into_iter().rev().fold(body, |body, (binder, ty)| {
                     let value = ctx.tag_image(Expr::new(TypedExprNode::Abstract), stmt.span);
@@ -1089,6 +1104,28 @@ pub(super) fn lower_middle_stmt(
             let value = match default {
                 Some(default) => lower_expr(default, ctx)?,
                 None => ctx.tag_image(Expr::new(TypedExprNode::Abstract), stmt.span),
+            };
+            // A `const` parameter's default is a constant over the parameters above it.
+            let constant = match constant {
+                Some(_) => {
+                    let param = ctx
+                        .constants
+                        .param(&name.node)
+                        .expect("each `const param` is recorded before the module lowers")
+                        .clone();
+                    let default = match default {
+                        Some(default) => match ctx.const_term(default, stmt.span.start) {
+                            Ok(term) => Some(term),
+                            Err(constants::Refused(Some(error))) => return Err(error),
+                            // A member of a module with errors of its own: the parameter
+                            // takes no default value, and reports nothing more.
+                            Err(constants::Refused(None)) => None,
+                        },
+                        None => None,
+                    };
+                    Some(modules::ConstParameter { param, default })
+                }
+                None => None,
             };
             // The annotation is the whole annotation of the parameter's `let`, so it may be
             // polymorphic (`docs/chl-spec.md`, "Polymorphic type annotations").
@@ -1103,7 +1140,10 @@ pub(super) fn lower_middle_stmt(
                 name: name.node.clone(),
                 declared: stmt.span,
                 default: default.is_some(),
-                kind: modules::ParameterKind::Value(annotation.clone()),
+                kind: modules::ParameterKind::Value {
+                    ty: annotation.clone(),
+                    constant,
+                },
             });
             let bound = match annotation {
                 Some(ty) => Expr::let_bind_annotated(name.node.as_str(), value, body, ty),
@@ -2656,6 +2696,7 @@ pub(super) fn pre_declare_module_types(
                 name,
                 annotation,
                 default,
+                ..
             } if is_type_name(&name.node) => {
                 if let Some(clash) = nominal_type_clash(&name.node, stmt.span, ctx) {
                     errors.push(clash);
