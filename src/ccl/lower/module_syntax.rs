@@ -519,6 +519,13 @@ impl Refusals {
                 self.expr(domain);
                 self.expr(codomain);
             }
+            ChlExpr::Family { binders, body } => {
+                for (_, ty) in binders {
+                    self.expr(ty);
+                }
+                self.expr(body);
+            }
+            ChlExpr::TypeBinder { ty, .. } => self.expr(ty),
             ChlExpr::Subscript { target, index, .. } => {
                 self.expr(target);
                 self.expr(index);

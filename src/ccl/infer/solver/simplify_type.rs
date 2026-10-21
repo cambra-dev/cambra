@@ -239,6 +239,19 @@ fn simplify_analyze(
             );
         }
     }
+    // A family's domains and body recurse as a dependent tuple's components do.
+    if let Some(family) = &ct.family {
+        for v in family.domains.iter().chain(std::iter::once(&*family.body)) {
+            simplify_analyze(
+                v,
+                pol,
+                input_rec_vars,
+                all_vars,
+                rec_processed,
+                co_occurrences,
+            );
+        }
+    }
     // Variant payloads recurse at the same polarity (covariant depth),
     // matching how records' payloads behave.
     if let Some(tags) = &ct.var {
@@ -406,6 +419,16 @@ fn simplify_reconstruct(
             .collect(),
     });
 
+    let new_family = ct.family.map(|f| super::compact::CompactFamily {
+        names: f.names,
+        domains: f
+            .domains
+            .into_iter()
+            .map(|d| simplify_reconstruct(d, var_subst))
+            .collect(),
+        body: Box::new(simplify_reconstruct(*f.body, var_subst)),
+    });
+
     let new_nominal = ct
         .nominal
         .into_iter()
@@ -430,6 +453,7 @@ fn simplify_reconstruct(
         refinements: ct.refinements,
         history_slot: new_history_slot,
         dep_tuple: new_dep_tuple,
+        family: new_family,
         nominal: new_nominal,
         nominal_conflict: ct.nominal_conflict.map(|(decl, a, b)| {
             (

@@ -334,6 +334,15 @@ fn hash_type<'a>(
                 hash_type(t, env, wenv, free, state);
             }
         }
+        // The body's references to the binders are indices, so the names stay out, as a
+        // `Fun`'s binder does.
+        T::Family { binders, body } => {
+            binders.len().hash(state);
+            for (_, t) in binders {
+                hash_type(t, env, wenv, free, state);
+            }
+            hash_type(body, env, wenv, free, state);
+        }
         T::Record(fields) => hash_type_fields(fields, env, wenv, free, state),
         // Openness is not decoration: an open arm set commits only to the arms it
         // lists, so a closed and an open type over the same arms make different

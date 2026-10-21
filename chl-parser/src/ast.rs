@@ -552,8 +552,9 @@ pub enum PayloadPattern {
 pub struct TypeDecl {
     /// The capitalized type name.
     pub name: Spanned<SmolStr>,
-    /// The type parameters, `T` in `type Option(T):`.
-    pub params: Vec<Spanned<SmolStr>>,
+    /// The type parameters, `T` in `type Option(T):`, each with its kind where it states one,
+    /// `V: K => Type` for a family parameter.
+    pub params: Vec<TypeParam>,
     pub body: TypeDeclBody,
 }
 
@@ -1097,6 +1098,22 @@ pub enum Expr {
         type_params: Vec<TypeParam>,
         body: Box<Spanned<Expr>>,
         requires: Vec<Spanned<Requirement>>,
+    },
+
+    /// A family: `forall (k: K) T`, a type for each value `k` of `K`, written where a family
+    /// parameter takes its argument (`docs/chl-spec.md`, "Family parameters"). Its binders
+    /// name values and begin with a lowercase letter, where a [`Expr::Forall`]'s name types.
+    Family {
+        binders: Vec<(Spanned<SmolStr>, Spanned<Expr>)>,
+        body: Box<Spanned<Expr>>,
+    },
+
+    /// A binder in a type, `k: K`: the value of type `K` the type after it may read by the
+    /// name `k`. Written as a function type's parenthesised domain, `(k: K) |=> V(k)`.
+    /// Annotation-only, like [`Expr::FunctionType`].
+    TypeBinder {
+        name: Spanned<SmolStr>,
+        ty: Box<Spanned<Expr>>,
     },
 
     /// Ternary conditional: `then_expr if cond else else_expr`.

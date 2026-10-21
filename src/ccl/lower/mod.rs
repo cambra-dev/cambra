@@ -486,6 +486,20 @@ pub struct LoweringContext {
     /// (`docs/chl-spec.md`, "Type parameters"), which is what this answers.
     pub(super) type_params_in_scope: Vec<String>,
 
+    /// The family parameters of the type declaration being lowered, each with its index
+    /// types: a family parameter is written applied, `V(k)` (`docs/chl-spec.md`, "Family
+    /// parameters").
+    pub(super) family_params: Vec<(SmolStr, Rc<crate::ccl::ty::TypeParam>, Vec<Type>)>,
+
+    /// The value binders a type written here is inside, innermost last, each with the type it
+    /// ranges over: `k` in `(k: K) |=> V(k)` and in `forall (k: K) T`. A refinement and an
+    /// application of a family parameter read them.
+    pub(super) type_binders: Vec<(SmolStr, Type)>,
+
+    /// Whether a type declaration's constructors are being lowered, the one place a function
+    /// type binds its domain's value, `(k: K) |=> V(k)`.
+    pub(super) in_type_declaration: bool,
+
     /// The nominal types the module declares, by name (`docs/chl-spec.md`, "Declaring a
     /// nominal type"). Unlike an alias, a nominal type survives lowering as a
     /// [`Type::Nominal`] naming its declaration. Declared only at the top level, so never
@@ -1490,6 +1504,19 @@ fn lower_expr_inner(
             expr.span,
             "`forall (T) V` is a polymorphic *type*; it is written in annotation \
              position, not as a value",
+        )),
+        ChlExpr::Family { .. } => Err(LoweringError::unsupported(
+            expr.span,
+            "`forall (k: K) V` is a family of types; it is written as a type's argument, not \
+             as a value",
+        )),
+        ChlExpr::TypeBinder { name, .. } => Err(LoweringError::unsupported(
+            expr.span,
+            format!(
+                "`{0}: T` binds a value in a type, as a function type's domain `({0}: K) |=> \
+                 V`, not as a value",
+                name.node
+            ),
         )),
         // Attribute access `target.attr` → `Apply(target, Proj(k))`. The `Proj` images
         // the `.attr` access the user wrote.

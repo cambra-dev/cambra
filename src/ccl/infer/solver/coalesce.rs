@@ -190,6 +190,12 @@ pub fn refuse_param_joined_with_outer_variable(graph: &CompactGraph) -> Result<(
         for component in ct.dep_tuple.iter().flat_map(|d| &d.components) {
             go(component, polarity)?;
         }
+        if let Some(family) = &ct.family {
+            for domain in &family.domains {
+                go(domain, polarity)?;
+            }
+            go(&family.body, polarity)?;
+        }
         for payload in ct.var.iter().flat_map(|tags| tags.tags.values()) {
             go(payload, polarity)?;
         }
@@ -505,6 +511,18 @@ fn coalesce_compact_go(
         }
         shapes.push(Type::dep_tuple(components));
     }
+    // A family's body arrives closed against its binders, so the family is its
+    // materialized parts as they stand.
+    if let Some(family) = &ct.family {
+        let mut binders = Vec::with_capacity(family.domains.len());
+        for (name, d) in family.names.iter().zip(&family.domains) {
+            binders.push((name.clone(), coalesce_compact_go(d, polarity, scope)?));
+        }
+        shapes.push(Type::Family {
+            binders,
+            body: Box::new(coalesce_compact_go(&family.body, polarity, scope)?),
+        });
+    }
     if let Some(var) = &ct.var {
         shapes.push(materialize_variant(var, polarity, scope)?);
     }
@@ -808,6 +826,7 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
         let has_other = !ct.atoms.is_empty()
             || ct.rec.is_some()
             || ct.dep_tuple.is_some()
+            || ct.family.is_some()
             || ct.var.is_some()
             || ct.fun.is_some();
         if !has_other {

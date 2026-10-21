@@ -177,7 +177,16 @@ impl Printer {
                 None => p.spelling.to_string(),
             },
             // A compiler-made family has no CHL spelling.
-            Type::FamilyApp(_) => self.fallback(ty),
+            Type::FamilyApp(app) if app.param.generalized => self.fallback(ty),
+            Type::FamilyApp(app) => {
+                let args: Vec<String> = app
+                    .args
+                    .iter()
+                    .map(|a| self.expr(&a.term, Prec::Lowest, &Vec::new()))
+                    .collect();
+                format!("{}({})", app.param.spelling, args.join(", "))
+            }
+            Type::Family { binders, body } => self.family(binders, body),
             Type::Tuple(ts) => match ts.as_slice() {
                 [] => "{}".to_string(),
                 [only] => format!("{{{},}}", self.ty(only)),
@@ -280,6 +289,36 @@ impl Printer {
             | Type::WitnessProjection(_)
             | Type::BoundedHole(_)
             | Type::DepTuple(_) => self.fallback(ty),
+        }
+    }
+
+    /// A family, `forall (k: K) T`, or its body alone where the body reads no binder: a type
+    /// where a family is wanted is the family constant at it.
+    fn family(&mut self, binders: &[(Option<Name>, Type)], body: &Type) -> String {
+        let dependent = crate::ccl::subst::references_binder_within(body, binders.len() as u32);
+        let mut shown = Vec::with_capacity(binders.len());
+        for (name, domain) in binders {
+            let spelled = match name {
+                Some(n) => self.binder(n, "k"),
+                None => "_".to_string(),
+            };
+            shown.push(format!("{spelled}: {}", self.ty(domain)));
+            self.binders.push(Some(spelled.clone()));
+            if let Some(n) = name {
+                self.spelled.push((n.clone(), spelled));
+            }
+        }
+        let text = self.ty(body);
+        for (name, _) in binders {
+            self.binders.pop();
+            if name.is_some() {
+                self.spelled.pop();
+            }
+        }
+        if dependent {
+            format!("forall ({}) {text}", shown.join(", "))
+        } else {
+            text
         }
     }
 

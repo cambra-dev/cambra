@@ -620,7 +620,7 @@ fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
             declared.insert(
                 decl.name.node.to_string(),
                 DeclaredType {
-                    params: decl.params.iter().map(|p| p.node.to_string()).collect(),
+                    params: decl.params.iter().map(|p| p.name.to_string()).collect(),
                     ctors,
                 },
             );

@@ -81,8 +81,9 @@ pub enum AtomKey {
     /// A witness projected through a sum's value ([`Type::WitnessProjection`]), which
     /// matches only a projection equal to it: one witness, named the same way.
     Projection(ClosedAtom),
-    /// A generalized family applied to terms ([`Type::FamilyApp`]), which matches only an
-    /// application equal to it: one family, at the same values.
+    /// A family applied to terms ([`Type::FamilyApp`]): a generalized one, or an opened family
+    /// parameter inside the definition it is opened for. It matches only an application equal
+    /// to it: one family, at the same values.
     Family(ClosedAtom),
 }
 
@@ -105,7 +106,7 @@ impl ClosedAtom {
     fn new(ty: &Type) -> Self {
         debug_assert!(
             !crate::ccl::subst::type_contains_infer(ty),
-            "a closed atom is born after inference and the solver holds it whole: {ty}"
+            "a closed atom holds no inference variable, so the solver holds it whole: {ty}"
         );
         let unnamed = ty.without_pi_names();
         let hash = {
@@ -603,6 +604,17 @@ pub struct CompactDepTuple {
     pub components: Vec<CompactType>,
 }
 
+/// A family in a compacted position ([`Type::Family`]): each binder's name and domain, and
+/// the body compacted under every binder. The names are opening addresses and spellings, as
+/// [`CompactFun::name`] is; the body's references to the binders are indices by the time they
+/// land.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactFamily {
+    pub names: Vec<Option<Name>>,
+    pub domains: Vec<CompactType>,
+    pub body: Box<CompactType>,
+}
+
 /// A merged function shape — the **single** carrier for every function-shaped type,
 /// plain function and dependent sum alike. What distinguishes them is the
 /// [`CompactTypeKind`], so both reach one position through one slot and
@@ -723,6 +735,7 @@ impl CompactType {
             refinements,
             history_slot,
             dep_tuple,
+            family,
             nominal,
             nominal_conflict: _,
         } = self;
@@ -734,6 +747,7 @@ impl CompactType {
                 || refinements.as_ref().is_some_and(|r| !r.is_empty())
                 || history_slot.is_some()
                 || dep_tuple.is_some()
+                || family.is_some()
                 || !nominal.is_empty(),
         }
     }
@@ -1054,6 +1068,10 @@ pub struct CompactType {
     /// two shapes ([`shapes`](Self::shapes)). Materialization collapses a tuple whose
     /// components read no earlier one to the plain tuple (`Type::dep_tuple`).
     pub dep_tuple: Option<CompactDepTuple>,
+    /// A family, if one contributed here ([`CompactFamily`]): the body compacted under every
+    /// binder, as a dependent tuple's later components are under the earlier ones. It stands
+    /// only as a nominal type's argument.
+    pub family: Option<CompactFamily>,
     /// Nominal contributions, keyed by declaration: each declaration with its arguments,
     /// one position per argument. Two declarations at one position are two shapes, which
     /// [`shapes`](Self::shapes) counts and coalesce reports: a join of two nominal types is
@@ -1216,6 +1234,12 @@ impl CompactType {
             visit(&mut history.value, Variance::Invariant);
             visit(&mut history.domain, Variance::Invariant);
         }
+        if let Some(family) = &mut self.family {
+            for d in family.domains.iter_mut() {
+                visit(d, Variance::Invariant);
+            }
+            visit(&mut family.body, Variance::Covariant);
+        }
         for (decl, args) in self.nominal.iter_mut() {
             let mut args = args.iter_mut();
             for v in &decl.body().variances {
@@ -1282,6 +1306,7 @@ impl CompactType {
             refinements: _,
             history_slot,
             dep_tuple,
+            family,
             nominal,
             nominal_conflict: _,
         } = self;
@@ -1293,6 +1318,7 @@ impl CompactType {
             + usize::from(fun.is_some())
             + usize::from(history_slot.is_some())
             + usize::from(dep_tuple.is_some())
+            + usize::from(family.is_some())
             + nominal.len()
     }
 
@@ -1305,6 +1331,10 @@ impl CompactType {
                 .iter()
                 .flat_map(|d| &d.components)
                 .any(Self::conflicted)
+            || self
+                .family
+                .iter()
+                .any(|f| f.domains.iter().any(Self::conflicted) || f.body.conflicted())
             || self
                 .var
                 .iter()
@@ -1375,6 +1405,7 @@ impl CompactType {
             refinements,
             history_slot,
             dep_tuple,
+            family,
             nominal,
             nominal_conflict: _,
         } = self;
@@ -1395,6 +1426,15 @@ impl CompactType {
                             .iter()
                             .zip(&b.components)
                             .all(|(x, y)| x.equiv(y))
+                }
+                _ => false,
+            }
+            && match (family, &other.family) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    a.domains.len() == b.domains.len()
+                        && a.domains.iter().zip(&b.domains).all(|(x, y)| x.equiv(y))
+                        && a.body.equiv(&b.body)
                 }
                 _ => false,
             }
@@ -1513,6 +1553,34 @@ impl CompactType {
                 })
             }
         };
+        // Binder by binder and then the body, as `constrain_go` relates two families: the
+        // binders are keyed by position, and a name is either side's spelling.
+        let family = match (lhs.family, rhs.family) {
+            (None, f) | (f, None) => f,
+            (Some(a), Some(b)) => {
+                assert_eq!(
+                    a.domains.len(),
+                    b.domains.len(),
+                    "two families of different arities met at one position: an argument of one \
+                     family parameter flowing into another's"
+                );
+                Some(CompactFamily {
+                    names: a
+                        .names
+                        .into_iter()
+                        .zip(b.names)
+                        .map(|(x, y)| x.or(y))
+                        .collect(),
+                    domains: a
+                        .domains
+                        .into_iter()
+                        .zip(b.domains)
+                        .map(|(x, y)| Self::merge(pol, x, y))
+                        .collect(),
+                    body: Box::new(Self::merge(pol, *a.body, *b.body)),
+                })
+            }
+        };
         let refinements = match (lhs.refinements, rhs.refinements) {
             // `None` is the identity, exactly as for the shape slots above.
             (None, r) | (r, None) => r,
@@ -1586,6 +1654,7 @@ impl CompactType {
             refinements,
             history_slot,
             dep_tuple,
+            family,
             nominal,
             nominal_conflict,
         }
@@ -1612,6 +1681,7 @@ impl CompactType {
             refinements,
             history_slot,
             dep_tuple,
+            family,
             kinds,
             nominal,
             nominal_conflict: _,
@@ -1623,6 +1693,7 @@ impl CompactType {
             && refinements.is_none()
             && history_slot.is_none()
             && dep_tuple.is_none()
+            && family.is_none()
             && nominal.is_empty()
             && kinds.is_empty()
     }
@@ -1850,6 +1921,7 @@ fn refinement_slot_present(ct: &CompactType) -> bool {
         || ct.fun.is_some()
         || ct.history_slot.is_some()
         || ct.dep_tuple.is_some()
+        || ct.family.is_some()
         || !ct.nominal.is_empty();
     if carries_content && ct.refinements.is_none() {
         return false;
@@ -1863,6 +1935,9 @@ fn refinement_slot_present(ct: &CompactType) -> bool {
             .iter()
             .flat_map(|d| &d.components)
             .all(refinement_slot_present)
+        && ct.family.iter().all(|f| {
+            f.domains.iter().all(refinement_slot_present) && refinement_slot_present(&f.body)
+        })
         && ct
             .var
             .iter()
@@ -2123,6 +2198,17 @@ fn consulted_in(
         // predicate (`compact_go`'s projection arm).
         Type::WitnessProjection(p) => {
             if crate::ccl::subst::holds_infer_var(&p.term) {
+                return None;
+            }
+            Some(crate::ccl::subst::type_free_vars(ty))
+        }
+        // A family's terms are quoted, as a projection's is.
+        Type::FamilyApp(app) => {
+            if app
+                .args
+                .iter()
+                .any(|a| crate::ccl::subst::holds_infer_var(&a.term))
+            {
                 return None;
             }
             Some(crate::ccl::subst::type_free_vars(ty))
@@ -2872,6 +2958,31 @@ fn compact_go_inner(
                 ..CompactType::value()
             }
         }
+        // A domain is an index type, compacted as a data domain is; the body compacts under
+        // every binder, as a codomain under its function's.
+        Type::Family { binders, body } => {
+            let domains = binders
+                .iter()
+                .map(|(_, t)| compact_go(t, pol, subst_acc, Position::invariant(), st))
+                .collect();
+            let mut acc = subst_acc.clone();
+            for (name, _) in binders {
+                st.scope.enter(name.clone());
+                if let Some(b) = name {
+                    acc = acc.shadow(b);
+                }
+            }
+            let body = compact_go(body, pol, &acc, Position::default(), st);
+            binders.iter().for_each(|_| st.scope.exit());
+            CompactType {
+                family: Some(CompactFamily {
+                    names: binders.iter().map(|(n, _)| n.clone()).collect(),
+                    domains,
+                    body: Box::new(body),
+                }),
+                ..CompactType::value()
+            }
+        }
         // A projection quotes a term, so a term substitution acts on it, as it does on
         // a predicate: a dependent application's `[c ↦ 𝑎]` turns `σ₁(c)` into `σ₁(𝑎)`.
         Type::WitnessProjection(_) => {
@@ -3470,6 +3581,7 @@ fn compact_go_inner(
                     fun,
                     history_slot,
                     dep_tuple,
+                    family,
                     nominal,
                     var,
                     // A sum is a shape: it is what the position *is*, and it
@@ -3502,6 +3614,7 @@ fn compact_go_inner(
                     && fun.is_none()
                     && history_slot.is_none()
                     && dep_tuple.is_none()
+                    && family.is_none()
                     && nominal.is_empty()
                     && !var_is_shape
             };

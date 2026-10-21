@@ -79,6 +79,32 @@ and whose input side is their meet, which both arms are subtypes of. Equating th
 arguments instead would need a join computed when the bounds are recorded, which the solver does
 not do.
 
+### Family parameters
+
+A family parameter, `V: K => Type`
+([chl-spec.md, "Family parameters"](../../../docs/chl-spec.md#family-parameters)), is a
+`TypeParam` with an `arity`, the number of values it is indexed by (`TypeParam::declared_family`).
+The declaration holds each one's index types, which read its other parameters
+(`NominalDecl::family_domains`). They are lowered before any constructor of the module, since a
+constructor's type may apply another declaration's family parameter.
+
+- **The declaration applies a family parameter as `Type::FamilyApp`**, the parameter and one
+  term per index. Each term is a variable naming a binder of a function type around it, `(k: K)`,
+  so the application is closed with that function's codomain.
+- **Its argument is a `Type::Family`**: binders, each with its domain, and a body stored under
+  them, as a codomain is stored under its function's binder. A reference from the body to binder
+  `𝑗` of `𝑛` is `PiBound(𝑛 − 1 − 𝑗)`. Lowering builds one for each argument form: written
+  `forall (k: K) T`, a family parameter passed on as `forall (k: K) V(k)`, and any other type
+  `T` as the constant family over fresh binders. `applied_to_params` passes each family
+  parameter as its own `forall (k: K) V(k)`.
+- **Instantiating applies the argument.** At `V(t)`, `instantiate` opens the argument's body at
+  its binders' names and maps each to the matching term (`subst::discharge_binders`). A term that
+  is a binder renames, which every application lowering builds is; any other term discharges.
+  `instantiate` reads a declaration with a family parameter opened (`generalize::opened_deep`),
+  so the terms name their binders, and closes the result.
+- **Variance counts each application as an occurrence of its parameter.** A family's domains are
+  equality positions, and its body stands where the family does.
+
 ---
 
 ## Lowering
@@ -278,7 +304,11 @@ one: a declaration named `Option`, and an associated function of it.
 ### The constructor rule
 
 `emit_nominal_ctor` types a constructor `N::c(𝑒)` as `N(𝛼…)`, one fresh variable per type
-parameter, and constrains `𝑒` below the constructor's payload at `𝛼…`. The payload is compared
+parameter, and constrains `𝑒` below the constructor's payload at `𝛼…`. A family parameter's
+argument is the family over fresh binders whose body is a variable minted under them
+(`fresh_nominal_args`), as a function's codomain variable is minted inside its binder, so it may
+read them; an application of the parameter in the payload renames them to its binders, and the
+variable resolves to the family a value's type determines. The payload is compared
 with its refinements stripped. The node is only ever the body of the constructor's function, whose
 parameter annotation already discharged them, or a constructor without parameters, whose payload
 is `unit`; the declaration's own predicates were never typed.
@@ -303,6 +333,10 @@ pair relates its output sides as a covariant pair and its input sides as a contr
 two arguments that are not split relate both ways. A nominal
 type paired with any other type, including another nominal type, falls to the catch-all mismatch.
 
+Two families relate their domains both ways and their bodies under the two sides' binders aligned,
+as two functions relate their codomains. A side whose body reads its binders by index opens at its
+names where the other side holds a variable, as a dependent tuple's components do.
+
 `extrude` carries each argument across a level boundary at the polarity its variance gives it,
 and an invariant argument, or a bipolar one that is not split, through the two-way proxies a
 history's payload uses. A split argument extrudes each side at its own polarity.
@@ -320,6 +354,11 @@ reports the join of two nominal types as a conflict. `coalesce_compact_go` mater
 as `Type::Nominal`, each side at its own polarity and a bipolar argument's two sides as one type
 where they agree (`nominal::split`). The specialization key (`spec_key`) and the simplification
 and display walks follow the same layout and polarities.
+
+A family compacts into `CompactType::family`: its domains as data domains are, and its body under
+its binders, which the scope enters as a function's binder. An application of an opened family
+parameter is an atom (`AtomKey::Family`), its terms closed against the binders the walk is inside
+of, and the names it consults are its terms' (`consulted_in`).
 
 ### Traits
 

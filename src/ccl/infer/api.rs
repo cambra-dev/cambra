@@ -2236,11 +2236,15 @@ fn collect_type_errors(
         // binder's scope over what the type can no longer name, and that `Poly` stays
         // (`src/ccl/design/type-parameters.md`, "Generalized types").
         Type::Param(param) if param.generalized => {}
-        // A family is generalized, so it stays as its `Poly` does.
-        Type::FamilyApp(_) => {}
+        // A generalized family stays as its `Poly` does.
+        Type::FamilyApp(app) if app.param.generalized => {}
         Type::Param(param) => errors.push(InferError::Unsupported(format!(
             "type parameter `{}` survived inference at `{context_sym}`",
             param.spelling
+        ))),
+        Type::FamilyApp(app) => errors.push(InferError::Unsupported(format!(
+            "family parameter `{}` survived inference at `{context_sym}`",
+            app.param.spelling
         ))),
         Type::Poly(poly)
             if !poly.params.is_empty() && poly.params.iter().all(|p| p.param.generalized) => {}
@@ -2255,6 +2259,8 @@ fn collect_type_errors(
         // (`src/ccl/design/nominal-types.md`, "After inference"). Its arguments are
         // walked below.
         Type::Nominal(..) | Type::Split { .. } => {}
+        // A family stands as a nominal type's argument, which stays to operator conversion.
+        Type::Family { .. } => {}
         Type::Fun { fun_kind, .. } => {
             // Coalesce resolves every kind var to a concrete `Data`/`Compute`
             // (`FunKind::resolved`); a surviving `FunKind::Var` is a missed resolution

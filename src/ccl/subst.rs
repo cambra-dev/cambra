@@ -2160,6 +2160,22 @@ impl Subst {
                     }
                 }
             }
+            // A domain stands where the family does, and the body is under every binder's
+            // name, restricted as a `Fun`'s codomain is.
+            Type::Family { binders, body } => {
+                for (_, t) in binders.iter_mut() {
+                    self.rewrite_type_go(t, memo);
+                }
+                let names: Vec<Name> = binders.iter().filter_map(|(n, _)| n.clone()).collect();
+                let restricted = names
+                    .iter()
+                    .fold(self.clone(), |s, b| s.shadow(b))
+                    .acting_on_type(body);
+                for b in &names {
+                    restricted.assert_no_capture(b);
+                }
+                restricted.rewrite_type_go(body, memo);
+            }
             Type::Nominal(_, ts) => ts.iter_mut().for_each(|t| self.rewrite_type_go(t, memo)),
             Type::Split { input, output } => {
                 self.rewrite_type_go(input, memo);
@@ -2579,6 +2595,25 @@ impl Subst {
                 }
                 Type::DepTuple(out)
             }
+            // The body under every binder's name, as a codomain is under its function's
+            // ([`Self::under_binder_ty`]).
+            Type::Family { binders, body } => {
+                let names: Vec<Name> = binders.iter().filter_map(|(n, _)| n.clone()).collect();
+                let restricted = names
+                    .iter()
+                    .fold(self.clone(), |s, b| s.shadow(b))
+                    .acting_on_type(body);
+                for b in &names {
+                    restricted.assert_no_capture(b);
+                }
+                Type::Family {
+                    binders: binders
+                        .iter()
+                        .map(|(n, t)| (n.clone(), self.apply_type(t)))
+                        .collect(),
+                    body: Box::new(restricted.apply_type(body)),
+                }
+            }
             Type::Nominal(d, ts) => {
                 Type::Nominal(d.clone(), ts.iter().map(|t| self.apply_type(t)).collect())
             }
@@ -2865,6 +2900,62 @@ pub fn close_pi_binder(binder: &Name, ty: &Type) -> Type {
     let mut out = ty.clone();
     PiWalk::new(PiMode::Close(&enclosing)).ty(&mut out, 0);
     out
+}
+
+/// Close `ty`'s references to `binders`, the binders around it outermost first, into indices:
+/// a reference to binder `𝑗` of `𝑛` becomes `PiBound(𝑛 − 1 − 𝑗)` plus the crossings walked inside
+/// `ty`. [`close_pi_binder`] is the one-binder case, and a [`Type::Family`]'s body is closed
+/// over all its binders at once ([`Type::family`]).
+pub fn close_pi_binders(binders: &[Option<Name>], ty: &Type) -> Type {
+    if !binders.iter().flatten().any(|b| is_free_in_type(b, ty)) {
+        return ty.clone();
+    }
+    let mut out = ty.clone();
+    PiWalk::new(PiMode::Close(binders)).ty(&mut out, 0);
+    out
+}
+
+/// A family's body, stored under `n` binders, with binder `𝑗` opened at what `at(𝑗)` maps it
+/// to, outermost first: the body reaches binder `𝑗` at `𝑛 − 1 − 𝑗` ([`Type::Family`]).
+pub fn open_family_body(n: usize, body: &Type, mut at: impl FnMut(usize) -> Mapping) -> Type {
+    let mut out = body.clone();
+    for j in 0..n {
+        out = open_pi_binder_at(&at(j), &out, (n - 1 - j) as u32);
+    }
+    out
+}
+
+/// `ty`, read under the names `binders`, at the terms `args`: a family applied to them
+/// ([`Type::FamilyApp`]). A term that is a binder renames the family's binder to it, which is
+/// the pattern-fragment case an application of a family parameter always is
+/// (`src/ccl/design/nominal-types.md`, "Family parameters"); any other term is discharged. A
+/// variable in `ty` suspends on the substitution, which is how an application reads a family
+/// whose instance inference has not yet found, and a rename is what lets the bounds that
+/// suspension receives reach the family's own variable.
+pub fn discharge_binders(binders: &[Name], ty: &Type, args: &[Rc<TypedExpr>]) -> Type {
+    debug_assert_eq!(binders.len(), args.len(), "one term per binder");
+    // The terms are the application's own, moved into the body, so they keep their
+    // identities.
+    crate::ccl::provenance::preserving_ids(|| {
+        let mapping: BTreeMap<Binder, Mapping> = binders
+            .iter()
+            .zip(args)
+            .filter(|(b, a)| !matches!(&a.node, TypedExprNode::Var(n) if n == *b))
+            .map(|(b, a)| {
+                let to = match &a.node {
+                    TypedExprNode::Var(n) if n.pi_bound_index().is_none() => {
+                        Mapping::Rename(n.clone())
+                    }
+                    _ => Mapping::Discharge(Rc::new((**a).clone())),
+                };
+                (b.clone(), to)
+            })
+            .collect();
+        if mapping.is_empty() {
+            return ty.clone();
+        }
+        Subst::of_binders(mapping).apply_type(ty)
+    })
 }
 
 /// Open the function whose codomain `ty` was just extracted from
@@ -3341,6 +3432,17 @@ impl<'a> PiWalk<'a> {
                 }
                 self.shadowed.truncate(base);
             }
+            // A domain stands where the family does; the body is inside every binder.
+            Type::Family { binders, body } => {
+                for (_, t) in binders.iter_mut() {
+                    self.ty(t, depth);
+                }
+                let base = self.shadowed.len();
+                self.shadowed
+                    .extend(binders.iter().filter_map(|(n, _)| n.clone()));
+                self.ty(body, depth + binders.len() as u32);
+                self.shadowed.truncate(base);
+            }
             Type::Nominal(_, ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
             Type::Split { input, output } => {
                 self.ty(input, depth);
@@ -3601,6 +3703,12 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
                 .iter()
                 .enumerate()
                 .any(|(k, (_, t))| ty_scan(t, depth + k as u32, within, visited)),
+            Type::Family { binders, body } => {
+                binders
+                    .iter()
+                    .any(|(_, t)| ty_scan(t, depth, within, visited))
+                    || ty_scan(body, depth + binders.len() as u32, within, visited)
+            }
             Type::Nominal(_, ts) => ts.iter().any(|t| ty_scan(t, depth, within, visited)),
             Type::Split { input, output } => {
                 ty_scan(input, depth, within, visited) || ty_scan(output, depth, within, visited)

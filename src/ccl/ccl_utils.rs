@@ -2235,6 +2235,13 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
                 .map(|(n, t)| (n.clone(), strip_refinements(t)))
                 .collect(),
         ),
+        Type::Family { binders, body } => Type::Family {
+            binders: binders
+                .iter()
+                .map(|(n, t)| (n.clone(), strip_refinements(t)))
+                .collect(),
+            body: Box::new(strip_refinements(body)),
+        },
         Type::Record(fs) => Type::Record(
             fs.iter()
                 .map(|(n, t)| (n.clone(), strip_refinements(t)))

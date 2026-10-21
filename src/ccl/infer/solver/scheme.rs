@@ -262,6 +262,11 @@ pub struct FreshenCache {
     pub own_params: Option<Rc<[crate::ccl::ty::TypeParamId]>>,
     /// An operator scheme's Pi binder → the name this instantiation gives it.
     pub binders: HashMap<crate::ccl::Name, crate::ccl::Name>,
+    /// Opened family parameter → what this instantiation stands it at: a variable that may
+    /// read the binders beside it, one per term the parameter is applied to. An application
+    /// is the variable with those binders discharged to its terms
+    /// (`src/ccl/design/nominal-types.md`, "Family parameters").
+    pub family_params: HashMap<crate::ccl::ty::TypeParamId, (Vec<crate::ccl::Name>, Type)>,
 }
 
 impl FreshenCache {
@@ -435,6 +440,13 @@ fn freshen_level(ty: &Type) -> Level {
         // solver never reads; normalization replaced it where the right-hand side was
         // emitted.
         Type::Param(param) => param.opened_at.unwrap_or(0),
+        // An application of an opened family parameter is quantified with its parameter,
+        // and its terms hold type slots as a predicate does.
+        Type::FamilyApp(app) => app
+            .args
+            .iter()
+            .map(|a| predicate_level(&a.term))
+            .fold(app.param.opened_at.unwrap_or(0), Level::max),
         Type::ChanDom(_, l) => l.0,
         _ => 0,
     };
@@ -446,6 +458,74 @@ fn freshen_level(ty: &Type) -> Level {
     }
     ty.walk_children(|c| lvl = lvl.max(freshen_level(c)));
     lvl
+}
+
+/// Whether `ty` holds an application of an opened family parameter.
+fn holds_family_app(ty: &Type) -> bool {
+    ty.holds_type(&|t| matches!(t, Type::FamilyApp(app) if app.param.opened_at.is_some()))
+}
+
+/// An application of the opened family parameter `app.param`, freshened: the variable this
+/// instantiation stands the parameter at, its binders discharged to the application's terms
+/// ([`FreshenCache::family_params`]). A parameter this freshening does not instantiate, one
+/// deeper than the cutoff in a specialization clone, is re-minted as a parameter is.
+fn freshen_family_app(
+    lim: Level,
+    app: &crate::ccl::ty::FamilyApp,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Type {
+    let args: Vec<Rc<TypedExpr>> = app
+        .args
+        .iter()
+        .map(|a| {
+            let _f = crate::ccl::provenance::copy_frame("infer.freshen_family_arg");
+            let mut term = (*a.term).clone();
+            freshen_expr_type_slots(&mut term, lim, target, cache);
+            Rc::new(term)
+        })
+        .collect();
+    let param = &app.param;
+    let instantiated = matches!(target, FreshenLevel::At(_)) || param.level() == lim + 1;
+    if !instantiated {
+        let fresh = match cache.params.get(&param.id) {
+            Some((_, Type::Param(p))) => Rc::clone(p),
+            _ => {
+                let p = crate::ccl::ty::TypeParam::opened_family(
+                    param.spelling.clone(),
+                    target.level_of(param.level()),
+                    None,
+                    param.bound_at,
+                    param.arity,
+                );
+                cache
+                    .params
+                    .insert(param.id, (Rc::clone(param), Type::Param(Rc::clone(&p))));
+                p
+            }
+        };
+        return Type::FamilyApp(crate::ccl::ty::FamilyApp::new(fresh, args));
+    }
+    if !cache.family_params.contains_key(&param.id) {
+        let names: Vec<crate::ccl::Name> = (0..param.arity)
+            .map(|_| crate::ccl::Name::fresh(format!("__{}_k", param.spelling.to_lowercase())))
+            .collect();
+        let telescope = names.iter().fold(
+            cache
+                .param_telescope
+                .clone()
+                .unwrap_or_else(Telescope::empty),
+            |t, n| t.extended(n.clone()),
+        );
+        let level = match target {
+            FreshenLevel::At(at) => at,
+            _ => target.level_of(param.level()),
+        };
+        let var = Type::Infer(InferVar::fresh_in(level, &telescope));
+        cache.family_params.insert(param.id, (names, var));
+    }
+    let (names, var) = &cache.family_params[&param.id];
+    crate::ccl::subst::discharge_binders(names, var, &args)
 }
 
 /// Copy `ty` with every variable introduced above `lim` replaced by a fresh one
@@ -482,7 +562,45 @@ pub fn freshen_above(
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_) => ty.clone(),
-        Type::FamilyApp(_) => unreachable!("a generalized family is born after inference"),
+        Type::FamilyApp(app) if app.param.generalized => {
+            unreachable!("a generalized family is born after inference")
+        }
+        // A declared family parameter, as a declared parameter is, names no solver content.
+        Type::FamilyApp(app) if app.param.opened_at.is_none() => ty.clone(),
+        Type::FamilyApp(app) => freshen_family_app(lim, app, target, cache),
+        // Each binder renamed as a function's is, and the body freshened opened, so an
+        // application of a family parameter in it discharges that parameter's binders to the
+        // terms by name.
+        Type::Family { binders, body } => {
+            let renamed: Vec<crate::ccl::Name> = binders
+                .iter()
+                .map(|(n, _)| {
+                    let n = n
+                        .clone()
+                        .unwrap_or_else(|| crate::ccl::Name::fresh("__family_k"));
+                    match &cache.site_telescope {
+                        Some(_) => cache
+                            .binders
+                            .entry(n.clone())
+                            .or_insert_with(|| crate::ccl::Name::fresh(n.base()))
+                            .clone(),
+                        None => n,
+                    }
+                })
+                .collect();
+            let opened = crate::ccl::subst::open_family_body(binders.len(), body, |j| {
+                crate::ccl::subst::Mapping::Rename(renamed[j].clone())
+            });
+            let fresh_body = freshen_above(lim, &opened, target, cache);
+            Type::family(
+                renamed
+                    .into_iter()
+                    .zip(binders)
+                    .map(|(n, (_, t))| (n, freshen_above(lim, t, target, cache)))
+                    .collect(),
+                fresh_body,
+            )
+        }
         // `uncurry`'s scheme names its components as a function names its binder, so each
         // instantiation names its own, the way the `Fun` arm below renames, and the variables
         // under them follow ([`FreshenCache::binders`]).
@@ -545,22 +663,40 @@ pub fn freshen_above(
                 ),
                 _ => name.clone(),
             };
+            let fun_kind = match fun_kind {
+                // A sum's binder kinds carry type children — the scheme's quantified
+                // variables sit among the candidates — so they freshen like any
+                // other position. The binders themselves are re-minted just below, by
+                // [`Type::alpha_convert_sum`].
+                FunKind::Data(Some(ws)) => FunKind::Data(Some(Rc::new(
+                    ws.iter()
+                        .map(|w| w.map_types(|t| freshen_above(lim, t, target, cache)))
+                        .collect(),
+                ))),
+                other => freshen_fun_kind(other, lim, target, cache),
+            };
+            let domain = freshen_above(lim, d, target, cache);
+            let codomain = match &name {
+                // An application of a family parameter discharges that parameter's
+                // binders to its terms by name, so a codomain holding one is freshened
+                // opened at the binder.
+                Some(b) if holds_family_app(c) => {
+                    let opened = crate::ccl::subst::open_pi_binder(
+                        &crate::ccl::subst::Mapping::Rename(b.clone()),
+                        c,
+                    );
+                    crate::ccl::subst::close_pi_binder(
+                        b,
+                        &freshen_above(lim, &opened, target, cache),
+                    )
+                }
+                _ => freshen_above(lim, c, target, cache),
+            };
             let out = Type::Fun {
                 name,
-                fun_kind: match fun_kind {
-                    // A sum's binder kinds carry type children — the scheme's quantified
-                    // variables sit among the candidates — so they freshen like any
-                    // other position. The binders themselves are re-minted just below, by
-                    // [`Type::alpha_convert_sum`].
-                    FunKind::Data(Some(ws)) => FunKind::Data(Some(Rc::new(
-                        ws.iter()
-                            .map(|w| w.map_types(|t| freshen_above(lim, t, target, cache)))
-                            .collect(),
-                    ))),
-                    other => freshen_fun_kind(other, lim, target, cache),
-                },
-                domain: Box::new(freshen_above(lim, d, target, cache)),
-                codomain: Box::new(freshen_above(lim, c, target, cache)),
+                fun_kind,
+                domain: Box::new(domain),
+                codomain: Box::new(codomain),
             };
             // The parts of a function whose kind may bind witnesses sit under those binders.
             if let Type::Fun {

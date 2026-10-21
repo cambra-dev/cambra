@@ -347,6 +347,12 @@ fn for_each_child(
     {
         f(child, pol)?;
     }
+    if let Some(family) = &mut ct.family {
+        for child in family.domains.iter_mut() {
+            f(child, pol)?;
+        }
+        f(&mut family.body, pol)?;
+    }
     if let Some(cf) = &mut ct.fun {
         for w in &mut cf.binders {
             match &mut w.type_kind {
@@ -415,6 +421,7 @@ impl Parametrize<'_> {
             || ct.fun.is_some()
             || ct.history_slot.is_some()
             || ct.dep_tuple.is_some()
+            || ct.family.is_some()
             || !ct.nominal.is_empty();
         if quantified.is_empty() {
             // Nothing reached this position: it is unconstrained, which a parameter

@@ -29,6 +29,7 @@ holds.
 | `box(a) if c else box(b)` | `Box(Array(2, Int) \| Array(3, Int))` | no |
 | `stdin()` | `Source(stdin, String)` | no |
 | a feed | `Feed(Int)` | no |
+| a nominal type's family argument | `forall (k: Bool) {UInt where _ < 3 and key(xs[_]) == k} \|=> Int`, or `T` where the body reads no binder | no |
 
 - **A collection over an index range is an `Array`.** A collection over any other domain is a
   data-function type `𝐷 |=> 𝑉` over that domain. An index range alone is `{UInt where _ < 𝑛}`,
@@ -38,7 +39,8 @@ holds.
   mentions its key `k`, as a group-by's groups do. A function whose result type mentions its
   parameter is `(x: 𝑇) => 𝑈`. A binder the compiler minted is spelled `k` (a key) or `x` (a
   parameter or a comprehension's variable), numbered where another name in the type already reads
-  as that.
+  as that. A family a nominal type takes, `Type::Family`, is written `forall (k: 𝐾) 𝑇`, and as
+  `𝑇` where `𝑇` reads no binder, which is the constant family the annotation `𝑇` lowers to.
 - **A read of a collection is an index, `xs[_]`; any other application is a call, `f(x)`.** The
   two differ only in the function's kind, so the types inside a predicate are resolved when the
   error is raised (`coalesce_for_error`), while their variables still hold their bounds. A function

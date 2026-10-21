@@ -276,6 +276,11 @@ impl<'m> Walk<'m> {
             }
             Type::Tuple(ts) | Type::Nominal(_, ts) => ts.iter().for_each(|t| self.ty(t)),
             Type::DepTuple(components) => self.components(components),
+            // A domain stands where the family does; the body is under every binder.
+            Type::Family { binders, body } => {
+                binders.iter().for_each(|(_, t)| self.ty(t));
+                self.under(binders.iter().filter_map(|(n, _)| n.as_ref()), |w| w.ty(body));
+            }
             Type::Split { input, output } => {
                 self.ty(input);
                 self.ty(output);
