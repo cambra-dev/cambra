@@ -108,45 +108,21 @@ impl serde::Serialize for NodeId {
 /// [`RewriteTag`], and surfaced from there for inspector tooltips.
 pub type RewriteLabel = &'static str;
 
-/// The fidelity of a node to its blamed source — the one fact the folded
-/// graph cannot recover. A trinary axis.
+/// Attribution category selected by a recording site or lowering's root wrapper.
 ///
-/// **Work in progress.** This axis exists to carry display metadata to the
-/// inspector frontend, and neither the vocabulary nor the tagging is settled: the
-/// three variants are a first cut and the rule assigning them is deliberately
-/// structural for now (below). Treat a node's nature as a hint the frontend may
-/// present, not as a fact any compiler decision should turn on — nothing in
-/// `ccl/` branches on it today, and the per-site `label` is the durable datum.
-/// Retagging is cheap precisely because of that: a label-keyed remap can
-/// recompute a different taxonomy without touching how any phase records.
-///
-/// Public because it rides in the public [`RewriteTag`] (and thus
-/// [`SourceAttribution`]); a [`LoweringStep::Leaf`] carries one too.
-///
-/// [`Source`](Nature::Source) is listed first because it is the base case: the
-/// root of a lowered source expression. The rule for who gets it is *structural*
-/// and stated in one place — see `LoweringContext::tag_source` in
-/// `src/ccl/lower/mod.rs`, and `design/provenance.md`, "The seam". It is emitted
-/// **only by lowering**: [`attribute`]
-/// debug-asserts that no *phase* rewrite carries it, and that is the one guard.
-/// On the wire a `Source`-nature tag null-compresses
-/// (serializes as
-/// `rewritten: null` via [`is_source`](Nature::is_source)) so the wire stays
-/// byte-identical to the retired `rewritten: None` encoding.
+/// The taxonomy is provisional. Source has a structural lowering rule and is
+/// null-encoded by the inspector; Expansion and Machinery classify phase products.
+/// See `src/ccl/design/provenance.md`, "Lowering attribution" and
+/// "Choosing between `Expansion` and `Machinery`" for the guarantees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Nature {
-    /// The node is the root of a lowered source expression. Lowering-only;
-    /// guarded off the phase rows and off the wire. Note this is a *positional*
-    /// fact, not "images something the user wrote" — an interior image (a call's
-    /// callee, a chained comparison's operands) carries `Machinery` with the
-    /// `"lower.image"` label instead.
+    /// The root of a lowered source expression. Only lowering emits it;
+    /// interior images do not qualify merely by corresponding to source text.
     Source,
-    /// Faithful expansion of a source construct (an inlined UDF body, a
-    /// transaction's writer, a channelized defer cluster). Recorded by phases,
-    /// never by lowering, whose expansions carry `Machinery` with a per-rule
-    /// label.
+    /// A phase's expansion of a source construct. Lowering uses Machinery for
+    /// its non-root products, including expansions.
     Expansion,
-    /// Pure plumbing with no direct source counterpart.
+    /// Administrative or implementation material; also lowering's interior images.
     Machinery,
 }
 
@@ -173,46 +149,26 @@ impl Nature {
     }
 }
 
-/// Lowering's log entry, in the two shapes lowering actually has.
+/// A literal-span assignment or captured copy in the ordered lowering log.
 ///
-/// Its attribution channel is a literal source **span**, attached here at
-/// construction because lowering knows the source token it is imaging right
-/// there. A [`ProvenanceTable`] row's `blame`, by contrast, is a NodeId
-/// *reference* resolved later through the accumulating projection: a phase names
-/// an upstream id whose spans it does not itself hold. Attached-literal and
-/// resolved-through-state are different semantics, not two instances of one
-/// thing, which is why lowering records into its own log rather than into the
-/// table — and thread-local statics cannot be generic, so an
-/// attribution-domain generic would erase to the same thing at the recorder
-/// boundary anyway. There is no NodeId-blame channel here: the one site that
-/// would name an upstream id — a substitution, whose replacement takes the
-/// replaced occurrence's attribution — carries the occurrence's identity instead
-/// (`crate::ccl::subst`'s `as_expr_preserving`), so there is no id left to
-/// resolve. Add one when a site demands it.
+/// Unlike table rows, leaves carry spans directly. Repeated leaves replace
+/// earlier attribution for the same ID; copies depend on earlier entries.
+/// See `src/ccl/design/provenance.md`, "The lowering fold".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LoweringStep {
-    /// A **leaf mint**: one node, imaged at one span. Lowering's ordinary
-    /// record — it mints from scratch, so a leaf has no ancestor and is
-    /// a node plus the span it images, and nothing else.
+    /// Assign literal-span attribution to one ID. May re-tag an existing ID.
     Leaf {
         /// The node this record is about.
         id: NodeId,
         /// The literal source span it images.
         anchor: Span,
-        /// `Source` for a lowered expression's root, `Machinery` for an interior
-        /// image or manufactured plumbing (`Expansion` is unused at lowering
-        /// sites — the split folds into `Machinery`, the per-rule label being
-        /// the primary datum).
+        /// Source for an expression root; Machinery for other lowering products.
         nature: Nature,
         /// Stable rewrite label for tooling (`"lower.image"`, `"lower.<rule>"`).
         label: RewriteLabel,
     },
-    /// A **copy**: `produced` are freshened duplicates of `origin` and mirror
-    /// its folded entry verbatim. It carries no anchor, nature or label because
-    /// the fold reads none of them — uncurry's template interiors and the
-    /// compare-chain's second-use operands are exactly their origins' images, so
-    /// a tag here would be an unobservable value, and a wrong one would look
-    /// meaningful while being inert.
+    /// Fresh duplicates that mirror their origin's complete folded attribution.
+    /// No independent span or tag is supplied.
     Copy {
         /// The node whose folded entry the copies mirror. Must be recorded by an
         /// earlier record, else [`Leak::DanglingParent`].
@@ -228,42 +184,19 @@ pub(crate) enum LoweringStep {
 /// projection.
 pub(crate) type LoweringLog = Vec<LoweringStep>;
 
-/// The lowering log, plus the set of [`NodeId`]s it has already explained.
-///
-/// The set exists for one caller: [`lowering_predicate_leaf`], which sweeps a
-/// finished refinement predicate and must **not** re-record a node that already
-/// carries precise attribution from its own lowering. The fold is
-/// last-write-wins, so a blanket sweep would silently replace a node's real span
-/// and label with the coarse predicate ones — a loss no leak class can see,
-/// because the node stays explained either way.
+/// Ordered log and IDs already recorded. The predicate sweep uses the set to
+/// avoid replacing precise existing attribution with its coarse fallback.
 #[derive(Default)]
 struct LoweringRecord {
     log: LoweringLog,
     recorded: HashSet<NodeId>,
 }
 
-/// What an edge asserts about its two endpoints — a **set**, because one pair of
-/// ids can carry both labels at once.
+/// Nonempty set of ancestry and blame labels for one endpoint pair.
 ///
-/// Each label is one row column, closed transitively:
-///
-/// * **ancestry** — the closure of `parents`: the downstream node descends from
-///   the upstream one, every hop between them having consumed the node before it
-///   to produce the next. Reflexive, so a surviving node is its own ancestor;
-///   the column itself is irreflexive, since an in-place rewrite that keeps a
-///   node's id is a *preserve* and records nothing.
-/// * **blame** — the closure of `blame`: the downstream node is related to, but
-///   did not consume, the upstream one. A blamed id may name a node still alive
-///   elsewhere in the output tree, which is why it is not an ancestry claim.
-///
-/// The closure is **weakest-link** ([`then`](Self::then)): a path is ancestry
-/// only while every hop on it is an ancestry hop, and one blame hop anywhere
-/// makes the whole path blame. Without that rule the label would decay into
-/// "reachable somehow" over two hops: a node does not descend from something it
-/// is only blamed on. Paths meeting at one endpoint pair [`union`](Self::union)
-/// their labels, which is how a pair comes to carry both.
-///
-/// The set is never empty: a label set exists only where an edge does.
+/// A parent hop contributes ancestry; a blame hop contributes relatedness without
+/// ancestry. [`then`](Self::then) composes paths and [`union`](Self::union)
+/// combines alternative paths. See `src/ccl/design/provenance.md`, "The edge labels".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EdgeLabels {
     ancestry: bool,
@@ -271,16 +204,13 @@ pub struct EdgeLabels {
 }
 
 impl EdgeLabels {
-    /// *Descends from*, alone — a `parents` hop, and the identity of
-    /// [`then`](Self::then): the zero-length path from a surviving node to
-    /// itself is ancestry, which is what makes a dense self-edge read as
-    /// ancestry rather than needing a special case.
+    /// Ancestry-only hop and the identity for path composition.
     pub const ANCESTRY: Self = EdgeLabels {
         ancestry: true,
         blame: false,
     };
 
-    /// *Related to, but not consumed*, alone — a `blame` hop.
+    /// Blame-only hop, without an ancestry claim.
     pub const BLAME: Self = EdgeLabels {
         ancestry: false,
         blame: true,
@@ -296,13 +226,8 @@ impl EdgeLabels {
         self.blame
     }
 
-    /// Extend a path by one hop: the weakest-link composition.
-    ///
-    /// Ancestry survives only if both the path so far and the hop are ancestry;
-    /// blame appears as soon as either is blame, because a path may take the
-    /// blame reading of any hop that offers one. Associative, with
-    /// [`ANCESTRY`](Self::ANCESTRY) as its identity, so the sweep can carry one
-    /// label per root and fold hops in any order.
+    /// Compose path labels: ancestry requires both operands; blame requires either.
+    /// Associative, with [`ANCESTRY`](Self::ANCESTRY) as identity.
     #[must_use]
     pub fn then(self, hop: Self) -> Self {
         EdgeLabels {
@@ -321,12 +246,7 @@ impl EdgeLabels {
     }
 }
 
-/// One end of a labelled edge: the id at the far end, and what the edge to it
-/// asserts.
-///
-/// The accessors hand back these rather than bare ids because the label is the
-/// content of the edge, not a detail to project away — a consumer that cannot
-/// tell blame from ancestry cannot choose to render or prune it.
+/// The opposite endpoint of an edge and its label set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Link<T> {
     /// The id at the far end of the edge.
@@ -335,22 +255,12 @@ pub struct Link<T> {
     pub labels: EdgeLabels,
 }
 
-/// A folded bidirectional relation between two id domains, its edges labelled
-/// by what they assert ([`EdgeLabels`]).
+/// Bidirectional relation with one label set per endpoint pair.
 ///
-/// **One entry per `(upstream, downstream)` pair**, holding the label set: a
-/// pair reached both by ancestry and by blame is one edge carrying both,
-/// never two edges disagreeing about one pair.
-///
-/// **Dense**: an id that survived a phase appears as its own ancestry self-edge,
-/// so there is one uniform edge kind and no identity special case. Self-edges
-/// are derivable (an id present in both snapshots is its own edge) and so are
-/// the two directions from each other, so a later sparse re-encoding behind the
-/// accessors is a pure re-encoding — consumers must go through
-/// [`upstream`](Self::upstream) / [`downstream`](Self::downstream) /
-/// [`edges`](Self::edges) and never touch the raw maps. The accessors expose the
-/// labels, so that promise covers what an edge *asserts* as well as which pairs
-/// exist.
+/// The phase fold includes ancestry self-edges for unchanged input IDs.
+/// Accessors expose those edges alongside rewritten-node edges; callers need
+/// not reconstruct identity edges. Both directions are stored with sorted
+/// adjacency lists. See `src/ccl/design/provenance.md`, "The fold".
 pub struct ProvenanceMap<U, D> {
     /// upstream → labelled downstream (fan-out).
     down: HashMap<U, Vec<Link<D>>>,
@@ -400,28 +310,21 @@ where
     }
 }
 
-/// A pane node's source attribution — the blame channel's terminal form.
+/// Source spans and a rewrite tag associated with a node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceAttribution {
-    /// Source spans this node traces to. **Empty** = machinery with no source
-    /// anchor (a *known* node with no span) — deliberately distinct from a node
-    /// that is absent from the [`SourceProjection`] entirely (a node the
-    /// projection knows nothing about).
+    /// Known source spans. An empty vector is a present attribution with no known
+    /// anchor, distinct from an ID absent from [`SourceProjection`].
     pub spans: Vec<Span>,
-    /// How the node came to exist — **mandatory**. A direct image is
-    /// [`RewriteTag::direct_image`] (`{via: Lower, nature: Source, label:
-    /// "lower.image"}`), never an absence; every other tag names the rewrite
-    /// that produced the node. Null-compressed on the wire when the tag
-    /// [`is_source`](Nature::is_source).
+    /// The producing rewrite, or [`RewriteTag::direct_image`] for a lowered root.
+    /// Mandatory internally; the inspector encodes a Source-nature tag as null.
     pub rewritten: RewriteTag,
 }
 
-/// How a rewritten node came to exist, for tooltips and display policy.
+/// Producing phase and site-selected nature and label.
 ///
-/// `Hash`/`Eq` are what let a [`ProvenanceTable`] intern the whole triple as one
-/// [`TagId`]. The recording site fixes `label` and `nature`, the enclosing
-/// [`PhaseScope`] supplies `via`, and both are settled before a row is written,
-/// so the triple is one value rather than three columns.
+/// The table interns the whole triple. A phase scope supplies `via`; the
+/// recording site supplies `nature` and `label`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RewriteTag {
     /// The phase that performed the rewrite.
@@ -433,13 +336,8 @@ pub struct RewriteTag {
 }
 
 impl RewriteTag {
-    /// The tag a **lowered expression root** carries: `{via: Lower, nature:
-    /// Source, label: "lower.image"}` — a tag, never an absence.
-    ///
-    /// An interior image shares the `"lower.image"` label but carries
-    /// `Nature::Machinery`, per the structural rule on
-    /// `LoweringContext::tag_source`, so this constructor is specifically the
-    /// root case.
+    /// The tag for a lowered source expression's root. Interior images can use the
+    /// same label with `Nature::Machinery`; they do not use this constructor.
     pub fn direct_image() -> Self {
         RewriteTag {
             via: Phase::Lower,
@@ -449,103 +347,40 @@ impl RewriteTag {
     }
 }
 
-/// Per-pane node → attribution. The lowering-projection instance (folded from
-/// the `LoweringLog` at the lowering boundary) is always-on; a downstream
-/// pane's instance is materialized by [`fold`] at snapshot-serve time.
+/// Node attribution at a pipeline boundary. The lowering projection is always
+/// computed; downstream projections are materialized by [`fold`] when requested
+/// by a consumer or the compile-time leak gate.
 pub type SourceProjection = HashMap<NodeId, SourceAttribution>;
 
-/// A history-integrity violation surfaced by a fold. The folds' error channel,
-/// and every class in it is a defect: a gate asserts the whole vector empty.
+/// A recording-integrity failure detected by a fold.
 ///
-/// # The classes name a detection role, not two defects
-///
-/// One unrecorded mint produces either class or both, according to what became
-/// of the node downstream. It surfaces as [`Leak::Unrecorded`] while it survives
-/// into the output pane, as [`Leak::DanglingParent`] once a recorded rewrite
-/// consumes it, and as both when it is copied and also survives. Neither class
-/// identifies the site to fix on its own.
-///
-/// What the split carries is which half of the recording failed across a whole
-/// fold. `Unrecorded == 0` says a recording scope was open at every mint in the
-/// span. A `DanglingParent` count over a zero `Unrecorded` count says the scopes
-/// are open and that some producer upstream of the span never rowed the ids
-/// those recordings name. That reading is what holds the first pane pair out of
-/// the gate; see `MaterializedPanes::gated_pane_pairs` in `crate::ccl::panes`.
-///
-/// Each class is reported once per distinct id. [`fold`] sorts and dedups its
-/// vector, so a dangling parent that four rows name is one entry.
-///
-/// # Deaths and duplicates are not classes
-///
-/// An input id absent from the output pane **died**. That is the set difference
-/// `input_ids ∖ output_ids`, which no row declares and which every ordinary
-/// rewrite produces, so [`fold`] returns the deaths as their own collection for
-/// the inspector to read.
-///
-/// `Leak::Duplicate` (one id at two tree positions) is a tree invariant, checked
-/// pipeline-wide by `assert_unique_node_ids` rather than by a fold. Nor is any
-/// class shaped like a claim about a rewrite. A row describes a node, so "two
-/// rewrites did X" has nowhere to live. The two invariants that are properties
-/// of a record, one row per id and every row anchored through some channel, are
-/// asserted at [`ProvenanceTable::record`], at the site that would violate them.
+/// One missing mint can cause either class or both. Folds deduplicate by class
+/// and ID; neither class alone identifies the recording site to fix. Deaths
+/// are separate set-difference products, and live-ID duplication is checked by
+/// the tree-identity checks. See `src/ccl/design/provenance.md`, "Recording leaks".
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Leak {
-    /// Found walking the **output tree**: an output-pane id with no row that the
-    /// input pane does not hold either, a `fresh()` where a preserve was
-    /// intended. Nothing explains why it is in the output tree.
+    /// An output ID is neither an input ID nor a product known to the fold.
     Unrecorded { output: NodeId },
-    /// Found walking the **table**: a row's parent edge names an id the fold
-    /// never saw. No row it read produced that id and the input pane does not
-    /// hold it, so a recorded node's ancestry stops at an id that describes
-    /// nothing.
-    ///
-    /// **One class for both edge shapes.** The sole parent of a freshened copy
-    /// and one consumed id of a fusion are the identical condition, an edge to
-    /// an id outside the fold. Telling them apart would mean recording the shape
-    /// of the rewrite, which the `parents` column does not carry: its
-    /// cardinality already expresses 1:1, 1:many and many:1, and nothing else
-    /// about the shape was ever read.
+    /// A recorded ancestry hop names an ID unknown to the fold. Phase folding
+    /// checks all selected rows, not just rows reachable from surviving products.
+    /// Unknown blame-only endpoints do not produce this leak.
     DanglingParent { parent: NodeId },
 }
 
-/// The [`SourceAttribution`] a recorded node carries: the ordered, deduplicated
-/// union of its attribution sources' spans, tagged with the row's tag.
+/// Attribute a recorded node using its row's tag and upstream spans.
 ///
-/// **The sources are `parents` ∪ `blame`** — both channels, `parents` first and
-/// then blame's distinct additions. Parentage takes precedence in the *order*,
-/// which is what keeps the projection deterministic, but blame is never dropped:
-/// a rewrite that names blame is saying "these outputs are also about that
-/// node", not "attribute them there instead". A row with no parents (the pure
-/// insertion) has blame as all there is; a row with no blame — the common case,
-/// blame being named at a handful of sites, all in the mutability phases —
-/// resolves through what it was made from, which is why walking the parent
-/// edges recovers a source location for almost every node.
-///
-/// The union is **unlabelled**: a span is a span whichever channel named the
-/// node it came from, so this function reads the two columns as one sequence.
-/// The distinction they carry is spent in the [`ProvenanceMap`] instead, where each
-/// column labels the edges it contributes ([`EdgeLabels`]) — `mut_elim`'s
-/// `enter(stmt_id)` + `blame(for_id)` is the shape: the products descend from
-/// the statement and are merely *related to* the loop keyword, and both spans
-/// are theirs.
-///
-/// A source id absent from `attr` contributes no spans (it has no known source),
-/// which is legal: a node whose every source is unknown gets `spans: []`, the
-/// "known node, no source anchor" case, deliberately distinct from a node absent
-/// from the projection entirely.
+/// Spans are deduplicated in first-seen order, parents before blame. Unknown
+/// source IDs contribute nothing; the returned entry may have no spans.
+/// See `src/ccl/design/provenance.md`, "Source attribution".
 fn attribute(
     table: &ProvenanceTable,
     id: NodeId,
     tag: RewriteTag,
     attr: &SourceProjection,
 ) -> SourceAttribution {
-    // No *phase* row may carry `Nature::Source`: `Source` means "this node is a
-    // source construct's direct one-to-one translation", which only lowering can
-    // produce — a later phase rewriting a node changes what it is. The guard sits
-    // here, on the node being attributed by a rewrite, not on projection entries:
-    // an *inherited* Source tag on a preserved id in a later pane is legal and
-    // reaches the projection by clone, never through this fn. See
-    // `design/provenance.md`, "The provenance model".
+    // Source tags originate in lowering. Preserved IDs inherit them without
+    // passing through this helper; newly produced phase nodes must not use one.
     debug_assert!(
         !tag.nature.is_source(),
         "a phase rewrite carries Nature::Source (label {:?}, via {:?}) — \
@@ -569,14 +404,8 @@ fn attribute(
     }
 }
 
-/// A row's one-hop upstream edges, each with what that hop asserts: `parents` as
-/// ancestry hops, `blame` as blame hops.
-///
-/// **One entry per id.** A row naming an id in both columns is one hop carrying
-/// both labels, not two hops — the pair `(p, x)` is a single edge, and emitting
-/// it twice would leave the endpoint pair with two disagreeing labels for the
-/// fold to pick between. Parents come first so the order is deterministic; the
-/// linear scan is over a row's own columns, which hold a handful of ids.
+/// Distinct upstream IDs with labels from both columns, parents first.
+/// An ID present in both columns contributes one hop with both labels.
 fn row_hops(table: &ProvenanceTable, x: NodeId) -> Vec<(NodeId, EdgeLabels)> {
     let mut hops: Vec<(NodeId, EdgeLabels)> = Vec::new();
     let named = (table.parents(x).iter().map(|p| (*p, EdgeLabels::ANCESTRY)))
@@ -590,80 +419,21 @@ fn row_hops(table: &ProvenanceTable, x: NodeId) -> Vec<(NodeId, EdgeLabels)> {
     hops
 }
 
-/// Fold the rows the phases between two panes wrote into the [`ProvenanceMap`]
-/// joining them, the output pane's [`SourceProjection`], the input ids that
-/// **died**, and any integrity [`Leak`]s.
+/// Fold selected phase rows into a bidirectional relation, output attribution,
+/// sorted input-minus-output deaths and sorted, deduplicated leaks.
 ///
-/// The deaths are `input_ids ∖ output_ids`, returned as a product rather than as
-/// a leak class: nothing declares a fate, so the difference fires on every
-/// ordinary rewrite and is data the inspector reads. Every [`Leak`] is a defect.
+/// Input IDs without selected rows are roots; earlier-phase rows are not
+/// followed past this boundary. Such roots are pre-seeded regardless of ID order.
+/// A dependency between two selected products must point from smaller to larger
+/// ID (debug-asserted). This permits one ascending sweep independent of row
+/// insertion order.
 ///
-/// `phases` are the ones between the two panes, and they are what restricts a
-/// whole-compile table to that span: one table covers every session a compile
-/// opens, so a row's `via` is the only thing that says which span produced it.
-/// **An id whose row lies outside `phases` is, to this fold, an ordinary
-/// un-produced id** — an input-pane node if the input pane holds it, and unknown
-/// otherwise. Without that restriction an `Infer`-produced input-pane id would
-/// resolve straight past the post-channelize pane it is supposed to bottom out
-/// in.
+/// A recorded vertex with no reachable input retains an empty root map; an
+/// unknown output has no entry and produces [`Leak::Unrecorded`]. All selected
+/// rows are checked for dangling parents, including discarded products.
 ///
-/// `input_ids` / `output_ids` are the two pane snapshots; `upstream_attr` is the
-/// input pane's already-resolved projection, which untouched ids inherit
-/// unchanged.
-///
-/// # The algebra
-///
-/// A node's provenance annotation is a **map from input-pane ids to the label of
-/// the path that reached them** ([`EdgeLabels`]):
-///
-/// ```text
-/// roots(x) = ⋃ { roots(p) ∘ hop(p → x) : p ∈ parents(x) ∪ blame(x) }
-/// roots(x) = { x ↦ ancestry }                  if x is an input-pane id
-/// ```
-///
-/// where `hop(p → x)` is ancestry for a `parents` edge, blame for a `blame`
-/// edge and both for an id the row names in both columns; `∘` extends every path
-/// in `roots(p)` by that hop, weakest-link ([`EdgeLabels::then`]); and `⋃` unions
-/// the labels of paths that arrive at one root. The empty union `∅` is a row
-/// whose parents are all unknown.
-///
-/// Labelled root maps under that union form a commutative monoid — `union` on
-/// [`EdgeLabels`] is a join, and `then` distributes over it — and commutativity
-/// plus associativity, plus one row per id so no node has two definitions to
-/// order, are exactly what make the fold insensitive to the order the rows were
-/// written in. (Idempotence buys cheapness, not order-freeness.)
-///
-/// Order-freeness is load-bearing, because write order is not chronology: rows
-/// are written when their guard drops, so an enclosing rewrite's rows land after
-/// the rows of the rewrites nested inside it.
-///
-/// Ids born and consumed inside those phases are interior vertices on a path and
-/// compose away; the self-edge for an untouched id falls out; the N:M bipartite
-/// product of a fusion falls out of its product rows each holding the whole
-/// consumed set as parents.
-///
-/// # The fold is one ascending sweep
-///
-/// Every edge runs from a smaller [`NodeId`] to a larger one: a row's parents and
-/// its blame are alike ids the rewrite *read*, and the node itself was minted
-/// afterwards from one process-global monotone counter (a produced id is
-/// *captured* via [`on_mint`], never declared). A node is therefore never its
-/// own ancestor, so **ascending `NodeId` order is a topological order** and one
-/// sweep suffices — no fixed point, no memo, no cycle guard. [`sweep_metrics`]
-/// measures the falsifier (a backward edge).
-///
-/// A node reachable from nothing still keeps an entry holding `∅`, which is what
-/// distinguishes "known, with empty ancestry" from "the fold has never heard of
-/// this id" ([`Leak::Unrecorded`]).
-///
-/// # The attribution channel rides along, and is not a monoid
-///
-/// `attr` is resolved in the same sweep, and needs the same topological order for
-/// a different reason: a row's attribution sources are ids that existed when the
-/// rewrite ran. But attribution has no join — one node cannot carry two
-/// `via`/`label` pairs — so it depends on there being exactly **one row per id**,
-/// not on any algebra. That is the invariant [`ProvenanceTable::record`] asserts at
-/// write time, where the second writer is standing.
+/// See `src/ccl/design/provenance.md`, "The fold", "The fold is order-free",
+/// "Source attribution" and "Recording leaks".
 pub(crate) fn fold(
     table: &ProvenanceTable,
     phases: &[Phase],
@@ -678,8 +448,7 @@ pub(crate) fn fold(
 ) {
     let mut leaks: Vec<Leak> = Vec::new();
 
-    // The vertex set: every id the fold knows, in mint order — which is a
-    // topological order of the edges (see the doc comment).
+    // Input roots and selected products form the complete vertex set.
     let mut vertices: Vec<NodeId> = table
         .rows_in(phases)
         .chain(input_ids.iter().copied())
@@ -690,14 +459,8 @@ pub(crate) fn fold(
     let mut roots: HashMap<NodeId, HashMap<NodeId, EdgeLabels>> = HashMap::new();
     let mut attr: SourceProjection = upstream_attr.clone();
 
-    // An id no row among these phases produced is reachable from itself and
-    // nothing else, whatever its place in the order. Seeding those before the
-    // sweep rather than at their place in it is what lets a row name one as an
-    // upstream regardless of age: operator conversion rows an operator it took
-    // from the version it replaces against the node that version's replacement
-    // binds it at, and that node is younger than the operator by a whole
-    // compile. Nothing else about the order relaxes — an id this fold produces
-    // is still resolved before anything may name it.
+    // Input-boundary roots may be newer than products (for example, reused
+    // operators). Seed them before the ordered sweep of selected products.
     for &x in &vertices {
         if table.tag_in(x, phases).is_none() {
             roots.insert(x, HashMap::from([(x, EdgeLabels::ANCESTRY)]));
@@ -706,9 +469,7 @@ pub(crate) fn fold(
 
     for &x in &vertices {
         let Some(tag) = table.tag_in(x, phases) else {
-            // Seeded above; a node descends from itself, so the self-edge is an
-            // ancestry edge, and its upstream attribution passes through
-            // unchanged.
+            // Its root and attribution were seeded before the sweep.
             continue;
         };
 
@@ -721,13 +482,8 @@ pub(crate) fn fold(
                  of what the fold produces, so a rewrite must read an id before it mints \
                  one",
             );
-            // An upstream older than `x` is already resolved if the fold knows
-            // it at all. No entry means it is neither an input-pane id nor
-            // produced here: an *ancestry* hop there stops at an id that
-            // describes nothing, while a blame-only hop is the same
-            // silence `attribute` keeps for a blamed id with no known spans —
-            // blame is a pointer at material the relation need not hold, so it
-            // contributes no edge and no class.
+            // Missing ancestry is a leak; unknown blame contributes neither
+            // a relation nor an error. Empty known roots remain distinct from absence.
             match roots.get(&p) {
                 Some(pr) => {
                     for (root, path) in pr {
@@ -778,50 +534,35 @@ pub(crate) fn fold(
         ds.sort_unstable();
     }
 
-    // An input id absent from the output pane **died**. Nothing declares a fate,
-    // so this difference is the whole death report rather than a residue of one,
-    // which is why it is a product of the fold and not a leak class.
+    // Deaths depend on boundary membership, not on rows' ancestry claims.
     let mut deaths: Vec<NodeId> = input_ids.difference(output_ids).copied().collect();
     deaths.sort_unstable();
 
-    // The pane projection is exactly the output nodes' attributions: transients
-    // (born and consumed within the phase) drop out, untouched ids keep their
-    // inherited entry, and an output id with no attribution is legitimately
-    // absent (distinct from a present-but-empty `spans`).
+    // Discard intermediate attributions. A missing entry remains different
+    // from a present attribution with an empty span vector.
     let projection: SourceProjection = output_ids
         .iter()
         .filter_map(|o| attr.get(o).map(|a| (*o, a.clone())))
         .collect();
 
-    // One entry per distinct defect. A dangling parent is discovered once per row
-    // that names it, so the raw vector counts rows rather than broken ancestry
-    // targets: the id every row of a specialized definition points at would be
-    // reported once per copy.
+    // Several rows can name the same missing parent.
     leaks.sort_unstable();
     leaks.dedup();
 
     (ProvenanceMap { down, up }, projection, deaths, leaks)
 }
 
-/// What one ascending sweep of [`fold`] costs over a given set of phases, and whether
-/// the sweep's premise holds. Measurement-only.
-///
-/// [`backward_edges`](Self::backward_edges) is the falsifier: ascending `NodeId`
-/// order is only a topological order of what the fold produces if every edge
-/// between two produced ids runs from a smaller id to a larger one, so a
-/// non-zero count is exactly the number of vertices the sweep would have to
-/// revisit — the fixed point it claims not to need.
+/// Counts for the selected fold graph, without computing its closure.
+/// Backward edges violate the selected-product ordering; the count does not
+/// measure vertices to revisit or the cost of an alternative algorithm.
 #[cfg(test)]
 pub(crate) struct SweepMetrics {
-    /// Vertices the sweep visits — and, since `roots` only ever grows, its peak
-    /// entry count.
+    /// Distinct input IDs and selected products; also the final roots-map size.
     pub vertices: usize,
     /// Provenance edges (`upstream → node`, either label) the fold reads.
     pub edges: usize,
-    /// Edges running from a larger `NodeId` to a smaller one, counting only
-    /// those whose upstream this fold produces — the revisit count. Must be
-    /// zero. An edge to an input-pane id runs backwards without costing a
-    /// revisit, because [`fold`] resolves those before the sweep.
+    /// Hops whose upstream is also selected and has an ID greater than or equal
+    /// to the product's ID. Pre-seeded input roots are excluded.
     pub backward_edges: usize,
 }
 
@@ -851,34 +592,15 @@ pub(crate) fn sweep_metrics(
     }
 }
 
-/// Fold a [`LoweringLog`] into the always-on **lowering projection** and any
-/// integrity [`Leak`]s. The lowering counterpart to [`fold`], and the one
-/// fold that is **sequential**: its log genuinely is chronology (leaf entries
-/// are appended at construction, not when a guard drops), and its last-tag-wins
-/// re-imaging is real semantics rather than an artifact of reading a log as a
-/// sequence. Four simplifications follow from lowering minting from scratch:
+/// Read the lowering log in order and return output attribution and leaks.
 ///
-/// * **no input pane** — so there is no ancestry to compose. Where [`fold`]
-///   carries a set of input-pane roots per id, here every such set would be
-///   empty, and what is left of it is a plain **live set**: the ids some record
-///   has covered;
-/// * **no [`ProvenanceMap`] output** — the lowering projection ships as pane-0
-///   spans, not edges, so there is no `up`/`down` to build and no deaths to
-///   report (there are no input ids to drop);
-/// * **no attribution state to resolve through** — a leaf's attribution is
-///   `{spans: [anchor], RewriteTag}` built directly here from its literal span; a
-///   copy mirrors its origin's already-folded entry;
-/// * **no one-row-per-id requirement** — a re-image is a second record for one
-///   id (`lower_expr` re-tags an arm's already-tagged root as the construct's
-///   direct image) and the later tag deliberately wins.
+/// Leaves assign literal spans and tags; later leaves for the same ID win.
+/// Copies mirror earlier origins. An unknown origin produces DanglingParent
+/// and leaves its products unexplained; unknown output IDs produce Unrecorded.
+/// The projection contains only output IDs, so discarded templates are allowed.
 ///
-/// Runs always-on at the lowering→pipeline handoff (the leak *checks* stay
-/// debug/test-gated at the boundary). [`Leak::Unrecorded`] is an unrecorded mint
-/// (an output-tree node that no leaf produced and no copy placed);
-/// [`Leak::DanglingParent`] is a copy of an origin no earlier record covered; a
-/// template id born, copied, and never placed composes away (live but not an
-/// output, so no leak); orphaned keys are structurally impossible (the projection
-/// is produced by the fold, never mutated).
+/// Runs in every build. Leak assertions belong to the boundary, not this function.
+/// See `src/ccl/design/provenance.md`, "The lowering fold".
 pub(crate) fn fold_lowering(
     log: &LoweringLog,
     output_ids: &HashSet<NodeId>,
@@ -929,10 +651,7 @@ pub(crate) fn fold_lowering(
         }
     }
 
-    // Every output-tree node must be explained (produced by a leaf or a copy).
-    // An unexplained output is an unrecorded lowering mint; this leak IS the
-    // coverage check (there is no separate gate). There are no deaths to report
-    // (no input pane).
+    // Output coverage is checked separately from copy-origin validity.
     for o in output_ids {
         if !live.contains(o) {
             leaks.push(Leak::Unrecorded { output: *o });
@@ -1287,12 +1006,8 @@ impl OpenRecording {
 
 #[cfg(test)]
 thread_local! {
-    /// How many nodes the predicate sweep has skipped on this thread.
-    ///
-    /// A skip is one node the sweep would otherwise have clobbered, so the count
-    /// is the size of the damage the skip prevents. No leak class can see it — a
-    /// clobbered node is still explained — which is why it is counted rather than
-    /// asserted away.
+    /// Count of already-recorded IDs skipped by the predicate sweep on this thread.
+    /// A coarser replacement would still pass structural leak checks.
     static PREDICATE_SWEEP_SKIPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1302,22 +1017,12 @@ pub(crate) fn take_predicate_sweep_skips() -> usize {
     PREDICATE_SWEEP_SKIPS.with(|n| n.replace(0))
 }
 
-/// Record one node of a **refinement predicate**, unless it is already
-/// explained.
+/// Record fallback attribution for a predicate node unless its ID is already
+/// recorded. Ignore placeholders and do nothing without a lowering session.
 ///
-/// Lowering builds a predicate out of ordinary sub-expressions that were lowered
-/// — and therefore recorded — in the main tree, then mints and copies extra
-/// nodes to assemble them (`ccl_utils::refined_data_fun` is where the result is
-/// sealed into a `Refinement`). Those assembly nodes live only in a type slot,
-/// outside the `walk_children` domain, so nothing recorded them.
-///
-/// The skip is the whole point. A node the main-tree walk already explained has
-/// a precise span and label; re-recording it here would replace both with this
-/// sweep's coarse ones, because the fold is last-write-wins. Without the skip
-/// the sweep clobbers 30 nodes over the pipeline corpus, and no leak class
-/// reports anything, since a clobbered node is still explained.
-/// `the_predicate_sweep_skips_already_recorded_nodes` pins the skip and
-/// `the_predicate_sweep_skips_this_many_nodes_over_the_corpus` pins its size.
+/// Skipping existing entries preserves the subexpression's precise span and tag.
+/// See `src/ccl/design/provenance.md`, "Lowering attribution", and the
+/// `the_predicate_sweep_skips_already_recorded_nodes` regression test.
 pub(crate) fn lowering_predicate_leaf(id: NodeId, span: Span, nature: Nature, label: RewriteLabel) {
     if id == NodeId::PLACEHOLDER {
         return;
@@ -1748,15 +1453,9 @@ pub(crate) fn on_copy(origin: NodeId, fresh: NodeId) {
     );
 }
 
-/// RAII installer for **lowering's** log.
-///
-/// Installed unconditionally for the whole of lowering in every build, because
-/// the projection it folds into is release-critical: an `InferError` resolves
-/// its blame node to a span through it. [`into_log`](Self::into_log) drains and
-/// ends the session; `Drop` clears the slot so a panic never leaves a stale log
-/// installed. At most one per thread, and it must fully drain before the first
-/// [`PhaseScope`] opens — a guard closing while both were installed would record
-/// lowering-shaped copies for a phase rewrite.
+/// Owner of the lowering log, installed in every pipeline compile for diagnostics.
+/// Drain before opening a phase scope. Drop clears the slot, including unwinding;
+/// installation rejects nesting with a debug assertion.
 pub(crate) struct LoweringSession {
     // Not `Copy`/`Clone`; holds the installed-log invariant for its lifetime.
     _private: (),
@@ -1813,21 +1512,14 @@ pub(crate) enum DerivationStep {
     },
 }
 
-/// The recordings a phase closed, in closing order, kept whether or not
-/// provenance capture is on.
-///
-/// A phase whose mints an error can be raised at, and whose mints have no
-/// lowering-projection ancestor in the tree around them, needs this to resolve
-/// that error to a span when [`compile_to`](crate::ccl::context::compile_to)
-/// records nothing. [`fold_derivation`] turns it into a projection over the
-/// lowering projection. See `design/provenance.md`, "The derivation log".
+/// Phase recordings in closing order, independent of table capture.
+/// Used for error attribution by `Blame`; see `src/ccl/design/provenance.md`,
+/// "The derivation log".
 pub(crate) type DerivationLog = Vec<DerivationStep>;
 
-/// RAII installer for a [`DerivationLog`], the always-on sink a phase's
-/// recordings write to beside the table.
-///
-/// Non-reentrant, and never open while lowering's log is: lowering's records
-/// carry literal spans and go to its own sink.
+/// Phase-local derivation log owner, independent of table capture.
+/// Installation debug-checks non-reentrancy and exclusion of the lowering log.
+/// Drain to obtain the log; drop clears the installed slot.
 pub(crate) struct DerivationSession {
     // Not `Copy`/`Clone`; holds the installed-log invariant for its lifetime.
     _private: (),
@@ -1863,15 +1555,11 @@ impl Drop for DerivationSession {
     }
 }
 
-/// Fold `log`, written by phase `via`, into a projection of the ids it minted
-/// or copied, resolving each through `base` and through the entries the fold
-/// has already made. `base` answers for ids an earlier projection holds.
+/// Attribute derivation products in log order, consulting `base` before entries
+/// already computed here. Mints copy named-input spans with a new tag; copies
+/// mirror origins. Unknown inputs contribute no entries, not a leak report.
 ///
-/// A mint takes its named node's spans and the recording's tag; a copy mirrors
-/// its origin. Steps are read in closing order, so a recording that names or
-/// copies a node an inner recording minted finds that node already folded. A
-/// step whose named node or origin resolves to nothing contributes no entry,
-/// and a lookup for one of its ids falls through to the caller's next answer.
+/// See `src/ccl/design/provenance.md`, "The derivation log".
 pub(crate) fn fold_derivation(
     log: &DerivationLog,
     base: &dyn Fn(&NodeId) -> Option<SourceAttribution>,

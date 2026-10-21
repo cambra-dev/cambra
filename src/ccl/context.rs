@@ -345,26 +345,10 @@ impl From<ConversionError> for CompileError {
     }
 }
 
-/// Resolves a [`Located`] error's node to the source span it traces to, through
-/// the lowering projection and the phase projections derived over it.
-///
-/// A phase projection covers the mints of a phase run under a
-/// [`DerivationSession`], in every compile; today that is the comprehension
-/// phase alone. A node minted after lowering by any other phase (an inlined
-/// body, a monomorphization clone, a predicate inference copied out of an
-/// annotation) has no entry in either. Its span is then, in order of
-/// preference:
-///
-/// 1. that of the nearest node it was derived from, when the compile records
-///    provenance (`compile_program` does; [`compile_to`] does not);
-/// 2. that of the nearest enclosing node in the tree it was found in, when that
-///    tree is at hand;
-/// 3. the whole root file.
-///
-/// Reaching the third means the node lost its provenance: nothing records what it
-/// was derived from, and no tree places it under a node lowering made. A debug
-/// build panics there, so a pass that drops provenance fails the suite rather
-/// than underlining the whole file.
+/// Resolve located errors through lowering and derivation projections, then
+/// recorded ancestry and enclosing expressions. Missing spans panic in debug
+/// builds and fall back to the whole root file otherwise.
+/// See `src/ccl/design/provenance.md`, "Error attribution".
 struct Blame<'a> {
     projection: &'a SourceProjection,
     /// The phase projections [`derive`](Self::derive) folded, disjoint from
@@ -1099,30 +1083,11 @@ pub struct CompiledProgram {
     /// programs the sender is dropped immediately, so `try_recv` never returns
     /// `Ok` — pure programs are driven entirely by the `main` producer.
     pub done: std::sync::mpsc::Receiver<()>,
-    /// The always-on **lowering projection**: **every** lowered node's
-    /// [`NodeId`](crate::ccl::provenance::NodeId) mapped to the
-    /// [`SourceAttribution`](crate::ccl::provenance::SourceAttribution) folded from
-    /// lowering's [`LoweringLog`](crate::ccl::provenance::LoweringLog). Every entry
-    /// is `via: Lower`; the tag is one of **three** shapes, not two:
-    ///
-    /// - `Nature::Source` + `"lower.image"` — the root of a lowered
-    ///   `Spanned<ChlExpr>`. Structural and decidable; emitted only by
-    ///   `lower_expr` (see `LoweringContext::tag_source`).
-    /// - `Nature::Machinery` + `"lower.image"` — **the common case**: a node the
-    ///   minting rule considered an image of source text but which is not an
-    ///   expression root (a callee `Var`, a chained comparison, a statement-level
-    ///   image).
-    /// - `Nature::Machinery` + `"lower.<rule>"` — lowering-manufactured plumbing.
-    ///
-    /// The `"lower.image"` label carries no cross-site guarantee — it is per-rule
-    /// judgment, and the taxonomy is provisional (`LoweringContext::tag_image`).
-    /// Coverage, by contrast, is guaranteed: the whole `walk_children` domain is
-    /// present, since an unrecorded mint surfaces as `Leak::Unrecorded` at the
-    /// fold. Produced by
-    /// [`fold_lowering`](crate::ccl::provenance::fold_lowering) at the
-    /// lowering boundary, never mutated incrementally. It is always-on, and every
-    /// diagnostic a pass after lowering raises resolves its blame node against it
-    /// (`Blame`).
+    /// Always-computed attribution for the lowered tree, including predicate IDs.
+    /// Produced by `fold_lowering` before later phases; diagnostics use it even
+    /// when table capture is disabled. Missing-record assertions are debug/test
+    /// checks, not release validation. See `src/ccl/design/provenance.md`,
+    /// "Lowering attribution" and "The lowering fold".
     pub lowering_projection: SourceProjection,
     /// The **pre-inference** IR snapshot — the inspector's upstream (source-shaped,
     /// pre-monomorphization) pane, captured right after `uniquify` and before
@@ -2005,11 +1970,8 @@ fn run_frontend(
         return Err(errors);
     }
 
-    // The always-on lowering session: installed in every
-    // build for the whole of lowering. Its leaf entries (`tag_source`/
-    // `tag_machinery`) and copy-sink writes (uncurry, compare-chain) record a
-    // `LoweringLog`, folded once at the handoff below into the always-on lowering
-    // projection. It must fully drain before the first phase (`Infer`) session opens.
+    // Lowering attribution is required even without table capture. Drain this log
+    // before opening later phase scopes.
     let lowering_session = LoweringSession::install();
     let lower_result = lower_program(program, ctx.lowering_ctx());
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
@@ -2032,24 +1994,10 @@ fn run_frontend(
     // Drain sink bindings before taking sources.
     let sink_bindings = ctx.lowering_ctx().take_sink_bindings();
 
-    // Drain the lowering log and fold it once, at the lowering→pipeline
-    // handoff (before uniquify/inference, so the release `InferError` read timing
-    // is unchanged), into the always-on **lowering projection**: every lowered
-    // node's [`SourceAttribution`], keyed by NodeId. It is the base every later
-    // pane fold bottoms out in, and the source every post-lowering diagnostic
-    // resolves against (`Blame`). `uniquify` preserves every id in
-    // place, so the projection's keys survive into the pre-inference pane.
-    //
-    // The fold's leak taxonomy enforces mint coverage: an unrecorded lowering
-    // mint surfaces as `Leak::Unrecorded` (every output-tree node must be
-    // explained by a leaf or a copy). The checks are debug/test
-    // gated at the boundary via `gate_leaks`; the fold itself is
-    // always-on (its product is release-critical).
-    // Id uniqueness is the precondition for keying anything by `NodeId`, so gate
-    // it before the fold that does exactly that: a duplicate here would silently
-    // collapse two nodes' attributions into one projection entry. Lowering's own
-    // copy sites (uncurry's template discharge, the chained-comparison operand
-    // freshens) are what make this a live risk at this boundary.
+    // Check identity before keying attribution by NodeId: duplicate live IDs
+    // would collapse separate nodes' entries. Both boundary assertions are
+    // debug/test checks; the projection is computed in every build.
+    // See `src/ccl/design/provenance.md`, "The lowering fold".
     assert_unique_node_ids(&expr, "post-lowering");
 
     let lowering_log = lowering_session.into_log();
