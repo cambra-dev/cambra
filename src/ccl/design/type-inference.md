@@ -1309,6 +1309,10 @@ redirect a predicate during the callback. `rebuild` therefore also compares the 
 counter before deciding whether to retain the rebuilt copy or reuse the origin.
 `walk_refined_predicates_mut` reports change to callers that run a fixpoint.
 
+The Boolean is not a general slot-allocation change report. A cache hit can redirect the slot
+to an earlier result and still returns `false`. On a miss, the result combines the callback's
+flag with revision changes during that callback.
+
 ### 3.2 The `InferArena`: who owns inference variables
 
 Inference-variable bounds can form strong-reference cycles. Recording a same-level

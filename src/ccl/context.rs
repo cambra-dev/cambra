@@ -1342,7 +1342,7 @@ pub enum Phase {
     /// Encode surface comprehensions after A-normalization and read naming.
     /// This order keeps their refined-cast encoding from bypassing normalization.
     Comprehension,
-    /// Bind opaque-dependent lambda results under a barrier-variable annotation.
+    /// Bind lambda results under a barrier-variable annotation for opaque binders in the body.
     /// Runs after comprehension lowering to include its generated lambdas.
     /// See `crate::ccl::opaque_output`.
     OpaqueOutput,
