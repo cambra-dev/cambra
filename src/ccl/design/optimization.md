@@ -474,14 +474,17 @@ boundary and is rejected.
 
 `operator_conversion::fusable_prefix` reads each `Compose` chain at every position where an input
 operator exists. It takes the longest prefix that is a function of the input column built from
-`id`, projections, literal constants, binary and unary scalar builtins, and `zip`s of such chains,
-and converts it to `MapResult(input, Constant(FunctionDef::Scalar(expr)))`
-(`interpreter/scalar_expr.rs`, `fuse_prefix`). The arms of a `zip` in the prefix read the same
-input, so the fused chain has no `Memo`, `FanOut`, `Zip` or intermediate pair. A prefix of fewer
-than two operations converts as before, since fusing it would replace one operator with one.
+`id`, projections, closed constants (a literal, or a tuple or record of them), binary and unary
+scalar builtins, and `zip`s of such chains, and converts it to
+`MapResult(input, Constant(FunctionDef::Scalar(program)))` (`interpreter/scalar_expr.rs`,
+`fuse_prefix`). The program is a straight-line sequence of instructions over slots, so a value that
+two operations read is computed once, and a field path is read from the input as one slice. The
+arms of a `zip` in the prefix read the same input, so the fused chain has no `Memo`, `FanOut`, `Zip`
+or intermediate pair. A prefix of fewer than two operations converts as before, since fusing it
+would replace one operator with one.
 
 The prefix ends before the first element outside that set. An aggregate, a lookup, a conditional,
-a store read, or a constant that is not a literal stays an operator. Conversion also declines when
+a store read, or a constant that is not closed stays an operator. Conversion also declines when
 the input is a bare product, whose fields are tiles, or when its values at the current level hold
 a collection, since neither is a column. A chain that ends in a `zip` is a tile of fields and
 stays on the `Zip` path; only a chain that ends in one column fuses.

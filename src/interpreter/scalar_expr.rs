@@ -3,169 +3,151 @@
 //!
 //! A `zip` of arms over one input converts to `Memo`, `FanOut`, one map per arm, a `Zip` and a
 //! map over the pair. When every arm is element-wise, the whole chain is a function of the one
-//! input column. [`fuse_prefix`] recognizes such a chain and [`ScalarExpr::eval`] computes it
+//! input column. [`fuse_prefix`] recognizes such a chain and [`ScalarProgram::eval`] computes it
 //! without an operator or an intermediate pair per arm.
 //!
-//! `eval` works through the input in blocks of [`BLOCK_ROWS`] rows. Every node of the tree but the
-//! root writes one block-sized column into a buffer of its own, which later blocks reuse, so the
-//! intermediates of a chain are a few kilobytes each, allocated once per `eval`, and each node's
-//! kernel runs over a column that is still in cache. The root appends to the result column.
+//! A [`ScalarProgram`] is a straight-line program over slots: instruction 𝑖 writes slot 𝑖, and
+//! its operands name earlier slots. A value that two operations read is one slot, computed once.
+//!
+//! `eval` works through the input in blocks of [`BLOCK_ROWS`] rows. Every instruction but the
+//! last writes one block-sized column into a slot of its own, which later blocks reuse, so the
+//! intermediates of a chain are a few kilobytes each, allocated once per `eval`, and each
+//! kernel runs over columns that are still in cache. The last instruction appends to the result
+//! column.
 
+use std::collections::HashMap;
 use std::mem::replace;
 
 use smol_str::SmolStr;
 
-use crate::ccl::{Builtin, Expr, Lit, ProjKey, TypedExprNode};
+use crate::ccl::{Builtin, Expr, ProjKey, TypedExprNode};
 
 use super::{
-    BaseType, BinOpKind as InterpreterBinOp, ColumnValue, Extent, UnaryOpKind, apply_binop_into,
-    apply_unaryop_into, binop_output_extent, binop_result_column, tuple_field,
+    BaseType, BinOpKind as InterpreterBinOp, ColumnValue, Extent, UnaryOpKind, Value,
+    apply_binop_into, apply_unaryop_into, binop_output_extent, binop_result_column,
+    operator_conversion::expr_to_value, tuple_field,
 };
 
-/// An element-wise expression over the input column.
+/// The index of an instruction, which is also the slot it writes.
+type Slot = u32;
+
+/// One instruction of a [`ScalarProgram`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Instr {
+    /// The column at `path` inside the map's input value; an empty path is the value itself.
+    Input {
+        path: Vec<SmolStr>,
+    },
+    /// One value at every row: a literal, or a closed tuple or record.
+    Const(Value),
+    Bin(InterpreterBinOp, Slot, Slot),
+    Un(UnaryOpKind, Slot),
+}
+
+/// A function of one column, as a straight-line program over slots.
 ///
-/// Each node has one parent, so a subterm that two operations read appears once under each of
-/// them. Only the input is read more than once, and it is a leaf.
+/// The last instruction is the output. Every instruction is an operand of a later one or the
+/// output, so equal functions have equal programs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Tree {
-    /// The input column.
-    Arg,
-    /// A literal, repeated at every position.
-    Lit(Lit),
-    /// A field of a record column.
-    Field(Box<Tree>, SmolStr),
-    Bin(InterpreterBinOp, Box<Tree>, Box<Tree>),
-    Un(UnaryOpKind, Box<Tree>),
+pub struct ScalarProgram {
+    instrs: Vec<Instr>,
 }
 
-impl Tree {
-    /// How many nodes the tree has: one slot of a [`Scratch`] each.
-    fn nodes(&self) -> usize {
-        1 + match self {
-            Tree::Arg | Tree::Lit(_) => 0,
-            Tree::Field(a, _) | Tree::Un(_, a) => a.nodes(),
-            Tree::Bin(_, a, b) => a.nodes() + b.nodes(),
-        }
-    }
-}
-
-/// A function of one column, as an expression tree.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ScalarExpr {
-    root: Tree,
-}
-
-/// Rows evaluated at a time: 8 KiB per column of 64-bit values, so a node's operands and result
-/// stay in L1.
+/// Rows evaluated at a time: 8 KiB per column of 64-bit values, so an instruction's operands
+/// and result stay in L1.
 const BLOCK_ROWS: usize = 1024;
 
-/// The column in `slot`, leaving the unwritten marker behind.
-fn take(slot: &mut ColumnValue) -> ColumnValue {
-    replace(slot, ColumnValue::Units(0))
+/// The column of `input` that `path` reads.
+fn field<'i>(input: &'i ColumnValue, path: &[SmolStr]) -> &'i ColumnValue {
+    path.iter().fold(input, |column, name| {
+        let ColumnValue::Records(fields) = column else {
+            panic!("a field of a column that is not a record column")
+        };
+        fields
+            .get(name)
+            .unwrap_or_else(|| panic!("Missing field {name}"))
+    })
 }
 
-/// The columns of an evaluation, one per node of the tree but the root, kept from block to block.
+/// The columns of an evaluation, one per instruction, kept from block to block.
 ///
-/// A node writes its block into its own slot with the `_into` kernels, so a slot's buffer is
-/// allocated while the first block is evaluated and reused for every later one, instead of
-/// each block allocating a column per node. Nodes number their slots in the order `eval`
-/// visits them, which is the same for every block.
+/// An instruction writes its block into its own slot, so a slot's buffer is allocated while
+/// the first block is evaluated and reused for every later one, instead of each block
+/// allocating a column per instruction.
 struct Scratch<'a> {
     input: &'a ColumnValue,
-    /// A slot is `Units(0)` until its node first writes it; no node's result is a `Units`
-    /// column, so the marker is unambiguous.
+    /// A slot is `Units(0)` until its instruction first writes it; no instruction's result is
+    /// a `Units` column, so the marker is unambiguous. The last instruction writes to the
+    /// result, so its slot stays unwritten unless it is an `Input` or a `Const`.
     slots: Vec<ColumnValue>,
-    /// The next slot to hand out in the current block.
-    next: usize,
-    /// The current block: the rows `start..start + len` of the input. A literal column takes
-    /// `len`.
+    /// The current block: the rows `start..start + len` of the input.
     start: usize,
     len: usize,
 }
 
 impl<'a> Scratch<'a> {
-    fn new(input: &'a ColumnValue, tree: &Tree) -> Self {
+    fn new(input: &'a ColumnValue, program: &ScalarProgram) -> Self {
         Self {
             input,
-            slots: vec![ColumnValue::Units(0); tree.nodes()],
-            next: 0,
+            slots: vec![ColumnValue::Units(0); program.instrs.len()],
             start: 0,
             len: 0,
         }
     }
 
-    /// Evaluate `tree` over the rows `start..start + len` and append the block's result to `out`.
+    /// Run `program` over the rows `start..start + len` and append the block's result to `out`.
     ///
-    /// The root's kernel appends straight to `out`, so the result is written once, with no slot
-    /// of its own and no copy out of one. `out` is created at the first block with room for
-    /// `total` rows, the length of the whole input.
-    fn block(
-        &mut self,
-        tree: &Tree,
-        start: usize,
-        len: usize,
-        total: usize,
-        out: &mut Option<ColumnValue>,
-    ) {
-        self.next = 1;
+    /// The last instruction's kernel appends straight to `out`, so the result is written once,
+    /// with no slot of its own and no copy out of one. `out` is the result column of
+    /// [`ScalarProgram::empty_output`], with room for the whole input reserved.
+    fn block(&mut self, program: &ScalarProgram, start: usize, len: usize, out: &mut ColumnValue) {
         self.start = start;
         self.len = len;
-        let created = |mut column: ColumnValue| {
-            column.reserve(total);
-            column
-        };
-        match tree {
-            Tree::Un(op, a) => {
-                let a = self.eval(a);
-                let out = out.get_or_insert_with(|| created(self.slots[a].empty_like()));
+        let (last, body) = program
+            .instrs
+            .split_last()
+            .expect("a program has an output instruction");
+        for (slot, instr) in body.iter().enumerate() {
+            self.run(slot, instr);
+        }
+        match last {
+            Instr::Un(op, a) => {
+                let a = *a as usize;
                 apply_unaryop_into(*op, &self.slots[a], out);
             }
-            Tree::Bin(op, a, b) => {
-                let a = self.eval(a);
-                let b = self.eval(b);
-                let out =
-                    out.get_or_insert_with(|| created(binop_result_column(*op, &self.slots[a])));
+            Instr::Bin(op, a, b) => {
+                let (a, b) = (*a as usize, *b as usize);
                 apply_binop_into(*op, &self.slots[a], &self.slots[b], out);
             }
-            // A root that is a column already has no kernel to write the result with.
-            _ => {
-                self.next = 0;
-                let root = self.eval(tree);
-                let out = out.get_or_insert_with(|| created(self.slots[root].empty_like()));
-                out.extend_from(&self.slots[root]);
+            // An output that is a column already has no kernel to write the result with.
+            Instr::Input { .. } | Instr::Const(_) => {
+                let slot = body.len();
+                self.run(slot, last);
+                out.extend_from(&self.slots[slot]);
             }
         }
     }
 
-    /// Evaluate `tree` into a fresh slot and return its index.
-    fn eval(&mut self, tree: &Tree) -> usize {
-        let slot = self.next;
-        self.next += 1;
+    /// Write the block of `instr` into `slot`.
+    fn run(&mut self, slot: usize, instr: &Instr) {
         let rows = self.start..self.start + self.len;
-        match tree {
-            Tree::Arg => self.input.slice_into(rows, &mut self.slots[slot]),
-            Tree::Lit(lit) => fill_lit(lit, self.len, &mut self.slots[slot]),
-            // A field of the input is sliced alone, not with the rest of the record column.
-            Tree::Field(inner, name) if matches!(**inner, Tree::Arg) => {
-                let ColumnValue::Records(fields) = self.input else {
-                    panic!("a field of a column that is not a record column")
-                };
-                fields
-                    .get(name)
-                    .unwrap_or_else(|| panic!("Missing field {name}"))
-                    .slice_into(rows, &mut self.slots[slot]);
+        match instr {
+            Instr::Input { path } => {
+                // A field of the input is sliced alone, not with the rest of the record column.
+                let leaf = field(self.input, path);
+                leaf.slice_into(rows, &mut self.slots[slot]);
             }
-            Tree::Field(inner, name) => {
-                let inner = self.eval(inner);
-                let ColumnValue::Records(mut fields) = take(&mut self.slots[inner]) else {
-                    panic!("a field of a column that is not a record column")
-                };
-                self.slots[slot] = fields
-                    .remove(name)
-                    .unwrap_or_else(|| panic!("Missing field {name}"));
+            // A constant's slot holds the same value in every row of every block, so it is
+            // rewritten only when the block length changes: the first block and a shorter last
+            // one.
+            Instr::Const(value) => {
+                let held = &self.slots[slot];
+                if matches!(held, ColumnValue::Units(_)) || held.len() != self.len {
+                    self.slots[slot] = ColumnValue::single(value.clone()).repeat(self.len);
+                }
             }
-            Tree::Un(op, a) => {
-                let a = self.eval(a);
+            Instr::Un(op, a) => {
+                let a = *a as usize;
                 let mut out = take(&mut self.slots[slot]);
                 if matches!(out, ColumnValue::Units(_)) {
                     out = self.slots[a].empty_like();
@@ -175,9 +157,8 @@ impl<'a> Scratch<'a> {
                 apply_unaryop_into(*op, &self.slots[a], &mut out);
                 self.slots[slot] = out;
             }
-            Tree::Bin(op, a, b) => {
-                let a = self.eval(a);
-                let b = self.eval(b);
+            Instr::Bin(op, a, b) => {
+                let (a, b) = (*a as usize, *b as usize);
                 let mut out = take(&mut self.slots[slot]);
                 if matches!(out, ColumnValue::Units(_)) {
                     out = binop_result_column(*op, &self.slots[a]);
@@ -188,171 +169,161 @@ impl<'a> Scratch<'a> {
                 self.slots[slot] = out;
             }
         }
-        slot
     }
 }
 
-impl ScalarExpr {
-    fn new(root: Tree) -> Self {
-        Self { root }
-    }
+/// The column in `slot`, leaving the unwritten marker behind.
+fn take(slot: &mut ColumnValue) -> ColumnValue {
+    replace(slot, ColumnValue::Units(0))
+}
 
+impl ScalarProgram {
     /// Evaluate over `input`, the column of the values the function is applied to.
     ///
     /// The result is built block by block, with room for all of it reserved at the first block,
     /// so peak memory is the input, the result, and one block's slots.
     pub fn eval(&self, input: &ColumnValue) -> ColumnValue {
         let len = input.len();
-        let mut scratch = Scratch::new(input, &self.root);
-        let mut out = None;
+        let mut scratch = Scratch::new(input, self);
+        let mut out = self.empty_output(input);
+        out.reserve(len);
         let mut start = 0;
         loop {
             let rows = BLOCK_ROWS.min(len - start);
-            scratch.block(&self.root, start, rows, len, &mut out);
+            scratch.block(self, start, rows, &mut out);
             start += rows;
             if start >= len {
                 break;
             }
         }
-        let out = out.expect("a block was evaluated, which created the result");
         debug_assert_eq!(
             out.len(),
             len,
-            "ScalarExpr::eval: one result row per input row"
+            "ScalarProgram::eval: one result row per input row"
         );
         out
     }
+
+    /// The empty column the result is appended to: a column of the output instruction's type,
+    /// found from the input's columns and the instructions' types without evaluating any block.
+    fn empty_output(&self, input: &ColumnValue) -> ColumnValue {
+        let mut empties: Vec<ColumnValue> = Vec::with_capacity(self.instrs.len());
+        for instr in &self.instrs {
+            let empty = match instr {
+                Instr::Input { path } => field(input, path).empty_like(),
+                Instr::Const(value) => ColumnValue::single(value.clone()).empty_like(),
+                // `neg` and `not` keep their operand's type.
+                Instr::Un(_, a) => empties[*a as usize].clone(),
+                Instr::Bin(op, a, _) => binop_result_column(*op, &empties[*a as usize]),
+            };
+            empties.push(empty);
+        }
+        empties.pop().expect("a program has an output instruction")
+    }
 }
 
-impl std::fmt::Display for Tree {
+impl std::fmt::Display for Instr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Tree::Arg => write!(f, "_"),
-            Tree::Lit(lit) => match lit {
-                Lit::Int(n) => write!(f, "{n}"),
-                Lit::String(s) => write!(f, "{s:?}"),
-                Lit::Bool(b) => write!(f, "{b}"),
-                Lit::Unit => write!(f, "unit"),
-            },
-            Tree::Field(a, name) => write!(f, "{a}.{name}"),
-            Tree::Un(op, a) => write!(f, "{op:?}({a})"),
-            Tree::Bin(op, a, b) => {
-                write!(f, "{}({a}, {b})", crate::pretty_graph::fmt_binop(op))
+            Instr::Input { path } if path.is_empty() => write!(f, "_"),
+            Instr::Input { path } => write!(f, "_.{}", path.join(".")),
+            Instr::Const(value) => write!(f, "{value}"),
+            Instr::Un(op, a) => write!(f, "{op:?}(s{a})"),
+            Instr::Bin(op, a, b) => {
+                write!(f, "{}(s{a}, s{b})", crate::pretty_graph::fmt_binop(op))
             }
         }
     }
 }
 
-impl std::fmt::Display for ScalarExpr {
+impl std::fmt::Display for ScalarProgram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.root.fmt(f)
+        for (slot, instr) in self.instrs.iter().enumerate() {
+            write!(f, "s{slot} = {instr}; ")?;
+        }
+        write!(f, "=> s{}", self.instrs.len() - 1)
     }
 }
 
-/// `lit` repeated `len` times.
-fn lit_column(lit: &Lit, len: usize) -> ColumnValue {
-    match lit {
-        Lit::Int(n) => ColumnValue::Ints(vec![*n; len]),
-        Lit::String(s) => ColumnValue::Strings(vec![s.clone(); len]),
-        Lit::Bool(b) => ColumnValue::Bools(vec![*b; len]),
-        Lit::Unit => unreachable!("a unit literal is never fused: the recognizer declines it"),
-    }
-}
-
-/// `lit` repeated `len` times, written into `out`.
-///
-/// A literal node's slot is written by this function alone, so a column of the literal's kind
-/// already holds that literal from an earlier block, and only its length can differ. `resize`
-/// cuts it or extends it with the literal, and writes nothing when the length is the same,
-/// which is every block but the last. Any other `out` is replaced.
-fn fill_lit(lit: &Lit, len: usize, out: &mut ColumnValue) {
-    match (lit, &mut *out) {
-        (Lit::Int(n), ColumnValue::Ints(o)) => {
-            debug_assert!(
-                o.iter().all(|x| x == n),
-                "a literal's slot holds the literal"
-            );
-            o.resize(len, *n);
-        }
-        (Lit::String(t), ColumnValue::Strings(o)) => {
-            debug_assert!(
-                o.iter().all(|x| x == t),
-                "a literal's slot holds the literal"
-            );
-            o.resize(len, t.clone());
-        }
-        (Lit::Bool(b), ColumnValue::Bools(o)) => {
-            debug_assert!(
-                o.iter().all(|x| x == b),
-                "a literal's slot holds the literal"
-            );
-            o.resize(len, *b);
-        }
-        _ => *out = lit_column(lit, len),
-    }
-}
-
-/// A fused chain: the expression, the extents it is applied between, and how many of the
+/// A fused chain: the program, the extents it is applied between, and how many of the
 /// chain's elements it replaces.
 pub struct Fused {
-    pub expr: ScalarExpr,
+    pub program: ScalarProgram,
     pub domain: Extent,
     pub codomain: Extent,
     pub consumed: usize,
 }
 
-/// The value a chain element is applied to, while the chain is being read. A product is
-/// tracked structurally and is an expression only where an operation needs its column.
+/// The value a chain element is applied to, while the chain is being read. A `zip` is tracked
+/// structurally and is a slot only where an operation needs its column.
 #[derive(Clone)]
 enum Val {
-    /// A column, with the extent of its values.
-    Column(Tree, Extent),
+    /// The chain's input, or a field path into it, not yet read into a slot, with the extent of
+    /// its values. An empty path is the input itself.
+    Read(Vec<SmolStr>, Extent),
+    /// A computed column, with the extent of its values.
+    Slot(Slot, Extent),
+    /// The arms of a `zip`, which a binary operation takes its operands from.
     Tuple(Vec<Val>),
-    Record(Vec<(SmolStr, Val)>),
 }
 
 struct Parser {
+    /// The instructions emitted so far. Instructions are appended and never removed.
+    instrs: Vec<Instr>,
+    /// The `Input` instruction of each path read so far, so a path read twice is one slot.
+    reads: HashMap<Vec<SmolStr>, Slot>,
     /// How many operations the chain read so far: every element that is neither the
     /// identity nor a composition of others. Fusing replaces that many operators with one.
     ops: usize,
 }
 
 impl Parser {
-    /// The column a value stands for. A product has none.
-    fn column(v: &Val) -> Option<(Tree, Extent)> {
+    fn emit(&mut self, instr: Instr) -> Slot {
+        self.instrs.push(instr);
+        (self.instrs.len() - 1) as Slot
+    }
+
+    /// The column a value stands for, read into a slot. A product has none.
+    fn column(&mut self, v: &Val) -> Option<(Slot, Extent)> {
         match v {
-            Val::Column(tree, extent) => Some((tree.clone(), extent.clone())),
-            _ => None,
-        }
-    }
-
-    fn literal(lit: &Lit) -> Option<Val> {
-        let base = match lit {
-            Lit::Int(_) => BaseType::Int,
-            Lit::String(_) => BaseType::String,
-            Lit::Bool(_) => BaseType::Bool,
-            Lit::Unit => return None,
-        };
-        Some(Val::Column(Tree::Lit(lit.clone()), Extent::Base(base)))
-    }
-
-    fn project(v: Val, key: &ProjKey) -> Option<Val> {
-        match (v, key) {
-            (Val::Tuple(items), ProjKey::Index(i)) => items.get(*i).cloned(),
-            (Val::Record(fields), ProjKey::Field(name)) => fields
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, v)| v.clone()),
-            (Val::Column(tree, extent), key) => {
-                let name = match key {
-                    ProjKey::Index(i) => tuple_field(*i),
-                    ProjKey::Field(name) => name.clone(),
+            Val::Slot(slot, extent) => Some((*slot, extent.clone())),
+            Val::Read(path, extent) => {
+                let slot = match self.reads.get(path) {
+                    Some(&slot) => slot,
+                    None => {
+                        let slot = self.emit(Instr::Input { path: path.clone() });
+                        self.reads.insert(path.clone(), slot);
+                        slot
+                    }
                 };
-                let field = extent.record_fields()?.get(&name)?.clone();
-                Some(Val::Column(Tree::Field(Box::new(tree), name), field))
+                Some((slot, extent.clone()))
             }
-            _ => None,
+            Val::Tuple(_) => None,
         }
+    }
+
+    /// `value` at every position, when it has an extent a column of it can be read at: a base
+    /// value or a record of them.
+    fn constant(&mut self, value: Value) -> Option<Val> {
+        let extent = value_extent(&value)?;
+        let slot = self.emit(Instr::Const(value));
+        Some(Val::Slot(slot, extent))
+    }
+
+    /// A field of the chain's input. A projection of a product built in the chain,
+    /// `⟨f, g⟩ ≫ .0`, is a product beta redex that `simplify` reduces before conversion, so it is
+    /// not read.
+    fn project(v: Val, key: &ProjKey) -> Option<Val> {
+        let Val::Read(mut path, extent) = v else {
+            return None;
+        };
+        let name = match key {
+            ProjKey::Index(i) => tuple_field(*i),
+            ProjKey::Field(name) => name.clone(),
+        };
+        let field = extent.record_fields()?.get(&name)?.clone();
+        path.push(name);
+        Some(Val::Read(path, field))
     }
 
     /// Read `e` as a function applied to `cur`.
@@ -372,28 +343,25 @@ impl Parser {
                 let [a, b] = items.as_slice() else {
                     return None;
                 };
-                let ((a, _), (b, _)) = (Self::column(a)?, Self::column(b)?);
+                let ((a, _), (b, _)) = (self.column(a)?, self.column(b)?);
                 let op: InterpreterBinOp = (*op).into();
                 let extent = binop_output_extent(&op);
-                Some(Val::Column(Tree::Bin(op, Box::new(a), Box::new(b)), extent))
+                Some(Val::Slot(self.emit(Instr::Bin(op, a, b)), extent))
             }
             TypedExprNode::Builtin(b @ (Builtin::Neg | Builtin::NotFn)) => {
-                let (a, operand) = Self::column(&cur)?;
+                let (a, operand) = self.column(&cur)?;
                 let op = if *b == Builtin::Neg {
                     UnaryOpKind::Neg
                 } else {
                     UnaryOpKind::Not
                 };
                 let extent = op.output_extent(&operand);
-                Some(Val::Column(Tree::Un(op, Box::new(a)), extent))
+                Some(Val::Slot(self.emit(Instr::Un(op, a)), extent))
             }
             TypedExprNode::Apply { argument, function } => match &function.node {
-                // `𝑐 ▷ const` for a literal: the same value at every position.
+                // `𝑐 ▷ const` for a closed value: the same value at every position.
                 TypedExprNode::Builtin(Builtin::Const) => {
-                    let TypedExprNode::Lit(lit) = &argument.node else {
-                        return None;
-                    };
-                    Self::literal(lit)
+                    self.constant(expr_to_value(argument).ok()?)
                 }
                 // Every arm is a function of the value the zip is applied to.
                 TypedExprNode::Builtin(Builtin::Zip) => match &argument.node {
@@ -402,11 +370,6 @@ impl Parser {
                         .map(|arm| self.step(arm, cur.clone()))
                         .collect::<Option<Vec<_>>>()
                         .map(Val::Tuple),
-                    TypedExprNode::Record(arms) => arms
-                        .iter()
-                        .map(|(name, arm)| Some((name.clone(), self.step(arm, cur.clone())?)))
-                        .collect::<Option<Vec<_>>>()
-                        .map(Val::Record),
                     _ => None,
                 },
                 _ => None,
@@ -415,16 +378,34 @@ impl Parser {
         }
     }
 
-    /// The expression a chain ending at `v` yields. A product ends as a tile of its fields
-    /// rather than as one column, which a column function cannot build, so a product has none.
-    fn root_of(v: &Val) -> Option<(Tree, Extent)> {
+    /// The slot a chain ending at `v` yields. A product ends as a tile of its fields rather
+    /// than as one column, which a column function cannot build, so a product has none.
+    fn root_of(&mut self, v: &Val) -> Option<(Slot, Extent)> {
         match v {
-            // The argument itself: nothing to compute.
-            Val::Column(Tree::Arg, _) => None,
-            Val::Column(tree, extent) => Some((tree.clone(), extent.clone())),
-            Val::Tuple(_) | Val::Record(_) => None,
+            // The input itself: nothing to compute.
+            Val::Read(path, _) if path.is_empty() => None,
+            Val::Read(..) | Val::Slot(..) => self.column(v),
+            Val::Tuple(_) => None,
         }
     }
+}
+
+/// The extent of a closed value that a column of it can be read at: a base value or a record of
+/// them.
+fn value_extent(value: &Value) -> Option<Extent> {
+    Some(match value {
+        Value::Int(_) => Extent::Base(BaseType::Int),
+        Value::UInt(_) => Extent::Base(BaseType::UInt),
+        Value::String(_) => Extent::Base(BaseType::String),
+        Value::Bool(_) => Extent::Base(BaseType::Bool),
+        Value::Record(fields) => Extent::Record(
+            fields
+                .iter()
+                .map(|(name, v)| Some((name.clone(), value_extent(v)?)))
+                .collect::<Option<_>>()?,
+        ),
+        _ => return None,
+    })
 }
 
 /// Whether a column of `extent` is one `eval` can read: a base type or a record of them.
@@ -436,38 +417,54 @@ fn is_plain(extent: &Extent) -> bool {
     }
 }
 
-/// The longest prefix of `chain` that is a pointwise function of its input, as one expression.
+/// The longest prefix of `chain` that is a pointwise function of its input, as one program.
 /// `input` is the extent of the values the chain is applied to.
 ///
-/// The recognizer reads the identity, projections, literal constants, binary and unary
+/// The recognizer reads the identity, projections, closed constants, binary and unary
 /// operations, and `zip`s of such chains. The prefix ends before the first other element: an
-/// aggregate, a lookup, a conditional, a store read, or a constant that is not a literal has a
+/// aggregate, a lookup, a conditional, a store read, or a constant that is not closed has a
 /// domain or a value outside the input column. A prefix of one operation keeps its own
 /// conversion, since fusing it would replace one operator with one. A binary operation takes its
 /// operands from a `zip`, so a prefix that holds one is at least two operations: `x + 1` fuses,
 /// and the single-operation prefixes are a lone unary operation (`neg`, `not`), a projection and
-/// a literal.
+/// a constant.
 pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
     if !is_plain(input) {
         return None;
     }
-    let mut parser = Parser { ops: 0 };
-    let mut cur = Val::Column(Tree::Arg, input.clone());
-    let mut best: Option<(usize, Tree, Extent)> = None;
+    let mut parser = Parser {
+        instrs: Vec::new(),
+        reads: HashMap::new(),
+        ops: 0,
+    };
+    let mut cur = Val::Read(Vec::new(), input.clone());
+    // The chosen prefix: how many elements it consumes, how many instructions it keeps, and its
+    // output extent.
+    let mut best: Option<(usize, usize, Extent)> = None;
     for (k, e) in chain.iter().enumerate() {
         let Some(next) = parser.step(e, cur.clone()) else {
             break;
         };
         cur = next;
         if parser.ops >= 2
-            && let Some((tree, extent)) = Parser::root_of(&cur)
+            && let Some((output, extent)) = parser.root_of(&cur)
         {
-            best = Some((k + 1, tree, extent));
+            debug_assert_eq!(
+                output as usize + 1,
+                parser.instrs.len(),
+                "the output of a prefix is the instruction emitted last: no element projects an \
+                 arm of a zip away, because `simplify` reduces `⟨f, g⟩ ≫ .0` before conversion"
+            );
+            best = Some((k + 1, parser.instrs.len(), extent));
         }
     }
-    let (consumed, tree, codomain) = best?;
+    let (consumed, len, codomain) = best?;
+    // Instructions past the prefix belong to an element the parse then abandoned.
+    parser.instrs.truncate(len);
     Some(Fused {
-        expr: ScalarExpr::new(tree),
+        program: ScalarProgram {
+            instrs: parser.instrs,
+        },
         domain: input.clone(),
         codomain,
         consumed,
@@ -477,7 +474,7 @@ pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, LogicKind};
+    use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Lit, LogicKind};
 
     fn id() -> Expr {
         Expr::builtin(Builtin::Id)
@@ -530,7 +527,7 @@ mod tests {
         assert_eq!(fused.consumed, 2);
         assert_eq!(fused.codomain, Extent::Base(BaseType::Bool));
         let out = fused
-            .expr
+            .program
             .eval(&ColumnValue::Ints(vec![100, 600, 1499, 1500, 2000]));
         assert_eq!(bools(out), [false, true, true, false, false]);
     }
@@ -549,15 +546,15 @@ mod tests {
         ];
         let fused = fuse_prefix(&chain, &int()).unwrap();
         assert_eq!(
-            fused.expr.eval(&ColumnValue::Ints(vec![1, 2, 3])),
+            fused.program.eval(&ColumnValue::Ints(vec![1, 2, 3])),
             ColumnValue::Ints(vec![2, 6, 12])
         );
     }
 
-    /// A computed subterm that two operations read is one copy under each: the tree has no
-    /// node that has two parents, so the sum is evaluated once per reader.
+    /// A computed subterm that two operations read is one slot, computed once: `(x + 1) * (x + 1)`
+    /// holds one `add`.
     #[test]
-    fn a_shared_computed_subterm_appears_under_each_reader() {
+    fn a_shared_computed_subterm_is_one_slot() {
         let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
         let mul = binop(BinOpKind::Arithmetic(ArithmeticKind::Mul));
         // `(x + 1) * (x + 1)`, as the chain `⟨id, 1⟩ ≫ add ≫ ⟨id, id⟩ ≫ mul`.
@@ -568,10 +565,63 @@ mod tests {
             mul,
         ];
         let fused = fuse_prefix(&chain, &int()).unwrap();
+        // The input, the constant, the sum and the product.
+        assert_eq!(fused.program.instrs.len(), 4, "{}", fused.program);
         assert_eq!(
-            fused.expr.eval(&ColumnValue::Ints(vec![1, 2, 3])),
+            fused.program.eval(&ColumnValue::Ints(vec![1, 2, 3])),
             ColumnValue::Ints(vec![4, 9, 16])
         );
+    }
+
+    /// Two reads of one field path are one `Input`.
+    #[test]
+    fn a_field_read_twice_is_one_input() {
+        let record = Extent::Record(
+            [(tuple_field(0), int()), (tuple_field(1), int())]
+                .into_iter()
+                .collect(),
+        );
+        let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
+        let chain = vec![zip(vec![Expr::proj_index(0), Expr::proj_index(0)]), add];
+        let fused = fuse_prefix(&chain, &record).unwrap();
+        let inputs = fused
+            .program
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, Instr::Input { .. }))
+            .count();
+        assert_eq!(inputs, 1, "{}", fused.program);
+    }
+
+    /// A closed record is a constant, so a product compares against it in a fused chain.
+    #[test]
+    fn a_record_constant_fuses() {
+        let record = Extent::Record(
+            [(tuple_field(0), int()), (tuple_field(1), int())]
+                .into_iter()
+                .collect(),
+        );
+        let pair = Expr::apply(
+            Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]),
+            Expr::builtin(Builtin::Const),
+        );
+        let eq = binop(BinOpKind::Compare(CompareKind::Equals));
+        let chain = vec![zip(vec![id(), pair]), eq];
+        let fused = fuse_prefix(&chain, &record).expect("a closed record is a constant");
+        let n = 2 * BLOCK_ROWS + 5;
+        let input = ColumnValue::Records(
+            [
+                (
+                    tuple_field(0),
+                    ColumnValue::Ints((0..n as i64).map(|i| i % 2).collect()),
+                ),
+                (tuple_field(1), ColumnValue::Ints(vec![2; n])),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let want: Vec<bool> = (0..n).map(|i| i % 2 == 1).collect();
+        assert_eq!(bools(fused.program.eval(&input)), want);
     }
 
     /// `7 - x` and `x - 7` keep their operand order through the zip.
@@ -581,7 +631,7 @@ mod tests {
         let left = vec![zip(vec![constant(7), id()]), sub.clone()];
         let right = vec![zip(vec![id(), constant(7)]), sub];
         let input = || ColumnValue::Ints(vec![1, 10]);
-        let eval = |chain: &[Expr]| fuse_prefix(chain, &int()).unwrap().expr.eval(&input());
+        let eval = |chain: &[Expr]| fuse_prefix(chain, &int()).unwrap().program.eval(&input());
         assert_eq!(eval(&left), ColumnValue::Ints(vec![6, -3]));
         assert_eq!(eval(&right), ColumnValue::Ints(vec![-6, 3]));
     }
@@ -604,7 +654,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        assert_eq!(fused.expr.eval(&input), ColumnValue::Ints(vec![11, 22]));
+        assert_eq!(fused.program.eval(&input), ColumnValue::Ints(vec![11, 22]));
     }
 
     /// Fusing one operation would replace one operator with one.
@@ -616,7 +666,7 @@ mod tests {
         let fused = fuse_prefix(&[zip(vec![id(), constant(1)]), add], &int()).unwrap();
         assert_eq!(fused.consumed, 2);
         assert_eq!(
-            fused.expr.eval(&ColumnValue::Ints(vec![1, 2])),
+            fused.program.eval(&ColumnValue::Ints(vec![1, 2])),
             ColumnValue::Ints(vec![2, 3])
         );
         assert!(fuse_prefix(&[Expr::builtin(Builtin::Neg)], &int()).is_none());
@@ -639,7 +689,7 @@ mod tests {
         let fused = fuse_prefix(&chain, &int()).expect("two operations");
         assert_eq!(fused.consumed, 2);
         assert_eq!(
-            fused.expr.eval(&ColumnValue::Ints(vec![1, -2, 3])),
+            fused.program.eval(&ColumnValue::Ints(vec![1, -2, 3])),
             ColumnValue::Ints(vec![1, -2, 3])
         );
         let bools = Extent::Base(BaseType::Bool);
@@ -647,7 +697,7 @@ mod tests {
         let fused = fuse_prefix(&chain, &bools).expect("two operations");
         let input = vec![true, false, true];
         assert_eq!(
-            fused.expr.eval(&ColumnValue::Bools(input.clone())),
+            fused.program.eval(&ColumnValue::Bools(input.clone())),
             ColumnValue::Bools(input)
         );
     }
@@ -684,23 +734,13 @@ mod tests {
         assert!(fuse_prefix(&conjunction(), &function).is_none());
     }
 
-    /// A projection that picks one arm and an abandoned attempt both read more than the
-    /// expression keeps. The expression holds none of it, so equal expressions compare equal.
+    /// An element the parse abandons part-way leaves the instructions it emitted past the chosen
+    /// prefix, and the program holds none of them, so equal chains give equal programs.
     #[test]
-    fn a_projection_and_an_abandoned_attempt_leave_the_same_expression() {
+    fn an_abandoned_attempt_leaves_the_same_program() {
         let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
-        let mul = binop(BinOpKind::Arithmetic(ArithmeticKind::Mul));
         let plain = vec![zip(vec![id(), constant(1)]), add.clone()];
-        let plain = fuse_prefix(&plain, &int()).unwrap().expr;
-        // `(x + 1, x * 2).0` reads the sum and abandons the product.
-        let projected = vec![
-            zip(vec![
-                Expr::compose(vec![zip(vec![id(), constant(1)]), add.clone()]),
-                Expr::compose(vec![zip(vec![id(), constant(2)]), mul]),
-            ]),
-            Expr::proj_index(0),
-        ];
-        let projected = fuse_prefix(&projected, &int()).unwrap().expr;
+        let plain = fuse_prefix(&plain, &int()).unwrap().program;
         // A good prefix, then a `zip` whose second arm is not element-wise.
         let abandoned = vec![
             zip(vec![id(), constant(1)]),
@@ -710,8 +750,7 @@ mod tests {
                 Expr::builtin(Builtin::Sum),
             ]),
         ];
-        let abandoned = fuse_prefix(&abandoned, &int()).unwrap().expr;
-        assert_eq!(projected, plain);
+        let abandoned = fuse_prefix(&abandoned, &int()).unwrap().program;
         assert_eq!(abandoned, plain);
         assert_eq!(
             plain.eval(&ColumnValue::Ints(vec![1, 2])),
@@ -744,7 +783,7 @@ mod tests {
             };
             let want: Vec<bool> = xs.iter().map(|&x| x > 500 && x < 1500).collect();
             assert_eq!(
-                bools(fused.expr.eval(&ColumnValue::Ints(xs))),
+                bools(fused.program.eval(&ColumnValue::Ints(xs))),
                 want,
                 "n = {n}"
             );
@@ -772,7 +811,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        assert_eq!(fused.expr.eval(&input), column(|i| 11 * i));
+        assert_eq!(fused.program.eval(&input), column(|i| 11 * i));
     }
 
     /// A column of `Bool`s is cut into blocks like any other.
@@ -782,14 +821,14 @@ mod tests {
         let fused = fuse_prefix(&chain, &Extent::Base(BaseType::Bool)).unwrap();
         let input: Vec<bool> = (0..2 * BLOCK_ROWS + 5).map(|i| i % 3 == 0).collect();
         assert_eq!(
-            fused.expr.eval(&ColumnValue::Bools(input.clone())),
+            fused.program.eval(&ColumnValue::Bools(input.clone())),
             ColumnValue::Bools(input)
         );
     }
 
-    /// A node's buffer is the one its first block allocated: later blocks write into it, so
-    /// the evaluation allocates per node, not per node and block. The root has no slot: it
-    /// appends to the result, whose buffer the first block reserved in full.
+    /// A slot's buffer is the one its first block allocated: later blocks write into it, so
+    /// the evaluation allocates per instruction, not per instruction and block. The output has
+    /// no slot: it appends to the result, whose buffer the first block reserved in full.
     #[test]
     fn a_node_reuses_its_buffer_across_blocks() {
         let pointer = |column: &ColumnValue| -> *const u8 {
@@ -802,49 +841,25 @@ mod tests {
         let fused = fuse_prefix(&conjunction(), &int()).unwrap();
         let total = 3 * BLOCK_ROWS;
         let input = ramp(total);
-        let mut scratch = Scratch::new(&input, &fused.expr.root);
-        let mut out = None;
-        scratch.block(&fused.expr.root, 0, BLOCK_ROWS, total, &mut out);
-        let result = pointer(out.as_ref().unwrap());
-        let (root, children) = scratch.slots.split_first().unwrap();
+        let mut scratch = Scratch::new(&input, &fused.program);
+        let mut out = fused.program.empty_output(&input);
+        out.reserve(total);
+        scratch.block(&fused.program, 0, BLOCK_ROWS, &mut out);
+        let result = pointer(&out);
+        let (output, body) = scratch.slots.split_last().unwrap();
         assert!(
-            matches!(root, ColumnValue::Units(0)),
-            "the root writes to the result, not a slot"
+            matches!(output, ColumnValue::Units(0)),
+            "the output writes to the result, not a slot"
         );
-        let buffers: Vec<*const u8> = children.iter().map(pointer).collect();
+        let buffers: Vec<*const u8> = body.iter().map(pointer).collect();
         for start in [BLOCK_ROWS, 2 * BLOCK_ROWS] {
-            scratch.block(&fused.expr.root, start, BLOCK_ROWS, total, &mut out);
-            let children = &scratch.slots[1..];
-            for (slot, &before) in children.iter().zip(&buffers) {
+            scratch.block(&fused.program, start, BLOCK_ROWS, &mut out);
+            let body = &scratch.slots[..buffers.len()];
+            for (slot, &before) in body.iter().zip(&buffers) {
                 assert_eq!(pointer(slot), before, "block at {start}");
             }
-            assert_eq!(pointer(out.as_ref().unwrap()), result, "block at {start}");
+            assert_eq!(pointer(&out), result, "block at {start}");
         }
-        assert_eq!(out.unwrap().len(), total);
-    }
-
-    /// A literal's slot keeps its contents between blocks: it grows or shrinks to the block's
-    /// length, and a block of the same length writes nothing.
-    #[test]
-    fn a_literal_slot_follows_the_block_length() {
-        let mut slot = ColumnValue::Units(0);
-        for len in [4, 4, 2, 6, 0, 3] {
-            fill_lit(&Lit::Int(7), len, &mut slot);
-            assert_eq!(slot, ColumnValue::Ints(vec![7; len]), "len = {len}");
-        }
-        let mut slot = ColumnValue::Units(0);
-        for len in [2, 5, 1] {
-            fill_lit(&Lit::Bool(true), len, &mut slot);
-            assert_eq!(slot, ColumnValue::Bools(vec![true; len]), "len = {len}");
-        }
-        let mut slot = ColumnValue::Units(0);
-        for len in [3, 1, 4] {
-            fill_lit(&Lit::String("a".into()), len, &mut slot);
-            assert_eq!(
-                slot,
-                ColumnValue::Strings(vec!["a".into(); len]),
-                "len = {len}"
-            );
-        }
+        assert_eq!(out.len(), total);
     }
 }

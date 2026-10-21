@@ -27,7 +27,7 @@ pub mod value_probe;
 
 pub use binop::*;
 pub use http_server::HttpServerDataSource;
-pub use scalar_expr::ScalarExpr;
+pub use scalar_expr::ScalarProgram;
 pub use scheduler::*;
 pub use stdio::*;
 #[cfg(any(test, feature = "test-helpers"))]

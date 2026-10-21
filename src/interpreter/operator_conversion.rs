@@ -25,7 +25,7 @@ use crate::{
         FunctionDef,
         Position,
         Predicate,
-        ScalarExpr,
+        ScalarProgram,
         Tile,
         UnaryOpKind,
         Value,
@@ -1888,7 +1888,7 @@ fn convert_impl_inner(
                     let input = result.take().expect("fusable_prefix read an input");
                     result = Some(apply_scalar_expr(
                         input,
-                        fused.expr,
+                        fused.program,
                         fused.domain,
                         fused.codomain,
                         ctx.level(),
@@ -3358,7 +3358,7 @@ fn curried_levels(ty: &Type) -> usize {
 /// (`src/ccl/planning/const_fold.rs` states which shapes it folds and which it leaves);
 /// what reaches the fallback arm is what the fold declined, and a list literal's element
 /// position cannot express it.
-fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
+pub(super) fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
     match &expr.node {
         TypedExprNode::Lit(lit) => Ok(match lit {
             Lit::Int(n) => Value::Int(*n),
@@ -5435,7 +5435,7 @@ fn apply_binop(
     )))
 }
 
-/// The pointwise prefix of `chain` that fuses into one [`ScalarExpr`] map over `input`, when
+/// The pointwise prefix of `chain` that fuses into one [`ScalarProgram`] map over `input`, when
 /// `input` holds a column of values at `level`.
 ///
 /// A bare product's fields are tiles and a value holding a level is not a column, so the
@@ -5450,12 +5450,12 @@ fn fusable_prefix(chain: &[Expr], input: &Tiling, level: CurryLevel) -> Option<s
 /// `MapResult(input, Constant(Scalar(expr)))`: one pass over the column the chain started from.
 fn apply_scalar_expr(
     input: Box<dyn TileOperator>,
-    expr: ScalarExpr,
+    program: ScalarProgram,
     domain: Extent,
     codomain: Extent,
     level: CurryLevel,
 ) -> Box<dyn TileOperator> {
-    let fn_value = Value::ComputableFunction(FunctionDef::Scalar(expr));
+    let fn_value = Value::ComputableFunction(FunctionDef::Scalar(program));
     let fn_extent = Extent::Function {
         domain: Box::new(domain),
         codomain: Box::new(codomain),
