@@ -1894,7 +1894,14 @@ where
         let trait_item = choice((
             just(Token::Type)
                 .ignore_then(binder)
-                .map(TraitItem::AssocType),
+                .then(annotation_mode().then(expr.clone()).or_not())
+                .map(|(name, annotation)| TraitItem::AssocType {
+                    name,
+                    annotation: annotation.map(|(mode, ty)| match mode {
+                        AnnotationMode::Exact => KindAnnotation::Kind(ty),
+                        AnnotationMode::Bounded => KindAnnotation::Bound(ty),
+                    }),
+                }),
             fn_signature,
         ))
         .then_ignore(just(Token::Newline));
@@ -1924,7 +1931,7 @@ where
                 let heads = std::iter::once((&name, "trait name"))
                     .chain(params.iter().map(|p| (p, "trait operand")))
                     .chain(items.iter().filter_map(|i| match i {
-                        TraitItem::AssocType(a) => Some((a, "associated type")),
+                        TraitItem::AssocType { name, .. } => Some((name, "associated type")),
                         TraitItem::Function(_) => None,
                     }));
                 for (head, what) in heads {
@@ -2966,7 +2973,10 @@ mod tests {
             Some("e")
         );
         let [
-            TraitItem::AssocType(elem),
+            TraitItem::AssocType {
+                name: elem,
+                annotation: None,
+            },
             TraitItem::Function(first),
             TraitItem::Function(tag),
         ] = decl.items.as_slice()

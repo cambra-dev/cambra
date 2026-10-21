@@ -593,8 +593,13 @@ pub struct TraitDecl {
 /// One line of a [`TraitDecl`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum TraitItem {
-    /// `type Elem`: an associated type.
-    AssocType(Spanned<SmolStr>),
+    /// `type Elem`, or `type Elem <: B` / `type Elem: K`: an associated type, with the bound
+    /// or kind every instance's choice of it has, written as a type parameter's is
+    /// (`docs/chl-spec.md`, "Declaring a trait").
+    AssocType {
+        name: Spanned<SmolStr>,
+        annotation: Option<KindAnnotation>,
+    },
     /// `def f(…) => T requires …`: a function the trait declares, with no body.
     Function(Box<Spanned<FunctionSignature>>),
 }

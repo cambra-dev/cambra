@@ -238,7 +238,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
     let mut operands: Vec<Rc<TypeParam>> = Vec::new();
     let mut assocs: Vec<(Assoc, Rc<TypeParam>)> = Vec::new();
     let assoc_names = decl.items.iter().filter_map(|i| match i {
-        TraitItem::AssocType(a) => Some(a),
+        TraitItem::AssocType { name, .. } => Some(name),
         TraitItem::Function(_) => None,
     });
     for (n, is_operand) in decl
@@ -276,9 +276,34 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
             assocs.push((Assoc::Declared(n.node.clone()), param));
         }
     }
+    // Each associated type's bound, written as a type parameter's kind is. It may name the
+    // operands and the other associated types, all in scope by now, but not the type it
+    // bounds.
+    let mut assoc_bounds: Vec<(Assoc, Type)> = Vec::new();
+    for item in &decl.items {
+        let TraitItem::AssocType {
+            name: n,
+            annotation: Some(annotation),
+        } = item
+        else {
+            continue;
+        };
+        let tp = chl_parser::ast::TypeParam {
+            name: n.node.clone(),
+            name_span: n.span,
+            annotation: Some(annotation.clone()),
+        };
+        match lower_kind(&tp, std::slice::from_ref(&tp), ctx)? {
+            TypeKind::SubtypesOf(bound) => {
+                assoc_bounds.push((Assoc::Declared(n.node.clone()), *bound));
+            }
+            TypeKind::Type => {}
+            other => unreachable!("`lower_kind` writes `Type` or `SubtypesOf`, got {other:?}"),
+        }
+    }
     // What every instance requires of the trait's types: requirements of the traits declared
     // above it.
-    let (requires, named) = lower_named_requirements(&decl.requires, ctx)?;
+    let (requires, named) = lower_named_requirements(&decl.requires, None, ctx)?;
     let mut functions: Vec<TraitFunction> = Vec::new();
     let mut function_spans: Vec<Span> = Vec::new();
     for item in &decl.items {
@@ -306,6 +331,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         span: name.span,
         operands,
         assocs,
+        assoc_bounds,
         functions,
         requires,
         named,
@@ -405,7 +431,7 @@ fn declare_function(
         ));
     };
     let output = signature_type(output, &qualified, ctx)?;
-    let requires = lower_requirements(requires, ctx)?;
+    let requires = lower_requirements(requires, None, ctx)?;
     // A call opens the function's own type parameters afresh, so its arguments determine
     // each: it appears in a parameter's type, or is the associated type of a requirement on
     // types they determine.
@@ -508,6 +534,41 @@ pub(super) fn declare_instances(
         }
     }
     errors
+}
+
+/// Whether `ty` could be below `bound` by its form: a function where `bound` is a function of
+/// its kind, through the domain and codomain; the base or nominal type `bound` is; a type of
+/// the form `bound` has. A hole or a type variable on either side could be anything. Whether
+/// a type of the right form is below is left to inference, which decides the subtyping.
+fn may_be_below(ty: &Type, bound: &Type) -> bool {
+    use crate::ccl::FunKind;
+    let (ty, bound) = (ty.peel_refinements(), bound.peel_refinements());
+    match (ty, bound) {
+        (Type::Hole | Type::Param(_), _) | (_, Type::Hole | Type::Param(_)) => true,
+        (
+            Type::Fun {
+                fun_kind: k0,
+                domain: d0,
+                codomain: c0,
+                ..
+            },
+            Type::Fun {
+                fun_kind: k1,
+                domain: d1,
+                codomain: c1,
+                ..
+            },
+        ) => {
+            let data = |k: &FunKind| !matches!(k, FunKind::Compute);
+            data(k0) == data(k1) && may_be_below(d0, d1) && may_be_below(c0, c1)
+        }
+        (Type::Base(a), Type::Base(b)) => a == b,
+        (Type::Nominal(d, xs), Type::Nominal(e, ys)) => {
+            d == e && xs.iter().zip(ys).all(|(x, y)| may_be_below(x, y))
+        }
+        // Two types of different forms: no value of one is a value of the other.
+        (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
 }
 
 /// An instance's head, `Container(Bag(T), Elem=T)`, for diagnostics.
@@ -675,6 +736,24 @@ fn declare_instance(
                 ),
             ));
         }
+        // An instance's choice is below the associated type's bound. Whether it is, given
+        // the operands, is inference's question wherever the instance is used; a choice of
+        // another form than the bound has no use that could satisfy it.
+        if let Some(bound) = trait_.assoc_bound(&name)
+            && !may_be_below(&ty, bound)
+        {
+            return Err(LoweringError::unsupported(
+                a.value.span,
+                format!(
+                    "`{}` is declared `{} <: {bound}` in `trait {trait_}`, and `{}` is not \
+                     below `{bound}`",
+                    a.name,
+                    a.name,
+                    crate::ccl::chl_print::chl_type(&ty),
+                    bound = crate::ccl::chl_print::chl_type(bound),
+                ),
+            ));
+        }
         assoc.push((name, ty));
     }
     if let Some(missing) = trait_
@@ -692,7 +771,7 @@ fn declare_instance(
         ));
     }
     let head = head_spelling(&trait_, &operands, &assoc);
-    let (requires, named) = lower_named_requirements(&block.requires, ctx)?;
+    let (requires, named) = lower_named_requirements(&block.requires, None, ctx)?;
     // The instance's functions read the requirements the trait names and those the block
     // names, by one set of names.
     if let Some((name, r)) = named
@@ -1321,7 +1400,7 @@ fn lower_instance_def(
     let requires = if requires.is_empty() {
         stated_requires
     } else {
-        let written = lower_requirements(requires, ctx)?;
+        let written = lower_requirements(requires, None, ctx)?;
         let same = written.len() == stated_requires.len()
             && written.iter().all(|w| stated_requires.contains(w));
         if !same {
