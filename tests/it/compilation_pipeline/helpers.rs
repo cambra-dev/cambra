@@ -185,6 +185,18 @@ pub(crate) fn check_program_scalar(program: &LoadedProgram, expected: Value) {
     assert_eq!(scalar.as_single().unwrap(), expected);
 }
 
+/// Run `code`, which writes to the test sink `out`, and check what the sink received, rendered
+/// as the differential interpreter's value: keyed, with entries in key order, so the order rows
+/// arrive in is not part of it.
+pub(crate) fn check_sink(code: &str, expected: &str) {
+    match crate::differential::run_compiled(code) {
+        crate::differential::Compiled::Value(v) => {
+            assert_eq!(v.to_string(), expected, "program:\n{code}")
+        }
+        other => panic!("the program produced no value: {other}\n  program:\n{code}"),
+    }
+}
+
 /// Check that the compiler produces an expected error on a program.
 /// Use this for negative tests and for program features that have
 /// only been partially implemented.

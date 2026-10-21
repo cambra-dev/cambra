@@ -364,21 +364,12 @@ function transformer: it narrows the upstream collection's domain and preserves 
 values. Accordingly, `upstream ▷ (p ▷ restrict)` applies the transformer to the
 upstream function; composing it as a morphism would have the wrong input type.
 
-A filter's predicate is compiled out of a refinement, so the iteration walk never reaches a
-collection the predicate aggregates, `[1, 2]` in `if x > sum([1, 2])`. The filter evaluates its
-predicate per element, and the collection is an iteration site like anywhere else. Each rewrite
-that builds a filter therefore runs the walk over its predicate as it builds it.
-`wrap_with_iterate` plans the `restrict`s of its iteration source, and the hash-join rewrite the
-residual `restrict`s of its plan, both through `plan_filter_predicates`. The hash-join rewrite
-also plans each side of an equality as it builds the key, since a key is computed per row too.
-The per-group filter rewrite plans its `filter_values` predicate with `insert_iterate_recurse`.
-
-The refinement `make_restrict` writes on the narrowed domain states the predicate unmarked. It meets
-the same predicate on the site's consumers and on its body's `cast`, which predicate compilation
-leaves unmarked, and the post-planning typecheck compares refinements structurally; a marked
-refinement fails that typecheck's collection-domain check. The typecheck never compares the
-refinement with the term the `restrict` applies, because `restrict` is a builtin whose stamped type
-it trusts.
+A `restrict`'s predicate is compiled at the site it filters. The refinement on the narrowed domain
+states the predicate as compiled, and the `restrict` applies it planned
+([Planning a lifted term](#planning-a-lifted-term)). The `restrict` lifts the predicate as the site
+stated it before compilation, so the lifted term reaches planning's phases with its nested
+refinements bare, as a term in the tree does: a group-by in a conditional's guard is recognized by
+the partition's bare equation.
 
 `Builtin::Iterate` requires no upstream input and compiles to `IterateExtent`. A
 nontrivial predicate on that builtin adds a `Restrict` operator; the planner's default
@@ -399,6 +390,69 @@ The complete `is_iteration_bearing` skip cases are:
 
 Recognizing a `restrict`-led chain is necessary for repeated planning walks: its upstream already
 has an iteration source, and another wrapper would stack a second one.
+
+### Planning a lifted term
+
+A refinement predicate is a term that planning reads in two ways. As the refinement a type
+carries, it is compiled to point-free form and stays a statement: it holds no planning, and two
+types stating one predicate compare equal. Where planning lifts it into the tree to run, it is a
+term like any other.
+
+Planning runs one list of phases, `PlanningPhase`: conditional realization, group-by recognition,
+correlated filters, `simplify`, correlated pairing, constant folding, the iteration walk, predicate
+compilation (`compile_refinement_predicates`), per-group filters, and a last `simplify`. The
+program runs every phase (`run`). A term lifted into the tree during one of them runs, where it is
+lifted, the phases the tree ran before it, since those phases do not rewrite inside a predicate
+while the term sits in one; the tree runs every later phase on it. Whether the lifting phase also
+runs at the lift depends on the order its walk rewrites in (`PlanningPhase::reaches_its_lifts`):
+
+- A top-down phase rewrites a node and then descends into what it built, so its own walk reaches
+  the term. Realization's gates, a group-by key, a correlated pair's filter, and a dependent
+  tuple's key family are lifted this way, by realization, group-by recognition, correlated filters
+  and correlated pairing.
+- A bottom-up phase has walked a node's children before it builds there, so the term runs that
+  phase at the lift. The iteration walk lifts a `restrict`'s predicate (`planned_restrict`) and a
+  hash join's keys and residual predicates, and the per-group filter phase lifts a filter's value
+  predicate.
+
+So each phase runs once on a lifted term, and `plan_lifted(term, lifted_during, witnesses)` reads
+the phases off `lifted_during`. The walk does not treat a lifted term's root as an iteration site:
+a consumer applies the term per element. A hash join plans its keys and residual predicates once
+the join is built: the join typechecks each piece as it builds it, against neighbours that state
+their predicates bare, and a planned term states its own compiled. It plans them against a copy of
+the witness decisions, kept only if the join is. Realization records what it decided about each
+witness once for the whole program (`Witnesses`), because a lifted term names the witnesses of the
+tree it came from.
+
+Every lift point-frees its term through `eliminate_lifted`, which states which of the passes
+between inference and planning skip a predicate and runs those on the term. Channelize is the one
+a predicate can need: the predicate shape rule keeps the mutable-variable forms out of a predicate
+(`debug_assert_predicate_shape`), but a generator called in a filter or a key leaves its `defer`
+block there. For a term holding a `defer`, `eliminate_lifted` runs channelize, which turns the
+block into the loop feeding its channel, then lambda elimination, then letrec recognition
+(`plan_loops`), which reads that loop as the collection it builds. Until a predicate is lifted, its
+`defer` block is source form: channelize reports an error in it (`check_predicate_defers`) without
+rewriting it, its residue check skips it, and the typecheck before planning checks it at
+`Strictness::PreChannelize`. Planning compiles every predicate, so the check of planning's output,
+`Strictness::Planned`, takes no predicate holding a `defer`.
+
+A `restrict` applies its predicate planned and states it as compiled (`make_restrict_stating`). A
+predicate that aggregates a correlated or filtered comprehension,
+`if sum([z for z in zs if z > x]) > 1`, runs as the `strength_over` site and `iterate`/`restrict`
+chain planning gives it anywhere else, and the refinement states the `cast` its source was written
+as.
+
+Realization leaves a conditional inside a refinement alone. Under leg 𝑖 a conditional source is its
+arm 𝑖, and planning substitutes that arm into each leg's predicates for a conditional that has a
+witness. A conditional still in a predicate when the predicate is lifted is realized with the
+lifted term. A lifted term that applies a union at its element, a realized conditional or a `++`,
+rather than iterating it, is refused (`refuse_a_union_applied_at_the_input`): the legs of a realized
+same-domain conditional, applied at one index, both answer, and `flat_merge` would reject the
+overlap at run time. A conditional chosen per row is not refused, since `filter_values` gates each
+of its legs on the element and one leg answers. A filter over a same-domain conditional source
+reaches this, because the filter's predicate holds its own copy of the source and the copy has no
+witness to substitute by (`a_filter_over_a_union_source_is_refused` in
+`tests/it/compilation_pipeline/comprehensions.rs`).
 
 ### Per-group value filters
 

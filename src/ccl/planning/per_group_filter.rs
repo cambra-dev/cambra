@@ -47,11 +47,17 @@ use crate::ccl::{Refinement, application_order, subst::open_codomain};
 /// filter.
 pub(super) fn insert_per_group_filters(
     expr: &mut Expr,
-    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
-) {
-    expr.walk_children_mut(|child| insert_per_group_filters(child, realized));
+    witnesses: &mut Witnesses,
+) -> Result<(), String> {
+    let mut result = Ok(());
+    expr.walk_children_mut(|child| {
+        if result.is_ok() {
+            result = insert_per_group_filters(child, witnesses);
+        }
+    });
+    result?;
     let TypedExprNode::Compose(elts) = &expr.node else {
-        return;
+        return Ok(());
     };
     // The compose is what the recording names: the filter is spliced into it,
     // and the site it narrows keeps its own id, re-typed in place. `Machinery`, for
@@ -69,22 +75,27 @@ pub(super) fn insert_per_group_filters(
         provenance::Nature::Machinery,
     );
     let Some(site) = elts.iter().position(|e| per_group_filter_site(e).is_some()) else {
-        return;
+        return Ok(());
     };
     // `site` is never 0: the morphism consumes a collection, so something upstream
     // produces one.
     if site == 0 {
-        return;
+        return Ok(());
     }
     let TypedExprNode::Compose(elts) = &mut expr.node else {
         unreachable!("matched a Compose above")
     };
-    let Some((site_codomain, mut value_predicate)) = per_group_filter_site(&elts[site]) else {
+    let Some((site_codomain, value_predicate)) = per_group_filter_site(&elts[site]) else {
         unreachable!("position found it")
     };
-    // The filter evaluates its predicate per value, so a collection the predicate
-    // aggregates is an iteration site (`super::iterate::plan_filter_predicates`).
-    iterate::insert_iterate_recurse(&mut value_predicate, realized);
+    // The filter evaluates its predicate per value, so it is planned as a `restrict`'s
+    // predicate is ([`iterate::planned_restrict`]): a collection it aggregates is an
+    // iteration site.
+    let value_predicate = plan_lifted(
+        value_predicate,
+        PlanningPhase::InsertPerGroupFilters,
+        witnesses,
+    )?;
     let narrowed = site_codomain
         .domain()
         .expect("a per-group filter site returns a collection");
@@ -119,6 +130,7 @@ pub(super) fn insert_per_group_filters(
     }
     elts[site].ty = retyped;
     elts.insert(site, filter);
+    Ok(())
 }
 
 /// The site's codomain and the value predicate to filter by, if `expr` is a per-group
@@ -334,7 +346,7 @@ mod tests {
     #[test]
     fn two_added_refinements_become_one_conjoined_filter() {
         let (mut expr, _) = site_adding(&["q1", "q2"]);
-        insert_per_group_filters(&mut expr, &Default::default());
+        insert_per_group_filters(&mut expr, &mut Default::default()).unwrap();
         let (filter, site_ty) = planned(&expr);
         let filter = filter.expect("the site narrows, so a filter was inserted");
         assert_eq!(
@@ -377,7 +389,7 @@ mod tests {
         refinements.insert(closed);
 
         let before = expr.clone();
-        insert_per_group_filters(&mut expr, &Default::default());
+        insert_per_group_filters(&mut expr, &mut Default::default()).unwrap();
         assert_eq!(planned(&expr).0, None, "no filter was inserted");
         assert_eq!(expr, before, "the site is untouched");
         let rejected = reject_unmaterialized_narrowings(&expr)
@@ -389,7 +401,7 @@ mod tests {
     #[test]
     fn a_materialized_site_is_not_rejected() {
         let (mut expr, _) = site_adding(&["q1"]);
-        insert_per_group_filters(&mut expr, &Default::default());
+        insert_per_group_filters(&mut expr, &mut Default::default()).unwrap();
         assert_eq!(reject_unmaterialized_narrowings(&expr), Ok(()));
     }
 }

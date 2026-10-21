@@ -1490,8 +1490,15 @@ fn assert_annotations_cleared(expr: &Expr, visited: &mut HashSet<crate::ccl::Pre
 /// How the annotation checks treat inference-transient type variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strictness {
+    /// The contract of planning's output: [`Strict`](Self::Strict), with no
+    /// exception for a refinement predicate. Planning compiles every predicate,
+    /// and lifting one channelizes the `defer` blocks it holds
+    /// (`crate::ccl::planning::predicates::eliminate_lifted`).
+    Planned,
     /// No `Hole`, `Infer`, or `Feed` anywhere — the contract downstream of
-    /// `channelize`.
+    /// `channelize` — except in a refinement predicate holding its own `defer`.
+    /// That predicate is in source form until planning lifts it, and is checked
+    /// at [`PreChannelize`](Self::PreChannelize).
     Strict,
     /// `Hole` is still a bug (coalesce replaces every slot it visits), but
     /// `Infer`, `Feed`/`Overwrite` histories, and `ChanDom` channel domains are
@@ -1500,6 +1507,14 @@ pub enum Strictness {
     /// induction accumulators (`Overwrite` histories whose `Infer` domain the unified
     /// phase resolves), none of which are erased yet.
     PreChannelize,
+}
+
+impl Strictness {
+    /// Whether an inference-transient variant (`Infer`, `ChanDom`, a history) is an
+    /// error at this strictness.
+    fn rejects_transients(self) -> bool {
+        matches!(self, Strictness::Planned | Strictness::Strict)
+    }
 }
 
 /// Assert that no type slot in `expr` carries a **free** witness reference.
@@ -1791,7 +1806,7 @@ fn collect_type_errors(
             // to the writing loop's domain); the relaxation tolerates it (see
             // [`Strictness`]). Feed channel domains are the rigid `ChanDom`
             // handled below, not `Infer`.
-            if strictness == Strictness::Strict {
+            if strictness.rejects_transients() {
                 errors.push(InferError::UnresolvedInfer {
                     id: var.uid,
                     at: context_sym.to_string(),
@@ -1802,7 +1817,7 @@ fn collect_type_errors(
         // exactly like an `Infer` channel domain — `channelize` must
         // substitute it away; a survivor at the strict wall is a compiler bug.
         Type::ChanDom(name, _) => {
-            if strictness == Strictness::Strict {
+            if strictness.rejects_transients() {
                 errors.push(InferError::Unsupported(format!(
                     "channel domain chan({name}) survived channelize at `{context_sym}`"
                 )));
@@ -1869,7 +1884,7 @@ fn collect_type_errors(
             // A history handle at the strict wall is a compiler bug — a `Feed`
             // history should have been erased by `channelize`, an `Overwrite`
             // history by the unified phase (`transact_phase` / `mut_elim`).
-            if strictness == Strictness::Strict {
+            if strictness.rejects_transients() {
                 let what = match history_kind {
                     HistoryKind::Append => "feed handle type survived channelize",
                     HistoryKind::Overwrite => "mutable-reference type survived the unified phase",
@@ -1893,6 +1908,16 @@ fn collect_type_errors(
             // with the refinement walk.
             for refinement in refinements {
                 if seen_refinements.insert(refinement.predicate_id()) {
+                    // A predicate holding its own `defer` is in source form until it is
+                    // lifted, which channelizes it (`planning::predicates::eliminate_lifted`),
+                    // so before planning it is checked as the tree before channelize is.
+                    let strictness = if strictness == Strictness::Strict
+                        && crate::ccl::channelize::holds_defer(&refinement.predicate)
+                    {
+                        Strictness::PreChannelize
+                    } else {
+                        strictness
+                    };
                     collect_expr_errors(
                         &refinement.predicate,
                         strictness,
@@ -1938,10 +1963,21 @@ pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
     super::check(expr)
 }
 
-/// [`typecheck`] against the types of the registered data sources, which also verifies the type
-/// of each projected source and reports a path through a field its source's type does not
-/// carry. Projection pruning mints projected sources after inference, so this is the first
-/// check that sees one.
+/// [`typecheck`] for planning's output, at [`Strictness::Planned`], where a refinement predicate
+/// holding a `defer` is an error, and against the types of the registered data sources, which
+/// also verifies the type of each projected source and reports a path through a field its
+/// source's type does not carry. Projection pruning mints projected sources during planning, so
+/// this is the first check that sees one.
+pub fn typecheck_planned(
+    expr: &Expr,
+    sources: &HashMap<String, Type>,
+) -> Result<(), Vec<InferError>> {
+    check_annotated(expr, Strictness::Planned).map_err(unlocated)?;
+    crate::ccl::infer::check::check_located_against(expr, Some(sources)).map_err(unlocated)
+}
+
+/// [`typecheck`] against the types of the registered data sources ([`typecheck_planned`]
+/// without its planning-only strictness).
 pub fn typecheck_against(
     expr: &Expr,
     sources: &HashMap<String, Type>,
@@ -4756,6 +4792,30 @@ mod tests {
         assert_eq!(
             undischarged_index_hint(&str_lit_ty("nope"), &Type::Base(BaseType::Int)),
             None
+        );
+    }
+
+    /// A predicate holding a `defer` is source form until planning lifts it: the check
+    /// between channelize and planning takes it, and the check of planning's output reports
+    /// the feed handle it binds.
+    #[test]
+    fn a_defer_in_a_predicate_is_an_error_only_after_planning() {
+        let feed = Type::feed(Type::UIntRange(3), Type::Base(BaseType::Int));
+        let defer = Expr::new(TypedExprNode::Defer).with_ty(feed);
+        let truth = Expr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool));
+        let predicate = Expr::let_bind("d", defer, truth).with_ty(Type::Base(BaseType::Bool));
+        let refined = Type::refined_one(
+            Type::UIntRange(3),
+            crate::ccl::ty::Refinement::born(std::rc::Rc::new(predicate)),
+        );
+        let tree = Expr::lambda("x", refined, Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1)));
+        typecheck(&tree).expect("before planning, a predicate holding a `defer` is source form");
+        let errs = typecheck_planned(&tree, &HashMap::new())
+            .expect_err("a feed handle in a predicate passed");
+        assert!(
+            errs.iter()
+                .any(|e| format!("{e:?}").contains("feed handle type survived channelize")),
+            "{errs:?}"
         );
     }
 }

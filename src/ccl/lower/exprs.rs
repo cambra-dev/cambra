@@ -10,6 +10,7 @@ use crate::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, BindingTransparency, Builtin,
         CompareKind, Expr, Lit, LogicKind, Name, Refinement, Type, TypedExprNode, UnaryOpKind,
         ccl_utils::{make_cast, refined_data_fun},
+        uniquify,
     },
     chl_parser::ast::{
         AssignTarget, AugOp, BinOp as ChlBinOp, BindingTransparency as ChlTransparency, BoolOp,
@@ -388,6 +389,31 @@ pub(super) fn lower_application(
     Ok(Expr::apply(arg_tuple, callee))
 }
 
+/// A lowered term that lowering places at more than one position.
+///
+/// [`MintedTerm::mint`] mints its binders before any copy is taken ("Mint before copy",
+/// `crate::ccl::uniquify`), so every copy names the same binders. A copy of a raw term would
+/// mint binders of its own at the program's `uniquify`, while a refinement nested in the
+/// term is one `Rc` that every copy shares and that pass rebuilds once, against the first
+/// copy's binders; the other copies' refinement would name a binder they do not have.
+struct MintedTerm(Expr);
+
+impl MintedTerm {
+    fn mint(term: Expr) -> Self {
+        Self(uniquify::run(term))
+    }
+
+    /// A copy to place.
+    fn copy(&self) -> Expr {
+        self.0.clone()
+    }
+
+    /// The term itself, for its last placement.
+    fn into_inner(self) -> Expr {
+        self.0
+    }
+}
+
 /// Lower group-by and return its present-key domain for re-keying callers.
 /// Reuse the returned domain: it shares both the key-type hole and the predicate allocation.
 /// See `src/ccl/design/collections.md`, "`groupby`'s exact type".
@@ -397,6 +423,9 @@ fn lower_groupby(
     span: Span,
     ctx: &mut LoweringContext,
 ) -> (Expr, Type) {
+    // Both operands are placed in the key domain and in the partition.
+    let collection = MintedTerm::mint(collection);
+    let key_fn = MintedTerm::mint(key_fn);
     let key_domain = {
         let key = ctx.fresh_shared_hole();
         present_key_domain(&collection, &key_fn, key, span, ctx)
@@ -410,15 +439,15 @@ fn lower_groupby(
     // unrecorded lowering mint is a `Leak::Unexplained` at the boundary.
     let bare_pred = Expr::binop(
         Expr::apply(
-            Expr::apply(Expr::var(Name::elem()), collection.clone()),
-            key_fn,
+            Expr::apply(Expr::var(Name::elem()), collection.copy()),
+            key_fn.into_inner(),
         ),
         BinOpKind::Compare(CompareKind::Equals),
         Expr::var("__gb_k"),
     );
     let gb = "lower.groupby";
     let inner_var = ctx.tag_machinery(Expr::var("__gb_i"), span, gb);
-    let inner_body = ctx.tag_machinery(Expr::apply(inner_var, collection), span, gb);
+    let inner_body = ctx.tag_machinery(Expr::apply(inner_var, collection.into_inner()), span, gb);
     // The group is a **collection** — the members sharing one key — so the lambda under
     // the cast carries the same `Data` stamp the outer function does. The cast target's
     // `Data` alone is not enough: a cast re-views its value at the target's kind, so an
@@ -491,15 +520,15 @@ fn lower_rekeyed(
 /// over `Int` keys.
 /// See `src/ccl/design/collections.md`, "The key domain is the key morphism's image".
 fn present_key_domain(
-    collection: &Expr,
-    key_fn: &Expr,
+    collection: &MintedTerm,
+    key_fn: &MintedTerm,
     key: Type,
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Type {
     // The composition retains the collection's data domain. Its codomain must share the
     // refinement base, not merely constrain that base through builtin application.
-    let morphism = Expr::compose(vec![collection.clone(), key_fn.clone()])
+    let morphism = Expr::compose(vec![collection.copy(), key_fn.copy()])
         .with_user_annotation(Type::data_fun(Type::Hole, key.clone()));
     let characteristic = Expr::apply(morphism, Expr::builtin(Builtin::CollectionContains));
     // The domain's nodes are minted here and live in a type slot, outside the
@@ -766,12 +795,12 @@ pub(super) fn lower_compare(
 ) -> Result<Expr, LoweringError> {
     // Lower all operands up-front. For a chain of n ops there are n+1 operands:
     // left, comparators[0], comparators[1], …
-    let mut operands: Vec<Expr> = Vec::with_capacity(comparators.len() + 1);
+    let mut operands: Vec<MintedTerm> = Vec::with_capacity(comparators.len() + 1);
     let mut operand_spans: Vec<Span> = Vec::with_capacity(comparators.len() + 1);
-    operands.push(lower_expr(left, ctx)?);
+    operands.push(MintedTerm::mint(lower_expr(left, ctx)?));
     operand_spans.push(left.span);
     for comp in comparators {
-        operands.push(lower_expr(comp, ctx)?);
+        operands.push(MintedTerm::mint(lower_expr(comp, ctx)?));
         operand_spans.push(comp.span);
     }
 
@@ -783,7 +812,7 @@ pub(super) fn lower_compare(
     let operand = |i: usize| {
         use crate::ccl::provenance::copy_frame;
         let _frame = copy_frame("lower.compare_operand");
-        operands[i].clone()
+        operands[i].copy()
     };
     let mut comparisons: Vec<Expr> = Vec::with_capacity(ops.len());
     for (i, op) in ops.iter().enumerate() {

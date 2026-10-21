@@ -183,8 +183,13 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
 
 /// The point-free predicate function `p : base ⇒ Bool` underlying a refinement's
 /// bare predicate `__elem ▷ p` (the inverse of [`ccl_utils::bare_predicate_of_fn`]).
-/// Fast-pathed when the bare predicate is already that single application;
-/// otherwise η-expands to `λ __elem → bare` and lambda-eliminates to point-free.
+/// Fast-pathed when the bare predicate is already that single application; otherwise
+/// η-expands to `λ __elem → bare` and lambda-eliminates to point-free.
+///
+/// The fast path returns `p` as it stands, and lambda elimination leaves predicates alone, so
+/// `p` can still hold a lambda: a group-by's key domain states
+/// `__elem ▷ ((c ≫ λ 𝑒 → key) ▷ collection_contains)`. A `p` holding a `defer`, from a
+/// generator called in the key, runs [`eliminate_lifted`] on itself, which channelizes it.
 ///
 /// The function is a **collection**: it yields one `Bool` per element of what the refinement
 /// refines, and the runtime `Restrict` evaluates it over the extent
@@ -207,6 +212,10 @@ pub(crate) fn fn_of_bare_predicate(
     if let TypedExprNode::Apply { argument, function } = &bare.node
         && matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
     {
+        if crate::ccl::channelize::holds_defer(function) {
+            return eliminate_lifted((**function).clone())
+                .expect("lambda-elim of a refinement predicate holding a `defer`");
+        }
         return (**function).clone();
     }
     // A plain collection carries no binders; a sum carries the telescope `base` is written
@@ -237,7 +246,72 @@ pub(crate) fn fn_of_bare_predicate(
         }
         _ => lam,
     };
-    lambda_elim::run(lam).expect("lambda-elim of refinement predicate")
+    eliminate_lifted(lam).expect("lambda-elim of refinement predicate")
+}
+
+/// Point-free `term`, a term lifted out of a refinement predicate, by the passes between
+/// inference and planning that it skipped while it sat in a type
+/// (`src/ccl/design/optimization.md`, "Planning a lifted term").
+///
+/// Of those passes:
+///
+/// - `inline` reaches a predicate: its substitution rewrites type slots too.
+/// - `transact_phase::run` and `mut_elim` find nothing to rewrite there: a predicate holds no
+///   mutability statement ([`crate::ccl::ty::debug_assert_predicate_shape`]).
+/// - `channelize` skips a predicate holding a `defer` block, which a generator called in a
+///   filter or a key leaves there. This runs it on such a term, then letrec recognition
+///   (`plan_loops`), which reads the loop channelize builds as the collection it feeds.
+/// - `transact_phase::rewrite_as_of_reads` walks terms only, and a predicate holds no
+///   `as_of_read`: that read is bound in the tree, and a predicate reads its binder.
+/// - `lambda_elim` skips predicates, and this runs it.
+///
+/// Debug builds assert that the result holds none of these passes' source forms.
+pub(crate) fn eliminate_lifted(term: Expr) -> Result<Expr, lambda_elim::LambdaElimError> {
+    let eliminated = if crate::ccl::channelize::holds_defer(&term) {
+        // Channelize reported every error in a `defer` block a predicate holds
+        // (`channelize::check_predicate_defers`), so this one channelizes.
+        let channelized = crate::ccl::channelize::run(term)
+            .unwrap_or_else(|e| panic!("channelizing a term lifted out of a predicate: {e:?}"));
+        plan_loops(lambda_elim::run(channelized)?)
+    } else {
+        lambda_elim::run(term)?
+    };
+    #[cfg(debug_assertions)]
+    if let Some(form) = pre_planning_source_form(&eliminated) {
+        panic!(
+            "a term lifted out of a predicate still holds a `{form}`, which a pass before \
+             planning rewrites: {}",
+            symbolic(&eliminated)
+        );
+    }
+    Ok(eliminated)
+}
+
+/// The first node in `e`'s term that a pass between inference and planning rewrites
+/// ([`eliminate_lifted`] lists them).
+#[cfg(debug_assertions)]
+fn pre_planning_source_form(e: &Expr) -> Option<&'static str> {
+    use TypedExprNode as N;
+    let here = match &e.node {
+        N::Lambda { .. } => Some("Lambda"),
+        N::Defer => Some("Defer"),
+        N::Feed { .. } => Some("Feed"),
+        N::Define { .. } => Some("Define"),
+        N::MutDecl { .. } => Some("MutDecl"),
+        N::MutWrite { .. } => Some("MutWrite"),
+        N::For { .. } => Some("For"),
+        N::Begin { .. } => Some("Begin"),
+        N::LetRec { .. } => Some("LetRec"),
+        N::Apply { function, .. } if is_builtin(function, Builtin::AsOfRead) => Some("as_of_read"),
+        _ => None,
+    };
+    let mut found = here;
+    e.walk_children(|c| {
+        if found.is_none() {
+            found = pre_planning_source_form(c);
+        }
+    });
+    found
 }
 
 fn compile_predicates_in_type(

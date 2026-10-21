@@ -538,6 +538,35 @@ fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
+/// A generator called in a filter or a group-by key: its body stays in the predicate until
+/// planning lifts the predicate or the key out of it, which channelizes it.
+#[rstest]
+#[case::in_a_filter(indoc! {r#"
+    def triples(hxs):
+        for hx in hxs:
+            yield hx * 3
+    out = test_sink()
+    out << sum([x for x in [1, 4, 7] if max(triples([1, 2])) > x + 1])
+"#}, "[() -> 5]")]
+#[case::in_a_key(indoc! {r#"
+    def triples(hxs):
+        for hx in hxs:
+            yield hx * 3
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> max(triples([1, 2])) // e)])
+"#}, "[() -> 4]")]
+#[case::in_a_key_under_a_loop(indoc! {r#"
+    def triples(hxs):
+        for hx in hxs:
+            yield hx * 3
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([sum(g) for g in groupby([1, 1, 2], \e -> max(triples([1, 2])) * i)])
+"#}, "[4, 4]")]
+fn a_generator_called_in_a_predicate(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
 // ---------------------------------------------------------------------------
 // Function-kind inference on a parameter
 // ---------------------------------------------------------------------------

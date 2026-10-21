@@ -20,8 +20,8 @@
 use log::trace;
 
 use crate::ccl::ccl_utils::{
-    self, PredMemo, apply_function, make_iterate, make_restrict, refine_extent, set_codomain,
-    trivially_true_predicate, typed_compose,
+    self, PredMemo, apply_function, make_iterate, make_restrict, make_restrict_stating,
+    refine_extent, set_codomain, trivially_true_predicate, typed_compose,
 };
 // Re-exported so the `planning` submodules (`groupby`, `join`) can keep calling
 // `is_builtin` unqualified through their `use super::*`.
@@ -47,6 +47,8 @@ mod loops;
 mod per_group_filter;
 mod predicates;
 mod projection_pruning;
+
+use conditionals::Witnesses;
 
 // Preserve the `crate::ccl::planning::…` paths that other modules' doc-comments
 // and prose reference (design docs link `insert_iterate_markers`; `ccl_utils` /
@@ -82,8 +84,8 @@ pub(crate) use predicates::fn_of_bare_predicate;
 ///    onto it: `(iterate ▷ (p₁ ▷ restrict) ▷ … ▷ (pₙ ▷ restrict)) ≫ body`.  Each `restrict` *applies* to
 ///    its upstream — it is a function transformer, not a morphism composed
 ///    with the source (its honest type makes the composed form ill-typed;
-///    see [`make_restrict`]).  Unrefined sites get just the chain-head
-///    iterate.
+///    see [`make_restrict`](crate::ccl::ccl_utils::make_restrict)).  Unrefined sites get
+///    just the chain-head iterate.
 ///
 /// Hash join is the specialised strategy; the iterate-then-restricts
 /// chain is the default.  Both branches are materialising the same
@@ -96,66 +98,262 @@ pub(crate) use predicates::fn_of_bare_predicate;
 /// runs before the materialisation walk.
 ///
 /// The error is an unsupported program: a jagged row realization cannot keep
-/// ([`conditionals::realize_conditional_collections`]), or a per-group narrowing no
-/// filter materializes ([`per_group_filter::reject_unmaterialized_narrowings`]).
-pub fn run(mut expr: Expr) -> Result<Expr, String> {
-    // Refinement predicates travel through inference and lambda-elim as bare
-    // expressions over the implicit `REFINEMENT_BINDER` (design §6.3) and are
-    // compiled to point-free form only when a refined type is iterated (§6.5).
-    // The group-by recognizer runs first and matches the bare predicate
-    // directly; the generic filter / hash-join paths compile the predicate
-    // lazily at each iteration site (see `wrap_with_iterate`).
-    // Realize conditional collections first: the gated union it produces is an ordinary
-    // collection, so every later phase — recognizers, iteration-site materialisation,
-    // predicate compilation — sees one shape rather than needing a `Case` case.
-    let realized = conditionals::realize_conditional_collections(&mut expr)?;
-    groupby::recognize_groupby_sites(&mut expr);
-    correlated::emit_correlated_filters(&mut expr);
-    let mut expr = simplify(expr);
-    correlated::pair_correlated_sites(&mut expr)?;
-    // Constant-fold before the iteration walk so a collection literal's elements are
-    // already values when op conversion reads them. It runs after `simplify` because
-    // `try_string_add_to_concat` is what retargets `String + String` to `Concat`, and the
-    // fold dispatches on the operator it is handed.
-    const_fold::fold_constants(&mut expr);
-    insert_iterate_markers(&mut expr, &realized);
-    // Normalize every remaining bare predicate tree-wide to point-free form.
-    // `wrap_with_iterate` compiles each iteration *site*'s predicate, but a
-    // refinement also rides **consumer contracts** that sit outside any site —
-    // an aggregate's domain (`sum : ({D | p} ⇒ Int) ⇒ Int`), a composition
-    // adjacency — carrying the same predicate as the producer they validate
-    // against. With immutable predicate terms those are independent `Rc`s, so
-    // the per-site compilation doesn't reach them; this whole-tree pass (one
-    // shared memo) compiles them to the *same* point-free form, so the
-    // post-planning typecheck's structural refinement match holds. It runs
-    // after the recognizers (which already consumed the bare shapes they
-    // match) and is idempotent on already-compiled predicates.
-    compile_refinement_predicates(&mut expr, &PredMemo::new());
-    // A refinement on an inner collection's domain is materialized here rather than
-    // by the iteration walk above: `wrap_with_iterate` reads a node's own domain,
-    // and this one is a codomain in. It runs after predicate compilation because it
-    // matches the point-free predicate, and after the group-by rewrite because the
-    // site's upstream is the `converse` chain it splices into.
-    per_group_filter::insert_per_group_filters(&mut expr, &realized);
-    per_group_filter::reject_unmaterialized_narrowings(&expr)?;
-    // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
-    // boilerplate that [`join::try_hash_join_rewrite`] emits via
-    // [`replace_tuple_project_with_id`].  `simplify` is marker-aware: its
-    // structural-discard rules self-guard against dropping or relocating
-    // the `Apply(_, Iterate)` / `Apply(_, Restrict)` markers just inserted,
-    // so the only rules that fire here are the always-safe cleanups (plus
-    // any reduction of a fully marker-free sub-tree, which is sound).
-    let mut expr = simplify(expr);
-    // Projection pruning runs after the final `simplify`, on the planned tree. Every rewrite
-    // above matches a source in the shape it has when the source is read whole, and pruning
-    // retypes the source from the record to the leaves its chain reads. It follows the
-    // point-free chain heads planning leaves, so it needs the identities and nested
-    // compositions the last `simplify` removes.
-    projection_pruning::run(&mut expr);
+/// ([`conditionals::realize_conditional_collections`]), a correlated site whose keys nothing
+/// enumerates, in the tree or in a lifted term (`correlated::pair_correlated_sites`), a
+/// lifted term applying a union at its element ([`refuse_a_union_applied_at_the_input`]), or
+/// a per-group narrowing no filter materializes
+/// ([`per_group_filter::reject_unmaterialized_narrowings`]).
+pub fn run(expr: Expr) -> Result<Expr, String> {
     // Live cross-endpoint reads are recognized earlier, in
     // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
     // such read is already an `as_of` join — nothing to do at planning time.
+    let mut expr = run_phases(
+        expr,
+        Root::Program,
+        &PlanningPhase::ALL,
+        &mut Witnesses::default(),
+    )?;
+    // Projection pruning runs on the planned program, after the final `simplify`
+    // ([`PlanningPhase::Cleanup`]). Every phase matches a source in the shape it has when the
+    // source is read whole, and pruning retypes the source from the record to the leaves its
+    // chain reads. It follows the point-free chain heads planning leaves, so it needs the
+    // identities and nested compositions the last `simplify` removes.
+    projection_pruning::run(&mut expr);
     Ok(expr)
+}
+
+/// The phases of planning, in the order [`run`] runs them on the program.
+///
+/// A term planning lifts out of a refinement predicate enters the tree during one of
+/// them, and [`plan_lifted`] reads off that phase which of them the term runs where it is
+/// lifted (`src/ccl/design/optimization.md`, "Planning a lifted term").
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(super) enum PlanningPhase {
+    /// Rewrite every collection-valued value-`Case` into its gated union
+    /// ([`conditionals::realize_conditional_collections`]). It runs first, so every later
+    /// phase sees an ordinary collection rather than needing a `Case` case. Top-down: it
+    /// descends into the union it builds, so it reaches each leg's gate.
+    RealizeConditionals,
+    /// The pointful group-by rewrite ([`groupby::recognize_groupby_sites`]). Top-down: it
+    /// descends into the chain it builds, so it reaches the key it lifts.
+    RecognizeGroupBy,
+    /// The filter riding each correlated `curry` site's pair
+    /// ([`correlated::emit_correlated_filters`]). Top-down: it descends into the curried
+    /// morphism the filter joins.
+    EmitCorrelatedFilters,
+    /// `simplify`, which the pairing below reads: a `curry` an eta reduction removes is gone
+    /// before it.
+    Simplify,
+    /// Rewrite each correlated `curry` site through `strength_over`
+    /// ([`correlated::pair_correlated_sites`]). Top-down: it descends into the rewritten
+    /// site, so it reaches a dependent tuple's key family.
+    PairCorrelatedSites,
+    /// Constant folding, so a collection literal's elements are values when op conversion
+    /// reads them. It runs after `simplify` because `try_string_add_to_concat` is what
+    /// retargets `String + String` to `Concat`, and the fold dispatches on the operator it is
+    /// handed.
+    FoldConstants,
+    /// The iteration walk ([`iterate::insert_iterate_recurse`]). Bottom-up: it builds a
+    /// site's `restrict`s and a hash join's keys after walking the site's children, and does
+    /// not walk what it built.
+    MarkIterationSites,
+    /// Compile every remaining bare predicate to point-free form. `wrap_with_iterate`
+    /// compiles each iteration site's predicate, but a refinement also rides consumer
+    /// contracts outside any site, an aggregate's domain (`sum : ({D | p} ⇒ Int) ⇒ Int`) or a
+    /// composition adjacency, carrying the same predicate as the producer they validate
+    /// against. Those are independent `Rc`s, so this pass, with one shared memo, compiles
+    /// them to the same point-free form, and the post-planning typecheck's structural
+    /// refinement match holds. It runs after the recognizers, which consume the bare shapes
+    /// they match.
+    CompilePredicates,
+    /// Materialize a refinement on an inner collection's domain as a per-group filter
+    /// ([`per_group_filter::insert_per_group_filters`]), then refuse a narrowing none
+    /// materializes. `wrap_with_iterate` reads a node's own domain, and this one is a
+    /// codomain in. It runs after predicate compilation because it matches the point-free
+    /// predicate, and after the group-by rewrite because the site's upstream is the
+    /// `converse` chain it splices into. Bottom-up: it inserts a filter after walking the
+    /// site's children.
+    InsertPerGroupFilters,
+    /// `simplify` again, absorbing the `id` leaves and nested `Compose` that
+    /// [`join::try_hash_join_rewrite`] emits through [`replace_tuple_project_with_id`].
+    /// `simplify` is marker-aware: its structural-discard rules do not drop or move an
+    /// `Apply(_, Iterate)` or `Apply(_, Restrict)` marker, so only the cleanups and the
+    /// reduction of a marker-free subtree fire here.
+    Cleanup,
+}
+
+impl PlanningPhase {
+    const ALL: [PlanningPhase; 10] = [
+        PlanningPhase::RealizeConditionals,
+        PlanningPhase::RecognizeGroupBy,
+        PlanningPhase::EmitCorrelatedFilters,
+        PlanningPhase::Simplify,
+        PlanningPhase::PairCorrelatedSites,
+        PlanningPhase::FoldConstants,
+        PlanningPhase::MarkIterationSites,
+        PlanningPhase::CompilePredicates,
+        PlanningPhase::InsertPerGroupFilters,
+        PlanningPhase::Cleanup,
+    ];
+
+    /// Whether this phase's walk of the tree reaches a term it lifts into the tree. A
+    /// top-down walk rewrites a node and then descends into what it built; a bottom-up walk
+    /// has walked a node's children before it builds there.
+    ///
+    /// # Panics
+    ///
+    /// For a phase that lifts no term.
+    fn reaches_its_lifts(self) -> bool {
+        match self {
+            PlanningPhase::RealizeConditionals
+            | PlanningPhase::RecognizeGroupBy
+            | PlanningPhase::EmitCorrelatedFilters
+            | PlanningPhase::PairCorrelatedSites => true,
+            PlanningPhase::MarkIterationSites | PlanningPhase::InsertPerGroupFilters => false,
+            PlanningPhase::Simplify
+            | PlanningPhase::FoldConstants
+            | PlanningPhase::CompilePredicates
+            | PlanningPhase::Cleanup => unreachable!("planning's `{self:?}` lifts no term"),
+        }
+    }
+}
+
+/// What [`run_phases`] plans: the program, or a term lifted out of a refinement predicate.
+///
+/// The program's root is an iteration site ([`iterate::insert_iterate_markers`]). A lifted
+/// term is a predicate or a key that a consumer applies per element, so its root is not one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Root {
+    Program,
+    Lifted,
+}
+
+/// Plan `term`, which planning lifted out of a refinement predicate into the tree during
+/// `lifted_during`.
+///
+/// The term sat in a type while the tree ran the phases before `lifted_during`, and those
+/// phases do not rewrite inside a predicate, so it runs them here. It runs `lifted_during`
+/// here only when that phase's walk does not reach what it lifts
+/// ([`PlanningPhase::reaches_its_lifts`]). Every later phase reaches it with the tree. So a
+/// lifted term runs each phase once (`src/ccl/design/optimization.md`, "Planning a lifted
+/// term").
+///
+/// The error is planning's ([`run`]), or a term that applies a union of collections at its
+/// input ([`refuse_a_union_applied_at_the_input`]).
+pub(super) fn plan_lifted(
+    term: Expr,
+    lifted_during: PlanningPhase,
+    witnesses: &mut Witnesses,
+) -> Result<Expr, String> {
+    let through = PlanningPhase::ALL
+        .iter()
+        .position(|&p| p == lifted_during)
+        .expect("`ALL` lists every phase")
+        + usize::from(!lifted_during.reaches_its_lifts());
+    run_phases(
+        term,
+        Root::Lifted,
+        &PlanningPhase::ALL[..through],
+        witnesses,
+    )
+}
+
+/// Run `phases` on `term`, in order.
+fn run_phases(
+    mut term: Expr,
+    root: Root,
+    phases: &[PlanningPhase],
+    witnesses: &mut Witnesses,
+) -> Result<Expr, String> {
+    for phase in phases {
+        match phase {
+            PlanningPhase::RealizeConditionals => {
+                conditionals::realize_conditional_collections(&mut term, witnesses)?;
+                if root == Root::Lifted {
+                    refuse_a_union_applied_at_the_input(&term)?;
+                }
+            }
+            PlanningPhase::RecognizeGroupBy => {
+                groupby::recognize_groupby_sites(&mut term, witnesses)?
+            }
+            PlanningPhase::EmitCorrelatedFilters => {
+                correlated::emit_correlated_filters(&mut term, witnesses)?
+            }
+            PlanningPhase::Simplify | PlanningPhase::Cleanup => term = simplify(term),
+            PlanningPhase::PairCorrelatedSites => {
+                correlated::pair_correlated_sites(&mut term, witnesses)?
+            }
+            PlanningPhase::FoldConstants => const_fold::fold_constants(&mut term),
+            PlanningPhase::MarkIterationSites => match root {
+                Root::Program => insert_iterate_markers(&mut term, witnesses)?,
+                Root::Lifted => iterate::insert_iterate_recurse(&mut term, witnesses)?,
+            },
+            PlanningPhase::CompilePredicates => {
+                compile_refinement_predicates(&mut term, &PredMemo::new())
+            }
+            PlanningPhase::InsertPerGroupFilters => {
+                per_group_filter::insert_per_group_filters(&mut term, witnesses)?;
+                per_group_filter::reject_unmaterialized_narrowings(&term)?;
+            }
+        }
+    }
+    Ok(term)
+}
+
+/// Refuse a lifted term that applies a union of collections at its input.
+///
+/// A predicate or a key is applied per element, so a collection in a position that
+/// receives the element is looked up at the element's index. A union there, a realized
+/// conditional or a `++`, is a collection only iteration compiles: the realized legs of a
+/// same-domain conditional both answer at one index, and `flat_merge` rejects the overlap
+/// at run time. A union a consumer iterates, the argument of `sum` say, compiles, and so does
+/// a conditional chosen per row, whose legs `filter_values` gates on the element.
+///
+/// The positions that receive the input are the term's root, each element of a
+/// composition, a cast's value, each component a `zip` pairs, and both sides of an
+/// application whose function is not a builtin. A builtin decides its argument's input,
+/// and the walk below stops there.
+fn refuse_a_union_applied_at_the_input(term: &Expr) -> Result<(), String> {
+    fn find(e: &Expr) -> Option<&Expr> {
+        match &e.node {
+            // A conditional chosen per row gates each leg by its arm's condition on the
+            // element, `(𝑝 ▷ filter_values) ≫ 𝑥`, so one leg answers per element.
+            TypedExprNode::Copair(legs) | TypedExprNode::DisjointJoin(legs)
+                if legs.iter().all(gated_per_element) =>
+            {
+                legs.iter().find_map(find)
+            }
+            TypedExprNode::Copair(_)
+            | TypedExprNode::DisjointJoin(_)
+            | TypedExprNode::Realize(_) => e.ty.is_collection().then_some(e),
+            TypedExprNode::Compose(elts) | TypedExprNode::Tuple(elts) => elts.iter().find_map(find),
+            TypedExprNode::Record(fields) => fields.iter().find_map(|(_, f)| find(f)),
+            TypedExprNode::Cast { value, .. } => find(value),
+            TypedExprNode::Apply { argument, function } => {
+                if is_builtin(function, Builtin::Zip) {
+                    find(argument)
+                } else if iterate::builtin_at_function_position(function).is_some() {
+                    None
+                } else {
+                    find(argument).or_else(|| find(function))
+                }
+            }
+            _ => None,
+        }
+    }
+    fn gated_per_element(leg: &Expr) -> bool {
+        matches!(&leg.node, TypedExprNode::Compose(elts)
+            if elts.first().is_some_and(|head| matches!(&head.node,
+                TypedExprNode::Apply { function, .. } if is_builtin(function, Builtin::FilterValues))))
+    }
+    match find(term) {
+        Some(union) => Err(format!(
+            "a predicate or a key applies a union of collections at its element rather than \
+             iterating it, which planning does not compile yet: {}",
+            symbolic(union)
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Is `e` a bare `Var` other than the element binder (the free key binder)?
@@ -703,7 +901,7 @@ mod tests {
 
         let mut expr = Expr::let_bind("xs".to_string(), list_123(), body_chain).with_ty(list_ty);
 
-        insert_iterate_markers(&mut expr, &Default::default());
+        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
 
         let TypedExprNode::Let {
             bound_expr, body, ..
@@ -738,7 +936,7 @@ mod tests {
             fun_ty(fun_ty(Type::UIntRange(3), int.clone()), int.clone()),
             int,
         );
-        insert_iterate_markers(&mut expr, &Default::default());
+        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
         let TypedExprNode::Apply { argument, function } = &expr.node else {
             panic!("expected Apply, got: {}", symbolic(&expr));
         };
@@ -774,7 +972,7 @@ mod tests {
             ("n".into(), int),
         ]));
 
-        insert_iterate_markers(&mut expr, &Default::default());
+        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
 
         let TypedExprNode::Record(outs) = &expr.node else {
             panic!("expected a record, got: {}", symbolic(&expr));

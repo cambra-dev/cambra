@@ -936,6 +936,66 @@ fn unbound_defer_handle_rejected() {
     expect_feed_error("defer()", "unbound defer handle");
 }
 
+/// A generator whose `defer` both feeds and defines.
+const FEEDS_AND_DEFINES: &str = indoc! {r#"
+    def g(n):
+        x = defer()
+        x << n
+        x <<= [2]
+        x
+"#};
+
+/// A generator whose `defer` defines twice.
+const DEFINES_TWICE: &str = indoc! {r#"
+    def g(n):
+        x = defer()
+        x <<= [n]
+        x <<= [2]
+        x
+"#};
+
+/// A generator whose `defer` neither feeds nor defines.
+const NEITHER: &str = indoc! {r#"
+    def g(n):
+        x = defer()
+        x
+"#};
+
+/// An error in a generator's `defer` block is the program's wherever the generator is
+/// called. A call in a filter or a group-by key leaves the block in a refinement predicate,
+/// and channelize reports its error as it reports one in the tree.
+#[rstest]
+#[case::mixed_in_the_tree(FEEDS_AND_DEFINES, "max(g(1))", "both feeds and a define")]
+#[case::mixed_in_a_filter(
+    FEEDS_AND_DEFINES,
+    "sum([q for q in [1, 2] if max(g(q)) > 0])",
+    "both feeds and a define"
+)]
+#[case::mixed_in_a_key(
+    FEEDS_AND_DEFINES,
+    r"sum([sum(h) for h in groupby([1, 2], \e -> max(g(e)))])",
+    "both feeds and a define"
+)]
+#[case::defined_twice_in_a_filter(
+    DEFINES_TWICE,
+    "sum([q for q in [1, 2] if max(g(q)) > 0])",
+    "multiple definitions"
+)]
+#[case::neither_in_a_filter(
+    NEITHER,
+    "sum([q for q in [1, 2] if max(g(q)) > 0])",
+    "has no feed or define"
+)]
+fn a_defer_error_in_a_predicate_is_a_compile_error(
+    #[case] generator: &str,
+    #[case] call: &str,
+    #[case] needle: &str,
+) {
+    let code = format!("{generator}\n{call}\n");
+    expect_feed_error(&code, needle);
+    expect_feed_error(&code, "deferred collection error");
+}
+
 /// TODO: Support refined writes to vars used with feeds.
 #[test]
 fn refined_write_used_with_feed() {

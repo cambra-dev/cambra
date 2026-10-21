@@ -65,8 +65,14 @@
 //! refinement dedup has to collapse against its origin is therefore made
 //! after this pass: [`crate::ccl::comprehension`] copies each generator source
 //! into its loop-join predicate, and runs after `uniquify`. Lowering's own
-//! copies are made before it (a chained comparison clones its middle operand),
-//! and nothing compares them. This pass treats minted names as settled: minted
+//! copies are made before it: a chained comparison places its middle operand
+//! twice, and a group-by places its collection and key function in its key
+//! domain and its partition. A refinement nested in such a term is one shared
+//! `Rc` across the copies, which `memo` rebuilds once, against whichever copy's
+//! binders it meets first, so a raw copy would leave the others' nested
+//! refinements naming a binder they do not have. Lowering therefore places
+//! these terms through `MintedTerm` (`lower/exprs.rs`), which runs this pass on
+//! the term before taking any copy. This pass treats minted names as settled: minted
 //! binding sites are not re-minted and push nothing on the environment (their
 //! bound variables are already resolved; their free variables are still raw
 //! and resolve against the environment at the position of each copy), which

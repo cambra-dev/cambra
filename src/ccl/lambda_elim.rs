@@ -408,13 +408,6 @@ fn remove_restated_component_facts(param: &Name, param_ty: &Type, predicate: &mu
     in_expr(predicate, &restated);
 }
 
-/// Whether a type inside `expr`, one of its subterms' or its own, reads `param`.
-fn reads_in_its_types(param: &Name, expr: &Expr) -> bool {
-    let mut found = false;
-    expr.walk_type_slots(|ty| found = found || crate::ccl::ccl_utils::is_free_in_type(param, ty));
-    found || expr.any_child(|child| reads_in_its_types(param, child))
-}
-
 /// The components of a pairing `⟨𝑓₀, 𝑓₁, …⟩ ▷ zip : (𝑎 : 𝐴) ⇒ 𝑇` as terms in its input's
 /// binder: `𝑎 ▷ 𝑓ₖ`, or `𝑎` for an `id` component. `None` for any other term, and for a
 /// pairing whose type names no binder for its input, which leaves nothing to state the
@@ -1285,21 +1278,6 @@ fn elim_lambda_impl(
                 .filter(|r| !r.is_collection_membership())
                 .cloned()
                 .collect();
-            // A filter whose subterms' types read `param` cannot be lifted onto the pair yet:
-            // writing `__elem.0` into a nested refinement there would capture that
-            // refinement's own element (`subst::Subst`'s `assert_no_element_capture`). A
-            // group-by under a loop over a source the loop's binder filters reaches this.
-            for r in &lifting {
-                let mut predicate = (*r.predicate).clone();
-                remove_restated_component_facts(param, param_ty, &mut predicate);
-                if reads_in_its_types(param, &predicate) {
-                    return Err(LambdaElimError::Unsupported(format!(
-                        "lifting a filter whose subterms' types read `{param}` onto the pair is \
-                         not supported yet: {}",
-                        symbolic(&predicate)
-                    )));
-                }
-            }
             let staying: Vec<Refinement> = refinements
                 .iter()
                 .filter(|r| r.is_collection_membership() || !is_free_in_value(param, &r.predicate))
@@ -1343,8 +1321,26 @@ fn elim_lambda_impl(
                     let on_element =
                         crate::ccl::subst::Subst::discharge(Name::elem(), at(1, &y_ty))
                             .apply_expr(predicate);
-                    crate::ccl::subst::Subst::discharge(param.clone(), at(0, param_ty))
-                        .apply_expr(&on_element)
+                    // **`param` is bound, not substituted, where a nested refinement reads
+                    // it.** Writing `__elem.0` there would capture: the nested refinement
+                    // binds `__elem` to its own element, and no spelling names the
+                    // enclosing one. Applying `λ param → …` to the pair's first component
+                    // leaves the nested refinement reading a binder of the predicate's own
+                    // term, which every reader resolves as it resolves any lambda binder
+                    // in a predicate (`src/ccl/design/type-inference.md`, "Lifting a
+                    // filter onto the pair").
+                    let free = crate::ccl::ccl_utils::count_free(param, &on_element);
+                    if free > crate::ccl::ccl_utils::count_free_in_value(param, &on_element) {
+                        let ty = on_element.ty.clone();
+                        Expr::apply(
+                            at(0, param_ty),
+                            Expr::lambda(param.clone(), param_ty.clone(), on_element),
+                        )
+                        .with_ty(ty)
+                    } else {
+                        crate::ccl::subst::Subst::discharge(param.clone(), at(0, param_ty))
+                            .apply_expr(&on_element)
+                    }
                 };
                 let key = (param.clone(), bare_pair.clone());
                 let lifted: Vec<Refinement> = lifting
