@@ -12,9 +12,12 @@
 //! enums live here, with `crate::ccl::BinOpKind` converting into [`BinOpKind`]
 //! (`impl From`, in `src/ccl/ops.rs`) — the one place the two spellings meet.
 
+use std::iter::repeat_n;
 use std::ops::{AddAssign, MulAssign, SubAssign};
 
 use smol_str::{SmolStr, SmolStrBuilder};
+
+pub use crate::view::View;
 
 /// Kinds of binary operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,11 +152,39 @@ pub enum LogicKind {
     Xnor,
 }
 
-// Every kernel below reads two operand slices of one length and appends one result per row to
-// `out`. The caller owns `out`: it clears the rows it does not want to keep and reserves room
-// for the new ones, and the kernel writes each result once into that room, so no result memory
-// is initialized before the kernel writes it. `apply_binop_into` fixes the length at the
-// operands' common prefix.
+// Every kernel below reads two operands of one length as views and appends one result per row to
+// `out`. A view is a slice of stored values or one value repeated, and a repeated operand is read
+// as one value, not as a column of copies. The caller owns `out`: it clears the rows it does not
+// want to keep and reserves room for the new ones, and the kernel writes each result once into
+// that room, so no result memory is initialized before the kernel writes it.
+// `apply_binop_views` fixes the length at the operands' common prefix.
+
+/// Append `f(l[i], r[i])` to `out` for every position, reading each operand as its view says.
+#[inline]
+fn zip_views<T, R: Clone>(
+    l: View<'_, T>,
+    r: View<'_, T>,
+    out: &mut Vec<R>,
+    f: impl Fn(&T, &T) -> R,
+) {
+    debug_assert_eq!(l.len(), r.len(), "the operands have one length");
+    match (l, r) {
+        (View::Slice(l), View::Slice(r)) => out.extend(l.iter().zip(r).map(|(a, b)| f(a, b))),
+        (View::Slice(l), View::Constant { value, .. }) => {
+            out.extend(l.iter().map(|a| f(a, value)));
+        }
+        (View::Constant { value, .. }, View::Slice(r)) => {
+            out.extend(r.iter().map(|b| f(value, b)));
+        }
+        (View::Constant { value: a, len }, View::Constant { value: b, .. }) => {
+            // A repeat of length 0 combines nothing, so `f` is not applied: a division by a
+            // constant zero over no rows does not fault.
+            if len > 0 {
+                out.extend(repeat_n(f(a, b), len));
+            }
+        }
+    }
+}
 
 // Performance note: trying to factor this futher to avoid repeating the zip/iter logic
 // slows it down by ~15%
@@ -161,99 +192,86 @@ pub(crate) fn zip_arithmetic<
     T: IntPow + IntFloorDiv + AddAssign<T> + SubAssign<T> + MulAssign<T>,
 >(
     op: ArithmeticKind,
-    l: &[T],
-    r: &[T],
+    l: View<'_, T>,
+    r: View<'_, T>,
     out: &mut Vec<T>,
 ) {
-    debug_assert_eq!(
-        l.len(),
-        r.len(),
-        "zip_arithmetic: the operands have one length"
-    );
-    let rows = l.iter().zip(r);
     match op {
-        ArithmeticKind::Add => out.extend(rows.map(|(&a, &b)| {
+        ArithmeticKind::Add => zip_views(l, r, out, |&a, &b| {
             let mut x = a;
             x += b;
             x
-        })),
-        ArithmeticKind::Sub => out.extend(rows.map(|(&a, &b)| {
+        }),
+        ArithmeticKind::Sub => zip_views(l, r, out, |&a, &b| {
             let mut x = a;
             x -= b;
             x
-        })),
-        ArithmeticKind::Mul => out.extend(rows.map(|(&a, &b)| {
+        }),
+        ArithmeticKind::Mul => zip_views(l, r, out, |&a, &b| {
             let mut x = a;
             x *= b;
             x
-        })),
-        ArithmeticKind::FloorDiv => out.extend(rows.map(|(&a, &b)| a.floor_div(b))),
-        ArithmeticKind::Pow => out.extend(rows.map(|(&a, &b)| a.int_pow(b))),
+        }),
+        ArithmeticKind::FloorDiv => zip_views(l, r, out, |&a, &b| a.floor_div(b)),
+        ArithmeticKind::Pow => zip_views(l, r, out, |&a, &b| a.int_pow(b)),
     }
 }
 
-pub(crate) fn zip_concat(l: &[SmolStr], r: &[SmolStr], out: &mut Vec<SmolStr>) {
-    debug_assert_eq!(l.len(), r.len(), "zip_concat: the operands have one length");
-    out.extend(l.iter().zip(r).map(|(a, b)| {
+pub(crate) fn zip_concat(l: View<'_, SmolStr>, r: View<'_, SmolStr>, out: &mut Vec<SmolStr>) {
+    zip_views(l, r, out, |a, b| {
         let mut builder = SmolStrBuilder::new();
         builder.push_str(a);
         builder.push_str(b);
         builder.finish()
-    }));
+    });
 }
 
 pub(crate) fn zip_compare<T: PartialEq + PartialOrd>(
     op: CompareKind,
-    l: &[T],
-    r: &[T],
+    l: View<'_, T>,
+    r: View<'_, T>,
     out: &mut Vec<bool>,
 ) {
-    debug_assert_eq!(
-        l.len(),
-        r.len(),
-        "zip_compare: the operands have one length"
-    );
-    let rows = l.iter().zip(r);
     match op {
-        CompareKind::Equals => out.extend(rows.map(|(a, b)| a == b)),
-        CompareKind::NotEquals => out.extend(rows.map(|(a, b)| a != b)),
-        CompareKind::Less => out.extend(rows.map(|(a, b)| a < b)),
-        CompareKind::LessOrEq => out.extend(rows.map(|(a, b)| a <= b)),
-        CompareKind::Greater => out.extend(rows.map(|(a, b)| a > b)),
-        CompareKind::GreaterOrEq => out.extend(rows.map(|(a, b)| a >= b)),
+        CompareKind::Equals => zip_views(l, r, out, |a, b| a == b),
+        CompareKind::NotEquals => zip_views(l, r, out, |a, b| a != b),
+        CompareKind::Less => zip_views(l, r, out, |a, b| a < b),
+        CompareKind::LessOrEq => zip_views(l, r, out, |a, b| a <= b),
+        CompareKind::Greater => zip_views(l, r, out, |a, b| a > b),
+        CompareKind::GreaterOrEq => zip_views(l, r, out, |a, b| a >= b),
     }
 }
 
-#[inline]
-fn zip_bools_with(l: &[bool], r: &[bool], out: &mut Vec<bool>, f: impl Fn(bool, bool) -> bool) {
-    debug_assert_eq!(
-        l.len(),
-        r.len(),
-        "zip_bools_with: the operands have one length"
-    );
-    out.extend(l.iter().zip(r).map(|(&a, &b)| f(a, b)));
-}
-
-pub(crate) fn zip_bool_compare(op: CompareKind, l: &[bool], r: &[bool], out: &mut Vec<bool>) {
+pub(crate) fn zip_bool_compare(
+    op: CompareKind,
+    l: View<'_, bool>,
+    r: View<'_, bool>,
+    out: &mut Vec<bool>,
+) {
     // Boolean ordering: false < true.
     match op {
-        CompareKind::Equals => zip_bools_with(l, r, out, |a, b| a == b),
-        CompareKind::NotEquals => zip_bools_with(l, r, out, |a, b| a != b),
-        CompareKind::Less => zip_bools_with(l, r, out, |a, b| !a & b),
-        CompareKind::LessOrEq => zip_bools_with(l, r, out, |a, b| a <= b),
-        CompareKind::Greater => zip_bools_with(l, r, out, |a, b| a & !b),
-        CompareKind::GreaterOrEq => zip_bools_with(l, r, out, |a, b| a >= b),
+        CompareKind::Equals => zip_views(l, r, out, |&a, &b| a == b),
+        CompareKind::NotEquals => zip_views(l, r, out, |&a, &b| a != b),
+        CompareKind::Less => zip_views(l, r, out, |&a, &b| !a & b),
+        CompareKind::LessOrEq => zip_views(l, r, out, |&a, &b| a <= b),
+        CompareKind::Greater => zip_views(l, r, out, |&a, &b| a & !b),
+        CompareKind::GreaterOrEq => zip_views(l, r, out, |&a, &b| a >= b),
     }
 }
 
-pub(crate) fn zip_bool_logic(op: LogicKind, l: &[bool], r: &[bool], out: &mut Vec<bool>) {
+pub(crate) fn zip_bool_logic(
+    op: LogicKind,
+    l: View<'_, bool>,
+    r: View<'_, bool>,
+    out: &mut Vec<bool>,
+) {
     match op {
-        LogicKind::And => zip_bools_with(l, r, out, |a, b| a & b),
-        LogicKind::Nand => zip_bools_with(l, r, out, |a, b| !(a & b)),
-        LogicKind::Or => zip_bools_with(l, r, out, |a, b| a | b),
-        LogicKind::Nor => zip_bools_with(l, r, out, |a, b| !(a | b)),
-        LogicKind::Xor => zip_bools_with(l, r, out, |a, b| a ^ b),
-        LogicKind::Xnor => zip_bools_with(l, r, out, |a, b| a == b),
+        LogicKind::And => zip_views(l, r, out, |&a, &b| a & b),
+        LogicKind::Nand => zip_views(l, r, out, |&a, &b| !(a & b)),
+        LogicKind::Or => zip_views(l, r, out, |&a, &b| a | b),
+        LogicKind::Nor => zip_views(l, r, out, |&a, &b| !(a | b)),
+        LogicKind::Xor => zip_views(l, r, out, |&a, &b| a ^ b),
+        LogicKind::Xnor => zip_views(l, r, out, |&a, &b| a == b),
     }
 }
 
@@ -286,7 +304,12 @@ mod tests {
         let right: Vec<_> = cases.iter().map(|&(_, b, _)| b).collect();
         let expected: Vec<_> = cases.iter().map(|&(_, _, q)| q).collect();
         let mut out = Vec::new();
-        zip_arithmetic(ArithmeticKind::FloorDiv, &left, &right, &mut out);
+        zip_arithmetic(
+            ArithmeticKind::FloorDiv,
+            View::Slice(&left),
+            View::Slice(&right),
+            &mut out,
+        );
         assert_eq!(out, expected);
     }
 
@@ -313,8 +336,8 @@ mod tests {
         let mut out = Vec::new();
         zip_arithmetic(
             ArithmeticKind::FloorDiv,
-            &[0_u64, 7, u64::MAX],
-            &[2, 2, 1],
+            View::Slice(&[0_u64, 7, u64::MAX]),
+            View::Slice(&[2, 2, 1]),
             &mut out,
         );
         assert_eq!(out, [0, 3, u64::MAX]);
@@ -323,13 +346,23 @@ mod tests {
     #[test]
     #[should_panic(expected = "divide by zero")]
     fn floor_division_zero_divisor_panics() {
-        zip_arithmetic(ArithmeticKind::FloorDiv, &[1_i64], &[0], &mut Vec::new());
+        zip_arithmetic(
+            ArithmeticKind::FloorDiv,
+            View::Slice(&[1_i64]),
+            View::Slice(&[0]),
+            &mut Vec::new(),
+        );
     }
 
     #[test]
     #[should_panic(expected = "divide by zero")]
     fn floor_division_unsigned_zero_divisor_panics() {
-        zip_arithmetic(ArithmeticKind::FloorDiv, &[1_u64], &[0], &mut Vec::new());
+        zip_arithmetic(
+            ArithmeticKind::FloorDiv,
+            View::Slice(&[1_u64]),
+            View::Slice(&[0]),
+            &mut Vec::new(),
+        );
     }
 
     #[test]
@@ -337,8 +370,8 @@ mod tests {
     fn floor_division_unrepresentable_quotient_panics() {
         zip_arithmetic(
             ArithmeticKind::FloorDiv,
-            &[i64::MIN],
-            &[-1],
+            View::Slice(&[i64::MIN]),
+            View::Slice(&[-1]),
             &mut Vec::new(),
         );
     }

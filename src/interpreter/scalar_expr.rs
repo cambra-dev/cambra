@@ -22,10 +22,12 @@ use smol_str::SmolStr;
 
 use crate::ccl::{Builtin, Expr, ProjKey, TypedExprNode};
 
+use crate::view::View;
+
 use super::{
-    BaseType, BinOpKind as InterpreterBinOp, ColumnValue, Extent, UnaryOpKind, Value,
-    apply_binop_into, apply_unaryop_into, binop_output_extent, binop_result_column,
-    operator_conversion::expr_to_value, tuple_field,
+    BaseType, BinOpKind as InterpreterBinOp, ColumnValue, ColumnView, Extent, UnaryOpKind, Value,
+    apply_binop_into, apply_binop_views, apply_unaryop_views, binop_output_extent,
+    binop_result_column, binop_result_column_of, operator_conversion::expr_to_value, tuple_field,
 };
 
 /// The index of an instruction, which is also the slot it writes.
@@ -69,11 +71,26 @@ fn field<'i>(input: &'i ColumnValue, path: &[SmolStr]) -> &'i ColumnValue {
     })
 }
 
+/// The values of a closed scalar as a view of the value itself, repeated over `len` rows, or
+/// `None` for a value that is not a base type (a record), whose column is built.
+fn const_view(value: &Value, len: usize) -> Option<ColumnView<'_>> {
+    Some(match value {
+        Value::Int(n) => ColumnView::Ints(View::repeated(n, len)),
+        Value::UInt(n) => ColumnView::UInts(View::repeated(n, len)),
+        Value::String(s) => ColumnView::Strings(View::repeated(s, len)),
+        Value::Bool(b) => ColumnView::Bools(View::repeated(b, len)),
+        _ => return None,
+    })
+}
+
 /// The columns of an evaluation, one per instruction, kept from block to block.
 ///
-/// An instruction writes its block into its own slot, so a slot's buffer is allocated while
-/// the first block is evaluated and reused for every later one, instead of each block
-/// allocating a column per instruction.
+/// An operation writes its block into its own slot, so a slot's buffer is allocated while the
+/// first block is evaluated and reused for every later one, instead of each block allocating a
+/// column per operation. An instruction that reads a column already stored, an `Input` or a
+/// `Const`, writes no slot: its block is read in place as a [`ColumnView`], a region of the
+/// input or one value repeated. The exception is a column that is not flat, a record, which the
+/// view cannot hold: its block is built in the slot.
 struct Scratch<'a> {
     input: &'a ColumnValue,
     /// A slot is `Units(0)` until its instruction first writes it; no instruction's result is
@@ -95,6 +112,23 @@ impl<'a> Scratch<'a> {
         }
     }
 
+    /// The block of instruction `slot` as a view, or `None` when its column is not flat.
+    fn view<'s>(&'s self, program: &'s ScalarProgram, slot: usize) -> Option<ColumnView<'s>> {
+        match &program.instrs[slot] {
+            Instr::Input { path } => field(self.input, path)
+                .view()
+                .map(|leaf| leaf.range(self.start..self.start + self.len)),
+            Instr::Const(value) => const_view(value, self.len),
+            Instr::Bin(..) | Instr::Un(..) => self.slots[slot].view(),
+        }
+    }
+
+    /// The block of an operand of an operation, which is a flat column.
+    fn flat<'s>(&'s self, program: &'s ScalarProgram, slot: usize) -> ColumnView<'s> {
+        self.view(program, slot)
+            .unwrap_or_else(|| panic!("the operand s{slot} is a flat column"))
+    }
+
     /// Run `program` over the rows `start..start + len` and append the block's result to `out`.
     ///
     /// The last instruction's kernel appends straight to `out`, so the result is written once,
@@ -108,64 +142,88 @@ impl<'a> Scratch<'a> {
             .split_last()
             .expect("a program has an output instruction");
         for (slot, instr) in body.iter().enumerate() {
-            self.run(slot, instr);
+            self.run(program, slot, instr);
         }
         match last {
             Instr::Un(op, a) => {
-                let a = *a as usize;
-                apply_unaryop_into(*op, &self.slots[a], out);
+                apply_unaryop_views(*op, &self.flat(program, *a as usize), out);
             }
             Instr::Bin(op, a, b) => {
                 let (a, b) = (*a as usize, *b as usize);
-                apply_binop_into(*op, &self.slots[a], &self.slots[b], out);
+                match (self.view(program, a), self.view(program, b)) {
+                    (Some(a), Some(b)) => apply_binop_views(*op, &a, &b, out),
+                    // Two record columns, built in their slots.
+                    _ => apply_binop_into(*op, &self.slots[a], &self.slots[b], out),
+                }
             }
             // An output that is a column already has no kernel to write the result with.
             Instr::Input { .. } | Instr::Const(_) => {
                 let slot = body.len();
-                self.run(slot, last);
-                out.extend_from(&self.slots[slot]);
+                match self.view(program, slot) {
+                    Some(view) => out.extend_from_view(view),
+                    None => {
+                        self.run(program, slot, last);
+                        out.extend_from(&self.slots[slot]);
+                    }
+                }
             }
         }
     }
 
-    /// Write the block of `instr` into `slot`.
-    fn run(&mut self, slot: usize, instr: &Instr) {
+    /// Write the block of `instr` into `slot`, unless it is read in place.
+    fn run(&mut self, program: &ScalarProgram, slot: usize, instr: &Instr) {
         let rows = self.start..self.start + self.len;
         match instr {
             Instr::Input { path } => {
-                // A field of the input is sliced alone, not with the rest of the record column.
                 let leaf = field(self.input, path);
-                leaf.slice_into(rows, &mut self.slots[slot]);
+                if leaf.view().is_none() {
+                    // A record column: a field of it is sliced alone, not with the rest.
+                    leaf.slice_into(rows, &mut self.slots[slot]);
+                }
             }
-            // A constant's slot holds the same value in every row of every block, so it is
-            // rewritten only when the block length changes: the first block and a shorter last
-            // one.
-            Instr::Const(value) => {
+            // A record constant holds the same value in every row of every block, so its slot
+            // is rewritten only when the block length changes: the first block and a shorter
+            // last one.
+            Instr::Const(value) if const_view(value, self.len).is_none() => {
                 let held = &self.slots[slot];
                 if matches!(held, ColumnValue::Units(_)) || held.len() != self.len {
                     self.slots[slot] = ColumnValue::single(value.clone()).repeat(self.len);
                 }
             }
+            Instr::Const(_) => {}
             Instr::Un(op, a) => {
-                let a = *a as usize;
                 let mut out = take(&mut self.slots[slot]);
+                let a = self.flat(program, *a as usize);
                 if matches!(out, ColumnValue::Units(_)) {
-                    out = self.slots[a].empty_like();
+                    out = a.empty_like();
                 } else {
                     out.clear();
                 }
-                apply_unaryop_into(*op, &self.slots[a], &mut out);
+                apply_unaryop_views(*op, &a, &mut out);
                 self.slots[slot] = out;
             }
             Instr::Bin(op, a, b) => {
                 let (a, b) = (*a as usize, *b as usize);
                 let mut out = take(&mut self.slots[slot]);
-                if matches!(out, ColumnValue::Units(_)) {
-                    out = binop_result_column(*op, &self.slots[a]);
-                } else {
-                    out.clear();
+                match (self.view(program, a), self.view(program, b)) {
+                    (Some(a), Some(b)) => {
+                        if matches!(out, ColumnValue::Units(_)) {
+                            out = binop_result_column(*op, &a);
+                        } else {
+                            out.clear();
+                        }
+                        apply_binop_views(*op, &a, &b, &mut out);
+                    }
+                    // Two record columns, built in their slots.
+                    _ => {
+                        if matches!(out, ColumnValue::Units(_)) {
+                            out = binop_result_column_of(*op, &self.slots[a]);
+                        } else {
+                            out.clear();
+                        }
+                        apply_binop_into(*op, &self.slots[a], &self.slots[b], &mut out);
+                    }
                 }
-                apply_binop_into(*op, &self.slots[a], &self.slots[b], &mut out);
                 self.slots[slot] = out;
             }
         }
@@ -214,7 +272,7 @@ impl ScalarProgram {
                 Instr::Const(value) => ColumnValue::single(value.clone()).empty_like(),
                 // `neg` and `not` keep their operand's type.
                 Instr::Un(_, a) => empties[*a as usize].clone(),
-                Instr::Bin(op, a, _) => binop_result_column(*op, &empties[*a as usize]),
+                Instr::Bin(op, a, _) => binop_result_column_of(*op, &empties[*a as usize]),
             };
             empties.push(empty);
         }
@@ -852,12 +910,29 @@ mod tests {
             matches!(output, ColumnValue::Units(0)),
             "the output writes to the result, not a slot"
         );
-        let buffers: Vec<*const u8> = body.iter().map(pointer).collect();
+        // An input and a scalar constant are read in place and own no buffer; only an
+        // operation's slot holds a column.
+        let written = |slot: &ColumnValue| !matches!(slot, ColumnValue::Units(_));
+        let buffers: Vec<Option<*const u8>> = body
+            .iter()
+            .map(|slot| written(slot).then(|| pointer(slot)))
+            .collect();
+        for (slot, instr) in buffers.iter().zip(&fused.program.instrs) {
+            assert_eq!(
+                slot.is_some(),
+                matches!(instr, Instr::Bin(..) | Instr::Un(..)),
+                "{instr}"
+            );
+        }
         for start in [BLOCK_ROWS, 2 * BLOCK_ROWS] {
             scratch.block(&fused.program, start, BLOCK_ROWS, &mut out);
             let body = &scratch.slots[..buffers.len()];
-            for (slot, &before) in body.iter().zip(&buffers) {
-                assert_eq!(pointer(slot), before, "block at {start}");
+            for (slot, before) in body.iter().zip(&buffers) {
+                assert_eq!(
+                    written(slot).then(|| pointer(slot)),
+                    *before,
+                    "block at {start}"
+                );
             }
             assert_eq!(pointer(&out), result, "block at {start}");
         }
