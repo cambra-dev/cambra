@@ -315,19 +315,13 @@ fn bug_duplicate_constant_map_key_panics_instead_of_compile_error() {
     run_pipeline("map([(1, 10), (2, 20), (1, 99)])");
 }
 
-// A `set(…)` value **nested as another comprehension's source** is not driven:
-// planning inserts the iteration site at a chain head, so `set(…)` compiles as the
-// program tail (`test_set` above) and let-bound-then-consumed (`s = set(…)` …
-// `[k for k in s]`), but inlined into a comprehension source the underlying list
-// literal reaches op-conversion with no `iterate` before it. This is the acceptance test
-// for that gap.
+// A `set(…)` value **nested as another comprehension's source**, read only for its keys:
+// the element ignores the value, so the source survives only in its domain's membership
+// refinement, and planning enumerates the members (three distinct keys).
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[ignore = "a set value nested as a comprehension source is not driven by planning"]
-fn test_undriven_set_as_a_comprehension_source() {
-    // Asserting only that compilation succeeds: the point is that planning gives
-    // the source an iteration site at all.
-    run_pipeline("[1 for k in set([1,2,2,3])]");
+fn a_set_nested_as_a_comprehension_source_is_driven() {
+    check_scalar("sum([1 for k in set([1,2,2,3])])", Value::Int(3));
 }
 
 // A bare `groupby(…)` **is** driven: the program tail is a chain head, which is where
@@ -1306,11 +1300,22 @@ fn a_zip_with_a_constant_arm_pairs_at_the_groups(#[case] fast: &str, #[case] gen
     );
 }
 
+/// A group-by whose groups the element never reads: planning enumerates its present keys,
+/// the image of the key function, two here.
+#[test]
+fn counting_the_groups_of_a_group_by() {
+    check_scalar(
+        r"sum([1 for g in groupby([1, 2, 3], \x -> x // 2)])",
+        Value::Int(2),
+    );
+}
+
 /// A group-by in a conditional's guard: the guard becomes each leg's filter, which planning
 /// lifts from its uncompiled predicate and plans as the tree, so the group-by is recognized there
 /// too.
 #[rstest]
 #[case::summing_the_groups(r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) else 0")]
+#[case::counting_the_groups(r"1 if 0 < sum([1 for g in groupby([1, 1, 2], \e -> e)]) else 0")]
 #[case::in_a_chained_comparison(
     r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100 else 0"
 )]

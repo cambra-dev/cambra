@@ -787,31 +787,31 @@ fn a_correlated_inner_aggregate_under_a_collection_result() {
     );
 }
 
-/// A **map comprehension whose body never reads the element** does not compile, with or
-/// without an enclosing comprehension.
-///
-/// Nothing here is about correlation or nesting: this one-line program fails, and so does
-/// the base branch's, which has none of the correlated work. A body that reads the element
-/// applies the collection, which is what puts it in the term
-/// (`sum([v for v in c])` answers 3). A body that does not leaves the collection reachable
-/// only through its domain's carried `collection_contains`, which op-conversion meets as a
-/// non-combinator handed an input.
-///
-/// The correlated form fails too and reports differently — reading the domain off the type
-/// answers the unbounded key type — which is why the message, not just the failure, is
-/// pinned here.
+/// A comprehension whose element never reads the generator's value counts the keys its
+/// source has. The source is reachable only through its domain's membership refinement, and
+/// planning enumerates that domain as the membership collection's image.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[should_panic(expected = "non-combinator collection_contains")]
-fn a_map_comprehension_that_ignores_the_element_does_not_compile() {
-    check_scalar(
-        indoc! {r#"
-            c = map([("a", 1), ("b", 2)])
-            sum([1 for v in c])
-        "#},
-        // One per entry.
-        Value::Int(2),
-    );
+#[case::over_a_map(
+    indoc! {r#"
+        c = map([("a", 1), ("b", 2)])
+        sum([1 for v in c])
+    "#},
+    2
+)]
+// Two entries, under rows 1 and 2.
+#[case::correlated(
+    indoc! {r#"
+        c = map([("a", 1), ("b", 2)])
+        sum([sum([1 for v in c]) * r for r in [1, 2]])
+    "#},
+    6
+)]
+fn a_comprehension_ignoring_the_element_counts_the_present_keys(
+    #[case] program: &str,
+    #[case] total: i64,
+) {
+    check_scalar(program, Value::Int(total));
 }
 
 /// A correlated inner comprehension **inside a transaction**, where the outer binder is the

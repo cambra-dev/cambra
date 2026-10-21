@@ -601,8 +601,31 @@ pub(super) fn wrap_with_iterate(
     let site_ty = body.ty.clone();
     // A projected domain is enumerated from the collection it projects, not from its
     // key bound: `unbox(𝑡) ▷ map_domain`, the keys `𝑡` holds.
-    let mut source = domain_keys(base, ctx)?;
-    for (r, elem_ty) in crate::ccl::application_order(domain_ty.refinements(), base) {
+    // A membership refinement states which keys are present and is never executed, so the
+    // source enumerates its collection's image instead of restricting by it.
+    let membership = domain_ty
+        .refinements()
+        .iter()
+        .find(|r| r.is_collection_membership())
+        .cloned();
+    let (mut source, filters, filtered_base) = match &membership {
+        Some(m) => {
+            let present = Type::refined_one(base.clone(), m.clone());
+            let filters: Vec<_> = domain_ty
+                .refinements()
+                .iter()
+                .filter(|r| *r != m)
+                .cloned()
+                .collect();
+            (membership_keys(m, &present, ctx)?, filters, present)
+        }
+        None => (
+            domain_keys(base, ctx)?,
+            domain_ty.refinements().to_vec(),
+            base.clone(),
+        ),
+    };
+    for (r, elem_ty) in crate::ccl::application_order(&filters, &filtered_base) {
         let position = domain_ty
             .refinements()
             .iter()
@@ -801,6 +824,34 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
 fn is_filter_values_led(leg: &Expr) -> bool {
     matches!(&head_of(leg).node, TypedExprNode::Apply { function, .. }
         if builtin_at_function_position(function) == Some(Builtin::FilterValues))
+}
+
+/// `𝑚 ▷ converse ▷ map_domain`, the keys present in the membership refinement
+/// `__elem ▷ (𝑚 ▷ collection_contains)`: the image of `𝑚`, keyed by itself, over `present`.
+///
+/// `𝑚` is a term lifted out of a type into the tree, so it is planned as every such term is
+/// (`src/ccl/design/optimization.md`, "Planning a lifted term").
+fn membership_keys(
+    membership: &crate::ccl::Refinement,
+    present: &Type,
+    ctx: &mut PlanningCtx,
+) -> Result<Expr, String> {
+    let collection = membership
+        .membership_collection()
+        .expect("the caller found a membership refinement")
+        .clone();
+    let image = predicates::eliminate_lifted(collection)
+        .map_err(|e| format!("eliminating a membership's collection: {e:?}"))?;
+    let indices = image
+        .ty
+        .domain()
+        .ok_or_else(|| format!("a membership's collection is a function, got {}", image.ty))?;
+    let keys = present.peel_refinements().clone();
+    let groups = Type::data_fun(keys, Type::data_fun(indices.clone(), indices));
+    let grouped = apply_primitive(image, Builtin::Converse, groups);
+    let key_set = Type::data_fun(present.clone(), present.clone());
+    let keys = apply_primitive(grouped, Builtin::MapDomain, key_set);
+    plan_lifted(keys, PlanningPhase::MarkIterationSites, ctx)
 }
 
 /// `unbox(𝑡) ▷ map_domain`, the keys of the sum `𝑡`, over its projected domain.
