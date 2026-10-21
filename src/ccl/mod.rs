@@ -11,6 +11,7 @@ pub mod ccl_utils;
 pub mod channelize;
 pub mod chl_print;
 pub mod comprehension;
+pub mod constant;
 pub mod content_hash;
 pub mod context;
 pub mod diff;

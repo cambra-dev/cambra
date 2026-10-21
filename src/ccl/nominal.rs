@@ -16,9 +16,11 @@ use std::rc::Rc;
 use chl_parser::ast::Span;
 use smol_str::SmolStr;
 
-use crate::ccl::ccl_utils::strip_refinements;
+use crate::ccl::ccl_utils::{free_names, strip_refinements};
+use crate::ccl::constant::{ConstParam, ConstTerm, NoValue};
 use crate::ccl::{
-    BaseType, FieldKey, FunKind, Label, Type, TypeKind, TypeParam, TypeParamId, V_NONE, V_SOME,
+    BaseType, FieldKey, FunKind, Label, Name, Refinement, RefinementSet, Type, TypeKind, TypeParam,
+    TypeParamId, V_NONE, V_SOME,
 };
 
 /// The name the compiler-provided `Option` declaration binds.
@@ -130,6 +132,14 @@ pub struct NominalDecl {
     /// The argument each of [`Self::implicit`] takes in this instance, or `None` for the
     /// declaration as its own module names it, where each is the parameter itself.
     implicit_args: Option<Vec<Type>>,
+    /// The `const` parameters of the declaring module that the type reaches, through its
+    /// constructors' refinements and its associated functions, set once that module has
+    /// lowered. They identify the type alongside [`Self::implicit`]. Shared with every
+    /// instance.
+    implicit_consts: Rc<OnceCell<Vec<ConstParam>>>,
+    /// The argument each of [`Self::implicit_consts`] takes in this instance, as
+    /// [`Self::implicit_args`] holds the type parameters'.
+    const_args: Option<Vec<ConstTerm>>,
 }
 
 /// What a [`NominalDecl`] declares after its head.
@@ -161,6 +171,38 @@ impl NominalCtor {
             [(_, ty)] => ty.clone(),
             params => Type::Tuple(params.iter().map(|(_, ty)| ty.clone()).collect()),
         }
+    }
+
+    /// The payload a pattern destructures: [`Self::payload`] without the refinements whose
+    /// predicates read a name other than the refined value. Such a predicate reads a `const`
+    /// parameter of the declaring module, which only the constructor's own function, bound
+    /// where the name is in scope, can read. Each construction discharged it there.
+    pub fn destructured(&self) -> Type {
+        fn drop_named(ty: &mut Type) {
+            if let Type::Refinement(base, refinements) = ty {
+                let kept: Vec<Refinement> = refinements
+                    .iter()
+                    .filter(|r| free_names(&r.predicate).iter().all(Name::is_elem))
+                    .cloned()
+                    .collect();
+                if kept.len() != refinements.len() {
+                    let mut base = std::mem::replace(&mut **base, Type::Hole);
+                    drop_named(&mut base);
+                    *ty = if kept.is_empty() {
+                        base
+                    } else {
+                        let mut set = RefinementSet::new();
+                        set.extend(kept);
+                        Type::refined(base, set)
+                    };
+                    return;
+                }
+            }
+            ty.walk_children_mut(drop_named);
+        }
+        let mut ty = self.payload();
+        drop_named(&mut ty);
+        ty
     }
 }
 
@@ -266,6 +308,8 @@ impl NominalDecl {
             body: Rc::new(OnceCell::new()),
             implicit: Rc::new(OnceCell::new()),
             implicit_args: None,
+            implicit_consts: Rc::new(OnceCell::new()),
+            const_args: None,
         })
     }
 
@@ -311,16 +355,85 @@ impl NominalDecl {
         after.iter_mut().for_each(&mut *substitute);
         (after != before).then(|| {
             Rc::new(NominalDecl {
-                module: self.module.clone(),
-                name: self.name.clone(),
-                params: self.params.clone(),
-                span: self.span,
-                declares_extract: self.declares_extract,
-                body: Rc::clone(&self.body),
-                implicit: Rc::clone(&self.implicit),
                 implicit_args: Some(after),
+                ..self.instance()
             })
         })
+    }
+
+    /// Record the declaring module's `const` parameters the type reaches
+    /// ([`Self::implicit_consts`]).
+    ///
+    /// # Panics
+    ///
+    /// When recorded twice.
+    pub fn set_implicit_consts(&self, params: Vec<ConstParam>) {
+        let set = self.implicit_consts.set(params);
+        assert!(
+            set.is_ok(),
+            "`{}`'s implicit `const` parameters set twice",
+            self.name
+        );
+    }
+
+    /// The declaring module's `const` parameters the type reaches: empty until that module
+    /// has lowered.
+    pub fn implicit_consts(&self) -> &[ConstParam] {
+        self.implicit_consts.get().map_or(&[], Vec::as_slice)
+    }
+
+    /// The term each of [`Self::implicit_consts`] takes: the parameter itself in the
+    /// declaration as its module names it.
+    pub fn const_args(&self) -> Vec<ConstTerm> {
+        match &self.const_args {
+            Some(args) => args.clone(),
+            None => self
+                .implicit_consts()
+                .iter()
+                .cloned()
+                .map(ConstTerm::Param)
+                .collect(),
+        }
+    }
+
+    /// The instance whose `const` arguments are this one's with each parameter `values`
+    /// maps replaced by its term, or `None` when that changes none of them.
+    ///
+    /// # Errors
+    ///
+    /// An argument the substitution leaves with no value, such as one dividing by zero.
+    pub fn substituted_consts(
+        &self,
+        values: &HashMap<TypeParamId, ConstTerm>,
+    ) -> Result<Option<Rc<NominalDecl>>, NoValue> {
+        let before = self.const_args();
+        let after = before
+            .iter()
+            .map(|term| term.substituted(values))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((after != before).then(|| {
+            Rc::new(NominalDecl {
+                const_args: Some(after),
+                ..self.instance()
+            })
+        }))
+    }
+
+    /// A copy of `self` sharing its body and its implicit parameters, for an instance to
+    /// replace the arguments of.
+    fn instance(&self) -> NominalDecl {
+        NominalDecl {
+            module: self.module.clone(),
+            name: self.name.clone(),
+            params: self.params.clone(),
+            span: self.span,
+            declares_extract: self.declares_extract,
+            body: Rc::clone(&self.body),
+            implicit: Rc::clone(&self.implicit),
+            implicit_args: self.implicit_args.clone(),
+            implicit_consts: Rc::clone(&self.implicit_consts),
+            const_args: self.const_args.clone(),
+        }
     }
 
     /// `self` applied to its own type parameters: the type of `self` inside a function
@@ -408,9 +521,10 @@ impl NominalDecl {
         } else {
             format!("{}::{}", self.module.join("::"), self.name)
         };
-        match &self.implicit_args {
-            Some(_) => format!("{name}{}", self.implicit_spelling()),
-            None => name,
+        if self.is_instance() {
+            format!("{name}{}", self.implicit_spelling())
+        } else {
+            name
         }
     }
 
@@ -450,6 +564,17 @@ impl NominalDecl {
             .collect();
         let mut out = ty.clone();
         replace_params(&mut out, true, &map);
+        // A type of the module that reaches the same `const` parameters names them as its
+        // own module does, so it takes this instance's arguments too.
+        let consts: HashMap<TypeParamId, ConstTerm> = self
+            .implicit_consts()
+            .iter()
+            .map(|p| p.id)
+            .zip(self.const_args())
+            .collect();
+        if self.const_args.is_some() {
+            replace_consts(&mut out, &consts);
+        }
         out
     }
 
@@ -494,7 +619,7 @@ impl fmt::Debug for NominalDecl {
             write!(f, "{segment}::")?;
         }
         write!(f, "{}", self.name)?;
-        if self.implicit_args.is_some() {
+        if self.is_instance() {
             write!(f, "{}", self.implicit_spelling())?;
         }
         Ok(())
@@ -503,20 +628,36 @@ impl fmt::Debug for NominalDecl {
 
 impl NominalDecl {
     /// What identifies the declaration: its module's path, its name, and its implicit
-    /// arguments.
-    fn identity(&self) -> (&[SmolStr], &SmolStr, Vec<Type>) {
-        (&self.module, &self.name, self.implicit_args())
+    /// arguments, the types and then the `const` terms.
+    fn identity(&self) -> (&[SmolStr], &SmolStr, Vec<Type>, Vec<ConstTerm>) {
+        (
+            &self.module,
+            &self.name,
+            self.implicit_args(),
+            self.const_args(),
+        )
+    }
+
+    /// Whether this is an instance, reached through a run or an import, rather than the
+    /// declaration as its own module names it.
+    fn is_instance(&self) -> bool {
+        self.implicit_args.is_some() || self.const_args.is_some()
     }
 
     /// The implicit arguments of an instance, as a diagnostic writes them after the type's
-    /// name: `[Receipt = stripe::Receipt]`.
+    /// name: `[Receipt = stripe::Receipt, max_rate = 30]`.
     fn implicit_spelling(&self) -> String {
-        let args: Vec<String> = self
+        let types = self
             .implicit()
             .iter()
             .zip(self.implicit_args())
-            .map(|(p, a)| format!("{} = {a}", p.spelling))
-            .collect();
+            .map(|(p, a)| format!("{} = {a}", p.spelling));
+        let consts = self
+            .implicit_consts()
+            .iter()
+            .zip(self.const_args())
+            .map(|(p, a)| format!("{} = {a}", p.spelling));
+        let args: Vec<String> = types.chain(consts).collect();
         format!("[{}]", args.join(", "))
     }
 }
@@ -724,6 +865,18 @@ fn replace_params(ty: &mut Type, pol: bool, map: &HashMap<TypeParamId, (&Type, &
         }
         _ => ty.walk_children_mut(|child| replace_params(child, pol, map)),
     }
+}
+
+/// `ty` with each nominal type it names, at any depth, the instance whose `const` arguments
+/// read `consts`'s terms for the parameters `consts` maps. An argument left with no value
+/// keeps its term, as `substitute_decl` keeps it, and is reported where its run is created.
+fn replace_consts(ty: &mut Type, consts: &HashMap<TypeParamId, ConstTerm>) {
+    if let Type::Nominal(decl, _) = ty
+        && let Ok(Some(instance)) = decl.substituted_consts(consts)
+    {
+        *decl = instance;
+    }
+    ty.walk_children_mut(|child| replace_consts(child, consts));
 }
 
 fn collect_decls(ty: &Type, out: &mut Vec<Rc<NominalDecl>>) {

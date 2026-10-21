@@ -703,7 +703,8 @@ fn declaration_errors_name_what_is_wrong() {
 
                 Rate::new(3)
             "#},
-            "names `limit`; naming a module binding there is not supported yet",
+            "names `limit`, which is not a constant; a refinement in a declaration names only `_` \
+             and constants",
         ),
     ] {
         check_compile_error(src, needle);

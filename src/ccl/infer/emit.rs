@@ -2810,7 +2810,7 @@ fn emit_nominal_scrutinee<C: Typing>(
                 decl.name
             )
         });
-        let mut payload = decl.instantiate(&ctor.payload(), &args);
+        let mut payload = decl.instantiate(&ctor.destructured(), &args);
         ctx.type_annotation_predicates(&mut payload)?;
         let payload = ctx.normalize(&payload);
         let slot = ctx.binding_slot(&mut p.binding.ty);

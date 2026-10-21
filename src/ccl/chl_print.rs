@@ -420,6 +420,21 @@ impl Printer {
                 None => (Prec::Atom, self.fallback_expr(e)),
             },
             TypedExprNode::Apply { function, argument } => self.apply(e, function, argument, env),
+            // A ternary, as lowering builds one: a guard with its arm, then `True` with the
+            // other.
+            TypedExprNode::Case {
+                scrutinee: None,
+                branches,
+            } if let [then, otherwise] = branches.as_slice()
+                && then.pattern.is_none()
+                && otherwise.pattern.is_none()
+                && matches!(otherwise.guard.node, TypedExprNode::Lit(Lit::Bool(true))) =>
+            {
+                let arm = self.expr(&then.body, Prec::Or, env);
+                let guard = self.expr(&then.guard, Prec::Or, env);
+                let other = self.expr(&otherwise.body, Prec::Lowest, env);
+                (Prec::Lowest, format!("{arm} if {guard} else {other}"))
+            }
             _ => (Prec::Atom, self.fallback_expr(e)),
         }
     }

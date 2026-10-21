@@ -136,6 +136,30 @@ fn two_runs_of_a_module_have_their_own_state(
     check_program_scalar(&program(&root, &[(module, text)]), Value::Int(expected));
 }
 
+/// Two runs of a module whose code holds refinements each hold their own copy of them: a
+/// refined parameter type, and a nominal type's refined constructor.
+#[rstest]
+#[case::function(
+    indoc! {"
+        pub def f(x: {Int where _ > 0}) => Int:
+            x
+    "},
+    "a::f(1) + b::f(2)"
+)]
+#[case::constructor(
+    "pub type P = {Int where _ > 0}\n",
+    "a::P::new(1).extract() + b::P::new(2).extract()"
+)]
+#[timeout(Duration::from_secs(10))]
+fn two_runs_of_a_module_hold_their_own_refinements(#[case] text: &str, #[case] read: &str) {
+    let root = formatdoc! {"
+        run refined as a
+        run refined as b
+        {read}
+    "};
+    check_program_scalar(&program(&root, &[("refined", text)]), Value::Int(3));
+}
+
 /// Each run's sinks are its own, named by its run path.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -375,6 +399,77 @@ fn two_runs_serving_one_route_are_refused() {
         "{errors}"
     );
     assert!(errors.contains("the run that serves it first"), "{errors}");
+}
+
+/// A route takes its address from `const` parameters, so two runs given the same address
+/// conflict as two runs of a literal route do, and an address that is not a constant, or
+/// one that is no port, is refused.
+#[rstest]
+#[case::one_address(
+    indoc! {r#"
+        run service(path="/ping") as eu
+        run service(path="/ping") as us
+    "#},
+    "the run `us` serves port=0, method=GET, path=/ping, which the run `eu` already serves"
+)]
+#[case::the_roots(
+    indoc! {r#"
+        const param path: String = "/ping"
+        run service(path="/ping") as eu
+        reqs, resps = http_serve("0", "GET", path)
+        for r in reqs:
+            resps << "pong"
+    "#},
+    "this program serves port=0, method=GET, path=/ping, which the run `eu` already serves"
+)]
+#[case::not_a_port(
+    "run service(path=\"/ping\", port=\"http\") as eu\n",
+    "the route declared here has no address in this run: http_serve port must be a u16, got \"http\""
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_route_takes_its_address_from_its_run(#[case] root: &str, #[case] needle: &str) {
+    let service = indoc! {r#"
+        const param path: String
+        const param port: String = "0"
+        reqs, resps = http_serve(port, "GET", path)
+        for r in reqs:
+            resps << "pong"
+    "#};
+    let errors = compile_errors(&program(root, &[("service", service)]));
+    assert!(errors.contains(needle), "{errors}");
+}
+
+/// A route's address is a string constant: one read from a parameter without `const` is
+/// refused, and so is an argument that is no string in any run, once, at the statement.
+#[rstest]
+#[case::not_a_constant(
+    indoc! {r#"
+        param path: String
+        reqs, resps = http_serve("0", "GET", path)
+        for r in reqs:
+            resps << "pong"
+    "#},
+    "`path` is a parameter without `const`"
+)]
+#[case::not_a_string(
+    indoc! {r#"
+        const param path: String
+        reqs, resps = http_serve(8080, "GET", path)
+        for r in reqs:
+            resps << "pong"
+    "#},
+    "http_serve's arguments are strings, and one is `8080`"
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_routes_address_is_a_string_constant(#[case] service: &str, #[case] needle: &str) {
+    let errors = compile_errors(&program(
+        indoc! {r#"
+            run service(path="/eu") as eu
+            run service(path="/us") as us
+        "#},
+        &[("service", service)],
+    ));
+    assert_eq!(errors.matches(needle).count(), 1, "{errors}");
 }
 
 /// A module of value parameters: `base` without a default, `step` with one.

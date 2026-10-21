@@ -387,7 +387,8 @@ pub enum TypedExprNode {
     /// its parameter: the module's spelling in the declaring module, or `None`
     /// when that module has errors of its own, and the argument's span. `types`
     /// are its type arguments, each with its parameter and its span, lowered
-    /// where the statement stands.
+    /// where the statement stands, and `consts` the term each `const` parameter
+    /// takes, over the declaring module's `const` parameters.
     ///
     /// Exists only between lowering and linking. Linking replaces it with the
     /// run's chain around `body`, so no pass after it sees one, and each has an
@@ -399,6 +400,10 @@ pub enum TypedExprNode {
         arguments: Vec<SmolStr>,
         modules: Vec<(SmolStr, Option<crate::ccl::names::QualifiedName>, Span)>,
         types: Vec<(crate::ccl::names::QualifiedName, Span, Type)>,
+        consts: Vec<(
+            crate::ccl::constant::ConstParam,
+            crate::ccl::constant::ConstTerm,
+        )>,
         body: Box<TypedExpr>,
     },
 

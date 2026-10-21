@@ -59,12 +59,12 @@ pub(super) fn reroot(ty: &Type, qualifier: &QualifiedName) -> Type {
 }
 
 /// `ty` with each type parameter `arguments` maps replaced by its type.
-pub(in crate::ccl::lower) fn substitute(ty: &mut Type, arguments: &HashMap<TypeParamId, Type>) {
+pub(in crate::ccl::lower) fn substitute(ty: &mut Type, arguments: &Arguments) {
     if arguments.is_empty() {
         return;
     }
     if let Type::Param(param) = ty
-        && let Some(argument) = arguments.get(&param.id)
+        && let Some(argument) = arguments.types.get(&param.id)
     {
         *ty = argument.clone();
         return;
@@ -76,7 +76,7 @@ pub(in crate::ccl::lower) fn substitute(ty: &mut Type, arguments: &HashMap<TypeP
 }
 
 /// [`substitute`] in every type slot of `expr`.
-pub(super) fn substitute_in(expr: &mut Expr, arguments: &HashMap<TypeParamId, Type>) {
+pub(super) fn substitute_in(expr: &mut Expr, arguments: &Arguments) {
     if arguments.is_empty() {
         return;
     }
@@ -108,11 +108,15 @@ pub(super) fn substitute_in(expr: &mut Expr, arguments: &HashMap<TypeParamId, Ty
 
 /// `decl` as the instance `arguments` reach, when it reaches any of them
 /// ([`NominalDecl::substituted`]).
-pub(in crate::ccl::lower) fn substitute_decl(
-    decl: &mut Rc<NominalDecl>,
-    arguments: &HashMap<TypeParamId, Type>,
-) {
+pub(in crate::ccl::lower) fn substitute_decl(decl: &mut Rc<NominalDecl>, arguments: &Arguments) {
     if let Some(instance) = decl.substituted(&mut |arg| substitute(arg, arguments)) {
+        *decl = instance;
+    }
+    // A `const` argument with no value is reported where the run that passes it is
+    // created (`ProgramLowering::create`), so the instance keeps the term it had.
+    if !arguments.consts.is_empty()
+        && let Ok(Some(instance)) = decl.substituted_consts(&arguments.consts)
+    {
         *decl = instance;
     }
 }
@@ -140,6 +144,7 @@ pub(super) fn instantiate(prefix: &QualifiedName, ty: &Rc<ModuleType>) -> Rc<Mod
     let mut instance = (**ty).clone();
     let mut map = HashMap::new();
     fresh(prefix, &mut instance, &mut map);
+    let map = Arguments::of_types(map);
     let mut instance = AliasType::Module(Rc::new(instance));
     instance.walk_types_mut(&mut |ty| substitute(ty, &map));
     let AliasType::Module(instance) = instance else {
@@ -196,8 +201,8 @@ pub(super) fn reached_types(
     interface: &Interface,
     spelling: &QualifiedName,
     given: &HashMap<QualifiedName, Type>,
-) -> TypeArguments {
-    let mut arguments = HashMap::new();
+) -> ReachedArguments {
+    let mut arguments = Arguments::default();
     for parameter in &interface.parameters {
         if let Some(ty) = parameter.module() {
             for (member, param) in abstract_members(&QualifiedName::new(parameter.name.clone()), ty)
@@ -207,7 +212,7 @@ pub(super) fn reached_types(
                     (None, Some(default)) => reroot(default, spelling),
                     (None, None) => Type::Hole,
                 };
-                arguments.insert(param.id, ty);
+                arguments.types.insert(param.id, ty);
             }
             continue;
         }
@@ -226,7 +231,7 @@ pub(super) fn reached_types(
             }
             (None, None) => Type::Hole,
         };
-        arguments.insert(param.id, ty);
+        arguments.types.insert(param.id, ty);
     }
     Rc::new(arguments)
 }
@@ -234,9 +239,9 @@ pub(super) fn reached_types(
 /// A name a refinement in `ty` reads other than its element, if one does.
 pub(super) fn value_named(ty: &Type) -> Option<Name> {
     fn walk(ty: &Type, visited: &mut HashSet<crate::ccl::PredicateId>, found: &mut Option<Name>) {
-        crate::ccl::ccl_utils::walk_refined_predicates(ty, visited, &mut |predicate, _| {
+        walk_refined_predicates(ty, visited, &mut |predicate, _| {
             if found.is_none() {
-                *found = crate::ccl::ccl_utils::free_names(predicate)
+                *found = free_names(predicate)
                     .into_iter()
                     .find(|name| !name.is_elem());
             }

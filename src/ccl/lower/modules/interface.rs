@@ -2,6 +2,7 @@
 //! its members, and its parameters (`docs/modules.md`, "The module interface").
 
 use super::*;
+use crate::ccl::constant::{ConstParam, ConstTerm};
 
 /// What a module declares, for the modules that reach it (`docs/modules.md`,
 /// "The module interface").
@@ -20,6 +21,9 @@ pub struct Interface {
     pub(super) modules: HashMap<SmolStr, ModuleBinding>,
     /// Each parameter, in the order declared.
     pub(super) parameters: Vec<Parameter>,
+    /// The term of each public `const` member, over the module's `const` parameters
+    /// (`docs/chl-spec.md`, "9.19 Constants").
+    pub(in crate::ccl::lower) constants: HashMap<SmolStr, ConstTerm>,
     /// Why importing the module is an error, if it is.
     pub unimportable: Option<Unimportable>,
 }
@@ -39,7 +43,11 @@ pub struct Parameter {
 #[derive(Debug, Clone)]
 pub enum ParameterKind {
     /// A value, with its annotated type as its module lowered it, if it has one.
-    Value(Option<Type>),
+    Value {
+        ty: Option<Type>,
+        /// For a `const param`, what makes it one (`docs/chl-spec.md`, "9.19 Constants").
+        constant: Option<ConstParameter>,
+    },
     /// A module of its Module type.
     Module {
         ty: Rc<ModuleType>,
@@ -61,8 +69,40 @@ pub enum ParameterKind {
     },
 }
 
-/// The type each type parameter of a run or a shared import takes, by parameter.
-pub type TypeArguments = Rc<HashMap<TypeParamId, Type>>;
+/// A `const param`: the parameter as the nominal types that reach it record it, and its
+/// default, if it has one, as a term over the parameters above it.
+#[derive(Debug, Clone)]
+pub struct ConstParameter {
+    pub param: ConstParam,
+    pub default: Option<ConstTerm>,
+}
+
+/// What a run or a shared import gives its module's parameters, as the module that reaches it
+/// writes them: the type each type parameter takes, and the term each `const` parameter
+/// takes (`docs/chl-spec.md`, "Nominal type identity"). Each is by parameter.
+#[derive(Debug, Clone, Default)]
+pub struct Arguments {
+    pub types: HashMap<TypeParamId, Type>,
+    pub consts: HashMap<TypeParamId, ConstTerm>,
+}
+
+impl Arguments {
+    /// The arguments `types` alone, for a site that gives no `const` parameter one.
+    pub fn of_types(types: HashMap<TypeParamId, Type>) -> Arguments {
+        Arguments {
+            types,
+            consts: HashMap::new(),
+        }
+    }
+
+    /// Whether it gives no parameter anything.
+    pub fn is_empty(&self) -> bool {
+        self.types.is_empty() && self.consts.is_empty()
+    }
+}
+
+/// [`Arguments`], shared by each qualifier that reaches the one run.
+pub type ReachedArguments = Rc<Arguments>;
 
 impl Parameter {
     /// The type the abstract type member `member` of its Module type takes
@@ -70,7 +110,15 @@ impl Parameter {
     pub fn default_type(&self, member: &QualifiedName) -> Option<&Type> {
         match &self.kind {
             ParameterKind::Module { default_types, .. } => default_types.get(member),
-            ParameterKind::Value(_) | ParameterKind::Type { .. } => None,
+            ParameterKind::Value { .. } | ParameterKind::Type { .. } => None,
+        }
+    }
+
+    /// The `const` parameter it is, if it is one.
+    pub fn constant(&self) -> Option<&ConstParameter> {
+        match &self.kind {
+            ParameterKind::Value { constant, .. } => constant.as_ref(),
+            ParameterKind::Module { .. } | ParameterKind::Type { .. } => None,
         }
     }
 
@@ -82,7 +130,7 @@ impl Parameter {
     /// Its annotated type, if it takes a value and has one.
     pub fn annotation(&self) -> Option<&Type> {
         match &self.kind {
-            ParameterKind::Value(annotation) => annotation.as_ref(),
+            ParameterKind::Value { ty, .. } => ty.as_ref(),
             ParameterKind::Module { .. } | ParameterKind::Type { .. } => None,
         }
     }
@@ -91,7 +139,7 @@ impl Parameter {
     pub fn module(&self) -> Option<&Rc<ModuleType>> {
         match &self.kind {
             ParameterKind::Module { ty, .. } => Some(ty),
-            ParameterKind::Value(_) | ParameterKind::Type { .. } => None,
+            ParameterKind::Value { .. } | ParameterKind::Type { .. } => None,
         }
     }
 
@@ -100,7 +148,7 @@ impl Parameter {
     pub fn module_default(&self) -> Option<&QualifiedName> {
         match &self.kind {
             ParameterKind::Module { default, .. } => default.as_ref(),
-            ParameterKind::Value(_) | ParameterKind::Type { .. } => None,
+            ParameterKind::Value { .. } | ParameterKind::Type { .. } => None,
         }
     }
 
@@ -161,7 +209,7 @@ pub struct ModuleBinding {
     pub view: Option<Rc<ModuleView>>,
     /// The types the run it is bound to gives its module's type parameters, as
     /// its declaring module writes them.
-    pub types: TypeArguments,
+    pub types: ReachedArguments,
 }
 
 /// What a Module-typed parameter reaches of the module it takes: each member
@@ -314,6 +362,7 @@ impl NominalMember {
             .implicit()
             .iter()
             .map(|p| p.spelling.as_str())
+            .chain(decl.implicit_consts().iter().map(|p| p.spelling.as_str()))
             .collect();
         if !implicit.is_empty() {
             notes.push(format!("one type per argument of {}", implicit.join(", ")));
@@ -374,7 +423,7 @@ impl Interface {
         self.parameters
             .iter()
             .filter(|p| match &p.kind {
-                ParameterKind::Value(annotation) => annotation
+                ParameterKind::Value { ty, .. } => ty
                     .as_ref()
                     .is_none_or(|ty| ty.holds_type(&|ty| matches!(ty, Type::Hole))),
                 _ => false,
@@ -435,21 +484,34 @@ impl Interface {
                 ParameterKind::Type {
                     bound: Some(bound), ..
                 } => format!(" <: {}", crate::ccl::chl_print::chl_type(bound)),
-                ParameterKind::Value(Some(ty)) => {
+                ParameterKind::Value { ty: Some(ty), .. } => {
                     format!(": {}", crate::ccl::chl_print::chl_type(ty))
                 }
-                ParameterKind::Type { bound: None, .. } | ParameterKind::Value(None) => {
+                ParameterKind::Type { bound: None, .. } | ParameterKind::Value { ty: None, .. } => {
                     String::new()
                 }
             };
             let default = if parameter.default { " = …" } else { "" };
-            lines.push(format!("param {}{stated}{default}", parameter.name));
+            let constant = if parameter.constant().is_some() {
+                "const "
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "{constant}param {}{stated}{default}",
+                parameter.name
+            ));
         }
         let mut members: Vec<(Span, String)> = Vec::new();
         for (name, member) in &self.members {
             if member.public {
                 let contract = contracts.get(name).map_or("…", String::as_str);
-                members.push((member.declared, format!("pub {name}: {contract}")));
+                let constant = if self.constants.contains_key(name) {
+                    "const "
+                } else {
+                    ""
+                };
+                members.push((member.declared, format!("pub {constant}{name}: {contract}")));
             }
         }
         for (name, member) in &self.types {
@@ -496,6 +558,7 @@ impl Interface {
             nominal: HashMap::new(),
             modules: HashMap::new(),
             parameters: Vec::new(),
+            constants: HashMap::new(),
             unimportable: Some(why),
         }
     }
@@ -574,6 +637,14 @@ impl Interface {
             nominal: nominal_members(ast, ctx),
             modules,
             parameters,
+            constants: bindings
+                .iter()
+                .filter(|binding| binding.public)
+                .filter_map(|binding| {
+                    let term = ctx.constants.term_of(&binding.name)?;
+                    Some((binding.name.clone(), term))
+                })
+                .collect(),
             unimportable,
         }
     }

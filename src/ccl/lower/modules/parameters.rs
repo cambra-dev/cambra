@@ -22,6 +22,7 @@ impl LoweringContext {
             name,
             annotation: Some(annotation),
             default,
+            ..
         } = &stmt.node
         else {
             return Vec::new();
@@ -81,7 +82,7 @@ impl LoweringContext {
                 name: QualifiedName::new(name.node.clone()),
                 view: Some(Rc::new(view)),
                 view_base: QualifiedName::default(),
-                types: TypeArguments::default(),
+                types: ReachedArguments::default(),
             },
         );
         self.parameters.push(Parameter {
@@ -260,6 +261,7 @@ impl LoweringContext {
                 .collect(),
             modules: arguments.modules,
             types: self.run_type_arguments.remove(name).unwrap_or_default(),
+            consts: self.run_const_arguments.remove(name).unwrap_or_default(),
             body: Box::new(body),
         });
         let run = self.tag_image(run, statement);
@@ -344,6 +346,56 @@ impl LoweringContext {
             },
         });
         error.map_or(Ok(()), Err)
+    }
+
+    /// The term each `const` parameter of the module `interface` declares takes from the
+    /// `run` statement's arguments `args`, or from its default, in the order the module
+    /// declares them. An argument that is not a constant is an error in `errors`, and so is
+    /// one with no value. A parameter with neither an argument nor a default takes nothing,
+    /// which creating the run reports.
+    fn run_consts(
+        &mut self,
+        interface: &Interface,
+        args: &[KeywordArg],
+        errors: &mut Vec<LoweringError>,
+    ) -> Vec<(ConstParam, ConstTerm)> {
+        let mut consts: Vec<(ConstParam, ConstTerm)> = Vec::new();
+        for parameter in &interface.parameters {
+            let Some(constant) = parameter.constant() else {
+                continue;
+            };
+            let given: HashMap<_, _> = consts
+                .iter()
+                .map(|(param, term)| (param.id, term.clone()))
+                .collect();
+            let term = match args.iter().find(|arg| arg.name.node == parameter.name) {
+                Some(arg) => match self.const_term(&arg.value, arg.value.span.start) {
+                    Ok(term) => term,
+                    Err(refused) => {
+                        refused.report(errors);
+                        continue;
+                    }
+                },
+                None => match &constant.default {
+                    Some(default) => match default.substituted(&given) {
+                        Ok(term) => term,
+                        Err(e) => {
+                            errors.push(LoweringError::unsupported(
+                                parameter.declared,
+                                format!(
+                                    "the default of `{}` has no value: {}",
+                                    parameter.name, e.0
+                                ),
+                            ));
+                            continue;
+                        }
+                    },
+                    None => continue,
+                },
+            };
+            consts.push((constant.param.clone(), term));
+        }
+        consts
     }
 
     /// Lower the type arguments `args` of the `run` statement declaring the run
@@ -449,17 +501,23 @@ impl LoweringContext {
             given.insert(QualifiedName::new(arg.name.node.clone()), ty.clone());
             lowered.push((QualifiedName::new(arg.name.node.clone()), span, ty));
         }
+        let consts = self.run_consts(&interface, args, &mut errors);
         let typed = interface.parameters.iter().any(|p| {
             p.is_type()
                 || p.module().is_some_and(|ty| {
                     !abstract_members(&QualifiedName::new(p.name.clone()), ty).is_empty()
                 })
         });
-        if !typed && checked.is_empty() {
+        if !typed && checked.is_empty() && consts.is_empty() {
             return errors;
         }
         let run_spelling = QualifiedName::new(run.clone());
-        let types = reached_types(&interface, &run_spelling, &given);
+        let mut types = reached_types(&interface, &run_spelling, &given);
+        Rc::make_mut(&mut types).consts = consts
+            .iter()
+            .map(|(param, term)| (param.id, term.clone()))
+            .collect();
+        self.run_const_arguments.insert(run.clone(), consts);
         let checks = type_checks(checked, &run_spelling, &types);
         self.run_type_checks.insert(run.clone(), checks);
         let qualifier = self

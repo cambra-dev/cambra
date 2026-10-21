@@ -7,6 +7,7 @@
 import catalog use sale_price as price
 run storefront as us
 param region: String = "us"
+const ceiling = 10
 
 pub def quote(item, qty) => Int requires Transaction:
     return this::price(item) * qty

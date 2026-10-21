@@ -420,7 +420,7 @@ const MAX_FOLDED_STRING: usize = 64 * 1024;
 /// on a one-element column, so agreement is by construction rather than by two
 /// implementations being kept in step. What belongs to the fold is the exclusion list, and
 /// that is what [`runtime_answers`] is.
-fn eval_binop(op: BinOpKind, left: &Lit, right: &Lit) -> Option<Lit> {
+pub(crate) fn eval_binop(op: BinOpKind, left: &Lit, right: &Lit) -> Option<Lit> {
     let rt = crate::scalar_ops::BinOpKind::from(op);
     if !runtime_answers(rt, left, right) {
         return None;

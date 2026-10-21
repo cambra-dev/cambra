@@ -22,7 +22,7 @@ pub fn is_module_body(expr: &Expr) -> bool {
 /// the body of a `let`, a mutable variable, a statement, a type alias, an `impl`
 /// block's group of functions, or a `run`. A module's top level is the chain of
 /// these bodies from the root.
-pub(super) fn spine_body(expr: &Expr) -> Option<&Expr> {
+pub(in crate::ccl::lower) fn spine_body(expr: &Expr) -> Option<&Expr> {
     match &expr.node {
         TypedExprNode::Let { body, .. }
         | TypedExprNode::MutDecl { body, .. }
@@ -35,7 +35,7 @@ pub(super) fn spine_body(expr: &Expr) -> Option<&Expr> {
 }
 
 /// [`spine_body`], to rewrite the rest of the module.
-pub(super) fn spine_body_mut(expr: &mut Expr) -> Option<&mut Expr> {
+pub(in crate::ccl::lower) fn spine_body_mut(expr: &mut Expr) -> Option<&mut Expr> {
     match &mut expr.node {
         TypedExprNode::Let { body, .. }
         | TypedExprNode::MutDecl { body, .. }
@@ -74,6 +74,142 @@ pub fn fill_module_body(mut chain: Expr, body: Expr) -> Expr {
     }
     *at = body;
     chain
+}
+
+/// `expr` with each reference a refinement predicate in its type slots makes to a binder
+/// `literals` maps replaced by its literal, each operation over literals this leaves folded
+/// to the literal it computes, and each ternary whose condition this decides replaced by
+/// the arm it takes. A predicate a run's copy holds then reads the run's `const` arguments
+/// as values, which a refinement check compares (`docs/modules.md`, "Linking").
+///
+/// Each node rewritten keeps its id, a reference or an operation now standing for its
+/// value, and a ternary for the arm it takes, so rebuilding a predicate, which copies and
+/// mints nothing, holds no new node.
+pub(super) fn inline_const_literals(expr: &mut Expr, literals: &HashMap<Name, Lit>) {
+    fn fold(expr: &mut Expr, literals: &HashMap<Name, Lit>) -> bool {
+        if let TypedExprNode::Var(name) = &expr.node
+            && let Some(value) = literals.get(name)
+        {
+            expr.node = TypedExprNode::Lit(value.clone());
+            return true;
+        }
+        let mut changed = false;
+        expr.walk_children_mut(|child| changed |= fold(child, literals));
+        if let TypedExprNode::BinOp { left, op, right } = &expr.node
+            && let (TypedExprNode::Lit(l), TypedExprNode::Lit(r)) = (&left.node, &right.node)
+            && let Some(value) = crate::ccl::constant::fold_binop(*op, l, r)
+        {
+            expr.node = TypedExprNode::Lit(value);
+            changed = true;
+        }
+        let negated = match &expr.node {
+            TypedExprNode::UnaryOp(crate::ccl::UnaryOpKind::Neg, operand) => match operand.node {
+                TypedExprNode::Lit(Lit::Int(n)) => n.checked_neg().map(Lit::Int),
+                _ => None,
+            },
+            TypedExprNode::UnaryOp(crate::ccl::UnaryOpKind::Not, operand) => match operand.node {
+                TypedExprNode::Lit(Lit::Bool(b)) => Some(Lit::Bool(!b)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(value) = negated {
+            expr.node = TypedExprNode::Lit(value);
+            changed = true;
+        }
+        // A ternary, as `predicate_term` builds one: the first branch whose guard holds.
+        if let TypedExprNode::Case {
+            scrutinee: None,
+            branches,
+        } = &mut expr.node
+        {
+            while branches.len() > 1
+                && matches!(branches[0].guard.node, TypedExprNode::Lit(Lit::Bool(false)))
+            {
+                branches.remove(0);
+                changed = true;
+            }
+            if matches!(branches[0].guard.node, TypedExprNode::Lit(Lit::Bool(true))) {
+                let taken = std::mem::take(&mut branches[0].body);
+                expr.node = taken.node;
+                changed = true;
+            }
+        }
+        changed
+    }
+    fn walk(expr: &mut Expr, literals: &HashMap<Name, Lit>, memo: &PredMemo) {
+        expr.walk_type_slots_mut(|ty| {
+            walk_refined_predicates_mut(ty, memo, &(), &mut |predicate, _| {
+                fold(predicate, literals)
+            });
+        });
+        expr.walk_children_mut(|child| walk(child, literals, memo));
+    }
+    if !literals.is_empty() {
+        walk(expr, literals, &PredMemo::new());
+    }
+}
+
+/// A `const` parameter whose value is a tuple, a record or a list, by the binder of its
+/// `let`, which no predicate holds yet (`docs/chl-spec.md`, "Declaring a nominal type").
+#[derive(Debug, Clone)]
+pub(super) struct CompoundConst {
+    name: SmolStr,
+    value: ConstTerm,
+    /// The statement that gives the value: a `run`, an `import`, or the root's `const param`.
+    given: Span,
+    /// The parameter's declaration.
+    declared: Span,
+}
+
+/// One error per parameter of `compounds` that a refinement predicate in `expr`'s type slots
+/// reads.
+pub(super) fn compound_const_reads(
+    expr: &Expr,
+    compounds: &HashMap<Name, CompoundConst>,
+) -> Vec<LoweringError> {
+    fn walk<'a>(
+        expr: &Expr,
+        compounds: &'a HashMap<Name, CompoundConst>,
+        read: &mut Vec<&'a CompoundConst>,
+    ) {
+        expr.walk_type_slots(&mut |ty: &Type| {
+            walk_refined_predicates(ty, &mut HashSet::new(), &mut |predicate, _| {
+                for name in free_names(predicate) {
+                    if let Some(compound) = compounds.get(&name)
+                        && !read.iter().any(|r| std::ptr::eq(*r, compound))
+                    {
+                        read.push(compound);
+                    }
+                }
+            });
+        });
+        expr.walk_children(|child| walk(child, compounds, read));
+    }
+    if compounds.is_empty() {
+        return Vec::new();
+    }
+    let mut read = Vec::new();
+    walk(expr, compounds, &mut read);
+    read.sort_by_key(|c| (c.given.start, c.name.clone()));
+    read.into_iter()
+        .map(|c| {
+            let error = LoweringError::unsupported(
+                c.given,
+                format!(
+                    "`{}` is `{}` here, and a declaration's refinement reads it; a tuple, a \
+                     record or a list constant in a declaration's refinement is not supported \
+                     yet",
+                    c.name, c.value
+                ),
+            );
+            if c.declared == c.given {
+                error
+            } else {
+                error.with_related(c.declared, "the parameter")
+            }
+        })
+        .collect()
 }
 
 /// `expr`, a copy of a module's chain, with each refinement predicate in its type slots
@@ -215,14 +351,14 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     // The root's type parameters take their defaults, and so do the abstract
     // type members of its Module-typed parameters. Each type parameter takes
     // its default after the ones declared above it, which its default may name.
-    let mut defaults = HashMap::new();
+    let mut defaults = Arguments::default();
     for parameter in &ctx.parameters {
         let Some(ty) = parameter.module() else {
             continue;
         };
         for (member, param) in abstract_members(&QualifiedName::new(parameter.name.clone()), ty) {
             if let Some(default) = parameter.default_type(&member) {
-                defaults.insert(param.id, default.clone());
+                defaults.types.insert(param.id, default.clone());
             }
         }
     }
@@ -237,7 +373,24 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         {
             let mut default = default.clone();
             substitute(&mut default, &defaults);
-            defaults.insert(param.id, default);
+            defaults.types.insert(param.id, default);
+        }
+        // A `const` parameter takes its default, a term over the ones above it.
+        if let Some(constant) = parameter.constant()
+            && let Some(default) = &constant.default
+        {
+            match default.substituted(&defaults.consts) {
+                Ok(term) => {
+                    defaults.consts.insert(constant.param.id, term);
+                }
+                Err(no_value) => lowering.errors.push(LoweringError::unsupported(
+                    parameter.declared,
+                    format!(
+                        "the default of `{}` has no value: {}",
+                        parameter.name, no_value.0
+                    ),
+                )),
+            }
         }
     }
     // The root's lowering, for its check: a copy no tree holds.
@@ -278,16 +431,48 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             chain = lowering.bind_module_parameter(chain, &name, &ty, &names, at, ctx);
             modules.insert(name, names);
         }
-        let chain = lowering.expand_runs(chain, &RunPath::default(), &mut qualified, &modules, ctx);
+        let program_span = ast
+            .body
+            .first()
+            .map_or(Span::new(root, 0, 0), |stmt| stmt.span);
+        let sinks = sinks_at(
+            &sinks,
+            &defaults.consts,
+            &mut chain,
+            program_span,
+            &mut lowering.errors,
+        );
+        let chain = lowering.expand_runs(
+            chain,
+            &RunPath::default(),
+            &mut qualified,
+            &modules,
+            &defaults.consts,
+            ctx,
+        );
         let (chain, refused) = finish_program(&ast.body, chain, &sinks, ctx);
         lowering.errors.extend(refused);
         let scope = use_names(&scope, qualified);
         let root = uniquify::run_in(chain, &raw_scope(&scope), None);
+        // The root's `const` parameters bind their `let`s on its spine, with no home.
+        let (spine_binders, _) = spine(&root);
+        for binder in spine_binders {
+            if binder.home().is_none()
+                && let Some(constant) = ctx.constants.param(binder.base())
+                && let Some(value) = defaults.consts.get(&constant.id)
+                && let Some(parameter) = ctx.parameters.iter().find(|p| p.name == binder.base())
+            {
+                lowering.record_const(binder, value, parameter, parameter.declared);
+            }
+        }
         let mut program = chains
             .into_iter()
             .rev()
             .fold(root, |body, chain| fill_module_body(chain, body));
         add_method_copies(&mut program, &lowering.method_copies, ctx);
+        inline_const_literals(&mut program, &lowering.const_literals);
+        let refused = compound_const_reads(&program, &lowering.const_compounds);
+        lowering.errors.extend(refused);
         program
     });
     errors.extend(std::mem::take(&mut lowering.errors));
@@ -379,6 +564,13 @@ pub(super) struct ProgramLowering<'a> {
     /// module declares, which a method call reaches wherever the copy is in scope
     /// ([`add_method_copies`]).
     pub(super) method_copies: Vec<MethodCopy>,
+    /// The literal each run's `const` parameter takes, by the binder of the parameter's
+    /// `let` in the run's chain, which each predicate reading it holds in its place
+    /// ([`inline_const_literals`]).
+    pub(super) const_literals: HashMap<Name, Lit>,
+    /// Each run's `const` parameter whose value is a tuple, a record or a list, by the binder
+    /// of its `let`, which no predicate may read yet ([`compound_const_reads`]).
+    pub(super) const_compounds: HashMap<Name, CompoundConst>,
 }
 
 /// A run's copy of a public method ([`ProgramLowering::method_copies`]).
@@ -429,8 +621,8 @@ pub(super) fn add_method_copies(tree: &mut Expr, copies: &[MethodCopy], ctx: &mu
 fn method_copy(
     interface: &Interface,
     binder: &Name,
-    defaults: &HashMap<TypeParamId, Type>,
-    arguments: &HashMap<TypeParamId, Type>,
+    defaults: &Arguments,
+    arguments: &Arguments,
 ) -> Option<MethodCopy> {
     let (ty, method) = binder.base().split_once("::")?;
     let member = interface.nominal.get(ty).filter(|member| member.public)?;
@@ -539,6 +731,39 @@ impl<'a> ProgramLowering<'a> {
             import_checks: HashMap::new(),
             errors: Vec::new(),
             method_copies: Vec::new(),
+            const_literals: HashMap::new(),
+            const_compounds: HashMap::new(),
+        }
+    }
+
+    /// Record `value`, which the `const` parameter `parameter` takes at `given`, by `binder`,
+    /// the binder of the parameter's `let`: a literal is inlined into each predicate that
+    /// reads it ([`inline_const_literals`]), and a tuple, a record or a list is refused where
+    /// a predicate reads it ([`compound_const_reads`]).
+    fn record_const(
+        &mut self,
+        binder: &Name,
+        value: &ConstTerm,
+        parameter: &Parameter,
+        given: Span,
+    ) {
+        match value {
+            ConstTerm::Lit(lit) => {
+                self.const_literals.insert(binder.clone(), lit.clone());
+            }
+            value if value.is_value() => {
+                self.const_compounds.insert(
+                    binder.clone(),
+                    CompoundConst {
+                        name: parameter.name.clone(),
+                        value: value.clone(),
+                        given,
+                        declared: parameter.declared,
+                    },
+                );
+            }
+            // A term over the parameters of a module checked alone, which compares as written.
+            _ => {}
         }
     }
 
@@ -725,7 +950,14 @@ impl<'a> ProgramLowering<'a> {
             .filter(|interface| interface.unimportable.is_none())
             .and_then(|_| {
                 let home = Home::Import(shared.clone());
-                self.create(file, Some(home), None, Supplied::Import(&shared, site), ctx)
+                self.create(
+                    file,
+                    Some(home),
+                    None,
+                    Supplied::Import(&shared, site),
+                    &[],
+                    ctx,
+                )
             });
         let (chain, names) = match created {
             Some(created) => (Some(created.chain), Some(Rc::new(created.names))),
@@ -755,6 +987,7 @@ impl<'a> ProgramLowering<'a> {
         home: Option<Home>,
         place: Option<(RunPath, Span)>,
         supplied: Supplied,
+        given_consts: &[(ConstParam, ConstTerm)],
         ctx: &mut LoweringContext,
     ) -> Option<Created> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
@@ -791,18 +1024,18 @@ impl<'a> ProgramLowering<'a> {
             Supplied::Run(.., types) => types,
             Supplied::Import(_, site) => &site.types,
         };
-        let mut defaults = HashMap::new();
-        let mut arguments = HashMap::new();
+        let mut defaults = Arguments::default();
+        let mut arguments = Arguments::default();
         for parameter in &lowered.interface.parameters {
             if let ParameterKind::Type { param, default, .. } = &parameter.kind {
                 if let Some(argument) = given.get(&QualifiedName::new(parameter.name.clone())) {
-                    arguments.insert(param.id, argument.clone());
+                    arguments.types.insert(param.id, argument.clone());
                     continue;
                 }
                 if let Some(default) = default {
                     let mut default = default.clone();
                     substitute(&mut default, &defaults);
-                    defaults.insert(param.id, default);
+                    defaults.types.insert(param.id, default);
                     continue;
                 }
             } else if let Some(ty) = parameter.module() {
@@ -812,9 +1045,9 @@ impl<'a> ProgramLowering<'a> {
                     abstract_members(&QualifiedName::new(parameter.name.clone()), ty)
                 {
                     if let Some(argument) = given.get(&member) {
-                        arguments.insert(param.id, argument.clone());
+                        arguments.types.insert(param.id, argument.clone());
                     } else if let Some(default) = parameter.default_type(&member) {
-                        defaults.insert(param.id, default.clone());
+                        defaults.types.insert(param.id, default.clone());
                     } else if let (Supplied::Run(_, modules, _), Some((_, statement))) =
                         (&supplied, &place)
                         && modules
@@ -955,11 +1188,76 @@ impl<'a> ProgramLowering<'a> {
                 chain = ctx.tag_image(bound, *span);
             }
         }
+        // Each `const` parameter takes the term its run passes, the literal its import
+        // passes, or its default, over the parameters above it.
+        let statement = match (&place, &supplied) {
+            (Some((_, statement)), _) => *statement,
+            (None, Supplied::Import(_, site)) => site.statement,
+            (None, Supplied::Run(..)) => unreachable!("a run has a `run` statement"),
+        };
+        for parameter in &lowered.interface.parameters {
+            let Some(constant) = parameter.constant() else {
+                continue;
+            };
+            let imported = match &supplied {
+                Supplied::Import(_, site) => match site.arguments.get(&parameter.name) {
+                    Some((_, KeyArgument::Lit(value))) => Some(ConstTerm::Lit(value.clone())),
+                    _ => None,
+                },
+                Supplied::Run(..) => None,
+            };
+            let term = given_consts
+                .iter()
+                .find(|(param, _)| param.id == constant.param.id)
+                .map(|(_, term)| Ok(term.clone()))
+                .or(imported.map(Ok))
+                .or_else(|| {
+                    let default = constant.default.as_ref()?;
+                    Some(default.substituted(&arguments.consts))
+                });
+            match term {
+                Some(Ok(term)) => {
+                    arguments.consts.insert(constant.param.id, term);
+                }
+                Some(Err(no_value)) => self.errors.push(
+                    LoweringError::unsupported(
+                        statement,
+                        format!(
+                            "the default of `{}` has no value here: {}",
+                            parameter.name, no_value.0
+                        ),
+                    )
+                    .with_related(parameter.declared, "the parameter"),
+                ),
+                // A parameter with no argument and no default is reported above.
+                None => {}
+            }
+        }
         substitute_in(&mut chain, &defaults);
+        // A route takes the address its run gives it. A module's check keeps the name the
+        // module's chain gives its source, which it reads the requests' type off.
+        let declared = if self.checking {
+            Vec::new()
+        } else {
+            sinks_at(
+                &lowered.sinks,
+                &arguments.consts,
+                &mut chain,
+                statement,
+                &mut self.errors,
+            )
+        };
         let mut qualified = own;
-        let chain = self.expand_runs(chain, &path, &mut qualified, &modules, ctx);
+        let chain = self.expand_runs(
+            chain,
+            &path,
+            &mut qualified,
+            &modules,
+            &arguments.consts,
+            ctx,
+        );
         let (sinks, refused) = match &place {
-            Some(place) if !self.checking => ctx.register_sinks(&lowered.sinks, Some(place)),
+            Some(place) if !self.checking => ctx.register_sinks(&declared, Some(place)),
             _ => (Vec::new(), Vec::new()),
         };
         if !self.checking
@@ -993,6 +1291,14 @@ impl<'a> ProgramLowering<'a> {
                 if let Some(copy) = method_copy(&lowered.interface, name, &defaults, &arguments) {
                     self.method_copies.push(copy);
                 }
+            }
+        }
+        for parameter in &lowered.interface.parameters {
+            if let Some(constant) = parameter.constant()
+                && let Some(value) = arguments.consts.get(&constant.param.id)
+                && let Some(binder) = names.get(&QualifiedName::new(parameter.name.clone()))
+            {
+                self.record_const(binder, value, parameter, statement);
             }
         }
         // A member bound to a module reaches what that module does, so a Module
@@ -1070,6 +1376,7 @@ impl<'a> ProgramLowering<'a> {
         path: &RunPath,
         qualified: &mut HashMap<QualifiedName, Name>,
         modules: &HashMap<SmolStr, Rc<HashMap<QualifiedName, Name>>>,
+        own_consts: &HashMap<TypeParamId, ConstTerm>,
         ctx: &mut LoweringContext,
     ) -> Expr {
         if matches!(expr.node, TypedExprNode::Run { .. }) {
@@ -1080,11 +1387,30 @@ impl<'a> ProgramLowering<'a> {
                 arguments,
                 modules: passed,
                 types,
+                consts,
                 body,
             } = expr.node
             else {
                 unreachable!("matched a `Run` above");
             };
+            // Each `const` argument is a term over the declaring module's `const`
+            // parameters, which take this run's values.
+            let consts: Vec<(ConstParam, ConstTerm)> = consts
+                .into_iter()
+                .filter_map(|(param, term)| match term.substituted(own_consts) {
+                    Ok(term) => Some((param, term)),
+                    Err(no_value) => {
+                        self.errors.push(LoweringError::unsupported(
+                            statement,
+                            format!(
+                                "the argument for `{}` has no value here: {}",
+                                param.spelling, no_value.0
+                            ),
+                        ));
+                        None
+                    }
+                })
+                .collect();
             let passed = passed
                 .into_iter()
                 .map(|(parameter, spelling, span)| PassedModule {
@@ -1107,6 +1433,7 @@ impl<'a> ProgramLowering<'a> {
                     Some(home),
                     place,
                     Supplied::Run(&arguments, passed, given),
+                    &consts,
                     ctx,
                 )
             });
@@ -1116,10 +1443,10 @@ impl<'a> ProgramLowering<'a> {
                     for (spelling, binder) in created.names {
                         qualified.insert(QualifiedName::new(name.clone()).then(&spelling), binder);
                     }
-                    let body = self.expand_runs(*body, path, qualified, modules, ctx);
+                    let body = self.expand_runs(*body, path, qualified, modules, own_consts, ctx);
                     fill_module_body(created.chain, body)
                 }
-                None => self.expand_runs(*body, path, qualified, modules, ctx),
+                None => self.expand_runs(*body, path, qualified, modules, own_consts, ctx),
             };
             return types
                 .into_iter()
@@ -1133,7 +1460,7 @@ impl<'a> ProgramLowering<'a> {
         // The rest of the spine stays in place, so no node is minted.
         if let Some(body) = spine_body_mut(&mut expr) {
             let rest = std::mem::take(body);
-            *body = self.expand_runs(rest, path, qualified, modules, ctx);
+            *body = self.expand_runs(rest, path, qualified, modules, own_consts, ctx);
         }
         expr
     }

@@ -1587,6 +1587,7 @@ where
                         name,
                         annotation,
                         default,
+                        constant: None,
                     },
                 )
             });
@@ -1991,6 +1992,30 @@ where
                 )
             });
 
+        // `const` before the binding or `param` it marks (`docs/chl-spec.md`, "9.19
+        // Constants"). Any statement parses after it, so `const` on one that
+        // binds no constant is reported against the keyword.
+        let const_stmt = just(Token::Const)
+            .map_with(|_, e| e.span())
+            .then(stmt.clone())
+            .validate(|(keyword, mut inner): (Span, Spanned<Stmt>), e, emitter| {
+                match &mut inner.node {
+                    Stmt::Assign { constant, .. }
+                    | Stmt::AnnAssign { constant, .. }
+                    | Stmt::Param { constant, .. }
+                        if constant.is_none() =>
+                    {
+                        *constant = Some(keyword);
+                    }
+                    other => {
+                        if let Some(refused) = const_refusal(other) {
+                            emitter.emit(Rich::custom(keyword, refused));
+                        }
+                    }
+                }
+                Spanned::new(e.span(), inner.node)
+            });
+
         // Recovery skips a failed statement's whole extent, and every layout
         // token in it in balanced pairs. A layout token left behind closes the
         // enclosing block early, or at the top level matches nothing and fails
@@ -2040,6 +2065,7 @@ where
             impl_stmt,
             decorated_stmt,
             pub_stmt,
+            const_stmt,
             block_assign,
             simple_stmt,
         ))
@@ -2070,6 +2096,23 @@ where
             }
             WrittenPath { segments }
         })
+}
+
+/// Why `const` cannot stand on `stmt`, which is not an `=` binding or a `param` that
+/// `const` is not already on, or `None` for a recovered [`Stmt::Error`], whose own parse
+/// error already reports it.
+fn const_refusal(stmt: &Stmt) -> Option<&'static str> {
+    Some(match stmt {
+        Stmt::Error => return None,
+        Stmt::Assign { .. } | Stmt::AnnAssign { .. } | Stmt::Param { .. } => {
+            "`const` is written once"
+        }
+        Stmt::MutAssign { .. } => {
+            "`const` is refused on `:=`: a mutable variable changes, so it is no constant"
+        }
+        Stmt::Pub { .. } => "`const` stands after `pub`: `pub const x = e`",
+        _ => "`const` marks a constant: a binding `const x = e`, or a `const param`",
+    })
 }
 
 /// Why `pub` cannot mark `stmt`, or `None` if `stmt` may introduce a member
@@ -2360,11 +2403,13 @@ fn assign_stmt<'src>(
             target: to_target(target)?,
             value,
             transparency,
+            constant: None,
         },
         AssignTail::Annotated(ann, val) => Stmt::AnnAssign {
             target: to_target(target)?,
             annotation: ann,
             value: val,
+            constant: None,
         },
         AssignTail::MutPlain(value) => Stmt::MutAssign {
             target: to_target(target)?,

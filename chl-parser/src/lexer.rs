@@ -114,6 +114,10 @@ pub enum Token {
     Run,
     #[token("param", priority = 3)]
     Param,
+    /// Marks a link-time constant, a binding or a parameter (`docs/chl-spec.md`, "9.19
+    /// Constants").
+    #[token("const", priority = 3)]
+    Const,
     /// The qualifier naming the current module's own labels, `this::f1`.
     #[token("this", priority = 3)]
     This,
@@ -316,6 +320,7 @@ pub const KEYWORDS: &[(&str, Token)] = &[
     ("pub", Token::Pub),
     ("run", Token::Run),
     ("param", Token::Param),
+    ("const", Token::Const),
     ("this", Token::This),
 ];
 
@@ -459,6 +464,7 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::Pub
         | Token::Run
         | Token::Param
+        | Token::Const
         | Token::This => C::KeywordOther,
         Token::ColonEq => C::Mutation,
         Token::LShift => C::Feed,
@@ -708,6 +714,7 @@ impl fmt::Display for Token {
             Token::Pub => "pub",
             Token::Run => "run",
             Token::Param => "param",
+            Token::Const => "const",
             Token::This => "this",
             // Operators (multi-char before single-char)
             Token::LShiftEq => "<<=",
@@ -1391,16 +1398,16 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// The token `tok` at `span` starts a statement, or is the `pub` before
-    /// one.
+    /// The token `tok` at `span` starts a statement, or is the `pub` or `const`
+    /// before one.
     fn statement_head(&mut self, tok: &Token, span: Span) {
         self.line_head = (self.out.len(), span.start);
         if self.head_is_line_first {
             self.line_opens_at_first_token = opens_block_at_line_start(tok);
         }
-        // `pub` prefixes the statement it marks, so the token after it is
-        // the one that says whether the statement opens a block itself.
-        self.head_next = matches!(tok, Token::Pub);
+        // `pub` and `const` prefix the statement they mark, so the token after
+        // them is the one that says whether the statement opens a block itself.
+        self.head_next = matches!(tok, Token::Pub | Token::Const);
     }
 
     /// The first token of a logical line: open or close indentation levels.

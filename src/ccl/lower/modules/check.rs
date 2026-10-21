@@ -24,7 +24,7 @@ pub struct TypeCheck {
 pub(super) fn type_checks(
     checked: Vec<(Span, Type, TypeEntryForm)>,
     spelling: &QualifiedName,
-    types: &HashMap<TypeParamId, Type>,
+    types: &Arguments,
 ) -> Vec<TypeCheck> {
     let written = |ty: &Type| {
         let mut ty = reroot(ty, spelling);
@@ -194,6 +194,33 @@ impl<'a> ProgramLowering<'a> {
     /// creating them here is the only place it is raised ([`lower_for_check`]).
     pub(super) fn check(&mut self, file: FileId, ctx: &mut LoweringContext) -> Option<ModuleCheck> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
+        // The shared imports it reaches, each after the ones it reaches.
+        let mut reached = HashSet::new();
+        let mut pending: Vec<SharedImport> = self.program.ast(file).map_or_else(Vec::new, |ast| {
+            ast.body
+                .iter()
+                .filter_map(|stmt| Some(self.imports.get(&stmt.span)?.shared.clone()))
+                .collect()
+        });
+        while let Some(shared) = pending.pop() {
+            if reached.insert(shared.clone()) {
+                pending.extend(
+                    self.shared_reached
+                        .get(&shared)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        // The tree holds the module's own predicates, and each shared import's copy holds its
+        // module's, so a run the module creates of any of them copies its own.
+        self.holding_predicates.clear();
+        self.holding_predicates.insert(file);
+        let shared_modules: Vec<FileId> = reached
+            .iter()
+            .filter_map(|shared| self.program.file_of(&shared.module))
+            .collect();
+        self.holding_predicates.extend(shared_modules);
         let mut chain = {
             let _copy = crate::ccl::provenance::copy_frame("check.module");
             lowered.chain.clone()
@@ -253,7 +280,14 @@ impl<'a> ProgramLowering<'a> {
         let chain = checked_by(chain, &QualifiedName::new("import"), &imports, ctx);
         let mut qualified = self.shared_names(&lowered.scope);
         self.checking = true;
-        let chain = self.expand_runs(chain, &RunPath::default(), &mut qualified, &modules, ctx);
+        let chain = self.expand_runs(
+            chain,
+            &RunPath::default(),
+            &mut qualified,
+            &modules,
+            &HashMap::new(),
+            ctx,
+        );
         self.checking = false;
         let scope = use_names(&lowered.scope, qualified);
         let chain = uniquify::run_in(chain, &raw_scope(&scope), None);
@@ -266,24 +300,6 @@ impl<'a> ProgramLowering<'a> {
             let tail = ctx.tag_machinery(Expr::lit(Lit::Unit), span, "check.module");
             fill_module_body(chain, tail)
         };
-        // The shared imports it reaches, each after the ones it reaches.
-        let mut reached = HashSet::new();
-        let mut pending: Vec<SharedImport> = self.program.ast(file).map_or_else(Vec::new, |ast| {
-            ast.body
-                .iter()
-                .filter_map(|stmt| Some(self.imports.get(&stmt.span)?.shared.clone()))
-                .collect()
-        });
-        while let Some(shared) = pending.pop() {
-            if reached.insert(shared.clone()) {
-                pending.extend(
-                    self.shared_reached
-                        .get(&shared)
-                        .cloned()
-                        .unwrap_or_default(),
-                );
-            }
-        }
         {
             let _copy = crate::ccl::provenance::copy_frame("check.module");
             for (shared, chain) in self.shared_chains.iter().rev() {
@@ -294,6 +310,7 @@ impl<'a> ProgramLowering<'a> {
         }
         let copies = self.method_copies.clone();
         add_method_copies(&mut tree, &copies, ctx);
+        inline_const_literals(&mut tree, &self.const_literals);
         Some(ModuleCheck {
             module: lowered.interface.module.clone(),
             file,

@@ -174,6 +174,9 @@ pub enum Stmt {
         target: Spanned<AssignTarget>,
         value: Spanned<Expr>,
         transparency: BindingTransparency,
+        /// The `const` keyword, on a constant binding `const x = e` (`docs/chl-spec.md`,
+        /// "9.19 Constants").
+        constant: Option<Span>,
     },
 
     /// Annotated assignment: `target: ty = value` or `target <: ty = value`.
@@ -186,6 +189,8 @@ pub enum Stmt {
         target: Spanned<AssignTarget>,
         annotation: TypeAnnotation,
         value: Spanned<Expr>,
+        /// The `const` keyword, as on [`Stmt::Assign`](Stmt::Assign).
+        constant: Option<Span>,
     },
 
     /// Augmented assignment: `target op= value`, e.g. `x += 1`.
@@ -340,6 +345,9 @@ pub enum Stmt {
         name: Spanned<SmolStr>,
         annotation: Option<TypeAnnotation>,
         default: Option<Spanned<Expr>>,
+        /// The `const` keyword, on `const param x: T` (`docs/chl-spec.md`, "9.4
+        /// Parameters").
+        constant: Option<Span>,
     },
 
     /// `@Discard` on the line above a declaration head: what the version this

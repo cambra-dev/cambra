@@ -437,9 +437,10 @@ fn a_type_reaches_what_its_functions_name() {
     );
 }
 
-/// An associated function reaches nothing a run gives its module, so every run's copy of
-/// it is one function: no state, no feed, no value parameter, no member of a Module-typed
-/// parameter, and no member of a run, directly or through the module's bindings.
+/// An associated function reaches nothing a run gives its module but a `const` parameter, so
+/// every run's copy of it is one function: no state, no feed, no value parameter without
+/// `const`, no member of a Module-typed parameter, and no member of a run, directly or
+/// through the module's bindings.
 #[rstest]
 #[case::state(
     indoc! {"
@@ -470,7 +471,7 @@ fn a_type_reaches_what_its_functions_name() {
         pub def Price::get(self) => Int:
             plus(self.extract())
     "},
-    "reads `n`, a value parameter of its module, through `plus` → `limit`;"
+    "reads `n`, a value parameter of its module without `const`, through `plus` → `limit`;"
 )]
 #[case::run_member(
     indoc! {"

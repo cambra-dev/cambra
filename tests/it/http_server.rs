@@ -537,3 +537,42 @@ fn a_retired_route_answers_a_request_it_had_accepted() {
         "the same answer the address gives once the route is gone",
     );
 }
+
+/// A module whose route takes its address from `const` parameters serves, in each run, the
+/// address that run gives it (`docs/chl-spec.md`, "9.19 Constants").
+#[rstest]
+fn two_runs_serve_the_routes_their_arguments_give() {
+    let port = reserve_test_port();
+    let service = indoc! {r#"
+        const param port: String
+        const param path: String
+        param reply: String
+        requests, responses = http_serve(port, "GET", path)
+        for req in requests:
+            responses << reply
+    "#};
+    let root = formatdoc! {r#"
+        run service(port="{port}", path="/eu", reply="hello from eu") as eu
+        run service(port="{port}", path="/us", reply="hello from us") as us
+    "#};
+    let loaded = LoadedProgram::load(
+        cambra::ccl::load::RootFile {
+            path: "main.cambra".to_owned(),
+            module: None,
+            text: root,
+        },
+        &mut cambra::ccl::load::InMemory::default().with("service", service),
+    );
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut ctx = GlobalContext::default();
+    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+
+    let (tx, rx) = mpsc::channel::<Vec<String>>();
+    thread::spawn(move || {
+        let eu = http_get(port, "/eu");
+        let us = http_get(port, "/us");
+        tx.send(vec![eu, us]).unwrap();
+    });
+    let responses = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(responses, vec!["hello from eu", "hello from us"]);
+}
