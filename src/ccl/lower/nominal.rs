@@ -487,7 +487,7 @@ fn bind_is_none(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
             pattern: Some(Pattern {
                 head: PatternHead::Constructor {
                     decl: Rc::clone(decl),
-                    ctor: tag.to_string(),
+                    ctor: tag.name().into(),
                 },
                 binding: TypedBinding::new_unannotated(payload),
                 empty_payload,
@@ -550,7 +550,7 @@ fn bind_extract(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
             pattern: Some(Pattern {
                 head: PatternHead::Constructor {
                     decl: Rc::clone(decl),
-                    ctor: ctor.name.to_string(),
+                    ctor: ctor.name.clone(),
                 },
                 binding: TypedBinding::new_unannotated(payload),
                 empty_payload: false,
@@ -909,7 +909,7 @@ pub(super) fn constructor_arm_pattern(
     let pattern = Pattern {
         head: PatternHead::Constructor {
             decl: Rc::clone(decl),
-            ctor: pattern.ctor.node.to_string(),
+            ctor: pattern.ctor.node.clone(),
         },
         binding: TypedBinding::new_unannotated(payload),
         empty_payload: binders.is_empty(),

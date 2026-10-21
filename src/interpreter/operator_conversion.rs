@@ -1,3 +1,4 @@
+use crate::ccl::Label;
 use bit_set::BitSet;
 use log::trace;
 use smol_str::SmolStr;
@@ -222,8 +223,9 @@ pub fn convert_outputs_to_operators(
                 // The sink is the program's output boundary, so it belongs to the
                 // output expression rather than to the record or the program root.
                 let _scope = crate::ccl::provenance::converting(elt.node_id());
-                record_sink(name);
-                Ok((name.clone(), op))
+                let name = name.runtime_key();
+                record_sink(&name);
+                Ok((name, op))
             })
             .collect(),
         other => Err(ConversionError::Unsupported(format!(
@@ -370,7 +372,7 @@ struct StoreReadInfo {
     /// read is a slot of this one fan.
     fan: Rc<FanOut>,
     /// Per-variable read info, keyed by the variable's [`Name::field_key`].
-    keys: HashMap<SmolStr, KeyReadInfo>,
+    keys: HashMap<Label, KeyReadInfo>,
     /// Which engine backs the store (selects the read projection).
     kind: StoreReadKind,
 }
@@ -1711,7 +1713,7 @@ the compilation declined outlives it here"
             Type::Record(named) => {
                 let fields: Result<HashMap<SmolStr, Extent>, _> = named
                     .iter()
-                    .map(|(name, t)| Ok((name.clone(), self.extent_of(t)?)))
+                    .map(|(name, t)| Ok((name.runtime_key(), self.extent_of(t)?)))
                     .collect();
                 Ok(Extent::record(fields?))
             }
@@ -2034,7 +2036,7 @@ fn convert_impl_inner(
                         .iter()
                         .map(|(name, elt)| {
                             let arm_input = (!is_leaf_zip_arm(elt, ctx)).then(|| fan_out.slot());
-                            Ok((name.clone(), convert_impl(elt, arm_input, ctx)?))
+                            Ok((name.runtime_key(), convert_impl(elt, arm_input, ctx)?))
                         })
                         .collect();
                     let ops = ops?;
@@ -2613,7 +2615,7 @@ fn convert_impl_inner(
 
         TypedExprNode::Proj(ProjKey::Field(name)) => proj_named_field(
             expect_input(input, &format!("Proj({name})"))?,
-            name,
+            &name.runtime_key(),
             ctx.level(),
         ),
 
@@ -2930,7 +2932,7 @@ fn convert_impl_inner(
             expect_no_input(input, "record literal")?;
             let ops: Result<Vec<_>, _> = fields
                 .iter()
-                .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, ctx)?)))
+                .map(|(name, elt)| Ok((name.runtime_key(), convert_impl(elt, None, ctx)?)))
                 .collect();
             build_product(ops?, expr, ctx)
         }
@@ -2950,10 +2952,14 @@ fn convert_impl_inner(
         // column machinery already built for `iterate`/`++`.
         // A nominal constructor builds the same column: its value is the union row of its
         // type's representation (`Type::structure`).
-        TypedExprNode::VariantCtor { tag, payload }
-        | TypedExprNode::NominalCtor {
-            ctor: tag, payload, ..
-        } => {
+        ctor @ (TypedExprNode::VariantCtor { .. } | TypedExprNode::NominalCtor { .. }) => {
+            let (tag, payload) = match ctor {
+                TypedExprNode::VariantCtor { tag, payload } => (tag.clone(), payload),
+                TypedExprNode::NominalCtor { ctor, payload, .. } => {
+                    (crate::ccl::nominal::ctor_tag(ctor), payload)
+                }
+                _ => unreachable!("matched as a constructor"),
+            };
             expect_no_input(input, "variant constructor")?;
             let ty = expr.ty.peel_refinements().structure();
             let Type::Variant(variants, _) = &*ty else {
@@ -2965,7 +2971,7 @@ fn convert_impl_inner(
             };
             // No arm position to resolve: `VariantWrap` names the tag it injects,
             // and the column it builds is keyed the same way.
-            let tag_key = FieldKey::Name(tag.as_str().into());
+            let tag_key = FieldKey::Name(tag.clone());
             let mut variant_extents = Vec::with_capacity(variants.len());
             for (k, t) in variants {
                 variant_extents.push((k.clone(), ctx.extent_of(t)?));
@@ -3218,7 +3224,7 @@ fn record_field<'a>(elt: &'a Expr, name: &str) -> Result<&'a Expr, ConversionErr
             .map(|(_, part)| part),
         TypedExprNode::Record(parts) => parts
             .iter()
-            .find(|(field, _)| field == name)
+            .find(|(field, _)| field.runtime_key() == name)
             .map(|(_, part)| part),
         _ => None,
     }
@@ -3343,7 +3349,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
         TypedExprNode::Record(fields) => {
             let map: Result<HashMap<SmolStr, Value>, _> = fields
                 .iter()
-                .map(|(name, e)| Ok((name.clone(), expr_to_value(e)?)))
+                .map(|(name, e)| Ok((name.runtime_key(), expr_to_value(e)?)))
                 .collect();
             Ok(Value::Record(map?))
         }
@@ -3352,11 +3358,12 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
         // Without it, a list literal of variants (``[`a(1), `b(2)]``) is rejected even
         // though `ColumnValue::from_values` builds a union column from a `Union`
         // extent perfectly well.
-        TypedExprNode::VariantCtor { tag, payload }
-        | TypedExprNode::NominalCtor {
-            ctor: tag, payload, ..
-        } => Ok(Value::Union {
-            tag: FieldKey::Name(tag.as_str().into()),
+        TypedExprNode::VariantCtor { tag, payload } => Ok(Value::Union {
+            tag: FieldKey::Name(tag.clone()),
+            inner: Box::new(expr_to_value(payload)?),
+        }),
+        TypedExprNode::NominalCtor { ctor, payload, .. } => Ok(Value::Union {
+            tag: FieldKey::Name(crate::ccl::nominal::ctor_tag(ctor)),
             inner: Box::new(expr_to_value(payload)?),
         }),
         // A nested collection is constant exactly when its elements are, and its
@@ -3440,7 +3447,7 @@ fn build_transact_store(
 /// ``variant_project(`fired)`` on the read eliminates it — so the *stream's*
 /// restriction to fired positions is a typed step rather than a decode the type
 /// cannot see.
-fn body_tap_fields(body_ty: &Type) -> Vec<(SmolStr, Type)> {
+fn body_tap_fields(body_ty: &Type) -> Vec<(Label, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
     };
@@ -3470,22 +3477,27 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(SmolStr, Type)> {
 /// The tag is also the name a decision's write set is keyed by, which `body_decision_at`
 /// reads back — so the engine's own tests build their keys here rather than restating
 /// the shape.
-pub(crate) fn store_key(reg: &str) -> Value {
+///
+/// The tag is the variable's label ([`Name::field_key`]). A store's state is a run-time
+/// record, so it keys the variable's changelog by the label's [`Label::runtime_key`]
+/// ([`store_key_name`]), and [`Label::from_runtime_key`] rebuilds the key from a store's
+/// state.
+pub(crate) fn store_key(reg: &Label) -> Value {
     Value::Union {
-        tag: FieldKey::Name(reg.into()),
+        tag: FieldKey::Name(reg.clone()),
         inner: Box::new(Value::Unit),
     }
 }
 
-/// The mutable variable a store key names — the tag half of [`store_key`], and the field
-/// the key's changelog sits at in a [`Tile::Store`](crate::interpreter::Tile)'s state.
-/// `None` for a value that is not a store key.
-pub(crate) fn store_key_name(key: &Value) -> Option<&str> {
+/// The field a store key's changelog sits at in a [`Tile::Store`](crate::interpreter::Tile)'s
+/// state: the [`Label::runtime_key`] of the mutable variable the key names, the tag half of
+/// [`store_key`]. `None` for a value that is not a store key.
+pub(crate) fn store_key_name(key: &Value) -> Option<SmolStr> {
     match key {
         Value::Union {
             tag: FieldKey::Name(reg),
             ..
-        } => Some(reg),
+        } => Some(reg.runtime_key()),
         _ => None,
     }
 }
@@ -3497,7 +3509,7 @@ pub(crate) fn store_key_name(key: &Value) -> Option<&str> {
 /// v` into the whole-value write `m := insert(m, k, v)`, so a mutable variable holds its whole
 /// collection at the single key `` `reg(unit) `` and the data key never reaches this key
 /// space. The tag is what would keep two mutable variables' keys disjoint if one ever did.
-fn store_key_extent(arms: Vec<(SmolStr, Extent)>) -> Extent {
+fn store_key_extent(arms: Vec<(Label, Extent)>) -> Extent {
     Extent::Union(TagMap::from_arms(
         arms.into_iter()
             .map(|(f, e)| (FieldKey::Name(f), e))
@@ -3527,11 +3539,11 @@ fn build_commit_store(
     // The reply taps join that key space, so their arms are collected before the
     // operator is built — the extent it carries has to describe every key the
     // store will hold, and a tap key is written from the first commit on.
-    let per_writer_taps: Vec<Vec<(SmolStr, Type)>> = writers
+    let per_writer_taps: Vec<Vec<(Label, Type)>> = writers
         .iter()
         .map(|w| body_tap_fields(&w.body.ty))
         .collect();
-    let mut key_arms: Vec<(SmolStr, Extent)> = keys
+    let mut key_arms: Vec<(Label, Extent)> = keys
         .iter()
         .map(|k| (k.name.field_key(), Extent::Base(BaseType::Unit)))
         .collect();
@@ -3541,7 +3553,7 @@ fn build_commit_store(
         }
     }
     let key_extent = store_key_extent(key_arms);
-    let mut keys_map: HashMap<SmolStr, KeyReadInfo> = HashMap::with_capacity(keys.len());
+    let mut keys_map: HashMap<Label, KeyReadInfo> = HashMap::with_capacity(keys.len());
     // Per scalar key, the stream giving its seed, the value it holds before any commit (a
     // literal init is a constant; a computed init streams to its value).
     let mut seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
@@ -3647,11 +3659,16 @@ fn build_commit_store(
     // converted below — after the store they read back.
     let mut store_values: HashMap<SmolStr, Tiling> = keys_map
         .iter()
-        .map(|(field, info)| (field.clone(), Tiling::Scalar(info.value_extent.clone())))
+        .map(|(field, info)| {
+            (
+                field.runtime_key(),
+                Tiling::Scalar(info.value_extent.clone()),
+            )
+        })
         .collect();
     for taps in &per_writer_taps {
         for (field, tap_ty) in taps {
-            store_values.insert(field.clone(), Tiling::Scalar(ctx.extent_of(tap_ty)?));
+            store_values.insert(field.runtime_key(), Tiling::Scalar(ctx.extent_of(tap_ty)?));
         }
     }
 
@@ -3725,7 +3742,7 @@ fn build_commit_store(
         // `Fun(Txn, V)` value-stream off the shared log. A tap takes no seed op —
         // it has no seed, so its stream starts at the first reply.
         let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
-        let mut tap_fields: Vec<SmolStr> = Vec::with_capacity(taps.len());
+        let mut tap_fields: Vec<Label> = Vec::with_capacity(taps.len());
         for (field, tap_ty) in taps {
             let tap_value_extent = ctx.extent_of(&tap_ty)?;
             write_keys.push(store_key(&field));
@@ -3761,7 +3778,7 @@ fn build_commit_store(
             driver_fan.slot(),
             w.read_keys.iter().map(runtime_key).collect(),
             write_keys,
-            tap_fields,
+            tap_fields.iter().map(Label::runtime_key).collect(),
             key_extent.clone(),
             value_extent.clone(),
         );
@@ -4540,8 +4557,8 @@ fn build_induction_store(
 /// arrives holding the accumulators and leaves holding the taps beside them.
 fn store_parts(
     w: &WriterSite,
-    taps: Vec<(SmolStr, Type)>,
-    keys_map: &mut HashMap<SmolStr, KeyReadInfo>,
+    taps: Vec<(Label, Type)>,
+    keys_map: &mut HashMap<Label, KeyReadInfo>,
     ctx: &mut OpConversionContext,
 ) -> Result<StoreParts, ConversionError> {
     let read_extents: Vec<Extent> = w
@@ -4561,7 +4578,7 @@ fn store_parts(
         .iter()
         .map(|n| store_key(&n.field_key()))
         .collect();
-    let mut tap_fields: Vec<SmolStr> = Vec::new();
+    let mut tap_fields: Vec<Label> = Vec::new();
     for (field, tap_ty) in taps {
         let value_extent = ctx.extent_of(&tap_ty)?;
         let runtime_key = store_key(&field);
@@ -4588,7 +4605,12 @@ fn store_parts(
     }
     let store_values = keys_map
         .iter()
-        .map(|(field, info)| (field.clone(), Tiling::Scalar(info.value_extent.clone())))
+        .map(|(field, info)| {
+            (
+                field.runtime_key(),
+                Tiling::Scalar(info.value_extent.clone()),
+            )
+        })
         .collect();
     Ok(StoreParts {
         read_extents,
@@ -4605,7 +4627,7 @@ struct StoreParts {
     /// Keys written, in decision-`writes` order: the accumulators, then the tap keys.
     write_keys: Vec<Value>,
     /// The reply-tap fields, appended to each write set.
-    tap_fields: Vec<SmolStr>,
+    tap_fields: Vec<Label>,
     /// The store's state, one field per key.
     store_values: HashMap<SmolStr, Tiling>,
 }
@@ -4727,7 +4749,7 @@ fn build_nested_induction_store(
         (tuple_field(1), inner_domain),
     ]));
 
-    let mut keys_map: HashMap<SmolStr, KeyReadInfo> = HashMap::with_capacity(keys.len());
+    let mut keys_map: HashMap<Label, KeyReadInfo> = HashMap::with_capacity(keys.len());
     let mut seed_ops: Vec<Box<dyn TileOperator>> = Vec::new();
     let mut store_seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     // A seed is a morphism of the enclosing parameter, one per enclosing position, so it is
@@ -4793,7 +4815,7 @@ fn build_nested_induction_store(
     let store = InductionStore::new(
         store_seed_ops,
         parts.write_keys,
-        parts.tap_fields,
+        parts.tap_fields.iter().map(Label::runtime_key).collect(),
         nested_engines_tiling(
             nested_source.tiling(),
             standing.len(),
@@ -4891,7 +4913,7 @@ fn build_induction_store_single(
     // Each accumulator becomes a mutable variable key: its seed op (its value before any
     // position, read per pull until it settles) plus a dense-read entry carrying that
     // value as the leading-carry fold default.
-    let mut keys_map: HashMap<SmolStr, KeyReadInfo> = HashMap::with_capacity(keys.len());
+    let mut keys_map: HashMap<Label, KeyReadInfo> = HashMap::with_capacity(keys.len());
     let mut seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
@@ -4978,7 +5000,7 @@ resolves to the other's value",
     let store = InductionStore::new(
         seed_ops,
         parts.write_keys,
-        parts.tap_fields,
+        parts.tap_fields.iter().map(Label::runtime_key).collect(),
         full_store_tiling(induction_extent.clone(), parts.store_values),
         resumed_after.clone(),
     );
@@ -5085,7 +5107,7 @@ fn as_of_snapshot_fields(
                 ))
             })?;
             Ok(AsOfField {
-                field: field.clone(),
+                field: field.runtime_key(),
                 key: key.runtime_key.clone(),
                 value_extent: key.value_extent.clone(),
             })
@@ -5096,7 +5118,7 @@ fn as_of_snapshot_fields(
 /// The `(store, field)` of a `__hist.field` read on a registered store, if `e` is one.
 /// The same shape the generic `Apply`/`Proj` arm matches, factored out so the
 /// `FinalRead` arm can recognise its own operand.
-fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, SmolStr)> {
+fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, Label)> {
     let TypedExprNode::Apply { argument, function } = &e.node else {
         return None;
     };
@@ -5116,7 +5138,7 @@ fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, SmolStr)>
 /// induction accumulator.
 fn convert_store_settled_read(
     store_name: &Name,
-    field: &str,
+    field: &Label,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let info = ctx.lookup_store(store_name).ok_or_else(|| {
@@ -5144,7 +5166,7 @@ fn convert_store_settled_read(
 /// stream for something else to reduce.
 fn convert_store_read(
     store_name: &Name,
-    field: &str,
+    field: &Label,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let (fan, kind, key) = {
@@ -5644,7 +5666,7 @@ fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
 /// A read of key `field` of a nested induction store, and the steps after it.
 struct NestedStoreRead<'a> {
     store: Name,
-    field: SmolStr,
+    field: Label,
     steps: Vec<&'a Expr>,
 }
 

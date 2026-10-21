@@ -127,10 +127,16 @@ hint to keep `Name` at the width `Unique` needs.
 
 `Name::Raw` is unchanged. Every raw name is written in one module and resolves within it.
 
-A record label and a variant tag in `ccl::Type` and in a term carry the module path they belong to
+A record label and a variant tag in `ccl::Type` and in a term are a `Label`, which carries the
+module path it belongs to
 ([chl-spec.md, "9.12 Field labels and tags belong to a module"](chl-spec.md#912-field-labels-and-tags-belong-to-a-module)).
-Two labels are one label when both spelling and module agree. Rendering elides the module on the
-current module's own labels and writes `module::label` for another's.
+Two labels are one label when both spelling and module agree. The root's labels have no module
+path and render bare. Another module's label renders `module::label`, which is also its spelling at
+run time.
+
+A nominal type's constructor is not a label. The value it builds carries a tag of the root's
+namespace spelled as the constructor, so `Option::some` builds the same value in every module, and
+a user's `` `some `` builds that module's own tag.
 
 ### Pipeline
 
