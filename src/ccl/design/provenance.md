@@ -163,9 +163,11 @@ earlier freshening has three possible outcomes:
 
 A predicate lifted into the main tree must have fresh expression IDs because the predicate may
 remain on its original type slot or be lifted at another site. `fn_of_bare_predicate` freshens
-the placed term. Group-by key extraction goes through `lambda_elim::run`, which rebuilds it at
-new IDs; `groupby_recognition_lifts_the_key_without_aliasing` checks that result. The attribution
-test named above covers the iterate lift's parentage, not a separate uniqueness assertion there.
+the placed term. Group-by key extraction uses `predicates::eliminate_lifted`, including lambda
+elimination, before planning the lifted key. `groupby_recognition_lifts_the_key_without_aliasing`
+checks the resulting IDs. The attribution test named above covers the iterate lift's parentage,
+not a separate uniqueness assertion there. The required lowering passes are specified under
+[Planning a lifted term](optimization.md#planning-a-lifted-term).
 
 `compile_program` checks uniqueness after lowering and at the later boundaries handled by
 `settle`. `assert_unique_node_ids` and `gate_leaks` return without asserting when neither
@@ -174,189 +176,124 @@ for that checked tree, not for every intermediate tree built within the phase.
 
 ## The provenance model
 
-Recording is a **byproduct of performing a rewrite**, never a post-phase diff. As
-a phase runs, every node it *produces* gets a row in the `ProvenanceTable`:
+A `ProvenanceTable` stores one row per produced `NodeId`. Recordings populate the table during
+rewriting; a post-phase tree diff does not construct the rows.
 
-| column | what it holds |
+| Column | Meaning |
 |---|---|
-| `parents` | the ids the rewrite consumed to produce this node: the node the recording named, or a fusion's whole consumed set |
-| `blame` | the upstream ids the node is *related to but did not consume* — **not** the same as `parents` |
-| `tag` | an interned `RewriteTag` — the `{via, nature, label}` triple |
+| `parents` | Ancestry: IDs from which this node was produced. |
+| `blame` | Additional attribution: IDs related to the product without an ancestry claim. |
+| `tag` | An interned `RewriteTag` containing the producing `Phase`, `Nature` and `RewriteLabel`. |
 
-Four properties of the table, each load-bearing:
+The columns describe the product, not the later fate of an input. A parent or blamed node may
+survive in the output tree. Naming a surviving node as a parent gives an overly broad ancestry
+edge, not a death report. The fold reports deaths from the difference between input and output
+ID sets.
 
-- **No `span` column.** Spans are derived by walking `parents` back to a node
-  the lowering projection covers, which is a handful of hops and does not
-  lengthen as programs grow. Storing spans per row would denormalize that onto
-  every row ever minted.
-- **"No row" is a legitimate state.** The key space is `NodeId`, and a `NodeId`
-  can be addressed without ever having been recorded: an id minted by a phase that
-  records nothing, or one whose producer lies outside the phases a fold reads.
-  Reads answer empty / `None`; nothing panics.
-- **Row enumeration is taken over a phase range, never over the key space.**
-  `deaths(start, end, live)` reports what the phases from `start` through `end`
-  produced and then discarded, and row enumeration is private so it cannot be
-  taken any other way: a difference over addressed-but-unrecorded ids would
-  report a death for every id no phase produced. The range is `Phase`'s
-  declaration order, which is pipeline order for exactly this reason. This is a
-  narrower question than the fold's death product, which is `input_ids ∖
-  output_ids` between two panes: the fold sees a node no phase produced and
-  misses an intra-phase transient, and `deaths` is the mirror image.
-- **One table per compile, one phase scope per phase.** A row's key is
-  process-unique, so no phase set is needed to disambiguate it. That is also why
-  the phase reaches the write as an *ambient* fact: a recording site knows its
-  `label` and `nature` but not which phase is running, so `PhaseScope::enter(phase)`
-  carries it for the scope's extent and the tag is completed from it.
+One parent can describe either one product or several products with the same parent. Several
+parents describe fusion. A pure insertion may have no parents if its blame column anchors it.
+An in-place rewrite that retains its ID writes no new row; the fold can relate an unchanged ID
+to itself.
 
-A row's `via` is what restricts the whole-compile table to the phases between two
-panes: an id produced by a phase outside them is, to that fold, an ordinary
-un-produced id. The restriction is load-bearing — at the second pane pair an
-`Infer`-produced input-pane id has a row, and walking through it would resolve past
-the pane.
+The table stores no source spans. Attribution resolves through parents and then distinct blame
+additions, using the available upstream projection. A blame edge can add a span absent from the
+parents. For example, `mut_elim` can name a statement as the parent and blame the enclosing loop
+keyword. The node relation retains the two edge labels so a consumer can distinguish ancestry
+from related source material; [The edge labels](#the-edge-labels) specifies composition.
 
-Ids inside refinement predicates are rows like any other. Lowering's projection
-covers every id `collect_tree_ids` enumerates, and `PredMemo::rebuild` records a
-derived predicate against the one it was built from. Planning raising a predicate
-back into the main tree keeps the predicate's own parentage; see
-[Operator conversion](#operator-conversion).
+### Table access and write invariants
 
-The backing store is a `HashMap`; the paged, delta-encoded form is a later pure
-re-encoding behind the same accessors.
+`parents` and `blame` return empty slices for an unrecorded ID; `tag` and `tag_id` return
+`None`. An allocated or addressed ID need not have a row in this table. The backing store is
+a `HashMap` with a separate tag-interning table. Paged or delta-encoded storage remains a
+possible representation change, not the implemented layout.
 
-**No column records a fate.** Both columns make a claim about the *product* — one
-that it was consumed from these ids, one that it is about them — and neither says
-whether any named id survived. Deaths come from one place only: `input_ids ∖
-output_ids` between two panes. Nothing predicts a fate, so no phase can
-over-claim one.
+`ProvenanceTable::record` debug-asserts three write preconditions:
 
-That silence is what makes *adopt-a-live-subtree* expressible: a rewrite that
-keeps a node's id while minting a wrapper over one of its children must not be
-read as declaring that node dead. It is equally what makes a fusion's parent set
-safe — naming a survivor there costs an over-broad edge, never a phantom death.
+- The produced ID has no previous row. Attribution has one rewrite tag and no join for two
+  competing producers.
+- At least one of `parents` or `blame` is nonempty.
+- The produced ID is not one of its own parents.
 
-The parents column's **cardinality** carries the rewrite's shape, and nothing
-else about the shape is recorded: one parent is a 1:1 or 1:many rewrite (several
-products each rowing on the same node), several parents is a genuine fusion. A
-node cannot be its own parent — an in-place rewrite that keeps its id is a
-*preserve*, which records nothing, because identity here is referent identity
-and the pane resolves it by shared id. The *closure* of `parents` is reflexive
-even so, which is why a surviving node carries an ancestry self-edge
-([The edge labels](#the-edge-labels)).
+The row insertion is unconditional; these checks are not release-build validation. Several
+recordings may name the same input ID because they produce distinct output IDs. The same input
+may also appear as a parent in later recordings.
 
-Attribution resolves through **`parents` ∪ `blame`** — parentage first, then
-blame's distinct additions, so the span order is deterministic and blame is never
-dropped when it names a node the parents do not. Blame is named at a handful of
-sites, in the mutability phases and at the hash-join recognizer, so for almost
-every node this is simply the spans of what it was made from, which is why
-walking the parent edges recovers a source location at all.
+`tag_in(id, phases)` exposes a row only when its producing phase is selected.
+The fold must stop at an input pane's IDs rather than following their rows from earlier phases.
+Private `rows_in` enumerates recorded rows in a phase set, not the process-wide ID key space.
 
-**Two labels on one relation, which is why they stay separate columns.** Both
-relate a node to other nodes; what differs is what the relation *asserts* — a
-label on the edge, not the presence of one. `parents` says **descends from**;
-`blame` says **related to, but not consumed**. Blame may name a node that
-*survives* the rewrite, so welding it into `parents` would answer "what was this
-made from" with a live node elsewhere in the tree. Both columns reach the
-provenance map, each labelling the edges it contributes, and the leak audit reads
-the ancestry label alone (see
-[The edge labels](#the-edge-labels)).
+`deaths(start, end, live)` returns sorted recorded IDs produced in the inclusive phase range
+and absent from `live`; a reversed range triggers a debug assertion. This differs from the
+fold's `input_ids ∖ output_ids`: the table query includes intra-span products later discarded,
+while the fold can report the loss of an input node produced before the selected phases.
 
-Keeping the two apart is what lets a consumer render each faithfully — show the
-blame, or prune it — rather than receiving one unlabelled edge set it
-cannot take apart again. `mut_elim`'s `enter(stmt_id)` + `blame(for_id)` is the
-shape: the products descend from the statement and are *about* the loop keyword.
-
-`Nature::Source` — the root of a lowered source expression — is emitted **only by
-lowering**; the fold's attributing helper carries a debug guard that no phase row
-ever carries it.
-
-Three invariants are properties of the *write*, and are asserted at
-`ProvenanceTable::record`, at the site that would violate one, rather than in a
-fold that only runs when a pane is materialized: **one row per id** (attribution
-has no join, so a second claimant has no answer), **every row anchored through
-some channel** (consumption or blame — a row with neither cannot explain where
-its node came from), and **no node is its own parent**. All three are
-`debug_assert!`s: `record` is the construction hot path, so what is gated is the
-checking, never the row.
-
-**Several recordings may name one node, and a node may be named again later.**
-Rows key on the node a rewrite **produced**, so two recordings that name the same
-node write disjoint row sets — every product is a freshly minted id, and the
-one-row-per-id `debug_assert!` fires if two writes ever collide on one. Naming a
-node claims descent and says nothing about death, so the same id is free to appear
-in the `parents` of one rewrite's rows and again in a later rewrite's. Opening a
-second recording on one node is the supported shape for arms of different `Nature`
-([Where to open a recording](#where-to-open-a-recording)).
-
-Lowering records separately, into a `LoweringLog` of `LoweringStep`s, because
-its attribution channel is different in kind: a **literal source span attached
-at construction** (lowering knows the source token it is imaging right there)
-rather than a NodeId reference resolved later through the accumulating
-projection. A `LoweringStep` is therefore not a row but one of the two shapes
-lowering actually has — a **leaf mint** (one id, one span, a nature and a label)
-or a **copy** (an origin and its freshened duplicates, mirroring the origin's
-folded entry verbatim). Its log is folded **once** at the lowering handoff by
-`fold_lowering` into the always-on lowering projection (below).
+Predicate IDs use the same row representation. `PredMemo` records derived predicates against
+their source terms; copies raised into the main tree keep their predicate origins.
+The [predicate traversal contract](#walking-the-ids) specifies the required sharing.
 
 ### The recorder
 
-An ambient thread-local stack of open recordings (`RECORDING_STACK`) plus an installed
-sink, mirroring `infer_var::ACTIVE_ARENA`:
+`RECORDING_STACK` is a thread-local stack of open recordings.
+`Expr::new` calls `on_mint`; expression cloning reaches `on_copy`.
+Each hook captures into the innermost frame. A mint has that recording's named node and extra
+consumed IDs as parents. A copy instead has its own origin as its sole parent and no added blame.
+Naming blame on the enclosing recording therefore widens its minted products, not its copies.
 
-- `Expr::new` calls `on_mint` and the freshen helpers call `on_copy`, so a
-  recording open around a rewrite *captures* the births and copies in its dynamic
-  extent, innermost first. An empty stack means recording is off, which costs one
-  emptiness check on the construction hot path.
-
-  **Both hooks assert coverage**, under a phase scope that writes rows: a node
-  reaches a tree by being minted or by being copied, so a check on one channel
-  alone leaves the other silent. The silence was not hypothetical — when the
-  copy-side check was added, copies outnumbered mints among the uncaptured nodes,
-  and the one gap it found in an instrumented phase was inference freshening a
-  refinement predicate per scheme instantiation.
-- `TableSession` installs the table for a **whole compile**; `PhaseScope` names
-  the phase rows are tagged with, for **one phase**. The two nest that way because a
-  row's key is a process-unique `NodeId` and needs no phase set to disambiguate
-  it, while a `RewriteTag` needs a phase the recording site cannot supply: the site
-  knows its `label` and `nature` but not which phase is running, and the phase
-  boundary that opens the scope knows exactly that.
-- `LoweringSession` installs lowering's log instead, and is always-on.
-
-**A site declares nothing.** It names the node it is *about to rewrite*:
+A recording is opened before the local rewrite and held until its products have been built:
 
 ```rust
 let _g = provenance::enter(named_id, "inline.beta", Nature::Machinery);
 ```
 
-`named_id` is read off the node before the rewrite runs; every id minted while
-the guard is innermost gets a row naming `named_id` as its parent. The pairing is
-**(id before, minted during)**, not (value in, value out), so one recording fits
-an `fn(Expr) -> Expr` rewrite and an `&mut Expr` one alike. A recording that mints
-nothing writes nothing — that is the preserve case.
+`named_id` identifies the input before rewriting; the guard does not inspect the output value.
+This works for both consuming and in-place rewrites. An attempt that mints and copies nothing
+writes no row. Nesting assigns each product to the innermost recording active when its hook runs.
 
-Two escape hatches are **inherent methods on the guard**, so a site can only ever
-address the recording it holds (each debug-asserts it is the innermost open one,
-turning a channel fired into a callee's recording or an enclosing recursion's into
-a loud failure rather than a silent misattribution):
+Closing a guard first appends to an active `DerivationLog`, if present. It then routes the
+captured products to the active lowering log, or otherwise to the active phase's table.
+Without either sink, captured events produce no table or lowering rows.
+A `TableSession` alone does not supply the phase or open a recording.
 
-- `also_consumes(id)` — genuine fusion (many:1), the only thing that puts a
-  second parent on a row and the only place any id is named at record time.
-- `blame(ids)` — nodes this rewrite is **related to but did not consume to
-  produce** its outputs. Attribution unions them with the parents; the pane
-  relation carries them as *blame* edges. Blame is named at a handful of sites —
-  the mutability phases' effect and begin nodes, and the refinement predicate
-  `planning.hash_join` reads its plan out of — so `parents` alone is what
-  recovers a source location for almost every node.
+The installed scopes have different lifetimes:
 
-`enter` is the constructor a phase uses to record a rewrite. `copy_frame` is the
-one recording that names **no** node, for a duplication with nothing being
-rewritten and so no id to name: lowering's uncurry template-interior and
-compare-chain operand freshens, and inference's two freshens — a refinement
-predicate per scheme instantiation, and a trait obligation's stored operand
-expressions per obligation copy. Each captured copy carries its own origin from the
-hook, so the named node is never read. A recording that names no node has nowhere
-to attach a mint or a consume, which `OpenRecording::assert_copy_only` enforces —
-which is also what keeps the two constructors apart, since a mint captured in a
-copy-only recording is a site that should have named a node.
+| Scope | Installed state and lifetime |
+|---|---|
+| `TableSession` | One table for the compile when provenance capture is enabled. |
+| `PhaseScope` | The ambient producing phase for the enclosed phase's recordings. |
+| `LoweringSession` | The always-on lowering log, drained at the lowering handoff. |
+| `DerivationSession` | A phase-local log for error attribution, also written when table capture is disabled. |
+
+Session installation is non-reentrant, checked with debug assertions. A phase scope cannot open
+while lowering's log is installed. A derivation session also excludes lowering. Guards clear
+their installed state on drop, including ordinary unwinding.
+
+The mint and copy hooks ignore `NodeId::PLACEHOLDER`. Outside lowering, they debug-assert that
+an active phase has an open recording to capture each event. Without that phase, an uncaptured
+event is permitted and writes nothing. The coverage assertion checks the open frame, not the
+correctness of the node it names.
+
+`RecordingGuard` provides two additional channels:
+
+- `also_consumes(id)` adds an ancestor for minted products, supporting fusion. It ignores the
+  placeholder sentinel. It is not a death declaration.
+- `blame(ids)` adds related IDs whose spans augment the minted products' ancestry attribution.
+
+Both methods require their guard to be innermost; a debug assertion checks its stack depth.
+Drop has the same LIFO precondition. In release builds these assertions do not protect a caller
+that addresses or drops the wrong frame.
+
+`copy_frame(label)` opens a recording with no named node and `Nature::Machinery`.
+It is for standalone duplication: each copy hook supplies the origin that the frame lacks.
+It cannot capture consumed IDs or mints; `assert_copy_only` debug-asserts that restriction.
+A rewrite that also creates nodes uses `enter` instead.
+Under lowering, captured copies become `LoweringStep::Copy` entries; their folded attribution
+mirrors the origin verbatim. Under a phase scope, each copy becomes its own table row.
+
+Lowering leaf mints use `lowering_leaf` directly, supplying a literal source span.
+`lowering_predicate_leaf` skips already-recorded IDs so a sweep does not overwrite precise
+existing attribution. `fold_lowering` processes the log at the lowering handoff.
+The distinct log and fold contracts are specified under [The seam](#the-seam).
 
 **Where recordings are open today.** Lowering's leaf appends and copy sinks, plus
 every recording a pane pair's fold reads — each of the phases below runs inside a
@@ -381,29 +318,25 @@ shared helpers record under whichever phase scope is open around them: `subst`
 `letrec.feed`), which `transact_phase` calls for a cross-domain loop and so
 records a `letrec.*` label under `Transact`.
 
-Every phase that rewrites expression nodes runs under a `PhaseScope`, so no
-recording is inert: `simplify`'s rule combinator and `planning/iterate` both sit
-inside `planning::run`, which `compile_program` runs under `Phase::Planning`, and
-`transact_phase`'s as-of-read rewrite and `lambda_elim` each carry a phase of
-their own and each end a pane.
+Table capture is enabled by default and disabled by `CAMBRA_PROVENANCE=0` or a named audit span.
+When enabled, pipeline boundaries install the phase scopes. Shared helpers record under their
+caller's phase, not under a phase inferred from the helper's module or label.
+A phase that produces no nodes writes no rows.
 
-An **audit** is what remains for measuring, rather than for reaching a recording
-nothing reads. A developer sets `CAMBRA_PROVENANCE_AUDIT` in the environment
-before running the compiler or its tests; it opens one scope over the named span
-and prints a coverage and leak line to stderr when the span closes, which is how
-the figures below were measured. Naming a span turns pane capture off
-(`provenance_capture_enabled`), so an audit never runs in a build that also
-serves panes.
+An audit selected by `CAMBRA_PROVENANCE_AUDIT` opens its own scope over the chosen span and
+prints coverage and leak measurements on completion. Naming an audit disables ordinary pane
+capture so the two modes do not install competing phase scopes.
+See [Gate and audit coverage](#gate-and-audit-coverage) for endpoints and configuration.
 
 ### Where to open a recording
 
-> **Name the node the product replaces, not the phase. One recording per rewrite,
-> and split until every product has one.**
+A recording names the node whose rewrite produces the captured material. It surrounds the
+local rewrite, after recursive child work and early returns that abandon the rewrite.
+If every recursive frame opens its own recording, an outer frame may surround recursion:
+the inner frame captures its own products while it is active. Operator conversion uses this
+pattern through `converting`; [Operator conversion](#operator-conversion) specifies it.
 
-Every phase instrumented so far reduces to one of two forms.
-
-**Rule-table phase → one wrapper combinator.** `simplify::ruled` wraps all
-every rule invocation, with **no rule body edited at all**:
+A rule-table wrapper can record every attempt:
 
 ```rust
 fn ruled(label: RewriteLabel, expr: &mut Expr, rule: impl FnOnce(&mut Expr) -> bool) -> bool {
@@ -412,95 +345,50 @@ fn ruled(label: RewriteLabel, expr: &mut Expr, rule: impl FnOnce(&mut Expr) -> b
 }
 ```
 
-This works because a recording declares nothing, so wrapping every *attempt*
-rather than every *firing* costs one push and pop when the rule declines. The
-`bool` is never consulted: nothing needs to know whether the rule fired.
+A declined rule costs a push and pop but writes nothing if it minted or copied nothing.
+The recorder does not use the returned Boolean. A consuming traversal reads the input ID
+before destructuring the node; the ID is sufficient to open the recording.
 
-**Recursive traversal → one recording at each traversal entry.**
-`planning::iterate` names the marker site it rewrites, and `transact_phase`'s
-recordings are one per rewrite it performs. A recording takes only an
-**id**, so a site that has already moved `expr.node` out can still open one —
-read `expr.node_id()` before the destructure.
+The recording's scope follows the attribution required by its products:
 
-Four refinements the shapes above do not cover:
+- A product replacing several constructs names their enclosing input node, not a synthetic
+  stand-in minted only for attribution.
+- A recording may name a node just produced by this phase, provided its creation was recorded.
+  The fold then composes that intermediate ancestry.
+- Arms with different `Nature` values open separate recordings on the same input ID.
+  Each recording carries one nature and label and writes its own products.
+- An expansion with products attributable to different source constructs opens nested recordings
+  per construct. `mut_elim` records accumulator slots and feeds inside the enclosing loop.
+  The outer recording retains only the products it builds outside those nested scopes.
 
-- **A product spanning several nodes** — the transaction's `Transact` is what a set of
-  scattered `with begin():` blocks and register declarations collectively became.
-  Parent it on the **outermost** node it replaces, never on a synthetic stand-in.
-- **The named node may be one the phase itself just minted**, provided it was
-  minted under a recording: it is then produced by a phase the fold reads, and the fold reaches
-  the original in two hops. Reading the id *before* the rewrite does not
-  require it to be an input-pane node.
-- **One entry serving arms of different `Nature`** — open a **second recording on
-  the same node** inside the arm. The two write disjoint sets of rows on one
-  parent, which is what two rewrites attributed to one node should look like. A
-  recording carries one label and one nature for its whole extent by design.
-- **An expansion whose products belong to several source constructs** — a
-  mutation loop's `LetRec` carries one recurrence slot per accumulator and one
-  tap per feed, and a single recording on the loop statement claims all of them.
-  Open a **nested recording per construct** inside the enclosing one. The inner
-  recording is innermost while it runs, so the mint hook attaches to it and the
-  outer one keeps only what it built itself: `mut_elim` opens
-  `letrec.accumulator` per accumulating variable and `letrec.feed` on each feed
-  statement inside `letrec.loop`.
+An accumulator slot can represent several writes to one variable. Its recording names the first
+write and blames later writes; all contribute attribution, but only the named write contributes
+ancestry. Conversely, one product spanning several constructs cannot be divided into per-construct
+products: a conditional feed's lambda over the loop body stays on the enclosing recording.
 
-  A construct the split names can be several source statements. A recurrence slot
-  belongs to its accumulating variable, so a body that writes one variable twice
-  gets one recording, named on the first write with the later ones on its blame
-  column — every write answers with the slot's products, and only the write that
-  created the slot claims ancestry (`mut_elim`'s `AccumulatorVariable::enter`).
-
-  Two shapes bound the split. An expansion with **one product covering several
-  constructs** cannot be split at all: a conditional feed rides a single lambda
-  over the whole loop body, so no per-feed recording has anything to adopt, and
-  the products stay on the enclosing recording. An expansion where the **enclosing
-  construct mints nothing** inverts it: every product of an accumulator-free
-  mutation loop belongs to one of its feeds, so the inner recordings take the
-  whole expansion and the `for` around them rides their blame column
-  (`mut_elim`'s `StmtSite::blamed_in`). Blame is what a construct that produced
-  nothing gets, rather than an ancestry edge it did not earn or no edge at all.
+When an enclosing construct mints nothing, its source can still be blamed by its children's
+products. An accumulator-free mutation loop uses `StmtSite::blamed_in` for that case.
+A recording does not manufacture an ancestry edge merely to make the enclosing construct visible.
 
 #### Choosing between `Expansion` and `Machinery`
 
-**`Expansion` when the products are what the source construct denotes;
-`Machinery` when they are one way of carrying it out.** The two are decided per
-site and nothing in the compiler branches on the answer, so a site that does not
-say which reading it took leaves the next reader to guess.
+`Expansion` identifies products that express the source construct's meaning.
+`Machinery` identifies an implementation strategy or administrative transformation.
+The choice is made at each recording site and carried into attribution.
 
-Planning's two recognizers are the pair that makes the line concrete, and they
-land on opposite sides. `planning.groupby` is `Expansion`: the bucketize chain
-`converse(c ≫ key) ≫ map(c)` is what `groupby(c, key)` *means*, and a reader
-following the attribution back to the `groupby` call is seeing that call
-unfolded. `planning.hash_join` is `Machinery`: the user wrote a two-source
-comprehension with an equality guard, the join plan is one strategy for
-materialising it — picked off the domain's refinement structure, and replaced by
-`iterate`-then-`restrict` when the structure does not permit it — and nothing in
-the source names a join.
+`planning.groupby` is `Expansion`: its bucketize chain implements the meaning of `groupby`.
+`planning.hash_join` is `Machinery`: an equality-refined comprehension admits that strategy,
+with iteration and restriction as the fallback when recognition does not apply.
+`lambda_elim.filter` is `Expansion` because the guard becomes a domain refinement;
+algebraic simplification is `Machinery`.
 
-The same line elsewhere: `lambda_elim.filter` is `Expansion` because a
-comprehension's `if` guard becoming a domain refinement is that guard; `simplify`
-is `Machinery` because an algebraic rewrite has no source counterpart at all.
+`Nature::Source` is lowering-only and marks a lowered source expression's root.
+The phase-table attribution helper debug-asserts that a phase row does not use it.
+`planning_labels_carry_their_declared_nature` checks the group-by and hash-join labels.
 
-`Nature::Source` is not on this axis. It is structural and lowering-only — a node
-is `Source` exactly when it is the root of a lowered `Spanned<ChlExpr>` — so no
-phase ever chooses it (see [The seam](#the-seam)).
-
-`planning_labels_carry_their_declared_nature` (`src/ccl/panes.rs`) pins both
-planning answers, so flipping one is a test edit rather than a silent change to
-what the wire says.
-
-**And a caution about what the gate can tell you.** `Unrecorded == 0` is a
-*coverage* property — was anything recording when a node was minted — not a
-statement about where the recording pointed. Measured: replacing a phase's
-carefully placed recordings with a **single** `enter` on the program root scores
-identically on every leak class. Sites are placed correctly because the
-attribution *is* the product; the number will not tell you when they are wrong.
-
-`compile_program` opens one `PhaseScope` per phase — `Infer`, then `Inline`,
-`Transact`, `Letrec`, `Channelize` — inside the single `TableSession` that spans the
-whole compile, and retains the drained table as
-`CompiledProgram::provenance_table`. A phase that rewrites nothing on a given program
-writes no rows, which is the preserve case and not a gap.
+An empty leak vector checks recording coverage, not attribution precision. A recording on the
+program root can explain IDs while attributing them to the wrong source construct. Recording-site
+correctness therefore needs source-specific tests as well as the fold's structural checks.
 
 ### The fold
 
