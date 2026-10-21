@@ -204,7 +204,7 @@ diagnostics:
     10:1-10:28 while parsing statement
     10:9-10:28 while parsing expression
 symbols:
-  module http 12:1-12:12 (name 12:8-12:12)
+  module std::http 12:1-12:17 (name 12:8-12:17)
   variable deposit_reqs 14:1-14:69 (name 14:1-14:13)
   variable deposit_resps 14:1-14:69 (name 14:15-14:28)
   variable balance_reqs 15:1-15:68 (name 15:1-15:13)

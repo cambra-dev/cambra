@@ -1,6 +1,6 @@
 # Modules
 
-> **Status: [Sketched].** A proposed implementation. The first two items of the [Implementation
+> **Status: [Sketched].** A proposed implementation. The first three items of the [Implementation
 > stack](#implementation-stack) are implemented.
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
@@ -113,7 +113,7 @@ Two changes to `Name` (`src/ccl/names.rs`):
   statement declares, and absent for a local. Identity remains the `uid`. `home` is metadata of the
   kind `base` already is.
 
-Module paths and run paths are interned and shared: cloning one copies a pointer, and `Display`
+Module paths and run paths are shared behind an `Arc`: cloning one copies a pointer, and `Display`
 renders it without a lookup table. Neither uses a per-compilation counter. They appear in state keys
 and record labels, and a counter would give two compilations of one root different labels, the
 defect [`Name::field_key`](../src/ccl/names.rs) documents.
@@ -162,6 +162,37 @@ and monomorphization already duplicate checked terms.
 
 Errors in one file do not stop loading, lowering, or checking the others. Every module's errors are
 reported together.
+
+### Loading
+
+Loading is the `load` and `graph` steps, and runs before compilation. `LoadedProgram::load`
+([`src/ccl/load/`](../src/ccl/load/mod.rs)) produces the `SourceMap` of every file the root reaches,
+each file's parse, the module graph, and the link order. Every compile entry point takes the
+`LoadedProgram`, so compilation reads no file.
+
+- **Edges.** The module graph's edges are the top-level `import` and `run` statements, bare or under
+  `pub`. Lowering refuses a nested one, and it names no module.
+- **Resolution.** Each module path is resolved once. A path beginning with `std` resolves against
+  the std root, which has no modules until the std root item of the
+  [Implementation stack](#implementation-stack). Any other path resolves through a `ModuleFiles`:
+  `DiskFiles` reads under the root file's directory, and `InMemory` holds text keyed by module path.
+- **Disk.** `DiskFiles` matches the root file's name and each component of `a/b/c.cambra` against
+  its directory's entries, so a file whose name differs only in case is not the root or the module
+  on any file system. A file it already read for another module path, compared by canonical path, is
+  refused.
+- **The root.** The root's module path is its file name without `.cambra`. A module naming that path
+  reaches the root's own file, so the cycle is reported rather than the root read twice. A root
+  built by `LoadedProgram::from_text` has no module path, and no statement can name it.
+- **Missing modules.** Each statement naming a module with no file is an error at its module path.
+  The message says why: no file, a file differing in case, a file another module path already
+  reached, or a failed read.
+- **Files with no tree.** `parse_module` returns no tree for a file when its grammar fails where
+  recovery does not apply, and loading follows none of that file's statements.
+- **Cycles.** Each strongly connected component with a cycle is one error. It names the shortest
+  cycle through the component's least module path, with a label at each statement in it. The link
+  order exists only for an acyclic graph.
+- **Compilation.** Loading's errors come first: every file's parse errors, then missing modules and
+  cycles. Only the root is lowered, and lowering refuses every `import` and `run`.
 
 ### The module interface
 
@@ -226,8 +257,9 @@ Freshening
 ### Intrinsics resolve by identity
 
 The std root ([chl-spec.md, "9.16 The std root"](chl-spec.md#916-the-std-root)) is CHL source
-embedded in the binary. A std file has a `FileId` and a path like any other, so an error inside it
-renders against its source. The `http` status helpers are ordinary CHL functions there.
+embedded in the binary. A std file has a `FileId` and a path like any other, `<std>/http.cambra` for
+`std::http`, so an error inside it renders against its source. The `http` status helpers are
+ordinary CHL functions there.
 
 A std module may bind an intrinsic, meaning a builtin source, sink constructor, or special form. The
 interface records the member as that intrinsic. Lowering recognizes a special form by what the
@@ -284,8 +316,9 @@ diagnostic about a copy names the run as well as the span.
 ### The source map
 
 `SourceMap` holds, per `FileId`, the file path, the source text, and a newline index built on first
-use. Loading adds each file's module path. `CompiledProgram::sources` keeps the map a program was
-compiled from. The line and column of a span are computed from the map when a diagnostic renders.
+use. Loading adds each file's module path. `CompiledProgram::loaded` keeps the `LoadedProgram` a
+program was compiled from, and `CompiledProgram::sources` reads its map. The line and column of a
+span are computed from the map when a diagnostic renders.
 
 ### Diagnostics
 
@@ -321,7 +354,9 @@ An inference error's span resolves through the lowering projection, as it does t
   `cart` never produce the same address either.
 - **A reload carries every file.** `/diff` and `/reload` take a bundle mapping each module path to
   its source, including the root's. The single-source request form is removed. Reading files from
-  disk at reload time is not offered: `/diff` answers about exactly the version it was sent.
+  disk at reload time is not offered: `/diff` answers about exactly the version it was sent. Until
+  the bundle exists, a posted version is its root file alone, and one that names a module is refused
+  ([program-evolution.md, "The control port"](../src/ccl/design/program-evolution.md#the-control-port)).
 - **The run tree is diffed by run path**, and shared runs by module path. A run marked
   `@RenamedFrom(eu)` pairs with the predecessor's run `eu` instead of its own path.
 - **`@Discard` on a run or an import** covers every address below its run path.
@@ -375,7 +410,7 @@ pub AuditLog = Module{events: Feed(Event)}
 `audit.cambra`, a runnable module whose Module type is a subtype of `AuditLog`:
 
 ```python
-import http
+import std::http
 import audit_api use Event
 
 pub events: Feed(Event)
@@ -388,7 +423,7 @@ for req in reqs:
 `storefront.cambra`, a runnable module with parameters:
 
 ```python
-import http
+import std::http
 import catalog
 import audit_api
 
@@ -471,7 +506,7 @@ One PR per item, each updating the spec and design docs it touches:
    checks, qualified registries, `VarPath` run paths.
 7. **Module types and type parameters.** `Module{…}` and its subtyping, Module-typed parameters
    and the qualified references through them, type parameters.
-8. **The std root.** `http` as a std module, intrinsics recognized by identity, `http_serve`
+8. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
    removed, route uniqueness across runs.
 9. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
    qualified `@LoadFrom` loads, `@Discard`.
@@ -518,8 +553,6 @@ the [Implementation stack](#implementation-stack).
   script can write to ([chl-spec.md, "10. Sinks"](chl-spec.md#10-sinks)).
 - **`rec` bindings**, for cycles in the module graph ([chl-spec.md, "13. Reserved for future
   work"](chl-spec.md#13-reserved-for-future-work)).
-
----
 
 ---
 

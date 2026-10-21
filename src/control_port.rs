@@ -39,11 +39,11 @@ use std::thread;
 
 use log::info;
 
-use crate::ccl::context::{GlobalContext, Phase, ReuseTally};
-use crate::chl_parser::SourceMap;
+use crate::ccl::context::{CompileError, GlobalContext, Phase, ReuseTally};
+use crate::ccl::load::{LoadError, LoadedProgram};
 use crate::live_program::{
-    BranchError, LiveProgram, MAIN_BRANCH, MainConsumerFactory, ReloadReport, is_branch_name,
-    render_unreadable,
+    BranchError, LiveProgram, MAIN_BRANCH, MainConsumerFactory, ReloadError, ReloadReport,
+    is_branch_name, render_unreadable,
 };
 
 /// What a control-port client asked for.
@@ -161,14 +161,33 @@ const POSTED: &str = "<new>";
 /// The reply to a branch operation that did nothing: `404` for a name the
 /// table does not hold, `400` for a refusal or a compile error. `posted` is the
 /// version the request carried, which a compile error's spans point into.
-fn branch_error(error: BranchError, posted: &SourceMap) -> ControlReply {
+fn branch_error(error: BranchError, posted: &LoadedProgram) -> ControlReply {
     match error {
         BranchError::Unknown(name) => {
             ControlReply::not_found(format!("no branch named `{name}`\n"))
         }
         BranchError::Refused(why) => ControlReply::rejected(why),
-        BranchError::Reload(e) => ControlReply::rejected(e.render(posted)),
+        BranchError::Reload(e) => ControlReply::rejected(posted_rejection(&e, posted)),
     }
+}
+
+/// The text refusing a posted version.
+///
+/// A posted version is its root file alone, so a version naming a module that
+/// is not under the std root fails to load it. The reply says so, since the
+/// same version read from disk would find the module's file.
+fn posted_rejection(error: &ReloadError, posted: &LoadedProgram) -> String {
+    let mut reply = error.render(posted.sources());
+    let names_a_module = matches!(error, ReloadError::Compile(errs) if errs
+        .iter()
+        .any(|e| matches!(e, CompileError::Load(LoadError::Missing { .. }))));
+    if names_a_module {
+        reply.push_str(
+            "note: a posted version is a single file, so a program of several modules cannot \
+             be reloaded yet\n",
+        );
+    }
+    reply
 }
 
 /// Answer `request` against the running branch table.
@@ -189,7 +208,7 @@ pub fn service(
             code,
             phase,
         } => {
-            let posted = SourceMap::single(POSTED, code.as_str());
+            let posted = LoadedProgram::from_text(POSTED, code.as_str());
             match live.diff_against(ctx, branch, &posted, *phase) {
                 Ok(report) => ControlReply::ok(format!(
                     "{}{}",
@@ -205,20 +224,20 @@ pub fn service(
                 // Both versions are running ones, so `diff_between` renders a
                 // compile error in either against its own map, and nothing
                 // posted is rendered against.
-                Err(e) => branch_error(e, &SourceMap::single(POSTED, "")),
+                Err(e) => branch_error(e, &LoadedProgram::from_text(POSTED, "")),
             }
         }
         // A rebuilt operator's producer takes the scheduler's probe slot when it
         // is built, as the first compile's did; a created branch's do too.
         ControlRequest::Reload { branch, code } => {
-            let posted = SourceMap::single(POSTED, code.as_str());
+            let posted = LoadedProgram::from_text(POSTED, code.as_str());
             match live.reload(ctx, branch, &posted, main_consumer) {
                 Ok(report) => ControlReply::ok(render_reload(&report)),
                 Err(e) => branch_error(e, &posted),
             }
         }
         ControlRequest::Branch { name, parent, code } => {
-            let posted = SourceMap::single(POSTED, code.as_str());
+            let posted = LoadedProgram::from_text(POSTED, code.as_str());
             match live.create_branch(ctx, name, parent, &posted, main_consumer) {
                 Ok(created) => ControlReply::ok(format!(
                     "created `{}@{}` from `{}`\n{}",
@@ -232,11 +251,11 @@ pub fn service(
         }
         ControlRequest::Delete { name } => match live.delete_branch(ctx, name) {
             Ok(_) => ControlReply::ok(format!("deleted branch `{name}`\n")),
-            Err(e) => branch_error(e, &SourceMap::single(POSTED, "")),
+            Err(e) => branch_error(e, &LoadedProgram::from_text(POSTED, "")),
         },
         ControlRequest::Info { name } => match live.render_info(name) {
             Ok(info) => ControlReply::ok(info),
-            Err(e) => branch_error(e, &SourceMap::single(POSTED, "")),
+            Err(e) => branch_error(e, &LoadedProgram::from_text(POSTED, "")),
         },
         ControlRequest::List => ControlReply::ok(live.render_branches()),
     }
@@ -607,6 +626,24 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A posted version naming a module is refused with the reason the module
+    /// has no file: a posted version is one file.
+    #[test]
+    fn a_posted_version_naming_a_module_says_it_is_one_file() {
+        use crate::ccl::context::compile_to;
+        let note = "a program of several modules cannot be reloaded yet";
+        let reject = |code: &str| {
+            let posted = LoadedProgram::from_text(POSTED, code);
+            let errors = compile_to(&posted, Phase::Lower).unwrap_err();
+            posted_rejection(&ReloadError::Compile(errors), &posted)
+        };
+        let reply = reject("import catalog\n1\n");
+        assert!(reply.contains("no module `catalog`"), "{reply}");
+        assert!(reply.contains(note), "{reply}");
+        let reply = reject("x = = 1\n");
+        assert!(!reply.contains(note), "{reply}");
+    }
 
     fn diff_of(url: &str) -> (String, Phase) {
         match parse_request(url, "").expect("parses") {

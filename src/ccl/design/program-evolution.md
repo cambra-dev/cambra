@@ -79,6 +79,11 @@ path. `/reload` and the `/branch` forms that create or delete change what runs, 
 method. A verb that takes a source reads it from the request body when the body is non-blank, and
 otherwise from the query string, percent-decoded. Every reply is `text/plain; charset=utf-8`.
 
+A `<source>` is one file, the version's root. A version that imports or runs a module therefore
+fails to load it, and the 400 says that a program of several modules cannot be reloaded yet.
+[docs/modules.md, "Program evolution"](../../../docs/modules.md#program-evolution) replaces the
+source with a bundle of every file.
+
 A `<name>` is a non-empty path segment of ASCII letters, digits, `-` and `_`. A `<branch>` segment
 that is omitted means `main`, and so does an omitted `/from/<parent>`. No verb falls back to another
 branch, so while no branch is named `main` every verb must name its branch, and one that does not

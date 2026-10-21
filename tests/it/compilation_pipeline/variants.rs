@@ -17,9 +17,9 @@
 //! the boolean gate replaced by the tag projection, so it yields a `Scalar` exactly
 //! as `if`/`else` in the same position does.
 
-use cambra::chl_parser::SourceMap;
 use std::time::Duration;
 
+use cambra::ccl::load::LoadedProgram;
 use cambra::interpreter::Value;
 use indoc::{formatdoc, indoc};
 use rstest_log::rstest;
@@ -702,7 +702,7 @@ fn test_default_only_match_still_types_its_scrutinee() {
     assert!(
         compile_program(
             &mut ctx,
-            &SourceMap::single("<test>", "match nope:\n    case _:\n        0"),
+            &LoadedProgram::test("match nope:\n    case _:\n        0"),
             consumer
         )
         .is_err(),
@@ -1102,7 +1102,7 @@ fn test_variant_type_rejections(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     assert!(
-        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer).is_err(),
+        compile_program(&mut ctx, &LoadedProgram::test(code), consumer).is_err(),
         "expected a diagnostic for `{code}`"
     );
 }
@@ -1152,7 +1152,7 @@ fn test_a_named_payload_is_not_optional(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     assert!(
-        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer).is_err(),
+        compile_program(&mut ctx, &LoadedProgram::test(code), consumer).is_err(),
         "expected a diagnostic for `{code}`"
     );
 }
@@ -1229,7 +1229,7 @@ fn test_match_arm_payload_misuse_is_rejected(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     assert!(
-        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer).is_err(),
+        compile_program(&mut ctx, &LoadedProgram::test(code), consumer).is_err(),
         "expected a diagnostic for `{code}`"
     );
 }
@@ -1546,7 +1546,7 @@ fn test_one_arm_variant_type_rejections(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     assert!(
-        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer).is_err(),
+        compile_program(&mut ctx, &LoadedProgram::test(code), consumer).is_err(),
         "expected a diagnostic for `{code}`"
     );
 }
@@ -1565,7 +1565,7 @@ fn test_open_demand_renders_its_ellipsis_in_a_diagnostic() {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let code = "x = True\nmatch x:\n    case `a(v):\n        v\n    case _:\n        99";
-    let Err(errs) = compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer) else {
+    let Err(errs) = compile_program(&mut ctx, &LoadedProgram::test(code), consumer) else {
         panic!("a Bool is not a variant, so the scrutinee constraint must fail");
     };
     let err = format!("{errs:?}");

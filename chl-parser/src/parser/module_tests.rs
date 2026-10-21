@@ -53,7 +53,7 @@ fn names(segments: &[Spanned<SmolStr>]) -> Vec<&str> {
     segments.iter().map(|s| s.node.as_str()).collect()
 }
 
-fn path_of(path: &ModulePath) -> Vec<&str> {
+fn path_of(path: &WrittenPath) -> Vec<&str> {
     names(&path.segments)
 }
 

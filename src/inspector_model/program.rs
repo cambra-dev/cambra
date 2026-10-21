@@ -181,7 +181,7 @@ impl<'a> InspectedProgram<'a> {
             })
             .collect();
         InspectedProgram {
-            sources: &compiled.sources,
+            sources: compiled.sources(),
             panes,
             // Aligned with `panes.windows(2)` — `MaterializedPanes::pairs` is
             // already one shorter than its projections, in the same order.
@@ -267,6 +267,7 @@ mod tests {
     use crate::ccl::TypedExprNode;
     use crate::ccl::context::Phase;
     use crate::ccl::context::{GlobalContext, compile_program};
+    use crate::ccl::load::LoadedProgram;
     use crate::ccl::provenance::Nature;
     use crate::interpreter::Consumer;
 
@@ -275,8 +276,7 @@ mod tests {
     fn compile(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
-            .expect("program compiles")
+        compile_program(&mut ctx, &LoadedProgram::test(code), consumer).expect("program compiles")
     }
 
     /// The specialization-wrapper `Let`s that `coalesce_generalized_let`

@@ -3513,10 +3513,10 @@ unique across the program.
 > (`def not_found(body): (code=404, body=body)`, likewise `ok` /
 > `bad_request` / `conflict`), with the record literal as the escape
 > hatch for other codes — no new language surface. They live in an
-> **`http` module** (**[Decided]**): programs write `import http`,
-> then `http::ok(…)` / `http::not_found(…)`, and address the source the
-> same way, `http::serve(…)`. `http` is a module of the std root
-> ([9.16 The std root](#916-the-std-root)).
+> **`http` module** (**[Decided]**): programs write `import std::http`,
+> which binds `http`, then `http::ok(…)` / `http::not_found(…)`, and
+> address the source the same way, `http::serve(…)`. `std::http` is a
+> module of the std root ([9.16 The std root](#916-the-std-root)).
 > The north-star programs still spell these `http.ok` and `http.serve`.
 > A response feed's
 > element type would be per-endpoint: a bare serializable value,
@@ -4053,7 +4053,8 @@ stock                         # the predecessor's `stock` is intentionally gone
 A reload that drops a variable holding state is refused without one. The name resolves at its own
 position, outward, as `@LoadFrom`'s does. On a `run` or an `import` statement the tombstone covers
 every variable of that run
-([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)).
+([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)), and stands at a
+module's top level, as the statement it marks gone does.
 
 **A tombstone resolves against the ancestry**, not only the version it replaces: every version the
 running program descends from, through each reload and each branch it was created from. A tombstone
@@ -4133,10 +4134,12 @@ module_path ::= ident ("::" ident)*
   ([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)).
 - An import reaches every public member of the module's shared run. Importing a module that
   performs IO is an error ([9.7 Importing asserts no IO](#97-importing-asserts-no-io)).
+- An `import` stands at a module's top level. One inside a `def`, a loop, or a block is an error.
 - There is no wildcard `use`. Adding a public member to a module never changes what an importer's
   names mean.
-- Every module path is absolute from the module root ([9.15 Module files](#915-module-files)).
-  There are no relative imports, so moving a file does not change what the file itself imports.
+- Every module path is absolute, from the module root or, for a path beginning with `std`, from the
+  std root ([9.15 Module files](#915-module-files), [9.16 The std root](#916-the-std-root)). There
+  are no relative imports, so moving a file does not change what the file itself imports.
 - There is no re-export. `pub` is refused on an `import`, so a module's public members are the ones
   it declares and the runs it marks `pub run`.
 
@@ -4155,6 +4158,7 @@ run inventory as inv use stock                        # binds `inv`, and `stock`
 
 - A run's name defaults to the module path's last segment, as an import's does. `as` overrides it.
   A run name begins with a lowercase letter, as an import name does.
+- A `run` stands at a module's top level, as an `import` does.
 - Every run has a name, because the name is the run's identity: its state, its routes, and what a
   reload pairs it with. Two runs in one module with the same name are an error, fixed by `as`.
   Renaming a module file renames every run that relies on the default, so a long-lived run names
@@ -4224,6 +4228,7 @@ param payments: Module{charge: {amount: Int} => Receipt}
   both sites. A local may shadow a value parameter, except one of Module type
   ([9.6 Qualified references](#96-qualified-references)). A type parameter follows the scoping of a
   type alias ([6.7 Type-alias statements](#67-type-alias-statements)).
+- A `param` stands at a module's top level, as an `import` does.
 - The root module has no required parameters. The engine runs it, and no `run` statement supplies
   arguments, so a root parameter takes its default. A root with a parameter that has no default is
   an error that says to run the module from a root instead. Running one module alone takes a root of
@@ -4628,7 +4633,11 @@ prints. An annotation is how an author fixes the contract.
 ### 9.15 Module files
 
 - The **module root** is the directory containing the root file.
-- Module path `a::b::c` names the file `<root>/a/b/c.cambra`. A directory is not a module.
+- The root file's name is `<name>.cambra`, and the root's module path is `<name>`, a segment under
+  the rule below. A module whose statement names that path reaches the root, which is a cycle
+  ([9.11 The module graph](#911-the-module-graph)).
+- Module path `a::b::c` names the file `<root>/a/b/c.cambra`, unless it begins with `std`
+  ([9.16 The std root](#916-the-std-root)). A directory is not a module.
   `a.cambra` and `a/b.cambra` are two independent modules, and importing `a` does not make `a::b`
   available.
 - A submodule is not a member of its parent, and no statement makes it one, since there is no
@@ -4639,21 +4648,25 @@ prints. An annotation is how an author fixes the contract.
   so `m::X` is a type member and `X` is never a module. A segment beginning with `__` is refused,
   since user code cannot bind that namespace.
 - A missing file is an error at the statement naming it.
-- The match is case-sensitive, including on a case-insensitive file system. `import cart` does not
-  load `Cart.cambra`.
+- The match is case-sensitive, including on a case-insensitive file system, and so is the root
+  file's name. `import cart` does not load `Cart.cambra`, and naming `deploy.cambra` as the root
+  does not read `Deploy.cambra`.
 - Two module paths resolving to one file, through a symlink for example, are refused. The file would
   have two identities, and two shared runs.
 
 ### 9.16 The std root
 
-The compiler's own modules live under a **std root** and are imported like any other: `import http`,
-then `http::serve(…)` and `http::ok(…)` ([7.4 Sources](#74-sources)). The std root's top-level
-names (`http`, …) are reserved, and a user module at one of those paths is refused.
+The compiler's own modules live under a **std root**, and every std module's path begins with `std`:
+`import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.4
+Sources](#74-sources)). A path beginning with `std` names a module of the std root and never a file
+under the module root, so `std` is the only name the std root reserves, and adding a std module
+changes no user module's meaning. `std` alone names no module, and a root file named `std.cambra` is
+refused.
 
 A builtin source, sink, or special form a std module provides is recognized by what a name resolves
-to, not by how it is spelled. After `import http as web`, `reqs, resps = web::serve(…)` is the same
-form as `http::serve(…)`, and the bare name `http_serve` is gone. Its address arguments are string
-literals. **[Planned]** — an address passed as a parameter, fixed per run, needs a link-time
+to, not by how it is spelled. After `import std::http as web`, `reqs, resps = web::serve(…)` is the
+same form as `http::serve(…)`, and the bare name `http_serve` is gone. Its address arguments are
+string literals. **[Planned]** — an address passed as a parameter, fixed per run, needs a link-time
 constant, a value fixed once a run's arguments are bound, which the language does not define yet.
 Until it does, two runs of a module that serves a route serve the same address and conflict.
 

@@ -2443,6 +2443,7 @@ fn open_recording_depth() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::load::LoadedProgram;
 
     /// A span in the one file these tests' attributions name.
     fn span(start: usize, end: usize) -> Span {
@@ -3411,12 +3412,8 @@ mod tests {
         for (name, code) in pipeline_corpus() {
             let mut ctx = GlobalContext::default();
             let consumer: Box<dyn Consumer> = Box::new(|| {});
-            compile_program(
-                &mut ctx,
-                &chl_parser::SourceMap::single(name, &code),
-                consumer,
-            )
-            .unwrap_or_else(|e| panic!("{name}: expected a successful compile, got {e:?}"));
+            compile_program(&mut ctx, &LoadedProgram::from_text(name, &code), consumer)
+                .unwrap_or_else(|e| panic!("{name}: expected a successful compile, got {e:?}"));
             total += take_predicate_sweep_skips();
         }
         assert_eq!(

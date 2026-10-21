@@ -61,7 +61,6 @@
 //! }
 //! ```
 
-use cambra::chl_parser::SourceMap;
 use std::{
     cell::RefCell,
     io::Write,
@@ -70,6 +69,7 @@ use std::{
     rc::Rc,
 };
 
+use cambra::ccl::load::LoadedProgram;
 use cambra::{
     ccl::context::{CompileResultExt, GlobalContext, compile_program},
     interpreter::{
@@ -259,8 +259,8 @@ pub(crate) fn run_to_tile(source: &str) -> Tile {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let sources = SourceMap::single("<test>", source);
-    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::test(source);
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     ctx.scheduler().check_for_notifications();
     assert!(
         *notified.borrow(),

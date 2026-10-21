@@ -13,11 +13,12 @@ use crate::ast::{
     AnnotationMode, ArmPattern, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp,
     CmpOp, CompClause, Comprehension, Constructor, ConstructorParam, ConstructorPattern,
     DiscardHead, Expr, FileId, IfBranch, ImplBlock, KindAnnotation, Lit, MatchArm, MatchPattern,
-    Module, ModulePath, Param, PayloadPattern, QualifiedName, RecordField, Requirement, RunArg,
-    Span, Spanned, Stmt, TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem,
-    VariantPayload,
+    Module, Param, PayloadPattern, QualifiedName, RecordField, Requirement, RunArg, Span, Spanned,
+    Stmt, TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem, VariantPayload,
+    WrittenPath,
 };
 use crate::lexer::{self, Token};
+use crate::module_path::segment_error;
 
 mod error;
 #[cfg(test)]
@@ -1917,7 +1918,7 @@ where
 
 /// A module path, `shop::cart`, holding the rule its segments follow
 /// (`docs/chl-spec.md`, "9.15 Module files").
-fn module_path<'src, I>() -> impl Parser<'src, I, ModulePath, PErr<'src>> + Clone
+fn module_path<'src, I>() -> impl Parser<'src, I, WrittenPath, PErr<'src>> + Clone
 where
     I: ValueInput<'src, Token = Token, Span = Span>,
 {
@@ -1929,27 +1930,11 @@ where
         .collect::<Vec<_>>()
         .validate(|segments, _, emitter| {
             for segment in &segments {
-                if segment.node.starts_with("__") {
-                    emitter.emit(Rich::custom(
-                        segment.span,
-                        format!(
-                            "module name `{}` begins with `__`, a namespace user code \
-                             cannot bind",
-                            segment.node
-                        ),
-                    ));
-                } else if !segment.node.starts_with(|c: char| c.is_ascii_lowercase()) {
-                    emitter.emit(Rich::custom(
-                        segment.span,
-                        format!(
-                            "module name `{}` must begin with a lowercase letter; a \
-                             capitalized name is a type",
-                            segment.node
-                        ),
-                    ));
+                if let Some(message) = segment_error(&segment.node) {
+                    emitter.emit(Rich::custom(segment.span, message));
                 }
             }
-            ModulePath { segments }
+            WrittenPath { segments }
         })
 }
 
