@@ -565,146 +565,112 @@ bit is what says so until every phase in the pair records.
 
 ## The seam
 
-- **The lowering log + fold.** Lowering records a `LoweringLog` under an
-  always-on `LoweringSession` (installed in every build across `lower_stmts`,
-  drained before the first phase scope opens). It records at **leaf grain**:
-  `tag_source` / `tag_image` / `tag_machinery` are thin shims appending a
-  `LoweringStep::Leaf` (one id, anchored at the nearest real span). Ordinary
-  mints record **nothing**, so
-  `on_mint` stays a no-op on the hot path; a recording opens only where ambient
-  `Copy`
-  capture is needed — uncurry's template discharge and the chained-comparison
-  operand freshens, whose interior re-mints land as `Copy` LoweringSteps
-  mirroring their origins (`copy_frame`, which declares that shape and so has no
-  inert blame/nature arguments).
+Lowering and phase rewriting have different attribution inputs. Lowering knows literal source
+spans; later phases name existing nodes whose spans must be resolved. They therefore use separate
+logs and folds. The phase table supplies relations between retained pipeline snapshots, while
+the always-on lowering and derivation projections support error reporting even without that table.
 
-  **The rule for `Nature::Source` is structural: `Source` ⟺ the node is the root
-  of a lowered `Spanned<ChlExpr>`.** It is decided in exactly one place — the
-  `lower_expr` wrapper re-tags every lowered expression's root, last tag wins via
-  the fold's re-image path — so no lowering arm makes a judgment call. An arm
-  records its own nodes with `tag_image` (`"lower.image"`, an image of source
-  text) or `tag_machinery` (`"lower.<rule>"`, manufactured plumbing), both at
-  `Nature::Machinery`.
+### Lowering attribution
 
-  The cost is deliberate and worth stating: a node can be a one-to-one image of
-  something the user wrote and still not be `Source`, because it is not an
-  expression *root* — a call's callee `Var`, each comparison of `a < b < c`, the
-  projection of `x[i]`, and every statement-level image (statements are not
-  `Spanned<ChlExpr>`s, so a statement has no `Source` node at all). The converse
-  holds too: `groupby(c, key)` lowers to a `Lambda` the user never wrote, and as
-  the expression's root that `Lambda` is `Source`. The comprehension phase's
-  encoding is rooted at the `Comprehension` node's id, so the `Cast` or `Lambda`
-  there keeps that node's `Source` entry. What is lost from `nature` is preserved
-  in the `label` — `"lower.image"` marks an image either way.
+`LoweringSession` is installed throughout lowering in every build. Leaf-tagging helpers append
+one `LoweringStep::Leaf` with a node ID, literal span, nature and label. Ordinary mint hooks do
+not create these leaf records. Copy-only frames capture freshened template interiors and
+reused comparison operands as `LoweringStep::Copy` entries.
 
-  **`label`, unlike `nature`, has no rule: it is per-rule judgment, and carries no
-  cross-site guarantee.** Making `Source` structural moved the judgment call from
-  `nature` onto `label` rather than removing it, and the disagreement moved with
-  it: an `ExprStmt` at a statement's span is `"lower.image"` at several sites and
-  `tag_machinery(…, "lower.stmt_seq")` at nine — the same node kind in the same
-  span role, tagged both ways. So the guarantee is stated weakly on purpose.
-  `"lower.image"` means *the rule that minted this node considered it an image*,
-  and nothing more; no consumer may read it as a cross-site classification. A
-  consumer needing "this has a 1:1 source construct" needs a datum that
-  guarantees that, and none exists yet.
+`Nature::Source` marks the root returned by lowering a `Spanned<ChlExpr>`.
+The `lower_expr` wrapper calls `tag_source` after the arm returns, so its leaf entry replaces
+any earlier attribution for that root when the log is folded. Interior nodes and statement-level
+images do not receive Source merely because they correspond to source text. Conversely, a
+generated wrapper at an expression's root receives Source even if that wrapper was not written.
 
-  **The whole nature/label taxonomy is provisional.** Nothing branches on it
-  today, which is precisely why it drifted into two disagreeing rules in the first
-  place, and why a third of this doc's history is spent re-deciding it. Expect it
-  to change — most plausibly `nature` collapsing to what is decidable, with a
-  finer taxonomy recomputed by a label-keyed remap — as the inspector's real
-  consumption shows which distinction is load-bearing. Treat both axes as
-  unstable until then.
+Lowering uses these tags:
 
-  At the lowering→pipeline handoff (before uniquify and inference, so the release
-  `InferError` read timing is unchanged) `fold_lowering` folds the log
-  **once** into the always-on **lowering projection** (`NodeId →
-  SourceAttribution`, covering every id `collect_tree_ids` enumerates, the ids
-  inside refinement predicates included). This is the degenerate lowering case of
-  `fold`, and the one fold that stays sequential: no input pane (leaves are pure
-  insertions attributed from their literal anchor), no `ProvenanceMap` output, no
-  upstream attr (a copy mirrors its origin's already-folded entry), and no
-  one-record-per-id requirement (a re-image is a second entry for one id and the
-  later tag deliberately wins). `Phase::Lower` is lowering-projection vocabulary
-  only — it never tags a `ProvenanceTable` row, and the map between two panes
-  stays a homogeneous `NodeId → NodeId` (the lowering projection constrains the
-  **product**, not the producer).
-  Every diagnostic a pass after lowering raises carries a blame node and resolves
-  it against the projection (no fold, before any pane exists): the node's own
-  entry, else the entry of a node it was derived from in the active
-  `ProvenanceTable`, else that of a node enclosing it in the tree it was found
-  in. `CompiledProgram` retains the projection as `lowering_projection`.
-- **The lowering leak gate.** `fold_lowering`'s leak taxonomy replaces the
-  retired `assert_seed_coverage` (and its `SEED_EMPTY_SPANS_ALLOWLIST`): an
-  unrecorded lowering mint surfaces as `Leak::Unrecorded` (every output-tree
-  node must be explained by a leaf or a copy), and a copy of an origin no earlier
-  record covered as `Leak::DanglingParent`; a born-copied-discarded template id
-  composes away (live but neither placed nor an output). The fold is always-on
-  (its product is release-critical); the leak *checks* are debug/test-gated at
-  the lowering handoff via `gate_leaks`. Orphaned projection keys are
-  structurally impossible — the projection is *produced by* the fold, never
-  mutated incrementally.
-- **Materialization (cold, inspector-only).** `CompiledProgram::materialize_panes`
-  folds `provenance_table` across every adjacent pane pair, restricting it by
-  phase. `PANES` is the topology and declares it once: each entry names a pane,
-  the phases that produced it from the pane before it, and whether its pair is
-  gated. It returns a `SourceProjection` per pane and a `PanePair` per pair, each
-  carrying that pair's map, deaths and leak vector. There is no catch-all bridge:
-  a node is explained by a recorded row or it is not explained at all, and the
-  gate is what says which. Materialization returns the leaks rather than
-  asserting on them: a pair is clean only once every phase inside it records.
+| Helper | Nature | Label |
+|---|---|---|
+| `tag_source` | `Source` | `"lower.image"` |
+| `tag_image` | `Machinery` | `"lower.image"` |
+| `tag_machinery` | `Machinery` | The supplied rule label. |
 
-  The first entry is the anchor — it has no predecessor, and its projection is
-  the lowering projection rather than a fold product. Read `PANES` for the
-  current set rather than a list here; today it runs `pre-inference` through
-  `post-planning`. Projections chain: each pair folds
-  against the projection of the pane above it, so the first pair whose phases do
-  not record leaves every pane below it with nothing to carry forward.
-- **The pane leak gate.** `gate_leaks` asserts the whole `Leak` vector empty at
-  the lowering handoff and at each gated pane pair. `Unrecorded` (an output node
-  no capture explains) and `DanglingParent` (a parent edge to an id the fold has
-  never heard of) are the only two classes. A death is not one of them: it is an
-  ordinary product of any rewrite that replaces a node, carried on its own
-  `PanePair::deaths` channel and never asserted on.
+`tag_image` records a lowering site's classification of an image. The label does not establish
+a cross-site one-to-one correspondence with a written construct. Nature alone also does not
+separate interior images from generated material: both use Machinery. The nature/label taxonomy
+remains provisional; consumers must rely on the stated guarantees rather than infer a finer
+classification from those names. Source nature does affect the inspector's null encoding.
 
-  **`PaneSpec::gated` says whether a pair is asserted to carry neither class.**
-  Two checks read the same set at different widths:
-  `pane_pair_folds_have_no_structural_leaks` over the programs `corpus()` lists,
-  on every test run, and `CAMBRA_PROVENANCE_GATE=1` over whatever the caller
-  compiles, which is strictly stronger because the wider corpus reaches shapes
-  the listed programs do not.
+`tag_predicate` visits a finished predicate before it is placed in a refinement type.
+It records missing leaf attribution without replacing entries already supplied by the predicate's
+subexpressions. This preserves their narrower spans and tags; structural leak checks would not
+detect a replacement by a coarser but present attribution.
 
-  **The flag does not license a nonzero residue where it is false.** A leak is a
-  bug wherever it appears; the flag says whether an assertion has been turned on.
-  A pair goes ungated only while some phase inside it does not record, where the
-  residue is a count of how little that phase records — a constant no correct
-  recording elsewhere can drive down, so gating it would pin churn rather than
-  catch a defect.
+### The lowering fold
 
-  Where it stands: **every pair is gated**, from `pre-inference → post-inference`
-  down to `post-planning → post-conversion`. Capture is total across the whole
-  pipeline.
+`fold_lowering(log, output_ids)` reads the log in order:
+
+- A leaf establishes the ID and assigns its literal span and tag, with `via: Lower`.
+  A later leaf for the same ID replaces that attribution.
+- A copy requires its origin to have been established earlier. Each produced ID receives the
+  origin's complete attribution, including its tag.
+- A copy with an unknown origin reports `DanglingParent` and does not establish its products.
+- An output ID not established by either kind of record reports `Unrecorded`.
+
+The returned projection is restricted to `output_ids`; leak entries are sorted and deduplicated.
+A recorded template can be copied and then discarded without a leak. Lowering has no input
+pane, relation output or death set. Unlike table rows, its repeated leaf records have defined
+last-write-wins semantics. Log order therefore matters.
+
+The pipeline drains and folds the lowering log before uniquification and later phase scopes.
+It enumerates output IDs with `collect_tree_ids`, including predicate interiors, and retains
+the result as `CompiledProgram::lowering_projection`. The fold runs in release builds because
+diagnostics need its result. Boundary uniqueness and leak assertions are debug/test checks;
+they do not make release builds reject a missing record.
 
 ### The derivation log
 
-A phase run under a `DerivationSession` writes every recording that closes inside it to a
-`DerivationLog` as well as to the table, in every compile. The session exists for a phase whose
-mints inference can raise an error at, and whose mints no lowering-projection node encloses more
-tightly than the construct they encode. Without it, a compile that captures nothing (`compile_to`)
-resolves such an error to the enclosing construct's span or, when the blame node is outside the
-tree, to no span at all. The comprehension phase (`ccl/comprehension.rs`) is the one phase run under
-it.
+A phase under `DerivationSession` appends closed recordings to a `DerivationLog`, independently
+of table capture. The comprehension phase uses it so errors on its generated nodes can resolve
+to source spans even when `compile_to` does not capture provenance rows.
 
-`fold_derivation` folds the log into a projection over the lowering projection. A mint takes the
-spans of the node its recording named and the recording's own tag; a copy mirrors its origin. The
-steps are read in closing order, so a recording that names or copies a node an inner recording
-minted finds that node already folded. A step whose named node or origin is in neither projection
-contributes no entry. `Blame` consults this projection after the lowering projection and before the
-table.
+`fold_derivation(log, base, via)` processes closing order. It looks up an input in `base` first,
+then in the projection already built by this fold. A mint copies its named input's spans and
+uses the recording's nature and label with the supplied phase. A copy mirrors its origin's
+complete attribution. If neither lookup finds the named input or origin, the step adds no
+entries; there is no leak result from this fold.
 
-A recording under the session names no blame and consumes nothing beyond its named node, which
-`log_derivation` debug-asserts. The fold attributes a birth to the named node alone, so either
-channel would make it narrower than the table's attribution.
+Dependencies must therefore be available in the base projection or from an earlier log step.
+An inner recording closes before its enclosing recording, so the latter can use the former's
+products. This is not the table fold's insertion-order-independent algorithm.
+
+Recordings under a derivation session must not add extra consumed IDs or blame.
+`log_derivation` debug-asserts that restriction because the derivation fold attributes births
+only to their named input. Logging those extra channels without folding them would make this
+projection narrower than table attribution.
+
+### Error attribution
+
+`Blame` resolves a `Located` error's node in this order:
+
+1. Look up the node in the lowering projection, then the accumulated derivation projection.
+   Use the selected entry's first span.
+2. If no span was found, breadth-first search the active table's parents and blame IDs.
+   For each visited node, parents precede blame; already-visited IDs are skipped.
+3. If a containing expression tree was supplied, search its enclosing nodes nearest-first
+   for a projected span. Predicate nodes in type slots are enclosed by the expression holding
+   the slot.
+4. If no source is found, panic in debug builds; otherwise use the whole root-file span.
+
+An existing attribution with no spans does not resolve an error. The fallback table walk requires
+an active table, so capture-disabled compiles rely on projections and the optional enclosing tree.
+The derivation projection supplements lowering; it does not replace it.
+
+### Pane materialization
+
+`CompiledProgram::materialize_panes` uses `PANES` to fold each adjacent snapshot pair.
+The first projection is the lowering projection. Each later pair uses the preceding projection
+and its declared phase set. It returns maps, projections, deaths and leaks without asserting
+that the leaks are empty. The inspector and the compile-time leak gate both use this operation.
+
+[Gate and audit coverage](#gate-and-audit-coverage) owns assertion configuration and audit spans.
+[Operator conversion](#operator-conversion) specifies the non-expression output domain.
 
 ## Operator conversion
 

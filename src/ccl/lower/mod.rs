@@ -673,73 +673,21 @@ impl LoweringContext {
     /// anchored at `span`) appended to the always-on lowering log — and return it,
     /// for chaining at construction sites.
     ///
-    /// # The rule for `Nature::Source`
+    /// Tag the returned root of a lowered source expression as Source.
+    /// Called by `lower_expr` after its arm; the later leaf replaces any interim
+    /// root tag when folded. Interior and statement-level images do not qualify.
     ///
-    /// **`Source` ⟺ the node is the root of a lowered [`Spanned<ChlExpr>`].**
-    ///
-    /// It is a *positional* fact, so it is decided in exactly one place — the
-    /// [`lower_expr`] wrapper, which re-tags every lowered expression's root
-    /// (last tag wins, via the fold's re-image path). No arm calls this; an arm
-    /// records its own nodes with [`tag_image`](Self::tag_image) for a node that
-    /// images source text and [`tag_machinery`](Self::tag_machinery) for
-    /// manufactured plumbing, and whichever of them ends up at the root is
-    /// re-tagged here.
-    ///
-    /// The rule is deliberately structural rather than semantic, and the cost is
-    /// real: nodes that *are* one-to-one images of something the user wrote but
-    /// are not an expression root do not get `Source`. That includes a call's
-    /// callee `Var`, each comparison of a chained `a < b < c`, the projection node
-    /// of `x[i]` / `x.attr`, and every statement-level image (a `Let` for an
-    /// assignment, a `MutWrite` for `x := e`) — statements are not
-    /// `Spanned<ChlExpr>`s, so a statement has no `Source` node at all. The
-    /// converse also holds: a comprehension's root is a `Cast` wrapper the user
-    /// never wrote, and under this rule it *is* `Source`.
-    ///
-    /// That information is not lost, only moved: every such node carries the
-    /// `"lower.image"` label, which is the datum consumers read (see
-    /// [`tag_machinery`](Self::tag_machinery) on nature being a coarse
-    /// projection). A label-keyed remap can recover a finer taxonomy if one earns
-    /// a consumer; the structural rule is what makes "is this `Source`?" answerable
-    /// without reading the fold.
-    ///
-    /// A no-op when no lowering session is installed (the `lower` submodules' unit
-    /// tests, which only inspect the tree shape).
+    /// No effect without a lowering session. See `src/ccl/design/provenance.md`,
+    /// "Lowering attribution".
     pub(super) fn tag_source(&mut self, expr: Expr, span: Span) -> Expr {
         crate::ccl::provenance::lowering_leaf(expr.node_id(), span, Nature::Source, "lower.image");
         expr
     }
 
-    /// Record `expr` as an **image of source text** at `span` — a node that is a
-    /// one-to-one translation of something the user wrote, but is not the root of
-    /// a lowered expression and so is not `Nature::Source` under the rule on
-    /// [`tag_source`](Self::tag_source).
-    ///
-    /// It carries the same `"lower.image"` label as a root image, so the two are
-    /// distinguishable from plumbing ([`tag_machinery`](Self::tag_machinery)'s
-    /// per-rule labels) even though both are `Nature::Machinery`.
-    ///
-    /// # `label` is per-rule judgment, and carries no cross-site guarantee
-    ///
-    /// Unlike `Nature::Source`, which is structural and decidable (see
-    /// [`tag_source`](Self::tag_source)), the choice between this and
-    /// `tag_machinery` is **the lowering author's judgment about their own rule**.
-    /// There is no rule to apply, and the codebase does not agree with itself: the
-    /// same node kind at the same span role is tagged both ways — an `ExprStmt` at
-    /// a statement's span is `"lower.image"` at several sites and
-    /// `"lower.stmt_seq"` at nine.
-    ///
-    /// So the guarantee is deliberately weak, and stating it is the point:
-    /// **`"lower.image"` means "the rule that minted this node considered it an
-    /// image", nothing more.** No consumer may treat it as a cross-site
-    /// classification — not "every image has a 1:1 source construct", not "a
-    /// non-image is machinery". A consumer that needs one of those needs a datum
-    /// that guarantees it, and none exists yet.
-    ///
-    /// The whole nature/label taxonomy is **provisional**. It has no consumer that
-    /// branches on it today, which is exactly why it has drifted; expect it to
-    /// move — most likely to collapse or be recomputed by a label-keyed remap —
-    /// once real consumption tells us what distinction is actually load-bearing.
-    /// Do not build on the current shape.
+    /// Tag a site's image of source text as Machinery with label `"lower.image"`.
+    /// The wrapper re-tags expression roots as Source. This site's label does not
+    /// establish a cross-site one-to-one source correspondence.
+    /// See `src/ccl/design/provenance.md`, "Lowering attribution".
     pub(super) fn tag_image(&mut self, expr: Expr, span: Span) -> Expr {
         crate::ccl::provenance::lowering_leaf(
             expr.node_id(),
@@ -750,46 +698,20 @@ impl LoweringContext {
         expr
     }
 
-    /// Record `expr` as **manufactured by lowering** — a single-node leaf
-    /// [`LoweringStep`](crate::ccl::provenance::LoweringStep) (`Nature::Machinery`,
-    /// `label`, anchored at `span`) appended to the always-on lowering log — and
-    /// return it, for chaining at construction sites. The dual of
-    /// [`tag_image`](Self::tag_image): a node lowering *manufactured* — encoding
-    /// plumbing and faithful expansions alike — rather than one that translates
-    /// something the user wrote. `span` is the nearest real source span (the
-    /// enclosing statement for statement-level mints, the expression otherwise),
-    /// never a fabricated empty one.
-    ///
-    /// All manufactured nodes get the uniform `Nature::Machinery`: no consumer
-    /// behaves differently on the expansion-vs-plumbing bit today, and the
-    /// per-site `label` (one label per lowering rule, `lower.<rule>`) is the
-    /// primary datum — nature is a coarse projection that a label-keyed remap
-    /// can recompute later if a finer taxonomy ever earns a consumer.
-    ///
-    /// Nature alone therefore does **not** separate manufactured from imaged: an
-    /// image that is not an expression root is `Machinery` too (see
-    /// [`tag_source`](Self::tag_source) for the rule). The `label` is what
-    /// distinguishes them — `"lower.image"` versus a `lower.<rule>` name.
+    /// Tag a generated node as Machinery with the supplied rule label and return it.
+    /// Use the nearest real source span, not a fabricated empty anchor. Machinery
+    /// also covers interior source images; nature alone does not distinguish them.
     pub(super) fn tag_machinery(&mut self, expr: Expr, span: Span, label: RewriteLabel) -> Expr {
         crate::ccl::provenance::lowering_leaf(expr.node_id(), span, Nature::Machinery, label);
         expr
     }
 
-    /// Record every node of a finished **refinement predicate** that nothing
-    /// else has explained.
+    /// Supply fallback leaf attribution throughout a finished predicate's term tree.
+    /// Call before placing it in a refinement type. Already-recorded subexpressions
+    /// retain their existing attribution; missing IDs use this span and label.
     ///
-    /// A predicate is assembled from sub-expressions that were lowered — and so
-    /// recorded — in the main tree, plus the nodes minted and copied to join them
-    /// up. Sealed into a `Refinement` it lives in a *type slot*, outside the
-    /// `walk_children` domain, so those assembly nodes have no leaf of their own
-    /// and the widened `collect_tree_ids` would report them `Unrecorded`.
-    ///
-    /// Call this on the predicate **immediately before** handing it to
-    /// `ccl_utils::refined_data_fun`, which is the single point a lowering
-    /// predicate is born. Nodes already recorded keep their own precise
-    /// attribution — see [`lowering_predicate_leaf`].
-    ///
-    /// [`lowering_predicate_leaf`]: crate::ccl::provenance::lowering_predicate_leaf
+    /// This walk follows expression children, not nested predicate-bearing type slots.
+    /// See `crate::ccl::provenance::lowering_predicate_leaf`.
     pub(super) fn tag_predicate(&mut self, pred: &Expr, span: Span, label: RewriteLabel) {
         fn go(e: &Expr, span: Span, label: RewriteLabel) {
             crate::ccl::provenance::lowering_predicate_leaf(
@@ -1044,24 +966,12 @@ pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Lower a single CHL expression to a CCL expression, tagging the root of the
-/// lowered subtree with the source span it came from.
+/// Lower one CHL expression and tag its returned root with the source span.
 ///
-/// The recursion proper lives in [`lower_expr_inner`]; this thin wrapper is the
-/// **sole** emitter of `Nature::Source`, and so the one place the rule is applied:
-/// `Source` ⟺ the node is the root of a lowered `Spanned<ChlExpr>`. It re-tags the
-/// returned node via [`LoweringContext::tag_source`], overwriting any interim tag
-/// an arm put on its own root (last tag wins, through the fold's re-image path).
-/// The rule is positional, so no lowering arm ever decides it — see
-/// [`LoweringContext::tag_source`] for the rule and its costs.
-///
-/// Interior nodes an arm builds are each tagged at their mint site with
-/// [`LoweringContext::tag_image`] for a node that images source text or
-/// [`LoweringContext::tag_machinery`] for manufactured plumbing. **That choice is
-/// per-rule judgment, not a rule** — `tag_image`'s docs state what it does and
-/// does not guarantee. Whichever of them lands at the root is re-tagged here.
-/// [`fold_lowering`](crate::ccl::provenance::fold_lowering)'s leak taxonomy
-/// enforces full coverage of the lowered tree either way.
+/// The final leaf overrides any interim root attribution during folding.
+/// Individual arms tag their interior products; this wrapper alone calls
+/// `tag_source` for the expression root. See `src/ccl/design/provenance.md`,
+/// "Lowering attribution".
 pub fn lower_expr(
     expr: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
