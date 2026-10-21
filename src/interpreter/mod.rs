@@ -9,6 +9,7 @@ pub mod http_server;
 pub mod operator_conversion;
 pub mod operator_graph;
 mod producer_releases;
+mod scalar_expr;
 mod scheduler;
 pub mod sinks;
 mod stdio;
@@ -26,6 +27,7 @@ pub mod value_probe;
 
 pub use binop::*;
 pub use http_server::HttpServerDataSource;
+pub use scalar_expr::ScalarProgram;
 pub use scheduler::*;
 pub use stdio::*;
 #[cfg(any(test, feature = "test-helpers"))]

@@ -20,6 +20,9 @@ use crate::interpreter::tile_operators::{materialize_collections, open_collectio
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FunctionDef {
     BinOp(BinOpKind),
+    /// A fused chain of element-wise operations over one column
+    /// ([`crate::interpreter::operator_conversion`] builds it from a `zip` of pointwise arms).
+    Scalar(crate::interpreter::ScalarProgram),
     /// Unary arithmetic or boolean operation applied element-wise to a single column.
     UnaryOp(UnaryOpKind),
     RecordField(SmolStr),
@@ -37,6 +40,7 @@ impl FunctionDef {
                 fields.get(&tuple_field(0)).expect("Not a tuple"),
                 &fields[&tuple_field(1)],
             ),
+            (FunctionDef::Scalar(program), cv) => program.eval(&cv),
             (FunctionDef::UnaryOp(op), cv) => apply_unaryop_column(*op, &cv),
             (FunctionDef::RecordField(f), ColumnValue::Records(mut fields)) => fields
                 .remove(f)
@@ -172,6 +176,7 @@ impl std::fmt::Display for FunctionDef {
         match self {
             FunctionDef::UnaryOp(op) => write!(f, "UnaryOp({op:?})"),
             FunctionDef::BinOp(op) => write!(f, "BinOp({})", fmt_binop(op)),
+            FunctionDef::Scalar(program) => write!(f, "Scalar({program})"),
             FunctionDef::RecordField(field) => write!(f, ".{field}"),
             FunctionDef::Insert => write!(f, "insert"),
         }

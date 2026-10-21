@@ -1044,3 +1044,43 @@ fn a_correlated_filter_over_a_collection() {
 fn an_emptied_row_keeps_its_place(#[case] program: &str, #[case] expected: &[i64]) {
     check_tile(program, make_int_list(expected));
 }
+
+/// A conjunction of comparisons against literals compiles to one map over the input column:
+/// the zip of element-wise arms fuses, so nothing fans the input out, pairs a constant with it,
+/// or zips the arms' columns.
+#[test]
+fn a_conjunction_of_element_wise_arms_compiles_to_one_map() {
+    use std::{cell::RefCell, rc::Rc};
+
+    use cambra::ccl::Type;
+    use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
+    use cambra::ccl::load::LoadedProgram;
+    use cambra::interpreter::Consumer;
+
+    let mut ctx = GlobalContext::default();
+    ctx.register_source(Rc::new(RefCell::new(
+        cambra::interpreter::TestDataSource::new(
+            "source1",
+            Type::Base(cambra::ccl::BaseType::Int),
+            cambra::interpreter::Extent::Base(cambra::interpreter::BaseType::Int),
+        ),
+    )));
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let program = LoadedProgram::test("sum([x for x in source1() if x > 500 and x < 1500])");
+    let compiled = compile_program(&mut ctx, &program, consumer).unwrap_or_render(&program);
+    let kinds: Vec<&str> = compiled
+        .operator_graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match node {
+            cambra::interpreter::operator_graph::GraphNode::Operator { kind, .. } => Some(*kind),
+            _ => None,
+        })
+        .collect();
+    for fan_out in ["MapResultToConst", "Memo", "FanOutSlot", "Zip"] {
+        assert!(
+            !kinds.contains(&fan_out),
+            "an element-wise chain over one input needs no {fan_out}, got {kinds:?}"
+        );
+    }
+}

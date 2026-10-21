@@ -4535,12 +4535,12 @@
           "label": "Constant",
           "nodeId": 677,
           "role": "operator",
-          "tiling": "String",
+          "tiling": "(String -> String)",
           "spans": [
             {
               "file": 0,
               "start": 10,
-              "end": 14
+              "end": 21
             }
           ],
           "rewritten": {
@@ -4551,10 +4551,10 @@
           "inputs": []
         },
         {
-          "label": "MapResultToConst",
+          "label": "MapResult",
           "nodeId": 678,
           "role": "operator",
-          "tiling": "Fn(Source(stdin) → {String, String})",
+          "tiling": "Fn(Source(stdin) → String)",
           "spans": [
             {
               "file": 0,
@@ -4580,7 +4580,7 @@
             {
               "role": {
                 "kind": "named",
-                "name": "constant"
+                "name": "fn"
               },
               "kind": "value",
               "deferred": false,
@@ -4589,65 +4589,8 @@
           ]
         },
         {
-          "label": "Constant",
-          "nodeId": 679,
-          "role": "operator",
-          "tiling": "({String, String} -> String)",
-          "spans": [
-            {
-              "file": 0,
-              "start": 10,
-              "end": 21
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.convert"
-          },
-          "inputs": []
-        },
-        {
-          "label": "MapResult",
-          "nodeId": 680,
-          "role": "operator",
-          "tiling": "Fn(Source(stdin) → String)",
-          "spans": [
-            {
-              "file": 0,
-              "start": 10,
-              "end": 21
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.convert"
-          },
-          "inputs": [
-            {
-              "role": {
-                "kind": "named",
-                "name": "input"
-              },
-              "kind": "value",
-              "deferred": false,
-              "subscribed": 678
-            },
-            {
-              "role": {
-                "kind": "named",
-                "name": "fn"
-              },
-              "kind": "value",
-              "deferred": false,
-              "subscribed": 679
-            }
-          ]
-        },
-        {
           "label": "Memo",
-          "nodeId": 681,
+          "nodeId": 679,
           "role": "operator",
           "tiling": "Fn(Source(stdin) → String)",
           "spans": [
@@ -4670,13 +4613,13 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 680
+              "subscribed": 678
             }
           ]
         },
         {
           "label": "FanOutSlot",
-          "nodeId": 689,
+          "nodeId": 685,
           "role": "operator",
           "tiling": "Fn(Source(stdin) → String)",
           "spans": [
@@ -4699,13 +4642,13 @@
               },
               "kind": "share",
               "deferred": false,
-              "subscribed": 681
+              "subscribed": 679
             }
           ]
         },
         {
           "label": "IterateExtent",
-          "nodeId": 682,
+          "nodeId": 680,
           "role": "operator",
           "tiling": "Fn(Source(stdin) → Source(stdin))",
           "spans": [
@@ -4724,7 +4667,7 @@
         },
         {
           "label": "MapResultWithSource",
-          "nodeId": 683,
+          "nodeId": 681,
           "role": "operator",
           "tiling": "Fn(Source(stdin) → String)",
           "spans": [
@@ -4747,72 +4690,15 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 682
+              "subscribed": 680
             }
           ]
         },
         {
           "label": "Constant",
-          "nodeId": 684,
+          "nodeId": 682,
           "role": "operator",
-          "tiling": "String",
-          "spans": [
-            {
-              "file": 0,
-              "start": 61,
-              "end": 64
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.convert"
-          },
-          "inputs": []
-        },
-        {
-          "label": "MapResultToConst",
-          "nodeId": 685,
-          "role": "operator",
-          "tiling": "Fn(Source(stdin) → {String, String})",
-          "spans": [
-            {
-              "file": 0,
-              "start": 54,
-              "end": 64
-            }
-          ],
-          "rewritten": {
-            "via": "Convert",
-            "nature": "machinery",
-            "label": "opconv.convert"
-          },
-          "inputs": [
-            {
-              "role": {
-                "kind": "named",
-                "name": "input"
-              },
-              "kind": "value",
-              "deferred": false,
-              "subscribed": 683
-            },
-            {
-              "role": {
-                "kind": "named",
-                "name": "constant"
-              },
-              "kind": "value",
-              "deferred": false,
-              "subscribed": 684
-            }
-          ]
-        },
-        {
-          "label": "Constant",
-          "nodeId": 686,
-          "role": "operator",
-          "tiling": "({String, String} -> String)",
+          "tiling": "(String -> String)",
           "spans": [
             {
               "file": 0,
@@ -4829,7 +4715,7 @@
         },
         {
           "label": "MapResult",
-          "nodeId": 687,
+          "nodeId": 683,
           "role": "operator",
           "tiling": "Fn(Source(stdin) → String)",
           "spans": [
@@ -4852,7 +4738,7 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 685
+              "subscribed": 681
             },
             {
               "role": {
@@ -4861,13 +4747,13 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 686
+              "subscribed": 682
             }
           ]
         },
         {
           "label": "Memo",
-          "nodeId": 688,
+          "nodeId": 684,
           "role": "operator",
           "tiling": "Fn(Source(stdin) → String)",
           "spans": [
@@ -4890,13 +4776,13 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 687
+              "subscribed": 683
             }
           ]
         },
         {
           "label": "FanOutSlot",
-          "nodeId": 690,
+          "nodeId": 686,
           "role": "operator",
           "tiling": "Fn(Source(stdin) → String)",
           "spans": [
@@ -4919,13 +4805,13 @@
               },
               "kind": "share",
               "deferred": false,
-              "subscribed": 688
+              "subscribed": 684
             }
           ]
         },
         {
           "label": "MakeRecord",
-          "nodeId": 691,
+          "nodeId": 687,
           "role": "operator",
           "tiling": "{Fn(Source(stdin) → String), Fn(Source(stdin) → String)}",
           "spans": [
@@ -4948,7 +4834,7 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 689
+              "subscribed": 685
             },
             {
               "role": {
@@ -4957,13 +4843,13 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 690
+              "subscribed": 686
             }
           ]
         },
         {
           "label": "Sink(main)",
-          "nodeId": 692,
+          "nodeId": 688,
           "role": "sink",
           "tiling": null,
           "spans": [
@@ -4986,7 +4872,7 @@
               },
               "kind": "value",
               "deferred": false,
-              "subscribed": 691
+              "subscribed": 687
             }
           ]
         }
@@ -5749,64 +5635,48 @@
           676
         ],
         [
-          367,
-          678
-        ],
-        [
-          372,
+          376,
           677
         ],
         [
           376,
-          679
-        ],
-        [
-          376,
-          680
+          678
         ],
         [
           405,
-          683
-        ],
-        [
-          429,
-          685
-        ],
-        [
-          435,
-          684
-        ],
-        [
-          438,
-          686
-        ],
-        [
-          438,
-          687
-        ],
-        [
-          441,
-          691
-        ],
-        [
-          442,
-          689
-        ],
-        [
-          443,
-          690
-        ],
-        [
-          444,
-          688
-        ],
-        [
-          445,
           681
         ],
         [
+          438,
+          682
+        ],
+        [
+          438,
+          683
+        ],
+        [
+          441,
+          687
+        ],
+        [
+          442,
+          685
+        ],
+        [
+          443,
+          686
+        ],
+        [
+          444,
+          684
+        ],
+        [
           445,
-          692
+          679
+        ],
+        [
+          445,
+          688
         ],
         [
           560,
@@ -5814,7 +5684,7 @@
         ],
         [
           607,
-          682
+          680
         ]
       ]
     }

@@ -55,6 +55,7 @@ const LIVE: &[&str] = &[
     "arg_beside_fn",
     "binop_operand",
     "body_mut_intro",
+    "body_mut_intro_nested",
     "bool_feed",
     "comp_element",
     "comp_filter",
@@ -84,8 +85,11 @@ const LIVE: &[&str] = &[
     "mut_reads_itself",
     "mut_write_rhs",
     "nested_feed_filter_in_mut_loop",
+    "nested_feed_in_mut_loop",
     "nested_feed_let_filter_in_mut_loop",
+    "nested_loop_feed",
     "nested_mut_over_row",
+    "nested_mut_write_rhs",
     "rec_comp_element",
     "rec_comp_filter",
     "rec_comp_filter_in_loop",
@@ -121,10 +125,17 @@ const LIVE: &[&str] = &[
 /// leaves it undefined. The interpreter's refusal is the answer, so a cell here agrees when the
 /// interpreter refuses, whatever the compiler does
 /// (`undefined_cells_are_refused_by_the_interpreter`).
-const UNDEFINED: &[(&str, &str)] = &[(
-    "max_arg/all_filtered",
-    "`max` of an empty collection is not defined (`docs/chl-spec.md`, \"7.1 Aggregates\")",
-)];
+const UNDEFINED: &[(&str, &str)] = &[
+    (
+        "max_arg/all_filtered",
+        "`max` of an empty collection is not defined (`docs/chl-spec.md`, \"7.1 Aggregates\")",
+    ),
+    (
+        "mut_write_rhs/binder_floordiv_left[acc]",
+        "`acc` is 0 when `100 // acc` first reads it, and division by zero is not defined \
+         (`docs/chl-spec.md`, \"3. Expression semantics\")",
+    ),
+];
 
 /// Whether `cell` is one of the [`UNDEFINED`] cells.
 fn is_undefined(cell: &str) -> bool {
@@ -907,6 +918,22 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "union", ty: Ty::IntColl, needs: &[], decls: "", expr: "[1, 2] ++ [3, 4]" },
         Filler { name: "dup_union", ty: Ty::IntColl, needs: &[], decls: "", expr: "[1, 2] ++ [1, 2]" },
         Filler { name: "map_lit", ty: Ty::IntColl, needs: &[], decls: "", expr: "map([(\"a\", 1), (\"b\", 2)])" },
+        // Element-wise chains over the binder, which the planner fuses into one map. They cover
+        // each side a literal stands on, operations whose operands do not commute, a value read
+        // twice, and a leaf that is not element-wise (`sum`).
+        Filler { name: "binder_sub_right", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "{b} - 7" },
+        Filler { name: "binder_sub_left", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "7 - {b}" },
+        Filler { name: "binder_floordiv_right", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "{b} // 3" },
+        Filler { name: "binder_floordiv_left", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "100 // {b}" },
+        Filler { name: "binder_mul_left", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "3 * {b}" },
+        Filler { name: "binder_literal_chain", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "({b} + 1) * 2 - 3" },
+        Filler { name: "binder_shared_operand", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "{b} * {b} + {b}" },
+        Filler { name: "binder_shared_subterm", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "({b} + 1) * ({b} - 1)" },
+        Filler { name: "binder_plus_aggregate", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "{b} + sum([z2 for z2 in [1, 2]])" },
+        Filler { name: "binder_cmp_left", ty: Ty::Bool, needs: &[Ty::Int], decls: "", expr: "2 < {b}" },
+        Filler { name: "binder_conjunction", ty: Ty::Bool, needs: &[Ty::Int], decls: "", expr: "{b} > 1 and {b} < 3" },
+        Filler { name: "binder_disjunction", ty: Ty::Bool, needs: &[Ty::Int], decls: "", expr: "{b} > 1 and {b} < 3 or {b} == 0" },
+        Filler { name: "binder_negation", ty: Ty::Bool, needs: &[Ty::Int], decls: "", expr: "not ({b} > 1)" },
         Filler { name: "binder_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2]]" },
         Filler { name: "binder_filtered_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2, 3] if z2 > {b}]" },
         Filler { name: "map_arrow", ty: Ty::IntColl, needs: &[], decls: "", expr: "map([\"a\" -> 1, \"b\" -> 2])" },
@@ -919,6 +946,7 @@ fn fillers() -> Vec<Filler> {
         // --- values read out of a record binder
         Filler { name: "rec_binder_field", ty: Ty::Int, needs: &[Ty::Rec], decls: "", expr: "{b}.a" },
         Filler { name: "rec_binder_sum", ty: Ty::Int, needs: &[Ty::Rec], decls: "", expr: "{b}.a + {b}.b" },
+        Filler { name: "rec_binder_chain", ty: Ty::Int, needs: &[Ty::Rec], decls: "", expr: "{b}.a * {b}.b + {b}.a" },
         Filler { name: "rec_binder_in_comp", ty: Ty::Int, needs: &[Ty::Rec], decls: "", expr: "sum([z2 * {b}.a for z2 in [1, 2]])" },
         Filler { name: "rec_binder_cmp", ty: Ty::Bool, needs: &[Ty::Rec], decls: "", expr: "{b}.a > 1" },
         Filler { name: "rec_binder_corr_filter", ty: Ty::Int, needs: &[Ty::Rec], decls: "", expr: "sum([z2 * {b}.a for z2 in [1, 2, 3] if z2 > {b}.b])" },
@@ -928,6 +956,9 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "str_comp", ty: Ty::StrColl, needs: &[], decls: "", expr: "[sz + \"!\" for sz in [\"a\", \"b\"]]" },
         Filler { name: "str_union", ty: Ty::StrColl, needs: &[], decls: "", expr: "[\"a\"] ++ [\"b\"]" },
         Filler { name: "str_binder_concat", ty: Ty::Str, needs: &[Ty::Str], decls: "", expr: "{b} + \"!\"" },
+        Filler { name: "str_binder_concat_left", ty: Ty::Str, needs: &[Ty::Str], decls: "", expr: "\"!\" + {b}" },
+        Filler { name: "str_binder_concat_both", ty: Ty::Str, needs: &[Ty::Str], decls: "", expr: "{b} + \"!\" + {b}" },
+        Filler { name: "str_binder_cmp_greater", ty: Ty::Bool, needs: &[Ty::Str], decls: "", expr: "{b} > \"a\"" },
 
         // --- variants
         Filler { name: "variant_some", ty: Ty::Variant, needs: &[], decls: "", expr: "`some(7)" },
@@ -946,6 +977,8 @@ fn fillers() -> Vec<Filler> {
         // --- reading both binders in scope
         Filler { name: "two_binders", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "{b} + {c}" },
         Filler { name: "two_binders_arith", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "{b} * 10 + {c}" },
+        Filler { name: "two_binders_chain", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "{b} * {c} + 1" },
+        Filler { name: "two_binders_shared", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "({b} + {c}) * ({b} - {c})" },
         Filler { name: "two_binders_in_comp", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "sum([z2 * {b} + {c} for z2 in [1, 2]])" },
         Filler { name: "two_binders_in_filter", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "sum([z2 for z2 in [1, 2, 3] if z2 > {b} - {c}])" },
         Filler { name: "two_binders_ternary", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "({b} if {c} > 1 else {c})" },
