@@ -459,6 +459,11 @@ pub struct LoweringContext {
     /// [`Type::Nominal`] naming its declaration. Declared only at the top level, so never
     /// snapshotted.
     pub(super) nominal_types: Vec<Rc<NominalDecl>>,
+    /// The name of each public method of each public type of the modules lowered so far.
+    /// Linking lowers a module after every module it reaches, so a method call naming none
+    /// of these, and none the module declares or its qualifiers reach, names no method a
+    /// value it holds can have (`nominal::lower_method_call`). Kept across modules.
+    pub(super) reached_methods: HashSet<SmolStr>,
     /// The nominal types other modules declare that the module's `use` names name, by
     /// `use` name: the instance reached, and how the module spells the qualifier its
     /// members' bindings are reached through.

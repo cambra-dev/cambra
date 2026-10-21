@@ -283,10 +283,12 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         lowering.errors.extend(refused);
         let scope = use_names(&scope, qualified);
         let root = uniquify::run_in(chain, &raw_scope(&scope), None);
-        chains
+        let mut program = chains
             .into_iter()
             .rev()
-            .fold(root, |body, chain| fill_module_body(chain, body))
+            .fold(root, |body, chain| fill_module_body(chain, body));
+        add_method_copies(&mut program, &lowering.method_copies, ctx);
+        program
     });
     errors.extend(std::mem::take(&mut lowering.errors));
     // Each `import` reaching a shared import brings its copy in.
@@ -373,6 +375,83 @@ pub(super) struct ProgramLowering<'a> {
     /// ([`ProgramLowering::import_keys`]).
     pub(super) import_checks: HashMap<FileId, Vec<TypeCheck>>,
     pub(super) errors: Vec<LoweringError>,
+    /// Each run's and shared import's copy of each public method of each public type its
+    /// module declares, which a method call reaches wherever the copy is in scope
+    /// ([`add_method_copies`]).
+    pub(super) method_copies: Vec<MethodCopy>,
+}
+
+/// A run's copy of a public method ([`ProgramLowering::method_copies`]).
+#[derive(Clone)]
+pub(super) struct MethodCopy {
+    /// The type, as the instance the run reaches.
+    decl: Rc<crate::ccl::nominal::NominalDecl>,
+    method: SmolStr,
+    /// The number of value parameters it declares after `self`.
+    params: usize,
+    binder: Name,
+    /// The method's declaration, which a reference to the copy is imaged at.
+    declared: Span,
+}
+
+/// Add to each method call in `tree` a candidate for each of `copies` of its method,
+/// after the candidates lowering found. Inference takes a copy only where its binding is
+/// in scope ([`crate::ccl::MethodCandidate::copy`]), which reaches a type whose module the
+/// calling module neither imports nor runs (`docs/chl-spec.md`, "Associated functions and
+/// methods").
+pub(super) fn add_method_copies(tree: &mut Expr, copies: &[MethodCopy], ctx: &mut LoweringContext) {
+    if copies.is_empty() {
+        return;
+    }
+    if let TypedExprNode::Method {
+        name, candidates, ..
+    } = &mut tree.node
+    {
+        for copy in copies.iter().filter(|c| c.method == name.as_str()) {
+            let function = ctx.tag_machinery(
+                Expr::var(copy.binder.clone()),
+                copy.declared,
+                "link.method_copy",
+            );
+            candidates.push(crate::ccl::MethodCandidate {
+                decl: Rc::clone(&copy.decl),
+                params: copy.params,
+                function,
+                copy: true,
+            });
+        }
+    }
+    tree.walk_children_mut(|child| add_method_copies(child, copies, ctx));
+}
+
+/// The copy `binder` is of a public method of a public type `interface` declares, if it is
+/// one, with the type as the instance the run's `defaults` and `arguments` reach.
+fn method_copy(
+    interface: &Interface,
+    binder: &Name,
+    defaults: &HashMap<TypeParamId, Type>,
+    arguments: &HashMap<TypeParamId, Type>,
+) -> Option<MethodCopy> {
+    let (ty, method) = binder.base().split_once("::")?;
+    let member = interface.nominal.get(ty).filter(|member| member.public)?;
+    let (params, declared) = match member.functions.get(method) {
+        Some(function) if function.public && function.is_method => {
+            (function.arity - 1, function.declared)
+        }
+        Some(_) => return None,
+        None if method == "extract" && member.decl.declares_extract => (0, member.declared),
+        None => return None,
+    };
+    let mut decl = Rc::clone(&member.decl);
+    substitute_decl(&mut decl, defaults);
+    substitute_decl(&mut decl, arguments);
+    Some(MethodCopy {
+        decl,
+        method: method.into(),
+        params,
+        binder: binder.clone(),
+        declared,
+    })
 }
 
 /// The arguments a run is created with ([`ProgramLowering::create`]).
@@ -459,6 +538,7 @@ impl<'a> ProgramLowering<'a> {
             checking: false,
             import_checks: HashMap::new(),
             errors: Vec::new(),
+            method_copies: Vec::new(),
         }
     }
 
@@ -533,6 +613,7 @@ impl<'a> ProgramLowering<'a> {
             ctx,
             unimportable,
         );
+        ctx.reached_methods.extend(interface.public_methods());
         Some(LoweredModule {
             chain,
             interface: Rc::new(interface),
@@ -909,6 +990,9 @@ impl<'a> ProgramLowering<'a> {
             // whose binders carry that run's home.
             if name.home() == home.as_ref() {
                 names.insert(QualifiedName::new(name.base()), name.clone());
+                if let Some(copy) = method_copy(&lowered.interface, name, &defaults, &arguments) {
+                    self.method_copies.push(copy);
+                }
             }
         }
         // A member bound to a module reaches what that module does, so a Module

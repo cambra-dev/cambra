@@ -220,6 +220,10 @@ impl Typing for CheckCtx {
         0
     }
 
+    fn binds(&self, _: &Name) -> bool {
+        false
+    }
+
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
         // Recurse to collect the child's own errors, then hand back its
         // *recorded* type (not the rule-derived, throwaway-laden one) so the
