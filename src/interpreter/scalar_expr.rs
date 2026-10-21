@@ -319,7 +319,7 @@ impl Parser {
         };
         let name = match key {
             ProjKey::Index(i) => tuple_field(*i),
-            ProjKey::Field(name) => name.clone(),
+            ProjKey::Field(name) => name.runtime_key(),
         };
         let field = extent.record_fields()?.get(&name)?.clone();
         path.push(name);
@@ -378,14 +378,15 @@ impl Parser {
         }
     }
 
-    /// The slot a chain ending at `v` yields. A product ends as a tile of its fields rather
-    /// than as one column, which a column function cannot build, so a product has none.
+    /// The slot a chain ending at `v` yields. A projection of the input is nothing to compute,
+    /// whatever its path: the projection's own conversion takes the field without copying it, and
+    /// the prefix ends at an operation, so an `Input` is emitted only for an operation that reads
+    /// it. A product ends as a tile of its fields rather than as one column, which a column
+    /// function cannot build, so a product has none.
     fn root_of(&mut self, v: &Val) -> Option<(Slot, Extent)> {
         match v {
-            // The input itself: nothing to compute.
-            Val::Read(path, _) if path.is_empty() => None,
-            Val::Read(..) | Val::Slot(..) => self.column(v),
-            Val::Tuple(_) => None,
+            Val::Slot(..) => self.column(v),
+            Val::Read(..) | Val::Tuple(_) => None,
         }
     }
 }
@@ -861,5 +862,61 @@ mod tests {
             assert_eq!(pointer(&out), result, "block at {start}");
         }
         assert_eq!(out.len(), total);
+    }
+
+    /// `{name: inner}`.
+    fn record_of(name: &str, inner: Extent) -> Extent {
+        Extent::Record([(SmolStr::from(name), inner)].into_iter().collect())
+    }
+
+    /// A chain of projections alone computes nothing, whatever its length or how it is grouped,
+    /// so the prefix ends at an operation and no `Input` is read for nothing.
+    #[test]
+    fn a_chain_of_projections_alone_is_not_fused() {
+        let ab = record_of("a", record_of("b", int()));
+        let abc = record_of("a", record_of("b", record_of("c", int())));
+        let field = Expr::proj_field;
+        assert!(fuse_prefix(&[field("a"), field("b")], &ab).is_none());
+        assert!(fuse_prefix(&[field("a"), field("b"), field("c")], &abc).is_none());
+        let composed = Expr::compose(vec![field("a"), field("b"), field("c")]);
+        assert!(fuse_prefix(&[composed], &abc).is_none());
+    }
+
+    /// Equal chains give equal programs: projections read as separate elements and as one
+    /// composition, followed by an operation, are one `Input` and the operation, with no
+    /// instruction for the intermediate path.
+    #[test]
+    fn equal_chains_of_projections_give_equal_programs() {
+        let abc = record_of("a", record_of("b", record_of("c", int())));
+        let field = Expr::proj_field;
+        let times_two = || {
+            vec![
+                zip(vec![id(), constant(2)]),
+                binop(BinOpKind::Arithmetic(ArithmeticKind::Mul)),
+            ]
+        };
+        let separate = [vec![field("a"), field("b"), field("c")], times_two()].concat();
+        let composed = [
+            vec![Expr::compose(vec![field("a"), field("b"), field("c")])],
+            times_two(),
+        ]
+        .concat();
+        let separate = fuse_prefix(&separate, &abc).expect("an operation follows the projections");
+        let composed = fuse_prefix(&composed, &abc).expect("an operation follows the projections");
+        assert_eq!(separate.program, composed.program);
+        let inputs = |fused: &Fused| {
+            fused
+                .program
+                .instrs
+                .iter()
+                .filter(|i| matches!(i, Instr::Input { .. }))
+                .count()
+        };
+        assert_eq!(inputs(&separate), 1, "only the full path is read");
+        assert_eq!(
+            separate.program.instrs.len(),
+            3,
+            "the read, the constant, the product"
+        );
     }
 }

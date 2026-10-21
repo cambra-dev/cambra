@@ -1886,6 +1886,10 @@ fn convert_impl_inner(
                     .and_then(|input| fusable_prefix(rest, input.tiling(), ctx.level()))
                 {
                     let input = result.take().expect("fusable_prefix read an input");
+                    // The map replaces the chain up to its last element, whose result it
+                    // yields, so that element is the expression it belongs to.
+                    let _scope =
+                        crate::ccl::provenance::converting(rest[fused.consumed - 1].node_id());
                     result = Some(apply_scalar_expr(
                         input,
                         fused.program,

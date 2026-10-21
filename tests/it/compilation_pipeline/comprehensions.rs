@@ -1054,7 +1054,7 @@ fn a_conjunction_of_element_wise_arms_compiles_to_one_map() {
 
     use cambra::ccl::Type;
     use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
-    use cambra::chl_parser::SourceMap;
+    use cambra::ccl::load::LoadedProgram;
     use cambra::interpreter::Consumer;
 
     let mut ctx = GlobalContext::default();
@@ -1066,11 +1066,8 @@ fn a_conjunction_of_element_wise_arms_compiles_to_one_map() {
         ),
     )));
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single(
-        "<test>",
-        "sum([x for x in source1() if x > 500 and x < 1500])",
-    );
-    let compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
+    let program = LoadedProgram::test("sum([x for x in source1() if x > 500 and x < 1500])");
+    let compiled = compile_program(&mut ctx, &program, consumer).unwrap_or_render(&program);
     let kinds: Vec<&str> = compiled
         .operator_graph
         .nodes()
