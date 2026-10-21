@@ -2012,10 +2012,16 @@ where
                     },
                 )))
             });
-        // An associated type is its capitalized name alone: it is a type the instance defines,
-        // as an alias, not a nominal type a `type` declaration introduces.
-        let trait_item = choice((binder.map(TraitItem::AssocType), fn_signature))
-            .then_ignore(just(Token::Newline));
+        // An associated type is its capitalized name, alone or bounded, `Size <: Int`: it is a
+        // type the instance defines, as an alias, not a nominal type a `type` declaration
+        // introduces.
+        let trait_item = choice((
+            binder
+                .then(just(Token::LtColon).ignore_then(expr.clone()).or_not())
+                .map(|(name, bound)| TraitItem::AssocType { name, bound }),
+            fn_signature,
+        ))
+        .then_ignore(just(Token::Newline));
         let trait_stmt = just(Token::Trait)
             .ignore_then(binder)
             .then(
@@ -2042,7 +2048,7 @@ where
                 let heads = std::iter::once((&name, "trait name"))
                     .chain(params.iter().map(|p| (p, "trait operand")))
                     .chain(items.iter().filter_map(|i| match i {
-                        TraitItem::AssocType(a) => Some((a, "associated type")),
+                        TraitItem::AssocType { name, .. } => Some((name, "associated type")),
                         TraitItem::Function(_) => None,
                     }));
                 for (head, what) in heads {
@@ -3097,7 +3103,10 @@ mod tests {
         assert_eq!(decl.params.len(), 1);
         assert_eq!(requirement_binder(&decl.requires[0].node), Some("e"));
         let [
-            TraitItem::AssocType(elem),
+            TraitItem::AssocType {
+                name: elem,
+                bound: None,
+            },
             TraitItem::Function(first),
             TraitItem::Function(tag),
         ] = decl.items.as_slice()

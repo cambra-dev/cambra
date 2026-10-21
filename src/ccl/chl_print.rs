@@ -142,6 +142,7 @@ impl Printer {
 
     /// `forall (T, U <: B) V requires …`.
     fn poly(&mut self, poly: &PolyType) -> String {
+        let poly = &poly.with_member_names();
         let params: Vec<String> = poly
             .params
             .iter()

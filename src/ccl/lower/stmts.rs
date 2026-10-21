@@ -1994,7 +1994,7 @@ pub(super) fn declare_type_params(
 /// Lower the kind of type parameter `tp`, the first of `unopened`: `Type` when it has no
 /// annotation, and `SubtypesOf(𝐵)` for a bound `<: 𝐵` or a kind `: SubtypesOf(𝐵)`
 /// (`docs/chl-spec.md`, "Kinds and bounds"). Every other kind is refused.
-fn lower_kind(
+pub(super) fn lower_kind(
     tp: &TypeParam,
     unopened: &[TypeParam],
     ctx: &mut LoweringContext,
@@ -2097,8 +2097,8 @@ fn lower_bound(
 /// instance").
 pub(crate) type NamedRequirement = (SmolStr, Rc<crate::ccl::ty::TraitRequirement>);
 
-/// [`lower_named_requirements`] for a clause that names none of its requirements: a
-/// polymorphic type's, and a trait function's signature's.
+/// [`lower_named_requirements`] for a clause that names none of its requirements: an instance
+/// function's restatement of its trait's.
 pub(super) fn lower_requirements(
     requires: &[Spanned<Requirement>],
     ctx: &mut LoweringContext,
@@ -2129,10 +2129,16 @@ pub(super) fn lower_requirements(
 /// alone or with the other operands' bases, is refused here, since no use could
 /// satisfy it. A requirement on bases only states nothing about a parameter: it is
 /// checked against the table and dropped. A named requirement is named as written, at
-/// the types the clause writes.
+/// the types the clause writes, its associated types read as below.
 ///
 /// A requirement states nothing of what its trait requires of every instance
 /// (`docs/chl-spec.md`, "Declaring a trait").
+///
+/// `members` are the type parameters of the definition the clause belongs to, where it
+/// belongs to one that binds parameters (a `def`, a `forall`, an instance's head, a trait
+/// function's signature): the clause adds a member parameter for each associated type a
+/// requirement names, and for each one its trait bounds ([`lower_requirement_item`]). Without
+/// `members`, a clause reads no associated type.
 pub(super) fn lower_named_requirements(
     requires: &[Spanned<Requirement>],
     mut members: Option<&mut Vec<crate::ccl::ty::PolyParam>>,
@@ -2184,7 +2190,9 @@ fn check_bounds_satisfiable(
             let Some(bound) = declared.bound() else {
                 continue;
             };
-            if !is_closed(bound) {
+            // The collection rule answers a type parameter with whatever collection it is.
+            if !is_closed(bound) || (r.trait_.reads_collections() && !r.args.iter().all(is_closed))
+            {
                 continue;
             }
             let met = instances.instances(&r.trait_).iter().any(|row| {
@@ -2247,19 +2255,43 @@ fn lower_requirement_item(
                         format!("`{}` names two requirements of this clause", binder.node),
                     ));
                 }
-                if let Some(members) = members {
-                    for assoc in stated.trait_.assocs() {
-                        let param = crate::ccl::ty::TypeParam::declared(
-                            format!("{}::{}", binder.node, assoc.name()).as_str(),
-                        );
-                        members.push(crate::ccl::ty::PolyParam {
-                            param: Rc::clone(&param),
-                            kind: crate::ccl::ty::TypeKind::Type,
-                            bound_at: None,
-                        });
-                        stated.assoc.push((assoc, Type::Param(param)));
+            }
+            // A named requirement's associated types are the definition's member parameters,
+            // and so is each one an unnamed requirement's trait bounds, which the body reads
+            // through that bound: a loop over a parameter `Iterable` holds of reads its
+            // `Elements` as a collection. A bound may name a sibling the trait leaves
+            // unbounded, which is then a member too, so the bound names no parameter of the
+            // trait's own.
+            if let Some(members) = members {
+                let trait_ = &stated.trait_;
+                let mut in_bounds = HashSet::new();
+                for assoc in trait_.assocs() {
+                    if let Some(bound) = trait_.assoc_bound(&assoc) {
+                        collect_params(bound, &mut in_bounds);
                     }
                 }
+                for assoc in trait_.assocs() {
+                    let read_through_a_bound = trait_.assoc_bound(&assoc).is_some()
+                        || trait_
+                            .assoc_param(&assoc)
+                            .is_some_and(|p| in_bounds.contains(&p.id));
+                    if binder.is_none() && !read_through_a_bound {
+                        continue;
+                    }
+                    let owner = binder.as_ref().map_or("_", |b| b.node.as_str());
+                    let param = crate::ccl::ty::TypeParam::declared(
+                        format!("{owner}::{}", assoc.name()).as_str(),
+                    );
+                    members.push(crate::ccl::ty::PolyParam {
+                        param: Rc::clone(&param),
+                        kind: crate::ccl::ty::TypeKind::Type,
+                        bound_at: None,
+                    });
+                    stated.assoc.push((assoc, Type::Param(param)));
+                }
+                bound_members_by_their_trait(&stated, members);
+            }
+            if let Some(binder) = binder {
                 let stated = Rc::new(stated.clone());
                 named.push((binder.node.clone(), Rc::clone(&stated)));
                 ctx.named_requirements.push((binder.node.clone(), stated));
@@ -2322,6 +2354,16 @@ fn lower_requirement_item(
                 ));
             }
             let ty = lower_type_expr(bound, ctx)?;
+            // A hole in the bound is a parameter of the definition, before the member it bounds.
+            let at = members
+                .iter()
+                .position(|d| d.param.id == param.id)
+                .expect("the member is declared");
+            let ty = holes_to_params(&ty, param, members, at);
+            let slot = members
+                .iter_mut()
+                .find(|d| d.param.id == param.id)
+                .expect("the member is still declared");
             slot.kind = crate::ccl::ty::TypeKind::SubtypesOf(Box::new(ty));
             slot.bound_at = Some(bound.span);
             Ok(())
@@ -2377,6 +2419,79 @@ pub(super) fn lower_trait_type(
         assoc: Vec::new(),
         at: Some(span),
     })
+}
+
+/// `ty`, the bound on the member `bounded`, with each hole a fresh parameter of the definition,
+/// inserted into `params` at `at` in the order the holes occur, so a parameter bounded by `ty`
+/// can follow them.
+///
+/// A parameter minted for a hole is spelled `_𝑛 of 𝑚`, the hole's place among the bound's holes
+/// and the member it bounds, so a diagnostic names where a type no program wrote comes from.
+fn holes_to_params(
+    ty: &Type,
+    bounded: &crate::ccl::ty::TypeParam,
+    params: &mut Vec<crate::ccl::ty::PolyParam>,
+    at: usize,
+) -> Type {
+    fn go(ty: &Type, fresh: &mut Vec<crate::ccl::ty::PolyParam>, bounded: &str) -> Type {
+        if matches!(ty, Type::Hole) {
+            let spelling = format!("_{} of {bounded}", fresh.len() + 1);
+            let param = crate::ccl::ty::TypeParam::declared(spelling.as_str());
+            fresh.push(crate::ccl::ty::PolyParam {
+                param: Rc::clone(&param),
+                kind: crate::ccl::ty::TypeKind::Type,
+                bound_at: None,
+            });
+            return Type::Param(param);
+        }
+        let mut out = ty.clone();
+        out.walk_children_mut(|c| *c = go(c, fresh, bounded));
+        out
+    }
+    let mut fresh = Vec::new();
+    let out = go(ty, &mut fresh, &bounded.spelling);
+    let at = at.min(params.len());
+    params.splice(at..at, fresh);
+    out
+}
+
+/// Bound each member parameter `requirement` gives an associated type its trait declares
+/// with a bound by that bound, at the requirement's operands and associated types: what a
+/// definition reads of the type until its clause bounds it otherwise (`docs/chl-spec.md`,
+/// "Declaring a trait"). The bound's holes are parameters of the definition, placed before the
+/// member they bound, so every bound names only parameters opened before it.
+fn bound_members_by_their_trait(
+    requirement: &crate::ccl::ty::TraitRequirement,
+    members: &mut Vec<crate::ccl::ty::PolyParam>,
+) {
+    use crate::ccl::ty::TypeKind;
+    let trait_ = &requirement.trait_;
+    let mut at: HashMap<crate::ccl::ty::TypeParamId, Type> = trait_
+        .operand_params()
+        .iter()
+        .zip(&requirement.args)
+        .map(|(p, t)| (p.id, t.clone()))
+        .collect();
+    for (name, ty) in &requirement.assoc {
+        if let Some(p) = trait_.assoc_param(name) {
+            at.insert(p.id, ty.clone());
+        }
+    }
+    for (name, ty) in &requirement.assoc {
+        let (Some(bound), Type::Param(member)) = (trait_.assoc_bound(name), ty) else {
+            continue;
+        };
+        let Some(i) = members.iter().position(|d| d.param.id == member.id) else {
+            continue;
+        };
+        let bound = crate::ccl::infer::solver::traits::replace_params(bound, &at);
+        let bound = holes_to_params(&bound, member, members, i);
+        let i = members
+            .iter()
+            .position(|d| d.param.id == member.id)
+            .expect("the bounded member is still declared");
+        members[i].kind = TypeKind::SubtypesOf(Box::new(bound));
+    }
 }
 
 /// Whether `ty` may stand at a requirement's position: a type parameter in scope, a base
@@ -2444,24 +2559,28 @@ pub(super) fn check_pending_requirements(ctx: &mut LoweringContext) -> Vec<Lower
 }
 
 /// Whether some instance of `trait_` can satisfy the requirement: its head and the associated
-/// types it fixes unify with the requirement's, so some types are an instance of both.
+/// types it fixes unify with the requirement's, so some types are an instance of both. The
+/// collection rule is a candidate beside the rows ([`Trait::collection_rule_admits`]).
+///
+/// [`Trait::collection_rule_admits`]: crate::ccl::infer::solver::traits::Trait::collection_rule_admits
 fn requirement_satisfiable(
     trait_: &crate::ccl::infer::solver::traits::Trait,
     args: &[Type],
     assoc: &[(crate::ccl::infer::solver::traits::Assoc, Type)],
     instances: &crate::ccl::infer::solver::traits::InstanceTable,
 ) -> bool {
-    instances.instances(trait_).iter().any(|row| {
-        let mut stated = row.operands.clone();
-        let mut wanted = args.to_vec();
-        for (name, t) in assoc {
-            if let Some(accepted) = row.assoc_ty(name) {
-                stated.push(accepted);
-                wanted.push(t.clone());
+    trait_.collection_rule_admits(args, assoc)
+        || instances.instances(trait_).iter().any(|row| {
+            let mut stated = row.operands.clone();
+            let mut wanted = args.to_vec();
+            for (name, t) in assoc {
+                if let Some(accepted) = row.assoc_ty(name) {
+                    stated.push(accepted);
+                    wanted.push(t.clone());
+                }
             }
-        }
-        crate::ccl::infer::solver::traits::unify_all(&stated, &wanted)
-    })
+            crate::ccl::infer::solver::traits::unify_all(&stated, &wanted)
+        })
 }
 
 /// The error for a requirement no instance satisfies, at `span`.

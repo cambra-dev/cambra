@@ -2058,3 +2058,282 @@ fn a_nominal_elements_is_refused_at_the_instance() {
         "`Elements = Bag` in `impl Iterable(Wrap)` is a nominal type",
     );
 }
+
+/// A requirement of `Iterable` reads its bounded `Elements` through the definition's type
+/// parameters: a hole in it, or `Elements` left unnamed, is a parameter of the definition, so a
+/// loop over the operand types inside the body (`docs/chl-spec.md`, "Trait requirements").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::named_by_its_values(
+    indoc! {"
+        def largest(C, T, c: C) => T requires r: Iterable(C), r::Elements <: _ |=> T, Orderable(T, T):
+            max([x for x in c])
+        largest(Bag::new(box([1, 2, 3]))) + largest([4, 5])
+    "},
+    8
+)]
+#[case::named_by_a_value_type(
+    indoc! {"
+        def total(C, c: C) => Int requires r: Iterable(C), r::Elements <: _ |=> Int:
+            sum([x for x in c])
+        total(Bag::new(box([1, 2, 3]))) + total([4, 5])
+    "},
+    15
+)]
+#[case::named_by_a_collection_type(
+    indoc! {"
+        def total(C, c: C) => Int requires r: Iterable(C), r::Elements <: List(Int):
+            sum([x for x in c])
+        total(Bag::new(box([1, 2, 3])))
+    "},
+    6
+)]
+#[case::named_with_the_traits_bound(
+    indoc! {"
+        def count(C, c: C) => Int requires r: Iterable(C):
+            sum([1 for x in c])
+        count([4, 5]) + count(box([1, 2, 3]))
+    "},
+    5
+)]
+#[case::unnamed(
+    indoc! {"
+        def count(C, c: C) => Int requires Iterable(C):
+            sum([1 for x in c])
+        count([4, 5]) + count(box([1, 2, 3]))
+    "},
+    5
+)]
+#[case::returned_boxed(
+    indoc! {"
+        def doubled(C, T, c: C) => Collection(T) requires r: Iterable(C), r::Elements <: _ |=> T, s: Addable(T, T), s::Output <: T:
+            box([x + x for x in c])
+        sum([y for y in doubled([1, 2])])
+    "},
+    6
+)]
+#[case::a_hole_in_a_forall_annotation(
+    indoc! {"
+        total: forall (C) C => Int requires r: Iterable(C), r::Elements <: _ |=> Int = \\c -> sum([x for x in c])
+        total(Bag::new(box([1, 2, 3]))) + total([4, 5])
+    "},
+    15
+)]
+fn a_requirement_reads_iterables_elements(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(&format!("{BAG}\n{code}"), Value::Int(expected));
+}
+
+/// A trait whose associated type is bounded, and an instance of it.
+const MEASURED: &str = indoc! {"
+    trait Measured(T):
+        Size <: Int
+        def size(t: T) => Size
+    type Box2 = Int
+    impl Measured(Box2):
+        Size = Int
+        def size(t):
+            t.extract()
+"};
+
+/// A trait's associated type may be bounded, and a requirement leaving it unnamed gets a
+/// parameter with the bound (`docs/chl-spec.md`, "Declaring a trait").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::through_the_instance("summon(Measured(_))::size(Box2::new(4)) + 1", 5)]
+#[case::through_an_unnamed_bounded_type(
+    indoc! {"
+        def grown(T, t: T) => Int requires Measured(T):
+            summon(Measured(_))::size(t) + 1
+        grown(Box2::new(4))
+    "},
+    5
+)]
+#[case::through_a_named_requirement(
+    indoc! {"
+        def grown(T, t: T) => Int requires m: Measured(T):
+            m::size(t) + 1
+        grown(Box2::new(4))
+    "},
+    5
+)]
+fn a_bounded_associated_type_is_its_bound_where_unnamed(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(&format!("{MEASURED}\n{code}"), Value::Int(expected));
+}
+
+/// What a bounded associated type refuses, and where.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::an_instance_of_another_form(
+    indoc! {"
+        type Bad = Int
+        impl Iterable(Bad):
+            Elements = Int
+            def elements(b):
+                b.extract()
+        1
+    "},
+    "`Elements` is declared `Elements <: _ |=> _` in `trait Iterable`, and `Int` is not below"
+)]
+#[case::an_instance_of_another_base(
+    indoc! {"
+        trait Measured(T):
+            Size <: Int
+            def size(t: T) => Size
+        type Box2 = Int
+        impl Measured(Box2):
+            Size = String
+            def size(t):
+                \"a\"
+        1
+    "},
+    "`Size` is declared `Size <: Int` in `trait Measured`, and `String` is not below `Int`"
+)]
+// An instance's choice states no refinement, so it is below no refined bound.
+#[case::an_unrefined_instance_of_a_refined_bound(
+    indoc! {"
+        trait Measured(T):
+            Size <: {Int where _ > 0}
+            def size(t: T) => Size
+        type Box2 = Int
+        impl Measured(Box2):
+            Size = Int
+            def size(t):
+                t.extract()
+        1
+    "},
+    "`Size` is declared `Size <: {Int where _ > 0}` in `trait Measured`, and `Int` is not below"
+)]
+#[case::a_bound_in_a_trait_signature(
+    indoc! {"
+        trait Summed(C):
+            def total(c: C) => Int requires r: Iterable(C), r::Elements <: _ |=> Int
+        1
+    "},
+    "a trait function's type parameters take no bound yet"
+)]
+#[case::a_loop_needing_more_than_stated(
+    indoc! {"
+        def largest(C, T, c: C) => T requires r: Iterable(C), r::Elements <: _ |=> T:
+            max([x for x in c])
+        largest([1])
+    "},
+    "No requirement states that `T` is Orderable"
+)]
+#[case::a_bound_naming_an_operand(
+    indoc! {"
+        trait Conv(T):
+            Out <: T
+            def conv(t: T) => Out
+        type W = Int
+        impl Conv(W):
+            Out = String
+            def conv(w):
+                \"x\"
+        1
+    "},
+    "`Out` is declared `Out <: T` in `trait Conv`, which is `Out <: W` in `impl Conv(W)`, and \
+     `String` is not below `W`"
+)]
+#[case::a_bound_naming_a_sibling(
+    indoc! {"
+        trait Two(T):
+            A
+            B <: A
+            def b(t: T) => B
+        type Box2 = Int
+        impl Two(Box2):
+            A = Int
+            B = String
+            def b(t):
+                \"x\"
+        summon(Two(_))::b(Box2::new(1))
+    "},
+    "`B` is declared `B <: A` in `trait Two`, which is `B <: Int` in `impl Two(Box2)`, and \
+     `String` is not below `Int`"
+)]
+// A data function's domain is invariant.
+#[case::a_data_domain_wider_than_its_bound(
+    indoc! {"
+        trait Keyed(T):
+            Rows <: {Int where _ > 0} |=> Int
+            def rows(t: T) => Rows
+        type Box2 = Int
+        impl Keyed(Box2):
+            Rows = Int |=> Int
+            def rows(t):
+                [t.extract()]
+        1
+    "},
+    "and `Int |=> Int` is not below `{Int where _ > 0} |=> Int`"
+)]
+#[case::a_bound_naming_its_own_type(
+    indoc! {"
+        trait Sized(T):
+            Size <: List(Size)
+            def size(t: T) => Size
+        1
+    "},
+    "the bound on `Size` names `Size` itself"
+)]
+fn a_bounded_associated_type_refuses(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}
+
+/// A compute function's domain is contravariant, so a choice accepting more than its bound's
+/// domain is below the bound.
+#[test]
+fn a_compute_choice_may_accept_more_than_its_bound() {
+    check_scalar(
+        indoc! {"
+            trait Applied(T):
+                F <: {Int where _ > 0} => Int
+                def f(t: T) => F
+            type Box2 = Int
+            impl Applied(Box2):
+                F = Int => Int
+                def f(t):
+                    \\x -> x + t.extract()
+            g = summon(Applied(_))::f(Box2::new(1))
+            g(2)
+        "},
+        Value::Int(3),
+    );
+}
+
+/// An unnamed requirement gives a member parameter to an unbounded associated type a sibling's
+/// bound names, so the bound reads the definition's parameter, not the trait's.
+#[test]
+fn an_unnamed_requirement_reads_a_sibling_its_bound_names() {
+    check_scalar(
+        indoc! {"
+            trait Two(T):
+                A
+                B <: A
+                def b(t: T) => B
+            type Box2 = Int
+            impl Two(Box2):
+                A = Int
+                B = Int
+                def b(t):
+                    t.extract()
+            def g(T, t: T) => Int requires Two(T):
+                1
+            g(Box2::new(1))
+        "},
+        Value::Int(1),
+    );
+}
+
+/// A parameter standing for a hole in an associated type's bound is spelled by the member it
+/// bounds, so a diagnostic about it names where it comes from.
+#[test]
+fn a_hole_in_a_bound_is_spelled_by_its_member() {
+    check_compile_error(
+        indoc! {"
+            def first(C, c: C) => String requires Iterable(C):
+                sum([x for x in c])
+            1
+        "},
+        "of _::Elements",
+    );
+}

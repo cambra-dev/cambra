@@ -243,7 +243,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
     let mut operands: Vec<Rc<TypeParam>> = Vec::new();
     let mut assocs: Vec<(Assoc, Rc<TypeParam>)> = Vec::new();
     let assoc_names = decl.items.iter().filter_map(|i| match i {
-        TraitItem::AssocType(a) => Some(a),
+        TraitItem::AssocType { name, .. } => Some(name),
         TraitItem::Function(_) => None,
     });
     for (n, is_operand) in decl
@@ -284,6 +284,39 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
             assocs.push((Assoc::Declared(n.node.clone()), param));
         }
     }
+    // Each associated type's bound, written as a type parameter's kind is. It may name the
+    // operands and the other associated types, all in scope by now, but not the type it
+    // bounds.
+    let mut assoc_bounds: Vec<(Assoc, Type)> = Vec::new();
+    for item in &decl.items {
+        let TraitItem::AssocType {
+            name: n,
+            bound: Some(bound),
+        } = item
+        else {
+            continue;
+        };
+        let assoc = Assoc::Declared(n.node.clone());
+        let lowered = lower_type_expr(bound, ctx)?;
+        let own = assocs
+            .iter()
+            .find(|(a, _)| *a == assoc)
+            .map(|(_, p)| p.id)
+            .expect("every associated type has a parameter");
+        let mut named = HashSet::new();
+        collect_params(&lowered, &mut named);
+        if named.contains(&own) {
+            return Err(LoweringError::unsupported(
+                bound.span,
+                format!(
+                    "the bound on `{}` names `{}` itself; a bound names the operands and the \
+                     other associated types",
+                    n.node, n.node
+                ),
+            ));
+        }
+        assoc_bounds.push((assoc, lowered));
+    }
     // What every instance requires of the trait's types: requirements of the traits declared
     // above it.
     let (requires, named) = lower_named_requirements(&decl.requires, None, ctx)?;
@@ -314,6 +347,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         span: name.span,
         operands,
         assocs,
+        assoc_bounds,
         functions,
         requires,
         named,
@@ -562,6 +596,53 @@ pub(super) fn declare_instances(
     errors
 }
 
+/// Whether `ty`, an instance's choice of an associated type, is below `bound`, the trait's bound
+/// on it, as far as their forms decide: a function where `bound` is one of its kind, through the
+/// domain by its kind's variance and the codomain; the base or nominal type `bound` is; a type
+/// of the form `bound` has. A hole or a type variable on either side could be anything. A
+/// refinement `bound` states is one `ty` must state, so an unrefined `ty` is below a refined
+/// `bound` in no case.
+fn may_be_below(ty: &Type, bound: &Type) -> bool {
+    use crate::ccl::FunKind;
+    if matches!(bound, Type::Refinement(..)) && !matches!(ty, Type::Refinement(..)) {
+        return false;
+    }
+    let (ty, bound) = (ty.peel_refinements(), bound.peel_refinements());
+    match (ty, bound) {
+        (Type::Hole | Type::Param(_), _) | (_, Type::Hole | Type::Param(_)) => true,
+        (
+            Type::Fun {
+                fun_kind: k0,
+                domain: d0,
+                codomain: c0,
+                ..
+            },
+            Type::Fun {
+                fun_kind: k1,
+                domain: d1,
+                codomain: c1,
+                ..
+            },
+        ) => {
+            // A compute function's domain is contravariant, and a data function's invariant
+            // (`src/ccl/design/type-inference.md`, "Data domains are invariant").
+            let data = |k: &FunKind| !matches!(k, FunKind::Compute);
+            let domains = if data(k0) {
+                may_be_below(d0, d1) && may_be_below(d1, d0)
+            } else {
+                may_be_below(d1, d0)
+            };
+            data(k0) == data(k1) && domains && may_be_below(c0, c1)
+        }
+        (Type::Base(a), Type::Base(b)) => a == b,
+        (Type::Nominal(d, xs), Type::Nominal(e, ys)) => {
+            d == e && xs.iter().zip(ys).all(|(x, y)| may_be_below(x, y))
+        }
+        // Two types of different forms: no value of one is a value of the other.
+        (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
+}
+
 /// A trait at its operands, `Container(Bag(T))`, for diagnostics: an instance's head, or a
 /// requirement.
 fn head_spelling(trait_: &Trait, operands: &[Type]) -> String {
@@ -741,6 +822,47 @@ fn declare_instance(
             ));
         }
         assoc.push((name, ty));
+    }
+    // An instance's choice is below the associated type's bound, at the instance's operands
+    // and its other choices, which the bound may name. A type variable of the instance is
+    // inference's question wherever the instance is used; a choice of another form than the
+    // bound has no use that could satisfy it.
+    let mut at: HashMap<TypeParamId, Type> = trait_
+        .operand_params()
+        .iter()
+        .zip(&operands)
+        .map(|(p, t)| (p.id, t.clone()))
+        .collect();
+    for (name, ty) in &assoc {
+        if let Some(p) = trait_.assoc_param(name) {
+            at.insert(p.id, ty.clone());
+        }
+    }
+    for ((name, ty), a) in assoc.iter().zip(&block.assoc) {
+        let Some(declared) = trait_.assoc_bound(name) else {
+            continue;
+        };
+        let bound = replace_params(declared, &at);
+        if !may_be_below(ty, &bound) {
+            let chl = crate::ccl::chl_print::chl_type;
+            let (declared, bound) = (chl(declared), chl(&bound));
+            let here = if declared == bound {
+                String::new()
+            } else {
+                format!(
+                    ", which is `{name} <: {bound}` in `impl {}`",
+                    head_spelling(&trait_, &operands)
+                )
+            };
+            return Err(LoweringError::unsupported(
+                a.value.span,
+                format!(
+                    "`{name}` is declared `{name} <: {declared}` in `trait {trait_}`{here}, and \
+                     `{}` is not below `{bound}`",
+                    chl(ty),
+                ),
+            ));
+        }
     }
     if let Some(missing) = trait_
         .assocs()

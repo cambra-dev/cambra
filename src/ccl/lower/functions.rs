@@ -467,9 +467,24 @@ pub(super) fn lower_def(
     let scoped = ctx.type_params_in_scope.len();
     let in_scope = ctx.named_requirements.len();
     let result = declare_type_params(type_params, ctx).and_then(|mut declared| {
+        let written: Vec<(crate::ccl::ty::TypeParamId, Span)> = declared
+            .iter()
+            .zip(type_params)
+            .map(|(d, tp)| (d.param.id, tp.name_span))
+            .collect();
         let (requires, named) = lower_named_requirements(requires, Some(&mut declared), ctx)?;
         ctx.named_requirements.extend(named);
-        let spans: Vec<Option<Span>> = type_params.iter().map(|tp| Some(tp.name_span)).collect();
+        // The parameters the clause added are determined by the requirements naming them,
+        // and have no span of their own.
+        let spans: Vec<Option<Span>> = declared
+            .iter()
+            .map(|d| {
+                written
+                    .iter()
+                    .find(|(id, _)| *id == d.param.id)
+                    .map(|(_, span)| *span)
+            })
+            .collect();
         lower_def_declared(
             fn_span, declared, &spans, params, output, requires, body, ctx,
         )
@@ -502,7 +517,8 @@ pub(super) fn lower_def_declared(
     }
     // Every type parameter is determined by a call's arguments: it appears in a
     // value parameter's annotation, or it is the associated type of a requirement
-    // whose operands are determined (`docs/chl-spec.md`, "Type parameters").
+    // whose operands are determined, or it appears in such a type's bound, which the
+    // determined type then meets from below (`docs/chl-spec.md`, "Type parameters").
     let mut mentioned = parameter_annotation_params(&func);
     loop {
         let before = mentioned.len();
@@ -515,8 +531,14 @@ pub(super) fn lower_def_declared(
             let operands_known = in_operands.is_subset(&mentioned);
             if operands_known {
                 for (_, t) in &r.assoc {
-                    if let Type::Param(param) = t {
-                        mentioned.insert(param.id);
+                    collect_params(t, &mut mentioned);
+                    if let Type::Param(member) = t
+                        && let Some(bound) = declared
+                            .iter()
+                            .find(|d| d.param.id == member.id)
+                            .and_then(|d| d.bound())
+                    {
+                        collect_params(bound, &mut mentioned);
                     }
                 }
             }

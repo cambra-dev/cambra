@@ -1651,6 +1651,81 @@ impl PolyType {
             })
     }
 
+    /// This `Poly` with each member parameter of an unnamed requirement, spelled `_::Name`,
+    /// respelled through a name minted for its requirement, `r::Name`, numbered apart from the
+    /// clause's other names: the form CHL writes it in, which [`requires_text`](Self::requires_text)
+    /// then names the requirement by.
+    pub fn with_member_names(&self) -> PolyType {
+        let taken: Vec<String> = self
+            .params
+            .iter()
+            .filter(|p| self.is_member(&p.param))
+            .filter_map(|p| {
+                p.param
+                    .spelling
+                    .split_once("::")
+                    .map(|(b, _)| b.to_string())
+            })
+            .collect();
+        let mut minted = 0usize;
+        let mut renamed: std::collections::HashMap<TypeParamId, Rc<TypeParam>> =
+            std::collections::HashMap::new();
+        for r in &self.requires {
+            let unnamed: Vec<&Rc<TypeParam>> = r
+                .assoc
+                .iter()
+                .filter_map(|(_, t)| match t {
+                    Type::Param(p) if self.is_member(p) && p.spelling.starts_with("_::") => Some(p),
+                    _ => None,
+                })
+                .collect();
+            if unnamed.is_empty() {
+                continue;
+            }
+            let binder = loop {
+                let name = if minted == 0 {
+                    "r".to_string()
+                } else {
+                    format!("r{minted}")
+                };
+                minted += 1;
+                if !taken.contains(&name) {
+                    break name;
+                }
+            };
+            for p in unnamed {
+                let member = &p.spelling["_::".len()..];
+                renamed.insert(
+                    p.id,
+                    TypeParam::declared(format!("{binder}::{member}").as_str()),
+                );
+            }
+        }
+        if renamed.is_empty() {
+            return self.clone();
+        }
+        fn respell(
+            ty: &Type,
+            renamed: &std::collections::HashMap<TypeParamId, Rc<TypeParam>>,
+        ) -> Type {
+            if let Type::Param(p) = ty
+                && let Some(to) = renamed.get(&p.id)
+            {
+                return Type::Param(Rc::clone(to));
+            }
+            let mut out = ty.clone();
+            out.walk_children_mut(|c| *c = respell(c, renamed));
+            out
+        }
+        let mut poly = self.map_types(|t| respell(t, &renamed));
+        for p in &mut poly.params {
+            if let Some(to) = renamed.get(&p.param.id) {
+                p.param = Rc::clone(to);
+            }
+        }
+        poly
+    }
+
     /// The `requires` clause as CHL writes it, each type written by `write`: each requirement
     /// at its operands, named where it has associated types, then a bound on each associated
     /// type, `a: Addable(T, T), a::Output <: T`. One standing for a member parameter is
@@ -1660,10 +1735,12 @@ impl PolyType {
     pub fn requires_text(&self, mut write: impl FnMut(&Type) -> String) -> Vec<String> {
         let member_binder = |r: &TraitRequirement| {
             r.assoc.iter().find_map(|(_, t)| match t {
+                // An unnamed requirement's member is spelled `_::Name`, and printing names it.
                 Type::Param(p) if self.is_member(p) => p
                     .spelling
                     .split_once("::")
-                    .map(|(binder, _)| binder.to_string()),
+                    .map(|(binder, _)| binder.to_string())
+                    .filter(|binder| binder != "_"),
                 _ => None,
             })
         };
@@ -2621,6 +2698,7 @@ fn fmt_type(
         }
         // The spec's notation, `forall (T, U <: B) V`.
         Type::Poly(poly) => {
+            let poly = &poly.with_member_names();
             let params: Vec<String> = poly
                 .params
                 .iter()
