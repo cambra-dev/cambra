@@ -254,48 +254,16 @@ impl CompactTypeKind {
         }
     }
 
-    /// What a binder ranges over when two contributions meet at its position — the kind
-    /// order's **⊔** at a positive position and its **⊓** at a negative one.
+    /// Replace a bound whose parameter names no shape with the empty candidate kind.
+    /// Membership below that unresolved parameter is unknown, so a meet admits no candidates.
+    /// Treating the bound as the universe would admit every range in a meet with `UIntRanges`,
+    /// even if the parameter later resolves to `Int`.
     ///
-    /// The order is the one the kind premise draws (`constrain_type_kinds`): `Enumerated`
-    /// names its members, so containment is membership per member; `UIntRanges` and `Type` state a
-    /// property of theirs and name none; `SubtypesOf` names them by a type; and everything
-    /// lies in the universe.
-    ///
-    /// **The polarity is the enclosing function's.** A Σ binder is a property of the function
-    /// and not of its domain, so the kind widens as the function does — `Map(𝐾, 𝑉)`'s
-    /// `SubtypesOf(𝐾)` lies below `Collection(𝑉)`'s `Type` for the same reason the map lies
-    /// below the collection — and the premise is drawn unswapped, unlike the domain's.
-    ///
-    /// **Total**, and every row is the bound of the order this lattice actually has. The two
-    /// meets a key bound takes part in are intersections of a named set with a down-set, so
-    /// each is a named set again — a sublist, needing no kind the grammar lacks. Membership in
-    /// the down-set is decided by [`CompactType::is_below`], the order the merge itself
-    /// induces: sound as subtyping and incomplete, which at a negative position errs toward
-    /// the smaller answer.
-    ///
-    /// Least answers per row, both directions, in
-    /// `formal/CclFormal/TypeKindIsALattice.lean`.
-    ///
-    /// A bound whose parameter names **no shape**, read as the kind it is: one naming no
-    /// members.
-    ///
-    /// Whether a candidate lies below an unresolved parameter is unknown, and a lower bound
-    /// admits only what is certain — so the answer is the empty candidate list, the same answer
-    /// the rows that read a parameter give a conflicted one, and for the same reason. It is not
-    /// the universe: `Type ⊓ UIntRanges` is `UIntRanges`, which claims every range lies below
-    /// the parameter, and a parameter resolving to `Int` has none below it. A meet answering
-    /// above its operand is the defect this file already carries one fix for.
-    ///
-    /// **Not an error.** An unresolved parameter is an ordinary mid-inference state — a
-    /// `Map(𝐾, 𝑉)` whose key type nothing has pinned yet — so rejecting it would reject
-    /// programs. A parameter naming *two* shapes is an error, and it stays reportable: this
-    /// leaves it alone, so a lone bound carrying one still materializes as
-    /// `IncompatibleBounds`, and the rows that read a parameter answer the empty kind without
-    /// re-spelling the kind that holds it.
-    ///
-    /// Applied at the meet only, since no join row reads a parameter: they merge it or fold
-    /// candidates into it, and neither loses anything to an unresolved one.
+    /// An unresolved key type is an ordinary mid-inference state, not an error. A parameter
+    /// naming multiple shapes remains unchanged so materialization can report
+    /// `IncompatibleBounds`; the membership rows separately reject such a parameter.
+    /// Only meets apply this normalization. Join rows accumulate contributions without
+    /// deciding candidate membership.
     fn resolve_bound_naming_no_shape(self) -> CompactTypeKind {
         match self {
             CompactTypeKind::SubtypesOf(k) if k.shapes() == 0 => {
@@ -317,26 +285,23 @@ impl CompactTypeKind {
         Self::merge(pol, a, b)
     }
 
-    /// **A `SubtypesOf` parameter must name exactly one shape**, and the two rows that decide
-    /// a membership read it. The `SubtypesOf`/`SubtypesOf` row writes [`CompactType::merge`],
-    /// which unions contributions rather than reconciling them, so two incomparable parameters
-    /// leave a position denoting no type ([`CompactType::denotes_a_type`]). Read through
-    /// [`CompactType::is_below`] that position absorbs every candidate, since it contains each
-    /// side's atoms — an answer *above* an operand. The meet row answers the empty kind
-    /// instead, which is what that parameter's down-set is.
+    /// Merge binder kinds at the enclosing function's polarity. A sum binder constrains the
+    /// function, so its kind is covariant even though the function's domain is contravariant.
+    /// `Enumerated` names members, `SubtypesOf` gives a type bound, `UIntRanges` admits dense
+    /// prefix ranges, and `Type` is the universe. The semantic order and its least bounds are
+    /// defined in `formal/CclFormal/TypeKindIsALattice.lean`.
     ///
-    /// **A parameter naming no shape is the other end**, and
-    /// [`resolve_bound_naming_no_shape`](Self::resolve_bound_naming_no_shape) answers it before
-    /// any row dispatches — the merge would otherwise erase it, since an unconstrained position
-    /// is the merge's identity, and a bound is not unconstrained just because nothing has
-    /// pinned its parameter yet.
+    /// The membership rows require the bound to satisfy `denotes_a_type`. Otherwise an empty
+    /// position absorbs into every target, and a multi-atom target absorbs each constituent
+    /// without denoting a type. A meet normalizes an empty bound before dispatch and rejects
+    /// a conflicting bound when testing membership.
     ///
-    /// With both ends answered the meet is a lower bound and associative, checked
-    /// exhaustively rather than proved: `formal/CclFormal/TypeKindMerge.lean` runs all 5832
-    /// triples over 18 kinds at both polarities. `kind_glb_assoc` in
-    /// `formal/CclFormal/TypeKindIsALattice.lean` is why associativity was the thing to check —
-    /// it follows from leastness, so losing it located a defect in this procedure rather than
-    /// in the order. No program in the suite reaches any of the three rows.
+    /// Membership uses positive-merge absorption; its relationship to semantic subtyping has
+    /// additional conditions specified in `formal/design.md`, "Rust absorption checks".
+    /// `TypeKindMerge.lean` checks associativity over its finite `checkKinds` sample at both
+    /// polarities. That sample contains no nested record or function domains. The semantic
+    /// theorem `kind_glb_assoc` follows from leastness; it does not establish that this
+    /// implementation computes the semantic meet for every Rust compact position.
     fn merge(pol: bool, a: CompactTypeKind, b: CompactTypeKind) -> CompactTypeKind {
         use CompactTypeKind::{Enumerated, SubtypesOf, Type as Universe, UIntRanges};
         let (a, b) = if pol {
@@ -433,12 +398,10 @@ impl CompactTypeKind {
             // range, `UIntRange` subtyping is equality and the ranges below it look
             // spellable. The refinements are what rule it out.
             (SubtypesOf(_), UIntRanges) | (UIntRanges, SubtypesOf(_)) if pol => Universe,
-            // **A meet with a bound keeps the candidates below the parameter**
-            // (`glb_candidates_subtypesOf`). Membership is decided by the order this merge
-            // induces ([`CompactType::is_below`]), which is what the lattice at this
-            // representation *has*: sound as subtyping, incomplete, and its incompleteness
-            // drops a candidate rather than keeping one it should not — the safe direction for
-            // a lower bound.
+            // A meet with a bound filters candidates using `CompactType::is_below`.
+            // `denotes_a_type` checks shape compatibility, not resolved kinds or recursive
+            // data-domain agreement. The limits of this membership test are specified in
+            // `formal/design.md`, "Rust absorption checks".
             (Enumerated(xs), SubtypesOf(k)) | (SubtypesOf(k), Enumerated(xs)) => {
                 debug_assert!(
                     k.shapes() > 0,
@@ -1078,26 +1041,15 @@ impl CompactType {
         self.shapes() == 1 && !self.conflicted()
     }
 
-    /// Is `self` **below** `other` in the order this merge induces — `self ⊔ other ≡ other`?
+    /// Test positive-merge absorption using `equiv`, not full structural equality.
+    /// Both operands must satisfy `denotes_a_type`; callers establish that precondition,
+    /// and the assertion checks it only in debug builds. An empty position is the merge
+    /// identity and would otherwise absorb into every target without denoting a type.
     ///
-    /// Sound as a subtyping test and incomplete: absorption implies the two materialize to
-    /// subtypes (`formal/CclFormal/MaterializedMergeIsABound.lean`, `coalesce_monotone_record`
-    /// and its siblings), while two positions can materialize to one type and absorb neither
-    /// the other — a positive merge accumulates a function slot's domain alternatives rather
-    /// than deciding between them. Incompleteness is the safe direction wherever this decides
-    /// membership at a *negative* position: it answers "no" where the truth is unknown, which
-    /// shrinks a lower bound rather than growing it.
-    ///
-    /// **Both operands must name a type** ([`denotes_a_type`](Self::denotes_a_type)), and each
-    /// way of failing that answers wrongly rather than imprecisely. A position naming two
-    /// shapes contains each side's atoms, so every `self` absorbs into it. A position naming
-    /// none is the merge's identity, so it absorbs into every `other` — this reads it as ⊥,
-    /// which is its denotation at a *positive* position and not at the negative one where a
-    /// meet reads it. Callers establish the precondition; the assertion states it.
-    ///
-    /// Judged by [`equiv`](Self::equiv) and not `==`, because the merge unions `vars`: a
-    /// structural comparison would ask that `self` carry no variable `other` lacks, which is
-    /// a fact about the route each was reached by and not about the types.
+    /// The result describes the compact representation. Interpreting it as materialized
+    /// subtyping requires further hypotheses beyond `denotes_a_type`; see
+    /// `formal/design.md`, "Rust absorption checks". `equiv` excludes variable provenance,
+    /// so merging variable sets does not by itself prevent absorption.
     pub(super) fn is_below(&self, other: &CompactType) -> bool {
         debug_assert!(
             self.denotes_a_type() && other.denotes_a_type(),
@@ -1107,22 +1059,14 @@ impl CompactType {
         CompactType::merge(true, self.clone(), other.clone()).equiv(other)
     }
 
-    /// Do these two positions denote the same thing?
+    /// Compare represented shape while ignoring `vars`, kinding constraints, `nominal_conflict`
+    /// and the function's `combined` diagnostic snapshot. Child compact positions recurse
+    /// through this relation, so ignored variable provenance does not reappear below a slot.
     ///
-    /// `PartialEq` is structural and asks more than denotation does. Three slots are excluded
-    /// and each for its own reason:
-    ///
-    /// * `vars` — by the time the domain lattice reads a position, compaction has folded every
-    ///   variable's bounds into the other slots ([`occupied`](Self::occupied) drops them for
-    ///   the same reason). Which variables were walked to get here is a fact about the route.
-    /// * `kinds` — a kinding constraint is a condition on what the position resolves to, not a
-    ///   part of what it denotes.
-    /// * `combined` on a function slot — the two domains that had no common answer, kept for
-    ///   the diagnostic. `domains_disagree` beside it is the fact; this is the payload.
-    ///
-    /// Everything else compares structurally, which for the set- and map-backed slots is
-    /// already denotational. That leaves the relaxation minimal, and a too-strict equivalence
-    /// only makes [`is_below`](Self::is_below) answer "no" more often.
+    /// Function names, kinds, binder identities/kinds and `domains_disagree` still compare.
+    /// Variant openness and history kind also remain significant. This is neither a general
+    /// semantic-equivalence test nor the smaller Lean model's `equiv` relation; see
+    /// `formal/design.md`, "Why the model carries `CompactTy` at all".
     pub(super) fn equiv(&self, other: &CompactType) -> bool {
         let CompactType {
             vars: _,

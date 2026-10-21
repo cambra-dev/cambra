@@ -143,8 +143,9 @@ pub enum PartialKind {
 ///
 /// - **Two parameters a bound chain relates.** Under `𝑈 <: 𝑇` the join of `𝑇` and `𝑈`
 ///   is `𝑇` and the meet `𝑈`, so the other one is dropped.
-/// - **A meet keeps a parameter below the rest.** The meet of `𝑃` and a concrete type
-///   `𝑋` is `𝑃` when a bound on `𝑃`'s chain is below `𝑋` ([`CompactType::is_below`]).
+/// - A meet keeps `𝑃` alone when a bound on its chain passes [`CompactType::is_below`]
+///   against the remaining contributions. This absorption check has additional requirements
+///   for a semantic subtype interpretation; see `formal/design.md`, "Rust absorption checks".
 /// - **Otherwise a parameter is widened to its bound**, and the position merges as
 ///   one without it would: a value of a bounded parameter's type is a value of its
 ///   bound's type. `𝑇 ∨ {at: Int}` under `𝑇 <: {at: Int, sku: String}` is
