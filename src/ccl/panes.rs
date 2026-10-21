@@ -1,21 +1,12 @@
-//! The pipeline's **panes** — its retained snapshots — and what a fold between
-//! two adjacent ones produces.
+//! Retained pipeline snapshots and folds between adjacent snapshots.
 //!
-//! A pane is one snapshot taken at a named point in
-//! [`compile_program`](crate::ccl::context::compile_program): an expression tree
-//! through `post-planning`, and the operator graph at `post-conversion`.
-//! [`PANES`] declares the topology once: every pane, the phases that produced
-//! it from the pane before it, and whether its pair is gated.
+//! `PANES` declares ordered content, phase filters and leak-gate selection.
+//! Materialization returns relations, attribution, deaths and leaks; callers
+//! decide whether to assert leak freedom. Both the inspector and the optional
+//! compile-time gate consume it.
 //!
-//! Split out of [`context`](crate::ccl::context) because it is the inspector's
-//! half of the seam. `context` owns the pipeline and the [`Phase`] axis; this
-//! module owns what a pane pair is and what folding one yields. Only
-//! [`gate_leaks`] is asserted, and `compile_program` calls it under
-//! `CAMBRA_PROVENANCE_GATE` alone; the snapshots themselves are retained
-//! whatever the capture switch says. The inherent `impl
-//! CompiledProgram` below lives here rather than beside the struct for the same
-//! reason: the methods are the pane layer's, not the pipeline's. See
-//! `design/provenance.md`, "The seam".
+//! See `src/ccl/design/provenance.md`, "Retained snapshots", "Pane materialization"
+//! and "Gate and audit coverage".
 
 use std::collections::HashSet;
 
@@ -24,27 +15,17 @@ use crate::ccl::context::{CompiledProgram, Phase, collect_tree_ids};
 use crate::ccl::provenance::{Leak, NodeId, ProvenanceMap, SourceProjection, fold};
 
 impl CompiledProgram {
-    /// Fold [`provenance_table`](Self::provenance_table) across every adjacent
-    /// pane pair into the per-pane [`SourceProjection`]s, the pair
-    /// [`ProvenanceMap`]s, and each pair's [`Leak`]s. Cold path (snapshot-serve
-    /// only), never called by [`compile_program`].
-    ///
-    /// [`PANES`] is the topology: the anchor pane's projection is the lowering
-    /// projection, and each pane after it folds its own phases against the pane
-    /// before it. There is no catch-all pair — a node is explained by a recorded
-    /// row or it is not explained at all, and the gate is what says which.
-    ///
-    /// The leaks are **returned, not asserted**: a span reaches zero only once
-    /// every phase inside it records its rewrites, so [`gate_leaks`] is left to
-    /// the callers that fold an instrumented span. The deaths ride alongside them
-    /// as a product, since nothing declares a fate.
-    // Cold path: the inspector's snapshot serve, which is not in this workspace.
+    /// Fold adjacent snapshots using `PANES` phase filters. The anchor uses the
+    /// lowering projection; later folds consume the preceding projection.
+    /// Returns leaks without asserting on them. Used by the inspector and the
+    /// optional per-compile gate. See `src/ccl/design/provenance.md`,
+    /// "Pane materialization".
     #[allow(dead_code)]
     pub(crate) fn materialize_panes(&self) -> MaterializedPanes {
         let ids = self.pane_ids();
 
-        // The anchor pane's projection is the lowering projection: `uniquify`
-        // preserves every id in place, so lowering's keys are still its keys.
+        // The anchor precedes phases that mint new expression IDs. Lowering
+        // may contain extra keys for nodes removed by uniquification.
         let mut projections = Vec::with_capacity(PANES.len());
         projections.push(self.lowering_projection.clone());
         let mut pairs = Vec::with_capacity(PANES.len() - 1);
@@ -74,12 +55,8 @@ impl CompiledProgram {
         MaterializedPanes { projections, pairs }
     }
 
-    /// The retained pane trees, in pipeline order, element for element with
-    /// [`PANES`]' leading [`PaneKind::Ir`] entries. [`IR_PANE_COUNT`] is pinned
-    /// against [`PANES`], so the two cannot disagree about how many there are.
-    ///
-    /// The inspector model reads this alongside [`PANES`] to build one snapshot
-    /// pane per entry.
+    /// Expression snapshots in the order of `PANES`' leading IR entries.
+    /// The compile-time count check pins their number; callers depend on the order.
     pub(crate) fn pane_trees(&self) -> [&Expr; IR_PANE_COUNT] {
         [
             &self.pre_inference_ir,
@@ -91,11 +68,8 @@ impl CompiledProgram {
         ]
     }
 
-    /// Each pane's id set, in pipeline order, element for element with
-    /// [`PANES`].
-    ///
-    /// This is all the fold wants from a pane — it never reads content — which
-    /// is what lets a pane hold an operator graph rather than a tree.
+    /// IDs for each declared pane. IR sets include predicate interiors; operator
+    /// sets enumerate the graph. The fold requires only these sets, not content.
     pub(crate) fn pane_ids(&self) -> Vec<HashSet<NodeId>> {
         let mut trees = self.pane_trees().into_iter();
         PANES
@@ -121,50 +95,22 @@ pub(crate) enum PaneKind {
     Operators,
 }
 
-/// One pane — one retained snapshot of the pipeline — and the phases that
-/// produced it from the pane before it.
-///
-/// [`PANES`] declares the whole topology in one place, so adding a pane is one
-/// entry there, plus its tree in [`CompiledProgram::pane_trees`] when it holds
-/// one.
+/// One retained snapshot and the phases since its predecessor.
+/// Adding an IR entry also requires its matching tree in `pane_trees`.
 pub(crate) struct PaneSpec {
     /// The pane's name, e.g. `"post-channelize"`.
     pub(crate) name: &'static str,
-    /// What this pane holds.
-    ///
-    /// The fold reads id sets rather than content, so this distinction reaches
-    /// only the consumers that render a pane. Declaration order is pipeline
-    /// order and conversion runs last, so every [`PaneKind::Ir`] pane precedes
-    /// every [`PaneKind::Operators`] one, which the assertion under
-    /// [`IR_PANE_COUNT`] pins.
+    /// Content used for ID enumeration and rendering. IR entries must precede
+    /// operator entries, as checked by `IR_PANE_COUNT`.
     pub(crate) content: PaneKind,
-    /// The phases that ran between the previous pane and this one — the set
-    /// [`CompiledProgram::materialize_panes`] restricts the whole-compile table
-    /// by.
-    ///
-    /// A pair's fold is defined by the phases that ran between its two panes,
-    /// not by a position in this list: a program that skips a phase must not
-    /// shift another pair's set, and a row produced outside a pair's phases has
-    /// to read to it as an ordinary un-produced id. A phase therefore belongs to
-    /// exactly one pair, which
-    /// `every_recorded_phase_belongs_to_exactly_one_pane_pair` asserts.
+    /// Selected producing phases for this pair's fold. Filtering must stop at the
+    /// input boundary; a phase recorded in the corpus must belong to exactly one
+    /// pair (`every_recorded_phase_belongs_to_exactly_one_pane_pair`).
     pub(crate) phases: &'static [Phase],
-    /// Whether the pair ending at this pane is asserted to carry no [`Leak`] of
-    /// either class — by `pane_pair_folds_have_no_structural_leaks` over the
-    /// programs `corpus()` lists, and by `CAMBRA_PROVENANCE_GATE` over whatever
-    /// the caller compiles.
-    ///
-    /// **This does not license a nonzero residue where it is false.** A [`Leak`]
-    /// is a bug wherever it appears; the flag says whether an assertion has been
-    /// turned on. A pair goes ungated only while some phase inside it does not
-    /// record, where the residue is a count of how little that phase records — a
-    /// constant no correct recording elsewhere can drive down, so gating it would
-    /// pin churn rather than catch a defect. Flip it in the commit that
-    /// instruments the last phase in the pair, the same way an audit span's
-    /// endpoint moves. Unused on the anchor, which has no pair. A pane may be
-    /// issued at any point in the pipeline, so the bit outlives any one pair
-    /// becoming gated; see `src/ccl/design/provenance.md`, "What gating every
-    /// pair does not retire".
+    /// Whether callers should assert this pair's leaks are empty. Unused on the
+    /// anchor. All current pairs are gated; adding an uninstrumented pair can leave
+    /// it ungated while recording is completed. False does not redefine leaks as
+    /// valid provenance. See `src/ccl/design/provenance.md`, "Gate and audit coverage".
     pub(crate) gated: bool,
 }
 
@@ -174,17 +120,9 @@ pub(crate) struct PaneSpec {
 /// [`PANES`], so the trees zip against the [`PaneKind::Ir`] entries in order.
 pub(crate) const IR_PANE_COUNT: usize = 6;
 
-/// The pipeline's panes, in pipeline order, each naming the phases that produced
-/// it from its predecessor.
-///
-/// The first entry is the anchor: it has no predecessor, so its `phases` is
-/// empty and its `gated` is unused — its projection is the lowering projection
-/// rather than a fold product.
-///
-/// Every pair is gated, so the leak classes hold at zero over whatever the caller
-/// compiles. `pre-inference → post-inference` reaches that only because the fold's
-/// id domain was widened to the slot domain the passes rewrite and inference's
-/// per-instantiation predicate freshen took a copy recording.
+/// Ordered snapshot topology. The first entry has no predecessor or selected
+/// phases and uses the lowering projection. Each remaining entry defines one
+/// pair; all current pairs are selected for leak checking.
 pub(crate) const PANES: [PaneSpec; 7] = [
     PaneSpec {
         name: "pre-inference",
@@ -281,7 +219,7 @@ pub(crate) struct PanePair {
 /// The per-pane projections and per-pair folds materialized from
 /// [`CompiledProgram::provenance_table`] — see
 /// [`CompiledProgram::materialize_panes`].
-// Consumed by the inspector model; unused within the compiler itself.
+// Used by the inspector and optional per-compile leak checking.
 #[allow(dead_code)]
 pub(crate) struct MaterializedPanes {
     /// Each pane's projection, in pipeline order, parallel to [`PANES`].
@@ -317,27 +255,16 @@ impl MaterializedPanes {
             .unwrap_or_else(|| panic!("no pane pair named {pair}"))
     }
 
-    /// The pane pairs held at zero on both leak classes — [`PaneSpec::gated`].
-    ///
-    /// Two checks read this same set at different widths:
-    /// `pane_pair_folds_have_no_structural_leaks` over the programs `corpus()`
-    /// lists, on every test run, and `CAMBRA_PROVENANCE_GATE` over whatever the
-    /// caller compiles, which is strictly stronger because the wider corpus
-    /// reaches shapes the listed programs do not.
+    /// Pairs selected for leak checking by `PaneSpec::gated`.
+    /// Selection does not itself assert or filter their leak vectors.
     pub(crate) fn gated_pane_pairs(&self) -> impl Iterator<Item = &PanePair> {
         self.pairs.iter().filter(|p| p.gated)
     }
 }
 
-/// The leak gate: **a fold's [`Leak`] vector must be empty**.
-///
-/// Both classes are asserted the same way. Each means a node reached the output
-/// pane with nothing recording where it came from, and neither localizes the site
-/// to fix on its own, so the gate reads the vector's emptiness and not its
-/// composition (see [`Leak`]). A death is not a leak and reaches a caller as its
-/// own collection, so there is nothing here to filter.
-///
-/// Debug/test only, single code path (`cfg!`, not `#[cfg]`).
+/// Assert that the leak vector is empty in debug or test builds; otherwise return.
+/// Both classes are errors. Deaths are a separate fold product and are not passed
+/// here. See `src/ccl/design/provenance.md`, "Recording leaks".
 pub(crate) fn gate_leaks(leaks: &[Leak], pair: &str) {
     if !cfg!(any(debug_assertions, test)) {
         return;
@@ -402,16 +329,9 @@ mod tests {
         }
     }
 
-    /// **Capture totality**, as a corpus-wide property rather than a per-phase
-    /// assertion: every pane pair materializes and folds over every corpus
-    /// program, every output-pane node has an origin (`Unrecorded == 0`), and
-    /// no node's ancestry dangles (`DanglingParent == 0`).
-    ///
-    /// The two invariants fail differently and are worth reading apart.
-    /// `dangling_parent == 0` says no node's ancestry stops at an id the fold
-    /// never heard of. `Unrecorded == 0` says no rewrite went
-    /// *unrecorded* — it is the gate the whole driver-capture design exists to
-    /// phase, and the number a newly-added rewrite site breaks first.
+    /// Check both leak classes for gated pairs across the pipeline corpus.
+    /// This establishes coverage for observed outputs and selected rows, not that
+    /// every intermediate mint was recorded or every attribution is precise.
     #[test]
     fn pane_pair_folds_have_no_structural_leaks() {
         let mut totals: std::collections::HashMap<String, LeakCounts> =
@@ -434,14 +354,7 @@ mod tests {
                 eprintln!("[pane {name} / {pair_name}] {c:?}");
                 totals.entry(pair.name.clone()).or_default().add(&c);
             }
-            // The panes are the thing being materialized: each projection must
-            // hold entries for the tree it describes, and each map edges.
-            //
-            // Only down to the first uninstrumented pair. A pair folds against
-            // the projection of the pane above it, so the first pair whose
-            // phases do not record leaves every pane below it with nothing to
-            // carry forward — an empty projection there is the expected state,
-            // not a defect.
+            // Require nonempty products through the contiguous gated prefix.
             let reached = panes.pairs.iter().take_while(|p| p.gated).count();
             for (i, projection) in panes.projections.iter().take(reached + 1).enumerate() {
                 assert!(!projection.is_empty(), "{name}: {}", PANES[i].name);
@@ -457,12 +370,8 @@ mod tests {
         }
     }
 
-    /// Every phase that records rows in a normal compile belongs to exactly one
-    /// pane pair, so no rewrite is folded twice and none is silently dropped.
-    ///
-    /// [`PANES`]' phase sets are the only thing that decides which pane pair a
-    /// row reaches, so a phase that opens a scope without joining one would
-    /// record rows nothing ever folds, and a phase in two would be folded twice.
+    /// Require every phase recorded by a corpus compile to belong to exactly one
+    /// pair. Otherwise its rows are omitted or folded at multiple boundaries.
     #[test]
     fn every_recorded_phase_belongs_to_exactly_one_pane_pair() {
         for (name, code) in corpus() {
@@ -477,20 +386,9 @@ mod tests {
         }
     }
 
-    /// **The provenance map is well-formed and non-vacuous** on every corpus
-    /// program: every edge runs from an input-pane id to an output-pane id,
-    /// every id present in both panes is its own dense self-edge, and every
-    /// gated pane pair reads a *row* on at least one program.
-    ///
-    /// The non-vacuity half is what this test is for. A pane pair whose phases
-    /// minted nothing on a given program derives its whole map from the two
-    /// pane id sets, so the well-formedness assertions above hold there for
-    /// reasons that have nothing to do with the recording. Requiring one
-    /// witness per pair is what keeps a pair whose instrumentation stopped
-    /// firing — or a corpus that lost the only program exercising it — from
-    /// leaving a green tautology behind. Which programs supply the witness is
-    /// not pinned: a program rewrites where its own shape makes it rewrite, and
-    /// pinning that turns every corpus edit into a list edit.
+    /// Check endpoint membership and survivor self-edges across the corpus.
+    /// Each gated pair must also have a non-self edge on at least one program, so
+    /// identity-only maps cannot satisfy all checks without exercising recording.
     #[test]
     fn the_pane_folds_derive_a_non_vacuous_provenance_map() {
         let mut exercised: HashSet<usize> = HashSet::new();
@@ -521,10 +419,7 @@ mod tests {
                         d.id,
                     );
                 }
-                // Dense: a node present in both panes is its own self-edge, and
-                // a node descends from itself — so a consumer only ever follows
-                // edges, never reconstructs one, and reads ancestry off the
-                // label it finds there.
+                // Surviving corpus IDs must have ancestry self-edges.
                 for id in input_ids.intersection(output_ids) {
                     let self_edge = map.upstream(id).iter().find(|l| l.id == *id);
                     assert!(
@@ -532,9 +427,7 @@ mod tests {
                         "{name}: {id:?} survives {pair} without an ancestry self-edge",
                     );
                 }
-                // A non-self edge is the only proof a row was consulted: a
-                // pane pair whose phases rewrote nothing derives its whole
-                // map from the two pane id sets.
+                // Identity-only maps do not witness use of a recorded row.
                 if edges.iter().any(|(u, d)| *u != d.id) {
                     exercised.insert(i);
                 }
@@ -562,21 +455,9 @@ mod tests {
         "transaction / post-inference → post-channelize",
     ];
 
-    /// **Blame reaches the provenance map, labelled**: the `blame` column is
-    /// closed transitively alongside `parents`, so a consumer receives the
-    /// blame edges and can render or prune them.
-    ///
-    /// Pinned by name, unlike the per-pair witness
-    /// [`the_pane_folds_derive_a_non_vacuous_provenance_map`] asks for: blame is
-    /// named at a handful of sites — the mutability phases' effect and begin
-    /// nodes, and the refinement predicate `planning.hash_join` reads its plan
-    /// out of — so the pin is short, and a corpus or recording edit that stopped
-    /// exercising them would otherwise leave the labelled half of the map
-    /// untested.
-    ///
-    /// A blame edge is *only* blame here: no corpus rewrite both
-    /// consumes a node and blames it, so nothing in the corpus pins the
-    /// both-labels case — the fold tests in `provenance.rs` do.
+    /// Pin the corpus boundaries where at least one emitted edge carries blame.
+    /// This tests reachability of blame, not absence of ancestry on the same edge;
+    /// the mixed-label algebra is tested separately in `provenance.rs`.
     #[test]
     fn blame_reaches_the_provenance_map_labelled() {
         let mut relating: Vec<String> = Vec::new();
@@ -601,17 +482,8 @@ mod tests {
         );
     }
 
-    /// One mutation statement's image across the `post-inference →
-    /// post-channelize` pair, split by what the edge asserts: the nodes that
-    /// descend from it, and the nodes merely related to it.
-    ///
-    /// The two are kept apart because the claims are different. "This statement
-    /// reaches its own products" is ancestry; blame relates without claiming
-    /// ancestry, and two statements are legitimately blamed on one node
-    /// (`planning.hash_join` blames both of a join's conditions). Folding blame
-    /// in would let a statement that was only mentioned pass for one that
-    /// produced something, and would make disjointness reject a correct pair of
-    /// blame edges.
+    /// A statement's downstream IDs, separated into ancestry and blame relations.
+    /// Blame must not satisfy tests that require the statement to have products.
     struct StatementImage {
         kind: &'static str,
         descendants: HashSet<NodeId>,
@@ -807,16 +679,8 @@ mod tests {
         assert_disjoint(&images);
     }
 
-    /// **Both of a nested join's conditions reach the map**, as blame edges from
-    /// `planning.hash_join`.
-    ///
-    /// The site's recording blames what the *domain type* carries rather than the
-    /// refinement the recogniser accepted, because `join_plan_to_expr` re-enters
-    /// `convert_refinement_to_join` on an arm's own refined type — three frames
-    /// below the recording, with no access to its guard. A one-condition join
-    /// cannot tell the two apart, which is what the flat control fixes: the
-    /// nested program must blame two distinct predicates where the flat one
-    /// blames one.
+    /// Compare flat and nested joins: planning.hash_join must contribute blame
+    /// from one and two distinct predicate IDs respectively.
     #[test]
     fn a_nested_join_blames_both_join_conditions() {
         let flat = "[x + y for x in [2] for y in [1, 2, 3] if x == y]";
@@ -852,26 +716,12 @@ mod tests {
         }
     }
 
-    /// The corpus programs whose definitions inference **generalizes and then
-    /// specializes** — the ones monomorphization actually clones a subtree for.
-    /// Everything else in the corpus is first-order, and mono mints nothing.
+    /// Corpus fixtures selected to exercise generalized-definition specialization.
     const SPECIALIZING: &[&str] = &["generator_pipeline", "udf_chain"];
 
-    /// Monomorphization — the one thing that mints between the first two panes —
-    /// explains every node it produces, on first-order and specializing
-    /// programs alike.
-    ///
-    /// Two recordings get it there, and both are needed: `specialize_use` sinks
-    /// the clone's `on_copy` pairs, and `coalesce_generalized_let` sinks the
-    /// chain of `let`s the binding rebuilds itself as. Without the second, a
-    /// specializing program leaves one unrecorded `let` per demanded
-    /// specialization — a per-program count that tracks how many types the body
-    /// asked for, which is why it read as a small constant on this corpus.
-    ///
-    /// Asserted both ways so the zero cannot be vacuous: a specializing program
-    /// must also *kill* nodes here, since its generalized definition is
-    /// replaced by clones. A regression that stopped running mono at all would
-    /// otherwise pass.
+    /// Require no structural leaks across the first pair and nonempty deaths on
+    /// specializing fixtures. The pair includes normalization and other producers;
+    /// this test does not isolate monomorphization's rows.
     #[test]
     fn monomorphization_explains_every_node_it_produces() {
         for (name, code) in corpus() {
@@ -892,19 +742,9 @@ mod tests {
         }
     }
 
-    /// Every phase inside the second pane pair explains what it produces.
-    ///
-    /// The interesting programs are the ones that drive a *whole-program*
-    /// rewrite, where naming one node is least obviously applicable: a
-    /// transaction is disassembled into a `Transact` whose pieces have no
-    /// single source node, and a defer cluster becomes a `LetRec` assembled from
-    /// contributions scattered across the body. Both are covered by recording
-    /// against the node each product stands in for — the `with begin():`
-    /// statement, the register declaration, the `let d = Defer`.
-    ///
-    /// Asserted with a non-vacuity guard for the same reason the first pane pair is: a
-    /// program that reaches one of these phases must also kill nodes, so a
-    /// regression that stopped running the phase cannot pass as capture.
+    /// Require no structural leaks across the Inline/Transact/Letrec/Channelize pair.
+    /// Selected rewriting fixtures must also have deaths, preventing an unchanged
+    /// tree from satisfying every assertion.
     #[test]
     fn the_second_pane_pair_explains_every_node_its_phases_produce() {
         /// Reaches `transact_phase` or `channelize` — the whole-program
@@ -949,22 +789,10 @@ mod tests {
         );
     }
 
-    /// **Distinct predicate terms never share a `NodeId`** — with each other, or
-    /// with the main tree — on the three trees the panes retain.
-    ///
-    /// [`assert_unique_node_ids`] runs the same [`predicate_id_collisions`] walk
-    /// at every phase boundary, so what this adds is the panes: `pre_inference_ir`
-    /// is snapshotted after `uniquify`, between two boundaries, and no boundary
-    /// walk reaches it.
-    ///
-    /// What the walk catches is a rebuild that **preserves ids when it should
-    /// not**. A predicate cannot be mutated through its `Rc`, so every rewrite
-    /// builds a new `Rc` and repoints the refinement it was handed. That is a
-    /// *replacement* only if the walk reaches every occurrence; otherwise the
-    /// original survives on some type the walk missed, and preserving ids puts one
-    /// id-set on two live terms. `PredMemo::replacing` is the opt-in for walks
-    /// that do reach everything, and `uniquify` — the only one — asserts its own
-    /// 1:1 correspondence separately.
+    /// Check distinct-predicate and predicate/main-tree ID collisions on the three
+    /// explicitly listed snapshots. Shared occurrences of one predicate Rc are valid.
+    /// The traversal's limits are specified in `src/ccl/design/provenance.md`,
+    /// "Walking the ids".
     #[test]
     fn distinct_predicate_terms_never_share_a_node_id() {
         let mut found: Vec<(String, usize, &'static str)> = Vec::new();
@@ -987,23 +815,9 @@ mod tests {
         );
     }
 
-    /// A phase that rewrites the program records its rewrites under its own phase
-    /// tag — the tag being the one part of a row no recording site knows, and the
-    /// only thing that places a row in a pane pair's fold.
-    ///
-    /// A phase that rewrites *nothing* on a given program records nothing, which
-    /// is the preserve case and correct (most of the corpus preserves end to
-    /// end), so the fixture is one that drives the mutability phases: the
-    /// transaction, which `transact_phase` disassembles, `mut_elim` rebuilds as
-    /// a `LetRec`, and `channelize` rewrites.
-    ///
-    /// [`Phase::MutRead`] is absent for that reason: A-normalization names every
-    /// read this program performs (`crate::ccl::anf`, "A mutable-variable read
-    /// is not atomic") and `mut_read` adopts those bindings rather than minting
-    /// its own.
-    ///
-    /// The list is sorted by phase name rather than pipeline order, so it reads
-    /// as a set and a new phase lands where its spelling puts it.
+    /// Pin the recorded phase set for the transaction fixture, sorted by phase name.
+    /// A phase can run without recording a product; its absence from this set does
+    /// not establish that the phase was skipped.
     #[test]
     fn a_rewriting_phase_tags_its_rows_with_itself() {
         let (_, code) = corpus()

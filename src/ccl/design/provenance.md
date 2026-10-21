@@ -513,55 +513,60 @@ Its last-write-wins attribution and copy ordering are specified under [The seam]
 
 ### Gate and audit coverage
 
-The leak classes above can only be asserted zero where the phases in between
-record, which is what fixes both the audit spans and the set of gated pane pairs.
+`gate_leaks` asserts that a fold's leak vector is empty when either `debug_assertions` or
+`test` is enabled. It returns without asserting otherwise. Lowering always computes its
+projection and calls this gate at the handoff.
 
-An audit's endpoint is **chosen**, because a span running past the last
-instrumented phase counts everything the uninstrumented tail mints as a defect — a
-number that cannot reach zero however correct the recording is, which makes the
-audit read as a broken gate rather than a measurement. Every phase that rewrites
-expression nodes now records, so the `full` span reaches the end of the pipeline,
-`post-inference..join-planned`. Operator conversion is past it and has no node
-identity to measure against.
+Later pair checking has two entry points:
 
-**The same discipline governs the gate.** `CAMBRA_PROVENANCE_GATE=1` makes *every*
-compile fold every pane pair and gate the leak classes, so the gate's corpus
-becomes whatever the caller compiles — point it at the test suite and it covers
-every program there instead of the handful `context.rs`'s `corpus()` lists. That
-sample is what let two recording gaps live: `transact_phase` calling
-`mut_elim::fold_induction_loop` with nothing recording, and `flatten_spine`'s
-value-position writer hoist. Both are shapes the listed programs do not have. CI runs with it on; it costs about 4% of the test step.
+- `pane_pair_folds_have_no_structural_leaks` checks the pipeline corpus's gated pairs.
+- `compile_program` materializes and checks gated pairs when the environment enables it.
 
-It gates `gated_pane_pairs()`, which is now every pair: the leak classes hold at
-zero from the lowering handoff to the end of the pipeline over whatever the
-caller compiles.
+All current adjacent pairs in `PANES` are marked gated, including the operator-conversion pair.
+This marks which assertions to run; it does not prove coverage for untested programs.
+A new pair must cover its producers' recording before its gate can require zero leaks.
 
-**Move the endpoint when a phase becomes instrumented, in the commit that
-instruments it.** The rule has no outstanding move left in the CCL pipeline; the
-next one is operator conversion, which needs an identity first. Leaving an
-endpoint behind understates coverage; moving it ahead reintroduces the
-unreachable zero.
+The environment switches are read by the accessors in `context.rs`:
+
+| Variable | Behavior |
+|---|---|
+| `CAMBRA_PROVENANCE=0` | Disable ordinary phase-table capture; snapshots and diagnostic projections remain. |
+| `CAMBRA_PROVENANCE_GATE` | A set value other than `0` enables pair materialization/checking, provided ordinary capture is enabled. |
+| `CAMBRA_PROVENANCE_AUDIT` | Select a named audit span and disable ordinary phase scopes. |
+| `CAMBRA_PROVENANCE_PREDICATES=0` | Exclude predicate interiors from audit ID sets only. |
+
+An unset gate variable leaves per-compile pair checking off. CI's test job sets it to `1`.
+Disabling capture or setting an audit variable suppresses that gate even if its variable is set.
+An unrecognized audit name still disables ordinary capture but matches no audit span.
+
+Audit predicate inclusion defaults on, matching pane enumeration. Turning it off can report
+dangling parents for predicate IDs that were recorded correctly but omitted from the audit's
+input set. That comparison measures the narrower domain, not missing compiler instrumentation.
 
 #### What gating every pair does not retire
 
-A span is redundant with a gated pair when the pair covers the same phases, and
-not otherwise. The `planning` span went for that reason: it ran
-`recognized..join-planned` inside `post-lambda-elim → post-planning`, whose phase
-list is `Planning` alone, so the wider gated pair measured the same phase and
-keeping both invited trusting the wrong one.
+`ProvenanceAudit` measures selected pipeline spans rather than asserting zero leaks:
 
-`letrec` and `mutelim` stay because their pair bundles more phases than either
-span isolates. Both sit
-inside `post-inference → post-channelize`, over `Inline`, `Transact`, `Letrec` and
-`Channelize`, and `mutelim` runs `post-transact..post-letrec`, isolating `Letrec`.
-That pair holding at zero reports nothing about how much of `mut_elim` alone its
-recordings explain, and neither endpoint is a pane, so no pair can be gated to ask
-it. `ProvenanceAudit`, `CAMBRA_PROVENANCE_AUDIT`, `CAMBRA_PROVENANCE_PREDICATES`
-and the audit clause in `provenance_capture_enabled` stay with them.
+| Name | Input | Output | Included work |
+|---|---|---|---|
+| `full` | Post-inference | Post-planning (`join_planned`) | Inlining through planning. |
+| `letrec` | Post-inference | Post-letrec | Inlining, transaction lowering and induction lowering. |
+| `mutelim` | Post-transact | Post-letrec | Induction lowering. |
 
-`PaneSpec::gated` stays for a separate reason. A pane may be issued at any point
-during compilation, so the next pane added arrives with its pair ungated, and the
-bit is what says so until every phase in the pair records.
+The `full` audit stops before operator conversion even though that phase has node identities
+and a gated pane pair. The name does not mean every compiler phase is included.
+The narrower spans remain useful because their endpoints are not both retained panes.
+
+An enabled audit opens one `PhaseScope` over its whole span with nominal tag
+`AUDIT_VIA = Phase::Planning`. This is a grouping key, not the actual phase of each rewrite.
+The audit closes its scope, reads the active table, and folds with an empty upstream projection.
+Its report includes row, input, output, attributed-entry and death counts, plus leak counts.
+An attributed entry need not have known spans.
+
+The audit's table must remain installed until measurement completes. Ordinary capture and
+audit scopes are mutually exclusive because phase scopes are non-reentrant.
+Changing an audit endpoint requires checking which producers it includes; it need not follow
+a pane boundary. `PaneSpec::gated` remains a per-pair assertion setting independently of audits.
 
 ## The seam
 
@@ -662,6 +667,33 @@ An existing attribution with no spans does not resolve an error. The fallback ta
 an active table, so capture-disabled compiles rely on projections and the optional enclosing tree.
 The derivation projection supplements lowering; it does not replace it.
 
+### Retained snapshots
+
+`PANES` is the authoritative ordered topology. Its first entry anchors materialization at
+`pre-inference`; each later entry declares the phases since its predecessor.
+The `CompiledProgram` fields retain these boundaries:
+
+| Snapshot | Boundary and content |
+|---|---|
+| `pre_inference_ir` | After uniquification, before A-normalization; unresolved expression types. |
+| `post_inference_ir` | After inference and its checks, before inlining; typed expressions with lambdas. |
+| `post_channelize_ir` | After inlining, transaction/induction lowering and channelization. |
+| `post_as_of_read_ir` | After the fed-out mutable-read rewrite. |
+| `post_lambda_elim_ir` | After explicit lambdas are converted to point-free combinators. |
+| `ast` | After planning; retained in a stable allocation for the expression-to-operator map. |
+| `operator_graph` | After conversion, captured before subscription consumes graph inputs. |
+
+Snapshots clone with IDs preserved; they observe the same nodes rather than create new products.
+The first snapshot precedes A-normalization so its IDs can use the lowering projection.
+New A-normalization products are explained by the first pair's selected rows.
+Uniquification can remove `LetType` nodes; it does not require every lowering key to survive.
+
+`pane_trees` supplies the expression snapshots in topology order. `IR_PANE_COUNT` and its
+compile-time assertion require IR entries to precede operator entries and match the array's arity.
+`pane_ids` uses the predicate-inclusive expression walk for IR panes and graph IDs for operators.
+`every_recorded_phase_belongs_to_exactly_one_pane_pair` checks corpus-recorded phases against
+the declared phase sets.
+
 ### Pane materialization
 
 `CompiledProgram::materialize_panes` uses `PANES` to fold each adjacent snapshot pair.
@@ -674,63 +706,40 @@ that the leaks are empty. The inspector and the compile-time leak gate both use 
 
 ## Operator conversion
 
-A pane may be issued at any point during compilation, and the panes run through
-operator conversion: `Phase::Convert` records, `post-conversion` holds the
-operator graph, and its pair is gated like every pair above it.
+The final pair relates post-planning expression IDs to post-conversion operator-graph IDs.
+`Phase::Convert` writes provenance rows using the same `NodeId` domain as expression phases.
+`PaneSpec::content` selects expression-tree or operator-graph enumeration; the fold itself
+accepts ID sets and does not inspect either representation.
 
-Four properties carry a pane past the last expression tree, each independent of
-the others:
+Conversion opens a recording per expression frame through `converting`. A nested frame
+captures its own operators. Products constructed after a child returns are attributed to the
+parent frame unless the site opens a finer recording, as per-writer commit-store construction
+does. The operator graph includes output sink nodes, which also have identities and attribution.
 
-- An operator carries a `NodeId` drawn from the same counter as an expression
-  node's (`OperatorBase`), so a row has something to resolve against.
-- `PaneSpec::content` declares what a pane holds, and `CompiledProgram::pane_ids`
-  is all the fold reads from a pane — never its content — so a pane holding an
-  operator graph costs the fold nothing.
-- `OperatorGraph` enumerates its own nodes, which is the output id set `fold`
-  needs.
-- A `CycleSlot`'s edge is recorded when the slot is filled. `subscribe` consumes
-  the slot, so no traversal of a finished `CompiledProgram` can recover it.
+Graph-edge recording is distinct from provenance parent recording. Deferred inputs are registered
+when a `CycleSlot` is filled. The graph is captured before subscription takes slots and keyed
+inputs; a later traversal cannot recover those consumed inputs. The graph is retained even when
+phase-table capture is disabled.
 
-Planning's raising crossing was an entry here and is resolved. The three sites
-that lift a term out of a type — `planning/iterate`'s `fn_of_bare_predicate`
-lift, the group-by key extraction, and the hash-join key morphisms — each keep the
-predicate's parentage, because a clone's copy names the node it was freshened
-from rather than the node the recording named. What had looked like a missing
-re-rooting channel was the predicate ids being outside the enumerated domain,
-which the binder-slot widening fixed;
-`both_raising_paths_attribute_the_predicate_to_the_predicate` pins it.
+Planning's predicate-to-term copies use predicate origins, as specified under
+[Walking the ids](#walking-the-ids). They do not need an operator-conversion attribution rule.
 
 ## The inspector consumers (`src/inspector_model/`)
 
-The inspector model is the only consumer of the folds' projections and maps; the
-leak gate reads the same folds' `leaks` under `CAMBRA_PROVENANCE_GATE`, and a
-release compile reads the lowering projection and nothing else. The model's own
-reference is
-[design.md](../../inspector_model/design.md), which owns the payload shape, the
-usage model and the wire's versioning; what follows is what that layer reads out
-of this one.
+The inspector model consumes pane projections and relations. Its
+[design reference](../../inspector_model/design.md) owns payload shape, queries and schema
+versioning. This section specifies only the boundary with provenance.
 
-- `build_node_table` ships each attribution as it is stored: every span the
-  attribution records, narrowest first, plus its `rewritten` tag
-  (`{ via, nature, label }`). The tag serializes as
-  `null` for a direct image — `Nature::Source` null-compresses at the emission
-  site via `Nature::is_source`, and the consumer's validator guards that a
-  `"source"` nature never actually ships. The wire carries no flat
-  `Source`/`Derived`/`Synthetic` label string; the frontend formats the tag
-  itself.
-- `paneLinks` ship each pane-pair `ProvenanceMap` **dense** — self-edges included,
-  no identity-edge filter — via `dense_edges`; the frontend only follows edges,
-  never reconstructing them. An edge's label set stays here and does not reach
-  the wire: resolution is bidirectional and transitive, so a consumer treats
-  `descends` and `relates` alike, while `has_ancestry` drives leak accounting in
-  this layer. Every edge endpoint is a live node id in the pane it points into,
-  which
-  `every_pane_link_endpoint_is_a_node_of_the_tree_it_points_into` pins at the
-  producer and the consumer's validator re-checks on the shipped payload.
-- Ids inside refinement predicates are endpoints like any other, so every walk
-  that builds the payload descends into them
-  ([Walking the ids](#walking-the-ids)).
+`build_node_table` uses each available attribution's spans and tag. `wire_spans` orders spans
+by length and then position/file; it does not preserve the fold's parent-first span order.
+`rewrite_info` encodes a Source-nature tag as null and other tags as `{via, nature, label}`.
+An absent attribution also leaves the node's spans empty and its wire tag null; consumers cannot
+infer presence of an internal attribution from null alone.
 
-The payload carries its own version in `meta.schema`. Nothing under `ccl/` reads
-or depends on that number: this layer produces attributions and maps, and the
-serialization shape is the inspector's contract with its frontend.
+`dense_edges` emits every relation endpoint pair, including self-edges, but omits edge labels.
+The wire therefore does not distinguish ancestry from blame. Endpoint membership is checked by
+producer tests and payload validation. Predicate interiors are node-table entries and relation
+endpoints, following the [ID traversal contract](#walking-the-ids).
+
+The payload's `meta.schema` belongs to the inspector protocol. The CCL layer supplies identities,
+attributions and relations without depending on that version number.
