@@ -679,6 +679,9 @@ pub fn freshen_above(
                 cache.site_telescope.as_ref().unwrap_or(&tv.telescope),
                 fun_kind,
             );
+            if tv.names_domain() {
+                v.mark_named_domain();
+            }
             cache.vars.insert(tv.uid, Rc::clone(&v));
 
             // Snapshot bounds before recursing — the recursion may touch

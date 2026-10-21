@@ -160,7 +160,7 @@ pub(super) fn lower_generator_for(
             return Ok(generator_defer_binding(defer_name, inner, for_span, ctx));
         }
 
-        let source = lower_expr(iter, ctx)?;
+        let source = lower_loop_source(iter, ctx)?;
         let frame_introduced = HashSet::from([iter_var.clone()]);
         // Plain yield without loop-carried mutation: desugar yield → defer + feed.
         let defer_name = ctx.fresh_result_name();
@@ -187,7 +187,7 @@ pub(super) fn lower_generator_for(
         );
         Ok(generator_defer_binding(defer_name, seq, for_span, ctx))
     } else {
-        let source = lower_expr(iter, ctx)?;
+        let source = lower_loop_source(iter, ctx)?;
         let frame_introduced = HashSet::from([iter_var.clone()]);
         // The loop target shadows a like-named transactional mutable variable in the body.
         let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
@@ -300,6 +300,34 @@ fn in_loop_aug_assign_error(span: Span, name: &str) -> LoweringError {
              per-iteration value with `{name} = …`"
         ),
     )
+}
+
+/// Lower a loop's source, `for x in 𝑐` or a comprehension's `for x in 𝑐`, to the collection the
+/// loop walks: `𝑐 ▷ summon(Iterable(_))::elements` (`docs/chl-spec.md`, "4.6 `for` —
+/// iteration").
+///
+/// The call places the requirement `Iterable(C)` on `𝑐`'s type, and the loop binds each value of
+/// its `Elements`. Coalescing removes the call again where `𝑐` is a structural collection, which
+/// is its own `Elements`.
+pub(super) fn lower_loop_source(
+    iter: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    use crate::ccl::infer::solver::traits::{ITERABLE_ELEMENTS, Trait};
+    let source = lower_expr(iter, ctx)?;
+    let trait_ = Trait::iterable();
+    let label = "lower.iterable_elements";
+    let elements = ctx.tag_machinery(
+        Expr::new(TypedExprNode::TraitFn {
+            operands: (0..trait_.arity()).map(|_| Type::Hole).collect(),
+            assoc: Vec::new(),
+            trait_,
+            function: ITERABLE_ELEMENTS.into(),
+        }),
+        iter.span,
+        label,
+    );
+    Ok(ctx.tag_machinery(Expr::apply(source, elements), iter.span, label))
 }
 
 /// A `for` whose binder is a pattern or `_`, as the loop over a plain name it means.
@@ -818,7 +846,7 @@ fn lower_for_body_stmt(
                 None => (target, body.as_slice()),
             };
             let inner_var = extract_name_target(target, "for-loop target")?;
-            let inner_source = lower_expr(iter, ctx)?;
+            let inner_source = lower_loop_source(iter, ctx)?;
             // New frame: the outer frame's names (including iter_var) move into
             // mutation_scope so that the inner body cannot mutate them, except those a
             // pattern binder shadows.
@@ -1300,7 +1328,7 @@ fn lower_nested_loop(
         ));
     }
     let iter_var = extract_name_target(target, "for-loop target")?;
-    let source = lower_expr(iter, ctx)?;
+    let source = lower_loop_source(iter, ctx)?;
     // One that feeds and writes nothing outside it is a feed-only loop, built as one is
     // anywhere ([`tagged_for_loop`]); a `yield` in it feeds the enclosing generator.
     if writes.is_empty() && feeds {
@@ -1423,7 +1451,7 @@ pub(super) fn lower_direct_mirror_loop(
         for_span,
     } = site;
     let iter_var = extract_name_target(target, "for-loop target")?;
-    let source = lower_expr(iter, ctx)?;
+    let source = lower_loop_source(iter, ctx)?;
 
     // Build the statement chain right-to-left, ending in Unit (the For's
     // body is a statement, not a value). The loop target is in scope over the
@@ -1926,7 +1954,7 @@ def doubles(xs):
 doubles",
         "\
 let doubles : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ≫ (λ x → feed(__result_0, x * 2)); __result_0
+in xs ▷ Iterable::elements ≫ (λ x → feed(__result_0, x * 2)); __result_0
 in doubles"
     )]
     // Multi-param generator: captures outer parameter. Uncurried params
@@ -1939,7 +1967,7 @@ def add_to(xs, n):
 add_to",
         "\
 let add_to : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
-in __arg_tuple_1.0 ≫ (λ x → feed(__result_0, x + __arg_tuple_1.1)); __result_0
+in __arg_tuple_1.0 ▷ Iterable::elements ≫ (λ x → feed(__result_0, x + __arg_tuple_1.1)); __result_0
 in add_to"
     )]
     // Generator with if-guard: guard becomes a Case in the For body.
@@ -1952,7 +1980,7 @@ def positives(xs):
 positives",
         "\
 let positives : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ≫ (λ x → { x > 0 → feed(__result_0, x); true → unit }); __result_0
+in xs ▷ Iterable::elements ≫ (λ x → { x > 0 → feed(__result_0, x); true → unit }); __result_0
 in positives"
     )]
     // Nested for-loops: inner iter independent of outer loop variable.
@@ -1965,7 +1993,7 @@ def cross(xs, ys):
 cross",
         "\
 let cross : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
-in __arg_tuple_1.0 ≫ (λ x → __arg_tuple_1.1 ≫ (λ y → feed(__result_0, x + y))); __result_0
+in __arg_tuple_1.0 ▷ Iterable::elements ≫ (λ x → __arg_tuple_1.1 ▷ Iterable::elements ≫ (λ y → feed(__result_0, x + y))); __result_0
 in cross"
     )]
     // Three-level nested for.
@@ -1979,7 +2007,7 @@ def triple(xs, ys, zs):
 triple",
         "\
 let triple : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
-in __arg_tuple_1.0 ≫ (λ x → __arg_tuple_1.1 ≫ (λ y → __arg_tuple_1.2 ≫ (λ z → feed(__result_0, x + y + z)))); __result_0
+in __arg_tuple_1.0 ▷ Iterable::elements ≫ (λ x → __arg_tuple_1.1 ▷ Iterable::elements ≫ (λ y → __arg_tuple_1.2 ▷ Iterable::elements ≫ (λ z → feed(__result_0, x + y + z)))); __result_0
 in triple"
     )]
     // Guard before inner for: Case wraps the nested For node.
@@ -1993,7 +2021,7 @@ def cross_filtered(xs, ys):
 cross_filtered",
         "\
 let cross_filtered : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
-in __arg_tuple_1.0 ≫ (λ x → { x > 0 → __arg_tuple_1.1 ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
+in __arg_tuple_1.0 ▷ Iterable::elements ≫ (λ x → { x > 0 → __arg_tuple_1.1 ▷ Iterable::elements ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
 in cross_filtered"
     )]
     // Let-binding in generator body: y is a fresh local per iteration.
@@ -2006,7 +2034,7 @@ def with_let(xs):
 with_let",
         "\
 let with_let : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ≫ (λ x → let y = x + 1
+in xs ▷ Iterable::elements ≫ (λ x → let y = x + 1
 in feed(__result_0, y * 2)); __result_0
 in with_let"
     )]
@@ -2020,7 +2048,7 @@ def shadow(xs):
 shadow",
         "\
 let shadow : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ≫ (λ x → let x = x + 1
+in xs ▷ Iterable::elements ≫ (λ x → let x = x + 1
 in feed(__result_0, x)); __result_0
 in shadow"
     )]
@@ -2034,7 +2062,7 @@ def dep(xss):
 dep",
         "\
 let dep : (_ ⇒ _) = λ xss → let __result_0 = defer
-in xss ≫ (λ xs → xs ≫ (λ x → feed(__result_0, x))); __result_0
+in xss ▷ Iterable::elements ≫ (λ xs → xs ▷ Iterable::elements ≫ (λ x → feed(__result_0, x))); __result_0
 in dep"
     )]
     // Let inside an if-guard body.
@@ -2048,7 +2076,7 @@ def guarded_let(xs):
 guarded_let",
         "\
 let guarded_let : (_ ⇒ _) = λ xs → let __result_0 = defer
-in xs ≫ (λ x → { x > 0 → let y = x * 2
+in xs ▷ Iterable::elements ≫ (λ x → { x > 0 → let y = x * 2
 in feed(__result_0, y); true → unit }); __result_0
 in guarded_let"
     )]
@@ -2397,7 +2425,7 @@ x";
         assert_eq!(
             s,
             "x : Mut(_, _) := 0\n\
-             in for i in [1, 2] do { i > 0 → x := x + i; unit; \
+             in for i in [1, 2] ▷ Iterable::elements do { i > 0 → x := x + i; unit; \
              true → x := x - i; unit }; unit; x",
             "if/else conditional write lowers to a two-branch filter-Case, each \
              leg carrying its own MutWrite: {s}"
@@ -2465,7 +2493,8 @@ x";
         assert_eq!(
             s,
             "x : Mut(_, _) := 0\n\
-             in for i in [1, 2, 3] do { i > 1 → x := x + i; unit; true → unit }; unit; x",
+             in for i in [1, 2, 3] ▷ Iterable::elements do { i > 1 → x := x + i; unit; \
+             true → unit }; unit; x",
             "conditional write lowers to a statement-position filter-Case with the \
              MutWrite in the guarded leg and a `true → unit` carry-forward complement"
         );

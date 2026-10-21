@@ -512,6 +512,7 @@ const BUILTIN_FUNCTIONS: &[(&str, &str, &[usize])] = &[
     ("Divisible", "div", &[0, 1]),
     ("Exponentiable", "pow", &[0, 1]),
     ("Negatable", "neg", &[0]),
+    ("Iterable", "elements", &[0]),
 ];
 
 /// The function of an operator's trait an arithmetic operator calls (`docs/chl-spec.md`,
@@ -1641,7 +1642,7 @@ impl Interp {
             Stmt::For {
                 target, iter, body, ..
             } => {
-                let source = self.eval(iter)?;
+                let source = self.eval_loop_source(iter)?;
                 // A pending collection has pending keys and elements, so the body runs once,
                 // speculatively, over a pending element under a pending key.
                 if matches!(source, Value::Pending) {
@@ -1824,6 +1825,16 @@ impl Interp {
         };
         self.bind(format!("{ty}::{name}"), Slot::Fn(Rc::new(function)));
         Ok(())
+    }
+
+    /// The collection a loop over `iter` walks: `Iterable`'s `elements` of its value
+    /// (`docs/chl-spec.md`, "4.6 `for` — iteration"). A collection is its own, and a nominal
+    /// value's is what its type's instance returns.
+    fn eval_loop_source(&mut self, iter: &Spanned<Expr>) -> Result<Value, Error> {
+        match self.eval(iter)? {
+            v @ Value::Nominal { .. } => self.dispatch("Iterable", "elements", vec![v]),
+            v => Ok(v),
+        }
     }
 
     /// The trait function `trait_::function` at `values`: the function of the one instance
@@ -3387,7 +3398,7 @@ impl Interp {
                 _ => err("a comprehension guard is a boolean"),
             },
             Some((CompClause::For { target, iter }, rest)) => {
-                let c = match self.eval(iter)? {
+                let c = match self.eval_loop_source(iter)? {
                     Value::Collection(c) => c,
                     // A pending source has pending bindings, so the rest runs once,
                     // speculatively, over a pending one.
@@ -3512,6 +3523,11 @@ fn builtin_function(
         ("Multipliable", "mul") => pair(values).map(|(l, r)| binop(BinOp::Mul, l, r))?,
         ("Divisible", "div") => pair(values).map(|(l, r)| binop(BinOp::FloorDiv, l, r))?,
         ("Exponentiable", "pow") => pair(values).map(|(l, r)| binop(BinOp::Pow, l, r))?,
+        // A collection is its own `Elements` (`docs/chl-spec.md`, "Trait requirements").
+        ("Iterable", "elements") => match values {
+            [c @ Value::Collection(_)] => Ok(c.clone()),
+            _ => return None,
+        },
         ("Negatable", "neg") => match values {
             [Value::Int(i)] => i
                 .checked_neg()
@@ -3893,6 +3909,29 @@ mod tests {
             let e = refused(&format!("out = test_sink()\n{body}\n"));
             assert!(e.contains("`a` is bound twice"), "{body}: {e}");
         }
+    }
+
+    /// A loop walks its source's `Elements`: an instance's `elements` for a nominal type, and
+    /// the collection itself for a structural one.
+    #[test]
+    fn a_loop_walks_its_sources_elements() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Bag = List(Int)
+            impl Iterable(Bag):
+                Elements = List(Int)
+                def elements(b):
+                    b.extract()
+            def total(c):
+                sum([x for x in c])
+            n := 0
+            for x in Bag::new(box([1, 2])):
+                n += x
+            out << sum([x + 1 for x in Bag::new(box([1, 2, 3]))])
+            out << sum(summon(Iterable(_))::elements([4, 5])) + n
+            out << total(Bag::new(box([1, 2, 3]))) + total([4, 5])
+        "#});
+        assert_eq!(v.to_string(), "[`0(()) -> 9, `1(()) -> 12, `2(()) -> 15]");
     }
 
     /// A `for` binder takes a constructor pattern apart, as the compiler does.

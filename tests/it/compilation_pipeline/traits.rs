@@ -641,7 +641,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
             def area(s: S) => Int
         summon(Area(_))::area(Circle::new(1))
     "},
-    "No Area instance for Apply: operand 1 is Circle, and no instance of `Area` accepts a type there"
+    "No Area instance for Area::area: operand 1 is Circle, and no instance of `Area` accepts a type there"
 )]
 #[case::overlapping_instances(
     indoc! {"
@@ -1892,5 +1892,116 @@ fn orderable_requires_equatable() {
     check_compile_error(
         &same_and_least("Orderable(T, T)"),
         "No requirement states that `T` is Equatable",
+    );
+}
+
+/// A nominal type a module makes `Iterable`, whose `Elements` is the list it wraps.
+const BAG: &str = indoc! {"
+    type Bag = List(Int)
+    impl Iterable(Bag):
+        Elements = List(Int)
+        def elements(b):
+            b.extract()
+"};
+
+/// A loop walks its source's `Elements`: an instance's `elements` for a nominal type, and the
+/// collection itself for a structural one, which the instance in scope does not answer for
+/// (`docs/chl-spec.md`, "Trait requirements").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_comprehension_over_the_type("sum([x + 1 for x in Bag::new(box([1, 2, 3]))])", 9)]
+#[case::a_called_elements(
+    "sum([x for x in summon(Iterable(_))::elements(Bag::new(box([1, 2])))])",
+    3
+)]
+#[case::a_structural_collection_beside_the_instance("sum([x for x in [4, 5]])", 9)]
+#[case::a_structural_elements_is_the_identity("sum(summon(Iterable(_))::elements([4, 5]))", 9)]
+#[case::a_definition_over_either(
+    indoc! {"
+        def total(c):
+            sum([x for x in c])
+        total(Bag::new(box([1, 2, 3]))) + total([4, 5])
+    "},
+    15
+)]
+// A loop over a sum, the collection itself or the one an instance returns, types its chain
+// by the sum's own binders.
+#[case::a_feed_loop_over_a_box(
+    indoc! {"
+        out: Feed(_)
+        for x in box([1, 2]):
+            out << x
+        sum(out)
+    "},
+    3
+)]
+#[case::a_feed_loop_over_a_type_whose_elements_is_a_box(
+    indoc! {"
+        out: Feed(_)
+        for x in Bag::new(box([1, 2])):
+            out << x
+        sum(out)
+    "},
+    3
+)]
+#[case::a_generator_over_a_box(
+    indoc! {"
+        def g(b):
+            for x in b:
+                yield x * 2
+        sum(g(box([1, 2])))
+    "},
+    6
+)]
+#[case::a_generator_over_the_type(
+    indoc! {"
+        def g(b):
+            for x in b:
+                yield x * 2
+        sum(g(Bag::new(box([1, 2]))))
+    "},
+    6
+)]
+fn a_loop_walks_its_sources_elements(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(&format!("{BAG}\n{code}"), Value::Int(expected));
+}
+
+/// A loop over a type no instance of `Iterable` accepts is refused at its source, as the call of
+/// `Iterable::elements` the loop makes.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_scalar(indoc! {"
+    total := 0
+    for x in 3:
+        total += x
+    total
+"})]
+#[case::a_nominal_type_without_an_instance("type Box = Int\nsum([x for x in Box::new(3)])")]
+fn a_loop_over_a_type_without_an_iterable_instance(#[case] code: &str) {
+    check_compile_error(
+        code,
+        "No Iterable instance for Iterable::elements: operand 1 is",
+    );
+}
+
+/// An instance's `Elements` is a structural collection: a nominal one would need its own
+/// instance's `elements` after the loop's, and is refused at the instance.
+#[test]
+fn a_nominal_elements_is_refused_at_the_instance() {
+    check_compile_error(
+        indoc! {"
+            type Bag = List(Int)
+            impl Iterable(Bag):
+                Elements = List(Int)
+                def elements(b):
+                    b.extract()
+            type Wrap = Bag
+            impl Iterable(Wrap):
+                Elements = Bag
+                def elements(w):
+                    w.extract()
+            sum([x for x in Wrap::new(Bag::new(box([1, 2])))])
+        "},
+        "`Elements = Bag` in `impl Iterable(Wrap)` is a nominal type",
     );
 }

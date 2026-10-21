@@ -59,6 +59,12 @@ through the same table.
 
 ## Generator functions and feed-only loops
 
+Every loop's source `𝑐`, a `for` statement's and a comprehension's `for` clause's alike, lowers to
+`𝑐 ▷ Iterable::elements` (`lower_loop_source`): the loop walks the collection the source's
+`Iterable` instance returns. Over a structural collection the call is the identity, and coalescing
+removes it
+([type-inference.md, "A collection is answered off the table"](type-inference.md#a-collection-is-answered-off-the-table)).
+
 A feed-only or yield-only `for` loop without loop-carried mutation lowers to a composition of its
 source and an iteration lambda: `source ≫ (λ x → body)`. The composition carries a data-function
 annotation. A loop that feeds an existing defer handle needs no result binding. A loop with `yield`
@@ -75,7 +81,7 @@ lowers to the shape:
 ```text
 let f = λ xs →
     let __result_0 = defer
-    in xs ≫ (λ x → feed(__result_0, x * 2)); __result_0
+    in xs ▷ Iterable::elements ≫ (λ x → feed(__result_0, x * 2)); __result_0
 in body
 ```
 

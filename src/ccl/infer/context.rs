@@ -31,7 +31,7 @@ use super::solve::value_type;
 use super::typing::{LetScheme, Typing};
 use super::{coalesce_for_error, map_constrain_err};
 use crate::ccl::infer::solver::traits::{Assoc, InstanceTable, Trait, TraitObligation};
-use crate::ccl::ty::TraitRequirement;
+use crate::ccl::ty::{KindPin, TraitRequirement};
 
 /// A lexical-scope entry: the binder's polymorphic scheme.
 ///
@@ -110,12 +110,12 @@ pub(super) fn should_generalize(
     generalized: impl FnOnce(&Name) -> bool,
 ) -> bool {
     let polymorphic_form = match &def.node {
+        // A data function is shared data rather than a callable interface, whether its kind
+        // is written or a variable already pinned to one, as a comprehension's is.
         TypedExprNode::Lambda { .. } => !matches!(
-            def.ty,
-            Type::Fun {
-                fun_kind: crate::ccl::ty::FunKind::Data(..),
-                ..
-            }
+            &def.ty,
+            Type::Fun { fun_kind, .. }
+                if matches!(fun_kind.resolved(), KindPin::Plain | KindPin::Sum(_))
         ),
         TypedExprNode::Var(name) => generalized(name),
         TypedExprNode::TraitFn { .. } => true,
@@ -728,6 +728,20 @@ impl InferCtx {
         self.normalize_annotation_in(ty, &self.telescope)
     }
 
+    /// A function annotation's domain, normalized. A [`Type::SharedHole`] there names one
+    /// data domain, so its variable is marked as one ([`InferVar::names_domain`]): a domain
+    /// is the one position where the claim that two positions share a type is an equation
+    /// rather than a common bound.
+    fn normalize_domain(&self, domain: &Type, telescope: &Telescope) -> Type {
+        let normalized = self.normalize_annotation_in(domain, telescope);
+        if matches!(domain, Type::SharedHole(_))
+            && let Type::Infer(v) = &normalized
+        {
+            v.mark_named_domain();
+        }
+        normalized
+    }
+
     /// [`normalize_annotation`](Self::normalize_annotation)'s recursion, with
     /// the telescope threaded as a value: descending into a named function's
     /// codomain extends it with the Pi binder, so a variable minted inside a
@@ -860,7 +874,7 @@ impl InferCtx {
                         }
                         other => other.clone(),
                     },
-                    domain: Box::new(self.normalize_annotation_in(d, telescope)),
+                    domain: Box::new(self.normalize_domain(d, telescope)),
                     codomain: Box::new(self.normalize_annotation_in(c, &cod_telescope)),
                 }
             }
@@ -1048,42 +1062,7 @@ impl InferCtx {
         self.cache.at(self.here(), self.here());
         let result = constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope);
         self.settle_annotation_edge(result.is_err(), &mismatch)?;
-        // **A `SharedHole` naming a domain is an equation, not an ordering.** The edge
-        // above is contravariant in the domain, so it leaves the shared variable *below*
-        // every domain annotated with it: a common lower bound, which orders each domain
-        // under it and says nothing between them. Lowering writes the id to claim that two
-        // positions are one domain, and a data domain is invariant, so the claim is an
-        // equation and this draws its other half.
-        //
-        // Only where the id names the domain. A domain variable reached any other way may
-        // receive several domains deliberately — a conditional collection's arms, a
-        // domain-generic consumer's parameter — and equating those is what `constrain_go`'s
-        // invariant-domain arm declines to do for a variable-sided edge.
-        //
-        // Never against a **bound witness**. A sum's domain is its binder's reference, and
-        // entering a sum is a term (`src/ccl/design/type-inference.md`, "Only a term builds
-        // a sum"), so an equation between that reference and a free variable is not a claim
-        // about two positions but an escape of the binder — the coercion the one-way rule
-        // above exists to leave to the Σ rule.
-        if let Type::Fun {
-            domain: claimed, ..
-        } = ann_to_normalize.peel_refinements()
-            && matches!(**claimed, Type::SharedHole(_))
-            && let Type::Fun { domain: shared, .. } = ann_simple.peel_refinements()
-            && let Type::Fun {
-                domain: inferred_dom,
-                ..
-            } = inferred.peel_refinements()
-            && !matches!(inferred_dom.peel_refinements(), Type::WitnessRef(_))
-        {
-            let scope = SolverScope {
-                scopes: &self.scopes,
-                opaque_binders: &self.opaque_binders,
-            };
-            self.cache.at(self.here(), self.here());
-            let result = constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope);
-            self.settle_annotation_edge(result.is_err(), &mismatch)?;
-        }
+
         Ok(ann_simple)
     }
 

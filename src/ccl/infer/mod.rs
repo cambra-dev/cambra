@@ -249,6 +249,11 @@ pub(super) fn coalesce_for_error(ty: &Type) -> Type {
 /// [`coalesce_for_error`] for why a message's types are resolved when it is raised.
 pub(super) fn resolve_predicate_types(ty: &mut Type) {
     fn resolve_expr(e: &mut TypedExpr) {
+        // A collection's `elements` call is the identity, which coalescing drops; the message
+        // reads the collection as the program spells it.
+        while let Some(collection) = solve::elements_of_a_collection(e) {
+            *e = collection;
+        }
         if let Ok(resolved) = resolve_var_type(&e.ty) {
             e.ty = resolved;
         }
