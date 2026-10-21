@@ -92,6 +92,11 @@ pub(super) trait Typing {
     /// resolved so far. Check resolves no names, so it answers `0`.
     fn poisoned_reads(&self) -> usize;
 
+    /// Whether `name` is bound where the current node stands, which a method call asks of
+    /// each candidate's binding before it takes one ([`crate::ccl::MethodCandidate`]). Check
+    /// resolves no method calls, so it answers `false`.
+    fn binds(&self, name: &Name) -> bool;
+
     /// Obtain the type of a child sub-expression. In Emit mode this recurses
     /// via [`emit_node`](super::emit::emit_node), emitting the child's
     /// constraints and writing its inferred type onto the child node.

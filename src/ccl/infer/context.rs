@@ -920,6 +920,10 @@ impl Typing for InferCtx {
         self.poisoned_reads
     }
 
+    fn binds(&self, name: &Name) -> bool {
+        self.scopes.lookup(name).is_some()
+    }
+
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
         emit_node(child, self)
     }

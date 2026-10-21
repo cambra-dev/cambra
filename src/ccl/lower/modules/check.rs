@@ -272,12 +272,16 @@ impl<'a> ProgramLowering<'a> {
                 );
             }
         }
-        let _copy = crate::ccl::provenance::copy_frame("check.module");
-        for (shared, chain) in self.shared_chains.iter().rev() {
-            if reached.contains(shared) {
-                tree = fill_module_body(chain.clone(), tree);
+        {
+            let _copy = crate::ccl::provenance::copy_frame("check.module");
+            for (shared, chain) in self.shared_chains.iter().rev() {
+                if reached.contains(shared) {
+                    tree = fill_module_body(chain.clone(), tree);
+                }
             }
         }
+        let copies = self.method_copies.clone();
+        add_method_copies(&mut tree, &copies, ctx);
         Some(ModuleCheck {
             module: lowered.interface.module.clone(),
             file,

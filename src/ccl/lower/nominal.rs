@@ -1906,7 +1906,9 @@ pub(super) fn lower_method_call(
             owners.push((decl, params, Some(qualifier)));
         }
     }
-    if owners.is_empty() {
+    // A type another module declares that no qualifier reaches has its method found by
+    // inference, from the copies linking adds (`modules::add_method_copies`).
+    if owners.is_empty() && !ctx.reached_methods.contains(&method.node) {
         return Err(LoweringError::unsupported(
             method.span,
             format!(
@@ -1931,6 +1933,7 @@ pub(super) fn lower_method_call(
                 decl,
                 params,
                 function,
+                copy: false,
             }
         })
         .collect();

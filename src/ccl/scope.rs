@@ -692,6 +692,7 @@ mod tests {
                     ),
                     params: 0,
                     function: var("N::m"),
+                    copy: false,
                 }],
             }),
             transact_one_key_one_writer(),

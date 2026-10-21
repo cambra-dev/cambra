@@ -2511,6 +2511,10 @@ pub struct MethodCandidate {
     pub params: usize,
     /// A reference to the method's binding.
     pub function: TypedExpr,
+    /// Whether linking added the candidate: a run's copy of another module's public
+    /// method, which a call takes only where its binding is in scope. A program may hold
+    /// several copies of one type's method, and every one is the same function.
+    pub copy: bool,
 }
 
 /// What a [`Pattern`] matches: a structural variant's tag, or a nominal type's
