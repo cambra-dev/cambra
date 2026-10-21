@@ -6,7 +6,7 @@
 //! [`CompactType`] / [`CompactGraph`] are the shared currency consumed by the
 //! sibling [`mod@super::simplify_type`] and [`super::coalesce`] modules.
 
-use crate::ccl::nominal::{NominalDecl, Variance};
+use crate::ccl::nominal::{DeclMap, NominalDecl, Variance};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -850,7 +850,7 @@ pub struct CompactType {
     /// an error (`docs/chl-spec.md`, "A nominal type is opaque"). Each argument compacts
     /// at the polarity [`Variance::polarity`](crate::ccl::nominal::Variance::polarity)
     /// gives it.
-    pub nominal: BTreeMap<Rc<NominalDecl>, Vec<CompactType>>,
+    pub nominal: DeclMap<Vec<CompactType>>,
     /// Two applications of one declaration met here whose arguments at an
     /// [`Invariant`](Variance::Invariant) parameter differ: the
     /// declaration and the two arguments. Both sides of an equality position are one type,
@@ -1006,7 +1006,7 @@ impl CompactType {
             visit(value, Variance::Invariant);
             visit(domain, Variance::Invariant);
         }
-        for (decl, args) in &mut self.nominal {
+        for (decl, args) in self.nominal.iter_mut() {
             let mut args = args.iter_mut();
             for v in &decl.body().variances {
                 match v {
@@ -2337,7 +2337,7 @@ fn compact_go(
             }
             let args = sides;
             CompactType {
-                nominal: BTreeMap::from([(decl.clone(), args)]),
+                nominal: DeclMap::from([(decl.clone(), args)]),
                 ..CompactType::value()
             }
         }

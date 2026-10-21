@@ -28,6 +28,7 @@ mod joins_aggregates_groupby;
 mod key_collections;
 mod misc;
 mod module_checks;
+mod module_nominal_types;
 mod module_type_parameters;
 mod module_types;
 mod modules;

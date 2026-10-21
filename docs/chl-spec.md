@@ -1024,9 +1024,13 @@ parameters consumes all `n` arguments together. There is no implicit
 currying — `f(a)` for an `n>1`-arity `f` is a compile-time error, not
 a partial application.
 
-**No keyword arguments**, **no default values**, **no `*args`/`**kwargs`**,
-**no positional-only / keyword-only markers**. The function-call grammar
-is exactly a parenthesised, comma-separated list of expressions.
+**No default values**, **no `*args`/`**kwargs`**, **no positional-only /
+keyword-only markers**. A call's arguments are a parenthesised,
+comma-separated list of expressions, or of `name=value` fields, which
+build the record argument below: `f(x=1, y=2)` is `f((x=1, y=2))`. A
+field's name may carry the module its label belongs to, `shop::amount=3`
+([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
+A call that mixes expressions and fields is an error.
 
 > **Direction [Decided].** Every function takes exactly **one**
 > argument, and the argument's product structure is what "arity" is: a
@@ -3062,6 +3066,13 @@ method it means, and the method as an unapplied value has no other spelling.
 - **An associated function declares at least one value parameter.** `def Price::zero():` is an
   error: a function of no argument is a constant ([3.8 Function calls](#38-function-calls)). An
   associated value has no spelling and is **[Open]**.
+- **An associated function reaches nothing a run gives its module.** Every run of a module shares a
+  type that reaches none of the module's parameters
+  ([Nominal type identity](#nominal-type-identity)), so each run's copy of the type's functions must
+  be one function. An associated function reads no mutable variable, feed or source of its module,
+  no value parameter, no member of a Module-typed parameter, and no member of a run the module
+  declares, directly or through the module's bindings and functions, and an error names what it
+  reads. A type parameter of the module that it names is part of the type's identity instead.
 - Whether a module other than the type's own may declare an associated function of it is **[Open]**.
 
 **An `impl` block declares a type's associated functions together.** It is shorthand for writing
@@ -4283,13 +4294,13 @@ param payments: Module{charge: {amount: Int} => Receipt}
 pub def quote(item, qty): …
 pub limit: Int = 10
 pub Qty = {Int where _ >= 0}
-```
-
-**[Planned]** — `pub` on a nominal type, an associated function, and a mutable variable:
-
-```python
 pub type Price = {amount: Int}
 pub def Price::discounted(self, pct: Int) => Price: …
+```
+
+**[Planned]** — `pub` on a mutable variable:
+
+```python
 pub stock: Mut(Map(String, Int), Txn) := Map::empty
 ```
 
@@ -4314,9 +4325,10 @@ pub held: Int
   `pub` would change the module's interface.
 - Private names keep the ordinary top-level shadowing of
   [5. Scoping and binding](#5-scoping-and-binding).
-- **[Planned]** `pub` on a `type` declaration exports the nominal type with its constructors, and
-  with `new` and `extract` in the single-constructor form. `pub` on an associated function's `def` exports it, and
-  one without `pub` is reached only from its own module, in either spelling
+- `pub` on a `type` declaration exports the nominal type with its constructors, and with `new` and
+  `extract` in the single-constructor form. `pub` on an associated function's `def`, including one
+  in an `impl` block, exports it, and one without `pub` is reached only from its own module, in
+  either spelling
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). An associated
   function binds no module-level name, so the bound-once rule above does not apply to it.
 - Types need not be annotated on public members. An unannotated member's contract is its inferred
@@ -4334,7 +4346,7 @@ access](#39-subscript-and-attribute-access)). With `import shop::cart`, `run sho
 | Written | Position | Means |
 | --- | --- | --- |
 | `cart::total` | value | the public member `total` of `shop::cart`'s shared import |
-| `cart::Item` | type | the public type member `Item` of `shop::cart`, an alias, or a nominal type (**[Planned]**) |
+| `cart::Item` | type | the public type member `Item` of `shop::cart`, an alias or a nominal type |
 | `c::count` | value, write target | **[Planned]** the public member `count` of the run `c` |
 | `c::total` | value | the public member `total` of the run `c`, a copy distinct from `cart::total` |
 | `p::count` | value, write target | **[Planned]** the member `count` of the run passed as `p` |
@@ -4552,8 +4564,8 @@ nothing.
 
 - **[Open]** — a syntax that aliases another module's label or tag, so the importer writes it
   unqualified.
-- **[Planned]** A sum or product that several modules share is declared as a nominal type. The
-  constructors of a constructor list belong to the type and their parameter names are not labels
+- A sum or product that several modules share is declared as a nominal type. The constructors of a
+  constructor list belong to the type and their parameter names are not labels
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)), so another
   module writes `Shape::circle(1)` with no qualified tag or label. `Option` is such a type, in a
   std module ([9.16 The std root](#916-the-std-root)). A record in the single-constructor form
@@ -4562,40 +4574,26 @@ nothing.
 - **[Open]** — which module owns the labels of data from outside the program, such as the fields
   of an HTTP request body.
 
-A module's type members are its type aliases and, **[Planned]**, its nominal types
+A module's type members are its type aliases and its nominal types
 ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Exporting an
-alias exports a spelling for a structural type, and the user's type is the same type.
-**[Planned]** Exporting a nominal type exports the type itself: `mod::Price` is one type in every
-module that names it, and distinct from every other type of its shape.
+alias exports a spelling for a structural type, and the user's type is the same type. Exporting a
+nominal type exports the type itself: `mod::Price` is one type in every module that names it, and
+distinct from every other type of its shape.
+
+**[Planned]** — a method call on a value whose type a module declares that the calling module
+neither imports nor runs, as one another module's function returns.
 
 #### Nominal type identity
-
-**[Planned]** — the rules of this section.
 
 A nominal type is identified by its module path, its name, its type arguments, and the arguments of
 the module parameters its declaration depends on ([9.4 Parameters](#94-parameters)). A run reaches
 a type through its run name, and two spellings name one type exactly when those parts agree.
 
 - **A declaration's identity includes the argument of every module parameter it reaches.** It
-  reaches one by naming it, by naming another type of the module that reaches it, or by naming a
-  top-level binding whose definition reaches it. A top-level binding is followed through its
-  definition, and a `def` through its body and every function that body calls. Terms appear in a
-  declaration inside refinement predicates and term arguments to type constructors, so those are
-  where it names bindings. Each such parameter is an implicit parameter of the type, and each run's
-  argument fills it.
-
-  ```python
-  param max_rate: Int
-  limit = max_rate * 2
-  def valid(r): r <= limit
-
-  type Rate = {Int where _ <= max_rate * 2}   # names the parameter
-  type Capped = {Int where _ <= limit}        # reaches it through `limit`
-  type Checked = {Int where valid(_)}         # through `valid`'s body, then `limit`
-  ```
-
-  All three reach `max_rate`. A binding that reaches no parameter, such as `ten = 10`, is the same
-  in every run, and a declaration names it freely.
+  reaches a type parameter of its module by naming it, by naming another type of the module that
+  reaches it, or through an associated function whose signature or body names it, since each run's
+  copy of the function then has types of its own. Each such parameter is an implicit parameter of
+  the type, and each run's argument fills it.
 
   Two runs given different arguments reach different types:
 
@@ -4614,22 +4612,41 @@ a type through its run name, and two spellings name one type exactly when those 
   ```
 
   `eu::Order` is `shop::Order` at `Receipt = stripe::Receipt`, and differs from `us::Order`. A
-  diagnostic prints the arguments that tell two such types apart.
-- **A declaration reaches no state and no source.** A declaration that reaches a mutable variable,
-  a feed or a source, of its own module or of an imported one, is an error naming the binding that
-  reaches it. Those change over time rather than per run, so a value that met the declaration when
-  built could fail it later. `InStock = {String where _ in stock.keys()}` therefore stays an alias.
-  Reaching state is an effect, as IO is. Within a module the check follows a `def` through its
-  body, and an imported function is read through its module's interface, which records whether
-  each public function reaches state
+  diagnostic prints the arguments that tell two such types apart. `Price` reaches no parameter, so
+  `eu::Price` and `us::Price` are one type.
+- **[Planned]** A declaration also reaches a parameter by naming a top-level binding whose
+  definition reaches it. A top-level binding is followed through its definition, and a `def`
+  through its body and every function that body calls. Terms appear in a declaration inside
+  refinement predicates and term arguments to type constructors, so those are where it names
+  bindings.
+
+  ```python
+  param max_rate: Int
+  limit = max_rate * 2
+  def valid(r): r <= limit
+
+  type Rate = {Int where _ <= max_rate * 2}   # names the parameter
+  type Capped = {Int where _ <= limit}        # reaches it through `limit`
+  type Checked = {Int where valid(_)}         # through `valid`'s body, then `limit`
+  ```
+
+  All three reach `max_rate`. A binding that reaches no parameter, such as `ten = 10`, is the same
+  in every run, and a declaration names it freely.
+- **[Planned]** **A declaration reaches no state and no source.** A declaration that reaches a
+  mutable variable, a feed or a source, of its own module or of an imported one, is an error naming
+  the binding that reaches it. Those change over time rather than per run, so a value that met the
+  declaration when built could fail it later. `InStock = {String where _ in stock.keys()}`
+  therefore stays an alias. Reaching state is an effect, as IO is. Within a module the check
+  follows a `def` through its body, and an imported function is read through its module's
+  interface, which records whether each public function reaches state
   ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). Once function types
   state their effects
   ([6.9 Effects in function types [Tentative]](#69-effects-in-function-types-tentative)), the check
   reads them from the function's type.
-- **Type arguments compare by type equality, and Module arguments by the run passed.** A type
-  argument may be structural: two runs passing `{id: String, card: String}`, one through an alias
-  and one written out, reach one `Order`. A type argument compares the same whether written or
-  inferred at the `run`.
+- **Type arguments compare by type equality.** A type argument may be structural: two runs passing
+  `{id: String, card: String}`, one through an alias and one written out, reach one `Order`. A type
+  argument compares the same whether written or inferred at the `run`. **[Planned]** A Module
+  argument compares by the run passed.
 - **[Open] — comparing value-parameter arguments.** Comparing them by term identity makes runs
   given `30` and `10 + 20` reach two types, and comparing them by value would evaluate arguments
   during type checking. The same question applies to an alias whose refinement names a top-level

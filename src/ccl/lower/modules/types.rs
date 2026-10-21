@@ -2,6 +2,8 @@
 //! parameters replaced by their arguments, and with a Module type's type members.
 
 use super::*;
+use crate::ccl::nominal::NominalDecl;
+use crate::ccl::{Pattern, PatternHead};
 
 /// `ty`, a type its module lowered, as a module reaching it through the
 /// qualifier `qualifier` writes it: each raw name its predicates read free is
@@ -67,6 +69,9 @@ pub(in crate::ccl::lower) fn substitute(ty: &mut Type, arguments: &HashMap<TypeP
         *ty = argument.clone();
         return;
     }
+    if let Type::Nominal(decl, _) = ty {
+        substitute_decl(decl, arguments);
+    }
     ty.walk_children_mut(|child| substitute(child, arguments));
 }
 
@@ -76,7 +81,40 @@ pub(super) fn substitute_in(expr: &mut Expr, arguments: &HashMap<TypeParamId, Ty
         return;
     }
     expr.walk_type_slots_mut(|ty| substitute(ty, arguments));
+    // A node that names a nominal type outside a type slot names the instance the
+    // arguments reach.
+    match &mut expr.node {
+        TypedExprNode::NominalCtor { decl, .. } => substitute_decl(decl, arguments),
+        TypedExprNode::Case { branches, .. } => {
+            for branch in branches {
+                if let Some(Pattern {
+                    head: PatternHead::Constructor { decl, .. },
+                    ..
+                }) = &mut branch.pattern
+                {
+                    substitute_decl(decl, arguments);
+                }
+            }
+        }
+        TypedExprNode::Method { candidates, .. } => {
+            for candidate in candidates {
+                substitute_decl(&mut candidate.decl, arguments);
+            }
+        }
+        _ => {}
+    }
     expr.walk_children_mut(|child| substitute_in(child, arguments));
+}
+
+/// `decl` as the instance `arguments` reach, when it reaches any of them
+/// ([`NominalDecl::substituted`]).
+pub(in crate::ccl::lower) fn substitute_decl(
+    decl: &mut Rc<NominalDecl>,
+    arguments: &HashMap<TypeParamId, Type>,
+) {
+    if let Some(instance) = decl.substituted(&mut |arg| substitute(arg, arguments)) {
+        *decl = instance;
+    }
 }
 
 /// `ty`, the Module type of the parameter `prefix`, with a fresh type parameter

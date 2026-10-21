@@ -2446,10 +2446,10 @@ fn fmt_type(
         Type::DataSource(name) => write!(f, "source({name})"),
         Type::ChanDom(name, _) => write!(f, "chan({name})"),
         Type::Param(param) => write!(f, "{}", param.spelling),
-        Type::Nominal(decl, args) if args.is_empty() => write!(f, "{}", decl.name),
+        Type::Nominal(decl, args) if args.is_empty() => write!(f, "{}", decl.spelled()),
         Type::Nominal(decl, args) => {
             let args: Vec<String> = args.iter().map(|t| at(t, binders).to_string()).collect();
-            write!(f, "{}({})", decl.name, args.join(", "))
+            write!(f, "{}({})", decl.spelled(), args.join(", "))
         }
         // No program writes one, so it has no CHL spelling; this names both sides.
         Type::Split { input, output } => {

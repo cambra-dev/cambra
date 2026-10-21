@@ -243,8 +243,7 @@ a user's `` `some `` builds that module's own tag.
   error at the argument. This restriction is temporary: link-time constants lift it ([Link-time
   constants](#dependencies)). The module's copy for the import takes each type argument as a run's
   copy does ([Runs](#runs)).
-- **Refused:** an imported module's nominal `type` declarations and top-level `if`, `match` and
-  `with` statements.
+- **Refused:** an imported module's top-level `if`, `match` and `with` statements.
 
 ### Runs
 
@@ -298,8 +297,6 @@ a user's `` `some `` builds that module's own tag.
   own](#checking-a-module-on-its-own)).
 - **`pub` on a `run` is a parse error**, since a module returns a run by binding it to a public
   member ([A Module type is not a `Type`](#a-module-type-is-not-a-type)).
-- **Refused:** a nominal `type` declaration, an associated function or an `impl` block in any
-  module but the root (`module_nominal_refusals`).
 
 ### The module interface
 
@@ -311,6 +308,7 @@ public and private, so that `m::hidden` can say the member is private and point 
 | --- | --- |
 | value, `def`, mutable variable, feed | its visibility, its statement, and for a `def` whether it takes a `Mut` parameter |
 | type alias | its visibility, its statement, and its type as its module lowered it |
+| nominal type | its declaration, visibility and statement, and each associated function's visibility, statement and arity, and whether it is a method (`NominalMember`) |
 | member bound to a module, `pub audit = a` | its visibility, its statement, and the module it is bound to, as its module spells it |
 | parameter | its annotation, Module type, or bound, and whether it has a default |
 
@@ -323,7 +321,8 @@ correctly: a qualified callee reads it from the member, and a `use` name of such
 registered in `mut_param_fns` when its module begins lowering.
 
 Each module is lowered with fresh block state. Every spelling-keyed map in `LoweringContext`
-(`transactional_vars`, `type_aliases`, `mut_param_fns`, `shadow_depth`) covers one module. The
+(`transactional_vars`, `type_aliases`, `mut_param_fns`, `shadow_depth`, `nominal_types`,
+`associated_functions`, `used_nominal`) covers one module. The
 entries a module seeds from interfaces and from its parameters' Module types, `Txn` members in
 `transactional_vars` and `Mut`-parameter functions in `mut_param_fns`, are keyed by qualified
 spelling. The out-of-block read gate and the `MutWrite` shape then apply to `eu::stock` and
@@ -348,6 +347,53 @@ A top-level alias's predicate sees only the module's members and the prelude, so
 reads is a binder of its module. Visibility does not apply to those names ([chl-spec.md, "9.13
 Private-in-public"](chl-spec.md#913-private-in-public)), and a private one renders qualified, as
 `inventory::catalog` ([Names carry their home](#names-carry-their-home)).
+
+### Nominal types across modules
+
+Every module declares its nominal types before its statements lower, as the root does
+(`declare_top_level_types`): their heads, then its type aliases, then their constructors and
+associated functions. Its constructor functions are bound around its chain (`bind_constructors`),
+and an `impl` block's `DefGroup` stands on its spine, so a run's names include the type's functions
+and a `run` below the block is created. A declaration's path is its module's
+(`NominalDecl::module`), and the root's is empty.
+
+A name whose last qualifier segment is a type, `Shape::circle` or `shop::Shape::circle`, names a
+member of that type (`nominal::resolve_type`). The type is one the module declares, one a `use` name
+of the module names (`LoweringContext::used_nominal`), or a public one of the module the qualifier
+names (`Qualifier::reach_nominal`), which reports a private one. Another module's member reads the
+binding its module's chain binds, spelled through the qualifier, `shop::Shape::circle`, which
+creating the run resolves as it resolves any qualified member. `shop::Shape` and `shop::Box(Int)`
+in a type position name the type the same way (`qualified_nominal`). A public nominal type that
+takes no type arguments is a type member as an alias is, so it fills a Module type's type member
+(`Qualifier::reach_type`, `Interface::missing`). A method call's candidates add
+each public method of each public type a qualifier of the module reaches, an import's qualifier
+before a run's, since a run's name is in scope only below its statement (`foreign_methods`).
+
+A type's identity takes the module's type parameters it reaches ([chl-spec.md, "Nominal type
+identity"](chl-spec.md#nominal-type-identity)). Once the module lowers, `settle_implicit` records
+them on the declaration (`NominalDecl::implicit`): those its constructors' parameter types name,
+those any type slot of its associated functions' bindings names, and those of every type of the
+module it names, transitively. A module's type parameters are its `param T`s and the abstract type
+members of its Module-typed parameters. Equality and hashing compare the implicit arguments with
+the path and the name. The module's own code names the declaration with each
+parameter standing for itself. `substitute` and `substitute_in` turn it into the instance a run's
+type arguments reach (`NominalDecl::substituted`), in a type and in the nodes that hold a
+declaration outside a type slot: a `NominalCtor`, a constructor pattern and a method candidate. A
+type reached through a qualifier is the instance that qualifier's type arguments reach
+(`Qualifier::instance`). The instance shares the declaration's body, and `instantiate` replaces its
+implicit parameters with its arguments. A diagnostic writes them after the name,
+`shop::Order[Receipt = stripe::Receipt]`.
+
+Each run's copy of a type's associated functions is one function only if it reaches nothing a run
+gives its module. `associated_reach_errors` checks that on a uniquified copy of the module's chain,
+so a reference reads the binder it resolves to. It follows each top-level binding and function an
+associated function reads, and refuses one that reaches a mutable variable, a feed, a source, a
+value parameter, a value member of a Module-typed parameter, or a member of a run the module
+declares, naming the path it reaches it through.
+
+`cambra check` prints each public type as its module declares it, with each type parameter's
+variance and the module's type parameters whose arguments tell its runs' types apart, and each
+public associated function with its contract (`NominalMember::written`).
 
 ### A Module type is not a `Type`
 
@@ -472,7 +518,9 @@ around the root, and each run at its `run` statement in the module that declares
 ([Runs](#runs)). Each is created from its module's lowering, which happens once ([A module lowers
 once](#a-module-lowers-once)). Each copy of a module after the first in a tree copies the
 module's refinement predicates too (`copy_predicates`), since uniquifying rebuilds a predicate
-with the ids it had, and two runs holding one predicate's ids would collide.
+with the ids it had, and two runs holding one predicate's ids would collide. The first keeps the
+module's own, which its nominal types' declarations share, so a predicate inference reads off a
+declaration is one the tree holds.
 
 **The per-module check runs parsing, lowering, uniquification, and inference** (`Phase::Lower`,
 `Phase::Uniquify`, `Phase::Infer` in `src/ccl/context.rs`), plus the run-site checks of the

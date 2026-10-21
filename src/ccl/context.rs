@@ -2301,11 +2301,23 @@ fn check_modules(
         let mut wanted = HashSet::new();
         if contracts_of == Some(check.file) {
             let mut at = &tree;
-            while let TypedExprNode::Let { binding, body, .. }
-            | TypedExprNode::MutDecl { binding, body, .. } = &at.node
-            {
-                if binding.name.home().is_none() && check.interface.is_public(binding.name.base()) {
-                    wanted.insert(binding.name.clone());
+            loop {
+                let (binders, body): (Vec<&crate::ccl::TypedBinding>, &Expr) = match &at.node {
+                    TypedExprNode::Let { binding, body, .. }
+                    | TypedExprNode::MutDecl { binding, body, .. } => (vec![binding], body),
+                    TypedExprNode::DefGroup { bindings, body } => {
+                        (bindings.iter().map(|(binding, _)| binding).collect(), body)
+                    }
+                    _ => break,
+                };
+                for binding in binders {
+                    let base = binding.name.base();
+                    if binding.name.home().is_none()
+                        && (check.interface.is_public(base)
+                            || check.interface.is_public_function(base))
+                    {
+                        wanted.insert(binding.name.clone());
+                    }
                 }
                 at = body;
             }
