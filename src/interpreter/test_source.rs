@@ -6,7 +6,7 @@ use log::trace;
 use crate::{
     ccl::Type,
     interpreter::{
-        ColumnValue, DataSourceDomainExtentImpl, Extent, Value,
+        ColumnValue, DataSourceDomainExtentImpl, Extent, FieldPath, Value,
         producer_releases::ProducerReleases, tiling::Predicate,
     },
 };
@@ -124,6 +124,47 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         )
     }
 
+    fn get_fields(&self, mut keys: ColumnValue, paths: &[FieldPath]) -> ColumnValue {
+        if paths.is_empty() {
+            return self.get(keys);
+        }
+        let mut columns: Vec<Vec<Value>> = vec![Vec::new(); paths.len()];
+        for key in keys.drain_to_value_iter() {
+            let Some(value) = self.data.get(&key) else {
+                panic!("key {key:?} not found in TestDataSource")
+            };
+            for (column, path) in columns.iter_mut().zip(paths) {
+                let mut leaf = value;
+                for field in path {
+                    let Value::Record(record) = leaf else {
+                        panic!("{leaf:?} at {key:?} is not a record, to step to {field}")
+                    };
+                    leaf = record
+                        .get(field)
+                        .unwrap_or_else(|| panic!("the record {key:?} has no field {field}"));
+                }
+                column.push(leaf.clone());
+            }
+        }
+        let mut columns = columns
+            .into_iter()
+            .zip(paths)
+            .map(|(values, path)| {
+                ColumnValue::from_values(values, self.output_extent.at_path(path))
+            })
+            .collect::<Vec<_>>();
+        match columns.len() {
+            1 => columns.remove(0),
+            _ => ColumnValue::Records(
+                columns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, column)| (crate::interpreter::tuple_field(n), column))
+                    .collect(),
+            ),
+        }
+    }
+
     fn output_value_extent(&self) -> Extent {
         self.output_extent.clone()
     }
@@ -179,6 +220,122 @@ mod tests {
     use crate::ccl::Type;
     use crate::interpreter::{BaseType, tiling::Predicate};
     use test_log::test;
+
+    /// `get_fields` is what projecting `get`'s records gives: the whole value for no fields, one
+    /// field's column for one, and for several the column of tuples in the order asked, where a
+    /// field asked for twice is read twice.
+    #[test]
+    fn get_fields_is_the_projection_of_get() {
+        use crate::interpreter::tuple_field;
+        let mut source = TestDataSource::new(
+            "triples",
+            Type::Tuple(vec![Type::Base(BaseType::Int); 3]),
+            Extent::Record(HashMap::from(
+                [0, 1, 2].map(|n| (tuple_field(n), Extent::Base(BaseType::Int))),
+            )),
+        );
+        let triple = |a: i64| {
+            Value::Record(HashMap::from(
+                [0, 1, 2].map(|n| (tuple_field(n), Value::Int(a * 10 + n as i64))),
+            ))
+        };
+        source.add_data(&[
+            (Value::UInt(0), triple(1)),
+            (Value::UInt(1), triple(2)),
+            (Value::UInt(2), triple(3)),
+        ]);
+        let keys = || ColumnValue::UInts(vec![2, 0]);
+        let ColumnValue::Records(whole) = source.get(keys()) else {
+            panic!("a source of triples yields records")
+        };
+        let at = |n: usize| vec![tuple_field(n)];
+        assert_eq!(source.get_fields(keys(), &[]), source.get(keys()));
+        for n in 0..3 {
+            assert_eq!(
+                source.get_fields(keys(), &[at(n)]),
+                whole[&tuple_field(n)],
+                "field {n} alone"
+            );
+        }
+        assert_eq!(
+            source.get_fields(keys(), &[at(1)]),
+            ColumnValue::Ints(vec![31, 11])
+        );
+        let paths = [at(2), at(0)];
+        let ColumnValue::Records(columns) = source.get_fields(keys(), &paths) else {
+            panic!("several fields of a source yield records")
+        };
+        assert_eq!(columns.len(), paths.len());
+        for (n, path) in paths.iter().enumerate() {
+            assert_eq!(columns[&tuple_field(n)], whole[&path[0]], "component {n}");
+        }
+    }
+
+    /// A path steps through nested records: the leaf `[1, 0]` of `(a, (b, c))` is `b`, and
+    /// the leaves read together are the tuple of them in the order asked.
+    #[test]
+    fn get_fields_steps_through_nested_records() {
+        use crate::interpreter::{project_leaves, tuple_field};
+        let ints = || Extent::Base(BaseType::Int);
+        let mut source = TestDataSource::new(
+            "nested",
+            Type::Tuple(vec![
+                Type::Base(BaseType::Int),
+                Type::Tuple(vec![Type::Base(BaseType::Int); 2]),
+            ]),
+            Extent::Record(HashMap::from([
+                (tuple_field(0), ints()),
+                (
+                    tuple_field(1),
+                    Extent::Record(HashMap::from([
+                        (tuple_field(0), ints()),
+                        (tuple_field(1), ints()),
+                    ])),
+                ),
+            ])),
+        );
+        let row = |a: i64, b: i64, c: i64| {
+            Value::Record(HashMap::from([
+                (tuple_field(0), Value::Int(a)),
+                (
+                    tuple_field(1),
+                    Value::Record(HashMap::from([
+                        (tuple_field(0), Value::Int(b)),
+                        (tuple_field(1), Value::Int(c)),
+                    ])),
+                ),
+            ]))
+        };
+        source.add_data(&[
+            (Value::UInt(0), row(1, 2, 3)),
+            (Value::UInt(1), row(4, 5, 6)),
+        ]);
+        let keys = || ColumnValue::UInts(vec![1, 0]);
+        let inner = vec![tuple_field(1), tuple_field(0)];
+        assert_eq!(
+            source.get_fields(keys(), std::slice::from_ref(&inner)),
+            ColumnValue::Ints(vec![5, 2])
+        );
+        let ColumnValue::Records(both) = source.get_fields(keys(), &[vec![tuple_field(0)], inner])
+        else {
+            panic!("two leaves yield records")
+        };
+        assert_eq!(both[&tuple_field(0)], ColumnValue::Ints(vec![4, 1]));
+        assert_eq!(both[&tuple_field(1)], ColumnValue::Ints(vec![5, 2]));
+
+        // The default, which a source without an override uses, moves the same leaves out of
+        // the whole value.
+        let paths = [vec![tuple_field(0)], vec![tuple_field(1), tuple_field(0)]];
+        assert_eq!(
+            project_leaves(source.get(keys()), &paths),
+            source.get_fields(keys(), &paths)
+        );
+        assert_eq!(
+            project_leaves(source.get(keys()), &paths[1..]),
+            source.get_fields(keys(), &paths[1..])
+        );
+        assert_eq!(project_leaves(source.get(keys()), &[]), source.get(keys()));
+    }
 
     #[test]
     fn test_datasource_release_same_producer_accumulation() {

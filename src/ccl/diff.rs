@@ -455,7 +455,7 @@ fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
         | N::Var(_)
         | N::Builtin(_)
         | N::Proj(_)
-        | N::Source(_)
+        | N::Source(..)
         | N::LoadFrom(_)
         | N::Defer
         | N::Error => {

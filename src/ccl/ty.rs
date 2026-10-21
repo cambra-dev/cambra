@@ -4221,7 +4221,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Tuple(_)
         | N::Proj(_)
         | N::Record(_)
-        | N::Source(_)
+        | N::Source(..)
         | N::Compose(_)
         | N::Copair(_)
         | N::DisjointJoin(_)
@@ -4260,7 +4260,7 @@ fn eq_term_modulo_ty_slots_go(
         (N::Var(x), N::Var(y)) => paired_refs_match(pairs, x, y),
         (N::Builtin(x), N::Builtin(y)) => x == y,
         (N::Proj(x), N::Proj(y)) => x == y,
-        (N::Source(x), N::Source(y)) => x == y,
+        (N::Source(x, p), N::Source(y, q)) => x == y && p == q,
         // A `LoadFrom` name is not a reference to a binder the compared term introduces:
         // it addresses a variable the *retired* version declared, so it is that source's
         // own spelling and compares as one (`src/ccl/scope.rs`, where it is a leaf rather

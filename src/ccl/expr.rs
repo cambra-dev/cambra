@@ -705,7 +705,14 @@ pub enum TypedExprNode {
     /// [`crate::ccl::infer`] resolves it to a `Fun(DataSource(name), output_type)`
     /// via the source registry; [`crate::interpreter::operator_conversion`] compiles it to
     /// the appropriate reader operator.
-    Source(String),
+    ///
+    /// The second field lists the leaves the node reads, each a path of keys through nested
+    /// tuples and records. An empty list reads every field of a source's values. One path
+    /// makes the node's values that leaf's type. Two or more make them the tuple of the leaves'
+    /// types, in the order of the list. Projection pruning
+    /// ([`crate::ccl::planning`]) introduces it, with the paths sorted and none a prefix of
+    /// another, so a source read for a set of leaves has one spelling.
+    Source(String, Vec<Vec<ProjKey>>),
 
     /// The value the retired version of this program held for the mutable
     /// variable `x`, written `@LoadFrom(x)` on a declaration in the source.
@@ -887,7 +894,7 @@ impl TypedExprNode {
             TypedExprNode::Tuple(_) => "Tuple",
             TypedExprNode::Proj(_) => "Proj",
             TypedExprNode::Record(_) => "Record",
-            TypedExprNode::Source(_) => "Source",
+            TypedExprNode::Source(..) => "Source",
             TypedExprNode::LoadFrom(_) => "LoadFrom",
             TypedExprNode::Compose(_) => "Compose",
             TypedExprNode::Copair(_) => "Copair",
@@ -1739,7 +1746,7 @@ impl TypedExpr {
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
-            | TypedExprNode::Source(_)
+            | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
@@ -1944,7 +1951,7 @@ impl TypedExpr {
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
-            | TypedExprNode::Source(_)
+            | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
@@ -2082,7 +2089,7 @@ impl TypedExpr {
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
-            | TypedExprNode::Source(_)
+            | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error
@@ -2138,7 +2145,7 @@ impl TypedExpr {
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
-            | TypedExprNode::Source(_)
+            | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
             | TypedExprNode::Error

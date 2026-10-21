@@ -191,6 +191,11 @@ impl TypeInferenceContext {
     pub fn source_type(&self, name: &str) -> Option<Type> {
         self.source_types.get(name).cloned()
     }
+
+    /// The type of every registered source, by name.
+    pub fn source_types(&self) -> &HashMap<String, Type> {
+        &self.source_types
+    }
 }
 
 impl Deref for TypeInferenceContext {
@@ -1931,6 +1936,18 @@ fn collect_type_errors(
 pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
     check_fully_typed(expr)?;
     super::check(expr)
+}
+
+/// [`typecheck`] against the types of the registered data sources, which also verifies the type
+/// of each projected source and reports a path through a field its source's type does not
+/// carry. Projection pruning mints projected sources after inference, so this is the first
+/// check that sees one.
+pub fn typecheck_against(
+    expr: &Expr,
+    sources: &HashMap<String, Type>,
+) -> Result<(), Vec<InferError>> {
+    check_fully_typed(expr)?;
+    crate::ccl::infer::check::check_located_against(expr, Some(sources)).map_err(unlocated)
 }
 
 /// [`typecheck`] for the window between inference and `channelize`:
@@ -3769,7 +3786,7 @@ mod tests {
             domain: Box::new(Type::DataSource("mystream".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
         };
-        let mut expr = Expr::new(TypedExprNode::Source("mystream".into()));
+        let mut expr = Expr::new(TypedExprNode::Source("mystream".into(), Vec::new()));
         assert_eq!(infer(&mut expr, &mut ctx), Ok(source_ty));
     }
 
@@ -3777,9 +3794,165 @@ mod tests {
     #[test]
     fn test_infer_source_unregistered_is_unbound() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::new(TypedExprNode::Source("ghost".into()));
+        let mut expr = Expr::new(TypedExprNode::Source("ghost".into(), Vec::new()));
         assert_eq!(
             infer_bare(&mut expr, &mut ctx),
+            Err(vec![InferError::UnboundVariable("ghost".into())])
+        );
+    }
+
+    /// A projected source is typed by the post-planning check, against the registered type:
+    /// `source(pairs, 1)` of `(Int, String)` values is the `String` collection.
+    fn projected_pairs(
+        paths: Vec<Vec<crate::ccl::ProjKey>>,
+        stamped: Type,
+    ) -> (Expr, TypeInferenceContext) {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.register_source_type(
+            "pairs",
+            Type::Tuple(vec![
+                Type::Base(BaseType::Int),
+                Type::Base(BaseType::String),
+            ]),
+        );
+        let ty = Type::data_fun(Type::DataSource("pairs".into()), stamped);
+        (
+            Expr::new(TypedExprNode::Source("pairs".into(), paths)).with_ty(ty),
+            ctx,
+        )
+    }
+
+    #[test]
+    fn test_typecheck_projected_source_has_the_type_of_its_leaf() {
+        let one = vec![vec![crate::ccl::ProjKey::Index(1)]];
+        let (expr, ctx) = projected_pairs(one.clone(), Type::Base(BaseType::String));
+        assert_eq!(typecheck_against(&expr, ctx.source_types()), Ok(()));
+
+        // A stamped type that is not the leaf's is rejected as a mismatch.
+        let (expr, ctx) = projected_pairs(one, Type::Base(BaseType::Int));
+        let errs = typecheck_against(&expr, ctx.source_types())
+            .expect_err("a `String` leaf is not stamped as `Int`");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. })),
+            "expected a type mismatch, got {errs:?}"
+        );
+
+        // Two leaves are the tuple of their types, in the order of the paths.
+        let both = vec![
+            vec![crate::ccl::ProjKey::Index(0)],
+            vec![crate::ccl::ProjKey::Index(1)],
+        ];
+        let tuple = Type::Tuple(vec![
+            Type::Base(BaseType::Int),
+            Type::Base(BaseType::String),
+        ]);
+        let (expr, ctx) = projected_pairs(both, tuple);
+        assert_eq!(typecheck_against(&expr, ctx.source_types()), Ok(()));
+    }
+
+    /// Paths reach nested tuples and records, and `ProjKey::Field("_0")` names position 0 of a
+    /// tuple. A stamped type that is a different type from the leaf's is rejected as a mismatch,
+    /// and a field the record lacks as a missing field.
+    #[test]
+    fn test_typecheck_projected_source_follows_nested_paths() {
+        use crate::ccl::ProjKey;
+        let int = || Type::Base(BaseType::Int);
+        let string = || Type::Base(BaseType::String);
+        let mut ctx = TypeInferenceContext::new();
+        // `(Int, {name: String, age: Int})`.
+        ctx.register_source_type(
+            "people",
+            Type::Tuple(vec![
+                int(),
+                Type::Record(vec![("name".into(), string()), ("age".into(), int())]),
+            ]),
+        );
+        let source = |paths: Vec<Vec<ProjKey>>, stamped: Type| {
+            Expr::new(TypedExprNode::Source("people".into(), paths))
+                .with_ty(Type::data_fun(Type::DataSource("people".into()), stamped))
+        };
+        let nested = vec![ProjKey::Index(1), ProjKey::Field("name".into())];
+        let by_position = vec![ProjKey::Field("_0".into())];
+        let leaves = Type::Tuple(vec![string(), int()]);
+        assert_eq!(
+            typecheck_against(
+                &source(vec![nested.clone(), by_position], leaves),
+                ctx.source_types()
+            ),
+            Ok(())
+        );
+
+        let errs = typecheck_against(&source(vec![nested], int()), ctx.source_types())
+            .expect_err("a `String` leaf is not stamped as `Int`");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. })),
+            "expected a type mismatch, got {errs:?}"
+        );
+
+        let missing = vec![ProjKey::Index(1), ProjKey::Field("height".into())];
+        let errs = typecheck_against(&source(vec![missing], int()), ctx.source_types())
+            .expect_err("a record without the field is reported");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::MissingField { .. })),
+            "expected MissingField, got {errs:?}"
+        );
+    }
+
+    /// The paths of a projected source are non-empty, sorted and none inside another: the reader
+    /// moves each leaf out of the value once. A tree that breaks this is a pass bug, which the
+    /// check names where it runs with assertions on.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "non-empty, sorted, and none inside another")]
+    fn test_typecheck_projected_source_with_overlapping_paths_is_a_bug() {
+        use crate::ccl::ProjKey;
+        let mut ctx = TypeInferenceContext::new();
+        ctx.register_source_type(
+            "nested",
+            Type::Tuple(vec![Type::Tuple(vec![Type::Base(BaseType::Int); 2])]),
+        );
+        let inner = Type::Tuple(vec![Type::Base(BaseType::Int); 2]);
+        let overlapping = vec![
+            vec![ProjKey::Index(0)],
+            vec![ProjKey::Index(0), ProjKey::Index(1)],
+        ];
+        let expr =
+            Expr::new(TypedExprNode::Source("nested".into(), overlapping)).with_ty(Type::data_fun(
+                Type::DataSource("nested".into()),
+                Type::Tuple(vec![inner, Type::Base(BaseType::Int)]),
+            ));
+        let _ = typecheck_against(&expr, ctx.source_types());
+    }
+
+    /// A path through a field the registered type does not carry is a missing field, and a
+    /// projected source that was never registered is unbound.
+    #[test]
+    fn test_typecheck_projected_source_with_a_bad_path_is_rejected() {
+        let (expr, ctx) = projected_pairs(
+            vec![vec![crate::ccl::ProjKey::Index(5)]],
+            Type::Base(BaseType::Int),
+        );
+        let errs = typecheck_against(&expr, ctx.source_types())
+            .expect_err("a position the source's values lack is reported");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::MissingField { .. })),
+            "expected MissingField, got {errs:?}"
+        );
+
+        let ghost = Expr::new(TypedExprNode::Source(
+            "ghost".into(),
+            vec![vec![crate::ccl::ProjKey::Index(1)]],
+        ))
+        .with_ty(Type::data_fun(
+            Type::DataSource("ghost".into()),
+            Type::Base(BaseType::Int),
+        ));
+        assert_eq!(
+            typecheck_against(&ghost, &HashMap::new()),
             Err(vec![InferError::UnboundVariable("ghost".into())])
         );
     }
@@ -3804,8 +3977,8 @@ mod tests {
             codomain: Box::new(Type::Base(BaseType::String)),
         };
 
-        let mut e1 = Expr::new(TypedExprNode::Source("ints".into()));
-        let mut e2 = Expr::new(TypedExprNode::Source("strs".into()));
+        let mut e1 = Expr::new(TypedExprNode::Source("ints".into(), Vec::new()));
+        let mut e2 = Expr::new(TypedExprNode::Source("strs".into(), Vec::new()));
         assert_eq!(infer(&mut e1, &mut ctx), Ok(int_ty));
         assert_eq!(infer(&mut e2, &mut ctx), Ok(str_ty));
     }

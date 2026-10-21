@@ -20,7 +20,7 @@ use crate::{
         infer::{
             InferError, LocatedInferError, TypeInferenceContext, check_mut_discipline,
             check_mut_write_targets, check_pre_channelize, check_pre_channelize_located, infer,
-            typecheck,
+            typecheck, typecheck_against,
         },
         inline, lambda_elim,
         lower::{LoweredRoute, LoweringContext, LoweringError, modules::lower_program},
@@ -1830,6 +1830,9 @@ enum Check<'a> {
     PreChannelize,
     /// [`typecheck`]. A failure is a compiler bug.
     Typed,
+    /// [`typecheck_against`] the registered source types, which verifies projected sources.
+    /// A failure is a compiler bug.
+    TypedAgainst(&'a HashMap<String, Type>),
 }
 
 /// A phase boundary's post-conditions: ids unique, no witness reference free, output
@@ -1859,6 +1862,7 @@ fn settle(ir: &Expr, boundary: &str, check: Check<'_>) -> Result<(), Vec<Compile
         }
         Check::PreChannelize => check_pre_channelize(ir),
         Check::Typed => typecheck(ir),
+        Check::TypedAgainst(sources) => typecheck_against(ir, sources),
     };
     outcome.unwrap_or_else(|errs| invalid_tree(ir, boundary, &errs));
     Ok(())
@@ -2499,7 +2503,13 @@ fn run_passes(
     // matches the fresh refinements it mints by structural predicate
     // equality, so the staging shapes now validate without re-blinding the
     // check or peeling cast refinements.
-    settle(&join_planned, "post-planning", Check::Typed)?;
+    // Projection pruning has just minted the projected sources, so this check is given the
+    // registered source types to verify them against.
+    settle(
+        &join_planned,
+        "post-planning",
+        Check::TypedAgainst(ctx.inference_ctx().source_types()),
+    )?;
 
     // Invariant (debug): planning's `iterate`/`restrict` markers live in the
     // term tree, never inside a type's refinement predicates — the substitution

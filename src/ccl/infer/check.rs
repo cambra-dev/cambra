@@ -23,7 +23,7 @@ use super::emit::{
     emit_aggregate, emit_apply, emit_begin, emit_binop, emit_case, emit_cast, emit_compose,
     emit_copair, emit_disjoint_join, emit_expr_stmt, emit_for, emit_lambda, emit_let, emit_letrec,
     emit_list, emit_mut_decl, emit_nominal_ctor, emit_proj, emit_record, emit_transact, emit_tuple,
-    emit_unary, emit_variant_ctor,
+    emit_unary, emit_variant_ctor, paths_are_canonical, projected_source_type,
 };
 use super::schemes::OperatorSchemes;
 use super::typing::{LetScheme, Typing, escaped_opaque_binders};
@@ -67,6 +67,10 @@ use std::collections::HashMap;
 /// refinements still chain. (Previously this gap was papered over by a
 /// `contains_cast` peel in `emit_compose` and by leaving planning output un-checked.)
 pub(super) struct CheckCtx {
+    /// The types of the registered data sources, where the caller states them. A projected
+    /// source's recorded type is verified against its registered one; without a registry the
+    /// recorded type is trusted, as every other leaf's is.
+    sources: Option<HashMap<String, Type>>,
     schemes: OperatorSchemes,
     level: Level,
     /// Accumulated errors, each blamed on the node whose rule raised it. Check
@@ -146,6 +150,7 @@ impl CheckCtx {
         // scheme quantification level, so instantiated schemes mint vars at
         // the same level Check's `fresh` does.
         Self {
+            sources: None,
             schemes: OperatorSchemes::new(),
             level: 0,
             errors: Vec::new(),
@@ -789,10 +794,36 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // Leaves whose type carries the full load and was resolved during
         // inference — trust the recorded type (matching the old typecheck,
         // which left these unchecked).
-        TypedExprNode::Var(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::LoadFrom(_) => expr.ty.clone(),
+        TypedExprNode::Var(_) | TypedExprNode::Builtin(_) | TypedExprNode::LoadFrom(_) => {
+            expr.ty.clone()
+        }
+
+        // A projected source is minted by projection pruning, after planning, with the type
+        // of its leaves stamped on it. The registered source type states what that type must
+        // be, so a path with no field is reported here, where projected sources exist.
+        TypedExprNode::Source(name, paths) => match (&ctx.sources, paths.is_empty()) {
+            (Some(sources), false) => {
+                debug_assert!(
+                    paths_are_canonical(paths),
+                    "the paths of a projected source are non-empty, sorted, and none inside \
+                     another, got {paths:?}"
+                );
+                let Some(registered) = sources.get(name) else {
+                    return Err(ctx.raise(InferError::UnboundVariable(name.to_string())));
+                };
+                match projected_source_type(registered, paths) {
+                    Ok(ty) => ty,
+                    Err((key, found)) => {
+                        return Err(ctx.raise(InferError::MissingField {
+                            key,
+                            found: Box::new(found),
+                            at: format!("source({name})"),
+                        }));
+                    }
+                }
+            }
+            _ => expr.ty.clone(),
+        },
 
         TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, ctx)?,
 
@@ -1089,8 +1120,18 @@ pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
 
 /// [`check`], keeping the node each error was raised at.
 pub(crate) fn check_located(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
+    check_located_against(expr, None)
+}
+
+/// [`check_located`] against the types of the registered data sources, which verifies each
+/// projected source's recorded type and raises `MissingField` where a path has no field.
+pub(crate) fn check_located_against(
+    expr: &Expr,
+    sources: Option<&HashMap<String, Type>>,
+) -> Result<(), Vec<LocatedInferError>> {
     let mut cloned = expr.clone_preserving_ids();
     let mut ctx = CheckCtx::new(cloned.node_id());
+    ctx.sources = sources.cloned();
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —
     // `emit_case`'s `EmptyCase`, `emit_node`'s `UnboundVariable` — so the returned

@@ -266,6 +266,7 @@ engine during operator conversion. `planning::run` then performs these rewrites 
 7. Insert `map(filter_values(𝑞))` for supported refinements on inner, per-group collections, and
    refuse a narrowing none materializes (`reject_unmaterialized_narrowings`).
 8. Simplify the planned expression again.
+9. Prune projections: push the leaves each source's chain reads into the source.
 
 Constant folding evaluates supported operations through the runtime's `src/scalar_ops.rs` kernel
 on one-element columns. `src/ccl/planning/const_fold.rs` defines which expressions are excluded;
@@ -409,6 +410,36 @@ conditions into a value predicate 𝑞 and inserts one `map(filter_values(𝑞))
 The operator filters each group's elements independently. `reject_unmaterialized_narrowings`
 refuses a narrowing no per-group filter materializes, since operator conversion would compile the
 site without its filter.
+
+### Projection pruning
+
+`projection_pruning::run` rewrites a chain `source(𝑆) ≫ 𝑓₀ ≫ …`, where `source(𝑆)` is read
+whole, to `source(𝑆, [𝑝₁, …, 𝑝ₙ]) ≫ 𝑓₀′ ≫ …`. A path 𝑝ᵢ is the chain of projections through
+nested tuples and records that reaches a leaf the head 𝑓₀ reads, such as `.1` or `.1 ≫ .0`.
+For `sum([b.1 + b.2 + b.3 for b in source3()])`:
+
+```text
+source(source3) ≫ ((.1, .2) ▷ zip ≫ add, .3) ▷ zip ≫ add
+source(source3, [1, 2, 3]) ≫ ((.0, .1) ▷ zip ≫ add, .2) ▷ zip ≫ add
+```
+
+The head reads the record through a projection, the leading projections of a composition, the
+arguments of a zip, and the elements of a tuple or a record of functions. A constant and a
+literal read nothing. Any other head may read the record whole, and the source stays whole.
+
+The paths depend only on which leaves the head reads. They are sorted, so `b.2 - b.0` and
+`b.0 + b.2` give the same `source(𝑆, [0, 2])`. No path lies inside another: where the head reads
+`.1` whole and `.1 ≫ .0`, the source reads `[1]` and the longer read becomes `.𝑘 ≫ .0` on the
+leaf. A path goes through tuples and records only, so the step that crosses a variant, a
+collection or a box stays in the head.
+
+The new head 𝑓₀′ takes the leaf (one path) or the tuple of leaves (several) as its input: each
+path becomes the projection of its position, or `id` for one path. A head that is then the
+identity on what the source yields is dropped: the projection itself, and the zip of `.0 … .𝑛−1`
+in order. The reader fetches only the leaves ([`source(𝑆, paths)`](ir.md#source-injection)).
+The pass follows the final `simplify` so every projection it sees is the planned one. No
+`simplify` rule introduces a projected source, so every rewrite before the pass matches a
+source read whole.
 
 ---
 

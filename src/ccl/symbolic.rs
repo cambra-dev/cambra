@@ -12,7 +12,7 @@
 
 use crate::ccl::{
     ArithmeticKind, BinOpKind, BindingTransparency, Branch, Builtin, Expr, Lit, LogicKind, Type,
-    TypedExprNode, UnaryOpKind,
+    TypedExprNode, UnaryOpKind, source_projection_label,
 };
 
 // ---------------------------------------------------------------------------
@@ -630,7 +630,13 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             },
         ),
 
-        TypedExprNode::Source(name) => (Precedence::Atom, format!("source({name})")),
+        TypedExprNode::Source(name, keys) if keys.is_empty() => {
+            (Precedence::Atom, format!("source({name})"))
+        }
+        TypedExprNode::Source(name, keys) => (
+            Precedence::Atom,
+            format!("source({name}, {})", source_projection_label(keys)),
+        ),
 
         // N-ary compose: render as `f₀ ≫ f₁ ≫ … ≫ fₙ₋₁` at Compose precedence.
         // Left element at Compose (left-associative); each subsequent element

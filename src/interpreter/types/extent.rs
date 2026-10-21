@@ -86,6 +86,23 @@ pub struct NotifyOrSubscribeResult {
 }
 
 impl Extent {
+    /// The extent of the leaf at `path` through nested records.
+    ///
+    /// Panics where a step does not name a field of a record extent: the paths a source is
+    /// read for are checked against the registered type before they reach a reader.
+    pub fn at_path(&self, path: &[SmolStr]) -> &Extent {
+        let mut extent = self;
+        for field in path {
+            let Extent::Record(fields) = extent else {
+                panic!("cannot step to field {field} of values whose extent is {extent}")
+            };
+            extent = fields
+                .get(field)
+                .unwrap_or_else(|| panic!("the values have no field {field}"));
+        }
+        extent
+    }
+
     /// Whether a collection sits anywhere inside this extent, however a tile holds it
     /// (`src/interpreter/design-operators.md`, "A collection inside a value stays a tile").
     pub fn holds_a_collection(&self) -> bool {
@@ -278,6 +295,48 @@ pub trait DataSink: Send + Sync {
     fn process(&self, tile: &Tile);
 }
 
+/// The field names that lead through nested records to a leaf of a source's values.
+pub type FieldPath = Vec<SmolStr>;
+
+/// The leaves of `values`, a column of records, at `paths`, moved out of it: the whole of
+/// `values` for no paths, one leaf's column for one, and for several a column of records whose
+/// component 𝑛 is the leaf at `paths[𝑛]`. This is
+/// [`DataSourceDomainExtentImpl::get_fields`] over a source's `get`. The paths are distinct and
+/// none lies inside another, since a leaf is moved out once.
+pub fn project_leaves(mut values: ColumnValue, paths: &[FieldPath]) -> ColumnValue {
+    if paths.is_empty() {
+        return values;
+    }
+    let mut take = |path: &FieldPath| {
+        let (last, steps) = path.split_last().expect("a path names at least one field");
+        let mut column = &mut values;
+        for field in steps {
+            let ColumnValue::Records(record) = column else {
+                panic!("cannot step to field {field} of source values {column:?}")
+            };
+            column = record
+                .get_mut(field)
+                .unwrap_or_else(|| panic!("the source's values have no field {field}"));
+        }
+        let ColumnValue::Records(record) = column else {
+            panic!("cannot step to field {last} of source values {column:?}")
+        };
+        record.remove(last).unwrap_or_else(|| {
+            panic!("the source's values have no field {last}, or a path repeats it")
+        })
+    };
+    match paths {
+        [path] => take(path),
+        paths => ColumnValue::Records(
+            paths
+                .iter()
+                .enumerate()
+                .map(|(n, path)| (crate::interpreter::tuple_field(n), take(path)))
+                .collect(),
+        ),
+    }
+}
+
 pub trait DataSourceDomainExtentImpl {
     fn get_id(&self) -> &str;
     fn check_for_new_data(&mut self) -> bool;
@@ -296,6 +355,20 @@ pub trait DataSourceDomainExtentImpl {
     /// element to its corresponding output value when building a
     /// `DataFunction { domain, codomain: Scalar(output_values) }` tile.
     fn get(&self, keys: ColumnValue) -> ColumnValue;
+    /// Returns the leaves at `paths` of the output value of each domain key, for a source whose
+    /// values are records. A path is the field names to step through nested records.
+    ///
+    /// No paths is the whole value, as [`get`](Self::get). One path is that leaf's column.
+    /// Several are a column of records whose component 𝑛 is the leaf at `paths[𝑛]`, so the
+    /// values are the tuple of those leaves in that order. Each is the column that projecting
+    /// `get`'s result along the path gives. The paths are distinct and none lies inside another,
+    /// as the paths of a projected [`Source`](crate::ccl::TypedExprNode::Source) are. A source
+    /// overrides this method to read the leaves alone, where the default builds the whole
+    /// record of every key and moves the leaves out of it. Used by
+    /// [`crate::interpreter::tile_operators::MapResultWithSource`] for a projected source read.
+    fn get_fields(&self, keys: ColumnValue, paths: &[FieldPath]) -> ColumnValue {
+        project_leaves(self.get(keys), paths)
+    }
     /// Returns the [`Extent`] of each output value produced by this source.
     /// Used to type the codomain of [`crate::interpreter::tile_operators::MapResultWithSource`].
     fn output_value_extent(&self) -> Extent;

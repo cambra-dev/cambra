@@ -522,6 +522,278 @@ fn test_incremental_global_aggregate() {
     );
 }
 
+/// A projection of a source's values is read from the source.
+///
+/// `source3` holds pairs `(p + 12, p)`. The join key is its second field and the sum reads its
+/// first, so every use of the source is followed by a projection: `source(source3) ≫ .1` and
+/// `source(source3) ≫ .0` plan as `source(source3, 1)` and `source(source3, 0)`, and the
+/// source returns that field alone. The answer is the sum of `a + (a + 12)` over the twelve
+/// values `a` of `source2`, which is `2 * 66 + 12 * 12`.
+#[test_log::test]
+fn test_a_projection_after_a_source_is_read_from_the_source() {
+    let code = "sum([a + b.0 for a in source2() for b in source3() if a == b.1])";
+    let mut ctx = GlobalContext::default();
+    let ints = Rc::new(RefCell::new(TestDataSource::new(
+        "source2",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    let pairs = Rc::new(RefCell::new(TestDataSource::new(
+        "source3",
+        Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)]),
+        Extent::Record(HashMap::from([
+            (tuple_field(0), Extent::Base(BaseType::Int)),
+            (tuple_field(1), Extent::Base(BaseType::Int)),
+        ])),
+    )));
+    ctx.register_source(ints.clone());
+    ctx.register_source(pairs.clone());
+    let int_rows: Vec<(Value, Value)> = (0..12u64)
+        .map(|i| (Value::UInt(i), Value::Int(((i * 5) % 12) as i64)))
+        .collect();
+    let pair_rows: Vec<(Value, Value)> = (0..12u64)
+        .map(|i| {
+            let second = ((i * 7) % 12) as i64;
+            (
+                Value::UInt(i),
+                Value::Record(HashMap::from([
+                    (tuple_field(0), Value::Int(second + 12)),
+                    (tuple_field(1), Value::Int(second)),
+                ])),
+            )
+        })
+        .collect();
+    ints.borrow_mut().add_data(&int_rows);
+    pairs.borrow_mut().add_data(&pair_rows);
+    for source in [&ints, &pairs] {
+        source.borrow_mut().set_yield_predicate(Predicate::True);
+    }
+    let map = LoadedProgram::test(code);
+    let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
+    let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
+    assert!(
+        algebra.contains("source(source3, 1)") && algebra.contains("source(source3, 0)"),
+        "both reads of source3 name the field they use: {algebra}"
+    );
+    assert!(
+        !algebra.contains("source(source3)"),
+        "no read of source3 is left whole: {algebra}"
+    );
+
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    ctx.scheduler().check_for_notifications();
+    let result = producer.get(producer.tiling().universal_guard());
+    assert_eq!(
+        result,
+        Tile::Scalar(ColumnValue::from_ints(vec![2 * 66 + 12 * 12])),
+        "the sum of a + b.0 over the twelve matches"
+    );
+}
+
+/// Two projections of the values of one source are read from the source together:
+/// `source3() ≫ ((.2, .0) ▷ zip)` becomes `source(source3, [0, 2])`, whichever order the program
+/// names the fields in. The source holds triples `(3k, 6k, 9k)`, so the sum of `b.2 - b.0` over
+/// the eight keys is `6 * (0 + … + 7)`.
+#[test_log::test]
+fn test_two_projections_of_a_source_are_read_from_the_source_together() {
+    let code = "sum([b.2 - b.0 for b in source3()])";
+    let mut ctx = GlobalContext::default();
+    let triples = Rc::new(RefCell::new(TestDataSource::new(
+        "source3",
+        Type::Tuple(vec![Type::Base(BaseType::Int); 3]),
+        Extent::Record(HashMap::from(
+            [0, 1, 2].map(|n| (tuple_field(n), Extent::Base(BaseType::Int))),
+        )),
+    )));
+    ctx.register_source(triples.clone());
+    let rows: Vec<(Value, Value)> = (0..8u64)
+        .map(|k| {
+            (
+                Value::UInt(k),
+                Value::Record(HashMap::from([0, 1, 2].map(|n| {
+                    (tuple_field(n), Value::Int((k * (n as u64 + 1) * 3) as i64))
+                }))),
+            )
+        })
+        .collect();
+    triples.borrow_mut().add_data(&rows);
+    triples.borrow_mut().set_yield_predicate(Predicate::True);
+    let map = LoadedProgram::test(code);
+    let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
+    let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
+    assert!(
+        algebra.contains("source(source3, [0, 2])"),
+        "the source is read for the two fields in sorted order: {algebra}"
+    );
+
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    ctx.scheduler().check_for_notifications();
+    let result = producer.get(producer.tiling().universal_guard());
+    let expected: i64 = (0..8i64).map(|k| k * 9 - k * 3).sum();
+    assert_eq!(
+        result,
+        Tile::Scalar(ColumnValue::from_ints(vec![expected])),
+        "the sum of b.2 - b.0 over the eight keys"
+    );
+}
+
+/// Projection pruning reads of the planned chain what the source is asked for. Each source of
+/// `source3`, whose values are four integers `(k, 2k, 3k, 4k)`, names the fields its chain
+/// projects: the three of a nested sum, and the one a filter reads beside the two the body reads.
+#[test_log::test]
+fn test_a_source_reads_the_fields_its_planned_chain_projects() {
+    let width = 4usize;
+    let rows: Vec<(Value, Value)> = (0..10u64)
+        .map(|k| {
+            (
+                Value::UInt(k),
+                Value::Record(
+                    (0..width)
+                        .map(|n| (tuple_field(n), Value::Int((k * (n as u64 + 1)) as i64)))
+                        .collect::<HashMap<_, _>>(),
+                ),
+            )
+        })
+        .collect();
+    let cases = [
+        (
+            "sum([b.1 + b.2 + b.3 for b in source3()])",
+            vec!["source(source3, [1, 2, 3])"],
+            (0..10i64).map(|k| 2 * k + 3 * k + 4 * k).sum::<i64>(),
+        ),
+        (
+            "sum([b.1 + b.2 for b in source3() if b.0 > 4])",
+            vec!["source(source3, 0)", "source(source3, [1, 2])"],
+            (5..10i64).map(|k| 2 * k + 3 * k).sum::<i64>(),
+        ),
+        (
+            "sum([r.x + 3 * r.y for r in [(x=b.1, y=b.2) for b in source3()]])",
+            vec!["source(source3, [1, 2])"],
+            (0..10i64).map(|k| 2 * k + 3 * 3 * k).sum::<i64>(),
+        ),
+    ];
+    for (code, reads, expected) in cases {
+        let mut ctx = GlobalContext::default();
+        let source = Rc::new(RefCell::new(TestDataSource::new(
+            "source3",
+            Type::Tuple(vec![Type::Base(BaseType::Int); width]),
+            Extent::Record(
+                (0..width)
+                    .map(|n| (tuple_field(n), Extent::Base(BaseType::Int)))
+                    .collect(),
+            ),
+        )));
+        ctx.register_source(source.clone());
+        source.borrow_mut().add_data(&rows);
+        source.borrow_mut().set_yield_predicate(Predicate::True);
+        let map = LoadedProgram::test(code);
+        let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
+        let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
+        for read in &reads {
+            assert!(algebra.contains(read), "`{code}` reads `{read}`: {algebra}");
+        }
+        assert!(
+            !algebra.contains("source(source3)"),
+            "`{code}` reads no source whole: {algebra}"
+        );
+
+        let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+        ctx.scheduler().check_for_notifications();
+        let result = producer.get(producer.tiling().universal_guard());
+        assert_eq!(
+            result,
+            Tile::Scalar(ColumnValue::from_ints(vec![expected])),
+            "`{code}`"
+        );
+    }
+}
+
+/// A source of `(k, (2k, 3k), 5k)` is read for the leaves its chain projects, which go through
+/// the nested pair: `n.1.0 + n.2` reads `[1.0, 2]`. `n.1.0 + n.1.1` reads the whole pair, `1`,
+/// since the zip of both of its projections is the pair itself.
+#[test_log::test]
+fn test_a_source_reads_the_nested_leaves_its_planned_chain_projects() {
+    let int = || Type::Base(BaseType::Int);
+    let extent = || Extent::Base(BaseType::Int);
+    let record = |fields: Vec<(usize, Value)>| {
+        Value::Record(
+            fields
+                .into_iter()
+                .map(|(n, v)| (tuple_field(n), v))
+                .collect(),
+        )
+    };
+    let rows: Vec<(Value, Value)> = (0..10u64)
+        .map(|k| {
+            let k = k as i64;
+            (
+                Value::UInt(k as u64),
+                record(vec![
+                    (0, Value::Int(k)),
+                    (
+                        1,
+                        record(vec![(0, Value::Int(2 * k)), (1, Value::Int(3 * k))]),
+                    ),
+                    (2, Value::Int(5 * k)),
+                ]),
+            )
+        })
+        .collect();
+    let cases = [
+        (
+            "sum([n.1.0 + n.2 for n in nest()])",
+            vec!["source(nest, [1.0, 2])"],
+            (0..10i64).map(|k| 2 * k + 5 * k).sum::<i64>(),
+        ),
+        (
+            "sum([n.1.0 + n.1.1 for n in nest()])",
+            vec!["source(nest, 1)"],
+            (0..10i64).map(|k| 2 * k + 3 * k).sum::<i64>(),
+        ),
+        (
+            "sum([n.0 for n in nest() if n.2 > 12])",
+            vec!["source(nest, 2)", "source(nest, 0)"],
+            (3..10i64).sum::<i64>(),
+        ),
+    ];
+    for (code, reads, expected) in cases {
+        let mut ctx = GlobalContext::default();
+        let source = Rc::new(RefCell::new(TestDataSource::new(
+            "nest",
+            Type::Tuple(vec![int(), Type::Tuple(vec![int(), int()]), int()]),
+            Extent::Record(HashMap::from([
+                (tuple_field(0), extent()),
+                (
+                    tuple_field(1),
+                    Extent::Record(HashMap::from([
+                        (tuple_field(0), extent()),
+                        (tuple_field(1), extent()),
+                    ])),
+                ),
+                (tuple_field(2), extent()),
+            ])),
+        )));
+        ctx.register_source(source.clone());
+        source.borrow_mut().add_data(&rows);
+        source.borrow_mut().set_yield_predicate(Predicate::True);
+        let map = LoadedProgram::test(code);
+        let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
+        let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
+        for read in &reads {
+            assert!(algebra.contains(read), "`{code}` reads `{read}`: {algebra}");
+        }
+
+        let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+        ctx.scheduler().check_for_notifications();
+        let result = producer.get(producer.tiling().universal_guard());
+        assert_eq!(
+            result,
+            Tile::Scalar(ColumnValue::from_ints(vec![expected])),
+            "`{code}`"
+        );
+    }
+}
+
 /// A *conditional* induction write over an async source: `if i > 15: x := x + i`.
 /// An async (`DataSourceDomain`) extent routes to the changelog induction store.
 /// The writer decision is *carry-complete*

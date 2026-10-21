@@ -209,7 +209,7 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
     match &e.node {
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
-        | TypedExprNode::Source(_)
+        | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Defer
@@ -316,7 +316,7 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
         }
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
-        | TypedExprNode::Source(_)
+        | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Defer

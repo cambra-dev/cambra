@@ -505,6 +505,20 @@ registered zero-argument source calls and records the source name in the node. I
 a data function type with a nominal `DataSource(name)` domain and the registered element type.
 Operator conversion resolves that domain to the registered source extent and reader.
 
+The node is `Source(name, paths)`. An empty `paths` reads each value whole. Each path is a list of
+keys through nested tuples and records, and names one leaf of the value. One path makes the node's
+type the data function from `DataSource(name)` to that leaf's type. Several make it the data
+function to the tuple of the leaves' types, in the order of `paths`. Lowering and inference make
+whole reads. [Projection pruning](optimization.md#projection-pruning) makes projected reads, after
+the last `simplify`, with the paths sorted and none a prefix of another. Inference sees whole reads
+only. The post-planning check derives the type of a projected read from the registered source type
+(`projected_source_type`), requires it to be a subtype of the type the pass stamped, and raises
+a missing-field error where a path steps through a key the type does not carry. Operator
+conversion reads it with `MapResultWithSource::projecting`, which asks the source for the column
+through `DataSourceDomainExtentImpl::get_fields`, which takes the same paths as field names. A
+source overrides it to read the leaves alone; the default moves the leaves out of the result of
+`get`.
+
 `GlobalContext` coordinates the lowering, inference, and conversion registries. The lowering
 registry makes names available while constructing the tree; `compile_program` registers sources
 with inference and conversion after lowering has discovered them. The conversion registry
