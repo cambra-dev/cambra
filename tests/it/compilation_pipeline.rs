@@ -27,6 +27,7 @@ mod generators_udf_poly;
 mod joins_aggregates_groupby;
 mod key_collections;
 mod misc;
+mod modules;
 mod mutability;
 mod nested_loops;
 mod nominal_types;

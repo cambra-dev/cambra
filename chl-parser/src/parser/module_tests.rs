@@ -1,5 +1,5 @@
 //! The module syntax: `import`, `run`, `param`, `pub`, `@Discard`, and `::`
-//! paths (`docs/chl-spec.md`, "9. Modules [Decided]").
+//! paths (`docs/chl-spec.md`, "9. Modules").
 
 use super::*;
 use crate::FileId;

@@ -156,8 +156,7 @@ A lambda is written `\x -> body` (§3.10); `\` and `->` are punctuation
 reserved for future use.
 
 `import`, `use`, `as`, `pub`, `run`, `param` and `this` are the module keywords
-([9. Modules [Decided]](#9-modules-decided)). The statements they introduce parse, and lowering
-refuses each of them until modules are implemented.
+([9. Modules](#9-modules)).
 
 `match` and `case` introduce tag dispatch over a variant (§4.10).
 
@@ -309,7 +308,7 @@ named `Module`, after Python's `ast.Module`.)
 > **Direction [Decided].** A source file is a **module**. Importing one
 > asserts that it performs no IO and reaches its one shared run; running one
 > creates a run of its own. The engine runs one root module. Modules are
-> specified in [9. Modules [Decided]](#9-modules-decided), whose statements (`import`, `run`, `param`,
+> specified in [9. Modules](#9-modules), whose statements (`import`, `run`, `param`,
 > and `pub` on a member) extend this grammar ([2.2 Statements](#22-statements)).
 
 ### 2.2 Statements
@@ -433,8 +432,7 @@ begin():`, §8.2, `[Decided]`); any other context is rejected. `with` does
 > this list.)
 
 The module statements `import_stmt`, `run_stmt`, `param_stmt`, `renamed_from_stmt`, `discard_stmt`
-and `pub_stmt` parse, with the productions of [9. Modules [Decided]](#9-modules-decided). Lowering
-refuses each of them until modules are implemented.
+and `pub_stmt` parse, with the productions of [9. Modules](#9-modules).
 
 ### 2.3 Expression precedence
 
@@ -4071,11 +4069,9 @@ deletes no state.
 
 ---
 
-## 9. Modules [Decided]
+## 9. Modules
 
-A **module** is one `.cambra` file. The statements of this section, qualified names, and qualified
-labels and tags parse. Lowering refuses each of them, so a program is still one file. A module is
-used in one of two ways:
+A **module** is one `.cambra` file. A module is used in one of two ways:
 
 - **Importing** it brings its public members into scope. Importing asserts that the module performs
   no IO. Its members and its state exist once in the program, however many modules import it
@@ -4126,8 +4122,9 @@ module_path ::= ident ("::" ident)*
 
 - `import a::b` binds the last segment, `b`. `import a::b as c` binds `c`. This departs from
   Python, where `import a.b` binds `a`. The module name an import binds appears in the statement.
-- `import a::b use f, T as U` binds `b`, and also binds `f` and `U` to the public members `f` and
-  `T` of `a::b`. A `use` item binds an unqualified name; the module name stays bound beside it.
+- **[Planned]** `import a::b use f, T as U` binds `b`, and also binds `f` and `U` to the public
+  members `f` and `T` of `a::b`. A `use` item binds an unqualified name; the module name stays bound
+  beside it.
 - An import name begins with a lowercase letter, as a module path segment does
   ([9.15 Module files](#915-module-files)). A `use` alias keeps the case of the member it names,
   `T as U` or `f as g`. Both rules follow from a capitalized name being a type
@@ -4144,6 +4141,8 @@ module_path ::= ident ("::" ident)*
   it declares and the runs it marks `pub run`.
 
 ### 9.3 Runs
+
+**[Planned]** — the rules of this section.
 
 ```ebnf
 run_stmt ::= ["pub"] "run" module_path ["(" [arg ("," arg)* [","]] ")"] ["as" ident] [use_clause]
@@ -4185,6 +4184,8 @@ run inventory as inv use stock                        # binds `inv`, and `stock`
   `pub run … as eu` inside a run `shop`.
 
 ### 9.4 Parameters
+
+**[Planned]** — the rules of this section.
 
 ```ebnf
 param_stmt ::= "param" ident [":" type] ["=" expr]
@@ -4243,15 +4244,20 @@ param payments: Module{charge: {amount: Int} => Receipt}
 pub def quote(item, qty): …
 pub limit: Int = 10
 pub Qty = {Int where _ >= 0}
+```
+
+**[Planned]** — `pub` on a nominal type, an associated function, a mutable variable, and a `run`:
+
+```python
 pub type Price = {amount: Int}
 pub def Price::discounted(self, pct: Int) => Price: …
 pub stock: Mut(Map(String, Int), Txn) := Map::empty
 pub run inventory as inv
 ```
 
-A declaration loaded with `@LoadFrom` is an ordinary declaration without an initializer
-([8.8 `@LoadFrom`](#88-loadfrom)), so its `pub` stands at the head of the declaration's line, below
-the decorator:
+**[Planned]** A declaration loaded with `@LoadFrom` is an ordinary declaration without an
+initializer ([8.8 `@LoadFrom`](#88-loadfrom)), so its `pub` stands at the head of the declaration's
+line, below the decorator:
 
 ```python
 @LoadFrom(qty)
@@ -4259,9 +4265,9 @@ pub held: Int
 ```
 
 - A member without `pub` is private. Only its own module can name it.
-- `pub` on `:=` is accepted on the statement that introduces a `Txn` mutable variable and refused on
-  a later write to it. It is refused on an induction variable
-  ([9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
+- `pub` on `:=` is accepted (**[Planned]**) on the statement that introduces a `Txn` mutable
+  variable and refused on a later write to it. It is refused on an induction variable ([9.10
+  Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
 - `pub` is refused on `import`, `param`, `op=`, `<<=`, `for`, `if`, `match`, `with`, expression
   statements, and anywhere but a module's top level.
 - A public name is bound exactly once at its module's top level. A later binding of the same
@@ -4270,8 +4276,8 @@ pub held: Int
   `pub` would change the module's interface.
 - Private names keep the ordinary top-level shadowing of
   [5. Scoping and binding](#5-scoping-and-binding).
-- `pub` on a `type` declaration exports the nominal type with its constructors, and with `new` and
-  `extract` in the single-constructor form. `pub` on an associated function's `def` exports it, and
+- **[Planned]** `pub` on a `type` declaration exports the nominal type with its constructors, and
+  with `new` and `extract` in the single-constructor form. `pub` on an associated function's `def` exports it, and
   one without `pub` is reached only from its own module, in either spelling
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). An associated
   function binds no module-level name, so the bound-once rule above does not apply to it.
@@ -4288,12 +4294,12 @@ Module type. `::` separates the name from the member, and `.` stays record proje
 | Written | Position | Means |
 | --- | --- | --- |
 | `cart::total` | value | the public member `total` of `shop::cart`'s shared run |
-| `cart::Item` | type | the public type member `Item` of `shop::cart`, an alias or a nominal type |
-| `c::count` | value, write target | the public member `count` of the run `c` |
-| `c::total` | value | the public member `total` of the run `c`, a copy distinct from `cart::total` |
-| `p::count` | value, write target | the member `count` of the run passed as `p` |
-| `cart` | value | `shop::cart`'s shared run, as a value of its Module type ([9.8 Module types](#98-module-types)) |
-| `c` | value | the run `c`, as a value of its Module type |
+| `cart::Item` | type | **[Planned]** the public type member `Item` of `shop::cart`, an alias or a nominal type |
+| `c::count` | value, write target | **[Planned]** the public member `count` of the run `c` |
+| `c::total` | value | **[Planned]** the public member `total` of the run `c`, a copy distinct from `cart::total` |
+| `p::count` | value, write target | **[Planned]** the member `count` of the run passed as `p` |
+| `cart` | value | **[Planned]** `shop::cart`'s shared run, as a value of its Module type ([9.8 Module types](#98-module-types)) |
+| `c` | value | **[Planned]** the run `c`, as a value of its Module type |
 | `cart::hidden` | any | error: `hidden` is private to `shop::cart`, with a secondary label at its declaration |
 | `cart::missing` | any | error: `shop::cart` has no member `missing` |
 
@@ -4303,11 +4309,12 @@ Module type. `::` separates the name from the member, and `.` stays record proje
 - Import names and run names are in scope throughout their module, including above the statement.
   They are static facts rather than evaluations, so no order constrains them.
 - A qualified member is a named callee. `cart::total(x)` is a call to the member it resolves to,
-  including the special forms and `Mut`-parameter call shapes that dispatch on the callee. Through
-  a parameter, `p::f(x)` takes its call shape from `f`'s type in the parameter's Module type.
+  including the special forms (**[Planned]**) and `Mut`-parameter call shapes (**[Planned]**) that
+  dispatch on the callee. Through a parameter, `p::f(x)` takes its call shape from `f`'s type in the
+  parameter's Module type (**[Planned]**).
 - A qualified generic member keeps its polymorphism: `n::id(1)` and `n::id("a")` both check.
-- Names bound by `use` are ordinary names and may be shadowed by locals. A member of the importing
-  module with the same spelling is an error naming both sites.
+- **[Planned]** Names bound by `use` are ordinary names and may be shadowed by locals. A member of
+  the importing module with the same spelling is an error naming both sites.
 
 ### 9.7 Importing asserts no IO
 
@@ -4315,6 +4322,8 @@ Importing a module asserts that the module performs no IO. A module performs IO 
 source or binds a sink, or when it runs a module that performs IO. Importing one is an error at the
 `import`, with a secondary label at the IO site. The check is per module: a module that serves a
 route is run, whatever else it exports.
+
+**[Planned]** — importing a module that declares mutable state.
 
 An imported module's top level is evaluated once, however many modules import it, because its
 members are values it computes and state it declares. That evaluation is the module's **shared
@@ -4336,10 +4345,12 @@ that lands, one `InStock`. `run inventory as eu_inv` is a
 separate run with its own `stock`, and `eu_inv::InStock` is a different type from
 `inventory::InStock`.
 
-A module with a parameter that has no default cannot be imported, since an import supplies no
-arguments.
+**[Planned]** A module with a parameter that has no default cannot be imported, since an import
+supplies no arguments.
 
 ### 9.8 Module types
+
+**[Planned]** — the rules of this section.
 
 A **Module type** is the structural type of a module's public members. It is written like a record
 type, with `Module` before the braces:
@@ -4383,6 +4394,8 @@ run in each run of its module. A `Txn` member reached through it is a bare varia
 through a run name.
 
 ### 9.9 Running
+
+**[Planned]** — the rules of this section.
 
 Each run performs its module's top level, with its parameters bound to its arguments:
 
@@ -4439,13 +4452,14 @@ Within one module the source is that order. Between modules no source order exis
 induction variable would have no defined position in its history. A `Txn` variable has no such
 problem: its order is the commit order the transaction engine decides at run time, not program text.
 
-- A module passes its own induction variable to another module's function, `lib::bump(cnt)`. The
+- **[Planned]** A module passes its own induction variable to another module's function,
+  `lib::bump(cnt)`. The
   call sits in the caller's program order, so the writes it makes have their place.
-- A module publishes an induction variable's progression by feeding it out, `pub counts: Feed(Int)`
-  with `counts << cnt` in the loop. A feed's order is its own, and several readers are its
-  semantics.
-- A module publishes an induction variable's value at one position by binding it to an immutable
-  public member there. The member is an ordinary value, read like any other:
+- **[Planned]** A module publishes an induction variable's progression by feeding it out,
+  `pub counts: Feed(Int)` with `counts << cnt` in the loop. A feed's order is its own, and several
+  readers are its semantics.
+- **[Planned]** A module publishes an induction variable's value at one position by binding it to
+  an immutable public member there. The member is an ordinary value, read like any other:
 
   ```python
   cnt := 0
@@ -4481,15 +4495,15 @@ A tag's qualifier precedes its backtick, so the backtick still opens the tag: ``
 constructs `mod2`'s `` `some ``, `` {mod2::`some{Int} | `none} `` is a variant type over it, and
 `` case mod2::`some(v): `` matches it.
 
-The qualifier is `this`, an import name, or a run name. Record and variant types stay structural
-([3.15 Variant constructors](#315-variant-constructors)), and two modules agree on a type by naming
-the same labels. `{audit_api::app: String}` written in `storefront` is the type `audit_api` writes
-as `{app: String}`. Within one file this changes nothing.
+The qualifier is `this`, an import name, or a run name (**[Planned]**). Record and variant types
+stay structural ([3.15 Variant constructors](#315-variant-constructors)), and two modules agree on a
+type by naming the same labels. `{audit_api::app: String}` written in `storefront` is the type
+`audit_api` writes as `{app: String}`. Within one file this changes nothing.
 
 - **[Open]** — a syntax that aliases another module's label or tag, so the importer writes it
   unqualified.
-- A sum or product that several modules share is declared as a nominal type. The constructors of a
-  constructor list belong to the type and their parameter names are not labels
+- **[Planned]** A sum or product that several modules share is declared as a nominal type. The
+  constructors of a constructor list belong to the type and their parameter names are not labels
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)), so another
   module writes `Shape::circle(1)` with no qualified tag or label. `Option` is such a type, in a
   std module ([9.16 The std root](#916-the-std-root)). A record in the single-constructor form
@@ -4498,13 +4512,15 @@ as `{app: String}`. Within one file this changes nothing.
 - **[Open]** — which module owns the labels of data from outside the program, such as the fields
   of an HTTP request body.
 
-A module's type members are its type aliases and its nominal types
+**[Planned]** A module's type members are its type aliases and its nominal types
 ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Exporting an
 alias exports a spelling for a structural type, and the user's type is the same type. Exporting a
 nominal type exports the type itself: `mod::Price` is one type in every module that names it, and
 distinct from every other type of its shape.
 
 #### Nominal type identity
+
+**[Planned]** — the rules of this section.
 
 A nominal type is identified by its module path, its name, its type arguments, and the arguments of
 the module parameters its declaration depends on ([9.4 Parameters](#94-parameters)). A run reaches
@@ -4578,6 +4594,8 @@ a type through its run name, and two spellings name one type exactly when those 
 
 ### 9.13 Private-in-public
 
+**[Planned]** — the rules of this section.
+
 A public member's type may mention private members. A public alias's refinement may name a private
 value, and a public function's inferred type may carry a refinement over one:
 
@@ -4592,6 +4610,8 @@ resolved in `inventory`, so it still refers to `inventory`'s `catalog`. Diagnost
 restrict what a type may mention.
 
 ### 9.14 Checking a module on its own
+
+**[Planned]** — the rules of this section.
 
 A module is checked once, alone, with no root and nothing that uses it. `cambra check lib.cambra`
 runs that check and prints the module's interface.
@@ -4656,6 +4676,8 @@ prints. An annotation is how an author fixes the contract.
 
 ### 9.16 The std root
 
+**[Planned]** — the rules of this section.
+
 The compiler's own modules live under a **std root**, and every std module's path begins with `std`:
 `import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.4
 Sources](#74-sources)). A path beginning with `std` names a module of the std root and never a file
@@ -4683,10 +4705,14 @@ constructors
 
 ### 9.17 No trailing expressions
 
+**[Planned]** — the rules of this section.
+
 A trailing value expression is an error in every module, since what a module does is its sinks. A
 script-shaped root therefore needs an output sink, which [10. Sinks](#10-sinks) does not yet define.
 
 ### 9.18 Reloading a program of modules
+
+**[Planned]** — the rules of this section.
 
 A reload replaces the source of every module, the root's included, and the running program carries
 its state across ([8.8 `@LoadFrom`](#88-loadfrom)):
@@ -4912,9 +4938,8 @@ with parser-level support that lowering rejects:
 - **Recursion** — self-reference in `def` is not yet wired through;
   self-referential *value* bindings get the explicit `rec` form
   (**[Decided]**, §4.3).
-- **Imports / multiple files** — CHL is single-file today. Modules,
-  imports, runs, and parameters are **[Decided]** and specified in
-  [9. Modules [Decided]](#9-modules-decided).
+- **Imports / multiple files** — modules, imports, runs, and parameters
+  are specified in [9. Modules](#9-modules).
 - **Classes / `try`** — not in the language. `with` **is** a keyword
   (§1.6), but only for transaction blocks `with begin():` (§8.2); it does
   not carry Python's general context-manager meaning.

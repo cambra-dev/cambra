@@ -91,7 +91,7 @@ pub enum Token {
     /// "Associated functions and methods").
     #[token("impl", priority = 3)]
     Impl,
-    // The module keywords (`docs/chl-spec.md`, "9. Modules [Decided]").
+    // The module keywords (`docs/chl-spec.md`, "9. Modules").
     #[token("import", priority = 3)]
     Import,
     #[token("use", priority = 3)]
