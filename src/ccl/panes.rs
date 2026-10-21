@@ -679,16 +679,8 @@ mod tests {
         assert_disjoint(&images);
     }
 
-    /// **Both of a nested join's conditions reach the map**, as blame edges from
-    /// `planning.hash_join`.
-    ///
-    /// The site's recording blames what the *domain type* carries rather than the
-    /// refinement the recogniser accepted, because `join_plan_to_expr` re-enters
-    /// `convert_refinement_to_join` on an arm's own refined type — three frames
-    /// below the recording, with no access to its guard. A one-condition join
-    /// cannot tell the two apart, which is what the flat control fixes: the
-    /// nested program must blame two distinct predicates where the flat one
-    /// blames one.
+    /// Compare flat and nested joins: planning.hash_join must contribute blame
+    /// from one and two distinct predicate IDs respectively.
     #[test]
     fn a_nested_join_blames_both_join_conditions() {
         let flat = "[x + y for x in [2] for y in [1, 2, 3] if x == y]";
@@ -724,26 +716,12 @@ mod tests {
         }
     }
 
-    /// The corpus programs whose definitions inference **generalizes and then
-    /// specializes** — the ones monomorphization actually clones a subtree for.
-    /// Everything else in the corpus is first-order, and mono mints nothing.
+    /// Corpus fixtures selected to exercise generalized-definition specialization.
     const SPECIALIZING: &[&str] = &["generator_pipeline", "udf_chain"];
 
-    /// Monomorphization — the one thing that mints between the first two panes —
-    /// explains every node it produces, on first-order and specializing
-    /// programs alike.
-    ///
-    /// Two recordings get it there, and both are needed: `specialize_use` sinks
-    /// the clone's `on_copy` pairs, and `coalesce_generalized_let` sinks the
-    /// chain of `let`s the binding rebuilds itself as. Without the second, a
-    /// specializing program leaves one unrecorded `let` per demanded
-    /// specialization — a per-program count that tracks how many types the body
-    /// asked for, which is why it read as a small constant on this corpus.
-    ///
-    /// Asserted both ways so the zero cannot be vacuous: a specializing program
-    /// must also *kill* nodes here, since its generalized definition is
-    /// replaced by clones. A regression that stopped running mono at all would
-    /// otherwise pass.
+    /// Require no structural leaks across the first pair and nonempty deaths on
+    /// specializing fixtures. The pair includes normalization and other producers;
+    /// this test does not isolate monomorphization's rows.
     #[test]
     fn monomorphization_explains_every_node_it_produces() {
         for (name, code) in corpus() {
@@ -764,19 +742,9 @@ mod tests {
         }
     }
 
-    /// Every phase inside the second pane pair explains what it produces.
-    ///
-    /// The interesting programs are the ones that drive a *whole-program*
-    /// rewrite, where naming one node is least obviously applicable: a
-    /// transaction is disassembled into a `Transact` whose pieces have no
-    /// single source node, and a defer cluster becomes a `LetRec` assembled from
-    /// contributions scattered across the body. Both are covered by recording
-    /// against the node each product stands in for — the `with begin():`
-    /// statement, the register declaration, the `let d = Defer`.
-    ///
-    /// Asserted with a non-vacuity guard for the same reason the first pane pair is: a
-    /// program that reaches one of these phases must also kill nodes, so a
-    /// regression that stopped running the phase cannot pass as capture.
+    /// Require no structural leaks across the Inline/Transact/Letrec/Channelize pair.
+    /// Selected rewriting fixtures must also have deaths, preventing an unchanged
+    /// tree from satisfying every assertion.
     #[test]
     fn the_second_pane_pair_explains_every_node_its_phases_produce() {
         /// Reaches `transact_phase` or `channelize` — the whole-program
@@ -821,22 +789,10 @@ mod tests {
         );
     }
 
-    /// **Distinct predicate terms never share a `NodeId`** — with each other, or
-    /// with the main tree — on the three trees the panes retain.
-    ///
-    /// [`assert_unique_node_ids`] runs the same [`predicate_id_collisions`] walk
-    /// at every phase boundary, so what this adds is the panes: `pre_inference_ir`
-    /// is snapshotted after `uniquify`, between two boundaries, and no boundary
-    /// walk reaches it.
-    ///
-    /// What the walk catches is a rebuild that **preserves ids when it should
-    /// not**. A predicate cannot be mutated through its `Rc`, so every rewrite
-    /// builds a new `Rc` and repoints the refinement it was handed. That is a
-    /// *replacement* only if the walk reaches every occurrence; otherwise the
-    /// original survives on some type the walk missed, and preserving ids puts one
-    /// id-set on two live terms. `PredMemo::replacing` is the opt-in for walks
-    /// that do reach everything, and `uniquify` — the only one — asserts its own
-    /// 1:1 correspondence separately.
+    /// Check distinct-predicate and predicate/main-tree ID collisions on the three
+    /// explicitly listed snapshots. Shared occurrences of one predicate Rc are valid.
+    /// The traversal's limits are specified in `src/ccl/design/provenance.md`,
+    /// "Walking the ids".
     #[test]
     fn distinct_predicate_terms_never_share_a_node_id() {
         let mut found: Vec<(String, usize, &'static str)> = Vec::new();
@@ -859,23 +815,9 @@ mod tests {
         );
     }
 
-    /// A phase that rewrites the program records its rewrites under its own phase
-    /// tag — the tag being the one part of a row no recording site knows, and the
-    /// only thing that places a row in a pane pair's fold.
-    ///
-    /// A phase that rewrites *nothing* on a given program records nothing, which
-    /// is the preserve case and correct (most of the corpus preserves end to
-    /// end), so the fixture is one that drives the mutability phases: the
-    /// transaction, which `transact_phase` disassembles, `mut_elim` rebuilds as
-    /// a `LetRec`, and `channelize` rewrites.
-    ///
-    /// [`Phase::MutRead`] is absent for that reason: A-normalization names every
-    /// read this program performs (`crate::ccl::anf`, "A mutable-variable read
-    /// is not atomic") and `mut_read` adopts those bindings rather than minting
-    /// its own.
-    ///
-    /// The list is sorted by phase name rather than pipeline order, so it reads
-    /// as a set and a new phase lands where its spelling puts it.
+    /// Pin the recorded phase set for the transaction fixture, sorted by phase name.
+    /// A phase can run without recording a product; its absence from this set does
+    /// not establish that the phase was skipped.
     #[test]
     fn a_rewriting_phase_tags_its_rows_with_itself() {
         let (_, code) = corpus()
