@@ -133,7 +133,7 @@ its keys are reached through `keys` rather than through a structural reading of 
 `Type` has no nominal collection constructor distinguishing `Set(K)` from `Map(K, unit)` today.
 The decision is that `Set`, `Map` and `FullMap` become **nominal builtins**: type constructors the
 compiler declares, opaque as a `type` declaration is
-([chl-spec, 6.8 Nominal types and methods [Decided]](../../../docs/chl-spec.md#68-nominal-types-and-methods-decided)),
+([chl-spec, 6.8 Nominal types and methods](../../../docs/chl-spec.md#68-nominal-types-and-methods)),
 with no constructors or `extract` a program can reach. `Array`, `List` and `Collection` stay
 structural: the kind already tells a bare range `Fun`, `UIntRanges` and `Type` apart. `FullMap` is nominal
 because it iterates entries as `Map` does, which a structural `(𝑘: 𝐾) ⤇ 𝑉` does not.

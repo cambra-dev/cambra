@@ -1328,7 +1328,7 @@ pub enum Type {
     /// See `src/ccl/design/type-parameters.md`.
     Poly(Rc<PolyType>),
     /// A **nominal type** applied to its type arguments: `Shape`, `Option(Int)`
-    /// (`docs/chl-spec.md`, "6.8 Nominal types and methods \[Decided\]").
+    /// (`docs/chl-spec.md`, "6.8 Nominal types and methods").
     ///
     /// Related only to another application of the same declaration, argument by argument
     /// as each parameter's [`Variance`](crate::ccl::nominal::Variance) requires. The

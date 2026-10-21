@@ -1,6 +1,6 @@
 //! Nominal types: the declaration a [`Type::Nominal`] names.
 //!
-//! A `type` declaration (`docs/chl-spec.md`, "6.8 Nominal types and methods \[Decided\]")
+//! A `type` declaration (`docs/chl-spec.md`, "6.8 Nominal types and methods")
 //! lowers to one [`NominalDecl`]. Inference relates two applications of it by the variance
 //! of each parameter, and relates it to no other type. A nominal type keeps its name to
 //! operator conversion, and a pass that reads a value's shape reads it as the

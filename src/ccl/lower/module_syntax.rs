@@ -39,7 +39,7 @@ fn spell(qualifier: &[Spanned<SmolStr>], name: &str) -> String {
 
 /// Whether a `::` path names a method rather than a module member: a capitalized
 /// qualifier segment is the type the method belongs to (`docs/chl-spec.md`, "6.8
-/// Nominal types and methods \[Decided\]").
+/// Nominal types and methods").
 fn names_a_method(qualifier: &[Spanned<SmolStr>]) -> bool {
     qualifier.iter().any(|segment| is_type_name(&segment.node))
 }

@@ -41,7 +41,18 @@ Programs are run on the Cambra engine, which compiles and executes CHL programs.
 
 CHL supports full type inference, so all type annotations are optional. Its type system brings together **structural subtyping** ("if it has the right shape, it works"), [**nominal types**](../src/ccl/design/nominal-types.md) ("types are the same only if they're the same-named thing"), and **refinement types** ("a type such that its terms satisfy a given predicate"). The type checker is a constraint-based inference engine over the whole program — emission, solving, and coalescing are described in [src/ccl/design/type-inference.md](../src/ccl/design/type-inference.md). Base vocabulary: `Int`, `Bool`, `String`, unit, `List(T)`, tuples, records, variants (AKA "sum types" or "enums" — written `` {`some{Int} | `none} ``, constructed `` `tag(payload) ``, matched with `match` — [docs/chl-spec.md](chl-spec.md#65-variants)), and functions. A capitalized `=` binding is a **type alias** — `Cents = Int` — which names an existing type rather than making a new one, so it is interchangeable with what it names in every position ([docs/chl-spec.md](chl-spec.md#67-type-alias-statements)).
 
-**Refinement types** look like this: `{𝑥: 𝑇 | 𝑝(𝑥)}` — a value of the base type for which a predicate holds. The machinery is implemented inside the checker today — basic refinement inference, constraint solving over refined subtyping, explicit refinement acquisition, and specialization of polymorphic call sites — and built-ins like `groupby` produce refined types internally. The surface syntax exists: the CHL spelling is `{T where p(_)}`, which drops the named binder in favour of `_` for the refined value ([docs/chl-spec.md](chl-spec.md#64-refinement-syntax)). It parses, lowers, and is enforced against a body — `def f(a) => {Int where _ == 9}: 9` typechecks and `: 8` does not. What does **not** exist yet is discharge over anything but a singleton: `{Int where _ == 9}` is satisfied by the literal `9`, whose type is `Int@9`, while `{Int where _ >= 0}` against the literal `7` fails subsumption. Verifiable, whole-application contracts expressed through refinements are the driving design direction rather than a current capability. The `{𝑥: 𝑇 | 𝑝(𝑥)}` form above stays the *internal* notation — a dependent codomain refinement has to name the binder it closes over — so it is what compiler output and the CCL design docs show.
+**Refinement types** look like this: `{𝑥: 𝑇 | 𝑝(𝑥)}` — a value of the base type for which a
+predicate holds. The CHL spelling is `{T where p(_)}`, which drops the named binder in favour of
+`_` for the refined value ([docs/chl-spec.md](chl-spec.md#64-refinement-syntax)). It parses,
+lowers, and is checked against the value it annotates. The checker discharges a predicate over a
+literal: `x: {Int where _ >= 0} = 7` compiles and `= -7` does not. A parameter's refinement is
+discharged at each call (`tests/programs/refinement/`). Arithmetic carries no refinement, so
+`a + 1` is an `Int` whatever `a`'s refinement is, and an annotation that needs a predicate of it
+fails (`pi_type_scope` in `tests/it/compilation_pipeline/type_annotations.rs`). Built-ins like
+`groupby` produce refined types internally. Verifiable, whole-application contracts expressed
+through refinements are the driving design direction rather than a current capability. The
+`{𝑥: 𝑇 | 𝑝(𝑥)}` form above is the internal notation, because a dependent codomain refinement names
+the binder it closes over, so compiler output and the CCL design docs show it.
 
 ### Functions
 
@@ -50,11 +61,13 @@ Functions are defined like in Python, with optional type annotations. They are f
 For example:
 
 ```python
-def repeat(n: Int, y: String) => String: # return type syntax is [Sketched]
-  z := "" # Muts inside fn bodies are [Planned]
-  for i in range(n): # range is [Planned]
-    z += y
-  return z
+def repeat(xs, y: String) => String:
+    z := ""
+    for x in xs:
+        z += y
+    z  # the body's last expression is its value; `return` is [Planned]
+
+repeat([1, 2, 3], "ab")  # "ababab"
 ```
 
 A `Mut(_)` parameter annotation gives pass-by-reference access to a caller's mutable variable, under a deliberately *second-class* discipline — mutables flow down into calls but are not returned or stored in data structures (see [src/ccl/design/mutability.md](../src/ccl/design/mutability.md)). Captures of ordinary bindings are read-only. Captures of transactional variables are **[Decided]** (§8 of the [spec](chl-spec.md)).
@@ -72,7 +85,7 @@ Lists do carry an integer *addressing* structure (`xs[i]` is well-defined), but 
 Comprehensions and generators are CHL's primary collection-level construct — what `SELECT … FROM … WHERE …` is to SQL:
 
 ```python
-[ (customer=u.name, total=o.amount) # `(=,)` record syntax is [Decided], currently `{:,}`
+[ (customer=u.name, total=o.amount)
   for u in users
   for o in orders
   if u.id == o.user_id ]
@@ -211,11 +224,12 @@ The connections between the layers above and the capabilities Cambra claims:
 | Streaming sources and sinks (`stdin`, `http_serve`) | Implemented |
 | Generator functions | Implemented (single-`for` bodies; general shapes **[Planned]**) |
 | `:=` mutation and loop accumulators (induction histories) | Implemented |
-| Transactions: `with begin():` over `Mut(V, Txn)` variables | Implemented (single deny-guard conditionals only; handle form and `abort()` still landing) |
+| Transactions: `with begin():` over `Mut(V, Txn)` variables | Implemented, with `if`/`elif`/`else` and `match` inside a block; the `with t = begin():` handle and `abort()` **[Decided]** |
 | Aggregates | `sum`, `max`, `min` implemented; `count`/`avg`/`len` **[Planned]** |
-| Refinement typing | Machinery implemented (internal); surface syntax **[Decided]** |
+| Refinement typing | `{T where p(_)}` annotations implemented; arithmetic carries no refinement; `assert` contracts **[Decided]** |
 | Feed channels | Via `defer()` / `http_serve` implemented; `Feed(_)` declarations designed, not yet |
-| Contextual parameters (`requires` / `given` / `summon`) | **[Decided]** |
+| Contextual parameters (`requires` / `given` / `summon`) | `requires` with built-in traits implemented; `requires Transaction`, `given` and `summon` **[Decided]** |
+| Nominal types (`type`, `impl`, methods) | Implemented; recursive types, `@RenamedFrom` and nominal state across a reload **[Decided]** |
 | `rec` fixpoint bindings | **[Decided]** |
 | Collections-as-functions model | **[Decided]** — one representation (the data function `D ⤇ V`), five surface kinds; `Array`/`List`/`Collection` types implemented, `Map`/`Set` types and the operation layer landing (see [src/ccl/design/collections.md](../src/ccl/design/collections.md)) |
 | `match` / `case` | Tag dispatch implemented; deeper patterns **[Tentative]** |

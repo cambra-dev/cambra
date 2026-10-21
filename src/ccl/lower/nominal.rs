@@ -1,5 +1,5 @@
 //! Lowering `type` declarations and the names their constructors bind
-//! (`docs/chl-spec.md`, "6.8 Nominal types and methods \[Decided\]").
+//! (`docs/chl-spec.md`, "6.8 Nominal types and methods").
 //!
 //! A module's declarations lower in two steps around its type aliases, since an alias
 //! may name a nominal type and a constructor's parameter type may name an alias.
