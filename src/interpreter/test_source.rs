@@ -150,16 +150,7 @@ impl DataSourceDomainExtentImpl for TestDataSource {
             .into_iter()
             .zip(paths)
             .map(|(values, path)| {
-                let mut extent = &self.output_extent;
-                for field in path {
-                    let Extent::Record(fields) = extent else {
-                        panic!("cannot step to field {field} of a source whose values are {extent}")
-                    };
-                    extent = fields
-                        .get(field)
-                        .unwrap_or_else(|| panic!("the source's values have no field {field}"));
-                }
-                ColumnValue::from_values(values, extent)
+                ColumnValue::from_values(values, self.output_extent.at_path(path))
             })
             .collect::<Vec<_>>();
         match columns.len() {
@@ -270,7 +261,7 @@ mod tests {
             source.get_fields(keys(), &[at(1)]),
             ColumnValue::Ints(vec![31, 11])
         );
-        let paths = [at(2), at(0), at(2)];
+        let paths = [at(2), at(0)];
         let ColumnValue::Records(columns) = source.get_fields(keys(), &paths) else {
             panic!("several fields of a source yield records")
         };
@@ -284,7 +275,7 @@ mod tests {
     /// the leaves read together are the tuple of them in the order asked.
     #[test]
     fn get_fields_steps_through_nested_records() {
-        use crate::interpreter::tuple_field;
+        use crate::interpreter::{project_leaves, tuple_field};
         let ints = || Extent::Base(BaseType::Int);
         let mut source = TestDataSource::new(
             "nested",
@@ -331,6 +322,19 @@ mod tests {
         };
         assert_eq!(both[&tuple_field(0)], ColumnValue::Ints(vec![4, 1]));
         assert_eq!(both[&tuple_field(1)], ColumnValue::Ints(vec![5, 2]));
+
+        // The default, which a source without an override uses, moves the same leaves out of
+        // the whole value.
+        let paths = [vec![tuple_field(0)], vec![tuple_field(1), tuple_field(0)]];
+        assert_eq!(
+            project_leaves(source.get(keys()), &paths),
+            source.get_fields(keys(), &paths)
+        );
+        assert_eq!(
+            project_leaves(source.get(keys()), &paths[1..]),
+            source.get_fields(keys(), &paths[1..])
+        );
+        assert_eq!(project_leaves(source.get(keys()), &[]), source.get(keys()));
     }
 
     #[test]

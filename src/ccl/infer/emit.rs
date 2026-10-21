@@ -260,22 +260,17 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             emit_nominal_ctor(decl, ctor, payload, ctx)?
         }
 
-        // A projected source is minted by projection pruning, after inference. Its type is
-        // read off the registered one, so this check verifies the paths against it.
+        // Inference sees whole reads: projection pruning mints the projected ones after planning,
+        // and the post-planning check derives their type ([`projected_source_type`]).
         TypedExprNode::Source(name, paths) => {
+            debug_assert!(
+                paths.is_empty(),
+                "a projected source reached inference; projection pruning runs after planning"
+            );
             let Some(registered) = ctx.sources.get(name) else {
                 return Err(ctx.raise(InferError::UnboundVariable(name.to_string())));
             };
-            match projected_source_type(registered, paths) {
-                Ok(ty) => ty,
-                Err((key, found)) => {
-                    return Err(ctx.raise(InferError::MissingField {
-                        key,
-                        found: Box::new(found),
-                        at: format!("source({name})"),
-                    }));
-                }
-            }
+            registered.clone()
         }
 
         // `@LoadFrom(x)` is typed by its context. The value it denotes belongs to
@@ -3372,23 +3367,35 @@ fn enclosing_component(parameter: &Type) -> Type {
     parts[0].clone()
 }
 
+/// Are `paths` the paths of a projected source: each non-empty, strictly increasing, and none
+/// inside another? Projection pruning mints them so, and the reader moves each leaf out of the
+/// source's value once.
+pub(super) fn paths_are_canonical(paths: &[Vec<ProjKey>]) -> bool {
+    paths.iter().all(|path| !path.is_empty())
+        && paths.windows(2).all(|pair| pair[0] < pair[1])
+        && paths
+            .iter()
+            .enumerate()
+            .all(|(i, path)| paths[..i].iter().all(|earlier| !path.starts_with(earlier)))
+}
+
 /// The type of a source read for `paths`: the registered `Fun(DataSource(𝑆), 𝑉)` with 𝑉
 /// replaced by the type at the end of the one path, or by the tuple of the types at the ends of
 /// several. An empty list is the registered type. The error is the key a path steps through
 /// that the type it steps from does not carry, with that type.
-fn projected_source_type(
+pub(super) fn projected_source_type(
     registered: &Type,
     paths: &[Vec<ProjKey>],
 ) -> Result<Type, (FieldKey, Type)> {
+    if paths.is_empty() {
+        return Ok(registered.clone());
+    }
     let Type::Fun {
         domain, codomain, ..
     } = registered
     else {
-        return Ok(registered.clone());
+        unreachable!("a registered source type is `Fun(DataSource(𝑆), 𝑉)`, got {registered}")
     };
-    if paths.is_empty() {
-        return Ok(registered.clone());
-    }
     let mut leaves = Vec::new();
     for path in paths {
         let mut ty = (**codomain).clone();

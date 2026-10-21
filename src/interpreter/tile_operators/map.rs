@@ -891,18 +891,7 @@ fn projected_extent(paths: &[FieldPath], values: Extent) -> Extent {
     if paths.is_empty() {
         return values;
     }
-    let leaf = |path: &FieldPath| {
-        let mut extent = &values;
-        for field in path {
-            let Extent::Record(fields) = extent else {
-                panic!("cannot step to field {field} of a source whose values are {extent}")
-            };
-            extent = fields
-                .get(field)
-                .unwrap_or_else(|| panic!("the source's values have no field {field}"));
-        }
-        extent.clone()
-    };
+    let leaf = |path: &FieldPath| values.at_path(path).clone();
     match paths {
         [path] => leaf(path),
         paths => Extent::Record(
