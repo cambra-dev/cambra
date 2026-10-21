@@ -4,8 +4,6 @@
 use smol_str::SmolStr;
 use std::collections::HashMap;
 
-use bit_vec::BitVec;
-
 pub use crate::scalar_ops::{ArithmeticKind, BinOpKind, CompareKind, LogicKind};
 use crate::scalar_ops::{
     zip_arithmetic, zip_bool_compare, zip_bool_logic, zip_compare, zip_concat,
@@ -72,36 +70,36 @@ fn compare_records(
     op: CompareKind,
     left: HashMap<SmolStr, ColumnValue>,
     right: &HashMap<SmolStr, ColumnValue>,
-) -> BitVec {
+) -> Vec<bool> {
     let rows = left
         .iter()
         .filter(|(field, _)| right.contains_key(*field))
         .flat_map(|(field, l)| [l.len(), right[field].len()])
         .min()
         .unwrap_or(0);
-    let mut acc = BitVec::from_elem(rows, op == CompareKind::Equals);
+    let mut acc = vec![op == CompareKind::Equals; rows];
     for (field, l) in left {
         // A column only one side carries is the surplus of a wider value, not a field of
         // the product being compared.
         let Some(r) = right.get(&field) else {
             continue;
         };
-        let mut field_eq = match apply_binop_column(BinOpKind::Compare(op), l, r) {
+        let field_eq = match apply_binop_column(BinOpKind::Compare(op), l, r) {
             ColumnValue::Bools(b) => b,
             other => unreachable!("a comparison yields a Bool column, got {other:?}"),
         };
         // A nested product reports the length of one of its own fields, so a recursive
-        // comparison can answer for fewer positions than `rows`. Both sides shrink to what
-        // arrived: `and`/`or` require equal lengths, and padding would invent positions.
+        // comparison can answer for fewer positions than `rows`. `acc` shrinks to what
+        // arrived: zipping `acc` with a shorter `field_eq` leaves the tail of `acc` unchanged
+        // rather than dropping it, and padding would invent positions.
         if field_eq.len() < acc.len() {
             acc.truncate(field_eq.len());
         }
-        field_eq.truncate(acc.len());
         match op {
-            CompareKind::Equals => acc.and(&field_eq),
-            CompareKind::NotEquals => acc.or(&field_eq),
+            CompareKind::Equals => acc.iter_mut().zip(&field_eq).for_each(|(a, &b)| *a &= b),
+            CompareKind::NotEquals => acc.iter_mut().zip(&field_eq).for_each(|(a, &b)| *a |= b),
             _ => unreachable!("guarded by the caller's match"),
-        };
+        }
     }
     acc
 }
@@ -117,14 +115,12 @@ mod tests {
     /// Verify all six CompareKind operations on every pair of bool values.
     #[test]
     fn test_zip_bool_compare_all_ops() {
-        use bit_vec::BitVec;
-
         // Compare single bool values via the public apply_binop_column API.
         let cmp = |op: CompareKind, l: bool, r: bool| -> bool {
             let result = apply_binop_column(
                 BinOpKind::Compare(op),
-                ColumnValue::Bools(BitVec::from_elem(1, l)),
-                &ColumnValue::Bools(BitVec::from_elem(1, r)),
+                ColumnValue::Bools(vec![l; 1]),
+                &ColumnValue::Bools(vec![r; 1]),
             );
             match result {
                 ColumnValue::Bools(v) => v[0],
@@ -166,8 +162,6 @@ mod tests {
     /// the longer operand's tail verbatim) and the bool-op equal-length panic.
     #[test]
     fn binop_unequal_lengths_combine_common_prefix_only() {
-        use bit_vec::BitVec;
-
         // String concat: `l` longer than `r` → result is the 2-element prefix.
         let l = ColumnValue::Strings(
             ["a", "b", "c"]
@@ -193,12 +187,12 @@ mod tests {
             other => panic!("expected Ints, got {other:?}"),
         }
 
-        // Bool ops must not panic on unequal lengths (BitVec set ops assert
-        // equal length); they align to the common prefix instead.
+        // Bool ops must not panic on unequal lengths; the kernels combine the
+        // common prefix and drop the rest.
         match apply_binop_column(
             BinOpKind::Compare(CompareKind::Less),
-            ColumnValue::Bools(BitVec::from_elem(3, false)),
-            &ColumnValue::Bools(BitVec::from_elem(1, true)),
+            ColumnValue::Bools(vec![false; 3]),
+            &ColumnValue::Bools(vec![true; 1]),
         ) {
             ColumnValue::Bools(v) => {
                 assert_eq!(v.len(), 1);
@@ -208,8 +202,8 @@ mod tests {
         }
         match apply_binop_column(
             BinOpKind::BoolLogic(LogicKind::And),
-            ColumnValue::Bools(BitVec::from_elem(1, true)),
-            &ColumnValue::Bools(BitVec::from_elem(4, true)),
+            ColumnValue::Bools(vec![true; 1]),
+            &ColumnValue::Bools(vec![true; 4]),
         ) {
             ColumnValue::Bools(v) => {
                 assert_eq!(v.len(), 1);

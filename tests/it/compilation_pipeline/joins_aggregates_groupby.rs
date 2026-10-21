@@ -9,7 +9,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use bit_set::BitSet;
-use bit_vec::BitVec;
 use cambra::ccl::Type;
 use cambra::ccl::context::GlobalContext;
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
@@ -367,7 +366,7 @@ fn a_bare_groupby_tail_is_driven() {
 #[case(
     "[x for x in [False,True] if x]",
     "iterate ▷ ([false, true] ▷ restrict) ≫ cast([false, true]):({[0, 1] | __elem ▷ [false, true]} ⤇ Bool)",
-    Tile::data_function(ColumnValue::UInts(vec![1]), Box::new(Tile::Scalar(ColumnValue::Bools(BitVec::from_elem(1, true)))), Predicate::True, BitSet::new()),
+    Tile::data_function(ColumnValue::UInts(vec![1]), Box::new(Tile::Scalar(ColumnValue::Bools(vec![true; 1]))), Predicate::True, BitSet::new()),
 )]
 #[case(
     "[x + 10 for x in [1,2,3] if x == 2]",

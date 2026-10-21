@@ -31,7 +31,7 @@ pub fn apply_unaryop_column(op: UnaryOpKind, operand: ColumnValue) -> ColumnValu
             ColumnValue::Ints(v)
         }
         (UnaryOpKind::Not, ColumnValue::Bools(mut v)) => {
-            v.negate();
+            v.iter_mut().for_each(|b| *b = !*b);
             ColumnValue::Bools(v)
         }
         (op, operand) => panic!("Unsupported unary op: {op:?} on {operand:?}"),

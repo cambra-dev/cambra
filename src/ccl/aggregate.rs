@@ -1,6 +1,5 @@
 //! Aggregation kinds and their interpreter-facing fold semantics.
 
-use bit_vec::BitVec;
 use smol_str::SmolStr;
 
 use crate::ccl::BaseType;
@@ -122,11 +121,9 @@ impl AggregateKind {
                 ColumnValue::Strings(vec![SmolStr::default()])
             }
             (AggregateKind::Max, Extent::Base(BaseType::Bool)) => {
-                ColumnValue::Bools(BitVec::from_elem(1, false))
+                ColumnValue::Bools(vec![false; 1])
             }
-            (AggregateKind::Min, Extent::Base(BaseType::Bool)) => {
-                ColumnValue::Bools(BitVec::from_elem(1, true))
-            }
+            (AggregateKind::Min, Extent::Base(BaseType::Bool)) => ColumnValue::Bools(vec![true; 1]),
             // The single `unit` a drained group collapses to; further elements
             // fold in as no-ops (see `accumulate`).
             (AggregateKind::Drain, Extent::Base(BaseType::Unit)) => ColumnValue::Units(1),
@@ -178,7 +175,7 @@ impl AggregateKind {
             // `False < True`, so the maximum is whether any element is `True`.
             (AggregateKind::Max, ColumnValue::Bools(acc), ColumnValue::Bools(vs)) => {
                 if (start..end).any(|i| vs[i]) {
-                    acc.set(0, true);
+                    acc[0] = true;
                 }
             }
             (AggregateKind::Min, ColumnValue::Ints(acc), ColumnValue::Ints(vs)) => {
@@ -190,7 +187,7 @@ impl AggregateKind {
             // `False < True`, so the minimum is whether every element is `True`.
             (AggregateKind::Min, ColumnValue::Bools(acc), ColumnValue::Bools(vs)) => {
                 if (start..end).any(|i| !vs[i]) {
-                    acc.set(0, false);
+                    acc[0] = false;
                 }
             }
             // `Drain`: the accumulator already holds the single `unit` the group

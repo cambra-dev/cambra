@@ -865,10 +865,11 @@ impl TileProducer for SelectFieldProducer {
             let rows = tile.deepest_values().rows();
             let level = CurryLevel::innermost_of(self.input.tiling())
                 .expect("only a record beneath a level holds no cell at a row");
-            tile.values_at_mut(level)
-                .retain_keys(&bit_vec::BitVec::from_fn(rows, |row| {
-                    !missing.contains(row)
-                }));
+            tile.values_at_mut(level).retain_keys(
+                &(0..rows)
+                    .map(|row| !missing.contains(row))
+                    .collect::<Vec<bool>>(),
+            );
         }
         // The record stands at the chain's deepest values, so the field takes its place and
         // every level above it is left where it was.

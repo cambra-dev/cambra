@@ -1215,10 +1215,10 @@ impl Predicate {
             ColumnValue::UInts(v) => Predicate::intervals(single_interval_set(v)),
             ColumnValue::Bools(v) => {
                 let mut vec = Vec::new();
-                if v.count_ones() > 0 {
+                if v.iter().any(|&b| b) {
                     vec.push(true)
                 }
-                if v.count_zeros() > 0 {
+                if v.iter().any(|&b| !b) {
                     vec.push(false)
                 }
                 vec_to_predicate(&vec)
@@ -1644,7 +1644,6 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
 #[cfg(test)]
 mod tests {
     use crate::ccl::FieldKey;
-    use bit_vec::BitVec;
     use intervalsets::ops::Contains;
 
     use super::*;
@@ -2278,9 +2277,9 @@ mod tests {
 
     #[test]
     fn from_column_value_bools_both_values() {
-        let mut bv = BitVec::from_elem(2, false);
-        bv.set(0, true);
-        bv.set(1, false);
+        let mut bv = vec![false; 2];
+        bv[0] = true;
+        bv[1] = false;
         // Both values are the whole of `Bool`, which has one spelling.
         assert_eq!(
             Predicate::from_column_value(&ColumnValue::Bools(bv)),
@@ -2290,7 +2289,7 @@ mod tests {
 
     #[test]
     fn from_column_value_bools_only_true() {
-        let bv = BitVec::from_elem(3, true);
+        let bv = vec![true; 3];
         let p = Predicate::from_column_value(&ColumnValue::Bools(bv));
         let Predicate::Intervals(s) = p else {
             panic!("expected Intervals");
@@ -2302,7 +2301,7 @@ mod tests {
     #[test]
     fn from_column_value_empty_bools_is_false() {
         assert_eq!(
-            Predicate::from_column_value(&ColumnValue::Bools(BitVec::new())),
+            Predicate::from_column_value(&ColumnValue::Bools(Vec::new())),
             Predicate::False
         );
     }
@@ -3605,7 +3604,7 @@ mod tests {
     fn union_from_column_value_empty_tags_is_false() {
         let cv = ColumnValue::positional_union(
             &[],
-            vec![ColumnValue::Ints(vec![]), ColumnValue::Bools(BitVec::new())],
+            vec![ColumnValue::Ints(vec![]), ColumnValue::Bools(Vec::new())],
         );
         assert_eq!(Predicate::from_column_value(&cv), Predicate::False);
     }

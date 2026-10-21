@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 
 use bit_set::BitSet;
-use bit_vec::BitVec;
 
 use super::*;
 use crate::interpreter::operator_graph::value;
@@ -321,8 +320,10 @@ fn answer_key_stream(keys: &Tile, coll: &Tile, out_extent: &Extent) -> Tile {
         .map(|i| answer_for(&key_col.index_at(i), coll))
         .collect();
     let mut out = keys.clone();
-    let decided = BitVec::from_fn(answers.len(), |i| answers[i].is_some());
-    if !decided.all() {
+    let decided = (0..answers.len())
+        .map(|i| answers[i].is_some())
+        .collect::<Vec<bool>>();
+    if !decided.iter().all(|&d| d) {
         let paths = keys.paths_at(CurryLevel::new(depth));
         let withheld: Vec<&[Value]> = paths
             .iter()

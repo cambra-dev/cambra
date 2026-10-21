@@ -442,11 +442,11 @@ impl MapResultProducer {
                 .checked_sub(1)
                 .unwrap_or_else(|| unreachable!("the input was matched as a collection"));
             let paths = input_tile.row_paths_at(innermost + 1);
-            let mut keep = bit_vec::BitVec::from_elem(arguments.len(), true);
+            let mut keep = vec![true; arguments.len()];
             let mut withheld: Vec<&[Value]> = Vec::new();
             for (i, path) in paths.iter().enumerate() {
                 if !f_domain_predicate.contains(&arguments.index_at(i)) {
-                    keep.set(i, false);
+                    keep[i] = false;
                     withheld.push(path);
                 }
             }

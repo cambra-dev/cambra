@@ -5,7 +5,6 @@ use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 
 use bit_set::BitSet;
-use bit_vec::BitVec;
 use std::borrow::Cow;
 
 use super::curry_level::CurryLevel;
@@ -652,7 +651,7 @@ impl Tile {
     ///
     /// The mask is over this tile's own rows, so a scalar keeps the entries it names, a
     /// record keeps them in every field, and a collection keeps those rows' whole groups.
-    pub fn retain_rows(&mut self, mask: &BitVec) {
+    pub fn retain_rows(&mut self, mask: &[bool]) {
         match self {
             // A column that carries no row has nothing to filter, and a mask over the rows
             // names nothing in it. A record's fields stand over the same rows without being
@@ -680,7 +679,7 @@ impl Tile {
                 let kept: Vec<Vec<usize>> = mask
                     .iter()
                     .enumerate()
-                    .filter(|(_, keep)| *keep)
+                    .filter(|(_, keep)| **keep)
                     .map(|(row, _)| vec![row])
                     .collect();
                 *self = self.regroup_rows(&kept);
@@ -832,7 +831,7 @@ impl Tile {
     /// The levels below `level` keep their statements. Under a withheld path they speak of
     /// entries this tile no longer holds, and a consumer releases by the keys it holds
     /// ([`Self::to_guard`]), so nothing reads them.
-    pub(crate) fn withhold(&mut self, level: CurryLevel, keep: &BitVec, withheld: &[&[Value]]) {
+    pub(crate) fn withhold(&mut self, level: CurryLevel, keep: &[bool], withheld: &[&[Value]]) {
         for depth in 0..=level.index() {
             let prefixes = Predicate::flatten_or(
                 withheld
@@ -857,7 +856,7 @@ impl Tile {
     /// The mask is over this collection's keys, which is what a predicate over its elements
     /// produces. A key goes with the value under it, as a row goes with its group; what
     /// differs is the axis, so rows keep their identity and only their groups shrink.
-    pub fn retain_keys(&mut self, mask: &BitVec) {
+    pub fn retain_keys(&mut self, mask: &[bool]) {
         let Tile::DataFunction {
             row_starts,
             domain,
@@ -893,7 +892,7 @@ impl Tile {
     ///
     /// Physical arrays are untouched, so `to_guard` still reports every key that was ever
     /// present. Call [`Tile::compact`] to drop them for real.
-    pub fn mark_deleted(&mut self, mask: &BitVec) {
+    pub fn mark_deleted(&mut self, mask: &[bool]) {
         let Tile::DataFunction { deleted, .. } = self else {
             panic!("mark_deleted is a collection's: {self:?}")
         };
@@ -922,7 +921,7 @@ impl Tile {
             } => {
                 if !deleted.is_empty() {
                     let removed = std::mem::take(deleted);
-                    let keep: BitVec = (0..domain.len()).map(|k| !removed.contains(k)).collect();
+                    let keep: Vec<bool> = (0..domain.len()).map(|k| !removed.contains(k)).collect();
                     self.retain_keys(&keep);
                 }
                 let Tile::DataFunction { codomain, .. } = self else {
@@ -1028,9 +1027,9 @@ impl Tile {
                             })
                             .collect();
                         if !released.is_empty() && !cells.is_empty() {
-                            let keep = BitVec::from_fn(cells.len(), |cell| {
-                                !released.iter().any(|&row| at[row] == Some(cell))
-                            });
+                            let keep = (0..cells.len())
+                                .map(|cell| !released.iter().any(|&row| at[row] == Some(cell)))
+                                .collect::<Vec<bool>>();
                             cells.retain(&keep);
                             missing.extend(released);
                         }
@@ -1180,11 +1179,13 @@ impl Tile {
                 let key_paths = domain_predicate
                     .qualifies()
                     .then(|| self.key_paths(row_paths));
-                let open = BitVec::from_fn(domain.len(), |key| match &key_paths {
-                    Some(paths) => !domain_predicate.contains_path(&paths[key]),
-                    None => !domain_predicate.contains(&domain.index_at(key)),
-                });
-                if !open.any() {
+                let open = (0..domain.len())
+                    .map(|key| match &key_paths {
+                        Some(paths) => !domain_predicate.contains_path(&paths[key]),
+                        None => !domain_predicate.contains(&domain.index_at(key)),
+                    })
+                    .collect::<Vec<bool>>();
+                if !open.contains(&true) {
                     return TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone()));
                 }
                 let mut open_values = (**codomain).clone();
@@ -1824,7 +1825,7 @@ impl Tile {
         keep: &dyn Fn(&[Value]) -> bool,
     ) {
         let paths = self.key_paths(&row_paths);
-        let mask: BitVec = paths.iter().map(|p| keep(p)).collect();
+        let mask: Vec<bool> = paths.iter().map(|p| keep(p)).collect();
         self.retain_keys(&mask);
         if depth == 0 {
             return;
@@ -1832,7 +1833,7 @@ impl Tile {
         let survivors: Vec<Vec<Value>> = paths
             .into_iter()
             .zip(mask.iter())
-            .filter(|(_, kept)| *kept)
+            .filter(|(_, kept)| **kept)
             .map(|(path, _)| path)
             .collect();
         let Tile::DataFunction { codomain, .. } = self else {
@@ -1988,9 +1989,9 @@ impl Tile {
                     return TileGuard::Function(FunctionGuard::Domain(self.held_keys(row_paths)));
                 }
                 let key_paths = self.key_paths(row_paths);
-                let complete = BitVec::from_fn(key_paths.len(), |key| {
-                    domain_predicate.contains_path(&key_paths[key])
-                });
+                let complete = (0..key_paths.len())
+                    .map(|key| domain_predicate.contains_path(&key_paths[key]))
+                    .collect::<Vec<bool>>();
                 let whole = key_paths
                     .iter()
                     .enumerate()
@@ -1998,7 +1999,11 @@ impl Tile {
                     .map(|(_, path)| Predicate::exactly(path))
                     .fold(Predicate::False, |all, one| all.union(&one));
                 let mut open_values = (**codomain).clone();
-                open_values.retain_rows(&BitVec::from_fn(key_paths.len(), |key| !complete[key]));
+                open_values.retain_rows(
+                    &(0..key_paths.len())
+                        .map(|key| !complete[key])
+                        .collect::<Vec<bool>>(),
+                );
                 let open_paths: Vec<Vec<Value>> = key_paths
                     .into_iter()
                     .enumerate()
@@ -2151,7 +2156,7 @@ impl Tile {
             return Some(vec![head]);
         }
         let mut group = (**codomain).clone();
-        group.retain_rows(&BitVec::from_fn(domain.len(), |i| i == last));
+        group.retain_rows(&(0..domain.len()).map(|i| i == last).collect::<Vec<bool>>());
         let mut path = vec![head.clone()];
         let mut below = row_paths[owner].clone();
         below.push(head.clone());
@@ -3155,7 +3160,6 @@ fn valid_over_settled(
 #[cfg(test)]
 mod tests {
     use bit_set::BitSet;
-    use bit_vec::BitVec;
 
     use super::super::interval_sets::test_support::Lcg;
     use super::super::predicate::same_region;
@@ -3959,7 +3963,7 @@ mod tests {
             .unwrap_or_else(|| unreachable!("three levels"));
         // Keep only `C` keys 201 and 300 — `B=1`'s only entry goes.
         tile.values_at_mut(CurryLevel::new(innermost))
-            .retain_keys(&BitVec::from_fn(4, |k| k >= 2));
+            .retain_keys(&(0..4).map(|k| k >= 2).collect::<Vec<bool>>());
 
         assert_eq!(
             tile.row_paths_at(2),
@@ -4148,7 +4152,7 @@ mod tests {
         assert_eq!(gathered.rows(), 3);
 
         let mut kept = (**codomain).clone();
-        kept.retain_rows(&BitVec::from_fn(2, |row| row == 0));
+        kept.retain_rows(&(0..2).map(|row| row == 0).collect::<Vec<bool>>());
         let Tile::Record { fields, absent } = &kept else {
             panic!("expected a record, got {kept:?}");
         };
@@ -4525,7 +4529,7 @@ mod tests {
             !Tile::Aggregation {
                 kind: AggregateKind::Sole,
                 accumulator: Box::new(collection),
-                terminal: ColumnValue::Bools(BitVec::from_elem(1, false)),
+                terminal: ColumnValue::Bools(vec![false; 1]),
             }
             .holds_a_level(),
             "an aggregation carries its own completeness, so it answers for what it holds"
@@ -4610,7 +4614,7 @@ mod tests {
         let mut tile = Tile::Aggregation {
             kind: AggregateKind::Sole,
             accumulator: Box::new(accumulator),
-            terminal: ColumnValue::Bools(BitVec::from_elem(2, false)),
+            terminal: ColumnValue::Bools(vec![false; 2]),
         };
         tile.compact();
 
@@ -4855,7 +4859,7 @@ mod tests {
     #[test]
     fn retaining_a_key_takes_its_group_from_a_collection_component() {
         let mut tile = rows_with_a_collection_component();
-        tile.retain_keys(&BitVec::from_fn(2, |i| i == 0));
+        tile.retain_keys(&(0..2).map(|i| i == 0).collect::<Vec<bool>>());
         let Tile::DataFunction { codomain, .. } = &tile else {
             unreachable!()
         };
@@ -5963,7 +5967,7 @@ mod tests {
         let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
-        codomain.retain_keys(&BitVec::from_elem(6, true));
+        codomain.retain_keys(&[true; 6]);
         assert_eq!(tile, three_groups());
     }
 
@@ -5973,7 +5977,7 @@ mod tests {
         let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
-        codomain.retain_keys(&BitVec::from_elem(6, false));
+        codomain.retain_keys(&[false; 6]);
         assert_eq!(
             tile,
             two_level_uint_int(
@@ -5993,7 +5997,7 @@ mod tests {
         let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
-        codomain.retain_keys(&BitVec::from_fn(6, |i| i < 2));
+        codomain.retain_keys(&(0..6).map(|i| i < 2).collect::<Vec<bool>>());
         assert_eq!(
             tile,
             two_level_uint_int(
@@ -6012,7 +6016,7 @@ mod tests {
         let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
-        codomain.retain_keys(&BitVec::from_fn(6, |i| (2..5).contains(&i)));
+        codomain.retain_keys(&(0..6).map(|i| (2..5).contains(&i)).collect::<Vec<bool>>());
         assert_eq!(
             tile,
             two_level_uint_int(
@@ -6031,7 +6035,7 @@ mod tests {
         let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
-        codomain.retain_keys(&BitVec::from_fn(6, |i| i == 5));
+        codomain.retain_keys(&(0..6).map(|i| i == 5).collect::<Vec<bool>>());
         assert_eq!(
             tile,
             two_level_uint_int(
@@ -6050,7 +6054,7 @@ mod tests {
         let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
-        codomain.retain_keys(&BitVec::from_fn(6, |i| !(2..5).contains(&i)));
+        codomain.retain_keys(&(0..6).map(|i| !(2..5).contains(&i)).collect::<Vec<bool>>());
         assert_eq!(
             tile,
             two_level_uint_int(
@@ -6070,7 +6074,7 @@ mod tests {
         let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
-        codomain.retain_keys(&BitVec::from_fn(6, |i| i == 1 || i == 3));
+        codomain.retain_keys(&(0..6).map(|i| i == 1 || i == 3).collect::<Vec<bool>>());
         assert_eq!(
             tile,
             two_level_uint_int(
@@ -6090,7 +6094,7 @@ mod tests {
         let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
-        codomain.retain_keys(&BitVec::from_fn(6, |i| i == 2 || i == 4));
+        codomain.retain_keys(&(0..6).map(|i| i == 2 || i == 4).collect::<Vec<bool>>());
         assert_eq!(
             tile,
             two_level_uint_int(
@@ -6109,7 +6113,7 @@ mod tests {
         Tile::Aggregation {
             kind: AggregateKind::Sum,
             accumulator: Box::new(Tile::Scalar(ColumnValue::Ints(acc))),
-            terminal: ColumnValue::Bools(BitVec::from_elem(rows, true)),
+            terminal: ColumnValue::Bools(vec![true; rows]),
         }
     }
 

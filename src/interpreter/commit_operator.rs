@@ -1636,7 +1636,7 @@ pub fn store_row(store: &Tile, row: usize, rows: usize) -> Tile {
         // and silently folds one enclosing position's writes into the next.
         unreachable!("store_row takes a row of a vectorized store, got {store:?}")
     };
-    let keep = bit_vec::BitVec::from_fn(rows, |i| i == row);
+    let keep = (0..rows).map(|i| i == row).collect::<Vec<bool>>();
     let retained = |t: &Tile| {
         let mut t = t.clone();
         t.retain_rows(&keep);
@@ -3442,9 +3442,9 @@ impl StoreFinalReadProducer {
             .collect();
         // A row is answered once complete. One whose key has no value yet — a
         // collection-valued key its seed omits, before its first write — has none to give.
-        let whole = bit_vec::BitVec::from_fn(n, |k| {
-            complete.contains_path(&paths[k]) && values[k].is_some()
-        });
+        let whole = (0..n)
+            .map(|k| complete.contains_path(&paths[k]) && values[k].is_some())
+            .collect::<Vec<bool>>();
         let answered: Vec<Value> = values
             .into_iter()
             .enumerate()

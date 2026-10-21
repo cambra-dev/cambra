@@ -416,9 +416,9 @@ impl TileProducer for VariantWrapProducer {
                 Some(rows) => {
                     let complete = tile.completion_at(rows);
                     let paths = tile.paths_at(rows);
-                    let whole = bit_vec::BitVec::from_fn(paths.len(), |key| {
-                        complete.contains_path(&paths[key])
-                    });
+                    let whole = (0..paths.len())
+                        .map(|key| complete.contains_path(&paths[key]))
+                        .collect::<Vec<bool>>();
                     tile.values_at_mut(rows).retain_keys(&whole);
                 }
             }
@@ -952,7 +952,7 @@ impl TileProducer for VariantIsProducer {
                 .filter(|p| !deleted.contains(*p))
                 .collect(),
         };
-        let answers: bit_vec::BitVec = positions.iter().map(|p| carried.contains(*p)).collect();
+        let answers: Vec<bool> = positions.iter().map(|p| carried.contains(*p)).collect();
         let out_domain = match domain_col {
             Some(d) => d.select_indices(positions.iter().copied(), positions.len()),
             None => ColumnValue::uints_from_rows(positions),

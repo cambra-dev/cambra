@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::iter;
 use std::mem::take;
 
-use bit_vec::BitVec;
 use smol_str::SmolStr;
 
 use super::{BaseType, Extent, RowIndex, Value, row_index, uint_of_row};
@@ -31,22 +30,21 @@ pub struct FuncBinding {
 ///
 /// Order-stable: walks `v` with a write cursor, swapping each kept element
 /// into the next write slot.  A faster two-pointer swap-with-end algorithm
-/// (similar to the one used for the `Bools` variant of `ColumnValue::retain`)
 /// would not preserve order, which is incompatible with how mutation-loop
 /// outputs land in a `Tile::DataFunction` with a `Union`-domain: the
 /// `Union` variants in `ColumnValue::retain` use a stable `select_indices`
 /// filter (their order has to match the stably-filtered `tags`), so the
 /// codomain — retained via this function — must also stay in source order
 /// to keep domain/codomain entries aligned position-by-position.
-fn retain_vec<T>(v: &mut Vec<T>, mask: &BitVec) {
+fn retain_vec<T>(v: &mut Vec<T>, mask: &[bool]) {
     debug_assert_eq!(
         mask.len(),
         v.len(),
         "retain_vec: mask length must match vector length"
     );
     let mut write = 0usize;
-    for read in 0..v.len() {
-        if mask[read] {
+    for (read, &keep) in mask.iter().enumerate() {
+        if keep {
             if write != read {
                 v.swap(write, read);
             }
@@ -64,7 +62,7 @@ pub enum ColumnValue {
     Ints(Vec<i64>),
     UInts(Vec<u64>),
     Strings(Vec<SmolStr>),
-    Bools(BitVec),
+    Bools(Vec<bool>),
     Variants(Vec<Value>),
     FunctionBindings {
         inputs: Box<ColumnValue>,
@@ -267,7 +265,7 @@ impl ColumnValue {
         assert_eq!(self.len(), 1, "repeat requires single-element ColumnValue");
         match self {
             ColumnValue::Units(_) => ColumnValue::Units(n),
-            ColumnValue::Bools(v) => ColumnValue::Bools(BitVec::from_elem(n, v[0])),
+            ColumnValue::Bools(v) => ColumnValue::Bools(vec![v[0]; n]),
             ColumnValue::Ints(v) => ColumnValue::Ints(vec![v[0]; n]),
             ColumnValue::UInts(v) => ColumnValue::UInts(vec![v[0]; n]),
             ColumnValue::Strings(v) => ColumnValue::Strings(vec![v[0].clone(); n]),
@@ -589,7 +587,7 @@ impl ColumnValue {
             // e.g. a `` `abort(unit) `` (`Unit` payload) variant value fanned through a
             // `Memo`. Keep the representation canonical here.
             Value::Unit => ColumnValue::Units(1),
-            Value::Bool(b) => ColumnValue::Bools(BitVec::from_elem(1, b)),
+            Value::Bool(b) => ColumnValue::Bools(vec![b; 1]),
             Value::Int(i) => ColumnValue::Ints(vec![i]),
             Value::UInt(i) => ColumnValue::UInts(vec![i]),
             Value::String(s) => ColumnValue::Strings(vec![s]),
@@ -615,7 +613,7 @@ impl ColumnValue {
                 Box::new(iter::repeat_n(Value::Unit, count))
             }
             ColumnValue::Bools(v) => {
-                // BitVec::take gives us ownership so we can return a 'static iterator.
+                // `mem::take` moves the elements out so the iterator can be 'static.
                 Box::new(take(v).into_iter().map(Value::Bool))
             }
             ColumnValue::Ints(v) => Box::new(take(v).into_iter().map(Value::Int)),
@@ -745,7 +743,7 @@ impl ColumnValue {
             ColumnValue::Ints(_) => ColumnValue::Ints(Vec::new()),
             ColumnValue::UInts(_) => ColumnValue::UInts(Vec::new()),
             ColumnValue::Strings(_) => ColumnValue::Strings(Vec::new()),
-            ColumnValue::Bools(_) => ColumnValue::Bools(BitVec::new()),
+            ColumnValue::Bools(_) => ColumnValue::Bools(Vec::new()),
             ColumnValue::Variants(_) => ColumnValue::Variants(Vec::new()),
             ColumnValue::FunctionBindings { inputs, outputs } => {
                 ColumnValue::function_bindings(inputs.empty_like(), outputs.empty_like())
@@ -840,8 +838,8 @@ impl ColumnValue {
 
     /// Retain only elements where `mask[i]` is true, in-place.
     ///
-    /// Not guaranteed to preserve element ordering; when possible, uses swap-remove to avoid shifting data.
-    pub fn retain(&mut self, mask: &BitVec) {
+    /// Preserves the relative order of the kept elements.
+    pub fn retain(&mut self, mask: &[bool]) {
         assert_eq!(
             mask.len(),
             self.len(),
@@ -849,38 +847,13 @@ impl ColumnValue {
         );
         match self {
             ColumnValue::Units(_) => {
-                *self = ColumnValue::Units(mask.count_ones() as usize);
+                *self = ColumnValue::Units(mask.iter().filter(|&&keep| keep).count());
             }
             ColumnValue::Ints(v) => retain_vec(v, mask),
             ColumnValue::UInts(v) => retain_vec(v, mask),
             ColumnValue::Strings(v) => retain_vec(v, mask),
             ColumnValue::Variants(v) => retain_vec(v, mask),
-            ColumnValue::Bools(v) => {
-                let n = v.len();
-                if n > 0 {
-                    let mut left = 0usize;
-                    let mut right = n - 1;
-                    loop {
-                        while left < right && mask[left] {
-                            left += 1;
-                        }
-                        while right > left && !mask[right] {
-                            right -= 1;
-                        }
-                        if left >= right {
-                            break;
-                        }
-                        let lv = v[left];
-                        let rv = v[right];
-                        v.set(left, rv);
-                        v.set(right, lv);
-                        left += 1;
-                        right -= 1;
-                    }
-                }
-                let count = mask.iter().filter(|b| *b).count();
-                v.truncate(count);
-            }
+            ColumnValue::Bools(v) => retain_vec(v, mask),
             ColumnValue::FunctionBindings { inputs, outputs } => {
                 inputs.retain(mask);
                 outputs.retain(mask);
@@ -896,7 +869,7 @@ impl ColumnValue {
                 // payload slot, so no per-variant mask has to be built.
                 let mut new_row = vec![usize::MAX; mask.len()];
                 let mut next = 0usize;
-                for (i, keep) in mask.iter().enumerate() {
+                for (i, &keep) in mask.iter().enumerate() {
                     if keep {
                         new_row[i] = next;
                         next += 1;
@@ -987,8 +960,8 @@ impl ColumnValue {
         }
     }
 
-    /// Returns a reference to the internal bitvec if this ColumnValue is bools.
-    pub fn as_bitvec(&self) -> Option<&BitVec> {
+    /// Returns the booleans if this ColumnValue is a `Bools` column.
+    pub fn as_bools(&self) -> Option<&[bool]> {
         if let ColumnValue::Bools(b) = self {
             Some(b)
         } else {
@@ -1116,7 +1089,7 @@ mod tests {
         // `retain` reaches the same place from a mask: drop rows 0 and 3,
         // leaving abort (was row 1) at 0 and commit(30) (was row 2) at 1.
         let mut retained = mixed_union_column();
-        retained.retain(&BitVec::from_fn(4, |i| i == 1 || i == 2));
+        retained.retain(&(0..4).map(|i| i == 1 || i == 2).collect::<Vec<bool>>());
         retained.debug_assert_union_invariants();
         assert_eq!(retained.len(), 2);
         assert_eq!(
@@ -1166,29 +1139,46 @@ mod tests {
     #[test]
     fn test_retain_vec_keep_some() {
         // mask: keep indices 0 and 2, drop index 1.
-        // Order is unspecified; sort to compare.
         let mut v = vec![10, 20, 30];
-        let mut mask = BitVec::from_elem(3, false);
-        mask.set(0, true);
-        mask.set(2, true);
+        let mut mask = vec![false; 3];
+        mask[0] = true;
+        mask[2] = true;
         retain_vec(&mut v, &mask);
-        v.sort();
         assert_eq!(v, vec![10, 30]);
     }
 
     #[test]
     fn test_retain_vec_keep_all() {
         let mut v = vec![1, 2, 3];
-        let mask = BitVec::from_elem(3, true);
+        let mask = vec![true; 3];
         retain_vec(&mut v, &mask);
-        v.sort();
         assert_eq!(v, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_retain_vec_keeps_source_order() {
+        // A kept element after a dropped one moves left past it, so a swap-with-end
+        // algorithm would return `[40, 20]` here.
+        let mut v = vec![10, 20, 30, 40];
+        retain_vec(&mut v, &[false, true, false, true]);
+        assert_eq!(v, vec![20, 40]);
+    }
+
+    #[test]
+    fn test_retain_bools_preserves_order() {
+        // Mask `[F, T, T]` once returned `[v2, v1]`.
+        let mut col = ColumnValue::Bools(vec![true, false, true]);
+        col.retain(&[false, true, true]);
+        assert_eq!(col, ColumnValue::Bools(vec![false, true]));
+        let mut col = ColumnValue::Bools(vec![true, false, false, true, false, true]);
+        col.retain(&[true, false, true, false, true, true]);
+        assert_eq!(col, ColumnValue::Bools(vec![true, false, false, true]));
     }
 
     #[test]
     fn test_retain_vec_keep_none() {
         let mut v = vec![1, 2, 3];
-        let mask = BitVec::from_elem(3, false);
+        let mask = vec![false; 3];
         retain_vec(&mut v, &mask);
         assert!(v.is_empty());
     }
@@ -1243,10 +1233,10 @@ mod tests {
         out.into_iter().map(|(_, t, v)| (t, v)).collect()
     }
 
-    fn mask(bits: &[bool]) -> BitVec {
-        let mut bv = BitVec::from_elem(bits.len(), false);
+    fn mask(bits: &[bool]) -> Vec<bool> {
+        let mut bv = vec![false; bits.len()];
         for (i, &b) in bits.iter().enumerate() {
-            bv.set(i, b);
+            bv[i] = b;
         }
         bv
     }

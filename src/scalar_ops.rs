@@ -14,7 +14,6 @@
 
 use std::ops::{AddAssign, MulAssign, SubAssign};
 
-use bit_vec::BitVec;
 use smol_str::{SmolStr, SmolStrBuilder};
 
 /// Kinds of binary operations.
@@ -206,7 +205,7 @@ pub(crate) fn zip_compare<T: PartialEq + PartialOrd>(
     op: CompareKind,
     l: Vec<T>,
     r: &[T],
-) -> BitVec {
+) -> Vec<bool> {
     match op {
         CompareKind::Equals => l.iter().zip(r.iter()).map(|(a, b)| a == b).collect(),
         CompareKind::NotEquals => l.iter().zip(r.iter()).map(|(a, b)| a != b).collect(),
@@ -217,68 +216,39 @@ pub(crate) fn zip_compare<T: PartialEq + PartialOrd>(
     }
 }
 
-/// Align two bit-vectors to their common-prefix length. `BitVec`'s in-place set
-/// ops (`and`/`or`/`xor`/…) assert *equal* length, so a still-converging operand
-/// (one side ahead of the other — the co-presence case `zip_arithmetic` handles
-/// by truncation) would panic without this. `l` is truncated in place; `r` is
-/// returned truncated, cloned into `scratch` only when it is the longer side.
-fn align_common<'a>(l: &mut BitVec, r: &'a BitVec, scratch: &'a mut Option<BitVec>) -> &'a BitVec {
-    let n = l.len().min(r.len());
-    l.truncate(n);
-    if r.len() == n {
-        r
-    } else {
-        let mut c = r.clone();
-        c.truncate(n);
-        &*scratch.insert(c)
+/// Combine `l` with `r` element by element in place, over the common-prefix length of the two.
+///
+/// A still-converging operand (one side ahead of the other — the co-presence case
+/// `zip_arithmetic` handles by truncation) is cut to the shorter length, so unequal lengths
+/// do not panic.
+#[inline]
+fn zip_bools_with(mut l: Vec<bool>, r: &[bool], f: impl Fn(bool, bool) -> bool) -> Vec<bool> {
+    l.truncate(r.len());
+    l.iter_mut().zip(r).for_each(|(a, &b)| *a = f(*a, b));
+    l
+}
+
+pub(crate) fn zip_bool_compare(op: CompareKind, l: Vec<bool>, r: &[bool]) -> Vec<bool> {
+    // Boolean ordering: false < true.
+    match op {
+        CompareKind::Equals => zip_bools_with(l, r, |a, b| a == b),
+        CompareKind::NotEquals => zip_bools_with(l, r, |a, b| a != b),
+        CompareKind::Less => zip_bools_with(l, r, |a, b| !a & b),
+        CompareKind::LessOrEq => zip_bools_with(l, r, |a, b| a <= b),
+        CompareKind::Greater => zip_bools_with(l, r, |a, b| a & !b),
+        CompareKind::GreaterOrEq => zip_bools_with(l, r, |a, b| a >= b),
     }
 }
 
-pub(crate) fn zip_bool_compare(op: CompareKind, mut l: BitVec, r: &BitVec) -> BitVec {
-    // Boolean ordering: false < true (0 < 1).
-    let mut scratch = None;
-    let r = align_common(&mut l, r, &mut scratch);
+pub(crate) fn zip_bool_logic(op: LogicKind, l: Vec<bool>, r: &[bool]) -> Vec<bool> {
     match op {
-        CompareKind::Equals => l.xnor(r),
-        CompareKind::NotEquals => l.xor(r),
-        CompareKind::Less => {
-            // a < b  ≡  !a & b
-            l.negate();
-            l.and(r)
-        }
-        CompareKind::LessOrEq => {
-            // a <= b  ≡  !a | b
-            l.negate();
-            l.or(r)
-        }
-        CompareKind::Greater => {
-            // a > b  ≡  a & !b
-            let mut not_r = r.clone();
-            not_r.negate();
-            l.and(&not_r)
-        }
-        CompareKind::GreaterOrEq => {
-            // a >= b  ≡  a | !b
-            let mut not_r = r.clone();
-            not_r.negate();
-            l.or(&not_r)
-        }
-    };
-    l
-}
-
-pub(crate) fn zip_bool_logic(op: LogicKind, mut l: BitVec, r: &BitVec) -> BitVec {
-    let mut scratch = None;
-    let r = align_common(&mut l, r, &mut scratch);
-    match op {
-        LogicKind::And => l.and(r),
-        LogicKind::Nand => l.nand(r),
-        LogicKind::Or => l.or(r),
-        LogicKind::Nor => l.nor(r),
-        LogicKind::Xor => l.xor(r),
-        LogicKind::Xnor => l.xnor(r),
-    };
-    l
+        LogicKind::And => zip_bools_with(l, r, |a, b| a & b),
+        LogicKind::Nand => zip_bools_with(l, r, |a, b| !(a & b)),
+        LogicKind::Or => zip_bools_with(l, r, |a, b| a | b),
+        LogicKind::Nor => zip_bools_with(l, r, |a, b| !(a | b)),
+        LogicKind::Xor => zip_bools_with(l, r, |a, b| a ^ b),
+        LogicKind::Xnor => zip_bools_with(l, r, |a, b| a == b),
+    }
 }
 
 #[cfg(test)]
