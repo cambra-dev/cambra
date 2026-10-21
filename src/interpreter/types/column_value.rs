@@ -294,6 +294,24 @@ impl ColumnValue {
         }
     }
 
+    /// Make room for `additional` more rows, so that appending them does not reallocate.
+    ///
+    /// A hint: the columns that hold their rows outside one buffer (`FunctionBindings`,
+    /// `Union`) keep their own growth.
+    pub fn reserve(&mut self, additional: usize) {
+        match self {
+            ColumnValue::Ints(v) => v.reserve_exact(additional),
+            ColumnValue::UInts(v) => v.reserve_exact(additional),
+            ColumnValue::Strings(v) => v.reserve_exact(additional),
+            ColumnValue::Variants(v) => v.reserve_exact(additional),
+            ColumnValue::Bools(v) => v.reserve_exact(additional),
+            ColumnValue::Records(r) => r.values_mut().for_each(|v| v.reserve(additional)),
+            ColumnValue::Units(_)
+            | ColumnValue::FunctionBindings { .. }
+            | ColumnValue::Union(_) => {}
+        }
+    }
+
     /// Convert a Vec<Value> into typed ColumnValue.
     pub fn from_values(values: Vec<Value>, extent: &Extent) -> ColumnValue {
         match extent {

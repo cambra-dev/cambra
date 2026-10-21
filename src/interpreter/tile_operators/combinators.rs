@@ -6,7 +6,7 @@ use std::iter::repeat_n;
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::{
-    ColumnValue, Consumer, Extent, Scheduler, Value, shared_consumer, tuple_field,
+    BaseType, ColumnValue, Consumer, Extent, Scheduler, Value, shared_consumer, tuple_field,
 };
 
 /// Inverts a function operator, producing a lookup-function from codomain to domain.
@@ -897,7 +897,9 @@ impl TileProducer for FilterProducer {
                     let Tile::DataFunction { ref domain, .. } = input else {
                         unreachable!("matched above")
                     };
-                    let func_result = f.apply(domain.clone());
+                    let mut func_result =
+                        ColumnValue::from_values(Vec::new(), &Extent::Base(BaseType::Bool));
+                    f.apply(domain.clone(), &mut func_result);
                     let mask = func_result
                         .as_bools()
                         .unwrap_or_else(|| panic!("Expected boolean mask"));

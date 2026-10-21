@@ -184,9 +184,9 @@ pub fn try_scalar_tile_to_column_value(tile: Tile) -> Option<ColumnValue> {
 ///   through the table.
 /// - A one-level [`Tile::DataFunction`]: a point-lookup table keyed by domain value.
 ///
-/// `output_extent` types the output column for the bindings-table case and for an empty
-/// scalar; it is unused for `ComputableFunction`, which determines its own output type, and
-/// for a collection, whose values carry their own.
+/// `output_extent` types the output column: the empty column a `ComputableFunction` writes to,
+/// the table of the bindings case and the output of an empty scalar. A collection's values carry
+/// their own type.
 pub(crate) fn apply_function_tile(
     function_tile: Tile,
     mut input: ColumnValue,
@@ -195,7 +195,11 @@ pub(crate) fn apply_function_tile(
 ) -> ColumnValue {
     match function_tile {
         Tile::Scalar(func) => match func.as_single() {
-            Some(Value::ComputableFunction(f)) => f.apply(input),
+            Some(Value::ComputableFunction(f)) => {
+                let mut out = ColumnValue::from_values(Vec::new(), output_extent);
+                f.apply(input, &mut out);
+                out
+            }
             Some(Value::Function(bindings)) => {
                 if bindings_are_list(&bindings) {
                     // Inputs are sequential u0, u1, … so input holds raw indices.

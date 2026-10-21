@@ -9,7 +9,7 @@ use smol_str::SmolStr;
 
 use crate::ccl::FieldKey;
 use crate::interpreter::{
-    BinOpKind, Extent, Tile, UnaryOpKind, apply_binop_column, apply_unaryop_column, tuple_field,
+    BinOpKind, Extent, Tile, UnaryOpKind, apply_binop_into, apply_unaryop_into, tuple_field,
 };
 use crate::pretty_graph::fmt_binop;
 use crate::util::fmt_record;
@@ -30,30 +30,42 @@ pub enum FunctionDef {
 }
 
 impl FunctionDef {
-    pub fn apply(&self, input: ColumnValue) -> ColumnValue {
+    /// Apply this function to a column of inputs and write the outputs to `out`.
+    ///
+    /// `out` is an empty column of the function's codomain extent, which the producer creates from
+    /// that extent. `BinOp` and `UnaryOp` reserve room for the operand's rows and append their
+    /// results to it. `RecordField` and `Insert` replace it with a column they already hold or
+    /// build, the projected field and the bindings. The input is not measured as a whole: a record
+    /// column whose fields are still filling has no length.
+    pub fn apply(&self, input: ColumnValue, out: &mut ColumnValue) {
         match (self, input) {
-            (FunctionDef::BinOp(op), ColumnValue::Records(fields)) => apply_binop_column(
-                *op,
-                fields.get(&tuple_field(0)).expect("Not a tuple"),
-                &fields[&tuple_field(1)],
-            ),
-            (FunctionDef::UnaryOp(op), cv) => apply_unaryop_column(*op, &cv),
-            (FunctionDef::RecordField(f), ColumnValue::Records(mut fields)) => fields
-                .remove(f)
-                .unwrap_or_else(|| panic!("Missing field {f}")),
+            (FunctionDef::BinOp(op), ColumnValue::Records(fields)) => {
+                let left = fields.get(&tuple_field(0)).expect("Not a tuple");
+                out.reserve(left.len());
+                apply_binop_into(*op, left, &fields[&tuple_field(1)], out);
+            }
+            (FunctionDef::UnaryOp(op), cv) => {
+                out.reserve(cv.len());
+                apply_unaryop_into(*op, &cv, out);
+            }
+            (FunctionDef::RecordField(f), ColumnValue::Records(mut fields)) => {
+                *out = fields
+                    .remove(f)
+                    .unwrap_or_else(|| panic!("Missing field {f}"));
+            }
             (FunctionDef::Insert, ColumnValue::Records(mut fields)) => {
                 let maps = fields
                     .remove(&tuple_field(0))
                     .expect("insert: no collection");
                 let keys = fields.remove(&tuple_field(1)).expect("insert: no key");
                 let values = fields.remove(&tuple_field(2)).expect("insert: no value");
-                ColumnValue::Variants(
+                *out = ColumnValue::Variants(
                     (0..maps.len())
                         .map(|i| {
                             insert_binding(maps.index_at(i), keys.index_at(i), values.index_at(i))
                         })
                         .collect(),
-                )
+                );
             }
             _ => panic!("Invalid function application"),
         }
