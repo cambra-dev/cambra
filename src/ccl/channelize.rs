@@ -1279,6 +1279,9 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
         TypedExprNode::Method { .. } => {
             unreachable!("a Method reached channelize; inference resolves every method")
         }
+        TypedExprNode::LetType { .. } => {
+            unreachable!("uniquify removes every `LetType`")
+        }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
         TypedExprNode::MutDecl { .. } => {
@@ -1354,6 +1357,9 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         }
         TypedExprNode::Method { .. } => {
             unreachable!("a Method reached channelize; inference resolves every method")
+        }
+        TypedExprNode::LetType { .. } => {
+            unreachable!("uniquify removes every `LetType`")
         }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
@@ -2073,6 +2079,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             TypedExprNode::Method { .. } => {
                 unreachable!("a Method reached channelize; inference resolves every method")
             }
+            TypedExprNode::LetType { .. } => unreachable!("uniquify removes every `LetType`"),
             TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
                 if !bound.iter().any(|b| b == name) {
                     out.insert(name.clone());
@@ -2332,6 +2339,9 @@ fn extract_for_defer_impl(
         }
         TypedExprNode::Method { .. } => {
             unreachable!("a Method reached channelize; inference resolves every method")
+        }
+        TypedExprNode::LetType { .. } => {
+            unreachable!("uniquify removes every `LetType`")
         }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.

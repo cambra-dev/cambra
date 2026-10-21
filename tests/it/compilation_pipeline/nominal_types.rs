@@ -501,21 +501,43 @@ fn a_product_of_nominal_values_joins(#[case] join: &str, #[case] expected: Value
 }
 
 /// An alias may name a nominal type, and a constructor's parameter type may name an alias
-/// declared anywhere in the module.
+/// declared above it.
 #[test]
 fn aliases_and_nominal_types_name_each_other() {
     check_scalar(
         indoc! {r#"
+            Cents = Int
+
             type Order:
                 placed(Cents)
 
-            Cents = Int
             Placed = {Order, Cents}
 
             p: Placed = (Order::placed(5), 5)
             p.0
         "#},
         ctor("placed", Value::Int(5)),
+    );
+}
+
+/// A constructor's parameter type may name a refined alias. The constructor is bound
+/// outside the alias's declaration, so its predicate names no binding (`src/ccl/design/ir.md`,
+/// "Type aliases resolve where they are declared").
+#[test]
+fn a_constructor_parameter_may_name_a_refined_alias() {
+    check_scalar(
+        indoc! {r#"
+            Count = {Int where _ >= 0}
+
+            type Stock:
+                held(Count)
+
+            def restock(n: Count) => Stock:
+                Stock::held(n)
+
+            restock(2)
+        "#},
+        ctor("held", Value::Int(2)),
     );
 }
 

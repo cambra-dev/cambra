@@ -198,6 +198,24 @@ mutable initializer binds the value read from it; `b = a` does not create a muta
 is structural and remains available after source annotations are cleared by inference. See
 [mutability](mutability.md) for read and write rules.
 
+### Type aliases resolve where they are declared
+
+`LetType { name, ty, body }` is the type alias `name = ty` declared over `body`. It binds no value:
+lowering substitutes `ty` at every use, so nothing refers to `name`. The node holds `ty` where the
+alias is declared, because a refinement predicate in `ty` reads values, as `Pos = {Int where _ > k}`
+reads `k`, and those names resolve in the declaration's scope, not at a use under a local `k`.
+
+Every use shares `ty`'s predicate terms, and uniquify rebuilds a shared predicate once. A use in a
+statement lies in `body` ([chl-spec.md, "6.7 Type-alias
+statements"](../../../docs/chl-spec.md#67-type-alias-statements)), so uniquify reaches the
+`LetType` first and the use takes the resolution made there. A nominal constructor's parameter type
+is the one use outside `body`: `nominal::bind_constructors` binds each constructor around the whole
+module, so uniquify reaches the constructor first. Lowering refuses a constructor parameter type
+whose refinement names a binding (`lower_parameter_type`), so every predicate reached there is
+closed and resolves the same in both scopes. A debug build asserts that a use uniquify reaches
+before its alias's `LetType` resolves each free name as the `LetType` does. Uniquify then replaces
+the node with `body`. No pass after it sees a `LetType`, and each has an unreachable arm for one.
+
 ### `Cast` — explicit refinement acquisition
 
 `Cast { value, target }` attaches a refinement to a function's domain. Lowering constructs it for
@@ -264,8 +282,8 @@ The remaining nodes supply values or mark source structure for a later phase:
 | `Error` | Recovery placeholder accompanied by lowering errors; compilation stops before inference. |
 
 `Source` is specified under [source injection](#source-injection). `Realize`, `Transact`,
-`LetRec`, and `Aggregate` have their own sections because their typing or phase ownership needs
-more than a node description.
+`LetRec`, `LetType`, and `Aggregate` have their own sections because their typing or phase
+ownership needs more than a node description.
 
 ### `Copair` and `DisjointJoin` — two collection-combining operations, not one
 
