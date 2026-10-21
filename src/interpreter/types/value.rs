@@ -32,12 +32,12 @@ pub enum FunctionDef {
 impl FunctionDef {
     pub fn apply(&self, input: ColumnValue) -> ColumnValue {
         match (self, input) {
-            (FunctionDef::BinOp(op), ColumnValue::Records(mut fields)) => apply_binop_column(
+            (FunctionDef::BinOp(op), ColumnValue::Records(fields)) => apply_binop_column(
                 *op,
-                fields.remove(&tuple_field(0)).expect("Not a tuple"),
+                fields.get(&tuple_field(0)).expect("Not a tuple"),
                 &fields[&tuple_field(1)],
             ),
-            (FunctionDef::UnaryOp(op), cv) => apply_unaryop_column(*op, cv),
+            (FunctionDef::UnaryOp(op), cv) => apply_unaryop_column(*op, &cv),
             (FunctionDef::RecordField(f), ColumnValue::Records(mut fields)) => fields
                 .remove(f)
                 .unwrap_or_else(|| panic!("Missing field {f}")),

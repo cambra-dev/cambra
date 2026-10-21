@@ -755,6 +755,22 @@ impl ColumnValue {
         }
     }
 
+    /// Remove every row, keeping the buffers of the columns that hold their rows in one.
+    pub fn clear(&mut self) {
+        match self {
+            ColumnValue::Units(n) => *n = 0,
+            ColumnValue::Ints(v) => v.clear(),
+            ColumnValue::UInts(v) => v.clear(),
+            ColumnValue::Strings(v) => v.clear(),
+            ColumnValue::Bools(v) => v.clear(),
+            ColumnValue::Variants(v) => v.clear(),
+            ColumnValue::Records(r) => r.values_mut().for_each(ColumnValue::clear),
+            ColumnValue::FunctionBindings { .. } | ColumnValue::Union(_) => {
+                *self = self.empty_like();
+            }
+        }
+    }
+
     /// Assert the [`ColumnValue::Union`] partition invariants in debug builds.
     ///
     /// The arms' `rows` must be disjoint and together cover `0..len` exactly. The

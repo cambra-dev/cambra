@@ -11,32 +11,112 @@ use crate::scalar_ops::{
 
 use super::ColumnValue;
 
-/// Apply a binary operation element-wise on two `ColumnValue`s.
-pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue) -> ColumnValue {
-    match (op, left, right) {
-        (BinOpKind::Arithmetic(op), ColumnValue::Ints(l), ColumnValue::Ints(r)) => {
-            ColumnValue::Ints(zip_arithmetic(op, l, r))
+/// The empty column that holds the result of `op` over operands shaped like `left`.
+fn result_column(op: BinOpKind, left: &ColumnValue) -> ColumnValue {
+    match op {
+        BinOpKind::Arithmetic(_) => left.empty_like(),
+        BinOpKind::Concat => ColumnValue::Strings(Vec::new()),
+        BinOpKind::BoolLogic(_) | BinOpKind::Compare(_) => ColumnValue::Bools(Vec::new()),
+    }
+}
+
+/// The operands cut to their common prefix, `min(l.len(), r.len())`.
+///
+/// Only co-present positions combine. A longer `l` would otherwise keep its surplus tail in
+/// the result, which fabricates values for positions the other operand has not reached. That
+/// misfires when `r` has not yet converged (a sibling induction loop's still-empty final
+/// read): the result would read as terminal instead of waiting. The sibling half of this
+/// invariant is that `MapResultToConstProducer` emits an empty non-terminal tile rather than
+/// broadcasting an absent constant.
+fn co_present<'a, T>(l: &'a [T], r: &'a [T]) -> (&'a [T], &'a [T]) {
+    let rows = l.len().min(r.len());
+    (&l[..rows], &r[..rows])
+}
+
+/// Apply a binary operation element-wise on two `ColumnValue`s, appending the result to `out`.
+///
+/// `out` is a column of the result's variant (see [`apply_binop_column`] for a fresh one). One
+/// row is appended per position of the operands' common prefix. The caller owns the rest of
+/// the column's state: it clears the rows it does not keep and reserves room for the new ones,
+/// and the kernel writes each result once into that room.
+pub fn apply_binop_into(
+    op: BinOpKind,
+    left: &ColumnValue,
+    right: &ColumnValue,
+    out: &mut ColumnValue,
+) {
+    match (op, left, right, out) {
+        (
+            BinOpKind::Arithmetic(op),
+            ColumnValue::Ints(l),
+            ColumnValue::Ints(r),
+            ColumnValue::Ints(o),
+        ) => {
+            let (l, r) = co_present(l, r);
+            zip_arithmetic(op, l, r, o);
         }
-        (BinOpKind::Arithmetic(op), ColumnValue::UInts(l), ColumnValue::UInts(r)) => {
-            ColumnValue::UInts(zip_arithmetic(op, l, r))
+        (
+            BinOpKind::Arithmetic(op),
+            ColumnValue::UInts(l),
+            ColumnValue::UInts(r),
+            ColumnValue::UInts(o),
+        ) => {
+            let (l, r) = co_present(l, r);
+            zip_arithmetic(op, l, r, o);
         }
-        (BinOpKind::BoolLogic(op), ColumnValue::Bools(l), ColumnValue::Bools(r)) => {
-            ColumnValue::Bools(zip_bool_logic(op, l, r))
+        (
+            BinOpKind::BoolLogic(op),
+            ColumnValue::Bools(l),
+            ColumnValue::Bools(r),
+            ColumnValue::Bools(o),
+        ) => {
+            let (l, r) = co_present(l, r);
+            zip_bool_logic(op, l, r, o);
         }
-        (BinOpKind::Concat, ColumnValue::Strings(l), ColumnValue::Strings(r)) => {
-            ColumnValue::Strings(zip_concat(l, r))
+        (
+            BinOpKind::Concat,
+            ColumnValue::Strings(l),
+            ColumnValue::Strings(r),
+            ColumnValue::Strings(o),
+        ) => {
+            let (l, r) = co_present(l, r);
+            zip_concat(l, r, o);
         }
-        (BinOpKind::Compare(op), ColumnValue::Strings(l), ColumnValue::Strings(r)) => {
-            ColumnValue::Bools(zip_compare(op, l, r))
+        (
+            BinOpKind::Compare(op),
+            ColumnValue::Strings(l),
+            ColumnValue::Strings(r),
+            ColumnValue::Bools(o),
+        ) => {
+            let (l, r) = co_present(l, r);
+            zip_compare(op, l, r, o);
         }
-        (BinOpKind::Compare(op), ColumnValue::Ints(l), ColumnValue::Ints(r)) => {
-            ColumnValue::Bools(zip_compare(op, l, r))
+        (
+            BinOpKind::Compare(op),
+            ColumnValue::Ints(l),
+            ColumnValue::Ints(r),
+            ColumnValue::Bools(o),
+        ) => {
+            let (l, r) = co_present(l, r);
+            zip_compare(op, l, r, o);
         }
-        (BinOpKind::Compare(op), ColumnValue::UInts(l), ColumnValue::UInts(r)) => {
-            ColumnValue::Bools(zip_compare(op, l, r))
+        (
+            BinOpKind::Compare(op),
+            ColumnValue::UInts(l),
+            ColumnValue::UInts(r),
+            ColumnValue::Bools(o),
+        ) => {
+            let (l, r) = co_present(l, r);
+            zip_compare(op, l, r, o);
         }
-        (BinOpKind::Compare(op), ColumnValue::Bools(l), ColumnValue::Bools(r)) => {
-            ColumnValue::Bools(zip_bool_compare(op, l, r))
+        (
+            BinOpKind::Compare(op),
+            ColumnValue::Bools(l),
+            ColumnValue::Bools(r),
+            ColumnValue::Bools(o),
+        ) => {
+            let (l, r) = co_present(l, r);
+            zip_bool_compare(op, l, r, o);
         }
         // A product compares **componentwise**, which is the whole of what makes one
         // equatable (`src/ccl/design/type-inference.md`, "What the tables hold").
@@ -44,9 +124,21 @@ pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue)
             BinOpKind::Compare(op @ (CompareKind::Equals | CompareKind::NotEquals)),
             ColumnValue::Records(l),
             ColumnValue::Records(r),
-        ) => ColumnValue::Bools(compare_records(op, l, r)),
-        (op, left, right) => panic!("Unsupported binop: {:?} on {:?}, {:?}", op, left, right),
+            ColumnValue::Bools(o),
+        ) => o.extend(compare_records(op, l, r)),
+        (op, left, right, out) => {
+            panic!("Unsupported binop: {op:?} on {left:?}, {right:?}, into a column {out:?}")
+        }
     }
+}
+
+/// Apply a binary operation element-wise on two `ColumnValue`s, into a newly allocated column.
+///
+/// Neither operand's buffer is reused.
+pub fn apply_binop_column(op: BinOpKind, left: &ColumnValue, right: &ColumnValue) -> ColumnValue {
+    let mut out = result_column(op, left);
+    apply_binop_into(op, left, right, &mut out);
+    out
 }
 
 /// Compare two record columns field by field, `Equals` conjoining the results and
@@ -68,7 +160,7 @@ pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue)
 /// `type-checker-inlining-drops-a-narrowing-annotation`.
 fn compare_records(
     op: CompareKind,
-    left: HashMap<SmolStr, ColumnValue>,
+    left: &HashMap<SmolStr, ColumnValue>,
     right: &HashMap<SmolStr, ColumnValue>,
 ) -> Vec<bool> {
     let rows = left
@@ -81,12 +173,13 @@ fn compare_records(
     for (field, l) in left {
         // A column only one side carries is the surplus of a wider value, not a field of
         // the product being compared.
-        let Some(r) = right.get(&field) else {
+        let Some(r) = right.get(field) else {
             continue;
         };
-        let field_eq = match apply_binop_column(BinOpKind::Compare(op), l, r) {
-            ColumnValue::Bools(b) => b,
-            other => unreachable!("a comparison yields a Bool column, got {other:?}"),
+        let mut field_eq = ColumnValue::Bools(Vec::new());
+        apply_binop_into(BinOpKind::Compare(op), l, r, &mut field_eq);
+        let ColumnValue::Bools(field_eq) = field_eq else {
+            unreachable!("a comparison yields a Bool column")
         };
         // A nested product reports the length of one of its own fields, so a recursive
         // comparison can answer for fewer positions than `rows`. `acc` shrinks to what
@@ -119,7 +212,7 @@ mod tests {
         let cmp = |op: CompareKind, l: bool, r: bool| -> bool {
             let result = apply_binop_column(
                 BinOpKind::Compare(op),
-                ColumnValue::Bools(vec![l; 1]),
+                &ColumnValue::Bools(vec![l; 1]),
                 &ColumnValue::Bools(vec![r; 1]),
             );
             match result {
@@ -170,7 +263,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let r = ColumnValue::Strings(["1", "2"].into_iter().map(SmolStr::new).collect::<Vec<_>>());
-        match apply_binop_column(BinOpKind::Concat, l, &r) {
+        match apply_binop_column(BinOpKind::Concat, &l, &r) {
             ColumnValue::Strings(v) => {
                 assert_eq!(v, vec![SmolStr::new("a1"), SmolStr::new("b2")]);
             }
@@ -180,7 +273,7 @@ mod tests {
         // Arithmetic: `r` longer than `l` → result is the 1-element prefix.
         match apply_binop_column(
             BinOpKind::Arithmetic(ArithmeticKind::Add),
-            ColumnValue::Ints(vec![10]),
+            &ColumnValue::Ints(vec![10]),
             &ColumnValue::Ints(vec![1, 2, 3]),
         ) {
             ColumnValue::Ints(v) => assert_eq!(v, vec![11]),
@@ -191,7 +284,7 @@ mod tests {
         // common prefix and drop the rest.
         match apply_binop_column(
             BinOpKind::Compare(CompareKind::Less),
-            ColumnValue::Bools(vec![false; 3]),
+            &ColumnValue::Bools(vec![false; 3]),
             &ColumnValue::Bools(vec![true; 1]),
         ) {
             ColumnValue::Bools(v) => {
@@ -202,7 +295,7 @@ mod tests {
         }
         match apply_binop_column(
             BinOpKind::BoolLogic(LogicKind::And),
-            ColumnValue::Bools(vec![true; 1]),
+            &ColumnValue::Bools(vec![true; 1]),
             &ColumnValue::Bools(vec![true; 4]),
         ) {
             ColumnValue::Bools(v) => {
@@ -252,7 +345,8 @@ mod tests {
             "ColumnData",
             || l.clone(),
             |l| {
-                let _result = apply_binop_column(BinOpKind::Arithmetic(ArithmeticKind::Add), l, &r);
+                let _result =
+                    apply_binop_column(BinOpKind::Arithmetic(ArithmeticKind::Add), &l, &r);
             },
         );
     }
@@ -307,5 +401,40 @@ mod tests {
                 });
             },
         );
+    }
+
+    /// The caller clears a recycled `out`; the call appends the common prefix to what is left.
+    #[test]
+    fn a_result_is_appended_to_the_callers_column() {
+        let add = BinOpKind::Arithmetic(ArithmeticKind::Add);
+        let mut out = ColumnValue::Ints(vec![99; 8]);
+        out.clear();
+        apply_binop_into(
+            add,
+            &ColumnValue::Ints(vec![1, 2, 3]),
+            &ColumnValue::Ints(vec![10, 20]),
+            &mut out,
+        );
+        assert_eq!(out, ColumnValue::Ints(vec![11, 22]));
+        apply_binop_into(
+            add,
+            &ColumnValue::Ints(vec![1]),
+            &ColumnValue::Ints(vec![10]),
+            &mut out,
+        );
+        assert_eq!(out, ColumnValue::Ints(vec![11, 22, 11]));
+    }
+
+    /// A comparison reads integers and writes a `Bool` column.
+    #[test]
+    fn a_comparison_writes_a_bool_column() {
+        let mut out = ColumnValue::Bools(Vec::new());
+        apply_binop_into(
+            BinOpKind::Compare(CompareKind::Greater),
+            &ColumnValue::Ints(vec![1, 5, 9]),
+            &ColumnValue::Ints(vec![4, 4, 4]),
+            &mut out,
+        );
+        assert_eq!(out, ColumnValue::Bools(vec![false, true, true]));
     }
 }
