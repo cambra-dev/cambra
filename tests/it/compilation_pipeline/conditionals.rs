@@ -607,8 +607,10 @@ fn test_conditional_feed_skips_partial_off_path_arm(
 //
 // `[f(x) for x in (xs if c else ys)]` iterates the source `Case` where it stands:
 // `crate::ccl::comprehension` encodes it like any other generator source, and
-// A-normalization names it. The `Case`'s arms join into the Σ at coalesce and
-// compile via the gate fan-out, rather than colliding over distinct index domains.
+// A-normalization names it. Its type is a Σ over the arms' domains, and the
+// comprehension's result is that sum bound back over the witness it named
+// (`src/ccl/design/mutability.md`, "Value-selecting `Case` and conditional induction
+// writes (partially implemented)").
 // ---------------------------------------------------------------------------
 
 #[rstest]
@@ -955,13 +957,9 @@ fn test_conditional_between_comprehensions(#[case] code: &str, #[case] expected:
 // ---------------------------------------------------------------------------
 // Conditional element in a comprehension
 //
-// `[a if g(x) else b for x in xs]` — a per-element conditional — fans the source
-// out by each arm's *element-dependent* first-match gate
-// (`crate::ccl::comprehension`'s `fan_out_element_case`): `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`.
-// Each arm is a filtered map (source restricted by the gate, mapped by the arm
-// value); the gates partition the source, so the `++`-union recombines the arms
-// by position into the fully-mapped collection. A `Copair`, so the
-// compute-kinded per-arm maps do not need to join.
+// `[a if g(x) else b for x in xs]` — a per-element conditional — stays a value
+// `Case` in the element's lambda, which lambda elimination compiles to a disjoint
+// join of the arms over the element stream: `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)`.
 // ---------------------------------------------------------------------------
 
 #[rstest]
@@ -976,7 +974,7 @@ fn test_conditional_between_comprehensions(#[case] code: &str, #[case] expected:
     "sum([(x * 2 if x > 2 else x + 100) for x in [1, 2, 3, 4]])",
     Value::Int(217)
 )]
-// Nested `elif` element flattens to a flat partition.
+// A nested `elif` element: the inner conditional is an arm's value, compiled by the same rule.
 #[case(
     "sum([(100 if x == 1 else 200 if x == 2 else 300) for x in [1, 2, 3]])",
     Value::Int(600)
@@ -988,14 +986,39 @@ fn test_conditional_element_comprehension(#[case] code: &str, #[case] expected: 
     check_scalar(code, expected);
 }
 
-// The conditional-element comprehension result is a tagged union — one variant
-// per arm, each carrying the elements the arm mapped.
+// The conditional-element comprehension result is a collection over the source's
+// positions, each holding the value of the arm its element selected.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_conditional_element_result() {
     // x>2 → x*10 (positions 2,3 → 30,40); else 0 (positions 0,1 → 0,0).
     let result = run_pipeline("[(x * 10 if x > 2 else 0) for x in [1, 2, 3, 4]]");
     assert_eq!(codomain_ints(&result), vec![0, 0, 30, 40]);
+}
+
+/// A conditional element of a comprehension nested in another comprehension or under a loop,
+/// reading the enclosing binder, or reading a mutable variable.
+#[rstest]
+#[case::reading_the_outer_binder(indoc! {r#"
+    out = test_sink()
+    out << sum([sum([(w if w > 3 else 0) for z in [1, 2]]) for w in [3, 4]])
+"#}, "[() -> 8]")]
+#[case::gating_on_the_inner_binder(indoc! {r#"
+    out = test_sink()
+    out << sum([sum([(w if z > 1 else z) for z in [1, 2]]) for w in [3, 4]])
+"#}, "[() -> 9]")]
+#[case::under_a_loop(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([(i if q > 1 else q) for q in [1, 2, 3]])
+"#}, "[3, 5]")]
+#[case::reading_a_mutable_variable(indoc! {r#"
+    x := 3
+    out = test_sink()
+    out << sum([x ^+ i if i > 1 else 0 for i in [1, 2, 3]])
+"#}, "[() -> 11]")]
+fn a_conditional_element_reading_an_enclosing_binder(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
 }
 
 // ---------------------------------------------------------------------------

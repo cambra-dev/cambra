@@ -58,10 +58,14 @@ const LIVE: &[&str] = &[
     "body_mut_intro_nested",
     "bool_feed",
     "comp_element",
+    "comp_element_filtered",
+    "comp_element_in_loop",
     "comp_filter",
     "comp_filter_in_loop",
+    "comp_in_comp",
     "comp_source",
     "comp_source_in_loop",
+    "comp_two_generators",
     "defer_feed",
     "feed",
     "feed_collection",
@@ -75,6 +79,8 @@ const LIVE: &[&str] = &[
     "function_arg",
     "groupby_source",
     "keyed_write_value",
+    "lambda_body",
+    "lambda_body_in_loop",
     "loop_let_filter",
     "loop_source",
     "match_arm",
@@ -105,6 +111,7 @@ const LIVE: &[&str] = &[
     "record_feed_in_loop",
     "record_field",
     "record_projected",
+    "rows_comp_element",
     "scrutinee_beside_fn",
     "str_coll_source",
     "str_loop_feed",
@@ -279,6 +286,11 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             for i in [1, 2]:
                 out << sum([{} for q in [1, 2, 3]])
+        "#}},
+        // The element beside a filter, which keeps `q = 1` so a partial arm still sits off-path.
+        Skeleton { name: "comp_element_filtered", hole: Ty::Int, scope: &[("q", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            out << sum([{} for q in [1, 2, 3] if q < 3])
         "#}},
         Skeleton { name: "comp_source", hole: Ty::IntColl, scope: &[], body: indoc! {r#"
             out = test_sink()
@@ -533,6 +545,10 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "comp_in_comp", hole: Ty::Int, scope: &[("w", Ty::Int), ("z", Ty::Int)], body: indoc! {r#"
             out = test_sink()
             out << sum([sum([{} for z in [1, 2]]) for w in [3, 4]])
+        "#}},
+        Skeleton { name: "comp_two_generators", hole: Ty::Int, scope: &[("w", Ty::Int), ("z", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            out << sum([{} for w in [3, 4] for z in [1, 2]])
         "#}},
         Skeleton { name: "comp_filter_in_loop", hole: Ty::Bool, scope: &[("i", Ty::Int), ("z", Ty::Int)], body: indoc! {r#"
             out = test_sink()
@@ -887,6 +903,9 @@ fn fillers() -> Vec<Filler> {
                 hn * 2
         "#}, expr: "helper_fn2({b})" },
         Filler { name: "binder_ternary", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "({b} if {b} > 1 else 0)" },
+        // An arm that divides by zero where the binder is 1, which its guard keeps off-path.
+        Filler { name: "binder_partial_ternary", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "(6 // ({b} - 1) if {b} > 1 else 0)" },
+        Filler { name: "binder_elif", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "({b} if {b} > 2 else {b} * 10 if {b} > 1 else 0)" },
         Filler { name: "binder_pow", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "{b} ** 2" },
         // A correlated filter whose body reads the binder too, beside `binder_in_comp_filter`,
         // whose body reads nothing outer.
@@ -982,6 +1001,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "two_binders_in_comp", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "sum([z2 * {b} + {c} for z2 in [1, 2]])" },
         Filler { name: "two_binders_in_filter", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "sum([z2 for z2 in [1, 2, 3] if z2 > {b} - {c}])" },
         Filler { name: "two_binders_ternary", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "({b} if {c} > 1 else {c})" },
+        Filler { name: "two_binders_elif", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "({b} if {c} > 2 else {c} * 10 if {b} > 1 else 0)" },
         Filler { name: "two_binders_cmp", ty: Ty::Bool, needs: &[Ty::Int, Ty::Int], decls: "", expr: "{b} > {c}" },
         Filler { name: "two_binders_corr_filter", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "sum([z2 * {b} for z2 in [1, 2, 3] if z2 > {c}])" },
         Filler { name: "two_binders_both_filter", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "sum([z2 * {b} * {c} for z2 in [1, 2, 3] if z2 > {b} - {c}])" },
