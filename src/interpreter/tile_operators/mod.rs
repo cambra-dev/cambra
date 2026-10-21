@@ -115,22 +115,11 @@ pub trait TileOperator {
         short_type_name::<Self>()
     }
 
-    /// Subscribe to this operator with an intent guard and consumer.
-    /// Returns a producer that allows the consumer to get data and release regions.
-    ///
-    /// Builds exactly one producer, whose [`ProducerBase::new`] names this
-    /// operator and takes `scheduler`'s probe slot. An input's producer is
-    /// reached through the input's own `subscribe`.
-    ///
-    /// # Arguments
-    /// * `intent_guard` - The region of the operator's extent that the consumer
-    ///   is interested in
-    /// * `consumer` - The consumer that will receive notifications when data is ready
-    /// * `scheduler` - The scheduler that coordinates source triggering and
-    ///   inter-operator work during execution.
-    ///
-    /// # Returns
-    /// A producer that provides access to the data and allows releasing regions
+    /// Constructs one producer for `consumer` over the requested `intent_guard` region.
+    /// Its [`ProducerBase`] names this operator and holds `scheduler`'s probe slot.
+    /// An input's producer comes from the input's own `subscribe`, which attributes it
+    /// to that operator.
+    /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn subscribe(
         &mut self,
         intent_guard: TileGuard,
@@ -276,28 +265,13 @@ macro_rules! impl_operator_base {
 // it to the crate root.
 pub(crate) use impl_operator_base;
 
-/// Whether a producer's input has notified it since the producer last pulled.
-///
-/// A [`Consumer::notify`](crate::interpreter::Consumer) says new data is available and
-/// carries no payload, so it is the only signal a producer can act on without pulling.
-/// The flag is set by the consumer handle an operator installs on its own input
-/// ([`Self::consumer`]) and cleared by a pull, so a producer whose input has said nothing
-/// since it last read knows there is nothing to read.
-///
-/// Held behind an `Rc<Cell<_>>` because the setter and the reader are built at different
-/// times: `subscribe` must hand the input a consumer before it has a producer to put the
-/// flag in.
-///
-/// A producer instance has exactly one consumer — sharing goes through a
-/// [`FanOut`](crate::interpreter::tile_operators::FanOut), whose slots are separate
-/// producers with separate flags — so "since the consumer last pulled" and "since anyone
-/// last pulled" are the same statement.
-///
-/// The same bit gates the consumer an operator shares between its inputs
-/// ([`shared_consumer`](crate::interpreter::shared_consumer)): a notification that finds it
-/// set has nothing to add to the one that set it, so it is not passed on. That flag starts
-/// clear ([`Self::clear`]), so a notification an operator sends as it subscribes passes, and
-/// every pull clears it ([`ProducerBase::sharing`]).
+/// Whether an input notification has arrived since the flag was last taken.
+/// `subscribe` installs [`Self::consumer`] on the input before the producer exists;
+/// `Rc<Cell<_>>` connects the two and carries no tile values.
+/// Each producer has one consumer, including each
+/// `FanOut` slot. See `src/interpreter/design-operators.md`, "The notification contract".
+/// [`Self::clear`] starts clear, so the first notification passes, including during `subscribe`.
+/// [`ProducerBase::sharing`] clears it on every pull, even without reading the input.
 #[derive(Clone)]
 pub enum Notified {
     /// The input's notification does not reach this producer, so every pull reads —
@@ -309,8 +283,7 @@ pub enum Notified {
 }
 
 impl Notified {
-    /// A live [`Flag`](Self::Flag), starting set: a producer that has never pulled has
-    /// everything to read.
+    /// A [`Flag`](Self::Flag) starting set, so the first pull can read before a notification.
     pub fn flag() -> Self {
         Self::Flag(Rc::new(Cell::new(true)))
     }
@@ -353,10 +326,7 @@ impl Notified {
         }
     }
 
-    /// A consumer handle that sets this flag and then passes the notification on.
-    ///
-    /// Installed on a producer's own input so the notification reaches the operator
-    /// rather than running straight from source to sink past it.
+    /// An input consumer that sets this flag before forwarding the notification downstream.
     pub fn consumer(&self, downstream: Box<dyn Consumer>) -> Box<dyn Consumer> {
         let flag = self.clone();
         let mut downstream = downstream;
@@ -764,10 +734,7 @@ fn completeness_violation(
     None
 }
 
-/// Common identity and tiling state shared by every [`TileProducer`].
-///
-/// Storing these together avoids repeating the same two fields and their
-/// trivial accessor implementations across every producer struct.
+/// Identity, output shape, release state and notification/probe handles for a producer.
 pub struct ProducerBase {
     /// Instance-unique ID, allocated by [`TileProducer::alloc_id`].
     pub id: usize,
@@ -795,8 +762,7 @@ pub struct ProducerBase {
 }
 
 impl ProducerBase {
-    /// The base of the producer `owner`'s `subscribe` builds. Its input
-    /// notification does not reach it, so every pull reads.
+    /// Initialize a producer without an input notification flag; every pull may read its input.
     pub(crate) fn new(
         id: usize,
         tiling: &Tiling,
@@ -806,9 +772,8 @@ impl ProducerBase {
         Self::listening(id, tiling, owner, scheduler, Notified::Always)
     }
 
-    /// [`new`](Self::new), for a producer that reads only when its input has
-    /// said something since its last pull. `notified` is the flag whose
-    /// [`Notified::consumer`] this producer's `subscribe` installed on its input.
+    /// Initialize with the flag whose [`Notified::consumer`] was installed on the input.
+    /// Producer-specific code decides when an unnotified pull can use cached data.
     pub(crate) fn listening(
         id: usize,
         tiling: &Tiling,
@@ -953,7 +918,12 @@ pub trait TileProducer {
         &self.base().obsolete_guard
     }
 
-    /// Fetch the current tile value.  Contains generic logic for all producers
+    /// Call [`get_impl`](Self::get_impl), remove released scalar record cells, and check
+    /// the result.
+    /// Tiling conformance is asserted in every build; release, structural and completeness
+    /// checks require debug assertions. Probe observations occur after those checks.
+    /// Projection is the implementation's responsibility.
+    /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
         // Cleared before the pull, so a notification arriving while it runs passes: the
         // pull may already have read past the input that sent it.
@@ -962,26 +932,14 @@ pub trait TileProducer {
         }
         self.base_mut().pulls += 1;
         let mut result = self.get_impl(projection_guard);
-        // A scalar field's cell released while its row stays open is left out here rather
-        // than by each producer: a producer rebuilds a row from inputs released by whole key,
-        // so it has the cell again, and its consumer has it already
-        // (`src/interpreter/design-operators.md`, "The release contract").
+        // Released scalar cells are removed while their enclosing rows remain open;
+        // see `src/interpreter/design-operators.md`, "The release contract".
         if let Some(cells) = self.obsolete_guard().released_cells() {
             result.remove_guarded(cells);
         }
-        // A release says that data is never requested and never returned again.
-        // Being pulled afterwards is fine — the answer is whatever lies outside
-        // the released region, which after a universal release is nothing at all
-        // — so what has to hold is this post-condition, at every granularity
-        // rather than only the universal one.
-        //
-        // Returning released data breaks things *silently*, which is why it is
-        // checked centrally rather than left to each operator: a consumer that
-        // has already taken delivery merges the same values a second time, and a
-        // `Tile::Scalar`'s positions are implicit, so merge cannot tell "this
-        // position again" from "one more position" and appends. One value becomes
-        // two, and it surfaces at whichever downstream consumer broadcasts the
-        // result rather than here.
+        // A duplicate scalar delivery can append cells without identifying the repeated
+        // positions. Check every released region here, not just universal releases.
+        // See `src/interpreter/design-operators.md`, "The release contract".
         debug_assert!(
             !result.contains_guarded(self.obsolete_guard()),
             "{} returned data it had released: {result:?} overlaps {:?}",
@@ -1030,13 +988,14 @@ pub trait TileProducer {
         result
     }
 
-    /// Fetch the current tile value.  Producer-specific logic
+    /// Produce the tile for `projection_guard`, honoring accumulated releases and completeness.
+    /// The [`get`](Self::get) wrapper supplies validation, not general projection or reclamation.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile;
 
-    /// Release interest in a region.
-    /// The `obsolete_guard` specifies a sub-region of the subscription that
-    /// is no longer needed. It is added to [`obsolete_guard`](Self::obsolete_guard),
-    /// and [`release_impl`](Self::release_impl) runs only when that grew.
+    /// Permanently release a region after checking its shape and normalizing it.
+    /// Accumulate the region in [`obsolete_guard`](Self::obsolete_guard); call
+    /// [`release_impl`](Self::release_impl) with the normalized argument only if accumulation
+    /// changes the stored guard. See `src/interpreter/design-operators.md`, "The release contract".
     fn release(&mut self, obsolete_guard: TileGuard) {
         trace!("{} release: {obsolete_guard:?}", self.name());
         assert!(
@@ -1054,8 +1013,9 @@ pub trait TileProducer {
         }
     }
 
-    /// Release interest in a region.
-    /// Contains producer-specific release logic.
+    /// Honor or reject the normalized release argument, already included in the obsolete guard.
+    /// Reclaim local state and forward releases according to this operator's input usage.
+    /// Ignoring an unsupported guard does not cancel the wrapper's accumulated promise.
     fn release_impl(&mut self, obsolete_guard: TileGuard);
 
     /// What this producer keeps of its own between pulls ([`ProducerStateInfo`]).
@@ -1098,13 +1058,9 @@ pub trait TileProducer {
     }
 }
 
-/// How much state a producer holds of its own: what it keeps from one pull to the next, as
-/// opposed to what it computes in a pull and hands on.
-///
-/// Counted in values — a cell of a column, a key of a collection, an entry of a changelog —
-/// rather than bytes, so the count is a property of the program's data and not of how a
-/// value is laid out. A count that grows with how long a program has run where its data does
-/// not is state the program never gives back.
+/// Values retained by one producer between pulls, excluding its inputs' retained state.
+/// The unit is values, not bytes.
+/// See `src/interpreter/design-operators.md`, "What a producer holds".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProducerStateInfo {
     /// The values held: a cached tile's cells ([`Tile::cell_count`]), an accumulator's, or a
