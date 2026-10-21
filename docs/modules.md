@@ -1,8 +1,9 @@
 # Modules
 
 > **Status: [Sketched].** A proposed implementation. The first three items of the [Implementation
-> stack](#implementation-stack) are implemented, and the first two parts of the fourth, importing
-> values and `use` clauses ([Imports](#imports)).
+> stack](#implementation-stack) are implemented, the first two parts of the fourth, importing values
+> and `use` clauses ([Imports](#imports)), and a shared run's member's `home` ([Names carry their
+> home](#names-carry-their-home)).
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -115,7 +116,9 @@ in (`raw_scope`).
 One change to `Name` (`src/ccl/names.rs`): **`Name::Unique { base, uid, home }`**, where `home` is
 the run a member belongs to: `Shared(module_path)` for a shared run's member, `Run(run_path)` for a
 member of a run a `run` statement declares, and absent for a local. Identity remains the `uid`.
-`home` is metadata of the kind `base` already is.
+`home` is metadata of the kind `base` already is. It is implemented as `home: Option<Arc<Home>>`.
+`uniquify::run_in` mints a run's top-level binders with it, and every other binder, the root's
+members included, without one.
 
 Module paths and run paths are shared behind an `Arc`: cloning one copies a pointer, and `Display`
 renders it without a lookup table. Neither uses a per-compilation counter. They appear in state keys
@@ -124,10 +127,11 @@ defect [`Name::field_key`](../src/ccl/names.rs) documents.
 
 Rendering: symbolic IR output prints a member as `home::base`, `catalog::price` or `eu::stock`, and
 a local as `base`. A diagnostic about a location in a module elides the qualifier on that module's
-own members.
+own members. That elision is not implemented: a diagnostic's text, types included, is formatted
+during inference, before the error has a location, so every diagnostic qualifies an imported
+module's members, its own diagnostics included.
 
-The implementing change measures `Name`'s width before and after, since `PiRef` already boxes its
-hint to keep `Name` at the width `Unique` needs.
+`home` widens `Unique`, and `PiRef` boxes its hint to keep `Name` at the width `Unique` needs.
 
 `Name::Raw` is unchanged. A raw name is written in one module, and resolves within the run of it
 being created, through that run's scope when it is spelled through a qualifier.
@@ -155,9 +159,9 @@ Linking creates each imported module's shared run from its module's lowering
 (`ProgramLowering::create`):
 
 1. **Copy** the chain. `Clone` mints fresh node ids and records each copy for provenance.
-2. **Uniquify** the copy in a scope that maps each spelling through a qualifier to the binder of
-   the run the qualifier reaches: `m::f` to the member of `m`'s shared run (`uniquify::run_in`).
-   Each `use` name maps to its member's binder.
+2. **Uniquify** the copy with the run's home, in a scope that maps each spelling through a
+   qualifier to the binder of the run the qualifier reaches: `m::f` to the member of `m`'s shared run
+   (`uniquify::run_in`). Each `use` name maps to its member's binder.
 
 A created run's names are every spelling its top level resolves: its spine's binders by spelling,
 and its scope's entries. A module reaching the run spells each through its qualifier for it.
@@ -569,8 +573,8 @@ One PR per item, each updating the spec and design docs it touches:
    4. **Imported mutable state** and `Mut`-parameter functions.
 5. **Per-module checking.** Inference over one module against the interfaces it uses, contracts in
    the interface, `cambra check`.
-6. **Runs and parameters.** `Name::Member`, `Unique::home`, the run tree, per-run copies of a
-   module, value parameters, run-site checks, qualified registries, `VarPath` run paths.
+6. **Runs and parameters.** `Name::Member`, a run's `Unique::home`, the run tree, per-run copies of
+   a module, value parameters, run-site checks, qualified registries, `VarPath` run paths.
 7. **Module types and type parameters.** `Module{…}` and its subtyping, Module-typed parameters
    and the qualified references through them, type parameters.
 8. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`

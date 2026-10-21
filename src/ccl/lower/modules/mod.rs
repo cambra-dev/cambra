@@ -10,8 +10,8 @@
 //! that reach it to resolve against while they lower.
 //!
 //! Linking creates each imported module's shared run from its chain
-//! ([`ProgramLowering::create`]): a copy, uniquified with a scope that maps each
-//! qualified spelling to the binder of the run it reaches.
+//! ([`ProgramLowering::create`]): a copy, uniquified with the run's home and a
+//! scope that maps each qualified spelling to the binder of the run it reaches.
 //! The root has one run, and the shared runs' chains wrap it.
 
 mod interface;
@@ -28,7 +28,7 @@ use super::{
 use crate::ccl::load::{EdgeKind, LoadedProgram};
 use crate::ccl::names::QualifiedName;
 use crate::ccl::uniquify;
-use crate::ccl::{Expr, Label, Name, TypedExprNode};
+use crate::ccl::{Expr, Home, Label, Name, TypedExprNode};
 use crate::chl_parser::ast::{
     AssignTarget, Module as ChlModule, QualifiedName as ParserQualifiedName, Span, Spanned,
     Stmt as ChlStmt,
