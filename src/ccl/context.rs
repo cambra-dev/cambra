@@ -1375,24 +1375,17 @@ pub enum Phase {
     Convert,
 }
 
-/// Ids carried by two *distinct* predicate terms, or by a predicate term and the
-/// main tree — the half of uniqueness [`duplicate_node_ids`] cannot answer.
+/// Find IDs shared by distinct predicate terms or by a predicate and the main tree.
 ///
-/// Dedups by `Rc` pointer first: one term riding many type slots is one term and
-/// shares its ids with itself, and that sharing is an invariant the predicate
-/// domain is built on (`design/type-inference.md`, "Sharing is an invariant, not
-/// an optimization detail"). What survives the dedup is two live terms on one
-/// id-set. A raw id-set walk over the type slots cannot report that, because it
-/// cannot tell the sharing apart from the collision — which is why the main-tree
-/// walk stays `Rc`-blind and this one does not.
+/// One shared predicate `Rc` may occur in several type slots. The walk collects one
+/// ID set per distinct pointer, then compares those sets with each other and the
+/// main-tree set. It does not count repeated occurrences inside one predicate's set.
+/// Results are sorted and deduplicated.
 ///
-/// Coverage is [`TypedExpr::walk_type_slots`]', which is what reaches a predicate
-/// riding a binder's **annotation** and nothing else. `f: (Int => {Int where _ ==
-/// 9}) = …` is that shape, and it is live at the `post-lowering` boundary: the
-/// annotation holds the only occurrence until inference consumes it, so a walk
-/// over node types alone enumerates none of the predicate's ids there.
-///
-/// Both walks run at every boundary, from [`assert_unique_node_ids`].
+/// `walk_type_slots` includes user and binder annotations as well as node types;
+/// predicate terms' own type slots are also visited. A predicate carried only by
+/// `f: (Int => {Int where _ == 9}) = …` must therefore be included before inference.
+/// See `src/ccl/design/provenance.md`, "Walking the ids".
 pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)> {
     use crate::ccl::ty::Type;
     use std::collections::{HashMap, HashSet};
@@ -1441,15 +1434,10 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
     dups
 }
 
-/// Every [`NodeId`] on the **main tree only** — the `walk_children` node-set,
-/// refinement predicates excluded.
+/// Collect the main-tree IDs reachable through `walk_children`, excluding type predicates.
 ///
-/// The counterpart to [`collect_tree_ids`], which is predicate-*inclusive* and is
-/// the id domain the fold must explain. This narrow walk exists so the two can be
-/// measured against the same logs (see [`ProvenanceAudit::live_ids`]): with the
-/// narrow live set, planning's *main-tree* output is essentially fully explained
-/// and the residue is entirely inside refinement predicates, which is the
-/// measurement that says where the remaining work is.
+/// Audits use this narrower set to distinguish main-tree coverage from predicate coverage.
+/// Expression-pane folds use [`collect_tree_ids`] instead.
 pub(crate) fn collect_main_tree_ids(expr: &Expr) -> HashSet<NodeId> {
     fn go(e: &Expr, acc: &mut HashSet<NodeId>) {
         acc.insert(e.node_id());
@@ -1460,13 +1448,11 @@ pub(crate) fn collect_main_tree_ids(expr: &Expr) -> HashSet<NodeId> {
     acc
 }
 
-/// Every node id reachable in `expr`: the `walk_children` node set plus the
-/// interiors of every refinement predicate riding a type slot — the id domain the
-/// recordings and the pane projections must explain.
+/// Collect main-tree IDs and refinement-predicate IDs reachable through type slots.
 ///
-/// Deliberately wider than `assert_unique_node_ids`, which walks children only.
-/// Explanation and uniqueness are two questions with two answers; see
-/// `design/provenance.md`, "Walking the ids".
+/// This is the explanation domain used by pane folds and source projections.
+/// Uniqueness covers the same domains with different sharing rules; see
+/// `src/ccl/design/provenance.md`, "Walking the ids".
 pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
     use crate::ccl::ty::Type;
 
@@ -1494,13 +1480,10 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
     acc
 }
 
-/// Every duplicated [`NodeId`] over the **main tree** — the `walk_children`
-/// node-set, refinement predicates excluded. Returns `(id, node kind)` for each
-/// occurrence *beyond the first*.
+/// Report each main-tree occurrence of an ID beyond its first occurrence.
 ///
-/// Predicates are excluded because they are reached through `Rc`s a walk visits
-/// many times over, so a second sighting of an id is not yet a collision;
-/// [`predicate_id_collisions`] answers that domain, dedupping by `Rc` first.
+/// This walk does not deduplicate shared pointers. Type predicates are excluded;
+/// [`predicate_id_collisions`] checks their permitted `Rc` sharing separately.
 fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
     fn walk(e: &Expr, seen: &mut HashSet<NodeId>, dups: &mut Vec<(NodeId, &'static str)>) {
         if !seen.insert(e.node_id()) {
@@ -1514,29 +1497,17 @@ fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
     dups
 }
 
-/// Pipeline-wide id-uniqueness tripwire: panic if `expr` carries a duplicated
-/// [`NodeId`], naming the `boundary` and the offending id(s) + node kinds.
+/// Assert main-tree uniqueness, predicate-term ID separation and no main-tree placeholders.
 ///
-/// Uniqueness within a tree is what makes a `NodeId` an *identity*: the provenance
-/// map is keyed by id, so two live nodes sharing one id make their attributions
-/// and edges indistinguishable. The failure mode this catches is a clone that
-/// forgot to freshen, or a rewrite that preserved an id where it minted.
+/// The main-tree walk counts occurrences; the predicate walk compares ID sets from
+/// distinct predicate `Rc`s and checks them against the main tree. A collision would
+/// make two nodes share one provenance row and one attribution.
+/// The assertions name the checked `boundary`.
 ///
-/// This asserts a *tree invariant* at a phase boundary and encodes no phase order,
-/// so it is robust to phase reordering (a moved phase carries its check with it).
-/// It catches the *class* of preserve-as-mint / clone-without-freshen bugs
-/// across the whole test suite, not just a crafted program.
-///
-/// Uniqueness spans the same ids [`collect_tree_ids`] enumerates, and takes two
-/// walks to check because the two domains share differently.
-/// [`duplicate_node_ids`] is `Rc`-blind and covers the main tree, where a second
-/// sighting of an id is a collision outright. [`predicate_id_collisions`] dedups
-/// by `Rc` first and covers the predicate interiors, where one term riding many
-/// type slots shares its ids with itself. See `design/provenance.md`, "Walking
-/// the ids". Gated
-/// via `cfg!(...)` as an expression (not a `#[cfg]` item) so the same call site
-/// compiles under both `./ci.sh` clippy passes without a release-only
-/// gated-item-reference failure.
+/// Checks run only under `cfg!(any(debug_assertions, test))`. The function remains
+/// compiled in every configuration so ungated callers compile in release builds.
+/// It checks the tree at this boundary, independently of pipeline phase order.
+/// See `src/ccl/design/provenance.md`, "Walking the ids".
 pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
     if !cfg!(any(debug_assertions, test)) {
         return;
