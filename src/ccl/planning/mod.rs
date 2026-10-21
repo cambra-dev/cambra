@@ -187,7 +187,11 @@ pub(super) enum PlanningPhase {
     /// site's `restrict`s and a hash join's keys after walking the site's children, and does
     /// not walk what it built.
     MarkIterationSites,
-    /// Compile every remaining bare predicate to point-free form. `wrap_with_iterate`
+    /// Compile every remaining bare predicate to point-free form. A membership refinement is
+    /// carried and never executed ([`crate::ccl::ty::Refinement::is_collection_membership`]),
+    /// and compiles as any other: `fn_of_bare_predicate` returns a bare `__elem ▷ f` predicate
+    /// unchanged, so the refinement's predicate stays as written, and the refinements nested in
+    /// its collection's types compile in turn. `wrap_with_iterate`
     /// compiles each iteration site's predicate, but a refinement also rides consumer
     /// contracts outside any site, an aggregate's domain (`sum : ({D | p} ⇒ Int) ⇒ Int`) or a
     /// composition adjacency, carrying the same predicate as the producer they validate

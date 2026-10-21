@@ -55,8 +55,6 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("function_body", "rows_sum", "CompilerPanics"),
     ("loop_source_in_loop", "cond_coll", "CompilerPanics"),
     ("loop_source_in_loop", "dup_union", "CompilerRejects"),
-    ("loop_source_in_loop", "map_arrow", "CompilerPanics"),
-    ("loop_source_in_loop", "map_lit", "CompilerPanics"),
     ("loop_source_in_loop", "union", "CompilerRejects"),
     ("nested_mut_source", "cond_coll", "CompilerPanics"),
     ("nested_mut_source", "dup_union", "CompilerRejects"),

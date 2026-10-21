@@ -280,11 +280,14 @@ fn keys_family(components: &[(Option<Name>, Type)], ctx: &mut PlanningCtx) -> Re
             )
         })?;
     let keys = component.peel_refinements().clone();
-    // The keys are grouped by `converse`, which inverts a collection of scalar values only.
+    // The keys are grouped by `converse`, which inverts a collection whose values tile as one
+    // column (`Tile::Scalar`). A tuple or record key computed per row tiles as a record of
+    // columns (`Tile::Record`), one per component, which `converse` does not invert.
     if !matches!(keys, Type::Base(_) | Type::UIntRange(_) | Type::Variant(..)) {
         return Err(format!(
-            "a group-by under a loop whose key reads the loop's binder and is not a scalar is \
-             not supported yet: its keys are {keys}"
+            "a group-by under a loop whose key reads the loop's binder and is a tuple or record \
+             is not supported yet: `converse` does not invert a record tile, and its keys are \
+             {keys}"
         ));
     }
     let indices = image
