@@ -228,7 +228,7 @@ fn hash_type<'a>(
         // and the hash is what compares them, so it folds the declaration's body too: each
         // constructor's name and parameter types, in declaration order. A declaration
         // reaches no other declaration that reaches it back, so the fold ends.
-        T::Nominal(decl, args) => {
+        T::Nominal(decl, args, _) => {
             decl.hash(state);
             let ctors = &decl.body().ctors;
             ctors.len().hash(state);
@@ -239,6 +239,8 @@ fn hash_type<'a>(
                     hash_type(t, &mut Vec::new(), &mut Vec::new(), free, state);
                 }
             }
+            // References to binding parameters are indices, so the binder names stay out,
+            // as a `Fun`'s binder does.
             args.len().hash(state);
             for t in args {
                 hash_type(t, env, wenv, free, state);
@@ -731,7 +733,7 @@ mod tests {
                     .collect(),
             )
             .expect("no parameters to use");
-            TypedExpr::lit(Lit::Unit).with_ty(Type::Nominal(decl, Vec::new()))
+            TypedExpr::lit(Lit::Unit).with_ty(Type::nominal(decl, Vec::new()))
         };
         assert_eq!(h(&light(&["red", "green"])), h(&light(&["red", "green"])));
         assert_ne!(

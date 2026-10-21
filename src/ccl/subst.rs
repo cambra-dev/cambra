@@ -93,6 +93,7 @@ use std::rc::Rc;
 use crate::ccl::ccl_utils::{
     PredMemo, free_among, is_free, is_free_in_type, strip_iterate_markers,
 };
+use crate::ccl::nominal::NominalDecl;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::scope::{
     ScopedItem, ScopedItemMut, for_each_scoped_item, for_each_scoped_item_mut,
@@ -576,6 +577,37 @@ impl Subst {
             Mapping::Discharge(t) => is_free(name, t),
             Mapping::Deferred(t, under) => under.image_of(&expr_free_vars(t)).contains(name),
         })
+    }
+
+    /// This substitution with each rename onto a name other renames share left out, unless
+    /// `keep` accepts its source: of the renames onto one name, the one `keep` accepts stays
+    /// where exactly one does, and none stays otherwise. What remains of the renames is
+    /// injective, so it inverts.
+    pub fn without_colliding_renames(&self, keep: impl Fn(&Binder) -> bool) -> Subst {
+        let mut onto: BTreeMap<&Binder, (usize, usize)> = BTreeMap::new();
+        for (k, v) in &self.binders {
+            if let Mapping::Rename(to) = v {
+                let (all, kept) = onto.entry(to).or_default();
+                *all += 1;
+                *kept += usize::from(keep(k));
+            }
+        }
+        Subst {
+            binders: self
+                .binders
+                .iter()
+                .filter(|(k, v)| match v {
+                    Mapping::Rename(to) => match onto[to] {
+                        (1, _) => true,
+                        (_, 1) => keep(k),
+                        _ => false,
+                    },
+                    Mapping::Discharge(_) | Mapping::Deferred(..) => true,
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            witnesses: self.witnesses.clone(),
+        }
     }
 
     /// This substitution's entries for `names`, without its witness mappings.
@@ -1396,7 +1428,16 @@ impl Subst {
                     }
                 }
             }
-            Type::Nominal(_, ts) => ts.iter_mut().for_each(|t| self.rewrite_type_go(t, memo)),
+            Type::Nominal(d, ts, names) => {
+                let mut restricted = self.clone();
+                for (i, t) in ts.iter_mut().enumerate() {
+                    restricted.rewrite_type_go(t, memo);
+                    if let Some(rank) = d.binder_rank(i) {
+                        restricted = restricted.shadow(&names[rank]);
+                        restricted.assert_no_capture(&names[rank]);
+                    }
+                }
+            }
             Type::Split { input, output } => {
                 self.rewrite_type_go(input, memo);
                 self.rewrite_type_go(output, memo);
@@ -1692,8 +1733,19 @@ impl Subst {
                 }
                 Type::DepTuple(out)
             }
-            Type::Nominal(d, ts) => {
-                Type::Nominal(d.clone(), ts.iter().map(|t| self.apply_type(t)).collect())
+            // A binding parameter's name binds the arguments after it, as a component's
+            // binds the components after it.
+            Type::Nominal(d, ts, names) => {
+                let mut restricted = self.clone();
+                let mut out = Vec::with_capacity(ts.len());
+                for (i, t) in ts.iter().enumerate() {
+                    out.push(restricted.apply_type(t));
+                    if let Some(rank) = d.binder_rank(i) {
+                        restricted = restricted.shadow(&names[rank]);
+                        restricted.assert_no_capture(&names[rank]);
+                    }
+                }
+                Type::Nominal(d.clone(), out, names.clone())
             }
             Type::Split { input, output } => Type::Split {
                 input: Box::new(self.apply_type(input)),
@@ -1939,9 +1991,18 @@ fn collect_type_fv(
             }
             rest(cs, bound, visited, out)
         }
-        Type::Nominal(_, ts) => ts
-            .iter()
-            .for_each(|t| collect_type_fv(t, bound, visited, out)),
+        // A binding parameter's name is bound in the arguments after it.
+        Type::Nominal(decl, ts, names) => {
+            let mut inner: Vec<Name> = Vec::new();
+            for (i, t) in ts.iter().enumerate() {
+                with_binders(bound, inner.clone(), |bnd| {
+                    collect_type_fv(t, bnd, visited, out)
+                });
+                if let Some(rank) = decl.binder_rank(i) {
+                    inner.push(names[rank].clone());
+                }
+            }
+        }
         Type::Split { input, output } => {
             collect_type_fv(input, bound, visited, out);
             collect_type_fv(output, bound, visited, out);
@@ -2162,6 +2223,17 @@ pub fn walk_children_opened<'t>(
                 binders.push((name.clone(), opened));
             }
         }
+        // An argument is opened at the binding parameters before it, each ranging over its
+        // own argument.
+        Type::Nominal(decl, args, names) if decl.has_binders() => {
+            let mut binders: Vec<(Name, Type)> = Vec::new();
+            for (i, opened) in open_nominal_args(decl, args, names).into_iter().enumerate() {
+                visit(&binders, Cow::Owned(opened.clone()));
+                if let Some(rank) = decl.binder_rank(i) {
+                    binders.push((names[rank].clone(), opened));
+                }
+            }
+        }
         _ => ty.walk_children(|child| visit(&[], Cow::Borrowed(child))),
     }
 }
@@ -2216,6 +2288,47 @@ pub fn tuple_of_components(components: Vec<(Option<Name>, Type)>) -> Vec<Type> {
         .map(|(k, (_, mut ty))| {
             if k > 0 {
                 PiWalk::new(PiMode::Lower(k as u32)).ty(&mut ty, 0);
+            }
+            ty
+        })
+        .collect()
+}
+
+/// Place each reference past `ty`, `r` crossings beyond its root, `f(r)` crossings beyond
+/// it: the walk [`crate::ccl::nominal::NominalDecl::instantiate`] moves an argument into
+/// the declaration's types with.
+pub fn remap_pi_references(ty: &mut Type, f: &dyn Fn(u32) -> u32) {
+    PiWalk::new(PiMode::Remap(f)).ty(ty, 0);
+}
+
+/// Close each argument's references to the binders before it, `names` holding one per
+/// binding parameter of `decl`, into indices: argument `𝑖` reaches the binding parameter of
+/// rank `𝑗` at `crossings(𝑖) − 1 − 𝑗` ([`Type::Nominal`]). Indices already present are left
+/// alone.
+pub fn close_nominal_args(decl: &NominalDecl, args: &mut [Type], names: &[Name]) {
+    for (i, ty) in args.iter_mut().enumerate() {
+        let crossed = decl.crossings(i) as usize;
+        if crossed == 0 {
+            continue;
+        }
+        let enclosing: Vec<Option<Name>> = names[..crossed].iter().cloned().map(Some).collect();
+        if !enclosing.iter().flatten().any(|n| is_free_in_type(n, ty)) {
+            continue;
+        }
+        PiWalk::new(PiMode::Close(&enclosing)).ty(ty, 0);
+    }
+}
+
+/// An application's arguments, each opened at the binders before it: argument `𝑖`'s
+/// reference to the binding parameter of rank `𝑗` becomes `names[𝑗]`.
+pub fn open_nominal_args(decl: &NominalDecl, args: &[Type], names: &[Name]) -> Vec<Type> {
+    args.iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            let crossed = decl.crossings(i);
+            let mut ty = arg.clone();
+            for (j, name) in names.iter().enumerate().take(crossed as usize) {
+                ty = open_pi_binder_at(&Mapping::Rename(name.clone()), &ty, crossed - 1 - j as u32);
             }
             ty
         })
@@ -2345,6 +2458,9 @@ enum PiMode<'a> {
     /// A reference past the structure being walked comes `n` crossings closer: the `n`
     /// binders it crossed there are gone. One to a binder the walk is inside of is left alone.
     Lower(u32),
+    /// A reference past the structure being walked, `r` crossings beyond its root, is
+    /// placed `f(r)` crossings beyond it. One to a binder the walk is inside of is left alone.
+    Remap(&'a dyn Fn(u32) -> u32),
 }
 
 /// The shared engine under [`close_pi_binder`] and [`open_pi_binder`]: one
@@ -2434,7 +2550,17 @@ impl<'a> PiWalk<'a> {
                 }
                 self.shadowed.truncate(base);
             }
-            Type::Nominal(_, ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
+            // Argument `𝑖` sits inside the scopes of the binding parameters before it.
+            Type::Nominal(decl, ts, names) => {
+                let base = self.shadowed.len();
+                for (i, t) in ts.iter_mut().enumerate() {
+                    self.ty(t, depth + decl.crossings(i));
+                    if let Some(rank) = decl.binder_rank(i) {
+                        self.shadowed.push(names[rank].clone());
+                    }
+                }
+                self.shadowed.truncate(base);
+            }
             Type::Split { input, output } => {
                 self.ty(input, depth);
                 self.ty(output, depth);
@@ -2520,6 +2646,21 @@ impl<'a> PiWalk<'a> {
                     self.changed += 1;
                     // Fall through: the occurrence's type slot may itself
                     // carry references to convert.
+                }
+            }
+            PiMode::Remap(f) => {
+                if let TypedExprNode::Var(Name::PiBound(r)) = &e.node
+                    && r.index >= depth
+                {
+                    let index = depth + f(r.index - depth);
+                    if index != r.index {
+                        e.node = TypedExprNode::Var(Name::PiBound(crate::ccl::names::PiRef {
+                            index,
+                            hint: r.hint.clone(),
+                        }));
+                        self.changed += 1;
+                    }
+                    // Fall through: the occurrence's type slot may carry references too.
                 }
             }
             PiMode::Lower(by) => {
@@ -2638,7 +2779,10 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
                 .iter()
                 .enumerate()
                 .any(|(k, (_, t))| ty_scan(t, depth + k as u32, within, visited)),
-            Type::Nominal(_, ts) => ts.iter().any(|t| ty_scan(t, depth, within, visited)),
+            Type::Nominal(decl, ts, _) => ts
+                .iter()
+                .enumerate()
+                .any(|(i, t)| ty_scan(t, depth + decl.crossings(i), within, visited)),
             Type::Split { input, output } => {
                 ty_scan(input, depth, within, visited) || ty_scan(output, depth, within, visited)
             }
@@ -2814,6 +2958,34 @@ mod tests {
     use super::*;
     use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement};
 
+    /// Of two renames onto one name, the one a reader binds stays and the other goes; a
+    /// collision no reader binds loses both. The rest inverts.
+    #[test]
+    fn a_colliding_rename_yields_to_the_readers_own() {
+        let (k, arg, at, a, b, to) = (
+            Name::fresh("k"),
+            Name::fresh("__arg"),
+            Name::fresh("i"),
+            Name::fresh("a"),
+            Name::fresh("b"),
+            Name::fresh("t"),
+        );
+        let s = Subst::id()
+            .extended_rename(k.clone(), at.clone())
+            .extended_rename(arg.clone(), at.clone())
+            .extended_rename(a.clone(), to.clone())
+            .extended_rename(b.clone(), to.clone());
+        let kept = s.without_colliding_renames(|n| *n == k);
+        let inverse = kept.invert().expect("what remains is injective");
+        let mut sources: Vec<_> = inverse.binders().cloned().collect();
+        sources.sort();
+        assert_eq!(
+            sources,
+            vec![at.clone()],
+            "only `k`'s rename onto `i` survives"
+        );
+        assert!(kept.binders().all(|n| *n != arg && *n != a && *n != b));
+    }
     fn var(s: &str) -> TypedExpr {
         TypedExpr::var(s)
     }

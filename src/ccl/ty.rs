@@ -1370,7 +1370,20 @@ pub enum Type {
     ///
     /// **Concrete**, and kept to operator conversion: a pass that reads a value's shape reads
     /// it through [`Type::structure`], which answers the representation.
-    Nominal(Rc<crate::ccl::nominal::NominalDecl>, Vec<Type>),
+    ///
+    /// The arguments are a telescope over the declaration's **binding** parameters
+    /// (`docs/chl-spec.md`, "Binding parameters"): argument `𝑖` sits inside the scope of
+    /// every binding parameter before it, and a reference to one is a
+    /// [`Name::PiBound`](crate::ccl::Name::PiBound) whose index counts the binding
+    /// parameters crossed, as a dependent tuple's does. The third field holds one name per
+    /// binding parameter, in order: the address the argument after it opens at and its
+    /// display spelling, as `Fun::name` is. Empty for a declaration with no binding
+    /// parameter. Built by [`Type::nominal`] or [`Type::nominal_named`].
+    Nominal(
+        Rc<crate::ccl::nominal::NominalDecl>,
+        Vec<Type>,
+        Vec<crate::ccl::Name>,
+    ),
     /// The argument of a [`Bipolar`](crate::ccl::nominal::Variance::Bipolar) parameter of a
     /// [`Type::Nominal`] whose two sides differ: the **input**, which the parameter's
     /// negative occurrences read, and the **output**, which its positive ones read
@@ -1577,7 +1590,7 @@ fn params_at_or_below(ty: &Type) -> impl Iterator<Item = TypeParamId> {
     fn go(ty: &Type, out: &mut Vec<TypeParamId>) {
         match ty {
             Type::Param(p) => out.push(p.id),
-            Type::Nominal(_, args) => args.iter().for_each(|a| go(a, out)),
+            Type::Nominal(_, args, _) => args.iter().for_each(|a| go(a, out)),
             _ => {}
         }
     }
@@ -2490,10 +2503,37 @@ fn fmt_type(
         Type::DataSource(name) => write!(f, "source({name})"),
         Type::ChanDom(name, _) => write!(f, "chan({name})"),
         Type::Param(param) => write!(f, "{}", param.spelling),
-        Type::Nominal(decl, args) if args.is_empty() => write!(f, "{}", decl.name),
-        Type::Nominal(decl, args) => {
-            let args: Vec<String> = args.iter().map(|t| at(t, binders).to_string()).collect();
-            write!(f, "{}({})", decl.name, args.join(", "))
+        Type::Nominal(decl, args, _) if args.is_empty() => write!(f, "{}", decl.name),
+        // A binding argument renders `k: K`, and each argument renders inside the binders
+        // before it.
+        Type::Nominal(decl, args, names) => {
+            fn rest(
+                shown: &mut Vec<String>,
+                decl: &crate::ccl::nominal::NominalDecl,
+                args: &[Type],
+                names: &[crate::ccl::Name],
+                binders: Option<&symbolic::PiBinderEnv<'_>>,
+            ) {
+                let Some((arg, later)) = args.split_first() else {
+                    return;
+                };
+                let i = decl.params.len() - args.len();
+                let rendered = at(arg, binders).to_string();
+                match decl.binder_rank(i) {
+                    Some(rank) => {
+                        shown.push(format!("{}: {rendered}", names[rank]));
+                        let inner = symbolic::PiBinderEnv::crossing(binders, Some(&names[rank]));
+                        rest(shown, decl, later, names, Some(&inner));
+                    }
+                    None => {
+                        shown.push(rendered);
+                        rest(shown, decl, later, names, binders);
+                    }
+                }
+            }
+            let mut shown = Vec::with_capacity(args.len());
+            rest(&mut shown, decl, args, names, binders);
+            write!(f, "{}({})", decl.name, shown.join(", "))
         }
         // No program writes one, so it has no CHL spelling; this names both sides.
         Type::Split { input, output } => {
@@ -2685,10 +2725,28 @@ impl Type {
         }
     }
 
+    /// `decl` applied to `args`, which read no binder by name: a fresh binder for each
+    /// binding parameter ([`Type::Nominal`]).
+    pub fn nominal(decl: Rc<crate::ccl::nominal::NominalDecl>, args: Vec<Type>) -> Self {
+        let names = decl.fresh_binders();
+        Type::Nominal(decl, args, names)
+    }
+
+    /// `decl` applied to `args`, whose references to the binding parameters read `names`,
+    /// one per binding parameter: closed into indices, as [`Type::pi`] closes its codomain.
+    pub fn nominal_named(
+        decl: Rc<crate::ccl::nominal::NominalDecl>,
+        mut args: Vec<Type>,
+        names: Vec<crate::ccl::Name>,
+    ) -> Self {
+        crate::ccl::subst::close_nominal_args(&decl, &mut args, &names);
+        Type::Nominal(decl, args, names)
+    }
+
     /// `Option(payload)`, the compiler-provided nominal type
     /// ([`crate::ccl::nominal::option`]) that a checked lookup answers.
     pub fn option_of(payload: Self) -> Self {
-        Type::Nominal(crate::ccl::nominal::option(), vec![payload])
+        Type::nominal(crate::ccl::nominal::option(), vec![payload])
     }
 
     /// The payload of an [`option_of`](Self::option_of), or `None` for any other type.
@@ -2697,7 +2755,9 @@ impl Type {
     /// rather than recomputing it.
     pub fn option_payload(&self) -> Option<&Self> {
         match self {
-            Type::Nominal(decl, args) if **decl == *crate::ccl::nominal::option() => args.first(),
+            Type::Nominal(decl, args, _) if **decl == *crate::ccl::nominal::option() => {
+                args.first()
+            }
             _ => None,
         }
     }
@@ -3092,7 +3152,7 @@ impl Type {
     /// it.
     pub fn structure(&self) -> Cow<'_, Type> {
         match self {
-            Type::Nominal(decl, args) => Cow::Owned(decl.representation(args)),
+            Type::Nominal(decl, args, names) => Cow::Owned(decl.representation(args, names)),
             _ => Cow::Borrowed(self),
         }
     }
@@ -3531,9 +3591,12 @@ impl Type {
                 *history_kind,
             ),
             Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(Type::without_pi_names))),
-            Type::Nominal(decl, args) => Type::Nominal(
+            // A binder's name is an opening address, and two applications compare by the
+            // indices their arguments hold, so every binder takes its declaration's spelling.
+            Type::Nominal(decl, args, _) => Type::Nominal(
                 decl.clone(),
                 args.iter().map(Type::without_pi_names).collect(),
+                decl.binder_spellings(),
             ),
             Type::Split { input, output } => Type::Split {
                 input: Box::new(input.without_pi_names()),
@@ -3642,7 +3705,7 @@ impl Type {
             // A `Poly`'s bounds are its children as its body is: a pass that rewrites
             // types (uniquify's α-renaming, `subst`) must reach a refinement in a bound.
             Type::Poly(poly) => poly.types().for_each(f),
-            Type::Nominal(_, args) => args.iter().for_each(f),
+            Type::Nominal(_, args, _) => args.iter().for_each(f),
             Type::Split { input, output } => {
                 f(input);
                 f(output);
@@ -3712,7 +3775,7 @@ impl Type {
             | Type::Param(_)
             | Type::Txn => {}
             Type::Poly(poly) => Rc::make_mut(poly).types_mut().for_each(f),
-            Type::Nominal(_, args) => args.iter_mut().for_each(f),
+            Type::Nominal(_, args, _) => args.iter_mut().for_each(f),
             Type::Split { input, output } => {
                 f(input);
                 f(output);

@@ -57,6 +57,11 @@ A data-function type `𝐷 |=> 𝑉` lowers to `𝐷 ⤇ 𝑉`, and its kind fol
   A sum binds its consumer's domain to its own witness, which cannot stand at the parameter's other
   positions.
 
+A parenthesised binder `(𝑘: 𝐷) |=> 𝑉`, and `FullMap(𝑘: 𝐾, 𝑉)`, lowers to the named function
+`(𝑘: 𝐷) ⤇ 𝑉` with `𝑉`'s references to `𝑘` closed into indices. The name slot then takes a fresh name
+of `𝑘`'s spelling, or, in a declaration's constructor types, the declaration's own name for that
+binder ([nominal-types.md, "Binders"](nominal-types.md#binders)).
+
 The table does not promise that every declared lookup or iteration interface is implemented.
 Those boundaries are specified under [Lookup](#lookup-membership-discharge) and
 [Operations](#operations-how-the-trait-layer-dispatches-planned).

@@ -284,8 +284,8 @@ fn simplify_analyze(
     }
     // A nominal type's arguments recurse at the polarity their variance gives them
     // (`CompactType::nominal`).
-    for (decl, args) in &ct.nominal {
-        for (arg, v) in args.iter().zip(decl.sided_variances()) {
+    for (decl, nominal) in &ct.nominal {
+        for (arg, v) in nominal.args.iter().zip(decl.sided_variances()) {
             let pol = v.polarity(pol);
             simplify_analyze(
                 arg,
@@ -388,12 +388,19 @@ fn simplify_reconstruct(
     let new_nominal = ct
         .nominal
         .into_iter()
-        .map(|(decl, args)| {
-            let args = args
+        .map(|(decl, nominal)| {
+            let args = nominal
+                .args
                 .into_iter()
                 .map(|a| simplify_reconstruct(a, var_subst))
                 .collect();
-            (decl, args)
+            (
+                decl,
+                super::compact::CompactNominal {
+                    binders: nominal.binders,
+                    args,
+                },
+            )
         })
         .collect();
 

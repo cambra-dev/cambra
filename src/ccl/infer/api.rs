@@ -961,7 +961,23 @@ fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
     if type_a.to_string() != type_b.to_string() {
         return None;
     }
-    let (a, b) = (format!("{type_a:?}"), format!("{type_b:?}"));
+    // A term's node id is its provenance, which two copies of one predicate differ in, so it
+    // is left out of the comparison.
+    let without_ids = |s: String| {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s.as_str();
+        while let Some(at) = rest.find("NodeId(") {
+            out.push_str(&rest[..at]);
+            rest = &rest[at..];
+            rest = rest.find(')').map_or("", |close| &rest[close + 1..]);
+        }
+        out.push_str(rest);
+        out
+    };
+    let (a, b) = (
+        without_ids(format!("{type_a:?}")),
+        without_ids(format!("{type_b:?}")),
+    );
     let Some(at) = a
         .char_indices()
         .zip(b.chars())
@@ -1438,7 +1454,13 @@ impl std::fmt::Debug for InferError {
                      A collection's domain is its data, so a join may not narrow it. Wrap each \
                      arm in `box` to keep them.",
                     listed.join(" vs ")
-                )
+                )?;
+                if let [a, b] = domains.as_slice()
+                    && let Some(hint) = identical_rendering_hint(a, b)
+                {
+                    write!(f, "\n{hint}")?;
+                }
+                Ok(())
             }
             InferError::MutNotBareVariable { at } => {
                 write!(

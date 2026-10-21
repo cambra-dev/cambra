@@ -109,11 +109,11 @@ pub fn convert(v: TileValue, ty: &Type) -> Value {
         }
         // A nominal value is held as the variant of its constructors; the type says which
         // declaration's constructor the tag is.
-        (TileValue::Union { tag, inner }, Type::Nominal(decl, args)) => {
+        (TileValue::Union { tag, inner }, Type::Nominal(decl, args, names)) => {
             let ctor = tag.to_string();
             let payload = decl
                 .ctor(&ctor)
-                .map(|c| decl.instantiate(&c.payload(), args))
+                .map(|c| decl.instantiate(&c.payload(), args, names))
                 .unwrap_or(Type::Hole);
             Value::Nominal {
                 ty: decl.name.to_string(),

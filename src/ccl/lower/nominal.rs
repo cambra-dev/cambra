@@ -20,7 +20,7 @@ use smol_str::SmolStr;
 
 use super::stmts::{is_mut_annotation, lower_type_expr, reserved_name};
 use super::{LoweringContext, LoweringError};
-use crate::ccl::nominal::{NominalCtor, NominalDecl, WrittenOrder};
+use crate::ccl::nominal::{DefineError, NominalCtor, NominalDecl, WrittenOrder};
 use crate::ccl::ty::{PolyParam, PolyType, TypeKind, TypeParam};
 use crate::ccl::{
     Expr, FieldKey, Lit, MethodCandidate, Name, Pattern, PatternHead, Type, TypedBinding,
@@ -171,27 +171,39 @@ pub(super) fn declare_nominal_types(
             continue;
         }
         let mut params: Vec<Rc<TypeParam>> = Vec::new();
+        let mut binders: Vec<Option<SmolStr>> = Vec::new();
         for param in &decl.params {
-            if let Some(what) = reserved_name(&param.node) {
+            let name = &param.name;
+            if let Some(what) = reserved_name(&name.node) {
                 errors.push(LoweringError::unsupported(
-                    param.span,
+                    name.span,
                     format!(
                         "`{}` is a built-in {what} and cannot name a type parameter",
-                        param.node
+                        name.node
                     ),
                 ));
-            } else if params.iter().any(|p| p.spelling == param.node) {
+            } else if params.iter().any(|p| p.spelling == name.node) {
                 errors.push(LoweringError::unsupported(
-                    param.span,
-                    format!("type parameter `{}` is declared twice", param.node),
+                    name.span,
+                    format!("type parameter `{}` is declared twice", name.node),
+                ));
+            } else if let Some(binder) = &param.binder
+                && binders.iter().flatten().any(|b| *b == binder.node)
+            {
+                errors.push(LoweringError::unsupported(
+                    binder.span,
+                    format!("binder `{}` is declared twice", binder.node),
                 ));
             } else {
-                params.push(TypeParam::declared(param.node.clone()));
+                params.push(TypeParam::declared(name.node.clone()));
+                binders.push(param.binder.as_ref().map(|b| b.node.clone()));
             }
         }
-        ctx.nominal_types.push(NominalDecl::declared(
+        ctx.nominal_types.push(NominalDecl::declared_in(
+            Vec::new(),
             name.node.clone(),
             params,
+            binders,
             name.span,
             matches!(decl.body, TypeDeclBody::Single(_)),
         ));
@@ -296,15 +308,20 @@ fn define_after_references(
     }
     let decl = &lowered[i].0;
     let ctors = slots[i].take().expect("each declaration is defined once");
-    if let Err(unused) = decl.define(ctors) {
+    if let Err(refused) = decl.define(ctors) {
         defined[i] = Progress::Failed;
-        errors.push(LoweringError::unsupported(
-            decl.span,
-            format!(
+        let message = match refused {
+            DefineError::Unused(param) => format!(
                 "type parameter `{}` of `{}` appears in no constructor's parameter type",
-                unused.spelling, decl.name
+                param.spelling, decl.name
             ),
-        ));
+            DefineError::Unbound { param, binder } => format!(
+                "type parameter `{}` of `{}` may read the binder `{binder}`, so it appears \
+                 only where a function `({binder}: …)` over that binder's parameter binds it",
+                param.spelling, decl.name
+            ),
+        };
+        errors.push(LoweringError::unsupported(decl.span, message));
     }
 }
 
@@ -362,6 +379,13 @@ fn lower_constructors(
         ctx.declare_type_throughout(param.spelling.as_str(), Type::Param(Rc::clone(param)));
         ctx.type_params_in_scope.push(param.spelling.to_string());
     }
+    ctx.declaration_binders = head
+        .binders
+        .iter()
+        .flatten()
+        .cloned()
+        .zip(head.binder_names.iter().cloned())
+        .collect();
     let result = (|| {
         let mut ctors: Vec<NominalCtor> = Vec::new();
         match &decl.body {
@@ -413,6 +437,7 @@ fn lower_constructors(
         }
         Ok(ctors)
     })();
+    ctx.declaration_binders.clear();
     ctx.type_params_in_scope.truncate(scoped);
     ctx.restore_type_aliases(aliases);
     result

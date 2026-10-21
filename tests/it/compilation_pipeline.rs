@@ -19,6 +19,7 @@
 
 mod helpers;
 
+mod binding_parameters;
 mod chl_types;
 mod comprehensions;
 mod conditionals;

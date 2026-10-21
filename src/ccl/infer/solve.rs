@@ -436,7 +436,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         // bookkeeping, not identity - see `ChanLevel`).
         (Type::ChanDom(a, _), Type::ChanDom(b, _)) => a == b,
         (Type::Param(a), Type::Param(b)) => a == b,
-        (Type::Nominal(d1, a1), Type::Nominal(d2, a2)) => {
+        (Type::Nominal(d1, a1, _), Type::Nominal(d2, a2, _)) => {
             d1 == d2
                 && a1
                     .iter()
@@ -940,7 +940,7 @@ fn pin_unobservable_param(lambda_ty: &Type, ctx: &mut CoalesceCtx) {
 /// (`docs/chl-spec.md`, "Type parameters"). See
 /// `src/ccl/design/type-inference.md`, "Pin sites".
 fn pin_unobservable_ctor_args(value_ty: &Type, ctx: &mut CoalesceCtx) {
-    let Type::Nominal(decl, args) = value_ty.peel_refinements() else {
+    let Type::Nominal(decl, args, _) = value_ty.peel_refinements() else {
         return;
     };
     for arg in args {
@@ -1071,7 +1071,7 @@ fn for_each_positioned_var(
             step(value, PositionStep::HistoryValue, path);
             step(domain, PositionStep::HistoryDomain, path);
         }
-        Type::Nominal(decl, args) => {
+        Type::Nominal(decl, args, _) => {
             for (i, t) in args.iter().enumerate() {
                 step(t, PositionStep::Argument(Rc::clone(decl), i), path);
             }
@@ -1112,7 +1112,9 @@ fn read_at<'a>(ty: &'a Type, path: &[PositionStep]) -> Option<&'a Type> {
         (Type::Variant(arms, _), PositionStep::Arm(key)) => &arms.iter().find(|(k, _)| k == key)?.1,
         (Type::History { value, .. }, PositionStep::HistoryValue) => value.as_ref(),
         (Type::History { domain, .. }, PositionStep::HistoryDomain) => domain.as_ref(),
-        (Type::Nominal(decl, args), PositionStep::Argument(at, i)) if decl == at => args.get(*i)?,
+        (Type::Nominal(decl, args, _), PositionStep::Argument(at, i)) if decl == at => {
+            args.get(*i)?
+        }
         (Type::Split { input, .. }, PositionStep::Input) => input.as_ref(),
         (Type::Split { output, .. }, PositionStep::Output) => output.as_ref(),
         // An argument that is not split is both its sides.
@@ -1181,7 +1183,9 @@ impl OccurrenceIndex {
                     (Rc::clone(bounds.lower()), Rc::clone(bounds.upper()))
                 };
                 for b in lower.iter() {
-                    let bound_ty = b.render_subst().apply_type(&b.ty);
+                    let bound_ty = b
+                        .render_subst(|n| v.telescope.contains(n))
+                        .apply_type(&b.ty);
                     for_each_positioned_var(&bound_ty, &mut Vec::new(), &mut |u, position| {
                         self.occurrences.entry(u.uid).or_default().push(Occurrence {
                             holder: Rc::clone(&v),
@@ -1317,7 +1321,9 @@ fn position_answer(
     for b in upper.iter() {
         // Each bound is resolved as its own position: `resolve_var_type` enters at that
         // type, so a collapse it causes happens there rather than along `v`'s chain.
-        let ty = b.render_subst().apply_type(&b.ty);
+        let ty = b
+            .render_subst(|n| v.telescope.contains(n))
+            .apply_type(&b.ty);
         if let Ok(resolved) = resolve_var_type(&ty)
             && let Some(answer) = offer(&resolved, partial)
         {
@@ -1714,7 +1720,7 @@ fn has_output_variable(ty: &Type, pol: bool) -> bool {
         Type::Fun {
             domain, codomain, ..
         } => has_output_variable(domain, !pol) || has_output_variable(codomain, pol),
-        Type::Nominal(decl, args) => args
+        Type::Nominal(decl, args, _) => args
             .iter()
             .zip(&decl.body().variances)
             .any(|(t, v)| has_output_variable(t, v.polarity(pol))),
@@ -2802,9 +2808,21 @@ fn coalesce_type_predicates_go(
             coalesce_type_predicates_go(c, level, ctx, scope);
             scope.exit();
         }
-        Type::Tuple(ts) | Type::Nominal(_, ts) => ts
+        Type::Tuple(ts) => ts
             .iter_mut()
             .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
+        // Argument `𝑖` is inside the scopes of the binding parameters before it.
+        Type::Nominal(decl, ts, names) => {
+            let mut entered = 0;
+            for (i, t) in ts.iter_mut().enumerate() {
+                coalesce_type_predicates_go(t, level, ctx, scope);
+                if let Some(rank) = decl.binder_rank(i) {
+                    scope.enter(Some(names[rank].clone()));
+                    entered += 1;
+                }
+            }
+            (0..entered).for_each(|_| scope.exit());
+        }
         Type::Split { input, output } => {
             coalesce_type_predicates_go(input, level, ctx, scope);
             coalesce_type_predicates_go(output, level, ctx, scope);

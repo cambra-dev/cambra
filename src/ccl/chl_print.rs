@@ -226,11 +226,8 @@ impl Printer {
                 format!("Feed({})", self.ty(value))
             }
             Type::Poly(poly) => self.poly(poly),
-            Type::Nominal(decl, args) if args.is_empty() => decl.name.to_string(),
-            Type::Nominal(decl, args) => {
-                let args: Vec<String> = args.iter().map(|t| self.ty(t)).collect();
-                format!("{}({})", decl.name, args.join(", "))
-            }
+            Type::Nominal(decl, args, _) if args.is_empty() => decl.name.to_string(),
+            Type::Nominal(decl, args, names) => self.nominal(decl, args, names),
             // No program writes one; this names both sides.
             Type::Split { input, output } => {
                 format!("in {} out {}", self.ty(input), self.ty(output))
@@ -288,6 +285,44 @@ impl Printer {
             (None, Type::Fun { .. }) => format!("({dom}) {arrow} {cod}"),
             (None, _) => format!("{dom} {arrow} {cod}"),
         }
+    }
+
+    /// A nominal application, `Ledger(k: SKU, V)`: each argument written inside the binders
+    /// before it, and a binding argument with its binder where a later argument reads it.
+    fn nominal(
+        &mut self,
+        decl: &crate::ccl::nominal::NominalDecl,
+        args: &[Type],
+        names: &[Name],
+    ) -> String {
+        let opened = crate::ccl::subst::open_nominal_args(decl, args, names);
+        let mut shown = Vec::with_capacity(args.len());
+        let mut entered = 0;
+        for (i, arg) in args.iter().enumerate() {
+            let written = self.ty(arg);
+            let Some(rank) = decl.binder_rank(i) else {
+                shown.push(written);
+                continue;
+            };
+            let name = &names[rank];
+            let read = opened[i + 1..]
+                .iter()
+                .any(|t| crate::ccl::subst::type_free_vars(t).contains(name));
+            let spelled = self.binder(name, decl.binders[i].as_deref().unwrap_or("k"));
+            self.binders.push(Some(spelled.clone()));
+            self.spelled.push((name.clone(), spelled.clone()));
+            entered += 1;
+            shown.push(if read {
+                format!("{spelled}: {written}")
+            } else {
+                written
+            });
+        }
+        for _ in 0..entered {
+            self.binders.pop();
+            self.spelled.pop();
+        }
+        format!("{}({})", decl.name, shown.join(", "))
     }
 
     /// A sum: the collection type its witness's kind names, or the `Box` of the

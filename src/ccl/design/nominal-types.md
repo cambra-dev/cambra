@@ -4,8 +4,8 @@ How the compiler implements
 [chl-spec.md, "6.8 Nominal types and methods [Decided]"](../../../docs/chl-spec.md#68-nominal-types-and-methods-decided).
 
 A `type` declaration lowers to a `NominalDecl` (`ccl/nominal.rs`), and an application of it is
-`Type::Nominal(decl, args)`. Inference relates two applications of one declaration argument by
-argument and relates a nominal type to no other type. The type keeps its name to operator
+`Type::Nominal(decl, args, binders)`. Inference relates two applications of one declaration argument
+by argument and relates a nominal type to no other type. The type keeps its name to operator
 conversion. A pass that reads a value's shape, rather than relating its type, reads the
 representation through `Type::structure`.
 
@@ -13,7 +13,8 @@ representation through `Type::structure`.
 
 ## Representation
 
-`Type::Nominal` holds the declaration by `Rc` and its type arguments as children. A walk over a
+`Type::Nominal` holds the declaration by `Rc`, its type arguments as children, and one name per
+binding parameter ([Binders](#binders)). A walk over a
 type's children visits the arguments and does not enter the declaration, which is an identity.
 Equality, ordering and hashing on `NominalDecl` are by the path of the module that declares it and
 its name ([chl-spec.md, "Nominal type identity"](../../../docs/chl-spec.md#nominal-type-identity)),
@@ -63,6 +64,38 @@ join of `Cell(Int@1)` and `Cell(Int@2)` is the application whose output side is 
 and whose input side is their meet, which both arms are subtypes of. Equating the two arms'
 arguments instead would need a join computed when the bounds are recorded, which the solver does
 not do.
+
+### Binders
+
+A binding parameter, `k: K` in `type Groups(k: K, V)`
+([chl-spec.md, "Binding parameters"](../../../docs/chl-spec.md#binding-parameters)), binds the
+arguments after it. `NominalDecl::binders` holds each parameter's binder spelling, or `None`.
+
+- **An application's arguments are a telescope over its binding parameters.** Argument `𝑖` sits
+  inside the `crossings(𝑖)` binding parameters before it, and a reference to one is a
+  `Name::PiBound` whose index counts the binding parameters crossed, as a dependent tuple's
+  component counts the components before it. Only binding parameters count, so a declaration
+  without one stores its arguments as before. Every binder-scope walk enters an argument at its
+  crossings: `PiWalk`, the free-variable and scan walks, substitution, normalization, display.
+- **The third field holds the opening address of each binder**, as `Fun::name` holds a
+  function's, and its display spelling. `Type::without_pi_names` sets each to its declaration's
+  spelling, since the indices are what two applications compare by. `Type::nominal_named` closes
+  arguments that read the names, and `Type::nominal` mints fresh ones for arguments that read
+  none.
+- **The declaration has one name per binder, `NominalDecl::binder_names`.** A function over a
+  binding parameter that the declaration's constructors write binds that name
+  (`LoweringContext::declaration_binders`), and so do the declaration applied to its own
+  parameters (`applied_to_params`), every constructor node and every constructor pattern. A
+  constructor function's polymorphic type then reads `V` under one binder in its parameter and
+  its result, and so does the post-inference check, which re-derives each node's type in the
+  same names.
+- **`define` refuses a parameter standing outside a binder before it** (`DefineError::Unbound`):
+  one not under a function whose name is that binder's and whose domain is its parameter.
+- **`instantiate` moves an argument under the function binding its binder.** At a parameter's
+  occurrence, a reference to binding parameter `𝑗` becomes a reference to the innermost
+  enclosing function binding `𝑗`, and a reference past the application counts the crossings
+  between the occurrence and the type's root (`subst::remap_pi_references`). The function takes
+  the application's name for the binder.
 
 ---
 
@@ -234,11 +267,13 @@ one: a declaration named `Option`, and an associated function of it.
 
 ### The constructor rule
 
-`emit_nominal_ctor` types a constructor `N::c(𝑒)` as `N(𝛼…)`, one fresh variable per type
-parameter, and constrains `𝑒` below the constructor's payload at `𝛼…`. The payload is compared
-with its refinements stripped. The node is only ever the body of the constructor's function, whose
-parameter annotation already discharged them, or a constructor without parameters, whose payload
-is `unit`; the declaration's own predicates were never typed.
+`emit_nominal_ctor` types a constructor `N::c(𝑒)` as `N(𝛼…)`, one fresh variable per type parameter,
+and constrains `𝑒` below the constructor's payload at `𝛼…`. Each variable is minted inside the
+binders before its parameter, each bound at its own parameter's variable (`fresh_nominal_args`), as
+a function's codomain variable is minted inside its binder. The payload is compared with its
+refinements stripped. The node is only ever the body of the constructor's function, whose parameter
+annotation already discharged them, or a constructor without parameters, whose payload is `unit`;
+the declaration's own predicates were never typed.
 
 ### The constructor-pattern rule
 
@@ -258,6 +293,11 @@ pair relates its output sides as a covariant pair and its input sides as a contr
 two arguments that are not split relate both ways. A nominal
 type paired with any other type, including another nominal type, falls to the catch-all mismatch.
 
+Two applications of a declaration with binding parameters relate their arguments with the two
+sides' binders identified, as two dependent functions relate their codomains: from a binding
+parameter on, the left side's substitution renames its binder to the right side's. Each side's
+arguments open at its own binders where the other side holds a variable.
+
 `extrude` carries each argument across a level boundary at the polarity its variance gives it,
 and an invariant argument, or a bipolar one that is not split, through the two-way proxies a
 history's payload uses. A split argument extrudes each side at its own polarity.
@@ -265,7 +305,11 @@ history's payload uses. A split argument extrudes each side at its own polarity.
 ### Compaction and coalescing
 
 `CompactType::nominal` maps each declaration at a position to its arguments' **sides**: one per
-argument, and two for a bipolar one, its input then its output (`NominalDecl::sided_variances`).
+argument, and two for a bipolar one, its input then its output (`NominalDecl::sided_variances`),
+with the application's binder names (`CompactNominal`). An argument compacts inside the binders
+before it, which shadow the accumulated substitution and close the refinements landing below, as
+a function's codomain does. A merge keeps either side's names, since the arguments' references to
+them are indices by then.
 Two contributions of one declaration merge side by side, a contravariant side at the flipped
 polarity, so a join meets the input sides and joins the output sides. An invariant argument is
 compacted as a data domain is, both sides merged however the walk reaches it, and two that differ

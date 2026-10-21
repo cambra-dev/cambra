@@ -1759,23 +1759,6 @@ fn a_bare_key_lookup_on_a_groupby_is_refused() {
     }
 }
 
-/// Consuming this boxed Map annotation fails inference: the reported domains name
-/// `__iter_record` and `__box_k` instead of reconciling the dependent key.
-/// The FullMap counterpart runs in `a_keyed_annotation_compiles_and_runs`.
-#[test]
-fn a_consumed_boxed_map_annotation_escapes_its_scope() {
-    let errs = infer_program_err(indoc! {r#"
-        g: Map(_, _) = box(groupby([1,2,3], \x -> x))
-        sum([sum(v) for v in g])
-    "#});
-    assert!(
-        errs.iter()
-            .map(|e| format!("{e:?}"))
-            .any(|m| m.contains("__iter_record") && m.contains("__box_k")),
-        "expected the two spellings of the key domain to collide, got {errs:?}"
-    );
-}
-
 /// FullMap(_, _) preserves the group-by domain at either annotation strength. Consuming the
 /// groups under either is run in `a_keyed_annotation_compiles_and_runs`.
 /// See `src/ccl/design/collections.md`, "`groupby`'s exact type".

@@ -160,3 +160,20 @@ fn an_inference_variable_keeps_its_identity() {
     assert!(domain.starts_with("‹?"), "a variable; got: {inferred}");
     assert_eq!(domain, codomain);
 }
+
+/// A binding argument is written with its binder where a later argument reads it, and the
+/// later argument names it.
+#[test]
+fn a_binding_argument_is_written_with_its_binder() {
+    let code = indoc! {r#"
+        type Groups(k: K, V) = (k: K) |=> V
+        g = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+        z: Int = g
+        1
+    "#};
+    check_compile_error(
+        code,
+        "inferred as Groups(k: {Bool where _ in [1 > 1, 2 > 1, 3 > 1]}, {UInt where _ < 3 and \
+         ([1, 2, 3][_] > 1) == k} |=> Int)",
+    );
+}

@@ -1963,9 +1963,15 @@ termination proof for arbitrary substitution-bearing graphs.
 Rendering a bound is different from transporting an edge. `Bound::render_subst` combines the
 content substitution with the inverse of the holder substitution. If the latter is not invertible,
 it preserves the invertible rename part and leaves the discharge part unapplied: the content is
-already in the post-discharge context. A non-injective rename part can also fall back to identity.
-Debug checks require every untransported binder to be absent from the content.
-Dropping the whole mixed substitution would also drop useful renames.
+already in the post-discharge context. Debug checks require every untransported binder to be
+absent from the content. Dropping the whole mixed substitution would also drop useful renames.
+
+Several renames onto one name make the rename part non-injective. They arise from one value's
+several binders: a dependent function's, an application's at a loop's index, and a group-by's key,
+each aligned to the next along the edges that relate them. Of the renames onto one name, the one
+whose source the reader binds stays, and the others go (`Subst::without_colliding_renames`). The
+reader is the holder's telescope and, during compaction, the functions the walk is inside of. A
+collision no reader resolves loses all its renames. What remains is injective and inverts.
 
 `compact_go` accumulates these rendering substitutions while following bounds and forces the
 composite at refinement leaves. `RefinementScope` then closes references against the functions
@@ -2028,9 +2034,11 @@ record-time obligation.
 #### The invariant
 
 `bound_scope_gaps` requires every free term name in a bound's type to occur in the holder's
-telescope or in the domain of either edge substitution. `enforce_bound_scope` panics on a gap
-in every build, naming the holder, bound side, and escaping reference. It is an internal invariant
-failure, not a recoverable user diagnostic.
+telescope, in the domain of either edge substitution, or among the names the holder side renames the
+holder's binders to. The last are the holder's binders as the content spells them: the content is
+read through the inverted rename, as `Bound::render_subst` reads it. `enforce_bound_scope` panics on
+a gap in every build, naming the holder, bound side, and escaping reference. It is an internal
+invariant failure, not a recoverable user diagnostic.
 
 `InferCtx::fresh` passes the current telescope to `InferVar::fresh_in`. Emission extends that
 telescope for term binders, and normalization extends it when descending dependent annotations.

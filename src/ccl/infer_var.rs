@@ -236,14 +236,21 @@ impl Bound {
     /// (debug-asserted). Falling to the identity *wholesale* would silently
     /// drop the rename part of a mixed composite, mis-naming binders in the
     /// rendered content.
-    pub fn render_subst(&self) -> subst::Subst {
+    ///
+    /// Two renames onto one name make the holder side non-injective. Where one of the two
+    /// renames a name `in_scope` accepts, a binder the holder or the walk reading it is
+    /// inside of, that one is the name the content means there: the other renames nothing
+    /// the reader holds, as an application's binder renamed to the name a function's binder
+    /// is aligned to does. It is dropped before inverting.
+    pub fn render_subst(&self, in_scope: impl Fn(&Name) -> bool) -> subst::Subst {
         if self.self_subst.is_id() {
             return self.ty_subst.clone();
         }
-        let inv = match self.self_subst.invert() {
+        let self_subst = self.self_subst.without_colliding_renames(in_scope);
+        let inv = match self_subst.invert() {
             Some(inv) => inv,
             None => {
-                let (ren, _term) = self.self_subst.split_renames();
+                let (ren, _term) = self_subst.split_renames();
                 // A non-injective rename part also lands here and falls to the
                 // identity — the very "silently drop the rename part" the doc
                 // above warns about. That branch is assert-guarded, not
@@ -262,7 +269,7 @@ impl Bound {
                     };
                     let fv = subst::type_free_vars(&self.ty);
                     debug_assert!(
-                        self.self_subst
+                        self_subst
                             .binders()
                             .filter(|b| !transported.contains(b))
                             .all(|b| !fv.contains(b)),
@@ -279,8 +286,9 @@ impl Bound {
     /// The bound type expressed in the holder's context — see
     /// [`render_subst`](Self::render_subst).
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn materialize(&self) -> Type {
-        self.render_subst().apply_type(&self.ty)
+    pub fn materialize(&self, holder: &Telescope) -> Type {
+        self.render_subst(|n| holder.contains(n))
+            .apply_type(&self.ty)
     }
 }
 
@@ -540,11 +548,23 @@ pub(crate) trait TelescopeWalk {
 /// an error. A program source is never one: a source reference is a
 /// [`crate::ccl::TypedExprNode::Source`] node, so it is not a term variable and
 /// [`subst::type_free_vars`] does not report it.
+///
+/// A name the holder side renames one of the holder's binders to is in scope too: the
+/// content is read in the holder's context through the inverted rename
+/// ([`Bound::render_subst`]), which spells it as that binder.
 pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet<Name> {
+    let renamed_into = bound
+        .self_subst
+        .split_renames()
+        .0
+        .invert()
+        .map(|inverse| inverse.binders().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
     subst::scope_gaps(&bound.ty, |n| {
         telescope.contains(n)
             || bound.ty_subst.binders().any(|b| b == n)
             || bound.self_subst.binders().any(|b| b == n)
+            || renamed_into.contains(n)
     })
 }
 

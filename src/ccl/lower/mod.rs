@@ -526,6 +526,12 @@ pub struct LoweringContext {
     /// a global meaning of `_`.
     pub(super) in_refinement_predicate: bool,
 
+    /// The binders of the `type` declaration whose constructors are being lowered, each
+    /// spelling with the declaration's name for it
+    /// ([`NominalDecl::binder_names`](crate::ccl::nominal::NominalDecl::binder_names)): a
+    /// function type over one of them binds that name rather than a fresh one.
+    pub(super) declaration_binders: Vec<(SmolStr, Name)>,
+
     /// The [`Type::SharedHole`] id mint, shared with the comprehension phase
     /// (`crate::ccl::comprehension`), which states the same domain equations on
     /// the same tree and so must not reuse an id lowering already spent.
@@ -1388,6 +1394,14 @@ fn lower_expr_inner(
                      position, not as a value"
                 }
             },
+        )),
+        ChlExpr::TypeBinder { name, .. } => Err(LoweringError::unsupported(
+            expr.span,
+            format!(
+                "`{}: T` binds a value in a type: it is written as a function type's domain, \
+                 `({}: T) |=> U`, or as an argument of a type, not as a value",
+                name.node, name.node
+            ),
         )),
         ChlExpr::Forall { .. } => Err(LoweringError::unsupported(
             expr.span,

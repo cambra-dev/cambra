@@ -190,6 +190,11 @@ pub struct FreshenCache {
     /// Original barrier variable → its fresh replacement, for the same reason as
     /// [`vars`](Self::vars).
     pub barrier_vars: HashMap<BarrierVarId, Rc<BarrierVar>>,
+    /// The binders the walk is under, outermost first: a named function's, around its
+    /// codomain, and an application's binding parameters', around the arguments after
+    /// them. A type parameter's variable is minted inside them, as a variable a codomain or
+    /// an argument holds is: a parameter a binding parameter precedes reads its binder.
+    pub binders_in_scope: Vec<crate::ccl::Name>,
     /// Original quantified channel-domain name → its rename. Seeded by
     /// `specialize_use` with use-site pairings; unpaired names mint fresh.
     pub chan_doms: HashMap<crate::ccl::Name, crate::ccl::Name>,
@@ -486,7 +491,14 @@ pub fn freshen_above(
                     other => freshen_fun_kind(other, cache),
                 },
                 domain: Box::new(freshen_above(lim, d, target, cache)),
-                codomain: Box::new(freshen_above(lim, c, target, cache)),
+                codomain: Box::new({
+                    cache.binders_in_scope.extend(name.clone());
+                    let codomain = freshen_above(lim, c, target, cache);
+                    if name.is_some() {
+                        cache.binders_in_scope.pop();
+                    }
+                    codomain
+                }),
             };
             // A scheme binds its witnesses, so each instantiation owes itself its own —
             // `box`'s scheme is one sum, and sharing its binders would make every `box`
@@ -503,12 +515,18 @@ pub fn freshen_above(
                 .map(|t| freshen_above(lim, t, target, cache))
                 .collect(),
         ),
-        Type::Nominal(decl, args) => Type::Nominal(
-            decl.clone(),
-            args.iter()
-                .map(|t| freshen_above(lim, t, target, cache))
-                .collect(),
-        ),
+        Type::Nominal(decl, args, names) => {
+            let base = cache.binders_in_scope.len();
+            let mut out = Vec::with_capacity(args.len());
+            for (i, t) in args.iter().enumerate() {
+                out.push(freshen_above(lim, t, target, cache));
+                if let Some(rank) = decl.binder_rank(i) {
+                    cache.binders_in_scope.push(names[rank].clone());
+                }
+            }
+            cache.binders_in_scope.truncate(base);
+            Type::Nominal(decl.clone(), out, names.clone())
+        }
         Type::Split { input, output } => Type::Split {
             input: Box::new(freshen_above(lim, input, target, cache)),
             output: Box::new(freshen_above(lim, output, target, cache)),
@@ -568,9 +586,15 @@ pub fn freshen_above(
                 return existing.clone();
             }
             let telescope = cache
-                .param_telescope
-                .clone()
-                .unwrap_or_else(Telescope::empty);
+                .binders_in_scope
+                .iter()
+                .fold(
+                    cache
+                        .param_telescope
+                        .clone()
+                        .unwrap_or_else(Telescope::empty),
+                    |t, b| t.extended(b.clone()),
+                );
             let out = match target {
                 FreshenLevel::At(at) => Type::Infer(InferVar::fresh_in(at, &telescope)),
                 _ if param.level() == lim + 1 => Type::Infer(InferVar::fresh_in(

@@ -2645,7 +2645,7 @@ mod tests {
             )
         };
         let argument = refine(Type::Base(BaseType::Int), "p");
-        let boxed = Type::Nominal(decl, vec![argument]);
+        let boxed = Type::nominal(decl, vec![argument]);
         assert_eq!(arms_variant(&[], &refine(boxed.clone(), "q")), boxed);
     }
 
