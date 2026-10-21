@@ -182,8 +182,8 @@ materialized types. Fixed-polarity permutation and duplication laws are also rep
 properties. Agreement after materialization alone would not prove those laws.
 
 The comparison boundary matters. Rust carries inference-variable sets, kinding constraints,
-history slots, function names, sum binders, `domains_disagree` and a `combined` diagnostic
-snapshot that this `CompactTy` does not model. The encoder also maps Rust's `Plain` and
+history and nominal slots, function names, sum binders, `domains_disagree` and a `combined`
+diagnostic snapshot that this `CompactTy` does not model. The encoder also maps Rust's `Plain` and
 `Data` kinds to the model's `data`. Model equivalence is therefore not equality of complete
 Rust `CompactType` values.
 
@@ -269,6 +269,26 @@ The induction `bounds_merge` varies the bound's side independently of merge pola
 The off-diagonal cases support function domains, where polarity and subtype direction reverse
 and data-function domains require both directions. The proof reasons about materialized types
 rather than assuming that `Subtyping` reflects into `absorbedBy`.
+
+### Rust absorption checks
+
+`CompactType::is_below(a, b)` tests whether the positive merge of `a` and `b` is `equiv` to `b`.
+Its debug assertion requires both operands to satisfy `denotes_a_type`. That predicate checks
+shape compatibility; it permits unresolved function kinds and does not establish the recursive
+data-domain agreement required by the [bound theorem](#bound-and-leastness-hypotheses).
+
+The `Enumerated`/`SubtypesOf` kind meet retains candidates that pass this test.
+`relate_params_by_bounds` also uses it: at a negative position, it retains a parameter alone
+when a nonrecursive compacted bound passes the test against the other contributions.
+Both callers check `denotes_a_type`. Neither separately establishes the theorem's kind-resolution
+and domain-agreement hypotheses. Their use of absorption as subtyping requires an additional
+soundness argument covering Rust's represented fields.
+
+`data_domains_disagree` compares refinements, atoms and immediate record keys after excluding
+domains that only name a variable or witness. It does not recurse into record field types.
+A false result therefore does not establish recursive domain agreement. An incorrect positive
+answer from `is_below` can retain a candidate outside a kind bound or discard a parameter's
+incompatible companion constraint.
 
 ### The fn slot holds one domain
 
