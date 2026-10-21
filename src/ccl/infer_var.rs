@@ -626,6 +626,18 @@ pub struct InferVar {
     /// obligation holds its output `Type`, which holds a variable, which holds the
     /// obligation.
     pub watches: RefCell<Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>>,
+    /// Whether the variable **names one data domain**: it was minted for a
+    /// [`Type::SharedHole`] written as a function annotation's domain, which is how lowering
+    /// claims that the positions annotated with that id are one domain. A data domain is
+    /// invariant, so the claim is an equation, and an invariant domain edge between this
+    /// variable and a domain is drawn in both directions
+    /// ([`domains_equate`](crate::ccl::infer::solver::constrain::domains_equate)).
+    ///
+    /// An unmarked variable at a domain may receive several domains deliberately — a
+    /// conditional collection's arms, a domain-generic consumer's parameter — so its edges
+    /// stay one-way. Set once, at minting, so the edge an equation takes does not depend on
+    /// when it is drawn.
+    named_domain: std::cell::Cell<bool>,
 }
 
 thread_local! {
@@ -759,6 +771,7 @@ impl InferVar {
             telescope: telescope.clone(),
             bounds: RefCell::new(InferBounds::default()),
             watches: RefCell::new(Vec::new()),
+            named_domain: std::cell::Cell::new(false),
         });
         ACTIVE_ARENA.with(|slot| {
             if let Some(vars) = slot.borrow_mut().as_mut() {
@@ -776,6 +789,16 @@ impl InferVar {
     /// The scope level the variable belongs to.
     pub fn level(&self) -> Level {
         self.level.get()
+    }
+
+    /// Whether the variable names one data domain ([`InferVar::named_domain`]).
+    pub fn names_domain(&self) -> bool {
+        self.named_domain.get()
+    }
+
+    /// Mark the variable as naming one data domain ([`InferVar::named_domain`]).
+    pub(crate) fn mark_named_domain(&self) {
+        self.named_domain.set(true);
     }
 
     /// Move the variable down to `level` if it sits above it. A monomorphic binding

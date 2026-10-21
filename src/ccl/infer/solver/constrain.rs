@@ -30,7 +30,7 @@ use crate::ccl::{
 use super::barrier::EdgeReport;
 use super::smt::{ScopeEnv, SmtError};
 use super::traits::{
-    Trait, link_barrier_watches, link_watches, notify_barrier_lower, notify_lower,
+    Trait, link_barrier_watches, link_watches, notify_barrier_lower, notify_lower, notify_upper,
 };
 use super::type_level;
 use crate::ccl::FieldKey;
@@ -976,6 +976,29 @@ fn constrain_type_kinds(
     }
 }
 
+/// Whether an invariant domain edge between `d0` and `d1` is an equation, drawn in both
+/// directions, rather than a bound recorded one way.
+///
+/// Between two domains that are not variables it is. A variable at a domain may receive
+/// several domains deliberately — a conditional collection's arms, a domain-generic
+/// consumer's parameter — so an edge against one is one-way, and the reverse obligation is
+/// discharged at materialization. The exception is a variable that names one domain
+/// ([`InferVar::names_domain`]): lowering wrote the claim that its positions are one domain,
+/// and that holds against every domain the variable meets.
+///
+/// Never between a named domain and a **bound witness**. A sum's domain is its binder's
+/// reference, and entering a sum is a term (`src/ccl/design/type-inference.md`, "Only a
+/// term builds a sum"), so an equation between that reference and a free variable is an
+/// escape of the binder rather than a claim about two positions.
+pub(crate) fn domains_equate(d0: &Type, d1: &Type) -> bool {
+    let witness = |d: &Type| matches!(d.peel_refinements(), Type::WitnessRef(_));
+    match (d0, d1) {
+        (Type::Infer(a), Type::Infer(b)) => a.names_domain() && b.names_domain(),
+        (Type::Infer(v), other) | (other, Type::Infer(v)) => v.names_domain() && !witness(other),
+        _ => true,
+    }
+}
+
 /// Check one candidate against a kind: equality for enumerations, a subtype edge for
 /// `SubtypesOf`, or structural membership for `UIntRanges` and `Type`.
 ///
@@ -1245,7 +1268,11 @@ fn constrain_go_impl(
             // the position. A kind nothing has reached yet is not known to be a collection,
             // and the reverse obligation a variable's domain owes is discharged where every
             // contribution to it meets.
-            let invariant_domains = k0.resolved().is_data() || k1.resolved().is_data();
+            let invariant_domains = k0.resolved().is_data()
+                || k1.resolved().is_data()
+                || [d0, d1]
+                    .iter()
+                    .any(|d| matches!(&***d, Type::Infer(v) if v.names_domain()));
             let cod_sl = sl.aligned(n0, n1);
             // Descent opens (`src/ccl/design/type-inference.md`, "Where the
             // conversions run"): a *closed* codomain — one whose refinements
@@ -1338,10 +1365,10 @@ fn constrain_go_impl(
                     let decided = cache
                         .swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))
                         .and_then(|()| {
-                            if matches!(**d0, Type::Infer(_)) || matches!(**d1, Type::Infer(_)) {
-                                Ok(())
-                            } else {
+                            if domains_equate(d0, d1) {
                                 constrain_go(d0, d1, sl, sr, cache, scope)
+                            } else {
+                                Ok(())
                             }
                         });
                     // Whichever edge found the two domains unequal, the report is the
@@ -1640,6 +1667,8 @@ fn constrain_go_impl(
             };
             // The arriving type may be the answer to a kinding edge this variable holds.
             answer_type_kinds(lv)?;
+            // A collection above a watched operand answers a trait that reads collections.
+            notify_upper(lv, rhs, cache)?;
             // **No join here.** A variable's lower bounds are joined where every other
             // join is: at compaction, off these same bounds. Assembling one here as well
             // would compute it twice, by two rules, and — because this arm runs again on

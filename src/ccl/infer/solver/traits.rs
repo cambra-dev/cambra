@@ -163,6 +163,22 @@ pub struct TraitDecl {
     pub named: Vec<(SmolStr, Rc<TraitRequirement>)>,
     /// Which products satisfy the trait when their components do.
     pub products: ProductReading,
+    /// Whether a structural collection satisfies the trait as itself.
+    pub collections: CollectionReading,
+}
+
+/// Whether a structural collection — a data function, a sum over one, or a feed's
+/// collection — satisfies a trait without an instance (`src/ccl/design/type-inference.md`,
+/// "A collection is answered off the table").
+///
+/// Only `Iterable` has a reading: a collection iterates itself, so its `Elements` is the
+/// collection and `elements` is the identity, which coalescing drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionReading {
+    /// No collection satisfies the trait without an instance.
+    None,
+    /// A collection satisfies `Iterable` with `Elements` the collection itself.
+    ItsOwnElements,
 }
 
 /// Which products a trait's product rule reads: a product satisfies the trait when its
@@ -228,6 +244,7 @@ struct CompilerTraits {
     equatable: Trait,
     orderable: Trait,
     negatable: Trait,
+    iterable: Trait,
     /// Every instance of these, which every program has.
     instances: Rc<InstanceTable>,
 }
@@ -235,6 +252,12 @@ struct CompilerTraits {
 thread_local! {
     static COMPILER_TRAITS: CompilerTraits = CompilerTraits::build();
 }
+
+/// `Iterable`'s function, the collection a loop walks.
+pub const ITERABLE_ELEMENTS: &str = "elements";
+
+/// `Iterable`'s associated type, the type of what [`ITERABLE_ELEMENTS`] returns.
+pub const ITERABLE_ELEMENTS_ASSOC: &str = "Elements";
 
 impl CompilerTraits {
     fn build() -> CompilerTraits {
@@ -377,6 +400,37 @@ impl CompilerTraits {
             )],
             &mut instances,
         );
+        // `for x in c` and a comprehension's `for` clause (`docs/chl-spec.md`, "4.6 `for` —
+        // iteration"): `elements` is the collection the loop walks, its `Elements`. A
+        // structural collection is answered by the collection reading and has no row; a
+        // nominal type's rows are its instances.
+        let iterable = {
+            let c = TypeParam::declared("C");
+            let elements = TypeParam::declared("Elements");
+            Trait::compiler(TraitDecl {
+                module: vec![SmolStr::new_static(COMPILER_MODULE)],
+                name: "Iterable".into(),
+                span: Span::new(chl_parser::FileId::ROOT, 0, 0),
+                operands: vec![Rc::clone(&c)],
+                assocs: vec![(
+                    Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into()),
+                    Rc::clone(&elements),
+                )],
+                functions: vec![TraitFunction {
+                    name: ITERABLE_ELEMENTS.into(),
+                    signature: Signature {
+                        params: Vec::new(),
+                        inputs: vec![Type::Param(c)],
+                        output: Type::Param(elements),
+                        requires: Vec::new(),
+                    },
+                }],
+                requires: Vec::new(),
+                named: Vec::new(),
+                products: ProductReading::None,
+                collections: CollectionReading::ItsOwnElements,
+            })
+        };
         CompilerTraits {
             addable,
             addable_refined,
@@ -387,6 +441,7 @@ impl CompilerTraits {
             equatable,
             orderable,
             negatable,
+            iterable,
             instances: Rc::new(instances),
         }
     }
@@ -466,6 +521,7 @@ impl OperatorTrait<'_> {
             requires,
             named: Vec::new(),
             products: self.products,
+            collections: CollectionReading::None,
         });
         for (bases, associated, primitive) in rows {
             assert!(
@@ -546,6 +602,15 @@ impl Trait {
     pub fn negatable() -> Trait {
         COMPILER_TRAITS.with(|c| c.negatable.clone())
     }
+    /// The trait a loop's source satisfies: `Iterable(C, Elements=E)`.
+    pub fn iterable() -> Trait {
+        COMPILER_TRAITS.with(|c| c.iterable.clone())
+    }
+
+    /// Whether a structural collection satisfies this trait as itself.
+    pub fn reads_collections(&self) -> bool {
+        self.0.collections == CollectionReading::ItsOwnElements
+    }
 
     /// Every trait the compiler provides, `AddableRefined` included.
     pub fn compiler_traits() -> Vec<Trait> {
@@ -560,6 +625,7 @@ impl Trait {
                 c.equatable.clone(),
                 c.orderable.clone(),
                 c.negatable.clone(),
+                c.iterable.clone(),
             ]
         })
     }
@@ -1330,6 +1396,9 @@ pub struct TraitObligation {
     /// rule was applied at, and the requirement sweep, which has no base intersection to
     /// take once an obligation is answered by the rule.
     product_rule: RefCell<ProductRule>,
+    /// Where the trait's **collection rule** stands: the candidate beside the rows that
+    /// answers a structural collection ([`CollectionRule`]).
+    collection_rule: Cell<CollectionRule>,
     /// The type positions this obligation associates, one per name the trait
     /// declares. Empty for a trait that is a pure requirement — the mechanism then
     /// still narrows and still rejects, it simply determines nothing.
@@ -1374,6 +1443,34 @@ enum ProductRule {
     /// A product arrived, recorded here with its components' refinements peeled, and the
     /// rule's conditions are minted ([`TraitObligation::apply_product_rule`]).
     Applied(Type),
+}
+
+/// The state of an obligation's collection rule, the candidate that answers a structural
+/// collection (`src/ccl/design/type-inference.md`, "A collection is answered off the table").
+///
+/// The rows key on bases and nominal types, so a contribution decides between them and the
+/// rule as it does for the product rule. Only a trait with a collection reading has the rule
+/// ([`Trait::reads_collections`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionRule {
+    /// The trait has no collection reading.
+    Absent,
+    /// No contribution has arrived to decide between the rows and the rule.
+    Open,
+    /// A base or a nominal type arrived, so only the rows can answer.
+    RuledOut,
+    /// A collection arrived, and the operand is related to `Elements`.
+    Applied,
+}
+
+impl CollectionRule {
+    fn for_trait(trait_: &Trait) -> Self {
+        if trait_.reads_collections() {
+            CollectionRule::Open
+        } else {
+            CollectionRule::Absent
+        }
+    }
 }
 
 /// A refinement an operator states of the associated type it asks for, which no instance
@@ -1443,6 +1540,7 @@ impl TraitObligation {
             } else {
                 ProductRule::Absent
             }),
+            collection_rule: Cell::new(CollectionRule::for_trait(&trait_)),
             assoc: assoc
                 .into_iter()
                 .map(|(name, ty)| AssocPosition {
@@ -1486,6 +1584,7 @@ impl TraitObligation {
             arg_slots: RefCell::new(original.arg_slots.borrow().clone()),
             operands: RefCell::new(Vec::new()),
             product_rule: RefCell::new(original.product_rule.borrow().clone()),
+            collection_rule: Cell::new(original.collection_rule.get()),
             assoc: original
                 .assoc
                 .iter()
@@ -1657,6 +1756,8 @@ impl TraitObligation {
         } else {
             ProductRule::Absent
         };
+        self.collection_rule
+            .set(CollectionRule::for_trait(&self.trait_));
         let kept: Vec<Rc<TraitRequirement>> = self
             .context
             .borrow()
@@ -1955,22 +2056,30 @@ impl TraitObligation {
         }
     }
 
-    /// Rule the product rule out, unless it is absent or already applied.
+    /// Rule the product rule out, unless it is absent or already applied, and the
+    /// collection rule likewise.
     fn rule_out_product_rule(&self) {
         let mut rule = self.product_rule.borrow_mut();
         if matches!(*rule, ProductRule::Open | ProductRule::Pending(_)) {
             *rule = ProductRule::RuledOut;
         }
+        if self.collection_rule.get() == CollectionRule::Open {
+            self.collection_rule.set(CollectionRule::RuledOut);
+        }
     }
 
-    /// Whether every candidate is gone: no row, no assumption, and no product rule
-    /// that could still answer.
+    /// Whether every candidate is gone: no row, no assumption, and no product or
+    /// collection rule that could still answer.
     fn exhausted(&self) -> bool {
         self.candidates.borrow().is_empty()
             && self.assumptions.borrow().is_empty()
             && !matches!(
                 *self.product_rule.borrow(),
                 ProductRule::Open | ProductRule::Pending(_) | ProductRule::Applied(_)
+            )
+            && !matches!(
+                self.collection_rule.get(),
+                CollectionRule::Open | CollectionRule::Applied
             )
     }
 
@@ -2007,7 +2116,7 @@ impl TraitObligation {
     /// product answered, whose conditions state it instead
     /// ([`narrow_product`](Self::narrow_product)).
     pub(super) fn stated_requirement(&self) -> Option<TraitRequirement> {
-        if self.answered_by_product().is_some() {
+        if self.answered_by_product().is_some() || self.answered_by_collection() {
             return None;
         }
         let arity = self.trait_.arity();
@@ -2112,6 +2221,13 @@ impl TraitObligation {
                 ProductRule::Open | ProductRule::Pending(_) => *rule = ProductRule::RuledOut,
                 ProductRule::Absent | ProductRule::RuledOut => {}
             }
+        }
+        // Likewise a collection the rule answered is contradicted by a base or a nominal
+        // type, which before any collection rules the rule out.
+        match self.collection_rule.get() {
+            CollectionRule::Applied => return self.reject(pos, &head.as_type()),
+            CollectionRule::Open => self.collection_rule.set(CollectionRule::RuledOut),
+            CollectionRule::Absent | CollectionRule::RuledOut => {}
         }
         // Read before the mutable borrow: "what this position could have accepted" is
         // only meaningful before the contribution rules rows out.
@@ -2334,6 +2450,64 @@ impl TraitObligation {
         Ok(())
     }
 
+    /// Answer the obligation by the collection rule: `contribution`, arriving at `pos`, is a
+    /// structural collection, so the operand is its own `Elements`.
+    ///
+    /// The first collection relates the operand's variable to `Elements`, and every later
+    /// contribution reaches `Elements` along that edge. Copying each contribution instead
+    /// would lose the edge substitutions it was recorded under: a group-by's group is
+    /// recorded with its key binder discharged by the edge, and the bare bound names the
+    /// binder free.
+    fn narrow_collection(
+        self: &Rc<Self>,
+        pos: u8,
+        contribution: &Type,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        match self.collection_rule.get() {
+            CollectionRule::Absent | CollectionRule::RuledOut => {
+                return self.reject(pos, contribution);
+            }
+            CollectionRule::Applied => return Ok(()),
+            CollectionRule::Open => {}
+        }
+        self.collection_rule.set(CollectionRule::Applied);
+        self.candidates.borrow_mut().clear();
+        self.rule_out_product_rule();
+        let operand = self.operands.borrow()[pos as usize]
+            .clone()
+            .expect("a contribution arrives at a position `watch` has bound");
+        let elements = self
+            .assoc
+            .iter()
+            .find(|p| p.name == Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into()))
+            .expect("a trait with a collection reading associates `Elements`")
+            .ty
+            .borrow()
+            .clone();
+        let _f = provenance::enter(
+            self.operator_node_id,
+            "infer.apply_collection_rule",
+            provenance::Nature::Machinery,
+        );
+        constrain_subtype(&operand, &elements, cache)
+    }
+
+    /// Whether the collection rule answers this obligation.
+    pub(super) fn answered_by_collection(&self) -> bool {
+        self.collection_rule.get() == CollectionRule::Applied
+    }
+
+    /// Whether the collection rule answers this obligation or still may. Either way the
+    /// operand is no requirement of a base: the rule accepts every collection, which the
+    /// requirement sweep's intersection of bases cannot state.
+    pub(super) fn collection_rule_can_answer(&self) -> bool {
+        matches!(
+            self.collection_rule.get(),
+            CollectionRule::Open | CollectionRule::Applied
+        )
+    }
+
     /// The product the product rule was applied at, if a product has arrived.
     pub(super) fn answered_by_product(&self) -> Option<Type> {
         match &*self.product_rule.borrow() {
@@ -2516,6 +2690,11 @@ impl TraitObligation {
     /// its `requires` clause names, and one that names none leaves the position
     /// open.
     fn agreed_assoc(&self, name: &Assoc) -> Option<Type> {
+        // The collection rule is a candidate beside the rows, and what it associates is the
+        // operand itself, which no row states.
+        if self.collection_rule.get() == CollectionRule::Open {
+            return None;
+        }
         let mut settled: Option<Type> = None;
         let mut agree = |ty: Type| match &settled {
             None => {
@@ -2919,6 +3098,7 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
             // An argument position is no requirement on its own: a type variable in a head
             // admits what no row lists, so its accepted heads are no intersection to take.
             if obligation.answered_by_product().is_some()
+                || obligation.collection_rule_can_answer()
                 || !obligation.assumptions.borrow().is_empty()
                 || obligation.is_arg_slot(*pos)
                 || obligation.has_variable_at(*pos)
@@ -3477,7 +3657,7 @@ pub(super) fn link_watches(
     // offered — it arrived before the edge existed. A type parameter is replayed
     // with the bases: missing one would leave an operator on an unbounded parameter
     // unchecked.
-    let (known, params, below, barriers_below) = {
+    let (known, params, collections, below, barriers_below) = {
         let bounds = lower.bounds.borrow();
         let known: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
             .lower()
@@ -3489,6 +3669,15 @@ pub(super) fn link_watches(
             .lower()
             .iter()
             .filter(|b| matches!(offered(&b.ty), Offered::Param(_)))
+            .map(|b| (b.ty.clone(), b.origin))
+            .collect();
+        // A collection offers no head, and the collection rule reads it all the same, from
+        // either side ([`notify_upper`]).
+        let collections: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
+            .lower()
+            .iter()
+            .chain(bounds.upper().iter())
+            .filter(|b| is_structural_collection(&b.ty))
             .map(|b| (b.ty.clone(), b.origin))
             .collect();
         let below: Vec<Rc<InferVar>> = bounds
@@ -3507,7 +3696,7 @@ pub(super) fn link_watches(
                 _ => None,
             })
             .collect();
-        (known, params, below, barriers_below)
+        (known, params, collections, below, barriers_below)
     };
     for (obligation, pos) in &added {
         for (known, origin) in &known {
@@ -3515,6 +3704,11 @@ pub(super) fn link_watches(
         }
         for (param, origin) in &params {
             deliver(obligation, *pos, param, *origin, cache)?;
+        }
+        if obligation.trait_.reads_collections() {
+            for (collection, origin) in &collections {
+                deliver(obligation, *pos, collection, *origin, cache)?;
+            }
         }
     }
     // Transitivity: anything flowing into `lower` flows into `upper` too.
@@ -3612,6 +3806,34 @@ pub(super) fn notify_lower(
     Ok(())
 }
 
+/// Deliver an upper bound to every obligation watching `var` that reads collections.
+///
+/// The rows key on what reaches a position, so every other obligation reads lower bounds
+/// only. The collection rule asks only whether the position holds collections, and a
+/// structural collection above `var` settles that as one below it does: only a collection
+/// is below a collection. A bounded annotation `xs <: Map(K, V)` is the case with no lower
+/// bound at all.
+pub(super) fn notify_upper(
+    var: &Rc<InferVar>,
+    bound: &Type,
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
+    if !is_structural_collection(bound) {
+        return Ok(());
+    }
+    let watches: Vec<(Rc<TraitObligation>, u8)> = var
+        .watches
+        .borrow()
+        .iter()
+        .filter(|(obligation, _)| obligation.trait_.reads_collections())
+        .cloned()
+        .collect();
+    for (obligation, pos) in watches {
+        deliver(&obligation, pos, bound, None, cache)?;
+    }
+    Ok(())
+}
+
 /// Offer `contribution` to `obligation` at position `pos`.
 ///
 /// A type parameter offers its bound: a value of a bounded parameter's type is a
@@ -3625,6 +3847,16 @@ fn deliver(
 ) -> Result<(), ConstrainError> {
     if obligation.is_arg_slot(pos) {
         let delivered = obligation.narrow_arg(pos, contribution, cache);
+        if delivered.is_err() {
+            cache.note_failure_with(value, Some(obligation.required_at()));
+        }
+        return delivered;
+    }
+    if obligation.trait_.reads_collections()
+        && !obligation.has_variable_at(pos)
+        && is_structural_collection(contribution)
+    {
+        let delivered = obligation.narrow_collection(pos, contribution, cache);
         if delivered.is_err() {
             cache.note_failure_with(value, Some(obligation.required_at()));
         }
@@ -3657,6 +3889,20 @@ fn deliver(
         cache.note_failure_with(value, Some(obligation.required_at()));
     }
     delivered
+}
+
+/// Whether `ty`, refinements peeled, is a structural collection: a data function, a sum over
+/// one, or a feed handle, which reads as its collection. A function whose kind is not settled
+/// yet counts, and a compute function does not: a callable capability is no collection.
+pub fn is_structural_collection(ty: &Type) -> bool {
+    match ty.peel_refinements() {
+        Type::Fun { fun_kind, .. } => fun_kind.resolved() != crate::ccl::ty::KindPin::Compute,
+        Type::History {
+            history_kind: crate::ccl::HistoryKind::Append,
+            ..
+        } => true,
+        _ => false,
+    }
 }
 
 /// The type `ty` holds at `path`, argument indices into the nominal types along the way.
