@@ -167,6 +167,9 @@ fn blame_node_for_place(
             }
             Type::Split { input, output } => mentions(input, uid) || mentions(output, uid),
             Type::DepTuple(cs) => cs.iter().any(|(_, t)| mentions(t, uid)),
+            Type::Family { binders, body } => {
+                binders.iter().any(|(_, t)| mentions(t, uid)) || mentions(body, uid)
+            }
             Type::Record(fields) => fields.iter().any(|(_, t)| mentions(t, uid)),
             Type::Variant(arms, _) => arms.iter().any(|(_, t)| mentions(t, uid)),
             Type::WitnessRef(_) | Type::WitnessProjection(_) | Type::FamilyApp(_) => false,
@@ -469,6 +472,9 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
         // is rather than reconcile two arms. No `ctx_label` either: the report's span
         // underlines the expression already, so rendering it again says the same thing
         // twice, once in source and once in CCL.
+        ConstrainError::NotCompiledYet(what) => {
+            InferError::Unsupported(format!("{what} is not compiled yet"))
+        }
         ConstrainError::NoJoinOverBinder {
             binders,
             refinement,

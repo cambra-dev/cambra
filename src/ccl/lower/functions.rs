@@ -445,6 +445,50 @@ pub(super) fn refuse_capitalized_lambda_binder(params: &[Param]) -> Result<(), L
     }
 }
 
+/// Refuse a value binder, lowercase by its name's case, whose annotation is a kind, as in
+/// `\\t: Type -> …`: a value's annotation is a type (`docs/chl-spec.md`, "Kinds and bounds").
+pub(super) fn refuse_kind_on_value_binder(
+    name: &str,
+    annotation: Option<&Spanned<ChlExpr>>,
+) -> Result<(), LoweringError> {
+    match annotation {
+        Some(kind) if is_kind(&kind.node) => Err(LoweringError::unsupported(
+            kind.span,
+            format!(
+                "`{name}` is lowercase, so it binds a value, and its annotation is a kind; a \
+                 value's annotation is a type, and a type parameter is capitalized"
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// [`refuse_kind_on_value_binder`] over each of a lambda's or a `def`'s value parameters.
+pub(super) fn refuse_kind_on_value_params(params: &[Param]) -> Result<(), LoweringError> {
+    params.iter().try_for_each(|p| {
+        refuse_kind_on_value_binder(&p.name, p.annotation.as_ref().map(|a| &a.ty))
+    })
+}
+
+/// Refuse a binder in a type, `(k: K)`, whose name or annotation is a type's: it binds a value,
+/// so its name is lowercase and its annotation a type (`docs/chl-spec.md`, "Kinds and bounds").
+pub(super) fn refuse_misannotated_type_binder(
+    name: &Spanned<SmolStr>,
+    ty: &Spanned<ChlExpr>,
+) -> Result<(), LoweringError> {
+    if is_type_name(&name.node) {
+        return Err(LoweringError::unsupported(
+            name.span,
+            format!(
+                "`{0}` is capitalized, so it names a type; `({0}: K)` binds a value of `K`, and \
+                 its name is lowercase",
+                name.node
+            ),
+        ));
+    }
+    refuse_kind_on_value_binder(&name.node, Some(ty))
+}
+
 /// A `def` with type parameters is a `let` annotated with a polymorphic type that
 /// binds them, over a `Hole` body: the lambda's own annotations already state the
 /// signature (`src/ccl/design/type-parameters.md`, "Lowering"). The returned
@@ -460,6 +504,7 @@ pub(super) fn lower_def(
     body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<(Expr, Option<Type>), LoweringError> {
+    refuse_kind_on_value_params(params)?;
     if type_params.is_empty() && requires.is_empty() {
         return Ok((
             lower_function_body(fn_span, params, output, body, ctx)?,

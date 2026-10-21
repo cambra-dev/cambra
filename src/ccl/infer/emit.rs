@@ -577,11 +577,13 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             refinements.try_rewrite_each(|_, r| emit_bare_predicate(r, &domain, ctx))?;
             emit_annotation_predicates(inner, ctx)
         }
+        // A codomain reading the binder is typed opened, with the binder in scope at the
+        // domain, and closed again.
         Type::Fun {
+            name,
             fun_kind,
             domain: d,
             codomain: c,
-            ..
         } => {
             for w in fun_kind.witnesses_mut() {
                 for t in w.types_mut() {
@@ -589,7 +591,75 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
                 }
             }
             emit_annotation_predicates(d, ctx)?;
-            emit_annotation_predicates(c, ctx)
+            match name {
+                Some(b) if crate::ccl::subst::references_enclosing_function(c) => {
+                    let bound = ctx.normalize(&ctx.refinement_domain(d));
+                    let mut opened = crate::ccl::subst::open_pi_binder(
+                        &crate::ccl::subst::Mapping::Rename(b.clone()),
+                        c,
+                    );
+                    ctx.scoped(b, &bound, |ctx| {
+                        emit_annotation_predicates(&mut opened, ctx)
+                    })?;
+                    **c = crate::ccl::subst::close_pi_binder(b, &opened);
+                    Ok(())
+                }
+                _ => emit_annotation_predicates(c, ctx),
+            }
+        }
+        // The body is typed opened, with each binder in scope at its domain, and closed again.
+        Type::Family { binders, body } => {
+            for (_, t) in binders.iter_mut() {
+                emit_annotation_predicates(t, ctx)?;
+            }
+            // A constant family's body reads no binder, so it is typed where the family stands.
+            if binders.iter().all(|(n, _)| n.is_none()) {
+                return emit_annotation_predicates(body, ctx);
+            }
+            let names: Vec<Name> = binders
+                .iter()
+                .map(|(n, _)| {
+                    n.clone()
+                        .expect("a family's binders are named until inference ends")
+                })
+                .collect();
+            let bounds: Vec<Type> = binders
+                .iter()
+                .map(|(_, t)| ctx.normalize(&ctx.refinement_domain(t)))
+                .collect();
+            let mut opened = crate::ccl::subst::open_family_body(binders.len(), body, |j| {
+                crate::ccl::subst::Mapping::Rename(names[j].clone())
+            });
+            fn under<C: Typing>(
+                scope: &[(Name, Type)],
+                body: &mut Type,
+                ctx: &mut C,
+            ) -> Result<(), LocatedInferError> {
+                match scope.split_first() {
+                    None => emit_annotation_predicates(body, ctx),
+                    Some(((name, bound), rest)) => {
+                        ctx.scoped(name, bound, |ctx| under(rest, body, ctx))
+                    }
+                }
+            }
+            let scope: Vec<(Name, Type)> = names.iter().cloned().zip(bounds).collect();
+            under(&scope, &mut opened, ctx)?;
+            let enclosing: Vec<Option<Name>> = names.into_iter().map(Some).collect();
+            **body = crate::ccl::subst::close_pi_binders(&enclosing, &opened);
+            Ok(())
+        }
+        // A family's arguments are terms the declaration writes, typed where they stand.
+        Type::FamilyApp(app) => {
+            let memo = ctx.pred_memo();
+            let mut typed = Ok(());
+            for arg in &mut app.args {
+                memo.rebuild_always(arg, |term| {
+                    if typed.is_ok() {
+                        typed = ctx.subexpr(term).map(|_| ());
+                    }
+                });
+            }
+            typed
         }
         Type::Tuple(ts) | Type::OpenTuple(ts) | Type::Nominal(_, ts) => {
             for t in ts.iter_mut() {
@@ -626,7 +696,6 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         | Type::ChanDom(..)
         | Type::WitnessRef(_)
         | Type::WitnessProjection(_)
-        | Type::FamilyApp(_)
         | Type::Txn
         | Type::Hole
         | Type::BarrierVar(_)
@@ -3040,7 +3109,7 @@ fn emit_nominal_scrutinee<C: Typing>(
     ctx: &mut C,
 ) -> Result<(), LocatedInferError> {
     let scrut_ty = emit_value_read(scrut, ctx)?;
-    let args: Vec<Type> = decl.params.iter().map(|_| ctx.fresh()).collect();
+    let args = fresh_nominal_args(decl, ctx);
     let expected = Type::Nominal(decl.clone(), args.clone());
     ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
     for b in branches.iter_mut() {
@@ -3245,6 +3314,7 @@ fn resolve_method<C: Typing>(
     arg_ty: &Type,
     ctx: &mut C,
 ) -> Result<(), LocatedInferError> {
+    let node = function.node_id();
     let TypedExprNode::Method { name, args, .. } = &function.node else {
         unreachable!("`resolve_method` is called on a `Method`")
     };
@@ -3283,7 +3353,7 @@ fn resolve_method<C: Typing>(
     let Some(at) = reached_candidate(candidates, &decl, ctx) else {
         return Err(ctx.raise(InferError::UnresolvedMethod {
             method: name.clone(),
-            receiver: Some(decl.applied_to_params()),
+            receiver: Some(method_receiver(&decl, node)),
         }));
     };
     let chosen = candidates.swap_remove(at);
@@ -3312,6 +3382,18 @@ fn reached_candidate<C: Typing>(
         .iter()
         .position(|c| *c.decl == *decl && in_scope(c))
         .or_else(|| candidates.iter().position(|c| *c.decl == *decl && !c.copy))
+}
+
+/// `decl` applied to its own type parameters, the receiver an unresolved method call on it
+/// names. A family parameter is applied to terms naming its binders, which mint under the
+/// call's node.
+fn method_receiver(decl: &std::rc::Rc<crate::ccl::nominal::NominalDecl>, call: NodeId) -> Type {
+    let _g = crate::ccl::provenance::enter(
+        call,
+        "infer.method_receiver",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    decl.applied_to_params(&mut |n, ty| Expr::var(n).with_ty(ty))
 }
 
 /// Defer the method call whose placeholder is `function` until its receiver's type,
@@ -3353,7 +3435,7 @@ pub(super) fn defer_method(
             Some(at) => reached_target(&candidates[at], &name, args, ctx),
             None => Err(Box::new(InferError::UnresolvedMethod {
                 method: name.clone(),
-                receiver: Some(decl.applied_to_params()),
+                receiver: Some(method_receiver(&decl, node)),
             })),
         };
         reached_at.extend(at);
@@ -3581,7 +3663,7 @@ pub(super) fn emit_nominal_ctor<C: Typing>(
             decl.name
         )
     });
-    let args: Vec<Type> = decl.params.iter().map(|_| ctx.fresh()).collect();
+    let args = fresh_nominal_args(decl, ctx);
     let expected =
         crate::ccl::ccl_utils::strip_refinements(&decl.instantiate(&declared.payload(), &args));
     let expected = ctx.normalize(&expected);
@@ -3589,6 +3671,46 @@ pub(super) fn emit_nominal_ctor<C: Typing>(
         format!("the argument of constructor `{}::{ctor}`", decl.name)
     })?;
     Ok(Type::Nominal(decl.clone(), args))
+}
+
+/// A fresh argument for each parameter of `decl`: a variable, and for a family parameter the
+/// family over fresh binders whose body is a variable minted under them, so it may read them,
+/// as a function's codomain variable is minted inside its binder
+/// (`src/ccl/design/nominal-types.md`, "Family parameters").
+fn fresh_nominal_args<C: Typing>(
+    decl: &crate::ccl::nominal::NominalDecl,
+    ctx: &mut C,
+) -> Vec<Type> {
+    fn under<C: Typing>(binders: &[(Name, Type)], ctx: &mut C) -> Type {
+        match binders.split_first() {
+            None => ctx.fresh(),
+            Some(((name, domain), rest)) => ctx.scoped(name, domain, |ctx| under(rest, ctx)),
+        }
+    }
+    let mut args: Vec<Type> = decl
+        .params
+        .iter()
+        .map(|p| {
+            if p.arity == 0 {
+                ctx.fresh()
+            } else {
+                Type::Hole
+            }
+        })
+        .collect();
+    for (i, p) in decl.params.iter().enumerate() {
+        if p.arity == 0 {
+            continue;
+        }
+        let binders: Vec<(Name, Type)> = decl
+            .family_domains_at(i, &args)
+            .into_iter()
+            .map(|d| (Name::fresh("k"), d))
+            .collect();
+        let body = under(&binders, ctx);
+        args[i] = Type::family(binders, body);
+    }
+    args
 }
 
 /// What [`compose_chain`] reports back about the chain it walked.

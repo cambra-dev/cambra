@@ -1313,6 +1313,52 @@ fn a_lambda_below_a_refined_function_annotation() {
     );
 }
 
+/// A lambda's parameter states its type as a `def`'s does: refined, bounded, a parenthesised
+/// function type, and one of two parameters.
+#[rstest]
+#[case::refined(
+    indoc! {r#"
+        g = \x: {Int where _ > 0} -> x
+        g(3)
+    "#},
+    Value::Int(3),
+)]
+#[case::bounded(
+    indoc! {r#"
+        g = \x <: Int -> x
+        g(3)
+    "#},
+    Value::Int(3),
+)]
+#[case::a_function(
+    indoc! {r#"
+        g = \f: (Int => Int) -> f(1)
+        g(\x -> x + 4)
+    "#},
+    Value::Int(5),
+)]
+#[case::one_of_two(
+    indoc! {r#"
+        g = \x: {Int where _ > 0}, y -> x + y
+        g(2, 3)
+    "#},
+    Value::Int(5),
+)]
+fn a_lambda_parameter_states_its_type(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+#[test]
+fn a_lambda_parameter_s_type_is_checked_at_the_argument() {
+    check_compile_error(
+        indoc! {r#"
+            g = \x: {Int where _ > 0} -> x
+            g(-1)
+        "#},
+        "expected {Int | __elem > 0}, found Int@-1",
+    );
+}
+
 /// Uses typed at an exact function annotation the definition's own type is below
 /// without being an instance of. The body's type need not mention the annotation's
 /// codomain at all, and a record codomain may be narrower than the body's.
@@ -1576,12 +1622,8 @@ fn pi_typed_collection() -> Type {
 
 /// Infer and type-check `λ c : 𝐶 → body`, where `𝐶` is [`pi_typed_collection`].
 ///
-/// TODO: Bind a Pi's binder while typing its codomain's annotation predicates.
-///
-/// Construction closes `i` in the codomain to a `PiBound` reference, and
-/// `emit_annotation_predicates` descends into the codomain without opening it, so
-/// the reference reaches the `Var` lookup unbound. Inference reports `Unbound
-/// variable: 'i'` (the `PiBound` prints its hint), and every caller pins it.
+/// `emit_annotation_predicates` types the codomain's predicate opened, with `i` in scope at
+/// the keys.
 fn check_over_pi_typed_collection(body: Expr) {
     let mut expr = uniquify::run(Expr::lambda("c", pi_typed_collection(), body));
     infer(&mut expr, &mut TypeInferenceContext::new())
@@ -1594,10 +1636,8 @@ fn check_over_pi_typed_collection(body: Expr) {
 /// Nothing applies `c`, so the only predicate naming the binder `i` is the annotation's
 /// own codomain refinement, which is in scope under the Pi that binds it.
 ///
-/// No CHL spelling names a Pi binder in an annotation (`FullMap(K, V)` mints its own), so
-/// the tree is built directly.
+/// The tree is built directly, its binder spelled `i` by name.
 #[test]
-#[should_panic = "Unbound variable: 'i'"]
 fn a_pi_typed_collection_parameter() {
     check_over_pi_typed_collection(Expr::var("c"));
 }
@@ -1610,7 +1650,7 @@ fn a_pi_typed_collection_parameter() {
 /// handle a Pi-binder referenced in the collection's codomain. See
 /// also `collection_contains_of_an_inferred_pi_typed_collection`.
 #[test]
-#[should_panic = "Unbound variable: 'i'"]
+#[should_panic = "is not compiled yet"]
 fn collection_contains_of_a_pi_typed_collection() {
     check_over_pi_typed_collection(Expr::apply(
         Expr::var("c"),
@@ -1628,7 +1668,7 @@ fn collection_contains_of_a_pi_typed_collection() {
 /// collection Pi type into the non-Pi-type template of
 /// `collection_contains`: the bound naming `__iter_record` lands outside its scope.
 #[test]
-#[should_panic = "open bound recorded"]
+#[should_panic = "is not compiled yet"]
 fn collection_contains_of_an_inferred_pi_typed_collection() {
     let code = indoc! {r#"
         xs = [1, 2, 3, 4, 5]
@@ -1660,7 +1700,7 @@ fn collection_contains_of_an_inferred_pi_typed_collection() {
 /// function's codomain as-is, even though it has been removed from
 /// the context of its Pi-binder.
 #[test]
-#[should_panic = "open bound recorded"]
+#[should_panic = "is not compiled yet"]
 fn dependent_function_composition() {
     let fc = Expr::lambda(
         "f1",

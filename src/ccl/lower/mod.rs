@@ -512,6 +512,16 @@ pub struct LoweringContext {
     /// every other position refuses one (`docs/chl-spec.md`, "Tuple width").
     pub(super) open_tuples: OpenTuples,
 
+    /// The family parameters of the type declaration being lowered, each with its index
+    /// types: a family parameter is written applied, `V(k)` (`docs/chl-spec.md`, "Family
+    /// parameters").
+    pub(super) family_params: Vec<(SmolStr, Rc<crate::ccl::ty::TypeParam>, Vec<Type>)>,
+
+    /// The value binders a type written here is inside, innermost last, each with the type it
+    /// ranges over: `k` in `(k: K) |=> V(k)` and in `\k: K -> T`. A refinement and an
+    /// application of a family parameter read them.
+    pub(super) type_binders: Vec<(SmolStr, Type)>,
+
     /// The nominal types the module declares, by name (`docs/chl-spec.md`, "Declaring a
     /// nominal type"). Unlike an alias, a nominal type survives lowering as a
     /// [`Type::Nominal`] naming its declaration. Declared only at the top level, so never
@@ -1518,6 +1528,14 @@ fn lower_expr_inner(
             "`forall (T) V` is a polymorphic *type*; it is written in annotation \
              position, not as a value",
         )),
+        ChlExpr::TypeBinder { name, .. } => Err(LoweringError::unsupported(
+            expr.span,
+            format!(
+                "`{0}: T` binds a value in a type, as a function type's domain `({0}: K) |=> \
+                 V`, not as a value",
+                name.node
+            ),
+        )),
         // Attribute access `target.attr` → `Apply(target, Proj(k))`. The `Proj` images
         // the `.attr` access the user wrote.
         ChlExpr::Attribute {
@@ -1570,6 +1588,7 @@ fn lower_expr_inner(
         }
         ChlExpr::Lambda { params, body } => {
             refuse_capitalized_lambda_binder(params)?;
+            refuse_kind_on_value_params(params)?;
             lower_lambda(expr.span, params, body, ctx)
         }
         ChlExpr::UnaryOp { op, operand } => lower_unaryop(*op, operand, ctx),

@@ -1787,11 +1787,20 @@ impl TraitObligation {
     ) -> Rc<TraitObligation> {
         // A row's head is its type at any arguments, so the receiver's type picks it, and
         // selection reads no more of it: the method's own type states what `self` takes.
+        // A family parameter's head applies it to terms naming its binders, which mint here.
+        let _f = provenance::enter(
+            operator_node_id,
+            "infer.method_receiver",
+            provenance::Nature::Machinery,
+        );
         let candidates = call
             .rows
             .iter()
             .map(|row| {
-                let operands = vec![row.decl.applied_to_params()];
+                let operands = vec![
+                    row.decl
+                        .applied_to_params(&mut |n, ty| crate::ccl::Expr::var(n).with_ty(ty)),
+                ];
                 Rc::new(TraitInstance {
                     params: row.decl.params.clone(),
                     heads: operands.iter().map(InstanceHead::of_pattern).collect(),
@@ -3651,6 +3660,8 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                 // A nominal value is opaque: no operation reaches a component of it, so
                 // its arguments name no place inside it.
                 Type::Nominal(..) | Type::Split { .. } => {}
+                // A family stands only as a nominal type's argument, so no place is inside it.
+                Type::Family { .. } => {}
                 Type::Poly(_) => unreachable!("a polymorphic type is never a recorded bound"),
                 // `peel_refinements` returns a non-refinement by construction.
                 Type::Refinement(_, _) => unreachable!("refinements are peeled above"),
