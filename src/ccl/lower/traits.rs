@@ -322,6 +322,19 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
     }))
 }
 
+/// Make every data-function type in `ty` whose funkind is a hole a plain collection. An
+/// instance's associated type is one type at every use, and a funkind hole is a fresh kind per
+/// use, which a sum could pin after inference has read the instance
+/// (`docs/chl-spec.md`, "6.3 Direction: collection types [Decided]").
+fn close_kind_holes(ty: &mut Type) {
+    if let Type::Fun { fun_kind, .. } = ty
+        && matches!(fun_kind, crate::ccl::FunKind::Var(v) if v.is_hole())
+    {
+        *fun_kind = crate::ccl::FunKind::Data(None);
+    }
+    ty.walk_children_mut(close_kind_holes);
+}
+
 /// Lower one signature of `trait T(…)`, with its operands and associated types in scope,
 /// `names` naming them all.
 fn declare_function(
@@ -702,7 +715,8 @@ fn declare_instance(
                 format!("`{}` is defined twice in `impl {written}`", a.name),
             ));
         }
-        let ty = lower_type_expr(&a.value, ctx)?;
+        let mut ty = lower_type_expr(&a.value, ctx)?;
+        close_kind_holes(&mut ty);
         if mentions_refinement(&ty) {
             return Err(LoweringError::internal(
                 a.value.span,

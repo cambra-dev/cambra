@@ -2582,6 +2582,13 @@ whose result is a collection. A function-valued parameter can carry a kind varia
 argument determines the kind. Inference must preserve those declarations rather than infer kind
 solely from the domain's shape or a later consumer's intent.
 
+An annotation carries a kind variable in one form: the **funkind hole** of a data-function type
+whose domain is a bare `_` (`_ |=> 𝑉`, `FunKind::data_hole`), which admits a plain collection and
+a sum. Normalization replaces each occurrence with a fresh kind variable pinned to data, as it
+replaces a `Hole` with a fresh type variable. Every other annotation states its kind. An
+instance's associated type closes its funkind holes to a plain collection, since it is one type at
+every use.
+
 Rebuilds use `Type::fun_like` to retain the exemplar's kind while changing its domain or codomain.
 `wrap_with_iterate` requires an iteration site already to be data; it does not turn a capability
 into a collection. A lost kind is a typing/rebuild error, not an instruction to stamp `Data` later.

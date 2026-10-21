@@ -10,8 +10,8 @@ use chumsky::prelude::*;
 use smol_str::SmolStr;
 
 use crate::ast::{
-    AnnotationMode, ArmPattern, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp,
-    CmpOp, CompClause, Comprehension, Constructor, ConstructorParam, ConstructorPattern,
+    AnnotationMode, ArmPattern, Arrow, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency,
+    BoolOp, CmpOp, CompClause, Comprehension, Constructor, ConstructorParam, ConstructorPattern,
     DiscardHead, EntryForm, Expr, FileId, FunctionSignature, IfBranch, ImplBlock, KeywordArg,
     KindAnnotation, Lit, MatchArm, MatchPattern, Module, ModuleTypeEntry, Param, PayloadPattern,
     QualifiedName, RecordField, Requirement, Span, Spanned, Stmt, TraitDecl, TraitItem, TraitType,
@@ -1181,22 +1181,27 @@ where
             .ignore_then(expr.clone())
             .map_with(|value, e| Spanned::new(e.span(), Expr::Yield(Box::new(value))));
 
-        // ---- Function type `T => U` (annotation-only; §4.1, §6) ------
+        // ---- Function types `T => U` and `T |=> U` (annotation-only; §4.1, §6.3) ----
         //
         // The loosest binary form, below `feed`. Right-associative: the codomain
         // is the whole `expr`, so `A => B => C` is `A => (B => C)`. `=>` in a
         // `def`'s return annotation is consumed at statement level before this
         // runs, so that position is unaffected. The parser accepts any expression
-        // on either side; lowering reads a type here and rejects a `=>` used as a
+        // on either side; lowering reads a type here and rejects an arrow used as a
         // value.
+        let arrow = choice((
+            just(Token::DoubleArrow).to(Arrow::Compute),
+            just(Token::DataArrow).to(Arrow::Data),
+        ));
         let fun_type = feed
-            .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
+            .then(arrow.then(expr.clone()).or_not())
             .map_with(|(domain, codomain), e| match codomain {
                 None => domain,
-                Some(codomain) => Spanned::new(
+                Some((arrow, codomain)) => Spanned::new(
                     e.span(),
                     Expr::FunctionType {
                         domain: Box::new(domain),
+                        arrow,
                         codomain: Box::new(codomain),
                     },
                 ),
@@ -3427,7 +3432,10 @@ mod tests {
     #[test]
     fn function_type_parses() {
         // `T => U` (§4.1, §6): a domain and a codomain around the `=>` arrow.
-        let Expr::FunctionType { domain, codomain } = parse_e("Int => Bool").node else {
+        let Expr::FunctionType {
+            domain, codomain, ..
+        } = parse_e("Int => Bool").node
+        else {
             panic!(
                 "expected a FunctionType, got {:?}",
                 parse_e("Int => Bool").node
@@ -3443,7 +3451,10 @@ mod tests {
         ));
 
         // The domain and codomain may be structural types.
-        let Expr::FunctionType { domain, codomain } = parse_e("{Int, Int} => Bool").node else {
+        let Expr::FunctionType {
+            domain, codomain, ..
+        } = parse_e("{Int, Int} => Bool").node
+        else {
             panic!("expected a FunctionType over a tuple-type domain");
         };
         assert!(matches!(domain.node, Expr::BraceGroup(_)));
@@ -3455,15 +3466,60 @@ mod tests {
     }
 
     #[test]
+    fn data_function_type_parses() {
+        // `T |=> U` (§6.3): the data arrow, one token, beside `=>`.
+        let Expr::FunctionType {
+            domain,
+            arrow: Arrow::Data,
+            codomain,
+        } = parse_e("_ |=> Int").node
+        else {
+            panic!(
+                "expected a data FunctionType, got {:?}",
+                parse_e("_ |=> Int").node
+            );
+        };
+        assert!(matches!(domain.node, Expr::Name(ref n) if n == "_"));
+        assert!(matches!(codomain.node, Expr::Name(ref n) if n == "Int"));
+        assert!(matches!(
+            parse_e("Int => Bool").node,
+            Expr::FunctionType {
+                arrow: Arrow::Compute,
+                ..
+            }
+        ));
+        // The two arrows mix, right-associatively.
+        let Expr::FunctionType {
+            arrow: Arrow::Compute,
+            codomain,
+            ..
+        } = parse_e("Int => Int |=> Int").node
+        else {
+            panic!("expected `=>` outermost");
+        };
+        assert!(matches!(
+            codomain.node,
+            Expr::FunctionType {
+                arrow: Arrow::Data,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn function_type_is_right_associative() {
         // `A => B => C` is `A => (B => C)` — the codomain is the whole rest.
-        let Expr::FunctionType { domain, codomain } = parse_e("A => B => C").node else {
+        let Expr::FunctionType {
+            domain, codomain, ..
+        } = parse_e("A => B => C").node
+        else {
             panic!("expected a FunctionType");
         };
         assert!(matches!(domain.node, Expr::Name(ref n) if n == "A"));
         let Expr::FunctionType {
             domain: b,
             codomain: c,
+            ..
         } = codomain.node
         else {
             panic!("expected the codomain to itself be a FunctionType");

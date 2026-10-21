@@ -238,7 +238,7 @@
     },
     "operator-arrow": {
       "name": "keyword.operator.arrow.cambra",
-      "match": "->|=>"
+      "match": "\\|=>|->|=>"
     },
     "operator-assignment-augmented": {
       "name": "keyword.operator.assignment.augmented.cambra",

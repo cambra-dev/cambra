@@ -599,17 +599,19 @@ fn coalesce_compact_go(
             KindPin::Data | KindPin::Plain | KindPin::Sum(_) => {
                 // **A data function's domain is one domain.** A consumed sum *names* its
                 // witness rather than putting a sum where a domain belongs, and a join
-                // forms no sum at all — that is `box`'s job — so nothing puts several
-                // candidates here. This is the property that lets [`CompactFun::domain`]
-                // be one ordinary position rather than a candidate set, so it is asserted
-                // rather than assumed. A sum materializes from the Σ slot beside this one,
-                // never by reading a second candidate off the domain.
+                // forms no sum at all — that is `box`'s job. Several candidates here are
+                // collections over distinct domains meeting at one position, as two
+                // arguments do at a parameter whose domain is one type parameter, which is
+                // the conflict the join reports. A sum materializes from the Σ slot beside
+                // this one, never by reading a second candidate off the domain.
                 let crate::ccl::ty::TypeKind::Enumerated(domains) = &type_kind else {
                     unreachable!("a data function slot's domain kind names no candidates")
                 };
-                let [_] = domains.as_slice() else {
-                    unreachable!("a data function's domain names several candidates: {type_kind}")
-                };
+                if domains.len() > 1 {
+                    return Err(CoalesceError::DomainJoinConflict {
+                        domains: domains.clone(),
+                    });
+                }
                 // **A binder's name is the binder's**, minted on the kind variable
                 // ([`crate::ccl::ty::FunKindVar::binder_ids`]) and never read back off the
                 // domain: the domain *refers* to the binder, so taking a name from it inverts

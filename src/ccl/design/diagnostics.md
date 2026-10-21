@@ -13,27 +13,28 @@ it names the same way. Every other diagnostic writes types with `Display for Typ
 
 A collection is written as the collection type it is
 ([chl-spec.md, "6.3 Direction: collection types [Decided]"](../../../docs/chl-spec.md#63-direction-collection-types-decided)),
-over its domain. The last column says whether the written form, used as an annotation, lowers back to
-the same type. `Box`, `Source`, a dependent `FullMap` and an index range written as a refinement have
-no annotation syntax. A predicate is written as the comprehension or membership test a reader would
-write, which lowers to a different term than the one the checker holds.
+over its domain. The last column says whether the written form, used as an annotation, lowers back
+to the same type. `Box`, `Source`, a dependent data function `(k: 𝐾) |=> 𝑉` and an index range
+written as a refinement have no annotation syntax. A predicate is written as the comprehension or
+membership test a reader would write, which lowers to a different term than the one the checker
+holds.
 
 | Inferred | Written | Lowers back |
 | --- | --- | --- |
 | a list literal, or a comprehension over one | `Array(3, Int)` | yes |
-| a filtered comprehension | `FullMap({UInt where _ < 3 and xs[_] > 1}, Int)` | no |
-| a map or set literal | `FullMap({String where _ in ["a", "b"]}, Int)` | no |
-| `groupby(xs, key)` | `FullMap(k: {Bool where _ in [key(x) for x in xs]}, FullMap({UInt where _ < 3 and key(xs[_]) == k}, Int))` | no |
+| a filtered comprehension | `{UInt where _ < 3 and xs[_] > 1} \|=> Int` | no |
+| a map or set literal | `{String where _ in ["a", "b"]} \|=> Int` | no |
+| `groupby(xs, key)` | `(k: {Bool where _ in [key(x) for x in xs]}) \|=> {UInt where _ < 3 and key(xs[_]) == k} \|=> Int` | no |
 | a `List`, `Map`, `Set` or `Collection` | `List(Int)`, `Map(String, Int)`, … | yes |
 | `box(a) if c else box(b)` | `Box(Array(2, Int) \| Array(3, Int))` | no |
 | `stdin()` | `Source(stdin, String)` | no |
 | a feed | `Feed(Int)` | no |
 
 - **A collection over an index range is an `Array`.** A collection over any other domain is a
-  `FullMap` over that domain, written as a type. An index range alone is `{UInt where _ < 𝑛}`,
+  data-function type `𝐷 |=> 𝑉` over that domain. An index range alone is `{UInt where _ < 𝑛}`,
   the bound an array's index carries
   ([chl-spec.md, "3.9 Subscript and attribute access"](../../../docs/chl-spec.md#39-subscript-and-attribute-access)).
-- **A key the value depends on is named.** `FullMap(k: 𝐾, 𝑉)` is a `FullMap` whose value type
+- **A key the value depends on is named.** `(k: 𝐾) |=> 𝑉` is a data function whose value type
   mentions its key `k`, as a group-by's groups do. A function whose result type mentions its
   parameter is `(x: 𝑇) => 𝑈`. A binder the compiler minted is spelled `k` (a key) or `x` (a
   parameter or a comprehension's variable), numbered where another name in the type already reads

@@ -475,6 +475,19 @@ impl FunKind {
         v.stamp_data();
         FunKind::Var(v)
     }
+
+    /// An annotation's **funkind hole**: a data function whose funkind the program left to
+    /// inference, written `_ |=> 𝑇` (`docs/chl-spec.md`, "6.3 Direction: collection types
+    /// \[Decided\]"). It admits a plain collection and a sum alike, as
+    /// [`fresh_data`](Self::fresh_data) does. A lowered annotation is a value that every
+    /// use of a type alias or a trait's signature clones, so the variable is a marker:
+    /// normalization replaces it with a fresh data funkind at each occurrence, and nothing
+    /// relates two occurrences through it.
+    pub fn data_hole() -> FunKind {
+        let v = FunKindVar::minted(true);
+        v.stamp_data();
+        FunKind::Var(v)
+    }
 }
 
 /// Stable identity of a [`FunKindVar`].
@@ -700,6 +713,10 @@ fn built_width(sources: &[FunKind]) -> Option<usize> {
 pub struct FunKindVar {
     /// Stable, globally-unique identity — and, with a position, each binder's.
     pub uid: FunKindVarId,
+    /// Whether this is an annotation's **funkind hole** ([`FunKind::data_hole`]): a funkind the
+    /// program left to inference, which normalization replaces with a fresh data funkind at
+    /// each occurrence, as it replaces a `Hole`. Immutable, like `uid`.
+    hole: bool,
     bounds: RefCell<FunKindBounds>,
     /// [`resolved`](Self::resolved)'s answer, with the [`KIND_FACTS`] count it was
     /// computed at: still the answer while no kind variable has been written since.
@@ -720,8 +737,13 @@ fn kind_fact_written() {
 impl FunKindVar {
     /// Allocate a fresh kind variable with nothing recorded.
     pub fn fresh() -> Rc<FunKindVar> {
+        Self::minted(false)
+    }
+
+    fn minted(hole: bool) -> Rc<FunKindVar> {
         let v = Rc::new(FunKindVar {
             uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            hole,
             bounds: RefCell::new(FunKindBounds::default()),
             resolved_at: RefCell::new(None),
         });
@@ -870,6 +892,11 @@ impl FunKindVar {
             b.settled[..arity].to_vec()
         };
         ids.iter().copied().map(WitnessId).collect()
+    }
+
+    /// Whether this is an annotation's funkind hole ([`FunKind::data_hole`]).
+    pub fn is_hole(&self) -> bool {
+        self.hole
     }
 
     /// Stamp this kind **data** at construction — a collection whatever slot it turns out

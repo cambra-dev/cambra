@@ -312,15 +312,40 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             found: Box::new(coalesce_for_error(&found)),
             expected: Some(Box::new(coalesce_for_error(&required))),
         },
-        ConstrainError::KindMismatch { lhs, rhs } => InferError::TypeMismatch {
-            ctx: format!(
-                "{ctx_label} (a compute function ⇒ and a data collection ⤇ met \
-                 at one position — the two kinds are incomparable, so neither \
-                 stands in for the other)"
-            ),
-            found: Box::new(coalesce_for_error(&lhs)),
-            expected: Some(Box::new(coalesce_for_error(&rhs))),
-        },
+        ConstrainError::KindMismatch { lhs, rhs } => {
+            // Which two kinds met: a capability and a collection, or a plain collection
+            // and a sum, which only `box` relates.
+            let compute = [&lhs, &rhs].iter().any(|t| {
+                t.fun_kind_of()
+                    .is_some_and(|k| k.resolved() == crate::ccl::ty::KindPin::Compute)
+            });
+            let ctx = if compute {
+                format!(
+                    "{ctx_label} (a compute function ⇒ and a data collection ⤇ met \
+                     at one position — the two kinds are incomparable, so neither \
+                     stands in for the other)"
+                )
+            } else if lhs
+                .fun_kind_of()
+                .is_some_and(|k| matches!(k.resolved(), crate::ccl::ty::KindPin::Sum(_)))
+            {
+                format!(
+                    "{ctx_label} (a sum reached a plain collection — a sum's domain is its \
+                     witness, which no written domain names; an annotation admits a sum \
+                     with the domain `_`, as in `_ |=> V`, or as `Collection(V)`)"
+                )
+            } else {
+                format!(
+                    "{ctx_label} (a plain collection reached a sum — a collection becomes a \
+                     sum only through `box`)"
+                )
+            };
+            InferError::TypeMismatch {
+                ctx,
+                found: Box::new(coalesce_for_error(&lhs)),
+                expected: Some(Box::new(coalesce_for_error(&rhs))),
+            }
+        }
         ConstrainError::TypeParamEscapes { param } => InferError::TypeParamEscapes {
             param: param.spelling.to_string(),
             target: None,

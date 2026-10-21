@@ -2799,16 +2799,44 @@ pub(super) fn lower_type_expr_or_poly(
              `` {`a | `b{Int}} ``",
         )),
         // A function type `T => U` (`docs/chl-spec.md`, "6. Types (informal
-        // sketch)"). The surface arrow is the compute arrow `⇒`
-        // ([`FunKind::Compute`]) — the kind a `def`/lambda produces — so an
-        // annotated binding `f: (Int => Int) = \x -> …` matches its value.
-        // `Type::fun` builds the non-dependent form (`name: None`); the surface
-        // has no binder to make it a Pi type, and a data collection (`⤇`) is
-        // written with its own constructor, never with `=>`.
-        ChlExpr::FunctionType { domain, codomain } => Ok(Type::fun(
+        // sketch)"). The arrow is the compute arrow `⇒` ([`FunKind::Compute`]) — the
+        // funkind a `def`/lambda produces — so an annotated binding
+        // `f: (Int => Int) = \x -> …` matches its value. `Type::fun` builds the
+        // non-dependent form (`name: None`): the surface has no binder to make it a Pi
+        // type.
+        ChlExpr::FunctionType {
+            domain,
+            arrow: chl_parser::ast::Arrow::Compute,
+            codomain,
+        } => Ok(Type::fun(
             lower_type_expr(domain, ctx)?,
             lower_type_expr(codomain, ctx)?,
         )),
+        // A data-function type `T |=> U`, a collection over `T` (`docs/chl-spec.md`,
+        // "6.3 Direction: collection types [Decided]"). A sum is a data function whose
+        // domain is its witness, so a bare `_` domain admits a sum as well as a plain
+        // collection, and its funkind is a hole. Any written domain, a type parameter
+        // included, names a type, which no witness is, so it makes a plain collection.
+        ChlExpr::FunctionType {
+            domain,
+            arrow: chl_parser::ast::Arrow::Data,
+            codomain,
+        } => {
+            let domain = lower_type_expr(domain, ctx)?;
+            let fun_kind = if matches!(domain, Type::Hole) {
+                crate::ccl::FunKind::data_hole()
+            } else {
+                crate::ccl::FunKind::Data(None)
+            };
+            // A binder as `FullMap(K, V)` has (`Type::full_map_of`): a value whose codomain
+            // reads its key, as a group-by's does, fills a hole in `V` under it.
+            Ok(Type::pi_kinded(
+                Name::fresh("__map_k"),
+                domain,
+                lower_type_expr(codomain, ctx)?,
+                fun_kind,
+            ))
+        }
         // A parenthesised comma list `(T, U)` is a *term* product; the tuple *type* is
         // written with braces `{T, U}` (`docs/chl-spec.md`). `->` builds the same node, so
         // a function type written with the wrong arrow arrives here too and the message
@@ -2841,10 +2869,11 @@ pub(super) fn lower_type_expr_or_poly(
                 ctx.named_requirements.extend(named);
                 let body = lower_type_expr(body, ctx);
                 ctx.named_requirements.truncate(in_scope);
+                let body = body?;
                 Ok(Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
                     params,
                     requires,
-                    body: body?,
+                    body,
                 })))
             });
             ctx.type_params_in_scope.truncate(scoped);
@@ -3959,6 +3988,38 @@ mod tests {
     use crate::ccl::symbolic::symbolic;
     use indoc::indoc;
     use rstest::rstest;
+
+    /// The funkind of each data-function type in `ty`, outermost first: `Some(true)` for a
+    /// funkind hole, `Some(false)` for a plain collection.
+    fn data_kinds(ty: &Type, out: &mut Vec<bool>) {
+        if let Type::Fun { fun_kind, .. } = ty {
+            match fun_kind {
+                crate::ccl::FunKind::Var(v) => out.push(v.is_hole()),
+                crate::ccl::FunKind::Data(None) => out.push(false),
+                _ => {}
+            }
+        }
+        ty.walk_children(|c| data_kinds(c, out));
+    }
+
+    /// A data-function type's funkind is a hole where its domain is a bare `_`, and a plain
+    /// collection's where the program writes any other domain, a type parameter included
+    /// (`docs/chl-spec.md`, "6.3 Direction: collection types \[Decided\]").
+    #[rstest]
+    #[case::a_written_domain("Int |=> Int", &[false])]
+    #[case::a_hole("_ |=> Int", &[true])]
+    #[case::a_hole_inside_the_domain("{_, Int} |=> Int", &[false])]
+    #[case::a_parameter_at_one_position("forall (D) (D |=> Int) => Int", &[false])]
+    #[case::a_parameter_at_two(
+        "forall (D) {D |=> Int, D |=> Int} => Int",
+        &[false, false]
+    )]
+    #[case::a_parameter_beside_its_result("forall (D) (D |=> Int) => D |=> Int", &[false, false])]
+    fn a_data_function_types_kind_follows_its_domain(#[case] code: &str, #[case] holes: &[bool]) {
+        let mut out = Vec::new();
+        data_kinds(&lower_type(code), &mut out);
+        assert_eq!(out, holes, "{code}");
+    }
 
     // -----------------------------------------------------------------------
     // Statement block tests (let bindings)

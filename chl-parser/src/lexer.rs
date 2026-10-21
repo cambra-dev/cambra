@@ -179,6 +179,11 @@ pub enum Token {
     /// maximal munch takes it over `=` then `>`.
     #[token("=>")]
     DoubleArrow,
+    /// Data-function-type arrow `|=>`, the collection counterpart of `=>`
+    /// (`docs/chl-spec.md`, "6.3 Direction: collection types \[Decided\]"). Three chars, so
+    /// maximal munch takes it over `|` then `=>`.
+    #[token("|=>")]
+    DataArrow,
     /// Exponentiation `**` (`docs/chl-spec.md`, "3.3 Arithmetic and logical
     /// operators"). Two chars, so maximal munch takes it over `Star` then
     /// `Star`; CHL has no unary `*`, so `a * *b` is not a competing parse.
@@ -359,7 +364,7 @@ pub enum HighlightClass {
     /// own class. A binding that shadows a builtin keeps this class.
     Builtin,
     /// An identifier whose first character is an ASCII capital, or the type
-    /// hole `_` directly after `:`, `<:`, `=>` or `{`.
+    /// hole `_` directly after `:`, `<:`, `=>`, `|=>` or `{`.
     Type,
     Identifier,
     /// A backtick and the identifier directly after it.
@@ -489,6 +494,7 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::MinusEq
         | Token::Arrow
         | Token::DoubleArrow
+        | Token::DataArrow
         | Token::StarStar
         | Token::StarEq
         | Token::DoubleSlashEq
@@ -567,7 +573,13 @@ pub fn highlight(file: FileId, source: &str) -> Highlighted {
             (Some(Token::Backtick), Token::Ident(_)) => Some(HighlightClass::VariantTag),
             (Some(Token::At), Token::Ident(_)) => Some(HighlightClass::Decorator),
             (
-                Some(Token::Colon | Token::LtColon | Token::DoubleArrow | Token::LBrace),
+                Some(
+                    Token::Colon
+                    | Token::LtColon
+                    | Token::DoubleArrow
+                    | Token::DataArrow
+                    | Token::LBrace,
+                ),
                 Token::Ident(name),
             ) if name == "_" => Some(HighlightClass::Type),
             _ => highlight_class(token),
@@ -750,6 +762,7 @@ impl fmt::Display for Token {
             Token::MinusEq => "-=",
             Token::Arrow => "->",
             Token::DoubleArrow => "=>",
+            Token::DataArrow => "|=>",
             Token::StarStar => "**",
             Token::StarEq => "*=",
             Token::DoubleSlashEq => "//=",

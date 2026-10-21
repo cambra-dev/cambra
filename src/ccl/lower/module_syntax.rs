@@ -513,7 +513,9 @@ impl Refusals {
                 self.expr(body);
                 self.requires(requires);
             }
-            ChlExpr::FunctionType { domain, codomain } => {
+            ChlExpr::FunctionType {
+                domain, codomain, ..
+            } => {
                 self.expr(domain);
                 self.expr(codomain);
             }
