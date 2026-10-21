@@ -33,7 +33,7 @@ use crate::chl_parser::ast::{
     AssignTarget, Module as ChlModule, QualifiedName as ParserQualifiedName, Span, Spanned,
     Stmt as ChlStmt,
 };
-use crate::chl_parser::{FileId, ModulePath};
+use crate::chl_parser::{FileId, ModulePath, SurfaceBuiltin};
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

@@ -125,13 +125,14 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             errors: lowering.errors,
         };
     };
-    let scope = lowering.scope(ast, None);
+    let scope = lowering.scope(ast, None, ctx);
     ctx.begin_module(scope.clone());
     let lowered = lower_stmts(ast, ctx);
     let mut errors = std::mem::take(&mut lowering.errors);
     errors.extend(lowered.errors);
     let value = lowered.value.map(|chain| {
-        let root = uniquify::run_in(chain, &raw_scope(&lowering.shared_names(&scope)));
+        let scope = use_names(&scope, lowering.shared_names(&scope));
+        let root = uniquify::run_in(chain, &raw_scope(&scope));
         chains
             .into_iter()
             .rev()
@@ -172,9 +173,9 @@ pub(super) struct Created {
     /// The run's chain, uniquified, around the placeholder for the rest of the
     /// tree it stands in.
     pub(super) chain: Expr,
-    /// Each name the run's top level resolves, by spelling: its members, and
-    /// each name spelled through one of its qualifiers. A module reaching the
-    /// run spells each through its own qualifier for it.
+    /// Each name the run's top level resolves, by spelling: its members, its
+    /// `use` names, and each name spelled through one of its qualifiers. A
+    /// module reaching the run spells each through its own qualifier for it.
     pub(super) names: HashMap<QualifiedName, Name>,
 }
 
@@ -203,7 +204,7 @@ impl ProgramLowering<'_> {
             .module(file)
             .expect("a module other than the root has a module path")
             .clone();
-        let scope = self.scope(ast, Some(module.clone()));
+        let scope = self.scope(ast, Some(module.clone()), ctx);
         ctx.begin_module(scope.clone());
         let lowered = lower_library(ast, ctx);
         let io_site = ctx.io_site;
@@ -257,14 +258,14 @@ impl ProgramLowering<'_> {
     ///
     /// Its chain is a copy of the module's, uniquified with a scope that maps
     /// each name spelled through a qualifier to the binder in the qualifier's
-    /// run.
+    /// run, and each `use` name to its member's binder.
     pub(super) fn create(&self, file: FileId) -> Option<Created> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
         let chain = {
             let _copy = crate::ccl::provenance::copy_frame("link.run");
             lowered.chain.clone()
         };
-        let scope = self.shared_names(&lowered.scope);
+        let scope = use_names(&lowered.scope, self.shared_names(&lowered.scope));
         let uniquified = uniquify::run_in(chain, &raw_scope(&scope));
         let mut names = scope;
         let (spine, _) = spine(&uniquified);
@@ -296,7 +297,12 @@ impl ProgramLowering<'_> {
     }
 
     /// The scope `module` lowers in ([`module_scope`]).
-    pub(super) fn scope(&mut self, module: &ChlModule, labels: Option<ModulePath>) -> ModuleScope {
+    pub(super) fn scope(
+        &mut self,
+        module: &ChlModule,
+        labels: Option<ModulePath>,
+        ctx: &LoweringContext,
+    ) -> ModuleScope {
         let mut interfaces = HashMap::new();
         for stmt in &module.body {
             let ChlStmt::Import { path, .. } = &stmt.node else {
@@ -307,6 +313,38 @@ impl ProgramLowering<'_> {
             };
             interfaces.insert(stmt.span, self.import_interface(file));
         }
-        module_scope(module, labels, self.program, &interfaces, &mut self.errors)
+        module_scope(
+            module,
+            labels,
+            self.program,
+            &interfaces,
+            ctx,
+            &mut self.errors,
+        )
     }
+}
+
+/// The scope a run of the module that lowered in `scope` is uniquified in:
+/// `qualified`, each name spelled through a qualifier, and each `use` name,
+/// mapped to its member's binder.
+pub(super) fn use_names(
+    scope: &ModuleScope,
+    qualified: HashMap<QualifiedName, Name>,
+) -> HashMap<QualifiedName, Name> {
+    let mut names = qualified;
+    for (bound, used) in &scope.uses {
+        let Some(member) = &used.member else {
+            continue;
+        };
+        let binder = names.get(member).cloned();
+        debug_assert!(
+            binder.is_some(),
+            "the `use` name `{bound}` reached `{member}` through an interface, so its \
+             qualifier's run holds it"
+        );
+        if let Some(binder) = binder {
+            names.insert(QualifiedName::new(bound.clone()), binder);
+        }
+    }
+    names
 }
