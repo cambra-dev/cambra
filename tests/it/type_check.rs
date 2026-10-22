@@ -1,12 +1,12 @@
-//! Integration tests: Python source → `ccl::lower` → `ccl::infer` → [`Type`].
+//! Integration tests: CHL source → `ccl::lower` → `ccl::infer` → [`Type`].
 //!
 //! These tests validate the lower + infer pipeline without invoking the
 //! compiler or interpreter. They are more stable than the end-to-end
 //! compilation tests because they stop before the compilation step.
 //!
 //! ```text
-//! Python source
-//!   → ccl::lower    (Python AST → CCL Expr)
+//! CHL source
+//!   → ccl::lower    (CHL AST → CCL Expr)
 //!   → ccl::infer    (type inference; annotates every node)
 //!   → Type          (test assertion here)
 //! ```

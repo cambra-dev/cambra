@@ -825,24 +825,24 @@ pub(crate) struct LetBinding {
 /// Created by [`OpConversionContext::enter_scope`]; pops the innermost scope when
 /// dropped. Implements [`std::ops::Deref`]/[`std::ops::DerefMut`] targeting
 /// [`OpConversionContext`], so `&mut guard` coerces to `&mut OpConversionContext`.
-pub(crate) struct TileCompileContextGuard<'a> {
+pub(crate) struct OpConversionContextGuard<'a> {
     ctx: &'a mut OpConversionContext,
 }
 
-impl std::ops::Deref for TileCompileContextGuard<'_> {
+impl std::ops::Deref for OpConversionContextGuard<'_> {
     type Target = OpConversionContext;
     fn deref(&self) -> &OpConversionContext {
         self.ctx
     }
 }
 
-impl std::ops::DerefMut for TileCompileContextGuard<'_> {
+impl std::ops::DerefMut for OpConversionContextGuard<'_> {
     fn deref_mut(&mut self) -> &mut OpConversionContext {
         self.ctx
     }
 }
 
-impl Drop for TileCompileContextGuard<'_> {
+impl Drop for OpConversionContextGuard<'_> {
     fn drop(&mut self) {
         self.ctx.scopes.pop_scope();
     }
@@ -914,9 +914,9 @@ impl OpConversionContext {
     ///
     /// The guard dereferences to `OpConversionContext`, so it can be passed as
     /// `&mut OpConversionContext` to recursive compile functions.
-    pub(crate) fn enter_scope(&mut self) -> TileCompileContextGuard<'_> {
+    pub(crate) fn enter_scope(&mut self) -> OpConversionContextGuard<'_> {
         self.scopes.push_scope();
-        TileCompileContextGuard { ctx: self }
+        OpConversionContextGuard { ctx: self }
     }
 
     /// Look up `name` from innermost scope outward.

@@ -1,6 +1,6 @@
 //! Cambra Core Language (CCL) abstract syntax tree.
 //!
-//! CCL is a λ-calculus–based intermediate representation. Python source is
+//! CCL is a λ-calculus–based intermediate representation. CHL source is
 //! lowered into CCL, where it is type-checked and optimized, then compiled
 //! to the dataflow operator graph for execution.
 //!

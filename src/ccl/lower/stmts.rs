@@ -3087,16 +3087,16 @@ in define(x, 1); define(y, 2); x"
     //
     // These are CHL expressions that will produce Expr::Let nodes in value
     // position once supported. They must be promoted to end-to-end pipeline
-    // tests (CHL → CCL → Operators) at that point, as compile_case and any
-    // other new compile_* function must save/restore ctx.scope to uphold the
-    // invariant described in compile_ccl::compile_let.
+    // tests (CHL → CCL → Operators) at that point: operator conversion binds
+    // each Let in a scope entered through `OpConversionContext::enter_scope`
+    // (the `Let` arm of `operator_conversion::convert_impl_inner`), and only
+    // converting a Let in a new position checks it against that.
     // -----------------------------------------------------------------------
 
     /// `if/else` with branch-local variables lowers to
-    /// `let result = case cond of { True → let tmp = … in … | False → let tmp = … in … } in result`.
-    /// The Case branches each contain a Let, so compile_case must save/restore
-    /// ctx.scope for each branch or value_op.subscribe() will panic on the
-    /// inner tmp VarRef.
+    /// `let result = { cond → let tmp = … in …; true → let tmp = … in … } in result`.
+    /// Each branch binds its own `tmp`, which operator conversion scopes to that
+    /// branch through the `Let` arm's `OpConversionContext::enter_scope`.
     #[test]
     #[ignore = "if/else as a non-final statement (assignment-binding desugaring) is not yet \
                 implemented; if/else as a final value-returning statement is now supported"]
@@ -3123,9 +3123,9 @@ result";
     /// placing a Let directly in the value field of an outer Let:
     /// `let x = (let y = 5 in y) + 1 in x`.
     /// This is the only planned CHL construct that puts a Let directly in
-    /// Let.value (not inside a Case branch). compile_let must be fixed to pass
-    /// the post-value scope (not parent_scope) to value_op.subscribe() before
-    /// this can run end-to-end.
+    /// Let.value (not inside a Case branch). Operator conversion converts the
+    /// inner Let in a scope of its own, entered while the outer binding's value
+    /// is converted and exited before the outer body is.
     #[test]
     #[ignore = "walrus operator (:=) not yet in the CHL grammar"]
     fn test_lower_walrus_let_in_value_position() {
