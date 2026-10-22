@@ -5029,9 +5029,13 @@ impl RefinementSet {
     /// A refinement already present is dropped rather than replacing the incumbent:
     /// the two are equal as *restrictions* ([`eq_term_modulo_ty_slots`]), and
     /// keeping the incumbent preserves whatever predicate `Rc` sharing the
-    /// position already had.
+    /// position already had. The exception is an incumbent spelled over its own
+    /// narrowing, which the newcomer replaces ([`replaces_equal`]).
     pub fn insert(&mut self, r: Refinement) -> bool {
-        if self.0.contains(&r) {
+        if let Some(incumbent) = self.0.iter_mut().find(|e| **e == r) {
+            if replaces_equal(incumbent, &r) {
+                *incumbent = r;
+            }
             return false;
         }
         if stress_reversed() {
@@ -5134,10 +5138,12 @@ impl RefinementSet {
             }
         }
         if self.0.len() > 1 {
-            let mut kept = Vec::with_capacity(self.0.len());
+            let mut kept: Vec<Refinement> = Vec::with_capacity(self.0.len());
             for r in self.0.drain(..) {
-                if !kept.contains(&r) {
-                    kept.push(r);
+                match kept.iter_mut().find(|e| **e == r) {
+                    Some(incumbent) if replaces_equal(incumbent, &r) => *incumbent = r,
+                    Some(_) => {}
+                    None => kept.push(r),
                 }
             }
             self.0 = kept;
@@ -5231,22 +5237,6 @@ pub fn application_order<'a>(
 /// unfiltered source — rather than the same one at a wider type, and for a nested
 /// comprehension that form is inside the inner one's lowering rather than at this site.
 fn dependency_order(refinements: &[Refinement]) -> Vec<&Refinement> {
-    fn reads_narrowed_by(ty: &Type, earlier: &Refinement) -> bool {
-        if let Type::Refinement(_, set) = ty
-            && set.contains(earlier)
-        {
-            return true;
-        }
-        let mut found = false;
-        ty.walk_children(|child| found |= reads_narrowed_by(child, earlier));
-        found
-    }
-    fn predicate_reads(pred: &TypedExpr, earlier: &Refinement) -> bool {
-        let mut found = false;
-        pred.walk_type_slots(|ty| found |= reads_narrowed_by(ty, earlier));
-        pred.walk_children(|child| found |= predicate_reads(child, earlier));
-        found
-    }
     let mut remaining: Vec<&Refinement> = refinements.iter().collect();
     // **Ties break on content, never on where the set happens to hold them.** A set's
     // physical order carries no meaning, so letting it decide between two *independent*
@@ -5274,6 +5264,42 @@ fn dependency_order(refinements: &[Refinement]) -> Vec<&Refinement> {
         ordered.push(remaining.remove(next));
     }
     ordered
+}
+
+/// Whether `pred` reads a value `earlier` has narrowed: some type inside it carries `earlier`.
+fn predicate_reads(pred: &TypedExpr, earlier: &Refinement) -> bool {
+    fn reads_narrowed_by(ty: &Type, earlier: &Refinement) -> bool {
+        if let Type::Refinement(_, set) = ty
+            && set.contains(earlier)
+        {
+            return true;
+        }
+        let mut found = false;
+        ty.walk_children(|child| found |= reads_narrowed_by(child, earlier));
+        found
+    }
+    let mut found = false;
+    pred.walk_type_slots(|ty| found |= reads_narrowed_by(ty, earlier));
+    pred.walk_children(|child| found |= predicate_reads(child, earlier));
+    found
+}
+
+/// Of two equal refinements, whether `newcomer` should replace `incumbent`: exactly when the
+/// incumbent's spelling reads the narrowing the refinement itself imposes and the newcomer's does
+/// not.
+///
+/// Equal refinements denote one restriction ([`eq_term_modulo_ty_slots`]), but their spellings
+/// carry their own types. A substitution can turn a predicate reading a filtered collection into
+/// a spelling of that collection's own filter: in `[a for a in xs₁ if a < 3]` where
+/// `xs₁ = [b for b in xs if b < 3]`, discharging `xs₁` makes the outer predicate equal to the
+/// inner one while its copy of `xs₁` is typed over `{𝐷 | b < 3}`. That spelling can be applied
+/// only after itself, so a set holding it alone has no [`application_order`]. Which spelling a
+/// set keeps then decides whether it type-checks, and the choice must not depend on the order the
+/// two arrived in. The nested `< 3` filters in `tests/it/compilation_pipeline/comprehensions.rs`'s
+/// `test_comprehensions` reach it under `CAMBRA_REFINEMENT_ORDER=reverse`.
+fn replaces_equal(incumbent: &Refinement, newcomer: &Refinement) -> bool {
+    predicate_reads(&incumbent.predicate, incumbent)
+        && !predicate_reads(&newcomer.predicate, newcomer)
 }
 
 /// [`application_order`]'s element types, indexed by each refinement's position in
