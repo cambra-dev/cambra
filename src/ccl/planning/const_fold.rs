@@ -14,6 +14,20 @@
 //! - `(𝑎, 𝑏) ▷ binop` where 𝑎 and 𝑏 are literals.
 //! - `𝑎 ▷ neg` and `𝑎 ▷ not_fn` where 𝑎 is a literal.
 //!
+//! A gate that folded to a literal then decides the filter it gates, and the fold applies these
+//! rewrites to the terms lambda elimination builds for a value-`Case`:
+//!
+//! - `filter_values(true ▷ const)` becomes `id`: every position passes.
+//! - A [`TypedExprNode::DisjointJoin`] loses each arm headed by `filter_values(false ▷ const)`,
+//!   which holds no position, and one arm left is the join. A writer decision that commits
+//!   unconditionally is ``Case[true → `commit(…); true → `abort]``, so it plans to its commit
+//!   arm alone.
+//! - A boolean gate `(𝑙 ▷ const, 𝑝) ▷ zip ≫ and` is 𝑝 where 𝑙 is `true` and `𝑙 ▷ const` where 𝑙 is
+//!   `false`. `≫ or` is 𝑝 where 𝑙 is `false` and `𝑙 ▷ const` where 𝑙 is `true`, and either operand
+//!   may be the literal. The gate may sit anywhere in a composition, and a composition folds every
+//!   gate it holds. The first-match gate of a later `Case` arm is `true and ¬𝑞` when the first
+//!   guard is the literal `true`.
+//!
 //! The walk is bottom-up and each shape reads its operands one level deep, so a chain
 //! (`a = 2; b = a * 3; c = b + 1`) folds in one pass without the fold evaluating
 //! anything recursively.
@@ -58,14 +72,18 @@
 //! matches a producer's contract against its consumer's
 //! (`src/ccl/design/type-inference.md`, "Sharing is an invariant, not an optimization
 //! detail"), so folding one occurrence of a predicate and not another would break the
-//! match. The folded node keeps its recorded type.
+//! match. The folded node keeps its recorded type, except that a gate replaced by its literal
+//! operand takes the type of the gate it replaces.
 //!
 //! # Agreement with the runtime
 //!
 //! By construction: `eval_binop` calls the kernel in [`crate::scalar_ops`] on a one-element
 //! column, and that is the kernel the `BinOp` operator runs. There is one implementation,
 //! so there is nothing for a compile-time answer and a run-time one to disagree about, and
-//! the exclusions above are the whole of what this pass decides.
+//! the exclusions above are the whole of what this pass decides, with one exception: a gate
+//! that drops its operand (`false and 𝑝`) also drops whatever failure evaluating 𝑝 would have
+//! raised, and a join that drops an empty arm does the same. The operators are columnar and do
+//! not short-circuit, so the unfolded term would have evaluated 𝑝 on every position.
 
 use super::*;
 use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
@@ -141,16 +159,208 @@ fn fold(expr: &mut Expr, consts: &mut Consts) {
         });
     }
     consts.0.truncate(base);
-    if let Some(lit) = value_of(expr, consts) {
-        expr.node = TypedExprNode::Lit(lit);
+    while let Some(reduction) = reduce(expr, consts) {
+        reduction.apply(expr);
     }
 }
 
-/// The value `expr` computes, when its children are already folded and it is one of the
-/// three shapes this pass recognizes.
-fn value_of(expr: &Expr, consts: &Consts) -> Option<Lit> {
+/// Where a boolean gate sits in a composition and which of its two operands replaces it.
+struct GateOperand {
+    /// Index of the `(𝑎, 𝑏) ▷ zip` element; the `and`/`or` element follows it.
+    at: usize,
+    /// Index into the zipped pair of the operand that replaces the gate.
+    operand: usize,
+    /// The type of the gate's `zip ≫ and`: its own function kind, its domain, and the codomain of
+    /// the `and`. A gate that is the whole composition has the composition's recorded type.
+    ty: Type,
+}
+
+/// What a node reduces to, decided from the node and its already folded children.
+///
+/// Each variant is applied in place by [`Reduction::apply`]: a literal replaces the node, `id`
+/// takes the node's own recorded type, and a promoted arm keeps its id, so nothing is minted.
+enum Reduction {
+    /// The node computes this value.
+    Lit(Lit),
+    /// A filter every position passes: `filter_values(true ▷ const)`, typed `𝐴 ⇒ 𝐴`.
+    Id,
+    /// A [`TypedExprNode::DisjointJoin`] loses its empty arms, and at least one arm is not empty.
+    Arms,
+    /// A boolean gate `(𝑎, 𝑏) ▷ zip ≫ and` (or `or`) is its operand with this index.
+    Operand(GateOperand),
+}
+
+impl Reduction {
+    fn apply(self, expr: &mut Expr) {
+        match self {
+            Reduction::Lit(lit) => expr.node = TypedExprNode::Lit(lit),
+            Reduction::Id => expr.node = TypedExprNode::Builtin(Builtin::Id),
+            Reduction::Arms => {
+                let TypedExprNode::DisjointJoin(arms) = &mut expr.node else {
+                    unreachable!("an arm reduction names the arms of a disjoint join")
+                };
+                arms.retain(|arm| !is_empty_arm(arm));
+                // One arm left is the join, when it has the join's own type, as the arms of a
+                // value-`Case` do.
+                if arms.len() == 1 && arms[0].ty == expr.ty {
+                    *expr = arms.pop().expect("one arm remains");
+                }
+            }
+            Reduction::Operand(GateOperand {
+                at,
+                operand: index,
+                ty,
+            }) => {
+                let TypedExprNode::Compose(elts) = &mut expr.node else {
+                    unreachable!("an operand reduction names a gate composition")
+                };
+                let TypedExprNode::Apply { argument, .. } = &mut elts[at].node else {
+                    unreachable!("a gate composition holds `(𝑎, 𝑏) ▷ zip` at `at`")
+                };
+                let TypedExprNode::Tuple(operands) = &mut argument.node else {
+                    unreachable!("a gate zips a pair")
+                };
+                let mut operand = operands.swap_remove(index);
+                operand.ty = ty;
+                if elts.len() == 2 {
+                    *expr = operand;
+                } else {
+                    let head = match operand.node {
+                        TypedExprNode::Compose(inner) => inner,
+                        _ => vec![operand],
+                    };
+                    elts.splice(at..at + 2, head);
+                }
+            }
+        }
+    }
+}
+
+/// The literal under a constant function: `𝑙` of `𝑙 ▷ const`.
+///
+/// The term is a function and not the literal, typed `𝐴 ⇒ 𝐵` where the literal is a `𝐵`, so
+/// it is recognized here and never replaced by it.
+fn const_literal(expr: &Expr) -> Option<&Lit> {
+    let TypedExprNode::Apply { argument, function } = &expr.node else {
+        return None;
+    };
+    match (&function.node, &argument.node) {
+        (TypedExprNode::Builtin(Builtin::Const), TypedExprNode::Lit(lit)) => Some(lit),
+        _ => None,
+    }
+}
+
+/// The predicate of `𝑝 ▷ filter_values`, when `expr` is one.
+fn filter_values_predicate(expr: &Expr) -> Option<&Expr> {
     match &expr.node {
+        TypedExprNode::Apply { argument, function }
+            if matches!(function.node, TypedExprNode::Builtin(Builtin::FilterValues)) =>
+        {
+            Some(argument)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `arm` of a join is empty: a filter by the constant `false`, alone or heading a
+/// composition.
+fn is_empty_arm(arm: &Expr) -> bool {
+    let head = match &arm.node {
+        TypedExprNode::Compose(elts) => elts.first(),
+        _ => Some(arm),
+    };
+    head.and_then(filter_values_predicate)
+        .and_then(const_literal)
+        .is_some_and(|lit| matches!(lit, Lit::Bool(false)))
+}
+
+/// The operand a boolean gate `(𝑎, 𝑏) ▷ zip ≫ and` or `≫ or` reduces to, when one operand is a
+/// constant function of a literal.
+///
+/// `true and 𝑝` and `false or 𝑝` are 𝑝; `false and 𝑝` and `true or 𝑝` are the literal operand
+/// and drop 𝑝. The operand replaces the gate only where it has the gate's own type, so a
+/// refinement on either side is not lost; a literal operand is re-stamped with it. The gate is the
+/// pair `zip ≫ and` at any position of a composition, and the elements around it stay. The first
+/// such pair is reported and [`fold`] asks again until none is left.
+fn gate_operand(expr: &Expr) -> Option<GateOperand> {
+    let TypedExprNode::Compose(elts) = &expr.node else {
+        return None;
+    };
+    let whole = (elts.len() == 2).then_some(&expr.ty);
+    (0..elts.len().saturating_sub(1))
+        .find_map(|at| gate_operand_at(&elts[at], &elts[at + 1], at, whole))
+}
+
+/// [`gate_operand`] for the adjacent pair `zipped ≫ logic` at position `at`.
+fn gate_operand_at(
+    zipped: &Expr,
+    logic: &Expr,
+    at: usize,
+    whole: Option<&Type>,
+) -> Option<GateOperand> {
+    use crate::ccl::ops::{BinOpKind, LogicKind};
+    let TypedExprNode::Builtin(Builtin::BinOp(BinOpKind::BoolLogic(kind))) = &logic.node else {
+        return None;
+    };
+    let TypedExprNode::Apply { argument, function } = &zipped.node else {
+        return None;
+    };
+    if !matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)) {
+        return None;
+    }
+    let TypedExprNode::Tuple(operands) = &argument.node else {
+        return None;
+    };
+    if operands.len() != 2 {
+        return None;
+    }
+    let absorbing = match kind {
+        LogicKind::And => false,
+        LogicKind::Or => true,
+        _ => return None,
+    };
+    for (literal, other) in [(0, 1), (1, 0)] {
+        let Some(Lit::Bool(b)) = const_literal(&operands[literal]) else {
+            continue;
+        };
+        let keep = if *b == absorbing { literal } else { other };
+        let Type::Fun {
+            fun_kind, domain, ..
+        } = &zipped.ty
+        else {
+            return None;
+        };
+        let ty = match whole {
+            Some(whole) => whole.clone(),
+            None => Type::Fun {
+                name: None,
+                fun_kind: fun_kind.clone(),
+                domain: domain.clone(),
+                codomain: Box::new(logic.ty.codomain()?),
+            },
+        };
+        // A kept literal is typed by its own refinement (`Bool@false`) and is re-stamped with
+        // the gate's type; a kept predicate must already have it.
+        return (keep == literal || operands[keep].ty == ty).then_some(GateOperand {
+            at,
+            operand: keep,
+            ty,
+        });
+    }
+    None
+}
+
+/// What `expr` reduces to, when its children are already folded and it is one of the shapes
+/// this pass recognizes: those that compute a value, and those a folded gate decides.
+fn reduce(expr: &Expr, consts: &Consts) -> Option<Reduction> {
+    let lit = match &expr.node {
         TypedExprNode::Var(name) => consts.get(name).cloned(),
+        TypedExprNode::DisjointJoin(arms) => {
+            // A join whose arms are all empty is left as it is, so it never has no operand.
+            let empty = arms.iter().filter(|arm| is_empty_arm(arm)).count();
+            return (0 < empty && empty < arms.len()).then_some(Reduction::Arms);
+        }
+        TypedExprNode::Compose(_) => return gate_operand(expr).map(Reduction::Operand),
         TypedExprNode::Apply { function, argument } => {
             let TypedExprNode::Builtin(builtin) = &function.node else {
                 return None;
@@ -178,11 +388,22 @@ fn value_of(expr: &Expr, consts: &Consts) -> Option<Lit> {
                     TypedExprNode::Lit(Lit::Bool(b)) => Some(Lit::Bool(!b)),
                     _ => None,
                 },
+                // Every position passes, so the filter is the identity. Only where it is typed
+                // `𝐴 ⇒ 𝐴`, as the value-`Case` arm types it: a filter that narrows its domain
+                // by a refinement keeps it.
+                Builtin::FilterValues => {
+                    let passes =
+                        const_literal(argument).is_some_and(|lit| matches!(lit, Lit::Bool(true)));
+                    let (domain, codomain) = (expr.ty.domain(), expr.ty.codomain());
+                    return (passes && domain.is_some() && domain == codomain)
+                        .then_some(Reduction::Id);
+                }
                 _ => None,
             }
         }
         _ => None,
-    }
+    };
+    lit.map(Reduction::Lit)
 }
 
 /// The longest string concatenation this pass will build.
@@ -285,5 +506,198 @@ fn apply_one(op: crate::scalar_ops::BinOpKind, left: &Lit, right: &Lit) -> Optio
             Some(Lit::Bool(out.pop()?))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::ops::{BinOpKind, LogicKind};
+
+    fn int() -> Type {
+        Type::Base(BaseType::Int)
+    }
+
+    fn boolean() -> Type {
+        Type::Base(BaseType::Bool)
+    }
+
+    fn var(name: &str, ty: Type) -> Expr {
+        Expr::new(TypedExprNode::Var(Name::from(name))).with_ty(ty)
+    }
+
+    fn builtin(builtin: Builtin, ty: Type) -> Expr {
+        Expr::new(TypedExprNode::Builtin(builtin)).with_ty(ty)
+    }
+
+    /// `𝑏 ▷ const`, typed `Int ⇒ Bool@𝑏` as lowering types a constant guard.
+    fn const_bool(b: bool) -> Expr {
+        let literal = Expr::new(TypedExprNode::Lit(Lit::Bool(b))).with_ty(boolean());
+        let ty = Type::fun(int(), boolean());
+        Expr::apply(literal, builtin(Builtin::Const, ty.clone())).with_ty(ty)
+    }
+
+    /// The elements `(𝑎, 𝑏) ▷ zip` and `and`/`or` of a gate, typed with `fun`: `Type::fun` or
+    /// `Type::data_fun`.
+    fn gate(a: Expr, b: Expr, kind: LogicKind, fun: fn(Type, Type) -> Type) -> (Expr, Expr) {
+        let pair = Type::tuple(vec![boolean(), boolean()]);
+        let tuple = Expr::new(TypedExprNode::Tuple(vec![a, b])).with_ty(pair.clone());
+        let zip_ty = fun(int(), pair.clone());
+        let zipped = Expr::apply(tuple, builtin(Builtin::Zip, zip_ty.clone())).with_ty(zip_ty);
+        let logic = builtin(
+            Builtin::BinOp(BinOpKind::BoolLogic(kind)),
+            fun(pair, boolean()),
+        );
+        (zipped, logic)
+    }
+
+    fn compose(elts: Vec<Expr>) -> Expr {
+        let ty = Type::fun(int(), boolean());
+        Expr::new(TypedExprNode::Compose(elts)).with_ty(ty)
+    }
+
+    fn elements(expr: &Expr) -> &[Expr] {
+        match &expr.node {
+            TypedExprNode::Compose(elts) => elts,
+            _ => panic!("expected a composition"),
+        }
+    }
+
+    fn predicate() -> Expr {
+        var("p", Type::fun(int(), boolean()))
+    }
+
+    fn is_const_bool(expr: &Expr, b: bool) -> bool {
+        const_literal(expr).is_some_and(|lit| *lit == Lit::Bool(b))
+    }
+
+    /// `true and 𝑝` is 𝑝 wherever the gate sits in its composition, and the elements around
+    /// it stay.
+    #[test]
+    fn a_gate_in_the_middle_of_a_composition_folds_to_its_operand() {
+        let before = var("f", Type::fun(int(), int()));
+        let after = builtin(Builtin::NotFn, Type::fun(boolean(), boolean()));
+        let (zipped, logic) = gate(const_bool(true), predicate(), LogicKind::And, Type::fun);
+        let mut expr = compose(vec![before, zipped, logic, after]);
+        fold_constants(&mut expr);
+        let elts = elements(&expr);
+        assert_eq!(elts.len(), 3, "the gate's two elements become its operand");
+        assert!(matches!(&elts[1].node, TypedExprNode::Var(n) if *n == Name::from("p")));
+        assert!(matches!(
+            &elts[2].node,
+            TypedExprNode::Builtin(Builtin::NotFn)
+        ));
+    }
+
+    /// `false or 𝑝` keeps 𝑝 and, with the literal on the right, `𝑝 and true` does too.
+    #[test]
+    fn a_neutral_literal_on_either_side_leaves_the_other_operand() {
+        for (a, b, logic, neutral) in [
+            (const_bool(false), predicate(), LogicKind::Or, false),
+            (predicate(), const_bool(true), LogicKind::And, true),
+        ] {
+            let (zipped, logic) = gate(a, b, logic, Type::fun);
+            let mut expr = compose(vec![zipped, logic]);
+            fold_constants(&mut expr);
+            assert!(
+                matches!(&expr.node, TypedExprNode::Var(n) if *n == Name::from("p")),
+                "a gate with the neutral literal {neutral} is its other operand"
+            );
+        }
+    }
+
+    /// `false and 𝑝` and `true or 𝑝` are the literal's `const`, stamped with the gate's own type.
+    #[test]
+    fn an_absorbing_literal_replaces_the_gate_by_its_constant() {
+        for (literal, logic) in [(false, LogicKind::And), (true, LogicKind::Or)] {
+            let (zipped, logic) = gate(const_bool(literal), predicate(), logic, Type::fun);
+            let mut expr = compose(vec![zipped, logic]);
+            fold_constants(&mut expr);
+            assert!(is_const_bool(&expr, literal));
+            assert_eq!(expr.ty, Type::fun(int(), boolean()));
+        }
+    }
+
+    /// A data-function gate keeps its `⤇`: the kept operand is stamped with the gate's kind.
+    #[test]
+    fn a_data_function_gate_keeps_its_function_kind() {
+        let (zipped, logic) = gate(
+            const_bool(false),
+            predicate(),
+            LogicKind::And,
+            Type::data_fun,
+        );
+        let mut expr = compose(vec![zipped, logic]).with_ty(Type::data_fun(int(), boolean()));
+        fold_constants(&mut expr);
+        assert!(is_const_bool(&expr, false));
+        assert_eq!(expr.ty, Type::data_fun(int(), boolean()));
+    }
+
+    /// A predicate that is a composition is spliced into the elements around the gate, and a
+    /// composition holding two gates folds both.
+    #[test]
+    fn a_composite_operand_is_spliced_and_every_gate_folds() {
+        let g = || var("g", Type::fun(int(), boolean()));
+        let h = || var("h", Type::fun(int(), boolean()));
+        let inner = compose(vec![g(), h()]);
+        let (z1, l1) = gate(const_bool(true), inner, LogicKind::And, Type::fun);
+        let (z2, l2) = gate(predicate(), const_bool(false), LogicKind::Or, Type::fun);
+        let mut expr = compose(vec![
+            var("f", Type::fun(int(), int())),
+            z1,
+            l1,
+            z2,
+            l2,
+            builtin(Builtin::NotFn, Type::fun(boolean(), boolean())),
+        ]);
+        fold_constants(&mut expr);
+        let names: Vec<_> = elements(&expr)
+            .iter()
+            .map(|e| match &e.node {
+                TypedExprNode::Var(n) => n.clone(),
+                TypedExprNode::Builtin(Builtin::NotFn) => Name::from("not_fn"),
+                other => panic!("unexpected element {other:?}"),
+            })
+            .collect();
+        let expected: Vec<_> = ["f", "g", "h", "p", "not_fn"].map(Name::from).into();
+        assert_eq!(names, expected);
+    }
+
+    /// A gate that is a whole composition keeps that composition's recorded type, and a
+    /// predicate typed otherwise does not replace it.
+    #[test]
+    fn a_whole_gate_composition_keeps_its_recorded_type() {
+        let refined = Type::fun(Type::UIntRange(3), boolean());
+        let (zipped, logic) = gate(const_bool(false), predicate(), LogicKind::And, Type::fun);
+        let mut expr = compose(vec![zipped, logic]).with_ty(refined.clone());
+        fold_constants(&mut expr);
+        assert!(is_const_bool(&expr, false));
+        assert_eq!(expr.ty, refined);
+
+        let (zipped, logic) = gate(const_bool(true), predicate(), LogicKind::And, Type::fun);
+        let mut expr = compose(vec![zipped, logic]).with_ty(refined);
+        fold_constants(&mut expr);
+        assert_eq!(elements(&expr).len(), 2, "the predicate is typed otherwise");
+    }
+
+    /// A predicate of another type than the gate is not substituted for it.
+    #[test]
+    fn a_predicate_of_another_type_than_the_gate_stays() {
+        let narrower = var("p", Type::fun(Type::UIntRange(2), boolean()));
+        let (zipped, logic) = gate(const_bool(true), narrower, LogicKind::And, Type::fun);
+        let mut expr = compose(vec![zipped, logic]);
+        fold_constants(&mut expr);
+        assert_eq!(elements(&expr).len(), 2);
+    }
+
+    /// `nand`, `nor` and `xor` are not folded: only `and` and `or` have an absorbing element.
+    #[test]
+    fn other_logic_kinds_are_not_folded() {
+        for kind in [LogicKind::Nand, LogicKind::Nor, LogicKind::Xor] {
+            let (zipped, logic) = gate(const_bool(true), predicate(), kind, Type::fun);
+            let mut expr = compose(vec![zipped, logic]);
+            fold_constants(&mut expr);
+            assert_eq!(elements(&expr).len(), 2);
+        }
     }
 }

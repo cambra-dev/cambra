@@ -18,7 +18,7 @@
 use std::time::Duration;
 
 use cambra::interpreter::Value;
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use rstest_log::rstest;
 
 use super::helpers::*;
@@ -1395,6 +1395,11 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
 /// position)` pair, seeded per enclosing position and read back per enclosing position with
 /// `final_read`. A constant inner source is paired with each enclosing position through
 /// `strength_over`; a source the outer row holds is the row itself (`over .1`).
+///
+/// A writer decision is a first-match `Case` over its gates, and a gate built from literals
+/// folds: the nests above write unconditionally and plan to their commit arm alone, with no
+/// filter and no abort arm. The flat loop at the end writes under a gate that varies with the
+/// item, so it keeps both arms and their filters.
 #[rstest]
 #[case::a_constant_inner_source(
     indoc! {r#"
@@ -1406,9 +1411,9 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     "#},
     indoc! {r#"
         let s : Int = 0
-        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, Int), [0, 1]) (s = .0) { [s]⇒[s] over iterate ▷ const ▷ strength_over ≫ (.1 ≫ [10, 20]) ▷ map do true ▷ const ▷ filter_values ≫ (writes: (s: (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
+        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, Int), [0, 1]) (s = .0) { [s]⇒[s] over iterate ▷ const ▷ strength_over ≫ (.1 ≫ [10, 20]) ▷ map do (writes: (s: (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
         in let s : ((Int, Int) ⇒ Int) = __hist ≫ .s ≫ final_read
-        in true ▷ const ▷ filter_values ≫ (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
+        in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
         in let s : Int = __hist.s ▷ final_read
         in s
     "#}
@@ -1423,12 +1428,27 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     "#},
     indoc! {r#"
         let s : Int = 0
-        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [[1, 2], [3, 4]] do let __hist : ((Int, ([0, 1] ⤇ Int)) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, ([0, 1] ⤇ Int)), [0, 1]) (s = .0) { [s]⇒[s] over .1 do .1 ≫ (true ▷ const ▷ filter_values ≫ (writes: (s: add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const) }
+        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [[1, 2], [3, 4]] do let __hist : ((Int, ([0, 1] ⤇ Int)) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, ([0, 1] ⤇ Int)), [0, 1]) (s = .0) { [s]⇒[s] over .1 do .1 ≫ (writes: (s: add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
         in let s : ((Int, ([0, 1] ⤇ Int)) ⇒ Int) = __hist ≫ .s ≫ final_read
-        in true ▷ const ▷ filter_values ≫ (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
+        in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
         in let s : Int = __hist.s ▷ final_read
         in s
     "#}
+)]
+#[case::a_conditional_write(
+    indoc! {"
+        total := 0
+        for n in [1, 2, 3]:
+            if n > 1:
+                total += n
+        total
+    "},
+    indoc! {"
+        let total : Int = 0
+        in let __hist : {total: ([0, 2] ⤇ Int)} = transact (total = 0) { [total]⇒[total] over iterate ≫ [1, 2, 3] do ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ (writes: (total: ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ add ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ .0) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ `abort(unit) ▷ const }
+        in let total : Int = __hist.total ▷ final_read
+        in total
+    "}
 )]
 fn a_nest_plans_to_a_transact_under_the_enclosing_pair(#[case] code: &str, #[case] expected: &str) {
     use cambra::ccl::context::{Phase, compile_to};
@@ -1439,4 +1459,29 @@ fn a_nest_plans_to_a_transact_under_the_enclosing_pair(#[case] code: &str, #[cas
     )
     .expect("the nest plans");
     assert_eq!(symbolic(&planned), expected.trim_end());
+}
+
+/// A constant operand of a write's guard folds the gate away (`const_fold.rs`, `gate_operand`)
+/// and the nest still computes the guarded sum.
+#[rstest]
+#[case::a_true_operand_of_and("True and n > 1", 5)]
+#[case::a_false_operand_of_or("False or n > 1", 5)]
+#[case::a_false_operand_of_and("False and n > 1", 0)]
+#[case::a_true_operand_of_or("True or n > 1", 6)]
+#[case::a_literal_on_the_right_of_and("n > 1 and True", 5)]
+#[case::an_absorbing_literal_on_the_right_of_and("n > 1 and False", 0)]
+#[case::an_absorbing_literal_on_the_right_of_or("n > 1 or True", 6)]
+#[case::a_literal_on_the_right_of_or("n > 1 or False", 5)]
+#[case::two_literals("True and False", 0)]
+fn a_constant_guard_operand_leaves_the_sum_unchanged(#[case] guard: &str, #[case] expected: i64) {
+    check_scalar(
+        &formatdoc! {"
+            total := 0
+            for n in [1, 2, 3]:
+                if {guard}:
+                    total += n
+            total
+        "},
+        Value::Int(expected),
+    );
 }
