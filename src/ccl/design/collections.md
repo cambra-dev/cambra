@@ -216,6 +216,12 @@ test. `fn_of_bare_predicate` returns `f` directly for a bare `__elem ▷ f` pred
 An occurrence that remains in a type is not thereby a compiled runtime `CollectionContains`
 operator. The compiler does not provide a surface `in` expression yet.
 
+An iteration site over a present-key domain enumerates the keys instead of testing membership:
+its source is `𝑚 ▷ converse ▷ map_domain`, the image of the membership's collection `𝑚`, and the
+domain's other refinements restrict it (`membership_keys` in `planning/iterate.rs`). A
+comprehension whose element ignores the group reaches this, `[1 for g in groupby(xs, key)]` or
+`[1 for v in m]` over a map, since nothing applies the partition.
+
 Producer-bearing domains expose two limitations:
 
 - A producer term is embedded in the type, so its structure can appear at many type sites.
