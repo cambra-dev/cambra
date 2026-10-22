@@ -3192,22 +3192,6 @@ fn typecheck_discarded_definition(
     raised
 }
 
-/// The type [`specialize_projection_domain`] writes, given the value `input`
-/// flowing in.
-///
-/// The overwrite reads the argument **node**, and a node's recorded type is the
-/// mutable variable *handle* wherever one was passed, because the read
-/// [`emit_apply`](super::emit::emit_apply) performed lives in the `arg <: domain`
-/// edge, not on the node. So this has to make that same decision again, and for a
-/// projection it is always the same one: **deref**. Rule 2
-/// keeps `Mut` out of every composite, so nothing projects *into* a mutable variable,
-/// only through one. Without the deref a projection off a mutable variable (`acc.0` on
-/// a compound accumulator) re-acquires the handle here and fails `emit_proj`'s
-/// `domain <: {tuple/record}` requirement at the post-inference wall.
-fn recovered_input(input: &Type) -> Type {
-    input.mut_value_type().unwrap_or(input).clone()
-}
-
 /// Monomorphize a projection to the value flowing into it — the **closed-form**
 /// case of use-site specialization, the sibling of [`specialize_use`].
 ///
@@ -3248,7 +3232,13 @@ pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
         && let Some(cod) = morphism.ty.codomain()
     {
         // A projection is non-dependent, so the rebuilt function type keeps `name: None`.
-        morphism.ty = Type::fun(recovered_input(input), cod);
+        // `input` can be a mutable variable handle: at an `Apply` it is the argument
+        // node's type, and `emit_apply` reads through the handle in the `arg <: domain`
+        // edge, not on the node. Rule 2 keeps `Mut` out of every composite, so a
+        // projection reads through a mutable variable, never into one. Without the read
+        // here, `acc.0` on a compound accumulator gets the handle as its domain and
+        // fails `emit_proj`'s `domain <: {tuple/record}` requirement.
+        morphism.ty = Type::fun(read_through(input), cod);
     }
 }
 
@@ -3378,7 +3368,7 @@ mod tests {
         TypedExprNode,
     };
 
-    // ----- the projection's monomorphization (`recovered_input`) -----
+    // ----- the projection's monomorphization (`read_through` at the projection) -----
 
     /// The projection's monomorphization overwrites a morphism's domain with the type
     /// read off the argument **node**, and that type is the mutable variable *handle* —
@@ -3386,14 +3376,14 @@ mod tests {
     /// node. So it has to redo the decision, and for a projection the answer is always
     /// to deref.
     ///
-    /// Driven at [`recovered_input`] rather than through a program because a
+    /// Driven at [`read_through`] rather than through a program because a
     /// projection off a mutable variable needs a compound accumulator, and the wrong
     /// answer there is silent: the domain re-acquires the handle and fails
     /// `emit_proj`'s `domain <: {tuple/record}` requirement at the post-inference
     /// wall rather than at the projection.
     #[test]
     fn the_projection_monomorphization_reads_through_a_mut_var() {
-        use super::recovered_input;
+        use super::read_through;
         use crate::ccl::Refinement;
         let mut_var = |value: Type| Type::mutable(Type::Txn, value);
         // Refinements are built here rather than via `refined_int`, which is
@@ -3408,12 +3398,12 @@ mod tests {
         let handle = mut_var(int.clone());
 
         // The handle reads through to its value type.
-        assert_eq!(recovered_input(&handle), int);
+        assert_eq!(read_through(&handle), int);
         // A refinement on the handle does not stop it being one (a refined mutable
         // variable is still a mutable variable), so it still reads through.
-        assert_eq!(recovered_input(&refined(handle.clone())), int);
+        assert_eq!(read_through(&refined(handle.clone())), int);
         // A non-mutable variable input is untouched.
-        assert_eq!(recovered_input(&int), int);
+        assert_eq!(read_through(&int), int);
     }
 
     // ----- ordering-invariant comparison (`types_agree_modulo_unread`) -----
