@@ -1115,9 +1115,9 @@ impl TypedExpr {
     /// [`clone_at`](Self::clone_at), whose one caller is
     /// [`crate::ccl::subst`]'s `as_expr_preserving`.
     ///
-    /// Nine rebuilds still carry a `TODO(preserve)` marker: `channelize` (six) and
-    /// one each in `feed_nest`, `subst`, and `lambda_elim`; the two in `subst` and
-    /// `lambda_elim` ask whether their rebuild should mint or preserve at all.
+    /// Rebuilds not yet converted carry a `TODO(preserve)` marker. The markers in
+    /// `subst` and `lambda_elim` ask whether their rebuild should mint or preserve
+    /// at all.
     pub(crate) fn preserve(node_id: NodeId, node: TypedExprNode) -> Self {
         TypedExpr {
             node,
