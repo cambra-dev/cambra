@@ -2529,6 +2529,7 @@ mod tests {
                     Box::new(Type::Base(BaseType::Int)),
                     RefinementSet::one(Refinement {
                         predicate: Rc::new(pred()),
+                        normal: Default::default(),
                     }),
                 )),
                 codomain: Box::new(Type::Base(BaseType::Int)),

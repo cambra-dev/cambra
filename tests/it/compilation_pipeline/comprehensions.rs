@@ -657,6 +657,25 @@ fn a_correlated_inner_comprehension_without_an_aggregate() {
     );
 }
 
+/// Rows filtered by the outer binder of a comprehension, with no aggregate over them: each
+/// row keeps its own keys.
+#[rstest]
+#[case::filtered_by_the_outer_binder(indoc! {r#"
+    out = test_sink()
+    out << [[v for v in [1, 2, 3] if v > r] for r in [1, 2]]
+"#}, "[() -> [[1 -> 2, 2 -> 3], [2 -> 3]]]")]
+#[case::reading_it_in_the_element(indoc! {r#"
+    out = test_sink()
+    out << [[v * r for v in [1, 2, 3] if v > r] for r in [1, 2]]
+"#}, "[() -> [[1 -> 2, 2 -> 3], [2 -> 6]]]")]
+#[case::filtered_by_a_computation_on_it(indoc! {r#"
+    out = test_sink()
+    out << [[v for v in [1, 2, 3] if v > r + 1] for r in [1, 2]]
+"#}, "[() -> [[2 -> 3], []]]")]
+fn correlated_rows_without_an_aggregate(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
 /// The same over a **collection** source, whose keys are the inner domain.
 ///
 /// Read as a set of `(row, key, value)` triples: a map carries its entries in its own order,
@@ -928,41 +947,6 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
         "#},
         "a correlated inner comprehension over a collection its body never applies is not \
          supported yet",
-    );
-}
-
-/// A correlated filter with **no aggregate over it** does not compile, where the same filter
-/// under a `sum` does (`a_correlated_inner_comprehension_runs_per_outer_row`,
-/// `correlated_filter`). The one predicate ends up spelled two ways — the term reads the outer
-/// list through the iteration record, while the copy in the type reads it through a `let` —
-/// and lambda elimination's check that a node keeps its type rejects the pair:
-///
-/// ```text
-/// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > (let __anf = [1, 2] in __iter_record ▷ __anf)} ⤇ Int)
-/// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)} ⤇ Int)
-/// ```
-///
-/// That check is `debug_assertions`-gated. Without it the tree reaches the post-lambda-elim
-/// wall, which reports the same disagreement as a collection-domain mismatch.
-///
-/// The fault is below the re-basing rewrite rather than in it: the rewrite that reaches one
-/// occurrence does not reach the other (`refinements-dependent-projection-of-a-refined-pair`
-/// in the issue tracker).
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[cfg_attr(
-    debug_assertions,
-    should_panic(expected = "lambda elimination changed a node's type")
-)]
-#[cfg_attr(
-    not(debug_assertions),
-    should_panic(expected = "Type mismatch for collection domain")
-)]
-fn a_correlated_filter_without_an_aggregate_does_not_compile() {
-    check_tile(
-        "[[v * r for v in [1, 2, 3] if v > r] for r in [1, 2]]",
-        // `[[2, 3], [6]]` if it compiled.
-        make_int_list(&[]),
     );
 }
 

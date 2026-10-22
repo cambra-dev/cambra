@@ -107,12 +107,16 @@ pub fn run(expr: Expr) -> Result<Expr, String> {
     // Live cross-endpoint reads are recognized earlier, in
     // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
     // such read is already an `as_of` join — nothing to do at planning time.
-    let mut expr = run_phases(
-        expr,
-        Root::Program,
-        &PlanningPhase::ALL,
-        &mut Witnesses::default(),
-    )?;
+    // Planning compiles the predicates it reaches by eliminating their lambdas, so one memo
+    // serves every binder conversion of a predicate shared across sites.
+    let mut expr = crate::ccl::subst::with_conversion_memo(|| {
+        run_phases(
+            expr,
+            Root::Program,
+            &PlanningPhase::ALL,
+            &mut Witnesses::default(),
+        )
+    })?;
     // Projection pruning runs on the planned program, after the final `simplify`
     // ([`PlanningPhase::Cleanup`]). Every phase matches a source in the shape it has when the
     // source is read whole, and pruning retypes the source from the record to the leaves its
@@ -265,6 +269,9 @@ fn run_phases(
     phases: &[PlanningPhase],
     witnesses: &mut Witnesses,
 ) -> Result<Expr, String> {
+    // One memo for the iteration walk and the predicate compilation after it, so a
+    // predicate shared across sites compiles once ([`PredMemo`], "One memo per pass").
+    let memo = PredMemo::new();
     for phase in phases {
         match phase {
             PlanningPhase::RealizeConditionals => {
@@ -285,12 +292,10 @@ fn run_phases(
             }
             PlanningPhase::FoldConstants => const_fold::fold_constants(&mut term),
             PlanningPhase::MarkIterationSites => match root {
-                Root::Program => insert_iterate_markers(&mut term, witnesses)?,
-                Root::Lifted => iterate::insert_iterate_recurse(&mut term, witnesses)?,
+                Root::Program => insert_iterate_markers(&mut term, witnesses, &memo)?,
+                Root::Lifted => iterate::insert_iterate_recurse(&mut term, witnesses, &memo)?,
             },
-            PlanningPhase::CompilePredicates => {
-                compile_refinement_predicates(&mut term, &PredMemo::new())
-            }
+            PlanningPhase::CompilePredicates => compile_refinement_predicates(&mut term, &memo),
             PlanningPhase::InsertPerGroupFilters => {
                 per_group_filter::insert_per_group_filters(&mut term, witnesses)?;
                 per_group_filter::reject_unmaterialized_narrowings(&term)?;
@@ -901,7 +906,7 @@ mod tests {
 
         let mut expr = Expr::let_bind("xs".to_string(), list_123(), body_chain).with_ty(list_ty);
 
-        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
+        insert_iterate_markers(&mut expr, &mut Default::default(), &PredMemo::new()).unwrap();
 
         let TypedExprNode::Let {
             bound_expr, body, ..
@@ -936,7 +941,7 @@ mod tests {
             fun_ty(fun_ty(Type::UIntRange(3), int.clone()), int.clone()),
             int,
         );
-        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
+        insert_iterate_markers(&mut expr, &mut Default::default(), &PredMemo::new()).unwrap();
         let TypedExprNode::Apply { argument, function } = &expr.node else {
             panic!("expected Apply, got: {}", symbolic(&expr));
         };
@@ -972,7 +977,7 @@ mod tests {
             ("n".into(), int),
         ]));
 
-        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
+        insert_iterate_markers(&mut expr, &mut Default::default(), &PredMemo::new()).unwrap();
 
         let TypedExprNode::Record(outs) = &expr.node else {
             panic!("expected a record, got: {}", symbolic(&expr));
