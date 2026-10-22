@@ -945,6 +945,31 @@ a == b
     )
 }
 
+/// An annotation inside a body demanding something of a parameter or loop variable in terms of
+/// a binder the body introduced panics: a read of the binder is its variable as-is, and that
+/// variable stands where the binder is bound, outside the body. The demand lands on it naming
+/// `y`, which nothing there binds (`src/ccl/design/type-inference.md`, "The invariant"). Both
+/// programs run, `y` being one more than the value annotated, so the panic is a compiler gap.
+#[rstest]
+#[case::a_parameter(indoc! {r#"
+    def f(x):
+        y = x + 1
+        z: {Int where _ < y} = x
+        z
+    f(3)
+"#})]
+#[case::a_loop_variable(indoc! {r#"
+    total := 0
+    for x in [1, 2, 3]:
+        y = x + 1
+        z: {Int where _ < y} = x
+        total += z
+    total
+"#})]
+fn a_demand_naming_a_body_binder_escapes_to_the_binder_variable(#[case] code: &str) {
+    check_compile_error(code, "open bound recorded");
+}
+
 /// Reading a mutable variable introduces an opaque binder whose scope closes
 /// inside the body, so the codomain's opaque drop runs; the same refinement names
 /// the parameter, which the Pi binds. The codomain variable carrying the drop is

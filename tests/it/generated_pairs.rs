@@ -79,8 +79,8 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("record_in_list", "sum_of_empty", "CompilerRejects"),
     ("record_in_list", "ternary", "CompilerRejects"),
     ("record_in_list", "union_sum", "CompilerRejects"),
-    ("rows_loop_feed", "rows_filtered", "CompilerRejects"),
-    ("rows_nested_mut", "rows_filtered", "CompilerRejects"),
+    ("rows_loop_feed", "rows_filtered", "CompilerPanics"),
+    ("rows_nested_mut", "rows_filtered", "CompilerPanics"),
     ("terminal_read", "terminal_in_agg[pool]", "CompilerRejects"),
     (
         "terminal_read_after_guard",

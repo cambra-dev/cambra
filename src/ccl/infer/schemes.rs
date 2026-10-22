@@ -172,9 +172,16 @@ impl OperatorSchemes {
         // body declares it on the witness domain, which is what the binder meant: it ranges
         // over elements of whichever domain the witness picked. A body written `σ ⤇ ε`
         // would leave `k` free, which the escape check reports as an out-of-scope binder.
-        let delta = fresh_var(BODY_LEVEL);
-        let epsilon = fresh_var(BODY_LEVEL);
+        //
+        // `ε` stands under that binder in both functions, so its telescope holds it, and an
+        // instantiation enters the binder its copy names into the copy's telescope
+        // (`FreshenCache::site_telescope`).
         let elem = crate::ccl::Name::from("__box_k");
+        let delta = fresh_var(BODY_LEVEL);
+        let epsilon = Type::Infer(crate::ccl::InferVar::fresh_in(
+            BODY_LEVEL,
+            &crate::ccl::infer_var::Telescope::empty().extended(elem.clone()),
+        ));
         let box_intro = PolyScheme::poly(
             SCHEME_LEVEL,
             fun(
