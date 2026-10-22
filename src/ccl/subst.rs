@@ -236,7 +236,28 @@ fn assert_preserves_typedness(replacement: &TypedExpr, occurrence_ty: &Type) {
     );
 }
 
+/// Whether `n` is a term name a type can read: not a Π-bound index or the enclosing refinement's
+/// element, which no binder's scope holds.
+fn is_read_name(n: &Name) -> bool {
+    n.pi_bound_index().is_none() && !n.is_elem()
+}
+
 impl Mapping {
+    /// The names a type names where this mapping acts on its binder: the target of a rename, the
+    /// free names of a discharged binder's term or of a keyed join's term, and none for a
+    /// binder joined with no term. An unspellable mapping names what the mapping it stands for
+    /// does.
+    fn image(&self) -> BTreeSet<Name> {
+        match self {
+            Mapping::Rename(to) => BTreeSet::from([to.clone()]),
+            Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
+                crate::ccl::ccl_utils::free_names(t).into_iter().collect()
+            }
+            Mapping::Join(None) => BTreeSet::new(),
+            Mapping::Unspellable(inner) => inner.image(),
+        }
+    }
+
     /// Whether the term this mapping puts at its binder reads the enclosing refinement's
     /// element.
     fn reads_elem(&self) -> bool {
@@ -862,20 +883,7 @@ impl Subst {
         let reads: Vec<Name> = self
             .binders
             .values()
-            .flat_map(|m| match m {
-                Mapping::Rename(to) => vec![to.clone()],
-                Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
-                    crate::ccl::ccl_utils::free_names(t).into_iter().collect()
-                }
-                Mapping::Unspellable(m) => match &**m {
-                    Mapping::Rename(to) => vec![to.clone()],
-                    Mapping::Discharge(t) => {
-                        crate::ccl::ccl_utils::free_names(t).into_iter().collect()
-                    }
-                    Mapping::Join(_) | Mapping::Unspellable(_) => Vec::new(),
-                },
-                Mapping::Join(None) => Vec::new(),
-            })
+            .flat_map(Mapping::image)
             .chain(
                 self.elims
                     .iter()
@@ -888,7 +896,7 @@ impl Subst {
                 WitnessMapping::Discharge(t) => type_free_vars(t).into_iter().collect(),
                 WitnessMapping::Rename(_) => Vec::new(),
             }))
-            .filter(|n| n.pi_bound_index().is_none() && !n.is_elem())
+            .filter(is_read_name)
             .collect();
         let telescope = v
             .telescope
@@ -923,6 +931,28 @@ impl Subst {
             bounds.upper_mut().push(bound);
         }
         Type::Infer(held)
+    }
+
+    /// The term names a type naming `names` names once this substitution's binder mappings
+    /// have acted on it, as [`Mapping::image`] reads them: a renamed binder's target, the free
+    /// names of a discharged binder's term or of a keyed join's term at the key, nothing for a
+    /// binder joined with no term or with no spelling, and every other name as it is. Read name
+    /// by name, so nothing is applied and no variable is suspended on.
+    ///
+    /// Eliminations and witness mappings act on whatever sum the type holds, which names alone
+    /// do not show, so this reads neither: a caller whose substitution has them
+    /// ([`has_witnesses`](Self::has_witnesses)) applies it.
+    pub fn names_after(&self, names: impl IntoIterator<Item = Name>) -> BTreeSet<Name> {
+        let mut out = BTreeSet::new();
+        for n in names {
+            match self.binders.get(&n) {
+                None => {
+                    out.insert(n);
+                }
+                Some(m) => out.extend(m.image().into_iter().filter(is_read_name)),
+            }
+        }
+        out
     }
 
     /// The binders this substitution acts on (its source domain).
@@ -1694,27 +1724,11 @@ impl Subst {
     /// What each entry's image reads, for carrying many name sets through this substitution
     /// ([`ImageTable::image`]).
     pub(crate) fn image_table(&self) -> ImageTable {
-        let image = |m: &Mapping| -> BTreeSet<Name> {
-            match m {
-                Mapping::Rename(to) => BTreeSet::from([to.clone()]),
-                Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
-                    crate::ccl::ccl_utils::free_names(t).into_iter().collect()
-                }
-                Mapping::Join(None) => BTreeSet::new(),
-                Mapping::Unspellable(inner) => match &**inner {
-                    Mapping::Rename(to) => BTreeSet::from([to.clone()]),
-                    Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
-                        crate::ccl::ccl_utils::free_names(t).into_iter().collect()
-                    }
-                    Mapping::Join(None) | Mapping::Unspellable(_) => BTreeSet::new(),
-                },
-            }
-        };
         ImageTable {
             names: self
                 .binders
                 .iter()
-                .map(|(k, m)| (k.clone(), image(m)))
+                .map(|(k, m)| (k.clone(), m.image()))
                 .collect(),
             witnesses: self
                 .witness_mappings()
@@ -3190,13 +3204,10 @@ pub fn name_spelled_stored_binders(ty: &Type) -> Vec<Binder> {
 /// The free term variables of `ty`'s refinement predicates that `in_scope` does
 /// not account for. Empty iff `ty` is well-formed there.
 ///
-/// One spelling for the whole family: the end-of-inference scope check
-/// (`infer::solve`'s `check_scope_valid`) and the record-time closure check
-/// (`infer_var`'s `bound_scope_gaps`) differ only in what they count as in scope, and both need the gap set rather than a yes/no — the first
-/// to name the unbound variables in its diagnostic, the second because every
-/// member is an error. `in_scope` is a predicate rather than a set so a caller
-/// whose scope is not one (a telescope plus two substitution domains) needs no
-/// set built to ask.
+/// The end-of-inference scope check (`infer::solve`'s `check_scope_valid`) needs the gap
+/// set rather than a yes/no, to name the unbound variables in its diagnostic. `in_scope` is
+/// a predicate rather than a set so a caller whose scope is not one needs no set built to
+/// ask.
 pub fn scope_gaps(ty: &Type, in_scope: impl Fn(&Binder) -> bool) -> BTreeSet<Binder> {
     let mut free = type_free_vars(ty);
     free.retain(|n| !in_scope(n));
