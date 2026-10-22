@@ -39,10 +39,10 @@ level forms:
   `elif` or `else`, has fixed. A line continues it as it continues a `Fixed` level.
 
 A `Pending` level opens with a zero-width `BlockValueIndent` and a `Pending` or `Pinned` level
-closes with `BlockValueDedent`. The `BlockValueIndent` sits before the first token of the
-statement that opens the level, after a leading `pub`. The parser's `block_assign` consumes the
-`BlockValueIndent`, and its `block_value` consumes the `BlockValueDedent` after parsing the `if`
-or `match` statement. Statement-level recovery skips from one to the other
+closes with `BlockValueDedent`. The `BlockValueIndent` sits before the first token of the line's
+last statement, after a top-level `;` and a leading `pub`. The parser's `block_assign` consumes the
+`BlockValueIndent`, and its `block_value` consumes the `BlockValueDedent` after parsing the `if` or
+`match` statement. Statement-level recovery skips from one to the other
 ([Statement-level recovery](#statement-level-recovery)).
 
 The stack starts with `Fixed(0)`. `end_line` pushes a `Pending` level when a logical line ends in
@@ -457,6 +457,31 @@ if c:
 
 A body whose first line is deeper than the rest follows the same rule: its later lines fall short
 of the column the first line fixed, and stay in the body.
+
+A short line that ends in `:` opens its block at the next line deeper than the short line's own
+column, not the level's, so a short header keeps its body:
+
+```text
+if a:
+    if b:
+        1
+  else:           →  `else` continues `if b`                     InconsistentIndent at `else`
+    2                2 is the `else` body
+```
+
+Only an indented block keeps a short line. A block right-hand side's `Pending` or `Pinned` level
+holds its chain's `elif` and `else` lines, which a short line does not continue, so that level
+closes for it. The line then belongs to the deepest enclosing level left of it:
+
+```text
+x = if c:
+        1
+    else:
+        2
+  y = 3           →  y = 3 is a statement after `x`             InconsistentIndent at `y`
+```
+
+`recovery_skips_a_stray_indentation_level` in `parser.rs` covers each shape.
 
 #### One diagnostic per lexical error
 

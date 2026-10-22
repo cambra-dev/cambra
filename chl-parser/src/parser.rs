@@ -4274,8 +4274,10 @@ mod tests {
 
     /// A line indented deeper than its siblings starts with an `Indent`, which
     /// recovery skips with the block it opens up to its `Dedent`. A line that
-    /// dedents short of its block's column stays in the block (`lexer.rs`,
-    /// `Layout::line_start`) with an `InconsistentIndent`, the one diagnostic.
+    /// dedents short of an indented block's column stays in the block
+    /// (`lexer.rs`, `Layout::line_start`) with an `InconsistentIndent`, the one
+    /// diagnostic. Such a line that ends in `:` keeps its body, and a line short
+    /// of a block right-hand side's chain closes the chain.
     #[test]
     fn recovery_skips_a_stray_indentation_level() {
         assert_recovers(&[
@@ -4321,6 +4323,87 @@ mod tests {
                 "},
                 &["FunctionDef(Assign, Assign)", "Assign"],
             ),
+            (
+                "an `else` short of its `if`",
+                indoc! {"
+                    if a:
+                        if b:
+                            1
+                      else:
+                        2
+                "},
+                &["If"],
+            ),
+            (
+                "a header short of its body's column",
+                indoc! {"
+                    def f():
+                        a = 1
+                      if c:
+                        b = 2
+                        d = 3
+                    e = 4
+                "},
+                &["FunctionDef(Assign, If)", "Assign"],
+            ),
+            (
+                "a line short of a block right-hand side's chain",
+                indoc! {"
+                    x = if c:
+                            1
+                        else:
+                            2
+                      y = 3
+                    z = 4
+                "},
+                &["Assign", "Assign", "Assign"],
+            ),
+            (
+                "a line short of a block right-hand side's chain in a body",
+                indoc! {"
+                    def f():
+                        x = if c:
+                                1
+                            else:
+                                2
+                          y = 3
+                        z = 4
+                    w = 5
+                "},
+                &["FunctionDef(Assign, Assign, Assign)", "Assign"],
+            ),
         ]);
+    }
+
+    /// A `;` starts another statement on its line, and the block right-hand
+    /// side opens before the line's last statement, `pub` or not.
+    #[test]
+    fn a_block_right_hand_side_after_a_semicolon_parses() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                indoc! {"
+                    a = 1; x = if c:
+                            1
+                        else:
+                            2
+                "},
+                &["Assign", "Assign"],
+            ),
+            (
+                indoc! {"
+                    a = 1; pub x = if c:
+                            1
+                        else:
+                            2
+                "},
+                &["Assign", "Pub"],
+            ),
+        ];
+        for (src, kinds) in cases {
+            let r = parse_mod(src);
+            assert!(r.errors.is_empty(), "{src:?}: {:#?}", r.errors);
+            let m = r.value.expect("a module");
+            assert_eq!(stmt_kinds(&m.body), *kinds, "{src:?}");
+        }
     }
 }

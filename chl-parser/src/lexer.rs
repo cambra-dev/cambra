@@ -1267,10 +1267,11 @@ struct Layout<'a> {
     /// The first newline dropped inside brackets since the last token: the end
     /// of the physical line before the next token's.
     dropped_newline: Option<Span>,
-    /// Where the current logical line's statement head lands in `out`, after
-    /// a leading `pub`, with its byte offset: the place a
+    /// Where the head of the current logical line's last statement lands in
+    /// `out`, after a leading `pub`, with its byte offset: the place a
     /// [`Token::BlockValueIndent`] goes if the line opens a block right-hand
-    /// side's level.
+    /// side's level. A top-level `;` starts another statement on the line, and
+    /// only the last one can end in the `:`.
     line_head: (usize, usize),
     /// The [`Token::BlockValueIndent`]s to insert into `out`, as the `out`
     /// index each goes before and its offset, in ascending order. They are
@@ -1280,9 +1281,19 @@ struct Layout<'a> {
     /// Whether the current line's first token is a block keyword, which is what
     /// separates a block that starts its line from one that does not.
     line_opens_at_first_token: bool,
-    /// Whether the current line's first token is `pub`, so that its second
-    /// token is the statement's head.
-    line_head_after_pub: bool,
+    /// Whether the next token is a statement's head: the line's first token
+    /// was `pub`, or a top-level `;` ended the statement before it.
+    head_next: bool,
+    /// Whether the head `head_next` waits for is the line's first statement's.
+    /// Only that head sets `line_opens_at_first_token`.
+    head_is_line_first: bool,
+    /// Whether the current line falls short of the level it stays in
+    /// ([`Layout::line_start`]).
+    line_short: bool,
+    /// Set when a line that fell short of its level ended in `:`. Carries that
+    /// line's column, which the next line must exceed to open the block, in
+    /// place of the level's column.
+    short_header: Option<usize>,
     /// The indent of the line the current logical line started on. A
     /// bracketed header spans several physical lines, and the floor a block
     /// right-hand side opens belongs to the statement, not to the physical
@@ -1306,7 +1317,10 @@ impl<'a> Layout<'a> {
             line_head: (0, 0),
             block_value_indents: Vec::new(),
             line_opens_at_first_token: false,
-            line_head_after_pub: false,
+            head_next: false,
+            head_is_line_first: false,
+            line_short: false,
+            short_header: None,
             line_indent: 0,
         };
         for (index, (tok, span)) in raw.iter().enumerate() {
@@ -1342,10 +1356,8 @@ impl<'a> Layout<'a> {
 
         if self.at_line_start && self.brackets.is_empty() {
             self.line_start(tok, span);
-        } else if self.line_head_after_pub {
-            self.line_head_after_pub = false;
-            self.line_head = (self.out.len(), span.start);
-            self.line_opens_at_first_token = opens_block_at_line_start(tok);
+        } else if self.head_next && !matches!(tok, Token::Newline) {
+            self.statement_head(tok, span);
         }
         self.at_line_start = false;
 
@@ -1372,30 +1384,53 @@ impl<'a> Layout<'a> {
             }
         } else {
             self.out.push((tok.clone(), span));
+            if matches!(tok, Token::Semi) && self.brackets.is_empty() {
+                self.head_next = true;
+                self.head_is_line_first = false;
+            }
         }
     }
+
+    /// The token `tok` at `span` starts a statement, or is the `pub` before
+    /// one.
+    fn statement_head(&mut self, tok: &Token, span: Span) {
+        self.line_head = (self.out.len(), span.start);
+        if self.head_is_line_first {
+            self.line_opens_at_first_token = opens_block_at_line_start(tok);
+        }
+        // `pub` prefixes the statement it marks, so the token after it is
+        // the one that says whether the statement opens a block itself.
+        self.head_next = matches!(tok, Token::Pub);
+    }
+
     /// The first token of a logical line: open or close indentation levels.
     fn line_start(&mut self, tok: &Token, span: Span) {
         let (line_start, indent) = self.column(span);
         self.line_indent = indent;
-        let current = self
+        self.line_short = false;
+        let level_floor = self
             .indent_stack
             .last()
             .expect("stack invariant: non-empty")
             .floor();
+        let current = self
+            .short_header
+            .take()
+            .map_or(level_floor, |column| column.min(level_floor));
         if indent > current {
             self.indent_stack.push(Level::Fixed(indent));
             self.out
                 .push((Token::Indent, Span::new(self.file, line_start, span.start)));
         } else {
-            // A level closes only when the line lands in the one beneath it. A
-            // line that falls short of the closing level's column and still
+            // A line that falls short of an indented block's column and still
             // stands right of the column beneath matches neither; it stays in
-            // the level it fell short of, so the block keeps it and the lines
-            // after it that return to the block's column.
+            // the block it fell short of, so the block keeps it and the lines
+            // after it that return to the block's column. A block right-hand
+            // side's level holds only its chain's `elif`/`else` lines, which a
+            // short line cannot continue, so that level closes for it.
             while let [.., below, top] = self.indent_stack[..]
                 && top.closes_at(indent)
-                && !below.strands(indent)
+                && !(matches!(top, Level::Fixed(_)) && below.strands(indent))
             {
                 self.indent_stack.pop();
                 self.out
@@ -1410,20 +1445,16 @@ impl<'a> Layout<'a> {
                 // The first line to land in a block right-hand side's level
                 // fixes its column for the rest of the chain.
                 slot @ Level::Pending { .. } => *slot = Level::Pinned(indent),
+                // Short of an indented block's column, or right of the
+                // level a closed block right-hand side's level left on top.
                 Level::Fixed(c) | Level::Pinned(c) => {
-                    debug_assert!(
-                        *c > indent,
-                        "a line right of the innermost level opens a block of its own"
-                    );
+                    self.line_short = *c > indent;
                     self.errors.push(LexError::InconsistentIndent { span })
                 }
             }
         }
-        // `pub` prefixes the statement it marks, so the token after it is
-        // the one that says whether the statement opens a block itself.
-        self.line_head_after_pub = matches!(tok, Token::Pub);
-        self.line_head = (self.out.len(), span.start);
-        self.line_opens_at_first_token = opens_block_at_line_start(tok);
+        self.head_is_line_first = true;
+        self.statement_head(tok, span);
     }
 
     /// A `Newline` outside brackets: the logical line ends.
@@ -1432,11 +1463,17 @@ impl<'a> Layout<'a> {
         // with the keyword that opened it, the block is an assignment's
         // right-hand side and continues at a column of its own rather than at
         // the statement's.
-        if matches!(self.out.last(), Some((Token::Colon, _))) && !self.line_opens_at_first_token {
+        let opens_block = matches!(self.out.last(), Some((Token::Colon, _)));
+        if opens_block && !self.line_opens_at_first_token {
             self.indent_stack.push(Level::Pending {
                 min: self.line_indent,
             });
             self.block_value_indents.push(self.line_head);
+        }
+        // A header short of its level stays in that level, so the level's
+        // column would leave the header's body nothing to indent past.
+        if opens_block && self.line_short {
+            self.short_header = Some(self.line_indent);
         }
         self.out.push((Token::Newline, span));
         self.at_line_start = true;
