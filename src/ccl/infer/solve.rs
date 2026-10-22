@@ -1740,7 +1740,32 @@ fn check_scope_valid_go(
 pub(crate) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
     let compacted = compact_type(ty);
     crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(&compacted)?;
-    coalesce_compact(&simplify_type(compacted))
+    let resolved = coalesce_compact(&simplify_type(compacted))?;
+    #[cfg(debug_assertions)]
+    if let Type::Infer(v) = ty {
+        assert_resolves_in_scope(v, &resolved);
+    }
+    Ok(resolved)
+}
+
+/// Hold a variable to the invariant every vacuity test relies on: it resolves to a type naming
+/// its telescope's binders and nothing else (`src/ccl/design/type-inference.md`, "The
+/// invariant"). The record-time check holds each bound to it as recorded, but a bound holding a
+/// variable says nothing there about what that variable resolves to, so only the resolved type
+/// shows the whole of it.
+#[cfg(debug_assertions)]
+fn assert_resolves_in_scope(v: &crate::ccl::InferVar, resolved: &Type) {
+    let outside: Vec<Name> = crate::ccl::subst::type_free_vars(resolved)
+        .into_iter()
+        .filter(|n| !v.telescope.contains(n))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "?{} resolved to `{resolved}`, which names {outside:?} outside its telescope {:?} \
+         (see type-inference.md, \"The invariant\")",
+        v.uid,
+        v.telescope,
+    );
 }
 
 /// Hold [`pin_unobservable_arm_payload`] to its premise: a tag it pinned is one the

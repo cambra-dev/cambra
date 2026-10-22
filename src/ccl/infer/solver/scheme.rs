@@ -180,10 +180,13 @@ impl PolyScheme {
 /// single fresh (or pre-seeded — see [`seed_chan_dom_pairings`]) rename.
 #[derive(Default)]
 pub struct FreshenCache {
-    /// When set, every variable this freshening mints takes *this* telescope
-    /// instead of inheriting its original's — the operator-scheme
-    /// instantiation mode ([`PolyScheme::instantiate_in`]). Unset for
-    /// specialization clones, which stand where their definition stood.
+    /// When set, every variable this freshening mints stands at *this* telescope instead
+    /// of its original's — the operator-scheme instantiation mode
+    /// ([`PolyScheme::instantiate_in`]). A template's own variables stand nowhere but under
+    /// the template's own functions, so an original's telescope holds only those
+    /// functions' binders, and the copy enters each after the site's as this
+    /// instantiation names it ([`binders`](Self::binders)). Unset for specialization
+    /// clones, which stand where their definition stood.
     pub site_telescope: Option<Telescope>,
     /// Original quantified var → its fresh replacement.
     pub vars: HashMap<InferVarId, Rc<InferVar>>,
@@ -678,8 +681,9 @@ pub fn freshen_above(
             // A freshened clone stands where the original stood, so it
             // inherits the original's telescope: the bounds copied below were
             // recorded against that scope. The exception is an operator-scheme
-            // instantiation, whose template stands nowhere — it takes the use
-            // site's telescope instead (see [`FreshenCache::site_telescope`]).
+            // instantiation, whose template stands nowhere but under its own functions — it
+            // takes the use site's telescope with those functions' binders entered after it
+            // (see [`FreshenCache::site_telescope`]).
             // **The copy stands over a copy of the original's kind**, registered in the
             // same cache as the bounds below. A variable's kind carries the edges to the
             // kinds of the function types that reached it; over a kind the cache does not
@@ -702,11 +706,22 @@ pub fn freshen_above(
                     f
                 }
             };
-            let v = InferVar::fresh_over(
-                new_level,
-                cache.site_telescope.as_ref().unwrap_or(&tv.telescope),
-                fun_kind,
-            );
+            let telescope = match &cache.site_telescope {
+                Some(site) => {
+                    let mut template: Vec<_> = tv.telescope.iter().cloned().collect();
+                    template.reverse();
+                    template.into_iter().fold(site.clone(), |t, n| {
+                        let renamed = cache
+                            .binders
+                            .entry(n.clone())
+                            .or_insert_with(|| crate::ccl::Name::fresh(n.base()))
+                            .clone();
+                        t.extended(renamed)
+                    })
+                }
+                None => tv.telescope.clone(),
+            };
+            let v = InferVar::fresh_over(new_level, &telescope, fun_kind);
             v.inherit_witness_placement_renamed(
                 tv,
                 |k| cache.fun_kind_vars.get(&k.uid).cloned().unwrap_or_else(|| Rc::clone(k)),

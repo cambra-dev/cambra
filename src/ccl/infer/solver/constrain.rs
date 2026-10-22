@@ -3997,7 +3997,12 @@ mod tests {
     #[test]
     fn pi_correspondence_renames_codomain_refinement() {
         let arena = crate::ccl::infer::InferArena::new();
-        let result = fresh_var(0);
+        // The codomain stands under the expected function's binder `x`, which it names
+        // once the correspondence lands.
+        let result = Type::Infer(InferVar::fresh_in(
+            0,
+            &crate::ccl::infer_var::Telescope::empty().extended(Name::from("x")),
+        ));
         let Type::Infer(result_var) = &result else {
             unreachable!()
         };
@@ -4029,7 +4034,11 @@ mod tests {
     #[test]
     fn dependent_application_discharges_through_coalesce() {
         let arena = crate::ccl::infer::InferArena::new();
-        let result = fresh_var(0);
+        // Under `x`, as in [`pi_correspondence_renames_codomain_refinement`].
+        let result = Type::Infer(InferVar::fresh_in(
+            0,
+            &crate::ccl::infer_var::Telescope::empty().extended(Name::from("x")),
+        ));
         let Type::Infer(result_var) = &result else {
             unreachable!()
         };

@@ -815,6 +815,32 @@ impl Subst {
         Type::Infer(held)
     }
 
+    /// The term names a type naming `names` names once this substitution has acted on it: a
+    /// renamed binder's target, the free names of a discharged binder's term or of a keyed
+    /// join's term at the key, nothing for a binder joined with no term or with no spelling,
+    /// and every other name as it is. Read name by name, so nothing is applied and no
+    /// variable is suspended on.
+    pub fn names_after(&self, names: impl IntoIterator<Item = Name>) -> BTreeSet<Name> {
+        let mut out = BTreeSet::new();
+        for n in names {
+            match self.binders.get(&n) {
+                None => {
+                    out.insert(n);
+                }
+                Some(Mapping::Rename(to)) => {
+                    out.insert(to.clone());
+                }
+                Some(Mapping::Discharge(t) | Mapping::Join(Some(t))) => out.extend(
+                    crate::ccl::ccl_utils::free_names(t)
+                        .into_iter()
+                        .filter(|m| m.pi_bound_index().is_none() && !m.is_elem()),
+                ),
+                Some(Mapping::Join(None) | Mapping::Unspellable(_)) => {}
+            }
+        }
+        out
+    }
+
     /// The binders this substitution acts on (its source domain).
     pub fn binders(&self) -> impl Iterator<Item = &Binder> {
         self.binders.keys()
@@ -2854,13 +2880,10 @@ pub fn name_spelled_stored_binders(ty: &Type) -> Vec<Binder> {
 /// The free term variables of `ty`'s refinement predicates that `in_scope` does
 /// not account for. Empty iff `ty` is well-formed there.
 ///
-/// One spelling for the whole family: the end-of-inference scope check
-/// (`infer::solve`'s `check_scope_valid`) and the record-time closure check
-/// (`infer_var`'s `bound_scope_gaps`) differ only in what they count as in scope, and both need the gap set rather than a yes/no — the first
-/// to name the unbound variables in its diagnostic, the second because every
-/// member is an error. `in_scope` is a predicate rather than a set so a caller
-/// whose scope is not one (a telescope plus two substitution domains) needs no
-/// set built to ask.
+/// The end-of-inference scope check (`infer::solve`'s `check_scope_valid`) needs the gap
+/// set rather than a yes/no, to name the unbound variables in its diagnostic. `in_scope` is
+/// a predicate rather than a set so a caller whose scope is not one needs no set built to
+/// ask.
 pub fn scope_gaps(ty: &Type, in_scope: impl Fn(&Binder) -> bool) -> BTreeSet<Binder> {
     let mut free = type_free_vars(ty);
     free.retain(|n| !in_scope(n));
