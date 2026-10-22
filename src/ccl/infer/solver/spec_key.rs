@@ -187,6 +187,48 @@ impl KeyView {
         }
     }
 
+    /// Drop the refinements at the positive positions of this view, read at polarity `pol`:
+    /// what a barrier variable's resolution drops (`CompactType::resolve_barrier_refinements`
+    /// in `src/ccl/infer/solver/compact.rs`). The children's polarities follow `key_go`'s.
+    fn drop_positive_refinements(&mut self, pol: bool) {
+        if pol {
+            self.refinements.clear();
+        }
+        for v in self.rec.values_mut().chain(self.var.values_mut()) {
+            v.drop_positive_refinements(pol);
+        }
+        for (domain, codomain) in self.fun.values_mut() {
+            domain.drop_positive_refinements(!pol);
+            codomain.drop_positive_refinements(pol);
+        }
+        for (value, domain) in self.history.values_mut() {
+            value.drop_positive_refinements(pol);
+            domain.drop_positive_refinements(pol);
+        }
+        for (decl, args) in &mut self.nominal {
+            let mut args = args.iter_mut();
+            for v in &decl.body().variances {
+                if *v == crate::ccl::nominal::Variance::Bipolar {
+                    args.next()
+                        .into_iter()
+                        .for_each(|a| a.drop_positive_refinements(!pol));
+                    args.next()
+                        .into_iter()
+                        .for_each(|a| a.drop_positive_refinements(pol));
+                } else {
+                    let pol = v.polarity(pol);
+                    args.next()
+                        .into_iter()
+                        .for_each(|a| a.drop_positive_refinements(pol));
+                }
+            }
+            debug_assert!(
+                args.next().is_none(),
+                "a nominal view carries one argument per variance, two per bipolar one"
+            );
+        }
+    }
+
     /// The marker a **witness reference** contributes: that the position is a binder, with
     /// no say in which. Its own slot rather than an atom, because there is no anonymous
     /// binder to build an atom from — anonymity is the absence of one.
@@ -385,7 +427,22 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // A `SharedHole` joins the `Hole` arm, mirroring `compact_go`: its id is a
         // lowering-time linkage and not part of the type, so there is nothing here to
         // key on either.
-        Type::Hole | Type::BarrierVar(_) | Type::SharedHole(_) => KeyView::default(),
+        Type::Hole | Type::SharedHole(_) => KeyView::default(),
+        // A barrier variable keys as its resolution, the `BarrierVar` arm of `compact_go`:
+        // its lower bounds, each read at positive polarity whatever the reference's, with
+        // the refinements at their positive positions dropped. It stands in a use's
+        // instantiation wherever an opaque-binding function's type does, so two uses whose
+        // barrier variables resolve differently clone differently.
+        Type::BarrierVar(barrier) => {
+            let lowers = barrier.lowers.borrow().clone();
+            let mut acc = KeyView::default();
+            for b in &lowers {
+                let inner_acc = Subst::then(&b.render_subst(), subst_acc);
+                acc.union(key_go(&b.ty, true, &inner_acc, ctx));
+            }
+            acc.drop_positive_refinements(true);
+            acc
+        }
         // A witness reference contributes an **anonymous** marker: enough to tell a position
         // that is a witness from one that is an ordinary domain, and nothing more. Which
         // binder it is cannot count — a binder is fresh per instantiation, so keying on it

@@ -1074,6 +1074,14 @@ placeholder identity. Conflicting contributions can coexist in a key; ordinary r
 key, reports type conflicts. Refinement comparisons are type-blind and compare sets rather than
 insertion order.
 
+A barrier variable keys as its resolution in both reads: its lower bounds, each read at positive
+polarity, with the refinements at their positive positions dropped (`KeyView`'s
+`drop_positive_refinements` in `solver/spec_key.rs`). It is not an undetermined position. It stands
+in every instantiation of an opaque-binding function's type, so two uses of one generic definition
+applied to functions whose barrier variables resolve to `Int` and `Bool` key apart
+(`uses_differing_only_in_a_barrier_variable_resolution_specialize_apart` in
+`tests/it/compilation_pipeline/type_annotations.rs`).
+
 The key also preserves distinctions needed by code generation, including function kind, history
 kind, and witness/kind shape. It does not use fresh inference-variable identities as a substitute
 for those distinctions.

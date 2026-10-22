@@ -1947,3 +1947,26 @@ g(1)
         Value::Int(1),
     )
 }
+
+/// `f` and `g` differ only in what their codomain barrier variables resolve to, `Int` and
+/// `Bool`, so the two uses of `id` key apart and take a clone each. Keyed without the
+/// resolution, they share one clone, typed at whichever use came first.
+#[test]
+fn uses_differing_only_in_a_barrier_variable_resolution_specialize_apart() {
+    check_scalar(
+        indoc! {r#"
+def f(x: Int):
+    r ^= x;
+    r ^+ 0
+def g(x: Int):
+    r ^= x;
+    (r ^+ 0) > 5
+def id(h):
+    h
+p = id(f)
+q = id(g)
+3
+        "#},
+        Value::Int(3),
+    )
+}
