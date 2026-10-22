@@ -2693,7 +2693,7 @@ impl Type {
             Type::DepTuple(cs) => {
                 cs.get(index)?;
                 crate::ccl::subst::open_tuple_components(&cs[..=index], |j, earlier| {
-                    crate::ccl::subst::Mapping::Discharge(Box::new(project(j, earlier)))
+                    crate::ccl::subst::Mapping::Discharge(Rc::new(project(j, earlier)))
                 })
                 .pop()
             }
