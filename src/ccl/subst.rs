@@ -586,11 +586,14 @@ impl Subst {
     /// is honest, and a caller that *means* a frame correspondence
     /// (relabeling, inversion-safe with no license) must say so with
     /// [`Subst::rename`].
-    pub fn discharge(binder: impl Into<Name>, term: TypedExpr) -> Self {
+    ///
+    /// `term` is shared where the caller holds it in an `Rc`: a template is read, never
+    /// rewritten in place.
+    pub fn discharge(binder: impl Into<Name>, term: impl Into<Rc<TypedExpr>>) -> Self {
         let binder = binder.into();
         debug_assert_no_pi_bound(&binder);
         let mut m = BTreeMap::new();
-        m.insert(binder, Mapping::Discharge(Rc::new(term)));
+        m.insert(binder, Mapping::Discharge(term.into()));
         Subst::of_binders(m)
     }
 
@@ -1476,27 +1479,37 @@ impl Subst {
             || self.binders.keys().any(|b| v.telescope.contains(b))
     }
 
-    /// This substitution with every discharge removed that cannot act on `v`: a term binder
-    /// outside `v`'s telescope, or a witness no binder of `v`'s witness scopes may bind. `v`
-    /// resolves to types naming those binders and nothing else
-    /// (`src/ccl/design/type-inference.md`, "The invariant"), so such a discharge leaves whatever
-    /// `v` resolves to unchanged, and dropping it is exact.
-    pub(crate) fn without_vacuous_discharges(&self, v: &crate::ccl::infer_var::InferVar) -> Subst {
-        Subst {
+    /// The part of this substitution that can act on `v`: every entry but those for a term
+    /// binder outside `v`'s telescope, renames included, and the witness discharges for a
+    /// witness no binder of `v`'s witness scopes may bind. `v` resolves to types naming its
+    /// telescope's binders and nothing else (`src/ccl/design/type-inference.md`, "The
+    /// invariant"), so a dropped entry leaves whatever `v` resolves to unchanged, and dropping it
+    /// is exact. Borrowed when nothing is dropped.
+    pub(crate) fn acting_on(&self, v: &crate::ccl::infer_var::InferVar) -> Cow<'_, Subst> {
+        let binder_acts = |k: &Name| v.telescope.contains(k);
+        let witness_acts = |w: &crate::ccl::ty::WitnessId, m: &WitnessMapping| {
+            matches!(m, WitnessMapping::Rename(_)) || v.may_name_witness(w)
+        };
+        if self.binders.keys().all(binder_acts)
+            && self.witnesses.iter().all(|(w, m)| witness_acts(w, m))
+        {
+            return Cow::Borrowed(self);
+        }
+        Cow::Owned(Subst {
             binders: self
                 .binders
                 .iter()
-                .filter(|(k, m)| matches!(m, Mapping::Rename(_)) || v.telescope.contains(k))
+                .filter(|(k, _)| binder_acts(k))
                 .map(|(k, m)| (k.clone(), m.clone()))
                 .collect(),
             witnesses: self
                 .witnesses
                 .iter()
-                .filter(|(w, m)| matches!(m, WitnessMapping::Rename(_)) || v.may_name_witness(w))
+                .filter(|(w, m)| witness_acts(w, m))
                 .map(|(w, m)| (*w, m.clone()))
                 .collect(),
             elims: self.elims.clone(),
-        }
+        })
     }
 
     /// What each entry's image reads, for carrying many name sets through this substitution

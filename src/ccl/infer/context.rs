@@ -1391,7 +1391,7 @@ impl InferCtx {
             .fold(Subst::id(), |exits, (i, name)| {
                 let exit = match self.exit_of(name) {
                     ScopeExit::Discharge(definition) => {
-                        Subst::discharge(name.clone(), definition.clone_preserving_ids())
+                        Subst::discharge(name.clone(), Rc::clone(definition))
                     }
                     _ if !joined[i] => return exits,
                     _ => match at_key.iter().find(|(x, _)| x == name) {
@@ -1878,7 +1878,6 @@ impl Typing for InferCtx {
         let Type::Infer(v) = &lifted else {
             unreachable!("fresh() yields a Type::Infer var");
         };
-        let definition = Rc::try_unwrap(definition).unwrap_or_else(|d| d.clone_preserving_ids());
         let bound = Bound::with_subst(body_ty, Subst::discharge(name.clone(), definition));
         enforce_bound_scope(v, "lower", &bound);
         v.bounds.borrow_mut().lower_mut().push(bound);

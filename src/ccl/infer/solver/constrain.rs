@@ -722,7 +722,7 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst, holder: Option<&InferVar>) -> Optio
     // binder the holder cannot name leaves the holder unchanged, so where the views differ only
     // there, `𝐿 <: 𝑉‹lo›` and `𝑉‹hi› <: 𝑈` meet at one type and `𝐿 <: 𝑈` needs no transport.
     if let Some(v) = holder
-        && lo.without_vacuous_discharges(v) == hi.without_vacuous_discharges(v)
+        && lo.acting_on(v) == hi.acting_on(v)
     {
         return Some((Subst::id(), Subst::id()));
     }
@@ -1142,6 +1142,15 @@ fn witness_range(t: &Type, gamma: &crate::ccl::ty::WitnessContext) -> Option<Typ
     }
 }
 
+/// `s` as it acts on `t`'s side of an edge: what can act on the variable when `t` is one, and
+/// `s` itself otherwise.
+fn acting_side<'s>(t: &Type, s: &'s Subst) -> std::borrow::Cow<'s, Subst> {
+    match t {
+        Type::Infer(v) => s.acting_on(v),
+        _ => std::borrow::Cow::Borrowed(s),
+    }
+}
+
 fn constrain_go(
     lhs: &Type,
     rhs: &Type,
@@ -1155,6 +1164,15 @@ fn constrain_go(
     // return before any arm looked at the keys.
     debug_assert_unique_product_keys(lhs);
     debug_assert_unique_product_keys(rhs);
+
+    // **A variable's side of an edge keeps only what can act on it** (`Subst::acting_on`). An
+    // entry for a binder outside the variable's telescope leaves its content unchanged, so the
+    // edge is the same constraint without it. Kept, it makes one constraint reached along
+    // several paths a different edge per path: each path through a dependent application or a
+    // lambda composes its own binders onto the substitution, and the variable then records the
+    // same bound once per path.
+    let (sl, sr) = (acting_side(lhs, sl), acting_side(rhs, sr));
+    let (sl, sr) = (&*sl, &*sr);
 
     // **An elimination meeting its function reads it through the term** before the arms
     // compare anything: the function is plain, and its binders are the witnesses the value

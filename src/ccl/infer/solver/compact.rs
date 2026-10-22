@@ -575,7 +575,7 @@ fn own_bounds(v: &crate::ccl::infer_var::InferVar) -> Vec<OwnBound> {
         .chain(b.upper().iter())
         .filter(|b| {
             let (_, discharged) = b.self_subst.split_renames();
-            discharged.without_vacuous_discharges(v).is_id()
+            discharged.acting_on(v).is_id()
         })
         .map(|b| {
             let mut reached = Vec::new();
@@ -3240,7 +3240,7 @@ fn compact_go(
                     return true;
                 };
                 let (_, discharged) = b.self_subst.split_renames();
-                let acting = discharged.without_vacuous_discharges(v);
+                let acting = discharged.acting_on(v);
                 if acting.is_id() {
                     return true;
                 }
