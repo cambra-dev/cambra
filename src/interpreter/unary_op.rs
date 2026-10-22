@@ -1,6 +1,10 @@
 //! UnaryOp operator: unary arithmetic and boolean operations on dataflow values.
 
-use super::{BaseType, ColumnValue, Extent};
+use std::iter::repeat_n;
+
+use crate::view::View;
+
+use super::{BaseType, ColumnValue, ColumnView, Extent};
 
 /// Kinds of unary operations supported by the interpreter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,22 +27,34 @@ impl UnaryOpKind {
     }
 }
 
-/// Apply a unary operation element-wise to a [`ColumnValue`], appending the result to `out`.
+/// Apply a unary operation element-wise to a column view, appending the result to `out`.
 ///
-/// `out` is a column of the operand's variant. One row is appended per row of the operand. The
-/// caller owns the rest of the column's state: it clears the rows it does not keep and reserves
-/// room for the new ones, and the call writes each result once into that room.
-pub fn apply_unaryop_into(op: UnaryOpKind, operand: &ColumnValue, out: &mut ColumnValue) {
+/// `out` is a column of the operand's element type. One row is appended per row of the operand.
+/// The caller owns the rest of the column's state: it clears the rows it does not keep and
+/// reserves room for the new ones, and the call writes each result once into that room.
+pub fn apply_unaryop_views(op: UnaryOpKind, operand: &ColumnView, out: &mut ColumnValue) {
     match (op, operand, out) {
-        (UnaryOpKind::Neg, ColumnValue::Ints(v), ColumnValue::Ints(o)) => {
-            o.extend(v.iter().map(|&x| -x));
-        }
-        (UnaryOpKind::Not, ColumnValue::Bools(v), ColumnValue::Bools(o)) => {
-            o.extend(v.iter().map(|&x| !x));
-        }
+        (UnaryOpKind::Neg, ColumnView::Ints(v), ColumnValue::Ints(o)) => match *v {
+            View::Slice(values) => o.extend(values.iter().map(|&x| -x)),
+            View::Constant { value, len } if len > 0 => o.extend(repeat_n(-*value, len)),
+            View::Constant { .. } => {}
+        },
+        (UnaryOpKind::Not, ColumnView::Bools(v), ColumnValue::Bools(o)) => match *v {
+            View::Slice(values) => o.extend(values.iter().map(|&x| !x)),
+            View::Constant { value, len } if len > 0 => o.extend(repeat_n(!*value, len)),
+            View::Constant { .. } => {}
+        },
         (op, operand, out) => {
             panic!("Unsupported unary op: {op:?} on {operand:?}, into a column {out:?}")
         }
+    }
+}
+
+/// Apply a unary operation element-wise to a [`ColumnValue`], appending the result to `out`.
+pub fn apply_unaryop_into(op: UnaryOpKind, operand: &ColumnValue, out: &mut ColumnValue) {
+    match operand.view() {
+        Some(view) => apply_unaryop_views(op, &view, out),
+        None => panic!("Unsupported unary op: {op:?} on {operand:?}, into a column {out:?}"),
     }
 }
 

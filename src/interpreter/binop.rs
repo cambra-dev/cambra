@@ -9,7 +9,7 @@ use crate::scalar_ops::{
     zip_arithmetic, zip_bool_compare, zip_bool_logic, zip_compare, zip_concat,
 };
 
-use super::{BaseType, ColumnValue, Extent};
+use super::{BaseType, ColumnValue, ColumnView, Extent};
 
 /// Output [`Extent`] for a [`BinOpKind`].
 pub fn binop_output_extent(op: &BinOpKind) -> Extent {
@@ -21,7 +21,7 @@ pub fn binop_output_extent(op: &BinOpKind) -> Extent {
 }
 
 /// The empty column that holds the result of `op` over operands shaped like `left`.
-pub fn binop_result_column(op: BinOpKind, left: &ColumnValue) -> ColumnValue {
+pub fn binop_result_column(op: BinOpKind, left: &ColumnView) -> ColumnValue {
     match op {
         BinOpKind::Arithmetic(_) => left.empty_like(),
         BinOpKind::Concat => ColumnValue::Strings(Vec::new()),
@@ -29,104 +29,96 @@ pub fn binop_result_column(op: BinOpKind, left: &ColumnValue) -> ColumnValue {
     }
 }
 
-/// The operands cut to their common prefix, `min(l.len(), r.len())`.
-///
-/// Only co-present positions combine. A longer `l` would otherwise keep its surplus tail in
-/// the result, which fabricates values for positions the other operand has not reached. That
-/// misfires when `r` has not yet converged (a sibling induction loop's still-empty final
-/// read): the result would read as terminal instead of waiting. The sibling half of this
-/// invariant is that `MapResultToConstProducer` emits an empty non-terminal tile rather than
-/// broadcasting an absent constant.
-fn co_present<'a, T>(l: &'a [T], r: &'a [T]) -> (&'a [T], &'a [T]) {
-    let rows = l.len().min(r.len());
-    (&l[..rows], &r[..rows])
+/// The empty column that holds the result of `op` over operands shaped like `left`, a column of a
+/// base type or a record column.
+fn binop_result_column_of(op: BinOpKind, left: &ColumnValue) -> ColumnValue {
+    match left.view() {
+        Some(view) => binop_result_column(op, &view),
+        // Only the comparison of two products reads a column that is not of a base type.
+        None => ColumnValue::Bools(Vec::new()),
+    }
 }
 
-/// Apply a binary operation element-wise on two `ColumnValue`s, appending the result to `out`.
+/// Apply a binary operation element-wise on two column views, appending the result to `out`.
 ///
-/// `out` is a column of the result's variant (see [`apply_binop_column`] for a fresh one). One
-/// row is appended per position of the operands' common prefix. The caller owns the rest of
-/// the column's state: it clears the rows it does not keep and reserves room for the new ones,
-/// and the kernel writes each result once into that room.
-pub fn apply_binop_into(
+/// `out` is a column of the result's variant (see [`binop_result_column`]). One row is appended
+/// per position of the operands' common prefix. The caller owns the rest of the column's state:
+/// it clears the rows it does not keep and reserves room for the new ones, and the kernel
+/// writes each result once into that room.
+///
+/// Only co-present positions combine. A longer operand would otherwise keep its surplus tail in
+/// the result, which fabricates values for positions the other operand has not reached. That
+/// misfires when the shorter operand has not yet converged (a sibling induction loop's
+/// still-empty final read): the result would read as terminal instead of waiting. The sibling
+/// half of this invariant is that `MapResultToConstProducer` emits an empty non-terminal tile
+/// rather than broadcasting an absent constant.
+pub fn apply_binop_views(
     op: BinOpKind,
-    left: &ColumnValue,
-    right: &ColumnValue,
+    left: &ColumnView,
+    right: &ColumnView,
     out: &mut ColumnValue,
 ) {
+    let rows = left.len().min(right.len());
+    let (left, right) = (left.prefix(rows), right.prefix(rows));
     match (op, left, right, out) {
         (
             BinOpKind::Arithmetic(op),
-            ColumnValue::Ints(l),
-            ColumnValue::Ints(r),
+            ColumnView::Ints(l),
+            ColumnView::Ints(r),
             ColumnValue::Ints(o),
-        ) => {
-            let (l, r) = co_present(l, r);
-            zip_arithmetic(op, l, r, o);
-        }
+        ) => zip_arithmetic(op, l, r, o),
         (
             BinOpKind::Arithmetic(op),
-            ColumnValue::UInts(l),
-            ColumnValue::UInts(r),
+            ColumnView::UInts(l),
+            ColumnView::UInts(r),
             ColumnValue::UInts(o),
-        ) => {
-            let (l, r) = co_present(l, r);
-            zip_arithmetic(op, l, r, o);
-        }
+        ) => zip_arithmetic(op, l, r, o),
         (
             BinOpKind::BoolLogic(op),
-            ColumnValue::Bools(l),
-            ColumnValue::Bools(r),
+            ColumnView::Bools(l),
+            ColumnView::Bools(r),
             ColumnValue::Bools(o),
-        ) => {
-            let (l, r) = co_present(l, r);
-            zip_bool_logic(op, l, r, o);
-        }
+        ) => zip_bool_logic(op, l, r, o),
         (
             BinOpKind::Concat,
-            ColumnValue::Strings(l),
-            ColumnValue::Strings(r),
+            ColumnView::Strings(l),
+            ColumnView::Strings(r),
             ColumnValue::Strings(o),
-        ) => {
-            let (l, r) = co_present(l, r);
-            zip_concat(l, r, o);
-        }
+        ) => zip_concat(l, r, o),
         (
             BinOpKind::Compare(op),
-            ColumnValue::Strings(l),
-            ColumnValue::Strings(r),
+            ColumnView::Strings(l),
+            ColumnView::Strings(r),
             ColumnValue::Bools(o),
-        ) => {
-            let (l, r) = co_present(l, r);
-            zip_compare(op, l, r, o);
-        }
+        ) => zip_compare(op, l, r, o),
         (
             BinOpKind::Compare(op),
-            ColumnValue::Ints(l),
-            ColumnValue::Ints(r),
+            ColumnView::Ints(l),
+            ColumnView::Ints(r),
             ColumnValue::Bools(o),
-        ) => {
-            let (l, r) = co_present(l, r);
-            zip_compare(op, l, r, o);
-        }
+        ) => zip_compare(op, l, r, o),
         (
             BinOpKind::Compare(op),
-            ColumnValue::UInts(l),
-            ColumnValue::UInts(r),
+            ColumnView::UInts(l),
+            ColumnView::UInts(r),
             ColumnValue::Bools(o),
-        ) => {
-            let (l, r) = co_present(l, r);
-            zip_compare(op, l, r, o);
-        }
+        ) => zip_compare(op, l, r, o),
         (
             BinOpKind::Compare(op),
-            ColumnValue::Bools(l),
-            ColumnValue::Bools(r),
+            ColumnView::Bools(l),
+            ColumnView::Bools(r),
             ColumnValue::Bools(o),
-        ) => {
-            let (l, r) = co_present(l, r);
-            zip_bool_compare(op, l, r, o);
+        ) => zip_bool_compare(op, l, r, o),
+        (op, left, right, out) => {
+            panic!("Unsupported binop: {op:?} on {left:?}, {right:?}, into a column {out:?}")
         }
+    }
+}
+
+/// Apply a binary operation element-wise on two `ColumnValue`s, appending the result to `out`,
+/// as [`apply_binop_views`] does for columns of a base type.
+fn apply_binop_into(op: BinOpKind, left: &ColumnValue, right: &ColumnValue, out: &mut ColumnValue) {
+    match (op, left, right, &mut *out) {
         // A product compares **componentwise**, which is the whole of what makes one
         // equatable (`src/ccl/design/type-inference.md`, "What the tables hold").
         (
@@ -135,9 +127,10 @@ pub fn apply_binop_into(
             ColumnValue::Records(r),
             ColumnValue::Bools(o),
         ) => o.extend(compare_records(op, l, r)),
-        (op, left, right, out) => {
-            panic!("Unsupported binop: {op:?} on {left:?}, {right:?}, into a column {out:?}")
-        }
+        _ => match (left.view(), right.view()) {
+            (Some(l), Some(r)) => apply_binop_views(op, &l, &r, out),
+            _ => panic!("Unsupported binop: {op:?} on {left:?}, {right:?}, into a column {out:?}"),
+        },
     }
 }
 
@@ -145,46 +138,51 @@ pub fn apply_binop_into(
 ///
 /// Neither operand's buffer is reused.
 pub fn apply_binop_column(op: BinOpKind, left: &ColumnValue, right: &ColumnValue) -> ColumnValue {
-    let mut out = binop_result_column(op, left);
+    let mut out = binop_result_column_of(op, left);
     apply_binop_into(op, left, right, &mut out);
     out
 }
 
-/// Compare two record columns field by field, `Equals` conjoining the results and
-/// `NotEquals` disjoining them.
+/// The fields a comparison of two products compares, each with the two sides' values: the fields
+/// both sides carry, in no particular order.
 ///
-/// **The fields both columns carry are the product the type names.** Typing rejects a
-/// comparison between two different products, so the two field sets differ only where
-/// width subtyping let a wider value reach a narrower position and the tiling kept the
-/// surplus column. A column the position's type does not name is not part of the value
-/// there, and the intersection reads the value at its type whichever operand carries it.
-///
-/// The length is the shortest column the intersection reads, a column still filling being
-/// one whose later positions have not been decided. A surplus column is excluded from that
-/// minimum for the same reason it is excluded from the answer: its extent belongs to the
-/// wider value, and a short one would truncate a result the named fields already decided.
+/// **The fields both sides carry are the product the type names.** Typing rejects a comparison
+/// between two different products, so the two field sets differ only where width subtyping let a
+/// wider value reach a narrower position and the tiling kept the surplus column. A field the
+/// position's type does not name is not part of the value there, and the intersection reads the
+/// value at its type whichever operand carries it.
 ///
 /// A value carrying exactly the fields its type names would retire the intersection. What
 /// keeps the surplus is inlining dropping the parameter's annotation — see the vault issue
 /// `type-checker-inlining-drops-a-narrowing-annotation`.
+pub(crate) fn compared_fields<'a, L, R>(
+    left: &'a HashMap<SmolStr, L>,
+    right: &'a HashMap<SmolStr, R>,
+) -> impl Iterator<Item = (&'a SmolStr, &'a L, &'a R)> + Clone {
+    left.iter()
+        .filter_map(|(name, l)| Some((name, l, right.get(name)?)))
+}
+
+/// Compare two record columns field by field, `Equals` conjoining the results and
+/// `NotEquals` disjoining them, over the fields [`compared_fields`] names.
+///
+/// The length is the shortest column those fields read, a column still filling being one whose
+/// later positions have not been decided. A surplus column is excluded from that minimum for the
+/// same reason it is excluded from the answer: its extent belongs to the wider value, and a short
+/// one would truncate a result the named fields already decided.
 fn compare_records(
     op: CompareKind,
     left: &HashMap<SmolStr, ColumnValue>,
     right: &HashMap<SmolStr, ColumnValue>,
 ) -> Vec<bool> {
-    let rows = left
-        .iter()
-        .filter(|(field, _)| right.contains_key(*field))
-        .flat_map(|(field, l)| [l.len(), right[field].len()])
+    let fields = compared_fields(left, right);
+    let rows = fields
+        .clone()
+        .flat_map(|(_, l, r)| [l.len(), r.len()])
         .min()
         .unwrap_or(0);
     let mut acc = vec![op == CompareKind::Equals; rows];
-    for (field, l) in left {
-        // A column only one side carries is the surplus of a wider value, not a field of
-        // the product being compared.
-        let Some(r) = right.get(field) else {
-            continue;
-        };
+    for (_, l, r) in fields {
         let mut field_eq = ColumnValue::Bools(Vec::new());
         apply_binop_into(BinOpKind::Compare(op), l, r, &mut field_eq);
         let ColumnValue::Bools(field_eq) = field_eq else {
@@ -211,6 +209,7 @@ mod tests {
     use std::hint::black_box;
     use std::time::Duration;
 
+    use super::apply_binop_into;
     use crate::interpreter::*;
     use test_log::test;
 
@@ -445,5 +444,55 @@ mod tests {
             &mut out,
         );
         assert_eq!(out, ColumnValue::Bools(vec![false, true, true]));
+    }
+
+    /// A constant operand is read as one value: it combines with a slice from either side, and
+    /// with another constant, as a column of repeats would.
+    #[test]
+    fn a_constant_operand_combines_without_a_column_of_repeats() {
+        use crate::view::View;
+        let sub = BinOpKind::Arithmetic(ArithmeticKind::Sub);
+        let column = ColumnValue::Ints(vec![10, 20, 30]);
+        let five = 5;
+        let constant = ColumnView::Ints(View::repeated(&five, 3));
+        let slice = column.view().unwrap();
+        let apply = |l: ColumnView, r: ColumnView| {
+            let mut out = binop_result_column(sub, &l);
+            apply_binop_views(sub, &l, &r, &mut out);
+            out
+        };
+        assert_eq!(apply(slice, constant), ColumnValue::Ints(vec![5, 15, 25]));
+        assert_eq!(
+            apply(constant, slice),
+            ColumnValue::Ints(vec![-5, -15, -25])
+        );
+        assert_eq!(apply(constant, constant), ColumnValue::Ints(vec![0, 0, 0]));
+        // The common prefix applies to a constant as to a slice.
+        let long = ColumnView::Ints(View::repeated(&five, 10));
+        assert_eq!(apply(slice, long), ColumnValue::Ints(vec![5, 15, 25]));
+    }
+
+    /// Two constants over no rows combine nothing: a division by a constant zero, and the
+    /// negation of the smallest integer, do not fault, as they do not over an empty column.
+    #[test]
+    fn two_constants_over_no_rows_apply_nothing() {
+        use crate::view::View;
+        let (one, zero) = (1, 0);
+        let floor_div = BinOpKind::Arithmetic(ArithmeticKind::FloorDiv);
+        let (l, r) = (
+            ColumnView::Ints(View::repeated(&one, 0)),
+            ColumnView::Ints(View::repeated(&zero, 0)),
+        );
+        let mut out = binop_result_column(floor_div, &l);
+        apply_binop_views(floor_div, &l, &r, &mut out);
+        assert_eq!(out, ColumnValue::Ints(Vec::new()));
+        let smallest = i64::MIN;
+        let mut out = ColumnValue::Ints(Vec::new());
+        apply_unaryop_views(
+            UnaryOpKind::Neg,
+            &ColumnView::Ints(View::repeated(&smallest, 0)),
+            &mut out,
+        );
+        assert_eq!(out, ColumnValue::Ints(Vec::new()));
     }
 }

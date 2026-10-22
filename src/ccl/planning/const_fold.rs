@@ -248,35 +248,40 @@ fn runtime_answers(op: crate::scalar_ops::BinOpKind, left: &Lit, right: &Lit) ->
 /// than an `unreachable!` because the two enumerations are separate matches.
 fn apply_one(op: crate::scalar_ops::BinOpKind, left: &Lit, right: &Lit) -> Option<Lit> {
     use crate::scalar_ops as rt;
+    use crate::view::View;
+    /// One position per operand: a value repeated once.
+    fn one<T>(value: &T) -> View<'_, T> {
+        View::repeated(value, 1)
+    }
     match (op, left, right) {
         (rt::BinOpKind::Arithmetic(a), Lit::Int(l), Lit::Int(r)) => {
             let mut out = Vec::new();
-            rt::zip_arithmetic(a, &[*l], &[*r], &mut out);
+            rt::zip_arithmetic(a, one(l), one(r), &mut out);
             Some(Lit::Int(out.pop()?))
         }
         (rt::BinOpKind::Concat, Lit::String(l), Lit::String(r)) => {
             let mut out = Vec::new();
-            rt::zip_concat(&[l.as_str().into()], &[r.as_str().into()], &mut out);
+            rt::zip_concat(one(l), one(r), &mut out);
             Some(Lit::String(out.pop()?))
         }
         (rt::BinOpKind::Compare(c), Lit::Int(l), Lit::Int(r)) => {
             let mut out = Vec::new();
-            rt::zip_compare(c, &[*l], &[*r], &mut out);
+            rt::zip_compare(c, one(l), one(r), &mut out);
             Some(Lit::Bool(out.pop()?))
         }
         (rt::BinOpKind::Compare(c), Lit::String(l), Lit::String(r)) => {
             let mut out = Vec::new();
-            rt::zip_compare(c, &[l.as_str()], &[r.as_str()], &mut out);
+            rt::zip_compare(c, one(&l.as_str()), one(&r.as_str()), &mut out);
             Some(Lit::Bool(out.pop()?))
         }
         (rt::BinOpKind::Compare(c), Lit::Bool(l), Lit::Bool(r)) => {
             let mut out = Vec::new();
-            rt::zip_bool_compare(c, &[*l], &[*r], &mut out);
+            rt::zip_bool_compare(c, one(l), one(r), &mut out);
             Some(Lit::Bool(out.pop()?))
         }
         (rt::BinOpKind::BoolLogic(g), Lit::Bool(l), Lit::Bool(r)) => {
             let mut out = Vec::new();
-            rt::zip_bool_logic(g, &[*l], &[*r], &mut out);
+            rt::zip_bool_logic(g, one(l), one(r), &mut out);
             Some(Lit::Bool(out.pop()?))
         }
         _ => None,
