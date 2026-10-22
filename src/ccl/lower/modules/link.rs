@@ -97,6 +97,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     let mut lowering = ProgramLowering {
         program,
         lowered: HashMap::new(),
+        imports: HashMap::new(),
         shared: HashMap::new(),
         import_refusals: HashSet::new(),
         errors: Vec::new(),
@@ -104,24 +105,23 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     // With a cycle there is no link order, and the root lowers with no module to
     // reach: loading has reported the cycle.
     let order = program.link_order().unwrap_or_default();
+    // Each import's shared run is decided by what it writes, before any module
+    // lowers, so each lowers knowing the shared run its imports reach.
+    let mut sites = lowering.shared_runs();
     for &file in order {
         if file != root {
             lowering.lower(file, ctx);
         }
     }
-    let imported: HashSet<FileId> = sources
-        .files()
-        .flat_map(|file| program.edges(file))
-        .filter(|(kind, _)| *kind == EdgeKind::Import)
-        .map(|(_, target)| target)
-        .collect();
     let mut chains = Vec::new();
     for &file in order {
-        if file != root
-            && imported.contains(&file)
-            && let Some(chain) = lowering.shared_run(file, ctx)
-        {
-            chains.push(chain);
+        if file == root {
+            continue;
+        }
+        for (run, site) in sites.remove(&file).unwrap_or_default() {
+            if let Some(chain) = lowering.shared_run(file, run, &site, ctx) {
+                chains.push(chain);
+            }
         }
     }
 
@@ -175,20 +175,34 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     LoweringResult { value, errors }
 }
 
-/// The lowering of a program's modules: each module lowered once, the names
-/// each shared run reaches, and the errors found.
+/// The lowering of a program's modules: each module lowered once, the shared
+/// run each `import` reaches, the names each shared run reaches, and the errors
+/// found.
 pub(super) struct ProgramLowering<'a> {
     pub(super) program: &'a LoadedProgram,
     /// Each module other than the root, lowered, by file, or `None` when it has
     /// no syntax tree or has errors of its own.
     pub(super) lowered: HashMap<FileId, Option<Rc<LoweredModule>>>,
-    /// The names each imported module's shared run reaches, by file
-    /// ([`Created::names`]), or `None` when it has none.
-    pub(super) shared: HashMap<FileId, Option<Rc<HashMap<QualifiedName, Name>>>>,
+    /// The shared run each `import` statement reaches, by the statement. An
+    /// import whose arguments are in error reaches none.
+    pub(super) imports: HashMap<Span, SharedRun>,
+    /// The names each shared run reaches ([`Created::names`]), or `None` when it
+    /// has none.
+    pub(super) shared: HashMap<SharedRun, Option<Rc<HashMap<QualifiedName, Name>>>>,
     /// The imported modules whose statements an import may not hold have been
     /// reported ([`ProgramLowering::importable`]).
     pub(super) import_refusals: HashSet<FileId>,
     pub(super) errors: Vec<LoweringError>,
+}
+
+/// The arguments a run is created with ([`ProgramLowering::create`]).
+pub(super) enum Supplied<'a> {
+    /// A run's: the parameters its `run` statement passes arguments for, each
+    /// bound above the run under its run name.
+    Run(&'a [SmolStr]),
+    /// A shared run's: its import's constants, bound at the head of its chain
+    /// under its spelling, `scaled(scale=3)`.
+    Import(&'a SharedRun, &'a ImportSite),
 }
 
 /// A module lowered once ([`ProgramLowering::lower`]).
@@ -301,42 +315,128 @@ impl ProgramLowering<'_> {
         self.importable(file).then(|| Rc::clone(&lowered.interface))
     }
 
-    /// Create the shared run of the imported module in `file`, recording the
-    /// names it reaches, and return its chain.
-    pub(super) fn shared_run(&mut self, file: FileId, ctx: &mut LoweringContext) -> Option<Expr> {
+    /// The shared runs the program's `import` statements reach, by the file of
+    /// their module, each with the first statement that reaches it: one per
+    /// module and distinct set of arguments. Records the shared run each
+    /// statement reaches.
+    ///
+    /// An argument is a literal for now (`docs/modules.md`, "Dependencies"). An
+    /// argument that is not one, or that names no parameter or one already given
+    /// an argument, is an error at the argument, and its import reaches no shared
+    /// run.
+    pub(super) fn shared_runs(&mut self) -> HashMap<FileId, BTreeMap<SharedRun, ImportSite>> {
+        let mut runs: HashMap<FileId, BTreeMap<SharedRun, ImportSite>> = HashMap::new();
+        for importer in self.program.sources().files() {
+            let Some(ast) = self.program.ast(importer) else {
+                continue;
+            };
+            for stmt in &ast.body {
+                let ChlStmt::Import { path, args, .. } = &stmt.node else {
+                    continue;
+                };
+                // A segment the parser refused names no module, and loading has
+                // reported a module with no file.
+                let Some(module) = path.to_path() else {
+                    continue;
+                };
+                let Some((file, target)) = self
+                    .program
+                    .file_of(&module)
+                    .and_then(|file| Some((file, self.program.ast(file)?)))
+                else {
+                    continue;
+                };
+                let parameters: HashSet<&str> = target
+                    .body
+                    .iter()
+                    .filter_map(|stmt| match &stmt.node {
+                        ChlStmt::Param { name, .. } => Some(name.node.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let mut errors = misused_arguments(args, &module, &parameters);
+                let mut arguments = HashMap::new();
+                for arg in args {
+                    match constant(&arg.value.node) {
+                        Some(value) => {
+                            arguments.insert(arg.name.node.clone(), (arg.value.span, value));
+                        }
+                        None => errors.push(LoweringError::unsupported(
+                            arg.value.span,
+                            "an argument to an import is supported only as a literal for now",
+                        )),
+                    }
+                }
+                if !errors.is_empty() {
+                    self.errors.extend(errors);
+                    continue;
+                }
+                let mut key: Vec<_> = arguments
+                    .iter()
+                    .map(|(parameter, (_, value))| (parameter.clone(), value.clone()))
+                    .collect();
+                key.sort();
+                let run = SharedRun {
+                    module,
+                    arguments: key.into(),
+                };
+                self.imports.insert(stmt.span, run.clone());
+                runs.entry(file)
+                    .or_default()
+                    .entry(run)
+                    .or_insert(ImportSite {
+                        statement: stmt.span,
+                        arguments,
+                    });
+            }
+        }
+        runs
+    }
+
+    /// Create the shared run `run` of the imported module in `file`, for the
+    /// import `site`, recording the names it reaches, and return its chain.
+    pub(super) fn shared_run(
+        &mut self,
+        file: FileId,
+        run: SharedRun,
+        site: &ImportSite,
+        ctx: &mut LoweringContext,
+    ) -> Option<Expr> {
         let interface = self.import_interface(file);
         let created = interface
             .filter(|interface| interface.unimportable.is_none())
-            .and_then(|interface| {
-                let home = Home::Shared(interface.module.clone());
-                self.create(file, Some(home), None, &[], ctx)
+            .and_then(|_| {
+                let home = Home::Shared(run.clone());
+                self.create(file, Some(home), None, Supplied::Import(&run, site), ctx)
             });
         let (chain, names) = match created {
             Some(created) => (Some(created.chain), Some(Rc::new(created.names))),
             None => (None, None),
         };
-        self.shared.insert(file, names);
+        self.shared.insert(run, names);
         chain
     }
 
     /// Create a run of the module in `file` with `home` as its members' home:
-    /// the shared run, with no `run` statement, or the run at the run path and
-    /// `run` statement `place`, which passes arguments for the parameters
-    /// `arguments`. `None` when the module has no lowering.
+    /// a shared run, with no `run` statement, or the run at the run path and
+    /// `run` statement `place`, with the arguments `supplied`. `None` when the
+    /// module has no lowering.
     ///
-    /// Its chain is a copy of the module's. Each parameter with an argument reads
-    /// it ([`argument_name`]), and one with neither an argument nor a default is
-    /// an error. Each run it declares is created in turn and put in place
-    /// ([`Self::expand_runs`]). It is uniquified with a scope that maps each name
-    /// spelled through a qualifier to the binder in the qualifier's run, and each
-    /// `use` name of an import to its member's binder. A run registers the sinks
-    /// its module declares, under its run path.
+    /// Its chain is a copy of the module's. Each parameter with an argument
+    /// reads it ([`argument_name`]), and one with neither an argument nor a
+    /// default is an error. A shared run's arguments are constants, bound at
+    /// the head of its chain at their parameters' types, so a mismatch is the
+    /// argument's error. Each run it declares is created in turn and put in
+    /// place ([`Self::expand_runs`]). It is uniquified with a scope that maps
+    /// each name spelled through a qualifier to the binder in the qualifier's
+    /// run, and each `use` name of an import to its member's binder. A run
+    /// registers the sinks its module declares, under its run path.
     pub(super) fn create(
         &mut self,
         file: FileId,
         home: Option<Home>,
         place: Option<(RunPath, Span)>,
-        arguments: &[SmolStr],
+        supplied: Supplied,
         ctx: &mut LoweringContext,
     ) -> Option<Created> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
@@ -348,38 +448,69 @@ impl ProgramLowering<'_> {
             .as_ref()
             .map(|(path, _)| path.clone())
             .unwrap_or_default();
+        let prefix = match supplied {
+            Supplied::Run(_) => place
+                .as_ref()
+                .and_then(|(path, _)| path.last())
+                .expect("a run has a name")
+                .to_string(),
+            Supplied::Import(run, _) => run.to_string(),
+        };
         for parameter in &lowered.interface.parameters {
-            if arguments.contains(&parameter.name) {
-                let run = place
-                    .as_ref()
-                    .and_then(|(path, _)| path.last())
-                    .expect("only a run passes arguments");
+            let given = match supplied {
+                Supplied::Run(arguments) => arguments.contains(&parameter.name),
+                Supplied::Import(_, site) => site.arguments.contains_key(&parameter.name),
+            };
+            if given {
                 let argument = ctx.tag_image(
-                    Expr::var(argument_name(run, &parameter.name)),
+                    Expr::var(argument_name(&prefix, &parameter.name)),
                     parameter.declared,
                 );
                 read_argument(&mut chain, &parameter.name, argument);
-            } else if !parameter.default {
-                let error = match &place {
-                    Some((path, statement)) => LoweringError::unsupported(
-                        *statement,
-                        format!(
-                            "the run `{path}` passes no argument for the parameter `{}`, which \
-                             has no default",
-                            parameter.name
-                        ),
-                    )
-                    .with_related(parameter.declared, "the parameter"),
-                    None => LoweringError::unsupported(
-                        parameter.declared,
-                        format!(
-                            "module `{}` is imported, and an import supplies no argument, so \
-                             its parameter `{}` needs a default",
-                            lowered.interface.module, parameter.name
-                        ),
+                continue;
+            }
+            if parameter.default {
+                continue;
+            }
+            let error = match (&place, &supplied) {
+                (Some((path, statement)), _) => LoweringError::unsupported(
+                    *statement,
+                    format!(
+                        "the run `{path}` passes no argument for the parameter `{}`, which has \
+                         no default",
+                        parameter.name
                     ),
+                ),
+                (None, Supplied::Import(_, site)) => LoweringError::unsupported(
+                    site.statement,
+                    format!(
+                        "this import passes no argument for the parameter `{}`, which has no \
+                         default",
+                        parameter.name
+                    ),
+                ),
+                (None, Supplied::Run(_)) => unreachable!("a run has a `run` statement"),
+            };
+            self.errors
+                .push(error.with_related(parameter.declared, "the parameter"));
+        }
+        if let Supplied::Import(_, site) = supplied {
+            let mut arguments: Vec<_> = site.arguments.iter().collect();
+            arguments.sort_by(|l, r| l.0.cmp(r.0));
+            for (parameter, (span, value)) in arguments.into_iter().rev() {
+                let ty = lowered
+                    .interface
+                    .parameters
+                    .iter()
+                    .find(|p| &p.name == parameter)
+                    .and_then(|p| p.annotation.clone());
+                let value = ctx.tag_image(Expr::lit(value.clone()), *span);
+                let bound = argument_name(&prefix, parameter);
+                let bound = match ty {
+                    Some(ty) => Expr::let_bind_annotated(bound, value, chain, ty),
+                    None => Expr::let_bind(bound, value, chain),
                 };
-                self.errors.push(error);
+                chain = ctx.tag_image(bound, *span);
             }
         }
         let mut qualified = self.shared_names(&lowered.scope);
@@ -440,7 +571,7 @@ impl ProgramLowering<'_> {
             let created = self.program.file_of(&module).and_then(|file| {
                 let home = Home::Run(run_path.clone());
                 let place = Some((run_path, statement));
-                self.create(file, Some(home), place, &arguments, ctx)
+                self.create(file, Some(home), place, Supplied::Run(&arguments), ctx)
             });
             let body = self.expand_runs(*body, path, qualified, ctx);
             return match created {
@@ -466,10 +597,8 @@ impl ProgramLowering<'_> {
     pub(super) fn shared_names(&self, scope: &ModuleScope) -> HashMap<QualifiedName, Name> {
         let mut qualified = HashMap::new();
         for (qualifier, reached) in &scope.qualifiers {
-            if reached.run {
-                continue;
-            }
-            let Some(Some(names)) = reached.file.and_then(|file| self.shared.get(&file)) else {
+            let Some(Some(names)) = reached.shared.as_ref().and_then(|run| self.shared.get(run))
+            else {
                 continue;
             };
             for (spelling, binder) in names.iter() {
@@ -514,6 +643,7 @@ impl ProgramLowering<'_> {
             labels,
             self.program,
             &interfaces,
+            &self.imports,
             ctx,
             &mut self.errors,
         )
@@ -536,6 +666,15 @@ pub(super) fn use_names(
         let Reached::Value(Some(reference)) = &used.reached else {
             continue;
         };
+        // An import whose arguments are in error reaches no shared run, and its `use` names
+        // reach nothing: the error at the import accounts for them.
+        let qualifier = reference.name.segments().first();
+        if !names
+            .keys()
+            .any(|name| name.segments().first() == qualifier)
+        {
+            continue;
+        }
         let binder = names.get(&reference.name).cloned();
         debug_assert!(
             binder.is_some(),

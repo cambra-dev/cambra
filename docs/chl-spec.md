@@ -306,8 +306,8 @@ exactly like any nested block (§4). (The parser's root AST node is
 named `Module`, after Python's `ast.Module`.)
 
 > **Direction [Decided].** A source file is a **module**. Importing one
-> asserts that it performs no IO and reaches its one shared run; running one
-> creates a run of its own. The engine runs one root module. Modules are
+> asserts that it performs no IO and reaches the shared run of its arguments;
+> running one creates a run of its own. The engine runs one root module. Modules are
 > specified in [9. Modules](#9-modules), whose statements (`import`, `run`, `param`,
 > and `pub` on a member) extend this grammar ([2.2 Statements](#22-statements)).
 
@@ -4009,9 +4009,9 @@ deletes no state.
 A **module** is one `.cambra` file. A module is used in one of two ways:
 
 - **Importing** it brings its public members into scope. Importing asserts that the module performs
-  no IO and declares no mutable state. Its members exist once in the program, however many modules
-  import it ([9.7 Importing asserts no IO and no
-  state](#97-importing-asserts-no-io-and-no-state)).
+  no IO and declares no mutable state. Its members exist once for each distinct set of arguments its
+  imports pass, however many modules import it with those arguments ([9.7 Importing asserts no IO
+  and no state](#97-importing-asserts-no-io-and-no-state)).
 - **Running** it performs its top-level computation, public and private: its state, its sources and
   sinks, and its loops. A module may be run any number of times, each run with its own name, its own
   arguments, and its own state.
@@ -4033,14 +4033,15 @@ members ([9.8 Module types](#98-module-types)).
 - **Run.** One running of a module, declared by a `run` statement. A run has a **run name** in the
   module that declares it and a **run path** from the root: `eu`, or `eu::inv` for a run `eu`
   declares.
-- **Shared run.** The one evaluation of an imported module's top level, whose members every importer
-  reaches. Its run path is the module path
+- **Shared run.** The one evaluation of an imported module's top level at one set of arguments,
+  whose members every import passing those arguments reaches. Its run path is the module path with
+  those arguments
   ([9.7 Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)).
 - **Member.** A binding at a module's top level. Bindings inside a `def`, a loop, or a block are
   **locals**.
 - **Public member.** A member declared with `pub`. Every other member is private to its module.
-- **Parameter.** A value, a type, or a module that a run supplies, declared by a `param` statement
-  ([9.4 Parameters](#94-parameters)).
+- **Parameter.** A value, a type, or a module that a run or an import supplies, declared by a
+  `param` statement ([9.4 Parameters](#94-parameters)).
 - **Module type.** The structural type of a module's public members, `Module{…}`
   ([9.8 Module types](#98-module-types)).
 - **Module interface.** What checking records about a module for the modules that use it: its
@@ -4050,7 +4051,7 @@ members ([9.8 Module types](#98-module-types)).
 ### 9.2 Imports
 
 ```ebnf
-import_stmt ::= "import" module_path ["as" ident] [use_clause]
+import_stmt ::= "import" module_path ["(" [arg ("," arg)* [","]] ")"] ["as" ident] [use_clause]
 use_clause  ::= "use" use_list
 use_list    ::= use_item ("," use_item)* | "(" use_item ("," use_item)* [","] ")"
 use_item    ::= ident ["as" ident]
@@ -4068,6 +4069,15 @@ module_path ::= ident ("::" ident)*
 - An import reaches every public member of the module's shared run. Importing a module that
   performs IO or declares mutable state is an error ([9.7 Importing asserts no IO and no
   state](#97-importing-asserts-no-io-and-no-state)).
+- An import passes arguments to the module's parameters as a run does
+  ([9.4 Parameters](#94-parameters)): keyword-only, one for each parameter without a default. Every
+  argument is a constant, so two imports of one module with equal arguments reach one shared run,
+  and its type members are one type in both: `import sorted_map(K=String)` in two modules gives
+  both one `sorted_map::Map`. An omitted argument is the parameter's default, so `import m` and
+  `import m(x=1)` reach one shared run when `x` defaults to `1` (**[Planned]**). An argument may be
+  any constant ([9.19 Open questions](#919-open-questions)): a literal, a type (**[Planned]**), or
+  an import name or run name passed as a value of its Module type (**[Planned]**, [9.8 Module
+  types](#98-module-types)).
 - An `import` stands at a module's top level. One inside a `def`, a loop, or a block is an error.
 - There is no wildcard `use`. Adding a public member to a module never changes what an importer's
   names mean.
@@ -4143,9 +4153,9 @@ param payments: Module{charge: {amount: Int} => Receipt}
 - **[Planned]** A **type parameter** is a capitalized parameter, since `Caps` means type ([6.1
   Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)). It
   names a type that varies with the run. The module is checked with it as an opaque type, known only
-  through its bound: `Receipt` above has an `id` and nothing else checking can rely on. A run
-  supplies it as an argument, `Receipt=stripe::Receipt`, as it does any parameter without a default.
-  **[Planned]** An argument left out is inferred from the types of the other arguments.
+  through its bound: `Receipt` above has an `id` and nothing else checking can rely on. A run or an
+  import supplies it as an argument, `Receipt=stripe::Receipt`, as it does any parameter without a
+  default. **[Planned]** An argument left out is inferred from the types of the other arguments.
 - **A structural bound is met by structural types only.** A nominal type relates to no structural
   type ([A nominal type is opaque](#a-nominal-type-is-opaque)), and a record meets `{id: String}`
   only through the labels the bound names, which belong to the bounding module
@@ -4281,10 +4291,11 @@ source says which modules reach it: the module that runs it, and the modules tha
 An imported module declares no run, since the import would reach the run's state. A module that
 runs another is itself run.
 
-An imported module's top level is evaluated once, however many modules import it, because its
-members are values it computes. That evaluation is the module's **shared run**. Every importer
-reaches the same members. Its run path is the module path, so it never collides with a run a `run`
-statement names.
+An imported module's top level is evaluated once for each distinct set of arguments, however many
+modules import it with those arguments, because its members are values it computes. That evaluation
+is the module's **shared run** at those arguments. Every import passing them reaches the same
+members. Its run path is the module path with its arguments, so it never collides with a run a
+`run` statement names.
 
 ```python
 # inventory.cambra: declares state, so it is run and not imported
@@ -4297,9 +4308,6 @@ pub InStock = {String where _ in stock.keys()}   # intended; not supported today
 `InStock` is intended and not supported today, in one file as across modules: the compiler cannot
 name a mutable map's key set in a type. `run inventory as inv` and `run inventory as eu_inv` are two
 runs, each with its own `stock`, and `inv::InStock` is a different type from `eu_inv::InStock`.
-
-A module with a parameter that has no default cannot be imported, since an import supplies no
-arguments.
 
 ### 9.8 Module types
 
@@ -4761,6 +4769,11 @@ undecided.
   coherence rule.
 - **Discarding and redeclaring one address.** A version that both writes `@Discard stock` and
   declares `stock` could mean a reset to the declared initial value, or be an error.
+- **Constants.** An import's arguments are constants, fixed when the program is linked, and so is
+  a route address passed as a parameter. Every expression whose value is fixed at link time is a
+  constant, along the lines of C++'s `constexpr`: a literal, a type, an import name or run name,
+  arithmetic over constants, a record or a list of them, and a member or an alias bound to one.
+  The rule that recognizes them is open.
 - **First-class Module values.** A Module value is written only as an argument or as a member
   bound to a run name or an import name. Storing one in data, returning one from a function, or
   choosing between two at run time would make a qualified reference's target depend on a value,

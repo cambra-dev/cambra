@@ -262,7 +262,14 @@ impl Refusals {
                 }
                 TypeDeclBody::Single(ty) => self.expr(ty),
             },
-            ChlStmt::Import { .. } | ChlStmt::Return(None) | ChlStmt::Pass | ChlStmt::Error => {}
+            // An import's module, arguments, and `use` items resolve against
+            // the program (`super::modules`).
+            ChlStmt::Import { args, .. } => {
+                for arg in args {
+                    self.expr(&arg.value);
+                }
+            }
+            ChlStmt::Return(None) | ChlStmt::Pass | ChlStmt::Error => {}
         }
     }
 
