@@ -1265,11 +1265,13 @@ A nested drive states which rows at each level are complete, and a row is comple
 source will put no more positions under it and the store has folded every position it did. The
 first half is the source's statement, which the drive accumulates across pulls: the source may
 stop stating a row once the drive has released it, and the store can fold the row's last
-position after that release. The second half reads the frontier: under the enclosing path the
-frontier is inside, the rows before the frontier's are folded, and the frontier's own row once
-every position under it is at or below the frontier. That counts the positions the drive has
-emitted as well as those the source still holds, because an emitted position is released back to
-the source before the store decides it.
+position after that release. The second half is that no position under the row is left to
+decide: no position the source has delivered and the drive has not emitted, and no emitted
+position past the store's frontier. Positions run in order, so everything at or below the
+frontier is decided. The drive counts the positions it has emitted as well as those the source
+still holds, because an emitted position is released back to the source before the store decides
+it. A row with no position under it is folded when it arrives, so a source that holds no
+positions leaves every row folded.
 
 ### One induction store at every depth
 

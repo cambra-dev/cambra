@@ -4304,10 +4304,10 @@ struct DriverRow {
     /// writer; `None` for a top-level one, whose body takes the slots alone. A tile for
     /// the same reason `item` is.
     enclosing: Option<Tile>,
-    /// The **rows** this position sits under, for a nested writer: one component per
+    /// The **outer row** this position sits under, for a nested writer: one component per
     /// level above it, outermost first. Levels rather than components of the position,
     /// which is what keeps a position a plain value of its own domain.
-    row: Option<Path>,
+    outer_row: Option<Path>,
     item_position: Position,
     /// The row's absolute domain position, which the body's decision is looked
     /// up by ([`body_decision_at`]). Ascending across the window, and on the
@@ -4321,10 +4321,21 @@ impl DriverRow {
     /// The path this row stands at in the drive's output: the rows above it, then its
     /// position.
     fn path(&self) -> Vec<Value> {
-        let mut path: Vec<Value> = self.row.as_ref().map_or(Vec::new(), |p| p.to_vec());
+        let mut path: Vec<Value> = self.outer_row.as_ref().map_or(Vec::new(), |p| p.to_vec());
         path.push(self.position.value().clone());
         path
     }
+}
+
+/// The inner rows of a driver window that sit under one outer row: the rows of positions,
+/// and the enclosing row they are under.
+struct DriverGroup {
+    /// The outer row's path, one component per level above the positions; `None` for a
+    /// window whose positions have no rows above them.
+    outer_row: Option<Path>,
+    /// The rows of positions under it, ascending. Empty once a release has named them all
+    /// while the outer row is still live.
+    inner_rows: Vec<DriverRow>,
 }
 
 /// The live window of emitted `(read…, item)` rows, and the body-input tile it
@@ -4364,7 +4375,13 @@ struct DriverWindow {
     /// enclosing position, so the check is per row and the window's own contents cannot say
     /// which row that is — compaction empties them.
     highest_pushed: Option<(Option<Path>, Position)>,
-    rows: Vec<DriverRow>,
+    /// The live inner rows, grouped under the outer row each sits under, in ascending order. A
+    /// group stays until a release names its outer row whole, which is later than the release
+    /// of its last position: its key is in what the window renders, and the drive has called
+    /// it complete, so a window that kept only the inner rows would drop a key it still owes.
+    /// A window with no rows above its positions has the one group of inner rows under no
+    /// outer row.
+    groups: Vec<DriverGroup>,
     /// Highest absolute position a consumer has released. The body fans this
     /// input through a `Memo` that pulls it several times per round, so an
     /// already-released position must not re-emit — that would duplicate a
@@ -4376,8 +4393,7 @@ impl DriverWindow {
     /// The values the window holds: each live row's snapshot, item and enclosing
     /// parameter.
     fn held_values(&self) -> usize {
-        self.rows
-            .iter()
+        self.inner_rows()
             .map(|r| {
                 r.snapshot.len()
                     + r.item.cell_count()
@@ -4393,6 +4409,16 @@ impl DriverWindow {
         self.nested.as_ref().map_or(0, |n| n.rows.len())
     }
 
+    /// The live inner rows, in ascending order.
+    fn inner_rows(&self) -> impl DoubleEndedIterator<Item = &DriverRow> {
+        self.groups.iter().flat_map(|g| g.inner_rows.iter())
+    }
+
+    /// How many inner rows are live.
+    fn inner_row_count(&self) -> usize {
+        self.groups.iter().map(|g| g.inner_rows.len()).sum()
+    }
+
     fn new(
         domain: Extent,
         nested: Option<NestedBody>,
@@ -4406,7 +4432,7 @@ impl DriverWindow {
             item,
             attempts: 0,
             highest_pushed: None,
-            rows: Vec::new(),
+            groups: Vec::new(),
             release_cursor: PrefixReleaseCursor::default(),
         }
     }
@@ -4417,13 +4443,13 @@ impl DriverWindow {
         Position::new(Value::UInt(self.attempts))
     }
 
-    /// Append a row at absolute position `position`.
+    /// Append an inner row at absolute position `position`, under `outer_row`.
     fn push(
         &mut self,
         snapshot: Vec<Value>,
         item: Tile,
         enclosing: Option<Tile>,
-        row: Option<Path>,
+        outer_row: Option<Path>,
         item_position: Position,
         position: Position,
     ) {
@@ -4432,18 +4458,24 @@ impl DriverWindow {
             self.read_extents.len(),
             "a body-input row carries one snapshot value per read key"
         );
-        // Positions ascend **within a row**: a nested store restarts its positions at
-        // each enclosing position, and the row is the level above rather than a component of
-        // the position, so the two runs are independent.
+        // Positions ascend **within an outer row**: a nested store restarts its positions at
+        // each enclosing position, and the outer row is the level above rather than a
+        // component of the position, so the two runs are independent.
         debug_assert!(
             self.highest_pushed
                 .as_ref()
-                .is_none_or(|(r, h)| *r != row || position > *h),
-            "body-input positions ascend within a row: pushing {position} at or below the \
-             highest already pushed ({:?})",
+                .is_none_or(|(r, h)| *r != outer_row || position > *h),
+            "body-input positions ascend within an outer row: pushing {position} at or below \
+             the highest already pushed ({:?})",
             self.highest_pushed
         );
-        self.highest_pushed = Some((row.clone(), position.clone()));
+        self.highest_pushed = Some((outer_row.clone(), position.clone()));
+        if self.groups.last().is_none_or(|g| g.outer_row != outer_row) {
+            self.groups.push(DriverGroup {
+                outer_row: outer_row.clone(),
+                inner_rows: Vec::new(),
+            });
+        }
         debug_assert_eq!(
             enclosing.is_some(),
             self.nested.is_some(),
@@ -4451,15 +4483,16 @@ impl DriverWindow {
              top-level one at none"
         );
         debug_assert_eq!(
-            row.is_some(),
+            outer_row.is_some(),
             self.nested.is_some(),
-            "a nested writer's rows each name the enclosing position they belong to"
+            "a nested writer's inner rows each name the outer row they belong to"
         );
-        self.rows.push(DriverRow {
+        let group = self.groups.last_mut().expect("a group was just ensured");
+        group.inner_rows.push(DriverRow {
             snapshot,
             item,
             enclosing,
-            row,
+            outer_row,
             item_position,
             position,
         });
@@ -4484,14 +4517,24 @@ impl DriverWindow {
             }
             // A row is named by its whole path — the rows it sits under, then its own
             // position — so the guard is read there rather than at one component of it.
-            g => self.rows.retain(|r| !g.covers_path(&r.path())),
+            g => {
+                self.groups.retain(|group| {
+                    group
+                        .outer_row
+                        .as_ref()
+                        .is_none_or(|outer_row| !g.covers_path(outer_row))
+                });
+                for group in &mut self.groups {
+                    group.inner_rows.retain(|r| !g.covers_path(&r.path()));
+                }
+            }
         }
     }
 
     /// The newest live row with its absolute position, or `None` when the window
     /// is empty.
     fn newest(&self) -> Option<(&Position, &DriverRow)> {
-        self.rows.last().map(|r| (&r.position, r))
+        self.inner_rows().next_back().map(|r| (&r.position, r))
     }
 
     /// Drop the prefix a release covers and report the extent, so a caller whose cursor
@@ -4500,13 +4543,24 @@ impl DriverWindow {
     /// only reclaims uses [`reclaim`](Self::reclaim), which needs no cursor.
     fn acknowledge(&mut self, pred: &Predicate) -> ReleasedExtent {
         let extent = self.release_cursor.advance_from(pred);
+        // Only a window with no rows above its positions acknowledges, so its inner rows are
+        // the one group's.
+        debug_assert!(
+            self.nested.is_none(),
+            "a release is acknowledged by a window with no rows above its positions"
+        );
+        let Some(group) = self.groups.first_mut() else {
+            return extent;
+        };
         let drop_through = match extent {
             ReleasedExtent::Nothing => return extent,
-            ReleasedExtent::All => self.rows.len(),
+            ReleasedExtent::All => group.inner_rows.len(),
             // Positions ascend, so the released ones are a prefix of the window.
-            ReleasedExtent::Through(ref w) => self.rows.partition_point(|r| r.position <= *w),
+            ReleasedExtent::Through(ref w) => {
+                group.inner_rows.partition_point(|r| r.position <= *w)
+            }
         };
-        self.rows.drain(..drop_through);
+        group.inner_rows.drain(..drop_through);
         extent
     }
 
@@ -4571,7 +4625,7 @@ impl DriverWindow {
         // one position at a time, so its statements are qualified by that position's path as
         // the column stacks them ([`Predicate::beneath`]).
         let items = column_of_rows(
-            self.rows.iter().map(|r| {
+            self.inner_rows().map(|r| {
                 let path = r.path();
                 let mut item = r.item.clone();
                 item.map_level_predicates(&mut |depth, pred| pred.beneath(&path, depth));
@@ -4582,8 +4636,7 @@ impl DriverWindow {
         // The rows this window holds, by path: what a column of values built without its
         // keys ([`stored_value_tile`]) can be stating anything about.
         let held_rows = self
-            .rows
-            .iter()
+            .inner_rows()
             .map(|r| Predicate::exactly(&r.path()))
             .fold(Predicate::False, |all, one| all.union(&one));
         let fields = body_input_fields(&self.read_extents, items, |i, ext| {
@@ -4592,7 +4645,7 @@ impl DriverWindow {
             // its values whole without knowing which rows it stands under, so it is qualified
             // by the rows it does.
             let mut column = stored_value_tile(
-                self.rows.iter().map(|r| r.snapshot[i].clone()).collect(),
+                self.inner_rows().map(|r| r.snapshot[i].clone()).collect(),
                 ext,
             );
             column.map_level_predicates(&mut |depth, pred| pred.qualified_by(&held_rows, depth));
@@ -4605,7 +4658,7 @@ impl DriverWindow {
                 (
                     tuple_field(0),
                     column_of_rows(
-                        self.rows.iter().map(|r| {
+                        self.inner_rows().map(|r| {
                             let mut enclosing = r
                                 .enclosing
                                 .clone()
@@ -4623,8 +4676,7 @@ impl DriverWindow {
             ])),
         };
         let positions: Vec<Value> = self
-            .rows
-            .iter()
+            .inner_rows()
             .map(|r| r.position.value().clone())
             .collect();
         let domain = ColumnValue::from_values(positions, &self.domain);
@@ -4658,15 +4710,6 @@ impl DriverWindow {
         // is nothing to reorder. A level's key begins a new run wherever the path down to it
         // differs from the previous row's, so a nest of any depth is one walk.
         let depth = nested.rows.len();
-        let paths: Vec<&Path> = self
-            .rows
-            .iter()
-            .map(|r| {
-                r.row
-                    .as_ref()
-                    .expect("a nested row names the rows it sits under")
-            })
-            .collect();
         let mut keys: Vec<Vec<Value>> = vec![Vec::new(); depth];
         // `starts[d]` indexes `keys[d]`, one entry per key of the level above it; the top
         // level stands at the one row every tile has.
@@ -4674,17 +4717,25 @@ impl DriverWindow {
         starts[0].push(0);
         let mut position_starts: Vec<usize> = Vec::new();
         let mut prev: Option<&Path> = None;
-        for (i, path) in paths.iter().enumerate() {
+        // A group stands until a release names its outer row whole, so an outer row whose
+        // inner rows are all released is a key with no position under it.
+        let mut at = 0;
+        for group in &self.groups {
+            let path = group
+                .outer_row
+                .as_ref()
+                .expect("a nested inner row names the outer row it sits under");
             for d in 0..depth {
                 if prev.is_some_and(|q| q[..=d] == path[..=d]) {
                     continue;
                 }
                 match starts.get_mut(d + 1) {
                     Some(below) => below.push(keys[d + 1].len()),
-                    None => position_starts.push(i),
+                    None => position_starts.push(at),
                 }
                 keys[d].push(path[d].clone());
             }
+            at += group.inner_rows.len();
             prev = Some(path);
         }
         // Which rows are complete is the drive's to say, from its source, at every level
@@ -5277,8 +5328,8 @@ impl TileProducer for InductionDriverProducer {
                 terminal: src.is_terminal(),
             };
             // The rows of one level the source will gain no more items beneath — one of the
-            // two halves of a row being answerable as a whole, `folded` below being the
-            // other. Read at the level itself: a standing level's rows are not the level
+            // two halves of a row being answerable as a whole, `rows_folded_at` below being
+            // the other. Read at the level itself: a standing level's rows are not the level
             // beneath's, and each level's completion is its own statement.
             for level in 0..self.source_producer.tiling().levels() {
                 if let Tile::DataFunction {
@@ -5486,63 +5537,31 @@ impl TileProducer for InductionDriverProducer {
         // positions are still being decided — and the reader that takes a row's final value
         // stops there, with the fold part-done.
         //
-        // The drive is sequential, so the store's frontier splits every row level: at each
-        // one, the rows before the one the frontier names are folded, and that row itself
-        // once every position the source put under it is decided. Each level answers for
-        // its own rows. A standing level left to say only "everything before the row still
-        // running" never finishes its last row, and the loop around it is waiting on
-        // exactly that row, so the nest stalls rather than lagging. Reading the frontier
-        // here is not circular — `decided` advances from the body's decisions, which never
-        // consult this predicate.
+        // A row is folded once no position under it is left to decide. The drive is sequential
+        // and positions run in order, so everything at or below the store's frontier is decided.
+        // What is left is the positions the source has delivered and this drive has not
+        // emitted, and an emitted position past the frontier: an emitted position is released
+        // back to the source, so the source no longer shows it while the store may not yet have
+        // decided it. A row with no position under it, including every row while the source
+        // holds none, is folded as soon as it arrives: left unfolded, the loop around it would
+        // wait on it forever. Each level answers for its own rows, so a nest never waits on a
+        // last row that only the level above can call whole. Reading the frontier here is not
+        // circular: the frontier advances from the body's decisions, which never consult this
+        // predicate.
         //
-        // Each level's keys are named **under the enclosing path the frontier is inside**.
-        // A key value repeats once per enclosing position, so naming the keys alone would say
-        // the same of a row the drive has not reached; the rows of this level under an
-        // earlier enclosing path are answered by the level above, which has called that
-        // path whole. A drive with no rows above it states none of this: its positions are
-        // its own level, and the window renders their completion directly.
+        // A row stays complete once stated: `source_complete_at` only accumulates, and a source
+        // puts no position under a row it has called complete. A source that did would withdraw
+        // the completion, which the check in `tile_operators/mod.rs` reports ("withdrew
+        // completion").
+        let undecided = undecided_positions(
+            self.source.items.keys(),
+            self.emitted_through.as_ref(),
+            frontier.as_ref(),
+        );
         let complete_rows: Vec<Predicate> = (0..levels_above)
             .map(|level| {
-                let folded = match &frontier {
-                    // Nothing decided, because there is nothing to decide: the source put
-                    // no position under any row, and a row with no positions is folded as
-                    // soon as it arrives. Left as `False` the nest never finishes a row,
-                    // so the loop around it waits on one forever.
-                    None if self.source.items.is_empty() && self.emitted_through.is_none() => {
-                        Predicate::True
-                    }
-                    None => Predicate::False,
-                    Some(f) => {
-                        let (rows, _) = f
-                            .split_position()
-                            .unwrap_or_else(|| unreachable!("a store's frontier names a position"));
-                        // What the source still holds, and what this drive has emitted: an
-                        // emitted position is released back to the source, so the source no
-                        // longer shows it while the store may not yet have decided it.
-                        let under = self
-                            .source
-                            .items
-                            .keys()
-                            .chain(self.emitted_through.iter())
-                            .filter(|p| {
-                                p.split_position()
-                                    .is_some_and(|(r, _)| r[..=level] == rows[..=level])
-                            });
-                        let row_domain = &self
-                            .window
-                            .nested
-                            .as_ref()
-                            .expect("a drive with rows above its positions is nested")
-                            .rows[level];
-                        let keys = if under.clone().all(|p| p <= f) {
-                            Predicate::at_or_below_in(rows[level].clone(), row_domain)
-                        } else {
-                            Predicate::below_in(rows[level].clone(), row_domain)
-                        };
-                        Predicate::qualified(Predicate::exactly(&rows[..level]), keys)
-                    }
-                };
-                source_complete_at(CurryLevel::new(level)).intersect(&folded)
+                source_complete_at(CurryLevel::new(level))
+                    .intersect(&rows_folded_at(level, &undecided))
             })
             .collect();
 
@@ -5846,22 +5865,21 @@ impl TransactDriverProducer {
     fn debug_assert_window_invariants(&self) {
         debug_assert!(
             self.window
-                .rows
-                .windows(2)
-                .all(|w| w[0].item_position == w[1].item_position),
+                .inner_rows()
+                .zip(self.window.inner_rows().skip(1))
+                .all(|(a, b)| a.item_position == b.item_position),
             "the driver's live window spans more than one item: {:?}",
             self.window
-                .rows
-                .iter()
+                .inner_rows()
                 .map(|r| r.item_position.clone())
                 .collect::<Vec<_>>(),
         );
         debug_assert!(
-            self.window.rows.len() <= MAX_LIVE_ATTEMPTS,
+            self.window.inner_row_count() <= MAX_LIVE_ATTEMPTS,
             "the driver's live window holds {} attempts (bound {MAX_LIVE_ATTEMPTS}) — a \
              superseded row is not being reclaimed, so a contended item costs O(retries) \
              rows retained and O(retries²) body rows evaluated",
-            self.window.rows.len()
+            self.window.inner_row_count()
         );
     }
 }
@@ -6969,6 +6987,49 @@ impl TileProducer for TransactWriterProducer {
             self.committed_base += uint_of_row(drop);
         }
     }
+}
+
+/// The positions a nested drive has yet to see decided: the `delivered` ones above the
+/// `emitted_through` cursor, and the emitted position itself while the store's `frontier` has
+/// not reached it.
+///
+/// A delivered path at or below the cursor is not undecided: the source may honour the drive's
+/// release a pull late, so its decode can still show a position the drive has emitted. The
+/// drive emits only when the frontier is at its last emitted position, so the emitted position
+/// is the only one that can be past the frontier. `delivered` is in path order.
+fn undecided_positions<'a>(
+    delivered: impl Iterator<Item = &'a Path>,
+    emitted_through: Option<&'a Path>,
+    frontier: Option<&Path>,
+) -> Vec<&'a Path> {
+    delivered
+        .filter(|p| emitted_through.is_none_or(|e| *p > e))
+        .chain(emitted_through.filter(|e| frontier.is_none_or(|f| *e > f)))
+        .collect()
+}
+
+/// The rows at `level` with no undecided position under them: every row of the level less the
+/// row each undecided position lies in, named by its full prefix of enclosing rows. A row no
+/// position names is in the predicate, including every row when `undecided` is empty.
+fn rows_folded_at(level: usize, undecided: &[&Path]) -> Predicate {
+    let mut rows_of_undecided: Vec<&[Value]> = undecided
+        .iter()
+        .map(|p| {
+            let (rows, _) = p
+                .split_position()
+                .unwrap_or_else(|| unreachable!("a source path names a position"));
+            &rows[..=level]
+        })
+        .collect();
+    // `undecided` lists the delivered paths in order, so their rows are grouped and one `minus`
+    // answers for all the positions under a row. The emitted position follows them; a repeat
+    // there is an idempotent `minus`.
+    rows_of_undecided.dedup();
+    rows_of_undecided
+        .into_iter()
+        .fold(Predicate::True, |folded, rows| {
+            folded.minus(&Predicate::exactly(rows))
+        })
 }
 
 #[cfg(test)]
@@ -10217,6 +10278,145 @@ mod tests {
             honoring_release(&self.tile.borrow(), self.obsolete_guard())
         }
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    fn position_path(components: &[u64]) -> Path {
+        Path::from(
+            components
+                .iter()
+                .map(|c| Value::UInt(*c))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn row_folded(folded: &Predicate, row: &[u64]) -> bool {
+        folded.contains_path(&row.iter().map(|c| Value::UInt(*c)).collect::<Vec<_>>())
+    }
+
+    /// An emitted position the store has not decided keeps its row unfolded, and one the
+    /// frontier has reached does not: with no frontier, or one before it, the position is
+    /// undecided.
+    #[test]
+    fn an_emitted_position_is_undecided_until_the_frontier_reaches_it() {
+        let emitted = position_path(&[0, 3]);
+        for (frontier, undecided) in [
+            (None, true),
+            (Some(position_path(&[0, 2])), true),
+            (Some(position_path(&[0, 3])), false),
+            (Some(position_path(&[1, 0])), false),
+        ] {
+            let positions =
+                undecided_positions(std::iter::empty(), Some(&emitted), frontier.as_ref());
+            assert_eq!(
+                positions.len(),
+                usize::from(undecided),
+                "frontier {frontier:?}"
+            );
+            assert_eq!(
+                row_folded(&rows_folded_at(0, &positions), &[0]),
+                !undecided,
+                "frontier {frontier:?}"
+            );
+        }
+    }
+
+    /// A delivered path at or below the cursor is a position the drive already emitted that the
+    /// source has not yet dropped, so it keeps no row unfolded.
+    #[test]
+    fn a_stale_delivered_path_at_or_below_the_cursor_is_not_undecided() {
+        let emitted = position_path(&[0, 2]);
+        let frontier = position_path(&[0, 2]);
+        let delivered = [
+            position_path(&[0, 1]),
+            position_path(&[0, 2]),
+            position_path(&[1, 0]),
+        ];
+        let positions = undecided_positions(delivered.iter(), Some(&emitted), Some(&frontier));
+        assert_eq!(positions, [&position_path(&[1, 0])]);
+        let folded = rows_folded_at(0, &positions);
+        assert!(row_folded(&folded, &[0]) && !row_folded(&folded, &[1]));
+    }
+
+    /// A row with no position under it is folded, at every level, and with no position at
+    /// all every row is.
+    #[test]
+    fn a_row_with_no_position_under_it_is_folded() {
+        let delivered = [position_path(&[1, 4, 0])];
+        let positions = undecided_positions(delivered.iter(), None, None);
+        let level0 = rows_folded_at(0, &positions);
+        assert!(row_folded(&level0, &[0]) && !row_folded(&level0, &[1]));
+        let level1 = rows_folded_at(1, &positions);
+        assert!(
+            row_folded(&level1, &[1, 3]),
+            "a sibling row at the level below"
+        );
+        assert!(
+            row_folded(&level1, &[0, 4]),
+            "the same key under another enclosing row"
+        );
+        assert!(!row_folded(&level1, &[1, 4]));
+        let none = undecided_positions(std::iter::empty(), None, None);
+        assert!(row_folded(&rows_folded_at(0, &none), &[7]));
+        assert!(row_folded(&rows_folded_at(1, &none), &[7, 7]));
+    }
+
+    /// A source that delivered row 1 before row 0 leaves row 1 unfolded and has no say about
+    /// row 0, which the source's own completeness decides.
+    #[test]
+    fn an_out_of_order_delivery_leaves_only_the_delivered_row_unfolded() {
+        let delivered = [position_path(&[1, 0]), position_path(&[1, 1])];
+        let positions = undecided_positions(delivered.iter(), None, None);
+        let folded = rows_folded_at(0, &positions);
+        assert!(row_folded(&folded, &[0]) && !row_folded(&folded, &[1]));
+    }
+
+    /// The rows under a frontier inside row R: the rows before R and rows holding no
+    /// position are folded; R is folded only when nothing under it is delivered or emitted
+    /// past the frontier.
+    #[test]
+    fn a_frontier_inside_a_row_folds_the_rows_before_it() {
+        let frontier = position_path(&[1, 2]);
+        let emitted = position_path(&[1, 2]);
+        let delivered = [position_path(&[1, 3])];
+        let positions = undecided_positions(delivered.iter(), Some(&emitted), Some(&frontier));
+        let folded = rows_folded_at(0, &positions);
+        assert!(row_folded(&folded, &[0]) && row_folded(&folded, &[2]));
+        assert!(
+            !row_folded(&folded, &[1]),
+            "position (1, 3) is still to run"
+        );
+        let positions = undecided_positions(std::iter::empty(), Some(&emitted), Some(&frontier));
+        assert!(row_folded(&rows_folded_at(0, &positions), &[1]));
+    }
+
+    /// Folding a row never shrinks as the frontier advances over a fixed delivery: a row
+    /// folded at one frontier is folded at every later one.
+    #[test]
+    fn a_row_folded_stays_folded_as_the_frontier_advances() {
+        let delivered = [position_path(&[2, 0])];
+        let emitted = position_path(&[1, 1]);
+        let frontiers = [
+            None,
+            Some(position_path(&[0, 5])),
+            Some(position_path(&[1, 1])),
+        ];
+        let mut folded_before: Vec<Vec<u64>> = Vec::new();
+        for frontier in &frontiers {
+            let positions =
+                undecided_positions(delivered.iter(), Some(&emitted), frontier.as_ref());
+            let folded = rows_folded_at(0, &positions);
+            for row in &folded_before {
+                assert!(
+                    row_folded(&folded, row),
+                    "row {row:?} was folded at an earlier frontier"
+                );
+            }
+            folded_before = (0..3u64)
+                .map(|r| vec![r])
+                .filter(|row| row_folded(&folded, row))
+                .collect();
+        }
+        assert_eq!(folded_before, vec![vec![0], vec![1]]);
     }
 
     /// A nested drive stays in a row until the source calls it complete: a position the row
