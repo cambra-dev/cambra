@@ -18,18 +18,21 @@
 //! by concurrent HTTP handlers is only correct if its state is transactional)
 //! and `hit_counter` (the request-stream aggregate).
 //!
-//! **Currently blocked at parsing.**  The `\` lambda lexes, the variant tags
-//! both lex and parse (`docs/chl-spec.md`, "3.15 Variant constructors"), and
-//! `import http` and the `requires Transaction` clause parse, so the first parse
-//! error is a `case` arm written on one line, `` case `some(_): abort() ``,
-//! whose body the grammar takes only as an indented block.  Behind it:
-//! `import http` and `requires Transaction` (both refused by lowering),
-//! `with begin()` / `abort()`, map-index assignment, structured requests, and
-//! `restrict` / `count`.  This pins the one-line `case` parse failure.
+//! **Currently blocked at loading.**  The whole program parses, its `case`
+//! arms on their `case` lines included (`docs/chl-spec.md`, "An arm on its
+//! `case` line"), so the first error is the loader finding no `http` module in
+//! the std root for `import std::http`.  Behind it: `requires Transaction`
+//! (refused by lowering), `with begin()` / `abort()`, map-index assignment,
+//! structured requests, and `restrict` / `count`.  This pins the loading error,
+//! and that no parse error precedes it.
 
-use super::common::expect_compile_error;
+use super::common::expect_compile_error_past;
 
 #[test]
-fn txn_kv_currently_blocked_at_parsing() {
-    expect_compile_error(include_str!("program.cambra"), "expected indented block");
+fn txn_kv_currently_blocked_at_loading() {
+    expect_compile_error_past(
+        include_str!("program.cambra"),
+        "no module `std::http`",
+        "parse error",
+    );
 }

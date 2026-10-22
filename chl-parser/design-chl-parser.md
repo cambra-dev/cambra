@@ -131,8 +131,9 @@ Key shape choices:
   not nest an `if` statement inside an `else` to represent the chain.
 - `Expr::Block` wraps an `if` or `match` statement in value position. Assignment-side
   blocks and one-line `match` therefore reach the same lowering entry, `lower_final_stmt`.
-  `match_arms` parameterizes the arm-body production; `assign_tail` parameterizes the
-  right-hand side for all six assignment forms.
+  `match_arms` parameterizes the arm-body production: an expression in the one-line form,
+  and in the indented form an indented block or one expression on the `case` line;
+  `assign_tail` parameterizes the right-hand side for all six assignment forms.
 - `Expr::Record` represents a record value. `BraceRecord`, `BraceGroup` and
   `BraceRefinement` retain type syntax for lowering to interpret. The distinction between
   `{T,}`, `{T}`, `{}` and refinements is specified under
