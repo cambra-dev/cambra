@@ -577,15 +577,25 @@ those spellings. See `higher_order_dependent_application_discharges_the_binder` 
 ##### Compaction traversal cost
 
 `CompactState::in_process` prevents recursive re-entry while a variable is being visited; it is
-not a cache of completed results. The entry is removed when that visit returns. Reaching a
-position again can therefore repeat compaction, and each structural child can enable a new
-opposite-side read.
+not a cache of completed results. The entry is removed when that visit returns.
 
-A result memo keyed only by variable identity and polarity would omit relevant inputs:
-`subst_acc` composes the substitutions on the path, and `st.scope` records the refinement
-scope. Reusing a result across different substitutions or scopes would conflate distinct readings.
-No such compaction result memo is implemented here. Memoization or interning would require its
-own correctness and performance checks; the traversal cost alone does not establish a safe key.
+One variable is reached along several paths in one walk, and each path through a dependent
+application or a lambda composes its own binders onto `subst_acc`. Walked afresh each time, a
+variable reached by two paths per level of nesting costs a walk exponential in the nesting.
+`CompactState::var_answers` keeps a variable's answer under what its walk reads:
+
+- the variable, its polarity, whether the position is invariant, and whether it is the position the
+  walk entered, which decides the opposite-polarity fallback;
+- `st.scope`'s enclosing functions, the data-domain depth, and whether a sum's candidate is being
+  compacted;
+- `subst_acc` as it acts on the variable (`Subst::acting_on`). The path's own binders are outside
+  the variable's telescope, so accumulators that differ only in them agree there
+  ([The invariant](#the-invariant)).
+
+An answer is kept only when the walk changed no walk-wide state (join violations, recursive
+placeholders, candidate widening), so a reuse has nothing to replay, and when every cycle check it
+hit cut at a variable the walk itself entered. A cut at a variable entered before it depends on the
+path that reached the variable, and is not reused.
 
 #### Binder-slot resolution
 
@@ -1974,13 +1984,19 @@ The codomain comparison aligns binder names with `Subst::aligned` when required.
 record the resulting relation in its native direction. Pre-inverting a discharge would lose the
 argument replacement, including when a concrete function reaches an earlier opaque application.
 
+A variable's side of an edge keeps only what can act on the variable (`Subst::acting_on`): an entry
+for a binder outside its telescope leaves its content unchanged
+([The invariant](#the-invariant)). `constrain_go` restricts both sides on entry, so one constraint
+reached along several paths, each composing the binders of the dependent applications and lambdas
+it passed through, is one edge, recorded once.
+
 When lower and upper entries meet at one holder, `bridge_holder_gap` reconciles their holder views:
 
 1. Identical views need no bridge.
-2. Views that differ only in discharges the holder cannot name act alike on it, so
-   `L <: 𝑉‹lo›` and `𝑉‹hi› <: 𝑈` meet at one type and need no bridge. A discharge cannot act on
-   `𝑉` when its binder is outside `𝑉`'s telescope, or its witness outside every binder scoping
-   over `𝑉` (`Subst::without_vacuous_discharges`).
+2. Views that differ only in entries the holder cannot name act alike on it, so
+   `L <: 𝑉‹lo›` and `𝑉‹hi› <: 𝑈` meet at one type and need no bridge. An entry cannot act on
+   `𝑉` when its binder is outside `𝑉`'s telescope, or a witness discharge when its witness is
+   outside every binder scoping over `𝑉` (`Subst::acting_on`).
 3. The bridge applies `licensed_correspondence_view`, which treats variable-target discharges as
    renames at this site. This is an existing restricted transport assumption, not general
    invertibility of discharge.

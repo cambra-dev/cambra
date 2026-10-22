@@ -486,7 +486,7 @@ fn content_mentions(
     };
     for b in &bounds {
         let (_, discharged) = b.self_subst.split_renames();
-        if !discharged.without_vacuous_discharges(v).is_id() {
+        if !discharged.acting_on(v).is_id() {
             continue;
         }
         let (n, w) = b.render_subst().preimage(names, witnesses);
@@ -1545,6 +1545,9 @@ fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
         candidate_widened: None,
         join_violations: Vec::new(),
         own_content: Default::default(),
+        var_answers: HashMap::new(),
+        cuts: Vec::new(),
+        entered: Vec::new(),
     };
     let term = compact_go(ty, true, &Subst::id(), Position::default(), &mut st);
     debug_assert!(
@@ -1787,6 +1790,32 @@ struct CompactState {
     /// asked about. The graph does not change while one type compacts, and the question is
     /// asked of a variable once per bound each time the walk reaches it.
     own_content: Rc<std::cell::RefCell<HashMap<OwnContentQuery, bool>>>,
+    /// [`compact_go`]'s answers for a variable, by what its walk reads ([`VarWalk`]) and the
+    /// accumulated substitution as it acts on the variable (`Subst::acting_on`). One variable is
+    /// reached along several paths, and each path through a dependent application or a lambda
+    /// composes its own binders onto the accumulator; acting on the variable, the accumulators
+    /// agree, and so does the answer.
+    var_answers: HashMap<VarWalk, Vec<(Subst, CompactType)>>,
+    /// The variables a cycle check cut the walk at, and the variables the walk entered, in walk
+    /// order. A variable's walk that was cut only at variables it entered itself read nothing of
+    /// the path that reached it, so its answer holds wherever the variable is reached again.
+    cuts: Vec<(InferVarId, bool)>,
+    entered: Vec<(InferVarId, bool)>,
+}
+
+/// What a variable's walk reads besides the variable and the accumulator: its polarity, whether
+/// the position is invariant and whether it is the position the walk entered (which decides
+/// the opposite-polarity fallback, [`fallback_allowed`]), the functions enclosing it, how many
+/// data domains do, and whether a sum's candidate is being compacted.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct VarWalk {
+    var: InferVarId,
+    pol: bool,
+    invariant: bool,
+    entered_position: bool,
+    enclosing: Vec<Option<Name>>,
+    data_domain_depth: u32,
+    candidate_widened: Option<bool>,
 }
 
 /// A [`content_mentions`] question: a variable, and the names and witnesses asked about.
@@ -2125,6 +2154,59 @@ fn kind_renames(
 /// a refinement's base, and reset at every other structural child, because they answer a
 /// question about the position and a structural child is a new one.
 fn compact_go(
+    ty: &Type,
+    pol: bool,
+    subst_acc: &Subst,
+    pos: Position<'_>,
+    st: &mut CompactState,
+) -> CompactType {
+    let Type::Infer(v) = ty else {
+        return compact_go_step(ty, pol, subst_acc, pos, st);
+    };
+    let acc = subst_acc.acting_on(v);
+    let walk = VarWalk {
+        var: v.uid,
+        pol,
+        invariant: pos.invariant,
+        entered_position: pos.parents.is_none(),
+        enclosing: st.scope.enclosing().to_vec(),
+        data_domain_depth: st.data_domain_depth,
+        candidate_widened: st.candidate_widened,
+    };
+    if let Some((_, answer)) = st
+        .var_answers
+        .get(&walk)
+        .and_then(|answers| answers.iter().find(|(s, _)| *s == *acc))
+    {
+        return answer.clone();
+    }
+    let (cuts, entered) = (st.cuts.len(), st.entered.len());
+    let (violations, recursive, rec_vars) = (
+        st.join_violations.len(),
+        st.recursive.len(),
+        st.rec_vars.len(),
+    );
+    let answer = compact_go_step(ty, pol, &acc, pos, st);
+    // An answer is kept only when the walk left the walk-wide state as it found it, so a
+    // reuse has nothing to replay, and read nothing of the path that reached the variable.
+    let self_contained = st.cuts[cuts..].is_empty() || {
+        let inside: HashSet<_> = st.entered[entered..].iter().collect();
+        st.cuts[cuts..].iter().all(|c| inside.contains(c))
+    };
+    if self_contained
+        && st.join_violations.len() == violations
+        && st.recursive.len() == recursive
+        && st.rec_vars.len() == rec_vars
+        && st.candidate_widened == walk.candidate_widened
+    {
+        let answers = st.var_answers.entry(walk).or_default();
+        answers.push((acc.into_owned(), answer.clone()));
+    }
+    answer
+}
+
+/// One step of [`compact_go`]: the type's own rule, with a variable's walk memoized around it.
+fn compact_go_step(
     ty: &Type,
     pol: bool,
     subst_acc: &Subst,
@@ -2484,6 +2566,7 @@ fn compact_go(
             let uid = state.uid;
             let key = (uid, pol);
             if st.in_process.contains(&key) {
+                st.cuts.push(key);
                 if pos.parents.is_some_and(|p| p.contains(uid)) {
                     // Spurious cycle (a <: b and b <: a with no
                     // structural intermediary). Drop the bound.
@@ -2499,6 +2582,7 @@ fn compact_go(
                 return CompactType::from_var(placeholder);
             }
             st.in_process.insert(key);
+            st.entered.push(key);
             // **A variable states a binder correspondence too**, and it is the only thing
             // that states the one a join needs: two conditional arms are two sums recorded
             // below one variable's kind, each spelled in its own binder, and the kind is what
@@ -2588,7 +2672,7 @@ fn compact_go(
                     return true;
                 };
                 let (_, discharged) = b.self_subst.split_renames();
-                let acting = discharged.without_vacuous_discharges(v);
+                let acting = discharged.acting_on(v);
                 if acting.is_id() {
                     return true;
                 }

@@ -115,23 +115,19 @@ pub enum Mapping {
     /// `binder ↦ other binder` — a correspondence between frames. Invertible.
     Rename(Binder),
     /// `binder ↦ term` — plug a term in for the binder. No inverse.
-    /// (Boxed: a term is much larger than a binder name.)
     ///
-    /// **Considered and deferred: `Rc<TypedExpr>`.** The payload is a template,
-    /// never a tree node and cloned afresh at every read ([`Mapping::as_expr`]),
-    /// so sharing it is sound. The solver copies substitutions constantly
-    /// (`Bound::render_subst`, [`Subst::then`], `compact`, `constrain`): with a
-    /// `Box` each of those ~28 sites deep-copies the payload tree, with an `Rc`
-    /// they are refcount bumps.
+    /// **The term is shared.** It is a template, never a tree node and cloned afresh at
+    /// every read ([`Mapping::as_expr`]), so sharing it is sound. The solver copies
+    /// substitutions constantly (`Bound::render_subst`, [`Subst::then`], `compact`,
+    /// `constrain`), and each copy of a shared term is a refcount bump rather than a copy
+    /// of the tree.
     ///
-    /// One trap if it is ever done: [`Subst::for_each_discharge_term_mut`] would
-    /// become `Rc::make_mut`, which copies out through `TypedExpr`'s freshening
-    /// `Clone`. `freshen_subst_payloads` clones the `Subst` while the source
-    /// `Bound` is still alive, so the payload is **always** shared at that point
-    /// and it would freshen every time. The fix is to stop mutating in place —
-    /// map to a new `Rc` per payload instead. See the vault's
-    /// `freshening-clone-report`.
-    Discharge(Box<TypedExpr>),
+    /// Sharing is why [`Subst::for_each_discharge_term_mut`] replaces each term with a
+    /// rewritten copy rather than reaching it through `Rc::make_mut`: `make_mut` copies a
+    /// shared term out through `TypedExpr`'s freshening `Clone`, and
+    /// `freshen_subst_payloads` rewrites a copy of a `Subst` whose source `Bound` is still
+    /// alive, so every term is shared there and would be freshened.
+    Discharge(Rc<TypedExpr>),
     /// `binder ↦` the join over every value the binder takes. A type leaving the
     /// binder's scope this way keeps what holds for every value: a refinement naming the
     /// binder is dropped where it states a value, and where it states a collection's
@@ -144,7 +140,7 @@ pub enum Mapping {
     /// domain naming the binder then has an answer, the domain with the binder discharged to
     /// that term ([`Subst::in_data_domain`]); a value's refinement is still dropped
     /// (`src/ccl/design/type-inference.md`, "A history's value may depend on its position").
-    Join(Option<Box<TypedExpr>>),
+    Join(Option<Rc<TypedExpr>>),
     /// The entry a substitution held, a discharge or a rename, whose term has no spelling at
     /// this position: it reads an enclosing refinement's element, and the position is under a nested refinement, which
     /// binds `__elem` to its own element ([`Subst::under_element`]). Acting on an occurrence
@@ -206,10 +202,8 @@ impl Clone for Mapping {
     fn clone(&self) -> Self {
         match self {
             Mapping::Rename(b) => Mapping::Rename(b.clone()),
-            Mapping::Discharge(t) => Mapping::Discharge(Box::new(t.clone_preserving_ids())),
-            Mapping::Join(at_key) => {
-                Mapping::Join(at_key.as_ref().map(|t| Box::new(t.clone_preserving_ids())))
-            }
+            Mapping::Discharge(t) => Mapping::Discharge(Rc::clone(t)),
+            Mapping::Join(at_key) => Mapping::Join(at_key.clone()),
             Mapping::Unspellable(m) => Mapping::Unspellable(Box::new((**m).clone())),
         }
     }
@@ -587,7 +581,7 @@ impl Subst {
         let binder = binder.into();
         debug_assert_no_pi_bound(&binder);
         let mut m = BTreeMap::new();
-        m.insert(binder, Mapping::Discharge(Box::new(term)));
+        m.insert(binder, Mapping::Discharge(Rc::new(term)));
         Subst::of_binders(m)
     }
 
@@ -598,7 +592,7 @@ impl Subst {
             env.iter()
                 .map(|(name, term)| {
                     debug_assert_no_pi_bound(name);
-                    (name.clone(), Mapping::Discharge(Box::new(term.clone())))
+                    (name.clone(), Mapping::Discharge(Rc::new(term.clone())))
                 })
                 .collect(),
         )
@@ -620,7 +614,7 @@ impl Subst {
         let binder = binder.into();
         debug_assert_no_pi_bound(&binder);
         let mut m = BTreeMap::new();
-        m.insert(binder, Mapping::Join(Some(Box::new(at_key))));
+        m.insert(binder, Mapping::Join(Some(Rc::new(at_key))));
         Subst::of_binders(m)
     }
 
@@ -703,7 +697,7 @@ impl Subst {
                     Mapping::Join(None) => None,
                     Mapping::Join(Some(t)) => Some((
                         k.clone(),
-                        Mapping::Discharge(Box::new(t.clone_preserving_ids())),
+                        Mapping::Discharge(Rc::new(t.clone_preserving_ids())),
                     )),
                     other => Some((k.clone(), other.clone())),
                 })
@@ -720,7 +714,7 @@ impl Subst {
         if self.joins_unkeyed_in(t) {
             Mapping::Join(None)
         } else {
-            Mapping::Join(Some(Box::new(self.in_data_domain().apply_expr(t))))
+            Mapping::Join(Some(Rc::new(self.in_data_domain().apply_expr(t))))
         }
     }
 
@@ -841,11 +835,14 @@ impl Subst {
     /// was captured at emit with the definition's inference variables and channel domains in
     /// its type slots, and a freshened clone must rename those alongside every other slot it
     /// copies — see `solver::scheme::freshen_subst_payloads`, called from `freshen_above`'s
-    /// bound-copying arm.
+    /// bound-copying arm. A term is shared ([`Mapping::Discharge`]), so `f` rewrites a copy at
+    /// the term's own identities, which replaces it.
     pub fn for_each_discharge_term_mut(&mut self, f: &mut impl FnMut(&mut TypedExpr)) {
         for m in self.binders.values_mut() {
             if let Mapping::Discharge(t) | Mapping::Join(Some(t)) = m {
-                f(t);
+                let mut copy = t.clone_preserving_ids();
+                f(&mut copy);
+                *t = Rc::new(copy);
             }
         }
         // A payload is a template, so it is copied at its own identities, as a discharge's is.
@@ -1075,7 +1072,7 @@ impl Subst {
                 Some(Mapping::Discharge(t)) if b.unspellable_in(t) => {
                     Mapping::Unspellable(Box::new(Mapping::Discharge(t.clone())))
                 }
-                Some(Mapping::Discharge(t)) => Mapping::Discharge(Box::new(b.apply_expr(t))),
+                Some(Mapping::Discharge(t)) => Mapping::Discharge(Rc::new(b.apply_expr(t))),
                 Some(Mapping::Unspellable(m)) => Mapping::Unspellable(m.clone()),
                 Some(Mapping::Join(None)) => Mapping::Join(None),
                 Some(Mapping::Join(Some(t))) => b.join_through(t),
@@ -1378,27 +1375,37 @@ impl Subst {
             || self.binders.keys().any(|b| v.telescope.contains(b))
     }
 
-    /// This substitution with every discharge removed that cannot act on `v`: a term binder
-    /// outside `v`'s telescope, or a witness no binder of `v`'s witness scopes may bind. `v`
-    /// resolves to types naming those binders and nothing else
-    /// (`src/ccl/design/type-inference.md`, "The invariant"), so such a discharge leaves whatever
-    /// `v` resolves to unchanged, and dropping it is exact.
-    pub(crate) fn without_vacuous_discharges(&self, v: &crate::ccl::infer_var::InferVar) -> Subst {
-        Subst {
+    /// The part of this substitution that can act on `v`: every entry but those for a term
+    /// binder outside `v`'s telescope, renames included, and the witness discharges for a
+    /// witness no binder of `v`'s witness scopes may bind. `v` resolves to types naming its
+    /// telescope's binders and nothing else (`src/ccl/design/type-inference.md`, "The
+    /// invariant"), so a dropped entry leaves whatever `v` resolves to unchanged, and dropping it
+    /// is exact. Borrowed when nothing is dropped.
+    pub(crate) fn acting_on(&self, v: &crate::ccl::infer_var::InferVar) -> Cow<'_, Subst> {
+        let binder_acts = |k: &Name| v.telescope.contains(k);
+        let witness_acts = |w: &crate::ccl::ty::WitnessId, m: &WitnessMapping| {
+            matches!(m, WitnessMapping::Rename(_)) || v.may_name_witness(w)
+        };
+        if self.binders.keys().all(binder_acts)
+            && self.witnesses.iter().all(|(w, m)| witness_acts(w, m))
+        {
+            return Cow::Borrowed(self);
+        }
+        Cow::Owned(Subst {
             binders: self
                 .binders
                 .iter()
-                .filter(|(k, m)| matches!(m, Mapping::Rename(_)) || v.telescope.contains(k))
+                .filter(|(k, _)| binder_acts(k))
                 .map(|(k, m)| (k.clone(), m.clone()))
                 .collect(),
             witnesses: self
                 .witnesses
                 .iter()
-                .filter(|(w, m)| matches!(m, WitnessMapping::Rename(_)) || v.may_name_witness(w))
+                .filter(|(w, m)| witness_acts(w, m))
                 .map(|(w, m)| (*w, m.clone()))
                 .collect(),
             elims: self.elims.clone(),
-        }
+        })
     }
 
     /// The binders whose image under this substitution names something in `names` or
@@ -1772,7 +1779,7 @@ impl Subst {
         let live: BTreeMap<Binder, Mapping> = env
             .iter()
             .filter(|(name, _)| live_names.contains(*name))
-            .map(|(name, term)| (name.clone(), Mapping::Discharge(Box::new(term.clone()))))
+            .map(|(name, term)| (name.clone(), Mapping::Discharge(Rc::new(term.clone()))))
             .collect();
         Subst::of_binders(live).rewrite_expr(&mut e);
         e
@@ -1798,7 +1805,7 @@ impl Subst {
                         .as_ref()
                         .is_some_and(|a| is_free_in_type(name, a))
             })
-            .map(|(name, term)| (name.clone(), Mapping::Discharge(Box::new(term.clone()))))
+            .map(|(name, term)| (name.clone(), Mapping::Discharge(Rc::new(term.clone()))))
             .collect();
         if live.is_empty() {
             return;
@@ -3654,7 +3661,7 @@ pub fn discharge_codomain(binder: &Name, argument: &TypedExpr, codomain: &Type) 
     }
     let opened = if references_enclosing_function(codomain) {
         open_pi_binder(
-            &Mapping::Discharge(Box::new(argument.clone_preserving_ids())),
+            &Mapping::Discharge(Rc::new(argument.clone_preserving_ids())),
             codomain,
         )
     } else {
@@ -4847,7 +4854,7 @@ mod locally_nameless_tests {
         assert_eq!(open_pi_binder(&Mapping::Rename(k.clone()), &closed), inner);
 
         let applied = open_pi_binder(
-            &Mapping::Discharge(Box::new(TypedExpr::lit(Lit::Int(5)))),
+            &Mapping::Discharge(Rc::new(TypedExpr::lit(Lit::Int(5)))),
             &closed,
         );
         let Type::Fun { domain, .. } = &applied else {
