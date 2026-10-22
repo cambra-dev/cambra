@@ -1546,16 +1546,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                         defer_names.push(b.name);
                         current_body = *inner;
                     }
-                    other => {
-                        current_body = TypedExpr {
-                            node: other,
-                            ty: current_body.ty,
-                            user_annotation: current_body.user_annotation,
-                            // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
-                            node_id: cur_let_id,
-                        };
-                        break;
-                    }
+                    _ => break,
                 }
             }
             // Recurse into the body first to handle any nested
@@ -2980,22 +2971,13 @@ fn extract_for_defer_impl(
                             node_id: elt_node_id,
                         });
                     }
-                    other => {
-                        let elt = TypedExpr {
-                            node: other,
-                            ty: elt_ty,
-                            user_annotation: elt_user_ann,
-                            // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
-                            node_id: elt_node_id,
-                        };
-                        new_elts.push(extract_for_defer(
-                            elt,
-                            defer_name,
-                            feeds,
-                            define,
-                            in_inner_scope,
-                        )?);
-                    }
+                    _ => new_elts.push(extract_for_defer(
+                        elt,
+                        defer_name,
+                        feeds,
+                        define,
+                        in_inner_scope,
+                    )?),
                 }
             }
             TypedExprNode::Compose(new_elts)
