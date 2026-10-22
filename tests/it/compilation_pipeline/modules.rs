@@ -563,8 +563,8 @@ fn option_is_one_type_in_every_module() {
 }
 
 /// Importing a module that performs IO is an error at the `import`, pointing at
-/// the IO (`docs/chl-spec.md`, "9.7 Importing asserts no IO"): a sink it binds, or
-/// a source it reads.
+/// the IO (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state"): a sink it
+/// binds, or a source it reads.
 #[rstest]
 #[case::a_sink(indoc! {"
     out = test_sink()
@@ -588,6 +588,98 @@ fn importing_a_module_that_performs_io_is_refused(#[case] audit: &str, #[case] i
     );
     assert!(errors.contains("the IO it performs"), "{errors}");
     assert!(errors.contains(io), "{errors}");
+}
+
+/// Importing a module that declares mutable state is an error at the `import`,
+/// pointing at the state: a module with state is run, not imported
+/// (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state").
+#[rstest]
+#[case::transactional_variable("pub stock: Mut(Int, Txn) := 0\n")]
+#[case::private_variable(indoc! {"
+    stock: Mut(Int, Txn) := 0
+    pub n = 1
+"})]
+#[case::mutable_variable("total := 0\n")]
+#[case::defined_output(indoc! {"
+    out = defer()
+    out <<= [1]
+"})]
+#[timeout(Duration::from_secs(10))]
+fn importing_a_module_that_declares_state_is_refused(#[case] library: &str) {
+    let errors = compile_errors(&program(
+        indoc! {"
+            import inventory
+            1
+        "},
+        &[("inventory", library)],
+    ));
+    assert!(
+        errors.contains(
+            "module `inventory` declares mutable state, so importing it is an error: run it instead"
+        ),
+        "{errors}"
+    );
+    assert!(errors.contains("the state it declares"), "{errors}");
+}
+
+/// A module of functions over the caller's state is imported: a call to its
+/// function with a `Mut` parameter takes the curried shape the function lowers
+/// to, by qualified name and through `use` (`docs/chl-spec.md`, "9.6 Qualified
+/// references").
+#[rstest]
+#[case::qualified("import bank\n", "bank::draw", "bank::transfer")]
+#[case::used("import bank use draw, transfer\n", "draw", "transfer")]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_function_writes_the_callers_state(
+    #[case] import: &str,
+    #[case] draw: &str,
+    #[case] transfer: &str,
+) {
+    let bank = indoc! {"
+        pub def draw(p: Mut(Int, Txn), amt: Int):
+            with begin():
+                p := p - amt
+        pub def transfer(src: Mut(Int, Txn), dst: Mut(Int, Txn), amt):
+            with begin():
+                src := src - amt
+                dst := dst + amt
+    "};
+    let root = formatdoc! {"
+        {import}a: Mut(Int, Txn) := 100
+        b: Mut(Int, Txn) := 0
+        {draw}(a, 10)
+        {transfer}(a, b, 30)
+        await_final(a) * 1000 + await_final(b)
+    "};
+    check_program_scalar(&program(&root, &[("bank", bank)]), Value::Int(60_030));
+}
+
+/// A loop passes its induction variable to another module's functions with a `Mut`
+/// parameter, by qualified name and through `use` (`docs/chl-spec.md`, "9.7 Importing
+/// asserts no IO and no state").
+#[rstest]
+#[case::qualified("import counter\n", "counter::bump", "counter::add")]
+#[case::used("import counter use bump, add\n", "bump", "add")]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_function_writes_the_callers_induction_variable(
+    #[case] import: &str,
+    #[case] bump: &str,
+    #[case] add: &str,
+) {
+    let counter = indoc! {"
+        pub def bump(c: Mut(Int)):
+            c := c + 1
+        pub def add(c: Mut(Int), x: Int):
+            c := c + x
+    "};
+    let root = formatdoc! {"
+        {import}cnt: Mut(Int) := 0
+        for x in [1, 2, 3]:
+            {bump}(cnt)
+            {add}(cnt, x)
+        cnt
+    "};
+    check_program_scalar(&program(&root, &[("counter", counter)]), Value::Int(9));
 }
 
 #[rstest]
@@ -659,10 +751,6 @@ fn a_misused_module_name_is_refused(#[case] root: &str, #[case] needle: &str) {
     pub x = 1
     x + 1
 "}, "an imported module has none")]
-#[case::mutable_state(
-    "stock := 1\n",
-    "mutable state in an imported module is not supported yet"
-)]
 #[case::top_level_loop(indoc! {"
     for x in [1]:
         pass
@@ -708,7 +796,7 @@ fn a_reference_into_a_module_with_errors_adds_no_error(#[case] root: &str) {
 
 /// A module two others import is evaluated once: its bindings stand once in the
 /// linked tree, ahead of both importers' (`docs/chl-spec.md`, "9.7 Importing
-/// asserts no IO").
+/// asserts no IO and no state").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn an_imported_module_is_linked_once() {
