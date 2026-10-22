@@ -1789,11 +1789,13 @@ fn rows_keyed_by_the_loops_around_the_feed(#[case] source: &str, #[case] expecte
     check_sink(source, expected);
 }
 
-/// Rows keyed by the loops that fed them, read back by a `for` loop, are refused: the loop
+/// Rows keyed by the loops that fed them, read back by a `for` loop, are not compiled: the loop
 /// types its element at a row that reads the position, which nothing binds over the loop's
-/// body. A comprehension over the same rows compiles (`read_back_through_a_defer`).
+/// body. Inference records the row's bound on a variable of the loop's body, whose telescope does
+/// not hold the position, and the telescope invariant panics there. A comprehension over the
+/// same rows compiles (`read_back_through_a_defer`).
 #[test]
-fn keyed_rows_read_back_by_a_loop_are_refused() {
+fn keyed_rows_read_back_by_a_loop_do_not_compile() {
     check_compile_error(
         indoc! {r#"
             o: Feed(_)
@@ -1804,7 +1806,7 @@ fn keyed_rows_read_back_by_a_loop_are_refused() {
                 out << sum(row)
             sum(out)
         "#},
-        "a `for` loop over a collection whose rows depend on their position",
+        "is not in the holder's telescope",
     );
 }
 

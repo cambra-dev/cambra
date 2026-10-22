@@ -2114,10 +2114,12 @@ group-by recognizer reads.
 
 ### Scoped inference variables: a stored bound closes against a telescope
 
-An inference variable carries the term-binder telescope at its creation. A bound can refer to
-those names or to any binder of its edge substitutions, renames included. Separately, references
-bound by functions inside a stored type use Pi indices. These mechanisms let the solver check
-scope at record time and compare closed types without depending on their binder spellings.
+An inference variable carries the term-binder telescope at its creation, and resolves to a type
+naming those binders and nothing else. A stored bound may name a binder of its own edge
+substitutions, since the edge maps it, but what the edge maps it to lands in the holder like
+anything else. Separately, references bound by functions inside a stored type use Pi indices.
+These mechanisms let the solver check scope at record time and compare closed types without
+depending on their binder spellings.
 
 A group-by annotation can place its refinement on a variable outside the function node that
 visually contains the key binder. The variable's telescope, not that node's shape, determines
@@ -2126,14 +2128,33 @@ record-time obligation.
 
 #### The invariant
 
-`bound_scope_gaps` requires every free term name in a bound's type to occur in the holder's
-telescope or in the domain of either edge substitution. `enforce_bound_scope` panics on a gap
-in every build, naming the holder, bound side, and escaping reference. It is an internal invariant
-failure, not a recoverable user diagnostic.
+A variable resolves to a type naming its telescope's binders and nothing else. Every test that
+decides a substitution leaves a variable alone rests on this: a binder outside the telescope is
+one the variable's content cannot name
+([A substitution reaching a variable suspends on it](#a-substitution-reaching-a-variable-suspends-on-it)).
+
+Two checks hold it, because no single point sees the whole of what a variable resolves to:
+
+- **At record time**, `bound_scope_gaps` reads a bound as its edge leaves it: each free term name
+  of the bound's type, with a name the edge discharges replaced by its term's names and one it
+  renames by the target (`Bound::rendered_names`). Every name read that way must be in the
+  holder's telescope. `enforce_bound_scope` panics on a gap in every build, naming the holder,
+  bound side, and escaping reference. A bound's type can hold variables whose content is not
+  known yet, so this sees the names the bound states, not what those variables bring.
+- **At resolution**, a debug build checks the type each variable resolves to against its
+  telescope (`assert_resolves_in_scope`).
+
+Both are internal invariant failures, not recoverable user diagnostics.
 
 `InferCtx::fresh` passes the current telescope to `InferVar::fresh_in`. Emission extends that
 telescope for term binders, and normalization extends it when descending dependent annotations.
 The scope invariant also applies to bounds recorded during specialization and post-pass derivation.
+
+An operator scheme's template stands nowhere but under its own functions, so a template variable's
+telescope holds only the binders of the functions it stands under: `box`'s element variable
+stands under `__box_k`. Instantiation names each such binder afresh, and a copy stands at the use
+site's telescope with its template binders entered after it, as that instantiation names them
+(`FreshenCache::site_telescope`).
 
 Each telescope also shares a growing set of opaque binders with the other telescopes from its
 root. `enter_opaque` adds a name to that set, including for variables created before entry.
@@ -2164,8 +2185,8 @@ not prove every later rewrite preserves lexical scope, so neither check is redun
 The representation is locally nameless:
 
 - A reference to a surrounding telescope entry is a free, uniquified `Name`. Each variable
-  receiving a bound checks that name against its own telescope or against any binder of either
-  edge substitution, renames included.
+  receiving a bound checks that name, as the edge's substitutions leave it, against its own
+  telescope.
 - A reference bound by a function inside the type is `Name::PiBound(PiRef)`. Its index counts
   enclosing function-codomain crossings to that function. Function domains do not enter their
   own term binder's scope.

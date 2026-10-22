@@ -1129,6 +1129,31 @@ a == b
     )
 }
 
+/// An annotation inside a body demanding something of a parameter or loop variable in terms of
+/// a binder the body introduced panics: a read of the binder is its variable as-is, and that
+/// variable stands where the binder is bound, outside the body. The demand lands on it naming
+/// `y`, which nothing there binds (`src/ccl/design/type-inference.md`, "The invariant"). Both
+/// programs run, `y` being one more than the value annotated, so the panic is a compiler gap.
+#[rstest]
+#[case::a_parameter(indoc! {r#"
+    def f(x):
+        y = x + 1
+        z: {Int where _ < y} = x
+        z
+    f(3)
+"#})]
+#[case::a_loop_variable(indoc! {r#"
+    total := 0
+    for x in [1, 2, 3]:
+        y = x + 1
+        z: {Int where _ < y} = x
+        total += z
+    total
+"#})]
+fn a_demand_naming_a_body_binder_escapes_to_the_binder_variable(#[case] code: &str) {
+    check_compile_error(code, "open bound recorded");
+}
+
 /// Reading a mutable variable introduces an opaque binder inside the body, so the
 /// body's type reaches the codomain through a barrier variable; the refinement it drops
 /// names the parameter as well as that binder
@@ -1599,9 +1624,9 @@ fn collection_contains_of_a_pi_typed_collection() {
 /// TODO: Currently fails because the collection codomain still
 /// references its Pi binder after being moved from the context of the
 /// collection Pi type into the non-Pi-type template of
-/// `collection_contains`.
+/// `collection_contains`: the bound naming `__iter_record` lands outside its scope.
 #[test]
-#[should_panic = "references out-of-scope binder(s) [\"__iter_record\"]"]
+#[should_panic = "open bound recorded"]
 fn collection_contains_of_an_inferred_pi_typed_collection() {
     let code = indoc! {r#"
         xs = [1, 2, 3, 4, 5]
