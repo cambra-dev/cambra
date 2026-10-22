@@ -2406,10 +2406,14 @@ fn convert_impl_inner(
         // the sum denotes is that leg keyed by its own keys. Merging flat at the bound the
         // sum's type declares is that, where a tagged merge would show every key wearing its
         // leg's tag (`src/ccl/design/collections.md`, "Compiling a conditional collection").
-        TypedExprNode::Realize(value) => match &value.node {
-            TypedExprNode::Copair(operands) if expr.ty.witness_kind().is_some() => {
+        TypedExprNode::Realize { value, .. } => match &value.node {
+            // Whether the sum survived or was erased to its one candidate's collection.
+            TypedExprNode::Copair(operands) => {
                 let Extent::Function { domain, codomain } = ctx.extent_of(&expr.ty)? else {
-                    unreachable!("a sum converts to a function extent: {}", expr.ty)
+                    unreachable!(
+                        "a realized collection converts to a function extent: {}",
+                        expr.ty
+                    )
                 };
                 union_operand_ops(
                     operands,

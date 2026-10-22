@@ -432,6 +432,13 @@ impl Printer {
                 Some(text) => (Prec::Atom, text),
                 None => (Prec::Atom, self.fallback_expr(e)),
             },
+            // `unbox` is the second projection of a sum: the collection it holds, which the
+            // program wrote as the sum itself.
+            TypedExprNode::Apply { function, argument }
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::Unbox)) =>
+            {
+                self.expr_inner(argument, env)
+            }
             TypedExprNode::Apply { function, argument } => self.apply(e, function, argument, env),
             _ => (Prec::Atom, self.fallback_expr(e)),
         }

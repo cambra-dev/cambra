@@ -69,70 +69,14 @@ use crate::ccl::{
     BindingTransparency, Expr, Lit, Name, Refinement, Type, TypedExprNode,
     ccl_utils::{
         PredMemo, count_free, discharge_transparent_lets, free_names_in_value, is_free,
-        refresh_let_binder, spelled_in_a_type, walk_refined_predicates_mut,
+        refresh_let_binder, spelled_in_a_type, walk_quoted_terms_mut,
     },
     lambda_elim::substitute,
     names::SyntheticKind,
     provenance,
 };
 
-use crate::ccl::infer::solver::smt::{ScopeEnv, SmtError, defined_as, smt_sub};
-
-/// The binders in scope where this pass checks a substitution, each at the type a query under it
-/// assumes: the type it is bound at, and for a transparent `let` its definition as well
-/// ([`defined_as`]). The same environment the post-inference check builds (`CheckScope` in
-/// `src/ccl/infer/check.rs`), so a refinement inference discharged with a binder's facts is
-/// discharged here with the same facts.
-///
-/// An opaque binder's type is kept past its scope, as the check keeps it: a type lifted past the
-/// binder keeps its name. A binder this walk does not track (a loop target, a pattern binder, a
-/// `letrec` group) contributes no assumption, which only weakens a query.
-#[derive(Default)]
-struct Scope {
-    frames: Vec<(Name, Type)>,
-    opaque_binders: std::collections::HashMap<Name, Type>,
-}
-
-impl Scope {
-    fn under<R>(&mut self, name: &Name, ty: Type, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.frames.push((name.clone(), ty));
-        let out = f(self);
-        self.frames.pop();
-        out
-    }
-
-    fn under_let<R>(
-        &mut self,
-        binding: &crate::ccl::TypedBinding,
-        definition: &Expr,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        let assumed = match binding.transparency {
-            BindingTransparency::Transparent => defined_as(binding.ty.clone(), definition),
-            BindingTransparency::Opaque => {
-                self.opaque_binders
-                    .insert(binding.name.clone(), binding.ty.clone());
-                binding.ty.clone()
-            }
-        };
-        self.under(&binding.name, assumed, f)
-    }
-}
-
-impl ScopeEnv for Scope {
-    fn binder_type(&self, name: &Name) -> Option<Type> {
-        self.frames
-            .iter()
-            .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, ty)| ty)
-            .or_else(|| self.opaque_binders.get(name))
-            .cloned()
-    }
-    fn is_skip_smt(&self) -> bool {
-        false
-    }
-}
+use crate::ccl::infer::solver::smt::{BinderScope, ScopeEnv, SmtError, smt_sub};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -152,7 +96,7 @@ impl ScopeEnv for Scope {
 /// are *not* folded here — `crate::ccl::simplify` handles that rewrite as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_capability_lambdas(expr: Expr) -> Expr {
-    let expr = inline_impl(expr, &mut Scope::default());
+    let expr = inline_impl(expr, &mut BinderScope::default());
     let expr = beta_reduce_variable_arguments(expr);
     inline_list_element_reads(expr, &PredMemo::new()).0
 }
@@ -172,13 +116,13 @@ pub fn inline_capability_lambdas(expr: Expr) -> Expr {
 /// redex is left to lambda elimination, whose rules read its shape: a group-by's partition
 /// is recognized as a lambda of its own.
 fn beta_reduce_variable_arguments(expr: Expr) -> Expr {
-    beta_reduce_variable_arguments_under(expr, &mut Vec::new(), &mut Scope::default())
+    beta_reduce_variable_arguments_under(expr, &mut Vec::new(), &mut BinderScope::default())
 }
 
 fn beta_reduce_variable_arguments_under(
     mut expr: Expr,
     enclosing: &mut Vec<Name>,
-    scope: &mut Scope,
+    scope: &mut BinderScope,
 ) -> Expr {
     if let TypedExprNode::Lambda { param, body } = &mut expr.node {
         enclosing.push(param.name.clone());
@@ -386,7 +330,7 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
     let mut moved = false;
 
     expr.walk_type_slots_mut(|ty| {
-        walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+        walk_quoted_terms_mut(ty, memo, &(), &mut |pred, memo| {
             let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
             let (rewritten, pred_moved) = inline_list_element_reads(old, memo);
             *pred = rewritten;
@@ -524,7 +468,7 @@ fn move_into_list_elements(
         }
     }
     body.walk_type_slots_mut(|ty| {
-        walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+        walk_quoted_terms_mut(ty, memo, &(), &mut |pred, memo| {
             // A predicate the binder does not occur in is reported unchanged, so
             // it keeps its origin `Rc` and stays pointer-shared with its
             // occurrences on other nodes rather than being reallocated at each.
@@ -694,7 +638,7 @@ fn anf_chain_builds_a_product(e: &Expr) -> bool {
 /// routes them through the defer-aware [`crate::ccl::subst::Subst`] engine,
 /// which renames a fed-to handle when a defer-mediating UDF is inlined. The
 /// defer-returning lift itself lives in `channelize::lift_defer`.
-fn inline_impl(expr: Expr, scope: &mut Scope) -> Expr {
+fn inline_impl(expr: Expr, scope: &mut BinderScope) -> Expr {
     // Carry `node_id` through every rebuild: reconstructing a node with
     // inlined children is a Preserve (the same node, same identity), so the
     // input id must flow onto the rebuilt `Expr` rather than being re-minted.
@@ -948,7 +892,7 @@ fn inline_and_beta_reduce(
     expr: Expr,
     name: &Name,
     lambda: &Expr,
-    scope: &mut Scope,
+    scope: &mut BinderScope,
     memo: &PredMemo,
 ) -> Expr {
     // Direct occurrence: replace the variable with the Lambda value — a UDF used
@@ -1214,10 +1158,10 @@ fn inline_in_type_predicates(
     ty: &mut Type,
     name: &Name,
     lambda: &Expr,
-    scope: &mut Scope,
+    scope: &mut BinderScope,
     memo: &PredMemo,
 ) {
-    walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+    walk_quoted_terms_mut(ty, memo, &(), &mut |pred, memo| {
         // A predicate the inlined binder does not occur in is reported
         // *unchanged*, so it keeps its origin `Rc` and stays pointer-shared with
         // its occurrences on other nodes rather than being reallocated at each
@@ -1712,7 +1656,7 @@ mod tests {
             body,
             &Name::raw("f"),
             &lambda,
-            &mut Scope::default(),
+            &mut BinderScope::default(),
             &PredMemo::new(),
         );
         assert_eq!(result, lambda);
@@ -1731,7 +1675,7 @@ mod tests {
             call,
             &Name::raw("f"),
             &lambda,
-            &mut Scope::default(),
+            &mut BinderScope::default(),
             &PredMemo::new(),
         );
         assert_eq!(result, arg);
@@ -1760,7 +1704,7 @@ mod tests {
             call,
             &Name::raw("f"),
             &lambda,
-            &mut Scope::default(),
+            &mut BinderScope::default(),
             &PredMemo::new(),
         );
         assert_eq!(result, TypedExpr::lit(Lit::Int(1)).with_ty(int));
@@ -1786,7 +1730,7 @@ mod tests {
             shadowed.clone(),
             &Name::raw("f"),
             &replacement,
-            &mut Scope::default(),
+            &mut BinderScope::default(),
             &PredMemo::new(),
         );
         assert_eq!(result, shadowed);

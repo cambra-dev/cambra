@@ -308,11 +308,11 @@ fn run_phases(
 /// Refuse a lifted term that applies a union of collections at its input.
 ///
 /// A predicate or a key is applied per element, so a collection in a position that
-/// receives the element is looked up at the element's index. A union there, a realized
-/// conditional or a `++`, is a collection only iteration compiles: the realized legs of a
-/// same-domain conditional both answer at one index, and `flat_merge` rejects the overlap
-/// at run time. A union a consumer iterates, the argument of `sum` say, compiles, and so does
-/// a conditional chosen per row, whose legs `filter_values` gates on the element.
+/// receives the element is looked up at the element's index. A `++` there is a collection
+/// only iteration compiles. A union a consumer iterates, the argument of `sum` say, compiles,
+/// and so does a conditional chosen per row, whose legs `filter_values` gates on the element.
+/// A realized conditional answers at each key as the conditional it stages does, so the walk
+/// stops at one.
 ///
 /// The positions that receive the input are the term's root, each element of a
 /// composition, a cast's value, each component a `zip` pairs, and both sides of an
@@ -328,9 +328,10 @@ fn refuse_a_union_applied_at_the_input(term: &Expr) -> Result<(), String> {
             {
                 legs.iter().find_map(find)
             }
-            TypedExprNode::Copair(_)
-            | TypedExprNode::DisjointJoin(_)
-            | TypedExprNode::Realize(_) => e.ty.is_collection().then_some(e),
+            TypedExprNode::Realize { .. } => None,
+            TypedExprNode::Copair(_) | TypedExprNode::DisjointJoin(_) => {
+                e.ty.is_collection().then_some(e)
+            }
             TypedExprNode::Compose(elts) | TypedExprNode::Tuple(elts) => elts.iter().find_map(find),
             TypedExprNode::Record(fields) => fields.iter().find_map(|(_, f)| find(f)),
             TypedExprNode::Cast { value, .. } => find(value),

@@ -536,6 +536,12 @@ fn coalesce_compact_go(
             .name
             .clone()
             .filter(|b| crate::ccl::subst::codomain_depends_on(b, &c));
+        // **Several domains at a data position are the conflict wherever they met.** Two
+        // function slots merging record it in `domains_disagree`; a domain variable meeting
+        // several collections does not pass through that merge. A consumer's parameter is
+        // the shape: each collection reaching it bounds its domain from above, and the
+        // bounds meet at the variable.
+        let domains_disagree = cf.domains_disagree || (cf.kind.is_data() && candidates.len() > 1);
         let type_kind = crate::ccl::ty::TypeKind::Enumerated(candidates);
         match cf.kind {
             // Each conflict reports the fact it is: the arms dispatch on `cf.kind` and
@@ -549,7 +555,7 @@ fn coalesce_compact_go(
                     details: format!("a compute function (capability) over {type_kind}"),
                 });
             }
-            _ if cf.domains_disagree => {
+            _ if domains_disagree => {
                 assert!(
                     !matches!(&type_kind, crate::ccl::ty::TypeKind::Enumerated(ds) if ds.is_empty()),
                     "a kind naming candidates reaches materialization with at least one"
@@ -599,11 +605,11 @@ fn coalesce_compact_go(
             KindPin::Data | KindPin::Plain | KindPin::Sum(_) => {
                 // **A data function's domain is one domain.** A consumed sum *names* its
                 // witness rather than putting a sum where a domain belongs, and a join
-                // forms no sum at all — that is `box`'s job — so nothing puts several
-                // candidates here. This is the property that lets [`CompactFun::domain`]
-                // be one ordinary position rather than a candidate set, so it is asserted
-                // rather than assumed. A sum materializes from the Σ slot beside this one,
-                // never by reading a second candidate off the domain.
+                // forms no sum at all — that is `box`'s job — so several candidates here
+                // are the conflict reported above. This is the property that lets
+                // [`CompactFun::domain`] be one ordinary position rather than a candidate
+                // set. A sum materializes from the Σ slot beside this one, never by reading
+                // a second candidate off the domain.
                 let crate::ccl::ty::TypeKind::Enumerated(domains) = &type_kind else {
                     unreachable!("a data function slot's domain kind names no candidates")
                 };
@@ -737,32 +743,18 @@ fn coalesce_compact_go(
     // A position with no refinement contribution materializes as the bare type: `None`
     // and an empty set both mean "no refinements hold here".
     let out = Type::refined(inner, ct.refinements.clone().unwrap_or_default());
-    // Discharge the kinding constraints this position gathered. A variable's kinding
-    // constraint is the one thing about it that cannot be recorded as a bound, so it
-    // rode compaction in its own slot and is answered here, where the position has
-    // finally become a type — the same moment its bounds become one.
+    // **The kinding constraints this position gathered are memberships still to decide.** A
+    // membership is decided once its type is a type, and its predicates too: the materialization
+    // that keeps this position collects it, and decides it after the predicates are coalesced,
+    // with the scope they read ([`collecting_memberships`]). A resolution kept for no tree — a
+    // display, a specialization key — decides none.
     //
-    // **Membership, not containment.** `𝛼 :: 𝐾` asks whether one domain lies in a kind,
-    // which is [`crate::ccl::ty::TypeKind::refuses`]; the kind premise asks whether one
-    // *set* of domains lies in another, and that one draws edges
-    // (`super::constrain::constrain_type_kinds`). Post-coalesce there is no graph left to
-    // emit into, so this side is the structural answer and can only be that.
-    // A position that materializes as a **variable** has not become a type yet, so the
-    // membership edge has no answer here, and needs none: `𝛼 :: 𝐾` is recorded on
-    // the variable and discharged wherever a type reaches it
-    // (`super::constrain::answer_type_kinds`), including at each instantiation of a
-    // generalized definition. Deciding it here would answer for a definition what only its
-    // uses can say.
-    let undecided = matches!(out.peel_refinements(), Type::Infer(_));
-    for k in &ct.kinds {
-        if undecided {
-            continue;
-        }
-        if k.refuses(&out) {
-            return Err(CoalesceError::KindMismatch {
-                resolved: Box::new(out),
-                type_kind: k.clone(),
-            });
+    // A position that materializes as a **variable** has not become a type yet and has no
+    // membership to decide: the requirement stays on the variable, which every position it
+    // reaches carries.
+    if !matches!(out.peel_refinements(), Type::Infer(_)) {
+        for k in &ct.kinds {
+            record_membership(&out, k, scope);
         }
     }
     Ok(out)
@@ -935,6 +927,47 @@ fn materialize_record(
             ),
         })
     }
+}
+
+/// A membership a materialization decides: `found` is the type a position resolved to, `kind`
+/// the kind it was required to belong to, and `witnesses` the binders enclosing the position,
+/// which classify a witness reference there.
+pub(crate) struct PendingMembership {
+    pub found: Type,
+    pub kind: crate::ccl::ty::TypeKind,
+    pub witnesses: Vec<crate::ccl::ty::Witness>,
+}
+
+thread_local! {
+    /// One list per materialization in progress, innermost last.
+    static PENDING_MEMBERSHIPS: std::cell::RefCell<Vec<Vec<PendingMembership>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f`, a materialization, collecting the memberships its positions require.
+pub(crate) fn collecting_memberships<R>(f: impl FnOnce() -> R) -> (R, Vec<PendingMembership>) {
+    PENDING_MEMBERSHIPS.with(|p| p.borrow_mut().push(Vec::new()));
+    let out = f();
+    let pending = PENDING_MEMBERSHIPS
+        .with(|p| p.borrow_mut().pop())
+        .expect("the list pushed above");
+    (out, pending)
+}
+
+fn record_membership(
+    found: &Type,
+    kind: &crate::ccl::ty::TypeKind,
+    witnesses: &[crate::ccl::ty::Witness],
+) {
+    PENDING_MEMBERSHIPS.with(|p| {
+        if let Some(top) = p.borrow_mut().last_mut() {
+            top.push(PendingMembership {
+                found: found.clone(),
+                kind: kind.clone(),
+                witnesses: witnesses.to_vec(),
+            });
+        }
+    });
 }
 
 #[cfg(test)]

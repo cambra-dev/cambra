@@ -177,9 +177,9 @@ This is an explicit-domain function, the `FullMap` representation, rather than a
 `Map(K, V)` abbreviation. An exact `FullMap(_, _)` annotation can preserve and consume the
 group-by's type. Boxing it to satisfy a `Map` annotation does not establish equivalent behavior:
 `a_consumed_boxed_map_annotation_escapes_its_scope` records an inference failure when that
-boxed annotation is consumed. Bounded group-by annotation cases also have an open-bound
-invariant failure in `a_consumed_bounded_keyed_annotation_records_an_open_bound`.
-These are implementation limitations, not rules rejecting every group-by annotation.
+boxed annotation is consumed. This is an implementation limitation, not a rule rejecting every
+group-by annotation: a bounded group-by annotation is consumed like the group-by itself
+(`a_consumed_bounded_keyed_annotation_is_consumable`).
 
 A checked lookup substitutes its key into the dependent group type during inference.
 The streamed collection-valued answer is rejected later at operator conversion; see
@@ -200,8 +200,8 @@ inferred predicate copies.
 
 The key domain is stamped during lowering. Delaying it until coalescing can leave a keyed-sum
 entry constraint with an unresolved candidate rather than the concrete membership-bearing domain
-it needs. General handling of unresolved candidates belongs to
-[kinding edges](type-inference.md#an-unresolved-candidate-becomes-a-kinding-edge).
+it needs. An unresolved candidate's membership is decided where it materializes
+([Membership is decided at materialization](type-inference.md#membership-is-decided-at-materialization)).
 
 Key types must support equality. Products compare componentwise, and runtime lookup pivots
 a computed product key into one value for comparison with stored product keys.
@@ -405,7 +405,8 @@ pair's two projections:
 - `σᵢ(𝑐)` is the `i`th witness, as a type, counting the sum's binders outermost first
   (`Type::WitnessProjection`). It is how a type outside the sum names `σ`, which no reference to
   `σ` can do outside the sum's own type.
-- `unbox(𝑐)` is the collection, at the type `𝐷[σ ↦ σ₁(𝑐)] ⤇ 𝑉` (`Builtin::Unbox`).
+- `unbox(𝑐)` is the collection, at the type `(𝐷 ⤇ 𝑉)[σ ↦ σ₁(𝑐)]` (`Builtin::Unbox`), every
+  binder of the sum read as its projection.
 
 `unbox` inverts `box`: `box` pairs a collection with the one candidate its domain is, and
 `unbox(box(𝑥))` is `𝑥` over `σ₁(box(𝑥))`, which erasure rewrites to that candidate.
@@ -428,10 +429,15 @@ projection quotes, under the id that term was typed with.
 ### Typing
 
 `unbox` has no scheme. Its result type is the sum's body as a function of the witness, which a
-scheme cannot quantify over, so each use carries a dependent type stamped for its argument's sum,
-`(𝑐 : Σ (σ : 𝐾). 𝐷[σ] ⤇ 𝑉) ⇒ 𝐷[σ ↦ σ₁(𝑐)] ⤇ 𝑉` (`ty::unbox_type`), and the post-inference check
-holds the stamp to that rule (`check_unbox`), as it does `strength_over`'s. Applying it discharges
-`𝑐` to the argument. A key typed `σ₁(𝑐)` then applies to `unbox(𝑐)` as to any collection over that
+scheme cannot quantify over. Inference types each use `(𝑐 : 𝐴) ⇒ 𝐴‹elim(𝑐)›`, which reads the
+binders of whatever sum `𝐴` turns out to be through `𝑐`
+([An elimination reads a sum through a term](type-inference.md#an-elimination-reads-a-sum-through-a-term)).
+A plain collection is the sum over no binders, and `unbox` of it is the collection, which the
+pipeline substitutes once inference has settled every argument (`drop_plain_unboxes` in
+`src/ccl/context.rs`). The
+post-inference check, which knows the argument's sum, stamps
+`(𝑐 : Σ (σ : 𝐾). 𝐷[σ] ⤇ 𝑉) ⇒ 𝐷[σ ↦ σ₁(𝑐)] ⤇ 𝑉` (`ty::unbox_type`) and holds it to that rule
+(`check_unbox`), as it does `strength_over`'s. Applying either discharges `𝑐` to the argument. A key typed `σ₁(𝑐)` then applies to `unbox(𝑐)` as to any collection over that
 domain. Two projections are equal when their positions are and their terms are equal by normal
 form.
 
@@ -502,11 +508,17 @@ Inlining can move a let-bound row into a jagged literal position, where its box 
 read from mutable storage has already had its determined witness erased. Such a bare row cannot fill
 a sum-typed element position; `reject_rows_fixed_elsewhere` reports the mismatch.
 
-Realization operates at a site whose type carries the witnesses and whose subtree contains
-their conditionals. Unboxed arms sharing a domain need no sum; boxed arms sharing a domain
-still have a one-candidate sum during inference. A same-domain boxed conditional is realized,
-not erased: realization records its witness in `realized`, and `collapse_determined_sums`
-preserves it so the `Realize` assertion retains its binder.
+A conditional is realized where it stands. The `Case` is replaced in place by its union, under a
+`Realize` that asserts the `Case`'s type and keeps the `Case` as the term it stages. Every consumer
+reads the conditional through `unbox`, over the projected domain `σ₁(𝑐)` of the `Case` term `𝑐`, so a
+consumer's types quote the conditional rather than name its witness. Normal form reads a `Realize`
+as the term it stages (`ccl_utils::normal_form`), so those types and the realized tree compare as
+one term. A `let`-bound conditional is realized once, in its binding, and its consumers share it.
+
+Unboxed arms sharing a domain need no sum; boxed arms sharing a domain still have a
+one-candidate sum during inference. A same-domain boxed conditional is realized, not erased:
+realization records its witness in `realized`, and `collapse_determined_sums` preserves it so the
+`Realize` assertion retains its binder.
 
 ### A conditional chosen per row
 
@@ -525,87 +537,28 @@ and the argument of `𝑥 ▷ const` the codomain it answers at every input, so 
 materialized as a jagged list literal's rows are. The iteration walk looks through a standing `box`
 to give its argument an iteration source (`mark_component_source`).
 
+A loop over a conditional chosen per row reads it through `unbox`, so a type after the loop quotes
+the conditional as written, `σ₁({ 𝑔(𝑥) → 𝑎; true → 𝑏 })`, while the tree holds its fan-out. Normal
+form reads the fan-out applied to the row back as the `Case`, so the two compare equal
+([Predicates are compared by normal form](type-inference.md#predicates-are-compared-by-normal-form)).
+A-normalization binds the conditional ahead of the loop, and lambda elimination makes that binding
+a collection over the enclosing positions. Nothing feeds a fan-out standing in a binding, so
+planning puts an `iterate` over those positions in front of it (`iterate::is_iteration_bearing`).
+
 At runtime the fed union merges rows whose values are collections. `UnionOperator` flattens the
 arms' domain to the rows they share whatever their codomain holds, and arms whose rows have
 different domains merge at the bound the node's type declares, as a list literal of boxed rows
 does (`OpConversionContext::witness_domain_extent`).
 
-### Realization instantiates the witness inside the predicate
+### A leg is an arm
 
-Realization substitutes one candidate for the witness at the site, and the predicate of a
-consumer's filter is one of the places that witness occurs: a domain refinement's predicate
-holds its own read of the source, and that read names the witness. So the leg is gated
-twice, by its path condition `π̂ᵢ` and by `𝑝` with `armᵢ` in place of the source
-(`read_the_arm_instead` in `src/ccl/planning/conditionals.rs`). Both gates are the one
-substitution reaching two occurrences.
-
-This is β, not a pushdown. Nothing weighs running the filter inside the leg against running
-it after the union: a leg is the site with the witness instantiated, and an occurrence left
-uninstantiated names a witness that no longer exists. A cost model has nothing to decide
-here, and no ordering of the two gates is available to choose between. The duplication the
-same substitution forces stands on the same ground, and stays an obligation until a runtime
-witness exists ([A `let`-bound conditional is copied to each
-consumer](#a-let-bound-conditional-is-copied-to-each-consumer)).
-
-The instantiated form is also the only expressible one. A predicate may name a plain arm,
-but it may not name the gated union: reading the union needs the `iterate`/`restrict`
-markers a predicate is forbidden to contain. Substituting `armᵢ` puts the read somewhere a
-predicate is allowed to be.
-
-Over a product domain, each predicate read is instantiated with its position's chosen arm.
-Equal candidate kinds do not identify positions: two independent conditionals can have the
-same kind. Source matching uses both the sum's kind and the index reading it. Predicate
-type slots must use the site's binder names; see
-[Binder resolution at materialization](type-inference.md#binder-resolution-at-materialization).
-
-#### A `let`-bound conditional is copied to each consumer
-
-Realization needs the `Case` below the site, because a leg is the site with the `Case`
-replaced by one arm; a binding precedes its body in scope, so a `Case` left there is above
-every site that reads it. The site then names a witness no term has materialized, and
-op-conversion rejects the domain. The copy is also what lets each consumer's substitution
-differ: two consumers filtering one conditional instantiate the same witness into two
-different predicates, which one set of legs cannot hold.
-
-A determined witness is copied too. A same-domain conditional names one candidate, and its
-`Case` still realizes into one leg per arm. Realized in its binding instead, the `Case` stays in
-every type the definition was discharged into. A filtered comprehension whose source is bound
-inside the comprehension's own scope is one: the `let`'s type holds the `Case` in its predicate,
-and the realized definition no longer matches it (`inline_conditional_bindings` in
+Each leg is one arm, gated by its first-match path condition `π̂ᵢ`. The arm's types are written at
+the `Case`'s witness, which the leg instantiates with the arm's domain, in its refinement
+predicates as well (`read_the_arm_instead` and `instantiate_witness_in_types` in
 `src/ccl/planning/conditionals.rs`).
 
-Materializing the conditional rather than realizing it would remove the copy, by letting one value
-serve several consumers; planning realizes it, so the copy is the only compiling form. It would
-also make this substitution one choice among several rather than the only expressible form — the
-point at which the duplication becomes a cost question instead of an obligation.
+Two conditional generators in one comprehension are two `Case`s, each realized where it stands.
+The comprehension reads each source through `unbox`, so its domain is the product of their
+projected domains, `(σ₁(𝑎), σ₁(𝑏))`, and each generator iterates the keys its realized source holds.
+No union is read at a projected index.
 
-### A site's witnesses are compiled together
-
-Two conditional generators in one comprehension put two sums over one product domain —
-`Σ (𝜎₄ : 𝐾₄). Σ (𝜎₇ : 𝐾₇). ((𝜎₄, 𝜎₇) ⤇ 𝑉)` — and that is one site with two choices on it,
-not a site within a site. So the legs are the **tuples** of arms, gated by the conjunction
-of their path conditions and indexed by the product of their domains: the same finite-Σ ≡
-gated-union isomorphism, stated for a product of witnesses. It is flat, which is what
-`Expr::copair` already is, flattening a nested copairing into its operands.
-
-Compiling the two one at a time instead leaves a union where a generator reads its
-collection at a projected index (`π₀ ≫ coll`), and a union there is a **fed** copairing,
-which op-conversion has no form for: its arms are over distinct index sets, so they cannot
-flat-merge onto the one domain the input carries.
-
-The gap is not particular to conditionals.
-`sum([x + y for x in ([1, 2] ++ [3, 4]) for y in [10, 20]])` reaches the same rejection, and
-the `let`-bound spelling of it reaches runtime instead and fails in
-`ColumnValue::transform_by_map`, which has no union-key case — the
-`an_inline_union_generator_beside_a_second_generator` and
-`a_let_bound_union_generator_beside_a_second_generator` tests in
-`tests/it/compilation_pipeline/scalars_collections.rs`. Compiling a site's witnesses together
-is what keeps every generator's domain a plain range, so no union is ever read at an index.
-A tagged fed copairing, demultiplexing the input by tag and re-tagging each arm's output, is
-what would let the legs be per conditional rather than per arm tuple.
-
-A site therefore **names** its witness rather than being it: beside a second generator the
-index is a product, so the filter rides `{(𝜎, 𝐷) | 𝑝}` and every rule keyed on the witness
-matches a *mention* of it rather than the whole domain. Reading the whole domain makes the
-product a silently different case, which emits the site's chain a second time over a witness
-that has no extent.

@@ -17,8 +17,8 @@ The proof families have distinct scopes:
 
 - Subtyping, term safety, compact merging and materialization are summarized in
   [the coverage table](design.md#what-is-pinned-today-and-what-is-not).
-- [`TypeKind.lean`](CclFormal/TypeKind.lean) defines membership, containment and refusal.
-  Containment transports membership; refusal implies non-membership.
+- [`TypeKind.lean`](CclFormal/TypeKind.lean) defines membership, containment and the membership
+  check. Containment transports membership; the check decides membership.
 - [`TypeKindIsALattice.lean`](CclFormal/TypeKindIsALattice.lean) states kind bounds by cases.
   Cases that require a bound in the underlying type order assume that bound exists. Associativity
   follows from the corresponding leastness/greatestness premises, not from an unconditional
@@ -61,7 +61,7 @@ is not generalized from this example.
 | `sub` | `constrain_subtype` versus `subtypeCheck` | `true` or `false` |
 | `merge` | `CompactType::merge` versus `CompactTy.merge` | `ok` or a mismatch with the model result |
 | `mergeKind` | `CompactTypeKind::merge` versus `mergeTypeKind` | `ok` or a mismatch with the model result |
-| `refuses` | `TypeKind::refuses` versus `refuses` | `ok` or a mismatch with the model verdict |
+| `admits` | `admits_resolved` versus `admitsCheck` | `ok` or a mismatch with the model verdict |
 | `coalesce` | Materialization versus `CompactTy.coalesce` | `ok` or a mismatch with the model outcome |
 
 Merge comparisons use `equiv` or `equivTypeKind` rather than bytewise JSON equality.
@@ -102,8 +102,8 @@ Running the Rust target directly does not rebuild a stale oracle; use the full g
 
 `CAMBRA_DIFF_SEED` overrides each driver's default seed; `CAMBRA_DIFF_N` defaults to 4,000.
 The count applies to accepted cases or fold steps, not raw generator attempts. A complete merge
-fold can take its step count past the requested threshold. Refusal tests also require both
-refused and non-refused samples, so very small counts are not useful smoke tests.
+fold can take its step count past the requested threshold. The membership test also requires both
+admitted and refused samples, so very small counts are not useful smoke tests.
 
 ### Reading a mismatch
 

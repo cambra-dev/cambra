@@ -238,6 +238,12 @@ pub fn temp_respelling(expr: &Expr) -> Subst {
 /// evaluated — after every binding this pass hoists out from beside it, which
 /// is to say after any write those perform. Naming it puts the read back at its
 /// source position, in sequence with the writes around it.
+/// [`is_atomic`] with no mutable variable in scope: whether a term is named where it stands,
+/// for an encoding built before this pass runs (`crate::ccl::comprehension`).
+pub(crate) fn is_atomic_term(e: &Expr) -> bool {
+    is_atomic(e, &Muts::new())
+}
+
 fn is_atomic(e: &Expr, muts: &Muts) -> bool {
     if is_mut_var(e, muts) {
         return false;
@@ -335,7 +341,9 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             // reading an earlier generator's binder stays in place, since no binding ahead of
             // the comprehension has that binder in scope.
             let mut sources = Vec::new();
-            if !crate::ccl::comprehension::encodes_to_lambda(&generators) {
+            // Every comprehension's domain is its sources' projections, so every source is
+            // bound ahead, filtered or not.
+            {
                 for k in 0..generators.len() {
                     let reads_a_binder = generators[..k]
                         .iter()
@@ -351,8 +359,9 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
                         core
                     } else {
                         let name = Name::anf_temp();
-                        sources.push((TypedBinding::new_unannotated(name.clone()), core));
-                        Expr::var(name)
+                        let var_ref = temp_read(&name, &core);
+                        sources.push((TypedBinding::new_unannotated(name), core));
+                        var_ref
                     };
                 }
             }
@@ -685,7 +694,7 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        TypedExprNode::Realize(_)
+        TypedExprNode::Realize { .. }
         | TypedExprNode::LetRec { .. }
         | TypedExprNode::Transact { .. }
         | TypedExprNode::DisjointJoin(_) => unreachable!(
@@ -748,9 +757,17 @@ fn atomize(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
     }
     let name = Name::anf_temp();
     let binding = TypedBinding::new_unannotated(name.clone());
-    let var_ref = Expr::var(name);
+    let var_ref = temp_read(&name, &core);
     binds.push((binding, core));
     (binds, var_ref)
+}
+
+/// A read of the temp `name` that binds `definition`. The read stands where the definition did
+/// and denotes it, so it is minted under the definition's identity: an error at the read is an
+/// error about the term the program wrote there.
+fn temp_read(name: &Name, definition: &Expr) -> Expr {
+    let _g = provenance::enter(definition.node_id(), "anf.temp_read", Nature::Machinery);
+    Expr::var(name.clone())
 }
 
 /// Undo [`let_chain`] at the root of `e`: split the bindings this pass sealed

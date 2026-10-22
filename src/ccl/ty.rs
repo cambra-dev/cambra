@@ -862,6 +862,33 @@ impl FunKindVar {
         ids.iter().copied().map(WitnessId).collect()
     }
 
+    /// The name of this funkind's binder at `position`, minted now whatever its arity
+    /// turns out to be. A position past the arity is never bound.
+    pub fn binder_id_at(self: &Rc<Self>, position: usize) -> WitnessId {
+        let mut b = self.bounds.borrow_mut();
+        if b.settled.len() <= position {
+            b.settled
+                .resize_with(position + 1, crate::ccl::infer_var::fresh_witness_binder_id);
+        }
+        WitnessId(b.settled[position])
+    }
+
+    /// The first binder's name ([`binder_id_at`](Self::binder_id_at)).
+    pub fn first_binder_id(self: &Rc<Self>) -> WitnessId {
+        self.binder_id_at(0)
+    }
+
+    /// Every binder name minted so far, arity known or not.
+    pub fn named_binder_ids(&self) -> Vec<WitnessId> {
+        self.bounds
+            .borrow()
+            .settled
+            .iter()
+            .copied()
+            .map(WitnessId)
+            .collect()
+    }
+
     /// Stamp this kind **data** at construction — a collection whatever slot it turns out
     /// to have. The one fact that is not an edge, because no `FunKind` spells it.
     pub fn stamp_data(&self) {
@@ -961,6 +988,37 @@ impl FunKindVar {
     /// What this kind is a copy of, where it is one.
     pub fn instantiated_from(&self) -> Option<Rc<FunKindVar>> {
         self.bounds.borrow().instantiated_from.clone()
+    }
+
+    /// Whether a part of a function of this kind can name `w`: one of the kind's own binders,
+    /// or of a sum related to it by a kind edge, whose occurrences arrive spelled in that sum's
+    /// binder before the correspondence renames them.
+    pub fn may_bind(&self, w: &WitnessId) -> bool {
+        fn go(k: &FunKindVar, w: &WitnessId, seen: &mut Vec<FunKindVarId>) -> bool {
+            if seen.contains(&k.uid) {
+                return false;
+            }
+            seen.push(k.uid);
+            if k.named_binder_ids().contains(w) {
+                return true;
+            }
+            let edges = {
+                let b = k.bounds.borrow();
+                b.lower
+                    .iter()
+                    .chain(b.upper.iter())
+                    .map(|(k, _)| k.clone())
+                    .collect::<Vec<_>>()
+            };
+            edges.iter().any(|kind| match kind {
+                FunKind::Data(Some(ws)) => ws.iter().any(|x| x.id() == w),
+                FunKind::Var(other) => go(other, w, seen),
+                _ => false,
+            }) || k
+                .instantiated_from()
+                .is_some_and(|original| go(&original, w, seen))
+        }
+        go(self, w, &mut Vec::new())
     }
 
     /// What this kind was stamped at construction — the one fact no edge spells
@@ -1823,8 +1881,8 @@ impl fmt::Debug for Witness {
 /// Used today only as the classifier of a Σ's type-witness ([`Witness`]), which is
 /// the sole kind-carrying position in the grammar; since a Σ's witness is a data
 /// function's domain, every type a kind classifies here happens to be a domain. That is
-/// a fact about current usage, not part of the notion — nothing in
-/// [`refuses`](TypeKind::refuses) is domain-specific.
+/// a fact about current usage, not part of the notion: nothing in the membership judgment
+/// (`constrain::admits`) is domain-specific.
 ///
 /// Note the direction: a kind admits many types and a type is admitted by many kinds, so
 /// there is no "kind of a type" to read off. What a type determines is the *minimal* kind
@@ -1923,45 +1981,6 @@ impl TypeKind {
             }
             TypeKind::SubtypesOf(k) => TypeKind::SubtypesOf(Box::new(f(k))),
             TypeKind::UIntRanges | TypeKind::Type => self.clone(),
-        }
-    }
-
-    /// Return true only for certain non-membership. False includes unresolved cases.
-    ///
-    /// This structural test cannot establish membership in `SubtypesOf`: the solver must
-    /// draw a subtyping edge to its parameter. It also abstains when an enumerated candidate
-    /// or the tested type has unresolved positions. Callers may reject on true, but must
-    /// not treat false as a membership proof.
-    ///
-    /// See `src/ccl/design/type-inference.md`, "Type kind containment" and
-    /// "An unresolved candidate becomes a kinding edge", for constraint-time behavior.
-    pub fn refuses(&self, ty: &Type) -> bool {
-        match self {
-            // ⊤: every type, so nothing to refuse.
-            TypeKind::Type => false,
-            // A dense prefix range, and nothing else. A `Refinement` over one is not a
-            // `UIntRange`, so a filtered collection is refused — it would be handed a length
-            // witness for a domain with holes. An unresolved head is the one thing this
-            // cannot read, and it abstains there.
-            TypeKind::UIntRanges => !matches!(
-                ty,
-                Type::UIntRange(_) | Type::Infer(_) | Type::Hole | Type::SharedHole(_)
-            ),
-            // **Membership here is subtyping**, which belongs to the solver: constraint time
-            // draws the edge (`super::infer::solver::constrain`, `constrain_type_kinds`)
-            // rather than asking this. A caller with no graph to draw into therefore has no
-            // answer, and had one anyway before — an exact match, which refuses every strict
-            // subtype the bound admits.
-            TypeKind::SubtypesOf(_) => false,
-            // A candidate list names its members, so membership is type equality — a
-            // candidate *is* a domain and data domains are invariant, so a refined range is a
-            // different candidate from the range it refines. Equality is certain only once
-            // both sides are: an unresolved position on either can still be filled to match.
-            TypeKind::Enumerated(domains) => {
-                !ty.holds_an_unresolved_position()
-                    && !domains.iter().any(Type::holds_an_unresolved_position)
-                    && !domains.contains(ty)
-            }
         }
     }
 }
@@ -2121,6 +2140,14 @@ impl Type {
 }
 
 impl Witness {
+    /// The one candidate a **determined** witness ranges over, which it is wherever it is read.
+    pub fn sole_candidate(&self) -> Option<Type> {
+        match self.type_kind() {
+            TypeKind::Enumerated(ds) if ds.len() == 1 => Some(ds[0].clone()),
+            _ => None,
+        }
+    }
+
     /// A binder and what it ranges over — the one place a [`Witness`] is formed, so the
     /// invariant a candidate list rests on is stated once rather than at each constructor.
     fn formed(id: WitnessId, range: Rc<TypeKind>) -> Witness {
@@ -2890,9 +2917,13 @@ impl Type {
     /// A **consumer's** collection function: data by construction, polymorphic in the
     /// slot ([`FunKind::fresh_data`]) so a plain collection and a sum satisfy it alike.
     pub fn consumer_fun(domain: Self, codomain: Self) -> Self {
+        let fun_kind = FunKind::fresh_data();
+        // The parts sit under the binders the kind may come to have.
+        InferVar::place_parts_under(&domain, &fun_kind);
+        InferVar::place_parts_under(&codomain, &fun_kind);
         Type::Fun {
             name: None,
-            fun_kind: FunKind::fresh_data(),
+            fun_kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }
@@ -3608,37 +3639,6 @@ impl Type {
         Type::Infer(InferVar::fresh(0))
     }
 
-    /// Does this type hold a position nothing has resolved yet?
-    ///
-    /// What a *rejecting* caller must ask before it reads a structural answer: two types that
-    /// differ today can still be resolved to the same one, so refusing on a difference is
-    /// sound only where nothing is left to resolve. [`TypeKind::refuses`] is the caller.
-    ///
-    /// [`crate::ccl::subst::type_contains_infer`] answers the `Infer` half and is the cheaper
-    /// check where that is all a caller wants; this one is the whole of "unresolved", which is
-    /// what certainty needs — see the transient-variant table on [`Type`].
-    ///
-    /// **A refinement counts as unresolved.** Equality compares a predicate, and the
-    /// predicate's own type slots are not reachable from [`walk_children`](Self::walk_children)
-    /// — reading them needs `crate::ccl::ccl_utils::walk_refined_predicates` and its visited
-    /// set. Answering "unresolved" instead abstains, which costs a refusal this has no
-    /// measured caller for and never costs correctness.
-    pub fn holds_an_unresolved_position(&self) -> bool {
-        if matches!(
-            self,
-            Type::Infer(_)
-                | Type::Hole
-                | Type::SharedHole(_)
-                | Type::BoundedHole(_)
-                | Type::Refinement(..)
-        ) {
-            return true;
-        }
-        let mut unresolved = false;
-        self.walk_children(|child| unresolved |= child.holds_an_unresolved_position());
-        unresolved
-    }
-
     /// Invoke `f` on each direct child [`Type`] of this type.
     ///
     /// "Direct child" means a `Type` reachable through this type's value
@@ -3931,6 +3931,29 @@ impl WitnessProjection {
     }
 }
 
+/// `witness`, the sum's binder at `position`, projected through `term`: `σᵢ(term)`, or the one
+/// candidate a determined witness has, which is what the projection is whatever term it reads.
+/// Every projection a pass builds from a sum it holds is spelled here, so a determined one has
+/// one spelling.
+/// The witnesses `ty` references, outside refinement predicates.
+pub fn witness_references(ty: &Type) -> std::collections::BTreeSet<WitnessId> {
+    fn go(t: &Type, out: &mut std::collections::BTreeSet<WitnessId>) {
+        if let Type::WitnessRef(w) = t {
+            out.insert(*w);
+        }
+        t.walk_children(|c| go(c, out));
+    }
+    let mut out = std::collections::BTreeSet::new();
+    go(ty, &mut out);
+    out
+}
+
+pub fn projected_witness(term: &Rc<TypedExpr>, position: usize, witness: &Witness) -> Type {
+    witness.sole_candidate().unwrap_or_else(|| {
+        Type::WitnessProjection(WitnessProjection::new(Rc::clone(term), position))
+    })
+}
+
 /// The type `unbox(𝑡)` has for a term `𝑡` of the sum type `sum_ty`: the sum's body with each
 /// witness it binds replaced by its projection through `𝑡` (`src/ccl/design/collections.md`,
 /// "Projecting a sum's witness"). `None` when `sum_ty` binds no witness.
@@ -3941,8 +3964,7 @@ pub fn unboxed_type(sum_ty: &Type, term: &Rc<TypedExpr>) -> Option<Type> {
             .iter()
             .enumerate()
             .fold(sum_ty.clone(), |ty, (position, witness)| {
-                let projection =
-                    Type::WitnessProjection(WitnessProjection::new(Rc::clone(term), position));
+                let projection = projected_witness(term, position, witness);
                 instantiate_witness(&ty, witness.id(), &projection)
             }),
     )
@@ -4466,7 +4488,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Var(_)
         | N::Builtin(_)
         | N::Apply { .. }
-        | N::Realize(_)
+        | N::Realize { .. }
         | N::Cast { .. }
         | N::BinOp { .. }
         | N::UnaryOp(..)
@@ -4788,7 +4810,9 @@ fn eq_term_modulo_ty_slots_go(
         // A realized conditional collection. Reachable inside a predicate because a
         // filter's predicate carries its own copy of the source (`__elem ▷ src ▷ 𝑓`), so
         // when `src` is a conditional, realization rewrites it *in the predicate*.
-        (N::Realize(v1), N::Realize(v2)) => eq_term_modulo_ty_slots_go(v1, v2, pairs),
+        (N::Realize { value: v1, .. }, N::Realize { value: v2, .. }) => {
+            eq_term_modulo_ty_slots_go(v1, v2, pairs)
+        }
         _ => {
             // **A missing arm is not "unequal", it is unanswered.** Falling through with
             // two nodes of the *same* shape means this function has no rule for that
@@ -5402,10 +5426,16 @@ mod tests {
     fn a_rebuilt_predicate_containing_realize_equals_itself() {
         let realizing = || {
             Rc::new(
-                TypedExpr::new(TypedExprNode::Realize(Box::new(
-                    TypedExpr::new(TypedExprNode::Var(Name::elem()))
-                        .with_ty(Type::Base(BaseType::Int)),
-                )))
+                TypedExpr::new(TypedExprNode::Realize {
+                    value: Box::new(
+                        TypedExpr::new(TypedExprNode::Var(Name::elem()))
+                            .with_ty(Type::Base(BaseType::Int)),
+                    ),
+                    staged: Rc::new(
+                        TypedExpr::new(TypedExprNode::Var(Name::elem()))
+                            .with_ty(Type::Base(BaseType::Int)),
+                    ),
+                })
                 .with_ty(Type::Base(BaseType::Int)),
             )
         };
@@ -5850,10 +5880,6 @@ mod tests {
         );
     }
 
-    fn rng(n: u64) -> Type {
-        Type::UIntRange(n)
-    }
-
     /// A kind's cached [`resolved`](FunKindVar::resolved) answer follows a later write to a
     /// kind it reaches. `record` is exercised throughout the suite; `stamp_data` and
     /// `contributes_first` are written today only on variables nothing reaches yet, so
@@ -5872,41 +5898,6 @@ mod tests {
         let (k1, k2) = reaching();
         k2.contributes_first(FunKind::Data(None));
         assert_eq!(k1.resolved(), KindPin::Plain);
-    }
-
-    /// Refusal is a predicate on **one** type against **one** kind — the whole of what a kind
-    /// decides for itself, and only the half a rejection may rest on. Containment *between*
-    /// two kinds is built from membership and lives with the solver, which is where an edge
-    /// can be drawn (`crate::ccl::infer::solver::constrain`, `constrain_type_kinds`).
-    #[test]
-    fn a_kind_refuses_only_what_it_can_be_certain_of() {
-        assert!(!TypeKind::UIntRanges.refuses(&rng(3)));
-        assert!(TypeKind::UIntRanges.refuses(&Type::DataSource("s".into())));
-        // A refined range is not a range: a filtered collection must be refused rather than
-        // handed a length witness for a domain with holes.
-        let refined = Type::refined_one(
-            rng(3),
-            Refinement::born(Rc::new(TypedExpr::lit(Lit::Bool(true)))),
-        );
-        assert!(TypeKind::UIntRanges.refuses(&refined));
-        // An unresolved head is the one thing the range test cannot read, so it abstains.
-        assert!(!TypeKind::UIntRanges.refuses(&Type::Hole));
-        // `Type` is ⊤ and refuses nothing.
-        assert!(!TypeKind::Type.refuses(&Type::DataSource("s".into())));
-        // **A bound refuses nothing.** Its membership question is subtyping, which constraint
-        // time draws as an edge; standing in for that structurally was certain in neither
-        // direction — an exact match admitted an unfixed key's every domain and refused every
-        // strict subtype a fixed one accepts.
-        assert!(!TypeKind::SubtypesOf(Box::new(Type::Hole)).refuses(&rng(3)));
-        assert!(!TypeKind::SubtypesOf(Box::new(rng(3))).refuses(&rng(3)));
-        assert!(!TypeKind::SubtypesOf(Box::new(rng(3))).refuses(&rng(2)));
-        // Candidates are members, so a concrete type absent from a concrete list is refused.
-        assert!(TypeKind::Enumerated(vec![rng(3)]).refuses(&rng(2)));
-        assert!(!TypeKind::Enumerated(vec![rng(3)]).refuses(&rng(3)));
-        // An unresolved position on either side can still be filled to match, so neither is
-        // refused.
-        assert!(!TypeKind::Enumerated(vec![rng(3)]).refuses(&Type::Hole));
-        assert!(!TypeKind::Enumerated(vec![Type::Hole]).refuses(&rng(2)));
     }
 
     /// Two predicates that each contain a [`TypedExprNode::Cast`] and differ

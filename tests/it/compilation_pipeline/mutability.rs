@@ -2344,37 +2344,19 @@ fn test_match_arm_write_carries(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
-/// Where a domain mismatch's two sides render alike, the report names the comparison
-/// that found them unequal rather than the inequality itself.
-///
-/// An exact annotation on a mutable collection binds a witness of its own, while the
-/// comprehension initializing it hands back a collection at the witness it opened. The
-/// two differ, and both print `σ` — a witness's binder identity is not something
-/// `Display` shows.
+/// A comprehension over a boxed collection is a plain collection over the witness the value
+/// carries (`docs/chl-spec.md`, "7.5 `box`"), so it does not initialize a variable annotated
+/// with a sum until it is boxed. The report names the two kinds and the remedy.
 #[test]
-fn a_domain_mismatch_whose_sides_render_alike_reports_its_cause() {
-    let code = indoc! {r#"
-        held = box(map([("btc", 2), ("eth", 1)]))
-        qty: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
-        await_final(qty)
-    "#};
-    let mut ctx = GlobalContext::default();
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let loaded = LoadedProgram::from_text("<identical-rendering-test>", code);
-    let errs = match compile_program(&mut ctx, &loaded, consumer) {
-        Ok(_) => panic!("the annotation binds its own witness, so the comprehension is rejected"),
-        Err(e) => e,
-    };
-    let rendered = render_errors(&errs, loaded.sources());
-    assert!(
-        rendered.contains("First structural difference"),
-        "the report quotes where the two sides diverge rather than asserting an \
-         inequality between two types it prints alike, got:\n{rendered}",
-    );
-    assert!(
-        rendered.contains("WitnessRef("),
-        "and the divergence it quotes is the binder identity, got:\n{rendered}",
-    );
+fn a_plain_collection_initializing_a_sum_is_told_to_box() {
+    check_compile_error(
+        indoc! {r#"
+            held = box(map([("btc", 2), ("eth", 1)]))
+            qty: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+            await_final(qty)
+        "#},
+        "a plain collection and a sum met at one position",
+    )
 }
 
 /// `test(x)` passes the mutable variable itself, and the declared output
@@ -2385,9 +2367,7 @@ fn a_domain_mismatch_whose_sides_render_alike_reports_its_cause() {
 ///
 /// What the pin holds is an internal error, not a diagnostic: the panic reads
 /// as a compiler bug for a program that is simply ill-typed. Pinned until the
-/// case reports a user error, so the day it does the pin says so — as
-/// `a_refined_map_key_in_a_mut_annotation_reaches_the_boundary` does for the
-/// refined-map-key form.
+/// case reports a user error, so the day it does the pin says so.
 #[test]
 fn dependent_codomain_discharges_mut_var_argument_into_refinement() {
     check_compile_error(
@@ -2703,7 +2683,9 @@ x
 
 /// A collection written to a mutable variable inside a loop, whose keys depend on the loop
 /// variable: the variable's type is the join of every value written to it, and collections
-/// over different keys have no join.
+/// over different keys have no join. The seed's domain is the first to meet a write's, and a
+/// data domain is invariant, so the report is the two domains differing; a write without the
+/// loop would be refused the same way.
 #[test]
 fn a_write_of_rows_whose_keys_vary_with_the_loop_has_no_join() {
     check_compile_error(
@@ -2713,7 +2695,7 @@ for r in [1, 2]:
     m := [v for v in [1, 2, 3] if v > r]
 sum(m)
 "#},
-        "depend on `r`",
+        "Type mismatch for collection domain",
     )
 }
 

@@ -156,6 +156,26 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // and `AwaitFinal` (`∀ν. Mut(ν, Txn) → ν`) qualify. All other
         // builtins arrive pre-stamped from lowering and just get converted
         // in place.
+        // `unbox` reads its argument's witnesses out of the value: `(c : 𝐴) ⇒ 𝐴‹elim(c)›`, the
+        // argument's collection type with each binder of its sum read as `σᵢ(c)`
+        // (`crate::ccl::subst::Elim`). Which binders those are is the argument's funkind's to
+        // say, so the type names none of them; a plain collection is the sum over none.
+        TypedExprNode::Builtin(crate::ccl::Builtin::Unbox) => {
+            let _g = crate::ccl::provenance::enter(
+                node_id,
+                "infer.unbox",
+                crate::ccl::provenance::Nature::Machinery,
+            );
+            let c = Name::fresh("__boxed");
+            let arg = ctx.fresh();
+            if let Type::Infer(v) = &arg {
+                v.fun_kind.stamp_data();
+            }
+            let term = std::rc::Rc::new(Expr::var(c.clone()).with_ty(arg.clone()));
+            let result = crate::ccl::subst::Subst::eliminating(term).apply_type(&arg);
+            Type::pi(c, arg, result)
+        }
+
         TypedExprNode::Builtin(b) => {
             if let Some(scheme) = ctx.schemes.builtin(b.clone()) {
                 // Through [`Typing::instantiate`], which stamps the *use site's*
@@ -178,7 +198,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // Realization is a planning rewrite, so it is born after inference has finished:
         // Emit only ever runs on a tree that has none. The post-inference check *does*
         // meet them, and trusts the assertion ([`check_node_rule`]).
-        TypedExprNode::Realize(_) => {
+        TypedExprNode::Realize { .. } => {
             unreachable!("Realize is born in planning, after inference")
         }
 
@@ -273,12 +293,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             registered.clone()
         }
 
-        // `@LoadFrom(x)` is typed by its context. The value it denotes belongs to
+        // `@LoadFrom(x)` is typed by its declaration. The value it denotes belongs to
         // the retired version of the program, which this compilation cannot see:
         // it is handed a `HashMap<VarPath, Value>` at operator conversion, long
         // after inference, and a runtime `Value` carries no CCL type to read a
-        // shape off. So the node contributes a fresh variable and the expression
-        // around it pins it — the annotation on the variable being declared, or
+        // shape off. So the node produces a value of the declared type, which lowering
+        // stamps on it; a hole in that type is pinned by the expression around it, as
         // the arithmetic reading it. An unpinned variable is the ordinary "cannot
         // infer" error, raised against the source span the node carries.
         //

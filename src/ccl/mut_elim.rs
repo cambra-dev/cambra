@@ -1186,70 +1186,6 @@ pub(crate) fn tvar(name: &Name, ty: Type) -> Expr {
     e
 }
 
-/// Refuse a loop that writes a mutable variable over a conditional collection, a sum written in
-/// place or bound by a `let`. A loop over a sum types its history over the source's projected
-/// witness (`src/ccl/design/collections.md`, "A `for` loop over a sum"), and realization copies a
-/// conditional into each of its consumers, a copy the projection quotes and realization does not
-/// rewrite.
-pub(crate) fn refuse_loops_writing_over_conditionals(expr: &Expr) -> Result<(), String> {
-    refuse_under(expr, &mut Vec::new())
-}
-
-/// [`refuse_loops_writing_over_conditionals`] under the `let`-bound conditionals in scope, each
-/// with its definition's rendering.
-fn refuse_under(expr: &Expr, conditionals: &mut Vec<(Name, String)>) -> Result<(), String> {
-    if let TypedExprNode::For { iter, body, .. } = &expr.node
-        && writes_a_mutable(body)
-        && source_fun(&iter.ty).sum().is_some()
-        && let Some(conditional) = match &iter.node {
-            TypedExprNode::Case { .. } => Some(symbolic(iter)),
-            TypedExprNode::Var(name) => conditionals
-                .iter()
-                .find(|(bound, _)| bound == name)
-                .map(|(_, definition)| definition.clone()),
-            _ => None,
-        }
-    {
-        return Err(format!(
-            "a `for` loop writing a mutable variable over a conditional collection is not \
-             compiled yet: `{conditional}` has type {}",
-            iter.ty
-        ));
-    }
-    if let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        body,
-    } = &expr.node
-    {
-        refuse_under(bound_expr, conditionals)?;
-        let scope = conditionals.len();
-        if matches!(bound_expr.node, TypedExprNode::Case { .. }) {
-            conditionals.push((binding.name.clone(), symbolic(bound_expr)));
-        }
-        let result = refuse_under(body, conditionals);
-        conditionals.truncate(scope);
-        return result;
-    }
-    let mut result = Ok(());
-    expr.walk_children(|child| {
-        if result.is_ok() {
-            result = refuse_under(child, conditionals);
-        }
-    });
-    result
-}
-
-/// Whether `body` writes a mutable variable anywhere.
-fn writes_a_mutable(body: &Expr) -> bool {
-    if matches!(body.node, TypedExprNode::MutWrite { .. }) {
-        return true;
-    }
-    let mut found = false;
-    body.walk_children(|child| found = found || writes_a_mutable(child));
-    found
-}
-
 /// Destructure a (possibly refinement- or `Mut`-wrapped) function type.
 ///
 /// A `Mut`-typed collection used as a loop source (`xs := [..]; for i in
@@ -1333,10 +1269,7 @@ fn loop_domain(iter: &Expr) -> Type {
         .iter()
         .enumerate()
         .fold(domain, |domain, (position, witness)| {
-            let projection = Type::WitnessProjection(crate::ccl::WitnessProjection::new(
-                Rc::clone(&source),
-                position,
-            ));
+            let projection = crate::ccl::ty::projected_witness(&source, position, witness);
             crate::ccl::ty::instantiate_witness(&domain, witness.id(), &projection)
         })
 }
