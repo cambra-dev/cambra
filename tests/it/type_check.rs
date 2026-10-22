@@ -2082,6 +2082,15 @@ f(box([1,2]),box([3,4,5]))"
 /// result is a `List`, not a function over an unresolved domain.
 #[test]
 fn list_param_under_a_domain_preserving_consumer() {
+    assert_eq!(
+        infer_program(
+            r"
+def f(a: List(Int)):
+    [x + 1 for x in a]
+sum(f(box([1,2])))"
+        ),
+        int()
+    );
     // Two consumers of one `List` param — a uniform one and a domain-preserving
     // one — so the annotation's kind meets two separate demands.
     assert_eq!(
@@ -2092,21 +2101,6 @@ def f(a: List(Int)):
 f(box([1,2]))"
         ),
         int()
-    );
-}
-
-/// The domain-preserving consumer alone: the comprehension over the parameter, bound ahead by
-/// A-normalization, is read through `unbox`, and the projection `σ₁(__anf)` its result is keyed
-/// by lands on a variable whose telescope does not hold the temp. Pinned on the panic it
-/// reaches; the program answers 5.
-#[test]
-#[should_panic(expected = "open bound recorded")]
-fn list_param_under_a_domain_preserving_consumer_alone() {
-    infer_program(
-        r"
-def f(a: List(Int)):
-    [x + 1 for x in a]
-sum(f(box([1,2])))",
     );
 }
 
