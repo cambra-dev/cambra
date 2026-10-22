@@ -3368,7 +3368,7 @@ mod tests {
         TypedExprNode,
     };
 
-    // ----- the projection's monomorphization (`read_through` at the projection) -----
+    // ----- the projection's monomorphization (`specialize_projection_domain`) -----
 
     /// The projection's monomorphization overwrites a morphism's domain with the type
     /// read off the argument **node**, and that type is the mutable variable *handle* —
@@ -3376,14 +3376,14 @@ mod tests {
     /// node. So it has to redo the decision, and for a projection the answer is always
     /// to deref.
     ///
-    /// Driven at [`read_through`] rather than through a program because a
+    /// Driven at [`specialize_projection_domain`] rather than through a program because a
     /// projection off a mutable variable needs a compound accumulator, and the wrong
     /// answer there is silent: the domain re-acquires the handle and fails
     /// `emit_proj`'s `domain <: {tuple/record}` requirement at the post-inference
     /// wall rather than at the projection.
     #[test]
     fn the_projection_monomorphization_reads_through_a_mut_var() {
-        use super::read_through;
+        use super::specialize_projection_domain;
         use crate::ccl::Refinement;
         let mut_var = |value: Type| Type::mutable(Type::Txn, value);
         // Refinements are built here rather than via `refined_int`, which is
@@ -3396,14 +3396,21 @@ mod tests {
         };
         let int = Type::Base(BaseType::Int);
         let handle = mut_var(int.clone());
+        // The domain starts as a stand-in that no input below equals.
+        let specialized_domain = |input: &Type| {
+            let mut proj = TypedExpr::proj_index(0).with_ty(Type::fun(Type::Txn, int.clone()));
+            specialize_projection_domain(&mut proj, input);
+            proj.ty
+        };
+        let expected = Type::fun(int.clone(), int.clone());
 
         // The handle reads through to its value type.
-        assert_eq!(read_through(&handle), int);
+        assert_eq!(specialized_domain(&handle), expected);
         // A refinement on the handle does not stop it being one (a refined mutable
         // variable is still a mutable variable), so it still reads through.
-        assert_eq!(read_through(&refined(handle.clone())), int);
+        assert_eq!(specialized_domain(&refined(handle.clone())), expected);
         // A non-mutable variable input is untouched.
-        assert_eq!(read_through(&int), int);
+        assert_eq!(specialized_domain(&int), expected);
     }
 
     // ----- ordering-invariant comparison (`types_agree_modulo_unread`) -----
