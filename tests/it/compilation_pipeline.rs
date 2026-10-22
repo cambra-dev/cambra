@@ -33,6 +33,7 @@ mod nested_loops;
 mod nominal_types;
 mod probes;
 mod records;
+mod runs;
 mod scalars_collections;
 mod secondary_labels;
 mod sources_incremental;

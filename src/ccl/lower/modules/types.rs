@@ -4,7 +4,7 @@ use super::*;
 
 /// `ty`, a type its module lowered, as a module reaching it through the
 /// qualifier `qualifier` writes it: each raw name its predicates read free is
-/// spelled through the qualifier, `limit` as `m::limit`, so creating the run
+/// spelled through the qualifier, `limit` as `eu::limit`, so creating the run
 /// that reaches it resolves the name to the binder in the qualifier's run
 /// (`docs/modules.md`, "Imported aliases are closed over their module").
 ///

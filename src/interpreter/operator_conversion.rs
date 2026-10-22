@@ -226,7 +226,9 @@ pub fn convert_outputs_to_operators(
                 // The sink is the program's output boundary, so it belongs to the
                 // output expression rather than to the record or the program root.
                 let _scope = crate::ccl::provenance::converting(elt.node_id());
-                let name = name.runtime_key();
+                // An output is named as its author reads the sink, `a::out` for a
+                // run's, which is how the sink registry keys it.
+                let name = SmolStr::from(name.to_string());
                 record_sink(&name);
                 Ok((name, op))
             })

@@ -1006,17 +1006,16 @@ fn nested_feed_only_gap(
     outer_bindings: &HashSet<String>,
     written: &[String],
 ) -> Option<&'static str> {
-    type Names = HashSet<crate::ccl::Name>;
+    type Names = HashSet<Name>;
     if for_body_has_yield(body_stmts) {
         return Some("a `yield` in a feed-only loop nested in a mutation loop is not compiled yet");
     }
     if body_has_match(body_stmts) {
         return Some("a `match` in a feed-only loop nested in a mutation loop is not compiled yet");
     }
-    let enclosing = |n: &crate::ccl::Name| {
-        !outer_bindings.contains(n.base()) || written.iter().any(|w| w == n.base())
-    };
-    let reads_enclosing = |e: &Expr, var: Option<&crate::ccl::Name>, lets: &Names| {
+    let enclosing =
+        |n: &Name| !outer_bindings.contains(n.base()) || written.iter().any(|w| w == n.base());
+    let reads_enclosing = |e: &Expr, var: Option<&Name>, lets: &Names| {
         crate::ccl::ccl_utils::free_names(e)
             .iter()
             .any(|n| Some(n) != var && !lets.contains(n) && enclosing(n))
@@ -1031,9 +1030,9 @@ fn nested_feed_only_gap(
     /// nothing enclosing are `lets`.
     fn walk(
         expr: &Expr,
-        var: &crate::ccl::Name,
+        var: &Name,
         lets: &mut Names,
-        reads_enclosing: &dyn Fn(&Expr, Option<&crate::ccl::Name>, &Names) -> bool,
+        reads_enclosing: &dyn Fn(&Expr, Option<&Name>, &Names) -> bool,
     ) -> Option<&'static str> {
         match &expr.node {
             TypedExprNode::Compose(elts) => match elts.split_last() {
@@ -1075,9 +1074,9 @@ fn nested_feed_only_gap(
     }
     fn children(
         expr: &Expr,
-        var: &crate::ccl::Name,
+        var: &Name,
         lets: &mut Names,
-        reads_enclosing: &dyn Fn(&Expr, Option<&crate::ccl::Name>, &Names) -> bool,
+        reads_enclosing: &dyn Fn(&Expr, Option<&Name>, &Names) -> bool,
     ) -> Option<&'static str> {
         let mut found = None;
         expr.any_child(|c| {
@@ -1092,7 +1091,7 @@ fn nested_feed_only_gap(
                               feed-only loop nested in a mutation loop, is not compiled yet";
     walk(
         body,
-        &crate::ccl::Name::from(iter_var),
+        &Name::from(iter_var),
         &mut Names::new(),
         &reads_enclosing,
     )

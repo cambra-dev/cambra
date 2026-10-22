@@ -1066,7 +1066,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
                 (None, _) => init,
             };
             TransactKey {
-                name: Name::fresh(label.name()),
+                name: Name::fresh_for_field(&label),
                 init,
             }
         })

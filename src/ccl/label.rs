@@ -1,5 +1,6 @@
 //! Record field labels and variant tags.
 
+use crate::ccl::names::RunPath;
 use crate::chl_parser::ModulePath;
 use smol_str::SmolStr;
 use std::fmt;
@@ -17,12 +18,23 @@ use std::fmt;
 ///   among them ([`crate::ccl::nominal::ctor_tag`]). A nominal value's tags meet
 ///   only its own type's constructors and patterns, which all build them there.
 ///
+/// A run's top-level mutable variable is labeled in its run instead
+/// ([`Label::in_run`]). That label is the variable's field in its store, which no
+/// source writes, and it keeps the variables of two runs of one module apart.
+///
 /// Labels order by spelling, then by module, so a record or variant written in
 /// one module keeps the order of its spellings.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Label {
     name: SmolStr,
-    module: Option<ModulePath>,
+    space: Option<Space>,
+}
+
+/// What a label belongs to, when not the root's namespace.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Space {
+    Module(ModulePath),
+    Run(RunPath),
 }
 
 impl Label {
@@ -30,7 +42,7 @@ impl Label {
     pub fn new(name: impl Into<SmolStr>) -> Self {
         let name = name.into();
         debug_assert_spelling(&name);
-        Label { name, module: None }
+        Label { name, space: None }
     }
 
     /// [`Label::new`] for a spelling known at compile time, so a label the
@@ -38,7 +50,7 @@ impl Label {
     pub const fn fixed(name: &'static str) -> Self {
         Label {
             name: SmolStr::new_static(name),
-            module: None,
+            space: None,
         }
     }
 
@@ -48,18 +60,36 @@ impl Label {
         debug_assert_spelling(&name);
         Label {
             name,
-            module: Some(module),
+            space: Some(Space::Module(module)),
+        }
+    }
+
+    /// The label spelled `name` of a top-level mutable variable of the run at `run`
+    /// ([`crate::ccl::Name::field_key`]).
+    pub fn in_run(run: RunPath, name: impl Into<SmolStr>) -> Self {
+        let name = name.into();
+        debug_assert_spelling(&name);
+        Label {
+            name,
+            space: Some(Space::Run(run)),
         }
     }
 
     /// The label whose [`runtime_key`](Self::runtime_key) is `key`. A spelling holds
-    /// no `::`, so the key's last `::` separates the module from the spelling, and a
-    /// key without one is a root label's.
+    /// no `::`, so the key's last `::` separates the module or the run from the
+    /// spelling, a leading `@` marks a run, and a key without `::` is a root label's.
     pub fn from_runtime_key(key: &SmolStr) -> Self {
         match key.rsplit_once("::") {
-            Some((module, name)) => {
-                Label::in_module(ModulePath::new(module.split("::").map(SmolStr::from)), name)
-            }
+            Some((space, name)) => match space.strip_prefix('@') {
+                Some(run) => Label::in_run(
+                    run.split("::")
+                        .fold(RunPath::default(), |path, segment| path.child(segment)),
+                    name,
+                ),
+                None => {
+                    Label::in_module(ModulePath::new(space.split("::").map(SmolStr::from)), name)
+                }
+            },
             None => Label::new(key.clone()),
         }
     }
@@ -69,16 +99,33 @@ impl Label {
         &self.name
     }
 
-    /// The module the label belongs to, or `None` for the root's namespace.
+    /// The module the label belongs to, or `None` for the root's namespace and a
+    /// run's.
     pub fn module(&self) -> Option<&ModulePath> {
-        self.module.as_ref()
+        match &self.space {
+            Some(Space::Module(module)) => Some(module),
+            Some(Space::Run(_)) | None => None,
+        }
     }
 
-    /// The label as run time keys records by, its [`Display`](fmt::Display)
-    /// spelling. A root label's is its spelling, shared rather than copied.
+    /// The run whose top-level mutable variable the label is the store field of, or
+    /// `None` for a root or a module's label ([`Label::in_run`]).
+    pub fn run(&self) -> Option<&RunPath> {
+        match &self.space {
+            Some(Space::Run(run)) => Some(run),
+            Some(Space::Module(_)) | None => None,
+        }
+    }
+
+    /// The label as run time keys records by: its [`Display`](fmt::Display)
+    /// spelling for a root or a module's label, and `@run::name` for a run's, since
+    /// no module path begins with `@`. A spelling holds no `::`, so no two labels
+    /// share a key, and [`Label::from_runtime_key`] inverts it. A root label's key
+    /// is its spelling, shared rather than copied.
     pub fn runtime_key(&self) -> SmolStr {
-        match &self.module {
-            Some(module) => smol_str::format_smolstr!("{module}::{}", self.name),
+        match &self.space {
+            Some(Space::Module(module)) => smol_str::format_smolstr!("{module}::{}", self.name),
+            Some(Space::Run(run)) => smol_str::format_smolstr!("@{run}::{}", self.name),
             None => self.name.clone(),
         }
     }
@@ -93,23 +140,24 @@ fn debug_assert_spelling(name: &str) {
     );
 }
 
-/// `name` for a label of the root's namespace and `module::name` for another
-/// module's. This is also the label's spelling at run time, where records are
-/// keyed by strings: a user identifier cannot contain `::`, so no two labels
-/// share a spelling.
+/// `name` for a label of the root's namespace, `module::name` for another
+/// module's, and `run::name` for a run's, as a source reads the run's member. A
+/// run's label and a module's can print alike; [`Label::runtime_key`] tells them
+/// apart.
 impl fmt::Display for Label {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.module {
-            Some(module) => write!(f, "{module}::{}", self.name),
+        match &self.space {
+            Some(Space::Module(module)) => write!(f, "{module}::{}", self.name),
+            Some(Space::Run(run)) => write!(f, "{run}::{}", self.name),
             None => f.write_str(&self.name),
         }
     }
 }
 
-/// The spelling as a quoted string.
+/// The run-time key as a quoted string, which no two labels share.
 impl fmt::Debug for Label {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.to_string(), f)
+        fmt::Debug::fmt(self.runtime_key().as_str(), f)
     }
 }
 
@@ -181,11 +229,24 @@ mod tests {
     }
 
     #[test]
+    fn a_run_label_prints_as_its_member_reads_and_keys_apart_from_a_modules() {
+        let run = Label::in_run(RunPath::default().child("eu"), "stock");
+        let module = Label::in_module(module("eu"), "stock");
+        assert_ne!(run, module);
+        assert_eq!(run.to_string(), "eu::stock");
+        assert_eq!(module.to_string(), "eu::stock");
+        assert_eq!(run.runtime_key(), "@eu::stock");
+        assert_eq!(module.runtime_key(), "eu::stock");
+    }
+
+    #[test]
     fn a_runtime_key_names_its_label() {
         for label in [
             Label::new("price"),
             Label::in_module(module("catalog"), "price"),
             Label::in_module(module("shop::cart"), "price"),
+            Label::in_run(RunPath::default().child("eu"), "price"),
+            Label::in_run(RunPath::default().child("t").child("a"), "price"),
         ] {
             assert_eq!(Label::from_runtime_key(&label.runtime_key()), label);
         }
