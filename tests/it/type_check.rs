@@ -3256,6 +3256,29 @@ fn test_unbound_feed_target_errors() {
 }
 
 #[test]
+fn test_unbound_define_target_errors() {
+    let errs = infer_program_err(indoc! {"
+        x <<= 1
+        0
+    "});
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, InferError::UnboundVariable(n) if n == "x")),
+        "defining an unbound name must report UnboundVariable, got {errs:?}"
+    );
+}
+
+#[test]
+fn test_unbound_mut_write_target_errors() {
+    let errs = infer_program_err("x += 1");
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, InferError::UnboundVariable(n) if n == "x")),
+        "writing an unbound name must report UnboundVariable, got {errs:?}"
+    );
+}
+
+#[test]
 fn test_generalized_defer_function_specializes_per_element_type() {
     // A defer minted inside a generalized function instantiates a fresh
     // feed handle (and element type) per call site — monomorphize then

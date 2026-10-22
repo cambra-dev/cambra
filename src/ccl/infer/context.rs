@@ -437,12 +437,15 @@ impl InferCtx {
     }
 
     /// The type a use of `name` has: its binding's scheme instantiated at the
-    /// current level, or `None` for a name no scope binds. A use of a
+    /// current level. A name no scope binds raises `UnboundVariable`. A use of a
     /// [poisoned](LetScheme::Poisoned) binding counts toward
     /// [`Typing::poisoned_reads`].
-    pub(super) fn instantiate_binding(&mut self, name: &Name) -> Option<Type> {
+    pub(super) fn instantiate_binding(&mut self, name: &Name) -> Result<Type, LocatedInferError> {
         self.note_use(name);
-        Some(self.scopes.lookup(name)?.scheme.instantiate(self.level))
+        let Some(binding) = self.scopes.lookup(name) else {
+            return Err(self.raise(InferError::UnboundVariable(name.to_string())));
+        };
+        Ok(binding.scheme.instantiate(self.level))
     }
 
     /// Count a use of `name` toward [`Typing::poisoned_reads`] when its binding is
