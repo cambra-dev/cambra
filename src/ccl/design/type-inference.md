@@ -2153,6 +2153,13 @@ Because an upper bound is not closed against the lower bounds, a demand on the c
 narrow a variable inside the body. A conflict between the two surfaces when the phase checks the
 upper bound.
 
+Recording a lower bound runs no occurs check, so a lower bound can reach its own barrier variable
+again through structure (`𝐻` with lower bound `Int ⇒ 𝐻`). The resolution is then a recursive type.
+Compaction cuts the walk at the second visit and records the join as a recursive variable, which
+coalescing reports as `CoalesceError::RecursiveType`; the phase above skips the check of such a
+resolution, as it skips any resolution that does not materialize. `spec_key` cuts the same edge
+(`a_barrier_reaching_itself_through_its_lower_is_a_recursive_type` in `solver/compact.rs`).
+
 `opaque_output::run` leaves a lambda unwrapped in two cases. Its body binds no opaque variable, or
 its body is `let 𝑦 : 𝑇 = body in 𝑦` with a concrete user annotation `𝑇`, the lowering of a `=> 𝑇`
 output annotation. A concrete annotation holds no `_`, inference variable, or barrier variable at

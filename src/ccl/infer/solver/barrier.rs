@@ -91,8 +91,14 @@ fn check_barrier(barrier: &Rc<BarrierVar>, failures: &mut Vec<BarrierFailure>) -
         return false;
     }
     // A resolution that does not materialize is not checked: the same join is what the
-    // variable's position compacts to, so coalescing that position reports it.
-    let Ok(resolved) = coalesce_position(&own, true) else {
+    // variable's position compacts to, so coalescing that position reports it. A
+    // recursive resolution is one of them (`CoalesceError::RecursiveType`).
+    let materialized = if own.rec_vars.is_empty() {
+        coalesce_position(&own.term, true).ok()
+    } else {
+        None
+    };
+    let Some(resolved) = materialized else {
         *barrier.checked.borrow_mut() = Some(BarrierCheck::Passed {
             resolution: None,
             uppers: uppers.len(),

@@ -13,6 +13,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::BarrierVar;
+use crate::ccl::infer_var::BarrierVarId;
 use crate::ccl::subst::{RefinementScope, Subst};
 
 use crate::ccl::{
@@ -1708,6 +1709,12 @@ struct CompactState {
     in_process: HashSet<(InferVarId, bool)>,
     /// Placeholder ids minted for genuinely recursive revisits.
     recursive: HashMap<(InferVarId, bool), InferVarId>,
+    /// Barrier variables whose lower bounds are currently being joined. Keyed on the
+    /// barrier alone: its lowers are read at positive polarity whatever the reference's.
+    barriers_in_process: HashSet<BarrierVarId>,
+    /// Placeholder ids minted for a barrier variable revisited while its lowers are being
+    /// joined, which the walk records in `rec_vars` as `recursive`'s are.
+    barrier_recursive: HashMap<BarrierVarId, InferVarId>,
     /// Bounds of recursive variables (surfaced as `RecursiveType` errors by
     /// `coalesce_compact`).
     rec_vars: BTreeMap<InferVarId, CompactType>,
@@ -1728,6 +1735,8 @@ impl CompactState {
         CompactState {
             in_process: HashSet::new(),
             recursive: HashMap::new(),
+            barriers_in_process: HashSet::new(),
+            barrier_recursive: HashMap::new(),
             rec_vars: BTreeMap::new(),
             collapse,
             scope: RefinementScope::default(),
@@ -1738,11 +1747,27 @@ impl CompactState {
 /// The resolution of a barrier variable, under `subst_acc`, as a [`CompactType`]: the join
 /// of its lower bounds with the refinements at its positive positions dropped, and the
 /// opaque binders the refinements kept at its negative positions name.
+///
+/// A lower bound that reaches `barrier` again is a recursive type. No occurs check keeps
+/// that graph from forming: the constrain arm recording a barrier's lower bound runs none.
+/// The revisit is a placeholder variable, and the join is recorded under it in
+/// `st.rec_vars`, which `coalesce_compact` reports as `CoalesceError::RecursiveType`.
+/// Every revisit counts as recursive, including one reached through inference variables
+/// alone: the lowers are walked as new positions, so no parent path spans the barrier,
+/// and the `Infer` arm treats a cycle through a barrier the same way.
 fn join_barrier_lowers(
     barrier: &BarrierVar,
     subst_acc: &Subst,
     st: &mut CompactState,
 ) -> (CompactType, Vec<Name>) {
+    if st.barriers_in_process.contains(&barrier.uid) {
+        let placeholder = *st
+            .barrier_recursive
+            .entry(barrier.uid)
+            .or_insert_with(fresh_infer_var_id);
+        return (CompactType::from_var(placeholder), Vec::new());
+    }
+    st.barriers_in_process.insert(barrier.uid);
     let lowers = barrier.lowers.borrow().clone();
     let mut joined = CompactType::empty();
     for b in &lowers {
@@ -1752,14 +1777,28 @@ fn join_barrier_lowers(
     }
     let mut escaped = Vec::new();
     joined.resolve_barrier_refinements(true, &barrier.opaque, &mut escaped);
+    st.barriers_in_process.remove(&barrier.uid);
+    if let Some(rec_uid) = st.barrier_recursive.remove(&barrier.uid) {
+        st.rec_vars.insert(rec_uid, joined);
+        return (CompactType::from_var(rec_uid), escaped);
+    }
     (joined, escaped)
 }
 
 /// The resolution of `barrier` in its own context, and the opaque binders it names at a
 /// negative position: what `super::barrier::solve_barrier_vars` checks the upper bounds
 /// against. A walk of its own, so it reads the graph as it stands and changes nothing.
-pub(super) fn barrier_resolution(barrier: &BarrierVar) -> (CompactType, Vec<Name>) {
-    join_barrier_lowers(barrier, &Subst::id(), &mut CompactState::new(true))
+///
+/// A graph, because a lower bound can reach `barrier` again: the resolution is then a
+/// recursive type, whose bounds are in `rec_vars`.
+pub(super) fn barrier_resolution(barrier: &BarrierVar) -> (CompactGraph, Vec<Name>) {
+    let mut st = CompactState::new(true);
+    let (term, escaped) = join_barrier_lowers(barrier, &Subst::id(), &mut st);
+    let graph = CompactGraph {
+        term,
+        rec_vars: st.rec_vars,
+    };
+    (graph, escaped)
 }
 
 /// What the binder at `position` of a kind **variable** ranges over, derived here from the
@@ -3241,6 +3280,42 @@ mod tests {
             Some(RefinementSet::new()),
             "a value carrying no refinement erases it: an empty set is absorbing under intersect"
         );
+    }
+
+    /// A barrier variable `𝐵` whose lower bound `Int ⇒ 𝐵` reaches `𝐵` through structure
+    /// alone, with no inference variable on the cycle to stop the walk. The constrain arm
+    /// that records a barrier's lower bound runs no occurs check, so nothing keeps this
+    /// graph from forming. Compacting `𝐵` terminates, and coalescing reports the cycle as
+    /// a recursive type.
+    fn barrier_with_a_self_reaching_lower() -> Rc<BarrierVar> {
+        let barrier = BarrierVar::fresh(Rc::from([]), Vec::new(), Vec::new());
+        let b = Type::BarrierVar(Rc::clone(&barrier));
+        let lower = Type::fun(Type::Base(BaseType::Int), b.clone());
+        constrain_subtype(&lower, &b, &mut ConstrainCache::new()).expect("the lower flows in");
+        barrier
+    }
+
+    /// The `BarrierVar` arm of `compact_go`.
+    #[test]
+    fn a_barrier_reaching_itself_through_its_lower_is_a_recursive_type() {
+        let barrier = barrier_with_a_self_reaching_lower();
+        let compact = compact_type(&Type::BarrierVar(barrier));
+        assert!(
+            matches!(
+                coalesce_compact(&compact),
+                Err(CoalesceError::RecursiveType { .. })
+            ),
+            "{compact:?}"
+        );
+    }
+
+    /// The same cycle read by [`barrier_resolution`], what `solve_barrier_vars` checks
+    /// the upper bounds against. It returns, and names no opaque binder.
+    #[test]
+    fn a_barrier_resolution_reaching_itself_through_its_lower_terminates() {
+        let barrier = barrier_with_a_self_reaching_lower();
+        let (_, escaped) = barrier_resolution(&barrier);
+        assert!(escaped.is_empty(), "{escaped:?}");
     }
 }
 

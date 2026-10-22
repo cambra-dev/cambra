@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry};
 use std::fmt;
 use std::rc::Rc;
 
+use crate::ccl::infer_var::BarrierVarId;
 use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
 
@@ -345,6 +346,11 @@ struct KeyCtx {
     /// the key — the invariant stated on `visiting`.
     #[cfg(debug_assertions)]
     visiting_scopes: HashMap<(InferVarId, bool), Vec<Option<Name>>>,
+    /// Barrier variables whose lower bounds are currently being walked, the guard
+    /// `compact_go`'s `BarrierVar` arm runs on the same key: a barrier's lowers are read
+    /// at positive polarity whatever the reference's. A lower reaching its own barrier
+    /// again is a recursive type, so the cut it makes is a truncation as `visiting`'s is.
+    visiting_barriers: HashSet<BarrierVarId>,
     /// Completed keys per `(variable, polarity, enclosing binders)`, for
     /// variables reached under the identity substitution.
     ///
@@ -378,6 +384,7 @@ pub fn spec_key(ty: &Type) -> SpecKey {
         visiting: HashSet::new(),
         #[cfg(debug_assertions)]
         visiting_scopes: HashMap::new(),
+        visiting_barriers: HashSet::new(),
         memo: HashMap::new(),
         truncations: 0,
         scope: RefinementScope::default(),
@@ -434,12 +441,17 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // instantiation wherever an opaque-binding function's type does, so two uses whose
         // barrier variables resolve differently clone differently.
         Type::BarrierVar(barrier) => {
+            if !ctx.visiting_barriers.insert(barrier.uid) {
+                ctx.truncations += 1;
+                return KeyView::default();
+            }
             let lowers = barrier.lowers.borrow().clone();
             let mut acc = KeyView::default();
             for b in &lowers {
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
                 acc.union(key_go(&b.ty, true, &inner_acc, ctx));
             }
+            ctx.visiting_barriers.remove(&barrier.uid);
             acc.drop_positive_refinements(true);
             acc
         }
@@ -947,10 +959,22 @@ mod tests {
             visiting: HashSet::new(),
             #[cfg(debug_assertions)]
             visiting_scopes: HashMap::new(),
+            visiting_barriers: HashSet::new(),
             memo: HashMap::new(),
             truncations: 0,
             scope: RefinementScope::default(),
         }
+    }
+
+    /// A barrier variable whose lower bound `Int ⇒ 𝐵` reaches `𝐵` again keys without
+    /// recursing forever, as `compact_go` compacts it: the back-edge is cut.
+    #[test]
+    fn a_barrier_reaching_itself_through_its_lower_keys() {
+        let barrier = crate::ccl::BarrierVar::fresh(Rc::from([]), Vec::new(), Vec::new());
+        let b = Type::BarrierVar(Rc::clone(&barrier));
+        let lower = Type::fun(int(), b.clone());
+        constrain_subtype(&lower, &b, &mut ConstrainCache::new()).expect("the lower flows in");
+        let _ = spec_key(&b);
     }
 }
 
