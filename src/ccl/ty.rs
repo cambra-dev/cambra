@@ -3533,17 +3533,6 @@ impl Type {
         ) || self.any_child(Type::holds_an_unresolved_position)
     }
 
-    /// Invoke `f` on each direct child [`Type`] of this type.
-    ///
-    /// "Direct child" means a `Type` reachable through this type's value
-    /// fields — the domain and codomain of a `Fun` **and the candidate domains of its Σ
-    /// binder kinds**, the elements of a `Tuple` / `Record`, the payloads of a `Variant`, and
-    /// the base of a `Refinement`.
-    ///
-    /// Does **not** descend into the refinement *predicate* (which is a
-    /// [`TypedExpr`], not a `Type`).  Callers that need to walk a
-    /// refinement's predicate must handle [`Type::Refinement`] explicitly
-    /// — e.g. by matching on it before calling this helper.
     /// Every [`Refinement`] riding this type or any of its nested type children,
     /// in pre-order: the refinements at each level before that level's children.
     ///
@@ -3568,6 +3557,17 @@ impl Type {
         self.walk_children(|c| c.walk_refinements(f));
     }
 
+    /// Invoke `f` on each direct child [`Type`] of this type.
+    ///
+    /// "Direct child" means a `Type` reachable through this type's value
+    /// fields — the domain and codomain of a `Fun` **and the candidate domains of its Σ
+    /// binder kinds**, the elements of a `Tuple` / `Record`, the payloads of a `Variant`, and
+    /// the base of a `Refinement`.
+    ///
+    /// Does **not** descend into the refinement *predicate* (which is a
+    /// [`TypedExpr`], not a `Type`).  Callers that need to walk a
+    /// refinement's predicate must handle [`Type::Refinement`] explicitly
+    /// — e.g. by matching on it before calling this helper.
     pub fn walk_children<'a>(&'a self, mut f: impl FnMut(&'a Type)) {
         match self {
             Type::Base(_)

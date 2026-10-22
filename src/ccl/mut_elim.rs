@@ -206,7 +206,7 @@ fn contains_mut_type(expr: &Expr) -> bool {
                 history_kind: HistoryKind::Overwrite,
                 ..
             }
-        ) || ty.fold_children(false, |acc, t| acc || ty_has_mut(t))
+        ) || ty.any_child(ty_has_mut)
     }
     let mut here = false;
     expr.walk_type_slots(|t| here |= ty_has_mut(t));
@@ -3191,7 +3191,7 @@ mod tests {
                     history_kind: HistoryKind::Overwrite,
                     ..
                 }
-            ) || ty.fold_children(false, |acc, t| acc || ty_has_mut(t))
+            ) || ty.any_child(ty_has_mut)
         }
         let mut found = false;
         expr.walk_binders(|b| found |= ty_has_mut(&b.ty));
