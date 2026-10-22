@@ -352,9 +352,11 @@ block_value     ::= if_stmt | match_stmt
 
 aug_op          ::= "+=" | "-=" | "*=" | "//="
 
-assign_target   ::= ident
+assign_target   ::= pair_target
+                 |  pair_target ( "," pair_target )+ [ "," ]
+pair_target     ::= target_atom [ "->" target_atom ]      -- a pair: the two-tuple (k, v)
+target_atom     ::= ident
                  |  "(" assign_target ( "," assign_target )* [ "," ] ")"
-                 |  assign_target ( "," assign_target )+ [ "," ]
 
 compound_stmt   ::= if_stmt | match_stmt | for_stmt | with_stmt | def_stmt
                  |  load_from_stmt | renamed_from_stmt | discard_stmt | pub_stmt
@@ -364,7 +366,7 @@ if_stmt         ::= "if" expression ":" block
                     [ "else" ":" block ]
 
 match_stmt      ::= "match" expression ":" NEWLINE INDENT case_arm+ DEDENT
-case_arm        ::= "case" case_pattern ":" block
+case_arm        ::= "case" case_pattern ":" ( block | expression NEWLINE )  -- the second [Decided]
 case_pattern    ::= "`" ident [ "(" ( ident | "_" ) ")" ]
                  |  "_"
 
@@ -449,7 +451,7 @@ noted:
 | 6 | `or` | short-circuit; n-ary flattening |
 | 7 | `and` | short-circuit; n-ary flattening |
 | 8 | `not` | prefix |
-| 9 | `==` `!=` `<` `<=` `>` `>=` | chained, *not* left-fold (see [3.4 Comparisons](#34-comparisons)) |
+| 9 | `==` `!=` `<` `<=` `>` `>=`, and `in` `not in` (**[Decided]**) | chained, *not* left-fold (see [3.4 Comparisons](#34-comparisons)); `in` and `not in` do not chain ([Membership expressions](#membership-expressions-decided)) |
 | 10 | `\|` | logical or |
 | 11 | `^` | logical xor |
 | 12 | `&` | logical and |
@@ -857,12 +859,64 @@ equality. A wider record is not compared only on its shared fields. Products do 
 ordering comparators; collection elements are not product fields, so this rule does not provide
 collection equality.
 
-`is`, `is not`, `in`, and `not in` are not comparison operators. A comprehension with a
-guard or an aggregate can express a membership query.
+`is` and `is not` are not operators. Membership `in` and `not in` are specified in
+[Membership expressions](#membership-expressions-decided).
 
-> **Direction [Decided] — Membership expressions.** `e in s` is planned for set membership,
-> and `k in m` for map-key membership. This does not change `in` as an iteration keyword in
-> `for x in xs`.
+#### Membership expressions [Decided]
+
+`e in c` is true when some item that iterating `c` yields equals `e`, and `e not in c` is
+`not (e in c)`. Both answer `Bool`. Membership has no trait of its own; it places the iteration
+and equality requirements ([Trait requirements](#trait-requirements)):
+
+```
+_ in _ : forall (C, E) {e: E, c: C} => Bool requires Iterable(C, Item=E), Equatable(E, E)
+```
+
+- **`in` tests what iteration binds** ([4.6 `for` — iteration](#46-for--iteration)): the key of a
+  `Set`, the value of an `Array`, `List` or `Collection`, and the entry `(k, v)` of a `Map` or
+  `FullMap`. Key membership in a map is `k in m.keys()`. `k in m` with `k: K` is a type error,
+  since the items of `m` are `(K, V)`.
+- **The item type is `Equatable`.** A nominal item type has membership only through an
+  `Equatable` instance, and declaring one is **[Open]**. A collection whose items are collections
+  has no membership test. A type with an `Iterable` instance has `in` with no further instance.
+- **A wider `e` widens the collection.** `List`, `Set` and `Map` are covariant, so with
+  `ks: List(Key)` and `Key` a refinement of `String`, `"x" in ks` is checked at `List(String)`.
+- **Readiness follows checked lookup**
+  ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)). `true` can be
+  answered once an equal item is present, and `false` requires the final collection. Over a live
+  feed with no final domain, `false` may never be answered.
+- **A true key-membership guard refines the key.** Under a true `k in s`, `k` is refined to the
+  domain of `s`; under a true `k in m.keys()`, to the domain of `m`, so `m[k]!` checks there
+  ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). Value
+  membership in a `List` gives no index evidence.
+
+`in` and `not in` share level 9 with the comparators
+([2.3 Expression precedence](#23-expression-precedence)), Python's placement, so an expression
+groups as it does in Python. Unlike the comparators they do not chain: an `in` or `not in`
+shares no chain with a comparator or with another `in`, and such a chain is a parse error that
+asks for parentheses. Python's chain `x in s == t` means `x in s and s == t`, which no reader of
+the first form expects.
+
+| Source | Reads as |
+|---|---|
+| `k in s` | `k in s` |
+| `i + 1 in ks` | `(i + 1) in ks` |
+| `x in a ++ b` | `x in (a ++ b)` |
+| `not k in s` | `not (k in s)`, which is `k not in s` |
+| `k in m.keys() and m[k]! > 0` | `(k in m.keys()) and (m[k]! > 0)` |
+| `a if k in s else b` | `a if (k in s) else b` |
+| `\r -> r.key in allowed` | `\r -> (r.key in allowed)` |
+| `{String where _ in ks}` | the strings `ks` holds |
+| `u -> u in admins` | `u -> (u in admins)`, a pair whose value is a `Bool` |
+| `x in s == true` | parse error; `(x in s) == true` |
+| `a < b in s` | parse error; `(a < b) and (b in s)` |
+| `x in s \| y in t` | parse error: `\|` binds tighter, so this is `x in (s \| y) in t`; `(x in s) or (y in t)` |
+
+`for x in xs` and a comprehension's `for x in xs` keep `in` as a keyword. What stands between
+`for` and that `in` is an `assign_target`, a name or a tuple of names, which holds no
+expression, so its `in` is never read as membership. A pair target `for k -> v in m` is a tuple
+target. The iterated expression after that `in` is an ordinary expression, so `for x in a in b`
+iterates `a in b`.
 
 ### 3.5 Short-circuit `not`, `and`, `or`
 
@@ -1038,7 +1092,7 @@ refined by whether the key is present, and postfix `!` takes an `Option` refined
 `none`:
 
 ```
-_[_] : {m: Map(K, V), k: K} => {Option(V) where _.is_none() == not (k in m)}
+_[_] : {m: Map(K, V), k: K} => {Option(V) where _.is_none() == (k not in m.keys())}
 _!   : {Option(T) where not _.is_none()} => T
 ```
 
@@ -2044,6 +2098,28 @@ value. A statement-position match is also allowed in a loop or transaction body.
 contribute a yield or feed where the enclosing context permits it; the value can use the
 payload binder and enclosing loop accumulators.
 
+#### An arm on its `case` line
+
+**[Decided]**, not implemented: the parser takes an arm's body only as an indented block today.
+An arm whose body is one expression may write it on the `case` line, after the `:`, in place of
+the indented block:
+
+```python
+match x:
+    case `some(v): v + 1
+    case `none: 0
+```
+
+The line break ends the arm, and arms of both shapes mix in one `match`. Such an arm means the
+indented arm whose block is that one expression. The body is an expression, not a statement:
+an assignment or a `:=` write takes the indented block. A line indented past the arm's `case`
+line after a body on it is an error.
+
+The `match` around such an arm is still the indented form, with one arm per line, so it needs no
+bracket. Its arms stay unambiguous: an expression cannot derive a `match` outside a bracket
+([The one-line form](#the-one-line-form)), so a `match` written after `` case `p: `` carries its
+own bracket and its own arm list.
+
 #### The one-line form
 
 ```
@@ -2066,7 +2142,9 @@ Nested one-line matches require their own delimiters. Without them,
 the final arm. Restricting only the immediate arm expression would not resolve this ambiguity:
 lambda bodies and function-type codomains accept full expressions and could reintroduce it.
 
-The indented and one-line forms use the same pattern, selection and value rules.
+The indented and one-line forms use the same pattern, selection and value rules. An indented
+`match` whose arms sit on their `case` lines
+([An arm on its `case` line](#an-arm-on-its-case-line)) is the indented form.
 
 **[Tentative]** Extending unused-binder `_` beyond pattern payloads to lambda parameters,
 loop targets and tuple patterns requires a binder-position rule distinct from the type-position
@@ -2484,8 +2562,9 @@ of a constructor into an unboxed term.
   over unordered collections take an explicit
   ordering instance. Default parallel iteration and loop-carried dependencies are specified in
   [Iteration](#46-for--iteration); storage order does not establish a source-language ordering.
-- Membership `in` tests keys for sets/maps and values for arrays/lists/collections.
-  A successful key-membership guard refines the key for proven access.
+- Membership `in` tests the items iteration yields, so a map's keys are tested through
+  `m.keys()` ([Membership expressions](#membership-expressions-decided)). A true key-membership
+  guard refines the key for proven access.
 - `len(c)` answers the size of a collection's domain, through the built-in `HasLen` trait
   ([Trait requirements](#trait-requirements)). A `List` lookup states presence as
   `i < len(xs)` ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
@@ -2507,8 +2586,9 @@ compiler provides, so `Set(K)` and `Map(K, unit)` are distinct types. Nothing re
 three to a structural collection type: none widens to `Collection`, and the methods `keys`,
 `values` and `items` are the written route. `FullMap` has every operation `Map` has, and differs
 only in how it is built and in its lookup's refinement. The operations of all three are built in:
-lookup, membership `in`, iteration, `len`, the methods `keys`, `values` and `items` (`keys` alone
-for a `Set`), and the re-keying constructors `set([…])` and `map([…])`. The representation is
+lookup, iteration, `len`, the methods `keys`, `values` and `items` (`keys` alone for a `Set`), and
+the re-keying constructors `set([…])` and `map([…])`. Membership `in` is not one of them: it
+comes from the `Iterable` instance ([Membership expressions](#membership-expressions-decided)). The representation is
 [Telling `Set` and `Map` apart](../src/ccl/design/collections.md#telling-set-and-map-apart-decided).
 
 A builtin differs from a declared nominal type in five ways:
@@ -2589,7 +2669,7 @@ predicate naming two parameters (§6). Ordinary lexical scope (§5) is what
 supplies those names, and nothing narrows them to parameters: a refinement
 written at the top level may name a top-level binding, which makes that
 binding's *value* part of the type. The example uses membership `in`, which
-is **[Planned]** ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)):
+is **[Decided]** ([Membership expressions](#membership-expressions-decided)):
 
 ```python
 ks = ["a", "b"]
@@ -3209,7 +3289,7 @@ types. The traits are built in:
 | `Divisible` | `//` | 2 | `Output` | `Int`, `UInt` |
 | `Exponentiable` | `**` | 2 | `Output` | `Int`, `UInt` |
 | `Negatable` | unary `-` | 1 | `Output` | `Int` |
-| `Equatable` | `==`, `!=` | 2 | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
+| `Equatable` | `==`, `!=`, `in`, `not in` | 2 | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
 | `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | `Int`, `UInt`, `String`, `Bool` |
 
 `max` and `min` place `Orderable(T, T)` on their element type `T`. A binary trait is satisfied by
@@ -3243,7 +3323,7 @@ product ([3.4 Comparisons](#34-comparisons)). A trait's `Output` is the type tha
 >
 > | Trait | Required by | Operands | Associated type | Satisfied by |
 > | --- | --- | --- | --- | --- |
-> | `Iterable` | `for`-in, a comprehension's `for` clause | 1 | `Item` | `Array`, `List`, `Collection`, `Set`, `Map`, `FullMap`, and every comprehension result |
+> | `Iterable` | `for`-in, a comprehension's `for` clause, `in`, `not in` | 1 | `Item` | `Array`, `List`, `Collection`, `Set`, `Map`, `FullMap`, and every comprehension result |
 > | `HasLen` | `len` | 1 | none | `Array`, `List`, `Collection`, `Set`, `Map`, `FullMap` |
 >
 > `Iterable`'s `Item` is what [4.6 `for` — iteration](#46-for--iteration) binds. `len` is the
