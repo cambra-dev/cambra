@@ -166,7 +166,7 @@ impl<K: Eq + std::hash::Hash + std::fmt::Debug, V> ScopeStack<K, V> {
     /// Push a fresh scope without returning a guard.
     ///
     /// Prefer [`enter_scope`](Self::enter_scope) when possible; this is a lower-level
-    /// escape hatch for wrapper types (e.g. [`CompileContext`](crate::interpreter::compile_ccl::CompileContext))
+    /// escape hatch for wrapper types (e.g. [`OpConversionContext`](crate::interpreter::operator_conversion::OpConversionContext))
     /// that need to manage scopes on a field while the wrapper itself is borrowed.
     pub(crate) fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());

@@ -1,13 +1,13 @@
-//! End-to-end pipeline tests: Python source → CCL lower → infer → compile → eval.
+//! End-to-end pipeline tests: CHL source → CCL lower → infer → compile → eval.
 //!
 //! All tests run through the full CCL pipeline via [`GlobalContext::compile_program`]:
 //!
 //! ```text
-//! Python source
-//!   → ccl::lower    (Python AST → CCL Expr)
-//!   → ccl::infer    (type inference; annotates Lambda param_ty)
-//!   → compile_ccl   (CCL Expr → dataflow operators)
-//!   → subscribe()   (operator evaluation)
+//! CHL source
+//!   → ccl::lower          (CHL AST → CCL Expr)
+//!   → ccl::infer          (type inference; annotates Lambda param_ty)
+//!   → operator_conversion (CCL Expr → dataflow operators)
+//!   → subscribe()         (operator evaluation)
 //! ```
 //!
 //! Unlike the unit tests in each module, these tests validate the composition

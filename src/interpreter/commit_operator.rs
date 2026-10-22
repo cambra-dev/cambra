@@ -3,7 +3,7 @@
 //! Implements the transactional time-domain machinery from
 //! `src/ccl/design/mutability.md` ("The runtime engines"): concurrent
 //! writers propose transactions against a shared variable, and this operator
-//! serializes them onto a single `CommitTimestamp` clock, validating read sets
+//! serializes them onto one commit-time clock, validating read sets
 //! and emitting the store with a watermark.
 //!
 //! # Structure
@@ -1163,17 +1163,17 @@ fn decided_positions_tile(rows: &[Vec<Position>], domain: &Extent, complete: Pre
     )
 }
 
-/// Fold `key` over an **ascending** sequence of `query_ticks` in a single
+/// Fold `key` over an **ascending** sequence of `query_positions` in a single
 /// O(changes + queries) pass — the incremental form of [`fold_changelog_key`],
-/// so a full-stream reader folding every tick is linear, not O(changes ×
-/// queries) (a per-tick [`fold_changelog_key`] each re-scans the whole log). Both
+/// so a full-stream reader folding every position is linear, not O(changes ×
+/// queries) (a per-position [`fold_changelog_key`] each re-scans the whole log). Both
 /// changelog readers ([`StoreValueStream`], [`StoreDenseRead`]) share it.
 ///
-/// Result element `i` is the fold at `query_ticks[i]` under the carry policy: the
-/// latest write ≤ the tick (`carry_forward: true`, an accumulator carried across
-/// ticks that did not write `key`), or the exact-tick delta (`carry_forward:
-/// false`, a reply tap — `None` where the tick did not write `key`). Requires
-/// `changes` ascending (the render invariant) and `query_ticks` ascending; the
+/// Result element `i` is the fold at `query_positions[i]` under the carry policy: the
+/// latest write ≤ the position (`carry_forward: true`, an accumulator carried across
+/// positions that did not write `key`), or the exact-position delta (`carry_forward:
+/// false`, a reply tap — `None` where the position did not write `key`). Requires
+/// `changes` ascending (the render invariant) and `query_positions` ascending; the
 /// cursor advances monotonically and never rewinds.
 pub fn fold_changelog_key_ascending(
     tile: &Tile,
@@ -1408,7 +1408,7 @@ fn map_extent(key_extent: &Extent, value_extent: &Extent) -> Extent {
 }
 
 /// The full multi-key store tiling: a [`Tiling::Store`] step function
-/// `CommitTimestamp ⇀ {key: value}`, whose codomain names every key the store holds
+/// `Position ⇀ {key: value}`, whose codomain names every key the store holds
 /// with that key's own value tiling. The `Store` tiling (not `DataFunction`) is what marks
 /// the output as a changelog to be folded, not a function to be indexed.
 ///
@@ -1700,7 +1700,7 @@ pub fn proposal_stream_tiling(key_extent: &Extent, value_extent: &Extent) -> Til
     )
 }
 
-/// A commit operator over a multi-key store `CommitTimestamp ⇀ (Key ⇀ Value)`,
+/// A commit operator over a multi-key store `Position ⇀ (Key ⇀ Value)`,
 /// fed by `n_writers` concurrent writers.
 ///
 /// Each writer input — a proposal stream `step → {snap, reads, writes}` with
@@ -3467,7 +3467,7 @@ impl StoreFinalReadProducer {
 /// The positions are the store's own domain rather than an enumeration of the loop extent,
 /// so a restricted source's read spans exactly the positions the recurrence ran at, in
 /// ascending order — which a co-iterated read (`for r in …: cnt += 1; with begin(): store :=
-/// store + cnt`) needs to align with its source through `zip_arms`. The fold reads the
+/// store + cnt`) needs to align with its source through `zip_arms_at`. The fold reads the
 /// changelog rather than the frontier, so a carry position takes the latest earlier write and
 /// a leading carry takes the seed.
 ///
@@ -8177,7 +8177,7 @@ mod tests {
         }
     }
 
-    /// The full multi-key store renders as `CommitTimestamp ⇀ {key: value}`: one
+    /// The full multi-key store renders as `Position ⇀ {key: value}`: one
     /// changelog per key, so a tick whose write set names some keys and not others is a
     /// tick those keys' changelogs carry and the rest omit. Heterogeneity per tick needs
     /// no encoding of its own — it is which changelogs a tick appears in.

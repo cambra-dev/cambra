@@ -88,9 +88,10 @@ use std::{
 /// emitted by [`crate::ccl::planning`]'s `insert_iterate_markers` pass (plus zero or more
 /// `Apply(p, Builtin::Restrict)` mid-chain filters, one per refinement).  This module compiles
 /// `Iterate` to an `IterateExtent` tile (plus a `Restrict` filter when the predicate is
-/// non-trivial) and `Restrict` to a `Restrict` tile over the upstream input.  Arms that
-/// previously fell back to an implicit iteration when `input=None` now error out — a planner bug,
-/// not a user error.
+/// non-trivial) and `Restrict` to a `Restrict` tile over the upstream input.  An arm that needs
+/// an upstream input and is reached without one returns `ConversionError::Unsupported`, through
+/// `expect_input` or, for a list literal and a nested `Transact`, the arm's own check: a planner
+/// bug, not a user error.
 /// Let-bindings are compiled by converting the bound expression to an operator, memoising it, and
 /// pushing a FanOut into the scope to share it between uses.
 ///
@@ -302,10 +303,9 @@ enum StoreReadKind {
     /// [`StoreValueStream`] over the commit-log map (keyed by `runtime_key`).
     Commit,
     /// An induction store backed by an [`InductionStore`] over a [`Tile::Store`]
-    /// changelog: a read is a [`StoreDenseRead`] folding the changelog at every
-    /// position the store decided into the dense history `D ⇀ V` — the changelog
-    /// counterpart of `Induction`'s `__hist.k`, which a co-iterated read consumes. The
-    /// trailing read samples the store instead ([`StoreFinalRead`]).
+    /// changelog: a `__hist.k` read is a [`StoreDenseRead`] folding the changelog at every
+    /// position the store decided into the dense history `D ⇀ V`, which a co-iterated read
+    /// consumes. The trailing read samples the store instead ([`StoreFinalRead`]).
     InductionChangelog,
     /// A **nested** induction store: the recurrence of an inner loop, run once per
     /// position of the loop around it, as one store per enclosing position. A read is one inner
@@ -822,29 +822,29 @@ pub(crate) struct LetBinding {
     pub(crate) depth: usize,
 }
 
-/// RAII scope guard for [`TileCompileContext`].
+/// RAII scope guard for [`OpConversionContext`].
 ///
-/// Created by [`TileCompileContext::enter_scope`]; pops the innermost scope when
+/// Created by [`OpConversionContext::enter_scope`]; pops the innermost scope when
 /// dropped. Implements [`std::ops::Deref`]/[`std::ops::DerefMut`] targeting
-/// [`TileCompileContext`], so `&mut guard` coerces to `&mut TileCompileContext`.
-pub(crate) struct TileCompileContextGuard<'a> {
+/// [`OpConversionContext`], so `&mut guard` coerces to `&mut OpConversionContext`.
+pub(crate) struct OpConversionContextGuard<'a> {
     ctx: &'a mut OpConversionContext,
 }
 
-impl std::ops::Deref for TileCompileContextGuard<'_> {
+impl std::ops::Deref for OpConversionContextGuard<'_> {
     type Target = OpConversionContext;
     fn deref(&self) -> &OpConversionContext {
         self.ctx
     }
 }
 
-impl std::ops::DerefMut for TileCompileContextGuard<'_> {
+impl std::ops::DerefMut for OpConversionContextGuard<'_> {
     fn deref_mut(&mut self) -> &mut OpConversionContext {
         self.ctx
     }
 }
 
-impl Drop for TileCompileContextGuard<'_> {
+impl Drop for OpConversionContextGuard<'_> {
     fn drop(&mut self) {
         self.ctx.scopes.pop_scope();
     }
@@ -914,11 +914,11 @@ impl OpConversionContext {
 
     /// Enter a fresh lexical scope, returning a guard that pops it on drop.
     ///
-    /// The guard dereferences to `TileCompileContext`, so it can be passed as
-    /// `&mut TileCompileContext` to recursive compile functions.
-    pub(crate) fn enter_scope(&mut self) -> TileCompileContextGuard<'_> {
+    /// The guard dereferences to `OpConversionContext`, so it can be passed as
+    /// `&mut OpConversionContext` to recursive compile functions.
+    pub(crate) fn enter_scope(&mut self) -> OpConversionContextGuard<'_> {
         self.scopes.push_scope();
-        TileCompileContextGuard { ctx: self }
+        OpConversionContextGuard { ctx: self }
     }
 
     /// Look up `name` from innermost scope outward.
@@ -2028,7 +2028,7 @@ fn convert_impl_inner(
                     // Generic path: fan_out the input so every slot shares the
                     // same upstream producer.  The arms' runtime tilings depend
                     // on the upstream `input` — scalar upstream produces scalar
-                    // arms, function upstream produces function arms.  `zip_arms`
+                    // arms, function upstream produces function arms.  `zip_arms_at`
                     // picks the matching combinator.
                     //
                     // A **store-read arm** (`__hist.k`) is a *leaf* source over
@@ -2037,7 +2037,7 @@ fn convert_impl_inner(
                     // reject it). This is the cross-domain co-iteration shape: a
                     // commit writer's source `zip((reqs, __cnt.acc))` pairs the
                     // request stream (input-driven) with an induction accumulator
-                    // read (leaf) position-by-position; `zip_arms` co-aligns them by
+                    // read (leaf) position-by-position; `zip_arms_at` co-aligns them by
                     // domain.
                     let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
                     let mut ops = Vec::new();
@@ -5690,13 +5690,12 @@ fn zip_pair(expr: &Expr) -> Option<(&Expr, &Expr)> {
     }
 }
 
-/// Whether a `zip` arm is a **leaf source** over its own domain — a store read
-/// `__hist.k` or an `as_of((trigger, store))` read — rather than an
-/// iteration-driven morphism. Such an arm is converted with *no* input (it would
-/// reject the fanned iteration input); `zip_arms` co-aligns it with the
-/// input-driven arms by domain position. This is the cross-domain co-iteration
-/// shape: a commit writer's source (`zip((reqs, __cnt.acc))`) or a reply
-/// combining the request with a store read (`zip((trigger, as_of(store)))`).
+/// Whether a `zip` arm is a **leaf source** over its own domain — a store read `__hist.k` or an
+/// `as_of((trigger, store))` read — rather than an iteration-driven morphism. Such an arm is
+/// converted with *no* input (it would reject the fanned iteration input); [`zip_arms_at`]
+/// ([`zip_arms_named_at`] for a record) co-aligns it with the input-driven arms by domain position.
+/// This is the cross-domain co-iteration shape: a commit writer's source (`zip((reqs, __cnt.acc))`)
+/// or a reply combining the request with a store read (`zip((trigger, as_of(store)))`).
 fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
     // A nested store's read, `__hist ≫ .k` — one inner history per enclosing position, over the
     // store's own rows.
