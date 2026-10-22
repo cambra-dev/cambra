@@ -65,7 +65,7 @@ pub(super) fn realize_conditional_collections(
         materialized,
     } = witnesses;
     inline_undetermined_conditionals(expr);
-    realize_and_unbox(
+    realize_and_erase_boxes(
         expr,
         erased,
         &PredMemo::new(),
@@ -74,13 +74,13 @@ pub(super) fn realize_conditional_collections(
         None,
         materialized,
     );
-    // **The other half of the erasure.** `unbox` removed the introduction from the *term*;
+    // **The other half of the erasure.** `erase_determined_boxes` removed the introduction from the *term*;
     // every type still says `Σ`. A type asserting an indeterminacy the term no longer has
     // is not a harmless leftover: the domain it presents at a consuming site is a witness,
     // which has no extent, so `planning::iterate` cannot build an iteration source for it
     // and drops the site's refinements with it (`tests/it/compilation_pipeline/sums.rs`).
     //
-    // Safe under exactly the precondition `unbox` already checks — one candidate, so the
+    // Safe under exactly the precondition `erase_determined_boxes` already checks — one candidate, so the
     // witness stands for a domain that is *known* — and applied to exactly the binders it
     // erased. That last part is what keeps a **realized** sum out of it: realization
     // consumes its arms' boxes without recording them, because the union it built has a
@@ -101,7 +101,7 @@ pub(super) fn realize_conditional_collections(
     // A same-domain conditional is that case — one candidate, two legs — and instantiating
     // its assertion would contradict the term it asserts over.
     // **What the term half declined to erase, the type half must decline too.** Realization
-    // consumed one set and [`unbox`] left the other standing; both are sums that survive.
+    // consumed one set and [`erase_determined_boxes`] left the other standing; both are sums that survive.
     //
     // One set for the whole expression, because survival is a fact about a witness rather
     // than about a position: a binder is minted once, where its sum is built
@@ -126,7 +126,7 @@ const ROW_FIXED_ELSEWHERE: &str = "a collection whose rows have different domain
 
 /// Reject a row whose sum collapsed away while the position holding it materialized one.
 ///
-/// The decision to keep a `box` is made where the `box` is written ([`unbox`]). Inlining moves
+/// The decision to keep a `box` is made where the `box` is written ([`erase_determined_boxes`]). Inlining moves
 /// a `let`-bound row into the literal that reads it, so that `box` stands where the row is
 /// merged. A row read from a mutable variable does not move: `x := box([1, 2])`, `y = x`, and
 /// then `[y, box([3, 4, 5])]` erases the `box` where `x` is introduced, its one candidate being
@@ -178,7 +178,7 @@ fn reject_rows_fixed_elsewhere(expr: &Expr) -> Result<(), String> {
 /// demands, and one shared set of legs can satisfy neither.
 ///
 /// A **determined** witness — one candidate — is not inlined: nothing realizes it, because
-/// the candidate is already its domain and [`unbox`] and [`collapse_determined_sums`] erase
+/// the candidate is already its domain and [`erase_determined_boxes`] and [`collapse_determined_sums`] erase
 /// the binder where it stands. Copying such a binding duplicates the arms and puts a box
 /// inside each consumer, where the erasure reaches the term but not every type that named
 /// it.
@@ -282,7 +282,7 @@ fn child_demand(expr: &Expr, effective: &Type) -> Option<Type> {
 }
 
 /// Whether `ty` binds a witness that is **not determined** — the complement, at the outermost
-/// binder, of the one-candidate precondition [`unbox`] erases under.
+/// binder, of the one-candidate precondition [`erase_determined_boxes`] erases under.
 ///
 /// Wider than [`undetermined_witness`], which asks only whether realization has candidates to
 /// fan out over. A described kind — `UIntRanges` for a `List(𝑇)`, `SubtypesOf(𝐾)` for a
@@ -302,7 +302,7 @@ fn binds_an_undetermined_witness(ty: &Type) -> bool {
 /// there — the `Case` stays, and the per-leg discharge above is what replaces it, with a
 /// plain arm rather than a union. Unboxing still runs: erasing a determined `box` adds
 /// nothing to iterate.
-fn realize_and_unbox(
+fn realize_and_erase_boxes(
     expr: &mut Expr,
     erased: &mut std::collections::HashMap<crate::ccl::ty::WitnessId, Type>,
     memo: &PredMemo<()>,
@@ -348,7 +348,7 @@ fn realize_and_unbox(
         &effective,
         materialized,
         &mut |child, demand, materialized| {
-            changed |= realize_and_unbox(
+            changed |= realize_and_erase_boxes(
                 child,
                 erased,
                 memo,
@@ -366,7 +366,7 @@ fn realize_and_unbox(
     // op-conversion, which has no `box` arm and rejects it as a non-combinator.
     expr.walk_type_slots_mut(|ty| {
         changed |= walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
-            realize_and_unbox(
+            realize_and_erase_boxes(
                 pred,
                 erased,
                 memo,
@@ -395,7 +395,7 @@ fn realize_and_unbox(
             "planning.unbox",
             provenance::Nature::Machinery,
         );
-        unbox(
+        erase_determined_boxes(
             std::mem::replace(expr, Expr::lit(crate::ccl::Lit::Unit)),
             Some(erased),
             &effective,
@@ -480,7 +480,7 @@ fn walk_children_with_demand(
 }
 
 /// Replace every sum on an **erased** binder by its single candidate, throughout `expr`'s
-/// types — the type-level half of [`unbox`].
+/// types — the type-level half of [`erase_determined_boxes`].
 ///
 /// Reaches refinement *predicates* too, via [`walk_refined_predicates_mut`]: a predicate is
 /// a term with type slots of its own, and a filter's predicate reads the very collection
@@ -498,6 +498,14 @@ fn instantiate_erased_witnesses(
         instantiate_erased_in_type(ty, erased);
     });
     expr.walk_children_mut(|child| instantiate_erased_witnesses(child, erased, memo));
+    // `unbox` of a collection whose witness is erased is that collection: its domain is the
+    // candidate the projection now names.
+    if let TypedExprNode::Apply { argument, function } = &mut expr.node
+        && matches!(function.node, TypedExprNode::Builtin(Builtin::Unbox))
+        && argument.ty.peel_refinements().sum().is_none()
+    {
+        *expr = std::mem::take(&mut **argument);
+    }
 }
 
 fn instantiate_erased_in_type(
@@ -529,6 +537,16 @@ fn instantiate_erased_in_type(
     // the source carries the concrete domain.
     if let Type::WitnessRef(b) = ty
         && let Some(sole) = erased.get(b)
+    {
+        *ty = sole.clone();
+        return;
+    }
+    // **So is a projection of one.** `σ(𝑐)` names the witness through `𝑐`, whose own type binds
+    // it, and erasing that witness leaves the candidate as the domain `𝑐` ranges over
+    // (`src/ccl/design/collections.md`, "Projecting a sum's witness").
+    if let Type::WitnessProjection(p) = ty
+        && let Some(witness) = p.witness()
+        && let Some(sole) = erased.get(witness.id())
     {
         *ty = sole.clone();
         return;
@@ -981,7 +999,7 @@ fn arm_choices(
 
 /// An arm with every **determined** witness discharged — the term *and* the types.
 ///
-/// [`unbox`] alone is the term half, and only where the arm *is* the introduction. A `box`
+/// [`erase_determined_boxes`] alone is the term half, and only where the arm *is* the introduction. A `box`
 /// interior to the arm — anything with a mapping body, where the introduction becomes a
 /// morphism inside a point-free chain — leaves the resulting sum standing on the arm's type,
 /// and the leg then carries it into the union, where the assertion that a leg is a plain
@@ -989,7 +1007,7 @@ fn arm_choices(
 ///
 /// Both halves, in the order [`realize_conditional_collections`] runs them tree-wide: the
 /// term first, so no `box` is left whose function type the type half would rewrite (that type
-/// is what [`unbox`] reads to know the witness is determined), then the types, per occurrence
+/// is what [`erase_determined_boxes`] reads to know the witness is determined), then the types, per occurrence
 /// via [`instantiate_erased_witnesses`] — a binder is named by the closed and the open
 /// spelling of its sum alike, and each occurrence instantiates against what it holds.
 ///
@@ -1010,7 +1028,7 @@ fn discharge_determined_witnesses(arm: Expr) -> Expr {
             materialized,
             &mut |child, demand, materialized| go(child, erased, demand, materialized),
         );
-        let (unboxed, _) = unbox(
+        let (unboxed, _) = erase_determined_boxes(
             std::mem::replace(expr, Expr::lit(crate::ccl::Lit::Unit)),
             Some(erased),
             &effective,
@@ -1025,7 +1043,7 @@ fn discharge_determined_witnesses(arm: Expr) -> Expr {
     // The disjointness [`realize_conditional_collections`] checks, for the same reason.
     assert!(
         erased.keys().all(|w| !materialized.contains(w)),
-        "a witness `unbox` erased at one position of an arm was materialized at another"
+        "a witness `erase_determined_boxes` erased at one position of an arm was materialized at another"
     );
     if !erased.is_empty() {
         instantiate_erased_witnesses(&mut arm, &erased, &PredMemo::new());
@@ -1050,7 +1068,7 @@ fn collapse_determined_sums(
     // **Not into the predicates.** A predicate holding a conditional source is a
     // placeholder realization replaces wholesale ([`read_the_arm_instead`]), and collapsing
     // a sum inside it rewrites a copy that does not survive — the same reason
-    // [`realize_and_unbox`] leaves one alone.
+    // [`realize_and_erase_boxes`] leaves one alone.
     fn gather_type(
         ty: &Type,
         keep: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
@@ -1071,6 +1089,11 @@ fn collapse_determined_sums(
             out.entry(*first.id()).or_insert_with(|| sole.clone());
             // A sum's body can be another, and dropping one binder is what exposes it.
             ty = ty.instantiate_sum(sole);
+        }
+        // A projection names its witness through the term it quotes, whose type binds it under
+        // the id that term was typed with, so the witness is gathered from there.
+        if let Type::WitnessProjection(p) = &ty {
+            gather(&p.term, keep, out);
         }
         ty.walk_children(|child| gather_type(child, keep, out));
     }
@@ -1288,7 +1311,7 @@ fn arm_domain(ty: &Type) -> Option<Type> {
 /// `None` for the arms it consumes: it materializes those witnesses itself, as the gated
 /// union, and `Realize` asserts the sum over a `Variant` domain on purpose — instantiating
 /// that assertion would contradict the term it is asserting over.
-fn unbox(
+fn erase_determined_boxes(
     e: Expr,
     erased: Option<&mut std::collections::HashMap<crate::ccl::ty::WitnessId, Type>>,
     effective: &Type,

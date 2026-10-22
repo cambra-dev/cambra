@@ -807,6 +807,12 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             check_strength_over(&expr.ty, &label, ctx);
             expr.ty.clone()
         }
+        // `unbox` is minted after inference with a type stamped by hand
+        // (`crate::ccl::ty::unbox_type`), so its rule is checked rather than trusted.
+        TypedExprNode::Builtin(Builtin::Unbox) => {
+            check_unbox(&expr.ty, &label, ctx);
+            expr.ty.clone()
+        }
 
         // Leaves whose type carries the full load and was resolved during
         // inference — trust the recorded type (matching the old typecheck,
@@ -1105,6 +1111,42 @@ fn check_strength_over(ty: &Type, label: &str, ctx: &mut CheckCtx) {
     };
     let at = || format!("{label}: strength_over pairs each value of its collection");
     // Both directions: the result is the collection's own shape, not a sub- or supertype.
+    let _ = ctx.require_sub(&expected, &recorded, &at);
+    let _ = ctx.require_sub(&recorded, &expected, &at);
+}
+
+/// The rule for [`Builtin::Unbox`]: `(𝑐 : Σ (σ : 𝐾). 𝐷[σ] ⤇ 𝑉) ⇒ 𝐷[σ ↦ σ(𝑐)] ⤇ 𝑉`, the sum's
+/// body with each witness projected through the binder. Recorded into `ctx.errors`, as
+/// `require_sub` records.
+fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
+    let expected = (|| {
+        let Type::Fun {
+            name: Some(boxed),
+            domain,
+            codomain,
+            ..
+        } = ty.peel_refinements()
+        else {
+            return None;
+        };
+        let recorded = crate::ccl::subst::open_codomain(ty, codomain);
+        // A reference compared against and rendered, never placed in a tree.
+        let term = std::rc::Rc::new(
+            Expr::throwaway(TypedExprNode::Var(boxed.clone())).with_ty((**domain).clone()),
+        );
+        Some((crate::ccl::ty::unboxed_type(domain, &term)?, recorded))
+    })();
+    let Some((expected, recorded)) = expected else {
+        let error = ctx.raise(InferError::TypeMismatch {
+            found: Box::new(ty.clone()),
+            expected: None,
+            ctx: format!("{label}: unbox takes a sum to its collection"),
+        });
+        ctx.errors.push(error);
+        return;
+    };
+    let at = || format!("{label}: unbox projects the sum's witness through its argument");
+    // Both directions: the result is the sum's own body, not a sub- or supertype.
     let _ = ctx.require_sub(&expected, &recorded, &at);
     let _ = ctx.require_sub(&recorded, &expected, &at);
 }

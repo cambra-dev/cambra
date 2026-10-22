@@ -561,6 +561,8 @@ pub fn freshen_above(
         // [`Type::alpha_convert_sum`] on the way out of the `Fun` arm; a kind variable's is
         // re-minted with the variable ([`freshen_kind_var`]), and the cache is what carries
         // that rename to the references — in this type and in the bounds copied with it.
+        // Minted after inference, so no scheme reaches one.
+        Type::WitnessProjection(_) => ty.clone(),
         Type::WitnessRef(w) => match cache.witnesses.get(w) {
             Some(fresh) => Type::WitnessRef(*fresh),
             None => ty.clone(),

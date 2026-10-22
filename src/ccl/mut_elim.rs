@@ -50,6 +50,7 @@
 
 use crate::ccl::Label;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::ccl::feed_nest::LoopFeed;
 use crate::ccl::{
@@ -923,8 +924,8 @@ fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
 /// [`Builtin::Box`]. A write `m := box(…)` names one key domain the same way. A keyed write
 /// needs nothing here: [`desugar_keyed_writes`] builds its `insert` at the variable's type.
 ///
-/// Stating the mutable variable's value type on that introduction is also what keeps it. `unbox`
-/// erases a box whose **stated** sum lists one candidate, reading the kind off `box`'s own
+/// Stating the mutable variable's value type on that introduction is also what keeps it.
+/// `erase_determined_boxes` erases a box whose **stated** sum lists one candidate, reading the kind off `box`'s own
 /// function type, and a described kind lists none
 /// (`src/ccl/planning/conditionals.rs`). So a seed built by a conditional still realizes —
 /// the fan-out acts on the inner, multi-candidate sum — while the introduction that states
@@ -1185,39 +1186,68 @@ pub(crate) fn tvar(name: &Name, ty: Type) -> Expr {
     e
 }
 
-/// Reject a `for` loop over a collection whose type is a sum.
-///
-/// A loop's history is a function over its source's domain ([`fun_parts`]), and a sum's
-/// domain is a reference to the witness the sum binds. The history stands outside the sum, so
-/// the reference in its domain has no binder, and nothing drives a loop over a domain only
-/// the value holds (`src/ccl/design/collections.md`, "Compiling a conditional collection").
-/// This holds for a determined sum as well: planning erases one only after this phase has
-/// typed the history. Runs on the inlined tree ahead of the transactional slice and
-/// [`run`], which both build a history over a loop's source.
-pub(crate) fn check_no_loop_over_a_sum(expr: &Expr) -> Result<(), provenance::Located<String>> {
-    if let TypedExprNode::For { iter, .. } = &expr.node
-        && matches!(
-            fun_parts(&iter.ty).0.peel_refinements(),
-            Type::WitnessRef(_)
-        )
+/// Refuse a loop that writes a mutable variable over a conditional collection, a sum written in
+/// place or bound by a `let`. A loop over a sum types its history over the source's projected
+/// witness (`src/ccl/design/collections.md`, "A `for` loop over a sum"), and realization copies a
+/// conditional into each of its consumers, a copy the projection quotes and realization does not
+/// rewrite.
+pub(crate) fn refuse_loops_writing_over_conditionals(expr: &Expr) -> Result<(), String> {
+    refuse_under(expr, &mut Vec::new())
+}
+
+/// [`refuse_loops_writing_over_conditionals`] under the `let`-bound conditionals in scope, each
+/// with its definition's rendering.
+fn refuse_under(expr: &Expr, conditionals: &mut Vec<(Name, String)>) -> Result<(), String> {
+    if let TypedExprNode::For { iter, body, .. } = &expr.node
+        && writes_a_mutable(body)
+        && source_fun(&iter.ty).sum().is_some()
+        && let Some(conditional) = match &iter.node {
+            TypedExprNode::Case { .. } => Some(symbolic(iter)),
+            TypedExprNode::Var(name) => conditionals
+                .iter()
+                .find(|(bound, _)| bound == name)
+                .map(|(_, definition)| definition.clone()),
+            _ => None,
+        }
     {
-        return Err(provenance::Located::new(
-            format!(
-                "a `for` loop over a collection whose type is a sum is not supported yet: `{}` \
-                 has type {}. A comprehension over it compiles",
-                symbolic(iter),
-                iter.ty
-            ),
-            iter.node_id(),
+        return Err(format!(
+            "a `for` loop writing a mutable variable over a conditional collection is not \
+             compiled yet: `{conditional}` has type {}",
+            iter.ty
         ));
+    }
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &expr.node
+    {
+        refuse_under(bound_expr, conditionals)?;
+        let scope = conditionals.len();
+        if matches!(bound_expr.node, TypedExprNode::Case { .. }) {
+            conditionals.push((binding.name.clone(), symbolic(bound_expr)));
+        }
+        let result = refuse_under(body, conditionals);
+        conditionals.truncate(scope);
+        return result;
     }
     let mut result = Ok(());
     expr.walk_children(|child| {
         if result.is_ok() {
-            result = check_no_loop_over_a_sum(child);
+            result = refuse_under(child, conditionals);
         }
     });
     result
+}
+
+/// Whether `body` writes a mutable variable anywhere.
+fn writes_a_mutable(body: &Expr) -> bool {
+    if matches!(body.node, TypedExprNode::MutWrite { .. }) {
+        return true;
+    }
+    let mut found = false;
+    body.walk_children(|child| found = found || writes_a_mutable(child));
+    found
 }
 
 /// Destructure a (possibly refinement- or `Mut`-wrapped) function type.
@@ -1227,6 +1257,17 @@ pub(crate) fn check_no_loop_over_a_sum(expr: &Expr) -> Result<(), provenance::Lo
 /// mutable variable's value type; `erase_mut` clears the residual `Mut` on the source node
 /// at the end of the phase.
 pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
+    match source_fun(ty) {
+        Type::Fun {
+            domain, codomain, ..
+        } => (*domain, *codomain),
+        other => panic!("letrec phase: loop source is not a function: {other}"),
+    }
+}
+
+/// The function type a loop source denotes, under its refinements and a mutable collection's
+/// `Mut` ([`fun_parts`]).
+fn source_fun(ty: &Type) -> Type {
     let mut t = ty;
     loop {
         match t {
@@ -1237,16 +1278,67 @@ pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
             Type::History {
                 history_kind: HistoryKind::Overwrite,
                 ..
-            } => t = t.history_parts().expect("matched a history").1,
-            _ => break,
+            } => return source_fun(t.history_parts().expect("matched a history").1),
+            _ => return t.clone(),
         }
     }
-    match t {
-        Type::Fun {
-            domain, codomain, ..
-        } => ((**domain).clone(), (**codomain).clone()),
-        other => panic!("letrec phase: loop source is not a function: {other}"),
-    }
+}
+
+/// `iter` as the collection a loop reads its items from: a sum unboxed, so its domain names the
+/// witness through the source exactly as the loop's positions do ([`loop_domain`]). A plain
+/// collection is itself.
+fn unboxed_source(iter: &Expr) -> Expr {
+    let value_ty = source_fun(&iter.ty);
+    // Every node this builds, the stamp's binder reference included, is a mint the loop's
+    // source owes: recorded against it, so a later rewrite naming one has its history.
+    let _g = provenance::enter(
+        iter.node_id(),
+        "mut_elim.unbox",
+        provenance::Nature::Machinery,
+    );
+    let Some(stamp) = crate::ccl::ty::unbox_type(&value_ty) else {
+        return iter.clone();
+    };
+    let source = Rc::new(source_value(iter));
+    let unboxed_ty = crate::ccl::ty::unboxed_type(&value_ty, &source)
+        .expect("`unbox_type` stamped a type, so the source is a sum");
+    let mut unboxed = Expr::apply(
+        source_value(iter),
+        Expr::builtin(Builtin::Unbox).with_ty(stamp),
+    );
+    unboxed.ty = unboxed_ty;
+    unboxed
+}
+
+/// A copy of the loop source at the collection it denotes: a mutable collection read to its value
+/// ([`fun_parts`]), as `erase_mut` leaves the source node.
+fn source_value(iter: &Expr) -> Expr {
+    let _frame = provenance::copy_frame("mut_elim.projected_source");
+    let mut source = iter.clone();
+    source.ty = source_fun(&iter.ty);
+    source
+}
+
+/// The domain a loop over `iter` ranges over, spelled for types outside the source's own: a
+/// sum's witnesses projected through the source (`src/ccl/design/collections.md`, "A `for`
+/// loop over a sum"). A plain collection's domain is its own.
+fn loop_domain(iter: &Expr) -> Type {
+    let fun = source_fun(&iter.ty);
+    let (domain, _) = fun_parts(&fun);
+    let Some(witnesses) = fun.sum() else {
+        return domain;
+    };
+    let source = Rc::new(source_value(iter));
+    witnesses
+        .iter()
+        .enumerate()
+        .fold(domain, |domain, (position, witness)| {
+            let projection = Type::WitnessProjection(crate::ccl::WitnessProjection::new(
+                Rc::clone(&source),
+                position,
+            ));
+            crate::ccl::ty::instantiate_witness(&domain, witness.id(), &projection)
+        })
 }
 
 /// A per-iteration feed collected from a loop body: the target defer, the
@@ -1714,7 +1806,8 @@ pub(crate) fn fold_induction_loop(
         "fold_induction_loop: caller must guard on a non-empty accumulator set"
     );
 
-    let (domain_ty, item_ty) = fun_parts(&iter.ty);
+    let (_, item_ty) = fun_parts(&iter.ty);
+    let domain_ty = loop_domain(iter);
     let acc_tys: Vec<Type> = accs.iter().map(|a| a.ty.clone()).collect();
     // The proposed write set, labelled by the accumulators' own names. A
     // positional tuple reads the same everywhere downstream and costs nothing
@@ -1805,7 +1898,7 @@ pub(crate) fn fold_induction_loop(
             app
         })
         .collect();
-    let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), iter.clone());
+    let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), unboxed_source(iter));
     item_read.ty = item_ty.clone();
     snap_elts.push(item_read);
     // The type rewrites read the argument without placing it, so they take copies that keep

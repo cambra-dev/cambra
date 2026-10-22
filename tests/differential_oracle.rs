@@ -499,11 +499,13 @@ fn atom_json(a: &AtomKey) -> Option<String> {
         // has no witness — outside the fragment for the same reason `ChanDom` is. Nor
         // does it have type parameters, which exist only inside a polymorphic
         // definition's body. A dependent tuple's components read one another by
-        // index, and the model has no binders.
+        // index, and the model has no binders. A witness projection names a witness
+        // through a term, which the model has neither of.
         AtomKey::ChanDom(..)
         | AtomKey::Witness(..)
         | AtomKey::Param(..)
-        | AtomKey::DepTuple(..) => return None,
+        | AtomKey::DepTuple(..)
+        | AtomKey::Projection(..) => return None,
     })
 }
 
