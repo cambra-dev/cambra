@@ -16,15 +16,15 @@ tags: [cambra, simplification, daily-run]
 
 | PR | change | diff | staff review |
 |---|---|---|---|
-| [#N](url) — title | {{one sentence naming the code}} | +a −b, net production ±n | {{n addressed in `fix-commit-id` / none}} |
+| [#N](url) — title <!-- doc-refs-ignore: template placeholder --> | {{one sentence naming the code}} | +a −b, net production ±n | {{n addressed in `fix-commit-id` / none}} |
 
-{{Per PR with staff-review findings: each finding's title line (`<category> : <location>
-<summary>`) and disposition — addressed, declined with the reason, dropped with the fix commit, or
-escalated to "Structural findings" for an `Architectural` finding.}}
+{{Per PR with staff-review findings: each finding's title line (`<kind> : <location> <summary>`)
+and its disposition: addressed, declined with the reason, or dropped with the fix commit.
+Architectural findings go under "Structural findings".}}
 
 ## Attempted, not pushed
 
-### {{subject in words}} — abandoned: {{reason class}} | discarded: reviewer {{REJECT}} | discarded: staff review {{unaddressed Critical finding}}
+### {{subject in words}} — abandoned: {{reason class}} | discarded: reviewer {{REJECT}} | discarded: staff review {{declined `incorrect` finding}} | discarded: reviewer edited the workspace
 
 - **Locations:** `path:lines`
 - **What happened:** {{two sentences}}
@@ -36,6 +36,10 @@ escalated to "Structural findings" for an `Architectural` finding.}}
 | candidate | category | locations | disposition |
 |---|---|---|---|
 | {{claim in words}} | duplication | `path:lines` | rejected at triage: hallucinated / not useful / design conflict (doc + heading) / history / deferred (ranked below the cut) |
+
+## Merge rate
+
+{{The merge-rate table from `$RUN/history.md`: per category, PRs merged, closed and open.}}
 
 ## Structural findings
 

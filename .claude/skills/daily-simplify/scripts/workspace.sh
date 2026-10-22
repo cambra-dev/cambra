@@ -20,13 +20,13 @@
 # by default <srcs>/vault, and must hold _system/AI-CONTEXT.md. Dates are America/Denver, as for
 # the vault's other jobs.
 #
-# Every jj call runs from the default workspace with --ignore-working-copy, so it never
-# snapshots or rewrites the user's working copy in cambra/.
+# The default workspace is `CAMBRA_REPO`, by default <srcs>/cambra. Every jj call runs against it
+# with --ignore-working-copy, so it never snapshots or rewrites the user's working copy.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRCS="${CAMBRA_SRCS:-$(cd "${HERE}/../../../../.." && pwd)}"
-REPO="${SRCS}/cambra"
+REPO="${CAMBRA_REPO:-${SRCS}/cambra}"
 CACHE="${CAMBRA_BUILD_CACHES:-${SRCS}/cambra_build_caches}/simplify-cache"
 TODAY="$(TZ=America/Denver date -I)"
 JJ=(jj -R "${REPO}" --ignore-working-copy --config ui.editor=true --config ui.paginate=never)

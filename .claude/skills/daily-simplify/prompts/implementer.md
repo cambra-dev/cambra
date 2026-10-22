@@ -27,8 +27,8 @@ behaviour is the failure this process exists to prevent.
   example `… in-workspace.sh {{WS}} 1800 cargo test <name>`. It uses the workspace's cargo target
   and a timeout. A test killed by the timeout under a temporary break counts as the test catching
   the break; on unmodified or refactored code it is a `behaviour-change`.
-- Run gates with `{{SKILL}}/scripts/gate.sh {{WS}} {{SCRATCH}}/gate fast` or `… full`. Each
-  writes `{{SCRATCH}}/gate-<step>.log` and prints its tail.
+- Run the gate, `./ci.sh fast`, with `{{SKILL}}/scripts/gate.sh {{WS}} {{SCRATCH}}/gate`. It
+  writes `{{SCRATCH}}/gate.log` and prints its tail.
 - Run pin checks (step 2) as targeted `cargo test <name>` runs, never the whole suite, and run at
   most one cargo command at a time.
 
@@ -40,7 +40,9 @@ behaviour is the failure this process exists to prevent.
 
 - Files you may touch: {{FILES}}. Adding a test file or a design-doc fix the candidate names is
   allowed.
-- Changed lines (`jj diff --stat` total): at most {{MAX_LINES}}.
+- Changed lines (`jj diff --stat` total, files under `tests/` excluded): at most {{MAX_LINES}}.
+  Tests you add in step 2 do not count. A test added inside a production file's `#[cfg(test)]`
+  module does count, so put a new test under `tests/`.
 - Expected net production line delta: {{NET_SIGN}}.
 
 ## Governing design docs
@@ -61,9 +63,12 @@ hard-wrapping Markdown at 100 columns.
    Check that it really does by temporarily breaking the code, for example by flipping a branch or
    returning early. Run that test, confirm it fails, then revert the break exactly. Where no test
    covers the touched behaviour, add a focused one that passes on the unmodified code before you
-   refactor. Use `indoc!` for multi-line CHL. A comment-only change skips this step.
+   refactor. Use `indoc!` for multi-line CHL. A program that compares the compiler against the
+   differential interpreter goes in the grid in `tests/it/generated_pairs.rs`, as a skeleton or a
+   filler, never as a one-off case in `tests/it/differential_interp.rs`. A comment-only change
+   skips this step.
 3. **Make the change.** Make it the smallest edit that achieves the candidate, and no adjacent
-   cleanups. Run `cargo fmt`, then loop on the `fast` gate (or a targeted `cargo test <name>` for a
+   cleanups. Run `cargo fmt`, then loop on the gate (or a targeted `cargo test <name>` for a
    tight loop).
    **Encapsulation candidates** (category `encapsulation`) take two stages:
    1. Make the owner establish the fact at its boundary. Add a `debug_assert!` (or a restricted
@@ -74,8 +79,8 @@ hard-wrapping Markdown at 100 columns.
       only asserts and fails loudly: boundary asserts and post-inference re-typechecking are
       deliberate tripwires.
 4. **Watch the abandonment triggers.** Abandon when any of these happens:
-   - `scope-creep`: you need a file outside the budget, the diff passes {{MAX_LINES}} lines, or you
-     need a new abstraction the candidate did not describe.
+   - `scope-creep`: you need a file outside the budget, the diff outside `tests/` passes
+     {{MAX_LINES}} lines, or you need a new abstraction the candidate did not describe.
    - `behaviour-change`: an existing test fails for a reason other than a typo in your edit; any
      inspector golden fixture or pinned expectation moves; or any diagnostic text, `Display`
      output or iteration order changes.
@@ -85,9 +90,7 @@ hard-wrapping Markdown at 100 columns.
    - `design-conflict`: the change needs a design decision the docs do not settle.
 
    When you abandon, leave the workspace as it is. Do not revert, and do not clean up.
-5. **Full gate.** Once `fast` is green, run the `full` gate: `./ci.sh --fix`, then the
-   `doc_adoption` check on `@`. It must pass.
-6. **Describe.** `jj describe -m "<imperative subject>" -m "<two to four sentences: what was
+5. **Describe.** `jj describe -m "<imperative subject>" -m "<two to four sentences: what was
    duplicated or convoluted, what replaces it, why behaviour is unchanged>"`. No AI attribution.
 
 ## Report
@@ -101,6 +104,6 @@ change: <jj log -r @ --no-graph -T 'change_id.short(12)'>
 diff: <jj diff --stat summary line>; net production lines: <±N>
 what changed: <2–4 sentences>
 behaviour evidence: <tests that pin the touched behaviour; the break you tried and the test that caught it; tests added>
-gate: <the full gate's last line; the gate-*.log paths under {{SCRATCH}}>
+gate: <the gate's last line; {{SCRATCH}}/gate.log>
 learned: <for ABANDONED: what the candidate got wrong, in a form the next run can use to avoid re-proposing it>
 ```

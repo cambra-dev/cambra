@@ -19,7 +19,9 @@ CLIPPY=1
 [[ "${3:-}" == "--no-clippy" ]] && CLIPPY=0
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="${CAMBRA_SRCS:-$(cd "${HERE}/../../../../.." && pwd)}/cambra"
+REPO="" TODAY=""
+paths="$("${HERE}/workspace.sh" paths)"
+eval "${paths}"
 TARGET="$("${HERE}/workspace.sh" target scout)"
 mkdir -p "${OUT}"
 cd "${WS}"
@@ -29,9 +31,8 @@ DIGEST="${OUT}/seeds.md"
 : > "${DIGEST}"
 section() { printf '\n## %s\n\n' "$1" >> "${DIGEST}"; }
 
-today="$(date -I)"
 base="$(jj log -r @- --no-graph -T 'commit_id.short(12)')"
-echo "# Seed signals — ${today}, main@origin ${base}" >> "${DIGEST}"
+echo "# Seed signals — ${TODAY}, main@origin ${base}" >> "${DIGEST}"
 
 # --- Hotspots: 120-day change count x code lines. -------------------------------------------
 section "Hotspots (commits touching the file in 120 days × code lines)"

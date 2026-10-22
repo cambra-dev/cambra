@@ -12,8 +12,9 @@ response to the review stay separate commits.
 
 ## Findings
 
-Each finding is a list item: a title line `<category> : <location> <summary>`, with the details
-beneath it. Locations refer to `{{CHANGE}}`.
+Each finding is a list item: a title line `<kind> : <location> <summary>`, with the details beneath
+it. The kind is `incorrect` when the finding says the change is wrong, and `improve` otherwise.
+Locations refer to `{{CHANGE}}`.
 
 {{FINDINGS}}
 
@@ -21,12 +22,9 @@ beneath it. Locations refer to `{{CHANGE}}`.
 
 1. Start the new commit before editing: `jj new {{CHANGE}} -m "Address staff review findings"`.
    Every edit after this lands in it.
-2. Decide each finding:
-   - **Critical and Important:** address it, unless the fix breaks a rule below.
-   - **Nit:** address it when the fix is local and stays inside the budget.
-   - **Decline** a finding when the fix needs a file outside the budget, changes behaviour, or
-     the finding is wrong about the code. A declined Critical finding ends the attempt: say so in
-     the report.
+2. Address each finding, or decline it with a reason. Decline only when the fix needs a file
+   outside the budget, the fix changes behaviour, or the finding is wrong about the code.
+   Declining an `incorrect` finding ends the attempt: say so in the report.
 3. The rules from your original procedure still hold:
    - no inspector golden fixture or pinned expectation moves;
    - no diagnostic text, `Display` output or iteration order changes;
@@ -42,11 +40,10 @@ beneath it. Locations refer to `{{CHANGE}}`.
    - Code you add for a finding must not rely on behaviour a reader has to work out, such as a
      zip that stops early or an iterator adaptor that drops elements. Write the case out, or say
      it in a comment.
-5. Files this commit may touch: {{FILES}}, plus test files a finding needs. Changed lines, test
-   files excluded, may not exceed {{MAX_FIX_LINES}}. A fix that needs more is a decline: say so in
+5. Files this commit may touch: {{FILES}}, plus files under `tests/` a finding needs. Changed lines
+   outside `tests/` may not exceed {{MAX_FIX_LINES}}. A fix that needs more is a decline: say so in
    the report.
-6. Gate: `cargo fmt`, then `{{SKILL}}/scripts/gate.sh {{WS}} {{SCRATCH}}/gate-fix fast` until
-   green, then `… gate.sh {{WS}} {{SCRATCH}}/gate-fix full`.
+6. Gate: `cargo fmt`, then `{{SKILL}}/scripts/gate.sh {{WS}} {{SCRATCH}}/gate-fix` until green.
    Five fix rounds without green ends the round: leave the workspace as it is.
 7. Describe: `jj describe -m "Address staff review of <subject of {{CHANGE}}>" -m "<one line per
    addressed finding: its title line and what changed>"`. No AI attribution.
@@ -64,7 +61,7 @@ fix change: <jj log -r @ --no-graph -T 'change_id.short(12)'> | none
 diff: <jj diff -r @ --stat summary line>
 addressed: <title line → what changed, one per line>
 declined: <title line → reason, one per line>
-gate: <the full gate's last line; the gate-fix-*.log paths under {{SCRATCH}}>
+gate: <the gate's last line; {{SCRATCH}}/gate-fix.log>
 ```
 
-`ENDED` means a Critical finding was declined or the gate did not go green.
+`ENDED` means an `incorrect` finding was declined or the gate did not go green.

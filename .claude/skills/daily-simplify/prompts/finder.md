@@ -17,6 +17,8 @@ file. Do not run cargo, jj or git commands that write anything.
 - Focus files: {{FOCUS_FILES}}. Spend most of your effort here, and follow references out of them
   as far as the category needs. A duplicate's other copy is usually elsewhere.
 - Already handled, so do not re-propose these unless the cited code has changed: {{HISTORY}}
+- What reviewers said on merged PRs of this category. Hold your candidates to the same standard:
+  {{GUIDANCE}}
 - Before you propose anything, read `{{SCOUT}}/CLAUDE.md`, especially "How to think about changes
   to this codebase" and "Prose style". Read the design doc that governs each file you propose to
   change: `docs/design.md`, `src/design.md`, `src/ccl/design/`, `src/interpreter/design-*.md`,

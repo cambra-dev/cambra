@@ -32,43 +32,50 @@ cleanups the change did not touch; list those under "Out of scope" instead.
 
 ## Report
 
-Write the skill's Executive Summary. A `## Findings` section takes the place of the skill's
-Architectural Notes, Detailed Feedback and Next Steps. The report ends with an `## Out of scope`
-section.
+Write the skill's Executive Summary. Three sections take the place of the skill's Architectural
+Notes, Detailed Feedback and Next Steps: `## Findings`, `## Architectural` and `## Out of scope`.
 
-Each finding is a list item. The item's first line is its title line, and the details sit
-indented beneath it:
+`## Findings` lists only what should change in this commit before it merges. A point the commit
+could take or leave is not a finding: leave it out. Each finding is a list item. The item's first
+line is its title line, and the details sit indented beneath it:
 
 ```
 ## Findings
 
-- Critical : src/ccl/simplify.rs:212 Merged arm drops the `Infer` guard
+- incorrect : src/ccl/simplify.rs:212 Merged arm drops the `Infer` guard
   <what is wrong and why, the concrete fix, and the test case the skill asks for>
-- Architectural : src/ccl/lower.rs Zip helper belongs to the lowering module
-  <the design problem, and what resolving it would touch>
+- improve : src/ccl/simplify.rs:240 Comment narrates the old loop
+  <what should change, and the replacement>
+
+## Architectural
+
+- src/ccl/lower.rs Zip helper belongs to the lowering module
+  <the design problem, the files and concepts the separate change would touch, and the design
+  question it must settle first, if any>
 
 ## Out of scope
 
 - src/ccl/inline.rs:88 <adjacent problem the diff did not touch>
 ```
 
-The title line has three parts:
+A finding's title line has three parts:
 
-- **Category**, one of four:
-  - `Critical`: the change is wrong. It changes behaviour, breaks an invariant, or contradicts a
-    design doc. The commit does not merge with it unfixed.
-  - `Important`: a defect in the change that should be fixed before merge.
-  - `Nit`: a local improvement the change can take or leave.
-  - `Architectural`: a design-level problem whose fix reaches beyond this change, such as a
-    missing concept or an abstraction in the wrong module. It is recorded for a human and not
-    fixed here. A design problem that makes the change itself wrong is `Critical`, not
-    `Architectural`.
+- **Kind**, one of two:
+  - `incorrect`: the change is wrong. It changes behaviour, breaks an invariant, or contradicts a
+    design doc. Declining it ends the attempt.
+  - `improve`: anything else that should change before merge.
 - **Location**: `path:line` at commit `{{CHANGE}}`, or `path` when no single line holds the
   finding, or `-` when no file does. Do not invent a line number to fit the format.
 - **Summary**: under 60 characters. It names the finding; the details beneath it carry the
   substance.
 
+`## Architectural` lists design-level problems whose fix reaches beyond this change, such as a
+missing concept or an abstraction in the wrong module. Each item is the brief for a separate change,
+which a later run or a human picks up, so give it enough detail to act on. Its title line is the
+location and summary, without a kind. A design problem whose fix fits this change is a finding: an
+`incorrect` one when it makes the change wrong, an `improve` one otherwise.
+
 No two title lines in one review are the same: the title line identifies the finding to the agent
 that addresses it and in the run log.
 
-Write `## Findings` followed by `none` when there are no findings.
+Write `none` under a section that has no items.

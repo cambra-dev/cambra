@@ -30,7 +30,7 @@ The evidence says nothing about:
 - workspace isolation;
 - tightening comments.
 
-Those parts of the skill rest on cambra's own conventions (`cambra/CLAUDE.md`) and on judgement.
+Those parts of the skill rest on cambra's own conventions (`CLAUDE.md`) and on judgement.
 
 Open questions worth revisiting as the run accumulates history:
 
@@ -38,4 +38,4 @@ Open questions worth revisiting as the run accumulates history:
 - Which diff-size thresholds best predict that an attempt has turned compound?
 - How often do triage and the reviewer disagree?
 
-The logs answer the last one.
+The merge-rate table in each run log answers the last one.

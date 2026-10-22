@@ -15,8 +15,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WSH="${HERE}/workspace.sh"
-SRCS="${CAMBRA_SRCS:-$(cd "${HERE}/../../../../.." && pwd)}"
-REPO="${SRCS}/cambra"
+SRCS="" REPO=""
+paths="$("${WSH}" paths)"
+eval "${paths}"
 DIR="${SRCS}/cambra-simplify-scout"
 JJ=(jj -R "${REPO}" --ignore-working-copy --config ui.paginate=never)
 
