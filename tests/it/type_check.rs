@@ -3268,13 +3268,20 @@ fn test_unbound_define_target_errors() {
     );
 }
 
-#[test]
-fn test_unbound_mut_write_target_errors() {
-    let errs = infer_program_err("x += 1");
+/// An unbound `Feed`, `Define` or `MutWrite` target is raised by that node's own
+/// rule. The written value is a literal, so no `Var` rule can raise the error instead.
+#[rstest]
+#[case::feed(Expr::feed("x", Expr::lit(Lit::Int(1))))]
+#[case::define(Expr::define("x", Expr::lit(Lit::Int(1))))]
+#[case::mut_write(Expr::mut_write("x", Expr::lit(Lit::Int(1))))]
+fn test_unbound_write_target_is_blamed_on_the_writing_node(#[case] mut expr: Expr) {
+    let write_id = expr.node_id();
+    let errors = infer(&mut expr, &mut TypeInferenceContext::new()).expect_err("`x` is unbound");
+    assert_eq!(errors[0].node_id, write_id);
     assert!(
-        errs.iter()
-            .any(|e| matches!(e, InferError::UnboundVariable(n) if n == "x")),
-        "writing an unbound name must report UnboundVariable, got {errs:?}"
+        matches!(&errors[0].error, InferError::UnboundVariable(n) if n == "x"),
+        "got {:?}",
+        errors[0].error
     );
 }
 
