@@ -2925,8 +2925,9 @@ fn decision_writes(dec: Expr) -> (BranchWrites, BranchScope) {
 }
 
 /// Build the writer decision `{commit, writes}` for a statement-`Case`, from its
-/// *writing* branches (first-match predicate + write set each) and the entering
-/// accumulator `snapshot`.
+/// writing branches (first-match predicate + write set each), the `carry` (the
+/// accumulators after any unconditional write), and the `entering` accumulator
+/// snapshots.
 ///
 /// One **carry-complete** shape covers every arity — one conditional write,
 /// `if/else`-both-write, `elif`-with-writes, and the pure-guard carry:
@@ -2946,9 +2947,8 @@ fn decision_writes(dec: Expr) -> (BranchWrites, BranchScope) {
 ///   evaluated at the positions its guard admits — never at a carried position.
 ///
 /// Carry-completeness is also what makes a **`.writes`-cycling** realization correct
-/// for an **async source**: `writes` carries `snapshotᵢ` (the previous accumulator)
-/// wherever no guard fires, so the guard is honored by the value rather than
-/// silently dropped.
+/// for an **async source**: `writes` carries `carryᵢ` wherever no guard fires, so
+/// the guard is honored by the value rather than dropped.
 fn conditional_decision(
     writing: Vec<(Expr, BranchWrites)>,
     carry: BranchWrites,
