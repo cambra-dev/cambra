@@ -1,21 +1,21 @@
 //! A document's folding ranges (`cambra-lsp/design-cambra-lsp.md`, "Folding
 //! ranges"). Every range is whole lines.
 
-use crate::document::Document;
+use crate::document::{Document, is_layout};
 use chl_parser::ast::{Span, Spanned};
-use chl_parser::lexer::{Token, tokenize};
-use chl_parser::{Expr, FileId, Stmt};
+use chl_parser::lexer::Token;
+use chl_parser::{Expr, Stmt};
 use lsp_types::{FoldingRange, FoldingRangeKind};
 
 pub(crate) fn folding_ranges(doc: &Document) -> Vec<FoldingRange> {
-    let tokens = tokenize(FileId::ROOT, doc.text()).tokens;
+    let tokens = doc.tokens();
     let mut out = Vec::new();
     if let Some(module) = &doc.parsed().value {
         for stmt in &module.body {
-            blocks(doc, &tokens, stmt, &mut out);
+            blocks(doc, tokens, stmt, &mut out);
         }
     }
-    brackets(doc, &tokens, &mut out);
+    brackets(doc, tokens, &mut out);
     comments(doc, &mut out);
     out.sort_by_key(|range| (range.start_line, range.end_line));
     out.dedup_by_key(|range| (range.start_line, range.end_line));
@@ -97,16 +97,10 @@ fn body_fold(
 ) -> Option<FoldingRange> {
     let (first, last) = (body.first()?, body.last()?);
     let before = tokens.partition_point(|(_, span)| span.start < first.span.start);
-    let (_, header_end) = tokens[..before].iter().rev().find(|(tok, _)| {
-        !matches!(
-            tok,
-            Token::Newline
-                | Token::Indent
-                | Token::Dedent
-                | Token::BlockValueIndent
-                | Token::BlockValueDedent
-        )
-    })?;
+    let (_, header_end) = tokens[..before]
+        .iter()
+        .rev()
+        .find(|(tok, _)| !is_layout(tok))?;
     let start_line = doc.line(header_end.start);
     let end_line = last_line(doc, last.span);
     (end_line > start_line).then(|| range(start_line, end_line, None))
@@ -130,11 +124,10 @@ fn match_fold(
     (end_line > start_line).then(|| range(start_line, end_line, None))
 }
 
-/// The line holding the last non-blank character of `span`. A block
-/// statement's span runs past the blank lines after its body.
+/// The line `span`'s source ends on ([`Document::content_end`]), which leaves out the
+/// blank lines and comments a block statement's span runs over.
 fn last_line(doc: &Document, span: Span) -> u32 {
-    let kept = doc.text()[span.start..span.end].trim_end().len();
-    doc.line(span.start + kept.saturating_sub(1))
+    doc.line(doc.content_end(span).saturating_sub(1).max(span.start))
 }
 
 /// A fold for each bracketed region that spans lines. A close bracket that

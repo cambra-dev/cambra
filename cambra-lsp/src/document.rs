@@ -2,6 +2,7 @@
 //! text (`cambra-lsp/design-cambra-lsp.md`, "Documents").
 
 use chl_parser::ast::{Module, Span};
+use chl_parser::lexer::{Token, tokenize};
 use chl_parser::line_index::{Encoding, LineCol, LineIndex};
 use chl_parser::parser::ParseResult;
 use chl_parser::{FileId, parse_module};
@@ -18,6 +19,8 @@ pub(crate) struct Document {
     /// The parse of `text`, made the first time it is asked for and
     /// discarded when `text` changes.
     parsed: OnceCell<ParseResult<Module>>,
+    /// The tokens of `text`, kept and discarded as `parsed` is.
+    tokens: OnceCell<Vec<(Token, Span)>>,
 }
 
 impl Document {
@@ -28,6 +31,7 @@ impl Document {
             version,
             encoding,
             parsed: OnceCell::new(),
+            tokens: OnceCell::new(),
         }
     }
 
@@ -49,6 +53,41 @@ impl Document {
             .get_or_init(|| parse_module(FileId::ROOT, &self.text))
     }
 
+    /// The tokens of the current text, lexing it if it has changed.
+    pub(crate) fn tokens(&self) -> &[(Token, Span)] {
+        self.tokens
+            .get_or_init(|| tokenize(FileId::ROOT, &self.text).tokens)
+    }
+
+    /// The end of `span`'s source. A block statement's span runs to the token after its
+    /// body, so it covers the blank lines and comments between the two; this end excludes
+    /// them. It is the end of the last token inside `span` that is not a layout token,
+    /// extended over the rest of that token's line up to a comment, which covers a close
+    /// bracket the lexer dropped from the stream. Every string is a token, so a `#` after
+    /// the last token starts a comment. `span.start` when `span` holds no such token.
+    pub(crate) fn content_end(&self, span: Span) -> usize {
+        let tokens = self.tokens();
+        let past = tokens.partition_point(|(_, t)| t.start < span.end);
+        let Some((_, last)) = tokens[..past]
+            .iter()
+            .rev()
+            .take_while(|(_, t)| t.start >= span.start)
+            .find(|(tok, _)| !is_layout(tok))
+        else {
+            return span.start;
+        };
+        let line = self.index.line_col(last.end).line;
+        let line_end = self
+            .index
+            .line_range(line)
+            .expect("a token's line exists")
+            .end
+            .min(span.end);
+        let rest = &self.text[last.end..line_end.max(last.end)];
+        let before_comment = rest.split('#').next().unwrap_or_default();
+        last.end + before_comment.trim_end().len()
+    }
+
     /// Applies one edit from a `didChange`. A range whose start lies after its
     /// end is refused and leaves the text unchanged.
     pub(crate) fn apply(&mut self, change: TextDocumentContentChangeEvent) -> Result<(), String> {
@@ -67,6 +106,7 @@ impl Document {
         }
         self.index = LineIndex::new(&self.text);
         self.parsed = OnceCell::new();
+        self.tokens = OnceCell::new();
         Ok(())
     }
 
@@ -110,6 +150,19 @@ impl Document {
     }
 }
 
+/// Whether `tok` is a line break or an indentation token, which the lexer emits for the
+/// layout around source rather than for source text.
+pub(crate) fn is_layout(tok: &Token) -> bool {
+    matches!(
+        tok,
+        Token::Newline
+            | Token::Indent
+            | Token::Dedent
+            | Token::BlockValueIndent
+            | Token::BlockValueDedent
+    )
+}
+
 /// Protocol positions are `u32`s; a document of 4 GiB or more is out of the
 /// protocol's range anyway.
 fn to_u32(n: usize) -> u32 {
@@ -136,6 +189,39 @@ mod tests {
                 text: text.to_owned(),
             },
         )
+    }
+
+    /// The end of the first top-level statement's source, as `line:col`, 1-based.
+    fn first_statement_end(text: &str) -> String {
+        let doc = Document::new(text.to_owned(), 1, Encoding::Utf8);
+        let span = doc.parsed().value.as_ref().expect("a module").body[0].span;
+        let end = doc.index().line_col(doc.content_end(span));
+        format!("{}:{}", end.line + 1, end.col + 1)
+    }
+
+    #[test]
+    fn a_block_statement_ends_before_the_comments_after_it() {
+        let text = indoc::indoc! {"
+            def f(a):
+                a + 1
+
+            # a comment after the body
+            # and another
+            y = 2
+        "};
+        assert_eq!(first_statement_end(text), "2:10");
+    }
+
+    #[test]
+    fn a_statement_ends_before_its_trailing_comment() {
+        assert_eq!(first_statement_end("x = 1  # one\ny = 2\n"), "1:6");
+    }
+
+    /// The lexer drops a `]` that does not match the open `(`, and the statement's source
+    /// still ends after it.
+    #[test]
+    fn a_dropped_close_bracket_stays_inside_its_statement() {
+        assert_eq!(first_statement_end("x = f(a]  # no\ny = 2\n"), "1:9");
     }
 
     #[test]

@@ -133,13 +133,11 @@ fn symbol(
     }
 }
 
-/// `span` without trailing whitespace. A block statement's span runs past the
-/// line break that ends its body, which would put the end of its range on
-/// the next line.
+/// `span` ending where its source does ([`Document::content_end`]). A block statement's
+/// span runs to the token after its body, past the blank lines and comments between.
 fn trim_end(doc: &Document, span: Span) -> Span {
-    let kept = doc.text()[span.start..span.end].trim_end().len();
     Span {
-        end: span.start + kept,
+        end: doc.content_end(span),
         ..span
     }
 }
