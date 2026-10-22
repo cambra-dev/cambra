@@ -514,6 +514,9 @@ pub struct LoweringContext {
     /// The sinks the module being lowered declares, in the order lowered, which
     /// each run of it registers ([`Self::register_sinks`]).
     declared_sinks: Vec<DeclaredSink>,
+    /// Each parameter of the module being lowered, recorded as its `param`
+    /// statement lowers.
+    pub(super) parameters: Vec<modules::Parameter>,
 }
 
 /// A sink a module declares: lowering binds its name, and each run of the
@@ -1548,6 +1551,7 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
     let members = modules::top_level_bindings(&module.body);
     errors.extend(modules::public_names_bound_twice(&members));
     errors.extend(use_name_members(&members, ctx));
+    errors.extend(parameter_names_bound_twice(&module.body, &members, ctx));
     errors.extend(use_name_members(
         &modules::top_level_aliases(&module.body),
         ctx,
@@ -1561,17 +1565,20 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
         // `pub` decides what an importer reaches, which the interface records,
         // and an `import` binds a name lowering resolves through the module's
         // scope. Neither leaves anything in the lowered tree.
+        // A parameter is in scope throughout its module, so its `let` heads the
+        // module's chain (`docs/chl-spec.md`, "9.4 Parameters").
+        let (parameters, rest): (Vec<_>, Vec<_>) = module
+            .body
+            .iter()
+            .filter(|stmt| !matches!(stmt.node, ChlStmt::Import { .. }))
+            .map(|stmt| match &stmt.node {
+                ChlStmt::Pub { stmt, .. } => (**stmt).clone(),
+                _ => stmt.clone(),
+            })
+            .partition(|stmt| matches!(stmt.node, ChlStmt::Param { .. }));
         let unmarked = ChlModule {
             file: module.file,
-            body: module
-                .body
-                .iter()
-                .filter(|stmt| !matches!(stmt.node, ChlStmt::Import { .. }))
-                .map(|stmt| match &stmt.node {
-                    ChlStmt::Pub { stmt, .. } => (**stmt).clone(),
-                    _ => stmt.clone(),
-                })
-                .collect(),
+            body: parameters.into_iter().chain(rest).collect(),
         };
         match lowered {
             Lowered::Root => lower_stmts_recovering(&unmarked, ctx, &mut errors),
@@ -1614,6 +1621,60 @@ fn module_name_binders(binders: &[(SmolStr, Span)], ctx: &LoweringContext) -> Ve
             )
         })
         .collect()
+}
+
+/// One error per parameter whose name an earlier parameter, a `use` name or a
+/// member of the module also takes: a parameter is in scope throughout its
+/// module, and so is a `use` name, so any of them would give one spelling two
+/// meanings at the top level (`docs/chl-spec.md`, "9.4 Parameters").
+fn parameter_names_bound_twice(
+    stmts: &[Spanned<ChlStmt>],
+    members: &[modules::TopLevelBinding],
+    ctx: &LoweringContext,
+) -> Vec<LoweringError> {
+    let mut errors = Vec::new();
+    let mut parameters: HashMap<&str, Span> = HashMap::new();
+    for stmt in stmts {
+        let ChlStmt::Param { name, .. } = &stmt.node else {
+            continue;
+        };
+        if let Some(used) = ctx.module.uses.get(&name.node) {
+            errors.push(
+                LoweringError::unsupported(
+                    stmt.span,
+                    format!(
+                        "`{}` is a `use` name, so no parameter of its module takes it",
+                        name.node
+                    ),
+                )
+                .with_related(used.item, "bound by `use` here"),
+            );
+        }
+        if let Some(earlier) = parameters.insert(name.node.as_str(), stmt.span) {
+            errors.push(
+                LoweringError::unsupported(
+                    stmt.span,
+                    format!("`{}` is already a parameter", name.node),
+                )
+                .with_related(earlier, "declared here first"),
+            );
+        }
+    }
+    for member in members {
+        if let Some(parameter) = parameters.get(member.name.as_str()) {
+            errors.push(
+                LoweringError::unsupported(
+                    member.span,
+                    format!(
+                        "`{}` is a parameter, so no member of its module takes it",
+                        member.name
+                    ),
+                )
+                .with_related(*parameter, "the parameter"),
+            );
+        }
+    }
+    errors
 }
 
 /// One error per member spelled like a `use` name: a `use` name is in scope
@@ -1665,6 +1726,7 @@ pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<Lowe
                 | ChlStmt::TypeDecl(_)
                 | ChlStmt::Impl(_)
                 | ChlStmt::Import { .. }
+                | ChlStmt::Param { .. }
                 | ChlStmt::Pass
                 | ChlStmt::Error => return None,
                 ChlStmt::Run { .. } => {

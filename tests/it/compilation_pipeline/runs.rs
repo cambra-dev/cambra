@@ -244,10 +244,6 @@ fn a_run_name_is_in_scope_below_its_statement(#[case] root: &str, #[case] needle
     "},
     "`counter` is already an import name"
 )]
-#[case::an_argument(indoc! {"
-    run counter(x=1)
-    1
-"}, "an argument to `run` is not supported yet")]
 #[case::public(indoc! {"
     pub run counter
     1
@@ -379,4 +375,261 @@ fn two_runs_serving_one_route_are_refused() {
         "{errors}"
     );
     assert!(errors.contains("the run that serves it first"), "{errors}");
+}
+
+/// A module of value parameters: `base` without a default, `step` with one.
+const STEPPER: &str = indoc! {"
+    param base: Int
+    param step: Int = 1
+    pub total = base + step
+"};
+
+/// A run's parameters take its arguments, and a parameter without one takes
+/// its default (`docs/chl-spec.md`, "9.4 Parameters"). An argument is any
+/// expression over the names above the run: the module's own members, and
+/// another run's members, so one run's result can be passed into another.
+#[rstest]
+#[case::default(indoc! {"
+    run stepper(base=10) as a
+    a::total
+"}, 11)]
+#[case::overriding_a_default(indoc! {"
+    run stepper(base=10, step=5) as a
+    a::total
+"}, 15)]
+#[case::two_runs_two_arguments(
+    indoc! {"
+        run stepper(base=1) as a
+        run stepper(base=100) as b
+        a::total + b::total
+    "},
+    103
+)]
+#[case::another_runs_member(
+    indoc! {"
+        run stepper(base=1) as a
+        run stepper(base=a::total) as b
+        b::total
+    "},
+    3
+)]
+#[case::the_modules_own_member(indoc! {"
+    x = 41
+    run stepper(base=x) as a
+    a::total
+"}, 42)]
+#[case::through_a_run_that_passes_its_own(indoc! {"
+    run relay(start=7) as r
+    r::out
+"}, 8)]
+#[timeout(Duration::from_secs(10))]
+fn a_runs_parameters_take_its_arguments(#[case] root: &str, #[case] expected: i64) {
+    let relay = indoc! {"
+        param start: Int
+        run stepper(base=start) as s
+        pub out = s::total
+    "};
+    check_program_scalar(
+        &program(root, &[("stepper", STEPPER), ("relay", relay)]),
+        Value::Int(expected),
+    );
+}
+
+/// The root and an imported module are run by no `run` statement, so their
+/// parameters take their defaults.
+#[rstest]
+#[case::root(indoc! {"
+    param n: Int = 5
+    n + 1
+"}, &[], 6)]
+#[case::imported(
+    indoc! {"
+        import scaled
+        scaled::by(3)
+    "},
+    &[("scaled", indoc! {"
+        param scale: Int = 2
+        pub def by(x):
+            x * scale
+    "})],
+    6
+)]
+#[case::inferred(
+    indoc! {"
+        run bump(k=3) as b
+        b::v
+    "},
+    &[("bump", indoc! {"
+        param k: _
+        pub v = k + 1
+    "})],
+    4
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_parameter_without_an_argument_takes_its_default(
+    #[case] root: &str,
+    #[case] modules: &[(&str, &str)],
+    #[case] expected: i64,
+) {
+    check_program_scalar(&program(root, modules), Value::Int(expected));
+}
+
+#[rstest]
+#[case::missing(
+    indoc! {"
+        run stepper as a
+        1
+    "},
+    "the run `a` passes no argument for the parameter `base`"
+)]
+#[case::unknown(
+    indoc! {"
+        run stepper(base=1, nope=2) as a
+        1
+    "},
+    "module `stepper` has no parameter `nope`"
+)]
+#[case::mistyped(indoc! {r#"
+    run stepper(base="x") as a
+    a::total
+"#}, "annotated as Int")]
+#[case::twice(
+    indoc! {"
+        run stepper(base=1, base=2) as a
+        1
+    "},
+    "the parameter `base` already has an argument"
+)]
+#[case::root_without_a_default(
+    indoc! {"
+        param n: Int
+        n
+    "},
+    "the root module's parameter `n` has no default"
+)]
+#[case::imported_without_a_default(indoc! {"
+    import stepper
+    1
+"}, "module `stepper` is imported")]
+#[case::bound_by_a_member(
+    indoc! {"
+        run clash(base=1)
+        1
+    "},
+    "`base` is a parameter, so no member of its module takes it"
+)]
+#[case::an_import_name(
+    indoc! {"
+        run named_like_an_import(lib=1) as a
+        1
+    "},
+    "`lib` is an import name, so no binder in its module takes it"
+)]
+#[case::a_run_name(
+    indoc! {"
+        run named_like_a_run(r=1) as a
+        1
+    "},
+    "`r` is a run name, so no binder in its module takes it"
+)]
+#[case::a_use_name(
+    indoc! {"
+        run named_like_a_use(x=1) as a
+        1
+    "},
+    "`x` is a `use` name, so no parameter of its module takes it"
+)]
+#[case::unannotated(
+    indoc! {"
+        run unannotated(k=1) as u
+        1
+    "},
+    "the parameter `k` has no annotation: write its type, `param k: Int`, or `param k: _`"
+)]
+#[case::a_monomorphic_argument_for_a_polymorphic_parameter(
+    indoc! {"
+        def inc(x: Int) => Int:
+            x + 1
+        run poly(f=inc) as p
+        p::n
+    "},
+    "annotated as forall (T) T => T, but inferred as Int => Int"
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_misused_parameter_is_refused(#[case] root: &str, #[case] needle: &str) {
+    assert_refused(
+        &program(
+            root,
+            &[
+                ("stepper", STEPPER),
+                (
+                    "clash",
+                    indoc! {"
+                        param base: Int
+                        base = 2
+                    "},
+                ),
+                ("lib", "pub x = 1\n"),
+                (
+                    "named_like_an_import",
+                    indoc! {"
+                        import lib
+                        param lib: Int
+                        pub y = lib::x
+                    "},
+                ),
+                (
+                    "named_like_a_run",
+                    indoc! {"
+                        param r: Int
+                        run lib as r
+                        pub y = r::x
+                    "},
+                ),
+                (
+                    "named_like_a_use",
+                    indoc! {"
+                        import lib use x
+                        param x: Int
+                        pub y = x
+                    "},
+                ),
+                ("poly", POLY),
+                (
+                    "unannotated",
+                    indoc! {"
+                        param k
+                        pub v = k
+                    "},
+                ),
+            ],
+        ),
+        needle,
+    );
+}
+
+/// A module whose parameter is a polymorphic function, which it calls at two types.
+const POLY: &str = indoc! {r#"
+    param f: forall (T) T => T
+    pub n = f(1) if f("ab") == "ab" else 0
+"#};
+
+/// A parameter's annotation is the whole annotation of its `let`, so it may be polymorphic,
+/// and a run passes a polymorphic function for it (`docs/chl-spec.md`, "Polymorphic type
+/// annotations").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_parameter_takes_a_polymorphic_function() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                def id(x):
+                    x
+                run poly(f=id) as p
+                p::n
+            "},
+            &[("poly", POLY)],
+        ),
+        Value::Int(1),
+    );
 }

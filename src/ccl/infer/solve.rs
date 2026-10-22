@@ -1995,6 +1995,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // A `Defer` leaf's `Feed(ρ)` resolves through the standard
         // end-of-function `resolve_var_type` like any other node type.
         TypedExprNode::Defer => {}
+        TypedExprNode::Abstract => unreachable!(
+            "the linked program holds no `Abstract`: each run binds its module's parameters"
+        ),
         // Feed/Define: recurse into the contributed value; the node's own `Unit` type
         // needs no resolution.
         TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {

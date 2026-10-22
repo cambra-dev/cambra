@@ -381,6 +381,8 @@ pub enum TypedExprNode {
     /// A `run` statement in a module being lowered: the run `name` of `module`,
     /// declared by the statement at `statement`, with the rest of the declaring
     /// module in `body` (`docs/modules.md`, "A module lowers once").
+    /// `arguments` are the parameters the statement passes arguments for, each
+    /// bound above the node.
     ///
     /// Exists only between lowering and linking. Linking replaces it with the
     /// run's chain around `body`, so no pass after it sees one, and each has an
@@ -389,6 +391,7 @@ pub enum TypedExprNode {
         name: SmolStr,
         module: ModulePath,
         statement: Span,
+        arguments: Vec<SmolStr>,
         body: Box<TypedExpr>,
     },
 
@@ -844,6 +847,11 @@ pub enum TypedExprNode {
     /// Eliminated by [`crate::ccl::channelize`] before type inference.
     Defer,
 
+    /// A value known only by its type: a module's parameter with no default, in
+    /// the module's chain (`docs/modules.md`, "Runs"). Each run binds the
+    /// parameter to its argument, so the linked program holds none.
+    Abstract,
+
     /// A `with begin():` transaction block, as **one statement** (value `Unit`).
     /// `body` is the per-transaction statement chain lowering builds (a
     /// `Let`/`MutWrite`/`Case`/`Feed` chain ending in `Unit`) — the block's
@@ -921,6 +929,7 @@ impl TypedExprNode {
             TypedExprNode::Define { .. } => "Define",
             TypedExprNode::Begin { .. } => "Begin",
             TypedExprNode::Defer => "Defer",
+            TypedExprNode::Abstract => "Abstract",
             TypedExprNode::Error => "Error",
         }
     }
@@ -1766,6 +1775,7 @@ impl TypedExpr {
             | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
+            | TypedExprNode::Abstract
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
                 f(function.as_ref());
@@ -1973,6 +1983,7 @@ impl TypedExpr {
             | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
+            | TypedExprNode::Abstract
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
                 f(function.as_mut());
@@ -2113,6 +2124,7 @@ impl TypedExpr {
             | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
+            | TypedExprNode::Abstract
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
@@ -2170,6 +2182,7 @@ impl TypedExpr {
             | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
             | TypedExprNode::Defer
+            | TypedExprNode::Abstract
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }

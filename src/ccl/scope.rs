@@ -285,6 +285,7 @@ where
         | N::Source(..)
         | N::LoadFrom(_)
         | N::Defer
+        | N::Abstract
         | N::Error => {}
         N::Var(n) => f(ScopedItem::VarRef(n)),
 
@@ -570,6 +571,7 @@ where
         | N::Source(..)
         | N::LoadFrom(_)
         | N::Defer
+        | N::Abstract
         | N::Error
         | N::Apply { .. }
         | N::Cast { .. }
@@ -655,6 +657,7 @@ mod tests {
                 name: "eu".into(),
                 module: chl_parser::ModulePath::new(["shop".into()]),
                 statement: chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
+                arguments: Vec::new(),
                 body: Box::new(var("rest")),
             }),
             TypedExpr::mut_decl(
@@ -724,6 +727,7 @@ mod tests {
             node(N::Source("src".into(), Vec::new())),
             node(N::LoadFrom("load_from_var".into())),
             node(N::Defer),
+            node(N::Abstract),
             node(N::Error),
         ]
     }
@@ -846,6 +850,7 @@ mod tests {
         N::Source(..) => "Source",
         N::LoadFrom(_) => "LoadFrom",
         N::Defer => "Defer",
+        N::Abstract => "Abstract",
         N::Error => "Error",
     }
 

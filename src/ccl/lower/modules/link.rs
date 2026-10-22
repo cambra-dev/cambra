@@ -134,6 +134,24 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     let scope = lowering.scope(ast, None, ctx);
     ctx.begin_module(scope.clone());
     let lowered = lower_root(ast, ctx);
+    // The root has one run, which no `run` statement supplies arguments.
+    for stmt in &ast.body {
+        if let ChlStmt::Param {
+            name,
+            default: None,
+            ..
+        } = &stmt.node
+        {
+            lowering.errors.push(LoweringError::unsupported(
+                stmt.span,
+                format!(
+                    "the root module's parameter `{}` has no default, and no `run` statement \
+                     supplies the root's arguments: run this module from a root instead",
+                    name.node
+                ),
+            ));
+        }
+    }
     let sinks = std::mem::take(&mut ctx.declared_sinks);
     let mut errors = std::mem::take(&mut lowering.errors);
     errors.extend(lowered.errors);
@@ -230,9 +248,9 @@ impl ProgramLowering<'_> {
         let chain = lowered.value.filter(|_| clean)?;
         let interface = Interface::of_lowered(
             module,
+            ast,
             &chain,
-            &top_level_bindings(&ast.body),
-            &top_level_aliases(&ast.body),
+            std::mem::take(&mut ctx.parameters),
             |name| ctx.is_mut_param_fn(name),
             unimportable,
         );
@@ -291,7 +309,7 @@ impl ProgramLowering<'_> {
             .filter(|interface| interface.unimportable.is_none())
             .and_then(|interface| {
                 let home = Home::Shared(interface.module.clone());
-                self.create(file, Some(home), None, ctx)
+                self.create(file, Some(home), None, &[], ctx)
             });
         let (chain, names) = match created {
             Some(created) => (Some(created.chain), Some(Rc::new(created.names))),
@@ -303,22 +321,26 @@ impl ProgramLowering<'_> {
 
     /// Create a run of the module in `file` with `home` as its members' home:
     /// the shared run, with no `run` statement, or the run at the run path and
-    /// `run` statement `place`. `None` when the module has no lowering.
+    /// `run` statement `place`, which passes arguments for the parameters
+    /// `arguments`. `None` when the module has no lowering.
     ///
-    /// Its chain is a copy of the module's, with each run it declares created in
-    /// turn and put in place ([`Self::expand_runs`]). It is uniquified with a
-    /// scope that maps each name spelled through a qualifier to the binder in the
-    /// qualifier's run, and each `use` name of an import to its member's binder.
-    /// A run registers the sinks its module declares, under its run path.
+    /// Its chain is a copy of the module's. Each parameter with an argument reads
+    /// it ([`argument_name`]), and one with neither an argument nor a default is
+    /// an error. Each run it declares is created in turn and put in place
+    /// ([`Self::expand_runs`]). It is uniquified with a scope that maps each name
+    /// spelled through a qualifier to the binder in the qualifier's run, and each
+    /// `use` name of an import to its member's binder. A run registers the sinks
+    /// its module declares, under its run path.
     pub(super) fn create(
         &mut self,
         file: FileId,
         home: Option<Home>,
         place: Option<(RunPath, Span)>,
+        arguments: &[SmolStr],
         ctx: &mut LoweringContext,
     ) -> Option<Created> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
-        let chain = {
+        let mut chain = {
             let _copy = crate::ccl::provenance::copy_frame("link.run");
             lowered.chain.clone()
         };
@@ -326,6 +348,40 @@ impl ProgramLowering<'_> {
             .as_ref()
             .map(|(path, _)| path.clone())
             .unwrap_or_default();
+        for parameter in &lowered.interface.parameters {
+            if arguments.contains(&parameter.name) {
+                let run = place
+                    .as_ref()
+                    .and_then(|(path, _)| path.last())
+                    .expect("only a run passes arguments");
+                let argument = ctx.tag_image(
+                    Expr::var(argument_name(run, &parameter.name)),
+                    parameter.declared,
+                );
+                read_argument(&mut chain, &parameter.name, argument);
+            } else if !parameter.default {
+                let error = match &place {
+                    Some((path, statement)) => LoweringError::unsupported(
+                        *statement,
+                        format!(
+                            "the run `{path}` passes no argument for the parameter `{}`, which \
+                             has no default",
+                            parameter.name
+                        ),
+                    )
+                    .with_related(parameter.declared, "the parameter"),
+                    None => LoweringError::unsupported(
+                        parameter.declared,
+                        format!(
+                            "module `{}` is imported, and an import supplies no argument, so \
+                             its parameter `{}` needs a default",
+                            lowered.interface.module, parameter.name
+                        ),
+                    ),
+                };
+                self.errors.push(error);
+            }
+        }
         let mut qualified = self.shared_names(&lowered.scope);
         let chain = self.expand_runs(chain, &path, &mut qualified, ctx);
         let (sinks, refused) = match &place {
@@ -374,6 +430,7 @@ impl ProgramLowering<'_> {
                 name,
                 module,
                 statement,
+                arguments,
                 body,
             } = expr.node
             else {
@@ -382,7 +439,8 @@ impl ProgramLowering<'_> {
             let run_path = path.child(name.clone());
             let created = self.program.file_of(&module).and_then(|file| {
                 let home = Home::Run(run_path.clone());
-                self.create(file, Some(home), Some((run_path, statement)), ctx)
+                let place = Some((run_path, statement));
+                self.create(file, Some(home), place, &arguments, ctx)
             });
             let body = self.expand_runs(*body, path, qualified, ctx);
             return match created {
