@@ -291,10 +291,24 @@ impl<K: Eq + std::hash::Hash + std::fmt::Debug, V> Default for ScopeStack<K, V> 
     }
 }
 
+/// The strongly connected components of `successors` that contain a cycle:
+/// every component with more than one vertex, plus every vertex with a
+/// self-loop. They come out in [`strongly_connected`]'s order.
+pub(crate) fn cyclic_components(successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    strongly_connected(successors)
+        .into_iter()
+        .filter(|c| c.len() > 1 || successors[c[0]].contains(&c[0]))
+        .collect()
+}
+
 /// The strongly connected components of the graph `successors`, by Tarjan's
-/// algorithm. The order of the components and of each one's members is a
-/// function of the vertex numbering and of the order of each successor list.
-pub(crate) fn strongly_connected(successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
+/// algorithm. Components come out in reverse topological order of the
+/// condensation: a component comes out after every component it reaches.
+/// Components that neither reaches come out in the order the depth-first
+/// search, which takes roots by ascending vertex and successors in list order,
+/// finishes them. A component's members come out in stack-pop order, not
+/// sorted.
+fn strongly_connected(successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
     struct Tarjan<'a> {
         successors: &'a [Vec<usize>],
         index: Vec<Option<usize>>,
@@ -355,4 +369,22 @@ pub(crate) fn strongly_connected(successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
         }
     }
     tarjan.components
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cyclic_components;
+
+    /// `0 ↔ 1` is a two-vertex cycle, `2` a self-loop, and `3` a vertex on no
+    /// cycle.
+    #[test]
+    fn cyclic_components_keeps_cycles_and_self_loops_only() {
+        let successors = vec![vec![1], vec![0], vec![2], vec![]];
+        let mut components = cyclic_components(&successors);
+        for component in &mut components {
+            component.sort_unstable();
+        }
+        components.sort();
+        assert_eq!(components, vec![vec![0, 1], vec![2]]);
+    }
 }

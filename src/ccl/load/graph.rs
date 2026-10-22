@@ -6,7 +6,7 @@
 
 use super::{CycleStep, LoadError, LoadedModule, module_name};
 use crate::chl_parser::{FileId, ModulePath, SourceMap};
-use crate::util::strongly_connected;
+use crate::util::cyclic_components;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The key modules are ordered by: the module path, and a root no module path
@@ -32,10 +32,7 @@ pub(super) fn cycles(modules: &[LoadedModule], sources: &SourceMap) -> Vec<LoadE
         .map(|m| m.edges.iter().map(|e| index[&e.target]).collect())
         .collect();
 
-    let mut components: Vec<Vec<usize>> = strongly_connected(&successors)
-        .into_iter()
-        .filter(|c| c.len() > 1 || successors[c[0]].contains(&c[0]))
-        .collect();
+    let mut components = cyclic_components(&successors);
     for component in &mut components {
         component.sort_by_key(|&i| key(sources, modules[i].file));
     }

@@ -31,7 +31,6 @@ mod hot_reload;
 mod http_server;
 mod inference_variants;
 mod inspector_goldens;
-mod letrec_causality;
 mod loop_body_binding_cost;
 mod predicate_sharing;
 mod predicate_sharing_review;

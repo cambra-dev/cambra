@@ -35,7 +35,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::ccl::{Builtin, Name, ProjKey, TypedBinding, TypedExpr, TypedExprNode};
-use crate::util::strongly_connected;
+use crate::util::cyclic_components;
 
 /// A non-causal cycle in a letrec group's reference graph: following these
 /// bindings' bodies leads back to the start without ever passing through a
@@ -93,7 +93,7 @@ pub fn check_letrec_causal(
     // history slot. (Causal-only edges never appear here — an edge is
     // causal exactly when *every* reference along it is causal.)
     // Each list is in ascending index order, which fixes the order the
-    // cycles, and so the errors, come out in.
+    // cycles, and so the errors, come out in (`cyclic_components`).
     let noncausal: Vec<Vec<usize>> = bindings
         .iter()
         .map(|(_, def)| {
@@ -104,11 +104,8 @@ pub fn check_letrec_causal(
         })
         .collect();
 
-    // A cycle is a component with more than one binding, or one binding
-    // with a self-loop.
-    let errors: Vec<LetRecCausalityError> = strongly_connected(&noncausal)
+    let errors: Vec<LetRecCausalityError> = cyclic_components(&noncausal)
         .into_iter()
-        .filter(|c| c.len() > 1 || noncausal[c[0]].contains(&c[0]))
         .map(|mut component| {
             component.sort_unstable();
             LetRecCausalityError {
@@ -463,6 +460,22 @@ mod tests {
         let errs = check_letrec_causal(&bindings).expect_err("time slot is non-causal");
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].cycle, vec![Name::raw("x")]);
+    }
+
+    /// Two disjoint cycles come out in the order `cyclic_components` documents:
+    /// neither reaches the other, so the search finishes them in successor
+    /// order. `root` lists `z` (index 1) before `y` (index 2), so `[z]` comes
+    /// first.
+    #[test]
+    fn noncausal_cycles_are_reported_in_search_order() {
+        let bindings = vec![
+            binding("root", add(Expr::var("z"), Expr::var("y"))),
+            binding("z", add(Expr::var("z"), int(1))),
+            binding("y", add(Expr::var("y"), int(1))),
+        ];
+        let errs = check_letrec_causal(&bindings).expect_err("two non-causal self-loops");
+        let cycles: Vec<Vec<Name>> = errs.into_iter().map(|e| e.cycle).collect();
+        assert_eq!(cycles, vec![vec![Name::raw("z")], vec![Name::raw("y")]]);
     }
 
     /// A fully-non-causal two-binding cycle is rejected, reporting both names.
