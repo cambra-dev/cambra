@@ -112,8 +112,8 @@ pub(crate) fn plan_loops(expr: Expr) -> Expr {
             return recognize_txn_group(bindings, body);
         }
         // An induction group is a single writer: a plain `mut` loop, and — since
-        // the conditional case folds to one always-commit-with-a-value-`Case` /
-        // `commit`-gated writer over the full source (`transform_chain`'s `Case`
+        // the conditional case folds to one commit-gated writer with a
+        // value-`Case` write set over the full source (`transform_chain`'s `Case`
         // arm) rather than per-leg restricted bindings — a conditional write too.
         debug_assert_eq!(
             bindings.len(),
