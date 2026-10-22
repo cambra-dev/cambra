@@ -576,7 +576,7 @@ fn own_bounds(v: &crate::ccl::infer_var::InferVar) -> Vec<OwnBound> {
         .chain(b.upper().iter())
         .filter(|b| {
             let (_, discharged) = b.self_subst.split_renames();
-            discharged.without_vacuous_discharges(v).is_id()
+            discharged.acting_on(v).is_id()
         })
         .map(|b| {
             let mut reached = Vec::new();
@@ -3532,7 +3532,7 @@ fn compact_go_inner(
                     return true;
                 };
                 let (_, discharged) = b.self_subst.split_renames();
-                let acting = discharged.without_vacuous_discharges(v);
+                let acting = discharged.acting_on(v);
                 if acting.is_id() {
                     return true;
                 }
@@ -3775,6 +3775,53 @@ mod carried_probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// `sum` over `depth` comprehensions, each filtering the one inside it.
+    fn nested_filters(depth: usize) -> String {
+        let mut source = "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]".to_string();
+        for k in 1..=depth {
+            source = format!("[x for x in {source} if x > {k}]");
+        }
+        format!("sum({source})\n")
+    }
+
+    /// Bounds recorded inferring `program`.
+    fn bounds_recorded(program: &str) -> usize {
+        let mut lctx = crate::ccl::lower::LoweringContext::default();
+        let module = chl_parser::parse_module(chl_parser::FileId::ROOT, program)
+            .into_result()
+            .expect("the program parses");
+        let lowered = crate::ccl::lower::lower_stmts(&module, &mut lctx)
+            .into_result()
+            .expect("the program lowers");
+        let mut expr = crate::ccl::opaque_output::run(crate::ccl::comprehension::run(
+            crate::ccl::uniquify::run(lowered),
+            lctx.shared_holes(),
+        ));
+        let mut ictx = crate::ccl::infer::TypeInferenceContext::new();
+        let mut typed = false;
+        let recorded = crate::ccl::infer::solver::constrain::bounds_probe::count(|| {
+            typed = crate::ccl::infer::infer(&mut expr, &mut ictx).is_ok()
+        });
+        assert!(typed, "the program type-checks:\n{program}");
+        recorded
+    }
+
+    /// Each filter's binders compose onto the substitutions of every edge inside it. An edge
+    /// that kept the entries no variable can act on would record one constraint once per path
+    /// (`Subst::acting_on`): the bounds recorded then grow about threefold per level of
+    /// nesting, and a debug build takes a minute at five levels. Restricted, they grow about
+    /// twofold per level, so two more levels take at most six times the bounds.
+    #[test]
+    fn bounds_grow_twofold_per_nested_filter() {
+        const SHORT: usize = 3;
+        const LONG: usize = 5;
+        let short = bounds_recorded(&nested_filters(SHORT));
+        let long = bounds_recorded(&nested_filters(LONG));
+        assert!(
+            long <= 6 * short,
+            "{LONG} nested filters record {long} bounds against {short} for {SHORT}"
+        );
+    }
 
     /// A width merge is associative, commutative and idempotent at both polarities, so a
     /// position's width does not depend on the order its bounds arrive in: in particular two

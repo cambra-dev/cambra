@@ -717,11 +717,14 @@ impl Subst {
     /// is honest, and a caller that *means* a frame correspondence
     /// (relabeling, inversion-safe with no license) must say so with
     /// [`Subst::rename`].
-    pub fn discharge(binder: impl Into<Name>, term: TypedExpr) -> Self {
+    ///
+    /// `term` is shared where the caller holds it in an `Rc`: a template is read, never
+    /// rewritten in place.
+    pub fn discharge(binder: impl Into<Name>, term: impl Into<Rc<TypedExpr>>) -> Self {
         let binder = binder.into();
         debug_assert_no_pi_bound(&binder);
         let mut m = BTreeMap::new();
-        m.insert(binder, Mapping::Discharge(Rc::new(term)));
+        m.insert(binder, Mapping::Discharge(term.into()));
         Subst::of_binders(m)
     }
 
@@ -868,12 +871,10 @@ impl Subst {
     /// `𝛼[σ]` for this substitution `σ` and the variable `𝛼`, which `σ` cannot compute while
     /// `𝛼` is unresolved: a variable carrying `𝛼` under `σ` as its lower and upper bound, so
     /// compaction applies `σ` to whatever `𝛼` resolves to (`src/ccl/design/type-inference.md`,
-    /// "A substitution reaching a variable suspends on it"). `𝛼` itself where `σ`'s domain
-    /// names no binder in `𝛼`'s telescope: `𝛼` resolves to types naming its telescope's
-    /// binders and nothing else. A witness mapping always suspends, since a telescope does not
-    /// list the witnesses a variable's content may name.
+    /// "A substitution reaching a variable suspends on it"). `𝛼` itself where no entry of `σ`
+    /// acts on `𝛼` ([`Self::acting_on`]).
     fn suspended(&self, v: &Rc<crate::ccl::infer_var::InferVar>) -> Type {
-        let acts = self.suspends_on(v);
+        let acts = self.acts_on_var(v);
         if !acts {
             return Type::Infer(Rc::clone(v));
         }
@@ -1613,9 +1614,9 @@ impl Subst {
     /// for a pure α-conversion, which is how a predicate keeps a spelling of an index its
     /// own base has since renamed.
     ///
-    /// An unresolved variable in one of `e`'s type slots is a place it acts too, where it would
-    /// suspend on the variable ([`Self::suspended`]): what the variable resolves to may name a
-    /// binder no free-name walk can see yet.
+    /// An unresolved variable in one of `e`'s type slots is a place it acts too, where it acts
+    /// on the variable ([`Self::acts_on_var`]): what the variable resolves to may name a binder
+    /// no free-name walk can see yet.
     fn acts_on(&self, e: &TypedExpr) -> bool {
         if !self.elims.is_empty() {
             return self.without_elim().acts_on(e);
@@ -1629,42 +1630,50 @@ impl Subst {
         } {
             return true;
         }
-        self.suspends_in_expr(e)
+        self.acts_on_a_var_in_expr(e)
     }
 
     /// Whether a type slot at or below `e`, a predicate's own slots included, holds a variable
-    /// this substitution suspends on ([`Self::suspended`]).
-    fn suspends_in_expr(&self, e: &TypedExpr) -> bool {
-        self.suspends_in_expr_visiting(e, &mut HashSet::new())
+    /// this substitution acts on ([`Self::acts_on_var`]).
+    fn acts_on_a_var_in_expr(&self, e: &TypedExpr) -> bool {
+        self.acts_on_a_var_in_expr_visiting(e, &mut HashSet::new())
     }
 
-    /// Whether `ty` holds a variable this substitution suspends on, at any depth, the
+    /// Whether `ty` holds a variable this substitution acts on, at any depth, the
     /// predicates its refinements carry included.
-    fn suspends_in_type(&self, ty: &Type) -> bool {
-        self.suspends_in_type_visiting(ty, &mut HashSet::new())
+    fn acts_on_a_var_in_type(&self, ty: &Type) -> bool {
+        self.acts_on_a_var_in_type_visiting(ty, &mut HashSet::new())
     }
 
     // Each predicate is visited once per scan: a predicate shared across type slots, as
     // nested dependent types share their inner levels' predicates, is one term, and a walk
     // that re-entered it at every occurrence would be exponential in the nesting.
-    fn suspends_in_expr_visiting(&self, e: &TypedExpr, visited: &mut HashSet<PredicateId>) -> bool {
+    fn acts_on_a_var_in_expr_visiting(
+        &self,
+        e: &TypedExpr,
+        visited: &mut HashSet<PredicateId>,
+    ) -> bool {
         let mut found = false;
-        e.walk_type_slots(|t| found |= !found && self.suspends_in_type_visiting(t, visited));
-        e.walk_children(|c| found |= !found && self.suspends_in_expr_visiting(c, visited));
+        e.walk_type_slots(|t| found |= !found && self.acts_on_a_var_in_type_visiting(t, visited));
+        e.walk_children(|c| found |= !found && self.acts_on_a_var_in_expr_visiting(c, visited));
         found
     }
 
-    fn suspends_in_type_visiting(&self, ty: &Type, visited: &mut HashSet<PredicateId>) -> bool {
+    fn acts_on_a_var_in_type_visiting(
+        &self,
+        ty: &Type,
+        visited: &mut HashSet<PredicateId>,
+    ) -> bool {
         match ty {
-            Type::Infer(v) => self.suspends_on(v),
+            Type::Infer(v) => self.acts_on_var(v),
             _ => {
                 ty.refinements().iter().any(|r| {
                     visited.insert(r.predicate_id())
-                        && self.suspends_in_expr_visiting(&r.predicate, visited)
+                        && self.acts_on_a_var_in_expr_visiting(&r.predicate, visited)
                 }) || {
                     let mut found = false;
                     ty.walk_children(|c| {
-                        found |= !found && self.suspends_in_type_visiting(c, visited);
+                        found |= !found && self.acts_on_a_var_in_type_visiting(c, visited);
                     });
                     found
                 }
@@ -1673,52 +1682,97 @@ impl Subst {
     }
 
     /// This substitution with only the binder entries that act on `ty`: a binder free there, or
-    /// one an unresolved variable there may resolve to read. The witness half is kept whole.
-    /// An entry acting on nothing in `ty` puts nothing there, so it captures nothing there,
-    /// as [`Self::under_binder`] states for a term.
+    /// one an unresolved variable there may resolve to read. The witness half and the
+    /// eliminations are kept whole: the caller asks only whether a term binder's image is
+    /// captured under a Pi binder, and only a binder entry puts a term there. An entry acting
+    /// on nothing in `ty` puts nothing there, so it captures nothing there, as
+    /// [`Self::under_binder`] states for a term.
     fn acting_on_type(&self, ty: &Type) -> Subst {
         let free = type_free_vars(ty);
         let mut out = self.clone();
         out.binders.retain(|k, m| {
             free.contains(k)
-                || Subst::of_binders(BTreeMap::from([(k.clone(), m.clone())])).suspends_in_type(ty)
+                || Subst::of_binders(BTreeMap::from([(k.clone(), m.clone())]))
+                    .acts_on_a_var_in_type(ty)
         });
         out
     }
 
-    /// Whether this substitution acts on what `v` may resolve to ([`Self::suspended`]).
-    fn suspends_on(&self, v: &crate::ccl::infer_var::InferVar) -> bool {
-        // The witness half acts only on a variable a binder of the mapped witness scopes over
-        // ([`crate::ccl::infer_var::InferVar::may_name_witness`]), as the name half acts
-        // only on one whose telescope holds a binder it maps.
-        // A respelling acts only on a variable a binder of its kind's component scopes over.
-        self.elims.iter().any(|e| {
-            !matches!(e, Elim::Onto(_) | Elim::Map(_)) || v.in_witness_scope(|s| e.acts_in(s))
-        }) || self.witnesses.keys().any(|w| v.may_name_witness(w))
-            || self.binders.keys().any(|b| v.telescope.contains(b))
+    /// Whether this substitution acts on what `v` may resolve to: whether [`Self::acting_on`]
+    /// keeps any entry. Where it keeps none, [`Self::suspended`] returns `v` itself.
+    fn acts_on_var(&self, v: &crate::ccl::infer_var::InferVar) -> bool {
+        self.binders.keys().any(|k| binder_acts_on(k, v))
+            || self.witnesses.keys().any(|w| v.may_name_witness(w))
+            || self.elims.iter().any(|e| elim_acts_on(e, v))
     }
 
-    /// This substitution with every discharge removed that cannot act on `v`: a term binder
-    /// outside `v`'s telescope, or a witness no binder of `v`'s witness scopes may bind. `v`
-    /// resolves to types naming those binders and nothing else
-    /// (`src/ccl/design/type-inference.md`, "The invariant"), so such a discharge leaves whatever
-    /// `v` resolves to unchanged, and dropping it is exact.
-    pub(crate) fn without_vacuous_discharges(&self, v: &crate::ccl::infer_var::InferVar) -> Subst {
-        Subst {
-            binders: self
-                .binders
-                .iter()
-                .filter(|(k, m)| matches!(m, Mapping::Rename(_)) || v.telescope.contains(k))
-                .map(|(k, m)| (k.clone(), m.clone()))
-                .collect(),
-            witnesses: self
-                .witnesses
-                .iter()
-                .filter(|(w, m)| matches!(m, WitnessMapping::Rename(_)) || v.may_name_witness(w))
-                .map(|(w, m)| (*w, m.clone()))
-                .collect(),
-            elims: self.elims.clone(),
+    /// The entries of this substitution that can change what `v` resolves to.
+    ///
+    /// `v` resolves to types that name only its telescope's binders and the witnesses its
+    /// witness scopes may bind (`src/ccl/design/type-inference.md`, "The invariant"). An entry
+    /// for anything else has nothing in `v` to replace, so dropping it leaves `v` read through
+    /// this substitution unchanged. For a `v` created inside `def f(a: Int)`, whose telescope is
+    /// `{a}`:
+    ///
+    /// - `a ↦ 5` is kept: it turns `{Int | __elem > a}` into `{Int | __elem > 5}`.
+    /// - `n ↦ 3` and `x → x'` are dropped: `v` never names `n` or `x`.
+    ///
+    /// Each entry is judged by one rule, the same for a rename and a discharge:
+    ///
+    /// - a binder entry acts when the binder is in `v`'s telescope;
+    /// - a witness entry acts when one of `v`'s witness scopes may bind the witness
+    ///   ([`InferVar::may_name_witness`](crate::ccl::infer_var::InferVar::may_name_witness));
+    /// - a respelling ([`Elim::Onto`]) or witness map ([`Elim::Map`]) acts when one of `v`'s
+    ///   witness scopes is related to what it maps ([`Elim::acts_in`]), or when an entry
+    ///   applied before it acts on `v`, since that entry can put into `v` what the respelling
+    ///   maps;
+    /// - an elimination through a term acts on whatever sum `v` resolves to, so it is kept.
+    ///
+    /// The answer reads `v`'s scopes as they stand. Dropping is exact only if an entry is
+    /// never dropped from a variable whose scopes later grow to cover it
+    /// (`src/ccl/design/type-inference.md`, "Native bound edges and closure"); debug builds
+    /// record each dropped entry and check it at arena teardown
+    /// ([`check_dropped_entries`]).
+    ///
+    /// Returns `self` borrowed when nothing is dropped.
+    pub(crate) fn acting_on(&self, v: &crate::ccl::infer_var::InferVar) -> Cow<'_, Subst> {
+        if self.binders.keys().all(|k| binder_acts_on(k, v))
+            && self.witnesses.keys().all(|w| v.may_name_witness(w))
+            && self.elims.iter().all(|e| elim_acts_on(e, v))
+        {
+            return Cow::Borrowed(self);
         }
+        let binders: BTreeMap<Binder, Mapping> = self
+            .binders
+            .iter()
+            .filter(|(k, _)| binder_acts_on(k, v))
+            .map(|(k, m)| (k.clone(), m.clone()))
+            .collect();
+        let witnesses: WitnessMap = self
+            .witnesses
+            .iter()
+            .filter(|(w, _)| v.may_name_witness(w))
+            .map(|(w, m)| (*w, m.clone()))
+            .collect();
+        let mut acted = !binders.is_empty() || !witnesses.is_empty();
+        let elims = self
+            .elims
+            .iter()
+            .filter(|e| {
+                let acts = acted || elim_acts_on(e, v);
+                acted |= acts;
+                acts
+            })
+            .cloned()
+            .collect();
+        let restricted = Subst {
+            binders,
+            witnesses,
+            elims,
+        };
+        #[cfg(debug_assertions)]
+        dropped_entries::record(v, self, &restricted);
+        Cow::Owned(restricted)
     }
 
     /// What each entry's image reads, for carrying many name sets through this substitution
@@ -2884,6 +2938,133 @@ impl Subst {
         restricted.apply_type(codomain)
     }
 }
+
+/// Whether a binder entry can act on `v`: the binder is in `v`'s telescope
+/// ([`Subst::acting_on`]).
+fn binder_acts_on(k: &Name, v: &crate::ccl::infer_var::InferVar) -> bool {
+    v.telescope.contains(k)
+}
+
+/// Whether an elimination can act on `v` judged by `v`'s own scopes, no earlier entry having
+/// acted ([`Subst::acting_on`]): a respelling or a witness map acts only on a variable one of
+/// whose witness scopes it relates to, and an elimination through a term on any.
+fn elim_acts_on(e: &Elim, v: &crate::ccl::infer_var::InferVar) -> bool {
+    match e {
+        Elim::Onto(_) | Elim::Map(_) => v.in_witness_scope(|s| e.acts_in(s)),
+        Elim::Top(_) | Elim::Kind(..) | Elim::ReadBack(..) => true,
+    }
+}
+
+/// The entries [`Subst::acting_on`] dropped during the active inference run, for the check at
+/// arena teardown ([`check_dropped_entries`]).
+///
+/// `acting_on` reads a variable's telescope (whose opaque set only grows), its witness scopes
+/// and the kind components they reach, all of which grow while solving. Dropping is exact only
+/// if each dropped entry stays out of the variable's scopes until solving ends; the check
+/// asserts that.
+#[cfg(debug_assertions)]
+mod dropped_entries {
+    use super::{Elim, Subst, binder_acts_on, elim_acts_on};
+    use crate::ccl::Name;
+    use crate::ccl::infer_var::{InferVar, InferVarId};
+    use crate::ccl::ty::WitnessId;
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct Dropped {
+        binders: HashSet<(InferVarId, Name)>,
+        witnesses: HashSet<(InferVarId, WitnessId)>,
+        /// Keyed by the respelling's shared payload, so a respelling reached along many paths
+        /// is checked once.
+        elims: HashMap<(InferVarId, usize), Elim>,
+    }
+
+    thread_local! {
+        static DROPPED: RefCell<Dropped> = RefCell::new(Dropped::default());
+    }
+
+    fn elim_key(e: &Elim) -> usize {
+        match e {
+            Elim::Onto(k) => Rc::as_ptr(k) as usize,
+            Elim::Map(m) => Rc::as_ptr(m) as *const () as usize,
+            Elim::Top(c) | Elim::Kind(_, c) | Elim::ReadBack(_, c) => Rc::as_ptr(c) as usize,
+        }
+    }
+
+    /// Record what `restricted` dropped from `whole` for `v`.
+    pub(super) fn record(v: &InferVar, whole: &Subst, restricted: &Subst) {
+        if !crate::ccl::infer_var::arena_is_active() {
+            return;
+        }
+        DROPPED.with(|d| {
+            let mut d = d.borrow_mut();
+            for k in whole.binders.keys() {
+                if !restricted.binders.contains_key(k) {
+                    d.binders.insert((v.uid, k.clone()));
+                }
+            }
+            for w in whole.witnesses.keys() {
+                if !restricted.witnesses.contains_key(w) {
+                    d.witnesses.insert((v.uid, *w));
+                }
+            }
+            for e in &whole.elims {
+                if !restricted.elims.contains(e) {
+                    d.elims
+                        .entry((v.uid, elim_key(e)))
+                        .or_insert_with(|| e.clone());
+                }
+            }
+        });
+    }
+
+    /// Forget every entry recorded so far: a new inference run starts.
+    pub(crate) fn clear() {
+        DROPPED.with(|d| *d.borrow_mut() = Dropped::default());
+    }
+
+    /// Assert that no entry dropped during this run acts on its variable now that solving has
+    /// ended. `vars` are the run's variables, before teardown severs their bounds.
+    pub(crate) fn check(vars: &[Rc<InferVar>]) {
+        let dropped = DROPPED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+        let by_uid: HashMap<InferVarId, &InferVar> = vars.iter().map(|v| (v.uid, &**v)).collect();
+        for (uid, k) in &dropped.binders {
+            if let Some(v) = by_uid.get(uid) {
+                assert!(
+                    !binder_acts_on(k, v),
+                    "acting_on dropped the entry for `{k}` from {uid:?}, whose telescope now \
+                     holds it: a binder entered after a substitution naming it reached the \
+                     variable"
+                );
+            }
+        }
+        for (uid, w) in &dropped.witnesses {
+            if let Some(v) = by_uid.get(uid) {
+                assert!(
+                    !v.may_name_witness(w),
+                    "acting_on dropped the entry for witness {w:?} from {uid:?}, whose witness \
+                     scopes now may bind it: a witness entry reached the variable before the \
+                     kind edge that puts the witness in its scope"
+                );
+            }
+        }
+        for ((uid, _), e) in &dropped.elims {
+            if let Some(v) = by_uid.get(uid) {
+                assert!(
+                    !elim_acts_on(e, v),
+                    "acting_on dropped {e:?} from {uid:?}, whose witness scopes are now \
+                     related to it: a respelling reached the variable before the kind edge \
+                     that relates them"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+pub(crate) use dropped_entries::{check as check_dropped_entries, clear as clear_dropped_entries};
 
 /// Is `e` exactly the variable `name` (a bare `Var(name)`)?
 fn is_var_named(e: &TypedExpr, name: &Name) -> bool {

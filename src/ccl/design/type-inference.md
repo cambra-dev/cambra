@@ -2121,13 +2121,32 @@ The codomain comparison aligns binder names with `Subst::aligned` when required.
 record the resulting relation in its native direction. Pre-inverting a discharge would lose the
 argument replacement, including when a concrete function reaches an earlier opaque application.
 
+A variable's side of an edge keeps only the entries that can act on the variable
+(`Subst::acting_on`). A variable's content names only its telescope's binders and the witnesses its
+witness scopes may bind ([The invariant](#the-invariant)), so these entries leave it unchanged and
+are dropped:
+
+- an entry, rename or discharge, for a binder outside the variable's telescope;
+- a witness entry, rename or discharge, for a witness no witness scope of the variable may bind;
+- a respelling (`Elim::Onto`) or witness map (`Elim::Map`) that relates to none of the variable's
+  witness scopes, when no entry applied before it acts on the variable.
+
+`constrain_go` restricts each side that is a variable, on entry, so one constraint reached along
+several paths, each composing the binders of the dependent applications and lambdas it passed
+through, is one edge, recorded once.
+
+The restriction reads the variable's scopes when the edge arrives, and nothing restores a dropped
+entry. It is exact under two premises: an opaque binder is entered into the shared opaque set
+before any substitution names it, and a witness entry or respelling reaches a variable only after
+the kind edge that puts its witness or kind in the variable's scope. Debug builds record every
+dropped entry and assert at arena teardown that none acts on its variable then.
+
 When lower and upper entries meet at one holder, `bridge_holder_gap` reconciles their holder views:
 
 1. Identical views need no bridge.
-2. Views that differ only in discharges the holder cannot name act alike on it, so
-   `L <: 𝑉‹lo›` and `𝑉‹hi› <: 𝑈` meet at one type and need no bridge. A discharge cannot act on
-   `𝑉` when its binder is outside `𝑉`'s telescope, or its witness outside every binder scoping
-   over `𝑉` (`Subst::without_vacuous_discharges`).
+2. Views that differ only in entries the holder cannot name act alike on it, so
+   `L <: 𝑉‹lo›` and `𝑉‹hi› <: 𝑈` meet at one type and need no bridge. The entries compared are
+   the ones `Subst::acting_on` keeps.
 3. The bridge applies `licensed_correspondence_view`, which treats variable-target discharges as
    renames at this site. This is an existing restricted transport assumption, not general
    invertibility of discharge.

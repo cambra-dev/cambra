@@ -198,10 +198,8 @@ binder. Both the outer function and the inner group are data functions.
 
 This is an explicit-domain function, the `FullMap` representation, rather than a uniform
 `Map(K, V)` abbreviation. A `FullMap(_, _)` annotation, exact or bounded, can preserve and consume
-the group-by's type. Boxing it to satisfy a `Map` annotation does not establish equivalent
-behavior: `a_consumed_boxed_map_annotation_escapes_its_scope` records an inference failure when
-that boxed annotation is consumed. This is an implementation limitation, not a rule rejecting
-every group-by annotation.
+the group-by's type. A `Map(_, _)` annotation holds it boxed, a sum over the key domain, and a
+consumer iterates the groups through the sum (`a_keyed_annotation_compiles_and_runs`).
 
 A checked lookup substitutes its key into the dependent group type during inference.
 The streamed collection-valued answer is rejected later at operator conversion; see

@@ -746,7 +746,7 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst, holder: Option<&InferVar>) -> Optio
     // binder the holder cannot name leaves the holder unchanged, so where the views differ only
     // there, `𝐿 <: 𝑉‹lo›` and `𝑉‹hi› <: 𝑈` meet at one type and `𝐿 <: 𝑈` needs no transport.
     if let Some(v) = holder
-        && lo.without_vacuous_discharges(v) == hi.without_vacuous_discharges(v)
+        && lo.acting_on(v) == hi.acting_on(v)
     {
         return Some((Subst::id(), Subst::id()));
     }
@@ -1190,6 +1190,15 @@ fn witness_range(t: &Type, gamma: &crate::ccl::ty::WitnessContext) -> Option<Typ
     }
 }
 
+/// `s` as it acts on `t`'s side of an edge: what can act on the variable when `t` is one, and
+/// `s` itself otherwise.
+fn acting_side<'s>(t: &Type, s: &'s Subst) -> std::borrow::Cow<'s, Subst> {
+    match t {
+        Type::Infer(v) => s.acting_on(v),
+        _ => std::borrow::Cow::Borrowed(s),
+    }
+}
+
 fn constrain_go(
     lhs: &Type,
     rhs: &Type,
@@ -1203,6 +1212,16 @@ fn constrain_go(
     // return before any arm looked at the keys.
     debug_assert_unique_product_keys(lhs);
     debug_assert_unique_product_keys(rhs);
+
+    // **A variable's side of an edge keeps only what can act on it** (`Subst::acting_on`): a
+    // binder outside the variable's telescope, a witness no scope of it may bind, and an
+    // `Onto`/`Map` relating to none of its scopes leave its content unchanged, so the edge is
+    // the same constraint without them. Kept, they make one constraint reached along several
+    // paths a different edge per path: each path through a dependent application or a lambda
+    // composes its own entries onto the substitution, and the variable then records the same
+    // bound once per path.
+    let (sl, sr) = (acting_side(lhs, sl), acting_side(rhs, sr));
+    let (sl, sr) = (&*sl, &*sr);
 
     // **An elimination meeting its function reads it through the term** before the arms
     // compare anything: the function is plain, and its binders are the witnesses the value
@@ -1957,6 +1976,8 @@ fn constrain_go_impl(
                 crate::ccl::infer_var::enforce_bound_scope(lv, "upper", &bound);
                 let mut s = lv.bounds.borrow_mut();
                 s.upper_mut().push(bound);
+                #[cfg(test)]
+                bounds_probe::record();
                 let lows = Rc::clone(s.lower());
                 drop(s);
                 // **A function-shaped bound carries a kind, so it lands on this variable's.**
@@ -2050,6 +2071,8 @@ fn constrain_go_impl(
                 crate::ccl::infer_var::enforce_bound_scope(rv, "lower", &bound);
                 let mut s = rv.bounds.borrow_mut();
                 s.lower_mut().push(bound);
+                #[cfg(test)]
+                bounds_probe::record();
                 let ups = Rc::clone(s.upper());
                 drop(s);
                 if let Some(k) = lhs.fun_kind_of() {
@@ -2906,6 +2929,30 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
     }
 }
 
+/// Counts the bounds [`constrain_go`] records on variables, so a test can bound how they grow
+/// with a program's shape (`bounds_grow_twofold_per_nested_filter`).
+///
+/// Thread-local, because `cargo test` runs tests concurrently in one process.
+#[cfg(test)]
+pub(crate) mod bounds_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static RECORDED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn record() {
+        RECORDED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Run `body`, returning how many bounds it recorded.
+    pub fn count(body: impl FnOnce()) -> usize {
+        RECORDED.with(|c| c.set(0));
+        body();
+        RECORDED.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::ccl::ty::FunKindVar;
@@ -3502,6 +3549,27 @@ mod tests {
         } else {
             unreachable!()
         }
+    }
+
+    /// One constraint reached along two paths whose substitutions differ only in entries that
+    /// cannot act on the variable, a discharge and a rename of binders outside its telescope,
+    /// is one bound (`Subst::acting_on`).
+    #[test]
+    fn entries_that_cannot_act_on_a_variable_leave_one_bound() {
+        let v = fresh_var(0);
+        let int = prim(BaseType::Int);
+        let mut cache = ConstrainCache::new();
+        let paths = [
+            Subst::discharge("n", TypedExpr::lit(Lit::Int(1))),
+            Subst::rename("x", "y"),
+        ];
+        for path in &paths {
+            constrain_go(&int, &v, &Subst::id(), path, &mut cache, &SkipSmtScope).unwrap();
+        }
+        let Type::Infer(state) = &v else {
+            unreachable!("a fresh variable")
+        };
+        assert_eq!(state.bounds.borrow().lower().len(), 1);
     }
 
     #[test]

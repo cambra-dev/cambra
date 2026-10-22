@@ -1092,6 +1092,10 @@ fn checked_lookup_over_a_key_stream(#[case] tail: &str, #[case] expected: Value)
     "g <: FullMap(_, _) = groupby([1,2,3,4], \\v -> v // 2)\nsum([sum(v) for v in g])",
     Value::Int(10)
 )]
+#[case(
+    "g: Map(_, _) = box(groupby([1,2,3], \\x -> x))\nsum([sum(v) for v in g])",
+    Value::Int(6)
+)]
 fn a_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
