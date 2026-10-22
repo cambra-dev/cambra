@@ -185,7 +185,7 @@ impl Qualifier {
         member: &str,
         span: Span,
     ) -> Result<Option<QualifiedName>, LoweringError> {
-        if crate::ccl::lower::stmts::is_type_name(member) {
+        if chl_parser::ast::is_type_name(member) {
             return Err(LoweringError::unsupported(
                 span,
                 format!("`{name}::{member}` is a type, not a value"),
@@ -229,7 +229,7 @@ impl Qualifier {
         member: &str,
         span: Span,
     ) -> Result<Option<Type>, LoweringError> {
-        if !crate::ccl::lower::stmts::is_type_name(member) {
+        if !chl_parser::ast::is_type_name(member) {
             return Err(LoweringError::unsupported(
                 span,
                 format!("`{name}::{member}` is a value, not a type"),
@@ -344,7 +344,7 @@ pub(super) fn module_scope(
     for (qualifier_name, item) in use_items {
         let bound = item.alias.as_ref().unwrap_or(&item.name);
         let qualifier = &qualifiers[&qualifier_name];
-        let reached = if crate::ccl::lower::stmts::is_type_name(&item.name.node) {
+        let reached = if chl_parser::ast::is_type_name(&item.name.node) {
             qualifier
                 .reach_type(&qualifier_name, &item.name.node, item.name.span)
                 .map(Reached::Type)

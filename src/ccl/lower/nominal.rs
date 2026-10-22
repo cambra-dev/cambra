@@ -649,7 +649,7 @@ fn member(decl: &NominalDecl, name: &str, ctx: &LoweringContext) -> Option<(Memb
 /// type rather than of another module, whose qualifier is lowercase
 /// (`docs/chl-spec.md`, "9.6 Qualified references").
 pub(super) fn names_a_type_member(q: &QualifiedName) -> bool {
-    matches!(q.qualifier.as_slice(), [ty] if super::stmts::is_type_name(&ty.node))
+    matches!(q.qualifier.as_slice(), [ty] if chl_parser::ast::is_type_name(&ty.node))
 }
 
 /// The declaration and member `q` names, `Shape::circle`.

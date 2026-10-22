@@ -10,7 +10,7 @@
 //! [`Level::Pending`] handles assignment-side blocks, whose closing `Dedent` has no
 //! corresponding `Indent`; see [`tokenize`] for the parser-facing token contract.
 
-use crate::ast::{FileId, Span};
+use crate::ast::{FileId, Span, is_type_name};
 use crate::builtins::SurfaceBuiltin;
 use logos::Logos;
 use smol_str::SmolStr;
@@ -491,7 +491,7 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         Token::Ident(name) => {
             if SurfaceBuiltin::from_name(name).is_some() {
                 C::Builtin
-            } else if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+            } else if is_type_name(name) {
                 C::Type
             } else {
                 C::Identifier
