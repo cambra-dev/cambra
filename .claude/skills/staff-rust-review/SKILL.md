@@ -47,9 +47,17 @@ Review the changes against these standards:
 Provide a structured response:
 
 - **Executive Summary**: High-level verdict on the changes.
-- **Architectural Notes**: How well the code aligns with the design.
-- **Detailed Feedback**: Specific line-by-line or function-level observations, categorized by "Critical," "Important," or "Nit."
-- **Next Steps**: Recommended actions or refactors.
+- **Architectural Notes**: Design-level findings: the change disagrees with a design doc, a concept
+  the code uses is unnamed, or an abstraction sits in the wrong module. Each note names the fix,
+  the files and concepts it touches, and one scope:
+  - `in scope`: the fix belongs in this change. The author, or an agent acting on the review,
+    makes it before merge, as for an Important finding.
+  - `follow-up`: the fix reaches beyond this change. The note is the brief for a separate change,
+    which an agent can pick up as readily as a human. Name what that change would touch and the
+    design question, if any, it must settle first.
+- **Detailed Feedback**: Specific line-by-line or function-level observations, categorized by
+  "Critical," "Important," or "Nit."
+- **Next Steps**: Recommended actions or refactors, including each `in scope` architectural note.
 
 If there are Critical or Important findings, attempt to produce an illustrative, concise test case which exercises the gap in logic or bug, or comment why this is challenging to do.
 
