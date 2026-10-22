@@ -27,30 +27,36 @@ fails: [Lexer recovery](#lexer-recovery) specifies the stream and errors it retu
 with lexical errors. This section describes a source with none.
 Logos produces span-bearing keywords, identifiers, literals, punctuation and physical newlines.
 It skips comments and horizontal whitespace. The source-level layout rules are owned by
-[Indentation](../docs/chl-spec.md#13-indentation-off-side-rule); the implementation uses two
+[Indentation](../docs/chl-spec.md#13-indentation-off-side-rule); the implementation uses three
 level forms:
 
 - `Fixed(column)` records an established indentation width. Increasing indentation emits
   `Indent`; closing the level emits `Dedent`. A dedent that reaches no compatible level
-  produces `InconsistentIndent`.
-- `Pending { min }` records the assignment column when a block starts within a logical line.
-  Entering this level emits no `Indent`. A branch body opens a `Fixed` level above it; the first
-  line that dedents back into it, the `elif` or `else`, fixes its column. A line at or below
-  `min` closes it. The parser's `block_value` consumes the extra closing `Dedent` after parsing
-  the `if` or `match` statement.
+  produces `InconsistentIndent` ([Inconsistent indentation](#inconsistent-indentation)).
+- `Pending { min }` records the assignment column when a block starts within a logical line. A
+  branch body opens a `Fixed` level above it. A line at or below `min` closes it.
+- `Pinned(column)` is a `Pending` level whose column the first line dedenting back into it, the
+  `elif` or `else`, has fixed. A line continues it as it continues a `Fixed` level.
 
-The stack starts with `Fixed(0)`. `block_value_open` requests a pending level when a logical
-line ends in `:` but did not start with a block-opening keyword. The floor comes from the
-logical statement's first line, not a later physical line containing the colon. Blank and
-comment-only lines do not consume the pending request or change the stack.
+A `Pending` level opens with a zero-width `BlockValueIndent` and a `Pending` or `Pinned` level
+closes with `BlockValueDedent`. The `BlockValueIndent` sits before the first token of the line's
+last statement, after a top-level `;` and a leading `pub`. The parser's `block_assign` consumes the
+`BlockValueIndent`, and its `block_value` consumes the `BlockValueDedent` after parsing the `if` or
+`match` statement. Statement-level recovery skips from one to the other
+([Statement-level recovery](#statement-level-recovery)).
+
+The stack starts with `Fixed(0)`. `end_line` pushes a `Pending` level when a logical line ends in
+`:` but did not start with a block-opening keyword. The floor comes from the logical statement's
+first line, not a later physical line containing the colon. The line's last token decides whether
+it opens the level, so the `BlockValueIndent` goes into the stream when the layout run ends.
 
 A stack of open brackets suppresses physical newlines and indentation processing while it is
 nonempty. Every open bracket belongs to the current logical line. A close bracket must match the
 innermost open bracket's kind.
 
-The token stream ends with a `Newline` and enough `Dedent`s to close the stack.
-Ordinary blocks balance `Indent` and `Dedent`; each pending assignment-side level contributes
-one extra `Dedent`. Tests include `block_right_hand_side_opens_a_level_of_its_own`,
+The token stream ends with a `Newline` and the `Dedent`s and `BlockValueDedent`s that close the
+stack. `Indent` pairs with `Dedent` and `BlockValueIndent` with `BlockValueDedent`, and the pairs
+nest. Tests include `block_right_hand_side_opens_a_level_of_its_own`,
 `a_wrapped_header_floors_the_level_at_the_statement`,
 `the_chain_column_is_fixed_by_its_first_line` and
 `a_match_right_hand_side_closes_its_level_unpinned`.
@@ -264,15 +270,29 @@ failure. It relies on the lexer's stream having balanced brackets
 
 ### Statement-level recovery
 
-`skip_to_newline` consumes at least one token other than `Newline` or `Dedent`, followed
-by an optional `Newline`. If an `Indent` follows, `skip_indented_block` consumes its
-balanced block. The result is `Stmt::Error` over the skipped region. Discarding an attached
-body prevents a malformed header from leaving orphan block tokens in the enclosing parser.
+Recovery skips the failed statement's whole extent and returns `Stmt::Error` over it. The
+statement's first token selects the extent:
 
-Recovery stops before `Dedent` rather than scanning through it. Its `at_least(1)` requirement
-makes it decline at `Newline`, `Dedent` and EOF when no token has been consumed. This prevents
-a zero-progress success inside `repeated()` and lets an enclosing block consume its own
-`Dedent` without an additional diagnostic.
+1. `BlockValueIndent`: through its paired `BlockValueDedent`. This covers a block right-hand
+   side, its `elif`/`else` chain, and any other line inside its level, such as a typo'd `elif`.
+2. `Indent`: through its paired `Dedent`. This covers a line indented deeper than its siblings
+   and the lines indented with it.
+3. Any other token: `skip_to_newline` consumes the line's tokens, none of them a layout token,
+   and an optional `Newline`. An `Indent` block that follows is skipped as in 2, and each
+   following line that starts with `elif` or `else` is skipped the same way with its block.
+
+Every layout token in the extent is skipped with its partner. A layout token left behind ends
+the enclosing block early, and at the top level it matches nothing, so `parse_module` returns no
+module. The `BlockValueIndent` is present whenever the lexer opened a block right-hand side's
+level: the line ended in `:` without starting with a block keyword, which includes a header the
+grammar has no statement for, such as `while i < 5:`. The parser does not repeat that rule. It
+reads the decision from the token. `recovery_skips_a_failed_block_right_hand_side` and
+`recovery_skips_a_stray_indentation_level` in `parser.rs` cover each case, and
+`mutated_sources_keep_the_stream_invariants` requires a module for every mutated source.
+
+Recovery never starts on `Newline`, `Dedent`, `BlockValueDedent` or EOF, and it consumes at
+least one token. This prevents a zero-progress success inside `repeated()` and lets an enclosing
+block consume its own closer without an additional diagnostic.
 `nested_block_recovery_reports_one_error_per_mistake` covers that boundary behavior.
 
 A semicolon terminates a valid simple statement, but is not a synchronization token for this
@@ -293,8 +313,9 @@ Two invariants hold for every input:
   it to the wrong token or to the end of the file. The lexer drops a closer that matches nothing
   and inserts a zero-width closer, a closer whose span is empty and covers no source text, for an
   opener the source never closes.
-- **Layout has its usual shape.** The stream ends with a `Newline` and the `Dedent`s that close
-  the indentation stack, as on valid input.
+- **Layout has its usual shape.** The stream ends with a `Newline` and the `Dedent`s and
+  `BlockValueDedent`s that close the indentation stack, as on valid input, and the layout pairs
+  nest.
 
 #### Characters no token matches
 
@@ -424,13 +445,44 @@ inside the bracket.
 #### Inconsistent indentation
 
 A line whose indentation matches no enclosing level gets `InconsistentIndent` at its first token
-and belongs to the deepest enclosing level left of it. No `Indent` is emitted for it.
+and stays in the innermost level whose column it falls short of. That level does not close, and
+no `Dedent` or `Indent` is emitted for the line. A later line back at the level's column continues
+the same block.
 
 ```text
 if c:
     x = 1
-  y = 2           →  y = 2 is a statement after the `if`      InconsistentIndent at `y`
+  y = 2           →  y = 2 is a statement in the `if` body       InconsistentIndent at `y`
+    z = 3            z = 3 is a statement in the `if` body
 ```
+
+A body whose first line is deeper than the rest follows the same rule: its later lines fall short
+of the column the first line fixed, and stay in the body.
+
+A short line that ends in `:` opens its block at the next line deeper than the short line's own
+column, not the level's, so a short header keeps its body:
+
+```text
+if a:
+    if b:
+        1
+  else:           →  `else` continues `if b`                     InconsistentIndent at `else`
+    2                2 is the `else` body
+```
+
+Only an indented block keeps a short line. A block right-hand side's `Pending` or `Pinned` level
+holds its chain's `elif` and `else` lines, which a short line does not continue, so that level
+closes for it. The line then belongs to the deepest enclosing level left of it:
+
+```text
+x = if c:
+        1
+    else:
+        2
+  y = 3           →  y = 3 is a statement after `x`             InconsistentIndent at `y`
+```
+
+`recovery_skips_a_stray_indentation_level` in `parser.rs` covers each shape.
 
 #### One diagnostic per lexical error
 

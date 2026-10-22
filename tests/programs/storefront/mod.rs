@@ -102,8 +102,9 @@
 //! refuses them.
 //!
 //! `/stats`'s rollup shape is pinned by `entry_pair_rollup_from_the_storefront` in
-//! `tests/it/chl_parser_roundtrip.rs`; recovery here stops before those lines, so this run
-//! says nothing about them.  What the rollup still needs is entry iteration:
+//! `tests/it/chl_parser_roundtrip.rs`. Recovery reaches those lines in this run and they
+//! parse, which the `found '->'` half of the assertion checks.  What the rollup still needs is
+//! entry iteration:
 //! `for key -> g in groupby(…)` binds a pair only once a keyed collection iterates entries
 //! (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Decided]").
 

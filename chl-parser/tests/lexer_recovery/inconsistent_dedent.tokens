@@ -8,11 +8,11 @@ tokens:
   2:7-2:8 Eq
   2:9-2:10 Int(1)
   2:10-3:1 Newline
-  3:3-3:3 Dedent
   3:3-3:4 Ident("y")
   3:5-3:6 Eq
   3:7-3:8 Int(2)
   3:8-4:1 Newline
+  4:1-4:1 Dedent
   4:1-4:2 Ident("z")
   4:3-4:4 Eq
   4:5-4:6 Int(3)
@@ -21,4 +21,4 @@ lex errors:
   3:3-3:4 indentation does not match any enclosing level
 parse errors:
   3:3-3:4 lex error: indentation does not match any enclosing level
-statements: If, Assign, Assign
+statements: If, Assign

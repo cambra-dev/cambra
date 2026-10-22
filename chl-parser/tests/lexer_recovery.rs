@@ -7,7 +7,8 @@
 //!   rewrites the goldens.
 //! - Every `.cambra` file under the repository's `tests/` and `editors/` lexes
 //!   with no error, the corpus `./ci.sh editors` checks.
-//! - A seeded mutation fuzzer checks the stream invariants on mutated sources.
+//! - A seeded mutation fuzzer checks the stream invariants on mutated sources,
+//!   and that `parse_module` returns a module for each one.
 //!   `CAMBRA_FUZZ_SEED` picks the seed and `CAMBRA_FUZZ_N` the number of
 //!   mutated sources, as in the repository's other fuzz tests.
 
@@ -259,7 +260,13 @@ fn check_invariants(source: &str) -> Result<(), String> {
                     ));
                 }
             }
-            Token::Newline | Token::Indent | Token::Dedent if !open.is_empty() => {
+            Token::Newline
+            | Token::Indent
+            | Token::Dedent
+            | Token::BlockValueIndent
+            | Token::BlockValueDedent
+                if !open.is_empty() =>
+            {
                 return Err(format!("{token:?} at {span:?} inside brackets"));
             }
             _ => {}
@@ -293,18 +300,30 @@ fn check_invariants(source: &str) -> Result<(), String> {
         return Err(format!("errors out of source order: {errors:?}"));
     }
 
-    // A block on an assignment's right-hand side closes with one `Dedent`
-    // that has no `Indent`, so `Dedent`s can outnumber `Indent`s and never
-    // the reverse.
-    let count = |kind: &Token| tokens.iter().filter(|(t, _)| t == kind).count();
-    let (indents, dedents) = (count(&Token::Indent), count(&Token::Dedent));
-    if dedents < indents {
-        return Err(format!("{indents} Indents but {dedents} Dedents"));
+    // Each layout level opens and closes with a pair of its own kind, and the
+    // levels nest: statement-level recovery skips them as balanced pairs.
+    let mut levels = Vec::new();
+    for (token, span) in &tokens {
+        let closes = match token {
+            Token::Indent | Token::BlockValueIndent => {
+                levels.push(token.clone());
+                continue;
+            }
+            Token::Dedent => Token::Indent,
+            Token::BlockValueDedent => Token::BlockValueIndent,
+            _ => continue,
+        };
+        if levels.pop() != Some(closes.clone()) {
+            return Err(format!("{token:?} at {span:?} closes no {closes:?}"));
+        }
+    }
+    if !levels.is_empty() {
+        return Err(format!("{levels:?} never closed"));
     }
 
     let tail = tokens
         .iter()
-        .rposition(|(t, _)| *t != Token::Dedent)
+        .rposition(|(t, _)| !matches!(t, Token::Dedent | Token::BlockValueDedent))
         .map(|i| &tokens[i].0);
     if tail != Some(&Token::Newline) {
         return Err(format!(
@@ -361,6 +380,14 @@ fn check_invariants(source: &str) -> Result<(), String> {
         .collect();
     if reported != errors.iter().collect::<Vec<_>>() {
         return Err("parse_module does not report the lexer's errors first".to_owned());
+    }
+    // Statement-level recovery skips every failed statement whole, so no
+    // source fails the module.
+    if parsed.value.is_none() {
+        return Err(format!(
+            "parse_module returns no module: {:?}",
+            parsed.errors
+        ));
     }
     Ok(())
 }

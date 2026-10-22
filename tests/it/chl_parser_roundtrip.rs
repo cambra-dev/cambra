@@ -582,10 +582,11 @@ fn nested_block_recovery_reports_one_error_per_mistake() {
                 z = 2
             "},
         ),
-        // A block right-hand side closes with one `Dedent` more than the
-        // blocks inside it opened (`lexer.rs`, `Level::Pending`), which the
-        // statement-level recovery's `nested_delimiters` skip has to survive:
-        // it pairs `Indent` with `Dedent` to swallow a broken header's body.
+        // A block right-hand side closes its level with a `BlockValueDedent`
+        // (`lexer.rs`, `Level::Pending`) beside the `Dedent`s of the blocks
+        // inside it. The statement-level recovery's `nested_delimiters` skip
+        // pairs `Indent` with `Dedent` to swallow a broken header's body, and
+        // has to leave the neighbouring statement's tokens alone.
         (
             "block right-hand side beside a broken header",
             indoc! {"

@@ -221,7 +221,7 @@ fn test_value_ternary_scalar(#[case] code: &str, #[case] expected: Value) {
         x"},
     Value::Int(9)
 )]
-// The value feeds an ordinary expression after the block: the `Dedent` ends the
+// The value feeds an ordinary expression after the block: the `BlockValueDedent` ends the
 // statement, and `x` is in scope from there.
 #[case(
     indoc! {"
