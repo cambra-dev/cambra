@@ -1173,19 +1173,17 @@ records one and the only site a `Transact` reaches"
     }
 
     /// Whether a store over `keys` at `paths` continues a recurrence the retired version was
-    /// running: the `continues` argument of [`iteration_input`](Self::iteration_input). A store
-    /// whose seed summarizes positions has folded them already, so its drive resumes above them;
-    /// one whose seed summarizes none needs its source from the beginning.
+    /// running, which is the `continues` argument of [`iteration_input`](Self::iteration_input).
+    /// A store whose seed summarizes positions resumes above them; one whose seed summarizes none
+    /// reads its input from the beginning.
     ///
-    /// Two ways a seed summarizes positions, and the identity of the variable is only the first. A
-    /// variable that carries its own value is the ordinary reload. A variable seeded from a
-    /// `@LoadFrom` is the other: its identity is new, so it carries nothing, while the value it
-    /// starts at is one the retired version folded positions into. Asking only the identity would
-    /// send such a store back over an input it has already counted.
+    /// A seed summarizes positions when its variable carries its own value
+    /// ([`Offer::mutable_state`]) or when a `@LoadFrom` seeded it ([`is_a_load`]). A load's target
+    /// has a new identity and carries nothing, so a store asking only the identity would refold the
+    /// positions the loaded value already counts.
     ///
-    /// Answered for the store rather than for each key, because one store drives one position
-    /// sequence: a key added beside one that resumes begins wherever that store resumes, and
-    /// folding the two over different prefixes of one drive is not a thing the store can do.
+    /// The answer is per store, because one store drives one position sequence: see
+    /// `src/ccl/design/program-evolution.md`, "A loaded value summarizes positions".
     fn store_continues(&self, keys: &[TransactKey], paths: &[VarPath]) -> bool {
         paths
             .iter()
@@ -1517,9 +1515,9 @@ in it has a correspondent",
             // Per variable, not per store: one loop drives one position sequence,
             // so a variable this version adds to a loop that carries another
             // begins wherever that loop resumes.
-            // Two ways a variable's value already summarizes the positions below where
-            // the store resumes, which `store_continues` also reads: it carries its own value, or
-            // a `@LoadFrom` seeded it from one the retired version folded positions
+            // Two ways a variable's value already summarizes the positions below where the
+            // store resumes, which `store_continues` also reads: it carries its own value,
+            // or a `@LoadFrom` seeded it from one the retired version folded positions
             // into. Only a variable with neither begins empty, so only those can be
             // missing a prefix — counting a loaded one as fresh reported a position that
             // was never lost, and taking it as proof the store restarts hid one that was.
