@@ -4,8 +4,7 @@
 //! `crate::ccl::planning::const_fold` calls the same kernels on one-element columns.
 //!
 //! The vectorized form is the primitive and the single-element call wraps it, rather than
-//! the other way round: a per-element closure over the column costs about 15% (measured;
-//! the note on [`zip_arithmetic`]), and folding one pair is not on any hot path.
+//! the other way round: folding one pair is not on any hot path.
 //!
 //! Its own module because the layering forbids `ccl` from depending upward on
 //! `interpreter`, so a kernel both import lives below both. That is also why the operator
@@ -17,7 +16,7 @@ use std::ops::{AddAssign, MulAssign, SubAssign};
 
 use smol_str::{SmolStr, SmolStrBuilder};
 
-pub use crate::view::View;
+use crate::view::View;
 
 /// Kinds of binary operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -186,8 +185,6 @@ fn zip_views<T, R: Clone>(
     }
 }
 
-// Performance note: trying to factor this futher to avoid repeating the zip/iter logic
-// slows it down by ~15%
 pub(crate) fn zip_arithmetic<
     T: IntPow + IntFloorDiv + AddAssign<T> + SubAssign<T> + MulAssign<T>,
 >(

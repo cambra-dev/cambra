@@ -29,12 +29,12 @@ pub fn binop_result_column(op: BinOpKind, left: &ColumnView) -> ColumnValue {
     }
 }
 
-/// The empty column that holds the result of `op` over operands shaped like `left`, a flat
-/// column or a record column.
-pub fn binop_result_column_of(op: BinOpKind, left: &ColumnValue) -> ColumnValue {
+/// The empty column that holds the result of `op` over operands shaped like `left`, a column of a
+/// base type or a record column.
+fn binop_result_column_of(op: BinOpKind, left: &ColumnValue) -> ColumnValue {
     match left.view() {
         Some(view) => binop_result_column(op, &view),
-        // Only the comparison of two products reads a column that is not flat.
+        // Only the comparison of two products reads a column that is not of a base type.
         None => ColumnValue::Bools(Vec::new()),
     }
 }
@@ -116,13 +116,8 @@ pub fn apply_binop_views(
 }
 
 /// Apply a binary operation element-wise on two `ColumnValue`s, appending the result to `out`,
-/// as [`apply_binop_views`] does for flat columns.
-pub fn apply_binop_into(
-    op: BinOpKind,
-    left: &ColumnValue,
-    right: &ColumnValue,
-    out: &mut ColumnValue,
-) {
+/// as [`apply_binop_views`] does for columns of a base type.
+fn apply_binop_into(op: BinOpKind, left: &ColumnValue, right: &ColumnValue, out: &mut ColumnValue) {
     match (op, left, right, &mut *out) {
         // A product compares **componentwise**, which is the whole of what makes one
         // equatable (`src/ccl/design/type-inference.md`, "What the tables hold").
@@ -148,41 +143,46 @@ pub fn apply_binop_column(op: BinOpKind, left: &ColumnValue, right: &ColumnValue
     out
 }
 
-/// Compare two record columns field by field, `Equals` conjoining the results and
-/// `NotEquals` disjoining them.
+/// The fields a comparison of two products compares, each with the two sides' values: the fields
+/// both sides carry, in no particular order.
 ///
-/// **The fields both columns carry are the product the type names.** Typing rejects a
-/// comparison between two different products, so the two field sets differ only where
-/// width subtyping let a wider value reach a narrower position and the tiling kept the
-/// surplus column. A column the position's type does not name is not part of the value
-/// there, and the intersection reads the value at its type whichever operand carries it.
-///
-/// The length is the shortest column the intersection reads, a column still filling being
-/// one whose later positions have not been decided. A surplus column is excluded from that
-/// minimum for the same reason it is excluded from the answer: its extent belongs to the
-/// wider value, and a short one would truncate a result the named fields already decided.
+/// **The fields both sides carry are the product the type names.** Typing rejects a comparison
+/// between two different products, so the two field sets differ only where width subtyping let a
+/// wider value reach a narrower position and the tiling kept the surplus column. A field the
+/// position's type does not name is not part of the value there, and the intersection reads the
+/// value at its type whichever operand carries it.
 ///
 /// A value carrying exactly the fields its type names would retire the intersection. What
 /// keeps the surplus is inlining dropping the parameter's annotation — see the vault issue
 /// `type-checker-inlining-drops-a-narrowing-annotation`.
+pub(crate) fn compared_fields<'a, L, R>(
+    left: &'a HashMap<SmolStr, L>,
+    right: &'a HashMap<SmolStr, R>,
+) -> impl Iterator<Item = (&'a SmolStr, &'a L, &'a R)> + Clone {
+    left.iter()
+        .filter_map(|(name, l)| Some((name, l, right.get(name)?)))
+}
+
+/// Compare two record columns field by field, `Equals` conjoining the results and
+/// `NotEquals` disjoining them, over the fields [`compared_fields`] names.
+///
+/// The length is the shortest column those fields read, a column still filling being one whose
+/// later positions have not been decided. A surplus column is excluded from that minimum for the
+/// same reason it is excluded from the answer: its extent belongs to the wider value, and a short
+/// one would truncate a result the named fields already decided.
 fn compare_records(
     op: CompareKind,
     left: &HashMap<SmolStr, ColumnValue>,
     right: &HashMap<SmolStr, ColumnValue>,
 ) -> Vec<bool> {
-    let rows = left
-        .iter()
-        .filter(|(field, _)| right.contains_key(*field))
-        .flat_map(|(field, l)| [l.len(), right[field].len()])
+    let fields = compared_fields(left, right);
+    let rows = fields
+        .clone()
+        .flat_map(|(_, l, r)| [l.len(), r.len()])
         .min()
         .unwrap_or(0);
     let mut acc = vec![op == CompareKind::Equals; rows];
-    for (field, l) in left {
-        // A column only one side carries is the surplus of a wider value, not a field of
-        // the product being compared.
-        let Some(r) = right.get(field) else {
-            continue;
-        };
+    for (_, l, r) in fields {
         let mut field_eq = ColumnValue::Bools(Vec::new());
         apply_binop_into(BinOpKind::Compare(op), l, r, &mut field_eq);
         let ColumnValue::Bools(field_eq) = field_eq else {
@@ -209,6 +209,7 @@ mod tests {
     use std::hint::black_box;
     use std::time::Duration;
 
+    use super::apply_binop_into;
     use crate::interpreter::*;
     use test_log::test;
 

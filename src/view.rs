@@ -4,10 +4,9 @@
 //! column, a region of one, and a literal. A region of the input is read without a copy, and a
 //! repeated operand is read as one value, not as a column of copies.
 //!
-//! Its own module, like `crate::scalar_ops`, because the layering forbids `ccl` from depending
-//! upward on `interpreter`, and `ccl::planning::const_fold` calls the kernels.
+//! A module of its own because `crate::scalar_ops` and `interpreter::types::ColumnView` both use
+//! the type, and neither depends on the other's module for it.
 
-use std::iter::repeat_n;
 use std::ops::Range;
 
 /// A borrowed region of a column: stored values, or one value repeated `len` times.
@@ -44,11 +43,6 @@ impl<'a, T> View<'a, T> {
         self.len() == 0
     }
 
-    /// The first `rows` values.
-    pub fn prefix(self, rows: usize) -> Self {
-        self.range(0..rows)
-    }
-
     /// The values in `range`.
     pub fn range(self, range: Range<usize>) -> Self {
         match self {
@@ -64,42 +58,15 @@ impl<'a, T> View<'a, T> {
     }
 }
 
-impl<T: Clone> View<'_, T> {
-    /// Append every value to `out`.
-    pub fn extend_into(self, out: &mut Vec<T>) {
-        match self {
-            View::Slice(values) => out.extend_from_slice(values),
-            View::Constant { value, len } => out.extend(repeat_n(value.clone(), len)),
-        }
-    }
-}
-
-/// Two views are equal when they read as the same values in the same order, however stored.
-impl<T: PartialEq> PartialEq for View<'_, T> {
-    fn eq(&self, other: &Self) -> bool {
-        match (*self, *other) {
-            (View::Slice(a), View::Slice(b)) => a == b,
-            (View::Constant { value: a, len: n }, View::Constant { value: b, len: m }) => {
-                n == m && (n == 0 || a == b)
-            }
-            (View::Slice(values), View::Constant { value, len })
-            | (View::Constant { value, len }, View::Slice(values)) => {
-                values.len() == len && values.iter().all(|v| v == value)
-            }
-        }
-    }
-}
-
-impl<T: Eq> Eq for View<'_, T> {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn values<T: Clone>(view: View<'_, T>) -> Vec<T> {
-        let mut out = Vec::new();
-        view.extend_into(&mut out);
-        out
+        match view {
+            View::Slice(values) => values.to_vec(),
+            View::Constant { value, len } => vec![value.clone(); len],
+        }
     }
 
     /// A stored column and a repeated value read as the same sequence.
@@ -121,17 +88,6 @@ mod tests {
         let part = View::repeated(&nine, 5).range(2..4);
         assert_eq!(part.len(), 2);
         assert_eq!(values(part), vec![9, 9]);
-        assert_eq!(values(part.prefix(1)), vec![9]);
-    }
-
-    /// Views compare by the values they read, not by how they are stored.
-    #[test]
-    fn views_compare_by_their_values() {
-        let (stored, seven) = (vec![7, 7], 7);
-        assert_eq!(View::Slice(&stored), View::repeated(&seven, 2));
-        assert_ne!(View::Slice(&stored), View::repeated(&seven, 3));
-        assert_ne!(View::Slice(&[7, 8]), View::repeated(&seven, 2));
-        assert_eq!(View::repeated(&seven, 0), View::Slice(&Vec::<i32>::new()));
     }
 
     #[test]

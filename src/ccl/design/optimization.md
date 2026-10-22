@@ -481,7 +481,10 @@ scalar builtins, and `zip`s of such chains, and converts it to
 two operations read is computed once, and a field path is read from the input as one slice. The
 arms of a `zip` in the prefix read the same input, so the fused chain has no `Memo`, `FanOut`, `Zip`
 or intermediate pair. A prefix of fewer than two operations converts as before, since fusing it
-would replace one operator with one.
+would replace one operator with one. A comparison of two records, `==` or `!=`, is read as one
+comparison per field both records carry, joined by `and` or `or`. A record against a non-record,
+two records with no field in common, and an ordering of records have no program, and the prefix
+ends before them.
 
 The prefix ends before the first element outside that set. An aggregate, a lookup, a conditional,
 a store read, or a constant that is not closed stays an operator. Conversion also declines when

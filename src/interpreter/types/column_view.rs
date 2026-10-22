@@ -1,4 +1,4 @@
-//! A borrowed column: the values of one flat column as a [`View`] of its element type.
+//! A borrowed column: the values of one column of a base type as a [`View`] of its element type.
 
 use smol_str::SmolStr;
 
@@ -11,7 +11,7 @@ use super::ColumnValue;
 ///
 /// The element-wise operations read their operands as column views, so an operand that is a
 /// region of the input, or one literal repeated, is read in place and never copied into a column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum ColumnView<'a> {
     Ints(View<'a, i64>),
     UInts(View<'a, u64>),
@@ -61,8 +61,8 @@ impl<'a> ColumnView<'a> {
 }
 
 impl ColumnValue {
-    /// This column as a view, or `None` for a column that is not flat (a record, a union, or
-    /// another composite).
+    /// This column as a view, or `None` for a column that is not of a base type: a record, a union
+    /// or another composite, and a `Units` column, which stores no values.
     pub fn view(&self) -> Option<ColumnView<'_>> {
         match self {
             ColumnValue::Ints(v) => Some(ColumnView::Ints(View::Slice(v))),
@@ -70,17 +70,6 @@ impl ColumnValue {
             ColumnValue::Strings(v) => Some(ColumnView::Strings(View::Slice(v))),
             ColumnValue::Bools(v) => Some(ColumnView::Bools(View::Slice(v))),
             _ => None,
-        }
-    }
-
-    /// Append every value of `view`, a view of the same element type.
-    pub fn extend_from_view(&mut self, view: ColumnView<'_>) {
-        match (self, view) {
-            (ColumnValue::Ints(o), ColumnView::Ints(v)) => v.extend_into(o),
-            (ColumnValue::UInts(o), ColumnView::UInts(v)) => v.extend_into(o),
-            (ColumnValue::Strings(o), ColumnView::Strings(v)) => v.extend_into(o),
-            (ColumnValue::Bools(o), ColumnView::Bools(v)) => v.extend_into(o),
-            (out, view) => panic!("cannot append {view:?} to {out:?}"),
         }
     }
 }

@@ -6,11 +6,15 @@
 //! input column. [`fuse_prefix`] recognizes such a chain and [`ScalarProgram::eval`] computes it
 //! without an operator or an intermediate pair per arm.
 //!
-//! A [`ScalarProgram`] is a straight-line program over slots: instruction 𝑖 writes slot 𝑖, and
+//! A [`ScalarProgram`] is a straight-line program over slots: instruction 𝑖 names slot 𝑖, and
 //! its operands name earlier slots. A value that two operations read is one slot, computed once.
+//! Every `Input` reads a column of a base type and every `Const` is a value of one, so a program
+//! has no record: [`fuse_prefix`] takes a comparison of two records apart into a comparison per
+//! field.
 //!
-//! `eval` works through the input in blocks of [`BLOCK_ROWS`] rows. Every instruction but the
-//! last writes one block-sized column into a slot of its own, which later blocks reuse, so the
+//! `eval` works through the input in blocks of [`BLOCK_ROWS`] rows. An `Input` or a `Const` is
+//! read in place, as a region of the input or one value repeated. Every operation but the last
+//! writes one block-sized column into a slot of its own, which later blocks reuse, so the
 //! intermediates of a chain are a few kilobytes each, allocated once per `eval`, and each
 //! kernel runs over columns that are still in cache. The last instruction appends to the result
 //! column.
@@ -25,9 +29,9 @@ use crate::ccl::{Builtin, Expr, ProjKey, TypedExprNode};
 use crate::view::View;
 
 use super::{
-    BaseType, BinOpKind as InterpreterBinOp, ColumnValue, ColumnView, Extent, UnaryOpKind, Value,
-    apply_binop_into, apply_binop_views, apply_unaryop_views, binop_output_extent,
-    binop_result_column, binop_result_column_of, operator_conversion::expr_to_value, tuple_field,
+    BaseType, BinOpKind as InterpreterBinOp, ColumnValue, ColumnView, CompareKind, Extent,
+    LogicKind, UnaryOpKind, Value, apply_binop_views, apply_unaryop_views, binop::compared_fields,
+    binop_output_extent, binop_result_column, operator_conversion::expr_to_value, tuple_field,
 };
 
 /// The index of an instruction, which is also the slot it writes.
@@ -36,11 +40,12 @@ type Slot = u32;
 /// One instruction of a [`ScalarProgram`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Instr {
-    /// The column at `path` inside the map's input value; an empty path is the value itself.
+    /// The column of a base type at `path` inside the map's input value; an empty path is the
+    /// value itself.
     Input {
         path: Vec<SmolStr>,
     },
-    /// One value at every row: a literal, or a closed tuple or record.
+    /// One value of a base type at every row.
     Const(Value),
     Bin(InterpreterBinOp, Slot, Slot),
     Un(UnaryOpKind, Slot),
@@ -71,31 +76,29 @@ fn field<'i>(input: &'i ColumnValue, path: &[SmolStr]) -> &'i ColumnValue {
     })
 }
 
-/// The values of a closed scalar as a view of the value itself, repeated over `len` rows, or
-/// `None` for a value that is not a base type (a record), whose column is built.
-fn const_view(value: &Value, len: usize) -> Option<ColumnView<'_>> {
-    Some(match value {
+/// The values of a closed scalar as a view of the value itself, repeated over `len` rows.
+fn const_view(value: &Value, len: usize) -> ColumnView<'_> {
+    match value {
         Value::Int(n) => ColumnView::Ints(View::repeated(n, len)),
         Value::UInt(n) => ColumnView::UInts(View::repeated(n, len)),
         Value::String(s) => ColumnView::Strings(View::repeated(s, len)),
         Value::Bool(b) => ColumnView::Bools(View::repeated(b, len)),
-        _ => return None,
-    })
+        _ => unreachable!("a constant instruction holds a value of a base type, got {value:?}"),
+    }
 }
 
 /// The columns of an evaluation, one per instruction, kept from block to block.
 ///
 /// An operation writes its block into its own slot, so a slot's buffer is allocated while the
 /// first block is evaluated and reused for every later one, instead of each block allocating a
-/// column per operation. An instruction that reads a column already stored, an `Input` or a
-/// `Const`, writes no slot: its block is read in place as a [`ColumnView`], a region of the
-/// input or one value repeated. The exception is a column that is not flat, a record, which the
-/// view cannot hold: its block is built in the slot.
+/// column per operation. An `Input` or a `Const` writes no slot: its block is read in place as a
+/// [`ColumnView`], a region of the input or one value repeated.
 struct Scratch<'a> {
     input: &'a ColumnValue,
-    /// A slot is `Units(0)` until its instruction first writes it; no instruction's result is
-    /// a `Units` column, so the marker is unambiguous. The last instruction writes to the
-    /// result, so its slot stays unwritten unless it is an `Input` or a `Const`.
+    /// The slot of an operation is `Units(0)` until its instruction first writes it; no
+    /// operation's result is a `Units` column, so the marker is unambiguous. The slot of an
+    /// `Input` or a `Const` stays unwritten, and so does the last instruction's, whose kernel
+    /// appends to the result.
     slots: Vec<ColumnValue>,
     /// The current block: the rows `start..start + len` of the input.
     start: usize,
@@ -112,21 +115,18 @@ impl<'a> Scratch<'a> {
         }
     }
 
-    /// The block of instruction `slot` as a view, or `None` when its column is not flat.
-    fn view<'s>(&'s self, program: &'s ScalarProgram, slot: usize) -> Option<ColumnView<'s>> {
+    /// The block of instruction `slot` as a view.
+    fn view<'s>(&'s self, program: &'s ScalarProgram, slot: usize) -> ColumnView<'s> {
         match &program.instrs[slot] {
             Instr::Input { path } => field(self.input, path)
                 .view()
-                .map(|leaf| leaf.range(self.start..self.start + self.len)),
+                .unwrap_or_else(|| panic!("the input at {path:?} is a column of a base type"))
+                .range(self.start..self.start + self.len),
             Instr::Const(value) => const_view(value, self.len),
-            Instr::Bin(..) | Instr::Un(..) => self.slots[slot].view(),
+            Instr::Bin(..) | Instr::Un(..) => self.slots[slot]
+                .view()
+                .unwrap_or_else(|| panic!("the result s{slot} is a column of a base type")),
         }
-    }
-
-    /// The block of an operand of an operation, which is a flat column.
-    fn flat<'s>(&'s self, program: &'s ScalarProgram, slot: usize) -> ColumnView<'s> {
-        self.view(program, slot)
-            .unwrap_or_else(|| panic!("the operand s{slot} is a flat column"))
     }
 
     /// Run `program` over the rows `start..start + len` and append the block's result to `out`.
@@ -146,54 +146,28 @@ impl<'a> Scratch<'a> {
         }
         match last {
             Instr::Un(op, a) => {
-                apply_unaryop_views(*op, &self.flat(program, *a as usize), out);
+                apply_unaryop_views(*op, &self.view(program, *a as usize), out);
             }
             Instr::Bin(op, a, b) => {
-                let (a, b) = (*a as usize, *b as usize);
-                match (self.view(program, a), self.view(program, b)) {
-                    (Some(a), Some(b)) => apply_binop_views(*op, &a, &b, out),
-                    // Two record columns, built in their slots.
-                    _ => apply_binop_into(*op, &self.slots[a], &self.slots[b], out),
-                }
+                let (a, b) = (
+                    self.view(program, *a as usize),
+                    self.view(program, *b as usize),
+                );
+                apply_binop_views(*op, &a, &b, out);
             }
-            // An output that is a column already has no kernel to write the result with.
             Instr::Input { .. } | Instr::Const(_) => {
-                let slot = body.len();
-                match self.view(program, slot) {
-                    Some(view) => out.extend_from_view(view),
-                    None => {
-                        self.run(program, slot, last);
-                        out.extend_from(&self.slots[slot]);
-                    }
-                }
+                unreachable!("the output of a prefix is an operation, which `root_of` checks")
             }
         }
     }
 
-    /// Write the block of `instr` into `slot`, unless it is read in place.
+    /// Write the block of an operation into `slot`. An `Input` or a `Const` is read in place.
     fn run(&mut self, program: &ScalarProgram, slot: usize, instr: &Instr) {
-        let rows = self.start..self.start + self.len;
         match instr {
-            Instr::Input { path } => {
-                let leaf = field(self.input, path);
-                if leaf.view().is_none() {
-                    // A record column: a field of it is sliced alone, not with the rest.
-                    leaf.slice_into(rows, &mut self.slots[slot]);
-                }
-            }
-            // A record constant holds the same value in every row of every block, so its slot
-            // is rewritten only when the block length changes: the first block and a shorter
-            // last one.
-            Instr::Const(value) if const_view(value, self.len).is_none() => {
-                let held = &self.slots[slot];
-                if matches!(held, ColumnValue::Units(_)) || held.len() != self.len {
-                    self.slots[slot] = ColumnValue::single(value.clone()).repeat(self.len);
-                }
-            }
-            Instr::Const(_) => {}
+            Instr::Input { .. } | Instr::Const(_) => {}
             Instr::Un(op, a) => {
                 let mut out = take(&mut self.slots[slot]);
-                let a = self.flat(program, *a as usize);
+                let a = self.view(program, *a as usize);
                 if matches!(out, ColumnValue::Units(_)) {
                     out = a.empty_like();
                 } else {
@@ -203,27 +177,17 @@ impl<'a> Scratch<'a> {
                 self.slots[slot] = out;
             }
             Instr::Bin(op, a, b) => {
-                let (a, b) = (*a as usize, *b as usize);
                 let mut out = take(&mut self.slots[slot]);
-                match (self.view(program, a), self.view(program, b)) {
-                    (Some(a), Some(b)) => {
-                        if matches!(out, ColumnValue::Units(_)) {
-                            out = binop_result_column(*op, &a);
-                        } else {
-                            out.clear();
-                        }
-                        apply_binop_views(*op, &a, &b, &mut out);
-                    }
-                    // Two record columns, built in their slots.
-                    _ => {
-                        if matches!(out, ColumnValue::Units(_)) {
-                            out = binop_result_column_of(*op, &self.slots[a]);
-                        } else {
-                            out.clear();
-                        }
-                        apply_binop_into(*op, &self.slots[a], &self.slots[b], &mut out);
-                    }
+                let (a, b) = (
+                    self.view(program, *a as usize),
+                    self.view(program, *b as usize),
+                );
+                if matches!(out, ColumnValue::Units(_)) {
+                    out = binop_result_column(*op, &a);
+                } else {
+                    out.clear();
                 }
+                apply_binop_views(*op, &a, &b, &mut out);
                 self.slots[slot] = out;
             }
         }
@@ -272,7 +236,12 @@ impl ScalarProgram {
                 Instr::Const(value) => ColumnValue::single(value.clone()).empty_like(),
                 // `neg` and `not` keep their operand's type.
                 Instr::Un(_, a) => empties[*a as usize].clone(),
-                Instr::Bin(op, a, _) => binop_result_column_of(*op, &empties[*a as usize]),
+                Instr::Bin(op, a, _) => {
+                    let operand = empties[*a as usize]
+                        .view()
+                        .expect("an operand is a column of a base type");
+                    binop_result_column(*op, &operand)
+                }
             };
             empties.push(empty);
         }
@@ -321,6 +290,9 @@ enum Val {
     Read(Vec<SmolStr>, Extent),
     /// A computed column, with the extent of its values.
     Slot(Slot, Extent),
+    /// A closed value, the same at every position, with its extent: held as a value until an
+    /// operation reads a base value of it as a column, or a comparison takes a record apart.
+    Const(Value, Extent),
     /// The arms of a `zip`, which a binary operation takes its operands from.
     Tuple(Vec<Val>),
 }
@@ -341,11 +313,12 @@ impl Parser {
         (self.instrs.len() - 1) as Slot
     }
 
-    /// The column a value stands for, read into a slot. A product has none.
+    /// The column a value stands for, read into a slot: a computed column, a path of the input, or
+    /// a base value. A product and a record have none.
     fn column(&mut self, v: &Val) -> Option<(Slot, Extent)> {
         match v {
             Val::Slot(slot, extent) => Some((*slot, extent.clone())),
-            Val::Read(path, extent) => {
+            Val::Read(path, extent) if has_view(extent) => {
                 let slot = match self.reads.get(path) {
                     Some(&slot) => slot,
                     None => {
@@ -356,16 +329,86 @@ impl Parser {
                 };
                 Some((slot, extent.clone()))
             }
-            Val::Tuple(_) => None,
+            Val::Const(value, extent) if has_view(extent) => {
+                Some((self.emit(Instr::Const(value.clone())), extent.clone()))
+            }
+            Val::Read(..) | Val::Const(..) | Val::Tuple(_) => None,
         }
     }
 
     /// `value` at every position, when it has an extent a column of it can be read at: a base
     /// value or a record of them.
-    fn constant(&mut self, value: Value) -> Option<Val> {
+    fn constant(value: Value) -> Option<Val> {
         let extent = value_extent(&value)?;
-        let slot = self.emit(Instr::Const(value));
-        Some(Val::Slot(slot, extent))
+        Some(Val::Const(value, extent))
+    }
+
+    /// The fields of a record `v` that is read from the input or is a constant, each as the value
+    /// of that field. A value that is not a record has none.
+    fn fields_of(v: &Val) -> Option<HashMap<SmolStr, Val>> {
+        match v {
+            Val::Read(path, extent) => Some(
+                extent
+                    .record_fields()?
+                    .iter()
+                    .map(|(name, field)| {
+                        let mut path = path.clone();
+                        path.push(name.clone());
+                        (name.clone(), Val::Read(path, field.clone()))
+                    })
+                    .collect(),
+            ),
+            Val::Const(Value::Record(values), extent) => {
+                let extents = extent.record_fields()?;
+                values
+                    .iter()
+                    .map(|(name, value)| {
+                        let field = Val::Const(value.clone(), extents.get(name)?.clone());
+                        Some((name.clone(), field))
+                    })
+                    .collect()
+            }
+            _ => None,
+        }
+    }
+
+    /// `a op b` for a binary operation. Two records compare field by field over the fields
+    /// [`compared_fields`] names, as `compare_records` compares the columns of two: `==` is the
+    /// conjunction of the fields' comparisons and `!=` their disjunction. A record against
+    /// anything but a record, two records with no field in common, and any other operation on a
+    /// record have no program.
+    fn operation(&mut self, op: InterpreterBinOp, a: &Val, b: &Val) -> Option<(Slot, Extent)> {
+        let InterpreterBinOp::Compare(kind @ (CompareKind::Equals | CompareKind::NotEquals)) = op
+        else {
+            let ((a, _), (b, _)) = (self.column(a)?, self.column(b)?);
+            return Some((self.emit(Instr::Bin(op, a, b)), binop_output_extent(&op)));
+        };
+        match (Self::fields_of(a), Self::fields_of(b)) {
+            (None, None) => {
+                let ((a, _), (b, _)) = (self.column(a)?, self.column(b)?);
+                Some((self.emit(Instr::Bin(op, a, b)), binop_output_extent(&op)))
+            }
+            (Some(left), Some(right)) => {
+                let join = InterpreterBinOp::BoolLogic(if kind == CompareKind::Equals {
+                    LogicKind::And
+                } else {
+                    LogicKind::Or
+                });
+                // In name order, so that equal chains give equal programs.
+                let mut fields: Vec<_> = compared_fields(&left, &right).collect();
+                fields.sort_by_key(|(name, ..)| *name);
+                let mut joined: Option<Slot> = None;
+                for (_, l, r) in fields {
+                    let (slot, _) = self.operation(op, l, r)?;
+                    joined = Some(match joined {
+                        None => slot,
+                        Some(prev) => self.emit(Instr::Bin(join, prev, slot)),
+                    });
+                }
+                Some((joined?, binop_output_extent(&join)))
+            }
+            _ => None,
+        }
     }
 
     /// A field of the chain's input. A projection of a product built in the chain,
@@ -401,10 +444,8 @@ impl Parser {
                 let [a, b] = items.as_slice() else {
                     return None;
                 };
-                let ((a, _), (b, _)) = (self.column(a)?, self.column(b)?);
-                let op: InterpreterBinOp = (*op).into();
-                let extent = binop_output_extent(&op);
-                Some(Val::Slot(self.emit(Instr::Bin(op, a, b)), extent))
+                let (slot, extent) = self.operation((*op).into(), a, b)?;
+                Some(Val::Slot(slot, extent))
             }
             TypedExprNode::Builtin(b @ (Builtin::Neg | Builtin::NotFn)) => {
                 let (a, operand) = self.column(&cur)?;
@@ -419,7 +460,7 @@ impl Parser {
             TypedExprNode::Apply { argument, function } => match &function.node {
                 // `𝑐 ▷ const` for a closed value: the same value at every position.
                 TypedExprNode::Builtin(Builtin::Const) => {
-                    self.constant(expr_to_value(argument).ok()?)
+                    Self::constant(expr_to_value(argument).ok()?)
                 }
                 // Every arm is a function of the value the zip is applied to.
                 TypedExprNode::Builtin(Builtin::Zip) => match &argument.node {
@@ -439,12 +480,13 @@ impl Parser {
     /// The slot a chain ending at `v` yields. A projection of the input is nothing to compute,
     /// whatever its path: the projection's own conversion takes the field without copying it, and
     /// the prefix ends at an operation, so an `Input` is emitted only for an operation that reads
-    /// it. A product ends as a tile of its fields rather than as one column, which a column
-    /// function cannot build, so a product has none.
+    /// it. A constant has no root for the same reason, since `simplify` has already reduced
+    /// `f ≫ c ▷ const`. A product ends as a tile of its fields rather than as one column, which a
+    /// column function cannot build, so a product has none.
     fn root_of(&mut self, v: &Val) -> Option<(Slot, Extent)> {
         match v {
             Val::Slot(..) => self.column(v),
-            Val::Read(..) | Val::Tuple(_) => None,
+            Val::Read(..) | Val::Const(..) | Val::Tuple(_) => None,
         }
     }
 }
@@ -467,7 +509,13 @@ fn value_extent(value: &Value) -> Option<Extent> {
     })
 }
 
-/// Whether a column of `extent` is one `eval` can read: a base type or a record of them.
+/// Whether a column of `extent` has a [`ColumnView`]: a base type other than `Unit`, whose column
+/// stores no values.
+fn has_view(extent: &Extent) -> bool {
+    matches!(extent, Extent::Base(base) if *base != BaseType::Unit)
+}
+
+/// Whether a column of `extent` is one `eval` can read from: a base type or a record of them.
 fn is_plain(extent: &Extent) -> bool {
     match extent {
         Extent::Base(_) => true,
@@ -534,6 +582,7 @@ pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
 mod tests {
     use super::*;
     use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Lit, LogicKind};
+    use crate::interpreter::apply_binop_column;
 
     fn id() -> Expr {
         Expr::builtin(Builtin::Id)
@@ -681,6 +730,254 @@ mod tests {
         );
         let want: Vec<bool> = (0..n).map(|i| i % 2 == 1).collect();
         assert_eq!(bools(fused.program.eval(&input)), want);
+    }
+
+    /// The extent `{_0: Int, _1: Int, …}`, one field per name given.
+    fn tuple_of_ints(n: usize) -> Extent {
+        Extent::Record((0..n).map(|i| (tuple_field(i), int())).collect())
+    }
+
+    /// The closed tuple of the integers `ns`, as a constant.
+    fn closed_tuple(ns: &[i64]) -> Expr {
+        let lits = ns.iter().map(|&n| Expr::lit(Lit::Int(n))).collect();
+        Expr::apply(Expr::tuple(lits), Expr::builtin(Builtin::Const))
+    }
+
+    /// The result of comparing `input` to the closed tuple `ns` with `op`, as a fused chain.
+    fn compare_to_tuple(
+        input_extent: &Extent,
+        op: CompareKind,
+        ns: &[i64],
+        input: &ColumnValue,
+    ) -> Option<Vec<bool>> {
+        let chain = vec![
+            zip(vec![id(), closed_tuple(ns)]),
+            binop(BinOpKind::Compare(op)),
+        ];
+        Some(bools(
+            fuse_prefix(&chain, input_extent)?.program.eval(input),
+        ))
+    }
+
+    /// `n` rows of `(i % 2, 2, 7)` as a record column of `width` fields.
+    fn tuples(width: usize, n: usize) -> ColumnValue {
+        let field = |i: usize| match i {
+            0 => ColumnValue::Ints((0..n as i64).map(|i| i % 2).collect()),
+            1 => ColumnValue::Ints(vec![2; n]),
+            _ => ColumnValue::Ints(vec![7; n]),
+        };
+        ColumnValue::Records((0..width).map(|i| (tuple_field(i), field(i))).collect())
+    }
+
+    /// `==` of two records is the conjunction of the fields' comparisons and `!=` their
+    /// disjunction, decided while the chain is read: the program holds comparisons of base
+    /// columns, and no record constant.
+    #[test]
+    fn a_record_comparison_is_taken_apart_into_its_fields() {
+        let n = 2 * BLOCK_ROWS + 5;
+        let input = tuples(2, n);
+        let eq = [CompareKind::Equals, CompareKind::NotEquals]
+            .map(|op| compare_to_tuple(&tuple_of_ints(2), op, &[1, 2], &input).unwrap());
+        let is_one: Vec<bool> = (0..n).map(|i| i % 2 == 1).collect();
+        assert_eq!(eq[0], is_one);
+        assert_eq!(eq[1], is_one.iter().map(|b| !b).collect::<Vec<_>>());
+        let chain = vec![
+            zip(vec![id(), closed_tuple(&[1, 2])]),
+            binop(BinOpKind::Compare(CompareKind::Equals)),
+        ];
+        let fused = fuse_prefix(&chain, &tuple_of_ints(2)).unwrap();
+        assert!(
+            fused
+                .program
+                .instrs
+                .iter()
+                .all(|instr| !matches!(instr, Instr::Const(Value::Record(_)))),
+            "{}",
+            fused.program
+        );
+    }
+
+    /// A field that is a record is compared the same way, down to its base fields.
+    #[test]
+    fn a_nested_record_comparison_is_taken_apart_to_base_fields() {
+        let inner = tuple_of_ints(2);
+        let extent = Extent::Record(
+            [(tuple_field(0), inner), (tuple_field(1), int())]
+                .into_iter()
+                .collect(),
+        );
+        let n = 5;
+        let input = ColumnValue::Records(
+            [
+                (tuple_field(0), tuples(2, n)),
+                (tuple_field(1), ColumnValue::Ints(vec![7; n])),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let nested = Expr::apply(
+            Expr::tuple(vec![
+                Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]),
+                Expr::lit(Lit::Int(7)),
+            ]),
+            Expr::builtin(Builtin::Const),
+        );
+        let chain = vec![
+            zip(vec![id(), nested]),
+            binop(BinOpKind::Compare(CompareKind::Equals)),
+        ];
+        let fused = fuse_prefix(&chain, &extent).expect("a nested record is compared by field");
+        let is_one: Vec<bool> = (0..n).map(|i| i % 2 == 1).collect();
+        assert_eq!(bools(fused.program.eval(&input)), is_one);
+    }
+
+    /// Two records compare over the fields both carry, as the columns of two records do
+    /// (`compare_records`): a wider value reaching a narrower position keeps its surplus field,
+    /// which is not part of the value there.
+    #[test]
+    fn a_comparison_reads_the_fields_both_records_carry() {
+        let n = 7;
+        let wide = tuples(3, n);
+        let got = compare_to_tuple(&tuple_of_ints(3), CompareKind::Equals, &[1, 2], &wide).unwrap();
+        let columns = ColumnValue::Records(
+            [
+                (tuple_field(0), ColumnValue::Ints(vec![1; n])),
+                (tuple_field(1), ColumnValue::Ints(vec![2; n])),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let want = apply_binop_column(
+            InterpreterBinOp::Compare(crate::scalar_ops::CompareKind::Equals),
+            &wide,
+            &columns,
+        );
+        assert_eq!(ColumnValue::Bools(got), want);
+    }
+
+    /// A record against a base value, two records with no field in common, and an ordering of two
+    /// records are not compared, so the chain stays unfused.
+    #[test]
+    fn a_comparison_without_a_field_to_compare_is_not_fused() {
+        let (record, other) = (tuple_of_ints(2), record_of("x", int()));
+        let fuses = |input: &Extent, constant: Expr, op: CompareKind| {
+            let chain = vec![zip(vec![id(), constant]), binop(BinOpKind::Compare(op))];
+            fuse_prefix(&chain, input).is_some()
+        };
+        assert!(fuses(&record, closed_tuple(&[1, 2]), CompareKind::Equals));
+        assert!(!fuses(&record, constant(1), CompareKind::Equals));
+        assert!(!fuses(&other, closed_tuple(&[1, 2]), CompareKind::Equals));
+        assert!(!fuses(&record, closed_tuple(&[1, 2]), CompareKind::Less));
+    }
+
+    /// A record compared to a record read from the input, or to another constant, is taken apart
+    /// the same way, and `!=` joins the fields' comparisons by `or`.
+    #[test]
+    fn records_compare_with_records_read_or_constant() {
+        let n = 6;
+        let input = tuples(2, n);
+        let record = tuple_of_ints(2);
+        let compare = |op, arms: Vec<Expr>| {
+            let chain = vec![zip(arms), binop(BinOpKind::Compare(op))];
+            bools(fuse_prefix(&chain, &record).unwrap().program.eval(&input))
+        };
+        let (a, b) = (closed_tuple(&[1, 2]), closed_tuple(&[1, 3]));
+        assert_eq!(
+            compare(CompareKind::Equals, vec![id(), id()]),
+            vec![true; n]
+        );
+        assert_eq!(
+            compare(CompareKind::NotEquals, vec![id(), id()]),
+            vec![false; n]
+        );
+        assert_eq!(
+            compare(CompareKind::Equals, vec![a.clone(), b.clone()]),
+            vec![false; n]
+        );
+        assert_eq!(compare(CompareKind::NotEquals, vec![a, b]), vec![true; n]);
+    }
+
+    /// A nested record is not equal when any base field differs: `!=` is joined by `or` at every
+    /// level.
+    #[test]
+    fn a_nested_record_differs_when_any_base_field_differs() {
+        let extent = Extent::Record(
+            [(tuple_field(0), tuple_of_ints(2)), (tuple_field(1), int())]
+                .into_iter()
+                .collect(),
+        );
+        let n = 5;
+        let input = ColumnValue::Records(
+            [
+                (tuple_field(0), tuples(2, n)),
+                (tuple_field(1), ColumnValue::Ints(vec![7; n])),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let nested = |last: i64| {
+            let inner = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]);
+            let pair = Expr::tuple(vec![inner, Expr::lit(Lit::Int(last))]);
+            Expr::apply(pair, Expr::builtin(Builtin::Const))
+        };
+        let ne = |last| {
+            let chain = vec![
+                zip(vec![id(), nested(last)]),
+                binop(BinOpKind::Compare(CompareKind::NotEquals)),
+            ];
+            bools(fuse_prefix(&chain, &extent).unwrap().program.eval(&input))
+        };
+        assert_eq!(ne(7), (0..n).map(|i| i % 2 == 0).collect::<Vec<_>>());
+        assert_eq!(ne(8), vec![true; n]);
+    }
+
+    /// The fields come from the extents, so a column wider than the extent that names it compares
+    /// over the fields both sides name, and a field with no values to read is not compared.
+    #[test]
+    fn a_column_wider_than_its_extent_compares_over_the_extents_fields() {
+        let n = 4;
+        let wide = tuples(3, n);
+        let got = compare_to_tuple(&tuple_of_ints(2), CompareKind::Equals, &[1, 2], &wide);
+        assert_eq!(got.unwrap(), (0..n).map(|i| i % 2 == 1).collect::<Vec<_>>());
+        let unit = Extent::Record(
+            [
+                (SmolStr::from("u"), Extent::Base(BaseType::Unit)),
+                (SmolStr::from("x"), int()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let chain = vec![
+            zip(vec![id(), id()]),
+            binop(BinOpKind::Compare(CompareKind::Equals)),
+        ];
+        assert!(
+            fuse_prefix(&chain, &unit).is_none(),
+            "a `Units` column has no view to compare"
+        );
+    }
+
+    /// Equal chains give equal programs, whatever order a hash map holds the record's fields in.
+    #[test]
+    fn a_record_comparison_gives_the_same_program_every_time() {
+        let wide = tuple_of_ints(12);
+        let chain = vec![
+            zip(vec![id(), closed_tuple(&(0..12).collect::<Vec<_>>())]),
+            binop(BinOpKind::Compare(CompareKind::Equals)),
+        ];
+        let first = fuse_prefix(&chain, &wide).unwrap().program;
+        for _ in 0..8 {
+            assert_eq!(fuse_prefix(&chain, &wide).unwrap().program, first);
+        }
+    }
+
+    /// A constant is not a root: `simplify` reduces `f ≫ c ▷ const` to the constant, so a chain
+    /// does not end at one, and the prefix ends before it.
+    #[test]
+    fn the_prefix_ends_before_a_trailing_constant() {
+        let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
+        let chain = vec![zip(vec![id(), constant(1)]), add, constant(5)];
+        assert_eq!(fuse_prefix(&chain, &int()).unwrap().consumed, 2);
     }
 
     /// `7 - x` and `x - 7` keep their operand order through the zip.

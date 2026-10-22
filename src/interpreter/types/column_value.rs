@@ -55,19 +55,6 @@ fn retain_vec<T>(v: &mut Vec<T>, mask: &[bool]) {
     v.truncate(write);
 }
 
-/// Make `dest` equal to `src` by overwriting the elements it already holds, and truncating or
-/// extending it only where the lengths differ.
-///
-/// Clearing first would drop every old element and then write every new one; for a type with
-/// drop glue (`SmolStr`) that is a drop and a clone per element, where overwriting is one
-/// `clone_from`. For a `Copy` type `clone_from_slice` is a `memcpy`.
-fn overwrite_from<T: Clone>(dest: &mut Vec<T>, src: &[T]) {
-    dest.truncate(src.len());
-    let (head, tail) = src.split_at(dest.len());
-    dest.clone_from_slice(head);
-    dest.extend_from_slice(tail);
-}
-
 /// Columnar data for vectorized execution.
 /// Each variant holds a typed batch of values produced during interpretation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,26 +311,6 @@ impl ColumnValue {
                 let len = range.len();
                 self.select_indices(range, len)
             }
-        }
-    }
-
-    /// The rows in `range`, copied into `out`. When `out` is a column of the same shape its
-    /// rows are overwritten in place and its buffers kept; any other `out` is replaced.
-    pub fn slice_into(&self, range: Range<usize>, out: &mut ColumnValue) {
-        match (self, &mut *out) {
-            (ColumnValue::Ints(v), ColumnValue::Ints(o)) => overwrite_from(o, &v[range]),
-            (ColumnValue::UInts(v), ColumnValue::UInts(o)) => overwrite_from(o, &v[range]),
-            (ColumnValue::Strings(v), ColumnValue::Strings(o)) => overwrite_from(o, &v[range]),
-            (ColumnValue::Bools(v), ColumnValue::Bools(o)) => overwrite_from(o, &v[range]),
-            (ColumnValue::Records(fields), ColumnValue::Records(o))
-                if o.len() == fields.len() && fields.keys().all(|k| o.contains_key(k)) =>
-            {
-                for (k, v) in fields {
-                    let out = o.get_mut(k).expect("the keys were checked above");
-                    v.slice_into(range.clone(), out);
-                }
-            }
-            _ => *out = self.slice(range),
         }
     }
 
@@ -1532,42 +1499,5 @@ mod tests {
         let mut acc = empty.values().clone();
         acc.append(ColumnValue::Ints(vec![7]));
         assert_eq!(acc, ColumnValue::Ints(vec![7]));
-    }
-
-    #[test]
-    fn slice_into_reuses_a_column_of_the_same_shape_and_replaces_any_other() {
-        let source = ColumnValue::Ints(vec![1, 2, 3, 4]);
-        let mut out = ColumnValue::Ints(Vec::with_capacity(16));
-        let buffer = match &out {
-            ColumnValue::Ints(v) => v.as_ptr(),
-            _ => unreachable!(),
-        };
-        source.slice_into(1..3, &mut out);
-        assert_eq!(out, ColumnValue::Ints(vec![2, 3]));
-        assert!(matches!(&out, ColumnValue::Ints(v) if v.as_ptr() == buffer));
-        let mut other = ColumnValue::Units(0);
-        source.slice_into(0..2, &mut other);
-        assert_eq!(other, ColumnValue::Ints(vec![1, 2]));
-    }
-
-    #[test]
-    fn extend_from_appends_without_consuming() {
-        let mut column = ColumnValue::Bools(vec![true]);
-        let more = ColumnValue::Bools(vec![false, true]);
-        column.extend_from(&more);
-        assert_eq!(column, ColumnValue::Bools(vec![true, false, true]));
-        assert_eq!(more, ColumnValue::Bools(vec![false, true]));
-    }
-
-    /// A slice written over a column that already holds other rows replaces them, whether the
-    /// new rows are fewer, as many or more.
-    #[test]
-    fn slice_into_overwrites_the_rows_the_column_holds() {
-        let source = ColumnValue::Strings(["a", "b", "c", "d", "e"].map(SmolStr::new).to_vec());
-        let mut out = ColumnValue::Strings(["x", "y", "z"].map(SmolStr::new).to_vec());
-        for range in [0..2, 1..4, 0..5, 3..3, 2..3] {
-            source.slice_into(range.clone(), &mut out);
-            assert_eq!(out, source.slice(range.clone()), "{range:?}");
-        }
     }
 }
