@@ -1956,3 +1956,23 @@ q = id(g)
         Value::Int(3),
     )
 }
+
+/// `f`'s body is an `Index` applied at the argument `[1, 2]` refines, an invariant position.
+/// The barrier variable keeps that refinement, so the result's argument stays equal to the
+/// body's. Dropped, it would make the two `Index` values' arguments differ, and the join of
+/// two applications of an invariant parameter at different arguments has no type.
+#[test]
+fn a_refinement_in_an_invariant_nominal_argument_survives_the_barrier() {
+    check_scalar(
+        indoc! {r#"
+type Index(K):
+    index(FullMap(K, Int))
+def f(x: Int):
+    r ^= x
+    Index::index(map([(1, 10), (2, 20)]))
+i = f(1)
+7
+        "#},
+        Value::Int(7),
+    )
+}

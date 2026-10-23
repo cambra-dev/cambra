@@ -6,7 +6,7 @@
 //! [`CompactType`] / [`CompactGraph`] are the shared currency consumed by the
 //! sibling [`mod@super::simplify_type`] and [`super::coalesce`] modules.
 
-use crate::ccl::nominal::NominalDecl;
+use crate::ccl::nominal::{NominalDecl, Variance};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -852,7 +852,7 @@ pub struct CompactType {
     /// gives it.
     pub nominal: BTreeMap<Rc<NominalDecl>, Vec<CompactType>>,
     /// Two applications of one declaration met here whose arguments at an
-    /// [`Invariant`](crate::ccl::nominal::Variance::Invariant) parameter differ: the
+    /// [`Invariant`](Variance::Invariant) parameter differ: the
     /// declaration and the two arguments. Both sides of an equality position are one type,
     /// so the join has none, as two collections over different domains have none. Not a
     /// shape: it is the fact the merge found, carried for coalescing to report.
@@ -949,19 +949,30 @@ impl CompactType {
         }
     }
 
-    /// Resolve the refinements of a barrier variable's join at polarity `pol`: drop every
-    /// refinement set at a positive position, keeping each slot's `None` (no contribution)
-    /// as `None`, and keep every one at a negative position. Push onto `escaped` each name
-    /// of `opaque` a kept refinement names.
+    /// Resolve the refinements of a barrier variable's join, read at a position of variance
+    /// `position`: drop every refinement set at a covariant position, keeping each slot's
+    /// `None` (no contribution) as `None`, and keep every one at a contravariant or an
+    /// invariant position. Push onto `escaped` each name of `opaque` a kept refinement names.
     ///
-    /// Dropping a refinement at a positive position widens what the type promises, so the
-    /// result is a supertype of the join. At a negative position it widens what the type
-    /// accepts, which is unsound, so the refinement is kept; one naming an opaque binder
-    /// can be neither kept nor dropped. Each child is visited at the polarity
-    /// [`compact_go`] compacts it at.
-    fn resolve_barrier_refinements(&mut self, pol: bool, opaque: &[Name], escaped: &mut Vec<Name>) {
+    /// Dropping a refinement at a covariant position widens what the type promises, so the
+    /// result is a supertype of the join. At a contravariant position it widens what the
+    /// type accepts, and at an invariant one (an invariant nominal argument, a history's
+    /// children, and everything below either) it changes a type that must stay equal, so
+    /// neither gives a supertype and the refinement is kept. One naming an opaque binder can
+    /// be neither kept nor dropped. Each child's variance composes `position` with the
+    /// variance [`compact_go`] compacts it at.
+    fn resolve_barrier_refinements(
+        &mut self,
+        position: Variance,
+        opaque: &[Name],
+        escaped: &mut Vec<Name>,
+    ) {
+        debug_assert!(
+            position != Variance::Bipolar,
+            "a barrier resolution reads each side of a bipolar argument at its own variance"
+        );
         match &mut self.refinements {
-            Some(r) if pol => *r = RefinementSet::default(),
+            Some(r) if position == Variance::Covariant => *r = RefinementSet::default(),
             Some(r) => {
                 for refinement in r.iter() {
                     let named = crate::ccl::ccl_utils::free_names(&refinement.predicate);
@@ -974,41 +985,40 @@ impl CompactType {
             }
             None => {}
         }
-        let mut visit =
-            |t: &mut CompactType, pol: bool| t.resolve_barrier_refinements(pol, opaque, escaped);
+        let mut visit = |t: &mut CompactType, inner: Variance| {
+            t.resolve_barrier_refinements(position.compose(inner), opaque, escaped)
+        };
         for t in self.rec.iter_mut().flat_map(|rec| rec.values_mut()) {
-            visit(t, pol);
+            visit(t, Variance::Covariant);
         }
         for t in self.var.iter_mut().flat_map(|v| v.tags.values_mut()) {
-            visit(t, pol);
+            visit(t, Variance::Covariant);
         }
         if let Some(f) = &mut self.fun {
-            visit(&mut f.domain, !pol);
-            visit(&mut f.codomain, pol);
+            visit(&mut f.domain, Variance::Contravariant);
+            visit(&mut f.codomain, Variance::Covariant);
             if let Some(CombinedDomains(pair)) = &mut f.combined {
-                visit(&mut pair.0, !pol);
-                visit(&mut pair.1, !pol);
+                visit(&mut pair.0, Variance::Contravariant);
+                visit(&mut pair.1, Variance::Contravariant);
             }
         }
         if let Some((value, domain, _)) = &mut self.history_slot {
-            visit(value, pol);
-            visit(domain, pol);
+            visit(value, Variance::Invariant);
+            visit(domain, Variance::Invariant);
         }
         for (decl, args) in &mut self.nominal {
             let mut args = args.iter_mut();
             for v in &decl.body().variances {
                 match v {
-                    crate::ccl::nominal::Variance::Bipolar => {
-                        args.next().into_iter().for_each(|t| visit(t, !pol));
-                        args.next().into_iter().for_each(|t| visit(t, pol));
+                    Variance::Bipolar => {
+                        args.next()
+                            .into_iter()
+                            .for_each(|t| visit(t, Variance::Contravariant));
+                        args.next()
+                            .into_iter()
+                            .for_each(|t| visit(t, Variance::Covariant));
                     }
-                    crate::ccl::nominal::Variance::Invariant => {
-                        args.next().into_iter().for_each(|t| visit(t, pol));
-                    }
-                    other => {
-                        let pol = other.polarity(pol);
-                        args.next().into_iter().for_each(|t| visit(t, pol));
-                    }
+                    other => args.next().into_iter().for_each(|t| visit(t, *other)),
                 }
             }
             debug_assert!(
@@ -1017,8 +1027,8 @@ impl CompactType {
             );
         }
         if let Some((_, a, b)) = &mut self.nominal_conflict {
-            visit(a, pol);
-            visit(b, pol);
+            visit(a, Variance::Invariant);
+            visit(b, Variance::Invariant);
         }
     }
 
@@ -1287,7 +1297,7 @@ impl CompactType {
                     .zip(args)
                     .zip(decl.sided_variances())
                     .map(|((a, b), v)| {
-                        if v == crate::ccl::nominal::Variance::Invariant
+                        if v == Variance::Invariant
                             && nominal_conflict.is_none()
                             && data_domains_disagree(&a, &b)
                         {
@@ -1776,7 +1786,7 @@ fn join_barrier_lowers(
         joined = CompactType::merge(true, joined, bc);
     }
     let mut escaped = Vec::new();
-    joined.resolve_barrier_refinements(true, &barrier.opaque, &mut escaped);
+    joined.resolve_barrier_refinements(Variance::Covariant, &barrier.opaque, &mut escaped);
     st.barriers_in_process.remove(&barrier.uid);
     if let Some(rec_uid) = st.barrier_recursive.remove(&barrier.uid) {
         st.rec_vars.insert(rec_uid, joined);
@@ -2311,12 +2321,12 @@ fn compact_go(
             let mut sides = Vec::new();
             for (t, v) in args.iter().zip(&decl.body().variances) {
                 match v {
-                    crate::ccl::nominal::Variance::Bipolar => {
+                    Variance::Bipolar => {
                         let (input, output) = crate::ccl::nominal::sides(t);
                         sides.push(compact_go(input, !pol, subst_acc, Position::default(), st));
                         sides.push(compact_go(output, pol, subst_acc, Position::default(), st));
                     }
-                    crate::ccl::nominal::Variance::Invariant => {
+                    Variance::Invariant => {
                         sides.push(compact_go(t, pol, subst_acc, Position::invariant(), st));
                     }
                     other => {

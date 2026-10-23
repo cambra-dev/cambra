@@ -15,6 +15,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ccl::infer_var::BarrierVarId;
+use crate::ccl::nominal::Variance;
 use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
 
@@ -188,39 +189,46 @@ impl KeyView {
         }
     }
 
-    /// Drop the refinements at the positive positions of this view, read at polarity `pol`:
-    /// what a barrier variable's resolution drops (`CompactType::resolve_barrier_refinements`
-    /// in `src/ccl/infer/solver/compact.rs`). The children's polarities follow `key_go`'s.
-    fn drop_positive_refinements(&mut self, pol: bool) {
-        if pol {
+    /// Drop the refinements at the covariant positions of this view, read at a position of
+    /// variance `position`: what a barrier variable's resolution drops
+    /// (`CompactType::resolve_barrier_refinements` in `src/ccl/infer/solver/compact.rs`). A
+    /// refinement at a contravariant or an invariant position is kept. The children's
+    /// variances follow `key_go`'s polarities, with a history's children and an invariant
+    /// nominal argument invariant.
+    fn drop_covariant_refinements(&mut self, position: Variance) {
+        debug_assert!(
+            position != Variance::Bipolar,
+            "a barrier resolution reads each side of a bipolar argument at its own variance"
+        );
+        if position == Variance::Covariant {
             self.refinements.clear();
         }
+        let at = |inner: Variance| position.compose(inner);
         for v in self.rec.values_mut().chain(self.var.values_mut()) {
-            v.drop_positive_refinements(pol);
+            v.drop_covariant_refinements(at(Variance::Covariant));
         }
         for (domain, codomain) in self.fun.values_mut() {
-            domain.drop_positive_refinements(!pol);
-            codomain.drop_positive_refinements(pol);
+            domain.drop_covariant_refinements(at(Variance::Contravariant));
+            codomain.drop_covariant_refinements(at(Variance::Covariant));
         }
         for (value, domain) in self.history.values_mut() {
-            value.drop_positive_refinements(pol);
-            domain.drop_positive_refinements(pol);
+            value.drop_covariant_refinements(at(Variance::Invariant));
+            domain.drop_covariant_refinements(at(Variance::Invariant));
         }
         for (decl, args) in &mut self.nominal {
             let mut args = args.iter_mut();
             for v in &decl.body().variances {
-                if *v == crate::ccl::nominal::Variance::Bipolar {
+                if *v == Variance::Bipolar {
                     args.next()
                         .into_iter()
-                        .for_each(|a| a.drop_positive_refinements(!pol));
+                        .for_each(|a| a.drop_covariant_refinements(at(Variance::Contravariant)));
                     args.next()
                         .into_iter()
-                        .for_each(|a| a.drop_positive_refinements(pol));
+                        .for_each(|a| a.drop_covariant_refinements(at(Variance::Covariant)));
                 } else {
-                    let pol = v.polarity(pol);
                     args.next()
                         .into_iter()
-                        .for_each(|a| a.drop_positive_refinements(pol));
+                        .for_each(|a| a.drop_covariant_refinements(at(*v)));
                 }
             }
             debug_assert!(
@@ -437,7 +445,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Hole | Type::SharedHole(_) => KeyView::default(),
         // A barrier variable keys as its resolution, the `BarrierVar` arm of `compact_go`:
         // its lower bounds, each read at positive polarity whatever the reference's, with
-        // the refinements at their positive positions dropped. It stands in a use's
+        // the refinements at their covariant positions dropped. It stands in a use's
         // instantiation wherever an opaque-binding function's type does, so two uses whose
         // barrier variables resolve differently clone differently.
         Type::BarrierVar(barrier) => {
@@ -452,7 +460,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 acc.union(key_go(&b.ty, true, &inner_acc, ctx));
             }
             ctx.visiting_barriers.remove(&barrier.uid);
-            acc.drop_positive_refinements(true);
+            acc.drop_covariant_refinements(Variance::Covariant);
             acc
         }
         // A witness reference contributes an **anonymous** marker: enough to tell a position
@@ -587,7 +595,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Nominal(decl, args) => {
             let mut sides = Vec::new();
             for (t, v) in args.iter().zip(&decl.body().variances) {
-                if *v == crate::ccl::nominal::Variance::Bipolar {
+                if *v == Variance::Bipolar {
                     let (input, output) = crate::ccl::nominal::sides(t);
                     sides.push(key_go(input, !pol, subst_acc, ctx));
                     sides.push(key_go(output, pol, subst_acc, ctx));
