@@ -344,6 +344,22 @@ fn an_error_the_enclosing_definition_causes_is_reported_in_its_body() {
     assert_eq!(inference_error_sites(code), ["g"]);
 }
 
+// A use that shares another use's specialization reports that specialization's error
+// too: both calls instantiate `f` at the same types, so the second reuses the first's
+// clone, and each call is a use whose types fail the body.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_error_a_shared_specialization_raises_is_reported_at_each_use() {
+    let code = indoc! {r#"
+        def f(c, a):
+            x = a if c else "s"
+            a
+        p = f(True, 2)
+        f(True, 2)
+    "#};
+    assert_eq!(inference_error_sites(code), ["f", "f"]);
+}
+
 // List-producing body chained through a poly wrapper, single concrete use
 // type. The lone `f` use sits inside `g`'s (generalized) definition, so it is
 // only ever reached through `g`'s clone — one concrete use type suffices to

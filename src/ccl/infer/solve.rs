@@ -2477,10 +2477,11 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     let shares = |s: &Specialization| {
         s.instantiation == instantiation || (shareable && s.shareable && s.key == key)
     };
-    let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
+    let surviving = surviving_use(ctx, frame_idx);
+    let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
         unreachable!("lookup_generalized returns indices of Generalized entries only");
     };
-    if let Some(spec) = frame.specs.iter().find(|s| shares(s)) {
+    if let Some(spec) = frame.specs.iter_mut().find(|s| shares(s)) {
         // Equal instantiations identify copies of one use only while inference instantiates
         // every use with fresh variables. Two uses in the tree itself are distinct, so where
         // the key would not share, one of the two is a predicate's copy.
@@ -2496,15 +2497,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         let (name, ty) = (spec.name.clone(), spec.def.ty.clone());
         // Sharing is what makes an entry live: an entry minted for a discarded use
         // is spliced after all once a surviving use adopts it.
-        if surviving_use(ctx, frame_idx) {
-            let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
-                unreachable!("lookup_generalized returns indices of Generalized entries only");
-            };
-            let spec = frame
-                .specs
-                .iter_mut()
-                .find(|s| shares(s))
-                .expect("the entry just found is still there");
+        if surviving {
             spec.referenced = true;
         }
         // A hit is *not* re-pinned, and the reason is worth recording because
@@ -2519,15 +2512,8 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         // hit needs a non-recording *subsumption* test rather than a constrain,
         // which the solver has no notion of today.
         let enclosing = ctx.specializing.clone();
-        let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
-            unreachable!("lookup_generalized returns indices of Generalized entries only");
-        };
         let at_use = use_expr.node_id();
-        let shared: Vec<HeldError> = frame
-            .specs
-            .iter()
-            .find(|s| shares(s))
-            .expect("the entry just found is still there")
+        let shared: Vec<HeldError> = spec
             .raised
             .iter()
             .map(|(origin, error)| HeldError {
