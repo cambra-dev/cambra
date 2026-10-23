@@ -12,7 +12,7 @@ behaviour is the failure this process exists to prevent.
 ## Your sandbox
 
 - Work only in `{{WS}}`. It is a jj workspace whose working-copy commit `@` sits on a fresh
-  `main@origin`. Your edits land in `@` automatically, and there is no staging. Start with
+  `main@origin`, or on the simplifications this run already pushed, which you leave as they are. Your edits land in `@` automatically, and there is no staging. Start with
   `cd {{WS}}`; the shell stays there between commands.
 - Never `cd` into, build in, or run jj against any other directory. Other workspaces hold other
   people's work, and a write there rewrites their commits.

@@ -10,8 +10,9 @@ digest with five sections:
 - PRs a human closed without merging, each with its closing comment as the reason. These are
   permanent history: a candidate matching one is never re-proposed unless its cited code has
   changed;
-- PRs settle-drafts.sh closed for a CI failure in the last `CI_HISTORY_DAYS` days. Its closing
-  comment starts with `CI_CLOSE_PREFIX`. These are not a human's decision, so they count toward
+- PRs settle_drafts.py closed in the last `RUN_HISTORY_DAYS` days: for a CI failure, or because
+  a stack repair left them conflicted or empty. Its closing comment starts with
+  `RUN_CLOSE_PREFIX` and gives the reason. These are not a human's decision, so they count toward
   neither the permanent history nor the merge rate;
 - review comments on the `MERGED_WITH_COMMENTS` most recently merged PRs, as guidance for the
   finders.
@@ -30,9 +31,9 @@ from datetime import datetime, timedelta, timezone
 REPO = "cambra-dev/cambra"
 PREFIX = "simplify-agent/"
 MERGED_WITH_COMMENTS = 20
-CI_HISTORY_DAYS = 14
-# Must match CLOSE_PREFIX in settle-drafts.sh.
-CI_CLOSE_PREFIX = "Closed by the daily simplification run: CI failed"
+RUN_HISTORY_DAYS = 14
+# Must match RUN_CLOSE_PREFIX in settle_drafts.py.
+RUN_CLOSE_PREFIX = "Closed by the daily simplification run:"
 # `gh pr close --comment` and the web UI's "Close with comment" post the comment just before
 # the close event.
 CLOSE_SLACK = timedelta(minutes=2)
@@ -89,14 +90,14 @@ def main(out_path):
         state = p["state"]
         if state == "CLOSED":
             p["closing"] = closing_comment(p["number"], p["closedAt"])
-            if p["closing"] and p["closing"]["body"].startswith(CI_CLOSE_PREFIX):
-                state = "CI_FAILED"
+            if p["closing"] and p["closing"]["body"].startswith(RUN_CLOSE_PREFIX):
+                state = "RUN_CLOSED"
         by_state[state].append(p)
 
     lines = [f"# Simplify PR history, {len(prs)} PRs", ""]
 
     lines += ["## Merge rate by category", "",
-              "| category | merged | closed by a human | closed: CI failed | open | merge rate |",
+              "| category | merged | closed by a human | closed by the run | open | merge rate |",
               "|---|---|---|---|---|---|"]
     counts = collections.defaultdict(collections.Counter)
     for state, group in by_state.items():
@@ -105,7 +106,7 @@ def main(out_path):
     for cat, c in sorted(counts.items()):
         decided = c["MERGED"] + c["CLOSED"]
         rate = f"{100 * c['MERGED'] // decided}%" if decided else "-"
-        lines.append(f"| {cat} | {c['MERGED']} | {c['CLOSED']} | {c['CI_FAILED']} | {c['OPEN']} "
+        lines.append(f"| {cat} | {c['MERGED']} | {c['CLOSED']} | {c['RUN_CLOSED']} | {c['OPEN']} "
                      f"| {rate} |")
 
     lines += ["", "## Open", ""]
@@ -122,9 +123,9 @@ def main(out_path):
         lines.append(f"- [#{p['number']}]({p['url']}) {p['title']} ({category(p['body'])}, "
                      f"closed {p['closedAt'][:10]}): {reason}")
 
-    lines += ["", f"## Closed for a CI failure in the last {CI_HISTORY_DAYS} days", ""]
-    cutoff = datetime.now(timezone.utc) - timedelta(days=CI_HISTORY_DAYS)
-    for p in by_state["CI_FAILED"]:
+    lines += ["", f"## Closed by the run in the last {RUN_HISTORY_DAYS} days", ""]
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RUN_HISTORY_DAYS)
+    for p in by_state["RUN_CLOSED"]:
         if when(p["closedAt"]) >= cutoff:
             lines.append(f"- [#{p['number']}]({p['url']}) {p['title']} ({category(p['body'])}, "
                          f"closed {p['closedAt'][:10]}): {p['closing']['body'].strip()}")
