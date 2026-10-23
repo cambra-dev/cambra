@@ -2039,15 +2039,10 @@ fn convert_impl_inner(
                     // request stream (input-driven) with an induction accumulator
                     // read (leaf) position-by-position; `zip_arms_at` co-aligns them by
                     // domain.
-                    let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+                    let mut readers = ZipReaders::new(input, elts.iter(), ctx);
                     let mut ops = Vec::new();
                     for elt in elts {
-                        let arm_input = if is_leaf_zip_arm(elt, ctx) {
-                            None
-                        } else {
-                            Some(fan_out.slot())
-                        };
-                        ops.push(convert_impl(elt, arm_input, ctx)?);
+                        ops.push(convert_impl(elt, readers.input_for(elt, ctx), ctx)?);
                     }
                     Ok(zip_arms_at(ops, level))
                 }
@@ -2055,11 +2050,11 @@ fn convert_impl_inner(
                     // zip(Record({f1: e1, ..., fn: en})) — produced by Record lambda elimination.
                     // Fan the shared input out to each field morphism, then combine into a named Record.
                     // A **leaf** field takes none, on the same rule the tuple arms follow.
-                    let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+                    let mut readers = ZipReaders::new(input, fields.iter().map(|(_, e)| e), ctx);
                     let ops: Result<Vec<_>, _> = fields
                         .iter()
                         .map(|(name, elt)| {
-                            let arm_input = (!is_leaf_zip_arm(elt, ctx)).then(|| fan_out.slot());
+                            let arm_input = readers.input_for(elt, ctx);
                             Ok((name.runtime_key(), convert_impl(elt, arm_input, ctx)?))
                         })
                         .collect();
@@ -3768,8 +3763,18 @@ fn build_commit_store(
         // memoized. A `Memo` releases its input as soon as it caches, which reaches the
         // driver as an ack for an attempt no slot has finished.
         let driver_fan = Rc::new(FanOut::new(Box::new(driver)));
-        // The body runs over the store's own domain, whatever the `Transact` sits in.
-        let body_op = convert_at(&w.body, Some(driver_fan.slot()), CurryLevel::new(1), ctx)?;
+        // The body releases each row as it consumes it, which is its half of that intersection.
+        // A `Memo` over the driver's slot makes that release for any body shape: a body that
+        // reads its input once has no fan of its own, and without the release a superseded
+        // attempt stays in the driver's window until its item finishes. A body that does fan
+        // its input holds a second, redundant `Memo`. The body runs over the store's own
+        // domain, whatever the `Transact` sits in.
+        let body_op = convert_at(
+            &w.body,
+            Some(Box::new(Memo::new(driver_fan.slot()))),
+            CurryLevel::new(1),
+            ctx,
+        )?;
         // A reply (`out << e`) rides this writer body as `__to_<defer>` decision
         // taps. Each commits as a write-only key (appended after the mutable variable write
         // keys), so the reply rides this transaction's commit and is read back as a
@@ -5687,6 +5692,50 @@ fn zip_pair(expr: &Expr) -> Option<(&Expr, &Expr)> {
     match elts.as_slice() {
         [source, default] => Some((source, default)),
         _ => None,
+    }
+}
+
+/// The input a zip's non-leaf arms read: the input itself for a lone reader, a memoized fan
+/// otherwise.
+///
+/// A fan exists so that several arms share one upstream producer. A single reader has no one to
+/// share with, so it reads the input directly. A leaf arm is a source over its own domain and
+/// reads none (`is_leaf_zip_arm`).
+enum ZipReaders {
+    Lone(Option<Box<dyn TileOperator>>),
+    Fan(Rc<FanOut>),
+}
+
+impl ZipReaders {
+    fn new<'e>(
+        input: Box<dyn TileOperator>,
+        arms: impl Iterator<Item = &'e Expr>,
+        ctx: &OpConversionContext,
+    ) -> Self {
+        match arms.filter(|e| !is_leaf_zip_arm(e, ctx)).count() {
+            1 => Self::Lone(Some(input)),
+            _ => Self::Fan(Rc::new(FanOut::new(Box::new(Memo::new(input))))),
+        }
+    }
+
+    /// The input `arm` reads, or `None` for a leaf arm. A lone reader takes the input, so it is
+    /// asked for once.
+    fn input_for(
+        &mut self,
+        arm: &Expr,
+        ctx: &OpConversionContext,
+    ) -> Option<Box<dyn TileOperator>> {
+        if is_leaf_zip_arm(arm, ctx) {
+            return None;
+        }
+        match self {
+            Self::Lone(input) => Some(
+                input
+                    .take()
+                    .expect("a lone reader is the zip's one non-leaf arm, asked once"),
+            ),
+            Self::Fan(fan) => Some(fan.slot()),
+        }
     }
 }
 
