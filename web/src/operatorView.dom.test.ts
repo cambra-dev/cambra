@@ -12,10 +12,13 @@
 // here would assert the engine rather than the pane; what matters is that every
 // node it returns is drawn and every id stays addressable.
 
+import { readFileSync, readdirSync } from "node:fs";
+import { resolve } from "node:path";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { OperatorView, serializeOperatorGraph } from "./operatorView";
-import { drawGraphOf, isBackEdge } from "./graph/model";
+import { type Detail, drawGraphOf, isBackEdge } from "./graph/model";
+import { COMPOSITE_NAMES, MAX_MEMBERS } from "./graph/rules";
 import { Store } from "./store";
 import { TreeView } from "./treeView";
 import type { GraphLayout, LayoutRequest, Placed } from "./graph/layout";
@@ -35,13 +38,14 @@ import sourceSharedJson from "./__fixtures__/source_shared.snapshot.json";
 // walk start, all value edges.
 const polymorphic = fixture(polymorphicJson);
 const listMin = fixture(listMinJson);
+const deferLift = fixture(deferLiftJson);
 // The only fixture with a `Source` node, and so the only one that pins a node
 // nothing subscribes getting a row.
 const sourceShared = fixture(sourceSharedJson);
 // Every committed fixture with an operator graph. `failed` has none.
 const withOperators: [string, Snapshot][] = [
   ["arithmetic", fixture(arithmeticJson)],
-  ["defer_lift", fixture(deferLiftJson)],
+  ["defer_lift", deferLift],
   ["list_min", listMin],
   ["polymorphic", polymorphic],
   ["source_shared", sourceShared],
@@ -111,12 +115,13 @@ function settled(): Promise<void> {
 async function mountGraph(
   snap: Snapshot,
   paneId: string,
+  detail: Detail = "Raw",
 ): Promise<{ store: Store; body: HTMLElement; pane: OperatorPane; view: OperatorView }> {
   const body = document.createElement("div");
   document.body.appendChild(body);
   const store = new Store(snap);
   const pane = operatorPaneById(snap, paneId);
-  const view = new OperatorView(body, store, pane, new RowLayout());
+  const view = new OperatorView(body, store, pane, new RowLayout(), detail);
   await view.draw();
   return { store, body, pane, view };
 }
@@ -330,7 +335,7 @@ describe("a layout that fails", () => {
     const pane = operatorPaneById(polymorphic, "post-conversion");
     const reported = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    new OperatorView(body, store, pane, new FailingLayout());
+    new OperatorView(body, store, pane, new FailingLayout(), "Raw");
     // Selected while the layout was still in flight, so this also pins that the
     // held selection is released by the fallback and not only by a drawing.
     const sink = pane.nodes.find((n) => n.role === "sink")!;
@@ -371,50 +376,186 @@ describe("a graph that reads a source", () => {
   });
 });
 
+// Hand-built operator panes, for shapes no committed fixture carries.
+const op = (
+  nodeId: number,
+  label: string,
+  inputs: OperatorPane["nodes"][number]["inputs"],
+  tiling: string | null = "SF(Int)",
+): OperatorPane["nodes"][number] => ({
+  label,
+  nodeId,
+  role: label === "Sink" ? "sink" : "operator",
+  tiling,
+  spans: [],
+  rewritten: null,
+  inputs,
+});
+const value = (name: string, subscribed: number, deferred = false) => ({
+  role: { kind: "named" as const, name },
+  kind: "value",
+  deferred,
+  subscribed,
+});
+const fan = (subscribed: number) => ({
+  role: { kind: "named" as const, name: "fan" },
+  kind: "share",
+  deferred: false,
+  subscribed,
+});
+const paneOf = (nodes: OperatorPane["nodes"]): OperatorPane => ({
+  id: "post-conversion",
+  label: "IR (POST-CONVERSION)",
+  kind: "operators",
+  nodes,
+});
+
+describe("the simplified level", () => {
+  // Merging is a drawing decision, so it may not cost a reader anything the
+  // wire named. These are the three ways it could, over every fixture with an
+  // operator graph.
+  for (const [name, snap] of withOperators) {
+    it(`answers for every operator of ${name}`, () => {
+      const pane = operatorPaneById(snap, "post-conversion");
+      const graph = drawGraphOf(pane, "Simplified");
+      for (const node of pane.nodes) expect(graph.viewItem(node.nodeId)).toBeDefined();
+    });
+
+    it(`keeps every composite of ${name} within the size limit`, () => {
+      const pane = operatorPaneById(snap, "post-conversion");
+      for (const box of drawGraphOf(pane, "Simplified").nodes) {
+        expect(box.members.length).toBeLessThanOrEqual(MAX_MEMBERS);
+      }
+    });
+
+    it(`draws ${name} with no more boxes than the Raw level`, () => {
+      const pane = operatorPaneById(snap, "post-conversion");
+      const simplified = drawGraphOf(pane, "Simplified").nodes.length;
+      expect(simplified).toBeLessThanOrEqual(drawGraphOf(pane, "Raw").nodes.length);
+    });
+  }
+
+  it("attributes a chip to a member of the box that draws it", () => {
+    const pane = operatorPaneById(polymorphic, "post-conversion");
+    const graph = drawGraphOf(pane, "Simplified");
+    const withChips = graph.nodes.filter((n) => n.chips.length > 0);
+    expect(withChips.length).toBeGreaterThan(0);
+    for (const box of withChips) {
+      for (const chip of box.chips) expect(box.members).toContain(chip.owner);
+    }
+  });
+
+  it("draws the level the reader asked for, and redraws on the other", async () => {
+    const { body } = await mountGraph(sourceShared, "post-conversion", "Simplified");
+    const simplified = body.querySelectorAll(".graph-node").length;
+    const button = body.querySelector<HTMLElement>('[data-detail="Raw"]')!;
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await settled();
+    expect(body.querySelectorAll(".graph-node").length).toBeGreaterThan(simplified);
+  });
+
+  // A pinned card is the pane's, so a redraw that replaces the panels takes it
+  // along, and a hidden pane hides it.
+  it("keeps a pinned card inside the pane that pinned it", async () => {
+    const { body } = await mountGraph(deferLift, "post-conversion", "Simplified");
+    const box = body.querySelector<HTMLElement>(".graph-canvas .graph-node")!;
+    box.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, clientX: 5, clientY: 5 }));
+
+    const card = document.querySelector<HTMLElement>(".graph-card.pinned");
+    expect(card).not.toBeNull();
+    expect(body.contains(card)).toBe(true);
+  });
+});
+
+describe("each merge rule", () => {
+  // One hand-built pane per rule shape, so a rule that stops firing fails here
+  // rather than only drawing more boxes. `UnionOperator` starts a pane where a
+  // rule-free start is wanted: no rule names it.
+  const drawn = (pane: OperatorPane) =>
+    drawGraphOf(pane, "Simplified").nodes.map((n) => `${n.label}[${[...n.members].sort((a, b) => a - b)}]`);
+
+  it("folds a group-by's keyed aggregate pair into one box named for the fold", () => {
+    const pane = paneOf([
+      op(1, "UnionOperator", []),
+      op(2, "MapAggregate", [value("input", 1)]),
+      op(3, "MapExtractAggregate", [value("input", 2)]),
+      op(4, "Sink", [value("out", 3)], null),
+    ]);
+    expect(drawn(pane)).toEqual(["UnionOperator[1]", "MapAggregate[2,3]", "Sink[4]"]);
+  });
+
+  it("merges a run of maps into a map chain", () => {
+    const pane = paneOf([
+      op(1, "UnionOperator", []),
+      op(2, "MapResult", [value("input", 1)]),
+      op(3, "MapResult", [value("input", 2)]),
+      op(4, "Sink", [value("out", 3)], null),
+    ]);
+    expect(drawn(pane)).toEqual(["UnionOperator[1]", "MapChain[2,3]", "Sink[4]"]);
+  });
+
+  it("merges a guard's predicate into the guard", () => {
+    const pane = paneOf([
+      op(1, "UnionOperator", []),
+      op(2, "UnionOperator", []),
+      op(3, "MapResult", [value("input", 2)]),
+      op(4, "Restrict", [value("input", 1), value("predicate", 3)]),
+      op(5, "Sink", [value("out", 4)], null),
+    ]);
+    expect(drawn(pane)).toEqual(["UnionOperator[1]", "UnionOperator[2]", "Restrict[3,4]", "Sink[5]"]);
+  });
+
+  // The back edge runs from the reader into the box a rule would absorb, so
+  // the merge would make it internal and drop the recurrence.
+  it("does not absorb a box into a reader that feeds it back", () => {
+    const pane = paneOf([
+      op(1, "UnionOperator", []),
+      op(2, "MapResult", [value("input", 1), value("body", 3, true)]),
+      op(3, "MapResult", [value("input", 2)]),
+      op(4, "Sink", [value("out", 3)], null),
+    ]);
+    const graph = drawGraphOf(pane, "Simplified");
+    expect(graph.edges.filter(isBackEdge)).toHaveLength(1);
+    expect(drawn(pane)).toEqual(["UnionOperator[1]", "MapResult[2]", "MapResult[3]", "Sink[4]"]);
+  });
+});
+
+describe("the operator kinds the rules name", () => {
+  // A rule matches a box by its kind, which is the Rust operator's type name
+  // (`TileOperator::kind`, `short_type_name::<Self>()`). A rename there leaves
+  // the rule matching nothing and the drawing silently less merged, so every
+  // kind `rules.ts` names has to be an operator the interpreter defines.
+  it("are all operators the interpreter defines", () => {
+    const root = resolve(__dirname, "../..") + "/";
+    const dir = `${root}src/interpreter`;
+    const defined = new Set<string>();
+    for (const file of readdirSync(dir, { recursive: true }) as string[]) {
+      if (!file.endsWith(".rs")) continue;
+      const text = readFileSync(`${dir}/${file}`, "utf8");
+      for (const m of text.matchAll(/impl(?:<[^>]*>)? TileOperator for (\w+)/g)) defined.add(m[1]);
+    }
+    const rules = readFileSync(`${root}web/src/graph/rules.ts`, "utf8");
+    const named = [...new Set([...rules.matchAll(/"([A-Z][A-Za-z]*)"/g)].map((m) => m[1]))];
+
+    expect(defined.size).toBeGreaterThan(0);
+    expect(named.filter((k) => !COMPOSITE_NAMES.has(k) && !defined.has(k))).toEqual([]);
+  });
+});
+
 describe("a back edge and a late one", () => {
   // No committed fixture carries either: the programs that hold a store are
   // asserted structurally in `tests/it/inspector_goldens.rs` rather than pinned
   // whole. So the shapes are built by hand, after the ones
   // `assert_store_edge_shapes` pins on the Rust side.
-  const op = (
-    nodeId: number,
-    label: string,
-    inputs: OperatorPane["nodes"][number]["inputs"],
-    tiling: string | null = "SF(Int)",
-  ): OperatorPane["nodes"][number] => ({
-    label,
-    nodeId,
-    role: label === "Sink" ? "sink" : "operator",
-    tiling,
-    spans: [],
-    rewritten: null,
-    inputs,
-  });
-  const value = (name: string, subscribed: number, deferred = false) => ({
-    role: { kind: "named" as const, name },
-    kind: "value",
-    deferred,
-    subscribed,
-  });
-  const fan = (subscribed: number) => ({
-    role: { kind: "named" as const, name: "fan" },
-    kind: "share",
-    deferred: false,
-    subscribed,
-  });
-  const paneOf = (nodes: OperatorPane["nodes"]): OperatorPane => ({
-    id: "post-conversion",
-    label: "IR (POST-CONVERSION)",
-    kind: "operators",
-    nodes,
-  });
 
+  // These pin the `Raw` drawing, where a suppressed branch is a glyph on
+  // its edge; `Simplified` moves that mark onto the producer.
   async function mountPane(pane: OperatorPane) {
     const body = document.createElement("div");
     document.body.appendChild(body);
     const snap = { ...listMin, panes: listMin.panes.map((p) => (p.id === pane.id ? pane : p)) };
     const layout = new RecordingLayout();
-    const view = new OperatorView(body, new Store(snap as Snapshot), pane, layout);
+    const view = new OperatorView(body, new Store(snap as Snapshot), pane, layout, "Raw");
     await view.draw();
     const laidOut = layout.requests.flatMap((r) => r.edges.map((e) => `${e.source}>${e.target}`));
     return { body, laidOut };
@@ -430,6 +571,12 @@ describe("a back edge and a late one", () => {
     op(4, "FanOutSlot", [fan(1)]),
     op(5, "Sink", [value("out", 4)], null),
   ]);
+
+  it("keeps the back edge when the rules merge", () => {
+    const back = (detail: Detail) => drawGraphOf(store, detail).edges.filter(isBackEdge).length;
+    expect(back("Simplified")).toBe(back("Raw"));
+    expect(back("Simplified")).toBe(1);
+  });
 
   it("draws the cycle as a back edge and never lays it out", async () => {
     const { body, laidOut } = await mountPane(store);
