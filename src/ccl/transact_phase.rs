@@ -67,11 +67,10 @@
 //! [`collect_txn_mut_vars`] walks the inlined, typed tree for `Let` bindings whose
 //! type (or [`crate::ccl::TypedBinding::user_annotation`]) is `Mut(_, Txn)` and
 //! collects their α-unique [`Name`]s; every membership test here (footprint
-//! collection, `contains_txn_write`, `block_writes_txn`) is exact-`Name`. This
-//! is immune to shadowing — an unrelated local spelled the same has a
-//! distinct binder identity — and sees cross-function variables whose writers were
-//! inlined to their call site (see `src/ccl/design/mutability.md`, "`Mut` is a
-//! CCL type").
+//! collection, `writes_any`) is exact-`Name`. This is immune to shadowing — an
+//! unrelated local spelled the same has a distinct binder identity — and sees
+//! cross-function variables whose writers were inlined to their call site (see
+//! `src/ccl/design/mutability.md`, "`Mut` is a CCL type").
 
 use crate::ccl::Label;
 use std::collections::{HashMap, HashSet};
@@ -682,7 +681,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
         "transact_phase: a `with begin():` block (`Begin`) survived stripping"
     );
     assert!(
-        !contains_txn_write(&stripped, txn_mut_vars),
+        !writes_any(&stripped, txn_mut_vars),
         "transact_phase: a `MutWrite` to a transactional mutable variable survived stripping — an \
          out-of-block mutable variable write the lowering write gate should have rejected"
     );
@@ -998,7 +997,7 @@ fn cross_domain_reads(sites: &[RawSite], txn_mut_vars: &HashSet<Name>) -> HashSe
 fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut CrossDomain) -> Expr {
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
         && let TypedExprNode::For { body, .. } = &effect.node
-        && loop_writes_any(body, cross_reads)
+        && writes_any(body, cross_reads)
     {
         let stmt_id = expr.node_id();
         let TypedExprNode::ExprStmt {
@@ -1082,14 +1081,14 @@ fn loop_induction_writes(body: &Expr, txn_mut_vars: &HashSet<Name>) -> HashSet<N
     out
 }
 
-/// Whether a loop body writes (via `MutWrite`) any name in `names`.
-fn loop_writes_any(body: &Expr, names: &HashSet<Name>) -> bool {
-    if let TypedExprNode::MutWrite { name, .. } = &body.node
+/// Whether the subtree holds a `MutWrite` to a name in `names`.
+fn writes_any(e: &Expr, names: &HashSet<Name>) -> bool {
+    if let TypedExprNode::MutWrite { name, .. } = &e.node
         && names.contains(name)
     {
         return true;
     }
-    body.any_child(|c| loop_writes_any(c, names))
+    e.any_child(|c| writes_any(c, names))
 }
 
 /// Rename `Var(from)` → `Var(to)` in a folded loop's continuation (no `MutWrite`
@@ -1102,16 +1101,6 @@ fn rename_var_uses(e: &mut Expr, from: &Name, to: &Name) {
         return;
     }
     e.walk_children_mut(|c| rename_var_uses(c, from, to));
-}
-
-/// Whether the subtree contains a `MutWrite` to a transactional mutable variable.
-fn contains_txn_write(expr: &Expr, txn_mut_vars: &HashSet<Name>) -> bool {
-    if let TypedExprNode::MutWrite { name, .. } = &expr.node
-        && txn_mut_vars.contains(name)
-    {
-        return true;
-    }
-    expr.any_child(|c| contains_txn_write(c, txn_mut_vars))
 }
 
 /// Whether the subtree still contains a `with begin():` block marker.
@@ -1181,7 +1170,7 @@ fn strip(
             g.blame(&[begin_id]);
             Box::new(crate::ccl::ccl_utils::statement_tag_cases_to_guards(*block))
         };
-        if block_writes_txn(&block, txn_mut_vars) {
+        if writes_any(&block, txn_mut_vars) {
             // A writing block → a commit-record site keyed on the *enclosing*
             // loop. Partition it by mutable variable domain: the transactional remainder is
             // the commit decision; each induction `MutWrite` is lifted onto the
@@ -1531,7 +1520,7 @@ pub fn check_no_induction_only_transactions(
     txn_mut_vars: &HashSet<Name>,
 ) -> Result<(), Located<String>> {
     if let TypedExprNode::Begin { body } = &expr.node
-        && !block_writes_txn(body, txn_mut_vars)
+        && !writes_any(body, txn_mut_vars)
         && let Some(name) = first_non_txn_write(body, txn_mut_vars)
     {
         // `name` is any non-transactional `MutWrite` target — an induction
@@ -2089,17 +2078,6 @@ fn first_non_txn_write(block: &Expr, txn_mut_vars: &HashSet<Name>) -> Option<Nam
         }
     });
     found
-}
-
-/// Whether a block (a `Begin` body) writes any transactional mutable variable — marks it a
-/// committing transaction site rather than a read-only block.
-fn block_writes_txn(block: &Expr, txn_mut_vars: &HashSet<Name>) -> bool {
-    if let TypedExprNode::MutWrite { name, .. } = &block.node
-        && txn_mut_vars.contains(name)
-    {
-        return true;
-    }
-    block.any_child(|c| block_writes_txn(c, txn_mut_vars))
 }
 
 /// The block's transactional footprint: mutable variable keys read (snapshot) and written,
