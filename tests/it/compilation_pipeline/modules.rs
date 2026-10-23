@@ -234,7 +234,7 @@ fn an_imported_module_uses_a_member_of_another() {
         import other
         import catalog use limit as other
     "},
-    "`other` is an import name or a run name, so no binder in its module takes it"
+    "`other` is an import name, so no binder in its module takes it"
 )]
 #[case::bound_twice(
     "import catalog use limit, double as limit\n",
@@ -631,7 +631,7 @@ fn an_imports_arguments_reach_its_modules_parameters(#[case] root: &str, #[case]
 
 /// The shared runs `program` lowers, by their homes: each `let` its chains bind
 /// stands on the spine above the root's.
-fn shared_runs(program: &LoadedProgram) -> BTreeSet<String> {
+pub(crate) fn shared_runs(program: &LoadedProgram) -> BTreeSet<String> {
     let mut ctx = GlobalContext::default();
     let lowered = lower_program(program, ctx.lowering_ctx());
     assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
@@ -747,7 +747,7 @@ fn assert_shared_runs(root: &str, other: &str, expected: &[&str]) {
         import scaled(scale=1 + 2)
         1
     "},
-    "an argument to an import is supported only as a literal for now"
+    "an argument to an import is supported only as a literal or an import name for now"
 )]
 #[case::not_a_literal_with_a_use_name(
     indoc! {"
@@ -807,6 +807,8 @@ fn importing_a_module_that_performs_io_is_refused(#[case] audit: &str, #[case] i
     out = defer()
     out <<= [1]
 "})]
+#[case::a_feed("pub events = defer()\n")]
+#[case::an_annotated_feed("pub events: Feed(Int) = defer()\n")]
 #[timeout(Duration::from_secs(10))]
 fn importing_a_module_that_declares_state_is_refused(#[case] library: &str) {
     let errors = compile_errors(&program(
@@ -930,12 +932,15 @@ fn an_imported_function_writes_the_callers_induction_variable(
     "},
     "`catalog::limit` is a value, not a type"
 )]
-#[case::unknown_qualifier(
-    "(nope::a=1).a\n",
-    "`nope` is not an import name or a run name of this module"
-)]
+#[case::unknown_qualifier("(nope::a=1).a\n", "`nope` does not name a module here")]
 #[case::value_qualified_by_this("this::a\n", "`this` qualifies a label or a tag")]
-#[case::member_of_a_run("shop::eu::stock\n", "names a member of a run")]
+#[case::through_a_value_member(
+    indoc! {"
+        import catalog
+        catalog::limit::x
+    "},
+    "module `catalog` has no member `limit` bound to a module"
+)]
 #[case::second_import_of_a_name(
     indoc! {"
         import catalog

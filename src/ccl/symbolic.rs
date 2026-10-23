@@ -10,6 +10,7 @@
 //!
 //! The public entry point is [`symbolic`].
 
+use crate::ccl::module_type::AliasType;
 use crate::ccl::{
     ArithmeticKind, BinOpKind, BindingTransparency, Branch, Builtin, Expr, Lit, LogicKind, Type,
     TypedExprNode, UnaryOpKind, source_projection_label,
@@ -198,6 +199,22 @@ fn ty_at<'a>(ty: &'a Type, opts: &'a SymbolicOpts<'a>) -> crate::ccl::ty::TypeUn
     crate::ccl::ty::TypeUnder(ty, opts.pi_binders)
 }
 
+/// What a type alias names, rendered as [`ty_at`] renders a type, a Module
+/// type entry by entry.
+fn alias_type_at(ty: &AliasType, opts: &SymbolicOpts) -> String {
+    match ty {
+        AliasType::Type(ty) => ty_at(ty, opts).to_string(),
+        AliasType::Module(module) => {
+            let entries: Vec<String> = module
+                .entries
+                .iter()
+                .map(|entry| format!("{}: {}", entry.name, alias_type_at(&entry.ty, opts)))
+                .collect();
+            format!("Module{{{}}}", entries.join(", "))
+        }
+    }
+}
+
 /// Render one transaction writer: `[reads]⇒[writes] over <source> do <body>` —
 /// its read-set / write-set footprint and the per-position decision body.
 fn fmt_transact_writer(w: &crate::ccl::WriterSite, opts: &SymbolicOpts) -> String {
@@ -245,9 +262,10 @@ fn statement_head<'e>(expr: &'e Expr, opts: &SymbolicOpts) -> Option<(String, &'
         TypedExprNode::Run {
             name, module, body, ..
         } => (format!("run {name} = {module}"), body),
-        TypedExprNode::LetType { name, ty, body } => {
-            (format!("let type {name} = {}", ty_at(ty, opts)), body)
-        }
+        TypedExprNode::LetType { name, ty, body } => (
+            format!("let type {name} = {}", alias_type_at(ty, opts)),
+            body,
+        ),
         TypedExprNode::Let {
             binding,
             bound_expr,

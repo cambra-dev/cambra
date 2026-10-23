@@ -471,8 +471,10 @@ impl Uniquifier {
             // top-level statements leaves the statements below it top-level.
             TypedExprNode::LetType { ty, body, .. } => {
                 #[cfg(debug_assertions)]
-                for_each_predicate(ty, &mut |r| self.assert_resolved_as_declared(r));
-                self.ty(ty);
+                ty.walk_types(&mut |ty| {
+                    for_each_predicate(ty, &mut |r| self.assert_resolved_as_declared(r))
+                });
+                ty.walk_types_mut(&mut |ty| self.ty(ty));
                 self.top_level = top_level;
                 self.expr(body);
             }
@@ -618,8 +620,10 @@ type EarlyResolution = Option<Vec<(Name, Option<Name>)>>;
 fn alias_predicates(expr: &Expr) -> HashMap<PredicateId, EarlyResolution> {
     fn go(e: &Expr, out: &mut HashMap<PredicateId, EarlyResolution>) {
         if let TypedExprNode::LetType { ty, .. } = &e.node {
-            for_each_predicate(ty, &mut |r| {
-                out.insert(r.predicate_id(), None);
+            ty.walk_types(&mut |ty| {
+                for_each_predicate(ty, &mut |r| {
+                    out.insert(r.predicate_id(), None);
+                })
             });
         }
         e.walk_children(|c| go(c, out));
@@ -1120,7 +1124,11 @@ mod tests {
             x
         "});
         fn alias_type(e: &Expr) -> Option<Type> {
-            if let TypedExprNode::LetType { ty, .. } = &e.node {
+            if let TypedExprNode::LetType {
+                ty: crate::ccl::module_type::AliasType::Type(ty),
+                ..
+            } = &e.node
+            {
                 return Some(ty.clone());
             }
             let mut found = None;

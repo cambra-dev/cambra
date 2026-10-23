@@ -629,3 +629,26 @@ fn a_parameter_takes_a_polymorphic_function() {
         Value::Int(1),
     );
 }
+
+/// A module feeds a run's public feed through its run name, in a loop or once
+/// (`docs/chl-spec.md`, "9.9 Running").
+#[rstest]
+#[case::in_a_loop(indoc! {"
+    run audit as a
+    for x in [1, 2]:
+        a::events << x
+    a::total
+"}, 3)]
+#[case::once(indoc! {"
+    run audit as a
+    a::events << 5
+    a::total
+"}, 5)]
+#[timeout(Duration::from_secs(10))]
+fn a_module_feeds_a_runs_feed(#[case] root: &str, #[case] expected: i64) {
+    let audit = indoc! {"
+        pub events = defer()
+        pub total = sum([e for e in events])
+    "};
+    check_program_scalar(&program(root, &[("audit", audit)]), Value::Int(expected));
+}

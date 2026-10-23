@@ -3,19 +3,19 @@
 //!
 //! [`refuse_module_syntax`] finds every such construct in a module, at any
 //! depth, and the module lowers nothing when it finds one. It refuses a type
-//! parameter, `@RenamedFrom`, `@Discard`, `pub` on anything but a value binding,
-//! a `def` or a type alias, a write to another module's member, a method
-//! reference, and a type a module qualifies. A qualified value, type, label, or
-//! tag reaches lowering, which resolves it against the module's import names and
-//! run names (`super::modules`), and so does a name qualified by one type,
-//! `Shape::circle`, which lowering resolves among the module's nominal types.
-//! Lowering therefore sees a top-level [`ChlStmt::Import`], [`ChlStmt::Run`],
-//! value [`ChlStmt::Param`], and [`ChlStmt::Pub`] on a binding, and no other
-//! module statement.
+//! parameter, `@RenamedFrom`, `@Discard`, `pub` on anything but a value
+//! binding, a `def` or a type alias, a write to another module's member, a
+//! method reference, and a type a module qualifies. A qualified value, type,
+//! label, or tag reaches lowering, which resolves it against the module's names
+//! that denote a module (`super::modules`), and so does a name qualified by one
+//! type, `Shape::circle`, which lowering resolves among the module's nominal
+//! types. Lowering therefore sees a top-level [`ChlStmt::Import`],
+//! [`ChlStmt::Run`], value [`ChlStmt::Param`], and [`ChlStmt::Pub`] on a
+//! binding, and no other module statement.
 //!
 //! The walk also collects every binder the module writes, for the rule that no
-//! binder takes an import name's or a run name's spelling (`docs/chl-spec.md`,
-//! "9.6 Qualified references").
+//! binder takes the spelling of a name that denotes a module
+//! (`docs/chl-spec.md`, "9.6 Qualified references").
 
 use super::LoweringError;
 use crate::chl_parser::ast::{
@@ -435,6 +435,11 @@ impl Refusals {
                 }
             }
             ChlExpr::Record(fields) | ChlExpr::BraceRecord(fields) => self.fields(fields),
+            ChlExpr::ModuleType(entries) => {
+                for entry in entries {
+                    self.expr(&entry.value);
+                }
+            }
             ChlExpr::Lit(_) | ChlExpr::Name(_) | ChlExpr::Error => {}
             ChlExpr::BinOp { left, right, .. } => {
                 self.expr(left);
