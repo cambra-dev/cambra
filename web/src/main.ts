@@ -33,7 +33,7 @@ import { SourceView } from "./sourceView";
 import { ElkLayout } from "./graph/elk";
 import { OperatorView, serializeOperatorGraph } from "./operatorView";
 import { TreeView, serializeTree } from "./treeView";
-import { type LiveTag, LiveStore, connectLive } from "./liveStore";
+import { type LiveStatus, type LiveTag, LiveStore, connectLive } from "./liveStore";
 import { renderLiveMenu } from "./liveMenu";
 import { LiveView, livePanelState, serializeLivePanel } from "./liveView";
 import { validateSnapshot } from "./wireValidate";
@@ -172,11 +172,29 @@ export function renderDiagnostics(
   parent.appendChild(box);
 }
 
+/** The header badge's text for a live run's status. */
+function valuesBadge(status: LiveStatus): string {
+  switch (status.kind) {
+    case "connecting":
+      return "waiting for values";
+    case "not-run":
+      return "static (no values)";
+    case "live":
+      return `live · frame ${status.published}`;
+    case "finished":
+      return "finished";
+    case "lost":
+      return "disconnected";
+  }
+}
+
 function renderHeader(
   parent: HTMLElement,
   snap: Snapshot,
   panes: readonly PaneDescriptor[],
   visibility: PaneVisibility,
+  disposers: (() => void)[],
+  live?: LiveStore,
 ): void {
   const header = el("div", "header");
   header.appendChild(el("span", "title", "Cambra Inspector"));
@@ -185,8 +203,19 @@ function renderHeader(
   const failed = snap.meta.payloadKind === "failed";
   header.appendChild(el("span", `badge${failed ? " failed" : ""}`, snap.meta.payloadKind));
 
-  // The payload describes the program, with no execution and no values.
-  header.appendChild(el("span", "badge", "static (no values)"));
+  // Whether values are flowing, which is a different question from whether the
+  // payload compiled. The badge follows the store's status, which `attachLive`
+  // sets to `not-run` for a payload no run produced; with no store at all the
+  // badge is static.
+  const values = el("span", "badge", "static (no values)");
+  header.appendChild(values);
+  if (live) {
+    const describe = () => {
+      values.textContent = valuesBadge(live.get().status);
+    };
+    describe();
+    disposers.push(live.subscribe(describe));
+  }
 
   header.appendChild(el("span", "spacer"));
   renderPaneMenu(header, panes, visibility);
@@ -437,7 +466,7 @@ export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): ()
   );
 
   root.replaceChildren();
-  renderHeader(root, store.snapshot, panes, visibility);
+  renderHeader(root, store.snapshot, panes, visibility, disposers, live);
 
   const panels = el("div", "panels");
   root.appendChild(panels);
@@ -523,6 +552,22 @@ export function followReloads(
   live.subscribe(() => void follow());
 }
 
+/**
+ * Feed `live` from the run behind `snap`, or mark it `not-run` when there is
+ * none.
+ *
+ * A payload no run produced has `meta.version` 0 (`--inspect-only`, a
+ * degraded payload). Its server still accepts `/api/live` and never publishes,
+ * so a socket would hold the store at `connecting` for good.
+ */
+export function attachLive(live: LiveStore, snap: Snapshot, open?: () => WebSocket): void {
+  if (snap.meta.version === 0) {
+    live.setStatus({ kind: "not-run" });
+    return;
+  }
+  connectLive(live, open);
+}
+
 async function main(): Promise<void> {
   const root = document.getElementById("app");
   if (!root) return;
@@ -537,7 +582,7 @@ async function main(): Promise<void> {
     // values pane, where a snapshot that would not load has nothing to show at
     // all.
     const live = new LiveStore();
-    connectLive(live);
+    attachLive(live, snap);
     followReloads(root, live, snap, async () => {
       const again = await fetch("/api/snapshot");
       if (!again.ok) throw new Error(`HTTP ${again.status}`);
