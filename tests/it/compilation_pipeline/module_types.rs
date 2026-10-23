@@ -9,7 +9,7 @@ use indoc::indoc;
 use rstest_log::rstest;
 
 use super::helpers::*;
-use super::modules::{assert_refused, compile_errors, program, shared_runs};
+use super::modules::{assert_refused, compile_errors, program, shared_imports};
 
 /// A module of a value, two functions, one generic, and a private value.
 const COUNTER: &str = indoc! {"
@@ -411,14 +411,14 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
         import shop(counter=x) as y
         1
     "},
-    "this import's arguments pass imports that pass it, in a cycle"
+    "this import's arguments name imports whose arguments name it, in a cycle"
 )]
 #[case::an_import_passing_itself(
     indoc! {"
         import shop(counter=x) as x
         1
     "},
-    "this import's arguments pass imports that pass it, in a cycle"
+    "this import's arguments name imports whose arguments name it, in a cycle"
 )]
 #[case::a_binding_in_a_function(
     indoc! {"
@@ -675,12 +675,12 @@ fn a_module_argument_with_errors_adds_no_error(#[case] root: &str) {
     assert_eq!(errors.matches("Error:").count(), 1, "{errors}");
 }
 
-/// Two imports that pass one module the same import reach one shared run, and
-/// its home names the argument's shared run (`docs/chl-spec.md`, "9.2
+/// Two imports that pass one module the same import reach one shared import, and
+/// its home names the argument's shared import (`docs/chl-spec.md`, "9.2
 /// Imports").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn an_import_passing_a_module_reaches_one_shared_run_per_argument() {
+fn an_import_passing_a_module_reaches_one_shared_import_per_argument() {
     let program = program(
         indoc! {"
             import counter
@@ -703,7 +703,7 @@ fn an_import_passing_a_module_reaches_one_shared_run_per_argument() {
     );
     let expected = ["both", "counter", "shop(counter=counter)"];
     assert_eq!(
-        shared_runs(&program),
+        shared_imports(&program),
         expected.iter().map(|s| s.to_string()).collect()
     );
 }

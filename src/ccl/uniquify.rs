@@ -982,7 +982,7 @@ mod tests {
     /// minted with the module as their home, and every other binder without one.
     #[test]
     fn top_level_binders_are_minted_with_their_home() {
-        let catalog = Home::Shared(crate::ccl::SharedRun::of(ModulePath::new([
+        let catalog = Home::Import(crate::ccl::SharedImport::of(ModulePath::new([
             "catalog".into()
         ])));
         // let a = (let b = 1 in b) in let f = λ x → x in f
