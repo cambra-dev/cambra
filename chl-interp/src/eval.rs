@@ -1645,6 +1645,76 @@ impl Interp {
         answer
     }
 
+    /// `l op r` for a comparison (`docs/chl-spec.md`, "3.4 Comparisons"): equal values are the
+    /// same value, and an ordering compares by [`Self::order`].
+    fn comparison(&mut self, op: CmpOp, l: Value, r: Value) -> Result<Value, Error> {
+        if any_pending([&l, &r]) {
+            return Ok(Value::Pending);
+        }
+        let ord = match op {
+            CmpOp::Eq => return Ok(Value::Bool(l == r)),
+            CmpOp::NotEq => return Ok(Value::Bool(l != r)),
+            _ => self.order(&l, &r)?,
+        };
+        Ok(Value::Bool(match op {
+            CmpOp::Lt => ord.is_lt(),
+            CmpOp::LtE => ord.is_le(),
+            CmpOp::Gt => ord.is_gt(),
+            CmpOp::GtE => ord.is_ge(),
+            CmpOp::Eq | CmpOp::NotEq => unreachable!(),
+        }))
+    }
+
+    /// The order of two values: a base's own, and a tuple's lexicographically by position.
+    fn order(&self, l: &Value, r: &Value) -> Result<std::cmp::Ordering, Error> {
+        match (l, r) {
+            (Value::Int(a), Value::Int(b)) => Ok(a.cmp(b)),
+            (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
+            (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
+            (Value::Record(a), Value::Record(b)) => {
+                for i in 0..a.len() {
+                    let name = format!("_{i}");
+                    let field = |v: &[(String, Value)]| {
+                        v.iter()
+                            .find(|(n, _)| *n == name)
+                            .map(|(_, x)| x.clone())
+                            .ok_or_else(|| Error(format!("a tuple has no field `{name}`")))
+                    };
+                    match self.order(&field(a)?, &field(b)?)? {
+                        std::cmp::Ordering::Equal => continue,
+                        other => return Ok(other),
+                    }
+                }
+                Ok(std::cmp::Ordering::Equal)
+            }
+            _ => err(format!("{l} and {r} have no order")),
+        }
+    }
+
+    /// The greatest value of collection `c`'s, or the least, by [`Self::order`]. Not defined
+    /// for an empty collection (`docs/chl-spec.md`, "7.1 Aggregates").
+    fn extreme(&self, c: &Collection, greatest: bool, name: &str) -> Result<Value, Error> {
+        let mut best: Option<Value> = None;
+        for (_, v) in c.entries() {
+            best = Some(match best {
+                None => v.clone(),
+                Some(b) => {
+                    let beyond = if greatest {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    };
+                    if self.order(v, &b)? == beyond {
+                        v.clone()
+                    } else {
+                        b
+                    }
+                }
+            });
+        }
+        best.ok_or_else(|| Error(format!("`{name}` of an empty collection is not defined")))
+    }
+
     /// `receiver.method(args)`: the method of the one type that declares it and has the
     /// receiver's constructor, called with the receiver as `self`.
     fn call_method(
@@ -2375,7 +2445,7 @@ impl Interp {
                 let mut prev = self.eval(left)?;
                 for (i, (op, rhs)) in ops.iter().zip(comparators).enumerate() {
                     let next = self.eval(rhs)?;
-                    match compare(*op, prev, next.clone())? {
+                    match self.comparison(*op, prev, next.clone())? {
                         Value::Bool(true) => {}
                         Value::Bool(false) => return Ok(Value::Bool(false)),
                         // Whether the chain stops here is undecided, so the comparands after
@@ -2603,15 +2673,7 @@ impl Interp {
                     Value::Pending => return Ok(Value::Pending),
                     _ => return err("`max` takes a collection"),
                 };
-                let mut best: Option<i64> = None;
-                for (_, v) in c.entries() {
-                    let Value::Int(i) = v else {
-                        return err("`max` takes a collection of integers");
-                    };
-                    best = Some(best.map_or(*i, |b: i64| b.max(*i)));
-                }
-                best.map(Value::Int)
-                    .ok_or_else(|| Error("`max` of an empty collection is not defined".into()))
+                self.extreme(&c, true, "max")
             }
 
             // `min` of an empty collection is not defined, as for `max`.
@@ -2621,15 +2683,7 @@ impl Interp {
                     Value::Pending => return Ok(Value::Pending),
                     _ => return err("`min` takes a collection"),
                 };
-                let mut best: Option<i64> = None;
-                for (_, v) in c.entries() {
-                    let Value::Int(i) = v else {
-                        return err("`min` takes a collection of integers");
-                    };
-                    best = Some(best.map_or(*i, |b: i64| b.min(*i)));
-                }
-                best.map(Value::Int)
-                    .ok_or_else(|| Error("`min` of an empty collection is not defined".into()))
+                self.extreme(&c, false, "min")
             }
 
             Some(SurfaceBuiltin::Sum) => {
@@ -3042,31 +3096,6 @@ fn binop(op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
     }
 }
 
-fn compare(op: CmpOp, l: Value, r: Value) -> Result<Value, Error> {
-    if any_pending([&l, &r]) {
-        return Ok(Value::Pending);
-    }
-    let ord = match (&l, &r) {
-        (Value::Int(a), Value::Int(b)) => a.cmp(b),
-        (Value::Str(a), Value::Str(b)) => a.cmp(b),
-        _ => {
-            return match op {
-                CmpOp::Eq => Ok(Value::Bool(l == r)),
-                CmpOp::NotEq => Ok(Value::Bool(l != r)),
-                _ => err(format!("unsupported {op:?} on {l} and {r}")),
-            };
-        }
-    };
-    Ok(Value::Bool(match op {
-        CmpOp::Eq => ord.is_eq(),
-        CmpOp::NotEq => ord.is_ne(),
-        CmpOp::Lt => ord.is_lt(),
-        CmpOp::LtE => ord.is_le(),
-        CmpOp::Gt => ord.is_gt(),
-        CmpOp::GtE => ord.is_ge(),
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3323,6 +3352,16 @@ mod tests {
             out << summon(Scales(_, _))::times(3, Vec2::new((1, 2))).extract().1
         "#});
         assert_eq!(v.to_string(), "[() -> 6]");
+    }
+
+    /// A tuple orders lexicographically by position, and `max` reads it so.
+    #[test]
+    fn a_tuple_orders_lexicographically() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            out << ((1, 2) < (1, 3), (2, 0) > (1, 9), max([(1, 2), (2, 0), (1, 9)]).0)
+        "#});
+        assert_eq!(v.to_string(), "[() -> (_0: true, _1: true, _2: 2)]");
     }
 
     /// Two single-constructor types share the constructor `new`, and a value names its type,

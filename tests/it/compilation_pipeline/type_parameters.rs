@@ -440,7 +440,7 @@ fn requirements_check_and_run(#[case] code: &str, #[case] expected: Value) {
     indoc! {"
         def larger(T, a: T, b: T) => T requires Orderable(T, T):
             b if a < b else a
-        larger((1, 2), (3, 4))
+        larger((x=1, y=2), (x=3, y=4))
     "},
     "No Orderable instance",
 )]

@@ -1442,3 +1442,34 @@ fn a_refined_associated_type_is_an_internal_gap() {
         "internal compiler error in lowering",
     );
 }
+
+/// A tuple orders lexicographically by position, and `max` and `min` read it so.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::ordered("(1, 2) < (1, 3) and (2, 0) > (1, 9)")]
+#[case::max("max([(1, 2), (2, 0), (1, 9)]) == (2, 0)")]
+#[case::min("min([(1, 2), (2, 0), (1, 9)]) == (1, 2)")]
+#[case::min_with_a_string("min([(2, \"a\"), (1, \"b\"), (1, \"a\")]) == (1, \"a\")")]
+#[case::max_with_a_string("max([(2, \"a\"), (1, \"b\"), (2, \"b\")]) == (2, \"b\")")]
+#[case::min_of_strings("min([\"b\", \"a\", \"c\"]) == \"a\"")]
+#[case::each_group_s_min_with_a_string(
+    indoc! {"
+        g = groupby([1, 2, 3, 4], \\x -> x // 2)
+        sum([min([(v, \"a\") for v in grp]).0 for grp in g]) == 7
+    "}
+)]
+#[case::each_group_s_max(
+    indoc! {"
+        g = groupby([1, 2, 3, 4], \\x -> x // 2)
+        sum([max([(v, 0) for v in grp]).0 for grp in g]) == 8
+    "}
+)]
+fn a_tuple_orders_lexicographically(#[case] code: &str) {
+    check_scalar(code, Value::Bool(true));
+}
+
+/// A record's fields have no order, so a record does not order.
+#[test]
+fn a_record_does_not_order() {
+    check_compile_error("(a=1, b=2) < (a=3, b=4)", "No Orderable instance");
+}

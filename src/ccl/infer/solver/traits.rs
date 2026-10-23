@@ -161,14 +161,25 @@ pub struct TraitDecl {
     /// `s` and `Same(A, B)` for `trait Ranked(A, B) requires s: Same(A, B)`. Each instance's
     /// functions read `s` at the instance's types.
     pub named: Vec<(SmolStr, Rc<TraitRequirement>)>,
-    /// Whether a **product** satisfies the trait when its components do.
-    ///
-    /// The one that does is `Equatable`: equality is defined componentwise on any product,
-    /// which is what makes the decomposition a reading of the trait rather than a new
-    /// relation. Ordering is not: comparing two products needs an order on their
-    /// components, and a record's fields carry none. Arithmetic has no product reading at
-    /// all, and neither has a module's trait.
-    pub structural: bool,
+    /// Which products satisfy the trait when their components do.
+    pub products: ProductReading,
+}
+
+/// Which products a trait's product rule reads: a product satisfies the trait when its
+/// components do (`docs/chl-spec.md`, "3.4 Comparisons").
+///
+/// The comparisons have one: equality is componentwise on any product, and a tuple's order is
+/// lexicographic, which is what makes the decomposition a reading of the trait rather than a
+/// new relation. Arithmetic has none, and neither has a module's
+/// trait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductReading {
+    /// No product satisfies the trait by its components.
+    None,
+    /// Any product, componentwise: `Equatable`.
+    AnyProduct,
+    /// A tuple, lexicographically: `Orderable`. A record's fields carry no order.
+    Tuples,
 }
 
 impl TraitDecl {
@@ -249,8 +260,16 @@ impl CompilerTraits {
                 (vec![Bool, Bool], None),
             ]
         };
-        let mut arithmetic =
-            |name: &str, rows| operator_trait(name, &binary, true, false, rows, &mut instances);
+        let mut arithmetic = |name: &str, rows| {
+            operator_trait(
+                name,
+                &binary,
+                true,
+                ProductReading::None,
+                rows,
+                &mut instances,
+            )
+        };
         // `+`. The `(String, String) ⇝ String` row is why surface `+` on strings types
         // through arithmetic; `simplify` rewrites it to `Concat` later.
         let addable = arithmetic("Addable", {
@@ -274,7 +293,7 @@ impl CompilerTraits {
             "Equatable",
             &binary,
             false,
-            true,
+            ProductReading::AnyProduct,
             comparison(),
             &mut instances,
         );
@@ -285,7 +304,7 @@ impl CompilerTraits {
             "Orderable",
             &binary,
             false,
-            false,
+            ProductReading::Tuples,
             comparison(),
             &mut instances,
         );
@@ -294,7 +313,7 @@ impl CompilerTraits {
             "Negatable",
             &["A"],
             true,
-            false,
+            ProductReading::None,
             vec![(vec![Int], Some(Int))],
             &mut instances,
         );
@@ -313,14 +332,15 @@ impl CompilerTraits {
     }
 }
 
-/// An operator's trait over `operands`, associating `Output` if `output`, with an instance
-/// in `instances` for each of `rows`: the bases it accepts, and the base it associates as
-/// `Output`. Every row has the declaration's shape.
+/// An operator's trait over `operands`, associating `Output` if `output` and reading
+/// `products` by their components, with an instance in `instances` for each of `rows`: the
+/// bases it accepts, and the base it associates as `Output`. Every row has the declaration's
+/// shape.
 fn operator_trait(
     name: &str,
     operands: &[&str],
     output: bool,
-    structural: bool,
+    products: ProductReading,
     rows: Vec<(Vec<BaseType>, Option<BaseType>)>,
     instances: &mut InstanceTable,
 ) -> Trait {
@@ -337,7 +357,7 @@ fn operator_trait(
         functions: Vec::new(),
         requires: Vec::new(),
         named: Vec::new(),
-        structural,
+        products,
     });
     for (bases, associated) in rows {
         assert!(
@@ -497,10 +517,20 @@ impl Trait {
         self.assocs().into_iter().find(|a| a.name() == name)
     }
 
-    /// Whether a product satisfies this trait when its components do
-    /// ([`TraitDecl::structural`]).
+    /// Whether some product satisfies this trait when its components do
+    /// ([`TraitDecl::products`]).
     pub fn is_structural(&self) -> bool {
-        self.structural
+        self.products != ProductReading::None
+    }
+
+    /// Whether this trait's product rule reads `product`: any product for `Equatable`, and
+    /// only a tuple for `Orderable` ([`ProductReading`]).
+    pub fn admits_product(&self, product: &Type) -> bool {
+        match self.products {
+            ProductReading::None => false,
+            ProductReading::AnyProduct => true,
+            ProductReading::Tuples => matches!(product.peel_refinements(), Type::Tuple(_)),
+        }
     }
 
     /// The trait's name, for diagnostics.
@@ -1886,10 +1916,10 @@ impl TraitObligation {
         }
         // Nothing that could answer a product: reported against what the rows accept.
         if !assumed
-            && matches!(
+            && (matches!(
                 *self.product_rule.borrow(),
                 ProductRule::Absent | ProductRule::RuledOut
-            )
+            ) || !self.trait_.admits_product(&peeled))
         {
             return self.reject(pos, product);
         }
@@ -3395,9 +3425,9 @@ pub fn entailed(
     }) {
         return true;
     }
-    if requirement.trait_.is_structural()
-        && let Some(first) = args.first()
+    if let Some(first) = args.first()
         && matches!(first, Type::Tuple(_) | Type::Record(_))
+        && requirement.trait_.admits_product(first)
     {
         let shape = product_shape(first);
         if args.iter().any(|a| product_shape(a) != shape) {

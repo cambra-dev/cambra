@@ -321,11 +321,10 @@ impl Typing for CheckCtx {
             // catches a later pass rewriting the tree into something ill-typed, and a
             // product is the shape inference answers structurally rather than through the
             // candidate set (`traits::narrow_product`), so nothing else downstream would.
-            if trait_.is_structural()
-                && operand_types
-                    .iter()
-                    .all(|t| matches!(strip_refinements(t), Type::Tuple(_) | Type::Record(_)))
-            {
+            if operand_types.iter().all(|t| {
+                let t = strip_refinements(t);
+                matches!(t, Type::Tuple(_) | Type::Record(_)) && trait_.admits_product(&t)
+            }) {
                 let shapes: Vec<Vec<FieldKey>> = operand_types
                     .iter()
                     .map(|t| product_fields(&strip_refinements(t)))
