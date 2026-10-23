@@ -11,13 +11,19 @@ fn live_rename() -> Subst {
     Subst::rename("k", "j")
 }
 
+/// What `live_rename` makes of each body: the occurrence `k` retargeted to `j`.
+fn renamed() -> TypedExprNode {
+    TypedExprNode::Var(Name::raw("j"))
+}
+
 #[test]
 fn a_lambda_keeps_its_param_name() {
     let e = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("k"));
-    let TypedExprNode::Lambda { param, .. } = live_rename().apply_expr(&e).node else {
+    let TypedExprNode::Lambda { param, body } = live_rename().apply_expr(&e).node else {
         panic!("expected a lambda");
     };
     assert_eq!(param.name, Name::raw("x"));
+    assert_eq!(body.node, renamed());
 }
 
 #[test]
@@ -27,10 +33,11 @@ fn a_for_keeps_its_target_name() {
         iter: Box::new(TypedExpr::var("xs")),
         body: Box::new(TypedExpr::var("k")),
     });
-    let TypedExprNode::For { target, .. } = live_rename().apply_expr(&e).node else {
+    let TypedExprNode::For { target, body, .. } = live_rename().apply_expr(&e).node else {
         panic!("expected a for");
     };
     assert_eq!(target.name, Name::raw("y"));
+    assert_eq!(body.node, renamed());
 }
 
 #[test]
@@ -40,10 +47,17 @@ fn a_let_keeps_its_binding_name() {
         TypedExpr::var("k"),
         TypedExpr::var("k"),
     );
-    let TypedExprNode::Let { binding, .. } = live_rename().apply_expr(&e).node else {
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = live_rename().apply_expr(&e).node
+    else {
         panic!("expected a let");
     };
     assert_eq!(binding.name, Name::raw("z"));
+    assert_eq!(bound_expr.node, renamed());
+    assert_eq!(body.node, renamed());
 }
 
 #[test]
