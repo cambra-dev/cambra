@@ -18,12 +18,12 @@ unit test ("Build and Test Scope" in `{{WS}}/.claude/skills/staff-rust-review/SK
 
 Where no existing test settles a behaviour risk, write one. Try it in temporary commits on
 `{{CHANGE}}` and on its parent, as "Trying a test in a temporary commit" in the same skill
-describes, with `-R {{WS}}` on every jj command and cargo run through `in-workspace.sh` as above.
-The orchestrator compares the workspace's commit ids before and after your review: a temporary
-commit left behind voids the review. A test that fails on `{{CHANGE}}` and passes on its parent
-is evidence for `REJECT` or `REVISE`. One that passes on `{{CHANGE}}` rules the risk out. One that
-fails on both shows a bug the change did not introduce: name it under "behaviour risks checked"
-and do not count it against the change.
+describes, with `-R {{WS}}` on every jj and `review-test.sh` command and cargo run through
+`in-workspace.sh` as above. The orchestrator compares the workspace's commit ids before and after
+your review: a temporary commit left at `@` voids the review. A test that fails on `{{CHANGE}}` and
+passes on its parent is evidence for `REJECT` or `REVISE`. One that passes on `{{CHANGE}}` rules the
+risk out. One that fails on both shows a bug the change did not introduce: name it under "behaviour
+risks checked" and do not count it against the change.
 
 Apart from those commits, do not edit any file in `{{WS}}`, and do not run jj commands that write.
 Write every log, backup copy (`*.orig`) and temp file under `{{SCRATCH}}`. Never use the session

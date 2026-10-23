@@ -25,9 +25,9 @@ Run no builds and no existing tests: the commit passed `./ci.sh fast` before thi
 GitHub CI runs the full gate on the pushed PR. Try the test for an `incorrect` finding as the
 skill's "Trying a test in a temporary commit" describes, running cargo through
 `{{SKILL}}/scripts/in-workspace.sh {{WS}} 1800 cargo test …`, which uses the workspace's cargo
-target and a timeout, and pass `-R {{WS}}` to every jj command. The orchestrator compares the
-workspace's commit ids before and after your review: a temporary commit left behind, or any other
-edit, voids the review.
+target and a timeout, and pass `-R {{WS}}` to every jj and `review-test.sh` command. The
+orchestrator compares the workspace's commit ids before and after your review: a temporary commit
+left at `@`, or any other edit, voids the review.
 
 Apart from those temporary commits, do not edit any file in `{{WS}}`, do not run jj commands that
 write, and do not touch any directory outside `{{WS}}` and `{{SCRATCH}}`. Write every log, backup

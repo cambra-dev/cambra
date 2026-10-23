@@ -300,14 +300,19 @@ Steps 6 and 7, runs inside this guard:
    `jj -R $WS log -r 'main@origin..@' --no-graph -T 'commit_id ++ "\n"'`.
 2. After the reviewer returns, run the same command and compare. It runs without
    `--ignore-working-copy`, so it snapshots any edit the reviewer left behind and the ids change.
+3. Abandon any temporary test commit the reviewer left, by the change id it reviewed:
+   `$SKILL/../staff-rust-review/scripts/review-test.sh -R $WS clean <change>`.
 
-Any difference voids the review: discard the attempt, whatever the verdict, and log it as
-`discarded: reviewer edited the workspace`.
+Any difference in step 2 voids the review: discard the attempt, whatever the verdict, and log it
+as `discarded: reviewer edited the workspace`.
 
-Either reviewer may try a new test in two temporary commits, one on top of `@` and one on the
-change's parent, and abandons both and returns `@` to where it was before it reports ("Trying a
-test in a temporary commit" in the `staff-rust-review` skill). Done that way, the commit ids
-match and the guard passes. A temporary commit left behind voids the review like any other edit.
+Either reviewer may try a new test in two temporary commits, one on the change and one on its
+parent, made and removed with `review-test.sh` ("Trying a test in a temporary commit" in the
+`staff-rust-review` skill). Done that way, `@` returns to where it was and the guard passes. A
+temporary commit left at `@` voids the review like any other edit. One left on the parent is not
+an ancestor of `@`, so step 2 cannot see it; it changes no commit under review, and step 3
+abandons it. `review-test.sh` describes each temporary commit with the change id it tests, so
+step 3 abandons only that review's commits and no other child of the same parents.
 
 ## Step 5 — Implementer
 
