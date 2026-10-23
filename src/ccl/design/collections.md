@@ -44,6 +44,19 @@ present-key domain. `full_map_annotations_are_satisfiable` and
 A `FullMap(Int, Int)` parameter can be type-checked with an integer subscript without establishing
 that a tested concrete collection can inhabit the parameter type.
 
+A data-function type `𝐷 |=> 𝑉` lowers to `𝐷 ⤇ 𝑉`, and its kind follows its domain
+(`leaves_domain_open` in `lower/stmts.rs`):
+
+- A domain holding a hole or a type parameter gets a kind hole (`FunKind::data_hole`), which
+  normalization replaces with a fresh data kind at each occurrence, plain or a sum. A lowered
+  annotation is cloned by every use of an alias, so the hole is a marker rather than a variable
+  the uses would share.
+- A written domain gets a plain collection's kind, as `FullMap(𝐾, 𝑉)` does.
+- A kind hole whose domain names a type parameter occurring more than once in its definition,
+  annotations and `requires` together, is closed to a plain collection's (`close_shared_domains`).
+  A sum binds its consumer's domain to its own witness, which cannot stand at the parameter's other
+  positions.
+
 The table does not promise that every declared lookup or iteration interface is implemented.
 Those boundaries are specified under [Lookup](#lookup-membership-discharge) and
 [Operations](#operations-how-the-trait-layer-dispatches-planned).

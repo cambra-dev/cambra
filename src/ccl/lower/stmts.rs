@@ -2158,6 +2158,71 @@ pub(super) fn lower_trait_type(
     })
 }
 
+/// Whether a data-function type over `domain` leaves its domain to inference: `domain`
+/// holds a hole or a type parameter.
+fn leaves_domain_open(domain: &Type) -> bool {
+    if matches!(
+        domain,
+        Type::Hole | Type::SharedHole(_) | Type::BoundedHole(_) | Type::Param(_)
+    ) {
+        return true;
+    }
+    let mut open = false;
+    domain.walk_children(|c| open |= leaves_domain_open(c));
+    open
+}
+
+/// How often each type parameter occurs, counted over a definition's annotations and its
+/// requirements' arguments by [`count_type_params`], for [`close_shared_domains`].
+pub(super) type ParamCounts = HashMap<crate::ccl::ty::TypeParamId, usize>;
+
+/// Count every type parameter `ty` names into `counts`.
+pub(super) fn count_type_params(ty: &Type, counts: &mut ParamCounts) {
+    if let Type::Param(p) = ty {
+        *counts.entry(p.id).or_default() += 1;
+    }
+    ty.walk_children(|c| count_type_params(c, counts));
+}
+
+/// Close the domain of every data-function type in `ty` whose domain names a type
+/// parameter occurring more than once in its definition: its kind becomes a plain
+/// collection's, where [`leaves_domain_open`] made it a hole.
+///
+/// A sum reaches a data-function type by binding the type's domain to its own witness. A
+/// parameter at one position is that witness only there. One occurring elsewhere would carry
+/// the witness out of the sum binding it, so it relates plain collections over one domain.
+pub(super) fn close_shared_domains(ty: &mut Type, counts: &ParamCounts) {
+    fn names_shared(ty: &Type, counts: &ParamCounts) -> bool {
+        if let Type::Param(p) = ty
+            && counts.get(&p.id).is_some_and(|&k| k > 1)
+        {
+            return true;
+        }
+        let mut shared = false;
+        ty.walk_children(|c| shared |= names_shared(c, counts));
+        shared
+    }
+    if let Type::Fun {
+        fun_kind, domain, ..
+    } = ty
+        && matches!(fun_kind, crate::ccl::FunKind::Var(v) if v.is_hole())
+        && names_shared(domain, counts)
+    {
+        *fun_kind = crate::ccl::FunKind::Data(None);
+    }
+    ty.walk_children_mut(|c| close_shared_domains(c, counts));
+}
+
+/// The arguments of `requires`, which name a definition's type parameters without being
+/// annotations of it.
+pub(super) fn requirement_types(
+    requires: &[Rc<crate::ccl::ty::TraitRequirement>],
+) -> impl Iterator<Item = &Type> {
+    requires
+        .iter()
+        .flat_map(|r| r.args.iter().chain(r.assoc.iter().map(|(_, t)| t)))
+}
+
 /// Whether `ty` may stand at a requirement's position: a type parameter in scope, a base
 /// type, or a nominal type applied to such types.
 fn is_requirement_operand(ty: &Type) -> bool {
@@ -2545,16 +2610,43 @@ pub(super) fn lower_type_expr_or_poly(
              `` {`a | `b{Int}} ``",
         )),
         // A function type `T => U` (`docs/chl-spec.md`, "6. Types (informal
-        // sketch)"). The surface arrow is the compute arrow `⇒`
-        // ([`FunKind::Compute`]) — the kind a `def`/lambda produces — so an
-        // annotated binding `f: (Int => Int) = \x -> …` matches its value.
-        // `Type::fun` builds the non-dependent form (`name: None`); the surface
-        // has no binder to make it a Pi type, and a data collection (`⤇`) is
-        // written with its own constructor, never with `=>`.
-        ChlExpr::FunctionType { domain, codomain } => Ok(Type::fun(
+        // sketch)"). The arrow is the compute arrow `⇒` ([`FunKind::Compute`]) — the
+        // kind a `def`/lambda produces — so an annotated binding
+        // `f: (Int => Int) = \x -> …` matches its value. `Type::fun` builds the
+        // non-dependent form (`name: None`): the surface has no binder to make it a Pi
+        // type.
+        ChlExpr::FunctionType {
+            domain,
+            arrow: chl_parser::ast::Arrow::Compute,
+            codomain,
+        } => Ok(Type::fun(
             lower_type_expr(domain, ctx)?,
             lower_type_expr(codomain, ctx)?,
         )),
+        // A data-function type `T |=> U`, a collection over `T` (`docs/chl-spec.md`,
+        // "6.3 Direction: collection types [Decided]"). A sum is a data function whose
+        // domain is its witness, so a domain left to inference — a hole, or a type
+        // parameter, which each use instantiates — admits a sum as well as a plain
+        // collection, and its kind is a hole. A domain the program writes names a type,
+        // which no witness is, so it makes a plain collection.
+        ChlExpr::FunctionType {
+            domain,
+            arrow: chl_parser::ast::Arrow::Data,
+            codomain,
+        } => {
+            let domain = lower_type_expr(domain, ctx)?;
+            let fun_kind = if leaves_domain_open(&domain) {
+                crate::ccl::FunKind::data_hole()
+            } else {
+                crate::ccl::FunKind::Data(None)
+            };
+            Ok(Type::Fun {
+                name: None,
+                fun_kind,
+                domain: Box::new(domain),
+                codomain: Box::new(lower_type_expr(codomain, ctx)?),
+            })
+        }
         // A parenthesised comma list `(T, U)` is a *term* product; the tuple *type* is
         // written with braces `{T, U}` (`docs/chl-spec.md`). `->` builds the same node, so
         // a function type written with the wrong arrow arrives here too and the message
@@ -2582,7 +2674,11 @@ pub(super) fn lower_type_expr_or_poly(
             let scoped = ctx.type_params_in_scope.len();
             let poly = declare_type_params(type_params, ctx).and_then(|params| {
                 let requires = lower_requirements(requires, ctx)?;
-                let body = lower_type_expr(body, ctx)?;
+                let mut body = lower_type_expr(body, ctx)?;
+                let mut counts = ParamCounts::new();
+                count_type_params(&body, &mut counts);
+                requirement_types(&requires).for_each(|t| count_type_params(t, &mut counts));
+                close_shared_domains(&mut body, &counts);
                 Ok(Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
                     params,
                     requires,
@@ -3453,6 +3549,38 @@ mod tests {
     use crate::ccl::symbolic::symbolic;
     use indoc::indoc;
     use rstest::rstest;
+
+    /// The kind of each data-function type in `ty`, outermost first: `Some(true)` for a
+    /// kind hole, `Some(false)` for a plain collection.
+    fn data_kinds(ty: &Type, out: &mut Vec<bool>) {
+        if let Type::Fun { fun_kind, .. } = ty {
+            match fun_kind {
+                crate::ccl::FunKind::Var(v) => out.push(v.is_hole()),
+                crate::ccl::FunKind::Data(None) => out.push(false),
+                _ => {}
+            }
+        }
+        ty.walk_children(|c| data_kinds(c, out));
+    }
+
+    /// A data-function type's kind is a hole where its domain is left to inference, and a
+    /// plain collection's where the program writes the domain or shares its parameter
+    /// (`docs/chl-spec.md`, "6.3 Direction: collection types \[Decided\]").
+    #[rstest]
+    #[case::a_written_domain("Int |=> Int", &[false])]
+    #[case::a_hole("_ |=> Int", &[true])]
+    #[case::a_hole_inside_the_domain("{_, Int} |=> Int", &[true])]
+    #[case::a_parameter_at_one_position("forall (D) (D |=> Int) => Int", &[true])]
+    #[case::a_parameter_at_two(
+        "forall (D) {D |=> Int, D |=> Int} => Int",
+        &[false, false]
+    )]
+    #[case::a_parameter_beside_its_result("forall (D) (D |=> Int) => D |=> Int", &[false, false])]
+    fn a_data_function_types_kind_follows_its_domain(#[case] code: &str, #[case] holes: &[bool]) {
+        let mut out = Vec::new();
+        data_kinds(&lower_type(code), &mut out);
+        assert_eq!(out, holes, "{code}");
+    }
 
     // -----------------------------------------------------------------------
     // Statement block tests (let bindings)

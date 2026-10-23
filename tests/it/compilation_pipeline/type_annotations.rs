@@ -777,7 +777,7 @@ fn a_refined_map_key_no_key_satisfies() {
 m: Map({String where _ != ""}, Int) = map([("a", 1), ("z", 2)])
 m
 "#,
-        r#"Annotation mismatch: annotated as Map({String where _ != ""}, Int), but inferred as FullMap({String where _ in ["a", "z"]}, Int)"#,
+        r#"Annotation mismatch: annotated as Map({String where _ != ""}, Int), but inferred as {String where _ in ["a", "z"]} |=> Int"#,
     )
 }
 
@@ -1975,4 +1975,90 @@ i = f(1)
         "#},
         Value::Int(7),
     )
+}
+
+/// A data-function type whose domain is left to inference, by a hole or by a type parameter
+/// at one position, admits a plain collection and a sum alike (`docs/chl-spec.md`, "6.3
+/// Direction: collection types [Decided]").
+#[rstest]
+#[case::a_plain_collection("xs: _ |=> Int = [1, 2, 3]\nsum(xs)", 6)]
+#[case::a_sum("xs: _ |=> Int = box([1, 2, 3])\nsum([x for x in xs])", 6)]
+#[case::a_parameter(
+    indoc! {"
+        def total(xs: _ |=> Int) => Int:
+            sum([x for x in xs])
+        total([1, 2]) + total(box([3, 4]))
+    "},
+    10
+)]
+#[case::a_type_parameter_domain(
+    indoc! {"
+        def total(D, xs: D |=> Int) => Int:
+            sum(xs)
+        total([1, 2]) + total(box([3, 4]))
+    "},
+    10
+)]
+#[case::each_use_of_an_alias(
+    indoc! {"
+        Ints = _ |=> Int
+        a: Ints = [1, 2]
+        b: Ints = box([3, 4])
+        sum(a) + sum(b)
+    "},
+    10
+)]
+#[case::a_polymorphic_annotation(
+    "f: forall (D) (D |=> Int) => Int = \\xs -> sum(xs)\nf(box([1, 2])) + f([3])",
+    6
+)]
+#[case::a_codomain("f: Int => _ |=> Int = \\n -> [n, n]\nsum(f(3))", 6)]
+#[case::a_shared_domain_over_one_plain_domain(
+    indoc! {"
+        def both(D, a: D |=> Int, b: D |=> Int) => Int:
+            sum(a) + sum(b)
+        both([1, 2], [3, 4])
+    "},
+    10
+)]
+fn a_data_function_type_admits_both_collections(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A type parameter naming several positions relates plain collections over one domain: a
+/// sum's witness cannot leave the sum to stand at the others, and two plain domains are not
+/// one.
+#[rstest]
+#[case::two_sums(
+    indoc! {"
+        def both(D, a: D |=> Int, b: D |=> Int) => Int:
+            sum(a) + sum(b)
+        both(box([1, 2]), box([3, 4, 5]))
+    "},
+    "a plain collection and a sum met at one position"
+)]
+#[case::a_sum_and_its_result(
+    indoc! {"
+        def ident(D, a: D |=> Int) => D |=> Int:
+            a
+        sum(ident(box([1, 2])))
+    "},
+    "a plain collection and a sum met at one position"
+)]
+#[case::two_plain_domains(
+    indoc! {"
+        def both(D, a: D |=> Int, b: D |=> Int) => Int:
+            sum(a) + sum(b)
+        both([1, 2], [3, 4, 5])
+    "},
+    "collection domains have no common answer"
+)]
+fn a_shared_data_function_domain_is_one_plain_domain(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}
+
+/// A data-function type is written in annotation position, as `T => U` is.
+#[test]
+fn a_data_function_type_is_no_value() {
+    check_compile_error("x = Int |=> Int\n1", "`T |=> U` is a data-function *type*");
 }

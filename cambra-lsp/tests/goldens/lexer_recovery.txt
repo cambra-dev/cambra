@@ -97,7 +97,7 @@ folds:
 == chl-parser/tests/lexer_recovery/unclosed_before_a_def.cambra
 diagnostics:
   1:8-1:9 bracket is never closed
-  1:12-2:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', or ':'
+  1:12-2:1 found 'newline', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '|=>', '**', or ':'
     1:1-1:12 while parsing statement
     1:4-1:12 while parsing expression
 symbols:

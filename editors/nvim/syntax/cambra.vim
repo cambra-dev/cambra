@@ -20,7 +20,7 @@ syn keyword cambraKeywordOther def where and or not forall requires type impl tr
 " defined last, so the mutation, feed and define operators below win over the
 " `:`, `<` and `<=` prefixes matched here.
 syn match cambraOperator "[-+*&|^=<>?]"
-syn match cambraOperator "\*\*\|//=\=\|++\|\^[+=]\|[-+*]=\|[=!<>]=\|<:\|->\|=>"
+syn match cambraOperator "\*\*\|//=\=\|++\|\^[+=]\|[-+*]=\|[=!<>]=\|<:\|->\|=>\||=>"
 syn match cambraPunctuation "[,;:.]"
 syn match cambraMutation ":="
 syn match cambraFeed "<<=\="
@@ -32,9 +32,10 @@ syn match cambraBuiltin "\<\%(sum\|max\|min\|groupby\|set\|map\|box\|empty_map\|
 syn match cambraLambda "\\"
 syn match cambraNumber "\<\d\+\>"
 syn match cambraType "\<\u\w*\>"
-" The type hole `_` directly after an annotation's `:`, `<:` or `=>`, or after
-" the `{` that opens a type literal. A `=>` whose `=` ends an operator before
-" it, as in `==>` or `<=>`, is not the arrow.
+" The type hole `_` directly after an annotation's `:`, `<:`, `=>` or `|=>`, or
+" after the `{` that opens a type literal. A `=>` whose `=` ends an operator
+" before it, as in `==>` or `<=>`, is not the arrow; the `|` of `|=>` is not such
+" an operator.
 syn match cambraType "\%(\%([:{]\|\%(^\|[^=<>!:+*/^-]\)=>\)\s*\)\@<=\<_\>"
 syn match cambraVariant "`\h\w*"
 syn match cambraDecorator "@\s*\h\w*"

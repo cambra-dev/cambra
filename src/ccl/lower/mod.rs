@@ -1374,12 +1374,20 @@ fn lower_expr_inner(
             "`{T where p}` is a refinement *type*; it is written in annotation \
              position, not as a value",
         )),
-        // A function type `T => U` is structural *type* syntax; it names a type,
-        // not a value. (Accepted in annotation position — see `lower_type_expr`.)
-        ChlExpr::FunctionType { .. } => Err(LoweringError::unsupported(
+        // A function type `T => U` or `T |=> U` is structural *type* syntax; it names a
+        // type, not a value. (Accepted in annotation position — see `lower_type_expr`.)
+        ChlExpr::FunctionType { arrow, .. } => Err(LoweringError::unsupported(
             expr.span,
-            "`T => U` is a function *type*; it is written in annotation \
-             position, not as a value",
+            match arrow {
+                chl_parser::ast::Arrow::Compute => {
+                    "`T => U` is a function *type*; it is written in annotation \
+                     position, not as a value"
+                }
+                chl_parser::ast::Arrow::Data => {
+                    "`T |=> U` is a data-function *type*; it is written in annotation \
+                     position, not as a value"
+                }
+            },
         )),
         ChlExpr::Forall { .. } => Err(LoweringError::unsupported(
             expr.span,

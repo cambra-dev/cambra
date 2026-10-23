@@ -50,7 +50,7 @@
     "vim": "Function"
   },
   "type": {
-    "construct": "Identifier starting with a capital, and the type hole _ directly after : <: => or {",
+    "construct": "Identifier starting with a capital, and the type hole _ directly after : <: => |=> or {",
     "textmate": "entity.name.type",
     "vim": "Type"
   },

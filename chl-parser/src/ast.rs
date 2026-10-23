@@ -948,18 +948,19 @@ pub enum Expr {
         predicate: Box<Spanned<Expr>>,
     },
 
-    /// A function type `T => U`: a domain type, the `=>` arrow, and a codomain
-    /// type (`docs/chl-spec.md`, "4.1 `def` — function definition" and "6. Types
-    /// (informal sketch)").
+    /// A function type `T => U`, or a data-function type `T |=> U`: a domain type, the
+    /// arrow, and a codomain type (`docs/chl-spec.md`, "4.1 `def` — function definition"
+    /// and "6.3 Direction: collection types \[Decided\]").
     ///
     /// Like [`Expr::BraceRefinement`], this is structural **type** syntax,
     /// meaningful only in annotation position: lowering reads it as a
-    /// `cambra::ccl::Type::Fun` (a compute function, `⇒`) and rejects it in
-    /// value position. It is right-associative — `A => B => C` parses as
-    /// `A => (B => C)` — because the parser takes the whole expression to the
-    /// right of `=>` as the codomain.
+    /// `cambra::ccl::Type::Fun` of the kind its [`Arrow`] names and rejects it in
+    /// value position. It is right-associative — `A => B |=> C` parses as
+    /// `A => (B |=> C)` — because the parser takes the whole expression to the
+    /// right of the arrow as the codomain.
     FunctionType {
         domain: Box<Spanned<Expr>>,
+        arrow: Arrow,
         codomain: Box<Spanned<Expr>>,
     },
 
@@ -1242,6 +1243,15 @@ pub enum AugOp {
     Sub,
     Mul,
     FloorDiv,
+}
+
+/// The arrow of an [`Expr::FunctionType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrow {
+    /// `=>`: a compute function.
+    Compute,
+    /// `|=>`: a data function, a collection over its domain.
+    Data,
 }
 
 #[cfg(test)]
