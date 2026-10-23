@@ -1329,9 +1329,9 @@ impl Subst {
     /// target term (binder uids are minted once at lowering; copies preserve
     /// them, so a range name and an inner binder are the same `Name` only if
     /// they are the same binder — and a binder's scope cannot nest inside
-    /// itself). The α-rename fallback is therefore asserted unreachable,
-    /// which is also what deletes the same-discharge-twice determinism
-    /// hazard: no fresh names are minted on any equality-mediated path.
+    /// itself). Capture is therefore asserted rather than α-renamed, so no
+    /// fresh names are minted on any equality-mediated path and the same
+    /// discharge applied twice yields the same term.
     fn under_binder(&self, binder: &Name, body: &TypedExpr) -> Subst {
         let restricted = self.shadow(binder);
         // If no substituted binder occurs free in the body, the substitution
