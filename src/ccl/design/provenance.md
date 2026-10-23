@@ -79,7 +79,8 @@ errors are zero at the snapshots.
 and off its own atomic counter. It rides inline on `TypedExpr`. Provenance and source attribution
 are both keyed by it, which is what lets an inference error on a node minted three phases ago
 resolve to the source span the user wrote. It is distinct from `Uid` because `Uid`
-identifies binders and a `NodeId` identifies expression nodes.
+identifies binders and a `NodeId` identifies expression nodes. **Planned:** a `NodeId` also names
+a binder's site, the place its name is written ([Binder sites](#binder-sites)).
 
 A node is **live** when it is reachable from the expression tree a phase hands on — the node set
 `walk_children` enumerates, called the **main tree** throughout this doc. A refinement predicate is
@@ -123,7 +124,8 @@ the main tree and its refinement predicates, and `collect_tree_ids` is the
 operative enumeration of that domain: children, plus the predicate reachable
 through a type slot, a `user_annotation`, or a `Cast` target. The fold's leak
 classes and every `SourceProjection` enumerate from it, so a node it returns is a
-node the fold must explain or report as a leak.
+node the fold must explain or report as a leak. **Planned:** every id walk reaches binder sites
+through one enumeration ([Walking the ids with sites](#walking-the-ids-with-sites)).
 
 Uniqueness needs **two walks** over that one domain, because the main tree and
 the predicates share differently. `assert_unique_node_ids` runs both at every
@@ -285,6 +287,174 @@ the mechanism, not the requirement; the requirement is that nothing aliased
 arrives. The `groupby` site pins it with
 `groupby_recognition_lifts_the_key_without_aliasing`; the `iterate` lift has no
 such test.
+
+## Binder sites
+
+**Planned.** Each binder carries a `NodeId` of its own, its **site**, recorded at the span of the
+name as the source writes it. Provenance mints, copies, enumerates, folds and gates a site as it
+does an expression node's id, so a `NodeId` names an expression node or a binder site. Nothing in
+provenance reads which of the two an id names.
+
+### What a binder lacks
+
+A binder (`TypedBinding`) is a field of the node that binds it, never a child, and carries no
+`NodeId`. Eight fields hold one, and `TypedExpr::walk_binders` enumerates all of them with an
+exhaustive match: `Lambda.param`, `Let.binding`, `LetRec.bindings`, `DefGroup.bindings`,
+`For.target`, `MutDecl.binding`, `Generator.target` and `Pattern.binding`. A use of a name is a
+node, `Var`, with an id and the span of the occurrence. The binding occurrence has neither. The
+parser holds the name's span (`Spanned<AssignTarget>`, a `def`'s name, `Param.name_span`, a
+comprehension target), and lowering drops it when it builds the binder from a `String`.
+
+In
+
+```
+out = defer()
+g = 10
+def f(p):
+    p + g
+out << f(1)
+```
+
+the lowering projection maps the `Var` in `p + g` to `g`, and the `Let` that binds `g` to all of
+`g = 10`. Go-to-definition (`src/inspector_model/definitions.rs`) therefore lands on the whole
+statement for `g`, and on the whole `def` for both `f` and `p`. A node that binds several names
+has one span for all of them: a comprehension with two generators, a `Case` binding a different
+name in each arm, a `LetRec` group. The name of a `Feed`, `Define` or `MutWrite` is a use the
+source writes, held as a field rather than a node, so `out` above resolves to nothing
+([Definitions resolve over the IR](../../inspector_model/design.md#definitions-resolve-over-the-ir)).
+
+Narrowing the binding node's span to the name does not close the gap. That span is the extent of
+what the node computes, and diagnostics read it that way: `x: String = g` reports its annotation
+mismatch across the whole statement.
+
+### The site field
+
+```rust
+pub struct TypedBinding {
+    pub name: Name,
+    pub site: Site,
+    pub ty: Type,
+    pub user_annotation: Option<Type>,
+    pub transparency: BindingTransparency,
+}
+
+Feed { name: Name, name_site: Site, value: Box<TypedExpr> }   // likewise Define and MutWrite
+```
+
+`Site` wraps a `NodeId` and gives it the two properties [Node identity](#node-identity) gives a
+`TypedExpr`'s id. Its `Clone` goes through `provenance::copy_id`, which freshens the id and reports
+the copy, or keeps the id inside `preserve_ids()`. Its `PartialEq` holds for any two sites, so a
+site is not part of a binder's value. `TypedBinding` and `TypedExprNode` derive `Clone` and
+`PartialEq`, and a bare `NodeId` field under them would be copied verbatim by every clone, putting
+two live binders on one site, and would take part in structural equality. `content_hash` hashes a
+binder field by field (`hash_binding`), so it leaves the site out without a change.
+
+A binder's identity stays its `Name`'s `Uid`. The site records where the binder is written and
+what it descends from. One `Uid` sits at several sites wherever a pass copies a binder:
+monomorphization's specializations, the comprehension phase's main-tree and predicate lambdas,
+`channelize`'s companion lambdas. Each copy is a row, so each resolves to the written name through
+`parents`.
+
+Fields that hold a name but bind nothing get no site: a `TransactKey` and a writer's footprint,
+which are labels; `Run.name` and a run's arguments; `LetType.name`, which `uniquify` removes;
+`Method.name`; a pattern head's constructor; and the names inside types (`Type::Fun`'s parameter
+name, a Σ witness). A multi-parameter function's parameters bind nothing, and keep the channel
+[ir.md](ir.md#source-locations-on-substituted-parameter-projections) describes.
+
+### Minting and recording sites
+
+| Where | What the site gets |
+|---|---|
+| Lowering, a binder the source writes | A `LoweringStep::Leaf` at the name's span, labelled `lower.image`. The binder helpers (`let_bind*`, `lambda`, `for_loop`, `mut_decl`, `AssignmentBindings`, `PrefixStmt::Bind`) take the name with its span in place of a `String`. |
+| Lowering, a binder the source does not write | A `tag_machinery` leaf at the span its node is tagged with: `__arg_tuple_N`, `__result_N`, the group-by and set binders, `OUTPUT_BINDER`, a constructor's argument, an absent payload. |
+| `uniquify` | Nothing new. It renames binders in place, so every site survives, and mints none. |
+| A copy of a subtree | A fresh id and a copy row, from `Site::clone`. `subst`'s transport, monomorphization and inlining need no change. |
+| A binder a pass makes | A mint under the open recording, which becomes its parent: `__anf_N`, the reads `mut_read` names, `mut_elim`'s history and writer binders. |
+| A binder a pass makes to stand for a source binder | A copy of the source binder's site through `copy_id`, so it resolves to the written name rather than to the recording's node. |
+| A throwaway (`Expr::throwaway`, `mem::take`) | `NodeId::PLACEHOLDER`, which the recorder ignores. |
+
+The construction helpers outside lowering (`Expr::lambda`, `let_bind`, `mut_decl`,
+`TypedBinding::new_*`) take a name, not a binder, so each call mints. A pass that rebuilds a
+binder through one replaces the binder's site with a fresh one parented on the open recording.
+The leak classes and the uniqueness check accept that result, because the new site is recorded and
+unique. Each helper therefore takes the site as an argument, a fresh mint or an existing binder's
+site, so every call states which it is. About 62 production calls outside lowering choose today.
+
+A binder that stands for a source binder is where the rules need more than the type change:
+
+- `comprehension`'s `per_element_lambda` builds `λ target` twice per generator, in the main tree and
+  in the loop-join predicate. One keeps the generator's site and the other copies it.
+- Each `channelize` companion lambda copies the original lambda's site, and `mono.coalesce_let`'s
+  per-specialization `let`s copy the generalized binder's.
+- `mut_elim`'s final-value binder (`Name::fresh_like(&acc.name)`) stands for the `MutDecl`'s
+  binder, whose site does not reach `AccumulatorVariable`. `channelize_cluster` drops the defer
+  binders' sites when it collects their names, and `normalize_bare_write` receives a `MutWrite`'s
+  name without its `name_site`. Each threads the site to where the binder is built.
+
+Two clones run with no recording open, and trip `on_copy`'s coverage assertion once a site rides
+them. `transact_phase`'s `walk_spine` collects store bindings before the `transact.store` recording
+opens, and `emit_group_member` clones a group member's binder only to write it back. Neither places
+a copy beside its source, so both become preserving clones. Lowering's `MintedTerm::copy` copies
+group-by terms with no `copy_frame`, so its copies are explained only by `tag_predicate`'s sweep,
+which records the sites it reaches as well as the expression ids.
+
+The payload binder of `` case `tag(v) `` has no span to record: `PayloadPattern::Named` holds a
+`SmolStr`. The parser gives it a span.
+
+### Walking the ids with sites
+
+Every walk that enumerates the ids of a tree reaches its sites, through one enumeration.
+`TypedExpr::for_each_own_id` yields the node's id, the site of each binder `walk_binders` reaches,
+and the `name_site` of a `Feed`, `Define` or `MutWrite`. It is an exhaustive match, so a binding
+form added to the IR fails to compile until it is covered. A tree-level walk built on it descends
+through `walk_children` and, when asked, through `walk_type_slots` into refinement predicates,
+which can hold binders: the group-by key predicate holds `λ x → x`.
+
+| Walk | Route |
+|---|---|
+| `collect_tree_ids` | The tree-level walk, with predicates. It is the domain of the fold, of every pane's id set and deaths, of the lowering projection and of the leak gate, so each covers sites through it. |
+| `collect_main_tree_ids`, `duplicate_node_ids`, the placeholder check in `assert_unique_node_ids` | The tree-level walk, without predicates. |
+| `predicate_id_collisions`, `uniquify`'s `distinct_predicate_terms` | `for_each_own_id` within each term, under their own `Rc` dedup. |
+| `uniquify::collect_node_ids` | The tree-level walk, keeping its `LetType` skip. |
+| `Blame`'s `enclosing` | `for_each_own_id` per node, so a blamed site's parent is its binding node. |
+| `copied_nodes` (monomorphization's pairing of a clone with its definition) | The two nodes' `for_each_own_id` sequences, zipped. |
+| `build_node_table` | Ships each site as an entry of the pane's node table, a child of its binding node. The entry's shape belongs to the [inspector model](../../inspector_model/design.md). |
+
+Hot reload's `keep_region` and `Correspondence`, and `diff.rs`, leave sites out: their domain is
+the expressions `diff` matches, and no operator is keyed by a site.
+
+The pane-link tests and both wire validators require every `paneLinks` endpoint to be an entry of
+its pane's node table. A fold whose domain holds sites puts edges between sites in every map, so
+`build_node_table` ships sites in the same change that widens `collect_tree_ids`.
+
+`uniquify::collect_node_ids` and `enclosing` list type slots by hand rather than calling
+`walk_type_slots`, and each misses slots today. `collect_node_ids` misses the predicates on a
+binder's `ty` and `user_annotation` and on a `Transact`'s `domain` and `parameter`. `enclosing`
+misses the `Cast` target and the `Transact` slots. Routing both through the shared walk closes
+these.
+
+### Checking sites
+
+The existing checks cover sites once the walks reach them. An unrecorded site is `Unrecorded`, a
+copy of a site no row explains is `DanglingParent`, and two binders on one site fail
+`assert_unique_node_ids` at every boundary.
+
+One check is new, because none of the existing ones can tell a carried site from a fresh mint. At
+every retained pane, each binder whose `Name` has a source spelling, and each `name_site`, resolves
+through the pane's projection to a span whose text is that spelling. A binder minted under a
+recording where it should have carried or copied its source binder's site resolves to the
+recording node's span, and the check reports it. Binders whose name the parser holds without a
+span (a `case` payload, an associated `def`, a module parameter, a constructor's destructured
+fields) are exempt until the parser records one, and the exemption names each form.
+
+### Reading sites
+
+- Go-to-definition reads a binder's site on the `pre-inference` pane in place of its binding
+  node's span, and resolves a `Feed`, `Define` or `MutWrite` use through its `name_site`.
+- A later pane's copies of a binder are reached through the pane-pair maps, as a node's are, so a
+  consumer can report the type of each specialization of `v` in `def twice(v)`.
+- Diagnostics keep blaming the binding node. A site that is blamed resolves through `enclosing` to
+  its binding node.
 
 ## The provenance model
 
@@ -1009,6 +1179,8 @@ of this one.
 - Ids inside refinement predicates are endpoints like any other, so every walk
   that builds the payload descends into them
   ([Walking the ids](#walking-the-ids)).
+- **Planned:** binder sites are endpoints too, and the node table ships each one
+  ([Binder sites](#binder-sites)).
 
 The payload carries its own version in `meta.schema`. Nothing under `ccl/` reads
 or depends on that number: this layer produces attributions and maps, and the
