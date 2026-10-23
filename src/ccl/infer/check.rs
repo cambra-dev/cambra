@@ -778,7 +778,14 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferE
 /// to the shared rule, then reconcile the rule-derived type against the node's
 /// recorded `Type`.
 fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferError> {
-    let label = symbolic(expr);
+    // Only the rules that read the label pay for it: a label spells the node's whole subtree,
+    // so one per node is quadratic in the tree. The reconcile below renders its own on failure.
+    let label = match &expr.node {
+        TypedExprNode::Case { .. } | TypedExprNode::Lit(_) | TypedExprNode::Builtin(_) => {
+            symbolic(expr)
+        }
+        _ => String::new(),
+    };
     let node_id = expr.node_id();
     // The `Lambda` rule reads the node's own type for its kind (see
     // `emit_lambda`), taken before the walk borrows the node.
@@ -1003,7 +1010,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // it builds — a Σ-headed chain is a Σ, a predicate over a witness-domained
         // collection is a collection over that witness — so neither side names an index its
         // own type does not bind.
-        ctx.require_sub(&ty, &expr.ty, &|| format!("type of {label}"))?;
+        ctx.require_sub(&ty, &expr.ty, &|| format!("type of {}", symbolic(expr)))?;
     }
     Ok(ty)
 }
