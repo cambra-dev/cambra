@@ -528,7 +528,7 @@ impl InferCtx {
         );
         let obligation = TraitObligation::new_in(
             &self.instances,
-            trait_,
+            trait_.clone(),
             wanted.clone(),
             operator_node_id,
             self.demand_at.unwrap_or(Origin::Node(operator_node_id)),
@@ -543,6 +543,37 @@ impl InferCtx {
         obligation.assume(&self.assumptions);
         for (i, position) in positions.iter().enumerate() {
             obligation.watch(position, i as u8);
+        }
+        // An associated type declared with a bound is below it at every obligation
+        // (`docs/chl-spec.md`, "Declaring a trait"). The bound names the trait's operands and
+        // associated types, which are this obligation's positions; an associated type this
+        // obligation does not ask for is a hole there.
+        if !trait_.assoc_bounds_empty() {
+            let mut params_at: HashMap<crate::ccl::ty::TypeParamId, Type> = trait_
+                .operand_params()
+                .iter()
+                .zip(&positions)
+                .map(|(p, t)| (p.id, t.clone()))
+                .collect();
+            for name in trait_.assocs() {
+                let ty = wanted
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map_or(Type::Hole, |(_, t)| t.clone());
+                if let Some(p) = trait_.assoc_param(&name) {
+                    params_at.insert(p.id, ty);
+                }
+            }
+            for (name, ty) in &wanted {
+                let Some(bound) = trait_.assoc_bound(name) else {
+                    continue;
+                };
+                let mut bound =
+                    crate::ccl::infer::solver::traits::replace_params(bound, &params_at);
+                name_function_binders(&mut bound);
+                let bound = self.normalize_annotation(&bound);
+                self.require_sub(ty, &bound, at)?;
+            }
         }
         // A trait whose instances already agree settles here, before any
         // operand is known — the ordinary "all candidates agree" rule reaching its
@@ -925,6 +956,23 @@ impl InferCtx {
         };
         Type::refined_one(base, Refinement::sharing(&predicate))
     }
+}
+
+/// Give every function layer of `ty` without a binder one of its own.
+///
+/// An associated type's bound is written over holes, and the type an obligation's position
+/// takes may be a dependent collection, whose codomain reads its binder: a group-by's groups
+/// read the key binder. A codomain variable minted under no binder would hold that reference
+/// out of its scope, so the bound's functions bind a name the codomain edge renames the
+/// collection's to.
+fn name_function_binders(ty: &mut Type) {
+    if let Type::Fun {
+        name: name @ None, ..
+    } = ty
+    {
+        *name = Some(Name::solver_arg());
+    }
+    ty.walk_children_mut(name_function_binders);
 }
 
 impl TelescopeWalk for InferCtx {

@@ -269,8 +269,35 @@ signature's.
 Any other requirement is refused at the requirement, since no use could satisfy it. `Transaction`
 is refused until
 [chl-spec.md, "8.7 Direction [Decided]: transactions as contextual parameters"](../../../docs/chl-spec.md#87-direction-decided-transactions-as-contextual-parameters)
-is implemented. For the check that every parameter is determined, a parameter that is the
-associated type of a requirement whose operands are determined counts as determined.
+is implemented. For the check that every parameter is determined, a parameter named in the
+associated types of a requirement whose operands are determined counts as determined.
+
+### Bounded associated types
+
+A trait's associated type may carry a bound (`TraitDecl::assoc_bounds`), lowered as a type
+parameter's kind is (`lower_kind`). `Iterable`'s `Elements` is bounded `<: _ |=> _`. The bound
+holds in three places:
+
+- **An instance.** An `impl`'s choice of the type must have the bound's form (`may_be_below` in
+  `lower/traits.rs`): a function where the bound is one, the base or nominal type the bound is.
+  Whether a type of that form is below the bound is inference's question at each use.
+- **An obligation.** `require_trait_obligation` bounds each associated position it mints by the
+  trait's bound at the obligation's own operand and associated variables. Each function layer of
+  the bound gets a binder of its own first (`name_function_binders`), so a dependent collection
+  reaching the position keeps its codomain in its binder's scope.
+- **A requirement.** `lower_named_requirements` takes the parameters of the definition its clause
+  belongs to (a `def` or a `forall`) and reads each bounded associated type through them
+  (`read_assoc_bounds`). A hole in the type the requirement names for it becomes a parameter; an
+  unnamed one becomes a parameter bounded by the bound; a parameter named for it with no bound of
+  its own gets the bound. The bound's own holes become parameters too, placed before the parameter
+  they bound, so every bound names only parameters opened before it. Each parameter is then
+  rigid in the body and instantiated per call like a written one. Where the clause belongs to no
+  such definition, as in a trait's signature or an `impl`'s condition, a hole is refused.
+
+The collection rule is a candidate beside the rows when a requirement is checked for
+satisfiability (`Trait::collection_rule_admits`), as it is at inference: a requirement of
+`Iterable` on a type parameter is satisfiable by a structural collection whatever instances the
+module declares.
 
 ---
 

@@ -1832,3 +1832,142 @@ const BAG: &str = indoc! {"
 fn a_loop_walks_its_sources_elements(#[case] code: &str, #[case] expected: i64) {
     check_scalar(&format!("{BAG}\n{code}"), Value::Int(expected));
 }
+
+/// A requirement of `Iterable` reads its bounded `Elements` through the definition's type
+/// parameters: a hole in it, or `Elements` left unnamed, is a parameter of the definition, so a
+/// loop over the operand types inside the body (`docs/chl-spec.md`, "Trait requirements").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::named_by_its_values(
+    indoc! {"
+        def largest(C, T, c: C) => T requires Iterable(C, Elements=_ |=> T), Orderable(T, T):
+            max([x for x in c])
+        largest(Bag::new(box([1, 2, 3]))) + largest([4, 5])
+    "},
+    8
+)]
+#[case::named_by_a_value_type(
+    indoc! {"
+        def total(C, c: C) => Int requires Iterable(C, Elements=_ |=> Int):
+            sum([x for x in c])
+        total(Bag::new(box([1, 2, 3]))) + total([4, 5])
+    "},
+    15
+)]
+#[case::named_by_a_collection_type(
+    indoc! {"
+        def total(C, c: C) => Int requires Iterable(C, Elements=List(Int)):
+            sum([x for x in c])
+        total(Bag::new(box([1, 2, 3])))
+    "},
+    6
+)]
+#[case::named_by_a_parameter(
+    indoc! {"
+        def count(C, E, c: C) => Int requires Iterable(C, Elements=E):
+            sum([1 for x in c])
+        count([4, 5]) + count(box([1, 2, 3]))
+    "},
+    5
+)]
+#[case::unnamed(
+    indoc! {"
+        def count(C, c: C) => Int requires Iterable(C):
+            sum([1 for x in c])
+        count([4, 5]) + count(box([1, 2, 3]))
+    "},
+    5
+)]
+#[case::returned_boxed(
+    indoc! {"
+        def doubled(C, T, c: C) => Collection(T) requires Iterable(C, Elements=_ |=> T), Addable(T, T, Output=T):
+            box([x + x for x in c])
+        sum([y for y in doubled([1, 2])])
+    "},
+    6
+)]
+fn a_requirement_reads_iterables_elements(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(&format!("{BAG}\n{code}"), Value::Int(expected));
+}
+
+/// A trait whose associated type is bounded, and an instance of it.
+const MEASURED: &str = indoc! {"
+    trait Measured(T):
+        type Size <: Int
+        def size(t: T) => Size
+    type Box2 = Int
+    impl Measured(Box2, Size=Int):
+        def size(t):
+            t.extract()
+"};
+
+/// A trait's associated type may be bounded, and a requirement leaving it unnamed gets a
+/// parameter with the bound (`docs/chl-spec.md`, "Declaring a trait").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::through_the_instance("summon(Measured(_))::size(Box2::new(4)) + 1", 5)]
+#[case::through_an_unnamed_bounded_type(
+    indoc! {"
+        def grown(T, t: T) => Int requires Measured(T):
+            summon(Measured(_))::size(t) + 1
+        grown(Box2::new(4))
+    "},
+    5
+)]
+#[case::through_a_named_requirement(
+    indoc! {"
+        def grown(T, t: T) => Int requires m: Measured(T):
+            m::size(t) + 1
+        grown(Box2::new(4))
+    "},
+    5
+)]
+fn a_bounded_associated_type_is_its_bound_where_unnamed(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(&format!("{MEASURED}\n{code}"), Value::Int(expected));
+}
+
+/// What a bounded associated type refuses, and where.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::an_instance_of_another_form(
+    indoc! {"
+        type Bad = Int
+        impl Iterable(Bad, Elements=Int):
+            def elements(b):
+                b.extract()
+        1
+    "},
+    "`Elements` is declared `Elements <: _ |=> _` in `trait Iterable`, and `Int` is not below"
+)]
+#[case::an_instance_of_another_base(
+    indoc! {"
+        trait Measured(T):
+            type Size <: Int
+            def size(t: T) => Size
+        type Box2 = Int
+        impl Measured(Box2, Size=String):
+            def size(t):
+                \"a\"
+        1
+    "},
+    "`Size` is declared `Size <: Int` in `trait Measured`, and `String` is not below `Int`"
+)]
+#[case::a_hole_in_a_trait_signature(
+    indoc! {"
+        trait Summed(C):
+            def total(c: C) => Int requires Iterable(C, Elements=_ |=> Int)
+        1
+    "},
+    "leaves part of its type to inference"
+)]
+#[case::a_loop_needing_more_than_stated(
+    indoc! {"
+        def largest(C, T, c: C) => T requires Iterable(C, Elements=_ |=> T):
+            max([x for x in c])
+        largest([1])
+    "},
+    "No requirement states that `T` is Orderable"
+)]
+fn a_bounded_associated_type_refuses(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}

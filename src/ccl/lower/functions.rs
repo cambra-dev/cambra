@@ -472,10 +472,25 @@ pub(super) fn lower_def(
     let aliases = ctx.snapshot_type_aliases();
     let scoped = ctx.type_params_in_scope.len();
     let in_scope = ctx.named_requirements.len();
-    let result = declare_type_params(type_params, ctx).and_then(|declared| {
-        let (requires, named) = lower_named_requirements(requires, ctx)?;
+    let result = declare_type_params(type_params, ctx).and_then(|mut declared| {
+        let written: Vec<(crate::ccl::ty::TypeParamId, Span)> = declared
+            .iter()
+            .zip(type_params)
+            .map(|(d, tp)| (d.param.id, tp.name_span))
+            .collect();
+        let (requires, named) = lower_named_requirements(requires, Some(&mut declared), ctx)?;
         ctx.named_requirements.extend(named);
-        let spans: Vec<Option<Span>> = type_params.iter().map(|tp| Some(tp.name_span)).collect();
+        // The parameters the clause added are determined by the requirements naming them,
+        // and have no span of their own.
+        let spans: Vec<Option<Span>> = declared
+            .iter()
+            .map(|d| {
+                written
+                    .iter()
+                    .find(|(id, _)| *id == d.param.id)
+                    .map(|(_, span)| *span)
+            })
+            .collect();
         lower_def_declared(
             fn_span, declared, &spans, params, output, requires, body, ctx,
         )
@@ -522,9 +537,7 @@ pub(super) fn lower_def_declared(
             let operands_known = in_operands.is_subset(&mentioned);
             if operands_known {
                 for (_, t) in &r.assoc {
-                    if let Type::Param(param) = t {
-                        mentioned.insert(param.id);
-                    }
+                    collect_params(t, &mut mentioned);
                 }
             }
         }

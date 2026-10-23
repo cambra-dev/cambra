@@ -3374,6 +3374,26 @@ type satisfies these traits where its module declares an instance
 - **An associated type is written by name after the operands.** `requires Addable(A, B, Output=O)`
   states that `A` and `B` are `Addable` and that `O` is their `Output`. Omitting `Output=…` leaves
   it unnamed.
+- **A bounded associated type is read through the definition's type parameters.** Where the trait
+  declares one with a bound ([Declaring a trait](#declaring-a-trait)), a definition's
+  `requires` clause:
+  - may name it by any type, holes included, and each hole is a type parameter of the
+    definition: `requires Iterable(C, Elements=_ |=> T)` states that `C`'s collection has values
+    of type `T`, whatever its domain;
+  - gives a type parameter it names there the bound, where the parameter's declaration gives none:
+    under `requires Iterable(C, Elements=E)`, `E <: _ |=> _`;
+  - may leave it unnamed, which states a type parameter bounded by the bound: under
+    `requires Iterable(C)`, `C`'s collection is some collection of some type.
+
+  A loop over `c` then types inside the definition, with `x` of the collection's value type:
+
+  ```python
+  def largest(C, T, c: C) => T requires Iterable(C, Elements=_ |=> T), Orderable(T, T):
+      max([x for x in c])
+  ```
+
+  Outside a definition's own clause, as in a trait's signature or an `impl` head's condition, a
+  hole in a requirement is an error.
 - **A requirement's arguments are any types.** `Equatable` reads a product componentwise, as `==`
   does ([3.4 Comparisons](#34-comparisons)), so `requires Equatable({T, U}, {T, U})` also states
   `Equatable(T, T)` and `Equatable(U, U)`. `requires Describe(Two(T))` states `Describe` of the
@@ -3462,7 +3482,7 @@ def total(S, s: S) => Int requires a: Area(S):
 ```ebnf
 trait_stmt  ::= "trait" Ident "(" Ident ( "," Ident )* [ "," ] ")" [ requires_clause ] ":"
                 NEWLINE INDENT trait_item+ DEDENT
-trait_item  ::= "type" Ident NEWLINE
+trait_item  ::= "type" Ident [ ( ":" | "<:" ) expression ] NEWLINE
              |  "def" ident "(" params ")" "=>" expression [ requires_clause ] NEWLINE
 ```
 
@@ -3507,6 +3527,12 @@ trait Scales(V, F):
 - **A requirement names a declared trait as it names a built-in one.** `requires Area(S)` states
   that `S` has an instance of `Area`, and `requires Container(C, Elem=E)` that `E` is the `Elem` of
   `C`'s.
+- **An associated type may be bounded.** `type Size <: Int`, or the kind form
+  `type Size: SubtypesOf(Int)`, is written as a type parameter's bound is
+  ([Kinds and bounds](#kinds-and-bounds)), and may name the trait's operands and its other
+  associated types. Every instance's choice of the type is below the bound: an
+  `impl Measured(Box2, Size=String)` is an error at the `impl`. A hole in the bound is any type,
+  chosen afresh at each use: `Iterable`'s `Elements` is bounded `<: _ |=> _`, every collection.
 - **A trait may require traits of its types.** `trait Ranked(A, B) requires s: Same(A, B):` states
   that every instance of `Ranked` is at types `Same` holds of: an instance whose types `Same` does
   not hold of, by the instances declared above it and its own `requires` clause, is an error. Each

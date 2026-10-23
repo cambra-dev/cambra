@@ -1892,7 +1892,7 @@ pub(super) fn declare_type_params(
 /// Lower the kind of type parameter `tp`, the first of `unopened`: `Type` when it has no
 /// annotation, and `SubtypesOf(𝐵)` for a bound `<: 𝐵` or a kind `: SubtypesOf(𝐵)`
 /// (`docs/chl-spec.md`, "Kinds and bounds"). Every other kind is refused.
-fn lower_kind(
+pub(super) fn lower_kind(
     tp: &TypeParam,
     unopened: &[TypeParam],
     ctx: &mut LoweringContext,
@@ -1996,6 +1996,7 @@ pub(crate) type NamedRequirement = (SmolStr, Rc<crate::ccl::ty::TraitRequirement
 /// polymorphic type's, and a trait function's signature's.
 pub(super) fn lower_requirements(
     requires: &[Spanned<Requirement>],
+    params: Option<&mut Vec<crate::ccl::ty::PolyParam>>,
     ctx: &mut LoweringContext,
 ) -> Result<Vec<Rc<crate::ccl::ty::TraitRequirement>>, LoweringError> {
     if let Some(binder) = requires.iter().find_map(|r| r.node.binder.as_ref()) {
@@ -2008,7 +2009,7 @@ pub(super) fn lower_requirements(
             ),
         ));
     }
-    lower_named_requirements(requires, ctx).map(|(requires, _)| requires)
+    lower_named_requirements(requires, params, ctx).map(|(requires, _)| requires)
 }
 
 /// Lower a `requires` clause over the type parameters in scope, and the requirements it
@@ -2021,12 +2022,24 @@ pub(super) fn lower_requirements(
 /// alone or with the other operands' bases, is refused here, since no use could
 /// satisfy it. A requirement on bases only states nothing about a parameter: it is
 /// checked against the table and dropped. A named requirement is named as written, at
-/// the types the clause writes.
+/// the types the clause writes, its associated types read as below.
 ///
 /// A requirement states nothing of what its trait requires of every instance
 /// (`docs/chl-spec.md`, "Declaring a trait").
+///
+/// `params` are the type parameters of the definition the clause belongs to, where it
+/// belongs to one that binds parameters (a `def` or a `forall`). A bounded associated type
+/// is read through them (`docs/chl-spec.md`, "Trait requirements"):
+///
+/// - a hole in the type a requirement names for it is a parameter of the definition;
+/// - one the requirement leaves unnamed is a parameter of the definition, bounded by the
+///   associated type's bound;
+/// - a parameter the requirement names for it, declared with no bound, has that bound.
+///
+/// Without `params`, a hole is refused and an unnamed associated type stays unnamed.
 pub(super) fn lower_named_requirements(
     requires: &[Spanned<Requirement>],
+    mut params: Option<&mut Vec<crate::ccl::ty::PolyParam>>,
     ctx: &mut LoweringContext,
 ) -> Result<
     (
@@ -2038,19 +2051,44 @@ pub(super) fn lower_named_requirements(
     let mut out = Vec::new();
     let mut named: Vec<NamedRequirement> = Vec::new();
     for req in requires {
-        let stated = lower_trait_type(&req.node.ty, req.span, ctx)?;
-        for ((n, ty), written) in stated.assoc.iter().zip(&req.node.ty.assoc) {
-            if !is_requirement_operand(ty) {
+        let crate::ccl::ty::TraitRequirement {
+            trait_,
+            args,
+            assoc: stated,
+            ..
+        } = lower_trait_type(&req.node.ty, req.span, ctx)?;
+        let mut assoc = Vec::with_capacity(stated.len());
+        for ((n, mut ty), written) in stated.into_iter().zip(&req.node.ty.assoc) {
+            // A bounded associated type takes any type below its bound; an unbounded one, only
+            // what an instance row can associate.
+            if trait_.assoc_bound(&n).is_none() && !is_requirement_operand(&ty) {
                 return Err(LoweringError::unsupported(
                     written.value.span,
                     format!(
                         "`{n}=…` names a type parameter or a base type; no instance of \
-                         `{}` associates `{}`",
-                        stated.trait_,
-                        crate::ccl::chl_print::chl_type(ty)
+                         `{trait_}` associates `{}`",
+                        crate::ccl::chl_print::chl_type(&ty)
                     ),
                 ));
             }
+            if has_hole(&ty) {
+                let Some(params) = params.as_deref_mut() else {
+                    return Err(LoweringError::unsupported(
+                        written.value.span,
+                        format!(
+                            "`{n}=…` leaves part of its type to inference, which only a \
+                             definition's own `requires` clause can, by giving it a type \
+                             parameter"
+                        ),
+                    ));
+                };
+                let at = params.len();
+                ty = holes_to_params(&ty, params, at);
+            }
+            assoc.push((n, ty));
+        }
+        if let Some(params) = params.as_deref_mut() {
+            read_assoc_bounds(&trait_, &args, &mut assoc, params);
         }
         if let Some(binder) = &req.node.binder {
             if is_type_name(&binder.node) {
@@ -2069,14 +2107,16 @@ pub(super) fn lower_named_requirements(
                     format!("`{}` names two requirements of this clause", binder.node),
                 ));
             }
-            named.push((binder.node.clone(), Rc::new(stated.clone())));
+            named.push((
+                binder.node.clone(),
+                Rc::new(crate::ccl::ty::TraitRequirement {
+                    trait_: trait_.clone(),
+                    args: args.clone(),
+                    assoc: assoc.clone(),
+                    at: Some(req.span),
+                }),
+            ));
         }
-        let crate::ccl::ty::TraitRequirement {
-            trait_,
-            args,
-            assoc,
-            ..
-        } = stated;
         // Before the module's instances are declared, a requirement of a trait, of one of its
         // signatures or of an instance's head is checked once they are.
         let check = if ctx.instances_declared {
@@ -2223,6 +2263,101 @@ pub(super) fn requirement_types(
         .flat_map(|r| r.args.iter().chain(r.assoc.iter().map(|(_, t)| t)))
 }
 
+/// Whether `ty` holds a hole.
+fn has_hole(ty: &Type) -> bool {
+    if matches!(ty, Type::Hole) {
+        return true;
+    }
+    let mut found = false;
+    ty.walk_children(|c| found |= has_hole(c));
+    found
+}
+
+/// `ty` with each hole a fresh parameter of the definition, inserted into `params` at `at` in
+/// the order the holes occur, so a parameter bounded by `ty` can follow them.
+///
+/// A parameter minted for a hole is spelled `_𝑛`, numbered apart from the definition's other
+/// parameters, so a printed type does not read it as the hole it replaced.
+fn holes_to_params(ty: &Type, params: &mut Vec<crate::ccl::ty::PolyParam>, at: usize) -> Type {
+    fn go(ty: &Type, fresh: &mut Vec<crate::ccl::ty::PolyParam>, base: usize) -> Type {
+        if matches!(ty, Type::Hole) {
+            let spelling = format!("_{}", base + fresh.len() + 1);
+            let param = crate::ccl::ty::TypeParam::declared(spelling.as_str());
+            fresh.push(crate::ccl::ty::PolyParam {
+                param: Rc::clone(&param),
+                kind: crate::ccl::ty::TypeKind::Type,
+                bound_at: None,
+            });
+            return Type::Param(param);
+        }
+        let mut out = ty.clone();
+        out.walk_children_mut(|c| *c = go(c, fresh, base));
+        out
+    }
+    let mut fresh = Vec::new();
+    let out = go(ty, &mut fresh, params.len());
+    let at = at.min(params.len());
+    params.splice(at..at, fresh);
+    out
+}
+
+/// Read a requirement's bounded associated types through the definition's `params`
+/// ([`lower_named_requirements`]): give each one `assoc` leaves unnamed a parameter of its own, and
+/// bound each parameter standing for one that its declaration leaves unbounded by the
+/// associated type's bound, at the requirement's types. The bound's holes are parameters too,
+/// placed before the parameter they bound.
+fn read_assoc_bounds(
+    trait_: &crate::ccl::infer::solver::traits::Trait,
+    args: &[Type],
+    assoc: &mut Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+    params: &mut Vec<crate::ccl::ty::PolyParam>,
+) {
+    use crate::ccl::ty::{PolyParam, TypeKind, TypeParam};
+    for name in trait_.assocs() {
+        if trait_.assoc_bound(&name).is_some() && !assoc.iter().any(|(n, _)| *n == name) {
+            let param = TypeParam::declared(name.name());
+            params.push(PolyParam {
+                param: Rc::clone(&param),
+                kind: TypeKind::Type,
+                bound_at: None,
+            });
+            assoc.push((name, Type::Param(param)));
+        }
+    }
+    let mut at: HashMap<crate::ccl::ty::TypeParamId, Type> = trait_
+        .operand_params()
+        .iter()
+        .zip(args)
+        .map(|(p, t)| (p.id, t.clone()))
+        .collect();
+    for (name, ty) in assoc.iter() {
+        if let Some(p) = trait_.assoc_param(name) {
+            at.insert(p.id, ty.clone());
+        }
+    }
+    for (name, ty) in assoc.iter() {
+        let Some(bound) = trait_.assoc_bound(name) else {
+            continue;
+        };
+        let Type::Param(p) = ty else {
+            continue;
+        };
+        let Some(i) = params
+            .iter()
+            .position(|d| d.param.id == p.id && d.kind == TypeKind::Type)
+        else {
+            continue;
+        };
+        let bound = crate::ccl::infer::solver::traits::replace_params(bound, &at);
+        let bound = holes_to_params(&bound, params, i);
+        let i = params
+            .iter()
+            .position(|d| d.param.id == p.id)
+            .expect("the bounded parameter is still declared");
+        params[i].kind = TypeKind::SubtypesOf(Box::new(bound));
+    }
+}
+
 /// Whether `ty` may stand at a requirement's position: a type parameter in scope, a base
 /// type, or a nominal type applied to such types.
 fn is_requirement_operand(ty: &Type) -> bool {
@@ -2289,24 +2424,28 @@ pub(super) fn check_pending_requirements(ctx: &mut LoweringContext) -> Vec<Lower
 }
 
 /// Whether some instance of `trait_` can satisfy the requirement: its head and the associated
-/// types it fixes unify with the requirement's, so some types are an instance of both.
+/// types it fixes unify with the requirement's, so some types are an instance of both. The
+/// collection rule is a candidate beside the rows ([`Trait::collection_rule_admits`]).
+///
+/// [`Trait::collection_rule_admits`]: crate::ccl::infer::solver::traits::Trait::collection_rule_admits
 fn requirement_satisfiable(
     trait_: &crate::ccl::infer::solver::traits::Trait,
     args: &[Type],
     assoc: &[(crate::ccl::infer::solver::traits::Assoc, Type)],
     instances: &crate::ccl::infer::solver::traits::InstanceTable,
 ) -> bool {
-    instances.instances(trait_).iter().any(|row| {
-        let mut stated = row.operands.clone();
-        let mut wanted = args.to_vec();
-        for (name, t) in assoc {
-            if let Some(accepted) = row.assoc_ty(name) {
-                stated.push(accepted);
-                wanted.push(t.clone());
+    trait_.collection_rule_admits(args, assoc)
+        || instances.instances(trait_).iter().any(|row| {
+            let mut stated = row.operands.clone();
+            let mut wanted = args.to_vec();
+            for (name, t) in assoc {
+                if let Some(accepted) = row.assoc_ty(name) {
+                    stated.push(accepted);
+                    wanted.push(t.clone());
+                }
             }
-        }
-        crate::ccl::infer::solver::traits::unify_all(&stated, &wanted)
-    })
+            crate::ccl::infer::solver::traits::unify_all(&stated, &wanted)
+        })
 }
 
 /// The error for a requirement no instance satisfies, at `span`.
@@ -2672,8 +2811,8 @@ pub(super) fn lower_type_expr_or_poly(
         } => {
             let snapshot = ctx.snapshot_type_aliases();
             let scoped = ctx.type_params_in_scope.len();
-            let poly = declare_type_params(type_params, ctx).and_then(|params| {
-                let requires = lower_requirements(requires, ctx)?;
+            let poly = declare_type_params(type_params, ctx).and_then(|mut params| {
+                let requires = lower_requirements(requires, Some(&mut params), ctx)?;
                 let mut body = lower_type_expr(body, ctx)?;
                 let mut counts = ParamCounts::new();
                 count_type_params(&body, &mut counts);
