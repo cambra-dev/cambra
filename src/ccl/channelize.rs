@@ -61,8 +61,8 @@
 //! # Vocabulary
 //!
 //! Throughout this module, a **channel** is the expression that
-//! resolves a deferred binding: the value the cluster's let-wrap
-//! ultimately binds to `d_i`.  For a single `<<` feed the channel is
+//! resolves a deferred binding: the value the cluster's letrec group
+//! binds to `d_i`.  For a single `<<` feed the channel is
 //! that feed's value, lifted to `Fun(Unit, T)` at top level whatever `T`
 //! is; for multiple feeds it is their `++`-union; for feeds
 //! inside an iteration scope it is the companion `Apply`/`Compose`/
@@ -83,9 +83,10 @@
 //!    to `Fun(Unit, T)`; emit refined-source channels for filter-feed
 //!    Case shapes.
 //! 3. **Letrec emission.**  Bind the cluster's channels as one
-//!    `Feed`-kind `LetRec` group at the cluster wrap site, which needs no
-//!    binding order; `check_letrec_causal` rejects a reference cycle
-//!    ([`bind_cluster_at_scope`]).
+//!    `Feed`-kind `LetRec` group at the cluster wrap site
+//!    ([`bind_cluster_at_scope`]). Every channel is in scope of the
+//!    others, so the group needs no binding order.
+//!    [`check_letrec_causal`] rejects a reference cycle among them.
 //!
 //! There is deliberately no α-renaming step: uniquification runs before
 //! channelization, so a channel's captured free variable can never be shadowed
@@ -738,9 +739,9 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
     }
 }
 
-/// Rename every free occurrence of `from` in `expr` to `to`, including
-/// `Feed`/`Define` targets and type-carried refinement predicates (`Cast`
-/// targets, annotations); a `Case` pattern binding of `from` shadows it.
+/// Rename every free occurrence of `from` in `expr` to `to`: `Var`s,
+/// `Feed`/`Define` targets, and refinement predicates in type slots (`Cast`
+/// targets, annotations). A binder of `from` ends the rename in its scope.
 ///
 /// A thin wrapper over the uniform engine's in-place mode
 /// ([`crate::ccl::subst::Subst::rewrite_expr`]).
@@ -1831,8 +1832,8 @@ fn channelize_cluster(
 /// Debug invariant: channelization relies on **Barendregt uniqueness**
 /// (`uniquify` runs before it), so a channel's captured free variable is never
 /// rebound by a `Let` on the wrap-to-feed spine — a body binder and a captured
-/// outer variable never share a `uid`, so the emitted `let d = channel` can't
-/// be shadow-captured. (A channel legitimately referencing a body-*internal*
+/// outer variable never share a `uid`, so a channel bound in the emitted
+/// letrec group can't be shadow-captured. (A channel legitimately referencing a body-*internal*
 /// binding — e.g. an accumulator — is excluded: such a name is bound in
 /// `body`, hence not free in it, so it never lands in the checked set.) A
 /// violation would mean a duplicate binder `uid` reached channelization (e.g. an
