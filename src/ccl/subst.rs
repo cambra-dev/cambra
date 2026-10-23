@@ -814,10 +814,9 @@ impl Subst {
                 // Domain refinements ride the param's *type* (a
                 // `Type::Refinement`); `apply_binder_types` rewrites that slot
                 // below, under the unrestricted substitution.
-                let (param_name, inner) = self.under_binder(&param.name, body);
+                let inner = self.under_binder(&param.name, body);
                 let body = Box::new(inner.apply_expr(body));
-                let mut param = param.clone();
-                param.name = param_name;
+                let param = param.clone();
                 Lambda { param, body }
             }
 
@@ -825,10 +824,9 @@ impl Subst {
             // outer scope — same discipline as `Lambda`.
             For { target, iter, body } => {
                 let iter = Box::new(self.apply_expr(iter));
-                let (target_name, inner) = self.under_binder(&target.name, body);
+                let inner = self.under_binder(&target.name, body);
                 let body = Box::new(inner.apply_expr(body));
-                let mut target = target.clone();
-                target.name = target_name;
+                let target = target.clone();
                 For { target, iter, body }
             }
 
@@ -838,12 +836,10 @@ impl Subst {
                 body,
             } => {
                 let bound_expr = Box::new(self.apply_expr(bound_expr));
-                let (bind_name, inner) = self.under_binder(&binding.name, body);
+                let inner = self.under_binder(&binding.name, body);
                 let body = Box::new(inner.apply_expr(body));
-                let mut binding = binding.clone();
-                binding.name = bind_name;
                 Let {
-                    binding,
+                    binding: binding.clone(),
                     bound_expr,
                     body,
                 }
@@ -1325,8 +1321,8 @@ impl Subst {
         }
     }
 
-    /// Restrict this substitution so it does not act on `binder`. Returns the
-    /// binder name to install and the substitution to use inside its scope.
+    /// Restrict this substitution so it does not act on `binder`, returning the
+    /// substitution to use inside its scope.
     ///
     /// Capture cannot happen: under the Barendregt convention nothing free in
     /// a substitution's range can collide with a binder bound inside the
@@ -1336,15 +1332,15 @@ impl Subst {
     /// itself). The α-rename fallback is therefore asserted unreachable,
     /// which is also what deletes the same-discharge-twice determinism
     /// hazard: no fresh names are minted on any equality-mediated path.
-    fn under_binder(&self, binder: &Name, body: &TypedExpr) -> (Binder, Subst) {
+    fn under_binder(&self, binder: &Name, body: &TypedExpr) -> Subst {
         let restricted = self.shadow(binder);
         // If no substituted binder occurs free in the body, the substitution
         // is inert there — return the identity so the body is left untouched.
         if !restricted.binders.keys().any(|k| is_free(k, body)) {
-            return (binder.clone(), Subst::id());
+            return Subst::id();
         }
         restricted.assert_no_capture(binder);
-        (binder.clone(), restricted)
+        restricted
     }
 
     /// Refuse a rewrite of `r` that would capture: the substitution acts on `r`'s predicate
@@ -1566,9 +1562,9 @@ impl Subst {
                 codomain,
             } => {
                 let domain = Box::new(self.apply_type(domain));
-                let (b2, inner) = self.under_binder_ty(b, codomain);
+                let inner = self.under_binder_ty(b, codomain);
                 Type::Fun {
-                    name: Some(b2),
+                    name: Some(b.clone()),
                     fun_kind: self.apply_fun_kind(fun_kind),
                     domain,
                     codomain: Box::new(inner),
@@ -1675,12 +1671,11 @@ impl Subst {
 
     /// `Fun`-codomain analogue of [`under_binder`](Self::under_binder):
     /// shadow the Pi binder in `codomain`. Capture is asserted unreachable
-    /// for the same reason (see `under_binder`); this is what retires the
-    /// spurious α-renames PR #233 observed at this site.
-    fn under_binder_ty(&self, binder: &Name, codomain: &Type) -> (Binder, Type) {
+    /// for the same reason (see `under_binder`).
+    fn under_binder_ty(&self, binder: &Name, codomain: &Type) -> Type {
         let restricted = self.shadow(binder);
         restricted.assert_no_capture(binder);
-        (binder.clone(), restricted.apply_type(codomain))
+        restricted.apply_type(codomain)
     }
 }
 
