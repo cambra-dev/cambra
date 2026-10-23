@@ -250,6 +250,17 @@ pub struct ConstrainCache {
     /// variable and its index in [`BarrierVar::uppers`], awaiting the report the edge's
     /// caller gives them ([`report_recorded`](Self::report_recorded)).
     unreported: Vec<(Rc<BarrierVar>, usize)>,
+    /// The proxies extrusion has made in the current constraint walk, per target level.
+    ///
+    /// A proxy is linked to its original by a bound, so a bound the original gains later
+    /// in the walk still reaches it: one proxy per variable, polarity and level serves
+    /// every edge of the walk that crosses that level. A cache per extrusion instead
+    /// copies a variable once per edge that reaches it, and a specialization's pin
+    /// reaches the clones of earlier specializations along many edges. Cleared at each
+    /// walk's entry, as SimpleSub scopes its cache to one constraint: this cache lives
+    /// across walks, and a proxy minted inside a `let` that has since been generalized
+    /// must not stand in for its original anywhere else.
+    extruded: HashMap<Level, ExtrudeCache>,
 }
 
 /// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
@@ -293,6 +304,7 @@ impl ConstrainCache {
             origins: (None, None),
             failure: None,
             unreported: Vec::new(),
+            extruded: HashMap::new(),
         }
     }
 
@@ -477,6 +489,7 @@ pub fn constrain_subtype_in(
     cache: &mut ConstrainCache,
     scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
+    cache.extruded.clear();
     constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache, scope)
 }
 
@@ -532,6 +545,7 @@ pub fn constrain_subtype_under_in(
     // the instantiation off the two types is what puts both sides in one spelling, so the
     // reference comparison below is name equality rather than two unrelated names.
     let instantiation = witness_instantiation(rhs, lhs, rhs_binders);
+    cache.extruded.clear();
     cache.under(lhs_binders, rhs_binders, |cache| {
         constrain_go(lhs, rhs, &Subst::id(), &instantiation, cache, scope)
     })
@@ -1741,14 +1755,24 @@ fn constrain_go_impl(
             if let Some(param) = escaping_param(rhs, lv.level()) {
                 return Err(ConstrainError::TypeParamEscapes { param });
             }
-            let new_rhs = extrude(rhs, false, lv.level(), &mut ExtrudeCache::new());
+            let new_rhs = extrude(
+                rhs,
+                false,
+                lv.level(),
+                cache.extruded.entry(lv.level()).or_default(),
+            );
             constrain_go(lhs, &new_rhs, sl, sr, cache, scope)
         }
         (_, Type::Infer(rv)) => {
             if let Some(param) = escaping_param(lhs, rv.level()) {
                 return Err(ConstrainError::TypeParamEscapes { param });
             }
-            let new_lhs = extrude(lhs, true, rv.level(), &mut ExtrudeCache::new());
+            let new_lhs = extrude(
+                lhs,
+                true,
+                rv.level(),
+                cache.extruded.entry(rv.level()).or_default(),
+            );
             constrain_go(&new_lhs, rhs, sl, sr, cache, scope)
         }
 

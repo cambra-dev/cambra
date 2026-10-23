@@ -2242,11 +2242,15 @@ fn a_boxed_payload_reads_back_as_its_collection() {
     );
 }
 
-/// A chain of `.extract()` calls on a value nested six deep. Each call's result is read through
-/// every bound its variable has gathered, and constraining one variable below another copies
-/// the lower one's bounds onto it, so compaction reaches one variable along many paths: it
-/// reads each once per walk. Read once per path, each call in the chain took several times as
-/// long as the one before.
+/// A chain of `.extract()` calls on a value nested ten deep, each call specializing `extract`
+/// at the next type down.
+///
+/// Each call's result is read through every bound its variable has gathered, and
+/// constraining one variable below another copies the lower one's bounds onto it, so
+/// compaction reaches one variable along many paths: it reads each once per walk. And each
+/// specialization's pin crosses into the clones earlier ones pinned, so extrusion copies
+/// them, once per walk rather than once per edge. Either one per path took several times as
+/// long at each call as at the one before.
 #[test]
 fn a_chain_of_extracts_on_a_deeply_nested_value() {
     let start = std::time::Instant::now();
@@ -2260,12 +2264,18 @@ fn a_chain_of_extracts_on_a_deeply_nested_value() {
             c4 = One::new(c3)
             c5 = One::new(c4)
             c6 = One::new(c5)
-            c6.extract().extract().extract().extract().extract().extract()
+            c7 = One::new(c6)
+            c8 = One::new(c7)
+            c9 = One::new(c8)
+            c10 = One::new(c9)
+            c10.extract().extract().extract().extract().extract().extract().extract().extract().extract().extract()
         "},
         Value::Int(1),
     );
+    // A debug build compiles this in a few seconds, and CI's runner in about ten; per path,
+    // it took over a minute.
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(10),
+        start.elapsed() < std::time::Duration::from_secs(30),
         "compiling took {:?}",
         start.elapsed()
     );
