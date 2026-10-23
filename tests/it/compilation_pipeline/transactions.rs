@@ -3891,6 +3891,155 @@ fn a_keyed_write_commits_a_computed_value_at_a_computed_key() {
     );
 }
 
+/// A checked lookup of a key the map-valued mutable variable does not hold answers `Option::none`
+/// inside a read-only block: key `2` is absent, and every position replies.
+///
+/// `m` has no writer, so every transaction reads its seed and the replies are independent of
+/// commit order.
+#[test]
+fn a_checked_lookup_of_an_absent_key_in_a_read_only_block_answers_none() {
+    check_scalar(
+        indoc! {r#"
+            m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+            out = defer()
+            for r in [1, 2, 1]:
+                with begin():
+                    out << (match m[r]?:
+                        case Option::some(v): v
+                        case Option::none: 0)
+            sum(out)
+        "#},
+        Value::Int(20),
+    );
+}
+
+/// A checked lookup of an absent key inside a block that writes stalls: the program quiesces
+/// without a final value of `n`, so `await_final(n)` never reaches a terminal tile.
+///
+/// The block writes `n`, not `m`. The same lookup in a read-only block answers `Option::none`
+/// (the sibling above), and a lookup of a present key in a writing block commits
+/// (`a_keyed_read_at_the_loop_item_reads_the_snapshot`). Feeding the lookup out of the block
+/// instead of writing it stalls the same way: over a `[1, 2, 1]` loop with seed `{1: 10}`, the
+/// block replies at the first key and stops at the absent second one, and the `cambra` binary
+/// running that program does not exit. A key off a source, such as the storefront's
+/// `inventory[req.body.sku]`, reaches the same stall.
+#[test]
+#[should_panic(expected = "producer stopped short of a terminal tile")]
+fn a_checked_lookup_of_an_absent_key_in_a_writing_block() {
+    check_scalar(
+        indoc! {r#"
+            def or_zero(o: Option(Int)) => Int:
+                match o:
+                    case Option::some(v):
+                        v
+                    case Option::none:
+                        0
+            m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+            n: Mut(Int, Txn) := 0
+            for r in [3]:
+                with begin():
+                    n := n + or_zero(m[r]?)
+            await_final(n)
+        "#},
+        Value::Int(0),
+    );
+}
+
+/// A checked lookup in a loop that writes the map back at the looked-up key: the read-modify-write
+/// counter `m[r] := or_zero(m[r]?) + 1` over an **induction** map, at a key the seed holds.
+#[test]
+fn a_counter_over_an_induction_map_at_a_present_key() {
+    let value = final_mut_var_value(indoc! {r#"
+        def or_zero(o: Option(Int)) => Int:
+            match o:
+                case Option::some(v):
+                    v
+                case Option::none:
+                    0
+        m: Mut(Map(Int, Int)) := box(map([(3, 0)]))
+        for r in [3, 3]:
+            m[r] := or_zero(m[r]?) + 1
+        m
+    "#});
+    assert_eq!(map_entries_int(&value), vec![(3, 2)]);
+}
+
+/// The same counter starting at a key the seed does not hold stalls: the loop produces no
+/// position of `m`. The absent-key stall of a writing `Txn` block
+/// (`a_checked_lookup_of_an_absent_key_in_a_writing_block`) on an induction map.
+#[test]
+#[should_panic(expected = "producer stopped short of a terminal tile")]
+fn a_counter_over_an_induction_map_at_an_absent_key() {
+    let value = final_mut_var_value(indoc! {r#"
+        def or_zero(o: Option(Int)) => Int:
+            match o:
+                case Option::some(v):
+                    v
+                case Option::none:
+                    0
+        m: Mut(Map(Int, Int)) := box(map([(1, 10)]))
+        for r in [3, 3]:
+            m[r] := or_zero(m[r]?) + 1
+        m
+    "#});
+    assert_eq!(map_entries_int(&value), vec![(1, 10), (3, 2)]);
+}
+
+/// A keyed write whose key is a mutable variable, `log[n] := 5` after `n := n + 1` in the same
+/// block, does not compile: the post-transact type check rejects the block's snapshot tuple,
+/// expecting `Mut(Int, Txn)` and finding `Int`. A `Map(Int, String)` panics the same way, and a
+/// key that is the loop item compiles (`a_keyed_write_commits_a_computed_value_at_a_computed_key`).
+/// Each transaction writes the key it has just counted to, so every commit order gives the same
+/// map.
+#[test]
+#[should_panic(expected = "post-transact produced an invalid tree: [Type mismatch")]
+fn a_keyed_write_at_a_mutable_variable_key() {
+    let value = final_mut_var_value(indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        log: Mut(Map(Int, Int), Txn) := empty_map()
+        for r in [1, 2, 3]:
+            with begin():
+                n := n + 1
+                log[n] := 5
+        await_final(log)
+    "#});
+    assert_eq!(map_entries_int(&value), vec![(1, 5), (2, 5), (3, 5)]);
+}
+
+/// A keyed write whose value is a conditional expression commits at every key: the `if`
+/// selects the value, and the write is on the block's spine.
+#[test]
+fn a_keyed_write_of_a_conditional_value_inside_a_block() {
+    let value = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+        for r in [1, 2]:
+            with begin():
+                m[r] := 5 if r > 1 else 6
+        await_final(m)
+    "#});
+    assert_eq!(map_entries_int(&value), vec![(1, 6), (2, 5)]);
+}
+
+/// A keyed write under an `if` inside a block panics at run time, in a flat merge
+/// (`src/interpreter/tile_operators/union.rs`) whose arms carry different extents.
+/// `src/ccl/design/mutability.md`, "General in-transaction conditionals (and conditional writes)"
+/// admits writes under a block's `if`. A scalar write under the same `if` and a keyed write of a conditional value (the
+/// sibling above) both run. Writing the key from both arms of a ``match m[r]?`` panics the same
+/// way.
+#[test]
+#[should_panic(expected = "a flat merge reassembles one domain, but the arms carry different")]
+fn a_keyed_write_under_an_if_inside_a_block() {
+    let value = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+        for r in [1, 2]:
+            with begin():
+                if r > 1:
+                    m[r] := 5
+        await_final(m)
+    "#});
+    assert_eq!(map_entries_int(&value), vec![(1, 10), (2, 5)]);
+}
+
 /// ``match m: case `tag(w): <writes>`` inside a `with begin():` block. The arms
 /// route their writes per path exactly as an `if` arm's do — lowering shares
 /// `match`'s tag rules through `lower_match_over`, and the phase converts the
