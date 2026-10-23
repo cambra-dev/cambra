@@ -43,9 +43,13 @@ Locations refer to `{{CHANGE}}`.
 5. Files this commit may touch: {{FILES}}, plus files under `tests/` a finding needs. Changed lines
    outside `tests/` may not exceed {{MAX_FIX_LINES}}. A fix that needs more is a decline: say so in
    the report.
-6. Gate: `cargo fmt`, then `{{SKILL}}/scripts/gate.sh {{WS}} {{SCRATCH}}/gate-fix` until green.
+6. Run each test a finding supplied before the gate, and only that test, scoped to the one binary
+   that holds it: `{{SKILL}}/scripts/in-workspace.sh {{WS}} 1800 cargo test -p <crate> --lib <name>`
+   for a unit test, `… cargo test --test it <name>` for one under `tests/it/`. A test for an
+   `incorrect` finding fails on `{{CHANGE}}` and passes with the fix.
+7. Gate: `cargo fmt`, then `{{SKILL}}/scripts/gate.sh {{WS}} {{SCRATCH}}/gate-fix` until green.
    Five fix rounds without green ends the round: leave the workspace as it is.
-7. Describe: `jj describe -m "Address staff review of <subject of {{CHANGE}}>" -m "<one line per
+8. Describe: `jj describe -m "Address staff review of <subject of {{CHANGE}}>" -m "<one line per
    addressed finding: its title line and what changed>"`. No AI attribution.
 
 If you decline every finding, abandon the empty commit with `jj abandon @` and report `fix change:

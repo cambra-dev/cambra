@@ -20,8 +20,13 @@ Follow the repo's `staff-rust-review` skill, read from
 - **The stated intent:** {{INTENT}}
 
 Read the surrounding code in `{{WS}}`, and judge comments and docs against "Prose style" and "Code
-Comments" in `{{WS}}/CLAUDE.md`. You may run tests with `{{SKILL}}/scripts/in-workspace.sh {{WS}} 1800 cargo test <name>`, which uses the workspace's
-cargo target and a timeout.
+Comments" in `{{WS}}/CLAUDE.md`.
+
+Run no builds and no existing tests. The commit passed `./ci.sh fast` before this review, and
+GitHub CI runs the full gate on the pushed PR. The skill's "Build and Test Scope" section applies,
+with one difference: you cannot add a test to `{{WS}}`, so the test the skill asks for on an
+`incorrect` finding goes in the finding's details, written out in full with the file it belongs in.
+The implementer adds it and runs it.
 
 Do not edit any file in `{{WS}}`, do not run jj commands that write, and do not touch any directory
 outside `{{WS}}` and `{{SCRATCH}}`. Write every log, backup copy (`*.orig`) and temp

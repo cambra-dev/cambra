@@ -4,7 +4,7 @@
 #   gate.sh <workspace-dir> <log-prefix>
 #
 # Runs through in-workspace.sh into <log-prefix>.log, prints the log's last lines and exits with the
-# gate's status. The full gate runs on GitHub against each draft PR; close-failed.sh reads its
+# gate's status. The full gate runs on GitHub against each draft PR; settle-drafts.sh reads its
 # result on the next run.
 set -euo pipefail
 

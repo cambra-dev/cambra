@@ -10,7 +10,7 @@ digest with five sections:
 - PRs a human closed without merging, each with its closing comment as the reason. These are
   permanent history: a candidate matching one is never re-proposed unless its cited code has
   changed;
-- PRs close-failed.sh closed for a CI failure in the last `CI_HISTORY_DAYS` days. Its closing
+- PRs settle-drafts.sh closed for a CI failure in the last `CI_HISTORY_DAYS` days. Its closing
   comment starts with `CI_CLOSE_PREFIX`. These are not a human's decision, so they count toward
   neither the permanent history nor the merge rate;
 - review comments on the `MERGED_WITH_COMMENTS` most recently merged PRs, as guidance for the
@@ -31,7 +31,7 @@ REPO = "cambra-dev/cambra"
 PREFIX = "simplify-agent/"
 MERGED_WITH_COMMENTS = 20
 CI_HISTORY_DAYS = 14
-# Must match CLOSE_PREFIX in close-failed.sh.
+# Must match CLOSE_PREFIX in settle-drafts.sh.
 CI_CLOSE_PREFIX = "Closed by the daily simplification run: CI failed"
 # `gh pr close --comment` and the web UI's "Close with comment" post the comment just before
 # the close event.

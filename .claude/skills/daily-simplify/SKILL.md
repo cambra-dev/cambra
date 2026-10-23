@@ -62,8 +62,9 @@ Two scripts set what a build or gate needs:
 - `$SKILL/scripts/gate.sh <ws> <log-prefix>` runs `./ci.sh fast` through `in-workspace.sh` and
   writes `<log-prefix>.log`.
 
-`fast` is the only gate the run executes. GitHub CI runs the full gate on each draft PR, and the
-next run's Step 0 closes a draft whose CI failed, so a failing draft stays open for at most a day.
+`fast` is the only gate the run executes. GitHub CI runs the full gate on each draft PR. The next
+run's Step 0 closes a draft whose CI failed and marks one whose CI passed ready for review, so a
+draft stays a draft for at most a day after its CI finishes.
 
 Each attempt's agents write their logs, backup copies and temp files under that attempt's
 `SCRATCH`, never under the session scratchpad or `/tmp`. A scratch directory is named by slug
@@ -108,7 +109,7 @@ $SKILL/scripts/workspace.sh paths          # SRCS, REPO, CACHE, VAULT, LOGDIR; T
 $SKILL/scripts/preflight.sh $LOGDIR/D.md   # in triage-only mode: $CACHE/runs/D/triage-only.md
 $SKILL/scripts/workspace.sh list           # stale simplify-* workspaces
 gh auth status 2>&1 | head -3
-$SKILL/scripts/close-failed.sh             # in triage-only mode: --dry-run
+$SKILL/scripts/settle-drafts.sh            # in triage-only mode: --dry-run
 mkdir -p $RUN
 python3 -I $SKILL/scripts/history.py $RUN/history.md   # every simplify PR, in any state
 ls -t $LOGDIR/                             # recent run logs
@@ -118,9 +119,13 @@ ls -t $LOGDIR/                             # recent run logs
   with them, and sweeps each cargo target down to a size limit. Record the free disk it prints under
   "Run notes". When less than 50 GB is free, it exits 3 after writing the reason to the day's log:
   stop the run there, with no further steps.
-- `close-failed.sh` closes each earlier run's draft whose GitHub CI failed, and prints one line per
-  PR. Log each one under "Attempted, not pushed" as `discarded: CI failed`, with the failed checks
-  and the PR link. It runs before `history.py`, so today's history already shows those PRs closed.
+- `settle-drafts.sh` settles each earlier run's draft whose GitHub CI has finished, and prints one
+  line per PR it changes. It runs before `history.py`, so today's history already shows each PR in
+  its new state.
+  - A draft whose CI failed is closed. Log each one under "Attempted, not pushed" as
+    `discarded: CI failed`, with the failed checks and the PR link.
+  - A draft whose CI passed is marked ready for review. List each one under "Run notes" as
+    `marked ready`, with the PR link.
 - If `$RUN/superseded.md` exists, the scheduler stopped a run still in progress to start this one.
   Copy its note into "Run notes".
 - If stale `simplify-*` workspaces exist, a previous run crashed or was superseded. For each one,
@@ -135,7 +140,7 @@ ls -t $LOGDIR/                             # recent run logs
   - a simplify PR a human closed without merging, with the closing comment as the reason. This
     entry is permanent: the run never re-proposes a candidate a human closed, unless its cited
     code has changed and the closing comment's reason no longer holds;
-  - a simplify PR `close-failed.sh` closed for a CI failure in the last 14 days;
+  - a simplify PR `settle-drafts.sh` closed for a CI failure in the last 14 days;
   - a candidate a log records as discarded, abandoned or rejected in the last 14 days.
 - `$RUN/history.md` also holds the review comments on recently merged simplify PRs. They are
   guidance for the finders (Step 3), not history entries.
