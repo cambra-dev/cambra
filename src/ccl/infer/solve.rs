@@ -2452,8 +2452,9 @@ fn coalesce_type_predicates_go(
             coalesce_type_predicates_go(value, level, ctx, scope);
             coalesce_type_predicates_go(domain, level, ctx, scope);
         }
-        // A hole survives coalescing only in a slot whose resolution failed, as an
-        // `Infer` does, and `resolve_binder_slot` has already reported that failure.
+        // A barrier var survives coalescing only in a slot whose
+        // resolution failed, as an `Infer` does, and
+        // `resolve_binder_slot` has already reported that failure.
         Type::BarrierVar(_)
         | Type::Base(_)
         | Type::UIntRange(_)

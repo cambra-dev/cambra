@@ -2130,11 +2130,11 @@ that names no such binder (`return_opaque_annotated_function_from_unannotated_fu
 
 `opaque_output::run` runs before inference and rewrites such a lambda to
 `λ 𝑥 → let __output : 𝐻 = body in __output`, where `𝐻` is a fresh `Type::BarrierVar` recording
-the opaque binders the body binds. Inference records each edge into the hole from a type other
-than an inference variable as a lower bound and each such edge out of it as an upper bound, and
-closes neither against the other. An edge between the hole and an inference variable is recorded on
-the inference variable. The hole resolves to
-the join of its lower bounds with the refinements at positive positions dropped
+the opaque binders the body binds. Inference records each edge into the barrier variable from a type
+other than an inference variable as a lower bound and each such edge out of it as an upper bound,
+and closes neither against the other. An edge between the barrier variable and an inference variable
+is recorded on the inference variable. The barrier variable resolves to the join of its lower bounds
+with the refinements at positive positions dropped
 (`CompactType::resolve_barrier_refinements` in `solver/compact.rs`).
 
 `solver::barrier::solve_barrier_vars` checks each barrier variable against its resolution. It
@@ -2171,13 +2171,13 @@ resolution, as it skips any resolution that does not materialize. `spec_key` cut
 its body is `let 𝑦 : 𝑇 = body in 𝑦` with a concrete user annotation `𝑇`, the lowering of a `=> 𝑇`
 output annotation. A concrete annotation holds no `_`, inference variable, or barrier variable at
 any depth. An annotation holding one leaves part of the codomain to inference, so the lambda is
-wrapped around the annotated `let`
-(`dont_discharge_opaques_out_of_fun_bodies_with_a_hole_codomain` in
-`tests/it/compilation_pipeline/type_annotations.rs`). An annotated `let` with any other
-continuation annotates only its definiens, so the lambda is wrapped. The search for an opaque binder stops at a nested lambda, which receives its own
-`__output`. An unwrapped lambda's codomain keeps the body's refinements, so a refinement naming a
-binder bound outside the function stays (`a_function_s_codomain_drops_its_body_s_opaque_binders`,
-case `bound_outside`, in `tests/it/type_check.rs`).
+wrapped around the annotated `let` (`dont_discharge_opaques_out_of_fun_bodies_with_a_hole_codomain`
+in `tests/it/compilation_pipeline/type_annotations.rs`). An annotated `let` with any other
+continuation annotates only its definiens, so the lambda is wrapped. The search for an opaque binder
+stops at a nested lambda, which receives its own `__output`. An unwrapped lambda's codomain keeps
+the body's refinements, so a refinement naming a binder bound outside the function stays
+(`a_function_s_codomain_drops_its_body_s_opaque_binders`, case `bound_outside`, in
+`tests/it/type_check.rs`).
 
 #### Discharge is application
 

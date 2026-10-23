@@ -995,8 +995,8 @@ pub fn seed_chan_dom_pairings(
 /// A type holding bounds that [`seed_pairings_go`] descends through, once each.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum BoundHolder {
-    Var(InferVarId),
-    Hole(BarrierVarId),
+    InferVar(InferVarId),
+    BarrierVar(BarrierVarId),
 }
 
 fn seed_pairings_go(
@@ -1018,7 +1018,7 @@ fn seed_pairings_go(
     // the cyclic bound graph). The use side is resolved; a placeholder var
     // there has no bounds and pairs nothing.
     if let Type::Infer(dv) = peel(def_ty) {
-        if seen.insert(BoundHolder::Var(dv.uid)) {
+        if seen.insert(BoundHolder::InferVar(dv.uid)) {
             let (lows, ups) = {
                 let s = dv.bounds.borrow();
                 (Rc::clone(s.lower()), Rc::clone(s.upper()))
@@ -1030,7 +1030,7 @@ fn seed_pairings_go(
         return;
     }
     if let Type::Infer(uv) = peel(use_ty) {
-        if seen.insert(BoundHolder::Var(uv.uid)) {
+        if seen.insert(BoundHolder::InferVar(uv.uid)) {
             let (lows, ups) = {
                 let s = uv.bounds.borrow();
                 (Rc::clone(s.lower()), Rc::clone(s.upper()))
@@ -1045,7 +1045,7 @@ fn seed_pairings_go(
     // structure on either side. Its upper bounds are checks against that join and
     // add no position to pair.
     if let Type::BarrierVar(dh) = peel(def_ty) {
-        if seen.insert(BoundHolder::Hole(dh.uid)) {
+        if seen.insert(BoundHolder::BarrierVar(dh.uid)) {
             let lows = dh.lowers.borrow().clone();
             for b in &lows {
                 seed_pairings_go(use_ty, &b.ty, lim, out, seen);
@@ -1054,7 +1054,7 @@ fn seed_pairings_go(
         return;
     }
     if let Type::BarrierVar(uh) = peel(use_ty) {
-        if seen.insert(BoundHolder::Hole(uh.uid)) {
+        if seen.insert(BoundHolder::BarrierVar(uh.uid)) {
             let lows = uh.lowers.borrow().clone();
             for b in &lows {
                 seed_pairings_go(&b.ty, def_ty, lim, out, seen);

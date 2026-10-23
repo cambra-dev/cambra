@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn each_wrap_mints_its_own_hole() {
+    fn each_wrap_mints_its_own_barrier_var() {
         let (r, s) = (Name::fresh("r"), Name::fresh("s"));
         let out = run(Expr::tuple(vec![
             lambda(opaque_let(&r, Expr::var(r.clone()))),
