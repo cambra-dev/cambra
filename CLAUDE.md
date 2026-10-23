@@ -430,38 +430,43 @@ Two ways that reads as something else:
   `gh api -X PATCH` instead, and re-read the base afterwards rather than trusting either command.
 - Closing the PR does not free it: `422 Cannot change the base branch of a closed pull request`.
 
-#### A merged PR is a permanent member, so a stack stops being dissolvable
+#### Merging a member
 
-`gh stack unstack <n>` is the documented escape, and it refuses wholesale once any member has
-merged:
-
-```
-✗ Unstacking not allowed: Pull requests #187, #203 cannot be removed from this stack
-```
-
-A PR cannot be un-merged, so that stack can never be dissolved. Since members merge in the normal
-course of landing a stack, treat `unstack` as available only until the stack's first merge.
-
-#### Restructuring a locked stack
-
-`gh stack submit` rebuilds the GitHub stack from local tracking, and that path sets bases the REST
-endpoint refuses. It is the way to reorder, reparent, or drop members of a stack that `unstack` will
-not release:
+A PR in a stack merges only through the asynchronous endpoint. `gh pr merge` fails with *This pull
+request is part of a stack and must be merged using the asynchronous merge REST API*:
 
 ```bash
-gh stack checkout <any-member-PR>      # import the remote stack into local tracking
-gh stack unstack <n> --local           # drop local tracking only; GitHub untouched
-gh stack init <bottom> … <top>         # non-interactive; adopt the branches in the new order
-gh stack submit                        # push branches AND set every base; creates a new stack
+gh api -X PUT repos/OWNER/REPO/pulls/N/merge-async -f merge_method=squash -f merge_action=direct_merge
+gh api repos/OWNER/REPO/pulls/N/merge-async/<uuid>   # status: pending, merged, enqueued or failed
 ```
 
-`init` reports `Found PRs for N of N branches` when each branch already has one, and `submit` prints
-`Updated base branch for PR #N to <branch>` for exactly the bases that moved.
+The repo allows only squash merges; `merge_method=merge` fails as *Merge is not an allowed merge
+method in this repository*. A draft must be marked ready first.
 
-`submit` migrates the open PRs into the new stack and strands the merged ones in the old, which
-shrinks to a tombstone holding only them, at their original positions. The new stack is dissolvable
-until its own first merge. `submit` leaves drafts as drafts; `--open` marks every PR ready for
-review.
+When a member merges, GitHub rebases every open member above it onto the new base and force-pushes
+their branches, and the member just above takes the merged one's base. Every head above changes,
+so `jj git fetch` before acting on any of them.
+
+A merged PR stays in its stack: a PR cannot be un-merged, and nothing removes it.
+
+#### Restructuring a stack
+
+`gh stack unstack <stack-number>` dissolves the stack on GitHub and releases its open and closed
+members, whose bases become editable again. It needs no TTY. A stack with no merged member is
+deleted (`✓ Stack removed on GitHub (stack #N)`). A stack with a merged member keeps it, at its
+original position, as a tombstone holding only merged PRs. `gh stack link` then forms the new stack
+from the released PRs, in the new order:
+
+```bash
+gh stack unstack <stack-number>
+gh stack link <bottom-pr-url> … <top-pr-url>   # chains the bases; creates a new stack
+```
+
+`link` reports `Updated base branch for PR #N to <branch>` for each base it moves. Pass PR URLs
+rather than branch names to keep it from pushing the branches.
+
+`gh stack submit` cannot restructure a stack GitHub still holds: it sets bases through the same
+check, and fails with *Cannot change the base branch because the pull request is part of a stack*.
 
 `gh stack modify` is the command the extension's docs point at for restructuring, but it is a TUI
 whose only flags are `--abort` and `--continue`, so a script or an agent cannot drive it.
@@ -480,8 +485,10 @@ of the two is recoverable:
   merged*, and no API un-merges a PR. Nothing reaches `main`, the merge being bookkeeping, but the
   PR number and its description are lost.
 
-So do not push branches by hand and then repair bases. Run a reorder through `init` and `submit`,
-which push and re-base in one step.
+So do not push branches by hand and then repair bases. Neither order is safe for a reorder: pushing
+first can put a head below its old base, and linking first can point a base at a branch that still
+contains the head. Dropping a member, as `settle_drafts.py` does, is safe in either order, because
+no remaining head moves below another.
 
 #### Operational notes
 
