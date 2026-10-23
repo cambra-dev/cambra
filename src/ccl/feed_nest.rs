@@ -333,7 +333,7 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
     let record = Name::fresh("__iter_record");
     let nest_params: Vec<Name> = generators.iter().map(|g| g.param.name.clone()).collect();
     around_lets(contribution, &mut |nest| {
-        let body = rebuild_nest(nest, 0, levels, &mut |depth, _, param, inner| {
+        let body = rebuild_nest(nest, 0, levels, &mut |depth, _, param, inner, was| {
             let position = Expr::apply(
                 Expr::var(&record).with_ty(keys.clone()),
                 Expr::proj_index(depth).with_ty(Type::fun(keys.clone(), domains[depth].clone())),
@@ -344,6 +344,7 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
                 generators[depth].source().clone(),
                 param,
                 inner,
+                was.as_ref(),
                 &nest_params,
             )
         });
@@ -500,6 +501,21 @@ fn generator_nest(
             }
             generator_nest(body, levels, scope, generators)
         }
+        TypedExprNode::Lambda { .. } => {
+            let parts = crate::ccl::ccl_utils::loop_parts(nest)?;
+            let (param, body) = (parts.element, parts.body);
+            let iterated = parts.source.clone();
+            let generator = Generator {
+                iterated,
+                param: param.clone(),
+            };
+            let reads = |names: &[Name], e: &Expr| names.iter().any(|n| count_free(n, e) > 0);
+            let independent = !reads(&scope.binders, &generator.iterated)
+                && !reads(&scope.lets, &generator.iterated);
+            generators.push(generator);
+            scope.binders.push(param.name.clone());
+            Some(generator_nest(body, levels - 1, scope, generators)? && independent)
+        }
         TypedExprNode::Compose(elts) => {
             let [prefix @ .., last] = elts.as_slice() else {
                 return None;
@@ -545,14 +561,15 @@ fn source_item(ty: &Type) -> Type {
         .unwrap_or_else(|| panic!("a loop's source is a collection, got {ty}"))
 }
 
-/// `nest` with each of its `levels` generators `𝑠 ≫ (λ 𝑥 → body)` rebuilt by `level`, which
-/// is handed the generator's depth, its source `𝑠`, its binder `𝑥` and the rebuilt `body`.
-/// Every `let` stays in place.
+/// `nest` with each of its `levels` generators, a loop `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)` or
+/// `𝑠 ≫ (λ 𝑥 → body)`, rebuilt by `level`, which is handed the generator's depth, its source `𝑠`,
+/// its binder `𝑥`, the rebuilt `body`, and the loop's position `𝑟` where it has one. Every `let`
+/// stays in place.
 fn rebuild_nest(
     nest: Expr,
     depth: usize,
     levels: usize,
-    level: &mut dyn FnMut(usize, Expr, TypedBinding, Expr) -> Expr,
+    level: &mut dyn FnMut(usize, Expr, TypedBinding, Expr, Option<Name>) -> Expr,
 ) -> Expr {
     if depth == levels {
         return nest;
@@ -575,6 +592,22 @@ fn rebuild_nest(
             node_id,
             rebuild_nest(*body, depth, levels, level),
         ),
+        TypedExprNode::Lambda { param, body } => {
+            let rebuilt = TypedExpr {
+                node: TypedExprNode::Lambda { param, body },
+                ty: Type::Hole,
+                user_annotation,
+                node_id,
+            };
+            let Ok((position, source, step)) = crate::ccl::ccl_utils::into_loop(rebuilt) else {
+                panic!("a loop level of a feed contribution is a loop over a source")
+            };
+            let TypedExprNode::Lambda { param, body } = step.node else {
+                unreachable!("into_loop's step is a lambda")
+            };
+            let inner = rebuild_nest(*body, depth + 1, levels, level);
+            level(depth, source, param, inner, Some(position.name))
+        }
         TypedExprNode::Compose(mut elts) => {
             let lambda = elts
                 .pop()
@@ -587,7 +620,7 @@ fn rebuild_nest(
                 _ => compose_typed_or_hole(elts),
             };
             let inner = rebuild_nest(*body, depth + 1, levels, level);
-            level(depth, source, param, inner)
+            level(depth, source, param, inner, None)
         }
         other => panic!(
             "a loop level of a feed contribution is `𝑠 ≫ (λ 𝑥 → body)`, got {}",
@@ -608,11 +641,28 @@ fn rebuild_nest(
 fn read_level(
     position: Expr,
     source: Expr,
-    param: TypedBinding,
-    inner: Expr,
+    mut param: TypedBinding,
+    mut inner: Expr,
+    was: Option<&Name>,
     nest_params: &[Name],
 ) -> Expr {
-    let item = source_item(&source.ty);
+    // A level that was a loop indexed by a position of its own reads it where its element's
+    // type depends on it; that position is this one.
+    if let Some(was) = was {
+        let at = crate::ccl::subst::Subst::discharge(was.clone(), position.clone_preserving_ids());
+        param.ty = at.apply_type(&param.ty);
+        crate::ccl::subst::Subst::discharge_in_place(&mut inner, was, &position);
+    }
+    // A source whose values depend on their position holds, at this one, its codomain read
+    // there.
+    let item = match source.ty.read_view().peel_refinements() {
+        Type::Fun {
+            name: Some(k),
+            codomain,
+            ..
+        } => crate::ccl::subst::discharge_codomain(k, &position, codomain),
+        _ => source_item(&source.ty),
+    };
     let read = Expr::apply(position, source).with_ty(item);
     let row_reads = crate::ccl::subst::type_free_vars(&inner.ty);
     if nest_params.iter().any(|p| row_reads.contains(p)) {
@@ -646,7 +696,7 @@ fn collection_over(position: &Name, domain: Type, body: Expr) -> Expr {
 /// read of that level's source, as it is in [`nest_as_product`]'s form.
 pub(crate) fn indexed_nest(nest: Expr, levels: usize) -> Expr {
     let nest_params = loop_params(&nest, levels);
-    rebuild_nest(nest, 0, levels, &mut |_, source, param, inner| {
+    rebuild_nest(nest, 0, levels, &mut |_, source, param, inner, was| {
         let inner = lets_into_position(inner);
         let domain = source_domain(&source.ty).expect("a loop's source is a collection");
         let position = Name::fresh("__iter_record");
@@ -655,20 +705,28 @@ pub(crate) fn indexed_nest(nest: Expr, levels: usize) -> Expr {
             source,
             param,
             inner,
+            was.as_ref(),
             &nest_params,
         );
         collection_over(&position, domain, step)
     })
 }
 
-/// The variables of the `levels` loops of `nest`, outermost first: each `𝑠 ≫ (λ 𝑥 → body)`'s
-/// `𝑥`, through the `let`s between them.
+/// The variables of the `levels` loops of `nest`, outermost first: each loop's element `𝑥`,
+/// through the `let`s between them.
 fn loop_params(nest: &Expr, levels: usize) -> Vec<Name> {
     let mut params = Vec::with_capacity(levels);
     let mut at = nest;
     while params.len() < levels {
         match &at.node {
             TypedExprNode::Let { body, .. } => at = body,
+            TypedExprNode::Lambda { .. } => match crate::ccl::ccl_utils::loop_parts(at) {
+                Some(parts) => {
+                    params.push(parts.element.name.clone());
+                    at = parts.body;
+                }
+                None => break,
+            },
             TypedExprNode::Compose(elts) => match elts.last().map(|e| &e.node) {
                 Some(TypedExprNode::Lambda { param, body }) => {
                     params.push(param.name.clone());

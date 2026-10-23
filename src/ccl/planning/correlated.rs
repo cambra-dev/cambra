@@ -208,7 +208,7 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
     let Some(curried) = expr.ty.codomain() else {
         unreachable!("`curry(𝑔)` is a function, got {}", expr.ty)
     };
-    let Type::Fun { fun_kind, .. } = &expr.ty else {
+    let Some(fun_kind) = expr.ty.fun_kind() else {
         unreachable!("`curry(𝑔)` is a function, got {}", expr.ty)
     };
     let collection = keys.ty.clone();

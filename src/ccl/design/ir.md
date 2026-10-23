@@ -120,6 +120,38 @@ keeps the replaced occurrence's root `NodeId` and freshens replacement interiors
 visit refinement predicates in type slots as well as expression children. A substitution may be
 vacuous in the expression children yet still affect a predicate or a witness reference in a type.
 
+### Every stored type is well-scoped
+
+Every type slot is well-scoped at every phase: each name free in it is bound by a term binder
+around the slot's node, or is one of the program's free names, its sources and sinks. The term
+binders are the ones [Binding structure lives in one place](#binding-structure-lives-in-one-place)
+lists. Inside a type, that type's own binders bind too: a Pi binder over its codomain, a dependent
+tuple's component over the components after it, `__elem` over a refinement's predicate, and a
+quoted term's binders over that term. A sum binds its witnesses within its own type and nowhere
+else.
+
+The rule does not change from phase to phase. Lowering and elimination change which form a term
+takes, not what binds where:
+
+- A morphism's binder binds within the morphism's own type. A morphism after it in a chain names
+  no binder of an earlier one
+  ([A chain names each position](type-inference.md#a-chain-names-each-position)).
+- A morphism lambda elimination lifts out of a parameter's scope receives in its input every value
+  its term reads. Where only its type reads the parameter, through what the morphism receives, its
+  type is generic in that part ([Generalized types](type-parameters.md#generalized-types)).
+- A view of a collection before lambda elimination is written with its position bound,
+  `λ 𝑟 → 𝑟 ▷ __hist ▷ 𝑠₁ ▷ … ▷ 𝑠ₙ` (`ccl_utils::pointwise_view`), as a loop over a collection is
+  (`λ 𝑟 → (𝑟 ▷ 𝑥𝑠) ▷ (λ 𝑥 → body)`).
+
+An opaque `let`'s name is the one exception, and only until mutability elimination. While
+inference runs, a read binder's definiens is a mutable variable no type may name, so a type lifted
+past the `let` keeps the binder's name (`Typing::close_let_type`). Mutability elimination names the
+value each read took and makes every opaque `let` transparent
+([A read is named while inference runs](mutability.md#a-read-is-named-while-inference-runs)).
+
+`well_scoped::assert_well_scoped` checks the rule in debug builds at every boundary `settle`
+checks, and `infer::debug_assert_no_free_witness` checks witnesses.
+
 ### Source locations on substituted parameter projections
 
 An ordinary multi-parameter `def f(p, q)` lowers to one lambda over a tuple parameter.
@@ -181,8 +213,10 @@ source at that position, through `unbox`; the second maps its element through th
 those application and lambda pairs, with a product of source domains for the outer parameter.
 `ccl/comprehension.rs` builds both, and the `__iter_record` binder it mints is a `Synthetic`:
 α-uniquification has already run, so a raw spelling would shadow its twin in a nested
-comprehension. A feed-only or yield-only statement loop without loop-carried mutation uses
-`xs ▷ unbox ≫ (λ x → body)` (`lower/loops.rs`), built at lowering. Both forms use existing
+comprehension. A feed-only or yield-only statement loop without loop-carried mutation is built at
+lowering as `xs ▷ unbox ≫ (λ x → body)` (`lower/loops.rs`) and indexed by the comprehension phase
+to the same form, `λ 𝑟 → (𝑟 ▷ (xs ▷ unbox)) ▷ (λ x → body)` (`ccl_utils::loop_parts` reads one).
+Both forms use existing
 function nodes; mutation and transaction loops instead retain a structured `For`. `lambda_elim`
 removes the lambdas and produces point-free combinators; operator conversion builds the dataflow
 operators. See [lambda elimination](optimization.md#lambda-elimination-ccllambda_elimrs) and the

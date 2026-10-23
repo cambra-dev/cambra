@@ -63,7 +63,9 @@ A feed-only or yield-only `for` loop without loop-carried mutation lowers to a c
 source's read and an iteration lambda: `source ▷ unbox ≫ (λ x → body)`. A loop is a generator, so
 it reads its source as a comprehension does, through `unbox`
 ([Projecting a sum's witness](collections.md#projecting-a-sums-witness)). The composition carries
-a data-function annotation. A loop that feeds an existing defer handle needs no result binding. A loop with `yield`
+a data-function annotation. The comprehension phase indexes it by its position before inference,
+`λ 𝑟 → (𝑟 ▷ (source ▷ unbox)) ▷ (λ x → body)`, the form a comprehension's generator takes, so an
+element whose type reads its position, a group of a group-by, is typed under the loop's binder. A loop that feeds an existing defer handle needs no result binding. A loop with `yield`
 creates a result defer handle and replaces each `yield 𝑒` with a feed to that handle:
 
 ```text

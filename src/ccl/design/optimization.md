@@ -504,10 +504,9 @@ function, where that refinement depends on the function's input collection. The 
 iteration walk sees the function's own domain and cannot materialize this inner one.
 When each added predicate reads that input collection, planning converts the added
 conditions into a value predicate 𝑞 and inserts one `map(filter_values(𝑞))` before the function.
-A predicate reads the input by the function's binder or as the value the morphism before it
-carries there, `𝑝 ▷ 𝑒` ([A chain names each position](type-inference.md#a-chain-names-each-position)):
-`[v for v in r.xs if v > 1]` over rows `r` narrows `.xs ≫ map(id)`, whose type reads `r ▷ .xs`.
-The value predicate reads neither, since the filter is handed the values alone.
+A predicate reads the input by the function's binder: `[v for v in r.xs if v > 1]` over rows `r`
+narrows `.xs ≫ map(id)`, whose `map` reads its input as its own binder. The value predicate does
+not read the input, since the filter is handed the values alone.
 The operator filters each group's elements independently. `reject_unmaterialized_narrowings`
 refuses a narrowing no per-group filter materializes, since operator conversion would compile the
 site without its filter.

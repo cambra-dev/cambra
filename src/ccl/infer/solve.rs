@@ -1595,7 +1595,7 @@ pub(super) fn check_scope_valid(
     // later one out.
     let mut scope = scope.clone();
     collect_opaque_binders(expr, &mut scope);
-    check_scope_valid_go(expr, &scope, &[], errors)
+    check_scope_valid_go(expr, &scope, errors)
 }
 
 /// Every [opaque](crate::ccl::BindingTransparency::Opaque) `let` binder in the
@@ -1609,26 +1609,9 @@ fn collect_opaque_binders(expr: &Expr, out: &mut std::collections::BTreeSet<Name
     expr.walk_children(|c| collect_opaque_binders(c, out));
 }
 
-/// Every witness binder `ty` **binds** — the binders of the sums occurring in it.
-///
-/// A sum binds its witness over its own body, and over the subtree of the node it types:
-/// the consumer's result is `Σ (𝑤 : 𝐾). 𝑊`, and the index term inside that consumer refers to
-/// `𝑤`. So a comprehension's `__iter_record` is *not* ill-scoped for naming the witness its
-/// source introduced — it is the consuming rule's `Γ, 𝑤 :: 𝐾 ⊢ 𝑓 : 𝐵[𝑤] ⇒ 𝑊` seen from
-/// the term side.
-fn witness_binders_bound_by(ty: &Type, out: &mut Vec<crate::ccl::ty::WitnessId>) {
-    if let Some(ws) = ty.sum() {
-        for w in ws {
-            out.push(*w.id());
-        }
-    }
-    ty.walk_children(|c| witness_binders_bound_by(c, out));
-}
-
 fn check_scope_valid_go(
     expr: &Expr,
     scope: &std::collections::BTreeSet<Name>,
-    witnesses: &[crate::ccl::ty::WitnessId],
     errors: &mut Vec<LocatedInferError>,
 ) {
     // The construction boundary holds from the outside too: a coalesced type is
@@ -1644,10 +1627,10 @@ fn check_scope_valid_go(
         crate::ccl::subst::name_spelled_stored_binders(&expr.ty),
         symbolic(expr),
     );
-    // Witness scope requires the complete tree: bottom-up coalescing does not yet know
-    // which sums enclose a node. A witness must be bound by an enclosing sum or within
-    // this node's type.
-    if crate::ccl::ty::has_free_witness_ref(&expr.ty, witnesses) {
+    // A sum binds its witnesses within its own type and nowhere else, so a node's type names
+    // only the witnesses its own sums bind. Checked on the complete tree, after coalescing has
+    // settled every type.
+    if crate::ccl::ty::has_free_witness_ref(&expr.ty, &[]) {
         errors.push(LocatedInferError {
             error: InferError::ScopeViolation {
                 at: symbolic(expr),
@@ -1659,9 +1642,6 @@ fn check_scope_valid_go(
             related: RelatedPositions::default(),
         });
     }
-    let mut witnesses = witnesses.to_vec();
-    witness_binders_bound_by(&expr.ty, &mut witnesses);
-    let witnesses = &witnesses[..];
 
     let unbound = crate::ccl::subst::scope_gaps(&expr.ty, |n| scope.contains(n));
     if !unbound.is_empty() {
@@ -1676,36 +1656,6 @@ fn check_scope_valid_go(
             related: RelatedPositions::default(),
         });
     }
-    // **A loop over rows that read their position is not compiled yet.** The loop
-    // `𝑠 ≫ (λ 𝑥 → body)` types `𝑥` at `𝑠`'s row, which reads `𝑠`'s position, and nothing in the
-    // tree binds that position over the lambda: a feed keyed by the loops that fed it, read back
-    // by a `for` loop. A comprehension over the same rows binds the position and compiles.
-    if let TypedExprNode::Compose(elts) = &expr.node
-        && let [source, step] = elts.as_slice()
-        && matches!(step.node, TypedExprNode::Lambda { .. })
-        && let read = source.ty.read_view()
-        && let Type::Fun {
-            name: Some(position),
-            codomain,
-            ..
-        } = read.peel_refinements()
-        && crate::ccl::subst::codomain_depends_on(position, codomain)
-        && crate::ccl::subst::type_free_vars(&step.ty).contains(position)
-    {
-        errors.push(LocatedInferError {
-            error: InferError::Unsupported(
-                "a `for` loop over a collection whose rows depend on their position, such as a \
-                 feed keyed by the loops that fed it, is not compiled yet; a comprehension over \
-                 it is"
-                    .to_string(),
-            ),
-            node_id: expr.node_id(),
-            also: Box::default(),
-            related: RelatedPositions::default(),
-        });
-        check_scope_valid_go(source, scope, witnesses, errors);
-        return;
-    }
     // The binders are the ones `for_each_scoped_item` states for every node, so a node that
     // introduces one is checked under it without this walk restating which nodes bind. A
     // scope's children are consecutive, so one extended set serves the whole run.
@@ -1719,7 +1669,7 @@ fn check_scope_valid_go(
             return;
         };
         if binders.is_empty() {
-            check_scope_valid_go(child, scope, witnesses, errors);
+            check_scope_valid_go(child, scope, errors);
             return;
         }
         if !opened
@@ -1731,13 +1681,20 @@ fn check_scope_valid_go(
             opened = Some((binders, s));
         }
         let (_, s) = opened.as_ref().expect("opened above");
-        check_scope_valid_go(child, s, witnesses, errors);
+        check_scope_valid_go(child, s, errors);
     });
 }
 
 /// Resolve a type that may contain inference variables into a concrete
 /// `Type`, via the compact → simplify → coalesce pipeline.
 pub(crate) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
+    // A generalized type is born after inference, resolved: the solver has nothing to say about it
+    // (`src/ccl/design/type-parameters.md`, "Generalized types").
+    if crate::ccl::generalize::holds_generalized_type(ty)
+        && !crate::ccl::subst::type_contains_infer(ty)
+    {
+        return Ok(ty.clone());
+    }
     let compacted = compact_type(ty);
     crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(&compacted)?;
     let resolved = coalesce_compact(&simplify_type(compacted))?;
@@ -4333,8 +4290,10 @@ mod tests {
         ));
     }
 
+    /// A sum binds its witness within its own type only: a node under a node typed by the sum
+    /// reads the witness free, as it reads any other sum's.
     #[test]
-    fn scope_check_requires_the_witness_own_binder() {
+    fn scope_check_binds_a_witness_within_its_sum_alone() {
         let sum = || {
             Type::sum_over(
                 crate::ccl::TypeKind::UIntRanges,
@@ -4344,17 +4303,14 @@ mod tests {
         };
         let own = sum();
         let foreign = sum();
-        for (domain, accepted) in [
-            (own.domain().unwrap(), true),
-            (foreign.domain().unwrap(), false),
-        ] {
+        for domain in [own.domain().unwrap(), foreign.domain().unwrap()] {
             let mut body = lit_int(0);
             body.ty = domain.clone();
             let mut expr = TypedExpr::lambda("i", domain, body);
             expr.ty = own.clone();
             let mut errors = Vec::new();
             super::check_scope_valid(&expr, &Default::default(), &mut errors);
-            assert_eq!(errors.is_empty(), accepted, "{errors:?}");
+            assert!(!errors.is_empty(), "{errors:?}");
         }
     }
 

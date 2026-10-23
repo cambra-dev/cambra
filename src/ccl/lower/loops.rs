@@ -199,7 +199,8 @@ pub(super) fn lower_generator_for(
 
 /// Build the `Compose([source, Lambda(iter_var, body)])` loop encoding (the
 /// shape of [`Expr::for_loop`]), tagging **both** minted nodes — the `Compose`
-/// and the interior `Lambda` — as the for statement's direct image.
+/// and the interior `Lambda` — as the for statement's direct image. The comprehension phase
+/// indexes it by its position before inference ([`crate::ccl::comprehension`]).
 ///
 /// Stamped `Data`: a loop over a collection *is* that collection mapped, and
 /// this is the site that knows it. Leaving the function unstamped would hand the
