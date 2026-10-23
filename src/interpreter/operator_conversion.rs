@@ -1172,6 +1172,27 @@ records one and the only site a `Transact` reaches"
             .cloned()
     }
 
+    /// Whether a store over `keys` at `paths` continues a recurrence the retired version was
+    /// running, which is the `continues` argument of [`iteration_input`](Self::iteration_input).
+    /// A store whose seed summarizes positions resumes above them; one whose seed summarizes none
+    /// reads its input from the beginning.
+    ///
+    /// A seed summarizes positions when its variable carries its own value
+    /// ([`Offer::mutable_state`]) or when a `@LoadFrom` seeded it ([`is_a_load`]). A load's target
+    /// has a new identity and carries nothing, so a store asking only the identity would refold the
+    /// positions the loaded value already counts.
+    ///
+    /// The answer is per store, because one store drives one position sequence: see
+    /// `src/ccl/design/program-evolution.md`, "A loaded value summarizes positions".
+    fn store_continues(&self, keys: &[TransactKey], paths: &[VarPath]) -> bool {
+        paths
+            .iter()
+            .any(|path| self.offer.mutable_state.contains_key(path))
+            || keys
+                .iter()
+                .any(|k| self.load_from_derived.contains(&k.init.node_id()))
+    }
+
     /// The operator a recurrence iterates, and the first position it will offer:
     /// `term` built behind a fan-out this compilation records, or a slot of
     /// the fan-out the previous version recorded at the node `term` corresponds
@@ -1494,10 +1515,9 @@ in it has a correspondent",
             // Per variable, not per store: one loop drives one position sequence,
             // so a variable this version adds to a loop that carries another
             // begins wherever that loop resumes.
-            // Two ways a variable's value already summarizes the positions below where
-            // the store resumes, which is what `build_commit_store` and
-            // `build_induction_store_single` read as well: it carries its own value, or
-            // a `@LoadFrom` seeded it from one the retired version folded positions
+            // Two ways a variable's value already summarizes the positions below where the
+            // store resumes, which `store_continues` also reads: it carries its own value,
+            // or a `@LoadFrom` seeded it from one the retired version folded positions
             // into. Only a variable with neither begins empty, so only those can be
             // missing a prefix — counting a loaded one as fresh reported a position that
             // was never lost, and taking it as proof the store restarts hid one that was.
@@ -3591,28 +3611,7 @@ fn build_commit_store(
     // Per scalar key, the stream giving its seed, the value it holds before any commit (a
     // literal init is a constant; a computed init streams to its value).
     let mut seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
-    // Whether this store continues a recurrence the retired version was running.
-    // A store whose seed summarizes positions has folded them already, so its
-    // drive resumes above them; one whose seed summarizes none needs its source
-    // from the beginning.
-    //
-    // Two ways a seed summarizes positions, and the identity of the variable is
-    // only the first. A variable that carries its own value is the ordinary
-    // reload. A variable seeded from a `@LoadFrom` is the other: its identity is
-    // new, so it carries nothing, while the value it starts at is one the retired
-    // version folded positions into. Asking only the identity would send such a
-    // store back over an input it has already counted.
-    //
-    // Answered for the store rather than for each key, because one store drives
-    // one position sequence: a key added beside one that resumes begins wherever
-    // that store resumes, and folding the two over different prefixes of one
-    // drive is not a thing the store can do.
-    let continues = paths
-        .iter()
-        .any(|path| ctx.offer.mutable_state.contains_key(path))
-        || keys
-            .iter()
-            .any(|k| ctx.load_from_derived.contains(&k.init.node_id()));
+    let continues = ctx.store_continues(keys, paths);
 
     // The store-wide per-commit value extent types a *proposal's* read and write set
     // cells (`proposal_stream_tiling`). One cell holds every key the writer touches, so
@@ -4921,28 +4920,7 @@ fn build_induction_store_single(
     let runtime_key = |n: &Name| store_key(&n.field_key());
     let domain = strip_refinements(domain);
 
-    // Whether this store continues a recurrence the retired version was running.
-    // A store whose seed summarizes positions has folded them already, so its
-    // drive resumes above them; one whose seed summarizes none needs its source
-    // from the beginning.
-    //
-    // Two ways a seed summarizes positions, and the identity of the variable is
-    // only the first. A variable that carries its own value is the ordinary
-    // reload. A variable seeded from a `@LoadFrom` is the other: its identity is
-    // new, so it carries nothing, while the value it starts at is one the retired
-    // version folded positions into. Asking only the identity would send such a
-    // store back over an input it has already counted.
-    //
-    // Answered for the store rather than for each key, because one store drives
-    // one position sequence: a key added beside one that resumes begins wherever
-    // that store resumes, and folding the two over different prefixes of one
-    // drive is not a thing the store can do.
-    let continues = paths
-        .iter()
-        .any(|path| ctx.offer.mutable_state.contains_key(path))
-        || keys
-            .iter()
-            .any(|k| ctx.load_from_derived.contains(&k.init.node_id()));
+    let continues = ctx.store_continues(keys, paths);
 
     // Each accumulator becomes a mutable variable key: its seed op (its value before any
     // position, read per pull until it settles) plus a dense-read entry carrying that
