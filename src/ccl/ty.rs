@@ -1515,7 +1515,7 @@ impl TraitRequirement {
     /// This requirement with `f` applied to each operand and associated type.
     pub fn map_types(&self, mut f: impl FnMut(&Type) -> Type) -> TraitRequirement {
         TraitRequirement {
-            trait_: self.trait_,
+            trait_: self.trait_.clone(),
             args: self.args.iter().map(&mut f).collect(),
             assoc: self.assoc.iter().map(|(n, t)| (*n, f(t))).collect(),
             at: self.at,
@@ -1523,8 +1523,8 @@ impl TraitRequirement {
     }
 
     /// The type this requirement associates with `name`, if it names one.
-    pub fn assoc_ty(&self, name: crate::ccl::infer::solver::traits::Assoc) -> Option<&Type> {
-        self.assoc.iter().find(|(n, _)| *n == name).map(|(_, t)| t)
+    pub fn assoc_ty(&self, name: &crate::ccl::infer::solver::traits::Assoc) -> Option<&Type> {
+        self.assoc.iter().find(|(n, _)| n == name).map(|(_, t)| t)
     }
 
     /// Whether an operand is one of the type parameters `params`.
@@ -3801,10 +3801,9 @@ pub type PredicateId = *const TypedExpr;
 /// it); nested refinements share it and shadow positionally.
 pub const REFINEMENT_BINDER: &str = "__elem";
 
-/// A predicate over an operator's result, as a function of the operand terms of
-/// one use. A trait instance's associated type may carry one, and depositing that
-/// type applies it to the operands the obligation recorded
-/// ([`TraitInstance`](crate::ccl::infer::solver::traits::TraitInstance)).
+/// A predicate over an operator's result, as a function of the operand terms of one use:
+/// `^+`'s, which its obligation applies to the operands it recorded when it deposits the
+/// result ([`OutputRefinement`](crate::ccl::infer::solver::traits::OutputRefinement)).
 pub type RefinementTemplate = fn(&[TypedExpr]) -> TypedExpr;
 
 /// A refinement predicate is a **boolean expression over

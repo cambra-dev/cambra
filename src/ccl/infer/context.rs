@@ -465,6 +465,89 @@ impl InferCtx {
         self.current_node_id = prev;
     }
 
+    /// [`Typing::require_trait`], with a variable back for each of the associated types
+    /// `assoc` names, in that order.
+    pub(super) fn require_trait_associating(
+        &mut self,
+        trait_: Trait,
+        operator_node_id: NodeId,
+        operand_types: &[&Type],
+        assoc: &[Assoc],
+        at: &dyn Fn() -> String,
+    ) -> Result<Vec<Type>, LocatedInferError> {
+        self.require_trait_obligation(trait_, operator_node_id, operand_types, assoc, None, at)
+            .map(|(settled, _)| settled)
+    }
+
+    /// [`require_trait_associating`](Self::require_trait_associating), with the refinement
+    /// the operator states of one associated type, if it states one, and returning the
+    /// obligation it placed.
+    pub(super) fn require_trait_obligation(
+        &mut self,
+        trait_: Trait,
+        operator_node_id: NodeId,
+        operand_types: &[&Type],
+        assoc: &[Assoc],
+        refinement: Option<(Assoc, crate::ccl::RefinementTemplate, &[&Expr])>,
+        at: &dyn Fn() -> String,
+    ) -> Result<(Vec<Type>, Rc<TraitObligation>), LocatedInferError> {
+        debug_assert_eq!(
+            operand_types.len(),
+            trait_.arity(),
+            "{trait_} is over {} type(s); an operator wired to it must supply that many",
+            trait_.arity(),
+        );
+        let positions: Vec<Type> = operand_types.iter().map(|_| self.fresh()).collect();
+        // Only a requested association gets a variable for the obligation to settle;
+        // a pure requirement determines nothing and mints none.
+        let wanted: Vec<(Assoc, Type)> = assoc.iter().map(|name| (*name, self.fresh())).collect();
+        // The recording covers the operand expressions an output refinement clones, and the
+        // nodes a deposit reached from here mints by building it, both at construction and
+        // from the `require_sub` narrowing below. So it names the node being typed, as the
+        // `Lit` rule's singleton recording does: a mint has nowhere to attach in a recording
+        // that names nothing.
+        let _f = crate::ccl::provenance::enter(
+            self.current_node_id,
+            "infer.require_trait",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        let obligation = TraitObligation::new(
+            trait_,
+            wanted.clone(),
+            operator_node_id,
+            self.demand_at.unwrap_or(Origin::Node(operator_node_id)),
+        );
+        if let Some((assoc, template, operands)) = refinement {
+            obligation.refine_output(crate::ccl::infer::solver::traits::OutputRefinement {
+                assoc,
+                template,
+                operands: operands.iter().map(|e| (*e).clone()).collect(),
+            });
+        }
+        obligation.assume(&self.assumptions);
+        for (i, position) in positions.iter().enumerate() {
+            obligation.watch(position, i as u8);
+        }
+        // A trait whose instances already agree settles here, before any
+        // operand is known — the ordinary "all candidates agree" rule reaching its
+        // condition immediately, not a special case.
+        self.cache.at(self.here(), self.demand_at.or(self.here()));
+        let deposited = obligation.try_deposit(&mut self.cache);
+        self.cache.report_recorded(|| EdgeReport::Labeled(at()));
+        if let Err(e) = deposited {
+            let failure = self.cache.take_failure();
+            return Err(self
+                .raise(map_constrain_err(e, &at()))
+                .with_failure(failure));
+        }
+        // Operands flow in as ordinary lower bounds, refinements and all. The
+        // narrowing hook peels them where the base actually arrives.
+        for (operand, position) in operand_types.iter().zip(&positions) {
+            self.require_sub(operand, position, at)?;
+        }
+        Ok((wanted.into_iter().map(|(_, ty)| ty).collect(), obligation))
+    }
+
     /// Normalize a user annotation / source type into a solver-ready
     /// `Type`: every `Hole` becomes a fresh inference variable and every
     /// `BarrierVar` a fresh barrier variable, both at the current level. Everything
@@ -895,62 +978,37 @@ impl Typing for InferCtx {
         trait_: Trait,
         operator_node_id: NodeId,
         operand_types: &[&Type],
-        operand_exprs: &[&Expr],
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError> {
-        debug_assert_eq!(
-            operand_types.len(),
-            trait_.arity(),
-            "{trait_} is over {} type(s); an operator wired to it must supply that many",
-            trait_.arity(),
-        );
-        let positions: Vec<Type> = operand_types.iter().map(|_| self.fresh()).collect();
-        // Only a requested association gets a variable for the obligation to settle;
-        // a pure requirement determines nothing and mints none.
-        let wanted = assoc.map(|name| (name, self.fresh()));
-        // The recording covers two things this rule produces: the operand
-        // expressions cloned into the obligation, and the nodes a deposit reached
-        // from here mints — an instance whose association carries a
-        // `RefinementTemplate` builds its predicate out of those operands
-        // (`Refinement::born_from_template`), and a deposit fires both at
-        // construction and from the `require_sub` narrowing below. So it names the
-        // node being typed, as the `Lit` rule's singleton recording does: a mint has
-        // nowhere to attach in a recording that names nothing.
-        let _f = crate::ccl::provenance::enter(
-            self.current_node_id,
-            "infer.require_trait",
-            crate::ccl::provenance::Nature::Machinery,
-        );
-        let obligation = TraitObligation::new(
+        let wanted: Vec<Assoc> = assoc.into_iter().collect();
+        let settled =
+            self.require_trait_associating(trait_, operator_node_id, operand_types, &wanted, at)?;
+        Ok(settled.into_iter().next())
+    }
+
+    fn require_trait_refined(
+        &mut self,
+        trait_: Trait,
+        operator_node_id: NodeId,
+        operand_types: &[&Type],
+        operand_exprs: &[&Expr],
+        assoc: Assoc,
+        refinement: crate::ccl::RefinementTemplate,
+        at: &dyn Fn() -> String,
+    ) -> Result<Type, LocatedInferError> {
+        let (settled, _) = self.require_trait_obligation(
             trait_,
-            wanted.clone().into_iter().collect(),
             operator_node_id,
-            operand_exprs.iter().map(|e| (*e).clone()).collect(),
-            self.demand_at.unwrap_or(Origin::Node(operator_node_id)),
-        );
-        obligation.assume(&self.assumptions);
-        for (i, position) in positions.iter().enumerate() {
-            obligation.watch(position, i as u8);
-        }
-        // A trait whose instances already agree settles here, before any
-        // operand is known — the ordinary "all candidates agree" rule reaching its
-        // condition immediately, not a special case.
-        self.cache.at(self.here(), self.demand_at.or(self.here()));
-        let deposited = obligation.try_deposit(&mut self.cache);
-        self.cache.report_recorded(|| EdgeReport::Labeled(at()));
-        if let Err(e) = deposited {
-            let failure = self.cache.take_failure();
-            return Err(self
-                .raise(map_constrain_err(e, &at()))
-                .with_failure(failure));
-        }
-        // Operands flow in as ordinary lower bounds, refinements and all. The
-        // narrowing hook peels them where the base actually arrives.
-        for (operand, position) in operand_types.iter().zip(&positions) {
-            self.require_sub(operand, position, at)?;
-        }
-        Ok(wanted.map(|(_, ty)| ty))
+            operand_types,
+            std::slice::from_ref(&assoc),
+            Some((assoc, refinement, operand_exprs)),
+            at,
+        )?;
+        Ok(settled
+            .into_iter()
+            .next()
+            .expect("an operator asking for an association gets its position back"))
     }
 
     fn type_annotation_predicates(&mut self, ty: &mut Type) -> Result<(), LocatedInferError> {

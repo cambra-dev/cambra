@@ -588,18 +588,20 @@ pub(crate) fn run(
     // node, and a generalized definition's variables are still reachable, which after
     // coalesce they are not.
     {
-        use solver::traits::{OperandFailure, OperandRequirement};
+        use solver::traits::{InstanceHead, OperandFailure, OperandRequirement};
         /// Render a solver-side requirement for display: bases become types, and the
         /// trait becomes its name, so no message borrows the solver's vocabulary.
         fn stated(r: OperandRequirement) -> StatedRequirement {
             StatedRequirement {
                 trait_: r.trait_.to_string(),
                 position: r.position,
-                accepted: r.accepted.into_iter().map(Type::Base).collect(),
+                accepted: r.accepted.iter().map(InstanceHead::as_type).collect(),
                 siblings: r
                     .siblings
                     .into_iter()
-                    .map(|(pos, accepted)| (pos, accepted.into_iter().map(Type::Base).collect()))
+                    .map(|(pos, accepted)| {
+                        (pos, accepted.iter().map(InstanceHead::as_type).collect())
+                    })
                     .collect(),
             }
         }
