@@ -121,8 +121,132 @@ pub fn zip_arms_named_at(
     if inputs.iter().all(|(_, op)| op.tiling().is_scalar()) {
         return Box::new(MakeRecord::new_named(inputs));
     }
+    // A lone arm over a collection has nothing to pair with, so its values are wrapped in place.
+    let inputs = match <[_; 1]>::try_from(inputs) {
+        Ok([(name, input)]) => return Box::new(RecordWrap::new_at(name, input, level)),
+        Err(inputs) => inputs,
+    };
     let (names, ops) = inputs.into_iter().unzip();
     Box::new(Zip::new_at(names, ops, level))
+}
+
+/// The values at `level` of its input, wrapped in a one-field record, under the levels
+/// standing above it: [`Zip`] with one arm.
+///
+/// A zip pairs its arms by key. One arm is paired with nothing, so the keys pass through and
+/// only the values change. Rows the input marks deleted pass through as they are, as they do
+/// through [`VariantWrap`].
+///
+/// An input that is a bare value, with no collection above `level`, is a [`MakeRecord`]'s to
+/// wrap, which [`zip_arms_named_at`] checks first.
+pub struct RecordWrap {
+    /// Output tiling: the standing levels, with a one-field `Record` where the values sat.
+    base: OperatorBase,
+    name: SmolStr,
+    input: Box<dyn TileOperator>,
+    /// The level the record sits at — the values every standing level is over.
+    level: CurryLevel,
+}
+
+impl RecordWrap {
+    /// Wrap the values `input` holds at `level` as the field `name`.
+    pub fn new_at(name: SmolStr, input: Box<dyn TileOperator>, level: CurryLevel) -> Self {
+        assert!(
+            level != CurryLevel::OUTERMOST,
+            "RecordWrap wraps the values of a collection, beneath at least one standing level"
+        );
+        let record = Tiling::Record(
+            [(name.clone(), input.tiling().values_at(level).clone())]
+                .into_iter()
+                .collect(),
+        );
+        let tiling = with_values_at(input.tiling(), level, record);
+        Self {
+            base: OperatorBase::new(tiling),
+            name,
+            input,
+            level,
+        }
+    }
+}
+
+impl TileOperator for RecordWrap {
+    impl_operator_base!();
+
+    fn inspect_annotation(&self) -> Option<String> {
+        Some(format!("field {}", self.name))
+    }
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let input =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        Box::new(RecordWrapProducer {
+            base: ProducerBase::new(
+                RecordWrapProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
+            name: self.name.clone(),
+            level: self.level,
+            input,
+        })
+    }
+}
+
+struct RecordWrapProducer {
+    base: ProducerBase,
+    name: SmolStr,
+    level: CurryLevel,
+    input: Box<dyn TileProducer>,
+}
+
+impl TileProducer for RecordWrapProducer {
+    impl_producer_base!();
+
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let mut tile = self.input.get(self.input.tiling().universal_guard());
+        assert!(
+            tile.is_data_function(),
+            "RecordWrap: the input must be a function tile, got {tile:?}"
+        );
+        let values = tile.values_at(self.level).clone();
+        *tile.values_at_mut(self.level) = Tile::Record {
+            fields: [(self.name.clone(), values)].into_iter().collect(),
+            absent: HashMap::new(),
+        };
+        tile
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let guard = match &obsolete_guard {
+            g if g.is_universal() => self.input.tiling().universal_guard(),
+            g if g.is_empty() => self.input.tiling().empty_guard(),
+            // The standing levels name the same keys of the input; at `level` the input is the
+            // one field of the record and takes that field's part.
+            g => crate::interpreter::tiling::onto_record_field(
+                g.clone(),
+                self.level.index(),
+                &self.name,
+                self.input.tiling(),
+            ),
+        };
+        self.input.release(guard);
+    }
 }
 
 impl TileOperator for Zip {
@@ -911,6 +1035,90 @@ mod tests {
     };
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
     use bit_set::BitSet;
+    use std::cell::RefCell;
+
+    fn record_wrap_over(
+        input_tile: Tile,
+        input_tiling: Tiling,
+        name: &str,
+    ) -> (RecordWrapProducer, Rc<RefCell<Vec<TileGuard>>>) {
+        let (spy, log) = ReleaseSpy::new(input_tile, input_tiling.clone());
+        let level = CurryLevel::new(1);
+        let record = Tiling::Record(
+            [(SmolStr::new(name), input_tiling.values_at(level).clone())]
+                .into_iter()
+                .collect(),
+        );
+        let out_tiling = with_values_at(&input_tiling, level, record);
+        let producer = RecordWrapProducer {
+            base: ProducerBase::unowned(RecordWrapProducer::alloc_id(), &out_tiling),
+            name: SmolStr::new(name),
+            level,
+            input: Box::new(spy),
+        };
+        (producer, log)
+    }
+
+    fn keyed_ints() -> (Tile, Tiling) {
+        let int = Extent::Base(BaseType::Int);
+        let tiling = Tiling::data_function(Extent::Base(BaseType::UInt), Tiling::Scalar(int));
+        let tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::from_ints(vec![10, 20]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        (tile, tiling)
+    }
+
+    /// The keys of the input pass through and its values become the one field of a record.
+    #[test]
+    fn record_wrap_keeps_the_keys_and_wraps_the_values() {
+        let (tile, tiling) = keyed_ints();
+        let (mut producer, _) = record_wrap_over(tile, tiling, "f");
+        let wrapped = producer.get(producer.tiling().universal_guard());
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &wrapped
+        else {
+            panic!("a wrapped function is a function, got {wrapped:?}");
+        };
+        assert_eq!(domain.len(), 2, "the keys pass through");
+        let Tile::Record { fields, .. } = codomain.as_ref() else {
+            panic!("the values are a record, got {codomain:?}");
+        };
+        assert_eq!(fields.len(), 1);
+        let Some(Tile::Scalar(values)) = fields.get(&SmolStr::new("f")) else {
+            panic!("the one field holds the input's values, got {fields:?}");
+        };
+        assert_eq!(values.len(), 2);
+    }
+
+    /// The universal release of the record reaches the input whole.
+    #[test]
+    fn record_wrap_forwards_a_release_to_its_input() {
+        let (tile, tiling) = keyed_ints();
+        let (mut producer, log) = record_wrap_over(tile, tiling, "f");
+        producer.release(producer.tiling().universal_guard());
+        assert!(
+            log.borrow().iter().any(|g| g.is_universal()),
+            "the universal release reaches the input, saw {:?}",
+            log.borrow()
+        );
+    }
+
+    /// An empty release names nothing, so no universal release reaches the input.
+    #[test]
+    fn record_wrap_does_not_forward_an_empty_release_whole() {
+        let (tile, tiling) = keyed_ints();
+        let (mut producer, log) = record_wrap_over(tile, tiling, "f");
+        producer.release(producer.tiling().empty_guard());
+        assert!(
+            log.borrow().iter().all(|g| !g.is_universal()),
+            "an empty release is not the input's universal one, saw {:?}",
+            log.borrow()
+        );
+    }
 
     /// A universal guard names every field, so every operand is released. Swallowing it
     /// strands every producer beneath a record field, and because [`FanOut`] forwards the
@@ -1415,7 +1623,7 @@ mod tests {
         // value there is whole once delivered, so it is released at its row — for that arm,
         // its key 0 — and the collection arm is released the inner key it delivered beneath
         // key 0.
-        let covers = |log: &Rc<std::cell::RefCell<Vec<TileGuard>>>, path: &[Value]| {
+        let covers = |log: &Rc<RefCell<Vec<TileGuard>>>, path: &[Value]| {
             log.borrow()
                 .iter()
                 .any(|g| TileGuard::flatten_or(vec![g.clone()]).covers_path(path))
