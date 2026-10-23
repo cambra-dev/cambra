@@ -305,8 +305,9 @@ Steps 6 and 7, runs inside this guard:
 Any difference voids the review: discard the attempt, whatever the verdict, and log it as
 `discarded: reviewer edited the workspace`.
 
-Either reviewer may try a new test in a temporary commit on top of `@`, and abandons it and
-returns `@` to where it was before it reports (`prompts/temporary-test-commit.md`). Done that way, the commit ids
+Either reviewer may try a new test in two temporary commits, one on top of `@` and one on the
+change's parent, and abandons both and returns `@` to where it was before it reports ("Trying a
+test in a temporary commit" in the `staff-rust-review` skill). Done that way, the commit ids
 match and the guard passes. A temporary commit left behind voids the review like any other edit.
 
 ## Step 5 — Implementer
