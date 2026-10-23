@@ -23,8 +23,8 @@ use crate::ccl::infer_var::Origin;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, KindPin, TypeKind};
 use crate::ccl::{
-    BarrierUpper, BarrierVar, Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement,
-    RefinementSet, Type,
+    BarrierUpper, BarrierVar, BarrierVarId, Bound, HistoryKind, InferVar, InferVarId, Level, Name,
+    Refinement, RefinementSet, Type,
 };
 
 use super::barrier::EdgeReport;
@@ -410,7 +410,21 @@ impl ConstrainCache {
 /// Each polarity gets its own extruded copy so positive and negative
 /// occurrences of the same variable can be approximated independently
 /// (see Parreaux 2020 §3.4).
-pub type ExtrudeCache = HashMap<(InferVarId, bool), Rc<InferVar>>;
+#[derive(Debug, Default)]
+pub struct ExtrudeCache {
+    /// Original inference variable → its proxy at the target level.
+    pub vars: HashMap<(InferVarId, bool), Rc<InferVar>>,
+    /// Original barrier variable → its copy at the target level. Registered before the
+    /// copy's bounds are extruded, so a bound reaching the original again resolves to
+    /// the copy.
+    pub barrier_vars: HashMap<(BarrierVarId, bool), Rc<BarrierVar>>,
+}
+
+impl ExtrudeCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// The empty scope that also suppresses the deficit rule's semantic fallback, so a
 /// refinement deficit under it is decided structurally.
@@ -2057,10 +2071,22 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         // `B' <: ?v <: B` at a negative one. Each edge is recorded on the barrier
         // variable, not on `?v`: a barrier variable's level is its bounds' maximum, so
         // `?v` at the target level leaves `B'` there, and `?v` cannot hold `B` as a bound
-        // without sitting above the target level. A bound reaching `B` after the
-        // extrusion then reaches `B'` through the barrier checks: `B`'s resolution is
-        // checked against `?v`, which closes against `?v <: B'`.
+        // without sitting above the target level, so `?v` has no bounds of its own. A
+        // bound reaching `B` after a positive extrusion then reaches `B'` through the
+        // barrier checks: `B`'s resolution is checked against `?v`, which records it as a
+        // lower bound of `?v`, and compacting `B'` reads the lower bounds of `?v`, one of
+        // its own lowers. A negative extrusion mirrors it with `B` and `B'` exchanged.
         Type::BarrierVar(barrier) => {
+            if let Some(existing) = cache.barrier_vars.get(&(barrier.uid, pol)) {
+                return Type::BarrierVar(Rc::clone(existing));
+            }
+            // Registered before the bounds are extruded, as `freshen_above` registers
+            // its copy: a bound reaching `B` through structure resolves to `B'` instead
+            // of extruding `B` again.
+            let fresh = BarrierVar::fresh(Rc::clone(&barrier.opaque), Vec::new(), Vec::new());
+            cache
+                .barrier_vars
+                .insert((barrier.uid, pol), Rc::clone(&fresh));
             // Snapshot bounds before recursing, as the `Infer` arm does.
             let lows = barrier.lowers.borrow().clone();
             let ups = barrier.uppers.borrow().clone();
@@ -2078,7 +2104,8 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                     report: u.report.clone(),
                 })
                 .collect();
-            let fresh = BarrierVar::fresh(Rc::clone(&barrier.opaque), new_lows, new_ups);
+            *fresh.lowers.borrow_mut() = new_lows;
+            *fresh.uppers.borrow_mut() = new_ups;
             // The bounds above are direct writes, so the copy carries the original's
             // watches, as `copy_watches` gives a proxy its original's.
             fresh
@@ -2195,7 +2222,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             *history_kind,
         ),
         Type::Infer(tv) => {
-            if let Some(existing) = cache.get(&(tv.uid, pol)) {
+            if let Some(existing) = cache.vars.get(&(tv.uid, pol)) {
                 return Type::Infer(Rc::clone(existing));
             }
             // Conservative approximation: a fresh variable at the target
@@ -2203,7 +2230,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             // proxies the original, so it inherits the original's telescope —
             // the bounds copied below close against the same scope.
             let nvs = InferVar::fresh_in(target_level, &tv.telescope);
-            cache.insert((tv.uid, pol), Rc::clone(&nvs));
+            cache.vars.insert((tv.uid, pol), Rc::clone(&nvs));
             copy_watches(tv, &nvs);
             // Kinding constraints ride along at **both** polarities, unlike the bounds
             // below. The proxy stands in for the original wherever the outer scope reads
@@ -2357,8 +2384,8 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             //    level boundary. Instead,
             //    reuse the proxy (it is the same original variable) but add the
             //    link the polar extrusion omitted, upgrading it to two-way.
-            let cached_pos = cache.get(&(tv.uid, true)).cloned();
-            let cached_neg = cache.get(&(tv.uid, false)).cloned();
+            let cached_pos = cache.vars.get(&(tv.uid, true)).cloned();
+            let cached_neg = cache.vars.get(&(tv.uid, false)).cloned();
             if let (Some(p), Some(n)) = (&cached_pos, &cached_neg)
                 && Rc::ptr_eq(p, n)
             {
@@ -2378,8 +2405,8 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             // proxy has neither.
             let has_pos_link = cached_pos.as_ref().is_some_and(|p| Rc::ptr_eq(p, &nvs));
             let has_neg_link = cached_neg.as_ref().is_some_and(|n| Rc::ptr_eq(n, &nvs));
-            cache.insert((tv.uid, true), Rc::clone(&nvs));
-            cache.insert((tv.uid, false), Rc::clone(&nvs));
+            cache.vars.insert((tv.uid, true), Rc::clone(&nvs));
+            cache.vars.insert((tv.uid, false), Rc::clone(&nvs));
             copy_watches(tv, &nvs);
 
             // Snapshot the original's bounds, excluding any edge that already
@@ -2586,6 +2613,35 @@ mod tests {
                 proxy.bounds.borrow().type_kinds,
                 vec![TypeKind::UIntRanges],
                 "pol={pol}: the proxy must inhabit the same kind"
+            );
+        }
+    }
+
+    /// A barrier variable `𝐵` whose lower bound `?a ⇒ 𝐵` reaches `𝐵` through structure,
+    /// with `?a` above the target level so the level short-circuit does not return the
+    /// bound unchanged. Extrusion terminates, and the copy's lower bound reaches the copy:
+    /// both references to `𝐵` become one copy `𝐵'`.
+    #[test]
+    fn extruding_a_barrier_reaching_itself_through_its_lower_reuses_the_copy() {
+        for pol in [true, false] {
+            let barrier = BarrierVar::fresh(Rc::from([]), Vec::new(), Vec::new());
+            let b = Type::BarrierVar(Rc::clone(&barrier));
+            barrier.lowers.borrow_mut().push(Bound::conc(Type::fun(
+                Type::Infer(InferVar::fresh(1)),
+                b.clone(),
+            )));
+            let out = extrude(&b, pol, 0, &mut ExtrudeCache::new());
+            let Type::BarrierVar(copy) = out else {
+                panic!("extruding a barrier variable yields one, got {out:?}");
+            };
+            assert_ne!(copy.uid, barrier.uid, "pol={pol}: the extrusion copies");
+            let lowers = copy.lowers.borrow();
+            let Some(Type::Fun { codomain, .. }) = lowers.first().map(|b| &b.ty) else {
+                panic!("pol={pol}: the copy keeps the function lower, got {lowers:?}");
+            };
+            assert!(
+                matches!(&**codomain, Type::BarrierVar(c) if c.uid == copy.uid),
+                "pol={pol}: the copy's lower reaches the copy, got {codomain:?}"
             );
         }
     }
