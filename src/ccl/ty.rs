@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use smol_str::SmolStr;
 
 use crate::ccl::{
-    BaseType, InferVar, Label, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils, symbolic,
+    BarrierVar, BaseType, InferVar, Label, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils,
+    symbolic,
 };
 
 /// The introduction level riding a [`Type::ChanDom`] — deliberately
@@ -1166,6 +1167,10 @@ pub enum Type {
     ///
     /// See `src/ccl/design/type-inference.md`, "Annotation kinds: exact and bounded".
     BoundedHole(Box<Type>),
+    /// Unresolved type that needs to hide opaque variables from the
+    /// outer scope, identified by a unique [`crate::ccl::BarrierVarId`].
+    /// Gathers its lower bounds.
+    BarrierVar(Rc<BarrierVar>),
     /// Unresolved type variable, identified by a unique [`crate::ccl::InferVarId`].
     ///
     /// Created during inference by the inference pass
@@ -1902,7 +1907,11 @@ impl TypeKind {
             // cannot read, and it abstains there.
             TypeKind::UIntRanges => !matches!(
                 ty,
-                Type::UIntRange(_) | Type::Infer(_) | Type::Hole | Type::SharedHole(_)
+                Type::UIntRange(_)
+                    | Type::Infer(_)
+                    | Type::Hole
+                    | Type::SharedHole(_)
+                    | Type::BarrierVar(_)
             ),
             // **Membership here is subtyping**, which belongs to the solver: constraint time
             // draws the edge (`super::infer::solver::constrain`, `constrain_type_kinds`)
@@ -2289,6 +2298,10 @@ fn fmt_type(
         // `n == 0` means an empty range (e.g. the domain of `[]`); render
         // it as `∅` instead of computing `n - 1` and underflowing.
         Type::BoundedHole(t) => write!(f, "<:{}", at(t, binders)),
+        // The mirror of `BoundedHole`'s `<:𝑇`. Rendered by identity like
+        // `Infer`'s `?N`, never by reading `lowers`, which may be cyclic or
+        // mutably borrowed.
+        Type::BarrierVar(var) => write!(f, ":>{}", var.uid),
         Type::UIntRange(0) => write!(f, "∅"),
         Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
         // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
@@ -3486,6 +3499,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
+            | Type::BarrierVar(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -3528,6 +3542,7 @@ impl Type {
                 | Type::Hole
                 | Type::SharedHole(_)
                 | Type::BoundedHole(_)
+                | Type::BarrierVar(_)
                 | Type::Refinement(..)
         ) || self.any_child(Type::holds_an_unresolved_position)
     }
@@ -3573,6 +3588,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
+            | Type::BarrierVar(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -3644,6 +3660,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::SharedHole(_)
+            | Type::BarrierVar(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)

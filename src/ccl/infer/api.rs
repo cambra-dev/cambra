@@ -90,6 +90,14 @@ impl Drop for InferArena {
             // lists make, and severed the same way.
             var.watches.borrow_mut().clear();
         }
+        // A barrier variable's bounds, watches and check memo hold types that can reach
+        // it again, through an inference variable or directly.
+        for barrier in crate::ccl::barrier_arena_exit() {
+            barrier.lowers.borrow_mut().clear();
+            barrier.uppers.borrow_mut().clear();
+            barrier.watches.borrow_mut().clear();
+            barrier.checked.borrow_mut().take();
+        }
     }
 }
 
@@ -543,6 +551,17 @@ pub enum InferError {
         /// predicates.
         unbound: Vec<String>,
     },
+    /// A function's result type, read outside the function body, constrains a parameter
+    /// with a refinement naming an opaque variable the body binds. Dropping the refinement
+    /// would accept arguments the function does not, and keeping it names a variable outside
+    /// its scope, so the result type needs an annotation that names no such variable.
+    OpaqueEscape {
+        /// The opaque variables the refinement names. Each binding's name is unique, so
+        /// these identify the function body.
+        names: Vec<Name>,
+        /// The function's result type, as read inside its body.
+        ty: Box<Type>,
+    },
     /// An incompatible-bounds conflict from coalescing.
     /// The solver rejects unions/intersections of distinct concrete types.
     IncompatibleBounds {
@@ -704,6 +723,7 @@ impl InferError {
             }
             InferError::MutInCompositeType { ty, .. } => each(ty),
             InferError::ScopeViolation { ty, .. } => each(ty),
+            InferError::OpaqueEscape { ty, .. } => each(ty),
             InferError::UnresolvedMethod { receiver, .. } => receiver.iter_mut().for_each(each),
             // No type to render: these carry a name, an id, or a rendered label.
             InferError::UnboundVariable(_)
@@ -1271,6 +1291,19 @@ impl std::fmt::Debug for InferError {
             InferError::UnresolvedPartial { kind, at } => {
                 write!(f, "Unresolved partial {kind} in expression: {at}")
             }
+            InferError::OpaqueEscape { names, ty } => {
+                let names = names
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "this function's result type {ty} refines a parameter by {names}, which \
+                     the function body binds opaquely; annotate the function's result type \
+                     with a type that does not name {names}"
+                )
+            }
             InferError::ScopeViolation { at, ty, unbound } => {
                 write!(
                     f,
@@ -1787,9 +1820,13 @@ fn collect_type_errors(
         // A `SharedHole` is a `Hole` with an identity, and just as transient:
         // `normalize_annotation` resolves both. A survivor means the annotation
         // never reached normalization, which is the same compiler bug either way.
-        Type::Hole | Type::SharedHole(_) => errors.push(InferError::UnresolvedHole {
-            at: context_sym.to_string(),
-        }),
+        //
+        // BarrierVar is handled the same way.
+        Type::Hole | Type::BarrierVar(_) | Type::SharedHole(_) => {
+            errors.push(InferError::UnresolvedHole {
+                at: context_sym.to_string(),
+            })
+        }
         // A bounded annotation inference never normalized. Reported at every
         // strictness, exactly like `Hole`: both are lowering markers whose whole
         // contract is that inference consumes them.

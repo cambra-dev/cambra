@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry};
 use std::fmt;
 use std::rc::Rc;
 
+use crate::ccl::infer_var::BarrierVarId;
+use crate::ccl::nominal::Variance;
 use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
 
@@ -187,6 +189,55 @@ impl KeyView {
         }
     }
 
+    /// Drop the refinements at the covariant positions of this view, read at a position of
+    /// variance `position`: what a barrier variable's resolution drops
+    /// (`CompactType::resolve_barrier_refinements` in `src/ccl/infer/solver/compact.rs`). A
+    /// refinement at a contravariant or an invariant position is kept. The children's
+    /// variances follow `key_go`'s polarities, with a history's children and an invariant
+    /// nominal argument invariant.
+    fn drop_covariant_refinements(&mut self, position: Variance) {
+        debug_assert!(
+            position != Variance::Bipolar,
+            "a barrier resolution reads each side of a bipolar argument at its own variance"
+        );
+        if position == Variance::Covariant {
+            self.refinements.clear();
+        }
+        let at = |inner: Variance| position.compose(inner);
+        for v in self.rec.values_mut().chain(self.var.values_mut()) {
+            v.drop_covariant_refinements(at(Variance::Covariant));
+        }
+        for (domain, codomain) in self.fun.values_mut() {
+            domain.drop_covariant_refinements(at(Variance::Contravariant));
+            codomain.drop_covariant_refinements(at(Variance::Covariant));
+        }
+        for (value, domain) in self.history.values_mut() {
+            value.drop_covariant_refinements(at(Variance::Invariant));
+            domain.drop_covariant_refinements(at(Variance::Invariant));
+        }
+        for (decl, args) in &mut self.nominal {
+            let mut args = args.iter_mut();
+            for v in &decl.body().variances {
+                if *v == Variance::Bipolar {
+                    args.next()
+                        .into_iter()
+                        .for_each(|a| a.drop_covariant_refinements(at(Variance::Contravariant)));
+                    args.next()
+                        .into_iter()
+                        .for_each(|a| a.drop_covariant_refinements(at(Variance::Covariant)));
+                } else {
+                    args.next()
+                        .into_iter()
+                        .for_each(|a| a.drop_covariant_refinements(at(*v)));
+                }
+            }
+            debug_assert!(
+                args.next().is_none(),
+                "a nominal view carries one argument per variance, two per bipolar one"
+            );
+        }
+    }
+
     /// The marker a **witness reference** contributes: that the position is a binder, with
     /// no say in which. Its own slot rather than an atom, because there is no anonymous
     /// binder to build an atom from — anonymity is the absence of one.
@@ -303,6 +354,11 @@ struct KeyCtx {
     /// the key — the invariant stated on `visiting`.
     #[cfg(debug_assertions)]
     visiting_scopes: HashMap<(InferVarId, bool), Vec<Option<Name>>>,
+    /// Barrier variables whose lower bounds are currently being walked, the guard
+    /// `compact_go`'s `BarrierVar` arm runs on the same key: a barrier's lowers are read
+    /// at positive polarity whatever the reference's. A lower reaching its own barrier
+    /// again is a recursive type, so the cut it makes is a truncation as `visiting`'s is.
+    visiting_barriers: HashSet<BarrierVarId>,
     /// Completed keys per `(variable, polarity, enclosing binders)`, for
     /// variables reached under the identity substitution.
     ///
@@ -336,6 +392,7 @@ pub fn spec_key(ty: &Type) -> SpecKey {
         visiting: HashSet::new(),
         #[cfg(debug_assertions)]
         visiting_scopes: HashMap::new(),
+        visiting_barriers: HashSet::new(),
         memo: HashMap::new(),
         truncations: 0,
         scope: RefinementScope::default(),
@@ -386,6 +443,26 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // lowering-time linkage and not part of the type, so there is nothing here to
         // key on either.
         Type::Hole | Type::SharedHole(_) => KeyView::default(),
+        // A barrier variable keys as its resolution, the `BarrierVar` arm of `compact_go`:
+        // its lower bounds, each read at positive polarity whatever the reference's, with
+        // the refinements at their covariant positions dropped. It stands in a use's
+        // instantiation wherever an opaque-binding function's type does, so two uses whose
+        // barrier variables resolve differently clone differently.
+        Type::BarrierVar(barrier) => {
+            if !ctx.visiting_barriers.insert(barrier.uid) {
+                ctx.truncations += 1;
+                return KeyView::default();
+            }
+            let lowers = barrier.lowers.borrow().clone();
+            let mut acc = KeyView::default();
+            for b in &lowers {
+                let inner_acc = Subst::then(&b.render_subst(), subst_acc);
+                acc.union(key_go(&b.ty, true, &inner_acc, ctx));
+            }
+            ctx.visiting_barriers.remove(&barrier.uid);
+            acc.drop_covariant_refinements(Variance::Covariant);
+            acc
+        }
         // A witness reference contributes an **anonymous** marker: enough to tell a position
         // that is a witness from one that is an ordinary domain, and nothing more. Which
         // binder it is cannot count — a binder is fresh per instantiation, so keying on it
@@ -518,7 +595,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Nominal(decl, args) => {
             let mut sides = Vec::new();
             for (t, v) in args.iter().zip(&decl.body().variances) {
-                if *v == crate::ccl::nominal::Variance::Bipolar {
+                if *v == Variance::Bipolar {
                     let (input, output) = crate::ccl::nominal::sides(t);
                     sides.push(key_go(input, !pol, subst_acc, ctx));
                     sides.push(key_go(output, pol, subst_acc, ctx));
@@ -890,10 +967,22 @@ mod tests {
             visiting: HashSet::new(),
             #[cfg(debug_assertions)]
             visiting_scopes: HashMap::new(),
+            visiting_barriers: HashSet::new(),
             memo: HashMap::new(),
             truncations: 0,
             scope: RefinementScope::default(),
         }
+    }
+
+    /// A barrier variable whose lower bound `Int ⇒ 𝐵` reaches `𝐵` again keys without
+    /// recursing forever, as `compact_go` compacts it: the back-edge is cut.
+    #[test]
+    fn a_barrier_reaching_itself_through_its_lower_keys() {
+        let barrier = crate::ccl::BarrierVar::fresh(Rc::from([]), Vec::new(), Vec::new());
+        let b = Type::BarrierVar(Rc::clone(&barrier));
+        let lower = Type::fun(int(), b.clone());
+        constrain_subtype(&lower, &b, &mut ConstrainCache::new()).expect("the lower flows in");
+        let _ = spec_key(&b);
     }
 }
 

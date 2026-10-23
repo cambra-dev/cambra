@@ -1,12 +1,20 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use bit_set::BitSet;
 use indoc::indoc;
 use rstest::rstest;
 
-use super::helpers::{check_compile_error, check_scalar, check_tile};
+use super::helpers::{check_compile_error, check_scalar, check_tile, make_int_list};
 
-use cambra::interpreter::{ColumnValue, Predicate, Tile, Value};
+use cambra::ccl::infer::{TypeInferenceContext, infer, typecheck};
+use cambra::ccl::lower::{LoweringContext, lower_stmts};
+use cambra::ccl::{
+    ArithmeticKind, BinOpKind, Builtin, CompareKind, Expr, FunKind, Lit, LogicKind, Name,
+    Refinement, Type, anf, comprehension, mut_read, opaque_output, uniquify,
+};
+use cambra::chl_parser::{self, FileId};
+use cambra::interpreter::{BaseType, ColumnValue, Predicate, Tile, Value};
 
 #[test]
 fn refinement() {
@@ -56,7 +64,7 @@ itsa_five(\"dummy_arg\")
 }
 
 #[test]
-fn output_annotation_ref1() {
+fn output_annotation_singleton_matches_the_literal() {
     check_scalar(
         "
 def itsa_nine(a) => {Int where _ == 9}:
@@ -69,7 +77,7 @@ itsa_nine(\"dummy_arg\")
 }
 
 #[test]
-fn output_annotation_ref2() {
+fn output_annotation_singleton_rejects_another_literal() {
     check_compile_error(
         "
 def itsa_nine(a) => {Int where _ == 9}:
@@ -171,7 +179,7 @@ x
 // Once that is fixed, it should fail for the different reason that
 // the argument b is not >= 0.
 #[test]
-fn output_annotation_ref3() {
+fn output_annotation_naming_a_parameter_not_entailed() {
     check_compile_error(
         "
 def sum_up(a: Int, b: {Int where _ >= 0}) => {Int where _ >= a}:
@@ -241,7 +249,7 @@ def test(x: {{Int where _ != y + y} where _ != y}) => {Int where _ > y + x}:
 }
 
 #[test]
-fn type_refined_input_only1() {
+fn type_refined_input_only_true() {
     check_scalar(
         "
 def f(x: {Int where True}) => Int:
@@ -253,7 +261,7 @@ def f(x: {Int where True}) => Int:
 }
 
 #[test]
-fn type_refined_input_only2() {
+fn type_refined_input_only_self_comparison() {
     check_scalar(
         "
 def f(x: {Int where _ >= _}) => Int:
@@ -265,7 +273,7 @@ def f(x: {Int where _ >= _}) => Int:
 }
 
 #[test]
-fn type_refined_input_only3() {
+fn type_refined_input_only_self_equality_after_a_parameter() {
     check_scalar(
         "
 def f(y: Int, x: {Int where _ == _}):
@@ -277,7 +285,7 @@ def f(y: Int, x: {Int where _ == _}):
 }
 
 #[test]
-fn type_refined_input_only4() {
+fn type_refined_input_only_self_equality() {
     check_scalar(
         "
 def f(x: {Int where _ == _}):
@@ -789,7 +797,7 @@ m
 /// refinement are stale at that point. Bug was fixed by freshening
 /// the inputs before creating the refinement.
 #[test]
-fn freshen_refined_add_double_arg1() {
+fn freshen_refined_add_double_arg_and_global() {
     check_scalar(
         indoc! {r#"
 g = 10
@@ -802,7 +810,7 @@ f(1,2)
 }
 
 #[test]
-fn freshen_refined_add_double_arg2() {
+fn freshen_refined_add_double_arg() {
     check_scalar(
         indoc! {r#"
 def f(p,q):
@@ -873,12 +881,13 @@ a == b
 /// `f(2)` to be the same value, and so `r` is not present in the
 /// external output type inferred for `f`: the refinement naming it is
 /// dropped at the lambda boundary and `f` reports `Int`
-/// (`Typing::close_body_type`).
+/// (`src/ccl/design/type-inference.md`, "A lambda's codomain drops the body's
+/// opaque binders").
 ///
 /// `b`'s annotation then demands `{Int | __elem == a}` of a value known
 /// only to be an `Int`, which nothing establishes.
 #[test]
-fn dont_discharge_opaques_out_of_fun_bodies() {
+fn dont_discharge_opaques_out_of_fun_bodies_with_an_unannotated_codomain() {
     check_compile_error(
         indoc! {r#"
 def f(x: Int):
@@ -889,6 +898,181 @@ b: {Int where _ == a} = f(2)
 a == b
         "#},
         "Annotation mismatch: annotated as {Int where _ == a}, but inferred as Int",
+    )
+}
+
+/// A `_` output annotation leaves the codomain to inference, so it is not
+/// concrete and `f`'s result still passes through a barrier variable that drops
+/// the refinement naming `r`, as in
+/// `dont_discharge_opaques_out_of_fun_bodies_with_an_unannotated_codomain`.
+#[test]
+fn dont_discharge_opaques_out_of_fun_bodies_with_a_hole_codomain() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => _:
+    r ^= x;
+    r ^+ 0
+a = f(1)
+b: {Int where _ == a} = f(2)
+a == b
+        "#},
+        "Annotation mismatch: annotated as {Int where _ == a}, but inferred as Int",
+    )
+}
+
+#[test]
+fn dont_discharge_opaques_out_of_fun_bodies_with_an_unrefined_codomain() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => Int:
+    r ^= x;
+    r ^+ 0
+a = f(1)
+b: {Int where _ == a} = f(2)
+a == b
+        "#},
+        "Annotation mismatch: annotated as {Int where _ == a}, but inferred as Int",
+    )
+}
+
+#[test]
+fn dont_discharge_opaques_out_of_fun_bodies_rejects_an_argument_outside_the_refined_domain() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: {Int where _ == 2}) => {Int where _ == 2}:
+    r ^= x;
+    r ^+ 0
+a = f(1)
+b: {Int where _ == a} = f(2)
+a == b
+        "#},
+        "Type mismatch for Apply: expected Int@2, found Int@1",
+    )
+}
+
+/// TODO: this should be typecheckable, but `a`'s refinement isn't
+/// being used.
+#[test]
+fn dont_discharge_opaques_out_of_fun_bodies_with_a_singleton_codomain_named_by_an_annotation() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: {Int where _ == 2}) => {Int where _ == 2}:
+    r ^= x;
+    r ^+ 0
+a = f(2)
+b: {Int where _ == a} = f(2)
+a == b
+        "#},
+        "Type mismatch for monomorphization specialization: expected {Int | __elem == a}, found Int@2",
+    )
+}
+
+#[test]
+fn dont_discharge_opaques_out_of_fun_bodies_without_annotations_compares_at_runtime() {
+    check_scalar(
+        indoc! {r#"
+def f(x):
+    r ^= x;
+    r ^+ 0
+a = f(1)
+b = f(2)
+a == b
+        "#},
+        Value::Bool(false),
+    )
+}
+
+#[test]
+fn dont_discharge_opaques_out_of_fun_bodies_with_a_singleton_codomain_meets_a_literal_annotation() {
+    check_scalar(
+        indoc! {r#"
+def f(x: {Int where _ == 2}) => {Int where _ == 2}:
+    r ^= x;
+    r ^+ 0
+a = f(2)
+b: {Int where _ == 2} = f(2)
+a == b
+        "#},
+        Value::Bool(true),
+    )
+}
+
+/// An annotated `let` at the head of a body annotates only its definiens, so the
+/// opaque `r` bound after it is still dropped from `f`'s codomain and `f` reports
+/// `Int`.
+#[test]
+fn dont_discharge_opaques_out_of_fun_bodies_after_an_annotated_let() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int):
+    y: Int = x
+    r ^= y
+    r ^+ 0
+a = f(1)
+b: {Int where _ == a} = f(1)
+a == b
+        "#},
+        "Annotation mismatch: annotated as {Int where _ == a}, but inferred as Int",
+    )
+}
+
+/// `f`'s codomain barrier variable is minted under `g`'s generalized body and reaches
+/// the lower-level variable `h` inside `f`'s function type.
+#[test]
+fn barrier_var_returned_from_a_nested_def() {
+    check_scalar(
+        indoc! {r#"
+def g(z):
+    def f(x):
+        r ^= x
+        r ^+ z
+    f
+h = g(1)
+h(2)
+        "#},
+        Value::Int(3),
+    )
+}
+
+/// `barrier_var_returned_from_a_nested_def` with the nested `f` passed to `g`'s
+/// parameter rather than returned.
+#[test]
+fn barrier_var_passed_to_a_parameter() {
+    check_scalar(
+        indoc! {r#"
+def k(f):
+    f(1)
+def g(h):
+    def f(x):
+        r ^= x
+        r ^+ 0
+    h(f)
+g(k)
+        "#},
+        Value::Int(1),
+    )
+}
+
+/// `k`'s domain refinement names the opaque variable `r`, so `f`'s
+/// barrier var is refused, as in
+/// `return_opaque_annotated_function_from_unannotated_function`.
+#[test]
+fn complex_refined_program_post_inline_failure() {
+    check_compile_error(
+        indoc! {r#"
+def f(x):
+    r ^= x;
+    def k(y: {Int where _ == r}):
+        y
+    k
+g = f(1)
+def p(w: {Int where _ > 5}):
+    w
+def h(z):
+    g(z) + p(z)
+h(7)
+        "#},
+        "this function's result type ({Int | __elem == r} ⇒ Int) refines a parameter by `r`",
     )
 }
 
@@ -913,10 +1097,9 @@ a == b
     )
 }
 
-/// Reading a mutable variable introduces an opaque binder whose scope closes
-/// inside the body, so the codomain's opaque drop runs; the same refinement names
-/// the parameter, which the Pi binds. The codomain variable carrying the drop is
-/// minted under the parameter binder for that reason
+/// Reading a mutable variable introduces an opaque binder inside the body, so the
+/// body's type reaches the codomain through a barrier variable; the refinement it drops
+/// names the parameter as well as that binder
 /// (`src/ccl/design/type-inference.md`, "A lambda's codomain drops the body's
 /// opaque binders").
 #[test]
@@ -932,26 +1115,16 @@ g(1)
     )
 }
 
-/// TODO: Allow mutable reads to be read in the body of a
-/// comprehension.
-///
-/// The limitation surfaces as `lambda_elim`'s point-free reconstruction assert, which is
-/// `debug_assertions`-gated, so the program compiles under a profile that drops it.
-#[cfg(debug_assertions)]
+/// A comprehension element reading a mutable variable.
 #[test]
-fn reading_mut_in_comprehension_not_supported() {
-    check_compile_error(
+fn reading_mut_in_comprehension() {
+    check_tile(
         indoc! {r#"
 x := 3
 ys = [x ^+ i for i in [1,2]]
 ys
         "#},
-        "λ i : Int → let __read : Int@3 ^= x
-in __read ^+ i
-to
-let __read : (Int ⇒ Int@3) = x ▷ const
-in (((id, __read ▷ const) ▷ zip ≫ apply, id) ▷ zip, add_refined ▷ const) ▷ zip ≫ apply
-with (Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == x ▷ const ^+ i})",
+        make_int_list(&[4, 5]),
     )
 }
 
@@ -971,26 +1144,10 @@ z        "#},
     )
 }
 
-/// Type inference drops the refinement from the `ys` function, making
-/// its type `(Int => Int)`, because the refinement contains an opaque
-/// read of `x`. During lambda_elim, a debug assertion rebuilds a
-/// refined type for the codomain from the body (containing `x`, which
-/// is now immutable, and has had its opaque read erased).  The two
-/// types are not structurally equal, and so the assertion fails.
-///
-/// This is the assert `reading_mut_in_comprehension_not_supported`
-/// pins for the unfiltered case. A filter and a nested comprehension each
-/// reach it too, where before the comprehension phase they failed inference
-/// with `MutableInRefinedType`. A conditional element compiles: it stays a
-/// value `Case` in the element's lambda, with no refined cast to reconstruct
-/// (`a_conditional_element_reading_an_enclosing_binder` in
-/// `tests/it/compilation_pipeline/conditionals.rs`).
-///
-/// TODO: Fix by mirroring the opaque dropping logic in lambda_elim's
-/// type reconstruction, or by dropping non-data-fun-domain type
-/// refinements (and debug assertion logic that reconstructs them)
-/// after inference.
-#[cfg(debug_assertions)]
+/// A filter and a nested comprehension around an element that reads a mutable
+/// variable. The conditional-element case is
+/// `a_conditional_element_reading_an_enclosing_binder` in
+/// `tests/it/compilation_pipeline/conditionals.rs`.
 #[rstest]
 #[case::filtered(
     indoc! {r#"
@@ -998,7 +1155,12 @@ x := 3
 ys = [x ^+ i for i in [1,2,3] if i > 1]
 ys
     "#},
-    "(Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == x ▷ const ^+ i})"
+    Tile::data_function(
+        ColumnValue::UInts(vec![1, 2]),
+        Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 6]))),
+        Predicate::True,
+        BitSet::new(),
+    ),
 )]
 #[case::nested(
     indoc! {r#"
@@ -1006,13 +1168,20 @@ x := 3
 ys = [[x ^+ j for j in [1,2]] for i in [1,2] if i > 1]
 ys
     "#},
-    "(Int ⇒ Int) vs ((j: Int) ⇒ {Int | __elem == x ▷ const ^+ j})"
+    Tile::data_function(
+        ColumnValue::UInts(vec![1]),
+        Box::new(Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 5]))),
+            Predicate::False,
+            BitSet::new(),
+        )),
+        Predicate::True,
+        BitSet::new(),
+    ),
 )]
-fn a_comprehension_that_reads_a_mut_fails_lambda_elims_reconstruction(
-    #[case] code: &str,
-    #[case] needle: &str,
-) {
-    check_compile_error(code, needle)
+fn a_comprehension_that_reads_a_mut(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected)
 }
 
 /// A filter over a mutable source. The comprehension phase copies the source
@@ -1170,4 +1339,640 @@ fn a_use_meets_a_refined_domain_of_a_function_parameter() {
         "#},
         "post-inference produced an invalid tree: [Type mismatch for Apply: expected {Int | __elem > 0}, found Int]",
     );
+}
+
+/// An opaque `let`'s body type names an enclosing binder: the read of `x` types
+/// `y` as `{Int | __elem == __anf ^+ a}`, and meeting `z`'s annotation needs both
+/// `__anf`'s refinement and the parameter `a`'s. Coalescing decides it under the
+/// walk's lexical scope, which supplies `a`.
+///
+/// Currently passes inference but fails post-planning
+/// typecheck. Expect this to be fixed if post-inference refinements
+/// are erased.
+#[test]
+fn an_opaque_let_body_entailed_under_an_enclosing_binder() {
+    check_compile_error(
+        indoc! {r#"
+            def f(a: {Int where _ >= 0}):
+                x: Mut({Int where _ >= 0}) := 0
+                y = x ^+ a
+                z: {Int where _ >= 0} = y
+                z
+
+            f(1)
+        "#},
+        "post-planning produced an invalid tree",
+    )
+}
+
+/// Two reads of a refined mutable variable meet a refined annotation: `y` is the opaque
+/// `let __anf : {Int | __elem >= 0} ^= x in __anf ^+ __anf`, and its body type
+/// `{Int | __elem == __anf ^+ __anf}` entails `{Int | __elem >= 0}` given `__anf`'s
+/// refinement.
+///
+/// TODO: Currently fails at post-planning typecheck due to pointfree
+/// refinements which are not structurally equal, and yet cannot be
+/// compared by SMT due to lack of encoding for pointfree
+/// expressions. Expect to fix this if post-inference refinements are
+/// erased.
+#[test]
+fn two_reads_of_a_refined_mut_meet_a_refined_annotation() {
+    check_compile_error(
+        indoc! {r#"
+            x: Mut({Int where _ >= 0}) := 0
+            y = x ^+ x
+            z: {Int where _ >= 0} = y
+            z
+        "#},
+        "post-planning produced an invalid tree",
+    )
+}
+
+#[test]
+fn opaque_let_on_ite() {
+    check_scalar(
+        indoc! {r#"
+acc = 10
+t = if True:
+        r ^= acc
+        r
+    else:
+        0
+t
+        "#},
+        Value::Int(10),
+    )
+}
+
+/// TODO: Allow a `^+` in a comprehension element. No mutable variable is
+/// involved — the element's refinement alone trips lambda elimination.
+///
+/// The generator lambda's codomain quotes its own body, which holds the `let`
+/// binding the source lookup. Elimination rewrites that body and rebuilds the
+/// quoting type only at a `Let` node, so the lambda's codomain still quotes the
+/// uneliminated form while the reconstruction quotes the eliminated one, and the
+/// pass's type-preservation assert compares the two structurally. The assert is
+/// `debug_assertions`-gated, so the program compiles under a profile that drops
+/// it.
+#[cfg(debug_assertions)]
+#[test]
+fn refined_add_in_a_comprehension_element_not_supported() {
+    check_compile_error(
+        indoc! {r#"
+ys = [1 ^+ i for i in [1,2]]
+ys
+        "#},
+        "((__iter_record: [0, 1]) ⤇ {Int | __elem == 1 ^+ (let __anf : ([0, 1] ⤇ Int) = [1, 2]
+in __iter_record ▷ __anf)}) vs ((__iter_record: [0, 1]) ⤇ \
+         {Int | __elem == 1 ^+ __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)})",
+    )
+}
+
+/// A comprehension body reading a captured mutable variable.
+#[rstest]
+#[case::singleton("x := 3", "")]
+#[case::refined("x: Mut({Int where _ >= 0}) := 3", "")]
+#[case::read_before_a_write("x := 3", "x := 7")]
+fn read_captured_mut_inside_comprehension(#[case] decl: &str, #[case] after: &str) {
+    let mut program = format!("{decl}\nys = [x ^+ i for i in [1,2]]\n");
+    if !after.is_empty() {
+        program.push_str(after);
+        program.push('\n');
+    }
+    program.push_str("ys\n");
+    check_tile(&program, make_int_list(&[4, 5]));
+}
+
+/// TODO: Allow a second operation between a comprehension element's mutable
+/// read and the element value.
+#[test]
+fn two_operations_on_a_mut_read_in_a_comprehension_not_supported() {
+    check_compile_error(
+        indoc! {r#"
+x := 3
+ys = [x ^+ x ^+ i for i in [1,2]]
+ys
+        "#},
+        // The binder's uid counts from the run, not from the program, so it is left out.
+        "Barendregt violation: substitution range mentions binder `Unique { base: \"i\"",
+    )
+}
+
+/// TODO: Allow a nested comprehension's element to read a mutable variable.
+///
+/// The same lift
+/// (`two_operations_on_a_mut_read_in_a_comprehension_not_supported`). The outer
+/// generator's binder is the first operation's second operand here, so the inner
+/// element lambda carries the same intermediate transparent `let`, and its
+/// eliminated definition holds the refinement free on the same unnamed `Fun`
+/// slots. The binder reported is the nested pair the enclosing binders merge
+/// into rather than any generator's own parameter.
+#[test]
+fn nested_comprehension_reading_a_mut_not_supported() {
+    check_compile_error(
+        indoc! {r#"
+x := 3
+ys = [[x ^+ i ^+ j for j in [10,20]] for i in [1,2]]
+ys
+        "#},
+        "Barendregt violation: substitution range mentions binder `Synthetic { kind: Pair",
+    )
+}
+
+/// TODO: Allow comprehensions nested through let-bindings
+#[test]
+fn consuming_a_comprehension_carries_mut_into_refinement() {
+    check_compile_error(
+        indoc! {r#"
+x := 3
+ys = [x ^+ i for i in [1,2]]
+zs = [y ^+ 1 for y in ys]
+zs
+        "#},
+        "Scope violation",
+    )
+}
+
+/// `(i: {Int | __elem >= 1 and __elem <= 5}) ⤇ {Int | __elem == i ^+ 1}`: a collection
+/// mapping the keys 1 through 5 to the values 2 through 6, whose codomain names its key.
+fn pi_typed_collection() -> Type {
+    let int = || Type::Base(BaseType::Int);
+    let elem = || Expr::var(Name::elem());
+    let int_lit = |n| Expr::lit(Lit::Int(n));
+    let refined = |predicate| Type::refined_one(int(), Refinement::born(Rc::new(predicate)));
+
+    let keys = refined(Expr::binop(
+        Expr::binop(
+            elem(),
+            BinOpKind::Compare(CompareKind::GreaterOrEq),
+            int_lit(1),
+        ),
+        BinOpKind::BoolLogic(LogicKind::And),
+        Expr::binop(
+            elem(),
+            BinOpKind::Compare(CompareKind::LessOrEq),
+            int_lit(5),
+        ),
+    ));
+    let values = refined(Expr::binop(
+        elem(),
+        BinOpKind::Compare(CompareKind::Equals),
+        Expr::binop(
+            Expr::var("i"),
+            BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
+            int_lit(1),
+        ),
+    ));
+    Type::pi_kinded("i", keys, values, FunKind::Data(None))
+}
+
+/// Infer and type-check `λ c : 𝐶 → body`, where `𝐶` is [`pi_typed_collection`].
+///
+/// TODO: Bind a Pi's binder while typing its codomain's annotation predicates.
+///
+/// Construction closes `i` in the codomain to a `PiBound` reference, and
+/// `emit_annotation_predicates` descends into the codomain without opening it, so
+/// the reference reaches the `Var` lookup unbound. Inference reports `Unbound
+/// variable: 'i'` (the `PiBound` prints its hint), and every caller pins it.
+fn check_over_pi_typed_collection(body: Expr) {
+    let mut expr = uniquify::run(Expr::lambda("c", pi_typed_collection(), body));
+    infer(&mut expr, &mut TypeInferenceContext::new())
+        .unwrap_or_else(|errs| panic!("inference must succeed: {errs:?}"));
+    typecheck(&expr).unwrap_or_else(|errs| panic!("the tree must type-check: {errs:?}"));
+}
+
+/// A parameter whose annotation is a Pi-typed collection, used bare: `λ c : 𝐶 → c`.
+///
+/// Nothing applies `c`, so the only predicate naming the binder `i` is the annotation's
+/// own codomain refinement, which is in scope under the Pi that binds it.
+///
+/// No CHL spelling names a Pi binder in an annotation (`FullMap(K, V)` mints its own), so
+/// the tree is built directly.
+#[test]
+#[should_panic = "Unbound variable: 'i'"]
+fn a_pi_typed_collection_parameter() {
+    check_over_pi_typed_collection(Expr::var("c"));
+}
+
+/// `collection_contains` applied to a Pi-typed collection: `λ c : 𝐶 → c ▷ collection_contains`.
+///
+/// No CHL spelling applies the builtin to a bare collection, so the tree is built directly.
+///
+/// TODO: the type template for collection_contains has no way to
+/// handle a Pi-binder referenced in the collection's codomain. See
+/// also `collection_contains_of_an_inferred_pi_typed_collection`.
+#[test]
+#[should_panic = "Unbound variable: 'i'"]
+fn collection_contains_of_a_pi_typed_collection() {
+    check_over_pi_typed_collection(Expr::apply(
+        Expr::var("c"),
+        Expr::builtin(Builtin::CollectionContains),
+    ));
+}
+
+/// `collection_contains` applied to a collection that infers a Pi type with no annotation.
+///
+/// No CHL spelling applies the builtin to a bare collection, so it is applied to the
+/// lowered program.
+///
+/// TODO: Currently fails because the collection codomain still
+/// references its Pi binder after being moved from the context of the
+/// collection Pi type into the non-Pi-type template of
+/// `collection_contains`.
+#[test]
+#[should_panic = "references out-of-scope binder(s) [\"__iter_record\"]"]
+fn collection_contains_of_an_inferred_pi_typed_collection() {
+    let code = indoc! {r#"
+        xs = [1, 2, 3, 4, 5]
+        c = [x ^+ 1 for x in xs]
+        c
+    "#};
+    let module = chl_parser::parse_module(FileId::ROOT, code)
+        .into_result()
+        .expect("the program parses");
+    let mut lctx = LoweringContext::default();
+    let program = lower_stmts(&module, &mut lctx)
+        .into_result()
+        .expect("the program lowers");
+    let applied = Expr::apply(program, Expr::builtin(Builtin::CollectionContains));
+    // The phases `compile_program` runs before inference.
+    let expr = mut_read::run(anf::run(uniquify::run(applied)));
+    let mut expr = opaque_output::run(comprehension::run(expr, lctx.shared_holes()));
+    infer(&mut expr, &mut TypeInferenceContext::new())
+        .unwrap_or_else(|errs| panic!("inference must succeed: {errs:?}"));
+    typecheck(&expr).unwrap_or_else(|errs| panic!("the tree must type-check: {errs:?}"));
+}
+
+/// A compute function composed with a refining lambda, then applied:
+/// `let fc = λ f1 : (String ⇒ Int) → f1 ≫ (λ i → i ^+ 1) in "Hello" ▷ ((λ s → 1) ▷ fc)`.
+///
+/// CHL has no `≫` and no call of a call's result, so the tree is built directly.
+///
+/// TODO: Currently fails because the emit rule for >> uses the final
+/// function's codomain as-is, even though it has been removed from
+/// the context of its Pi-binder.
+#[test]
+#[should_panic = "open bound recorded"]
+fn dependent_function_composition() {
+    let fc = Expr::lambda(
+        "f1",
+        Type::fun(Type::Base(BaseType::String), Type::Base(BaseType::Int)),
+        Expr::compose(vec![
+            Expr::var("f1"),
+            Expr::lambda(
+                "i",
+                Type::Hole,
+                Expr::binop(
+                    Expr::var("i"),
+                    BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
+                    Expr::lit(Lit::Int(1)),
+                ),
+            ),
+        ])
+        // The chain's kind stamp: a composition of compute functions is one.
+        .with_ty(Type::fun(Type::Hole, Type::Hole)),
+    );
+    let call = Expr::apply(
+        Expr::lit(Lit::String("Hello".into())),
+        Expr::apply(
+            Expr::lambda("s", Type::Hole, Expr::lit(Lit::Int(1))),
+            Expr::var("fc"),
+        ),
+    );
+    let mut expr = uniquify::run(Expr::let_bind("fc", fc, call));
+    infer(&mut expr, &mut TypeInferenceContext::new())
+        .unwrap_or_else(|errs| panic!("inference must succeed: {errs:?}"));
+    typecheck(&expr).unwrap_or_else(|errs| panic!("the tree must type-check: {errs:?}"));
+}
+
+/// TODO: Allow a comprehension over a collection whose elements read a mutable
+/// variable.
+///
+/// The consuming element's refinement quotes the producing comprehension whole,
+/// read and all, so the read's opaque binder sits inside a term a later
+/// refinement names rather than standing between the mutable variable and the
+/// type. Inference rejects it as `MutableInRefinedType`.
+///
+/// Plan to fix by making comprehension bindings opaque.
+#[test]
+fn binding_a_comprehension_carries_mut_into_refinement() {
+    check_compile_error(
+        indoc! {r#"
+x := 3
+ys = [x ^+ i for i in [1,2]]
+[y ^+ 1 for y in ys]
+        "#},
+        "Scope violation",
+    )
+}
+
+/// TODO: Make comprehension bindings opaque.
+#[test]
+fn nesting_a_comprehension_carries_mut_into_refinement() {
+    check_compile_error(
+        indoc! {r#"
+x := 3
+[y ^+ 1 for y in [x ^+ i for i in [1,2]]]
+        "#},
+        "Barendregt violation: substitution range mentions binder `Synthetic { kind: IterRecord,",
+    )
+}
+
+/// TODO: Make function bindings opaque. This is currently blocked by
+/// later inline-phase handling of opaque let-bindings.
+#[test]
+fn binding_a_function_carries_mut_into_refinement() {
+    check_compile_error(
+        indoc! {r#"
+x := 3
+f = \y -> y ^+ x
+f(1) ^+ 1
+        "#},
+        "Scope violation",
+    )
+}
+
+/// TODO: Make function bindings opaque
+#[test]
+fn declaring_a_function_carries_mut_into_refinement() {
+    check_compile_error(
+        indoc! {r#"
+x := 3
+def f(y):
+    y ^+ x
+f(1) ^+ 1
+        "#},
+        "Scope violation",
+    )
+}
+
+#[test]
+fn refined_op_on_opaque() {
+    check_compile_error(
+        indoc! {r#"
+x := 4
+y = x ^+ 1
+y ^+ 1
+        "#},
+        "expected {Int | __elem == __anf ^+ 1 ^+ 1}, found {Int | __elem == (__anf, 1) ▷ add_refined ^+ 1}",
+    )
+}
+
+/// The refined `y ^+ 1` in `zs` keeps its refinement through lambda
+/// elimination, which rewrites the refinement's free variable and so changes
+/// the node's type. With `debug_assertions` on, lambda elimination's own
+/// type-preservation assertion reports this. Without them, the
+/// post-lambda-elim check does.
+#[test]
+fn refined_op_in_nested_comprehension_not_supported() {
+    check_compile_error(
+        indoc! {r#"
+ys = [i for i in [1,2]]
+zs = [y ^+ 1 for y in ys]
+zs
+        "#},
+        if cfg!(debug_assertions) {
+            "lambda elimination changed a node's type"
+        } else {
+            "post-lambda-elim produced an invalid tree"
+        },
+    )
+}
+
+/// The refinement `r ^+ 0` names `r`, which is scoped inside `f`'s body, and
+/// sits in a tuple component of the body's type rather than at its top.
+/// Compaction moves it to an obligation at that nested position, as Check's
+/// reconstruction drops it there.
+#[test]
+fn opaque_refined_op_in_tuple() {
+    check_scalar(
+        indoc! {r#"
+def f(x: Int):
+    r ^= x
+    (r ^+ 0, 1)
+a = f(1)
+a.0
+        "#},
+        Value::Int(1),
+    )
+}
+
+/// `k`'s domain refinement names no opaque variable, so the barrier
+/// var's solution keeps it: a refinement at a negative position of the
+/// solution is kept, and dropping it would accept `-5`.
+#[test]
+fn return_refined_function_from_function() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int):
+    r ^= x
+    def k(y: {Int where _ > 0}):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
+    )
+}
+
+#[test]
+fn return_opaque_annotated_function_from_annotated_function() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => ({Int where _ > 0} => Int):
+    r ^= x
+    def k(y: {Int where _ > 0 and r == r}):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "──── Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
+    )
+}
+
+#[test]
+fn return_opaque_unannotated_function_from_annotated_function() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => ({Int where _ > 0} => Int):
+    r ^= x
+    def k(y: Int):
+        r
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "──── Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
+    )
+}
+
+/// `k`'s domain refinement names the opaque variable `r`, so inference
+/// refuses to solve the barrier var: keeping the refinement brings `r`
+/// out of its scope, and dropping it is unsound. A codomain annotation
+/// on `f` that does not name `r` resolves the refusal
+/// (`return_opaque_annotated_function_from_annotated_function`), so the
+/// message suggests one.
+#[test]
+fn return_opaque_annotated_function_from_unannotated_function() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int):
+    r ^= x
+    def k(y: {Int where _ > 0 and r == r}):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "this function's result type ({Int | __elem > 0 and r == r} ⇒ Int) refines a parameter by `r`, which the function body binds opaquely; annotate the function's result type with a type that does not name `r`",
+    )
+}
+
+/// This represents a user's incorrect response to the suggestion in
+/// the error given by
+/// `return_opaque_annotated_function_from_unannotated_function`. Here,
+/// the added codomain for `f` is not a subtype of `f`'s actual body
+/// type, and type inference rejects it.
+#[test]
+fn return_opaque_annotated_function_from_unannotated_function_bad_fix() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => (Int => Int):
+    r ^= x
+    def k(y: {Int where _ > 0 and r == r}):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "────── Annotation mismatch: annotated as Int => Int, but inferred as {Int where _ > 0 and r == r} => {Int where _ > 0 and r == r}",
+    )
+}
+
+/// This represents a user's correct response to the suggestion in the
+/// error given by
+/// `return_opaque_annotated_function_from_unannotated_function`. Here,
+/// the added codomain for `f` is a subtype of `f`'s actual body type,
+/// and in fact precisely describes it but without mentioning `r`.
+///
+/// Because `f` successfully types, type inference can continue to
+/// fail on the application `f1(-5)`, where an argument is encountered
+/// that does not satisfy the new annotation.
+#[test]
+fn return_opaque_annotated_function_from_unannotated_function_good_fix() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => ({Int where _ > 0} => {Int where _ > 0}):
+    r ^= x
+    def k(y: {Int where _ > 0 and r == r}):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "──── Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
+    )
+}
+
+/// `f`'s barrier variable is checked against the use `f1(-5)` before compaction, so
+/// `y` is solved before the walk reads it. If the `^=` is replaced with `=`, then no
+/// barrier var is introduced.
+#[test]
+fn return_unrefined_function_from_function() {
+    check_scalar(
+        indoc! {r#"
+def f(x: Int):
+    r ^= x
+    def k(y):
+        y
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        Value::Int(-5),
+    )
+}
+
+/// TODO: solve relevant base types before running an SMT check, and
+/// provide a better error message when an SMT check can't run.
+///
+/// The failure message this test pins is unhelpful: it looks like the
+/// quoted types do match, and should pass an SMT check. What's really
+/// happening is that the SMT check is refusing to run at all because
+/// `x`'s base type (and thus SMT encoding sort) is not yet known when
+/// the SMT check is called for.
+#[test]
+fn unsettled_base_type_auto_fails_smt_check() {
+    check_compile_error(
+        indoc! {r#"
+def f(x) => ({Int where _ > 0} => Int):
+    def k(y: {Int where _ > 0 and x == x}):
+        1
+    k
+f1 = f(1)
+f1(-5)
+        "#},
+        "Annotation mismatch: annotated as {Int where _ > 0} => Int, but inferred as {Int where _ > 0 and x == x} => {Int where _ == 1}",
+    )
+}
+
+#[test]
+fn barrier_var_with_sub_barrier_var() {
+    check_scalar(
+        indoc! {r#"
+def f(x):
+    r ^= x
+    r ^+ 0
+def g(y):
+    s ^= y
+    f(s)
+g(1)
+        "#},
+        Value::Int(1),
+    )
+}
+
+/// `f` and `g` differ only in what their codomain barrier variables resolve to, `Int` and
+/// `Bool`, so the two uses of `id` key apart and take a clone each. Keyed without the
+/// resolution, they share one clone, typed at whichever use came first.
+#[test]
+fn uses_differing_only_in_a_barrier_variable_resolution_specialize_apart() {
+    check_scalar(
+        indoc! {r#"
+def f(x: Int):
+    r ^= x;
+    r ^+ 0
+def g(x: Int):
+    r ^= x;
+    (r ^+ 0) > 5
+def id(h):
+    h
+p = id(f)
+q = id(g)
+3
+        "#},
+        Value::Int(3),
+    )
+}
+
+/// `f`'s body is an `Index` applied at the argument `[1, 2]` refines, an invariant position.
+/// The barrier variable keeps that refinement, so the result's argument stays equal to the
+/// body's. Dropped, it would make the two `Index` values' arguments differ, and the join of
+/// two applications of an invariant parameter at different arguments has no type.
+#[test]
+fn a_refinement_in_an_invariant_nominal_argument_survives_the_barrier() {
+    check_scalar(
+        indoc! {r#"
+type Index(K):
+    index(FullMap(K, Int))
+def f(x: Int):
+    r ^= x
+    Index::index(map([(1, 10), (2, 20)]))
+i = f(1)
+7
+        "#},
+        Value::Int(7),
+    )
 }

@@ -128,6 +128,9 @@ pub enum SyntheticKind {
     /// ([`crate::ccl::comprehension`]): the index position the element map is
     /// read at, which the generator sources are then indexed by.
     IterRecord,
+    /// The binder [`crate::ccl::opaque_output`] mints for a lambda's result,
+    /// annotated with a barrier variable.
+    Output,
 }
 
 impl SyntheticKind {
@@ -143,6 +146,7 @@ impl SyntheticKind {
             SyntheticKind::AnfTemp => "__anf",
             SyntheticKind::MutRead => "__read",
             SyntheticKind::IterRecord => "__iter_record",
+            SyntheticKind::Output => "__output",
         }
     }
 }
@@ -473,6 +477,12 @@ impl Name {
         Self::synthetic(SyntheticKind::MutRead)
     }
 
+    /// The binder for a lambda's result under a barrier-variable annotation
+    /// ([`crate::ccl::opaque_output`]).
+    pub fn output() -> Self {
+        Self::synthetic(SyntheticKind::Output)
+    }
+
     /// Is this a binder [`crate::ccl::anf`] minted for a hoisted
     /// sub-expression?
     ///
@@ -499,6 +509,20 @@ impl Name {
             self,
             Name::Synthetic {
                 kind: SyntheticKind::MutRead,
+                ..
+            }
+        )
+    }
+
+    /// Is this the binder [`crate::ccl::opaque_output`] mints for a lambda's
+    /// result?
+    ///
+    /// Asked by [`crate::ccl::opaque_output::output_body`].
+    pub fn is_output(&self) -> bool {
+        matches!(
+            self,
+            Name::Synthetic {
+                kind: SyntheticKind::Output,
                 ..
             }
         )

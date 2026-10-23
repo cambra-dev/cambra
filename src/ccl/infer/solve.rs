@@ -10,6 +10,7 @@ use std::rc::Rc;
 use crate::ccl::ccl_utils::{PredMemo, canonical_cast_ty};
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::emit::read_through;
+use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
     compact_type, compact_type_polarity_only, constrain_subtype, constrain_subtype_in,
@@ -52,11 +53,14 @@ fn is_significant_context(label: &str) -> bool {
     label.contains("let ") || label.contains("λ ") || label.contains('\n')
 }
 
-/// Push `new_err` onto `errors`, deduplicating [`InferError::IncompatibleBounds`].
+/// Push `new_err` onto `errors`, deduplicating [`InferError::IncompatibleBounds`] and
+/// [`InferError::OpaqueEscape`].
 ///
 /// If an existing error has the same `(polarity, conflicting)` key, `label` is
 /// appended to its context vec (when it passes [`is_significant_context`])
-/// instead of pushing a duplicate.  All other error kinds are pushed as-is.
+/// instead of pushing a duplicate. An `OpaqueEscape` naming the same binders as an
+/// existing one is dropped: each specialization of a function copies its barrier
+/// variable, and every copy reports it. All other error kinds are pushed as-is.
 ///
 /// `blame` is the node whose rule raised `new_err`. A merged
 /// `IncompatibleBounds` keeps the *first* contributing node: a bounds conflict
@@ -71,6 +75,13 @@ fn push_coalesce_err(
     label: String,
     blame: NodeId,
 ) {
+    if let InferError::OpaqueEscape { names, .. } = &new_err
+        && errors.iter().any(
+            |e| matches!(&e.error, InferError::OpaqueEscape { names: seen, .. } if seen == names),
+        )
+    {
+        return;
+    }
     if let InferError::IncompatibleBounds {
         polarity: p,
         conflicting: ref c,
@@ -1056,6 +1067,7 @@ fn for_each_positioned_var(
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
+        | Type::BarrierVar(_)
         | Type::SharedHole(_)
         | Type::Param(_)
         | Type::WitnessRef(_)
@@ -1374,6 +1386,62 @@ fn obligation_choices(v: &crate::ccl::infer_var::InferVar) -> Option<Vec<crate::
         candidates.retain(|c| also.contains(c));
     }
     Some(candidates)
+}
+
+/// Run [`solve_barrier_vars`](crate::ccl::infer::solver::barrier::solve_barrier_vars) and push
+/// each failure onto `errors`, blamed on the node its bound came from, or on `fallback` for a
+/// bound written in a polymorphic type or recorded with no origin.
+///
+/// A failed upper bound raises the error its edge's caller gave it
+/// ([`EdgeReport`]). One with none is a mismatch labeled by `label`, which renders the
+/// blamed node.
+pub(super) fn push_barrier_failures(
+    errors: &mut Vec<LocatedInferError>,
+    fallback: NodeId,
+    label: impl Fn(NodeId) -> String,
+) {
+    use crate::ccl::infer::solver::barrier::{BarrierFailure, solve_barrier_vars};
+    use crate::ccl::infer_var::Origin;
+    let blame = |origin: Option<Origin>| match origin {
+        Some(Origin::Node(node)) => node,
+        Some(Origin::Written(_)) | None => fallback,
+    };
+    for failure in solve_barrier_vars() {
+        match failure {
+            BarrierFailure::Escape {
+                names,
+                resolved,
+                origin,
+            } => {
+                let error = InferError::OpaqueEscape {
+                    names,
+                    ty: Box::new(resolved),
+                };
+                push_coalesce_err(errors, error, String::new(), blame(origin));
+            }
+            BarrierFailure::Upper {
+                error,
+                origin,
+                report,
+                failure,
+            } => {
+                let node = blame(origin);
+                let error = match report.as_deref() {
+                    Some(EdgeReport::Fixed(error)) => error.clone(),
+                    Some(EdgeReport::Labeled(at)) => map_constrain_err(error, at),
+                    None => map_constrain_err(error, &label(node)),
+                };
+                errors.push(
+                    LocatedInferError {
+                        error,
+                        node_id: node,
+                        related: RelatedPositions::default(),
+                    }
+                    .with_failure(failure),
+                );
+            }
+        }
+    }
 }
 
 pub(super) fn coalesce_pass(
@@ -2384,7 +2452,11 @@ fn coalesce_type_predicates_go(
             coalesce_type_predicates_go(value, level, ctx, scope);
             coalesce_type_predicates_go(domain, level, ctx, scope);
         }
-        Type::Base(_)
+        // A barrier var survives coalescing only in a slot whose
+        // resolution failed, as an `Infer` does, and
+        // `resolve_binder_slot` has already reported that failure.
+        Type::BarrierVar(_)
+        | Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
@@ -2406,6 +2478,9 @@ fn coalesce_type_predicates_go(
 // function-before-argument order and the debug read-stability check guard reads
 // already consumed. See `src/ccl/design/type-inference.md`,
 // "Specialization scope and lifecycle" and "Coalesce ordering and read stability".
+
+/// What a failed specialization pin reports its edge as.
+const PIN_LABEL: &str = "monomorphization specialization";
 
 /// Rewrite a generalized use to its specialization and stamp the resolved type.
 ///
@@ -2668,13 +2743,20 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
             obligation.redeliver(&mut cache)
         })
     });
+    cache.report_recorded(|| EdgeReport::Labeled(PIN_LABEL.to_string()));
+    // The pin added bounds to the clone's copies of the definition's barrier variables,
+    // and the walk below compacts them, so they are checked first.
+    if pinned.is_ok() {
+        let label = symbolic(use_expr);
+        push_barrier_failures(&mut ctx.errors, use_expr.node_id(), |_| label.clone());
+    }
     if let Err(e) = &pinned {
         let e = e.clone();
         // Blamed on the use site, which is the node whose demanded type the pin
         // failed to satisfy, and the node this specialization's recording names.
         ctx.errors.push(
             LocatedInferError {
-                error: map_constrain_err(e, "monomorphization specialization"),
+                error: map_constrain_err(e, PIN_LABEL),
                 node_id: use_expr.node_id(),
                 related: RelatedPositions::default(),
             }

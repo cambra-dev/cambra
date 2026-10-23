@@ -53,7 +53,7 @@ use crate::ccl::{BaseType, BinOpKind, CompareKind, Lit, Refinement, Type, TypedE
 
 use context::InferCtx;
 use emit::emit_node;
-use solve::{coalesce_pass, resolve_var_type};
+use solve::{coalesce_pass, push_barrier_failures, resolve_var_type};
 use solver::smt::SmtError;
 
 // `Name` is no longer debug-only: `lit_singleton` builds its predicate over the
@@ -147,6 +147,7 @@ fn blame_node_for_place(
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
+            | Type::BarrierVar(_)
             | Type::SharedHole(_)
             | Type::DataSource(_)
             | Type::ChanDom(_, _)
@@ -189,6 +190,20 @@ fn blame_node_for_place(
     uids.iter()
         .find_map(|uid| go(expr, *uid))
         .unwrap_or_else(|| expr.node_id())
+}
+
+/// The node of `expr` whose id is `id`.
+fn find_node(expr: &Expr, id: crate::ccl::provenance::NodeId) -> Option<&Expr> {
+    if expr.node_id() == id {
+        return Some(expr);
+    }
+    let mut found = None;
+    expr.walk_children(|child| {
+        if found.is_none() {
+            found = find_node(child, id);
+        }
+    });
+    found
 }
 
 /// Resolve a (possibly variable-laden) [`Type`] to a concrete type for use
@@ -540,6 +555,19 @@ pub(crate) fn run(
     if let Err(e) = emitted {
         errors.push(e);
     }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    // Check each barrier variable's upper bounds against its resolution. The checks add
+    // bounds, so they run before anything reads the graph: compaction reads a barrier
+    // variable's lower bounds and nothing else (`solver::barrier`).
+    push_barrier_failures(&mut errors, expr.node_id(), |node| {
+        find_node(expr, node).map_or_else(
+            || "a function's result".to_string(),
+            crate::ccl::symbolic::symbolic_head,
+        )
+    });
     if !errors.is_empty() {
         return Err(errors);
     }

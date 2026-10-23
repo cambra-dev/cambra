@@ -41,6 +41,7 @@
 
 use crate::ccl::{BaseType, InferVar, Level, Type};
 
+pub mod barrier;
 pub mod coalesce;
 pub mod compact;
 pub mod constrain;
@@ -75,6 +76,7 @@ pub use spec_key::{SpecKey, spec_key};
 pub fn type_level(ty: &Type) -> Level {
     match ty {
         Type::Infer(v) => v.level(),
+        Type::BarrierVar(barrier) => barrier.level(),
         // A bounded annotation's level is its bound's: the variable it becomes is
         // minted at the *use* level by `normalize_annotation`, so the bound is all
         // there is to report here.

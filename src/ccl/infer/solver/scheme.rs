@@ -14,7 +14,9 @@ use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::TraitRequirement;
 use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId};
-use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr};
+use crate::ccl::{
+    BarrierVar, BarrierVarId, Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr,
+};
 
 // ---------------------------------------------------------------------------
 // Polymorphic schemes
@@ -185,6 +187,9 @@ pub struct FreshenCache {
     pub site_telescope: Option<Telescope>,
     /// Original quantified var → its fresh replacement.
     pub vars: HashMap<InferVarId, Rc<InferVar>>,
+    /// Original barrier variable → its fresh replacement, for the same reason as
+    /// [`vars`](Self::vars).
+    pub barrier_vars: HashMap<BarrierVarId, Rc<BarrierVar>>,
     /// Original quantified channel-domain name → its rename. Seeded by
     /// `specialize_use` with use-site pairings; unpaired names mint fresh.
     pub chan_doms: HashMap<crate::ccl::Name, crate::ccl::Name>,
@@ -387,6 +392,7 @@ fn freshen_level(ty: &Type) -> Level {
     // answer `type_level` gives it and for the same reason.
     let mut lvl = match ty {
         Type::Infer(v) => v.level(),
+        Type::BarrierVar(barrier) => barrier.level(),
         // A declared parameter, in an annotation slot a clone copies, is a name the
         // solver never reads; normalization replaced it where the right-hand side was
         // emitted.
@@ -698,8 +704,63 @@ pub fn freshen_above(
                 s.type_kinds = new_kinds;
             }
             cache.relate_kind_copy(&tv.fun_kind, &v.fun_kind);
-            freshen_watches(lim, tv, &v, target, cache);
+            let watches = tv.watches.borrow().clone();
+            freshen_watches(
+                lim,
+                watches,
+                &|copy, pos| copy.watch(&Type::Infer(Rc::clone(&v)), pos),
+                target,
+                cache,
+            );
             Type::Infer(v)
+        }
+        // Freshens like `Infer`, over what a barrier variable carries: its opaque
+        // binders, its lower and upper bounds, and its watches. Its level is read from
+        // the bounds, so the copy's follows from the freshened ones. It has no telescope
+        // or kind to copy.
+        Type::BarrierVar(barrier) => {
+            if let Some(existing) = cache.barrier_vars.get(&barrier.uid) {
+                return Type::BarrierVar(Rc::clone(existing));
+            }
+            // Registered before the bounds are copied, so a bound that reaches this
+            // barrier variable again resolves to the copy.
+            let fresh = BarrierVar::fresh(
+                Rc::clone(&barrier.opaque),
+                Vec::new(),
+                Vec::new(),
+            );
+            cache.barrier_vars.insert(barrier.uid, Rc::clone(&fresh));
+
+            // Snapshot bounds before recursing, as the `Infer` arm does.
+            let lows = barrier.lowers.borrow().clone();
+            let ups = barrier.uppers.borrow().clone();
+            let mut freshen_bound = |b: &Bound| Bound {
+                origin: b.origin,
+                self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
+                ty: freshen_above(lim, &b.ty, target, cache),
+                ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
+            };
+            let new_lows: Vec<_> = lows.iter().map(&mut freshen_bound).collect();
+            let new_ups: Vec<_> = ups
+                .iter()
+                .map(|u| crate::ccl::BarrierUpper {
+                    bound: freshen_bound(&u.bound),
+                    report: u.report.clone(),
+                })
+                .collect();
+            *fresh.lowers.borrow_mut() = new_lows;
+            *fresh.uppers.borrow_mut() = new_ups;
+            // A barrier variable is never an operand, so the copy records the watch
+            // without `TraitObligation::watch`, which would make it one.
+            let watches = barrier.watches.borrow().clone();
+            freshen_watches(
+                lim,
+                watches,
+                &|copy, pos| fresh.watches.borrow_mut().push((Rc::clone(copy), pos)),
+                target,
+                cache,
+            );
+            Type::BarrierVar(fresh)
         }
     }
 }
@@ -776,7 +837,8 @@ impl FreshenCache {
     }
 }
 
-/// Copy `tv`'s trait obligations onto its freshened counterpart `v`.
+/// Copy the trait obligations in `watches`, a variable's watch list, onto its freshened
+/// counterpart: `attach` records the watch of each copy on it.
 ///
 /// Runs *after* the bounds write-back, so an obligation reached through a bound has
 /// already had its variables freshened into the cache and the copy's watches line up
@@ -791,22 +853,21 @@ impl FreshenCache {
 /// operands.
 fn freshen_watches(
     lim: Level,
-    tv: &Rc<InferVar>,
-    v: &Rc<InferVar>,
+    watches: Vec<(Rc<TraitObligation>, u8)>,
+    attach: &dyn Fn(&Rc<TraitObligation>, u8),
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) {
-    let watches = tv.watches.borrow().clone();
     for (obligation, pos) in watches {
         if let Some(existing) = cache.obligations.get(&obligation.uid) {
-            existing.watch(&Type::Infer(Rc::clone(v)), pos);
+            attach(existing, pos);
             continue;
         }
         // Phase 1: a copy carrying the original's candidate set, with the output
         // position still pointing at the definition's — enough to be reachable.
         let copy = TraitObligation::new_from(&obligation);
         cache.obligations.insert(obligation.uid, Rc::clone(&copy));
-        copy.watch(&Type::Infer(Rc::clone(v)), pos);
+        attach(&copy, pos);
         // A specialization clone turns the binding's own type parameters, the ones
         // one level above the cutoff, into variables; an assumption about one of
         // them no longer describes the copy. The parameters are told apart by identity:
@@ -931,12 +992,19 @@ pub fn seed_chan_dom_pairings(
     seed_pairings_go(use_ty, def_ty, lim, out, &mut seen);
 }
 
+/// A type holding bounds that [`seed_pairings_go`] descends through, once each.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum BoundHolder {
+    InferVar(InferVarId),
+    BarrierVar(BarrierVarId),
+}
+
 fn seed_pairings_go(
     use_ty: &Type,
     def_ty: &Type,
     lim: Level,
     out: &mut HashMap<crate::ccl::Name, crate::ccl::Name>,
-    seen: &mut std::collections::HashSet<InferVarId>,
+    seen: &mut std::collections::HashSet<BoundHolder>,
 ) {
     fn peel(ty: &Type) -> &Type {
         match ty {
@@ -950,7 +1018,7 @@ fn seed_pairings_go(
     // the cyclic bound graph). The use side is resolved; a placeholder var
     // there has no bounds and pairs nothing.
     if let Type::Infer(dv) = peel(def_ty) {
-        if seen.insert(dv.uid) {
+        if seen.insert(BoundHolder::InferVar(dv.uid)) {
             let (lows, ups) = {
                 let s = dv.bounds.borrow();
                 (Rc::clone(s.lower()), Rc::clone(s.upper()))
@@ -962,12 +1030,33 @@ fn seed_pairings_go(
         return;
     }
     if let Type::Infer(uv) = peel(use_ty) {
-        if seen.insert(uv.uid) {
+        if seen.insert(BoundHolder::InferVar(uv.uid)) {
             let (lows, ups) = {
                 let s = uv.bounds.borrow();
                 (Rc::clone(s.lower()), Rc::clone(s.upper()))
             };
             for b in lows.iter().chain(ups.iter()) {
+                seed_pairings_go(&b.ty, def_ty, lim, out, seen);
+            }
+        }
+        return;
+    }
+    // A barrier variable resolves to the join of its lower bounds, so those carry its
+    // structure on either side. Its upper bounds are checks against that join and
+    // add no position to pair.
+    if let Type::BarrierVar(dh) = peel(def_ty) {
+        if seen.insert(BoundHolder::BarrierVar(dh.uid)) {
+            let lows = dh.lowers.borrow().clone();
+            for b in &lows {
+                seed_pairings_go(use_ty, &b.ty, lim, out, seen);
+            }
+        }
+        return;
+    }
+    if let Type::BarrierVar(uh) = peel(use_ty) {
+        if seen.insert(BoundHolder::BarrierVar(uh.uid)) {
+            let lows = uh.lowers.borrow().clone();
+            for b in &lows {
                 seed_pairings_go(&b.ty, def_ty, lim, out, seen);
             }
         }

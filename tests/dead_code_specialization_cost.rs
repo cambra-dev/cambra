@@ -20,7 +20,7 @@ use cambra::ccl::{
     comprehension,
     infer::{TypeInferenceContext, infer},
     lower::{LoweringContext, lower_stmts},
-    uniquify,
+    opaque_output, uniquify,
 };
 use cambra::chl_parser;
 use cambra::chl_parser::FileId;
@@ -50,10 +50,11 @@ fn inference_allocations(code: &str) -> usize {
     let expr = lower_stmts(&module, &mut lctx)
         .into_result()
         .expect("lower");
-    // Uniquify outside the measurement window, as the pipeline does before
-    // `infer`: inference allocates against α-unique binders in the product, so
-    // measuring it on source spellings measures a tree it never sees.
-    let mut expr = comprehension::run(uniquify::run(expr), lctx.shared_holes());
+    // Run the pre-inference phases outside the measurement window, as the
+    // pipeline does before `infer`: inference allocates against α-unique binders
+    // in the product, so measuring it on source spellings measures a tree it
+    // never sees.
+    let mut expr = opaque_output::run(comprehension::run(uniquify::run(expr), lctx.shared_holes()));
     let mut ictx = TypeInferenceContext::new();
     let mut typed = false;
     let allocs = allocations(|| typed = infer(&mut expr, &mut ictx).is_ok());

@@ -24,7 +24,7 @@ use crate::{
         },
         inline, lambda_elim,
         lower::{LoweredRoute, LoweringContext, LoweringError, modules::lower_program},
-        mut_elim, mut_read,
+        mut_elim, mut_read, opaque_output,
         panes::gate_leaks,
         planning,
         provenance::{
@@ -1318,6 +1318,11 @@ pub enum Phase {
     /// leaves one exactly as it finds it, so a comprehension born at lowering
     /// reached inference un-normalized.
     Comprehension,
+    /// Result binding ([`crate::ccl::opaque_output`]): binding the body of each
+    /// lambda that binds an opaque variable to `__output`, annotated with an
+    /// barrier variable. Runs on the comprehension-lowered pre-inference tree, so the
+    /// lambdas of a comprehension's encoding are rewritten too.
+    OpaqueOutput,
     /// Type inference ([`crate::ccl::infer`]): the phase that bridges the
     /// pre-inference and post-inference panes. Monomorphization is what mints
     /// inside it — cloning a generalized definition's subtree once per distinct
@@ -2194,6 +2199,18 @@ fn run_passes(
     blame.derive(&derivation.into_log(), Phase::Comprehension);
     debug!("Comprehensions lowered:\n{}", symbolic(&expr));
     if at_phase_output(Phase::Comprehension, &expr, stop, capture, panes) {
+        return Ok(expr);
+    }
+
+    // Bind each lambda's result under a barrier-variable annotation where the body
+    // binds an opaque variable (`crate::ccl::opaque_output`). After
+    // comprehension lowering, so the encoding's lambdas are covered. `recorded`
+    // because the pass mints the `Let`/`Var` pair per lambda it rewrites.
+    expr = recorded(capture_provenance, Phase::OpaqueOutput, || {
+        opaque_output::run(expr)
+    });
+    debug!("Opaque outputs bound:\n{}", symbolic(&expr));
+    if at_phase_output(Phase::OpaqueOutput, &expr, stop, capture, panes) {
         return Ok(expr);
     }
 
