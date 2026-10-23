@@ -21,8 +21,10 @@ use super::context::InferCtx;
 use super::schemes::{OpSignature, OperatorResult};
 use super::typing::{LetScheme, Typing};
 use super::{product, variant_type};
-use crate::ccl::infer::solver::traits::Trait;
+use crate::ccl::infer::solver::traits::{Assoc, Signature, Trait, function_over, replace_params};
 use crate::ccl::infer_var::Origin;
+use crate::ccl::ty::{TraitRequirement, TypeParamId};
+use std::collections::HashMap;
 
 /// Walk one expression node, emit constraints for it, write its inferred
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
@@ -76,6 +78,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Method { name, .. } => {
             unreachable!("method `{name}` reached emission outside the application it resolves in")
         }
+        TypedExprNode::TraitFn {
+            trait_,
+            function,
+            operands,
+            assoc,
+        } => emit_trait_fn(trait_.clone(), function, operands, assoc, node_id, ctx)?,
         TypedExprNode::Lit(lit) => {
             // A literal's type is its singleton, `{Int | __elem == n}`, and the
             // three nodes of that `__elem == n` term are minted *here* — the
@@ -128,20 +136,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     // "Instantiation").
                     for r in &instance.requires {
                         let at = || format!("the requirement {}(…) of `{name}`", r.trait_);
-                        let named = r.assoc.first();
-                        let require = |ctx: &mut InferCtx| {
-                            ctx.require_trait(
-                                r.trait_.clone(),
-                                node_id,
-                                &r.args.iter().collect::<Vec<_>>(),
-                                named.map(|(n, _)| *n),
-                                &at,
-                            )
-                        };
-                        let settled = ctx.with_demand_at(r.at.map(Origin::Written), require)?;
-                        if let (Some(settled), Some((_, named))) = (settled, named) {
-                            ctx.require_sub(&settled, named, &at)?;
-                        }
+                        require_stated(r, node_id, &at, ctx)?;
                     }
                     instance.ty
                 }
@@ -1169,6 +1164,9 @@ pub(super) fn emit_apply<C: Typing>(
     let applied = ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), &|| {
         "Apply".to_string()
     });
+    if applied.is_ok() && matches!(function.node, TypedExprNode::TraitFn { .. }) {
+        ctx.bind_instance_function_called(function.node_id())?;
+    }
     // A call that fails against a generalized definition the definition alone already
     // rejects is the definition's error, reported at the definition rather than at a
     // call that only met it. Any other failure names the function a type parameter
@@ -1367,12 +1365,18 @@ fn require_single_obligation<C: Typing>(
             operator_node_id,
             operand_types,
             operand_exprs,
-            *name,
+            name.clone(),
             *refinement,
             at,
         ),
         OperatorResult::Associated(name) => {
-            let ty = ctx.require_trait(trait_, operator_node_id, operand_types, Some(*name), at)?;
+            let ty = ctx.require_trait(
+                trait_,
+                operator_node_id,
+                operand_types,
+                Some(name.clone()),
+                at,
+            )?;
             Ok(ty.expect("an operator asking for an association gets its position back"))
         }
         OperatorResult::Fixed(base) => {
@@ -2804,6 +2808,163 @@ fn emit_nominal_scrutinee<C: Typing>(
     Ok(())
 }
 
+/// Type a function of an instance by its trait's signature, at the operands the trait type
+/// states, each hole a fresh variable, of an obligation of the trait, and the variables it
+/// settles for the trait's associated types (`src/ccl/design/type-inference.md`, "Trait
+/// functions").
+///
+/// The operands are written back into the node's slots, so coalescing reads what each
+/// resolved to and chooses the instance there; the obligation's narrowing is what rejects an
+/// argument no instance accepts, here or at a use of a generalized definition. An associated
+/// type the trait type states bounds the one the obligation settles, as a requirement's does.
+///
+/// The signature opens the function's own type parameters afresh at each call, and each
+/// requirement it states becomes an obligation at the call's types.
+fn emit_trait_fn(
+    trait_: Trait,
+    function: &str,
+    operands: &mut [Type],
+    assoc: &mut [(Assoc, Type)],
+    node_id: NodeId,
+    ctx: &mut InferCtx,
+) -> Result<Type, LocatedInferError> {
+    let declared = trait_.function(function).cloned().unwrap_or_else(|| {
+        panic!("lowering names a function `{trait_}` declares, got `{trait_}::{function}`")
+    });
+    let at = || format!("{trait_}::{function}");
+    for slot in operands.iter_mut() {
+        *slot = ctx.normalize_annotation(slot);
+    }
+    let (settled, obligation) = ctx.require_trait_obligation(
+        trait_.clone(),
+        node_id,
+        &operands.iter().collect::<Vec<_>>(),
+        &trait_.assocs(),
+        None,
+        &at,
+    )?;
+    // A call its types already answer with an instance whose functions are a group being
+    // emitted, as a call within an `impl` block is, binds that function first, as a reference
+    // to a member does. A call whose argument has not reached it yet is asked again by the
+    // application that passes it (`Typing::bind_instance_function_called`).
+    bind_selected_instance_function(&obligation, function, operands, ctx)?;
+    ctx.trait_calls.insert(
+        node_id,
+        (
+            std::rc::Rc::clone(&obligation),
+            function.into(),
+            operands.to_vec(),
+        ),
+    );
+    for (name, stated) in assoc.iter_mut() {
+        let at_name = trait_
+            .assocs()
+            .iter()
+            .position(|n| n == name)
+            .expect("lowering names an associated type the trait declares");
+        *stated = ctx.normalize_annotation(stated);
+        ctx.require_sub(&settled[at_name], stated, &at)?;
+    }
+    let Signature {
+        params,
+        inputs,
+        output,
+        requires,
+    } = &declared.signature;
+    let mut opened: HashMap<TypeParamId, Type> = HashMap::new();
+    for (param, operand) in trait_.operands.iter().zip(operands.iter()) {
+        opened.insert(param.id, operand.clone());
+    }
+    for ((_, param), assoc) in trait_.assocs.iter().zip(&settled) {
+        opened.insert(param.id, assoc.clone());
+    }
+    for param in params {
+        opened.insert(param.id, ctx.fresh());
+    }
+    for requirement in requires {
+        let requirement = requirement.map_types(|t| replace_params(t, &opened));
+        let at = || {
+            format!(
+                "the requirement {}(…) of `{trait_}::{function}`",
+                requirement.trait_
+            )
+        };
+        require_stated(&requirement, node_id, &at, ctx)?;
+    }
+    let mut ty = replace_params(&function_over(inputs, output.clone()), &opened);
+    ctx.type_annotation_predicates(&mut ty)?;
+    Ok(ctx.normalize_annotation(&ty))
+}
+
+/// Emit the function `function` of the instance `obligation` selects first, where that
+/// instance's functions are a group being emitted and the call is at the instance's own
+/// types: its operands, read through the bounds they have gathered, bind each of the head's
+/// variables to the parameter the group's function opened for it. A call at other types is
+/// another specialization's, which the chain rule at coalesce judges, and orders nothing.
+pub(super) fn bind_selected_instance_function(
+    obligation: &crate::ccl::infer::solver::traits::TraitObligation,
+    function: &str,
+    operands: &[Type],
+    ctx: &mut InferCtx,
+) -> Result<(), LocatedInferError> {
+    let Some(instance) = obligation.selected_instance() else {
+        return Ok(());
+    };
+    let Some(binding) = instance.implementation(function) else {
+        return Ok(());
+    };
+    let gathered: Option<Vec<Type>> = operands.iter().map(gathered_type).collect();
+    let at_own_types = gathered
+        .and_then(|operands| instance.bind(&operands))
+        .is_some_and(|bound| {
+            instance.params.iter().all(|p| {
+                bound
+                    .get(&p.id)
+                    .is_some_and(|t| ctx.opened_param(p.id).is_some_and(|opened| opened == *t))
+            })
+        });
+    if at_own_types {
+        emit_group_member_for(binding, ctx)?;
+    }
+    Ok(())
+}
+
+/// The type `ty` states: itself, or the first bound its variable has gathered.
+fn gathered_type(ty: &Type) -> Option<Type> {
+    use std::ops::ControlFlow;
+    match ty.peel_refinements() {
+        Type::Infer(var) => for_each_gathered_bound(var, |b| ControlFlow::Break(b.clone())),
+        Type::Hole | Type::SharedHole(_) => None,
+        other => Some(other.clone()),
+    }
+}
+
+/// Mint the obligation the requirement `r` states at the types it names, as an operator's
+/// is minted, and give each associated type it names what the obligation settles
+/// (`src/ccl/design/type-parameters.md`, "Instantiation").
+fn require_stated(
+    r: &TraitRequirement,
+    node_id: NodeId,
+    at: &dyn Fn() -> String,
+    ctx: &mut InferCtx,
+) -> Result<(), LocatedInferError> {
+    let names: Vec<Assoc> = r.assoc.iter().map(|(n, _)| n.clone()).collect();
+    let require = |ctx: &mut InferCtx| {
+        ctx.require_trait_associating(
+            r.trait_.clone(),
+            node_id,
+            &r.args.iter().collect::<Vec<_>>(),
+            &names,
+            at,
+        )
+    };
+    let settled = ctx.with_demand_at(r.at.map(Origin::Written), require)?;
+    for (settled, (_, named)) in settled.iter().zip(&r.assoc) {
+        ctx.require_sub(settled, named, at)?;
+    }
+    Ok(())
+}
+
 /// Replace the `Method` placeholder `function` with the candidate its receiver's type names
 /// (`src/ccl/design/nominal-types.md`, "Method calls").
 ///
@@ -3203,7 +3364,7 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(Label, Type)> {
 /// any extra `__to_<defer>` fields ride the `` `commit `` payload as width-subtyped taps.
 fn emit_transact_writer<C: Typing>(
     writer: &mut WriterSite,
-    key_types: &std::collections::HashMap<Name, Type>,
+    key_types: &HashMap<Name, Type>,
     parameter: Option<&Type>,
     ctx: &mut C,
 ) -> Result<(), LocatedInferError> {
@@ -3454,7 +3615,7 @@ mod review_tests {
 
         // Our stack seeds the blame cursor at construction; this unit test has no
         // enclosing tree, so the predicate term itself is the root to blame.
-        let mut ctx = InferCtx::new(std::collections::HashMap::new(), shared.node_id());
+        let mut ctx = InferCtx::new(HashMap::new(), shared.node_id());
         let d1 = ctx.fresh();
         let d2 = ctx.fresh();
         emit_bare_predicate(&mut r1, &d1, &mut ctx).expect("first occurrence types");

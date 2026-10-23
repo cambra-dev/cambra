@@ -196,8 +196,9 @@ Key shape choices:
 ## Surface builtins
 
 `builtins.rs` lists the names a CHL call recognizes as builtins in `SURFACE_BUILTINS`. Each row
-holds a spelling, its `SurfaceBuiltin` variant, an arity, and a kind. The parser does not read the
-table: a builtin call parses as an ordinary `Expr::Call`. The table lives in this crate because
+holds a spelling, its `SurfaceBuiltin` variant, an arity, and a kind. A builtin call parses as an
+ordinary `Expr::Call`, except `summon(T)::f`: its argument is a trait type, so the parser reads the
+`summon` row's spelling and builds an `Expr::Summon`. The table lives in this crate because
 both of its consumers depend on this crate, and `chl-interp` depends on nothing else.
 
 A consumer resolves a called name with `SurfaceBuiltin::from_name` and matches on the variant. The
@@ -207,8 +208,8 @@ table records names and call shapes, not meaning. Each consumer keeps three deci
 - **A call of the wrong arity.** Lowering refuses it. The interpreter treats it as an unknown
   function.
 - **Shadowing.** Lowering resolves a `Function`-kind builtin before consulting scope, so a user
-  `def` of the same name does not shadow it. A builtin of another kind called in expression
-  position lowers as an ordinary call, where a user `def` does win, and a registered source wins
+  `def` of the same name does not shadow it, and it refuses a call of `summon` alone the same
+  way. A builtin of another kind called in expression position lowers as an ordinary call, where a user `def` does win, and a registered source wins
   over a user binding
   ([src/ccl/design/lowering.md, "Builtin calls"](../src/ccl/design/lowering.md#builtin-calls)).
   The interpreter lets the nearest binding win
@@ -224,6 +225,7 @@ The kind says which construct recognizes the call:
 | `TransactionMarker` | the context of `with begin():` | `validate_begin_context` |
 | `SinkDeclaration` | the right-hand side of an assignment that declares a sink | `sink_declaration` |
 | `Source` | a call to a registered data source | `LoweringContext::sources` |
+| `Qualifier` | the instance before `::`, `summon(T)::f` | the parser; `lower_call` refuses a call alone |
 
 A source resolves by its registration, not by the table, so a host can register a source the table
 does not list. The table lists the sources every `GlobalContext` registers, and
@@ -237,12 +239,13 @@ feature on this crate that only one of its consumers enables.
 ### Rows that differ from the spec
 
 [chl-spec.md, "7. Built-in functions and sources"](../docs/chl-spec.md#7-built-in-functions-and-sources)
-is the specification for most rows. Five rows are specified in other sections:
+is the specification for most rows. Six rows are specified in other sections:
 
 - `set`, `map`, and `empty_map` in
   [chl-spec.md, "3.11 List, tuple, record literals"](../docs/chl-spec.md#311-list-tuple-record-literals).
 - `begin` and `await_final` in
   [chl-spec.md, "8. Mutability, transactions, and feeds"](../docs/chl-spec.md#8-mutability-transactions-and-feeds).
+- `summon` in [chl-spec.md, "Summoning an instance"](../docs/chl-spec.md#summoning-an-instance).
 
 These rows and the spec disagree:
 

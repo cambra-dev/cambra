@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use super::stmts::{is_builtin_type_name, is_mut_annotation, lower_type_expr};
+use super::stmts::{is_mut_annotation, lower_type_expr, reserved_name};
 use super::{LoweringContext, LoweringError};
 use crate::ccl::nominal::{NominalCtor, NominalDecl};
 use crate::ccl::ty::{PolyParam, PolyType, TypeKind, TypeParam};
@@ -59,14 +59,23 @@ pub(super) struct AssociatedDef<'a> {
     pub body: &'a [Spanned<ChlStmt>],
     /// The block declaring it, if it is in one.
     pub block: Option<&'a ImplBlock>,
+    /// The type parameters the block binds, none outside a block (`inherent_params`).
+    pub block_params: Vec<Spanned<SmolStr>>,
     /// The `def`.
     pub span: Span,
 }
 
 /// The associated functions `stmt` declares: the one `def N::f(…)` declares, and each `def` of
-/// an `impl` block, a `pub def` as its `def`.
-pub(super) fn associated_defs(stmt: &Spanned<ChlStmt>) -> impl Iterator<Item = AssociatedDef<'_>> {
-    fn view<'a>(def: &'a Spanned<ChlStmt>, block: Option<&'a ImplBlock>) -> AssociatedDef<'a> {
+/// an inherent `impl` block, a `pub def` as its `def`. An instance of a trait declares none.
+pub(super) fn associated_defs<'a>(
+    stmt: &'a Spanned<ChlStmt>,
+    ctx: &LoweringContext,
+) -> Result<Vec<AssociatedDef<'a>>, LoweringError> {
+    fn view<'a>(
+        def: &'a Spanned<ChlStmt>,
+        block: Option<&'a ImplBlock>,
+        block_params: Vec<Spanned<SmolStr>>,
+    ) -> AssociatedDef<'a> {
         let def = match &def.node {
             ChlStmt::Pub { stmt, .. } => stmt.as_ref(),
             _ => def,
@@ -98,15 +107,24 @@ pub(super) fn associated_defs(stmt: &Spanned<ChlStmt>) -> impl Iterator<Item = A
             requires,
             body,
             block,
+            block_params,
             span: def.span,
         }
     }
-    let defs: Vec<_> = match &stmt.node {
-        ChlStmt::FunctionDef { owner: Some(_), .. } => vec![view(stmt, None)],
-        ChlStmt::Impl(block) => block.defs.iter().map(|d| view(d, Some(block))).collect(),
+    Ok(match &stmt.node {
+        ChlStmt::FunctionDef { owner: Some(_), .. } => vec![view(stmt, None, Vec::new())],
+        // An instance of a trait is `traits::declare_instances`'s.
+        ChlStmt::Impl(block) if ctx.trait_named(&block.ty.node).is_some() => Vec::new(),
+        ChlStmt::Impl(block) => {
+            let params = inherent_params(block)?;
+            block
+                .defs
+                .iter()
+                .map(|d| view(d, Some(block), params.clone()))
+                .collect()
+        }
         _ => Vec::new(),
-    };
-    defs.into_iter()
+    })
 }
 
 /// Declare the head of each `type` among the module's top-level `stmts`.
@@ -117,11 +135,11 @@ pub(super) fn declare_nominal_types(
     let mut errors = Vec::new();
     for (decl, _) in type_decls(stmts) {
         let name = &decl.name;
-        if is_builtin_type_name(&name.node) {
+        if let Some(what) = reserved_name(&name.node) {
             errors.push(LoweringError::unsupported(
                 name.span,
                 format!(
-                    "`{}` is a built-in type and cannot be given another meaning",
+                    "`{}` is a built-in {what} and cannot be given another meaning",
                     name.node
                 ),
             ));
@@ -142,11 +160,11 @@ pub(super) fn declare_nominal_types(
         }
         let mut params: Vec<Rc<TypeParam>> = Vec::new();
         for param in &decl.params {
-            if is_builtin_type_name(&param.node) {
+            if let Some(what) = reserved_name(&param.node) {
                 errors.push(LoweringError::unsupported(
                     param.span,
                     format!(
-                        "`{}` is a built-in type and cannot name a type parameter",
+                        "`{}` is a built-in {what} and cannot name a type parameter",
                         param.node
                     ),
                 ));
@@ -650,6 +668,54 @@ pub(super) fn names_a_type_member(q: &QualifiedName) -> bool {
     matches!(q.qualifier.as_slice(), [ty] if chl_parser::ast::is_type_name(&ty.node))
 }
 
+/// The type parameters an inherent `impl N(P…):` head binds: its arguments, each a name.
+/// An associated type or a `requires` clause belongs to an instance of a trait.
+pub(super) fn inherent_params(block: &ImplBlock) -> Result<Vec<Spanned<SmolStr>>, LoweringError> {
+    let ty = &block.ty.node;
+    if let Some(v) = block.vars.first() {
+        return Err(LoweringError::unsupported(
+            v.span,
+            format!(
+                "`impl {ty}(…)` declares functions of the type `{ty}`, whose head names its \
+                 parameters; `forall` declares the type variables of an instance of a trait"
+            ),
+        ));
+    }
+    if let Some(a) = block.assoc.first() {
+        return Err(LoweringError::unsupported(
+            a.name_span,
+            format!(
+                "`impl {ty}(…)` declares functions of the type `{ty}`, and `{}=…` fixes an \
+                 associated type, which only an instance of a trait does",
+                a.name
+            ),
+        ));
+    }
+    if let Some(r) = block.requires.first() {
+        return Err(LoweringError::unsupported(
+            r.span,
+            format!(
+                "`impl {ty}(…)` declares functions of the type `{ty}`, and a `requires` clause \
+                 on the block belongs to an instance of a trait"
+            ),
+        ));
+    }
+    block
+        .args
+        .iter()
+        .map(|a| match &a.node {
+            ChlExpr::Name(n) => Ok(Spanned::new(a.span, n.clone())),
+            _ => Err(LoweringError::unsupported(
+                a.span,
+                format!(
+                    "`impl {ty}(…)` binds the parameters of the type `{ty}`, each a name, as in \
+                     `impl Option(T):`"
+                ),
+            )),
+        })
+        .collect()
+}
+
 /// The declaration and member `q` names, `Shape::circle`.
 fn resolve_member(
     q: &QualifiedName,
@@ -1048,11 +1114,14 @@ pub(super) fn declare_associated_functions(
     stmts: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Vec<LoweringError> {
-    stmts
-        .iter()
-        .flat_map(associated_defs)
-        .filter_map(|def| declare_one(&def, ctx).err())
-        .collect()
+    let mut errors = Vec::new();
+    for stmt in stmts {
+        match associated_defs(stmt, ctx) {
+            Ok(defs) => errors.extend(defs.iter().filter_map(|def| declare_one(def, ctx).err())),
+            Err(e) => errors.push(e),
+        }
+    }
+    errors
 }
 
 fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), LoweringError> {
@@ -1079,9 +1148,11 @@ fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), Low
         return Err(LoweringError::unsupported(
             owner.span,
             format!(
-                "`{}` is not a nominal type this module declares, so `{}::{name}` has no \
+                "`{}` is not a nominal type{} this module declares, so `{}::{name}` has no \
                  type to belong to",
-                owner.node, owner.node
+                owner.node,
+                if block.is_some() { " or a trait" } else { "" },
+                owner.node
             ),
         ));
     };
@@ -1097,18 +1168,16 @@ fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), Low
             ),
         ));
     }
-    if let Some(block) = block
-        && block.params.len() != decl.params.len()
-    {
+    if block.is_some() && def.block_params.len() != decl.params.len() {
         return Err(LoweringError::unsupported(
-            block.ty.span,
+            owner.span,
             format!(
                 "`{}` takes {} type parameter{}, and `impl {}` names {}",
                 decl.name,
                 decl.params.len(),
                 if decl.params.len() == 1 { "" } else { "s" },
                 decl.name,
-                block.params.len()
+                def.block_params.len()
             ),
         ));
     }
@@ -1192,9 +1261,9 @@ fn check_self_annotation(
     def: &AssociatedDef,
 ) -> Result<(), LoweringError> {
     let qualified = format!("{}::{name}", decl.name);
-    if let Some(block) = def.block {
-        let params = block
-            .params
+    if def.block.is_some() {
+        let params = def
+            .block_params
             .iter()
             .map(|p| p.node.as_str())
             .collect::<Vec<_>>();
@@ -1268,7 +1337,7 @@ pub(super) fn lower_associated_def(
     def: &AssociatedDef,
     ctx: &mut LoweringContext,
 ) -> Result<(String, Expr, Option<Type>), LoweringError> {
-    let impl_params = def.block.map_or(&[][..], |b| b.params.as_slice());
+    let impl_params = def.block_params.as_slice();
     let AssociatedDef {
         name,
         type_params,

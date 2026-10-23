@@ -48,7 +48,7 @@ non-word character between the two.
 
 The builtin names are the spellings in `SURFACE_BUILTINS` in `chl-parser/src/builtins.rs`, every
 row of it: the functions, the transaction marker `begin`, the sink declarations `http_serve` and
-`test_sink`, and the source `stdin`. Each is a name the compiler resolves by its spelling, which is
+`test_sink`, the source `stdin`, and `summon`, which stands before `::`. Each is a name the compiler resolves by its spelling, which is
 what the class marks; a row's kind says where the name is accepted, not whether it is a builtin.
 `tests/it/editor_grammars.rs` reads the TextMate `builtin` rule and the Vim
 `syn match cambraBuiltin` line, and fails when either differs from the table.

@@ -32,6 +32,7 @@ pub enum SurfaceBuiltin {
     HttpServe,
     TestSink,
     Stdin,
+    Summon,
 }
 
 /// The number of arguments a [`SurfaceBuiltin`] call takes.
@@ -85,6 +86,10 @@ pub enum SurfaceBuiltinKind {
     /// every host registers. A registered source resolves by its registration, so a source
     /// absent from the table still resolves and a listed one resolves only once registered.
     Source,
+    /// The instance before `::` in `summon(T)::f`, which the parser reads as
+    /// [`Expr::Summon`](crate::ast::Expr::Summon), since its argument is a trait type rather
+    /// than an expression. Called alone, it is refused.
+    Qualifier,
 }
 
 /// One row of [`SURFACE_BUILTINS`].
@@ -118,7 +123,7 @@ const fn entry(
 pub const SURFACE_BUILTINS: &[SurfaceBuiltinEntry] = {
     use Arity::Exact;
     use SurfaceBuiltin as B;
-    use SurfaceBuiltinKind::{Function, SinkDeclaration, Source, TransactionMarker};
+    use SurfaceBuiltinKind::{Function, Qualifier, SinkDeclaration, Source, TransactionMarker};
     &[
         entry("sum", B::Sum, Exact(1), Function),
         entry("max", B::Max, Exact(1), Function),
@@ -137,6 +142,7 @@ pub const SURFACE_BUILTINS: &[SurfaceBuiltinEntry] = {
         // consumer gates its own recognition.
         entry("test_sink", B::TestSink, Exact(0), SinkDeclaration),
         entry("stdin", B::Stdin, Exact(0), Source),
+        entry("summon", B::Summon, Exact(1), Qualifier),
     ]
 };
 
@@ -195,7 +201,8 @@ mod tests {
             | B::Begin
             | B::HttpServe
             | B::TestSink
-            | B::Stdin => b,
+            | B::Stdin
+            | B::Summon => b,
         };
         [
             B::Sum,
@@ -212,6 +219,7 @@ mod tests {
             B::HttpServe,
             B::TestSink,
             B::Stdin,
+            B::Summon,
         ]
         .into_iter()
         .map(every)

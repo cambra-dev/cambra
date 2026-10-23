@@ -527,6 +527,7 @@ pub(crate) fn bool_lit_ty(b: bool) -> Type {
 pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
+    instances: &Rc<solver::traits::InstanceTable>,
 ) -> Result<Type, Vec<LocatedInferError>> {
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
@@ -537,7 +538,9 @@ pub(crate) fn run(
             .collect();
         // Seed the blame cursor with the root: every error is stamped with the
         // node whose rule raised it, and the root is the outermost such node.
-        InferCtx::new(translated, expr.node_id())
+        let mut ctx = InferCtx::new(translated, expr.node_id());
+        ctx.instances = Rc::clone(instances);
+        ctx
     };
 
     // Pass 1: emit constraints. The high-value variants
@@ -660,7 +663,11 @@ pub(crate) fn run(
     // state, so nothing needs to be kept in sync across them.
     // Each coalesce error arrives blamed on the node whose rule raised it, so
     // this pass's (potentially several) errors need no post-hoc attribution.
-    let errors = coalesce_pass(expr, std::mem::take(&mut sub_ctx.bound_at_annotation));
+    let errors = coalesce_pass(
+        expr,
+        std::mem::take(&mut sub_ctx.bound_at_annotation),
+        Rc::clone(instances),
+    );
     if !errors.is_empty() {
         return Err(errors);
     }

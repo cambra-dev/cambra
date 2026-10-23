@@ -185,11 +185,11 @@
     },
     "keyword-other": {
       "name": "keyword.other.cambra",
-      "match": "\\b(?:def|where|and|or|not|forall|requires|type|impl|import|use|as|pub|run|param|this)\\b"
+      "match": "\\b(?:def|where|and|or|not|forall|requires|type|impl|trait|import|use|as|pub|run|param|this)\\b"
     },
     "builtin": {
       "name": "support.function.builtin.cambra",
-      "match": "\\b(?:sum|max|min|groupby|set|map|box|empty_map|await_final|defer|begin|http_serve|test_sink|stdin)\\b"
+      "match": "\\b(?:sum|max|min|groupby|set|map|box|empty_map|await_final|defer|begin|http_serve|test_sink|stdin|summon)\\b"
     },
     "variant-tag": {
       "name": "variable.other.enummember.cambra",

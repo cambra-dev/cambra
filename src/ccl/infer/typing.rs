@@ -263,6 +263,17 @@ pub(super) trait Typing {
     /// Check has none to report.
     fn definition_alone_error(&self, name: &Name) -> Option<LocatedInferError>;
 
+    /// After an application passes its argument to the trait function `function`: where the
+    /// call's obligation now selects an instance whose functions are a group being emitted,
+    /// emit that function first, so the group binds it before the function calling it
+    /// (`src/ccl/design/type-inference.md`, "Trait functions"). Check has no group.
+    fn bind_instance_function_called(
+        &mut self,
+        _function: NodeId,
+    ) -> Result<(), LocatedInferError> {
+        Ok(())
+    }
+
     /// Run `f` with a `let` binding in scope over the body, at the type
     /// `binding.ty` records. Unless `scheme` is [`LetScheme::Monomorphic`], Emit
     /// generalizes that type at the current level into a polymorphic scheme (so
