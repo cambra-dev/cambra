@@ -129,6 +129,18 @@ fn labels(code: &str) -> (String, Vec<(String, &'static str)>) {
     "f",
     &[("a if c else \"s\"", "required here")],
 )]
+#[case::the_resolution_of_a_function_result_barrier(
+    indoc! {"
+        def f(x: Int):
+            r ^= x
+            r ^+ 0
+        a = f(1)
+        b: {Int where _ == a} = f(2)
+        a == b
+    "},
+    "b: {Int where _ == a} = f(2)",
+    &[("r ^+ 0", "the value comes from here")],
+)]
 fn an_error_labels_the_positions_its_edge_involves(
     #[case] code: &str,
     #[case] primary: &str,

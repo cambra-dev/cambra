@@ -11,11 +11,25 @@
 
 use std::rc::Rc;
 
+use crate::ccl::infer::InferError;
 use crate::ccl::infer_var::{BarrierCheck, Origin};
 use crate::ccl::{BarrierVar, Name, Type};
 
 use super::coalesce::coalesce_position;
 use super::constrain::{ConstrainCache, ConstrainError, constrain_opaque_upper};
+
+/// The error a failed check of a barrier variable's upper bound reports: the one the edge that
+/// recorded the bound raises when it fails as it is drawn. The check runs after emission, when
+/// that edge's typing rule is no longer there to choose it.
+#[derive(Debug)]
+pub enum EdgeReport {
+    /// The constraint's error, rendered by `map_constrain_err` under this label, as
+    /// `InferCtx::require_sub` raises it.
+    Labeled(String),
+    /// This error, whatever the constraint's: an annotation's mismatch, as
+    /// `InferCtx::reconcile_annotation` raises it.
+    Fixed(InferError),
+}
 
 /// A barrier variable whose check failed.
 #[derive(Debug, Clone)]
@@ -36,6 +50,11 @@ pub enum BarrierFailure {
         error: ConstrainError,
         /// Where the upper bound came from.
         origin: Option<Origin>,
+        /// What the edge that recorded the upper bound reports.
+        report: Option<Rc<EdgeReport>>,
+        /// The origins of the innermost failing edge: the value's and the demand's
+        /// ([`ConstrainCache::take_failure`]).
+        failure: (Option<Origin>, Option<Origin>),
     },
 }
 
@@ -124,12 +143,16 @@ fn check_barrier(barrier: &Rc<BarrierVar>, failures: &mut Vec<BarrierFailure>) -
     if first_unchecked == uppers.len() {
         return false;
     }
+    // The resolution's value comes from the lower bounds, as an `Escape` reports it.
+    let value = barrier.lowers.borrow().iter().find_map(|b| b.origin);
     let mut cache = ConstrainCache::new();
     for upper in &uppers[first_unchecked..] {
-        if let Err(error) = constrain_opaque_upper(&resolved, upper, &mut cache) {
+        if let Err(error) = constrain_opaque_upper(&resolved, value, upper, &mut cache) {
             failures.push(BarrierFailure::Upper {
                 error,
-                origin: upper.origin,
+                origin: upper.bound.origin,
+                report: upper.report.clone(),
+                failure: cache.take_failure(),
             });
             *barrier.checked.borrow_mut() = Some(BarrierCheck::Failed);
             return true;

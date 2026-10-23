@@ -565,7 +565,7 @@ pub(crate) fn run(
     push_barrier_failures(&mut errors, expr.node_id(), |node| {
         find_node(expr, node).map_or_else(
             || "a function's result".to_string(),
-            crate::ccl::symbolic::symbolic,
+            crate::ccl::symbolic::symbolic_head,
         )
     });
     if !errors.is_empty() {

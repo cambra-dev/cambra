@@ -829,7 +829,7 @@ pub struct BarrierVar {
     /// The gathered upper bounds. Each is checked against the resolution from
     /// `lowers` by `solver::barrier::solve_barrier_vars`, not closed against the
     /// lowers as they arrive.
-    pub uppers: RefCell<Vec<Bound>>,
+    pub uppers: RefCell<Vec<BarrierUpper>>,
     /// Trait obligations watching an inference variable this barrier variable is a lower
     /// bound of, with the operand position each watches. Every lower bound recorded here
     /// is delivered to them (`notify_barrier_lower` in `src/ccl/infer/solver/traits.rs`):
@@ -840,6 +840,27 @@ pub struct BarrierVar {
     /// first check. Severed at arena teardown with the bounds, since the resolution
     /// holds types that can reach this variable.
     pub checked: RefCell<Option<BarrierCheck>>,
+}
+
+/// An upper bound of a [`BarrierVar`], with the error a failed check of it reports.
+#[derive(Debug, Clone)]
+pub struct BarrierUpper {
+    pub bound: Bound,
+    /// The error the edge that recorded the bound raises when it fails as it is drawn,
+    /// given by that edge's caller after the edge
+    /// ([`ConstrainCache::report_recorded`](crate::ccl::infer::solver::ConstrainCache::report_recorded)).
+    /// `None` for a bound whose caller gives none, such as an extrusion's link.
+    pub report: Option<Rc<crate::ccl::infer::solver::barrier::EdgeReport>>,
+}
+
+impl BarrierUpper {
+    /// `bound`, with no report yet.
+    pub fn unreported(bound: Bound) -> Self {
+        BarrierUpper {
+            bound,
+            report: None,
+        }
+    }
 }
 
 /// The state [`BarrierVar::checked`] records after a check of a barrier variable.
@@ -860,7 +881,11 @@ pub enum BarrierCheck {
 impl BarrierVar {
     /// Mint a fresh barrier variable outside the binders `opaque`, over `lowers` and
     /// `uppers`.
-    pub fn fresh(opaque: Rc<[Name]>, lowers: Vec<Bound>, uppers: Vec<Bound>) -> Rc<BarrierVar> {
+    pub fn fresh(
+        opaque: Rc<[Name]>,
+        lowers: Vec<Bound>,
+        uppers: Vec<BarrierUpper>,
+    ) -> Rc<BarrierVar> {
         let barrier = Rc::new(BarrierVar {
             uid: fresh_barrier_var_id(),
             reading_level: std::cell::Cell::new(false),
@@ -890,8 +915,13 @@ impl BarrierVar {
             .lowers
             .borrow()
             .iter()
-            .chain(self.uppers.borrow().iter())
             .map(|b| crate::ccl::infer::solver::type_level(&b.ty))
+            .chain(
+                self.uppers
+                    .borrow()
+                    .iter()
+                    .map(|u| crate::ccl::infer::solver::type_level(&u.bound.ty)),
+            )
             .max()
             .unwrap_or(0);
         self.reading_level.set(false);

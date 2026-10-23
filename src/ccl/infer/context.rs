@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
+use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::display::poly_for_display;
 use crate::ccl::infer::solver::smt::{NoScope, ScopeEnv};
 use crate::ccl::infer::solver::{
@@ -772,7 +773,10 @@ impl InferCtx {
             opaque_binders: &self.opaque_binders,
         };
         self.cache.at(self.here(), self.here());
-        if constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope).is_err() {
+        let result = constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope);
+        self.cache
+            .report_recorded(|| EdgeReport::Fixed(mismatch.clone()));
+        if result.is_err() {
             let failure = self.cache.take_failure();
             return Err(self.raise(mismatch).with_failure(failure));
         }
@@ -809,7 +813,10 @@ impl InferCtx {
                 opaque_binders: &self.opaque_binders,
             };
             self.cache.at(self.here(), self.here());
-            if constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope).is_err() {
+            let result = constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope);
+            self.cache
+                .report_recorded(|| EdgeReport::Fixed(mismatch.clone()));
+            if result.is_err() {
                 let failure = self.cache.take_failure();
                 return Err(self.raise(mismatch).with_failure(failure));
             }
@@ -930,7 +937,9 @@ impl Typing for InferCtx {
         // operand is known — the ordinary "all candidates agree" rule reaching its
         // condition immediately, not a special case.
         self.cache.at(self.here(), self.demand_at.or(self.here()));
-        if let Err(e) = obligation.try_deposit(&mut self.cache) {
+        let deposited = obligation.try_deposit(&mut self.cache);
+        self.cache.report_recorded(|| EdgeReport::Labeled(at()));
+        if let Err(e) = deposited {
             let failure = self.cache.take_failure();
             return Err(self
                 .raise(map_constrain_err(e, &at()))
@@ -1048,7 +1057,9 @@ impl Typing for InferCtx {
             opaque_binders: &self.opaque_binders,
         };
         self.cache.at(self.here(), self.demand_at.or(self.here()));
-        match constrain_subtype_in(sub, sup, &mut self.cache, &scope) {
+        let result = constrain_subtype_in(sub, sup, &mut self.cache, &scope);
+        self.cache.report_recorded(|| EdgeReport::Labeled(at()));
+        match result {
             Ok(()) => Ok(()),
             Err(e) => {
                 let failure = self.cache.take_failure();

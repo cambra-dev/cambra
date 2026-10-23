@@ -741,7 +741,13 @@ pub fn freshen_above(
                 ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
             };
             let new_lows: Vec<_> = lows.iter().map(&mut freshen_bound).collect();
-            let new_ups: Vec<_> = ups.iter().map(&mut freshen_bound).collect();
+            let new_ups: Vec<_> = ups
+                .iter()
+                .map(|u| crate::ccl::BarrierUpper {
+                    bound: freshen_bound(&u.bound),
+                    report: u.report.clone(),
+                })
+                .collect();
             *fresh.lowers.borrow_mut() = new_lows;
             *fresh.uppers.borrow_mut() = new_ups;
             // A barrier variable is never an operand, so the copy records the watch

@@ -897,7 +897,7 @@ a = f(1)
 b: {Int where _ == a} = f(2)
 a == b
         "#},
-        "in a == b: expected {Int | __elem == a}, found Int",
+        "Annotation mismatch: annotated as {Int where _ == a}, but inferred as Int",
     )
 }
 
@@ -916,7 +916,7 @@ a = f(1)
 b: {Int where _ == a} = f(2)
 a == b
         "#},
-        "in a == b: expected {Int | __elem == a}, found Int",
+        "Annotation mismatch: annotated as {Int where _ == a}, but inferred as Int",
     )
 }
 
@@ -1012,7 +1012,7 @@ a = f(1)
 b: {Int where _ == a} = f(1)
 a == b
         "#},
-        "in a == b: expected {Int | __elem == a}, found Int",
+        "Annotation mismatch: annotated as {Int where _ == a}, but inferred as Int",
     )
 }
 
@@ -1772,7 +1772,7 @@ def f(x: Int):
 f1 = f(1)
 f1(-5)
         "#},
-        "Type mismatch for -5 ▷ f1: expected {Int | __elem > 0}, found Int@-5",
+        "Type mismatch for Apply: expected {Int | __elem > 0}, found Int@-5",
     )
 }
 

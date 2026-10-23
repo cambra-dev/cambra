@@ -151,6 +151,16 @@ pub fn symbolic(expr: &Expr) -> String {
     fmt(expr, Precedence::Lowest, &SymbolicOpts::default())
 }
 
+/// [`symbolic`], with a statement (`let`, `letrec`, `x := …`, …) rendered without its
+/// continuation: the node a diagnostic blames, not the rest of the program after it.
+pub fn symbolic_head(expr: &Expr) -> String {
+    let opts = SymbolicOpts::default();
+    match statement_head(expr, &opts) {
+        Some((head, _)) => head,
+        None => fmt(expr, Precedence::Lowest, &opts),
+    }
+}
+
 /// Render a CCL expression as a symbolic string.
 pub fn symbolic_typed(expr: &Expr) -> String {
     fmt(
@@ -204,6 +214,86 @@ fn fmt_transact_writer(w: &crate::ccl::WriterSite, opts: &SymbolicOpts) -> Strin
         fmt(&w.source, Precedence::Lowest, opts),
         fmt(&w.body, Precedence::Lowest, opts)
     )
+}
+
+/// A statement's rendering up to its continuation, and the continuation, which the full
+/// rendering puts after `in` on the next line. `None` for a node that is not a statement.
+fn statement_head<'e>(expr: &'e Expr, opts: &SymbolicOpts) -> Option<(String, &'e Expr)> {
+    let binder_ty = |ty: &Type| {
+        if matches!(ty, Type::Hole | Type::Infer(_)) {
+            String::new()
+        } else {
+            format!(" : {}", ty_at(ty, opts))
+        }
+    };
+    let (head, body): (String, &Expr) = match &expr.node {
+        // `x := init` — the mutable variable introduction, rendered with the operator
+        // that produced it so it is distinguishable from a `let` at a glance.
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body,
+        } => (
+            format!(
+                "{}{} := {}",
+                binding.name,
+                binder_ty(&binding.ty),
+                fmt(init, Precedence::Lowest, opts)
+            ),
+            body,
+        ),
+        TypedExprNode::Run {
+            name, module, body, ..
+        } => (format!("run {name} = {module}"), body),
+        TypedExprNode::LetType { name, ty, body } => {
+            (format!("let type {name} = {}", ty_at(ty, opts)), body)
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            // An opaque binder keeps CHL's `^=`. The two forms differ in what a
+            // type lifted past the binder reads in its place, and nothing in the
+            // term shows that, so one spelling would render them alike.
+            let op = match binding.transparency {
+                BindingTransparency::Transparent => "=",
+                BindingTransparency::Opaque => "^=",
+            };
+            (
+                format!(
+                    "let {}{} {op} {}",
+                    binding.name,
+                    binder_ty(&binding.ty),
+                    fmt(bound_expr, Precedence::Lowest, opts)
+                ),
+                body,
+            )
+        }
+        // Mutually recursive group: `letrec b₁ = e₁; …; bₙ = eₙ`, bindings separated
+        // by `; `. An `impl` block's group renders the same way under `defs`.
+        TypedExprNode::LetRec { bindings, body } | TypedExprNode::DefGroup { bindings, body } => {
+            let keyword = if matches!(expr.node, TypedExprNode::LetRec { .. }) {
+                "letrec"
+            } else {
+                "defs"
+            };
+            let binding_strs: Vec<_> = bindings
+                .iter()
+                .map(|(b, def)| {
+                    format!(
+                        "{}{} = {}",
+                        b.name,
+                        binder_ty(&b.ty),
+                        fmt(def, Precedence::Lowest, opts)
+                    )
+                })
+                .collect();
+            (format!("{keyword} {}", binding_strs.join("; ")), body)
+        }
+        _ => return None,
+    };
+    Some((head, body))
 }
 
 /// Render `expr`, wrapping in `( )` if its precedence is below `min_prec`.
@@ -363,67 +453,17 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Lowest, format!("{kind:?}({input_str})"))
         }
 
-        // `x := init` — the mutable variable introduction, rendered with the operator
-        // that produced it so it is distinguishable from a `let` at a glance.
-        TypedExprNode::MutDecl {
-            binding,
-            init,
-            body,
-        } => {
-            let ty_str = if !matches!(binding.ty, Type::Hole | Type::Infer(_)) {
-                format!(" : {}", ty_at(&binding.ty, opts))
-            } else {
-                String::new()
+        TypedExprNode::MutDecl { .. }
+        | TypedExprNode::Run { .. }
+        | TypedExprNode::LetType { .. }
+        | TypedExprNode::Let { .. }
+        | TypedExprNode::LetRec { .. }
+        | TypedExprNode::DefGroup { .. } => {
+            let Some((head, body)) = statement_head(expr, opts) else {
+                unreachable!("`statement_head` renders every statement node")
             };
-            let init_str = fmt(init, Precedence::Lowest, opts);
             let body_str = fmt(body, Precedence::Lowest, opts);
-            (
-                Precedence::Lowest,
-                format!("{}{ty_str} := {init_str}\nin {body_str}", binding.name),
-            )
-        }
-
-        TypedExprNode::Run {
-            name, module, body, ..
-        } => {
-            let body_str = fmt(body, Precedence::Lowest, opts);
-            (
-                Precedence::Lowest,
-                format!("run {name} = {module}\nin {body_str}"),
-            )
-        }
-
-        TypedExprNode::LetType { name, ty, body } => {
-            let body_str = fmt(body, Precedence::Lowest, opts);
-            (
-                Precedence::Lowest,
-                format!("let type {name} = {}\nin {body_str}", ty_at(ty, opts)),
-            )
-        }
-
-        TypedExprNode::Let {
-            binding,
-            bound_expr: value,
-            body,
-        } => {
-            let ty_str = if !matches!(binding.ty, Type::Hole | Type::Infer(_)) {
-                format!(" : {}", ty_at(&binding.ty, opts))
-            } else {
-                String::new()
-            };
-            let val_str = fmt(value, Precedence::Lowest, opts);
-            let body_str = fmt(body, Precedence::Lowest, opts);
-            // An opaque binder keeps CHL's `^=`. The two forms differ in what a
-            // type lifted past the binder reads in its place, and nothing in the
-            // term shows that, so one spelling would render them alike.
-            let op = match binding.transparency {
-                BindingTransparency::Transparent => "=",
-                BindingTransparency::Opaque => "^=",
-            };
-            (
-                Precedence::Lowest,
-                format!("let {}{ty_str} {op} {val_str}\nin {body_str}", binding.name),
-            )
+            (Precedence::Lowest, format!("{head}\nin {body_str}"))
         }
 
         TypedExprNode::List(elts) => {
@@ -578,39 +618,6 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
                     key_strs.join(", "),
                     writer_strs.join("; ")
                 ),
-            )
-        }
-
-        // Mutually recursive group: `letrec b₁ = e₁; …; bₙ = eₙ in body`,
-        // bindings separated by `; `, with the `in` continuation on its own
-        // line matching the `Let` rendering. Binding names carry ` : ty`
-        // when the declared type is known, like other typed binders. An `impl`
-        // block's group renders the same way under `defs`.
-        TypedExprNode::LetRec { bindings, body } | TypedExprNode::DefGroup { bindings, body } => {
-            let keyword = if matches!(expr.node, TypedExprNode::LetRec { .. }) {
-                "letrec"
-            } else {
-                "defs"
-            };
-            let binding_strs: Vec<_> = bindings
-                .iter()
-                .map(|(b, def)| {
-                    let ty_str = if !matches!(b.ty, Type::Hole | Type::Infer(_)) {
-                        format!(" : {}", ty_at(&b.ty, opts))
-                    } else {
-                        String::new()
-                    };
-                    format!(
-                        "{}{ty_str} = {}",
-                        b.name,
-                        fmt(def, Precedence::Lowest, opts)
-                    )
-                })
-                .collect();
-            let body_str = fmt(body, Precedence::Lowest, opts);
-            (
-                Precedence::Lowest,
-                format!("{keyword} {}\nin {body_str}", binding_strs.join("; ")),
             )
         }
 

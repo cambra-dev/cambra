@@ -2138,8 +2138,15 @@ the join of its lower bounds with the refinements at positive positions dropped
 (`CompactType::resolve_barrier_refinements` in `solver/compact.rs`).
 
 `solver::barrier::solve_barrier_vars` checks each barrier variable against its resolution. It
-reports the escape above, or checks each upper bound against the resolution; a failed check surfaces
-as the constraint error it raised, blamed on the node that recorded the bound. A check is a
+reports the escape above, or checks each upper bound against the resolution. A failed check is
+blamed on the node that recorded the bound and raises the error that bound's edge raises when it
+fails as it is drawn: an annotation's edge raises `InferError::AnnotationMismatch`, and an edge drawn
+with a label raises the constraint error under that label. The edge's caller gives each upper bound
+recorded during the edge that error after the edge returns (`ConstrainCache::report_recorded`). The
+check's value position is the origin of the barrier variable's first lower bound that has one, and
+its demand position is the upper bound's origin, so the error carries the secondary labels an
+ordinary edge does (`the_resolution_of_a_function_result_barrier` in
+`tests/it/compilation_pipeline/secondary_labels.rs`). A check is a
 `constrain`, so it adds bounds to the variables it reaches, other barrier variables' lower bounds
 included. The phase therefore repeats until a round checks nothing, and each variable records what
 it was last checked against (`BarrierVar::checked`), so an unchanged resolution has only its newly
