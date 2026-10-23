@@ -1,6 +1,6 @@
 //! The traits and instances a module declares, and their functions, read from an instance
 //! (`docs/chl-spec.md`, "Summoning an instance", "Declaring a trait", "Declaring an
-//! instance").
+//! instance"), and the arithmetic operators' instances on a module's types.
 
 use std::time::Duration;
 
@@ -744,12 +744,12 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
     "},
     "`Area::area` is no method, so no parameter of `area` is `self`"
 )]
-#[case::an_operator_trait(
+#[case::a_comparison_trait(
     indoc! {"
         type Money = Int
-        impl Addable(Money, Money, Output=Money):
-            def add(x, other):
-                x
+        impl Equatable(Money, Money):
+            def eq(m, other):
+                True
         1
     "},
     "an instance of one is not supported yet"
@@ -1441,6 +1441,144 @@ fn a_refined_associated_type_is_an_internal_gap() {
         "},
         "internal compiler error in lowering",
     );
+}
+
+/// A nominal type with instances of arithmetic operators' traits: `+` and unary `-` call the
+/// functions the instances define.
+const MONEY: &str = indoc! {"
+    type Money = Int
+    impl Addable(Money, Money, Output=Money):
+        def add(x, other):
+            Money::new(x.extract() + other.extract())
+    impl Negatable(Money, Output=Money):
+        def neg(x):
+            Money::new(0 - x.extract())
+"};
+
+fn with_money(code: &str) -> String {
+    format!("{MONEY}\n{code}")
+}
+
+/// An arithmetic operator on a nominal type calls the function its instance defines, at
+/// every use: in a loop's accumulation, in each use of a generic definition, and through a
+/// conditional instance at the types of its arguments.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::addition("(Money::new(1) + Money::new(2)).extract()", 3)]
+#[case::negation("(-Money::new(4)).extract()", -4)]
+#[case::accumulation(
+    indoc! {"
+        total := Money::new(0)
+        for x in [1, 2, 3]:
+            total += Money::new(x)
+        total.extract()
+    "},
+    6
+)]
+#[case::each_use_of_a_generic_definition(
+    indoc! {"
+        def twice(a):
+            a + a
+        twice(Money::new(3)).extract() + twice(4)
+    "},
+    14
+)]
+#[case::a_conditional_instance(
+    indoc! {"
+        type Two(T) = {T, T}
+        impl forall (T) Addable(Two(T), Two(T), Output=Two(T)) requires Addable(T, T, Output=T):
+            def add(x, other):
+                Two::new((x.extract().0 + other.extract().0, x.extract().1 + other.extract().1))
+        s = Two::new((Money::new(1), Money::new(2))) + Two::new((Money::new(10), Money::new(20)))
+        t = Two::new((1, 2)) + Two::new((3, 4))
+        s.extract().1.extract() + t.extract().0
+    "},
+    26
+)]
+fn an_arithmetic_operator_calls_its_instance(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(&with_money(code), Value::Int(expected));
+}
+
+/// An instance over two different types: `**`'s exponent is a non-negative `Int` at every
+/// instance.
+#[test]
+fn an_arithmetic_instance_over_two_types() {
+    check_scalar(
+        indoc! {"
+            type M = Int
+            impl Addable(M, Int, Output=M):
+                def add(x, other):
+                    M::new(x.extract() + other)
+            impl Exponentiable(M, Int, Output=M):
+                def pow(x, other):
+                    M::new(x.extract() ** other)
+            ((M::new(3) + 4) ** 2).extract()
+        "},
+        Value::Int(49),
+    );
+}
+
+/// What an instance of an operator's trait refuses: the compiler's traits belong to no
+/// module, so an instance of one names a type the module declares and no whole-operand
+/// variable, and `**`'s exponent is an `Int` at every instance.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::only_option(
+    indoc! {"
+        impl Addable(Option(Int), Option(Int), Output=Option(Int)):
+            def add(x, other):
+                x
+        1
+    "},
+    "names no type this module declares"
+)]
+#[case::a_whole_operand_variable(
+    indoc! {"
+        type Money = Int
+        impl forall (F) Multipliable(Money, F, Output=Money) requires Multipliable(Int, F, Output=Int):
+            def mul(x, k):
+                Money::new(x.extract() * k)
+        1
+    "},
+    "has a type variable as a whole operand"
+)]
+#[case::an_exponent_not_int(
+    indoc! {"
+        type M = Int
+        impl Exponentiable(M, M, Output=M):
+            def pow(x, e):
+                x
+        1
+    "},
+    "takes an exponent that is not `Int`"
+)]
+fn an_arithmetic_instance_refuses(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}
+
+/// An operator's trait function is read from an instance, a compiler instance as a module's:
+/// `summon(Addable(_, _))::add(a, b)` is `a + b`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::summoned("summon(Addable(_, _))::add(1, 2)", 3)]
+#[case::at_a_declared_instance(
+    "summon(Addable(_, _))::add(Money::new(1), Money::new(2)).extract()",
+    3
+)]
+#[case::concatenation(
+    "sum([1 for c in [\"a\", \"ab\"] if c == summon(Addable(_, _))::add(\"a\", \"b\")])",
+    1
+)]
+#[case::a_named_requirement(
+    indoc! {"
+        def plus(T, a: T, b: T) => T requires p: Addable(T, T, Output=T):
+            p::add(a, b)
+        plus(Money::new(1), Money::new(2)).extract() + plus(1, 2)
+    "},
+    6
+)]
+fn an_operator_trait_function_by_name(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(&with_money(code), Value::Int(expected));
 }
 
 /// A tuple orders lexicographically by position, and `max` and `min` read it so.

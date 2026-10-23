@@ -3460,8 +3460,8 @@ mod tests {
     #[test]
     fn test_infer_string_add_infers_string() {
         let mut ctx = TypeInferenceContext::new();
-        // "hello" + "world"  =>  String; Add is left as-is (Concat rewriting
-        // happens at compile time, not inference time).
+        // "hello" + "world"  =>  String, and the operator runs the `Addable(String, String)`
+        // instance's primitive, `Concat`.
         let mut expr = Expr::binop(
             Expr::lit(Lit::String("hello".into())),
             BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -3469,9 +3469,8 @@ mod tests {
         );
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::String));
-        // The op is NOT rewritten at inference time.
         if let TypedExprNode::BinOp { op, .. } = &expr.node {
-            assert_eq!(*op, BinOpKind::Arithmetic(ArithmeticKind::Add));
+            assert_eq!(*op, BinOpKind::Concat);
         } else {
             panic!("expected BinOp");
         }

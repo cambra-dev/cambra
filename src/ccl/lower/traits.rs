@@ -18,8 +18,8 @@ use smol_str::SmolStr;
 
 use super::*;
 use crate::ccl::infer::solver::traits::{
-    Assoc, DeclaredAt, InstanceHead, InstanceTable, ProductReading, Signature, Trait, TraitDecl,
-    TraitFunction, TraitInstance, entailed, replace_params, unify_all,
+    Assoc, DeclaredAt, Implementation, InstanceHead, InstanceTable, ProductReading, Signature,
+    Trait, TraitDecl, TraitFunction, TraitInstance, entailed, replace_params, unify_all,
 };
 use crate::ccl::ty::{PolyParam, TraitRequirement, TypeKind, TypeParam, TypeParamId};
 use crate::ccl::{Expr, Name, Type, TypedBinding, TypedExprNode};
@@ -529,7 +529,7 @@ fn declare_instance(
     ctx: &mut LoweringContext,
 ) -> Result<(), LoweringError> {
     let written = format!("{trait_}(…)");
-    if trait_.is_compiler() {
+    if trait_.is_compiler() && trait_.functions().is_empty() {
         return Err(LoweringError::unsupported(
             block.ty.span,
             format!(
@@ -578,6 +578,57 @@ fn declare_instance(
             format!(
                 "`impl {}` names no nominal type; an instance is for a type the module \
                  declares, so one of its operands names one",
+                head_spelling(&trait_, &operands, &[])
+            ),
+        ));
+    }
+    // The compiler's traits belong to no module, so an instance of one names a type this
+    // module declares, and stands outside its trait's module, where no operand is a whole
+    // type variable (`docs/chl-spec.md`, "Traits and instances across modules").
+    if trait_.is_compiler() {
+        let declares =
+            |decl: &Rc<NominalDecl>| ctx.nominal_types.iter().any(|d| Rc::ptr_eq(d, decl));
+        if !heads
+            .iter()
+            .any(|h| matches!(h, InstanceHead::Nominal(d) if declares(d)))
+        {
+            return Err(LoweringError::unsupported(
+                block.ty.span,
+                format!(
+                    "`impl {}` names no type this module declares; an instance is declared in \
+                     its trait's module or in the module of a type its head names, and \
+                     `{trait_}` is the compiler's",
+                    head_spelling(&trait_, &operands, &[])
+                ),
+            ));
+        }
+        if let Some((arg, _)) = block
+            .args
+            .iter()
+            .zip(&heads)
+            .find(|(_, h)| matches!(h, InstanceHead::Any))
+        {
+            return Err(LoweringError::unsupported(
+                arg.span,
+                format!(
+                    "`impl {}` has a type variable as a whole operand, which only an instance \
+                     in its trait's module may, and `{trait_}` is the compiler's; write an \
+                     instance for each type",
+                    head_spelling(&trait_, &operands, &[])
+                ),
+            ));
+        }
+    }
+    // A `**`'s exponent is a non-negative `Int` whichever instance answers it, so an instance
+    // of `Exponentiable` takes `Int` there (`docs/chl-spec.md`, "Declaring an instance").
+    if trait_ == Trait::exponentiable()
+        && operands.get(1) != Some(&Type::Base(crate::ccl::BaseType::Int))
+    {
+        return Err(LoweringError::unsupported(
+            block.args.get(1).map_or(block.ty.span, |a| a.span),
+            format!(
+                "`impl {}` takes an exponent that is not `Int`; a `**`'s exponent is a \
+                 non-negative `Int` whichever instance answers it",
                 head_spelling(&trait_, &operands, &[])
             ),
         ));
@@ -697,7 +748,7 @@ fn declare_instance(
         });
     }
     // The block defines each of the trait's functions, and nothing else.
-    let mut functions: Vec<(SmolStr, Name)> = Vec::new();
+    let mut functions: Vec<(SmolStr, Implementation)> = Vec::new();
     for def in &block.defs {
         let (fname, fspan, owner) = match &def.node {
             ChlStmt::FunctionDef { name, owner, .. } => (&name.node, def.span, owner),
@@ -733,7 +784,10 @@ fn declare_instance(
                 format!("`impl {head}` defines `{fname}` twice"),
             ));
         }
-        functions.push((fname.clone(), Name::fresh(format!("{trait_}::{fname}"))));
+        functions.push((
+            fname.clone(),
+            Implementation::Binding(Name::fresh(format!("{trait_}::{fname}"))),
+        ));
     }
     if let Some(missing) = trait_
         .functions()
@@ -1042,12 +1096,9 @@ fn lower_instance_def(
         .function(name)
         .cloned()
         .expect("`declare_instances` checked the instance's functions");
-    let binding = instance
-        .functions
-        .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, b)| b.clone())
-        .expect("`declare_instances` named each function's binding");
+    let Some(Implementation::Binding(binding)) = instance.implementation(name).cloned() else {
+        unreachable!("`declare_instances` named each function's binding")
+    };
     let qualified = format!("{trait_}::{name}");
     let sig = &function.signature;
     // The head's variables, then the function's own type parameters: the instance's

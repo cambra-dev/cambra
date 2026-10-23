@@ -2910,7 +2910,9 @@ pub(super) fn bind_selected_instance_function(
     let Some(instance) = obligation.selected_instance() else {
         return Ok(());
     };
-    let Some(binding) = instance.implementation(function) else {
+    let Some(crate::ccl::infer::solver::traits::Implementation::Binding(binding)) =
+        instance.implementation(function)
+    else {
         return Ok(());
     };
     let gathered: Option<Vec<Type>> = operands.iter().map(gathered_type).collect();
