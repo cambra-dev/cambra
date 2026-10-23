@@ -2041,12 +2041,7 @@ fn unlocated(located: Vec<LocatedInferError>) -> Vec<InferError> {
 /// that minted it — and the walk reaches the slot either way.
 fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
     fn ty_has_transient(ty: &Type) -> bool {
-        if matches!(ty, Type::History { .. }) {
-            return true;
-        }
-        let mut found = false;
-        ty.walk_children(|t| found |= ty_has_transient(t));
-        found
+        matches!(ty, Type::History { .. }) || ty.any_child(ty_has_transient)
     }
     fn binder_has_transient(expr: &Expr) -> bool {
         let mut found = false;

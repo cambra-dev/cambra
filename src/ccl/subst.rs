@@ -1732,47 +1732,14 @@ pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
 /// whole-program scan, for invariant assertions at pass boundaries. It walks the type skeleton only — a `Refinement`'s predicate is
 /// a term, not a type, and is not descended into (an `Infer` embedded in a
 /// predicate cast is out of scope and would need a term walk).
+///
+/// A [`Type::BoundedHole`] answers for its bound, which [`Type::walk_children`] visits. The
+/// variant occurs in annotation position only and is normalized away before solving; one
+/// that reaches a check is reported as
+/// [`InferError::UnresolvedBoundedHole`](crate::ccl::infer::InferError::UnresolvedBoundedHole),
+/// not by this test.
 pub fn type_contains_infer(ty: &Type) -> bool {
-    match ty {
-        Type::Base(_)
-        | Type::UIntRange(_)
-        | Type::DataSource(_)
-        | Type::ChanDom(..)
-        | Type::Txn
-        | Type::Hole
-        | Type::SharedHole(_)
-        | Type::Param(_)
-        | Type::WitnessRef(_) => false,
-        Type::Infer(_) => true,
-        Type::Poly(poly) => poly.types().any(type_contains_infer),
-        Type::Fun {
-            fun_kind,
-            domain,
-            codomain,
-            ..
-        } => {
-            fun_kind
-                .witnesses()
-                .iter()
-                .any(|w| w.types().iter().any(type_contains_infer))
-                || type_contains_infer(domain)
-                || type_contains_infer(codomain)
-        }
-        Type::History { value, domain, .. } => {
-            type_contains_infer(value) || type_contains_infer(domain)
-        }
-        Type::Tuple(ts) => ts.iter().any(type_contains_infer),
-        Type::DepTuple(cs) => cs.iter().any(|(_, t)| type_contains_infer(t)),
-        Type::Nominal(_, ts) => ts.iter().any(type_contains_infer),
-        Type::Split { input, output } => type_contains_infer(input) || type_contains_infer(output),
-        Type::Record(fs) => fs.iter().any(|(_, t)| type_contains_infer(t)),
-        Type::Variant(tags, _) => tags.iter().any(|(_, t)| type_contains_infer(t)),
-        Type::Refinement(base, _) => type_contains_infer(base),
-        // Annotation position only, and normalized away before solving. Answering
-        // for the bounded type is the honest reading of the question; a `BoundedHole` that
-        // reaches here at all is reported as `UnresolvedBoundedHole`, not by this test.
-        Type::BoundedHole(t) => type_contains_infer(t),
-    }
+    matches!(ty, Type::Infer(_)) || ty.any_child(type_contains_infer)
 }
 
 /// Insert each of `names` into `bound` for the duration of `f`, restoring the

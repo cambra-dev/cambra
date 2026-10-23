@@ -3021,12 +3021,7 @@ impl Type {
     /// the term copy alone leaves the two unequal where inference dedups them by
     /// structural equality (`crate::ccl::anf`, the refined `Cast` contract).
     pub fn carries_refinement(&self) -> bool {
-        if matches!(self, Type::Refinement(..)) {
-            return true;
-        }
-        let mut found = false;
-        self.walk_children(|c| found |= c.carries_refinement());
-        found
+        matches!(self, Type::Refinement(..)) || self.any_child(Type::carries_refinement)
     }
 
     /// The type whose shape this one has: a nominal type's
@@ -3047,9 +3042,7 @@ impl Type {
 
     /// Whether a [`Type::Nominal`] occurs anywhere in this type.
     pub fn mentions_nominal(&self) -> bool {
-        let mut found = matches!(self, Type::Nominal(..));
-        self.walk_children(|child| found |= child.mentions_nominal());
-        found
+        matches!(self, Type::Nominal(..)) || self.any_child(Type::mentions_nominal)
     }
 
     pub fn peel_refinements(&self) -> &Type {
@@ -3529,32 +3522,16 @@ impl Type {
     /// set. Answering "unresolved" instead abstains, which costs a refusal this has no
     /// measured caller for and never costs correctness.
     pub fn holds_an_unresolved_position(&self) -> bool {
-        if matches!(
+        matches!(
             self,
             Type::Infer(_)
                 | Type::Hole
                 | Type::SharedHole(_)
                 | Type::BoundedHole(_)
                 | Type::Refinement(..)
-        ) {
-            return true;
-        }
-        let mut unresolved = false;
-        self.walk_children(|child| unresolved |= child.holds_an_unresolved_position());
-        unresolved
+        ) || self.any_child(Type::holds_an_unresolved_position)
     }
 
-    /// Invoke `f` on each direct child [`Type`] of this type.
-    ///
-    /// "Direct child" means a `Type` reachable through this type's value
-    /// fields — the domain and codomain of a `Fun` **and the candidate domains of its Σ
-    /// binder kinds**, the elements of a `Tuple` / `Record`, the payloads of a `Variant`, and
-    /// the base of a `Refinement`.
-    ///
-    /// Does **not** descend into the refinement *predicate* (which is a
-    /// [`TypedExpr`], not a `Type`).  Callers that need to walk a
-    /// refinement's predicate must handle [`Type::Refinement`] explicitly
-    /// — e.g. by matching on it before calling this helper.
     /// Every [`Refinement`] riding this type or any of its nested type children,
     /// in pre-order: the refinements at each level before that level's children.
     ///
@@ -3579,6 +3556,17 @@ impl Type {
         self.walk_children(|c| c.walk_refinements(f));
     }
 
+    /// Invoke `f` on each direct child [`Type`] of this type.
+    ///
+    /// "Direct child" means a `Type` reachable through this type's value
+    /// fields — the domain and codomain of a `Fun` **and the candidate domains of its Σ
+    /// binder kinds**, the elements of a `Tuple` / `Record`, the payloads of a `Variant`, and
+    /// the base of a `Refinement`.
+    ///
+    /// Does **not** descend into the refinement *predicate* (which is a
+    /// [`TypedExpr`], not a `Type`).  Callers that need to walk a
+    /// refinement's predicate must handle [`Type::Refinement`] explicitly
+    /// — e.g. by matching on it before calling this helper.
     pub fn walk_children<'a>(&'a self, mut f: impl FnMut(&'a Type)) {
         match self {
             Type::Base(_)
@@ -3725,6 +3713,21 @@ impl Type {
             acc = Some(f(v, t));
         });
         acc.expect("Type::fold_children: walk_children dropped accumulator")
+    }
+
+    /// Return `true` if `f` returns `true` for any direct child [`Type`]. Mirrors
+    /// [`TypedExpr::any_child`].
+    ///
+    /// Calls `f` on the children in [`Type::walk_children`] order until one returns `true`;
+    /// the remaining children are visited without calling `f`.
+    pub fn any_child(&self, mut f: impl FnMut(&Type) -> bool) -> bool {
+        let mut found = false;
+        self.walk_children(|t| {
+            if !found && f(t) {
+                found = true;
+            }
+        });
+        found
     }
 }
 
@@ -4173,12 +4176,7 @@ pub fn instantiate_witness(ty: &Type, binder: &WitnessId, candidate: &Type) -> T
 /// occurrence is this binder's and no scope tracking is needed to recognise one.
 pub(crate) fn mentions_witness(ty: &Type, binder: &WitnessId) -> bool {
     fn go(ty: &Type, binder: &WitnessId) -> bool {
-        if matches!(ty, Type::WitnessRef(w) if w == binder) {
-            return true;
-        }
-        let mut found = false;
-        ty.walk_children(|c| found |= go(c, binder));
-        found
+        matches!(ty, Type::WitnessRef(w) if w == binder) || ty.any_child(|c| go(c, binder))
     }
     go(ty, binder)
 }
@@ -4970,14 +4968,8 @@ pub fn application_order<'a>(
 /// comprehension that form is inside the inner one's lowering rather than at this site.
 fn dependency_order(refinements: &[Refinement]) -> Vec<&Refinement> {
     fn reads_narrowed_by(ty: &Type, earlier: &Refinement) -> bool {
-        if let Type::Refinement(_, set) = ty
-            && set.contains(earlier)
-        {
-            return true;
-        }
-        let mut found = false;
-        ty.walk_children(|child| found |= reads_narrowed_by(child, earlier));
-        found
+        matches!(ty, Type::Refinement(_, set) if set.contains(earlier))
+            || ty.any_child(|child| reads_narrowed_by(child, earlier))
     }
     fn predicate_reads(pred: &TypedExpr, earlier: &Refinement) -> bool {
         let mut found = false;
