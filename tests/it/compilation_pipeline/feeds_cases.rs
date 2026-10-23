@@ -1045,3 +1045,62 @@ for i in [1, 2, 3]:
         Value::Unit,
     )
 }
+
+/// A loop that feeds `events` and counts, below a reader of `events`.
+///
+/// Channelize binds the channel above its first reader, `total`, which sits
+/// above the loop's `letrec __hist`, so the channel
+/// `__hist ≫ … ≫ .__to_events_0 ≫ …` refers to `__hist` outside its scope and
+/// op conversion rejects it. With `total` bound below the loop it compiles.
+/// Once channelize places the channel below the loop history it captures, this
+/// returns `9` and the `should_panic` comes off.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Pinned on the failure rather than deferred: an `#[ignore]` reports the same green whether
+// the gap closed, regressed, or went away, and nothing runs ignored tests here.
+#[should_panic(expected = "unrecognised Var(__hist) in λ-free CCL")]
+fn loop_feeds_a_channel_read_above_it() {
+    check_scalar(
+        indoc! {"
+            events = defer()
+            total = sum([e for e in events])
+            fed := 0
+            for x in [1, 2, 3]:
+                events << x
+                fed += 1
+            total + fed
+        "},
+        Value::Int(9),
+    );
+}
+
+/// A loop that feeds `events` and adds `total`, the sum of `events`, on each
+/// iteration. The program has no cycle: a read of a feed is the whole
+/// collection (`docs/chl-spec.md`, "8.4 Feeds are the second form of
+/// mutability"), and effects are ordered only by data dependencies
+/// (`docs/chl-spec.md`, "Evaluation order is unspecified"). The values fed to
+/// `events` are the `x`s, which read neither `fed` nor `total`, so `total` is
+/// `6`, `fed` is `3 × 6 = 18`, and the program returns `24`.
+///
+/// Channelize places this channel as it does in
+/// `loop_feeds_a_channel_read_above_it`, and op conversion rejects it the same
+/// way. Moving `total` below the loop does not apply here, because the loop
+/// reads `total`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Pinned on the failure, as `loop_feeds_a_channel_read_above_it` is.
+#[should_panic(expected = "unrecognised Var(__hist) in λ-free CCL")]
+fn loop_adds_the_total_of_its_own_feed() {
+    check_scalar(
+        indoc! {"
+            events = defer()
+            total = sum([e for e in events])
+            fed := 0
+            for x in [1, 2, 3]:
+                events << x
+                fed += total
+            total + fed
+        "},
+        Value::Int(24),
+    );
+}
