@@ -683,7 +683,8 @@ struct Contribution {
 /// feeds of the same collection, because feeds at different depths are keyed by different
 /// numbers of positions.
 ///
-/// `feed_loop` is `𝑠 ≫ (λ 𝑥 → body)` with no mutable variable written in `body`.
+/// `feed_loop` is a loop, `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)`, with no mutable variable written in
+/// `body`.
 pub(crate) fn loop_contributions(feed_loop: Expr) -> Vec<LoopFeed> {
     let mut contributions = Vec::new();
     let mut rest = feed_loop;
@@ -705,6 +706,38 @@ pub(crate) fn loop_contributions(feed_loop: Expr) -> Vec<LoopFeed> {
         }
     }
     contributions
+}
+
+/// `e` indexed by its position where it is the chain `source ≫ (λ 𝑥 → body)` a loop's
+/// extraction builds ([`crate::ccl::ccl_utils::indexed_loop`]), keeping `e`'s id. The step reads
+/// the position as `position`, which binds it where `same` holds and is renamed to a fresh
+/// binder otherwise.
+fn index_chain(e: &mut Expr, position: &Name, same: bool) {
+    let TypedExprNode::Compose(elts) = &e.node else {
+        return;
+    };
+    if !(elts.len() == 2 && matches!(elts[1].node, TypedExprNode::Lambda { .. })) {
+        return;
+    }
+    let id = e.node_id();
+    let TypedExprNode::Compose(mut elts) = std::mem::replace(&mut e.node, TypedExprNode::Defer)
+    else {
+        unreachable!("matched a Compose above")
+    };
+    let (Some(mut step), Some(source)) = (elts.pop(), elts.pop()) else {
+        unreachable!("matched two elements above")
+    };
+    let name = if same {
+        position.clone()
+    } else {
+        let fresh = position.refreshed();
+        let at = Expr::var(&fresh).with_ty(source.ty.read_view().domain().unwrap_or(Type::Hole));
+        crate::ccl::subst::Subst::discharge_in_place(&mut step, position, &at);
+        fresh
+    };
+    let indexed = crate::ccl::ccl_utils::indexed_loop(Some(name), source, step);
+    let ty = indexed.ty.clone();
+    *e = Expr::preserve(id, indexed.node).with_ty(ty);
 }
 
 /// Return `true` if `expr` contains any `Feed(target, …)` or
@@ -2406,6 +2439,33 @@ fn extract_for_defer_impl(
     define: &mut Option<(NodeId, Expr)>,
     in_inner_scope: bool,
 ) -> Result<Expr, Located<DeferError>> {
+    // A loop indexed by its position is the chain `source ≫ step` it denotes, whose arm below
+    // extracts the feeds a loop's step makes; each loop that arm hands back, the residual and
+    // every contribution, is indexed again.
+    let (id, loop_ty, annotation) = (
+        expr.node_id(),
+        expr.ty.clone(),
+        expr.user_annotation.clone(),
+    );
+    let expr = match crate::ccl::ccl_utils::into_loop(expr) {
+        Ok((position, source, step)) => {
+            let mut chain = Expr::preserve(id, TypedExprNode::Compose(vec![source, step]));
+            chain.ty = loop_ty;
+            chain.user_annotation = annotation.clone();
+            let start = feeds.len();
+            let out = extract_for_defer_impl(chain, defer_name, feeds, define, in_inner_scope)?;
+            // A contribution is a loop of its own over the source, so it binds a position of
+            // its own, which the step's reads of the loop's position become.
+            for contribution in &mut feeds[start..] {
+                index_chain(&mut contribution.value, &position.name, false);
+            }
+            let mut out = out;
+            index_chain(&mut out, &position.name, true);
+            out.user_annotation = annotation;
+            return Ok(out);
+        }
+        Err(expr) => *expr,
+    };
     let TypedExpr {
         node,
         ty,

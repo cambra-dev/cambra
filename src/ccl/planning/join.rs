@@ -180,7 +180,7 @@ fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]
         TypedExprNode::Tuple(elts) => {
             if let Type::Tuple(tys) = &mut expr.ty {
                 for ty in tys.iter_mut() {
-                    if matches!(ty, Type::Fun { .. }) {
+                    if matches!(crate::ccl::generalize::opened(ty), Type::Fun { .. }) {
                         set_domain_ty(ty, new_domain_ty);
                     }
                 }
@@ -194,7 +194,7 @@ fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]
             }
         }
         _ => {
-            if matches!(expr.ty, Type::Fun { .. }) {
+            if matches!(crate::ccl::generalize::opened(&expr.ty), Type::Fun { .. }) {
                 set_domain_ty(&mut expr.ty, new_domain_ty);
             }
         }

@@ -256,7 +256,10 @@ fn retarget(e: &mut Expr, plan: &Plan) {
         }
         TypedExprNode::Tuple(elts) => {
             if let Type::Tuple(tys) = &mut e.ty {
-                for ty in tys.iter_mut().filter(|ty| matches!(ty, Type::Fun { .. })) {
+                for ty in tys
+                    .iter_mut()
+                    .filter(|ty| matches!(crate::ccl::generalize::opened(ty), Type::Fun { .. }))
+                {
                     set_domain_ty(ty, value);
                 }
             }
@@ -266,10 +269,9 @@ fn retarget(e: &mut Expr, plan: &Plan) {
         }
         TypedExprNode::Record(entries) => {
             if let Type::Record(tys) = &mut e.ty {
-                for (_, ty) in tys
-                    .iter_mut()
-                    .filter(|(_, ty)| matches!(ty, Type::Fun { .. }))
-                {
+                for (_, ty) in tys.iter_mut().filter(|(_, ty)| {
+                    matches!(crate::ccl::generalize::opened(ty), Type::Fun { .. })
+                }) {
                     set_domain_ty(ty, value);
                 }
             }

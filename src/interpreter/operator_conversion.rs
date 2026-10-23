@@ -1851,6 +1851,20 @@ the compilation declined outlives it here"
                 }
                 Ok(Extent::Union(TagMap::from_arms(arms)))
             }
+            // A generalized type is stored as its body is, each parameter as its bound.
+            Type::Poly(p) if p.is_generalized() => self.extent_of(&p.body),
+            // A generalized parameter stands for a domain chosen per use, below its bound: the
+            // values it ranges over are the bound's (`src/ccl/design/type-parameters.md`,
+            // "Generalized types").
+            Type::Param(p) if p.generalized => {
+                let bound = p.bound.as_ref().ok_or_else(|| {
+                    ConversionError::Unsupported(format!(
+                        "a domain generic over a sum's witness (`{}`) has no extent to convert",
+                        p.spelling
+                    ))
+                })?;
+                self.extent_of(bound)
+            }
             // Leaf types — no refinements possible, handle inline.
             Type::Base(b) => Ok(Extent::Base(b.clone())),
             Type::UIntRange(n) => Ok(Extent::uint_range(*n)),
@@ -5836,7 +5850,7 @@ fn compared_by_key(op: &InterpreterBinOp, ty: &Type) -> Option<(CompareKind, Ord
     else {
         return None;
     };
-    let Type::Fun { domain, .. } = ty.peel_refinements() else {
+    let Type::Fun { domain, .. } = crate::ccl::generalize::opened(ty) else {
         return None;
     };
     let Type::Tuple(operands) = domain.peel_refinements() else {
@@ -6290,7 +6304,10 @@ fn nested_store_read_of<'a>(
 fn is_const(expr: &Expr) -> Option<&Expr> {
     if let TypedExprNode::Apply { function, argument } = &expr.node
         && as_builtin(function) == Some(Builtin::Const)
-        && !matches!(argument.ty, Type::Fun { .. })
+        && !matches!(
+            crate::ccl::generalize::opened(&argument.ty),
+            Type::Fun { .. }
+        )
     {
         return Some(argument.as_ref());
     }
