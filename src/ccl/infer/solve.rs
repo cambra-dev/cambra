@@ -52,11 +52,15 @@ fn is_significant_context(label: &str) -> bool {
     label.contains("let ") || label.contains("λ ") || label.contains('\n')
 }
 
-/// Push `new_err` onto `errors`, deduplicating [`InferError::IncompatibleBounds`].
+/// Push `new_err` onto `errors`, deduplicating [`InferError::IncompatibleBounds`] and
+/// [`InferError::NoJoinOverBinder`].
 ///
 /// If an existing error has the same `(polarity, conflicting)` key, `label` is
 /// appended to its context vec (when it passes [`is_significant_context`])
-/// instead of pushing a duplicate.  All other error kinds are pushed as-is.
+/// instead of pushing a duplicate. A `NoJoinOverBinder` is one fact about one
+/// contribution, which every node whose type reaches the target's variable meets
+/// again, so a second report of the same binders and keys is dropped. All other
+/// error kinds are pushed as-is.
 ///
 /// `blame` is the node whose rule raised `new_err`. A merged
 /// `IncompatibleBounds` keeps the *first* contributing node: a bounds conflict
@@ -71,6 +75,11 @@ fn push_coalesce_err(
     label: String,
     blame: NodeId,
 ) {
+    if let InferError::NoJoinOverBinder { .. } = &new_err
+        && errors.iter().any(|e| e.error == new_err)
+    {
+        return;
+    }
     if let InferError::IncompatibleBounds {
         polarity: p,
         conflicting: ref c,

@@ -1045,3 +1045,198 @@ for i in [1, 2, 3]:
         Value::Unit,
     )
 }
+
+/// A feed crossing `let`s between its target and itself: each is discharged on the edge
+/// into the target, so a row naming one compiles (`src/ccl/design/type-inference.md`, "A
+/// contribution crosses the binders after its target").
+#[rstest]
+#[case::a_let_before_the_feed(indoc! {r#"
+    out = test_sink()
+    xs = [1, 2, 3]
+    out << [v for v in xs if v > 1]
+"#}, "[() -> [1 -> 2, 2 -> 3]]")]
+#[case::a_constant_let_inside_a_loop(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        k = 1
+        out << [v for v in [1, 2, 3] if v > k]
+"#}, "[[1 -> 2, 2 -> 3], [1 -> 2, 2 -> 3]]")]
+#[case::a_let_before_a_loop(indoc! {r#"
+    out = test_sink()
+    xs = [1, 2, 3]
+    for r in [1, 2]:
+        out << [v for v in xs if v > 1]
+"#}, "[[1 -> 2, 2 -> 3], [1 -> 2, 2 -> 3]]")]
+// A mutable variable declared between the channel and the feed is one variable, so the
+// edge keeps its name; the filter's read of it is named by a binder of its own.
+#[case::a_mutable_variable_declared_after_the_channel(indoc! {r#"
+    out = test_sink()
+    acc := 1
+    out << [z for z in [1, 2, 3] if z > acc]
+"#}, "[() -> [1 -> 2, 2 -> 3]]")]
+fn a_feed_crossing_a_let(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
+/// A `def` feeding a handle declared outside it, called from the top level or a loop. The
+/// handle's element type stands at the level the handle is bound at, so the parameter
+/// written into it stays monomorphic and the channel receives what each call passes. Each
+/// call site feeds from its own place.
+#[rstest]
+#[case::called_once(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << y
+    f(1)
+"#}, "[() -> 1]")]
+#[case::called_in_a_loop(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << y
+    for r in [1, 2]:
+        f(r)
+"#}, "[1, 2]")]
+#[case::a_row_constant_in_the_parameter(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << [v + y for v in [1, 2, 3]]
+    for r in [1, 2]:
+        f(r)
+"#}, "[[2, 3, 4], [3, 4, 5]]")]
+// Each call site is its own place, as two `<<` statements are.
+#[case::called_twice(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << y
+    f(1)
+    f(2)
+"#}, "[`0(()) -> 1, `1(()) -> 2]")]
+#[case::called_once_and_from_a_loop(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << y
+    out << 0
+    f(0)
+    for r in [1, 2]:
+        f(r)
+"#}, "[`0(()) -> 0, `1(()) -> 0, `2(0) -> 1, `2(1) -> 2]")]
+#[case::called_through_another_def(indoc! {r#"
+    out = test_sink()
+    def f(y):
+        out << y
+    def g(z):
+        f(z)
+        f(z + 10)
+    g(1)
+"#}, "[`0(()) -> 1, `1(()) -> 11]")]
+fn a_def_feeding_a_handle_declared_outside_it(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
+/// A feed's element type is the join of every contribution, and a feed inside a loop or a
+/// `def` contributes once per value of the binders between the target and the feed
+/// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its
+/// target"). Rows whose keys depend on such a binder have no join, so the program is refused
+/// naming it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::filtered_by_the_loop_variable(indoc! {r#"
+    o = defer()
+    for r in [1, 2]:
+        o << [v for v in [1, 2, 3] if v > r]
+    o
+"#}, "`r`")]
+#[case::grouped_by_the_loop_variable(indoc! {r#"
+    o = defer()
+    for i in [1, 2]:
+        o << [sum(g) for g in groupby([1, 2, 3, 4], \e -> e // i)]
+    o
+"#}, "`i`")]
+#[case::through_a_let_of_the_loop_variable(indoc! {r#"
+    o = defer()
+    for r in [1, 2]:
+        k = r
+        o << [v for v in [1, 2, 3] if v > k]
+    o
+"#}, "`k`")]
+#[case::filtered_by_a_parameter(indoc! {r#"
+    o = defer()
+    def f(y):
+        o << [v for v in [1, 2, 3] if v > y]
+    for r in [1, 2]:
+        f(r)
+    o
+"#}, "`y`")]
+// One call is refused as well: the `def` is inferred once, for every call.
+#[case::filtered_by_a_parameter_of_a_def_called_once(indoc! {r#"
+    o = defer()
+    def f(y):
+        o << [v for v in [1, 2, 3] if v > y]
+    f(1)
+    o
+"#}, "`y`")]
+// A pattern's binder takes one value per evaluation of its `match`, and is joined over.
+#[case::filtered_by_a_pattern_binder(indoc! {r#"
+    o = defer()
+    v = `some(1)
+    match v:
+        case `some(x):
+            o << [z for z in [1, 2, 3] if z > x]
+        case `none(_):
+            o << [z for z in [1, 2, 3]]
+    o
+"#}, "`x`")]
+// The loop writes `t`, so the filter reads it once per iteration, and the message spells the
+// read's binder as the variable it reads.
+#[case::filtered_by_a_mutable_variable_the_loop_writes(indoc! {r#"
+    o = defer()
+    t := 0
+    for r in [1, 2]:
+        t += r
+        o << [v for v in [1, 2, 3] if v > t]
+    o
+"#}, "`t`")]
+fn rows_whose_keys_vary_with_a_binder_have_no_join(#[case] code: &str, #[case] binder: &str) {
+    check_compile_error(code, &format!("depend on {binder}"));
+}
+
+/// One contribution with no join is reported once, though every node whose type reaches the
+/// target meets it.
+#[test]
+fn a_contribution_with_no_join_is_reported_once() {
+    let code = indoc! {r#"
+        o = defer()
+        def f(y):
+            o << [v for v in [1, 2, 3] if v > y]
+        f(1)
+        o
+    "#};
+    let loaded = LoadedProgram::from_text("<no-join-once-test>", code);
+    let errs = match compile_program(&mut GlobalContext::default(), &loaded, Box::new(|| {})) {
+        Ok(_) => panic!("rows whose keys vary with a `def` parameter have no join"),
+        Err(e) => e,
+    };
+    let rendered = render_errors(&errs, loaded.sources());
+    assert_eq!(
+        rendered.matches("the keys of a collection").count(),
+        1,
+        "{rendered}"
+    );
+}
+
+/// Boxed rows whose keys vary with the loop variable do join, as a sum over every subtype
+/// of the row's domain, and inference accepts them. Lambda elimination does not: the row's
+/// filter stays on its domain on one side of the channel and not on the other. Pinned on that
+/// failure.
+#[test]
+fn boxed_rows_whose_keys_vary_with_the_loop_reach_a_lowering_gap() {
+    check_compile_error(
+        indoc! {r#"
+            o = defer()
+            for r in [1, 2]:
+                o << box([v for v in [1, 2, 3] if v > r])
+            o
+        "#},
+        "post-lambda-elim produced an invalid tree",
+    );
+}
