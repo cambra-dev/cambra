@@ -35,7 +35,7 @@ use crate::ccl::ty::FunKind;
 /// rewrite lifts ([`plan_lifted`]).
 pub(super) fn recognize_groupby_sites(
     expr: &mut Expr,
-    witnesses: &mut Witnesses,
+    ctx: &mut PlanningCtx,
 ) -> Result<(), String> {
     // The recording names the composition site — the term-tree node the
     // bucketize chain replaces — and deliberately not the key morphism the
@@ -63,7 +63,7 @@ pub(super) fn recognize_groupby_sites(
             "planning.groupby",
             provenance::Nature::Expansion,
         );
-        convert_groupby_pointful(expr, witnesses)?
+        convert_groupby_pointful(expr, ctx)?
     };
     if let Some(rewritten) = rewritten {
         *expr = rewritten;
@@ -71,7 +71,7 @@ pub(super) fn recognize_groupby_sites(
     let mut result = Ok(());
     expr.walk_children_mut(|child| {
         if result.is_ok() {
-            result = recognize_groupby_sites(child, witnesses);
+            result = recognize_groupby_sites(child, ctx);
         }
     });
     result
@@ -89,6 +89,7 @@ fn emit_groupby(
     key_binder: Option<Name>,
     key_dom: Type,
     value_ty: Type,
+    instances: &Rc<InstanceTable>,
 ) -> Expr {
     // A partition is a **collection of collections**: keyed by `K`, each group the
     // index set of its members. Both are data — the transformer
@@ -115,16 +116,16 @@ fn emit_groupby(
 
     let converse_ty = partition(group_of(group_idx_ty.clone()));
     let grouped = apply_primitive(keys, Builtin::Converse, converse_ty);
-    typecheck(&grouped).expect("Bad group expr");
+    typecheck_in(&grouped, instances).expect("Bad group expr");
     let values_fn = apply_primitive(
         values,
         Builtin::Map,
         Type::fun(group_of(group_idx_ty.clone()), group_of(value_ty.clone())),
     );
     let grouped_values_ty = partition(group_of(value_ty));
-    typecheck(&values_fn).expect("Bad values_fn expr");
+    typecheck_in(&values_fn, instances).expect("Bad values_fn expr");
     let grouped_values = compose(grouped, values_fn).with_ty(grouped_values_ty);
-    typecheck(&grouped_values).expect("Bad grouped_values expr");
+    typecheck_in(&grouped_values, instances).expect("Bad grouped_values expr");
     grouped_values
 }
 
@@ -330,10 +331,7 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite<'_>> {
 /// [`PointfulSite`] to the bucketize chain [`emit_groupby`] builds. `expr` is a
 /// `Compose` whose head is the source; the head is replaced and the tail (the
 /// per-group aggregate) kept.
-fn convert_groupby_pointful(
-    expr: &Expr,
-    witnesses: &mut Witnesses,
-) -> Result<Option<Expr>, String> {
+fn convert_groupby_pointful(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, String> {
     match &expr.node {
         // Consumed in place: `groupby(c, key) ≫ <per-group aggregate>`. Replace the head
         // and keep the tail.
@@ -341,7 +339,7 @@ fn convert_groupby_pointful(
             let Some(head) = elts.first() else {
                 return Ok(None);
             };
-            let Some(grouped) = rewrite_groupby_source(head, witnesses)? else {
+            let Some(grouped) = rewrite_groupby_source(head, ctx)? else {
                 return Ok(None);
             };
             let mut new_elts = vec![grouped];
@@ -352,13 +350,13 @@ fn convert_groupby_pointful(
         // lookups or iterations of the grouping itself. Matching it here is what lets it
         // stay bound and be shared: the generic fallback would try to iterate its *key*
         // domain, which is an element type rather than an index set.
-        _ => rewrite_groupby_source(expr, witnesses),
+        _ => rewrite_groupby_source(expr, ctx),
     }
 }
 
 /// The group-by source rewrite: recognize the pointful site and return the equivalent
 /// bucketize chain. See [`convert_groupby_pointful`].
-fn rewrite_groupby_source(head: &Expr, witnesses: &mut Witnesses) -> Result<Option<Expr>, String> {
+fn rewrite_groupby_source(head: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, String> {
     let Some(site) = match_pointful_site(head) else {
         return Ok(None);
     };
@@ -374,7 +372,7 @@ fn rewrite_groupby_source(head: &Expr, witnesses: &mut Witnesses) -> Result<Opti
     let Ok(key_pf) = predicates::eliminate_lifted(site.key_fn) else {
         return Ok(None);
     };
-    let key_pf = plan_lifted(key_pf, PlanningPhase::RecognizeGroupBy, witnesses)?;
+    let key_pf = plan_lifted(key_pf, PlanningPhase::RecognizeGroupBy, ctx)?;
     // The key stream: the collection read through its key function, so it is a
     // collection too, and it carries the kind of the source it is a read of. Its domain
     // keeps every refinement except the consumed grouping equation — dropping them here
@@ -391,6 +389,7 @@ fn rewrite_groupby_source(head: &Expr, witnesses: &mut Witnesses) -> Result<Opti
         site.key_binder,
         site.key_dom,
         site.value_ty,
+        &ctx.instances,
     )))
 }
 
@@ -417,7 +416,7 @@ mod tests {
     #[test]
     fn test_recognize_groupby_sites_on_var() {
         let mut expr = var("x");
-        recognize_groupby_sites(&mut expr, &mut Witnesses::default()).unwrap();
+        recognize_groupby_sites(&mut expr, &mut PlanningCtx::default()).unwrap();
         // Should remain unchanged
         assert!(matches!(expr.node, TypedExprNode::Var(ref v) if v.base() == "x"));
     }
@@ -465,7 +464,7 @@ mod tests {
     fn groupby_recognition_lifts_the_key_without_aliasing() {
         let key = var("key").with_ty(fun_ty(int_ty(), int_ty()));
         let mut expr = groupby_source_sharing_its_key(&key);
-        recognize_groupby_sites(&mut expr, &mut Witnesses::default()).unwrap();
+        recognize_groupby_sites(&mut expr, &mut PlanningCtx::default()).unwrap();
 
         assert!(
             !matches!(&expr.node, TypedExprNode::Compose(elts)
@@ -566,7 +565,7 @@ mod tests {
 
         let mut expr = Expr::compose(vec![head, var("agg")]);
         let before = symbolic(&expr);
-        recognize_groupby_sites(&mut expr, &mut Witnesses::default()).unwrap();
+        recognize_groupby_sites(&mut expr, &mut PlanningCtx::default()).unwrap();
         assert_eq!(
             symbolic(&expr),
             before,

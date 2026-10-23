@@ -29,6 +29,10 @@ A `NominalDecl` holds its name, its type parameters, and its body, set once by `
   declared parameters, each a documenting name and a type. The type parameters appear in those
   types as declared `Type::Param`s, which `NominalDecl::instantiate` replaces with an
   application's arguments.
+- Each parameter's `WrittenOrder`: the order of its type as the declaration writes it, each
+  record the declaration writes by its fields as written and a tuple by position. A
+  `Type::Record` keeps no order, so this is where a nominal type's order comes from
+  ([chl-spec.md, "Equality and order"](../../../docs/chl-spec.md#equality-and-order)).
 - One `Variance` per type parameter.
 
 A constructor's **payload** is the one argument it takes: `Unit` for no parameters, the
@@ -276,10 +280,15 @@ and display walks follow the same layout and polarities.
 
 A nominal type offers its declaration as its head (`traits::offered`), which only a declared
 instance accepts ([type-inference.md, "What the tables hold"](type-inference.md#what-the-tables-hold)).
-Arithmetic on a nominal value calls its instance's function
+Arithmetic on a nominal value calls its instance's function, and a comparison compares by value
 ([type-inference.md, "An operator's instance"](type-inference.md#an-operators-instance)); without
-an instance, the operator is rejected where it is applied. No comparison trait has a declared
-instance, so `==` and ordering on a nominal value are rejected.
+an instance, the operator is rejected where it is applied.
+
+An instance of `Equatable` or `Orderable` has no block. Lowering checks that it names one nominal
+type twice and that every constructor's argument compares by value under its `requires` clause
+(`compares_by_value`), and, for `Orderable`, that the type has one constructor whose argument has
+a written order. The instance goes in the program's `InstanceTable` with the others, which every
+check after inference reads.
 
 Lowering declares a module's traits after its types and before their associated functions, and
 its instances after those (`lower::traits`). An instance's `def`s lower where its `impl` stands,

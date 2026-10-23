@@ -63,14 +63,11 @@ use super::*;
 /// iteration without an upstream input is [`Builtin::Iterate`].  Any
 /// other input-less term reaching op-conversion (after this pass) is a
 /// planner bug.
-pub(crate) fn insert_iterate_markers(
-    expr: &mut Expr,
-    witnesses: &mut Witnesses,
-) -> Result<(), String> {
-    insert_iterate_recurse(expr, witnesses)?;
+pub(crate) fn insert_iterate_markers(expr: &mut Expr, ctx: &mut PlanningCtx) -> Result<(), String> {
+    insert_iterate_recurse(expr, ctx)?;
     // In addition to any deeper iteration sites materialised by the
     // recursion, the program root itself may also be an iteration site.
-    wrap_with_iterate(expr, witnesses, "root")
+    wrap_with_iterate(expr, ctx, "root")
 }
 
 /// Recursively walks `expr` and materializes every iteration site that
@@ -100,10 +97,7 @@ pub(crate) fn insert_iterate_markers(
 /// with the body composed onto it).  Structural recursion covers the
 /// rest of the tree — every iteration site reachable from the program
 /// root is reached.
-pub(super) fn insert_iterate_recurse(
-    expr: &mut Expr,
-    witnesses: &mut Witnesses,
-) -> Result<(), String> {
+pub(super) fn insert_iterate_recurse(expr: &mut Expr, ctx: &mut PlanningCtx) -> Result<(), String> {
     // A list literal's elements are **values**: op-conversion evaluates each with
     // `expr_to_value` and compiles none of them, so nothing inside one is an iteration
     // site. Marking a collection-valued element would leave `iterate ≫ […]` where a value
@@ -134,23 +128,23 @@ pub(super) fn insert_iterate_recurse(
         match &mut argument.node {
             TypedExprNode::Tuple(elts) => {
                 for elt in elts.iter_mut() {
-                    insert_iterate_recurse(elt, witnesses)?;
+                    insert_iterate_recurse(elt, ctx)?;
                 }
             }
             TypedExprNode::Record(fields) => {
                 for (_, field) in fields.iter_mut() {
-                    insert_iterate_recurse(field, witnesses)?;
+                    insert_iterate_recurse(field, ctx)?;
                 }
             }
-            _ => insert_iterate_recurse(argument, witnesses)?,
+            _ => insert_iterate_recurse(argument, ctx)?,
         }
-        return insert_iterate_recurse(function, witnesses);
+        return insert_iterate_recurse(function, ctx);
     }
 
     let mut result = Ok(());
     expr.walk_children_mut(|child| {
         if result.is_ok() {
-            result = insert_iterate_recurse(child, witnesses);
+            result = insert_iterate_recurse(child, ctx);
         }
     });
     result?;
@@ -179,10 +173,10 @@ pub(super) fn insert_iterate_recurse(
             match &mut argument.node {
                 TypedExprNode::Tuple(elts) => {
                     if let Some(stream) = elts.first_mut() {
-                        wrap_with_iterate(stream, witnesses, "asof-stream")?;
+                        wrap_with_iterate(stream, ctx, "asof-stream")?;
                     }
                 }
-                _ => wrap_with_iterate(argument, witnesses, "final-or-default")?,
+                _ => wrap_with_iterate(argument, ctx, "final-or-default")?,
             }
         }
         // `as_of` takes `Tuple([trigger, source])` — the `trigger` is the
@@ -198,7 +192,7 @@ pub(super) fn insert_iterate_recurse(
             if let TypedExprNode::Tuple(elts) = &mut argument.node
                 && let Some(trigger) = elts.first_mut()
             {
-                wrap_with_iterate(trigger, witnesses, "asof-trigger")?;
+                wrap_with_iterate(trigger, ctx, "asof-trigger")?;
             }
         }
         // `Copair`'s function form: argument is `Tuple(ops...)`
@@ -209,7 +203,7 @@ pub(super) fn insert_iterate_recurse(
         {
             if let TypedExprNode::Tuple(elts) = &mut argument.node {
                 for elt in elts.iter_mut() {
-                    wrap_with_iterate(elt, witnesses, "zip-field")?;
+                    wrap_with_iterate(elt, ctx, "zip-field")?;
                 }
             }
         }
@@ -227,7 +221,7 @@ pub(super) fn insert_iterate_recurse(
             if is_collection =>
         {
             for operand in operands.iter_mut() {
-                wrap_with_iterate(operand, witnesses, "copair-operand")?;
+                wrap_with_iterate(operand, ctx, "copair-operand")?;
             }
         }
         // The **checked lookup**'s collection is compiled with `input=None` (`𝑐 ▷ lookup?`
@@ -239,20 +233,20 @@ pub(super) fn insert_iterate_recurse(
                 TypedExprNode::Builtin(Builtin::LookupChecked)
             ) =>
         {
-            wrap_with_iterate(argument, witnesses, "checked-lookup-collection")?;
+            wrap_with_iterate(argument, ctx, "checked-lookup-collection")?;
         }
         // `𝑐 ▷ const` compiles `𝑐` with `input=None` and broadcasts what it produces over
         // the input (`MapResultToConst`), so `𝑐` is an iteration site exactly when it holds
         // a collection, as a product's component is.
         TypedExprNode::Apply { argument, function } if is_builtin(function, Builtin::Const) => {
-            mark_component_source(argument, witnesses)?;
+            mark_component_source(argument, ctx)?;
         }
         // The remaining input-internalising builtins all compile their
         // (single) argument with `input=None` — wrap it uniformly.
         TypedExprNode::Apply { argument, function }
             if is_internalising_builtin_function(function) =>
         {
-            wrap_with_iterate(argument, witnesses, "internalising-builtin")?;
+            wrap_with_iterate(argument, ctx, "internalising-builtin")?;
         }
         // Each transaction writer's source is iterated internally by the
         // mutable variable engine (the induction store for an accumulator); op-conversion
@@ -266,7 +260,7 @@ pub(super) fn insert_iterate_recurse(
         } => {
             if parameter.is_none() {
                 for w in writers.iter_mut() {
-                    wrap_with_iterate(&mut w.source, witnesses, "transact-source")?;
+                    wrap_with_iterate(&mut w.source, ctx, "transact-source")?;
                 }
             }
         }
@@ -276,12 +270,12 @@ pub(super) fn insert_iterate_recurse(
         // collection — see [`mark_component_source`].
         TypedExprNode::Tuple(elts) => {
             for elt in elts.iter_mut() {
-                mark_component_source(elt, witnesses)?;
+                mark_component_source(elt, ctx)?;
             }
         }
         TypedExprNode::Record(fields) => {
             for (_, field) in fields.iter_mut() {
-                mark_component_source(field, witnesses)?;
+                mark_component_source(field, ctx)?;
             }
         }
         // A constructor's payload is a component of the nominal value, as a product's is. A
@@ -291,9 +285,9 @@ pub(super) fn insert_iterate_recurse(
             TypedExprNode::Apply { argument, function }
                 if matches!(&function.node, TypedExprNode::Builtin(Builtin::Box)) =>
             {
-                mark_component_source(argument, witnesses)?;
+                mark_component_source(argument, ctx)?;
             }
-            _ => mark_component_source(payload, witnesses)?,
+            _ => mark_component_source(payload, ctx)?,
         },
         _ => {}
     }
@@ -316,17 +310,17 @@ pub(super) fn insert_iterate_recurse(
 ///
 /// A variant's payload is a component the same way: `𝑐 ▷ variant_wrap(tag)` compiles `𝑐` with
 /// the input the wrap is given and wraps what it produces, so the rule looks through the wrap.
-fn mark_component_source(component: &mut Expr, witnesses: &mut Witnesses) -> Result<(), String> {
+fn mark_component_source(component: &mut Expr, ctx: &mut PlanningCtx) -> Result<(), String> {
     if let TypedExprNode::Apply { argument, function } = &mut component.node
         && matches!(
             function.node,
             TypedExprNode::Builtin(Builtin::VariantWrap(_))
         )
     {
-        return mark_component_source(argument, witnesses);
+        return mark_component_source(argument, ctx);
     }
     if component.ty.is_collection() {
-        wrap_with_iterate(component, witnesses, "product-component-source")?;
+        wrap_with_iterate(component, ctx, "product-component-source")?;
     }
     Ok(())
 }
@@ -401,7 +395,7 @@ pub(super) fn builtin_at_function_position(func: &Expr) -> Option<Builtin> {
 /// report. Every caller names its own; there is no unlabelled one.
 pub(super) fn wrap_with_iterate(
     expr: &mut Expr,
-    witnesses: &mut Witnesses,
+    ctx: &mut PlanningCtx,
     site: &str,
 ) -> Result<(), String> {
     // `Let` nodes pass input through to both children — op-conversion's
@@ -427,9 +421,9 @@ pub(super) fn wrap_with_iterate(
         // for that eager compilation — #232 tracks making iteration
         // use-driven so a dead binding is dropped rather than wrapped.
         if matches!(&bound_expr.ty, Type::Fun { .. }) {
-            wrap_with_iterate(bound_expr, witnesses, site)?;
+            wrap_with_iterate(bound_expr, ctx, site)?;
         }
-        return wrap_with_iterate(body, witnesses, site);
+        return wrap_with_iterate(body, ctx, site);
     }
     if is_iteration_bearing(expr) {
         return Ok(());
@@ -467,7 +461,7 @@ pub(super) fn wrap_with_iterate(
         //
         // Emitting a chain here would restrict a second time, over a witness with no
         // extent.
-        if all_witnesses_realized(&domain_ty, &witnesses.realized) {
+        if all_witnesses_realized(&domain_ty, &ctx.witnesses.realized) {
             return Ok(());
         }
         // Otherwise the witness is the value's to carry, and iterating one is what has no
@@ -487,7 +481,7 @@ pub(super) fn wrap_with_iterate(
     // `iterate(predicate)` fall-through are choosing how to materialise the same
     // iteration site — hash join is just a more efficient strategy when the type
     // structure permits.
-    if try_hash_join_rewrite(expr, &domain_ty, witnesses) {
+    if try_hash_join_rewrite(expr, &domain_ty, ctx) {
         return Ok(());
     }
     // Generic fallback. Now compile the site's refinement predicates (design
@@ -589,7 +583,7 @@ pub(super) fn wrap_with_iterate(
             .expect("a filter is one of the site's refinements");
         let stated = fn_of_bare_predicate(&elem_ty, &r.predicate, &[]);
         let lifted = fn_of_bare_predicate(&elem_ty, &uncompiled[position].predicate, &[]);
-        source = planned_restrict(stated, lifted, source, witnesses)?;
+        source = planned_restrict(stated, lifted, source, ctx)?;
     }
     // An iteration source produces the refined extent it iterates, so its
     // codomain is the *site's* refined domain `{D | p}`, mirroring
@@ -649,9 +643,9 @@ pub(super) fn planned_restrict(
     stated: Expr,
     lifted: Expr,
     upstream: Expr,
-    witnesses: &mut Witnesses,
+    ctx: &mut PlanningCtx,
 ) -> Result<Expr, String> {
-    let planned = plan_lifted(lifted, PlanningPhase::MarkIterationSites, witnesses)?;
+    let planned = plan_lifted(lifted, PlanningPhase::MarkIterationSites, ctx)?;
     Ok(make_restrict_stating(stated, planned, upstream))
 }
 
@@ -672,7 +666,7 @@ fn head_of(expr: &Expr) -> &Expr {
 /// reading only the whole leaves the product case emitting a chain over a witness with no
 /// extent.
 ///
-/// **Every** one, because a domain naming two witnesses is iterable only once both have an
+/// **Every** one, because a domain naming two ctx is iterable only once both have an
 /// extent — one realized and one not is still a witness short.
 fn all_witnesses_realized(
     domain: &Type,

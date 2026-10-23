@@ -224,7 +224,7 @@ pub(crate) fn fn_of_bare_predicate(
     let fun_kind = if slot.is_empty() {
         crate::ccl::ty::FunKind::Data(None)
     } else {
-        crate::ccl::ty::FunKind::Data(Some(std::rc::Rc::new(slot.to_vec())))
+        crate::ccl::ty::FunKind::Data(Some(Rc::new(slot.to_vec())))
     };
     // Only the *kind* is declared. The shape is whatever the η-expansion built, so a bare
     // predicate that is already function-valued keeps the codomain it has.

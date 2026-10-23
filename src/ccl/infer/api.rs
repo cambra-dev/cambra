@@ -12,6 +12,7 @@ use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
+use crate::ccl::infer::solver::traits::InstanceTable;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
@@ -123,7 +124,7 @@ pub struct TypeInferenceContext {
     pub(crate) source_types: HashMap<String, Type>,
 
     /// The program's trait instances, which lowering builds.
-    pub(crate) instances: Rc<crate::ccl::infer::solver::traits::InstanceTable>,
+    pub(crate) instances: Rc<InstanceTable>,
 }
 
 /// RAII guard returned by [`TypeInferenceContext::enter_scope`].
@@ -2083,8 +2084,16 @@ fn collect_type_errors(
 /// Returns `Ok(())` if no errors are found, or all discovered errors as
 /// `Err(errs)`.
 pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
+    typecheck_in(expr, &InstanceTable::builtin())
+}
+
+/// [`typecheck`] of a program declaring `instances`.
+pub(crate) fn typecheck_in(
+    expr: &Expr,
+    instances: &Rc<InstanceTable>,
+) -> Result<(), Vec<InferError>> {
     check_fully_typed(expr)?;
-    super::check(expr)
+    crate::ccl::infer::check::check_located(expr, instances).map_err(unlocated)
 }
 
 /// [`typecheck`] for planning's output, at [`Strictness::Planned`], where a refinement predicate
@@ -2092,12 +2101,14 @@ pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// also verifies the type of each projected source and reports a path through a field its
 /// source's type does not carry. Projection pruning mints projected sources during planning, so
 /// this is the first check that sees one.
-pub fn typecheck_planned(
+pub(crate) fn typecheck_planned(
     expr: &Expr,
     sources: &HashMap<String, Type>,
+    instances: &Rc<InstanceTable>,
 ) -> Result<(), Vec<InferError>> {
     check_annotated(expr, Strictness::Planned).map_err(unlocated)?;
-    crate::ccl::infer::check::check_located_against(expr, Some(sources)).map_err(unlocated)
+    crate::ccl::infer::check::check_located_against(expr, Some(sources), instances)
+        .map_err(unlocated)
 }
 
 /// [`typecheck`] against the types of the registered data sources ([`typecheck_planned`]
@@ -2107,7 +2118,8 @@ pub fn typecheck_against(
     sources: &HashMap<String, Type>,
 ) -> Result<(), Vec<InferError>> {
     check_fully_typed(expr)?;
-    crate::ccl::infer::check::check_located_against(expr, Some(sources)).map_err(unlocated)
+    crate::ccl::infer::check::check_located_against(expr, Some(sources), &InstanceTable::builtin())
+        .map_err(unlocated)
 }
 
 /// [`typecheck`] for the window between inference and `channelize`:
@@ -2116,14 +2128,17 @@ pub fn typecheck_against(
 /// are permitted — the unified phase and `channelize` erase them (see
 /// [`Strictness::PreChannelize`]).
 pub fn check_pre_channelize(expr: &Expr) -> Result<(), Vec<InferError>> {
-    check_pre_channelize_located(expr).map_err(unlocated)
+    check_pre_channelize_located(expr, &InstanceTable::builtin()).map_err(unlocated)
 }
 
 /// [`check_pre_channelize`], keeping the node each error was raised at.
 ///
 /// The pipeline's post-inference check reports a residual `Type::Infer` as an
 /// ambiguous program, a user error, so it needs the node to point at.
-pub(crate) fn check_pre_channelize_located(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
+pub(crate) fn check_pre_channelize_located(
+    expr: &Expr,
+    instances: &Rc<InstanceTable>,
+) -> Result<(), Vec<LocatedInferError>> {
     // The relaxation applies only when the tree carries transient histories
     // (feed/mutable machinery). A program with none should be fully resolved
     // after inference, so a residual `Infer` there is an ambiguous program
@@ -2135,7 +2150,7 @@ pub(crate) fn check_pre_channelize_located(expr: &Expr) -> Result<(), Vec<Locate
         Strictness::Strict
     };
     check_annotated(expr, strictness)?;
-    crate::ccl::infer::check::check_located(expr)
+    crate::ccl::infer::check::check_located(expr, instances)
 }
 
 /// The errors of a located list, for a caller whose errors are compiler bugs:
@@ -4928,7 +4943,7 @@ mod tests {
         );
         let tree = Expr::lambda("x", refined, Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1)));
         typecheck(&tree).expect("before planning, a predicate holding a `defer` is source form");
-        let errs = typecheck_planned(&tree, &HashMap::new())
+        let errs = typecheck_planned(&tree, &HashMap::new(), &InstanceTable::builtin())
             .expect_err("a feed handle in a predicate passed");
         assert!(
             errs.iter()

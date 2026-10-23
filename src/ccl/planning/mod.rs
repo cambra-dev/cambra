@@ -30,7 +30,7 @@ use crate::ccl::{
     BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, Name, ProjKey, Type,
     TypedExprNode,
     ccl_utils::apply_primitive,
-    infer::typecheck,
+    infer::{solver::traits::InstanceTable, typecheck_in},
     lambda_elim::{self, compose, id},
     provenance,
     simplify::simplify,
@@ -49,6 +49,34 @@ mod predicates;
 mod projection_pruning;
 
 use conditionals::Witnesses;
+use std::rc::Rc;
+
+/// What planning's phases read and record besides the tree.
+#[derive(Clone)]
+pub(crate) struct PlanningCtx {
+    /// What realization decided about each witness.
+    pub(super) witnesses: Witnesses,
+    /// The program's instances, which the checks of the terms planning builds read: a
+    /// rewrite's term can state an obligation an instance the program declares answers, as
+    /// `converse` states `Equatable` of its keys.
+    pub(super) instances: Rc<InstanceTable>,
+}
+
+/// The context of a program that declares no instance, before realization.
+impl Default for PlanningCtx {
+    fn default() -> PlanningCtx {
+        PlanningCtx::of(InstanceTable::builtin())
+    }
+}
+
+impl PlanningCtx {
+    fn of(instances: Rc<InstanceTable>) -> PlanningCtx {
+        PlanningCtx {
+            witnesses: Witnesses::default(),
+            instances,
+        }
+    }
+}
 
 // Preserve the `crate::ccl::planning::…` paths that other modules' doc-comments
 // and prose reference (design docs link `insert_iterate_markers`; `ccl_utils` /
@@ -103,7 +131,7 @@ pub(crate) use predicates::fn_of_bare_predicate;
 /// lifted term applying a union at its element ([`refuse_a_union_applied_at_the_input`]), or
 /// a per-group narrowing no filter materializes
 /// ([`per_group_filter::reject_unmaterialized_narrowings`]).
-pub fn run(expr: Expr) -> Result<Expr, String> {
+pub fn run(expr: Expr, instances: &Rc<InstanceTable>) -> Result<Expr, String> {
     // Live cross-endpoint reads are recognized earlier, in
     // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
     // such read is already an `as_of` join — nothing to do at planning time.
@@ -111,7 +139,7 @@ pub fn run(expr: Expr) -> Result<Expr, String> {
         expr,
         Root::Program,
         &PlanningPhase::ALL,
-        &mut Witnesses::default(),
+        &mut PlanningCtx::of(Rc::clone(instances)),
     )?;
     // Projection pruning runs on the planned program, after the final `simplify`
     // ([`PlanningPhase::Cleanup`]). Every phase matches a source in the shape it has when the
@@ -242,19 +270,14 @@ enum Root {
 pub(super) fn plan_lifted(
     term: Expr,
     lifted_during: PlanningPhase,
-    witnesses: &mut Witnesses,
+    ctx: &mut PlanningCtx,
 ) -> Result<Expr, String> {
     let through = PlanningPhase::ALL
         .iter()
         .position(|&p| p == lifted_during)
         .expect("`ALL` lists every phase")
         + usize::from(!lifted_during.reaches_its_lifts());
-    run_phases(
-        term,
-        Root::Lifted,
-        &PlanningPhase::ALL[..through],
-        witnesses,
-    )
+    run_phases(term, Root::Lifted, &PlanningPhase::ALL[..through], ctx)
 }
 
 /// Run `phases` on `term`, in order.
@@ -262,36 +285,34 @@ fn run_phases(
     mut term: Expr,
     root: Root,
     phases: &[PlanningPhase],
-    witnesses: &mut Witnesses,
+    ctx: &mut PlanningCtx,
 ) -> Result<Expr, String> {
     for phase in phases {
         match phase {
             PlanningPhase::RealizeConditionals => {
-                conditionals::realize_conditional_collections(&mut term, witnesses)?;
+                conditionals::realize_conditional_collections(&mut term, &mut ctx.witnesses)?;
                 if root == Root::Lifted {
                     refuse_a_union_applied_at_the_input(&term)?;
                 }
             }
-            PlanningPhase::RecognizeGroupBy => {
-                groupby::recognize_groupby_sites(&mut term, witnesses)?
-            }
+            PlanningPhase::RecognizeGroupBy => groupby::recognize_groupby_sites(&mut term, ctx)?,
             PlanningPhase::EmitCorrelatedFilters => {
-                correlated::emit_correlated_filters(&mut term, witnesses)?
+                correlated::emit_correlated_filters(&mut term, ctx)?
             }
             PlanningPhase::Simplify | PlanningPhase::Cleanup => term = simplify(term),
             PlanningPhase::PairCorrelatedSites => {
-                correlated::pair_correlated_sites(&mut term, witnesses)?
+                correlated::pair_correlated_sites(&mut term, ctx)?
             }
             PlanningPhase::FoldConstants => const_fold::fold_constants(&mut term),
             PlanningPhase::MarkIterationSites => match root {
-                Root::Program => insert_iterate_markers(&mut term, witnesses)?,
-                Root::Lifted => iterate::insert_iterate_recurse(&mut term, witnesses)?,
+                Root::Program => insert_iterate_markers(&mut term, ctx)?,
+                Root::Lifted => iterate::insert_iterate_recurse(&mut term, ctx)?,
             },
             PlanningPhase::CompilePredicates => {
                 compile_refinement_predicates(&mut term, &PredMemo::new())
             }
             PlanningPhase::InsertPerGroupFilters => {
-                per_group_filter::insert_per_group_filters(&mut term, witnesses)?;
+                per_group_filter::insert_per_group_filters(&mut term, ctx)?;
                 per_group_filter::reject_unmaterialized_narrowings(&term)?;
             }
         }
@@ -604,6 +625,7 @@ mod tests {
     use super::test_helpers::*;
     use super::*;
     use crate::ccl::Expr;
+    use crate::ccl::infer::typecheck;
     use crate::ccl::symbolic::symbolic;
     // `super::*` also glob-imports `lambda_elim::compose` into scope; name the
     // test-helper `compose` (`Expr::compose`) explicitly so it wins over the

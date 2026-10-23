@@ -166,11 +166,10 @@ pub struct TraitDecl {
 }
 
 /// Which products a trait's product rule reads: a product satisfies the trait when its
-/// components do (`docs/chl-spec.md`, "3.4 Comparisons").
+/// components do (`docs/chl-spec.md`, "Equality and order").
 ///
-/// The comparisons have one: equality is componentwise on any product, and a tuple's order is
-/// lexicographic, which is what makes the decomposition a reading of the trait rather than a
-/// new relation. Arithmetic has none, and neither has a module's
+/// The comparisons have one, being by value, which is what makes the decomposition a reading
+/// of the trait rather than a new relation. Arithmetic has none, and neither has a module's
 /// trait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductReading {
@@ -322,16 +321,43 @@ impl CompilerTraits {
             requires: Vec::new(),
         }
         .build(comparison(), &mut instances);
+        // `Option(T)` compares by value where `T` does, its constructor and then its payload.
+        // `Option` is the compiler's, so this instance is too: no module may declare it
+        // (`docs/chl-spec.md`, "Traits and instances across modules").
+        {
+            let t = TypeParam::declared("T");
+            let option = Type::Nominal(
+                crate::ccl::nominal::option(),
+                vec![Type::Param(Rc::clone(&t))],
+            );
+            instances.add(
+                equatable.clone(),
+                Rc::new(TraitInstance {
+                    heads: vec![InstanceHead::of_pattern(&option); 2],
+                    operands: vec![option.clone(), option],
+                    assoc: Vec::new(),
+                    requires: vec![Rc::new(TraitRequirement {
+                        trait_: equatable.clone(),
+                        args: vec![Type::Param(Rc::clone(&t)), Type::Param(Rc::clone(&t))],
+                        assoc: Vec::new(),
+                        at: None,
+                    })],
+                    params: vec![t],
+                    functions: Vec::new(),
+                    declared: None,
+                }),
+            );
+        }
         // `<`, `<=`, `>`, `>=`. `max` and `min` place it on their codomain twice, `(γ, γ)`: a
         // pure requirement, since the aggregate's scheme already returns an element of what
-        // it consumes.
+        // it consumes. What orders by value is equal by value, so it requires `Equatable`.
         let orderable = OperatorTrait {
             name: "Orderable",
             operands: &binary,
             function: None,
             output: false,
             products: ProductReading::Tuples,
-            requires: Vec::new(),
+            requires: vec![equatable.clone()],
         }
         .build(comparison(), &mut instances);
         // Unary `-`: one operand, and an `Output` that genuinely depends on it.
@@ -713,9 +739,9 @@ impl fmt::Display for InstanceHead {
 /// requires of them, and the function it supplies for each of its trait's functions
 /// (`docs/chl-spec.md`, "Declaring an instance").
 ///
-/// The compiler's and a module's are the same data. A compiler instance's head names
-/// base types and nothing else; a module's, `impl Container(Bag(T), Elem=T) requires …:`,
-/// is built by lowering.
+/// The compiler's and a module's are the same data. A compiler instance's head names base
+/// types, except `Equatable`'s for `Option(T)`; a module's,
+/// `impl Container(Bag(T), Elem=T) requires …:`, is built by lowering.
 #[derive(Debug)]
 pub struct TraitInstance {
     /// The head's type variables, `T` in `Bag(T)`, declared ([`TypeParam::declared`]).
@@ -1004,6 +1030,42 @@ pub fn unify_all(a: &[Type], b: &[Type]) -> bool {
     }
     let mut subst = HashMap::new();
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| unify(x, y, &mut subst))
+}
+
+/// Whether values of `ty` satisfy the comparison trait `trait_`, `Equatable` or `Orderable`,
+/// where `requires` holds (`docs/chl-spec.md`, "Equality and order"): a base type by the
+/// compiler's instances, a product by its components, a nominal type by an instance of
+/// `instances` and that instance's conditions, and a type variable by a requirement.
+///
+/// A record's order is the declaration's that writes it, which a nominal type's instance is
+/// checked against where it is declared; here a record's fields are read as a product's.
+pub fn compares_by_value(
+    trait_: &Trait,
+    ty: &Type,
+    requires: &[Rc<TraitRequirement>],
+    instances: &InstanceTable,
+) -> bool {
+    let ty = crate::ccl::ccl_utils::strip_refinements(ty);
+    let pair = [ty.clone(), ty.clone()];
+    let each = |t: &Type| compares_by_value(trait_, t, requires, instances);
+    match &ty {
+        Type::Tuple(elems) => elems.iter().all(each),
+        Type::Record(fields) => fields.iter().all(|(_, t)| each(t)),
+        Type::Param(_) => requires
+            .iter()
+            .any(|r| r.trait_ == *trait_ && r.args == pair),
+        _ => instances.instances(trait_).iter().any(|i| {
+            i.bind(&pair).is_some_and(|bound| {
+                i.requires.iter().all(|r| {
+                    let r = r.map_types(|t| replace_params(t, &bound));
+                    r.args.first().is_some_and(|t| {
+                        r.args.iter().all(|a| a == t)
+                            && compares_by_value(&r.trait_, t, requires, instances)
+                    })
+                })
+            })
+        }),
+    }
 }
 
 /// The trait an operator requires of its operands and the function of it the operator calls
@@ -2339,7 +2401,10 @@ impl TraitObligation {
             let [only] = candidates.as_slice() else {
                 return Ok(());
             };
-            if only.declared.is_none() {
+            // A compiler row over bases states everything at its operands, and the deposit
+            // settles what it associates; one over type variables, `Option(T)`'s, is selected
+            // as a module's is.
+            if only.declared.is_none() && !only.has_type_variables() {
                 return Ok(());
             }
             Rc::clone(only)
