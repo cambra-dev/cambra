@@ -9,6 +9,7 @@ workspace, repo or PR.
 """
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -43,13 +44,16 @@ always = lambda lower, upper: True  # noqa: E731
 
 ms = [member(1, 1), member(2, 2), member(3, 3)]
 p = sd.plan(ms, {1: ("pass",), 2: ("pass",), 3: ("pending",)}, always)
-check("green drafts are marked ready; a pending one is left", nums(p.ready) == [1, 2])
-check("an all-green stack needs no repair", not p.drops and not p.rebase)
+check("an all-green stack needs no repair", not p.drops and not p.rebase and not p.close_ci)
 
 p = sd.plan(ms, {1: ("pass",), 2: ("fail", "test"), 3: ("fail", "test")}, always)
 check("only the lowest CI failure is closed", [m["number"] for m, _ in p.close_ci] == [2])
-check("members above a failure are repaired, not judged", nums(p.rebase) == [3]
-      and nums(p.ready) == [1])
+check("members above a failure are repaired, not judged", nums(p.rebase) == [3])
+
+for unfinished in [("pending",), ("none",)]:
+    p = sd.plan(ms, {1: unfinished, 2: ("fail", "test"), 3: ("pass",)}, always)
+    check(f"a {unfinished[0]} member ends the verdicts; the failure above it stays open",
+          not p.close_ci and not p.drops and not p.rebase)
 
 p = sd.plan(ms, {1: ("pass",), 2: ("pass",), 3: ("fail", "test")}, always)
 check("a failure at the top closes it with nothing to rebase",
@@ -58,14 +62,43 @@ check("a failure at the top closes it with nothing to rebase",
 ms = [member(1, 1, "MERGED"), member(2, 2, "CLOSED"), member(3, 3), member(4, 4, draft=False)]
 p = sd.plan(ms, {3: ("pass",), 4: ("pass",)}, always)
 check("a human-closed member carried above is dropped", nums(p.drops) == [2])
-check("verdicts above a drop are ignored", not p.ready and nums(p.rebase) == [3, 4])
+check("verdicts above a drop are ignored", nums(p.rebase) == [3, 4])
 
-p = sd.plan(ms, {3: ("pass",), 4: ("pass",)}, lambda lower, upper: False)
+p = sd.plan(ms, {3: ("fail", "test"), 4: ("pass",)}, lambda lower, upper: False)
 check("a closed member no open head carries is history, not a drop",
-      not p.drops and nums(p.ready) == [3])
+      nums(p.drops) == [3] and nums(p.rebase) == [4])
 
-p = sd.plan([member(9, 1, draft=False)], {9: ("pass",)}, always)
-check("a PR already ready for review is left alone", not p.ready)
+ms = [member(1, 1), member(2, 2, "CLOSED"), member(3, 3)]
+p = sd.plan(ms, {1: ("pending",), 3: ("pass",)}, always)
+check("a closed member above a pending one is still dropped",
+      nums(p.drops) == [2] and nums(p.rebase) == [3])
+
+
+# --- verdict ---
+
+def verdict_of(checks):
+    real = sd.run
+    sd.run = lambda *a, check=True: subprocess.CompletedProcess(a, 0, json.dumps(checks), "")
+    try:
+        return sd.verdict(1)
+    finally:
+        sd.run = real
+
+
+def c(name, bucket):
+    return {"name": name, "bucket": bucket}
+
+
+check("verdict: `check` passing passes, whatever the skipped gates",
+      verdict_of([c("check", "pass"), c("test", "skipping")]) == ("pass",))
+check("verdict: a cancelled run is no verdict",
+      verdict_of([c("check", "cancel"), c("lint", "pass"), c("test", "cancel")]) == ("none",))
+check("verdict: a failed `check` names the gates that failed or were cancelled",
+      verdict_of([c("check", "fail"), c("test", "fail"), c("web", "cancel"), c("lint", "pass")])
+      == ("fail", "test, web"))
+check("verdict: `check` still running is pending",
+      verdict_of([c("check", "pending"), c("test", "fail")]) == ("pending",))
+check("verdict: no checks is no verdict", verdict_of([]) == ("none",))
 
 
 # --- repair ---
@@ -158,5 +191,21 @@ with tempfile.TemporaryDirectory() as tmp:
           len(repo.ids("main@origin..b3")) == 1 and not repo.ids("conflicts()"))
     check("repair: only the surviving member is pushed and re-stacked",
           pushed == [["b3"]] and events[-1] == ("restack", [3]))
+
+with tempfile.TemporaryDirectory() as tmp:
+    path, heads = scratch_repo(tmp, [("b1", "one.txt", "1\n"), ("b2", "two.txt", "2\n")])
+    events, pushed = stub_github(), []
+    repo = sd.Repo(path, dry=False)
+    push_recorder(repo, pushed)
+    ms = stacked(heads, ["b1", "b2"], {"b1": "CLOSED"})
+    ms[1]["headRefName"] = "no-such-bookmark"
+    p = sd.plan(ms, {2: ("pass",)}, repo.contains)
+    try:
+        sd.repair(repo, tmp, None, ms, p)
+        skipped = False
+    except sd.RepairSkipped:
+        skipped = True
+    check("repair: a revset jj cannot resolve stops the repair",
+          skipped and not events and not pushed)
 
 sys.exit(1 if failures else 0)

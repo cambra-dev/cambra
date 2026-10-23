@@ -63,8 +63,8 @@ Two scripts set what a build or gate needs:
   writes `<log-prefix>.log`.
 
 `fast` is the only gate the run executes. GitHub CI runs the full gate on each draft PR. The next
-run's Step 0 closes a draft whose CI failed and marks one whose CI passed ready for review, so a
-draft stays a draft for at most a day after its CI finishes.
+run's Step 0 closes a draft whose CI failed. A draft whose CI passed stays a draft until a human
+marks it ready for review.
 
 A run pushes its PRs as one GitHub stack, in the order it attempted them. Each run starts a fresh
 stack on the `main@origin` its Step 1 fetched, and never builds on an earlier run's PRs, including
@@ -129,17 +129,16 @@ ls -t $LOGDIR/                             # recent run logs
 - `settle_drafts.py` settles earlier runs' PRs one stack at a time, bottom to top, and prints one
   line per PR it changes. Its docstring gives the rules. It runs before `history.py`, so today's
   history already shows each PR in its new state.
-  - A draft whose CI passed is marked ready for review. List each one under "Run notes" as
-    `marked ready`, with the PR link.
   - The lowest member whose CI failed is closed. Log it under "Attempted, not pushed" as
-    `discarded: CI failed`, with the failed checks and the PR link. CI results above it are not
-    read: those branches carry its commits.
+    `discarded: CI failed`, with the failed checks and the PR link. CI results above it, and above
+    a member whose CI has not finished, are not read: those branches carry its commits.
   - A member that is closed, by CI or by a human, is dropped from its stack. The members above it
     are rebased past it, pushed, and re-formed into one stack. A member the rebase leaves
     conflicted or empty is closed too; log it under "Attempted, not pushed" as `discarded: stack
     repair`, with the reason the script printed.
-  - `repair skipped` means the script could not find a dropped member's commits. Record it under
-    "Run notes"; a human re-forms that stack.
+  - `repair skipped` means a jj or `gh stack` call in the repair failed, and names the call and
+    its error. The script goes on to the next stack. Record it under "Run notes"; a human
+    re-forms that stack.
 - If `$RUN/superseded.md` exists, the scheduler stopped a run still in progress to start this one.
   Copy its note into "Run notes".
 - If stale `simplify-*` workspaces exist, a previous run crashed or was superseded. For each one,

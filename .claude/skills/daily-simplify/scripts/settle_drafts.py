@@ -8,23 +8,28 @@ members are walked bottom to top:
 
 - a merged member is skipped;
 - a member that is closed, and whose commits an open member above still carries, is dropped;
-- an open member whose checks have all finished, with at least one failed, is closed with a
-  comment naming the failed checks, and dropped;
-- an open draft whose checks have all finished, at least one passed and none failed, is marked
-  ready for review.
+- an open member whose `check` check failed is closed with a comment naming the failed jobs, and
+  dropped.
 
-The first drop ends the walk's CI verdicts: every member above carries the dropped commits, so its
-result says nothing about its own change. When open members remain above a drop, the stack is
-repaired:
+An open member is judged by `check` alone: it is the one required check, and it already accounts
+for skipped jobs. The first open member whose `check` has not passed ends the walk's CI verdicts:
+every member above carries its commits, so their results say nothing about their own changes.
+Closed members above it are still dropped. No member is marked ready for review; a human promotes
+a simplify PR.
+
+When open members remain above a drop, the stack is repaired:
 
 1. The dropped members' commits are abandoned in the jj repo, which rebases the members above onto
    what the dropped ones sat on.
 2. A rebased member that conflicts or has no changes left is closed with a comment starting
    `RUN_CLOSE_PREFIX`, and its commits are abandoned in turn. Pushing an empty member would put
    its head at its base, and GitHub then marks the PR merged.
-3. The rebased members are pushed, and the open members are re-formed into one stack. The old
-   stack is unstacked and the members linked again; once a member has merged, GitHub refuses the
-   unstack, and `gh stack init` + `submit` re-forms it instead.
+3. The rebased members are pushed, and the open members are re-formed into one stack: the old
+   stack is unstacked on GitHub, which leaves any merged member behind in it, and the open members
+   are linked again.
+
+A repair stops at the first jj or `gh stack` call that fails, prints `repair skipped` with the
+stack to re-form by hand, and goes on to the next stack.
 
 A PR outside any stack is settled as a stack of one. Prints one line per PR it changes;
 `--dry-run` prints what it would do and changes nothing.
@@ -38,6 +43,7 @@ import sys
 from dataclasses import dataclass, field
 
 REPO_SLUG = "cambra-dev/cambra"
+REQUIRED_CHECK = "check"
 PREFIX = "simplify-agent/"
 # Every comment this script closes a PR with starts with this; history.py reads it to tell the
 # run's decision from a human's.
@@ -53,8 +59,7 @@ query($n: Int!) { repository(owner: "cambra-dev", name: "cambra") { pullRequest(
 
 @dataclass
 class Plan:
-    close_ci: list = field(default_factory=list)   # (member, failed check names)
-    ready: list = field(default_factory=list)
+    close_ci: list = field(default_factory=list)   # (member, failed job names)
     drops: list = field(default_factory=list)      # closed or CI-failed members, bottom first
     rebase: list = field(default_factory=list)     # open members above the lowest drop
 
@@ -65,6 +70,7 @@ def plan(members, verdicts, contains):
     the upper head carries the lower commit."""
     out = Plan()
     opens = [m for m in members if m["state"] == "OPEN"]
+    judging = True
     for m in members:
         if m["state"] == "MERGED":
             continue
@@ -73,22 +79,34 @@ def plan(members, verdicts, contains):
             if any(contains(m["headRefOid"], o["headRefOid"]) for o in above):
                 out.drops.append(m)
             continue
-        if out.drops:
+        if not judging:
             continue
         v = verdicts[m["number"]]
         if v[0] == "fail":
             out.close_ci.append((m, v[1]))
             out.drops.append(m)
-        elif v[0] == "pass" and m["isDraft"]:
-            out.ready.append(m)
+        judging = v[0] == "pass"
     if out.drops:
         lowest = out.drops[0]["position"]
         out.rebase = [o for o in opens if o["position"] > lowest and o not in out.drops]
     return out
 
 
+class RepairSkipped(Exception):
+    """A step of a stack repair failed; the stack is left for a human to re-form."""
+
+
 def run(*args, check=True):
     return subprocess.run(args, check=check, capture_output=True, text=True)
+
+
+def must(*args):
+    """Runs a repair step, raising `RepairSkipped` with its error when it fails."""
+    r = run(*args, check=False)
+    if r.returncode != 0:
+        cmd = " ".join([os.path.basename(args[0]), *args[1:]])
+        raise RepairSkipped(f"`{cmd}` failed: {r.stderr.strip()}")
+    return r
 
 
 def gh_json(*args):
@@ -106,17 +124,23 @@ class Repo:
                    "--config", "ui.paginate=never"]
         self.dry = dry
 
+    def must_ids(self, revset):
+        out = must(*self.jj, "log", "-r", revset, "--no-graph", "-T", 'commit_id ++ "\\n"')
+        return out.stdout.split()
+
     def ids(self, revset):
-        r = run(*self.jj, "log", "-r", revset, "--no-graph", "-T", 'commit_id ++ "\\n"',
-                check=False)
-        return r.stdout.split() if r.returncode == 0 else None
+        """`must_ids`, with `None` for a revset jj cannot resolve."""
+        try:
+            return self.must_ids(revset)
+        except RepairSkipped:
+            return None
 
     def contains(self, lower, upper):
         found = self.ids(f"{lower} & ::{upper}")
         return found is None or bool(found)  # an unknown commit cannot be ruled out
 
     def write(self, *args):
-        run(*self.jj, *args)
+        must(*self.jj, *args)
 
 
 def stacks():
@@ -144,17 +168,18 @@ def stacks():
 
 
 def verdict(n):
+    """The PR's `REQUIRED_CHECK` result. A cancelled or missing one is `none`, so a run that
+    never finished neither passes nor fails."""
     r = run("gh", "pr", "checks", str(n), "--repo", REPO_SLUG, "--json", "name,bucket",
             check=False)
-    if not r.stdout.strip():
-        return ("none",)
-    checks = json.loads(r.stdout)
-    if any(c["bucket"] == "pending" for c in checks):
-        return ("pending",)
-    failed = [c["name"] for c in checks if c["bucket"] == "fail"]
-    if failed:
-        return ("fail", ", ".join(failed))
-    return ("pass",) if any(c["bucket"] == "pass" for c in checks) else ("none",)
+    checks = json.loads(r.stdout) if r.stdout.strip() else []
+    bucket = next((c["bucket"] for c in checks if c["name"] == REQUIRED_CHECK), None)
+    if bucket == "fail":
+        # `check` fails on a failed or cancelled gate; name those gates rather than `check`.
+        gates = [c["name"] for c in checks
+                 if c["bucket"] in ("fail", "cancel") and c["name"] != REQUIRED_CHECK]
+        return ("fail", ", ".join(gates) or REQUIRED_CHECK)
+    return (bucket,) if bucket in ("pass", "pending") else ("none",)
 
 
 def close(n, reason, dry):
@@ -182,12 +207,7 @@ def repair(repo, run_dir, stack_number, members, p):
     drop_ids = []
     for d in p.drops:
         below = [m["headRefOid"] for m in members if m["position"] < d["position"]]
-        ids = repo.ids(own_commits(d["headRefOid"], below, merged))
-        if ids is None:
-            print(f"repair skipped: the head of #{d['number']} is not in the jj repo; "
-                  f"re-form stack {stack_number} by hand")
-            return
-        drop_ids += ids
+        drop_ids += repo.must_ids(own_commits(d["headRefOid"], below, merged))
     repo.write("abandon", *drop_ids)
 
     # Rebased members follow their bookmarks. Close any that conflict or emptied, bottom first;
@@ -200,9 +220,9 @@ def repair(repo, run_dir, stack_number, members, p):
             below += [o["headRefOid"] for o in members
                       if o["state"] == "OPEN" and o["position"] < p.drops[0]["position"]]
             mine = own_commits(m["headRefName"], below, merged)
-            if repo.ids(f"({mine}) & conflicts()"):
+            if repo.must_ids(f"({mine}) & conflicts()"):
                 bad = (m, mine, f"conflicts after {dropped} below it was dropped")
-            elif not repo.ids(f"({mine}) ~ empty()"):
+            elif not repo.must_ids(f"({mine}) ~ empty()"):
                 bad = (m, mine, f"no changes left after {dropped} below it was dropped")
             if bad:
                 break
@@ -210,7 +230,7 @@ def repair(repo, run_dir, stack_number, members, p):
             break
         m, mine, reason = bad
         close(m["number"], reason, False)
-        repo.write("abandon", *repo.ids(mine))
+        repo.write("abandon", *repo.must_ids(mine))
         kept.remove(m)
 
     if kept:
@@ -224,18 +244,15 @@ def repair(repo, run_dir, stack_number, members, p):
 
 def restack(run_dir, stack_number, remaining):
     stack = [os.path.join(HERE, "gh-stack.sh"), run_dir]
-    if stack_number is not None and run(*stack, "unstack", str(stack_number),
-                                        check=False).returncode != 0:
-        # A stack with a merged member cannot be unstacked; submit re-forms it from tracking.
-        run(*stack, "checkout", str(remaining[0]["number"]))
-        run(*stack, "unstack", "--local")
-        run(*stack, "init", *(m["headRefName"] for m in remaining))
-        run(*stack, "submit", "--auto")
-    elif len(remaining) >= 2:
-        run(*stack, "link", *(m["url"] for m in remaining))
+    if stack_number is not None:
+        # Unstacking on GitHub releases the open members even after one has merged; the merged
+        # ones stay behind in the old stack.
+        must(*stack, "unstack", str(stack_number))
+    if len(remaining) >= 2:
+        must(*stack, "link", *(m["url"] for m in remaining))
     elif remaining:
-        run("gh", "api", "-X", "PATCH", f"repos/{REPO_SLUG}/pulls/{remaining[0]['number']}",
-            "-f", "base=main")
+        must("gh", "api", "-X", "PATCH", f"repos/{REPO_SLUG}/pulls/{remaining[0]['number']}",
+             "-f", "base=main")
     print(f"re-formed stack: {' '.join('#%d' % m['number'] for m in remaining) or 'empty'}")
 
 
@@ -248,14 +265,12 @@ def main(run_dir, dry):
         p = plan(members, verdicts, repo.contains)
         for m, names in p.close_ci:
             close(m["number"], f"CI failed ({names})", dry)
-        for m in p.ready:
-            if dry:
-                print(f"would mark ready #{m['number']}")
-            else:
-                run("gh", "pr", "ready", str(m["number"]), "--repo", REPO_SLUG)
-                print(f"marked ready #{m['number']}")
         if p.rebase:
-            repair(repo, run_dir, stack_number, members, p)
+            try:
+                repair(repo, run_dir, stack_number, members, p)
+            except RepairSkipped as e:
+                which = f"stack {stack_number}" if stack_number else f"#{members[0]['number']}"
+                print(f"repair skipped: {e}; re-form {which} by hand")
 
 
 if __name__ == "__main__":
