@@ -1203,21 +1203,23 @@ impl Interp {
                 ..
             } => {
                 let v = self.eval(value)?;
-                let bound = match v {
-                    Value::Pending => pattern
-                        .binders
-                        .iter()
-                        .flatten()
-                        .filter_map(|b| b.node.as_ref().map(|n| (n.to_string(), Value::Pending)))
-                        .collect(),
-                    Value::Nominal { ty, ctor, payload } if is_constructor(pattern, &ty, &ctor) => {
-                        constructor_binds(pattern, &payload)?
-                    }
-                    other => {
-                        return err(format!("`{}` does not match {other}", pattern.ctor.node));
-                    }
-                };
-                for (n, v) in bound {
+                for (n, v) in constructor_value_binds(pattern, v)? {
+                    self.bind(n, Slot::Val(v));
+                }
+                Ok(None)
+            }
+            // `a, (b, c) = v` binds each name to its position of `v`.
+            Stmt::Assign {
+                target:
+                    target @ Spanned {
+                        node: AssignTarget::Tuple(_),
+                        ..
+                    },
+                value,
+                ..
+            } => {
+                let v = self.eval(value)?;
+                for (n, v) in tuple_binds(target, v)? {
                     self.bind(n, Slot::Val(v));
                 }
                 Ok(None)
@@ -2392,6 +2394,26 @@ fn is_constructor(pattern: &ConstructorPattern, ty: &str, ctor: &str) -> bool {
     pattern.ctor.node == ctor && pattern.type_path.last().is_some_and(|t| t.node == ty)
 }
 
+/// The names the constructor pattern `pattern` binds from `value`, which its constructor built.
+/// A pending value leaves every name pending.
+fn constructor_value_binds(
+    pattern: &ConstructorPattern,
+    value: Value,
+) -> Result<Vec<(String, Value)>, Error> {
+    match value {
+        Value::Pending => Ok(pattern
+            .binders
+            .iter()
+            .flatten()
+            .filter_map(|b| b.node.as_ref().map(|n| (n.to_string(), Value::Pending)))
+            .collect()),
+        Value::Nominal { ty, ctor, payload } if is_constructor(pattern, &ty, &ctor) => {
+            constructor_binds(pattern, &payload)
+        }
+        other => err(format!("`{}` does not match {other}", pattern.ctor.node)),
+    }
+}
+
 /// The names a constructor pattern binds from a value's payload: the payload itself for
 /// one parameter, and its positions for several.
 fn constructor_binds(
@@ -2425,6 +2447,47 @@ fn constructor_binds(
         }
     }
     Ok(out)
+}
+
+/// The names a tuple pattern binds, each with its position of `value`, in order. A pending
+/// value leaves every name pending.
+fn tuple_binds(
+    target: &Spanned<AssignTarget>,
+    value: Value,
+) -> Result<Vec<(String, Value)>, Error> {
+    match &target.node {
+        AssignTarget::Name(n) => Ok(vec![(n.to_string(), value)]),
+        AssignTarget::Constructor(pattern) => constructor_value_binds(pattern, value),
+        AssignTarget::Tuple(elts) => {
+            if let Value::Record(fields) = &value
+                && fields.len() != elts.len()
+            {
+                return err(format!(
+                    "a pattern of {} components does not match {value}",
+                    elts.len()
+                ));
+            }
+            let mut out = Vec::new();
+            for (i, elt) in elts.iter().enumerate() {
+                let component = match &value {
+                    Value::Pending => Value::Pending,
+                    Value::Record(fields) => {
+                        let key = format!("_{i}");
+                        match fields.iter().find(|(k, _)| *k == key) {
+                            Some((_, v)) => v.clone(),
+                            None => return err(format!("a tuple pattern does not match {value}")),
+                        }
+                    }
+                    other => return err(format!("a tuple pattern does not match {other}")),
+                };
+                out.extend(tuple_binds(elt, component)?);
+            }
+            Ok(out)
+        }
+        other => err(format!(
+            "unsupported component of a tuple pattern: {other:?}"
+        )),
+    }
 }
 
 /// The single name an assignment target binds.
@@ -3633,6 +3696,40 @@ mod tests {
             out << 2 ** (0 - 3)
         "#});
         assert!(e.contains("is not defined"), "{e}");
+    }
+
+    /// A tuple pattern binds each name to its position, reading every element before any name
+    /// binds, and refuses a tuple of another length.
+    #[test]
+    fn a_tuple_pattern_binds_each_position() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            a, (b, c) = (1, (2, 3))
+            b, a = (a, b)
+            out << a * 100 + b * 10 + c
+        "#});
+        assert_eq!(v.to_string(), "[() -> 213]");
+        let e = refused(indoc! {r#"
+            out = test_sink()
+            a, b = (1, 2, 3)
+            out << a
+        "#});
+        assert!(
+            e.contains("a pattern of 2 components does not match"),
+            "{e}"
+        );
+    }
+
+    /// A constructor pattern takes its component of a tuple pattern apart.
+    #[test]
+    fn a_tuple_pattern_holds_a_constructor_pattern() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            type Price = Int
+            (Price::new(p), q) = (Price::new(3), 4)
+            out << p * 10 + q
+        "#});
+        assert_eq!(v.to_string(), "[() -> 34]");
     }
 
     /// An exponent past `u32` still has a value where the power does not overflow.

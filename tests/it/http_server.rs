@@ -311,6 +311,86 @@ fn test_http_serve_echo_with_outer_let() {
     assert_eq!(response, "Echo: world");
 }
 
+/// `http_serve` returns a tuple, which a parenthesised pattern takes apart as well as a bare one.
+#[rstest]
+fn test_http_serve_with_a_parenthesised_pattern() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        (requests, responses) = http_serve("{port}", "POST", "/echo")
+        for req in requests:
+            responses << "Echo: " + req
+    "#};
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let resp = http_post(port, "/echo", "world");
+        tx.send(resp).unwrap();
+    });
+
+    let response = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(response, "Echo: world");
+}
+
+/// Lower `template` with a free port in place of `PORT`, and answer the lowering errors'
+/// debug renderings.
+fn http_serve_lowering_errors(template: &str) -> Vec<String> {
+    let code = template.replace("PORT", &reserve_test_port().to_string());
+    let mut ctx = LoweringContext::default();
+    let module = chl_parser::parse_module(FileId::ROOT, &code)
+        .into_result()
+        .expect("parse failed");
+    let result = lower_stmts(&module, &mut ctx);
+    result.errors.iter().map(|e| format!("{e:?}")).collect()
+}
+
+/// The tuple `http_serve` returns can be bound to one name and taken apart later.
+#[rstest]
+fn test_http_serve_bound_to_one_name() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        route = http_serve("{port}", "POST", "/echo")
+        requests, responses = route
+        for req in requests:
+            responses << "Echo: " + req
+    "#};
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let resp = http_post(port, "/echo", "world");
+        tx.send(resp).unwrap();
+    });
+
+    let response = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(response, "Echo: world");
+}
+
+/// A call of `http_serve` inside an expression opens no route, and says where the call goes.
+#[test]
+fn test_http_serve_inside_an_expression_is_error() {
+    let errors = http_serve_lowering_errors(indoc! {r#"
+        requests = http_serve("PORT", "POST", "/echo").0
+        0
+    "#});
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("only supported as the whole right-hand side of a top-level `=`")),
+        "expected the expression-position refusal, got: {errors:?}",
+    );
+}
+
 /// `http_serve` inside an if/else branch is rejected at lowering time.
 #[test]
 fn test_http_serve_in_if_branch_is_error() {

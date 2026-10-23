@@ -354,6 +354,20 @@ pub(super) fn lower_call(
                     Vec::new(),
                 )));
             }
+            // `http_serve` opens a route once, when the program starts, so its call is the
+            // whole value of a top-level statement (`lower_http_serve`), never part of an
+            // expression. A call with an argument that is not a string literal arrives here
+            // too.
+            if builtin == Some(SurfaceBuiltin::HttpServe) {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    format!(
+                        "`{name}(…)` takes three string literals and is only supported as the \
+                         whole right-hand side of a top-level `=`, `requests, responses = \
+                         {name}(\"8080\", \"GET\", \"/path\")`"
+                    ),
+                ));
+            }
             // For zero-argument calls, only registered sources are allowed.
             if args.is_empty() {
                 return Err(LoweringError::unsupported(

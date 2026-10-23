@@ -1156,6 +1156,11 @@ impl LoweringContext {
     pub(super) fn fresh_ignored_payload(&mut self) -> String {
         self.mint_synthetic_id("__match_payload")
     }
+
+    /// A fresh name for a value a tuple pattern takes apart, or for one of its components.
+    pub(super) fn fresh_tuple_payload(&mut self) -> String {
+        self.mint_synthetic_id("__tuple_payload")
+    }
 }
 
 /// Prefix for synthetic parameter names representing the tupled domain of a
@@ -1170,6 +1175,13 @@ pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String
     // Sanitise path for use inside a Rust/CCL identifier.
     let path_id = path.replace(['/', '-', '.'], "_");
     format!("__http_requests_{port}_{method}_{path_id}")
+}
+
+/// The name the response channel of `http_serve(port, method, path)` is bound under, and the
+/// field of the program's sink record that carries it.
+pub(super) fn http_responses_sink_name(port: &str, method: &str, path: &str) -> String {
+    let path_id = path.replace(['/', '-', '.'], "_");
+    format!("__http_responses_{port}_{method}_{path_id}")
 }
 
 // ---------------------------------------------------------------------------

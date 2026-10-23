@@ -117,6 +117,18 @@ loop of its own whose recurrence is nested in the enclosing one
 ([ir.md](ir.md#transact--the-domain-parameterized-recurrence-carrier)). A `with begin():` block
 nested inside such a conditional is unsupported.
 
+## Tuple patterns
+
+`AssignmentBindings::Tuple` lowers `𝑝₀, …, 𝑝ₙ = 𝑣` to shadowing `let`s. Each component's value is
+bound to a minted name, and only then does each component pattern bind from the name its value
+is under, so `b, a = (a, b)` reads both old values.
+
+A tuple literal under a tuple pattern of the same length binds each element directly, at every
+depth of nesting, so the statement builds no tuple it only takes apart. Any other value is bound
+once to a minted name, and component `𝑖` reads its projection `.𝑖`. A feed handle projected out of
+a bound tuple literal reaches `channelize` as an alias of its channel through the inline pass's
+tuple-projection rule (the module docs of `src/ccl/inline.rs`).
+
 ## Deferred collection operators — `defer` / `<<` / `<<=`
 
 Deferred collection syntax initially produces `Defer`, `Feed`, and `Define` nodes. A defer binding
@@ -130,9 +142,10 @@ mixing the forms is an error. Feed and define expressions have type `Unit`.
 | `x <<= value` | Add the sole `Define(x, value)` contribution |
 
 `x = defer()` becomes `let x = defer in body`. A feed or define in statement position is sequenced
-through `ExprStmt`. A top-level `requests, responses = http_serve(port, method, path)` instead
-binds a registered request `Source` and a response `Defer`; the response binding is registered as
-a sink for compilation.
+through `ExprStmt`. A top-level `𝑝 = http_serve(port, method, path)` binds `𝑝` to the tuple
+`(Source(requests), responses)`, where `responses` names a `Defer` that a `let` around the
+statement binds. Both names are minted from the route, and `responses` is the sink's name for
+compilation, so the program's sink record reads the channel whatever `𝑝` binds.
 
 `out = test_sink()` binds a response `Defer` to a `TestSink` registered by the test through
 `GlobalContext::register_test_sink`. This form exists only under `cfg(test)` or the `test-helpers`

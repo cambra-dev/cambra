@@ -518,9 +518,11 @@ parameters — deferred to that design.)
 `http_serve`'s response half returns, what a defer-mediating UDF parameter (`λ out → out << e`)
 carries. It is the same `Type::History` variant a mutable variable uses, under the `Append` kind;
 unlike an overwrite variable it reads as its whole collection `𝐷 ⤇ 𝑉`, not a scalar deref. Feed
-handles are fully first-class — returnable and tuple-packable — because feed aliasing is benign
-(multiple feeders union by `++`). `channelize` eliminates every feed-typed term when it resolves
-channels, so no history type survives to planning.
+handles are first-class — returnable, aliasable and tuple-packable — because feed aliasing is
+benign (multiple feeders union by `++`). `channelize` resolves a handle through `Var` aliases only;
+a handle projected out of a tuple literal reaches it as one through the inline pass's
+tuple-projection rule (the module docs of `src/ccl/inline.rs`). `channelize` eliminates every
+feed-typed term when it resolves channels, so no history type survives to planning.
 
 ### `Txn` is a CCL type
 

@@ -1,6 +1,6 @@
-//! `http_serve`: recognizing `requests, responses = http_serve(port, method, path)`, and
-//! lowering it to a `Source` binding and a `Defer` binding whose sink is the route's reply
-//! sink.
+//! `http_serve`: recognizing `𝑝 = http_serve(port, method, path)`, and lowering the call to
+//! the tuple of a `Source` and a `Defer` whose sink is the route's reply sink, which `𝑝` takes
+//! apart like any other value.
 //!
 //! [`sink_declaration`](super::sink_declaration) recognizes the statement through
 //! [`http_serve_decl`], and [`lower_middle_stmt`](super::lower_middle_stmt) lowers it through
@@ -8,36 +8,22 @@
 
 use super::*;
 use crate::chl_parser::SurfaceBuiltin;
-use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Lit as ChlLit, Span, Spanned};
+use crate::chl_parser::ast::{
+    AssignTarget, BindingTransparency as ChlTransparency, Expr as ChlExpr, Lit as ChlLit, Span,
+    Spanned,
+};
 use crate::interpreter::HttpServerDataSource;
 
-/// `requests, responses = http_serve(port, method, path)`, with its names and string-literal
-/// arguments read off.
+/// `http_serve(port, method, path)`, with its string-literal arguments read off.
 pub(super) struct HttpServeDecl {
-    requests: String,
-    responses: String,
     port: String,
     method: String,
     path: String,
 }
 
-/// The declaration, when `target` is a 2-element name tuple and `value` is a call to
-/// `http_serve` with exactly 3 string-literal arguments.
-pub(super) fn http_serve_decl(
-    target: &Spanned<AssignTarget>,
-    value: &Spanned<ChlExpr>,
-) -> Option<HttpServeDecl> {
-    let AssignTarget::Tuple(elts) = &target.node else {
-        return None;
-    };
-    let [requests, responses] = elts.as_slice() else {
-        return None;
-    };
-    let (AssignTarget::Name(requests), AssignTarget::Name(responses)) =
-        (&requests.node, &responses.node)
-    else {
-        return None;
-    };
+/// The declaration, when `value` is a call to `http_serve` with exactly 3 string-literal
+/// arguments.
+pub(super) fn http_serve_decl(value: &Spanned<ChlExpr>) -> Option<HttpServeDecl> {
     let ChlExpr::Call { func, args } = &value.node else {
         return None;
     };
@@ -59,41 +45,37 @@ pub(super) fn http_serve_decl(
         _ => None,
     };
     Some(HttpServeDecl {
-        requests: requests.to_string(),
-        responses: responses.to_string(),
         port: string(port)?,
         method: string(method)?,
         path: string(path)?,
     })
 }
 
-/// Lower an `http_serve` declaration at `span`, whose arguments sit at `args_span`, in front
-/// of `body`:
+/// Lower `target = http_serve(…)` at `span`, whose arguments sit at `args_span`, in front of
+/// `body`:
 ///
 /// ```text
-/// let <requests> = Source("__http_requests_N") in
-/// let <responses> = Defer in
+/// let __http_responses_N = Defer in
+/// <target> = (Source("__http_requests_N"), __http_responses_N) in
 /// <body>
 /// ```
 ///
-/// The route is recorded as a [`DeclaredSink`] and registered for each run of the module
+/// The channel is bound under a name minted from the route, so the program's sink record
+/// reads it whatever `target` binds. A sink's binding must be in scope at the record, which
+/// is why the call is accepted only as the whole value of a top-level statement. The route
+/// is recorded as a [`DeclaredSink`] and registered for each run of the module
 /// ([`LoweringContext::register_sinks`]).
-// TODO we shouldn't need to special-case this.  Instead, we should support multi-return
-// in general.
 pub(super) fn lower_http_serve(
     decl: HttpServeDecl,
+    target: &Spanned<AssignTarget>,
+    transparency: ChlTransparency,
     span: Span,
     args_span: Span,
     body: Expr,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let HttpServeDecl {
-        requests,
-        responses,
-        port,
-        method,
-        path,
-    } = decl;
+    let bindings = AssignmentBindings::of(target, transparency, span, ctx)?;
+    let HttpServeDecl { port, method, path } = decl;
     let port_u16: u16 = port.parse().map_err(|_| {
         LoweringError::unsupported(
             args_span,
@@ -101,6 +83,7 @@ pub(super) fn lower_http_serve(
         )
     })?;
     let source_name = http_requests_source_name(&port, &method, &path);
+    let responses = http_responses_sink_name(&port, &method, &path);
     ctx.declared_sinks.push(DeclaredSink::Http {
         route: HttpRoute {
             source_name: source_name.clone(),
@@ -113,25 +96,25 @@ pub(super) fn lower_http_serve(
         args_span,
     });
     let requests_expr = ctx.tag_machinery(
-        Expr::new(TypedExprNode::Source(source_name.clone(), Vec::new())),
+        Expr::new(TypedExprNode::Source(source_name, Vec::new())),
         span,
         "lower.http_serve",
     );
-    // The responses binding is a plain Defer; the sink is registered by
-    // binding name so the scheduler can subscribe it independently.
-    let responses_expr =
-        ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, "lower.http_serve");
-    // The outer `requests` binding images the assignment statement (the
-    // real source construct); the inner `responses` Defer let, the
-    // Source node, and the Defer are manufactured plumbing of the
-    // http_serve expansion.
-    let inner_let = ctx.tag_machinery(
-        Expr::let_bind(responses, responses_expr, body),
+    let responses_read = ctx.tag_machinery(Expr::var(responses.as_str()), span, "lower.http_serve");
+    let value = ctx.tag_machinery(
+        Expr::tuple(vec![requests_expr, responses_read]),
         span,
         "lower.http_serve",
     );
-    let let_expr = Expr::let_bind(requests, requests_expr, inner_let);
-    Ok(ctx.tag_image(let_expr, span))
+    let bound = bindings.wrap(value, body, span, ctx);
+    let channel = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, "lower.http_serve");
+    // The channel's `let` and the `Defer` are manufactured plumbing; the bindings `target`
+    // makes image the assignment statement.
+    Ok(ctx.tag_machinery(
+        Expr::let_bind(responses, channel, bound),
+        span,
+        "lower.http_serve",
+    ))
 }
 
 /// The address an `http_serve` declaration serves, and the name of the source its requests
