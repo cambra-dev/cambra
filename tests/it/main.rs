@@ -34,7 +34,6 @@ mod inspector_goldens;
 mod loop_body_binding_cost;
 mod predicate_sharing;
 mod predicate_sharing_review;
-mod subst_binders;
 // The gallery stays at `tests/programs/`: its `program.cambra` paths are read at run time
 // and recorded in the inspector's golden fixtures. Its root is `mod.rs` rather than
 // `main.rs`, which autodiscovery would build as a binary of its own.

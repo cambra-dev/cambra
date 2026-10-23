@@ -1330,9 +1330,9 @@ impl Subst {
     /// target term (binder uids are minted once at lowering; copies preserve
     /// them, so a range name and an inner binder are the same `Name` only if
     /// they are the same binder — and a binder's scope cannot nest inside
-    /// itself). The α-rename fallback is therefore asserted unreachable,
-    /// which is also what deletes the same-discharge-twice determinism
-    /// hazard: no fresh names are minted on any equality-mediated path.
+    /// itself). Capture is therefore asserted rather than α-renamed, so no
+    /// fresh names are minted on any equality-mediated path and the same
+    /// discharge applied twice yields the same term.
     fn under_binder(&self, binder: &Name, body: &TypedExpr) -> Subst {
         let restricted = self.shadow(binder);
         // If no substituted binder occurs free in the body, the substitution
@@ -2713,7 +2713,7 @@ mod capture_assert_probe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement};
+    use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement, TypedBinding};
 
     fn var(s: &str) -> TypedExpr {
         TypedExpr::var(s)
@@ -3129,6 +3129,74 @@ mod tests {
             "the binder slot stays the composition's own; got `{}`",
             out.ty
         );
+    }
+
+    // A substitution crossing a binder leaves the binder's name as it is: under the Barendregt
+    // convention `Subst` never α-renames (`src/ccl/design/ir.md`, "Structured names and
+    // α-uniquification (Barendregt convention)").
+
+    /// `[k ↦ j]`, live in each expression body below, so each term crossing takes the
+    /// restricted path rather than the inert one; a `Fun` crossing has no inert path.
+    fn live_rename() -> Subst {
+        Subst::rename("k", "j")
+    }
+
+    /// What `live_rename` makes of each body: the occurrence `k` retargeted to `j`.
+    fn renamed() -> TypedExprNode {
+        TypedExprNode::Var(Name::raw("j"))
+    }
+
+    #[test]
+    fn a_lambda_keeps_its_param_name() {
+        let e = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("k"));
+        let TypedExprNode::Lambda { param, body } = live_rename().apply_expr(&e).node else {
+            panic!("expected a lambda");
+        };
+        assert_eq!(param.name, Name::raw("x"));
+        assert_eq!(body.node, renamed());
+    }
+
+    #[test]
+    fn a_for_keeps_its_target_name() {
+        let e = TypedExpr::new(TypedExprNode::For {
+            target: TypedBinding::new_unannotated("y"),
+            iter: Box::new(TypedExpr::var("xs")),
+            body: Box::new(TypedExpr::var("k")),
+        });
+        let TypedExprNode::For { target, body, .. } = live_rename().apply_expr(&e).node else {
+            panic!("expected a for");
+        };
+        assert_eq!(target.name, Name::raw("y"));
+        assert_eq!(body.node, renamed());
+    }
+
+    #[test]
+    fn a_let_keeps_its_binding_name() {
+        let e = TypedExpr::let_in(
+            TypedBinding::new_unannotated("z"),
+            TypedExpr::var("k"),
+            TypedExpr::var("k"),
+        );
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = live_rename().apply_expr(&e).node
+        else {
+            panic!("expected a let");
+        };
+        assert_eq!(binding.name, Name::raw("z"));
+        assert_eq!(bound_expr.node, renamed());
+        assert_eq!(body.node, renamed());
+    }
+
+    #[test]
+    fn a_pi_keeps_its_binder_name() {
+        let t = Type::pi("b", Type::Hole, Type::Hole);
+        let Type::Fun { name, .. } = live_rename().apply_type(&t) else {
+            panic!("expected a function type");
+        };
+        assert_eq!(name, Some(Name::raw("b")));
     }
 }
 
