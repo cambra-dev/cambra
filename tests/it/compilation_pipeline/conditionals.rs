@@ -479,6 +479,60 @@ c: Bool = False
     assert_eq!(codomain_ints(&result), vec![3, 4]);
 }
 
+/// A conditional collection whose condition reads the row: each row takes its own arm. Lambda
+/// elimination fans the rows out by the arms' gates, and each leg broadcasts its arm; boxed
+/// arms keep their `box`, since the union's codomain binds a witness per row
+/// (`src/ccl/design/collections.md`, "A conditional chosen per row").
+#[rstest]
+#[case::same_domain_arms_in_a_loop(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([1, 2] if i > 1 else [3, 4])
+"#}, "[7, 3]")]
+#[case::boxed_arms_in_a_loop(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum(box([1, 2]) if i > 1 else box([3, 4, 5]))
+"#}, "[12, 3]")]
+#[case::boxed_arms_as_a_comprehension_element(indoc! {r#"
+    out = test_sink()
+    out << [(box([1, 2]) if x > 1 else box([3])) for x in [1, 2]]
+"#}, "[() -> [[3], [1, 2]]]")]
+#[case::same_domain_arms_in_a_comprehension(indoc! {r#"
+    out = test_sink()
+    out << [sum([1, 2] if x > 1 else [3, 4]) for x in [1, 2]]
+"#}, "[() -> [7, 3]]")]
+#[case::an_elif_chain(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2, 3]:
+        out << sum(box([1]) if i == 1 else box([2, 2]) if i == 2 else box([3, 3, 3]))
+"#}, "[1, 4, 9]")]
+#[case::into_an_accumulator(indoc! {r#"
+    acc := 0
+    for i in [1, 2]:
+        acc := acc + sum(box([1, 2]) if i > 1 else box([3, 4, 5]))
+    out = test_sink()
+    out << acc
+"#}, "[() -> 15]")]
+#[case::iterated_by_a_comprehension(indoc! {r#"
+    out = test_sink()
+    out << [sum([y * 10 for y in (box([1, 2]) if x > 1 else box([3]))]) for x in [1, 2]]
+"#}, "[() -> [30, 30]]")]
+// A filter's predicate is planned as a lifted term, so a conditional in it reads the row the
+// same way.
+#[case::in_a_filter_reading_the_loop(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([x for x in [1, 2, 3, 4, 5, 6, 7, 8] if x > sum(box([1, 2]) if i > 1 else box([3, 4, 5]))])
+"#}, "[0, 30]")]
+#[case::in_a_filter_reading_the_element(indoc! {r#"
+    out = test_sink()
+    out << sum([x for x in [1, 2, 3, 4, 5, 6, 7, 8] if x > sum([1, 2] if x > 4 else [3, 4])])
+"#}, "[() -> 26]")]
+fn a_conditional_chosen_per_row(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
 // Consuming a conditional collection through a comprehension
 // (`[f(x) for x in (xs if c else ys)]`) is exercised below by
 // `test_comprehension_over_conditional`.

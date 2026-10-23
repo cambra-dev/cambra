@@ -52,30 +52,67 @@ use panic_message::panic_message;
 /// outside this list and [`UNDEFINED`] to agreement and every cell here to its kind, so a fix
 /// that makes one agree removes it, and a cell that starts failing another way fails the grid.
 const BROKEN: &[(&str, &str, &str)] = &[
+    (
+        "comp_source_in_loop",
+        "binder_cond_coll[i]",
+        "CompilerRejects",
+    ),
+    ("feed_collection", "cond_boxed", "Disagrees"),
+    (
+        "four_loop_collection_feed_in_mut_loop",
+        "cond_boxed",
+        "CompilerPanics",
+    ),
     ("function_body", "rows_sum", "CompilerPanics"),
     ("generator_yield", "rows_sum", "CompilerPanics"),
     ("groupby_tuple_key", "rec_comp", "CompilerPanics"),
     ("groupby_tuple_key", "rec_filtered", "CompilerPanics"),
     ("groupby_tuple_key", "rec_list", "CompilerPanics"),
+    ("loop_source", "cond_boxed", "Disagrees"),
+    (
+        "loop_source_in_loop",
+        "binder_cond_boxed[i]",
+        "CompilerRejects",
+    ),
+    (
+        "loop_source_in_loop",
+        "binder_cond_coll[i]",
+        "CompilerRejects",
+    ),
     (
         "loop_source_in_loop",
         "binder_filtered_comp[i]",
         "CompilerPanics",
     ),
+    ("loop_source_in_loop", "cond_boxed", "CompilerRejects"),
+    ("loop_source_in_loop", "cond_coll", "CompilerPanics"),
     ("loop_source_in_loop", "dup_union", "CompilerRejects"),
     ("loop_source_in_loop", "map_arrow", "CompilerPanics"),
     ("loop_source_in_loop", "map_lit", "CompilerPanics"),
     ("loop_source_in_loop", "union", "CompilerRejects"),
     (
         "nested_mut_source",
+        "binder_cond_boxed[i]",
+        "CompilerRejects",
+    ),
+    (
+        "nested_mut_source",
+        "binder_cond_coll[i]",
+        "CompilerRejects",
+    ),
+    (
+        "nested_mut_source",
         "binder_filtered_comp[i]",
         "CompilerPanics",
     ),
+    ("nested_mut_source", "cond_boxed", "CompilerRejects"),
+    ("nested_mut_source", "cond_coll", "CompilerPanics"),
     ("nested_mut_source", "dup_union", "CompilerRejects"),
     ("nested_mut_source", "generator_coll", "CompilerPanics"),
     ("nested_mut_source", "map_arrow", "CompilerPanics"),
     ("nested_mut_source", "map_lit", "CompilerPanics"),
     ("nested_mut_source", "union", "CompilerRejects"),
+    ("record_collection_field", "cond_boxed", "CompilerRejects"),
     ("record_in_list", "comp_sum", "CompilerRejects"),
     ("record_in_list", "filtered_sum", "CompilerRejects"),
     ("record_in_list", "generator_max", "CompilerRejects"),
@@ -91,6 +128,7 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("rows_comp_source", "rows_filtered", "CompilerPanics"),
     ("rows_inner_filter", "rows_filtered", "CompilerPanics"),
     ("rows_loop_feed", "rows_filtered", "CompilerRejects"),
+    ("rows_nested_mut", "rows_cond", "CompilerRejects"),
     ("rows_nested_mut", "rows_filtered", "CompilerRejects"),
     ("rows_nested_mut", "rows_jagged", "CompilerRejects"),
     ("terminal_read", "terminal_in_agg[pool]", "CompilerRejects"),
@@ -896,6 +934,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "binder_arith", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "{b} * 2 + 1" },
         Filler { name: "binder_in_comp", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "sum([z2 * {b} for z2 in [1, 2]])" },
         Filler { name: "binder_in_comp_filter", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "sum([z2 for z2 in [1, 2, 3] if z2 > {b}])" },
+        Filler { name: "binder_cond_sum", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "sum(box([1, 2]) if {b} > 1 else box([3, 4, 5]))" },
         Filler { name: "binder_in_call", ty: Ty::Int, needs: &[Ty::Int], decls: indoc! {r#"
             def helper_fn2(hn):
                 hn * 2
@@ -954,6 +993,11 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "binder_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2]]" },
         Filler { name: "binder_filtered_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2, 3] if z2 > {b}]" },
         Filler { name: "map_arrow", ty: Ty::IntColl, needs: &[], decls: "", expr: "map([\"a\" -> 1, \"b\" -> 2])" },
+        // --- conditional collections: same-domain arms and boxed ones, chosen once or per row
+        Filler { name: "cond_coll", ty: Ty::IntColl, needs: &[], decls: "", expr: "([1, 2] if 2 > 1 else [3, 4])" },
+        Filler { name: "cond_boxed", ty: Ty::IntColl, needs: &[], decls: "", expr: "(box([1, 2]) if 2 > 1 else box([3, 4, 5]))" },
+        Filler { name: "binder_cond_coll", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "([1, 2] if {b} > 1 else [3, 4])" },
+        Filler { name: "binder_cond_boxed", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "(box([1, 2]) if {b} > 1 else box([3, 4, 5]))" },
         Filler { name: "generator_coll", ty: Ty::IntColl, needs: &[], decls: indoc! {r#"
             def helper_gen2(hxs):
                 for hx in hxs:
@@ -1045,6 +1089,7 @@ fn fillers() -> Vec<Filler> {
             helper_lam = \hx -> hx + 3
         "#}, expr: "helper_lam" },
         Filler { name: "lambda_capturing", ty: Ty::IntFn, needs: &[Ty::Int], decls: "", expr: "\\fx -> fx + {b}" },
+        Filler { name: "rows_cond", ty: Ty::Rows, needs: &[], decls: "", expr: "[(box([1, 2]) if z2 > 1 else box([3])) for z2 in [1, 2]]" },
     ]
 }
 
