@@ -90,6 +90,9 @@ impl Rewrite<'_> {
         // that collection is whatever the program iterated.
         e.walk_type_slots_mut(|t| self.ty(t));
         e.walk_children_mut(|c| self.expr(c));
+        if is_loop(e) {
+            index_loop(e);
+        }
         if comprehension {
             self.depth -= 1;
             // The encoding replaces the whole expression, so the node is taken
@@ -141,6 +144,41 @@ impl Rewrite<'_> {
         });
         self.depth -= 1;
     }
+}
+
+/// Whether `e` is a loop as lowering builds one, `𝑠 ≫ (λ 𝑥 → body)`
+/// (`crate::ccl::lower::loops`'s `tagged_for_loop`).
+fn is_loop(e: &Expr) -> bool {
+    matches!(&e.node, TypedExprNode::Compose(elts)
+        if elts.len() == 2 && matches!(elts[1].node, TypedExprNode::Lambda { .. }))
+}
+
+/// Rewrite the loop `𝑠 ≫ (λ 𝑥 → body)` ([`is_loop`]) to `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)`, the
+/// form a comprehension's generator takes: the collection over `𝑠`'s positions of what the
+/// body makes of the element at each. The position is bound, so an element whose type reads
+/// it, a group of a group-by, is typed under its binder (`src/ccl/design/ir.md`, "Every
+/// stored type is well-scoped"). The rewritten loop keeps the loop's id and annotation, and
+/// the position's read and the step are recorded against it.
+fn index_loop(e: &mut Expr) {
+    let id = e.node_id();
+    let annotation = e.user_annotation.take();
+    let TypedExprNode::Compose(mut elts) = std::mem::replace(&mut e.node, TypedExprNode::Defer)
+    else {
+        unreachable!("is_loop matched a Compose")
+    };
+    let (Some(body), Some(source)) = (elts.pop(), elts.pop()) else {
+        unreachable!("is_loop matched two elements")
+    };
+    let _g = provenance::enter(id, "comprehension.loop_position", Nature::Machinery);
+    let position = Name::iter_record();
+    let read = Expr::apply(Expr::var(position.clone()), source);
+    let step = Expr::apply(read, body);
+    let TypedExprNode::Lambda { param, body } = Expr::lambda(position, Type::Hole, step).node
+    else {
+        unreachable!("Expr::lambda builds a Lambda")
+    };
+    *e = Expr::preserve(id, TypedExprNode::Lambda { param, body });
+    e.user_annotation = annotation;
 }
 
 /// Does this comprehension encode to a bare `Lambda` — an atomic term?

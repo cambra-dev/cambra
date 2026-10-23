@@ -1761,6 +1761,8 @@ fn settle(
     assert_unique_node_ids(ir, boundary);
     #[cfg(debug_assertions)]
     crate::ccl::infer::debug_assert_no_free_witness(ir, boundary);
+    #[cfg(debug_assertions)]
+    crate::ccl::well_scoped::assert_well_scoped(ir, boundary);
     debug!("{boundary} CCL:\n{}", symbolic(ir));
     debug!("{boundary} CCL (typed):\n{}", symbolic_typed(ir));
     let outcome = match check {
@@ -2696,7 +2698,15 @@ fn run_passes(
     }
 
     let lambda_elim = recorded(capture_provenance, Phase::LambdaElim, || {
-        lambda_elim::run(channelized)
+        // Every point-free morphism now serves every value of the parameters eliminated
+        // around it, so a type stated under one is generalized over what it can no longer
+        // name (`src/ccl/design/type-parameters.md`, "Generalized types"). Once, over the whole
+        // program: `run` also eliminates the lambdas of a predicate planning compiles, where
+        // the binders around the predicate are out of the tree it is handed.
+        lambda_elim::run(channelized).map(|mut program| {
+            crate::ccl::generalize::generalize_out_of_scope(&mut program);
+            program
+        })
     })
     .map_err(|error| match &error {
         lambda_elim::LambdaElimError::Unsupported(message) => vec![CompileError::Internal {
@@ -2737,12 +2747,20 @@ fn run_passes(
     // typecheck between them mints nothing, so splitting would buy a window in
     // which a recording writes nothing and nothing says why.
     let join_planned = recorded(capture_provenance, Phase::Planning, || {
-        let recognized = planning::plan_loops(lambda_elim);
+        let mut recognized = planning::plan_loops(lambda_elim);
+        crate::ccl::generalize::generalize_out_of_scope(&mut recognized);
         debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
         if let Err(errs) = typecheck_in(&recognized, &instances) {
             invalid_tree(&recognized, "letrec recognition", &errs);
         }
-        planning::run(recognized, &instances)
+        // Planning reads generic types by their bodies and builds types of its own, some
+        // under binders the morphisms it builds then leave (`src/ccl/design/type-parameters.md`,
+        // "Generalized types").
+        planning::run(recognized, &instances).map(|mut planned| {
+            crate::ccl::generalize::close_free_params(&mut planned);
+            crate::ccl::generalize::generalize_out_of_scope(&mut planned);
+            planned
+        })
     })
     .map_err(|message| {
         vec![CompileError::Internal {

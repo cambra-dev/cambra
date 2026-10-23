@@ -50,10 +50,7 @@ use crate::ccl::ccl_utils::{
 use crate::ccl::provenance;
 use crate::ccl::simplify::simplify;
 use crate::ccl::ty::FunKind;
-use crate::ccl::{
-    BaseType, BinOpKind, BindingTransparency, Branch, Builtin, CompareKind, FieldKey, Lit, Name,
-    Refinement,
-};
+use crate::ccl::{BaseType, BindingTransparency, Branch, Builtin, FieldKey, Lit, Name, Refinement};
 use crate::ccl::{Expr, Type, TypedExpr, TypedExprNode, symbolic::symbolic};
 
 // ---------------------------------------------------------------------------
@@ -1058,7 +1055,7 @@ fn elim_lambda(
     param_ty: &Type,
     body: Expr,
 ) -> Result<Expr, LambdaElimError> {
-    elim_lambda_at(ctx, param, param_ty, body, FunKind::Compute)
+    elim_lambda_kinded(ctx, param, param_ty, body, FunKind::Compute)
 }
 
 /// [`elim_lambda`] at a declared [`FunKind`] — see its note on why the default
@@ -1073,64 +1070,6 @@ fn elim_lambda_kinded(
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
         elim_lambda_impl(ctx, param, param_ty, body, fun_kind)
     })
-}
-
-/// [`elim_lambda_kinded`] where `λ param → body` itself is eliminated, rather than a subterm
-/// of its body: the morphism it returns is the one over `param`, so a chain it is binds
-/// `param` ([`bind_chain_input`]). A chain inside it, a zip's operand say, reads `param` as
-/// the enclosing input, and a rewrite can move it after another step, so it does not
-/// rebind the name.
-fn elim_lambda_at(
-    ctx: &mut ElimContext,
-    param: &Name,
-    param_ty: &Type,
-    body: Expr,
-    fun_kind: FunKind,
-) -> Result<Expr, LambdaElimError> {
-    let mut out = elim_lambda_kinded(ctx, param, param_ty, body, fun_kind)?;
-    bind_chain_input(&mut out, param);
-    Ok(out)
-}
-
-/// Make the chain `morphism` name its input `param`, where its morphisms' types read it.
-///
-/// Eliminating `λ param → …` gives a morphism over `param`, so a chain it is has `param` as
-/// its input, its head's position, and a chain names each position by the binder of the
-/// morphism there (`src/ccl/design/type-inference.md`, "A chain names each position"). The
-/// head takes `param`, or, binding a name of its own already, the reads of `param` take
-/// that name. A chain whose own binder names the input under another name, one
-/// [`crate::ccl::ccl_utils::chain_type`] minted for a dependent last morphism, has the reads
-/// of that name restated the same way.
-fn bind_chain_input(morphism: &mut Expr, param: &Name) {
-    let chain_binder = match morphism.ty.peel_refinements() {
-        Type::Fun { name, .. } => name.clone(),
-        _ => None,
-    };
-    let TypedExprNode::Compose(elts) = &mut morphism.node else {
-        return;
-    };
-    let input = elts[0].ty.domain().unwrap_or(Type::Hole);
-    let names = [Some(param.clone()), chain_binder].into_iter().flatten();
-    let read: Vec<Name> = names
-        .filter(|n| elts[1..].iter().any(|e| is_free(n, e)))
-        .collect();
-    let Some(first) = read.first() else {
-        return;
-    };
-    let mut slot = &mut elts[0].ty;
-    while let Type::Refinement(inner, _) = slot {
-        slot = inner;
-    }
-    let Type::Fun { name: head, .. } = slot else {
-        return;
-    };
-    let position = head.get_or_insert_with(|| first.clone()).clone();
-    let at = Expr::var(&position).with_ty(input);
-    for n in read.iter().filter(|n| **n != position) {
-        for e in elts[1..].iter_mut() {
-            crate::ccl::subst::Subst::discharge_in_place(e, n, &at);
-        }
-    }
 }
 
 /// Whether a value of type `ty` holds a collection whose domain reads `param`. A refinement
@@ -1315,27 +1254,29 @@ fn refine_filtering_casts(param: &Name, expr: &mut Expr) -> bool {
     rewrote
 }
 
-/// Whether a cast target's refinement reads `param` other than as the bare comparand of an
-/// equation: `𝑒 ▷ key == param` with `key` closed reads it only as the key a group is
-/// selected by, and anything else reads it inside the filter.
-fn key_reads(param: &Name, target: &Type) -> bool {
-    let Some(refinements) = cast_target_refinement(target) else {
-        return false;
-    };
-    refinements.iter().any(|r| {
-        if !is_free(param, &r.predicate) {
-            return false;
-        }
-        let TypedExprNode::BinOp {
-            left,
-            op: BinOpKind::Compare(CompareKind::Equals),
-            right,
-        } = &r.predicate.node
-        else {
-            return true;
-        };
-        let is_param = |e: &Expr| matches!(&e.node, TypedExprNode::Var(n) if n == param);
-        !((is_param(right) && !is_free(param, left)) || (is_param(left) && !is_free(param, right)))
+/// `λ 𝑦 → 𝑦 ▷ 𝑣`, the collection `𝑣` as the lambda reading it at each element.
+fn eta_expanded(v: Expr) -> Expr {
+    let _g = provenance::enter(
+        v.node_id(),
+        "lambda_elim.eta_expand_family",
+        provenance::Nature::Machinery,
+    );
+    let domain = v.ty.domain().unwrap_or(Type::Hole);
+    let codomain = v.ty.codomain().unwrap_or(Type::Hole);
+    let fun_kind = v.ty.fun_kind().cloned().unwrap_or(FunKind::Data(None));
+    let y = Name::fresh("__elem_at");
+    let body = Expr::apply(Expr::var(&y).with_ty(domain.clone()), v).with_ty(codomain.clone());
+    let mut binding = crate::ccl::expr::TypedBinding::new_unannotated(y.clone());
+    binding.ty = domain.clone();
+    Expr::new(TypedExprNode::Lambda {
+        param: binding,
+        body: Box::new(body),
+    })
+    .with_ty(Type::Fun {
+        name: None,
+        fun_kind,
+        domain: Box::new(domain),
+        codomain: Box::new(codomain),
     })
 }
 
@@ -1686,7 +1627,7 @@ fn elim_lambda_impl(
             // The merged pair morphism is the uncurried form of the same nested
             // abstraction, so it carries the enclosing function's kind: currying a
             // collection does not make it a capability.
-            let inner_elim = elim_lambda_at(ctx, &pair, &pair_ty, merged, fun_kind.clone())?;
+            let inner_elim = elim_lambda_kinded(ctx, &pair, &pair_ty, merged, fun_kind.clone())?;
             Ok(curry_at(inner_elim, result_ty))
         }
 
@@ -1734,20 +1675,22 @@ fn elim_lambda_impl(
             // the loop's binder — no one bucketing serves every `param`, and the
             // refinement is a filter on the inner binder that reads the outer one, which
             // the nested-lambda rule lifts onto the pair.
-            if matches!(value.node, TypedExprNode::Lambda { .. })
-                && (is_free(param, &value) || key_reads(param, &target))
-            {
-                let refined = refined_lambda(*value, &target, body_ty.clone());
-                return elim_lambda_kinded(ctx, param, param_ty, refined, fun_kind);
-            }
-            // `param` occurs only in the refinement (the group-by shape): the value
-            // is closed, so it lifts under `const` and the dependence rides the
-            // refinement, materialized as a `Restrict` at the iteration boundary.
-            let cast_val =
-                Expr::new(TypedExprNode::Cast { value, target }).with_ty(body_ty.clone());
-            let const_fn = Expr::builtin(Builtin::Const)
-                .with_ty(Type::fun(body_ty.clone(), result_pi.clone()));
-            Ok(Expr::apply(cast_val, const_fn).with_ty(result_pi))
+            //
+            // **The partition is not constant in `param`** where only the refinement reads
+            // it, the group-by shape: a collection's domain is its data, so each group is
+            // a different collection, and the family is a function of the key
+            // (`src/ccl/design/ir.md`, "Every stored type is well-scoped"). It takes the
+            // path above too: the refinement moves onto the lambda's binder, and the
+            // nested-lambda rule lifts it onto the pair of the key and the element, which
+            // `curry` turns back into the family. A value that is not a lambda is the
+            // lambda reading it at each element.
+            let _ = &result_pi;
+            let value = match value.node {
+                TypedExprNode::Lambda { .. } => *value,
+                _ => eta_expanded(*value),
+            };
+            let refined = refined_lambda(value, &target, body_ty.clone());
+            elim_lambda_kinded(ctx, param, param_ty, refined, fun_kind)
         }
 
         // Application: λ x → e ▷ f  ⟹  ⟨λx→e, λx→f⟩ ≫ apply
@@ -2602,7 +2545,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                 param: param.clone(),
                 body: Box::new(body.clone_preserving_ids()),
             }));
-            let mut result = elim_lambda_at(
+            let mut result = elim_lambda_kinded(
                 ctx,
                 &param.name,
                 &param.ty,

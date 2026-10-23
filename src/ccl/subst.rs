@@ -4347,8 +4347,8 @@ mod tests {
     /// substitution recomputes them — but its `FunKind` and Pi binder are not,
     /// and rebuilding with `Type::fun` would answer `Compute`/`None` for both.
     /// A data collection `⤇` must survive a discharge that reaches it, or
-    /// op-conversion dispatches on a downgraded domain. The binder here is one the
-    /// composition's morphisms read, the input they are typed under
+    /// op-conversion dispatches on a downgraded domain. The binder here is the one the
+    /// composition's codomain reads its input by
     /// (`src/ccl/design/type-inference.md`, "A chain names each position").
     #[test]
     fn a_compose_keeps_its_fun_kind_and_binder_across_a_discharge() {

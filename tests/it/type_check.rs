@@ -2677,7 +2677,7 @@ fn assert_predicate_discharged(ty: &Type, binder: &str) {
 fn set_infers_deduped_keyed_unit_collection() {
     assert_eq!(
         infer_program("set([1,2,3])").to_string(),
-        "({Int | __elem ▷ (([1, 2, 3] ≫ (λ __set_key : Int → __set_key)) ▷ collection_contains)} ⤇ Unit)"
+        "({Int | __elem ▷ ((λ __iter_record : 0..3 → __iter_record ▷ [1, 2, 3] ▷ (λ __set_key : Int → __set_key)) ▷ collection_contains)} ⤇ Unit)"
     );
 }
 
@@ -2697,7 +2697,7 @@ fn set_injects_into_nominal_set_annotation() {
     // [`map_injects_into_nominal_map_annotation`] shows.
     assert_eq!(
         infer_program("x <: Set(Int) = box(set([1,2,3]))\nx").to_string(),
-        "Σ (σ : [{Int | __elem ▷ (([1, 2, 3] ≫ (λ __set_key : Int → __set_key)) ▷ collection_contains)}]). (σ ⤇ Unit)"
+        "Σ (σ : [{Int | __elem ▷ ((λ __iter_record : 0..3 → __iter_record ▷ [1, 2, 3] ▷ (λ __set_key : Int → __set_key)) ▷ collection_contains)}]). (σ ⤇ Unit)"
     );
     // The **key type** flows too: it is a kind *parameter*, so the edge relates it
     // rather than ignoring it — and it survives the `box`, which reaches the annotation
@@ -2721,7 +2721,7 @@ fn set_injects_into_nominal_set_annotation() {
 fn map_infers_a_key_domain_over_the_value() {
     assert_eq!(
         infer_program("map([(1, 10), (2, 20)])").to_string(),
-        "({Int | __elem ▷ (([(1, 10), (2, 20)] ≫ (λ __map_kv : (Int, Int) → __map_kv.0)) ▷ collection_contains)} ⤇ Int)"
+        "({Int | __elem ▷ ((λ __iter_record : 0..2 → __iter_record ▷ [(1, 10), (2, 20)] ▷ (λ __map_kv : (Int, Int) → __map_kv.0)) ▷ collection_contains)} ⤇ Int)"
     );
 }
 

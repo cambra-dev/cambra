@@ -201,6 +201,18 @@ fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
         TypedExprNode::Copair(ops) => {
             !ops.is_empty() && ops.iter().all(|o| is_causal_history_slot(o, live))
         }
+        // A pointwise view `λ 𝑟 → 𝑟 ▷ 𝑣 ▷ 𝑠₁ ▷ … ▷ 𝑠ₙ` reads `𝑣` at the position it is read at,
+        // the pointful spelling of `𝑣 ≫ 𝑠₁ ≫ … ≫ 𝑠ₙ`, so it is causal as that chain is: `𝑣`
+        // a causal slot and no step naming the group.
+        TypedExprNode::Lambda { .. } => crate::ccl::ccl_utils::pointwise_view_parts(history)
+            .is_some_and(|(head, steps)| {
+                is_causal_history_slot(head, live)
+                    && steps.iter().all(|s| {
+                        let mut r = BTreeSet::new();
+                        collect_noncausal_refs(s, live, &mut r);
+                        r.is_empty()
+                    })
+            }),
         // A **`zip` of causal slots** — `⟨causal, …⟩` (a per-key commit
         // view combining several pointwise reads of the same commit stream, e.g.
         // `⟨commits ≫ .time, commits ≫ .decision ≫ variant_project(`commit) ≫

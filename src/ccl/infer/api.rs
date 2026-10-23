@@ -1998,21 +1998,8 @@ pub fn debug_assert_no_free_witness(expr: &Expr, stage: &str) {
         if let TypedExprNode::Cast { target, .. } = &e.node {
             check(target, scope, e, stage);
         }
-        // A node whose own type is a sum opens that binder over its binder slots and its
-        // whole subtree: the sum on `expr.ty` is what a decomposed term's scattered
-        // occurrences still name.
-        //
-        // **The whole chain, not just the head.** Consuming two conditional collections at
-        // once nests the closes — `Σ (𝜎₁ : 𝐾₁). Σ (𝜎₂ : 𝐾₂). (𝜎₁, 𝜎₂) ⤇ 𝑉` — and every binder
-        // in that chain scopes over the same subtree, so opening only the outermost
-        // reports the inner witness's occurrences as free.
-        let mut opened = 0;
-        if let Some(ws) = e.ty.peel_refinements().sum() {
-            for w in ws {
-                scope.push(*w.id());
-                opened += 1;
-            }
-        }
+        // A sum binds its witnesses within its own type, as every type binds its binders, and
+        // over nothing else: a node reading a witness is under a sum of its own.
         e.walk_binders(|b| {
             check(&b.ty, scope, e, stage);
             if let Some(a) = &b.user_annotation {
@@ -2021,7 +2008,6 @@ pub fn debug_assert_no_free_witness(expr: &Expr, stage: &str) {
         });
         e.walk_type_slots(|t| in_type(t, stage, scope, visited));
         e.walk_children(|c| go(c, stage, scope, visited));
-        scope.truncate(scope.len() - opened);
     }
     if std::env::var("DBG_TREE").is_ok() {
         eprintln!(
@@ -2241,10 +2227,17 @@ fn collect_type_errors(
         // Specialization substitutes each use's types for a type parameter, and a
         // `Poly` annotation leaves with the generalized `let` it annotated, so either
         // surviving is a compiler bug. Reported at every strictness, like `Hole`.
+        //
+        // A generalized type is the exception: a pass generalizes a type it moved out of a
+        // binder's scope over what the type can no longer name, and that `Poly` stays
+        // (`src/ccl/design/type-parameters.md`, "Generalized types").
+        Type::Param(param) if param.generalized => {}
         Type::Param(param) => errors.push(InferError::Unsupported(format!(
             "type parameter `{}` survived inference at `{context_sym}`",
             param.spelling
         ))),
+        Type::Poly(poly)
+            if !poly.params.is_empty() && poly.params.iter().all(|p| p.param.generalized) => {}
         // Reported once, like `BoundedHole`: its body and bounds are not walked.
         Type::Poly(_) => {
             errors.push(InferError::Unsupported(format!(

@@ -2232,7 +2232,9 @@ abstracts the result into a function type.
 An opaque entry (`x ^= e`) is not discharged: its name remains in the lifted type.
 `scoped_let` records its bound type in `opaque_binders` on entry, so refinement queries can
 recover that fact after lexical scope exit. `close_let_type` returns the body type unchanged
-for this case in both emission and checking.
+for this case in both emission and checking. Mutability elimination makes the entry transparent
+and discharges the name it left in the lifted types
+([A read is named while inference runs](mutability.md#a-read-is-named-while-inference-runs)).
 
 For a transparent value binding, `InferCtx::close_let_type` runs after restoring the enclosing
 telescope. It creates the let
@@ -2427,29 +2429,19 @@ pattern binder exits as the scrutinee's payload. Both need a term that reads a v
 #### A chain names each position
 
 A chain `𝑒₀ ≫ 𝑒₁ ≫ … ≫ 𝑒ₙ` names each position it passes through by the binder of the morphism
-there: `𝑒ᵢ`'s binder `𝑥ᵢ` is its input, and `𝑥₀` is the chain's. A type after `𝑒ᵢ` reads that
-position as `𝑥ᵢ`. No name binds two positions. A chain's own binder, where its type names one, is
-its head's input under a second name. `compose_chain` types each morphism under the binders before
-it and opens each codomain at its own binder for the adjacency with the next.
+there: `𝑒ᵢ`'s binder `𝑥ᵢ` is its input, and `𝑥₀` is the chain's. `𝑥ᵢ` binds within `𝑒ᵢ`'s own type
+and nowhere else, so no morphism after `𝑒ᵢ` names it
+([Every stored type is well-scoped](ir.md#every-stored-type-is-well-scoped)). `compose_chain` types
+every morphism in the chain's own scope and opens each codomain at its own binder for the adjacency
+with the next. A morphism whose type depends on what an earlier one hands it is generic in that
+part, and the adjacency instantiates it from the codomain before it
+([Generalized types](type-parameters.md#generalized-types)).
 
 A type that names a position does not depend on how the position is computed. Planning rewrites a
 morphism's implementation by equivalences normal form does not identify, a group-by into
-`converse` and `map` or a join into its plan, and the types naming the position stay valid. A pass
-that removes or merges the morphism binding a position restates the types that read it:
-
-- Flattening gives a nested chain's head the nested chain's binder, the name its position was read
-  by in the outer chain, or the outer chain's binder at the outer head.
-- Flattening restates the steps after a nested chain. They were typed against the nested chain's
-  own type, which reads each inner position as the chain's input carried there,
-  `ℎ ▷ 𝑒₀ ≫ … ≫ 𝑒ᵢ₋₁`. Spliced in, that position is the outer chain's and `𝑒ᵢ`'s binder names it,
-  so each read of it becomes that binder (`restate_spliced_reads`). A read is found by normal form
-  ([Predicates are compared by normal form](#predicates-are-compared-by-normal-form)). Where two
-  positions share a normal form (`𝑎 ▷ unbox` reads as `𝑎`), the first one names it.
-- Simplify's pairwise rewrite reads a binder its replacement no longer binds as the replacement's
-  input carried through the morphism it replaced (`restate_entered_binders`).
-- A per-group filter takes the binder of the site it is inserted before, whose input it now takes.
-- Simplify's inlining of an A-normalization temporary bound to a morphism gives the morphism the
-  binder its use site carried (`try_let_morphism_inline`).
+`converse` and `map` or a join into its plan, and the types stay valid. No type names another
+morphism's binder, so a pass that removes, merges or splices morphisms restates none: flattening a
+nested chain splices its elements in place.
 
 A chain's own type is a function of its input alone. Each position its codomain reads is written
 as the input carried there: `(𝑥₀ : 𝐷) ⇒ 𝐶[𝑥ᵢ ↦ 𝑥₀ ▷ 𝑒₀ ≫ … ≫ 𝑒ᵢ₋₁]`, where leading morphisms that map
@@ -2457,14 +2449,11 @@ each position to itself (`id`, an iteration source, `filter_values`) drop out of
 Emission discharges a codomain not resolved yet by suspension
 ([A substitution reaching a variable suspends on it](#a-substitution-reaching-a-variable-suspends-on-it)).
 After inference every pass that builds or rebuilds a chain types it by the same rule
-(`ccl_utils::chain_type_of`). The chain binds its input only where its codomain reads it, or a
-morphism after its head reads it under a name the head does not bind.
+(`ccl_utils::chain_type_of`).
 
-Lambda elimination keeps the names apart. Eliminating `λ 𝑝 → body` gives a morphism over `𝑝`, so a
-chain it returns names `𝑝` at its head (`bind_chain_input`). Every other morphism it builds takes a
-binder of its own, which only its own codomain reads. An operation's dependent result is stated
-over the operation's own input, `(𝑞 : (Int, Int)) ⇒ {Int | __elem == 𝑞.0 ^+ 𝑞.1}`, rather than over
-the eliminated parameter its operands were written with (`operation_type`).
+Lambda elimination states an operation's dependent result over the operation's own input,
+`(𝑞 : (Int, Int)) ⇒ {Int | __elem == 𝑞.0 ^+ 𝑞.1}`, rather than over the eliminated parameter its
+operands were written with (`operation_type`).
 
 #### Discharge is application
 
@@ -2892,8 +2881,10 @@ An edge's substitution acts before the arms compare: a reference it discharges i
 discharge put there, and a projection under it is the projection of the substituted term. Two
 projections through different binders that each discharge to one term are then one projection.
 
-A reference must remain under a binder that classifies it. Reference equality alone does not
-check this: a free ID compares equal to itself. `check_scope_valid` checks witness references
+A reference must remain under a binder that classifies it. A sum binds its witnesses within its
+own type and nowhere else, so a node's type names only witnesses its own sums bind
+([Every stored type is well-scoped](ir.md#every-stored-type-is-well-scoped)). Reference equality
+alone does not check this: a free ID compares equal to itself. `check_scope_valid` checks witness references
 in node types after coalescing and returns `ScopeViolation` in every build. Bound recording's
 `enforce_bound_scope` checks term names only, not witnesses. The debug-only
 `debug_assert_no_free_witness` also checks boundaries after inference, lambda elimination

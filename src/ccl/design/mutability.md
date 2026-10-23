@@ -267,6 +267,16 @@ a later pass reads the term there: an application's function and argument (the t
 positions above), a block's terminal expression (the tail rules, and rule 2's escape check), and the
 value of a feed (`rewrite_as_of_reads`). The module docs carry the per-position detail.
 
+A read binder is opaque only while inference runs. Mutability elimination gives every value a
+mutable variable holds a binder of its own, so a read binder's definiens is then that value, and
+`mut_read::reveal` makes every opaque binder transparent: a type lifted past one reads its
+definiens, as past any `let`. A value a loop computes is read through the loop's history, which no
+term outside the loop spells. A type that leaves its scope holds a sum over the domains it could
+have, `Σ (𝐷 : SubtypesOf(𝐵)). 𝐷 ⤇ 𝑉`, and a fact about a value naming it is dropped; a `box`
+introduces the sum where the value crosses, at the scope's result or at a feed to a channel declared
+outside it. `[z for z in [1, 2, 3, 4] if z > acc]` after a loop writing `acc` is fed as a collection
+over some subset of `0..4`.
+
 ## Surface language
 
 The surface syntax and the behaviour a programmer observes — `:=` mutation, `with begin():`

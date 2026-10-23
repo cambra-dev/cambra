@@ -261,6 +261,26 @@ pub(super) trait Typing {
     where
         Self: Sized;
 
+    /// `ty`, a morphism reached with an input of type `incoming`, instantiated for it where
+    /// it is a generalized type (`src/ccl/design/type-parameters.md`, "Generalized types").
+    /// Emission runs before any pass lifts a use, so it meets none.
+    fn instantiate_generalized(&mut self, ty: &Type, incoming: &Type) -> Type {
+        let _ = incoming;
+        ty.clone()
+    }
+
+    /// `ty`, a generalized type its input left generic, at its body, its parameters standing for
+    /// any type; the parameters are kept, for the chain's type to quantify over
+    /// ([`Self::requantify_opened`]). Emission meets no generalized type.
+    fn open_generic(&mut self, ty: Type) -> Type {
+        ty
+    }
+
+    /// `ty` quantified over the parameters [`Self::open_generic`] opened that it still reads.
+    fn requantify_opened(&mut self, ty: Type) -> Type {
+        ty
+    }
+
     /// [`Self::scoped`] for a mutable variable's binder, `name := …`. Emit also records that
     /// a contribution crossing the binder keeps its name: a mutable variable is one variable,
     /// not a binder taking a value per iteration or call, and no type names it
@@ -342,9 +362,8 @@ pub(super) trait Typing {
     /// `item`, one per position of type `position`. Emit keeps it for a feed that crosses the
     /// binder, whose channel is keyed by the loop's position, so the binder is `𝑘 ▷ source`
     /// at the key `𝑘` ([`InferCtx::require_feed`](super::context::InferCtx::require_feed)).
-    /// `position_binder` is the binder of a dependent source's type, which the chain scopes
-    /// over the loop's body as the position itself, so it is `𝑘`. Check trusts the recorded
-    /// types and keeps nothing.
+    /// `position_binder` is the loop's position, the binder of `λ 𝑟 → (𝑟 ▷ source) ▷ (λ 𝑥 →
+    /// body)`, which is `𝑘` there. Check trusts the recorded types and keeps nothing.
     fn note_loop_source(
         &mut self,
         _binder: &Name,

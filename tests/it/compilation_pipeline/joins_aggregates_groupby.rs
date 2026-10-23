@@ -506,7 +506,7 @@ fn a_bare_groupby_tail_is_driven() {
     // is realized as `converse`), and the compiled tile below is unchanged. The
     // morphism inside it stays **pointful** — planning point-frees the predicates it
     // reifies into a `Restrict`, and this one it never reaches.
-    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:({Int | __elem ▷ (([1, 2, 3, 4] ≫ (λ y : Int → y // 2)) ▷ collection_contains)} ⤇ Int)",
+    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:({Int | __elem ▷ ((λ __iter_record : 0..4 → __iter_record ▷ [1, 2, 3, 4] ▷ (λ y : Int → y // 2)) ▷ collection_contains)} ⤇ Int)",
     Tile::data_function(ColumnValue::Ints(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))), Predicate::True, BitSet::new()))]
 #[case(
     "[x + y for x in [1,2,3] for y in [2,3,4,5] if x == y]",
@@ -1427,12 +1427,12 @@ fn a_group_by_under_a_loop_not_compiled_yet(#[case] code: &str, #[case] gap: &st
     check_compile_error(code, gap);
 }
 
-/// A per-group count whose body does not read the row, `sum([1 for s in g])`, fails operator
-/// conversion: the comprehension's iteration binder `__iter_record` (`src/ccl/comprehension.rs`)
-/// reaches `src/interpreter/operator_conversion.rs` as a free variable after lambda elimination.
-/// A body that reads the row compiles (`a_binop_pairs_two_projections_at_the_grouped_row`).
+/// A per-group count whose body does not read the row, `sum([1 for s in g])`, does not compile:
+/// generalizing the lifted `curry` meets a collection domain that reads the comprehension's
+/// iteration binder `__iter_record`, which the morphism's input does not carry. A body that reads
+/// the row compiles (`a_binop_pairs_two_projections_at_the_grouped_row`).
 #[test]
-#[should_panic(expected = "unrecognised Var(__iter_record) in λ-free CCL")]
+#[should_panic(expected = "reads a binder no term binder around it binds")]
 fn a_per_group_count_that_ignores_the_row() {
     check_tile(
         &per_region_program("sum([1 for s in g])"),

@@ -8,7 +8,8 @@ A written polymorphic type is a `Type`: `Type::Poly` binds type parameters, thei
 Inside the body a type parameter is an opaque `Type::Param`. Each use instantiates the parameters as
 fresh inference variables and checks the kinds and requirements at its own types, and
 specialization substitutes the use's types for the parameters in the cloned body. No `Poly` or
-`Param` survives inference.
+`Param` the program writes survives inference. The compiler's own generic types, after lambda
+elimination, are the one `Poly` a later phase holds ([Generalized types](#generalized-types)).
 
 An unannotated generalized binding keeps the implicit polymorphism of
 [3.1 Let-Polymorphism is Freshening
@@ -418,12 +419,58 @@ as a right-hand side is checked against its `Poly`
 Members resolve statically to their binders, so no Module type flows through inference variables,
 and no subtyping rule between two `Poly`s is needed.
 
+After inference, a generalized type can sit inside another type: an applied `const`'s domain is its
+argument's type, generic or not, and a product of morphisms holds each component's own type
+([Generalized types](#generalized-types)).
+
+---
+
+## Generalized types
+
+Lambda elimination is lambda lifting: one point-free morphism serves every value of a parameter it
+eliminated. A use's type written under that parameter can name it, as
+`sum : ({0..4 | key(__elem) == 𝑘} ⤇ Int) ⇒ Int` names `𝑘` once no binder of `𝑘` encloses `sum`.
+`generalize::generalize_out_of_scope` rewrites each type that names a binder out of its scope, after
+lambda elimination, after loop recognition, and after planning:
+
+- A part of the morphism's input that names the binder becomes a **generalized parameter**, bounded
+  by the part's base without the refinements that name it:
+  `∀ (𝐷 <: 0..4). (𝐷 ⤇ Int) ⇒ Int`. A generalized parameter is a `TypeParam` with `generalized`
+  set, at level 0. A witness projection read through a term out of scope ranges over the witness's
+  kind.
+- The output's part spelled as an input part takes that part's parameter. A value fact the output
+  states about the binder is dropped. A refinement naming the binder on a collection's domain that
+  no input part determines does not generalize: the morphism depends on a value its input does not
+  carry, which the pass that built it has to pass in, and generalizing panics.
+- A collection, a data function, is not generalized: its domain is its data.
+- A variant constructor and `map_domain` state their output, so their types are generalized over
+  the output's parts as well, which a use fixes from the type it is stated at.
+- An applied `const` or `map` is stamped at its instance, the argument's type to the
+  application's, each generalized on its own.
+- A quantifier over a curried function's codomain, or over a product's components there, moves
+  outside the function where its bounds do not read the function's binder.
+
+A part read under a binder of the type's own, a position of the collection the morphism receives,
+is generalized with that binder read by name, so the parameter stands for the part at every
+position. A binder spelled like a name the type also reads free is renamed apart first, so the two
+stay distinct.
+
+Check instantiates a generalized type where it is used: at a chain edge from the codomain before it,
+at a chain's head from the chain's input, and at an application from the argument
+(`generalize::instantiate`). It matches the type's domain against what it receives, with every
+binder of that type read by name, and closes the result again. A parameter the input does not fix
+stays generic: the morphism is read at its body, and the result is generalized over it again. A
+generic node is checked at its body. Subtyping aligns a generic side with the other first
+(`generalize::align`). A builtin's type is trusted whole. After planning, `close_free_params` wraps
+each type a rebuild left reading a generalized parameter that nothing binds.
+
 ---
 
 ## After inference
 
-A `Poly` or `Param` in the tree that survives inference is a compiler defect.
-`collect_type_errors` reports one at every strictness, as it reports `Hole`. A specialized binding
+A `Poly` or `Param` the program wrote that survives inference is a compiler defect.
+`collect_type_errors` reports one at every strictness, as it reports `Hole`, and admits a
+generalized parameter and a `Poly` over generalized parameters alone. A specialized binding
 is rebuilt as monomorphic `let`s, so its `Poly` annotation leaves with it. `Display for Type`
 renders a `Poly` in the spec's notation and a parameter by its spelling. `hash_type_in` hashes a
 parameter by its spelling, as it hashes a channel domain, since an identity is per-compilation; no

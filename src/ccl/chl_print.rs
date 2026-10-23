@@ -451,10 +451,22 @@ impl Printer {
                     .collect();
                 (Prec::Atom, format!("({})", parts.join(", ")))
             }
-            TypedExprNode::Compose(stages) => match self.comprehension(stages, env) {
-                Some(text) => (Prec::Atom, text),
-                None => (Prec::Atom, self.fallback_expr(e)),
+            TypedExprNode::Compose(stages) => match stages.as_slice() {
+                [source, stage] => match &stage.node {
+                    TypedExprNode::Lambda { param, body } => {
+                        (Prec::Atom, self.comprehension(source, param, body, env))
+                    }
+                    _ => (Prec::Atom, self.fallback_expr(e)),
+                },
+                _ => (Prec::Atom, self.fallback_expr(e)),
             },
+            TypedExprNode::Lambda { .. } if crate::ccl::ccl_utils::loop_parts(e).is_some() => {
+                let parts = crate::ccl::ccl_utils::loop_parts(e).expect("matched above");
+                (
+                    Prec::Atom,
+                    self.comprehension(parts.source, parts.element, parts.body, env),
+                )
+            }
             // `unbox` is the second projection of a sum: the collection it holds, which the
             // program wrote as the sum itself.
             TypedExprNode::Apply { function, argument }
@@ -543,13 +555,13 @@ impl Printer {
 
     /// `c ≫ λ x → b` as the comprehension `[b for x in c]`, or, over a list literal,
     /// the list of `b` at each element.
-    fn comprehension<'a>(&mut self, stages: &'a [Expr], env: &Env<'a>) -> Option<String> {
-        let [source, stage] = stages else {
-            return None;
-        };
-        let TypedExprNode::Lambda { param, body } = &stage.node else {
-            return None;
-        };
+    fn comprehension<'a>(
+        &mut self,
+        source: &'a Expr,
+        param: &'a crate::ccl::TypedBinding,
+        body: &'a Expr,
+        env: &Env<'a>,
+    ) -> String {
         if let (TypedExprNode::List(elts), depth) = resolve(source, env) {
             let parts: Vec<String> = elts
                 .iter()
@@ -559,7 +571,7 @@ impl Printer {
                     self.expr(body, Prec::Lowest, &inner)
                 })
                 .collect();
-            return Some(format!("[{}]", parts.join(", ")));
+            return format!("[{}]", parts.join(", "));
         }
         let source = self.expr(source, Prec::Lowest, env);
         let mut inner = env.clone();
@@ -569,7 +581,7 @@ impl Printer {
         self.spelled.push((param.name.clone(), x.clone()));
         let body = self.expr(body, Prec::Lowest, &inner);
         self.spelled.pop();
-        Some(format!("[{body} for {x} in {source}]"))
+        format!("[{body} for {x} in {source}]")
     }
 
     /// A predicate term CHL has no spelling for, in the checker's notation.

@@ -1091,6 +1091,17 @@ pub(super) fn emit_apply<C: Typing>(
         let slot = ctx.binding_slot(&mut param.ty);
         ctx.require_sub(&read_through(&raw_arg_ty), &slot, &|| "Apply".to_string())?;
     }
+    // `(𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)` is a loop's step at the position `𝑟`, the form a `for` loop
+    // lowers to (`lower::loops::tagged_for_loop`): `𝑥` is `𝑠`'s value at `𝑟`.
+    if let TypedExprNode::Lambda { param, .. } = &function.node
+        && let TypedExprNode::Apply {
+            argument: position,
+            function: source,
+        } = &argument.node
+        && let TypedExprNode::Var(r) = &position.node
+    {
+        ctx.note_loop_source(&param.name, Some(r), source, &position.ty, &raw_arg_ty);
+    }
     // A function position is a value position, so a mutable variable mention there reads
     // (`src/ccl/design/mutability.md`, "A mutable variable read is an explicit operation").
     // Undereffed it meets the demand `fn_ty <: (x: d) ⇒ result` as a mismatch, the relation
@@ -2634,7 +2645,8 @@ pub(super) fn emit_for<C: Typing>(
     }
 
     // A `for` reaching inference as a loop node writes mutable variables declared outside
-    // it: one that only feeds lowers to `𝑠 ≫ (λ 𝑥 → body)` (`lower::loops::tagged_for_loop`).
+    // it: one that only feeds is a loop over its source's positions
+    // (`crate::ccl::comprehension`, `index_loop`).
     ctx.note_loop_source(&target.name, None, iter, &position_ty, &target_simple);
     ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))?;
     Ok(Type::Base(BaseType::Unit))
@@ -3335,24 +3347,20 @@ struct ChainEnds {
     first_dom: Type,
     /// The last morphism's codomain, opened at its binder.
     cod: Type,
-    /// Each morphism's binder with its domain, in order: the names the types after it may
-    /// read (`src/ccl/design/type-inference.md`, "A chain names each position").
+    /// Each morphism's binder with its domain, in order: the positions the chain's codomain
+    /// is written over its input at (`src/ccl/design/type-inference.md`, "A chain names each
+    /// position").
     binders: Vec<Option<(Name, Type)>>,
     /// The last morphism's type, which its own binder is read off of.
     last_ty: Type,
 }
 
-/// Type each morphism of a chain and draw the adjacency edges between them, **under the
-/// binders of the morphisms before it** (`src/ccl/design/type-inference.md`, "A chain names
-/// each position").
+/// Type each morphism of a chain in the chain's own scope and draw the adjacency edges between
+/// them (`src/ccl/design/type-inference.md`, "A chain names each position").
 ///
-/// A chain names each position it passes through: a morphism's binder is its input, and the
-/// types after it read that input by name. The chain's own binder, where its type names one,
-/// is its input too, the head's, so it is in scope for every morphism after the head. A
-/// morphism's codomain is opened at its own binder for the adjacency with the next, and
-/// the walk enters that binder for everything after it, so the variables a later step mints
-/// close against every earlier position (`src/ccl/design/type-inference.md`, "The
-/// invariant"). Recursion carries the scope: each step runs inside every binder before it.
+/// A morphism's binder is its input and binds within its own type alone. Its codomain is
+/// opened at that binder for the adjacency with the next morphism, and a generalized type is
+/// instantiated from the codomain that reaches it.
 ///
 /// The adjacency is strict and refinement-aware: `prev_cod <: next_dom`,
 /// refinements and all — no cast escape. A producer must already supply the
@@ -3375,11 +3383,23 @@ fn compose_chain<C: Typing>(
     // edge relates two parts cut out of two different functions, so each side carries the Σ
     // it left behind ([`Typing::require_sub_under`]).
     prev_cod: Option<(Type, Vec<crate::ccl::ty::Witness>)>,
-    chain_binder: Option<&Name>,
+    // The chain's input, at the head: what instantiates a generalized type there.
+    head_input: Option<&Type>,
     ctx: &mut C,
 ) -> Result<ChainEnds, LocatedInferError> {
     let (head, rest) = elts.split_at_mut(1);
     let ty = emit_value_read(&mut head[0], ctx)?;
+    // A generalized type is instantiated by what reaches it: the morphism before it, or at the
+    // head the chain's own input.
+    let ty = match (&prev_cod, head_input) {
+        (Some((prev, _)), _) => ctx.instantiate_generalized(&ty, prev),
+        (None, Some(input)) => ctx.instantiate_generalized(&ty, input),
+        (None, None) => ty,
+    };
+    // A part the input does not fix stays generic through the rest of the chain: the
+    // morphism is read at its body, and the chain's type is generic in it as well
+    // (`emit_compose`).
+    let ty = ctx.open_generic(ty);
     let (dom, cod) = ctx.as_function(&ty, &|| format!("Compose[{i}]"))?;
     let binders = ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
     if let Some((prev, prev_binders)) = prev_cod {
@@ -3392,14 +3412,6 @@ fn compose_chain<C: Typing>(
         Type::Fun { name, .. } => name.clone(),
         _ => None,
     };
-    // `𝑠 ≫ (λ 𝑥 → body)` is a loop over `𝑠`, the form a `for` loop that only feeds lowers to:
-    // `𝑥` is `𝑠`'s value at each position.
-    if i == 0
-        && let [next] = &*rest
-        && let TypedExprNode::Lambda { param, .. } = &next.node
-    {
-        ctx.note_loop_source(&param.name, own.as_ref(), &head[0], &dom, &cod);
-    }
     let here = own.clone().map(|b| (b, dom.clone()));
     if rest.is_empty() {
         return Ok(ChainEnds {
@@ -3409,18 +3421,10 @@ fn compose_chain<C: Typing>(
             last_ty: ty,
         });
     }
-    let mut tail =
-        |ctx: &mut C| compose_chain(rest, i + 1, Some((cod.clone(), binders.clone())), None, ctx);
-    // The chain's own binder names the head's input as well, where it differs from the
-    // head's.
-    let mut under_chain = |ctx: &mut C| match chain_binder.filter(|k| own.as_ref() != Some(*k)) {
-        Some(k) => ctx.scoped(k, &dom, &mut tail),
-        None => tail(ctx),
-    };
-    let ends = match &own {
-        Some(b) => ctx.scoped(b, &dom, &mut under_chain)?,
-        None => under_chain(ctx)?,
-    };
+    // A type names only the binders of the terms around it and its own
+    // (`src/ccl/design/ir.md`, "Every stored type is well-scoped"), so the morphisms after this
+    // one are typed outside its binder.
+    let ends = compose_chain(rest, i + 1, Some((cod.clone(), binders)), None, ctx)?;
     let mut all = vec![here];
     all.extend(ends.binders);
     Ok(ChainEnds {
@@ -3447,7 +3451,7 @@ pub(super) fn emit_compose<C: Typing>(
         cod,
         binders,
         last_ty,
-    } = compose_chain(elts, 0, None, recorded_binder.as_ref(), ctx)?;
+    } = compose_chain(elts, 0, None, recorded.domain().as_ref(), ctx)?;
     // The chain's kind **rides its own type**, like a lambda's (`emit_lambda`).
     // It is not the head morphism's: a head can be a re-indexing rather than a
     // decision — `id ≫ xs` and `.0 ≫ xs` denote the collection `xs` re-addressed,
@@ -3536,7 +3540,7 @@ pub(super) fn emit_compose<C: Typing>(
     };
     // Construction closes: the reference to the input goes back to the index form every
     // stored type is in.
-    Ok(if names_position {
+    let chain = if names_position {
         Type::pi_kinded(position, first_dom, cod, fun_kind)
     } else {
         Type::Fun {
@@ -3545,7 +3549,8 @@ pub(super) fn emit_compose<C: Typing>(
             domain: Box::new(first_dom),
             codomain: Box::new(cod),
         }
-    })
+    };
+    Ok(ctx.requantify_opened(chain))
 }
 
 /// The body domain for a mutation loop accumulator step and a transaction
@@ -3814,6 +3819,16 @@ pub(super) fn emit_transact<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     use std::collections::HashMap;
+    // A nested `Transact`'s histories run over each enclosing position's own domain, the
+    // parameter's position component, which reads the enclosing value by the parameter's name.
+    let (enclosing, domain) = match parameter {
+        Some(p) => {
+            let (name, position) = nested_parameter_parts(p);
+            (name.unwrap_or_else(|| Name::fresh("__enclosing")), position)
+        }
+        None => (Name::fresh("__enclosing"), domain.clone()),
+    };
+    let domain = &domain;
     let mut fields: Vec<(Label, Type)> = Vec::with_capacity(keys.len());
     // key Name → the type of one committed value (a writer's snapshot / write
     // bound) — the codomain of the key's history.
@@ -3841,8 +3856,6 @@ pub(super) fn emit_transact<C: Typing>(
         fields.push((k.name.field_key(), read_ty));
         key_types.insert(k.name.clone(), value_ty);
     }
-    // A nested `Transact`'s enclosing value, as its type and its fields' types name it.
-    let enclosing = Name::fresh("__enclosing");
     for w in writers.iter_mut() {
         emit_transact_writer(w, &key_types, parameter, ctx)?;
         // A `__to_<defer>` field on the writer's decision record becomes a
@@ -3873,6 +3886,29 @@ pub(super) fn emit_transact<C: Typing>(
             }
         }
     })
+}
+
+/// The name a nested `Transact`'s `(enclosing, position)` parameter gives its enclosing value,
+/// if the position reads it, and the position's domain, reading it by that name.
+fn nested_parameter_parts(parameter: &Type) -> (Option<Name>, Type) {
+    match parameter.peel_refinements() {
+        Type::Tuple(parts) => (None, parts[1].clone()),
+        Type::DepTuple(parts) => {
+            let enclosing = parts[0]
+                .0
+                .clone()
+                .unwrap_or_else(|| Name::fresh("__enclosing"));
+            let position = crate::ccl::subst::open_tuple_components(parts, |_, _| {
+                crate::ccl::subst::Mapping::Rename(enclosing.clone())
+            })
+            .pop()
+            .unwrap_or_else(|| unreachable!("the pair has two components"));
+            (Some(enclosing), position)
+        }
+        _ => {
+            panic!("a nested `Transact`'s parameter is the (enclosing, position) pair: {parameter}")
+        }
+    }
 }
 
 /// The enclosing half of a nested `Transact`'s `(enclosing, position)` parameter.
