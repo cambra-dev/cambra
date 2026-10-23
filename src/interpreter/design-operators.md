@@ -1233,6 +1233,17 @@ store tile and the source tile. The driver decodes the source into `(path, item)
 (`decode_source_paths`), since an async source's domain arrives unordered and compacts as its
 consumed prefix is released.
 
+The driver reads the source when the source has notified since the last read, and answers every
+other pull from the last decode (`DecodedSource`: the undelivered items in drive order, and every
+path the source held, deleted rows included). A tile only grows between a source's notifications
+and the driver's own releases, so the last read still describes it. An emitted position leaves
+the decode, and a release forgets every path through it. A pull that emits one position costs
+that position, and a loop over `n` rows costs `n` rather than `n²`. The source notifies through a
+flag the driver sets ahead of the forwarding consumer, because the forwarding consumer drops a
+notification that re-enters it behind a closed gate. The nested drive's enclosing-parameter and
+reseed streams are still decoded on every pull (`decode_pairs_pathed`), as are the row-level
+completeness reads over the undelivered paths, so a nested loop keeps the quadratic term.
+
 The driver releases the source prefix it has consumed: every position it has emitted, and every
 filtered row it has read past. A filtered row stays in the source tile, marked deleted, and no
 decision or ack ever names it, so the driver releases it once the source calls it complete along

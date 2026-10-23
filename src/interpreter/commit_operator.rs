@@ -50,13 +50,14 @@
 
 use bit_set::BitSet;
 use smol_str::SmolStr;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::ccl::{F_WRITES, Label};
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, CurryLevel, Extent, FunctionGuard, Gate, GatedConsumer, Path,
-    Position, Predicate, Scheduler, Tile, TileGuard, Tiling, Value, WakeupQueue, shared_consumer,
+    Position, Predicate, Scheduler, Tile, TileGuard, Tiling, Value, WakeupQueue,
+    forwarding_consumer, shared_consumer,
     tile_operators::{
         CycleSlot, CyclicSequencingProducer, Memo, ProducerBase, TileOperator, TileProducer,
         materialize_collections, materialized_row, subscribe_forwarding,
@@ -67,8 +68,8 @@ use crate::interpreter::{
 use crate::interpreter::operator_conversion::{store_key, store_key_name};
 use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_keyed, value_late};
 use crate::interpreter::tile_operators::{
-    OperatorBase, ProducerStateInfo, column_of_rows, impl_operator_base, impl_producer_base,
-    stored_value_tile, with_values_at,
+    Notified, OperatorBase, ProducerStateInfo, column_of_rows, impl_operator_base,
+    impl_producer_base, stored_value_tile, with_values_at,
 };
 use crate::interpreter::tiling::{
     domain_prefix_over, row_watermark, running_frontier, store_frontier_rows,
@@ -4737,6 +4738,9 @@ struct DriverInputs {
     gate: Gate,
     store_producer: Box<dyn TileProducer>,
     source_producer: Box<dyn TileProducer>,
+    /// Set by every notification the source sends, for a driver that pulls the source
+    /// only when it has news ([`InductionDriverProducer`]).
+    source_news: Notified,
 }
 
 fn subscribe_driver_inputs(
@@ -4746,7 +4750,14 @@ fn subscribe_driver_inputs(
     scheduler: &mut Scheduler,
 ) -> DriverInputs {
     let (consumer, gate) = shared_consumer(consumer);
-    let source_producer = subscribe_forwarding(source_op, &consumer, scheduler);
+    // The flag is set ahead of the forward, which drops a notification that re-enters a
+    // consumer behind a closed gate: the flag records every arrival the gate hides.
+    let source_news = Notified::flag();
+    let source_producer = source_op.subscribe(
+        source_op.tiling().universal_guard(),
+        source_news.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue())),
+        scheduler,
+    );
     // The store's progress changes what the drive renders — the next position it may
     // emit, and which rows it calls complete — so the store's wakes reach the drive's
     // consumer like the source's arrivals do.
@@ -4756,6 +4767,7 @@ fn subscribe_driver_inputs(
         gate,
         store_producer,
         source_producer,
+        source_news,
     }
 }
 
@@ -4990,6 +5002,8 @@ impl TileOperator for InductionDriver {
             .sharing(inputs.gate),
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
+            source_news: inputs.source_news,
+            source: DecodedSource::default(),
             nested,
             consumer,
             wakeups: scheduler.wakeup_queue(),
@@ -5026,10 +5040,54 @@ fn one_component(position: Position) -> Path {
     Path::from(vec![position.into_value()])
 }
 
+/// What the driver last read off its source: the undelivered items by path, and every path
+/// the source held then.
+///
+/// The driver reads the source when it has news and answers every other pull from this, so
+/// a pull that emits one position costs that position rather than the rows still to come.
+/// Both maps shed what the driver passes: an emitted position leaves `items`, and a
+/// release leaves neither.
+#[derive(Default)]
+struct DecodedSource {
+    /// The items the source delivers, in drive order ([`decode_source_paths`]).
+    items: BTreeMap<Path, Tile>,
+    /// Every path of the positions level the source held, rows it marks deleted included.
+    held: BTreeSet<Path>,
+    /// Whether the source said it will add nothing more.
+    terminal: bool,
+}
+
+impl DecodedSource {
+    /// The smallest delivered path above `after`.
+    fn next_delivered(&self, after: Option<&Path>) -> Option<&Path> {
+        let from = after.map_or(Unbounded, Excluded);
+        self.items
+            .range::<Path, _>((from, Unbounded))
+            .next()
+            .map(|(p, _)| p)
+    }
+
+    /// Forget every path at or below `through`.
+    fn forget_through(&mut self, through: &Path) {
+        while let Some(entry) = self.items.first_entry()
+            && entry.key() <= through
+        {
+            entry.remove();
+        }
+        while self.held.first().is_some_and(|p| p <= through) {
+            self.held.pop_first();
+        }
+    }
+}
+
 struct InductionDriverProducer {
     base: ProducerBase,
     store_producer: Box<dyn TileProducer>,
     source_producer: Box<dyn TileProducer>,
+    /// Whether the source has notified since it was last read.
+    source_news: Notified,
+    /// The source as of its last read.
+    source: DecodedSource,
     /// `None` for a drive whose body takes the position alone.
     nested: Option<NestedDrive<Box<dyn TileProducer>>>,
     /// This driver's consumer, re-armed through [`wakeups`](Self::wakeups) while
@@ -5141,6 +5199,7 @@ impl InductionDriverProducer {
                     }
                 }
             }
+            self.source.forget_through(&through);
             self.source_released_through = Some(through);
         }
         if done && !self.source_fully_released {
@@ -5188,10 +5247,7 @@ impl TileProducer for InductionDriverProducer {
         if self.source_fully_released {
             return self.render(true, &[]);
         }
-        let src = self
-            .source_producer
-            .get(self.source_producer.tiling().universal_guard());
-        let source_complete = src.is_terminal();
+        let levels_above = self.window.levels_above();
         // Everything the drive indexes is keyed by the **path** that reaches it: the
         // curried source names it as levels already, and the pair-keyed streams have their
         // pair exploded to match. Two spellings of one position would match neither.
@@ -5200,35 +5256,65 @@ impl TileProducer for InductionDriverProducer {
         // ([`NestedBody::rows`]), not a count of the source's levels: an item that is itself a
         // collection — a nest whose elements are collections — carries its own levels
         // beneath the positions, and counting those names a path one level too deep.
-        let levels_above = self.window.levels_above();
-        let by_path: HashMap<Path, Tile> = decode_source_paths(&src, levels_above + 1)
-            .into_iter()
-            .collect();
-        // Invariant: no path at or below the cursor arrives after the drive has passed it.
-        // The source may deliver in any order. The drive holds this by emitting a position
-        // only once the source calls every path before it complete (`waits` below), and
-        // nothing is added beneath a complete path. A path at or below the cursor is
-        // still legitimate *here*: the release is what removes the consumed prefix, and
-        // the source is free to honour it a pull late. The domain need not be contiguous —
-        // a restricted source (`for l in [x for x in xs if p(x)]`) delivers a subset of
-        // its extent's positions and the recurrence runs over exactly those.
-        debug_assert!(
-            by_path.keys().all(|p| {
-                self.emitted_through.as_ref().is_none_or(|e| p > e)
-                    || self
-                        .source_released_through
-                        .as_ref()
-                        .is_some_and(|r| p <= r)
-            }),
-            "induction source delivered a position at or below the emitted cursor {:?} \
-             that was never released: {:?}",
-            self.emitted_through,
-            {
-                let mut ks: Vec<Path> = by_path.keys().cloned().collect();
-                ks.sort();
-                ks
+        //
+        // The source is read when it has notified, and not otherwise: a tile only grows
+        // between its notifications and the drive's own releases, so the last read still
+        // answers. Without this each pull decodes every row not yet emitted, and a loop
+        // over `n` rows costs `n²`.
+        if self.source_news.take() {
+            let src = self
+                .source_producer
+                .get(self.source_producer.tiling().universal_guard());
+            self.source = DecodedSource {
+                items: decode_source_paths(&src, levels_above + 1)
+                    .into_iter()
+                    .collect(),
+                held: src
+                    .paths_at(CurryLevel::new(levels_above))
+                    .into_iter()
+                    .map(Path::from)
+                    .collect(),
+                terminal: src.is_terminal(),
+            };
+            // The rows of one level the source will gain no more items beneath — one of the
+            // two halves of a row being answerable as a whole, `folded` below being the
+            // other. Read at the level itself: a standing level's rows are not the level
+            // beneath's, and each level's completion is its own statement.
+            for level in 0..self.source_producer.tiling().levels() {
+                if let Tile::DataFunction {
+                    domain_predicate, ..
+                } = src.values_at(CurryLevel::new(level))
+                {
+                    match self.source_complete.get_mut(level) {
+                        Some(known) => *known = known.union(domain_predicate),
+                        None => self.source_complete.push(domain_predicate.clone()),
+                    }
+                }
             }
-        );
+            // Invariant: no path at or below the cursor arrives after the drive has passed
+            // it. The source may deliver in any order. The drive holds this by emitting a
+            // position only once the source calls every path before it complete (`waits`
+            // below), and nothing is added beneath a complete path. A path at or below the
+            // cursor is still legitimate *here*: the release is what removes the consumed
+            // prefix, and the source is free to honour it a pull late. The domain need not
+            // be contiguous — a restricted source (`for l in [x for x in xs if p(x)]`)
+            // delivers a subset of its extent's positions and the recurrence runs over
+            // exactly those.
+            debug_assert!(
+                self.source.items.keys().all(|p| {
+                    self.emitted_through.as_ref().is_none_or(|e| p > e)
+                        || self
+                            .source_released_through
+                            .as_ref()
+                            .is_some_and(|r| p <= r)
+                }),
+                "induction source delivered a position at or below the emitted cursor {:?} \
+                 that was never released: {:?}",
+                self.emitted_through,
+                self.source.items.keys().collect::<Vec<_>>()
+            );
+        }
+        let source_complete = self.source.terminal;
         // The enclosing parameter and the reseeds, keyed by the same paths. A reseed
         // restarts an accumulator, so it stands beside the store reads in the same
         // snapshot column and is read the way the store holds one: as a value per key.
@@ -5296,34 +5382,12 @@ impl TileProducer for InductionDriverProducer {
             }
         }
 
-        // The rows of one level the source will gain no more items beneath — one of the two
-        // halves of a row being answerable as a whole, `folded` below being the other. Read
-        // at the level itself: a standing level's rows are not the level beneath's, and
-        // each level's completion is its own statement.
-        for level in 0..self.source_producer.tiling().levels() {
-            if let Tile::DataFunction {
-                domain_predicate, ..
-            } = src.values_at(CurryLevel::new(level))
-            {
-                match self.source_complete.get_mut(level) {
-                    Some(known) => *known = known.union(domain_predicate),
-                    None => self.source_complete.push(domain_predicate.clone()),
-                }
-            }
-        }
         let known_complete = &self.source_complete;
         let source_complete_at = |level: CurryLevel| {
             known_complete
                 .get(level.index())
                 .cloned()
                 .unwrap_or(Predicate::False)
-        };
-        let next_delivered = |after: Option<&Path>| -> Option<Path> {
-            by_path
-                .keys()
-                .filter(|p| after.is_none_or(|e| *p > e))
-                .min()
-                .cloned()
         };
         debug_assert!(
             frontier.as_ref() <= self.emitted_through.as_ref(),
@@ -5338,7 +5402,10 @@ impl TileProducer for InductionDriverProducer {
             .fold(Predicate::False, |all, level| all.union(&level));
         let mut emitted_now = false;
         if frontier == self.emitted_through
-            && let Some(pos) = next_delivered(self.emitted_through.as_ref())
+            && let Some(pos) = self
+                .source
+                .next_delivered(self.emitted_through.as_ref())
+                .cloned()
         {
             // **The reseed.** A position whose enclosing components differ from the last
             // one emitted opens a new row, so the accumulator restarts where that row's
@@ -5394,7 +5461,7 @@ impl TileProducer for InductionDriverProducer {
             };
             if !waits
                 && let (Some(snapshot), Some(item), Some(enclosing)) =
-                    (snapshot, by_path.get(&pos), enclosing)
+                    (snapshot, self.source.items.get(&pos), enclosing)
             {
                 let (rows, at) = pos
                     .split_position()
@@ -5406,6 +5473,7 @@ impl TileProducer for InductionDriverProducer {
                 }
                 self.window
                     .push(snapshot, item.clone(), enclosing, row, inner.clone(), inner);
+                self.source.items.remove(&pos);
                 self.emitted_through = Some(pos);
                 emitted_now = true;
             }
@@ -5440,7 +5508,9 @@ impl TileProducer for InductionDriverProducer {
                     // no position under any row, and a row with no positions is folded as
                     // soon as it arrives. Left as `False` the nest never finishes a row,
                     // so the loop around it waits on one forever.
-                    None if by_path.is_empty() => Predicate::True,
+                    None if self.source.items.is_empty() && self.emitted_through.is_none() => {
+                        Predicate::True
+                    }
                     None => Predicate::False,
                     Some(f) => {
                         let (rows, _) = f
@@ -5449,7 +5519,9 @@ impl TileProducer for InductionDriverProducer {
                         // What the source still holds, and what this drive has emitted: an
                         // emitted position is released back to the source, so the source no
                         // longer shows it while the store may not yet have decided it.
-                        let under = by_path
+                        let under = self
+                            .source
+                            .items
                             .keys()
                             .chain(self.emitted_through.iter())
                             .filter(|p| {
@@ -5493,7 +5565,10 @@ impl TileProducer for InductionDriverProducer {
         // wakes it: the store wakes its readers, this drive among them, when it
         // decides, and the source when it delivers. A drive that woke itself while waiting
         // would keep a stuck nest looking busy.
-        let pending = next_delivered(self.emitted_through.as_ref());
+        let pending = self
+            .source
+            .next_delivered(self.emitted_through.as_ref())
+            .cloned();
         let done = source_complete && pending.is_none();
         let stated: Vec<Predicate> = match done {
             true => vec![Predicate::True; complete_rows.len() + 1],
@@ -5517,18 +5592,17 @@ impl TileProducer for InductionDriverProducer {
         // source holds, deleted rows included, below the next one to run, where the source
         // calls it complete along with every path before it ([`source_read_through`] states
         // the rule for a drive with no rows above it).
-        let read_through = src
-            .paths_at(CurryLevel::new(levels_above))
-            .into_iter()
-            .map(Path::from)
-            .filter(|p| pending.as_ref().is_none_or(|n| p < n))
-            .filter(|p| {
+        let read_through = self
+            .source
+            .held
+            .range::<Path, _>((Unbounded, pending.as_ref().map_or(Unbounded, Excluded)))
+            .rfind(|p| {
                 let (rows, at) = p
                     .split_position()
                     .unwrap_or_else(|| unreachable!("a source path names a position"));
                 settled.subsumes(&self.window.path_prefix(rows, at, true))
             })
-            .max();
+            .cloned();
         self.reclaim_consumed(frontier.as_ref(), read_through, done);
         self.render(done, &complete_rows)
     }

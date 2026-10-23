@@ -985,6 +985,92 @@ x";
     );
 }
 
+/// A source that grows while the induction driver is running.
+///
+/// The driver reads its source when the source notifies and answers every other pull from
+/// that read. Rows arriving after the driver has emitted positions are what a stale read would
+/// lose, so the test delivers them in batches, each yielding only through its own last key.
+/// After the first batch the driver has run its first positions, which its release of the
+/// source shows. A source that was not read again would leave that release where it was and
+/// never sum the later rows.
+#[test_log::test]
+fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
+    let code = indoc! {"
+        x := 0
+        for i in source1():
+            x := x + i
+        x
+    "};
+    let mut ctx = GlobalContext::default();
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(source.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let loaded = LoadedProgram::test(code);
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+
+    let deliver = |rows: &[(u64, i64)]| {
+        let data: Vec<(Value, Value)> = rows
+            .iter()
+            .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
+            .collect();
+        let through = rows.last().expect("a batch has a row").0;
+        source.borrow_mut().add_data(&data);
+        source
+            .borrow_mut()
+            .set_yield_predicate(Predicate::at_or_below(Value::UInt(through)));
+    };
+    let released_through = |key: u64| {
+        source
+            .borrow()
+            .get_released_predicate()
+            .subsumes(&Predicate::at_or_below(Value::UInt(key)))
+    };
+
+    // The first batch runs the driver through positions 0, 1 and 2. At least two iterations
+    // are done when the release covers position 1.
+    deliver(&[(0, 10), (1, 20), (2, 30)]);
+    pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+    assert!(
+        released_through(1),
+        "the driver should have run its first positions before the next batch arrives: {:?}",
+        source.borrow().get_released_predicate()
+    );
+    assert!(
+        !released_through(3),
+        "nothing past the first batch exists yet: {:?}",
+        source.borrow().get_released_predicate()
+    );
+
+    // The second batch arrives under a driver that has already emitted. Its positions are
+    // only reached if the driver reads the source again on the notification.
+    deliver(&[(3, 40), (4, 50)]);
+    pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+    assert!(
+        released_through(4),
+        "the driver should read the rows that arrived after its first iterations: {:?}",
+        source.borrow().get_released_predicate()
+    );
+
+    // A third batch, to read again once more, and then the source closes.
+    deliver(&[(5, 60)]);
+    pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+    assert!(released_through(5));
+    source.borrow_mut().set_yield_predicate(Predicate::True);
+    let mut total = pull_laps(ctx.scheduler(), &mut *producer, 256, Tile::is_terminal);
+    total.compact();
+    assert_eq!(
+        total,
+        Tile::Scalar(ColumnValue::Ints(vec![10 + 20 + 30 + 40 + 50 + 60])),
+        "every batch is summed, including the ones that arrived mid-run"
+    );
+    assert_eq!(source.borrow().get_released_predicate(), Predicate::True);
+}
+
 /// A transaction loop over a live source filtered to nothing releases every row it reads
 /// past. No block runs, so no commit acknowledges a row, and a row the filter removes is
 /// consumed when the drive reads past it, once the source calls it complete.
