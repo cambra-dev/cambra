@@ -3993,3 +3993,74 @@ fn a_transactional_variable_seeds_from_a_long_loops_result(#[case] n: i64, #[cas
         Tile::Scalar(ColumnValue::Ints(vec![expect])),
     );
 }
+
+/// A transaction loop's commit store holds a bounded amount of state however many items it
+/// runs: the driver, the writer and the reader of the final value each release the store's
+/// history behind the decided frontier, so the store reclaims a version once all three have
+/// passed it. The commit operator never holds more than 6 values (its seeds, the positions it
+/// decided and the few changelog entries still retained) and the fans around it no more than
+/// 17, for one loop, two loops over one variable and one loop with two blocks. The source
+/// literal's own constants grow with its length and are not counted. Every writer here reads
+/// its key, so the release of a writer without read keys is not exercised.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case::five(5)]
+#[case::twenty(20)]
+#[case::forty(40)]
+fn a_transaction_loop_holds_a_bounded_store_state_at_any_length(#[case] n: usize) {
+    let items = (1..=n)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shapes = [
+        (
+            "one loop",
+            formatdoc! {"
+                total: Mut(Int, Txn) := 0
+                for x in [{items}]:
+                    with begin():
+                        total := total + x
+                await_final(total)
+            "},
+        ),
+        (
+            "two loops over one variable",
+            formatdoc! {"
+                total: Mut(Int, Txn) := 0
+                for x in [{items}]:
+                    with begin():
+                        total := total + x
+                for y in [{items}]:
+                    with begin():
+                        total := total + y
+                await_final(total)
+            "},
+        ),
+        (
+            "one loop with two blocks",
+            formatdoc! {"
+                total: Mut(Int, Txn) := 0
+                for x in [{items}]:
+                    with begin():
+                        total := total + x
+                    with begin():
+                        total := total + 1
+                await_final(total)
+            "},
+        ),
+    ];
+    for (shape, code) in shapes {
+        let peak = peak_held_values(&code);
+        let held = |kind: &str| peak.get(kind).copied().expect("the loop has the operator");
+        assert!(
+            held("Commit") <= 6,
+            "{shape}: the commit operator held {} values",
+            held("Commit")
+        );
+        assert!(
+            held("FanOut") <= 17,
+            "{shape}: the fans held {} values",
+            held("FanOut")
+        );
+    }
+}
