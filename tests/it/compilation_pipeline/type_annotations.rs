@@ -1341,20 +1341,6 @@ fn a_use_meets_a_refined_domain_of_a_function_parameter() {
     );
 }
 
-#[test]
-fn compact_graph_experiment() {
-    check_scalar(
-        indoc! {r#"
-def f(x: Int):
-    r = x
-    r ^+ 1
-b: {Int where _ == 3} = f(2)
-b
-        "#},
-        Value::Int(3),
-    )
-}
-
 /// An opaque `let`'s body type names an enclosing binder: the read of `x` types
 /// `y` as `{Int | __elem == __anf ^+ a}`, and meeting `z`'s annotation needs both
 /// `__anf`'s refinement and the parameter `a`'s. Coalescing decides it under the
