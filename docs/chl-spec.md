@@ -1757,6 +1757,9 @@ per declared parameter, in order, so `Shape::rect(w, h)` binds `rect`'s two para
 is the type's name, qualified as anywhere else (`shop::Shape`). A constructor that declares no
 parameters takes no parentheses, `Option::none`.
 
+The wildcard `_` matches any value and binds nothing, so outside a refinement predicate (§6.4),
+where `_` is the refined value, no term reads it.
+
 Patterns are still **static** — which names a binding introduces is
 decidable from the syntax alone (§2.2). A variant pattern and a constructor pattern are the forms
 that can *fail* to match, which is why they appear only in a `case` arm or where the match is
@@ -1764,9 +1767,10 @@ exhaustive: a variant pattern against a single-tag variant type, and a construct
 a type that declares one constructor (`Price::new(r) = p`).
 
 Today's grammar accepts the tuple forms, unannotated, with the
-annotation restricted to the whole target (`ann_assign_stmt`, §2.2), and a constructor pattern on
-the left of `=`; record, variant, and wildcard patterns, a constructor pattern in a `for` binder,
-and per-component annotations are all unimplemented.
+annotation restricted to the whole target (`ann_assign_stmt`, §2.2), the wildcard `_`, and a
+constructor pattern, on the left of `=` and in a `for` binder. A comprehension binder takes names,
+`_` and tuples of them. Record and variant patterns, and per-component annotations, are
+unimplemented.
 
 ### 4.4 Define statement `<<=`
 
@@ -1854,10 +1858,10 @@ collections is `m.keys()` / `m.values()` / `m.items()` (§6.3).
 
 > **[Interim].** Today `for`-in binds the **value** (codomain) for every
 > collection — so a map iterates its values (as `groupby` results do) and a set
-> iterates `unit`. A destructuring target parses in either spelling, `(k, v)` and
-> `k -> v` alike, and lowering takes only a simple name. Entry/key iteration is
-> the [Planned] work; it only *adds* the type-directed element choice, so
-> `for k -> v in m` is the form to write once it lands. Design:
+> iterates `unit`. A destructuring target takes the element apart, in either
+> spelling, `(k, v)` and `k -> v` alike. Entry/key iteration is the [Planned]
+> work; it only *adds* the type-directed element choice, so `for k -> v in m` is
+> the form to write once it lands. Design:
 > [collections.md, "Operations: how the trait layer dispatches [Planned]"](../src/ccl/design/collections.md#operations-how-the-trait-layer-dispatches-planned).
 
 **Iterations are unordered and may run in parallel** (§3): unless the

@@ -29,9 +29,9 @@ fn refinement() {
         include_str!("type_annotations/complex_refinement.cambra"),
         "expected {{x: Int, y: Int} | __elem.y != 0}, found {x: Int@1, y: Int@0}",
     );
-    check_scalar(
+    check_compile_error(
         include_str!("type_annotations/underscore.cambra"),
-        Value::Int(3),
+        "`_` binds nothing, so it reads no value",
     )
 }
 

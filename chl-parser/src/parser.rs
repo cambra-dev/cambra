@@ -194,7 +194,7 @@ where
 
         let comp_clauses = {
             let for_clause = just(Token::For)
-                .ignore_then(expr.clone().try_map(|t, _| {
+                .ignore_then(bare_target(expr.clone()).try_map(|t, _| {
                     expr_to_assign_target(t)
                         .map_err(|bad| Rich::custom(bad, "invalid comprehension target"))
                 }))
@@ -1334,7 +1334,7 @@ where
 
         // ---- for x in iter: body ------------------------------------
         let for_stmt = just(Token::For)
-            .ignore_then(expr.clone().try_map(|t, _| {
+            .ignore_then(bare_target(expr.clone()).try_map(|t, _| {
                 expr_to_assign_target(t).map_err(|bad| Rich::custom(bad, "invalid for-loop target"))
             }))
             .then_ignore(just(Token::In))
@@ -2614,6 +2614,26 @@ where
         .collect::<Vec<_>>()
 }
 
+/// A `for` binder: one expression, or several separated by commas, which is the tuple
+/// pattern written without its parentheses (`docs/chl-spec.md`, "4.3.1 Destructuring
+/// patterns"). The binder ends at `in`, so the comma is unambiguous inside brackets too.
+fn bare_target<'src, I, E>(expr: E) -> impl Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    expr.separated_by(just(Token::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .map_with(|mut elts: Vec<Spanned<Expr>>, e| {
+            if elts.len() == 1 {
+                elts.pop().expect("at least one element")
+            } else {
+                Spanned::new(e.span(), Expr::Tuple(elts))
+            }
+        })
+}
+
 /// Convert an [`Expr`] parsed in target position into an [`AssignTarget`].
 ///
 /// CHL binding patterns are bare names and (possibly-nested) tuples of
@@ -3516,6 +3536,34 @@ mod tests {
         };
         assert!(matches!(comp.element.node, Expr::Tuple(ref kv) if kv.len() == 2));
         assert_eq!(comp.clauses.len(), 1);
+    }
+
+    /// A `for` binder and a comprehension binder take a tuple pattern without its parentheses,
+    /// ending at `in`.
+    #[test]
+    fn a_bare_tuple_binds_a_for_target() {
+        let m = parse_m(indoc! {r#"
+            for a, (b, c) in m:
+                [x for x, y in a]
+        "#});
+        let Stmt::For { target, body, .. } = &m.body[0].node else {
+            panic!("expected a For");
+        };
+        let AssignTarget::Tuple(parts) = &target.node else {
+            panic!("expected a tuple target, got {:?}", target.node);
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[1].node, AssignTarget::Tuple(inner) if inner.len() == 2));
+        let Stmt::Expr(e) = &body[0].node else {
+            panic!("expected an expression statement");
+        };
+        let Expr::ListComp(comp) = &e.node else {
+            panic!("expected a comprehension, got {:?}", e.node);
+        };
+        let CompClause::For { target, .. } = &comp.clauses[0] else {
+            panic!("expected a for clause");
+        };
+        assert!(matches!(&target.node, AssignTarget::Tuple(parts) if parts.len() == 2));
     }
 
     /// A `for` binder reads the pair as the tuple target it is, so entry

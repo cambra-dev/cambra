@@ -455,6 +455,12 @@ pub(super) fn lower_final_stmt(
             // Build outer bindings: caller's bindings + all names from rest.
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
+            // A pattern binder lowers as the plain-name loop it means (`ForPattern`).
+            let pattern = ForPattern::of(target, for_body, ctx);
+            let (target, for_body, scope) = match &pattern {
+                Some(p) => (&p.target, p.body.as_slice(), p.shadow(&scope)),
+                None => (target, for_body.as_slice(), scope),
+            };
             // A non-yielding loop that mutates a declared `Mut(…)`
             // accumulator is a valid *final* statement — the loop runs and its
             // final mutable-variable value is simply unobserved (`Unit`). Mirror
@@ -1007,6 +1013,12 @@ pub(super) fn lower_middle_stmt(
         } => {
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
+            // A pattern binder lowers as the plain-name loop it means (`ForPattern`).
+            let pattern = ForPattern::of(target, for_body, ctx);
+            let (target, for_body, scope) = match &pattern {
+                Some(p) => (&p.target, p.body.as_slice(), p.shadow(&scope)),
+                None => (target, for_body.as_slice(), scope),
+            };
 
             // Detect a mutation loop: at least one `:=` / `+=` to a variable
             // from the outer scope.  Yields are not a barrier — a generator with
@@ -1273,6 +1285,9 @@ impl TupleAssignment {
     }
 }
 
+/// The pattern that binds nothing, `_` (`docs/chl-spec.md`, "4.3.1 Destructuring patterns").
+pub(super) const WILDCARD: &str = "_";
+
 impl AssignmentBindings {
     /// The bindings `target` means, an assignment of `transparency` at `span`.
     pub(super) fn of(
@@ -1282,6 +1297,12 @@ impl AssignmentBindings {
         ctx: &mut LoweringContext,
     ) -> Result<Self, LoweringError> {
         Ok(match &target.node {
+            // `_` binds the value to a name no program spells, so the value is still
+            // computed, and a call writing through a `Mut` parameter still writes.
+            AssignTarget::Name(n) if n.as_str() == WILDCARD => AssignmentBindings::Name {
+                name: ctx.fresh_ignored_payload(),
+                transparency: binding_transparency(transparency),
+            },
             AssignTarget::Constructor(pattern) => AssignmentBindings::Constructor(Box::new(
                 nominal::check_constructor_assignment(pattern, span, ctx)?,
             )),
@@ -1392,7 +1413,7 @@ pub(super) fn extract_name_target(
             target.span,
             format!(
                 "{context}: a constructor pattern takes a value apart only in a plain `=` \
-                 assignment or a `match` arm"
+                 assignment, a `for` binder or a `match` arm"
             ),
         )),
     }

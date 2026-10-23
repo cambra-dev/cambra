@@ -302,6 +302,83 @@ fn in_loop_aug_assign_error(span: Span, name: &str) -> LoweringError {
     )
 }
 
+/// A `for` whose binder is a pattern or `_`, as the loop over a plain name it means.
+///
+/// `for 𝑝 in 𝑠: body` binds each element to a minted name `𝑒` and takes it apart in
+/// `𝑝 = 𝑒`, the first statement of the body, so every loop site lowers a binder that is one
+/// name. The pattern's names are bound by the loop, as a plain binder's name is: they shadow
+/// a like-named outer binding over the body rather than writing it, which is why they are
+/// returned for the caller to take out of the body's mutation scope.
+pub(super) struct ForPattern {
+    pub(super) target: Spanned<AssignTarget>,
+    pub(super) body: Vec<Spanned<ChlStmt>>,
+    pub(super) names: Vec<String>,
+}
+
+impl ForPattern {
+    /// The loop `target` and `body` mean, or `None` when `target` is a plain name.
+    pub(super) fn of(
+        target: &Spanned<AssignTarget>,
+        body: &[Spanned<ChlStmt>],
+        ctx: &mut LoweringContext,
+    ) -> Option<ForPattern> {
+        let element = match &target.node {
+            AssignTarget::Name(n) if n.as_str() != WILDCARD => return None,
+            AssignTarget::Name(_) => {
+                let element = ctx.fresh_ignored_payload();
+                return Some(ForPattern {
+                    target: Spanned::new(target.span, AssignTarget::Name(element.into())),
+                    body: body.to_vec(),
+                    names: Vec::new(),
+                });
+            }
+            _ => ctx.fresh_tuple_payload(),
+        };
+        let take_apart = Spanned::new(
+            target.span,
+            ChlStmt::Assign {
+                target: target.clone(),
+                value: Spanned::new(target.span, ChlExpr::Name(element.as_str().into())),
+                transparency: chl_parser::ast::BindingTransparency::Transparent,
+            },
+        );
+        let mut names = Vec::new();
+        pattern_names(&target.node, &mut names);
+        Some(ForPattern {
+            target: Spanned::new(target.span, AssignTarget::Name(element.into())),
+            body: std::iter::once(take_apart)
+                .chain(body.iter().cloned())
+                .collect(),
+            names,
+        })
+    }
+
+    /// `scope` without the names the pattern binds, which the loop shadows over its body.
+    pub(super) fn shadow(&self, scope: &HashSet<String>) -> HashSet<String> {
+        let mut scope = scope.clone();
+        for name in &self.names {
+            scope.remove(name);
+        }
+        scope
+    }
+}
+
+/// Every name `target` binds, `_` excepted.
+fn pattern_names(target: &AssignTarget, out: &mut Vec<String>) {
+    match target {
+        AssignTarget::Name(n) if n.as_str() != WILDCARD => out.push(n.to_string()),
+        AssignTarget::Tuple(elts) => elts.iter().for_each(|e| pattern_names(&e.node, out)),
+        AssignTarget::Constructor(pattern) => out.extend(
+            pattern
+                .binders
+                .iter()
+                .flatten()
+                .filter_map(|b| b.node.as_ref().map(|n| n.to_string())),
+        ),
+        _ => {}
+    }
+}
+
 /// The names a for-loop body's statement sits under: those bound above the loop
 /// and those the frame has bound. A block right-hand side is lowered in this
 /// scope, which decides whether a `:=` inside it writes a variable from outside
@@ -747,11 +824,21 @@ fn lower_for_body_stmt(
             ))
         }
         ChlStmt::For { target, iter, body } => {
+            let pattern = ForPattern::of(target, body, ctx);
+            let (target, body) = match &pattern {
+                Some(p) => (&p.target, p.body.as_slice()),
+                None => (target, body.as_slice()),
+            };
             let inner_var = extract_name_target(target, "for-loop target")?;
             let inner_source = lower_expr(iter, ctx)?;
             // New frame: the outer frame's names (including iter_var) move into
-            // mutation_scope so that the inner body cannot mutate them.
+            // mutation_scope so that the inner body cannot mutate them, except those a
+            // pattern binder shadows.
             let inner_mutation_scope = body_scope(mutation_scope, frame_introduced);
+            let inner_mutation_scope = match &pattern {
+                Some(p) => p.shadow(&inner_mutation_scope),
+                None => inner_mutation_scope,
+            };
             let inner_frame = HashSet::from([inner_var.clone()]);
             // The inner loop target shadows a like-named transactional mutable variable.
             let inner_body = ctx.with_shadowed([inner_var.clone()], |ctx| {
@@ -1675,6 +1762,15 @@ fn lower_loop_body_chain_scoped(
                 iter,
                 body: inner_body,
             } => {
+                let pattern = ForPattern::of(target, inner_body, ctx);
+                let shadowed;
+                let (target, inner_body, outer_bindings) = match &pattern {
+                    Some(p) => {
+                        shadowed = p.shadow(outer_bindings);
+                        (&p.target, p.body.as_slice(), &shadowed)
+                    }
+                    None => (target, inner_body.as_slice(), outer_bindings),
+                };
                 let site = ForSite {
                     target,
                     iter,

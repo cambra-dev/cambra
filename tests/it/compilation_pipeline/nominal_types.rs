@@ -1227,16 +1227,6 @@ fn match_errors_name_what_is_wrong() {
         ),
         (
             indoc! {r#"
-                type Price = Int
-
-                for Price::new(c) in [Price::new(1)]:
-                    c
-                1
-            "#},
-            "a constructor pattern takes a value apart only in a plain `=` assignment",
-        ),
-        (
-            indoc! {r#"
                 def f(x):
                     match x:
                         case shop::Shape::circle(r):
