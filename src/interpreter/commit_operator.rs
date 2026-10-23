@@ -5981,6 +5981,20 @@ impl TileProducer for TransactDriverProducer {
             .iter()
             .map(|k| store_current(&store, k).map(|(_, v)| v))
             .collect();
+        // Release the store below the decided frontier: this driver reads only the frontier
+        // and each key's latest value at or below it, which the store's reclaim keeps, so the
+        // changelog behind the frontier is dead to it. The release names the last change
+        // strictly below the frontier, so the frontier's own change survives. Without it this
+        // slot holds the `FanOut`'s meet where the store began, and every pull of the loop
+        // re-reads a changelog as long as the loop has run.
+        if let Some(f) = &frontier
+            && let Some(below) = last_position_below(store.store_change_positions(), f)
+        {
+            self.store_producer
+                .release(TileGuard::Function(FunctionGuard::Domain(
+                    Predicate::at_or_below(below.into_value()),
+                )));
+        }
 
         if let Some(path) = &next_item
             && let Some(frontier) = frontier

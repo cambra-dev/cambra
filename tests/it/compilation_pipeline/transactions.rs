@@ -3993,3 +3993,41 @@ fn a_transactional_variable_seeds_from_a_long_loops_result(#[case] n: i64, #[cas
         Tile::Scalar(ColumnValue::Ints(vec![expect])),
     );
 }
+
+/// A transaction loop's commit store holds a bounded amount of state however many items it
+/// runs, for a store with one `with begin():` site (two sites over one store still grow): the driver, the writer and the reader of the final value each release the store's
+/// history behind the decided frontier, so the store reclaims a version once all three have
+/// passed it. Over 5, 20 and 40 items the commit operator never holds more than 6 values (its
+/// seeds, the positions it decided and the few changelog entries still retained) and the fans
+/// around it no more than 17; the source literal's own constants grow with its length and are
+/// not counted. A driver that read the store without releasing it would pin the history, and
+/// the commit operator would hold more with every item, 12 already at 5.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+fn a_transaction_loop_holds_a_bounded_store_state_at_any_length() {
+    for n in [5, 20, 40] {
+        let items: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+        let code = format!(
+            indoc! {"
+                total: Mut(Int, Txn) := 0
+                for x in [{}]:
+                    with begin():
+                        total := total + x
+                await_final(total)
+            "},
+            items.join(", ")
+        );
+        let peak = peak_held_values(&code);
+        let held = |kind: &str| peak.get(kind).copied().expect("the loop has the operator");
+        assert!(
+            held("Commit") <= 6,
+            "the commit operator held {} values over {n} items",
+            held("Commit")
+        );
+        assert!(
+            held("FanOut") <= 17,
+            "the fans held {} values over {n} items",
+            held("FanOut")
+        );
+    }
+}
