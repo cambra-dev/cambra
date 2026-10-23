@@ -563,7 +563,7 @@ fn may_be_below(ty: &Type, bound: &Type) -> bool {
             data(k0) == data(k1) && may_be_below(d0, d1) && may_be_below(c0, c1)
         }
         (Type::Base(a), Type::Base(b)) => a == b,
-        (Type::Nominal(d, xs), Type::Nominal(e, ys)) => {
+        (Type::Nominal(d, xs, _), Type::Nominal(e, ys, _)) => {
             d == e && xs.iter().zip(ys).all(|(x, y)| may_be_below(x, y))
         }
         // Two types of different forms: no value of one is a value of the other.
@@ -1041,7 +1041,7 @@ fn check_comparison_instance(
              instance of `{trait_}` names one type twice"
         ));
     }
-    let Type::Nominal(decl, args) = one else {
+    let Type::Nominal(decl, args, names) = one else {
         unreachable!("an instance's head names a nominal type, and this one names one type")
     };
     let ctors = &decl.body().ctors;
@@ -1062,6 +1062,7 @@ fn check_comparison_instance(
         let payload = decl.instantiate(
             &crate::ccl::ccl_utils::strip_refinements(&ctor.payload()),
             args,
+            names,
         );
         if orderable && !ctor.payload_order().is_ordered() {
             return refuse(format!(
@@ -1149,7 +1150,7 @@ fn instance_pattern(
         .iter()
         .map(|a| instance_pattern(a, head, variables, ctx))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Type::Nominal(decl, applied))
+    Ok(Type::nominal(decl, applied))
 }
 
 /// The name an instance's completed signature types are bound to in its `def`'s alias

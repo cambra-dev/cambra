@@ -1549,7 +1549,6 @@ fn check_over_pi_typed_collection(body: Expr) {
 /// No CHL spelling names a Pi binder in an annotation (`FullMap(K, V)` mints its own), so
 /// the tree is built directly.
 #[test]
-#[should_panic = "Unbound variable: 'i'"]
 fn a_pi_typed_collection_parameter() {
     check_over_pi_typed_collection(Expr::var("c"));
 }
@@ -1562,7 +1561,7 @@ fn a_pi_typed_collection_parameter() {
 /// handle a Pi-binder referenced in the collection's codomain. See
 /// also `collection_contains_of_an_inferred_pi_typed_collection`.
 #[test]
-#[should_panic = "Unbound variable: 'i'"]
+#[should_panic = "`Raw(\"i\")` is free in the lower bound"]
 fn collection_contains_of_a_pi_typed_collection() {
     check_over_pi_typed_collection(Expr::apply(
         Expr::var("c"),
@@ -2061,4 +2060,48 @@ fn a_shared_data_function_domain_is_one_plain_domain(#[case] code: &str, #[case]
 #[test]
 fn a_data_function_type_is_no_value() {
     check_compile_error("x = Int |=> Int\n1", "`T |=> U` is a data-function *type*");
+}
+
+/// A parenthesised binder makes an arrow dependent: the codomain reads the argument by name.
+/// Over a group-by, `(k: _) |=> _` admits the group-by, whose groups read their key, at a
+/// parameter, a `let` and a `FullMap` written with its binder.
+#[rstest]
+#[case::parameter(indoc! {r#"
+    def total(g: (k: _) |=> _):
+        sum([sum(grp) for grp in g])
+    total(groupby([1, 2, 3], \x -> x > 1))
+"#})]
+#[case::binding(indoc! {r#"
+    g: (k: _) |=> _ = groupby([1, 2, 3], \x -> x > 1)
+    sum([sum(grp) for grp in g])
+"#})]
+#[case::full_map(indoc! {r#"
+    g: FullMap(k: _, _) = groupby([1, 2, 3], \x -> x > 1)
+    sum([sum(grp) for grp in g])
+"#})]
+// The annotation names its binder `__map_k`, the group-by `__gb_k` and the loop its index:
+// three names of one key, which an edge's substitution renames onto one name.
+#[case::unnamed_full_map_parameter(indoc! {r#"
+    def total(g: FullMap(_, _)):
+        sum([sum(grp) for grp in g])
+    total(groupby([1, 2, 3], \x -> x > 1))
+"#})]
+fn a_dependent_arrow_reads_its_argument(#[case] src: &str) {
+    check_scalar(src, Value::Int(6));
+}
+
+/// A codomain that reads the binder is checked at the argument: the predicate names `x`.
+#[test]
+fn a_dependent_arrow_states_its_codomain_at_the_argument() {
+    check_compile_error(
+        "f: (x: Int) => {Int where _ == x} = \\x -> 4\n1",
+        "annotated as (x: Int) => {Int where _ == x}, but inferred as",
+    );
+}
+
+/// A binder stands only where it binds: as an arrow's domain or as the argument of a binding
+/// parameter.
+#[test]
+fn a_type_binder_is_no_value() {
+    check_compile_error("x = (k: Int)\n1", "`k: T` binds a value in a type");
 }

@@ -187,8 +187,8 @@ pub fn refuse_param_joined_with_outer_variable(graph: &CompactGraph) -> Result<(
             go(value, polarity)?;
             go(domain, polarity)?;
         }
-        for (decl, args) in &ct.nominal {
-            for (arg, v) in args.iter().zip(decl.sided_variances()) {
+        for (decl, nominal) in &ct.nominal {
+            for (arg, v) in nominal.args.iter().zip(decl.sided_variances()) {
                 go(arg, v.polarity(polarity))?;
             }
         }
@@ -644,8 +644,8 @@ fn coalesce_compact_go(
     // Each declaration is one shape, so two at one position fall to the conflict below. A
     // bipolar argument's two sides are coalesced at their own polarities and joined back
     // into one argument (`nominal::split`).
-    for (decl, args) in &ct.nominal {
-        let mut sides = args.iter().zip(decl.sided_variances());
+    for (decl, nominal) in &ct.nominal {
+        let mut sides = nominal.args.iter().zip(decl.sided_variances());
         let mut slots = Vec::with_capacity(decl.params.len());
         for v in &decl.body().variances {
             let mut next = || {
@@ -660,7 +660,7 @@ fn coalesce_compact_go(
                 _ => next()?,
             });
         }
-        shapes.push(Type::Nominal(decl.clone(), slots));
+        shapes.push(Type::Nominal(decl.clone(), slots, nominal.binders.clone()));
     }
     let mut all = Vec::new();
     all.append(&mut atoms);

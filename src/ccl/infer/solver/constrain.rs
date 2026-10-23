@@ -1129,16 +1129,35 @@ fn constrain_go_impl(
         // morphisms at one variable. A nominal type relates to no other type, so every
         // other pairing falls to the catch-all `Mismatch` below (`docs/chl-spec.md`, "A
         // nominal type is opaque").
-        (Type::Nominal(d0, a0), Type::Nominal(d1, a1)) if d0 == d1 => {
-            for ((x, y), v) in a0.iter().zip(a1).zip(&d0.body().variances) {
+        //
+        // **An argument after a binding parameter relates under the two binders aligned**, as
+        // a function's codomain does (`docs/chl-spec.md`, "Binding parameters"): from the
+        // binder on, the left side's substitution respells its binder as the right side's,
+        // which the right side's variables are minted under. The alignment also rides the
+        // edges an invariant or bipolar argument draws with no morphism, since a reference
+        // to the binder is all the two sides share there. Each side's arguments open at its
+        // own binders where the other side is live, as a function's codomain does.
+        (Type::Nominal(d0, a0, n0), Type::Nominal(d1, a1, n1)) if d0 == d1 => {
+            let live = |other: &[Type]| {
+                d0.has_binders()
+                    && (cache.derivation.opens_unconditionally()
+                        || other.iter().any(crate::ccl::subst::type_contains_infer))
+            };
+            let a0_opened = live(a1).then(|| crate::ccl::subst::open_nominal_args(d0, a0, n0));
+            let a1_opened = live(a0).then(|| crate::ccl::subst::open_nominal_args(d0, a1, n1));
+            let a0 = a0_opened.as_deref().unwrap_or(a0);
+            let a1 = a1_opened.as_deref().unwrap_or(a1);
+            let mut sl = sl.clone();
+            let mut bare = Subst::id();
+            for (i, ((x, y), v)) in a0.iter().zip(a1).zip(&d0.body().variances).enumerate() {
                 match v {
-                    Variance::Covariant => constrain_go(x, y, sl, sr, cache, scope)?,
+                    Variance::Covariant => constrain_go(x, y, &sl, sr, cache, scope)?,
                     Variance::Contravariant => {
-                        cache.swapped(|cache| constrain_go(y, x, sr, sl, cache, scope))?
+                        cache.swapped(|cache| constrain_go(y, x, sr, &sl, cache, scope))?
                     }
                     Variance::Invariant => {
-                        constrain_go(x, y, &Subst::id(), &Subst::id(), cache, scope)?;
-                        constrain_go(y, x, &Subst::id(), &Subst::id(), cache, scope)?;
+                        constrain_go(x, y, &bare, &Subst::id(), cache, scope)?;
+                        constrain_go(y, x, &Subst::id(), &bare, cache, scope)?;
                     }
                     // The output sides relate as a covariant argument does and the input
                     // sides as a contravariant one. An argument that is not split is both
@@ -1146,11 +1165,16 @@ fn constrain_go_impl(
                     // with no morphism carried in, as an invariant pair's.
                     Variance::Bipolar => {
                         let ((xi, xo), (yi, yo)) = (sides(x), sides(y));
-                        constrain_go(xo, yo, &Subst::id(), &Subst::id(), cache, scope)?;
+                        constrain_go(xo, yo, &bare, &Subst::id(), cache, scope)?;
                         cache.swapped(|cache| {
-                            constrain_go(yi, xi, &Subst::id(), &Subst::id(), cache, scope)
+                            constrain_go(yi, xi, &Subst::id(), &bare, cache, scope)
                         })?;
                     }
+                }
+                if let Some(rank) = d0.binder_rank(i) {
+                    let (b0, b1) = (Some(n0[rank].clone()), Some(n1[rank].clone()));
+                    sl = sl.aligned(&b0, &b1);
+                    bare = bare.aligned(&b0, &b1);
                 }
             }
             Ok(())
@@ -2227,7 +2251,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         ),
         // Each argument extrudes at the polarity its variance gives it, and an invariant
         // one through two-way proxies, as a history's payload does.
-        Type::Nominal(decl, args) => Type::Nominal(
+        Type::Nominal(decl, args, names) => Type::Nominal(
             decl.clone(),
             args.iter()
                 .zip(&decl.body().variances)
@@ -2240,6 +2264,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                     }
                 })
                 .collect(),
+            names.clone(),
         ),
         // A bipolar argument's input side is read where its output side's polarity flips.
         Type::Split { input, output } => Type::Split {
@@ -3956,7 +3981,7 @@ mod tests {
         let lows = Rc::clone(vv.bounds.borrow().lower());
         let rendered: Vec<String> = lows
             .iter()
-            .map(|b| format!("{}", b.materialize()))
+            .map(|b| format!("{}", b.materialize(&vv.telescope)))
             .collect();
         assert_eq!(
             lows.len(),
@@ -4097,7 +4122,7 @@ mod tests {
         let lows = Rc::clone(kv.bounds.borrow().lower());
         let rendered: Vec<String> = lows
             .iter()
-            .map(|b| format!("{}", b.materialize()))
+            .map(|b| format!("{}", b.materialize(&kv.telescope)))
             .collect();
         assert_eq!(
             rendered,

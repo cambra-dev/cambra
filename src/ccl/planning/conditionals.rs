@@ -272,8 +272,12 @@ fn child_demand(expr: &Expr, effective: &Type) -> Option<Type> {
         TypedExprNode::Copair(_) | TypedExprNode::DisjointJoin(_) => Some(effective.clone()),
         TypedExprNode::List(_) => effective.codomain(),
         TypedExprNode::NominalCtor { decl, ctor, .. } => match effective.peel_refinements() {
-            Type::Nominal(applied, args) if applied == decl => decl.ctor(ctor).map(|c| {
-                crate::ccl::ccl_utils::strip_refinements(&decl.instantiate(&c.payload(), args))
+            Type::Nominal(applied, args, names) if applied == decl => decl.ctor(ctor).map(|c| {
+                crate::ccl::ccl_utils::strip_refinements(&decl.instantiate(
+                    &c.payload(),
+                    args,
+                    names,
+                ))
             }),
             _ => None,
         },

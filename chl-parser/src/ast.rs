@@ -548,8 +548,19 @@ pub struct TypeDecl {
     /// The capitalized type name.
     pub name: Spanned<SmolStr>,
     /// The type parameters, `T` in `type Option(T):`.
-    pub params: Vec<Spanned<SmolStr>>,
+    pub params: Vec<TypeDeclParam>,
     pub body: TypeDeclBody,
+}
+
+/// One parameter of a [`TypeDecl`]: `T`, or `k: K`, a parameter whose argument the
+/// arguments after it may read by the binder `k` (`docs/chl-spec.md`, "Binding
+/// parameters").
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDeclParam {
+    /// The lowercase binder, `k` in `k: K`.
+    pub binder: Option<Spanned<SmolStr>>,
+    /// The capitalized parameter name.
+    pub name: Spanned<SmolStr>,
 }
 
 /// An `impl` block ([`Stmt::Impl`]): a nominal type's associated functions, or an instance
@@ -967,6 +978,15 @@ pub enum Expr {
         domain: Box<Spanned<Expr>>,
         arrow: Arrow,
         codomain: Box<Spanned<Expr>>,
+    },
+
+    /// A binder in a type, `k: K`: the value of type `K` that the types after it may read
+    /// by the name `k`. Written as a function type's parenthesised domain, `(k: K) |=> V`,
+    /// and as an argument of a type application, `Ledger(k: SKU, V)`. Annotation-only, like
+    /// [`Expr::FunctionType`].
+    TypeBinder {
+        name: Spanned<SmolStr>,
+        ty: Box<Spanned<Expr>>,
     },
 
     /// Subscript: `target[index]`, or the **checked** form `target[index]?` —

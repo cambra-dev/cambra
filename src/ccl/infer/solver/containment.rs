@@ -55,7 +55,7 @@ pub(crate) fn bind_parameters(
             }
             let same_node = match (pattern, ty) {
                 (Type::Base(a), Type::Base(b)) => a == b,
-                (Type::Nominal(a, _), Type::Nominal(b, _)) => Rc::ptr_eq(a, b) || a == b,
+                (Type::Nominal(a, ..), Type::Nominal(b, ..)) => Rc::ptr_eq(a, b) || a == b,
                 (Type::Record(a), Type::Record(b)) => {
                     a.len() == b.len() && a.iter().zip(b).all(|((x, _), (y, _))| x == y)
                 }
@@ -111,7 +111,7 @@ fn node(ty: &Type) -> Node<'_> {
         Type::DepTuple(ts) => Node::Sequence(ts.iter().map(|(_, t)| t).collect()),
         Type::Record(fields) => Node::Record(fields.iter().map(|(n, t)| (n, t)).collect()),
         Type::Variant(arms, _) => Node::Variant(arms.iter().map(|(k, t)| (k, t)).collect()),
-        Type::Nominal(decl, args) => Node::Fixed(
+        Type::Nominal(decl, args, _) => Node::Fixed(
             std::mem::discriminant(ty),
             Some(Rc::as_ptr(decl).cast()),
             args.iter().collect(),

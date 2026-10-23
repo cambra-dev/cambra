@@ -547,11 +547,13 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             refinements.try_rewrite_each(|_, r| emit_bare_predicate(r, &domain, ctx))?;
             emit_annotation_predicates(inner, ctx)
         }
+        // A codomain reading the binder is typed opened, with the binder in scope at the
+        // domain, and closed again.
         Type::Fun {
+            name,
             fun_kind,
             domain: d,
             codomain: c,
-            ..
         } => {
             for w in fun_kind.witnesses_mut() {
                 for t in w.types_mut() {
@@ -559,9 +561,59 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
                 }
             }
             emit_annotation_predicates(d, ctx)?;
-            emit_annotation_predicates(c, ctx)
+            match name {
+                Some(b) if crate::ccl::subst::references_enclosing_function(c) => {
+                    let bound = ctx.normalize(&ctx.refinement_domain(d));
+                    let mut opened = crate::ccl::subst::open_pi_binder(
+                        &crate::ccl::subst::Mapping::Rename(b.clone()),
+                        c,
+                    );
+                    ctx.scoped(b, &bound, |ctx| {
+                        emit_annotation_predicates(&mut opened, ctx)
+                    })?;
+                    **c = crate::ccl::subst::close_pi_binder(b, &opened);
+                    Ok(())
+                }
+                _ => emit_annotation_predicates(c, ctx),
+            }
         }
-        Type::Tuple(ts) | Type::Nominal(_, ts) => {
+        Type::Tuple(ts) => {
+            for t in ts.iter_mut() {
+                emit_annotation_predicates(t, ctx)?;
+            }
+            Ok(())
+        }
+        // An argument is typed opened, inside the binders before it, each in scope at its
+        // own argument, and closed again.
+        Type::Nominal(decl, ts, names) if decl.has_binders() => {
+            fn rest<C: Typing>(
+                decl: &crate::ccl::nominal::NominalDecl,
+                opened: &mut [Type],
+                names: &[Name],
+                at: usize,
+                ctx: &mut C,
+            ) -> Result<(), LocatedInferError> {
+                let Some(arg) = opened.get_mut(at) else {
+                    return Ok(());
+                };
+                emit_annotation_predicates(arg, ctx)?;
+                match decl.binder_rank(at) {
+                    Some(rank) => {
+                        let bound = ctx.normalize(&ctx.refinement_domain(&opened[at]));
+                        ctx.scoped(&names[rank], &bound, |ctx| {
+                            rest(decl, opened, names, at + 1, ctx)
+                        })
+                    }
+                    None => rest(decl, opened, names, at + 1, ctx),
+                }
+            }
+            let mut opened = crate::ccl::subst::open_nominal_args(decl, ts, names);
+            rest(decl, &mut opened, names, 0, ctx)?;
+            crate::ccl::subst::close_nominal_args(decl, &mut opened, names);
+            *ts = opened;
+            Ok(())
+        }
+        Type::Nominal(_, ts, _) => {
             for t in ts.iter_mut() {
                 emit_annotation_predicates(t, ctx)?;
             }
@@ -2781,8 +2833,9 @@ fn emit_nominal_scrutinee<C: Typing>(
     ctx: &mut C,
 ) -> Result<(), LocatedInferError> {
     let scrut_ty = emit_value_read(scrut, ctx)?;
-    let args: Vec<Type> = decl.params.iter().map(|_| ctx.fresh()).collect();
-    let expected = Type::Nominal(decl.clone(), args.clone());
+    let names = decl.binder_names.clone();
+    let args = fresh_nominal_args(decl, &names, ctx);
+    let expected = Type::Nominal(decl.clone(), args.clone(), names.clone());
     ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
     for b in branches.iter_mut() {
         let Some(p) = &mut b.pattern else {
@@ -2803,7 +2856,7 @@ fn emit_nominal_scrutinee<C: Typing>(
                 decl.name
             )
         });
-        let mut payload = decl.instantiate(&ctor.payload(), &args);
+        let mut payload = decl.instantiate(&ctor.payload(), &args, &names);
         ctx.type_annotation_predicates(&mut payload)?;
         let payload = ctx.normalize(&payload);
         let slot = ctx.binding_slot(&mut p.binding.ty);
@@ -3092,14 +3145,14 @@ enum Head {
 fn nominal_head(ty: &Type) -> Head {
     use std::ops::ControlFlow;
     match ty.peel_refinements() {
-        Type::Nominal(decl, _) => Head::Nominal(decl.clone()),
+        Type::Nominal(decl, ..) => Head::Nominal(decl.clone()),
         Type::Infer(var) => {
             let mut found: Option<std::rc::Rc<crate::ccl::nominal::NominalDecl>> = None;
             let two = for_each_gathered_bound(var, |b| match (b, &found) {
-                (Type::Nominal(decl, _), Some(first)) if first != decl => {
+                (Type::Nominal(decl, ..), Some(first)) if first != decl => {
                     ControlFlow::Break(Head::Two(first.clone(), decl.clone()))
                 }
-                (Type::Nominal(decl, _), _) => {
+                (Type::Nominal(decl, ..), _) => {
                     found = Some(decl.clone());
                     ControlFlow::Continue(())
                 }
@@ -3163,14 +3216,50 @@ pub(super) fn emit_nominal_ctor<C: Typing>(
             decl.name
         )
     });
-    let args: Vec<Type> = decl.params.iter().map(|_| ctx.fresh()).collect();
-    let expected =
-        crate::ccl::ccl_utils::strip_refinements(&decl.instantiate(&declared.payload(), &args));
+    let names = decl.binder_names.clone();
+    let args = fresh_nominal_args(decl, &names, ctx);
+    let expected = crate::ccl::ccl_utils::strip_refinements(&decl.instantiate(
+        &declared.payload(),
+        &args,
+        &names,
+    ));
     let expected = ctx.normalize(&expected);
     ctx.require_sub(&payload_ty, &expected, &|| {
         format!("the argument of constructor `{}::{ctor}`", decl.name)
     })?;
-    Ok(Type::Nominal(decl.clone(), args))
+    Ok(Type::Nominal(decl.clone(), args, names))
+}
+
+/// A fresh variable for each argument of `decl`, whose binders are `names`: an argument's
+/// variable minted inside the binders before it, each bound at its own argument's variable,
+/// as a function's codomain is minted inside its binder.
+fn fresh_nominal_args<C: Typing>(
+    decl: &crate::ccl::nominal::NominalDecl,
+    names: &[Name],
+    ctx: &mut C,
+) -> Vec<Type> {
+    fn mint<C: Typing>(
+        decl: &crate::ccl::nominal::NominalDecl,
+        names: &[Name],
+        args: &mut Vec<Type>,
+        ctx: &mut C,
+    ) {
+        let i = args.len();
+        if i == decl.params.len() {
+            return;
+        }
+        args.push(ctx.fresh());
+        match decl.binder_rank(i) {
+            Some(rank) => {
+                let bound = args[i].clone();
+                ctx.scoped(&names[rank], &bound, |ctx| mint(decl, names, args, ctx));
+            }
+            None => mint(decl, names, args, ctx),
+        }
+    }
+    let mut args = Vec::with_capacity(decl.params.len());
+    mint(decl, names, &mut args, ctx);
+    args
 }
 
 /// What [`compose_chain`] reports back about the chain it walked: the head

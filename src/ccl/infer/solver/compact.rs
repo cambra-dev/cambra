@@ -850,7 +850,7 @@ pub struct CompactType {
     /// an error (`docs/chl-spec.md`, "A nominal type is opaque"). Each argument compacts
     /// at the polarity [`Variance::polarity`](Variance::polarity)
     /// gives it.
-    pub nominal: BTreeMap<Rc<NominalDecl>, Vec<CompactType>>,
+    pub nominal: BTreeMap<Rc<NominalDecl>, CompactNominal>,
     /// Two applications of one declaration met here whose arguments at an
     /// [`Invariant`](Variance::Invariant) parameter differ: the
     /// declaration and the two arguments. Both sides of an equality position are one type,
@@ -1006,8 +1006,8 @@ impl CompactType {
             visit(value, Variance::Invariant);
             visit(domain, Variance::Invariant);
         }
-        for (decl, args) in &mut self.nominal {
-            let mut args = args.iter_mut();
+        for (decl, nominal) in &mut self.nominal {
+            let mut args = nominal.args.iter_mut();
             for v in &decl.body().variances {
                 match v {
                     Variance::Bipolar => {
@@ -1104,7 +1104,7 @@ impl CompactType {
             || self
                 .nominal
                 .values()
-                .any(|args| args.iter().any(Self::conflicted))
+                .any(|n| n.args.iter().any(Self::conflicted))
     }
 
     /// Does this position name a type? Exactly one shape here, and no conflict below.
@@ -1185,11 +1185,11 @@ impl CompactType {
                 _ => false,
             }
             && nominal.len() == other.nominal.len()
-            && nominal.iter().all(|(decl, args)| {
+            && nominal.iter().all(|(decl, n)| {
                 other
                     .nominal
                     .get(decl)
-                    .is_some_and(|args2| args.iter().zip(args2).all(|(a, b)| a.equiv(b)))
+                    .is_some_and(|n2| n.args.iter().zip(&n2.args).all(|(a, b)| a.equiv(b)))
             })
             && match (fun, &other.fun) {
                 (None, None) => true,
@@ -1289,24 +1289,28 @@ impl CompactType {
         // which the merge erases, so it is recorded from the inputs, as a data domain's is.
         let mut nominal_conflict = lhs.nominal_conflict.or(rhs.nominal_conflict);
         let mut nominal = lhs.nominal;
-        for (decl, args) in rhs.nominal {
+        for (decl, theirs) in rhs.nominal {
             let merged = match nominal.remove(&decl) {
-                None => args,
-                Some(mine) => mine
-                    .into_iter()
-                    .zip(args)
-                    .zip(decl.sided_variances())
-                    .map(|((a, b), v)| {
-                        if v == Variance::Invariant
-                            && nominal_conflict.is_none()
-                            && data_domains_disagree(&a, &b)
-                        {
-                            nominal_conflict =
-                                Some((decl.clone(), Box::new(a.clone()), Box::new(b.clone())));
-                        }
-                        Self::merge(v.polarity(pol), a, b)
-                    })
-                    .collect(),
+                None => theirs,
+                Some(mine) => CompactNominal {
+                    binders: mine.binders,
+                    args: mine
+                        .args
+                        .into_iter()
+                        .zip(theirs.args)
+                        .zip(decl.sided_variances())
+                        .map(|((a, b), v)| {
+                            if v == Variance::Invariant
+                                && nominal_conflict.is_none()
+                                && data_domains_disagree(&a, &b)
+                            {
+                                nominal_conflict =
+                                    Some((decl.clone(), Box::new(a.clone()), Box::new(b.clone())));
+                            }
+                            Self::merge(v.polarity(pol), a, b)
+                        })
+                        .collect(),
+                },
             };
             nominal.insert(decl, merged);
         }
@@ -1575,7 +1579,19 @@ fn refinement_slot_present(ct: &CompactType) -> bool {
         && ct
             .nominal
             .values()
-            .all(|args| args.iter().all(refinement_slot_present))
+            .all(|n| n.args.iter().all(refinement_slot_present))
+}
+
+/// One declaration's contribution to a position: its arguments, one position per side
+/// ([`NominalDecl::sided_variances`]), and the names of its binding parameters.
+///
+/// An argument's references to a binder are indices once compacted, as a function's codomain
+/// references its binder, so the names are an opening address and a spelling, and a merge
+/// keeps either side's ([`CompactFun::name`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactNominal {
+    pub binders: Vec<Name>,
+    pub args: Vec<CompactType>,
 }
 
 /// The variables whose bounds the current path is walking, as a chain of stack
@@ -1746,7 +1762,7 @@ fn consulted_in(
             out.extend(consulted_in(codomain, pol, fresh, st)?);
             Some(out)
         }
-        Type::Nominal(decl, args) => {
+        Type::Nominal(decl, args, _) => {
             let mut out = BTreeSet::new();
             for (t, v) in args.iter().zip(&decl.body().variances) {
                 match v {
@@ -1833,7 +1849,7 @@ fn consulted_below(
         .map(|b| (b, pol))
         .chain(opposite.iter().filter(|_| read_opposite).map(|b| (b, !pol)));
     for (b, side) in sides {
-        let edge = b.render_subst();
+        let edge = b.render_subst(|n| state.telescope.contains(n));
         st.consult_edges.push(edge.clone());
         let below = consulted_in(&b.ty, side, chain, st);
         st.consult_edges.pop();
@@ -2056,7 +2072,10 @@ fn join_barrier_lowers(
     let lowers = barrier.lowers.borrow().clone();
     let mut joined = CompactType::empty();
     for b in &lowers {
-        let inner_acc = Subst::then(&b.render_subst(), subst_acc);
+        // A barrier variable has no telescope of its own: the binders in scope are the
+        // walk's.
+        let in_scope = |n: &Name| st.scope.enclosing().iter().flatten().any(|e| e == n);
+        let inner_acc = Subst::then(&b.render_subst(in_scope), subst_acc);
         let bc = compact_go(&b.ty, true, &inner_acc, Position::default(), st);
         joined = CompactType::merge(true, joined, bc);
     }
@@ -2592,27 +2611,44 @@ fn compact_go(
         Type::Split { .. } => {
             unreachable!("a split argument stands only in a nominal type, which reads its sides")
         }
-        Type::Nominal(decl, args) => {
+        //
+        // An argument sits inside the binding parameters before it, which shadow the
+        // accumulated substitution and deepen what a refinement landing below closes against,
+        // as a function's binder does its codomain.
+        Type::Nominal(decl, args, names) => {
             let mut sides = Vec::new();
-            for (t, v) in args.iter().zip(&decl.body().variances) {
+            let mut acc = subst_acc.clone();
+            let mut entered = 0;
+            for (i, (t, v)) in args.iter().zip(&decl.body().variances).enumerate() {
                 match v {
                     Variance::Bipolar => {
                         let (input, output) = crate::ccl::nominal::sides(t);
-                        sides.push(compact_go(input, !pol, subst_acc, Position::default(), st));
-                        sides.push(compact_go(output, pol, subst_acc, Position::default(), st));
+                        sides.push(compact_go(input, !pol, &acc, Position::default(), st));
+                        sides.push(compact_go(output, pol, &acc, Position::default(), st));
                     }
                     Variance::Invariant => {
-                        sides.push(compact_go(t, pol, subst_acc, Position::invariant(), st));
+                        sides.push(compact_go(t, pol, &acc, Position::invariant(), st));
                     }
                     other => {
                         let pol = other.polarity(pol);
-                        sides.push(compact_go(t, pol, subst_acc, Position::default(), st));
+                        sides.push(compact_go(t, pol, &acc, Position::default(), st));
                     }
                 }
+                if let Some(rank) = decl.binder_rank(i) {
+                    acc = acc.shadow(&names[rank]);
+                    st.scope.enter(Some(names[rank].clone()));
+                    entered += 1;
+                }
             }
-            let args = sides;
+            (0..entered).for_each(|_| st.scope.exit());
             CompactType {
-                nominal: BTreeMap::from([(decl.clone(), args)]),
+                nominal: BTreeMap::from([(
+                    decl.clone(),
+                    CompactNominal {
+                        binders: names.clone(),
+                        args: sides,
+                    },
+                )]),
                 ..CompactType::value()
             }
         }
@@ -2782,7 +2818,11 @@ fn compact_go(
                 // descending: a bound reached transitively through `v → w → …`
                 // arrives with every edge's morphism composed (design §3.6).
                 // Identity edges leave `subst_acc` unchanged (the common case).
-                let inner_acc = Subst::then(&b.render_subst(), subst_acc);
+                let in_scope = |n: &Name| {
+                    state.telescope.contains(n)
+                        || st.scope.enclosing().iter().flatten().any(|e| e == n)
+                };
+                let inner_acc = Subst::then(&b.render_subst(in_scope), subst_acc);
                 let bc = compact_go(&b.ty, pol, &inner_acc, pos.under(&new_parents), st);
                 bound = CompactType::merge(pol, bound, bc);
             }
@@ -2860,7 +2900,11 @@ fn compact_go(
             let mut recovered: Option<CompactType> = None;
             if read_opposite {
                 for b in opposite_bounds.iter() {
-                    let inner_acc = Subst::then(&b.render_subst(), subst_acc);
+                    let in_scope = |n: &Name| {
+                        state.telescope.contains(n)
+                            || st.scope.enclosing().iter().flatten().any(|e| e == n)
+                    };
+                    let inner_acc = Subst::then(&b.render_subst(in_scope), subst_acc);
                     let bc = compact_go(&b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
                     recovered = Some(match recovered {
                         None => bc,

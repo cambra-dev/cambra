@@ -5510,14 +5510,14 @@ fn order_key(ty: &Type) -> Option<OrderKey> {
     fn key_of(ty: &Type, written: &WrittenOrder) -> OrderKey {
         let ty = strip_refinements(ty);
         match (&ty, written) {
-            (Type::Nominal(decl, args), _) => {
+            (Type::Nominal(decl, args, names), _) => {
                 let [ctor] = decl.body().ctors.as_slice() else {
                     panic!(
                         "an orderable nominal type has one constructor, `{}` has not",
                         decl.name
                     )
                 };
-                let payload = decl.instantiate(&strip_refinements(&ctor.payload()), args);
+                let payload = decl.instantiate(&strip_refinements(&ctor.payload()), args, names);
                 OrderKey::Payload(
                     FieldKey::Name(crate::ccl::nominal::ctor_tag(&ctor.name)),
                     Box::new(key_of(&payload, &ctor.payload_order())),

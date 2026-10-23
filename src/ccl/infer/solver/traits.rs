@@ -354,7 +354,7 @@ impl CompilerTraits {
         // (`docs/chl-spec.md`, "Traits and instances across modules").
         {
             let t = TypeParam::declared("T");
-            let option = Type::Nominal(
+            let option = Type::nominal(
                 crate::ccl::nominal::option(),
                 vec![Type::Param(Rc::clone(&t))],
             );
@@ -827,7 +827,7 @@ impl InstanceHead {
     pub fn of_pattern(pattern: &Type) -> InstanceHead {
         match pattern {
             Type::Base(b) => InstanceHead::Base(b.clone()),
-            Type::Nominal(decl, _) => InstanceHead::Nominal(Rc::clone(decl)),
+            Type::Nominal(decl, ..) => InstanceHead::Nominal(Rc::clone(decl)),
             Type::Param(_) => InstanceHead::Any,
             other => unreachable!(
                 "an instance's operand is a base type, a nominal type or a type variable, got \
@@ -854,7 +854,7 @@ impl InstanceHead {
     pub fn as_type(&self) -> Type {
         match self {
             InstanceHead::Base(b) => Type::Base(b.clone()),
-            InstanceHead::Nominal(decl) => Type::Nominal(
+            InstanceHead::Nominal(decl) => Type::nominal(
                 Rc::clone(decl),
                 decl.params.iter().map(|_| Type::Hole).collect(),
             ),
@@ -971,7 +971,7 @@ impl TraitInstance {
         };
         for i in rest {
             match at {
-                Type::Nominal(_, args) => match args.get(*i as usize) {
+                Type::Nominal(_, args, _) => match args.get(*i as usize) {
                     Some(arg) => at = arg,
                     None => return PatternAt::Absent,
                 },
@@ -982,7 +982,7 @@ impl TraitInstance {
         match at {
             Type::Param(_) => PatternAt::Any,
             Type::Base(b) => PatternAt::Head(InstanceHead::Base(b.clone())),
-            Type::Nominal(decl, _) => PatternAt::Head(InstanceHead::Nominal(Rc::clone(decl))),
+            Type::Nominal(decl, ..) => PatternAt::Head(InstanceHead::Nominal(Rc::clone(decl))),
             _ => PatternAt::Absent,
         }
     }
@@ -1111,8 +1111,8 @@ fn match_pattern(pattern: &Type, ty: &Type, bound: &mut HashMap<TypeParamId, Typ
             }
         }
         Type::Base(b) => matches!(ty, Type::Base(c) if c == b),
-        Type::Nominal(decl, pargs) => match ty {
-            Type::Nominal(other, args) if other == decl && args.len() == pargs.len() => pargs
+        Type::Nominal(decl, pargs, _) => match ty {
+            Type::Nominal(other, args, _) if other == decl && args.len() == pargs.len() => pargs
                 .iter()
                 .zip(args)
                 .all(|(p, a)| match_pattern(p, a, bound)),
@@ -1156,7 +1156,7 @@ pub fn unify_all(a: &[Type], b: &[Type]) -> bool {
                 subst.insert(p.id, other.clone());
                 true
             }
-            (Type::Nominal(d, xs), Type::Nominal(e, ys)) => {
+            (Type::Nominal(d, xs, _), Type::Nominal(e, ys, _)) => {
                 d == e && xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| unify(x, y, subst))
             }
             _ => a == b,
@@ -1969,7 +1969,7 @@ impl TraitObligation {
                     }
                 })
                 .collect();
-            inner = Type::Nominal(Rc::clone(decl), args);
+            inner = Type::nominal(Rc::clone(decl), args);
             at = *parent;
         }
         (at, inner)
@@ -2017,7 +2017,7 @@ impl TraitObligation {
                 accepted,
             });
         }
-        if let Type::Nominal(decl, args) = contribution.peel_refinements() {
+        if let Type::Nominal(decl, args, _) = contribution.peel_refinements() {
             self.expand(pos, decl, args, cache)?;
         }
         self.try_deposit(cache)
@@ -3644,7 +3644,7 @@ pub fn offered(ty: &Type) -> Offered<'_> {
         // or added is the same mistake as a variant.
         Type::Variant(_, _) | Type::Fun { .. } => Offered::NotABase,
         // A nominal type satisfies the traits its module's instances name.
-        Type::Nominal(decl, _) => Offered::Nominal(decl),
+        Type::Nominal(decl, ..) => Offered::Nominal(decl),
         Type::Param(param) => Offered::Param(param),
         // Everything else is either a variable, a placeholder, or a carrier whose
         // payload reaches the watch by another route.
@@ -3943,7 +3943,7 @@ fn deliver(
         Offered::Nominal(decl) => obligation
             .narrow(pos, &InstanceHead::Nominal(Rc::clone(decl)), cache)
             .and_then(|()| match contribution.peel_refinements() {
-                Type::Nominal(decl, args) => obligation.expand(pos, decl, args, cache),
+                Type::Nominal(decl, args, _) => obligation.expand(pos, decl, args, cache),
                 _ => Ok(()),
             }),
         Offered::Product(product) => obligation.narrow_product(pos, product, cache),
@@ -3978,7 +3978,7 @@ fn type_at<'t>(ty: &'t Type, path: &[u8]) -> Option<&'t Type> {
     let mut at = ty.peel_refinements();
     for i in path {
         match at {
-            Type::Nominal(_, args) => at = args.get(*i as usize)?.peel_refinements(),
+            Type::Nominal(_, args, _) => at = args.get(*i as usize)?.peel_refinements(),
             _ => return None,
         }
     }

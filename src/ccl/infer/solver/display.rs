@@ -359,8 +359,8 @@ fn for_each_child(
         f(value, pol)?;
         f(domain, pol)?;
     }
-    for (decl, args) in ct.nominal.iter_mut() {
-        for (arg, v) in args.iter_mut().zip(decl.sided_variances()) {
+    for (decl, nominal) in ct.nominal.iter_mut() {
+        for (arg, v) in nominal.args.iter_mut().zip(decl.sided_variances()) {
             let pol = v.polarity(pol);
             f(arg, pol)?;
         }

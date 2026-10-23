@@ -307,7 +307,11 @@ The `Var` arm instantiates every binding through `PolyScheme::instantiate_with_p
 freshens the body, the bounds and the `requires` clause through one copy (`Instance`):
 
 1. Each type parameter above the scheme's cutoff maps to a fresh variable `𝛼` at the use's level,
-   in the use's telescope, through `FreshenCache::params`, and the body freshens through it.
+   in the use's telescope extended by the binders its first occurrence is under: a named
+   function's, around its codomain, and an application's binding parameters'
+   (`FreshenCache::binders_in_scope`). A parameter of a declaration with binding parameters reads
+   their binders, and stands under them wherever it occurs. The mapping goes through
+   `FreshenCache::params`, and the body freshens through it.
 2. For each parameter with bound `𝐵`, the arm records `𝛼 <: 𝐵[𝛼/𝑃]`, the bound freshened through
    the same cache.
 3. For each requirement of the scheme's `requires` clause, the arm calls `require_trait` over the

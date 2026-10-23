@@ -781,11 +781,21 @@ impl InferCtx {
                     .map(|(n, t)| (n.clone(), self.normalize_annotation_in(t, telescope)))
                     .collect(),
             ),
-            Type::Nominal(decl, args) => Type::Nominal(
+            // An argument's content sits inside the binders before it, as a codomain's
+            // sits inside its function's.
+            Type::Nominal(decl, args, names) => Type::Nominal(
                 decl.clone(),
                 args.iter()
-                    .map(|t| self.normalize_annotation_in(t, telescope))
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let crossed = decl.crossings(i) as usize;
+                        let inner = names[..crossed]
+                            .iter()
+                            .fold(telescope.clone(), |t, n| t.extended(n.clone()));
+                        self.normalize_annotation_in(t, &inner)
+                    })
                     .collect(),
+                names.clone(),
             ),
             Type::Split { input, output } => Type::Split {
                 input: Box::new(self.normalize_annotation_in(input, telescope)),

@@ -7,8 +7,8 @@ use super::modules::module_body;
 use super::*;
 use crate::{
     ccl::{
-        BaseType, BindingTransparency, Branch, Expr, FieldKey, Label, Lit, Pattern, PatternHead,
-        Type, TypedBinding, TypedExprNode,
+        BaseType, BindingTransparency, Branch, Expr, FieldKey, Label, Lit, Name, Pattern,
+        PatternHead, Type, TypedBinding, TypedExprNode,
     },
     chl_parser::ast::{
         AnnotationMode, ArmPattern, AssignTarget, BinOp as ChlBinOp, IfBranch, KindAnnotation,
@@ -2363,7 +2363,7 @@ fn read_assoc_bounds(
 fn is_requirement_operand(ty: &Type) -> bool {
     match ty {
         Type::Param(_) | Type::Base(_) => true,
-        Type::Nominal(_, args) => args.iter().all(is_requirement_operand),
+        Type::Nominal(_, args, _) => args.iter().all(is_requirement_operand),
         _ => false,
     }
 }
@@ -2751,41 +2751,65 @@ pub(super) fn lower_type_expr_or_poly(
         // A function type `T => U` (`docs/chl-spec.md`, "6. Types (informal
         // sketch)"). The arrow is the compute arrow `⇒` ([`FunKind::Compute`]) — the
         // kind a `def`/lambda produces — so an annotated binding
-        // `f: (Int => Int) = \x -> …` matches its value. `Type::fun` builds the
-        // non-dependent form (`name: None`): the surface has no binder to make it a Pi
-        // type.
-        ChlExpr::FunctionType {
-            domain,
-            arrow: chl_parser::ast::Arrow::Compute,
-            codomain,
-        } => Ok(Type::fun(
-            lower_type_expr(domain, ctx)?,
-            lower_type_expr(codomain, ctx)?,
-        )),
-        // A data-function type `T |=> U`, a collection over `T` (`docs/chl-spec.md`,
+        // `f: (Int => Int) = \x -> …` matches its value.
+        //
+        // A data-function type `T |=> U` is a collection over `T` (`docs/chl-spec.md`,
         // "6.3 Direction: collection types [Decided]"). A sum is a data function whose
         // domain is its witness, so a domain left to inference — a hole, or a type
         // parameter, which each use instantiates — admits a sum as well as a plain
         // collection, and its kind is a hole. A domain the program writes names a type,
         // which no witness is, so it makes a plain collection.
+        //
+        // A parenthesised binder `(k: T)` as the domain makes either arrow dependent: `U`
+        // reads the argument by `k`, and construction closes those references.
         ChlExpr::FunctionType {
             domain,
-            arrow: chl_parser::ast::Arrow::Data,
+            arrow,
             codomain,
         } => {
+            let (binder, domain) = match &domain.node {
+                ChlExpr::TypeBinder { name, ty } => (Some(Name::raw(name.node.clone())), &**ty),
+                _ => (None, &**domain),
+            };
             let domain = lower_type_expr(domain, ctx)?;
-            let fun_kind = if leaves_domain_open(&domain) {
-                crate::ccl::FunKind::data_hole()
-            } else {
-                crate::ccl::FunKind::Data(None)
+            let fun_kind = match arrow {
+                chl_parser::ast::Arrow::Compute => crate::ccl::FunKind::Compute,
+                chl_parser::ast::Arrow::Data if leaves_domain_open(&domain) => {
+                    crate::ccl::FunKind::data_hole()
+                }
+                chl_parser::ast::Arrow::Data => crate::ccl::FunKind::Data(None),
+            };
+            let codomain = lower_type_expr(codomain, ctx)?;
+            // Over a binder of the declaration whose constructors are being lowered, the
+            // function binds the declaration's name for it.
+            let (binder, codomain) = match binder {
+                Some(b) => {
+                    let closed = crate::ccl::subst::close_pi_binder(&b, &codomain);
+                    let slot = ctx
+                        .declaration_binders
+                        .iter()
+                        .find(|(spelling, _)| spelling.as_str() == b.base())
+                        .map_or_else(|| b.refreshed(), |(_, name)| name.clone());
+                    (Some(slot), closed)
+                }
+                None => (None, codomain),
             };
             Ok(Type::Fun {
-                name: None,
+                name: binder,
                 fun_kind,
                 domain: Box::new(domain),
-                codomain: Box::new(lower_type_expr(codomain, ctx)?),
+                codomain: Box::new(codomain),
             })
         }
+        ChlExpr::TypeBinder { name, .. } => Err(LoweringError::unsupported(
+            annotation.span,
+            format!(
+                "`{}: T` binds a value only as a function type's domain, `({}: T) |=> U`, or \
+                 as the argument of a type's binding parameter (`docs/chl-spec.md`, \
+                 \"Binding parameters\")",
+                name.node, name.node
+            ),
+        )),
         // A parenthesised comma list `(T, U)` is a *term* product; the tuple *type* is
         // written with braces `{T, U}` (`docs/chl-spec.md`). `->` builds the same node, so
         // a function type written with the wrong arrow arrives here too and the message
@@ -2872,6 +2896,7 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         | ChlExpr::BraceGroup(_)
         | ChlExpr::BraceRefinement { .. }
         | ChlExpr::FunctionType { .. }
+        | ChlExpr::TypeBinder { .. }
         | ChlExpr::Forall { .. }
         | ChlExpr::VariantCtor { .. }
         | ChlExpr::Tuple(_) => "this expression",
@@ -3284,11 +3309,45 @@ fn nominal_application(
             ),
         ));
     }
-    let args = args
-        .iter()
-        .map(|a| lower_type_expr(a, ctx))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Type::Nominal(decl, args))
+    // A binding parameter's argument may name its binder, `k: K`, which the arguments
+    // after it read; one written without a name binds a fresh one nothing reads.
+    let mut lowered = Vec::with_capacity(args.len());
+    let mut names = Vec::new();
+    for (i, arg) in args.iter().enumerate() {
+        match (&arg.node, decl.binder_rank(i)) {
+            (ChlExpr::TypeBinder { name, ty }, Some(_)) => {
+                lowered.push(lower_type_expr(ty, ctx)?);
+                names.push(Name::raw(name.node.clone()));
+            }
+            (ChlExpr::TypeBinder { name, .. }, None) => {
+                return Err(LoweringError::unsupported(
+                    arg.span,
+                    format!(
+                        "parameter {} of `{}` binds nothing, so its argument names no binder \
+                         `{}`",
+                        i + 1,
+                        decl.name,
+                        name.node
+                    ),
+                ));
+            }
+            (_, rank) => {
+                lowered.push(lower_type_expr(arg, ctx)?);
+                if rank.is_some() {
+                    names.push(Name::fresh(
+                        decl.binders[i].clone().expect("a binding parameter"),
+                    ));
+                }
+            }
+        }
+    }
+    // The written spellings are what the arguments read; once closed, each binder takes a
+    // fresh name of its spelling, so opening one never captures another of the same spelling.
+    let mut ty = Type::nominal_named(decl, lowered, names);
+    if let Type::Nominal(_, _, names) = &mut ty {
+        names.iter_mut().for_each(|n| *n = n.refreshed());
+    }
+    Ok(ty)
 }
 
 /// Extract the simple-name head of a type application (`List` in `List(T)`).
@@ -3364,14 +3423,28 @@ fn lower_type_application(
         // readable from `K` instead of hidden behind a witness (`Type::full_map_of`,
         // `src/ccl/design/collections.md`, "The six collection types"). Reaching a
         // `Map(K, V)` from here is `box`, which is where that readability is given up.
+        //
+        // `FullMap(k: K, V)` names its key `k` in `V`: `(𝑘: K) ⤇ V`.
         "FullMap" => {
             let [k, v] = args else {
                 return Err(arity_err("a key and a value type"));
             };
-            Ok(Type::full_map_of(
-                lower_type_expr(k, ctx)?,
-                lower_type_expr(v, ctx)?,
-            ))
+            match &k.node {
+                ChlExpr::TypeBinder { name, ty } => {
+                    let binder = Name::raw(name.node.clone());
+                    let value = lower_type_expr(v, ctx)?;
+                    Ok(Type::Fun {
+                        name: Some(binder.refreshed()),
+                        fun_kind: crate::ccl::FunKind::Data(None),
+                        domain: Box::new(lower_type_expr(ty, ctx)?),
+                        codomain: Box::new(crate::ccl::subst::close_pi_binder(&binder, &value)),
+                    })
+                }
+                _ => Ok(Type::full_map_of(
+                    lower_type_expr(k, ctx)?,
+                    lower_type_expr(v, ctx)?,
+                )),
+            }
         }
         // `Set(K)` = `Map(K, unit)` — a map whose codomain is `unit`, so the
         // key domain is the payload (`Type::set_of`).

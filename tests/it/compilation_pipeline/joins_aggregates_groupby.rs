@@ -1041,6 +1041,20 @@ fn a_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Va
     check_scalar(code, expected);
 }
 
+/// The `Map` counterpart of [`a_keyed_annotation_compiles_and_runs`] does not compile yet: the
+/// loop's read of the box leaves a variable no bound resolves, instead of reconciling the
+/// dependent key.
+#[test]
+fn a_consumed_boxed_map_annotation_escapes_its_scope() {
+    check_compile_error(
+        indoc! {r#"
+            g: Map(_, _) = box(groupby([1,2,3], \x -> x))
+            sum([sum(v) for v in g])
+        "#},
+        "Unresolved inference variable",
+    );
+}
+
 /// A binop over **two projections of one grouped row** — the shape that pins a fan-in's
 /// pairing depth.
 ///

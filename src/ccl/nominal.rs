@@ -42,6 +42,7 @@ fn option_declaration() -> Rc<NominalDecl> {
         vec![SmolStr::new_static(STD)],
         OPTION.into(),
         vec![Rc::clone(&t)],
+        vec![None],
         span,
         false,
     );
@@ -105,12 +106,38 @@ pub struct NominalDecl {
     /// types name them; [`NominalDecl::instantiate`] replaces them with an application's
     /// arguments.
     pub params: Vec<Rc<TypeParam>>,
+    /// One per parameter: the spelling of the binder a **binding** parameter declares,
+    /// `k` in `type Ledger(k: K, V)`, and `None` for any other (`docs/chl-spec.md`,
+    /// "Binding parameters"). The arguments after a binding parameter's may read its
+    /// argument's value, and the declaration's own types read it where a function of the
+    /// same spelling over that parameter binds it ([`NominalDecl::instantiate`]).
+    pub binders: Vec<Option<SmolStr>>,
+    /// One name per binding parameter, in order: the binder the declaration's own types bind,
+    /// in the functions over that parameter its constructors' types write and in its
+    /// application to its own parameters ([`NominalDecl::applied_to_params`]). One name for
+    /// both, so a parameter read under the binder in a constructor's type and in the type
+    /// the constructor builds reads one binder.
+    pub binder_names: Vec<crate::ccl::Name>,
     /// The declaration's name, for diagnostics naming it.
     pub span: Span,
     /// Whether the declaration is the single-constructor form `type N = R`, the one form
     /// that declares `N::extract` (`docs/chl-spec.md`, "The single-constructor form").
     pub declares_extract: bool,
     body: OnceCell<NominalBody>,
+}
+
+/// Why [`NominalDecl::define`] refused a declaration's constructors.
+#[derive(Debug)]
+pub enum DefineError {
+    /// A type parameter no constructor's parameter type names.
+    Unused(Rc<TypeParam>),
+    /// A type parameter a constructor's parameter type places outside every function that
+    /// binds `binder`, a binder declared before it (`docs/chl-spec.md`, "Binding
+    /// parameters").
+    Unbound {
+        param: Rc<TypeParam>,
+        binder: SmolStr,
+    },
 }
 
 /// What a [`NominalDecl`] declares after its head.
@@ -305,21 +332,36 @@ impl NominalDecl {
         span: Span,
         declares_extract: bool,
     ) -> Rc<NominalDecl> {
-        Self::declared_in(Vec::new(), name, params, span, declares_extract)
+        let binders = vec![None; params.len()];
+        Self::declared_in(Vec::new(), name, params, binders, span, declares_extract)
     }
 
-    /// The declaration of `name` in the module at `module`, with no constructors yet.
+    /// The declaration of `name` in the module at `module`, with no constructors yet, whose
+    /// parameter `𝑖` binds `binders[𝑖]` where that is set.
     pub fn declared_in(
         module: Vec<SmolStr>,
         name: SmolStr,
         params: Vec<Rc<TypeParam>>,
+        binders: Vec<Option<SmolStr>>,
         span: Span,
         declares_extract: bool,
     ) -> Rc<NominalDecl> {
+        assert_eq!(
+            params.len(),
+            binders.len(),
+            "`{name}` states a binder or none for each parameter"
+        );
+        let binder_names = binders
+            .iter()
+            .flatten()
+            .map(|b| crate::ccl::Name::fresh(b.clone()))
+            .collect();
         Rc::new(NominalDecl {
             module,
             name,
             params,
+            binders,
+            binder_names,
             span,
             declares_extract,
             body: OnceCell::new(),
@@ -334,7 +376,45 @@ impl NominalDecl {
             .iter()
             .map(|p| Type::Param(Rc::clone(p)))
             .collect();
-        Type::Nominal(Rc::clone(self), args)
+        Type::Nominal(Rc::clone(self), args, self.binder_names.clone())
+    }
+
+    /// Whether any parameter binds.
+    pub fn has_binders(&self) -> bool {
+        self.binders.iter().any(Option::is_some)
+    }
+
+    /// The position of parameter `i` among the binding parameters, if it binds: the index
+    /// of its name in a [`Type::Nominal`]'s third field.
+    pub fn binder_rank(&self, i: usize) -> Option<usize> {
+        self.binders[i].as_ref()?;
+        Some(self.crossings(i) as usize)
+    }
+
+    /// The binding parameters before parameter `i`: the binders argument `i` sits inside,
+    /// so the crossings an index in it counts on the way out of the application.
+    pub fn crossings(&self, i: usize) -> u32 {
+        self.binders[..i].iter().filter(|b| b.is_some()).count() as u32
+    }
+
+    /// Each binding parameter's spelling as a name, in order: the binder names an
+    /// application compares by ([`Type::without_pi_names`]).
+    pub fn binder_spellings(&self) -> Vec<crate::ccl::Name> {
+        self.binders
+            .iter()
+            .flatten()
+            .map(|b| crate::ccl::Name::raw(b.clone()))
+            .collect()
+    }
+
+    /// A fresh name for each binding parameter, spelled as the declaration spells it: the
+    /// binders of an application nothing names.
+    pub fn fresh_binders(&self) -> Vec<crate::ccl::Name> {
+        self.binders
+            .iter()
+            .flatten()
+            .map(|b| crate::ccl::Name::fresh(b.clone()))
+            .collect()
     }
 
     /// Define the constructors, computing each parameter's variance.
@@ -344,24 +424,30 @@ impl NominalDecl {
     ///
     /// # Errors
     ///
-    /// The type parameter that no constructor's parameter type names.
+    /// A type parameter that no constructor's parameter type names, or one a parameter
+    /// type places where a binder it sits inside is not bound ([`DefineError`]).
     ///
     /// # Panics
     ///
     /// On a declaration defined twice.
-    pub fn define(&self, ctors: Vec<NominalCtor>) -> Result<(), Rc<TypeParam>> {
+    pub fn define(&self, ctors: Vec<NominalCtor>) -> Result<(), DefineError> {
         let mut seen: HashMap<TypeParamId, Variance> = HashMap::new();
         for ctor in &ctors {
             for (_, ty) in &ctor.params {
                 occurrences(ty, Variance::Covariant, &mut |id, v| {
                     seen.entry(id).and_modify(|w| *w = w.join(v)).or_insert(v);
                 });
+                self.check_binders(ty, &mut Vec::new())?;
             }
         }
         let variances = self
             .params
             .iter()
-            .map(|p| seen.get(&p.id).copied().ok_or_else(|| p.clone()))
+            .map(|p| {
+                seen.get(&p.id)
+                    .copied()
+                    .ok_or_else(|| DefineError::Unused(p.clone()))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let defined = self.body.set(NominalBody { ctors, variances });
         assert!(
@@ -417,22 +503,100 @@ impl NominalDecl {
     /// replaced by the matching one of `args`: a bipolar parameter by its argument's output
     /// side where it occurs positively and by its input side where it occurs negatively
     /// ([`sides`]).
-    pub fn instantiate(&self, ty: &Type, args: &[Type]) -> Type {
+    ///
+    /// `args` are an application's arguments as it stores them, and `names` its binders.
+    /// An argument's reference to a binding parameter becomes a reference to the function
+    /// of `ty` that binds it there: the innermost one whose binder the declaration spells
+    /// as that parameter's and whose domain is that parameter, which takes the
+    /// application's name. [`define`](Self::define) refused a declaration placing a
+    /// parameter where no such function encloses it. A reference past the application
+    /// counts the crossings between its new position and `ty`'s root.
+    pub fn instantiate(&self, ty: &Type, args: &[Type], names: &[crate::ccl::Name]) -> Type {
         assert_eq!(
             args.len(),
             self.params.len(),
             "`{}` applied to the wrong number of arguments",
             self.name
         );
-        let map: HashMap<TypeParamId, (&Type, &Type)> = self
-            .params
-            .iter()
-            .map(|p| p.id)
-            .zip(args.iter().map(sides))
-            .collect();
+        assert_eq!(
+            names.len(),
+            self.crossings(self.params.len()) as usize,
+            "an application of `{}` names each binder it has",
+            self.name
+        );
+        let inst = Instantiation {
+            decl: self,
+            sides: self
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.id, (i, sides(&args[i]))))
+                .collect(),
+            names,
+        };
         let mut out = ty.clone();
-        replace_params(&mut out, true, &map);
+        replace_params(&mut out, true, &inst, 0, &mut Vec::new());
         out
+    }
+
+    /// Refuse a parameter `ty` places outside a function binding one of the binding
+    /// parameters before it, `bound` holding those of the functions around `ty`.
+    fn check_binders(&self, ty: &Type, bound: &mut Vec<usize>) -> Result<(), DefineError> {
+        match ty {
+            Type::Param(p) => {
+                let Some(i) = self.params.iter().position(|q| q.id == p.id) else {
+                    return Ok(());
+                };
+                match (0..i).find(|j| self.binders[*j].is_some() && !bound.contains(j)) {
+                    Some(j) => Err(DefineError::Unbound {
+                        param: Rc::clone(&self.params[i]),
+                        binder: self.binders[j].clone().expect("a binding parameter"),
+                    }),
+                    None => Ok(()),
+                }
+            }
+            Type::Fun {
+                name,
+                fun_kind,
+                domain,
+                codomain,
+            } => {
+                for w in fun_kind.witnesses() {
+                    for t in w.types() {
+                        self.check_binders(t, bound)?;
+                    }
+                }
+                self.check_binders(domain, bound)?;
+                let binds = self.binds_at(name.as_ref(), domain);
+                bound.extend(binds);
+                let inside = self.check_binders(codomain, bound);
+                if binds.is_some() {
+                    bound.pop();
+                }
+                inside
+            }
+            _ => {
+                let mut out = Ok(());
+                ty.walk_children(|child| {
+                    if out.is_ok() {
+                        out = self.check_binders(child, bound);
+                    }
+                });
+                out
+            }
+        }
+    }
+
+    /// The binding parameter function `name` over `domain` binds in the declaration's own
+    /// types: the one whose name `name` is, when `domain` is that parameter.
+    fn binds_at(&self, name: Option<&crate::ccl::Name>, domain: &Type) -> Option<usize> {
+        let name = name?;
+        let Type::Param(p) = domain else {
+            return None;
+        };
+        let i = self.params.iter().position(|q| q.id == p.id)?;
+        let rank = self.binder_rank(i)?;
+        (*name == self.binder_names[rank]).then_some(i)
     }
 
     /// The representation of `self(args)`: the closed variant tagged by constructor name,
@@ -444,13 +608,13 @@ impl NominalDecl {
     /// them during inference, and the predicates the declaration holds were never typed:
     /// the constructor's function carries its own copy, which inference types
     /// (`lower::nominal`). A refinement in `args` stays: the use that wrote it typed it.
-    pub fn representation(&self, args: &[Type]) -> Type {
+    pub fn representation(&self, args: &[Type], names: &[crate::ccl::Name]) -> Type {
         let mut arms: Vec<(FieldKey, Type)> = self
             .body()
             .ctors
             .iter()
             .map(|c| {
-                let payload = self.instantiate(&strip_refinements(&c.payload()), args);
+                let payload = self.instantiate(&strip_refinements(&c.payload()), args, names);
                 (FieldKey::Name(ctor_tag(&c.name)), payload)
             })
             .collect();
@@ -548,7 +712,7 @@ fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)
             occurrences(value, Variance::Invariant, f);
             occurrences(domain, Variance::Invariant, f);
         }
-        Type::Nominal(decl, args) => {
+        Type::Nominal(decl, args, _) => {
             for (arg, v) in args.iter().zip(&decl.body().variances) {
                 occurrences(arg, at.compose(*v), f);
             }
@@ -557,48 +721,129 @@ fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)
     }
 }
 
-/// Replace each type parameter in `map` with its output side where it occurs at a positive
-/// position and its input side at a negative one, `pol` being `ty`'s own.
+/// What [`NominalDecl::instantiate`] replaces each parameter with.
+struct Instantiation<'a> {
+    decl: &'a NominalDecl,
+    /// Each parameter's position and its argument's two sides.
+    sides: HashMap<TypeParamId, (usize, (&'a Type, &'a Type))>,
+    /// The application's binder names.
+    names: &'a [crate::ccl::Name],
+}
+
+impl Instantiation<'_> {
+    /// The side of parameter `id`'s argument polarity `pol` reads, placed `depth`
+    /// crossings below the root of the type being instantiated, inside the binding
+    /// functions `binding`: each a binding parameter's rank and the depth of the function
+    /// binding it, innermost last.
+    fn arg(
+        &self,
+        id: TypeParamId,
+        pol: bool,
+        depth: u32,
+        binding: &[(usize, u32)],
+    ) -> Option<Type> {
+        let &(i, (input, output)) = self.sides.get(&id)?;
+        let mut arg = if pol { output } else { input }.clone();
+        let crossed = self.decl.crossings(i);
+        if crossed == 0 && depth == 0 {
+            return Some(arg);
+        }
+        let decl = self.decl;
+        crate::ccl::subst::remap_pi_references(&mut arg, &|r| {
+            if r >= crossed {
+                return r - crossed + depth;
+            }
+            let rank = (crossed - 1 - r) as usize;
+            let &(_, level) = binding
+                .iter()
+                .rev()
+                .find(|(j, _)| *j == rank)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{}` places parameter `{}` where no function binds its binder: \
+                         `define` refuses that",
+                        decl.name, decl.params[i].spelling
+                    )
+                });
+            depth - 1 - level
+        });
+        Some(arg)
+    }
+}
+
+/// Replace each type parameter in `inst` with its output side where it occurs at a positive
+/// position and its input side at a negative one, `pol` being `ty`'s own,
+/// and `depth` the crossings between `ty` and the root of the type being instantiated.
 ///
 /// The polarity follows [`occurrences`]: a compute function's domain flips it, and an
 /// argument of a nominal type takes its parameter's variance. An equality position keeps
 /// it; a parameter occurring there is not bipolar, so its two sides are one type.
-fn replace_params(ty: &mut Type, pol: bool, map: &HashMap<TypeParamId, (&Type, &Type)>) {
+fn replace_params(
+    ty: &mut Type,
+    pol: bool,
+    inst: &Instantiation<'_>,
+    depth: u32,
+    binding: &mut Vec<(usize, u32)>,
+) {
     match ty {
         Type::Param(p) => {
-            if let Some((input, output)) = map.get(&p.id) {
-                *ty = if pol {
-                    (*output).clone()
-                } else {
-                    (*input).clone()
-                };
+            if let Some(arg) = inst.arg(p.id, pol, depth, binding) {
+                *ty = arg;
             }
         }
+        // A compute function's domain is contravariant and a data function's invariant,
+        // read at the polarity of the function. A function binding a binding parameter takes
+        // the application's name for it, and its codomain sits inside it.
         Type::Fun {
+            name,
             fun_kind,
             domain,
             codomain,
-            ..
-        } if !fun_kind.resolved().is_data() => {
-            replace_params(domain, !pol, map);
-            replace_params(codomain, pol, map);
+        } => {
+            let binds = inst.decl.binds_at(name.as_ref(), domain);
+            for w in fun_kind.witnesses_mut() {
+                for t in w.types_mut() {
+                    replace_params(t, pol, inst, depth, binding);
+                }
+            }
+            let domain_pol = if fun_kind.resolved().is_data() {
+                pol
+            } else {
+                !pol
+            };
+            replace_params(domain, domain_pol, inst, depth, binding);
+            let rank = binds.and_then(|i| inst.decl.binder_rank(i));
+            if let Some(rank) = rank {
+                *name = Some(inst.names[rank].clone());
+                binding.push((rank, depth));
+            }
+            replace_params(codomain, pol, inst, depth + 1, binding);
+            if rank.is_some() {
+                binding.pop();
+            }
         }
-        Type::Nominal(decl, args) => {
+        Type::Nominal(decl, args, _) => {
             let variances = decl.body().variances.clone();
-            for (arg, v) in args.iter_mut().zip(variances) {
-                replace_params(arg, v.polarity(pol), map);
+            for (i, (arg, v)) in args.iter_mut().zip(variances).enumerate() {
+                let at = depth + decl.crossings(i);
+                replace_params(arg, v.polarity(pol), inst, at, binding);
+            }
+        }
+        Type::DepTuple(components) => {
+            for (k, (_, t)) in components.iter_mut().enumerate() {
+                replace_params(t, pol, inst, depth + k as u32, binding);
             }
         }
         Type::Split { input, output } => {
-            replace_params(input, !pol, map);
-            replace_params(output, pol, map);
+            replace_params(input, !pol, inst, depth, binding);
+            replace_params(output, pol, inst, depth, binding);
         }
-        _ => ty.walk_children_mut(|child| replace_params(child, pol, map)),
+        _ => ty.walk_children_mut(|child| replace_params(child, pol, inst, depth, binding)),
     }
 }
 
 fn collect_decls(ty: &Type, out: &mut Vec<Rc<NominalDecl>>) {
-    if let Type::Nominal(decl, _) = ty
+    if let Type::Nominal(decl, ..) = ty
         && !out.contains(decl)
     {
         out.push(decl.clone());
@@ -609,6 +854,7 @@ fn collect_decls(ty: &Type, out: &mut Vec<Rc<NominalDecl>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Name;
     use chl_parser::FileId;
 
     fn int() -> Type {
@@ -630,8 +876,11 @@ mod tests {
             Span::new(FileId::ROOT, 0, 0),
             vec![(None, shape(Type::Param(t)))],
         );
-        decl.define(vec![ctor])
-            .map_err(|p| p.spelling.to_string())?;
+        decl.define(vec![ctor]).map_err(|e| match e {
+            DefineError::Unused(p) | DefineError::Unbound { param: p, .. } => {
+                p.spelling.to_string()
+            }
+        })?;
         Ok(decl.body().variances[0])
     }
 
@@ -702,7 +951,7 @@ mod tests {
         let (input, output) = (Type::Base(BaseType::Bool), int());
         let arg = split(input.clone(), output.clone());
         assert_eq!(
-            decl.instantiate(&decl.body().ctors[0].payload(), &[arg]),
+            decl.instantiate(&decl.body().ctors[0].payload(), &[arg], &[]),
             Type::fun(input, output)
         );
     }
@@ -728,7 +977,7 @@ mod tests {
         };
         let contra = inner(|u| Type::fun(u, Type::Base(BaseType::Int)));
         assert_eq!(
-            variance_of(|t| Type::fun(Type::Nominal(contra.clone(), vec![t]), int())),
+            variance_of(|t| Type::fun(Type::nominal(contra.clone(), vec![t]), int())),
             Ok(Variance::Covariant)
         );
     }
@@ -756,11 +1005,111 @@ mod tests {
         .expect("`c` names `T`");
         let argument = refine(int(), "written");
         assert_eq!(
-            decl.representation(std::slice::from_ref(&argument)),
+            decl.representation(std::slice::from_ref(&argument), &[]),
             Type::variant(vec![(
                 FieldKey::Name("c".into()),
                 Type::Tuple(vec![int(), argument])
             )])
+        );
+    }
+
+    /// `type N(k: K, V) = (k: K) |=> V`, with the payload's function over `K` binding the
+    /// declaration's name for `k`.
+    fn binding_declaration() -> Rc<NominalDecl> {
+        let span = Span::new(FileId::ROOT, 0, 0);
+        let (k, v) = (TypeParam::declared("K"), TypeParam::declared("V"));
+        let decl = NominalDecl::declared_in(
+            Vec::new(),
+            "N".into(),
+            vec![k.clone(), v.clone()],
+            vec![Some("k".into()), None],
+            span,
+            true,
+        );
+        let payload = Type::Fun {
+            name: Some(decl.binder_names[0].clone()),
+            fun_kind: FunKind::Data(None),
+            domain: Box::new(Type::Param(k)),
+            codomain: Box::new(Type::Param(v)),
+        };
+        decl.define(vec![NominalCtor::unwritten(
+            "new".into(),
+            span,
+            vec![(None, payload)],
+        )])
+        .expect("`V` stands under the function binding `k`");
+        decl
+    }
+
+    /// An argument's reference to a binding parameter becomes a reference to the function
+    /// binding it in the payload, which takes the application's name; one past the
+    /// application counts the crossing the function adds.
+    #[test]
+    fn an_argument_reads_its_binder_where_the_payload_binds_it() {
+        use crate::ccl::{Expr, Refinement, RefinementSet};
+        let refined_by = |name: Name| {
+            let bool_ty = Type::Base(BaseType::Bool);
+            Type::refined(
+                int(),
+                RefinementSet::one(Refinement::born(Rc::new(Expr::var(name).with_ty(bool_ty)))),
+            )
+        };
+        let decl = binding_declaration();
+        let m = Name::fresh("m");
+        let outer = Name::fresh("outer");
+        // Argument 1 sits inside one binder: `#0` is `k`, `#1` the binder around the whole.
+        let args = [
+            int(),
+            Type::Tuple(vec![
+                refined_by(Name::pi_bound(0, &m)),
+                refined_by(Name::pi_bound(1, &outer)),
+            ]),
+        ];
+        let payload = decl.instantiate(
+            &decl.body().ctors[0].payload(),
+            &args,
+            std::slice::from_ref(&m),
+        );
+        let Type::Fun { name, codomain, .. } = &payload else {
+            panic!("the payload is the function over `K`, got {payload}");
+        };
+        assert_eq!(
+            name.as_ref(),
+            Some(&m),
+            "the function takes the application's binder"
+        );
+        assert_eq!(
+            **codomain,
+            Type::Tuple(vec![
+                refined_by(Name::pi_bound(0, &m)),
+                refined_by(Name::pi_bound(1, &outer)),
+            ]),
+            "inside the function `#0` is its binder and `#1` the one around the application"
+        );
+    }
+
+    /// A parameter a binding parameter precedes stands only under a function binding it.
+    #[test]
+    fn a_parameter_outside_its_binder_is_refused() {
+        let span = Span::new(FileId::ROOT, 0, 0);
+        let (k, v) = (TypeParam::declared("K"), TypeParam::declared("V"));
+        let decl = NominalDecl::declared_in(
+            Vec::new(),
+            "N".into(),
+            vec![k.clone(), v.clone()],
+            vec![Some("k".into()), None],
+            span,
+            true,
+        );
+        let payload = Type::fun(Type::Param(k), Type::Param(v));
+        let refused = decl.define(vec![NominalCtor::unwritten(
+            "new".into(),
+            span,
+            vec![(None, payload)],
+        )]);
+        assert!(
+            matches!(&refused, Err(DefineError::Unbound { param, binder }) if param.spelling == "V" && binder == "k"),
+            "got {refused:?}"
         );
     }
 

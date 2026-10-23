@@ -467,7 +467,10 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             let lowers = barrier.lowers.borrow().clone();
             let mut acc = KeyView::default();
             for b in &lowers {
-                let inner_acc = Subst::then(&b.render_subst(), subst_acc);
+                // A barrier variable has no telescope of its own: the binders in scope are
+                // the walk's.
+                let in_scope = |n: &Name| ctx.scope.enclosing().iter().flatten().any(|e| e == n);
+                let inner_acc = Subst::then(&b.render_subst(in_scope), subst_acc);
                 acc.union(key_go(&b.ty, true, &inner_acc, ctx));
             }
             ctx.visiting_barriers.remove(&barrier.uid);
@@ -603,17 +606,26 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // A contravariant argument flips, as a function's domain does; an invariant one
         // keys at this polarity, as a history's children do. A bipolar one keys both its
         // sides, as compaction holds them (`NominalDecl::sided_variances`).
-        Type::Nominal(decl, args) => {
+        // An argument sits inside the binding parameters before it, as in `compact_go`.
+        Type::Nominal(decl, args, names) => {
             let mut sides = Vec::new();
-            for (t, v) in args.iter().zip(&decl.body().variances) {
+            let mut acc = subst_acc.clone();
+            let mut entered = 0;
+            for (i, (t, v)) in args.iter().zip(&decl.body().variances).enumerate() {
                 if *v == Variance::Bipolar {
                     let (input, output) = crate::ccl::nominal::sides(t);
-                    sides.push(key_go(input, !pol, subst_acc, ctx));
-                    sides.push(key_go(output, pol, subst_acc, ctx));
+                    sides.push(key_go(input, !pol, &acc, ctx));
+                    sides.push(key_go(output, pol, &acc, ctx));
                 } else {
-                    sides.push(key_go(t, v.polarity(pol), subst_acc, ctx));
+                    sides.push(key_go(t, v.polarity(pol), &acc, ctx));
+                }
+                if let Some(rank) = decl.binder_rank(i) {
+                    acc = acc.shadow(&names[rank]);
+                    ctx.scope.enter(Some(names[rank].clone()));
+                    entered += 1;
                 }
             }
+            (0..entered).for_each(|_| ctx.scope.exit());
             let args = sides;
             KeyView {
                 nominal: BTreeMap::from([(decl.clone(), args)]),
@@ -682,7 +694,11 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 // Compose the edge's morphism before descending, as `compact_go`
                 // does: a bound reached transitively arrives with every edge's
                 // substitution composed.
-                let inner_acc = Subst::then(&b.render_subst(), subst_acc);
+                let in_scope = |n: &Name| {
+                    state.telescope.contains(n)
+                        || ctx.scope.enclosing().iter().flatten().any(|e| e == n)
+                };
+                let inner_acc = Subst::then(&b.render_subst(in_scope), subst_acc);
                 acc.union(key_go(&b.ty, pol, &inner_acc, ctx));
             }
             ctx.visiting.remove(&visit_key);

@@ -15,7 +15,8 @@ use crate::ast::{
     DiscardHead, Expr, FileId, FunctionSignature, IfBranch, ImplBlock, KeywordArg, KindAnnotation,
     Lit, MatchArm, MatchPattern, Module, Param, PayloadPattern, QualifiedName, RecordField,
     Requirement, Span, Spanned, Stmt, TraitDecl, TraitItem, TraitType, TypeAnnotation, TypeDecl,
-    TypeDeclBody, TypeParam, UnaryOp, UseItem, VariantPayload, WrittenPath, is_type_name,
+    TypeDeclBody, TypeDeclParam, TypeParam, UnaryOp, UseItem, VariantPayload, WrittenPath,
+    is_type_name,
 };
 use crate::builtins::SurfaceBuiltin;
 use crate::lexer::{self, Token};
@@ -270,6 +271,24 @@ where
             .then_ignore(just(Token::RParen))
             .map_with(|fields, e| Spanned::new(e.span(), Expr::Record(fields)));
 
+        // A binder in a type, `k: K`: a function type's parenthesised domain, or a type
+        // application's argument. A name followed by `:` begins no other expression, so
+        // the alternative commits only once the colon is seen.
+        let type_binder = select! { Token::Ident(s) => s }
+            .map_with(|s, e| Spanned::new(e.span(), s))
+            .then_ignore(just(Token::Colon))
+            .then(bracketed_expr.clone())
+            .map_with(|(name, ty), e| {
+                Spanned::new(
+                    e.span(),
+                    Expr::TypeBinder {
+                        name,
+                        ty: Box::new(ty),
+                    },
+                )
+            })
+            .boxed();
+
         // Parenthesised expression / tuple / record / generator expression.
         let paren_group = just(Token::LParen)
             .ignore_then(choice((
@@ -277,6 +296,11 @@ where
                 just(Token::RParen).map_with(|_, e| Spanned::new(e.span(), Expr::Tuple(vec![]))),
                 // Record value `(name=value, …)`.
                 paren_record,
+                // The domain of a dependent function type, `(k: K)`.
+                type_binder
+                    .clone()
+                    .then_ignore(just(Token::RParen))
+                    .map_with(|binder, e| Spanned::new(e.span(), binder.node)),
                 bracketed_expr
                     .clone()
                     .then(choice((
@@ -601,8 +625,7 @@ where
         .boxed();
 
         // ---- Postfix: call, subscript, attribute ---------------------
-        let call_arg_list = bracketed_expr
-            .clone()
+        let call_arg_list = choice((type_binder.clone(), bracketed_expr.clone()))
             .separated_by(just(Token::Comma))
             .allow_trailing()
             .collect::<Vec<_>>()
@@ -1712,10 +1735,15 @@ where
                 .then_ignore(just(Token::Dedent))
                 .map(TypeDeclBody::Constructors),
         ));
+        let type_param = binder
+            .then_ignore(just(Token::Colon))
+            .or_not()
+            .then(binder)
+            .map(|(binder, name)| TypeDeclParam { binder, name });
         let type_stmt = just(Token::Type)
             .ignore_then(binder)
             .then(
-                binder
+                type_param
                     .separated_by(just(Token::Comma))
                     .at_least(1)
                     .allow_trailing()
@@ -1727,7 +1755,7 @@ where
             .then(type_body)
             .validate(|((name, params), body), e, emitter| {
                 let heads = std::iter::once((&name, "type name"))
-                    .chain(params.iter().map(|p| (p, "type parameter")));
+                    .chain(params.iter().map(|p| (&p.name, "type parameter")));
                 for (head, what) in heads {
                     if !is_type_name(&head.node) {
                         emitter.emit(Rich::custom(
@@ -1736,6 +1764,18 @@ where
                                 "{what} `{}` begins with a lowercase letter; a type's name \
                                  is capitalized",
                                 head.node
+                            ),
+                        ));
+                    }
+                }
+                for binder in params.iter().filter_map(|p| p.binder.as_ref()) {
+                    if is_type_name(&binder.node) {
+                        emitter.emit(Rich::custom(
+                            binder.span,
+                            format!(
+                                "binder `{}` is capitalized, which names a type; a binder \
+                                 names a value and begins with a lowercase letter",
+                                binder.node
                             ),
                         ));
                     }
@@ -2847,7 +2887,7 @@ mod tests {
             panic!("expected a type declaration, got {:?}", m.body[0].node)
         };
         assert_eq!(decl.name.node, "Shape");
-        let params: Vec<_> = decl.params.iter().map(|p| p.node.as_str()).collect();
+        let params: Vec<_> = decl.params.iter().map(|p| p.name.node.as_str()).collect();
         assert_eq!(params, ["T"]);
         let TypeDeclBody::Constructors(ctors) = &decl.body else {
             panic!("expected constructor lines, got {:?}", decl.body)
@@ -3089,6 +3129,50 @@ mod tests {
         assert!(matches!(decl.body, TypeDeclBody::Single(_)));
     }
 
+    /// A parameter written `k: K` binds `k`; one written `V` binds nothing.
+    #[test]
+    fn a_type_declaration_parameter_may_bind() {
+        let m = parse_m("type Ledger(k: K, V) = (k: K) |=> V\n");
+        let Stmt::TypeDecl(decl) = &m.body[0].node else {
+            panic!("expected a type declaration, got {:?}", m.body[0].node)
+        };
+        let params: Vec<_> = decl
+            .params
+            .iter()
+            .map(|p| {
+                (
+                    p.binder.as_ref().map(|b| b.node.as_str()),
+                    p.name.node.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(params, [(Some("k"), "K"), (None, "V")]);
+    }
+
+    /// `k: K` is a binder in a type application's arguments and in an arrow's parenthesised
+    /// domain.
+    #[test]
+    fn a_type_binder_is_an_argument_or_an_arrows_domain() {
+        let Expr::Call { args, .. } = parse_e("Ledger(k: SKU, Int)").node else {
+            panic!("expected a type application");
+        };
+        assert!(
+            matches!(&args[0].node, Expr::TypeBinder { name, .. } if name.node == "k"),
+            "the first argument binds `k`, got {:?}",
+            args[0].node
+        );
+        for src in ["(x: Int) => Int", "(k: K) |=> V"] {
+            let Expr::FunctionType { domain, .. } = parse_e(src).node else {
+                panic!("expected a function type for {src}");
+            };
+            assert!(
+                matches!(domain.node, Expr::TypeBinder { .. }),
+                "{src}: the domain is a binder, got {:?}",
+                domain.node
+            );
+        }
+    }
+
     /// A type's name and parameters are capitalized and its constructors are not, and each
     /// case error names the offending identifier.
     #[test]
@@ -3097,6 +3181,7 @@ mod tests {
             ("type price = Int\n", "type name `price`"),
             ("type Box(t) = t\n", "type parameter `t`"),
             ("type Shape:\n    Circle(Int)\n", "constructor `Circle`"),
+            ("type Ledger(K: K, V) = V\n", "binder `K`"),
         ] {
             let result = parse_mod(src);
             assert!(

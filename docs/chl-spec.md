@@ -2289,6 +2289,8 @@ marked one carries its status per "How to read this document".)
   function. A `def` or a lambda is a callable capability, and a comprehension or a literal is a
   collection: the construct decides, and an annotation states it.
 - `D |=> V` — data-function type: a collection over the domain `D` (§6.3).
+- `(x: T) => U`, `(k: D) |=> V` — a dependent function type: the codomain reads the argument by
+  the binder, as in `(k: K) |=> {V where … k …}`, where each value's type reads its key.
 - `Module{name: T, Name <: U, …}` — the type of a module's public members,
   through which one module is passed to another (**[Decided]**,
   [9.8 Module types](#98-module-types)).
@@ -2594,7 +2596,8 @@ of a constructor into an unboxed term.
 
 **A data-function type `D |=> V`** is a collection over `D` with values of type `V`. A `FullMap`
 is always a plain collection: `FullMap(K, V)` is the type `K |=> V` is for a written `K`, and
-`FullMap(_, V)` admits no sum.
+`FullMap(_, V)` admits no sum. `(k: D) |=> V` and `FullMap(k: K, V)` name the key `k` in `V`, so
+the type of each value may read its key, as a `groupby`'s groups do.
 
 - **A domain left to inference admits a sum.** A sum is a collection whose domain is its
   witness, so `_ |=> V`, or `D |=> V` for a type parameter `D` written nowhere else in its
@@ -2920,9 +2923,11 @@ spellings name the same nominal type is
 #### Declaring a nominal type
 
 ```ebnf
-type_stmt   ::= "type" Ident [ "(" Ident ( "," Ident )* [ "," ] ")" ] ":"
+type_stmt   ::= "type" Ident [ "(" type_param ( "," type_param )* [ "," ] ")" ] ":"
                 NEWLINE INDENT ctor_line+ DEDENT
-             |  "type" Ident [ "(" Ident ( "," Ident )* [ "," ] ")" ] "=" expression NEWLINE
+             |  "type" Ident [ "(" type_param ( "," type_param )* [ "," ] ")" ] "=" expression
+                NEWLINE
+type_param  ::= [ ident ":" ] Ident
 ctor_line   ::= [ "@" "RenamedFrom" "(" ident ")" NEWLINE ]
                 ident [ "(" ctor_param ( "," ctor_param )* [ "," ] ")" ] NEWLINE
 ctor_param  ::= [ ident ":" ] expression
@@ -3013,6 +3018,31 @@ with patterns, even when it has one constructor.
 
 **[Tentative]** — the name `extract`. The method shares the type's namespace with its own
 associated functions, so whatever name it takes is unavailable to every type declared with `= R`.
+
+#### Binding parameters
+
+A parameter written `k: K` binds `k`, the value of type `K` its argument stands for, in the
+arguments after it. A type whose values hold a collection whose value types read their keys passes
+that dependency through:
+
+```python
+type Groups(k: K, V) = (k: K) |=> V
+
+g = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+# g : Groups(k: {Bool where _ in [1 > 1, 2 > 1, 3 > 1]}, {UInt where … == k} |=> Int)
+```
+
+- **The declaration's types read the binder where a function binds it.** A parameter after a
+  binding parameter appears only inside a function type `(k: K) …`, spelled with the same binder
+  over the same parameter, and reads that function's argument there. `type Bad(k: K, V) = K => V`
+  is an error: nothing binds `k` where `V` appears.
+- **An argument may name the binder, and the arguments after it read that name.**
+  `Groups(k: SKU, {Int where _ > len(k)})` names it `k`, and any other name serves.
+  `Groups(SKU, Int)` names none, for arguments that read no key. A binder written at a parameter
+  that binds nothing is an error.
+- **Two applications relate argument by argument with their binders identified**, as two
+  dependent function types relate their codomains. A binding parameter's variance is computed as
+  any parameter's is; a data function's domain makes it invariant.
 
 #### A nominal type is opaque
 
