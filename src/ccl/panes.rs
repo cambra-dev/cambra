@@ -706,7 +706,7 @@ mod tests {
     fn a_loop_body_statement_reaches_its_own_products() {
         let images = statement_images(
             indoc! {"
-                out = defer()
+                out: Feed(_)
                 total := 0
                 for n in [1, 2, 3]:
                     total := total + n
@@ -734,7 +734,7 @@ mod tests {
     fn each_accumulator_reaches_the_statement_that_writes_it() {
         let images = statement_images(
             indoc! {"
-                out = defer()
+                out: Feed(_)
                 total := 0
                 count := 0
                 for n in [1, 2, 3]:
@@ -777,7 +777,7 @@ mod tests {
     fn a_feed_in_an_accumulator_free_loop_reaches_its_own_products() {
         let images = statement_images(
             indoc! {"
-                out = defer()
+                out: Feed(_)
                 pool: Mut(Int, Txn) := 100
                 for r in [10, 20, 30]:
                     with begin():
@@ -1087,7 +1087,7 @@ mod tests {
                 src
             }
             "feed" => {
-                let mut src = String::from("out = defer()\nxs = [1, 2, 3, 4, 5]\n");
+                let mut src = String::from("out: Feed(_)\nxs = [1, 2, 3, 4, 5]\n");
                 for i in 0..n {
                     src.push_str(&format!("for v in xs:\n    out << v + {i}\n"));
                 }

@@ -861,7 +861,7 @@ pub enum TypedExprNode {
     /// and replaces the surrounding `Defer` binding.
     Define { name: Name, value: Box<Expr> },
 
-    /// Placeholder for an output accumulator introduced by `x = defer()`.
+    /// Placeholder for an output accumulator introduced by `x: Feed(_)`.
     /// The bound name is resolved by the surrounding `Let` binding.
     /// Eliminated by [`crate::ccl::channelize`] before type inference.
     Defer,

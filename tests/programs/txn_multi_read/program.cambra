@@ -1,4 +1,4 @@
-out = defer()
+out: Feed(_)
 pool: Mut(Int, Txn) := 100
 for r in [10, 20, 30]:
     with begin():

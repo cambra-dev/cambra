@@ -4,7 +4,7 @@ This is the working specification of the **Cambra High-Level Language
 (CHL)** — the surface language a Cambra programmer writes. The
 specification describes CHL directly: what each construct *denotes*
 (the value it computes) and, where applicable, what *effects* its
-evaluation has on the program's deferred outputs.
+evaluation has on the program's feeds.
 
 Compilation lowers CHL to the Cambra Core Language (CCL), where the
 program is type-checked and run as producer/consumer dataflow. This
@@ -330,6 +330,7 @@ simple_stmt     ::= return_stmt
                  |  param_stmt
                  |  assign_stmt
                  |  ann_assign_stmt
+                 |  decl_stmt
                  |  mut_assign_stmt
                  |  aug_assign_stmt
                  |  define_stmt
@@ -340,6 +341,7 @@ pass_stmt       ::= "pass"
 
 assign_stmt     ::= assign_target "=" expression
 ann_assign_stmt ::= assign_target ":" expression "=" expression
+decl_stmt       ::= assign_target ":" expression
 mut_assign_stmt ::= assign_target [ ":" expression ] ":=" expression
 aug_assign_stmt ::= assign_target aug_op expression
 define_stmt     ::= assign_target "<<=" expression
@@ -424,10 +426,11 @@ optional `ident "="` prefix binding the transaction handle — `with t =
 begin():`, §8.2, `[Decided]`); any other context is rejected. `with` does
 **not** provide Python's general context-manager statement.
 
+`decl_stmt` declares a feed with no value, `h: Feed(V)`
+([Declaring a feed](#declaring-a-feed)); every other binding takes a value.
+
 > **Direction.** Planned statement forms, not in today's grammar:
-> `rec x = e` recursive bindings (**[Decided]**, §4.3), annotation-only
-> forward declarations such as `h: Feed(_)` with no initialiser
-> (**[Decided]**, §3.7 — today an annotation *requires* a value), and
+> `rec x = e` recursive bindings (**[Decided]**, §4.3), and
 > out-of-line collection definition through a subscript target,
 > `c[i] = v` (**[Tentative]**, §6.3 — this would relax the
 > no-subscript-target rule above). A `type` declaration, a `def` whose name is
@@ -644,9 +647,8 @@ payload's whenever the payload has any, and the tag's when it does not.
 Each CHL expression denotes a value; some expression forms additionally
 perform an **effect** when evaluated. The effecting forms:
 
-- **Feed `<<`** (§3.7) appends its right-hand side to a deferred
-  collection.
-- **`yield`** (§3.13) appends its operand to the deferred collection the
+- **Feed `<<`** (§3.7) appends its right-hand side to a feed.
+- **`yield`** (§3.13) appends its operand to the collection the
   enclosing generator function returns.
 - **A call to an effecting function** — one that writes a `Mut(…)`
   parameter (pass-by-reference, §6.2) or writes a transactional mutable variable
@@ -744,7 +746,7 @@ sub-expressions of a compound expression evaluate is **not specified** by
 this document. Argument evaluation order in a call, operand order in a
 binary operator, the relative order of two independent feeds in the same
 loop body — none of these are sequenced. The append effects (`<<`,
-`yield`) contribute to bag-valued deferred collections and commute, so
+`yield`) contribute to bag-valued feeds and generator results and commute, so
 they too impose no order among themselves beyond data dependencies. The
 one place order *is* observable — effecting calls and transactional
 writes — is governed by the dependency-edge model of §8.5, not by source
@@ -762,7 +764,7 @@ introduce such dependencies are:
 - short-circuit `and` / `or` (§3.5) and ternary `if`/`else` (§3.6),
   which select which sub-expressions contribute to the result,
 - sink contracts (e.g. `http_serve`'s response-paired-with-request
-  rule — §7.4), which fix ordering at the boundary between the
+  rule — §7.3), which fix ordering at the boundary between the
   program and the outside world.
 
 A consequence worth highlighting: a program may not rely on the
@@ -974,19 +976,19 @@ target << value
 denotes. The expression itself returns the unit value `()`; its
 purpose is the append.
 
-`target` must be a **deferred collection**: a value created by
-`defer()`, by an `<<=` define-statement (§4.4), or by a sink-producing
-builtin such as `http_serve` (§7.4). Feeding a non-deferred value is a
-compile-time error.
+`target` must be a **feed**, a value of type `Feed(V)`: a name declared
+`h: Feed(V)` ([Declaring a feed](#declaring-a-feed)), a `Feed(V)`
+parameter, or the response half of `http_serve` (§7.3). Feeding any
+other value is a compile-time error.
 
 Feeds against a given target are visible to anything that consumes
 that target: a downstream comprehension iterating the stream, a sink
 that dispatches the stream to an HTTP response, etc. The stream's
 element type is the type of `value`, or where several feeds target one
-defer, the join of their value types
+feed, the join of their value types
 ([Joining the types of several values](#joining-the-types-of-several-values)).
 
-The deferred collection a target accumulates is, like any CHL
+The collection a feed accumulates is, like any CHL
 collection, **unordered** (§3): multiple `<<` statements — across
 different iterations of a `for` loop, or across multiple feed sites
 in the same body — contribute their values to the bag without
@@ -1002,19 +1004,41 @@ with its request).
 `<<` is **not** a bitwise-shift operator (CHL has no bitwise shifts).
 Despite the token reuse, this is its only meaning.
 
-> **Direction — `Feed(V)` [Decided].** Feed-ability becomes a property
-> of the *type*, not of how the value was introduced: a feedable
-> collection has type `Feed(V)`, and a feed target is forward-declared
-> with an annotation-only binding `h: Feed(_)` (no initialiser) instead
-> of a `defer()` call
-> (2026-06-29 §5; the
-> north-star `fanout` program is the worked example). This vocabulary
-> supersedes the `deferred`-introducer sketch from the 2026-04-23
-> sink-operators design notes.
-> **[Tentative]**: `<<` additionally becoming the general append
-> operator for lists/sets/collections (2026-06-29 §2). **[Open]**:
-> whether the `<<=` define-statement (§4.4) survives alongside this
-> vocabulary — the new sketch never mentions it.
+#### Declaring a feed
+
+A declaration with an annotation and no value introduces a feed:
+
+```python
+out: Feed(Int)
+for x in [1, 2, 3]:
+    out << x * 10
+sum(out)                 # 60
+```
+
+The feeds of `out`, or its one `<<=` (§4.4), give it its value. A declaration is a statement,
+so a feed may be declared wherever a statement stands, a function body included, and a function
+may return the feed it declares. `Feed(_)` infers the value type; a written one is exact, the type
+every contribution has. The declaration is written with `:`: `Feed` is invariant in its value
+type, so `out <: Feed(V)` would claim nothing `:` does not, and is a compile-time error. Any
+annotation other than `Feed(…)` needs a value: `x: Int` with nothing after it is a compile-time
+error.
+
+`Feed(V)` is written at a binder, as `Mut(V)` is (§6.2): a declaration, a parameter, or an
+annotated binding of a feed, `log: Feed(_) = out`. A parameter that a function's body feeds is
+annotated `Feed(…)`, so a function of several parameters states which of them are feeds:
+
+```python
+def fanout(a: Feed(_), b: Feed(_)):
+    h: Feed(_)
+    for x in h:
+        a << x
+        b << x
+    h
+```
+
+> **Direction.** **[Tentative]**: `<<` additionally becoming the general
+> append operator for lists/sets/collections. **[Open]**: whether the
+> `<<=` define-statement (§4.4) survives alongside declared feeds.
 
 ### 3.8 Function calls
 
@@ -1051,14 +1075,14 @@ is exactly a parenthesised, comma-separated list of expressions.
 
 A *zero-argument* call is valid only against a name registered as a
 **data source** — `stdin()` or any source pre-registered by the host
-(§7.4) — against the builtins `defer()` (§7.3) and `empty_map()` (§3.11),
+(§7.3) — against the builtin `empty_map()` (§3.11),
 or as the context of `with begin():` (§8.2). A zero-argument call against
 any other name is a compile-time error.
 
 > **Direction [Decided] — a zero-argument call is an effect.** Terms are pure and immutable, so a
 > function of no argument is a constant and is written as a value. A zero-argument call remains
-> only where something other than a value is produced: a source read, a new channel (`defer()`),
-> or a transaction (`begin()`). `empty_map()` becomes the values `Map::empty` and `Set::empty`
+> only where something other than a value is produced: a source read or a transaction
+> (`begin()`). `empty_map()` becomes the values `Map::empty` and `Set::empty`
 > ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), and an
 > associated function that declares no parameters, `def Price::zero():`, is an error that says to
 > bind a value instead ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
@@ -1339,8 +1363,8 @@ yield expression
 containing any `yield` is a **generator function** (§4.2); `yield`
 outside a `def` is a compile-time error.
 
-Evaluating `yield e` adds `e` as one element of the deferred
-collection that the enclosing generator function returns. The
+Evaluating `yield e` adds `e` as one element of the collection that
+the enclosing generator function returns. The
 collection is, like any CHL collection, an **unordered bag** (§3);
 the relative order of values from distinct `yield` evaluations
 (whether from different iterations of a `for`, or from sequential
@@ -1586,7 +1610,7 @@ executes, so it can be the source of an unbounded stream (e.g. when
 | `target: T = value` | Same, additionally checking that `value` has type `T`. |
 | `target := value` | **Mutation** (§8.1): introduce (the first `:=`) or write a mutable variable. It is `:=`, not any annotation, that makes a variable mutable; transactional mutable variables are always introduced this way (`x: Mut(V, Txn) := …`). |
 | `target op= value` | Compound mutation — `target := target op value`, for `op` ∈ `+ - * //`. The target **must** be a mutable variable (one introduced with `:=`); a `+=` to an immutable binding is a type error, not a silent rebind. |
-| `target <<= value` | Resolves a previously-deferred name to `value` (§4.4). |
+| `target <<= value` | Gives the feed `target` the value `value` (§4.4). |
 
 `target` is an `AssignTarget`: a bare name or a (nested) tuple of bare
 names. Tuple destructuring:
@@ -1750,30 +1774,25 @@ and per-component annotations are all unimplemented.
 result <<= computation
 ```
 
-`<<=` resolves a deferred output by giving it a value. Semantics:
+`<<=` gives a feed its value outright. Semantics:
 
-- The name on the LHS must have previously been introduced as a
-  deferred-collection placeholder — either explicitly via `defer()`
-  (§7.3) or implicitly via a sink-producing call like `http_serve`
-  (§7.4).
-- `<<=` ties the placeholder to the RHS: from this point on, every
-  consumer of the deferred name sees the value computed by `computation`.
-- It is a compile-time error to `<<=` a name that wasn't introduced as
-  a defer, or to `<<=` the same defer twice.
+- The name on the LHS must be a feed (§3.7): a name declared
+  `result: Feed(V)`, or the response half of `http_serve` (§7.3).
+- `<<=` ties the feed to the RHS: from this point on, every consumer of
+  the feed sees the value computed by `computation`.
+- It is a compile-time error to `<<=` a name that is not a feed, or to
+  `<<=` the same feed twice.
 
-`<<` and `<<=` are the two halves of the deferred-output protocol:
-`<<` *feeds* elements into a deferred collection during a streaming
-computation; `<<=` *defines* the deferred collection outright as a
-specific value. A single defer is closed by exactly one of these
+`<<` and `<<=` are the two ways to give a feed its value: `<<` *feeds*
+elements into it during a streaming computation; `<<=` *defines* it
+outright as a specific value. A single feed takes exactly one of these
 forms.
 
 `<<=` is **not** an augmented assignment — the grammar recognises it
 as its own statement form.
 
-> **Direction.** The 2026-06-29 Feed vocabulary (§3.7) replaces
-> `defer()` with `Feed(_)` forward declarations and keeps `<<`; it does
-> not mention `<<=`. Whether the define-outright half of the protocol
-> survives, and under what spelling, is **[Open]**.
+> **Direction.** Whether the define-outright form survives beside
+> declared feeds, and under what spelling, is **[Open]**.
 
 ### 4.5 `if` / `elif` / `else`
 
@@ -1848,7 +1867,7 @@ concurrently. The single way to sequence iterations is a loop-carried
 accumulator (below).
 
 A bare `for` loop in a non-generator context is an **effect
-statement**: its purpose is to feed values into deferred outputs as it
+statement**: its purpose is to feed values into feeds as it
 iterates. The body must contain at least one `<<` feed expression;
 otherwise the loop would be inert (produces no value, has no effects)
 and is rejected. The canonical effect-for-loop is the `http_greeter`
@@ -2178,12 +2197,12 @@ statement to the end of its block.
 
 A loop binder is not available after the loop. Iterations are unordered, so there is no final
 iteration value to bind there. Results needed outside a loop must be carried by a loop-carried
-accumulator or contributed to a deferred collection; see [iteration](#46-for--iteration).
+accumulator or fed to a feed; see [iteration](#46-for--iteration).
 
 An immutable binding shadows an earlier binding with the same name for the rest of its scope.
 The earlier value is no longer accessible through that name. A write to an existing mutable
-binding advances its history rather than introducing a shadowing binding. Defining a deferred
-value with `<<=` resolves an existing deferred name; it does not introduce another name.
+binding advances its history rather than introducing a shadowing binding. Defining a feed with
+`<<=` resolves an existing feed's name; it does not introduce another name.
 See [Assignment forms](#43-assignment-forms), including the open question about shadowing
 under the decided timeless-equation model.
 
@@ -2287,7 +2306,7 @@ form `{T where p(_)}` (§6.4) is writable in annotation position.
 > and it is the parameter refinement, not a convention, that puts it there. For
 > the HTTP boundary specifically, the sketch has the library derive the check
 > from the handler's own signature rather than have every handler restate it
-> (§7.4).
+> (§7.3).
 >
 > Discharge is a spectrum, not a promise of static proof: an assert
 > the compiler can prove is discharged at compile time and erased; one
@@ -2477,12 +2496,11 @@ Wrappers have to appear in function signatures and inside data structures
 regardless (a function taking a mutable variable, a map *of* feeds), so
 they are types rather than introducer keywords.
 
-`Mut(V)` and `Mut(V, Txn)` are **implemented** — mutation and transactions
-are specified in §8, and the two supporting rules below hold today. `Feed(V)`
-exists as an internal type — what `defer()` and `http_serve` produce (§3.7) —
-but its *forward-declaration surface* `h: Feed(_)` is **[Decided]**, not yet
-accepted at lowering (§3.7, §7.3); `Feed` as a written type constructor is
-likewise not yet resolved in annotations.
+`Mut(V)`, `Mut(V, Txn)` and `Feed(V)` are **implemented**. Mutation and
+transactions are specified in §8, feeds in §3.7, and the two supporting
+rules below hold. `Feed(V)` is written at a binder: a declaration, a
+parameter, or an annotated binding
+([Declaring a feed](#declaring-a-feed)).
 
 Two supporting rules (implemented):
 
@@ -2521,7 +2539,7 @@ a compile-time error.** `1 if c else "x"` is rejected rather than given some
 `Int`-or-`String` type, and the same holds for a `match` whose arms disagree or a
 mutable variable written at two unrelated types. Cambra has no anonymous union type to
 fall back on; to carry values of several types in one place, say which by tagging them
-— a variant (§6.5) if the tags are meaningful to the program, `box` (§7.5) if they
+— a variant (§6.5) if the tags are meaningful to the program, `box` (§7.4) if they
 are not.
 
 > **Direction [Planned] — joining two collections.** Two collections that are not the
@@ -2530,7 +2548,7 @@ are not.
 > disagree about which indices exist. The two answers a program might want differ: one
 > keeps both possibilities and which occurred, the other forgets which collection it is
 > and with it the length. Neither is the default, so the program says which. `box` asks
-> for the first (§7.5); a `List(T)` or `Collection(T)` annotation asks for the second
+> for the first (§7.4); a `List(T)` or `Collection(T)` annotation asks for the second
 > (§6.3).
 
 ### 6.3 Direction: collection types [Decided]
@@ -3789,18 +3807,7 @@ what `groupby` is primarily designed to support.
 > entry rather than the group (§4.6), so `for g in groupby(…).values()` is how to
 > iterate the groups alone — which is what the unkeyed form above does today.
 
-### 7.3 `defer`
-
-`defer()` (zero arguments) creates a deferred collection placeholder.
-It is rarely written explicitly — most users get a defer implicitly
-from `http_serve` or from generator functions. When written, the
-defer must be tied off later with `<<=` or fed via `<<`.
-
-> **Direction [Decided].** `defer()` is superseded by the `Feed` type
-> wrapper: a feed target is introduced by an annotation-only forward
-> declaration `h: Feed(_)` rather than by a call (§3.7, §6.2).
-
-### 7.4 Sources
+### 7.3 Sources
 
 Sources are built-in functions registered at compile time. A source
 call denotes the entire stream the source will produce. `http_serve` is
@@ -3810,7 +3817,7 @@ responses ([10. Sinks](#10-sinks)).
 | Call | Source | Domain |
 |---|---|---|
 | `stdin()` | Process standard input | One element per line of UTF-8 text. |
-| `http_serve(port, method, path)` | HTTP server, a source and a sink | Returns a `(requests, responses)` 2-tuple. The requests source yields request bodies; the responses sink is a deferred collection to feed. Called only as the whole right-hand side of a top-level `=` (see below). |
+| `http_serve(port, method, path)` | HTTP server, a source and a sink | Returns a `(requests, responses)` 2-tuple. The requests source yields request bodies; the responses sink is a feed. Called only as the whole right-hand side of a top-level `=` (see below). |
 
 Additional sources may be pre-registered by the host embedding (testing,
 demos, etc.).
@@ -3826,7 +3833,7 @@ reqs, resps = http_serve(port, method, path)
 
 - the `reqs` side is a streaming source: each element is the
   body of one incoming request to `(method, path)` on `port`.
-- the `resps` side is a sink, a deferred output: feeds into it
+- the `resps` side is a sink, a feed: feeds into it
   (via `<<` from a request-handler `for` loop, or via `<<=` once)
   become the response bodies. The sink pairs each response with its
   triggering request — the request that was bound to the loop
@@ -3868,7 +3875,7 @@ unique across the program.
 > endpoint's response type can carry a contract refinement
 > (`{Response where _.code < 500}`, "never answers 500") ride on the
 > same library design. So does the typing of the response sink
-> itself: a *deferred keyed collection* — supporting both
+> itself: a *keyed feed* — supporting both
 > `resps[req.id] = …` and a feed form `resps << …` — that needs CCL
 > and CHL definitions.
 >
@@ -3891,7 +3898,7 @@ unique across the program.
 
 ---
 
-### 7.5 `box`
+### 7.4 `box`
 
 ```
 box(x)
@@ -4686,7 +4693,7 @@ record projection ([3.9 Subscript and attribute access](#39-subscript-and-attrib
 Importing a module asserts that the module performs no IO and declares no mutable state. A module
 performs IO when it opens a source or binds a sink, or when it runs a module that performs IO. It
 declares mutable state when its top level introduces a mutable variable, writes one, loads one with
-`@LoadFrom`, or resolves a deferred output with `<<=` ([4.4 Define statement
+`@LoadFrom`, or defines a feed with `<<=` ([4.4 Define statement
 `<<=`](#44-define-statement-)), or when it runs a module that declares mutable state. Importing
 either kind of module is an error at the `import`, with a secondary label at the IO site or the
 state. Such a module is run instead. The check is per module: a module that serves a route or holds
@@ -4822,7 +4829,7 @@ problem: its order is the commit order the transaction engine decides at run tim
 
 - A module passes its own induction variable to another module's function, `lib::bump(cnt)`. The
   call sits in the caller's program order, so the writes it makes have their place.
-- A module publishes an induction variable's progression by feeding it out, `pub counts = defer()`
+- A module publishes an induction variable's progression by feeding it out, `pub counts: Feed(Int)`
   with `counts << cnt` in the loop. A feed's order is its own, and several readers are its
   semantics.
 - A module publishes an induction variable's value at one position by binding it to an immutable
@@ -5044,8 +5051,8 @@ prints. An annotation is how an author fixes the contract.
 **[Planned]** — the rules of this section.
 
 The compiler's own modules live under a **std root**, and every std module's path begins with `std`:
-`import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.4
-Sources](#74-sources)). A path beginning with `std` names a module of the std root and never a file
+`import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.3
+Sources](#73-sources)). A path beginning with `std` names a module of the std root and never a file
 under the module root, so `std` is the only name the std root reserves, and adding a std module
 changes no user module's meaning. `std` alone names no module, and a root file named `std.cambra` is
 refused.
@@ -5057,7 +5064,7 @@ string literals. **[Planned]** — an address passed as a parameter, fixed per r
 constant, a value fixed once a run's arguments are bound, which the language does not define yet.
 Until it does, two runs of a module that serves a route serve the same address and conflict.
 
-The prelude (`sum`, `max`, `groupby`, `stdin`, `defer`, `box`, `begin`, …) stays unqualified and in
+The prelude (`sum`, `max`, `groupby`, `stdin`, `box`, `begin`, …) stays unqualified and in
 scope in every module.
 
 **[Decided]** — `Option` is a `type` declared in a std module, and is in the prelude
@@ -5248,7 +5255,7 @@ semantic reasons:
   function, `while` loops, `http_serve` not at top level).
 - Use of an unknown name as a zero-argument call.
 - Type mismatches (e.g. comparing values of incompatible types,
-  feeding a non-deferred name).
+  feeding a name that is not a feed).
 - Unsupported operator combination that the current planner can't
   emit dataflow for.
 

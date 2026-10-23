@@ -8,7 +8,7 @@ def squared(xs):
 
 readings = [1, 2, 3, 4]
 
-totals = defer()
+totals: Feed(_)
 totals << sum(doubled(readings))
 for x in squared(readings):
     totals << x

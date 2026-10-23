@@ -77,7 +77,7 @@ enum Slot {
     Val(Value),
     Mut(Rc<RefCell<MutCell>>),
     Fn(Rc<Function>),
-    /// A channel `defer()` or `test_sink()` opened; its state is in [`Interp::channels`]
+    /// A channel a feed declaration or `test_sink()` opened; its state is in [`Interp::channels`]
     /// under the same name.
     Chan,
     /// The instance a requirement names, `a` in `requires a: Area(S)`, by its trait, bound
@@ -116,7 +116,7 @@ struct TxnFrame {
     uncertain: bool,
 }
 
-/// An open channel: what `defer()` or `test_sink()` made.
+/// An open channel: what a feed declaration or `test_sink()` made.
 ///
 /// A feed nests: `target << value` appends `value` as one element (`docs/chl-spec.md`, "3.7
 /// Feed operator `<<`"), keyed by its site's iteration domain (`docs/chl-spec.md`, "8.4 Feeds
@@ -1187,6 +1187,29 @@ impl Interp {
         }
     }
 
+    /// Bind `name` to a new channel, which the program's output reports when `observed`.
+    fn declare_channel(&mut self, name: String, observed: bool) -> Result<(), Error> {
+        if self.channels.contains_key(&name) {
+            return err(format!(
+                "`{name}` is declared as a channel twice, and a channel's state is \
+                 keyed by its name"
+            ));
+        }
+        let sites = self.feed_sites.get(&name).cloned().unwrap_or_default();
+        self.channels.insert(
+            name.clone(),
+            Channel {
+                sites,
+                ..Channel::default()
+            },
+        );
+        self.bind(name.clone(), Slot::Chan);
+        if observed {
+            self.observed.insert(name);
+        }
+        Ok(())
+    }
+
     fn exec_stmt(&mut self, stmt: &Spanned<Stmt>) -> Result<Option<Value>, Error> {
         match &stmt.node {
             // `out = test_sink()` declares a sink; any other assignment binds a value. An
@@ -1226,30 +1249,27 @@ impl Interp {
             }
             Stmt::Assign { target, value, .. } => {
                 let name = name_of(target)?;
-                let is_sink = is_zero_arg_call(&value.node, SurfaceBuiltin::TestSink);
-                if is_sink || is_zero_arg_call(&value.node, SurfaceBuiltin::Defer) {
-                    if self.channels.contains_key(&name) {
-                        return err(format!(
-                            "`{name}` is declared as a channel twice, and a channel's state is \
-                             keyed by its name"
-                        ));
-                    }
-                    let sites = self.feed_sites.get(&name).cloned().unwrap_or_default();
-                    self.channels.insert(
-                        name.clone(),
-                        Channel {
-                            sites,
-                            ..Channel::default()
-                        },
-                    );
-                    self.bind(name.clone(), Slot::Chan);
-                    if is_sink {
-                        self.observed.insert(name);
-                    }
+                if is_zero_arg_call(&value.node, SurfaceBuiltin::TestSink) {
+                    self.declare_channel(name, true)?;
                     return Ok(None);
                 }
                 let slot = self.binding_of(value)?;
                 self.bind(name, slot);
+                Ok(None)
+            }
+
+            // `out: Feed(T)` declares a channel. The annotation's argument states a type,
+            // which nothing here reads.
+            Stmt::Declare { target, annotation } => {
+                let name = name_of(target)?;
+                let is_feed = matches!(&annotation.ty.node, Expr::Call { func, .. }
+                    if matches!(&func.node, Expr::Name(n) if n.as_str() == "Feed"));
+                if !is_feed {
+                    return err(format!(
+                        "`{name}` is declared with no value, which only a feed is"
+                    ));
+                }
+                self.declare_channel(name, false)?;
                 Ok(None)
             }
 
@@ -2972,7 +2992,6 @@ impl Interp {
             Some(
                 SurfaceBuiltin::Set
                 | SurfaceBuiltin::EmptyMap
-                | SurfaceBuiltin::Defer
                 | SurfaceBuiltin::Begin
                 | SurfaceBuiltin::HttpServe
                 | SurfaceBuiltin::TestSink
@@ -3939,9 +3958,9 @@ mod tests {
     #[test]
     fn a_channel_declared_twice_is_refused() {
         let e = refused(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             def f(n):
-                ch = defer()
+                ch: Feed(_)
                 ch << n
                 0
             out = test_sink()
@@ -3972,7 +3991,7 @@ mod tests {
     #[test]
     fn a_channel_read_before_a_feed_that_never_runs_is_the_whole_collection() {
         let v = out(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             out = test_sink()
             out << sum(ch)
             if 1 > 2:
@@ -4003,7 +4022,7 @@ mod tests {
     #[test]
     fn a_channel_read_before_its_define_runs_sees_it() {
         let v = out(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             out = test_sink()
             out << sum(ch)
             ch <<= [1, 2]
@@ -4014,7 +4033,7 @@ mod tests {
     #[test]
     fn a_channel_read_before_its_feeds_run_sees_them() {
         let v = out(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             out = test_sink()
             out << sum(ch)
             for x in [1, 2, 3]:
@@ -4028,7 +4047,7 @@ mod tests {
     #[test]
     fn a_channel_read_sees_a_feed_in_a_function_called_later() {
         let v = out(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             def push(n):
                 ch << n
                 0
@@ -4044,7 +4063,7 @@ mod tests {
     #[test]
     fn a_channel_fed_from_a_read_of_itself_is_refused() {
         let e = refused(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             ch << sum(ch)
             out = test_sink()
             out << 1
@@ -4057,7 +4076,7 @@ mod tests {
     #[test]
     fn a_cycle_through_a_mutable_variable_is_refused() {
         let e = refused(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             x := sum(ch)
             ch << x
             out = test_sink()
@@ -4070,7 +4089,7 @@ mod tests {
     #[test]
     fn a_cycle_through_a_branch_is_refused() {
         let e = refused(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             if sum(ch) > 0:
                 ch << 1
             out = test_sink()
@@ -4084,8 +4103,8 @@ mod tests {
     #[test]
     fn reads_that_depend_on_each_other_through_a_mutable_variable_resolve_in_order() {
         let v = out(indoc! {r#"
-            a = defer()
-            b = defer()
+            a: Feed(_)
+            b: Feed(_)
             out = test_sink()
             out << sum(b)
             x := sum(a)
@@ -4100,7 +4119,7 @@ mod tests {
     #[test]
     fn a_branch_on_a_channel_read_decides_a_later_read_of_a_mutable_variable() {
         let v = out(indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             x := 1
             out = test_sink()
             if sum(ch) > 3:

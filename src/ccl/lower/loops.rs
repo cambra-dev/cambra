@@ -109,7 +109,7 @@ pub(super) fn for_body_terminal_is_bare_effect(stmts: &[Spanned<ChlStmt>]) -> bo
 /// ```
 /// becomes
 /// ```text
-/// let __result = defer() in
+/// let __result = Defer in
 ///     (src ≫ λi → feed(__result, e)); __result
 /// ```
 ///
@@ -424,7 +424,7 @@ fn lower_for_body_stmts_scoped(
                 if mut_annotation_parts(&annotation.ty, ctx).is_some() {
                     return Err(mut_decl_with_assign_error(stmt.span, &name));
                 }
-                let ann = lower_let_annotation(annotation, value, ctx)?;
+                let ann = lower_let_annotation(&name, annotation, value, ctx)?;
                 let scope = body_scope(mutation_scope, &frame_introduced);
                 let val = lower_assigned_value(value, &[], &scope, ctx)?;
                 frame_introduced.insert(name.clone());
@@ -432,6 +432,20 @@ fn lower_for_body_stmts_scoped(
                     name,
                     value: val,
                     annotation: Some(ann),
+                    span: stmt.span,
+                    transparency: BindingTransparency::Transparent,
+                });
+            }
+            ChlStmt::Declare { target, annotation } => {
+                let (name, channel, ty) = feed_declaration(target, annotation, stmt.span, ctx)?;
+                if mutation_scope.contains(&name) {
+                    return Err(outer_binding_write_error(stmt.span, &name));
+                }
+                frame_introduced.insert(name.clone());
+                prefix.push(PrefixStmt::Bind {
+                    name,
+                    value: channel,
+                    annotation: Some(ty),
                     span: stmt.span,
                     transparency: BindingTransparency::Transparent,
                 });
@@ -1529,9 +1543,16 @@ fn lower_loop_body_chain_scoped(
                 if mut_annotation_parts(&annotation.ty, ctx).is_some() {
                     return Err(mut_decl_with_assign_error(stmt.span, &name));
                 }
-                let ann = lower_let_annotation(annotation, value, ctx)?;
+                let ann = lower_let_annotation(&name, annotation, value, ctx)?;
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                 ctx.tag_image(Expr::let_bind_annotated(name, val, chain, ann), stmt.span)
+            }
+            ChlStmt::Declare { target, annotation } => {
+                let (name, channel, ty) = feed_declaration(target, annotation, stmt.span, ctx)?;
+                ctx.tag_image(
+                    Expr::let_bind_annotated(name, channel, chain, ty),
+                    stmt.span,
+                )
             }
             // `o << value` — an in-loop feed. Emitted as a raw `Feed` marker
             // (reads stay bare); the phase resolves its value in the
@@ -2037,7 +2058,7 @@ in guarded_let"
         let code = indoc::formatdoc! {"
             lim = 15
             t := 0
-            out = defer()
+            out: Feed(_)
             for i in [1, 2]:
                 t += i
                 m = i * 10

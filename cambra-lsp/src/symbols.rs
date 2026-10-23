@@ -27,6 +27,7 @@ fn top_level(doc: &Document, stmt: &Spanned<Stmt>, range: Span, out: &mut Vec<Do
         Stmt::Assign { target, .. }
         | Stmt::AnnAssign { target, .. }
         | Stmt::MutAssign { target, .. }
+        | Stmt::Declare { target, .. }
         | Stmt::LoadFrom { target, .. } => bound_names(doc, target, range, out),
         Stmt::Param { name, .. } => {
             out.push(symbol(

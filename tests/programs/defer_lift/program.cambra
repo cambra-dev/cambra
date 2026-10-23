@@ -1,5 +1,5 @@
 def make_totals(xs):
-    t = defer()
+    t: Feed(_)
     t << sum(xs)
     t
 

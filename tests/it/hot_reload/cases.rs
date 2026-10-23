@@ -924,7 +924,7 @@ fn an_accumulator_over_a_product_carries_across_the_swap() {
 fn a_fed_accumulator_is_observable_across_the_swap() {
     let (reply, out) = stdin_across_reload(
         indoc! {r#"
-            out = defer()
+            out: Feed(_)
             n := 0
             for line in stdin():
                 n := n + 1
@@ -932,7 +932,7 @@ fn a_fed_accumulator_is_observable_across_the_swap() {
             out
         "#},
         indoc! {r#"
-            out = defer()
+            out: Feed(_)
             n := 0
             for line in stdin():
                 n := n + 2

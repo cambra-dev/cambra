@@ -804,7 +804,7 @@ fn importing_a_module_that_performs_io_is_refused(#[case] audit: &str, #[case] i
 "})]
 #[case::mutable_variable("total := 0\n")]
 #[case::defined_output(indoc! {"
-    out = defer()
+    out: Feed(Int)
     out <<= [1]
 "})]
 #[timeout(Duration::from_secs(10))]

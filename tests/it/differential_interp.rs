@@ -508,7 +508,7 @@ fn a_nested_write_reads_its_binders(#[case] term: &str) {
             out << m + j
 "#})]
 #[case::feeds_at_two_depths(indoc! {r#"
-    o = defer()
+    o: Feed(_)
     for i in [1, 2]:
         o << i
         for j in [10, 20]:
@@ -517,7 +517,7 @@ fn a_nested_write_reads_its_binders(#[case] term: &str) {
     out << sum(o)
 "#})]
 #[case::a_constant_value(indoc! {r#"
-    o = defer()
+    o: Feed(_)
     for i in [1, 2]:
         for j in [10, 20]:
             o << 7
@@ -543,7 +543,7 @@ fn a_nested_write_reads_its_binders(#[case] term: &str) {
 "#})]
 #[case::two_feed_only_loops_in_an_accumulator_loop(indoc! {r#"
     t := 0
-    o = defer()
+    o: Feed(_)
     for i in [1, 2]:
         t += i
         for j in [10, 20]:
@@ -840,7 +840,7 @@ fn a_generator_pipeline() {
 #[test]
 fn a_defer_channel_read_back() {
     agree(indoc! {r#"
-        ch = defer()
+        ch: Feed(_)
         for x in [1, 2, 3]:
             ch << x * 2
         out = test_sink()
@@ -910,7 +910,7 @@ fn a_function_is_resolved_where_its_caller_is_defined() {
 #[test]
 fn a_parameter_shadows_a_channel() {
     agree(indoc! {r#"
-        ch = defer()
+        ch: Feed(_)
         out = test_sink()
         for c in [1]:
             ch << c

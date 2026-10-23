@@ -51,7 +51,7 @@ pub(crate) fn pipeline_corpus() -> Vec<(&'static str, String)> {
         ),
         (
             "transaction",
-            "out = defer()\n\
+            "out: Feed(_)\n\
              pool: Mut(Int, Txn) := 100\n\
              for r in [10, 20, 30]:\n\
              \x20   with begin():\n\
@@ -74,7 +74,7 @@ pub(crate) fn pipeline_corpus() -> Vec<(&'static str, String)> {
         ),
         (
             "feed_loop",
-            "out = defer()\nfor x in [1, 2, 3]:\n    out << x * 2\nout\n".to_string(),
+            "out: Feed(_)\nfor x in [1, 2, 3]:\n    out << x * 2\nout\n".to_string(),
         ),
     ]
 }

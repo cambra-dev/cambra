@@ -3183,7 +3183,7 @@ Error: lowering error
     )]
     #[case::deferred_collection_defined_twice(
         indoc::indoc! {"
-            x = defer()
+            x: Feed(_)
             x <<= [1]
             x <<= [2]
             x
@@ -3193,7 +3193,7 @@ Error: lowering error
     )]
     #[case::deferred_collection_defined_in_a_loop(
         indoc::indoc! {"
-            x = defer()
+            x: Feed(_)
             for i in [1, 2]:
                 x <<= [i]
             x
@@ -3203,7 +3203,7 @@ Error: lowering error
     )]
     #[case::deferred_collection_fed_and_defined(
         indoc::indoc! {"
-            x = defer()
+            x: Feed(_)
             x << 1
             x <<= [2]
             x
@@ -3213,10 +3213,10 @@ Error: lowering error
     )]
     #[case::deferred_collection_never_fed(
         indoc::indoc! {"
-            x = defer()
+            x: Feed(_)
             x
         "},
-        "x = defer()",
+        "x: Feed(_)",
         0
     )]
     fn a_rejection_after_lowering_points_at_its_source(

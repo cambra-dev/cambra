@@ -27,7 +27,6 @@ pub enum SurfaceBuiltin {
     Box,
     EmptyMap,
     AwaitFinal,
-    Defer,
     Begin,
     HttpServe,
     TestSink,
@@ -134,7 +133,6 @@ pub const SURFACE_BUILTINS: &[SurfaceBuiltinEntry] = {
         entry("box", B::Box, Exact(1), Function),
         entry("empty_map", B::EmptyMap, Exact(0), Function),
         entry("await_final", B::AwaitFinal, Exact(1), Function),
-        entry("defer", B::Defer, Exact(0), Function),
         entry("begin", B::Begin, Exact(0), TransactionMarker),
         entry("http_serve", B::HttpServe, Exact(3), SinkDeclaration),
         // Listed unconditionally. The `cambra` crate recognizes it only under `cfg(test)` or
@@ -197,7 +195,6 @@ mod tests {
             | B::Box
             | B::EmptyMap
             | B::AwaitFinal
-            | B::Defer
             | B::Begin
             | B::HttpServe
             | B::TestSink
@@ -214,7 +211,6 @@ mod tests {
             B::Box,
             B::EmptyMap,
             B::AwaitFinal,
-            B::Defer,
             B::Begin,
             B::HttpServe,
             B::TestSink,

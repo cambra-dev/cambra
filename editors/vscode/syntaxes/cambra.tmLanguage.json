@@ -189,7 +189,7 @@
     },
     "builtin": {
       "name": "support.function.builtin.cambra",
-      "match": "\\b(?:sum|max|min|groupby|set|map|box|empty_map|await_final|defer|begin|http_serve|test_sink|stdin|summon)\\b"
+      "match": "\\b(?:sum|max|min|groupby|set|map|box|empty_map|await_final|begin|http_serve|test_sink|stdin|summon)\\b"
     },
     "variant-tag": {
       "name": "variable.other.enummember.cambra",

@@ -838,13 +838,13 @@ fn test_tuples(#[case] code: &str, #[case] expected: Value) {
 )]
 // A feed handle read out of a tuple is the channel it names, whether the tuple is taken apart
 // where it is written or bound to a name first.
-#[case("out = defer(); o, k = (out, 3); o << k; sum(out)", Value::Int(3))]
+#[case("out: Feed(_); o, k = (out, 3); o << k; sum(out)", Value::Int(3))]
 #[case(
-    "out = defer(); t = (1, (2, out)); o = t.1.1; o << t.0; sum(out)",
+    "out: Feed(_); t = (1, (2, out)); o = t.1.1; o << t.0; sum(out)",
     Value::Int(1)
 )]
 #[case(
-    "out = defer(); t = (1, (2, out)); a, (b, o) = t; o << a + b; sum(out)",
+    "out: Feed(_); t = (1, (2, out)); a, (b, o) = t; o << a + b; sum(out)",
     Value::Int(3)
 )]
 // A constructor pattern takes its component apart.
@@ -872,7 +872,7 @@ fn test_tuple_patterns(#[case] code: &str, #[case] expected: Value) {
 /// Compile `body` as the statements of a program feeding `out`, and answer its rendered
 /// compile errors, or `None` if it compiles.
 fn list_element_errors(body: &str) -> Option<String> {
-    let code = format!("out = defer()\n{}\nout\n", body.trim_end());
+    let code = format!("out: Feed(_)\n{}\nout\n", body.trim_end());
     let mut ctx = cambra::ccl::context::GlobalContext::default();
     let consumer: Box<dyn cambra::interpreter::Consumer> = Box::new(|| {});
     let loaded = cambra::ccl::load::LoadedProgram::test(&code);

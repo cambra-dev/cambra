@@ -910,11 +910,11 @@ the coalesce walk asks whether the name resolves to a specialization frame (`loo
 
 A `let` that `scoped_let` does not generalize is bound at its type as seen from the binding's level
 (`lower_levels` in `infer/solver/constrain.rs`): every variable the type reaches moves down to that
-level, transitively through bounds and kinds, and a `defer`'s channel name is at that level too. The
-right-hand side is emitted one level up, where a generalized sibling's is, so without the move the
-sibling's scheme would quantify the binding's variables and each of the sibling's uses would get a
-disconnected copy: beside `out = defer()`, every call of `def put(x): out << x` would feed a
-channel of its own. Bound at its own level, the binding is one type every use shares, the
+level, transitively through bounds and kinds, and a declared feed's channel name is at that level
+too. The right-hand side is emitted one level up, where a generalized sibling's is, so without the
+move the sibling's scheme would quantify the binding's variables and each of the sibling's uses
+would get a disconnected copy: beside `out: Feed(_)`, every call of `def put(x): out << x` would
+feed a channel of its own. Bound at its own level, the binding is one type every use shares, the
 sibling's included, and a type parameter reaching it escapes
 ([type-parameters.md, "Levels"](type-parameters.md#levels)).
 

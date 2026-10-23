@@ -1,4 +1,4 @@
-//! Feed (`<<`, `<<=`) and define operators on `defer()` channels, plus the
+//! Feed (`<<`, `<<=`) and define operators on declared `Feed(_)` channels, plus the
 //! multi-arm `if/elif`-with-feeds known-gap test.
 
 use std::time::Duration;
@@ -16,8 +16,8 @@ use super::helpers::*;
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::feed_list("x = defer(); x <<= [1,2,3]; x", make_int_list(&[1, 2, 3]))]
-#[case::feed_scalar_to_defer("x = defer(); x << 1; x", Tile::data_function(ColumnValue::Units(1), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))), Predicate::True, BitSet::new()))]
+#[case::feed_list("x: Feed(_); x <<= [1,2,3]; x", make_int_list(&[1, 2, 3]))]
+#[case::feed_scalar_to_defer("x: Feed(_); x << 1; x", Tile::data_function(ColumnValue::Units(1), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))), Predicate::True, BitSet::new()))]
 // An accumulator spelled like the tap its own loop's feed rides. The regression
 // these pin: a tap was named `to_<defer>_<n>`, which is a spelling user code can
 // write, and the tap and the accumulator share one decision record — so the
@@ -27,7 +27,7 @@ use super::helpers::*;
 // (`Name::defer_tap_field`).
 #[case::accumulator_spelled_like_its_tap(
 r#"to_o_0 := 0
-o = defer()
+o: Feed(_)
 for l in [1, 2, 3]:
     to_o_0 := to_o_0 + l
     o << l * 100
@@ -35,15 +35,15 @@ to_o_0"#, Tile::Scalar(ColumnValue::Ints(vec![6])))]
 // The same for a tap's `__fire` companion, which shares the record too.
 #[case::accumulator_spelled_like_its_taps_fire_gate(
 r#"to_o_0__fire := 0
-o = defer()
+o: Feed(_)
 for l in [1, 2, 3]:
     to_o_0__fire := to_o_0__fire + l
     if l > 1:
         o << l * 100
 to_o_0__fire"#, Tile::Scalar(ColumnValue::Ints(vec![6])))]
-#[case::feed_in_comprehension("x = defer(); [x << i for i in [1,2,3]]; x", make_int_list(&[1, 2, 3]))]
+#[case::feed_in_comprehension("x: Feed(_); [x << i for i in [1,2,3]]; x", make_int_list(&[1, 2, 3]))]
 #[case::feed_in_for_loop(
-r#"x = defer()
+r#"x: Feed(_)
 for i in [1,2,3]:
   x << i
 x"#, make_int_list(&[1, 2, 3]))]
@@ -52,8 +52,8 @@ x"#, make_int_list(&[1, 2, 3]))]
 // the source lands at two live positions and must be freshened per placement — a
 // bare clone trips the `post-letrec-run` id-uniqueness boundary.
 #[case::two_feeds_in_readonly_txn_loop(
-r#"x = defer()
-y = defer()
+r#"x: Feed(_)
+y: Feed(_)
 for i in [1,2,3]:
   with begin():
     x << i
@@ -66,20 +66,20 @@ x"#, make_int_list(&[1, 2, 3]))]
 // into an `IterateExtent` + `Restrict` and only guard-passing indices reach
 // the channel.
 #[case::feed_with_if(
-r#"x = defer()
+r#"x: Feed(_)
 for i in [0,1,2,3]:
   if i // 2 == 0:
     x << i
 x"#, make_int_list(&[0, 1]))]
 #[case::chained_defers_1(
-r#"x = defer()
-y = defer()
+r#"x: Feed(_)
+y: Feed(_)
 x <<= y
 y <<= [0, 1]
 x"#, make_int_list(&[0, 1]))]
 #[case::chained_defers_2(
-r#"x = defer()
-y = defer()
+r#"x: Feed(_)
+y: Feed(_)
 x <<= [0, 1]
 y <<= x
 y"#, make_int_list(&[0, 1]))]
@@ -88,22 +88,22 @@ y"#, make_int_list(&[0, 1]))]
 // (via define).  The channelize pass must topologically order the defers
 // across the intervening let so `x` is bound before `y`.
 #[case(
-r#"x = defer()
+r#"x: Feed(_)
 some_var = 5
-y = defer()
+y: Feed(_)
 x <<= [0, 1]
 y <<= x
 y"#, make_int_list(&[0, 1]))]
 // Symmetric case: x depends on y across the intervening let.
 #[case(
-r#"x = defer()
+r#"x: Feed(_)
 some_var = 5
-y = defer()
+y: Feed(_)
 x <<= y
 y <<= [0, 1]
 x"#, make_int_list(&[0, 1]))]
 #[case::two_feeds(
-r#"x = defer()
+r#"x: Feed(_)
 x << 1
 x << 2
 x"#,
@@ -112,7 +112,7 @@ x"#,
                 ColumnValue::Units(1),
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 #[case::scalar_and_loop_feeds(
-r#"x = defer()
+r#"x: Feed(_)
 x << 1
 for i in [1, 2, 3]:
     x << i
@@ -123,7 +123,7 @@ x"#,
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 // Three feed sites: locks down N-ary union construction beyond N=2.
 #[case::three_feeds(
-r#"x = defer()
+r#"x: Feed(_)
 x << 1
 x << 2
 x << 3
@@ -135,7 +135,7 @@ x"#,
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
 // Identical feed values still produce distinct variant tags.
 #[case::identical_feeds(
-r#"x = defer()
+r#"x: Feed(_)
 x << 1
 x << 1
 x"#,
@@ -145,14 +145,14 @@ x"#,
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 #[case::feed_via_alias(
 r#"
-x = defer()
+x: Feed(_)
 y = x
 for i in [1,2,3]:
   y << i
 y"#, make_int_list(&[1, 2, 3]))]
 #[case::feed_via_double_alias(
 r#"
-x = defer()
+x: Feed(_)
 y = x
 z = y
 for i in [1,2,3]:
@@ -161,7 +161,7 @@ z"#, make_int_list(&[1, 2, 3]))]
 #[case::return_defer_from_func(
 r#"
 def f(n):
-  x = defer()
+  x: Feed(_)
   x
 y = f(10)
 for i in [1,2,3]:
@@ -171,14 +171,14 @@ y"#, make_int_list(&[1, 2, 3]))]
 r#"
 def f(x):
   x
-x = defer()
+x: Feed(_)
 for i in [1,2,3]:
   y = f(f(x))
   y << i
 x"#, make_int_list(&[1, 2, 3]))]
 #[case::alias_inside_loop(
 r#"
-x = defer()
+x: Feed(_)
 for i in [1,2,3]:
   y = x
   y << i
@@ -186,7 +186,7 @@ x"#, make_int_list(&[1, 2, 3]))]
 #[case::feed_internal_and_external(
 r#"
 def f(n):
-  x = defer()
+  x: Feed(_)
   x << n
   x
 y = f(10)
@@ -199,7 +199,7 @@ y"#, Tile::data_function(ColumnValue::positional_union(&[0, 1, 1, 1], vec![
 #[case::multiple_func_feeds(
 r#"
 def f(n):
-  x = defer()
+  x: Feed(_)
   x << n
   x
 def g(c):
@@ -216,7 +216,7 @@ y"#, Tile::data_function(ColumnValue::positional_union(&[0, 1, 2, 2, 2], vec![
 #[case::union_of_complex_defers(
 r#"
 def f(n):
-  x = defer()
+  x: Feed(_)
   x << n
   x
 def g(c):
@@ -253,7 +253,7 @@ y ++ y"#, Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 0, 0, 1, 
 // rebinds, so `x` is `i` at the first feed and `2i` at the second.
 #[case(
     r#"
-o = defer()
+o: Feed(_)
 for i in [1, 2, 3]:
     x = i
     o << x
@@ -276,7 +276,7 @@ def fw(c: Mut(Int), o: Feed(Int)):
   o << c
   c += 1
 x := 0
-out = defer()
+out: Feed(_)
 for i in [1, 2, 3]:
   fw(x, out)
 out"#, make_int_list(&[0, 1, 2]))]
@@ -292,7 +292,7 @@ def fw(o: Feed(Int), c: Mut(Int)):
   o << c
   c += 1
 x := 0
-out = defer()
+out: Feed(_)
 for i in [1, 2, 3]:
   fw(out, x)
 out"#, make_int_list(&[0, 1, 2]))]
@@ -315,7 +315,7 @@ fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn multi_arm_if_elif_feeds_fan_out() {
-    let code = r#"d = defer()
+    let code = r#"d: Feed(_)
 for x in [1, 2, 3]:
     if x == 1:
         d << x * 10
@@ -353,7 +353,7 @@ d"#;
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn if_else_both_feed_fan_out() {
-    let code = r#"o = defer()
+    let code = r#"o: Feed(_)
 for i in [0, 1, 2, 3]:
     if i < 2:
         o << i
@@ -390,7 +390,7 @@ fn a_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] expected: i6
     check_scalar(
         &format!(
             indoc! {r"
-                out = defer()
+                out: Feed(_)
                 for v in [1, 2]:
                     with begin():
                         out << v
@@ -421,7 +421,7 @@ fn a_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] expected: i6
 fn a_filtered_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] expected: i64) {
     let feed = indoc! {r"
         n = 1
-        out = defer()
+        out: Feed(_)
         for v in [1, 2]:
             with begin():
                 out << v
@@ -438,7 +438,7 @@ fn a_filtered_comprehension_reads_a_feed_channel(#[case] read: &str, #[case] exp
 fn a_let_bound_filtered_comprehension_reads_a_feed_channel() {
     check_scalar(
         indoc! {r"
-            out = defer()
+            out: Feed(_)
             for v in [1, 2]:
                 with begin():
                     out << v
@@ -456,7 +456,7 @@ fn a_let_bound_filtered_comprehension_reads_a_feed_channel() {
 fn a_comprehension_reads_a_feed_channel_fed_outside_a_transaction() {
     check_scalar(
         indoc! {r"
-            out = defer()
+            out: Feed(_)
             for v in [1, 2]:
                 out << v
             sum([x for x in out])
@@ -492,8 +492,8 @@ fn two_defers_fed_from_complementary_match_arms(
 ) {
     let code = format!(
         indoc! {r#"
-            good = defer()
-            bad = defer()
+            good: Feed(_)
+            bad: Feed(_)
             for m in [`a(2), `b(3)]:
                 match m:
                     case `a(n):
@@ -527,8 +527,8 @@ fn two_defers_fed_from_complementary_if_arms(
 ) {
     let code = format!(
         indoc! {r#"
-            good = defer()
-            bad = defer()
+            good: Feed(_)
+            bad: Feed(_)
             for i in [1, 2]:
                 if i > 1:
                     good << i
@@ -564,8 +564,8 @@ fn a_default_arm_feeds_its_own_defer(
 ) {
     let code = format!(
         indoc! {r#"
-            a = defer()
-            b = defer()
+            a: Feed(_)
+            b: Feed(_)
             for m in [`x(1), `y(2), `z(4)]:
                 match m:
                     case `x(n):
@@ -596,9 +596,9 @@ fn a_default_arm_feeds_its_own_defer(
 // the first two's arms already `Unit` in the residual.
 #[case(
     indoc! {r#"
-        a = defer()
-        b = defer()
-        c = defer()
+        a: Feed(_)
+        b: Feed(_)
+        c: Feed(_)
         for i in [1, 2, 3]:
             if i == 1:
                 a << i
@@ -614,8 +614,8 @@ fn a_default_arm_feeds_its_own_defer(
 // channels union, and the arm in between keeps its guard in their predicates.
 #[case(
     indoc! {r#"
-        a = defer()
-        b = defer()
+        a: Feed(_)
+        b: Feed(_)
         for i in [1, 2, 3]:
             if i == 1:
                 a << i
@@ -631,8 +631,8 @@ fn a_default_arm_feeds_its_own_defer(
 // two defers in separate clusters.
 #[case(
     indoc! {r#"
-        a = defer()
-        b = defer()
+        a: Feed(_)
+        b: Feed(_)
         for i in [1, 2]:
             if i > 1:
                 a << i
@@ -657,7 +657,7 @@ fn more_defers_off_one_conditional(#[case] code: &str, #[case] expected: Value) 
 // One deferred collection.
 #[case(
     indoc! {r#"
-        o = defer()
+        o: Feed(_)
         for i in [1, 2]:
             o << i
             t = i * 10
@@ -670,8 +670,8 @@ fn more_defers_off_one_conditional(#[case] code: &str, #[case] expected: Value) 
 // weighted apart, so a fan-out routing an arm's values into the wrong one fails here.
 #[case(
     indoc! {r#"
-        a = defer()
-        b = defer()
+        a: Feed(_)
+        b: Feed(_)
         for i in [1, 2]:
             a << i
             t = i * 10
@@ -721,7 +721,7 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
 #[timeout(Duration::from_secs(10))]
 #[case(
     indoc! {r#"
-        o = defer()
+        o: Feed(_)
         for i in [1, 2, 3]:
             if i > 1:
                 o << i
@@ -732,7 +732,7 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
 )]
 #[case(
     indoc! {r#"
-        o = defer()
+        o: Feed(_)
         for m in [`a(2), `b(3)]:
             match m:
                 case `a(n):
@@ -746,7 +746,7 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
 )]
 #[case(
     indoc! {r#"
-        o = defer()
+        o: Feed(_)
         for i in [1, 2]:
             for j in [10, 20]:
                 o << i * j
@@ -760,7 +760,7 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
     indoc! {r#"
         def bump(x):
             x + 1
-        o = defer()
+        o: Feed(_)
         for i in [1, 2]:
             bump(i)
             o << i
@@ -770,7 +770,7 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
 )]
 #[case(
     indoc! {r#"
-        o = defer()
+        o: Feed(_)
         for i in [1, 2]:
             return i
             o << i
@@ -784,7 +784,7 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
 // statements without a recurrence, so this one has nothing to sequence it.
 #[case(
     indoc! {r#"
-        o = defer()
+        o: Feed(_)
         for i in [1, 2]:
             t := i * 2
             o << i
@@ -794,7 +794,7 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
 )]
 #[case(
     indoc! {r#"
-        o = defer()
+        o: Feed(_)
         for i in [1, 2]:
             t: Mut(Int) := i * 2
             o << i
@@ -806,7 +806,7 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
 // wherever it is written: a mutable variable is introduced solely with `:=`.
 #[case(
     indoc! {r#"
-        o = defer()
+        o: Feed(_)
         for i in [1, 2]:
             t: Mut(Int) = i * 2
             o << i
@@ -828,7 +828,7 @@ fn a_non_final_loop_body_statement_is_a_binding_or_a_feed(
 fn a_loop_body_ends_in_a_value() {
     check_compile_error(
         indoc! {r#"
-            o = defer()
+            o: Feed(_)
             for i in [1, 2]:
                 o << i
                 return i
@@ -845,7 +845,7 @@ fn a_loop_body_ends_in_a_value() {
 #[rstest]
 #[timeout(Duration::from_secs(1))]
 fn scalar_define_into_defer_is_rejected() {
-    let code = "x = defer()\nx <<= 1\nx";
+    let code = "x: Feed(_)\nx <<= 1\nx";
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let result = compile_program(&mut ctx, &LoadedProgram::test(code), consumer);
@@ -862,7 +862,7 @@ fn scalar_define_into_defer_is_rejected() {
 #[rstest]
 #[timeout(Duration::from_secs(1))]
 fn defer_type_errors_render_against_user_shape() {
-    let code = r#"x = defer()
+    let code = r#"x: Feed(_)
 x << 1
 x << "s"
 x"#;
@@ -913,7 +913,7 @@ fn expect_feed_error(code: &str, needle: &str) {
 #[test]
 fn multiple_defines_rejected() {
     expect_feed_error(
-        "x = defer()\nx <<= [1]\nx <<= [2]\nx",
+        "x: Feed(_)\nx <<= [1]\nx <<= [2]\nx",
         "multiple definitions",
     );
 }
@@ -924,44 +924,37 @@ fn multiple_defines_rejected() {
 #[test]
 fn feeds_and_define_mixed_rejected() {
     expect_feed_error(
-        "x = defer()\nx << 1\nx <<= [2]\nx",
+        "x: Feed(_)\nx << 1\nx <<= [2]\nx",
         "both feeds and a define",
     );
 }
 
-/// A bare `defer()` that is never bound to a name (so nothing feeds or defines
-/// it) leaves an unbound handle — rejected (`DeferError::UnboundDeferHandle`).
-#[test]
-fn unbound_defer_handle_rejected() {
-    expect_feed_error("defer()", "unbound defer handle");
-}
-
-/// A generator whose `defer` both feeds and defines.
+/// A generator whose feed both feeds and defines.
 const FEEDS_AND_DEFINES: &str = indoc! {r#"
     def g(n):
-        x = defer()
+        x: Feed(Int)
         x << n
         x <<= [2]
         x
 "#};
 
-/// A generator whose `defer` defines twice.
+/// A generator whose feed defines twice.
 const DEFINES_TWICE: &str = indoc! {r#"
     def g(n):
-        x = defer()
+        x: Feed(Int)
         x <<= [n]
         x <<= [2]
         x
 "#};
 
-/// A generator whose `defer` neither feeds nor defines.
+/// A generator whose feed neither feeds nor defines.
 const NEITHER: &str = indoc! {r#"
     def g(n):
-        x = defer()
+        x: Feed(Int)
         x
 "#};
 
-/// An error in a generator's `defer` block is the program's wherever the generator is
+/// An error in a generator's feed is the program's wherever the generator is
 /// called. A call in a filter or a group-by key leaves the block in a refinement predicate,
 /// and channelize reports its error as it reports one in the tree.
 #[rstest]
@@ -1002,7 +995,7 @@ fn refined_write_used_with_feed() {
     check_compile_error(
         indoc! {r#"
 x: Mut({Int where _ >= 0}) := 0
-o = defer()
+o: Feed(_)
 for p in [1,2,3]:
     o << x
     x := x ^+ 1
@@ -1019,7 +1012,7 @@ fn refined_read_used_with_feed() {
     check_compile_error(
         indoc! {r#"
 x := 0
-o = defer()
+o: Feed(_)
 for p in [1, 2, 3]:
     y = x ^+ 1
     o << y
@@ -1034,7 +1027,7 @@ o
 fn let_binding_into_feed() {
     check_scalar(
         indoc! {r#"
-out = defer()
+out: Feed(_)
 x := 0
 for i in [1, 2, 3]:
   if i > 1:
@@ -1062,7 +1055,7 @@ for i in [1, 2, 3]:
 fn loop_feeds_a_channel_read_above_it() {
     check_scalar(
         indoc! {"
-            events = defer()
+            events: Feed(_)
             total = sum([e for e in events])
             fed := 0
             for x in [1, 2, 3]:
@@ -1093,7 +1086,7 @@ fn loop_feeds_a_channel_read_above_it() {
 fn loop_adds_the_total_of_its_own_feed() {
     check_scalar(
         indoc! {"
-            events = defer()
+            events: Feed(_)
             total = sum([e for e in events])
             fed := 0
             for x in [1, 2, 3]:
@@ -1102,5 +1095,117 @@ fn loop_adds_the_total_of_its_own_feed() {
             total + fed
         "},
         Value::Int(24),
+    );
+}
+
+/// A declaration with no value introduces a feed, which its feeds and its `<<=` give a value,
+/// at any depth: at the top level, in a loop body and in a function body.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("out: Feed(_); out << 1; out << 2; sum(out)", 3)]
+#[case(
+    indoc! {"
+        out: Feed(Int)
+        for x in [1, 2, 3]:
+            out << x * 10
+        sum(out)
+    "},
+    60
+)]
+#[case("out: Feed(_); out <<= [1, 2, 3]; sum(out)", 6)]
+#[case(
+    indoc! {"
+        def totals(xs):
+            t: Feed(_)
+            t << sum(xs)
+            t
+        rs = [1, 2, 3, 4]
+        ts = totals(rs)
+        for x in rs:
+            ts << x
+        max(ts)
+    "},
+    10
+)]
+fn a_declared_feed_is_fed(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// The declared value type is the element type every contribution has.
+#[test]
+fn a_declared_feed_takes_its_value_type() {
+    check_compile_error(
+        "out: Feed(String); out << 1; out",
+        "Type mismatch for contribution to feed(out, 1)",
+    );
+}
+
+/// A `Feed(…)` annotation states a feed wherever a binder takes one: a parameter of a
+/// function of one or several parameters, and an annotated binding.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    indoc! {"
+        def g(o: Feed(Int)):
+            o << 5
+        out: Feed(_)
+        g(out)
+        sum(out)
+    "},
+    5
+)]
+#[case(
+    indoc! {"
+        def g(o: Feed(Int), x):
+            o << x
+        out: Feed(_)
+        g(out, 4)
+        g(out, 3)
+        sum(out)
+    "},
+    7
+)]
+#[case("out: Feed(_); o: Feed(Int) = out; o << 3; sum(out)", 3)]
+fn a_feed_annotation_states_a_feed(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A function of several parameters takes them as one tuple, and a feed targets a name, so a
+/// fed parameter has to say it is a feed.
+#[test]
+fn an_unannotated_fed_parameter_of_several_is_refused() {
+    check_compile_error(
+        indoc! {"
+            def g(o, x):
+                o << x
+            out: Feed(_)
+            g(out, 1)
+            sum(out)
+        "},
+        "`o` is fed in the body, which makes it a feed parameter: annotate it `o: Feed(_)`",
+    );
+}
+
+/// The north-star `fanout` with declared feeds in place of its two sinks: a function
+/// declares a feed, fans what it receives out to two feed parameters, and returns it.
+#[test]
+fn a_feed_returned_by_a_function_fans_out() {
+    check_scalar(
+        indoc! {"
+            def fanout(a: Feed(_), b: Feed(_)):
+                h: Feed(_)
+                for x in h:
+                    a << x
+                    b << x
+                h
+
+            o1: Feed(_)
+            o2: Feed(_)
+            out: Feed(_) = fanout(o1, o2)
+            for line in [1, 2, 3]:
+                out << line
+            sum(o1) * 10 + sum(o2)
+        "},
+        Value::Int(66),
     );
 }

@@ -9,7 +9,9 @@ use std::collections::HashSet;
 use super::*;
 use crate::{
     ccl::{Expr, Name, Type, TypedExprNode},
-    chl_parser::ast::{AnnotationMode, Param, Requirement, Span, Spanned, TypeParam, is_type_name},
+    chl_parser::ast::{
+        AnnotationMode, Param, Requirement, Span, Spanned, TypeAnnotation, TypeParam, is_type_name,
+    },
 };
 
 /// The binder a `=> T` output annotation introduces to check the body's result.
@@ -59,13 +61,46 @@ fn mut_param_history_type(
     }
 }
 
+/// The history type a `Mut(…)` or `Feed(…)` annotation on `param` states, if it has one: the
+/// parameters a caller passes by reference.
+fn history_param_type(
+    param: &Param,
+    ctx: &mut LoweringContext,
+) -> Option<Result<Type, LoweringError>> {
+    match mut_param_history_type(param, ctx) {
+        Some(res) => Some(res.map(|(mut_ty, _is_txn)| mut_ty)),
+        None => feed_param_history_type(param, ctx),
+    }
+}
+
+/// Whether `body` feeds or defines `name` where `name` is free.
+fn feeds_name(body: &Expr, name: &Name) -> bool {
+    match &body.node {
+        TypedExprNode::Feed {
+            name: target,
+            value,
+        }
+        | TypedExprNode::Define {
+            name: target,
+            value,
+        } => target == name || feeds_name(value, name),
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => feeds_name(bound_expr, name) || (&binding.name != name && feeds_name(body, name)),
+        TypedExprNode::Lambda { param, body, .. } => &param.name != name && feeds_name(body, name),
+        _ => body.any_child(|c| feeds_name(c, name)),
+    }
+}
+
 /// If `param` is annotated `Feed(T)` (a pass-by-reference deferred output),
 /// return its history type `Feed(T)`.
 ///
 /// The `Append` sibling of [`mut_param_history_type`]: both annotations name a
 /// [`Type::History`] carrier rather than an ordinary type, which is why neither
 /// reaches [`lower_type_annotation`] — a `Feed` there is still an unknown type
-/// application, so this recognizes it only in parameter position.
+/// application, so this recognizes it only at a binder.
 ///
 /// The domain is left inferred for the reason a `Mut` parameter's is: the call
 /// site's argument pins it, and leaving it open lets one writer serve feeds at
@@ -75,6 +110,19 @@ fn feed_param_history_type(
     ctx: &mut LoweringContext,
 ) -> Option<Result<Type, LoweringError>> {
     let annotation = param.annotation.as_ref()?;
+    feed_annotation_type(annotation, param.name.as_str(), param.name_span, ctx)
+}
+
+/// The history type `Feed(T)` that `annotation` on the binder `name` at `name_span` states,
+/// if it names `Feed` — the annotation of a feed parameter or of a feed declaration.
+///
+/// The domain is a hole: the writes to the feed decide where its positions come from.
+pub(super) fn feed_annotation_type(
+    annotation: &TypeAnnotation,
+    name: &str,
+    name_span: Span,
+    ctx: &mut LoweringContext,
+) -> Option<Result<Type, LoweringError>> {
     let ChlExpr::Call { func, args } = &annotation.ty.node else {
         return None;
     };
@@ -88,12 +136,11 @@ fn feed_param_history_type(
     // payloads, so `<:` admits exactly what `:` does and claims nothing more.
     if annotation.mode == AnnotationMode::Bounded {
         return Some(Err(LoweringError::unsupported(
-            param.name_span,
+            name_span,
             format!(
-                "`{} <: Feed(…)` bounds a feed parameter by its own type: `Feed` is \
+                "`{name} <: Feed(…)` bounds a feed by its own type: `Feed` is \
                  invariant in its value type, so `<:` claims nothing `:` does not. \
-                 Write `{}: Feed(…)`",
-                param.name, param.name
+                 Write `{name}: Feed(…)`"
             ),
         )));
     }
@@ -174,9 +221,9 @@ pub(super) fn uncurry_params(
         // one of the two binders that may hold a mutable variable, and nothing asks an
         // annotation about it. Non-`Mut` params stay `Hole` (inferred), as before.
         // Multi-arg pass-by-ref lands with transactions.
-        let param_ty = match mut_param_history_type(&params[0], ctx) {
-            Some(Ok((mut_ty, _is_txn))) => mut_ty,
-            _ => Type::Hole,
+        let param_ty = match history_param_type(&params[0], ctx) {
+            Some(ty) => ty?,
+            None => Type::Hole,
         };
         let mut lam = Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr);
         if let TypedExprNode::Lambda { param, .. } = &mut lam.node {
@@ -184,7 +231,7 @@ pub(super) fn uncurry_params(
             // `emit_lambda` binds at `user_annotation.or(param.ty)`, so restating it
             // as an annotation would be the same type twice.
             if let Some(ann) = &params[0].annotation
-                && mut_param_history_type(&params[0], ctx).is_none()
+                && history_param_type(&params[0], ctx).is_none()
             {
                 // Any *other* annotation (`int`, `List[T]`, …) is a
                 // **checking-mode** declaration: attach it so `emit_lambda` binds
@@ -204,24 +251,16 @@ pub(super) fn uncurry_params(
     // cross-function transactional writer `def transfer(src, dst, amt)`). Such
     // functions are always inlined (a `Mut`-param function must reach its call
     // sites), so the curried chain never survives to `lambda_elim`. Call sites
-    // apply curried to match (see `lower_call`, keyed on `mut_param_fns`).
-    if params
-        .iter()
-        .any(|p| mut_param_history_type(p, ctx).is_some())
-    {
+    // apply curried to match (see `lower_call`, keyed on `history_param_fns`). A `Feed`
+    // parameter is the same case: a feed's target is a name, so the channel the caller
+    // passes reaches the body's feeds only through a named binder.
+    if params.iter().any(|p| history_param_type(p, ctx).is_some()) {
         return params.iter().rev().try_fold(body_expr, |acc, param| {
             // A `Mut(…)`/`Feed(…)` annotation names a history carrier rather than
             // an ordinary type, so it lowers here and not through
             // `lower_type_annotation`. A malformed `Mut(…)` already returned from
             // `lower_function_body`; a malformed `Feed(…)` surfaces here.
-            let history_ty = match mut_param_history_type(param, ctx) {
-                Some(Ok((mut_ty, _is_txn))) => Some(mut_ty),
-                _ => match feed_param_history_type(param, ctx) {
-                    Some(Ok(feed_ty)) => Some(feed_ty),
-                    Some(Err(e)) => return Err(e),
-                    None => None,
-                },
-            };
+            let history_ty = history_param_type(param, ctx).transpose()?;
             let param_ty = history_ty.clone().unwrap_or(Type::Hole);
             let mut lam = Expr::lambda(param.name.as_str(), param_ty.clone(), acc);
             if let TypedExprNode::Lambda { param: p, .. } = &mut lam.node {
@@ -249,6 +288,21 @@ pub(super) fn uncurry_params(
     // double-underscore names here), this guarantees the outer
     // substitution's inserted `Var(outer_name)` never collides with an
     // inner binder.
+    // A feed's target is a name, and the substitution below replaces each parameter with a
+    // projection of the tuple, which no feed can target.
+    if let Some(param) = params.iter().find(|p| {
+        let name = Name::raw(p.name.as_str());
+        feeds_name(&body_expr, &name)
+    }) {
+        return Err(LoweringError::unsupported(
+            param.name_span,
+            format!(
+                "`{0}` is fed in the body, which makes it a feed parameter: annotate it \
+                 `{0}: Feed(_)`",
+                param.name
+            ),
+        ));
+    }
     let tuple_name = ctx.fresh_tuple_arg();
     let up = "lower.uncurry_proj";
     let body_with_subs = params.iter().enumerate().fold(body_expr, |acc, (i, arg)| {
