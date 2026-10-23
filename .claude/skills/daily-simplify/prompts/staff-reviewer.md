@@ -23,13 +23,14 @@ Read the surrounding code in `{{WS}}`, and judge comments and docs against "Pros
 Comments" in `{{WS}}/CLAUDE.md`.
 
 Run no builds and no existing tests. The commit passed `./ci.sh fast` before this review, and
-GitHub CI runs the full gate on the pushed PR. The skill's "Build and Test Scope" section applies,
-with one difference: you cannot add a test to `{{WS}}`, so the test the skill asks for on an
-`incorrect` finding goes in the finding's details, written out in full with the file it belongs in.
-The implementer adds it and runs it.
+GitHub CI runs the full gate on the pushed PR. The skill's "Build and Test Scope" section applies:
+the one test you run is one you write for a finding, to confirm it fails on `{{CHANGE}}`.
 
-Do not edit any file in `{{WS}}`, do not run jj commands that write, and do not touch any directory
-outside `{{WS}}` and `{{SCRATCH}}`. Write every log, backup copy (`*.orig`) and temp
+Try that test in a temporary commit, following `{{SKILL}}/prompts/temporary-test-commit.md`, and
+put it in the finding's details with the file it belongs in and the failure it produced.
+
+Apart from that commit, do not edit any file in `{{WS}}`, do not run jj commands that write, and do
+not touch any directory outside `{{WS}}` and `{{SCRATCH}}`. Write every log, backup copy (`*.orig`) and temp
 file under `{{SCRATCH}}`. Never use the session scratchpad or `/tmp`.
 
 Every finding is about this commit's diff or code the diff makes wrong. Do not propose adjacent
@@ -48,7 +49,8 @@ line is its title line, and the details sit indented beneath it:
 ## Findings
 
 - incorrect : src/ccl/simplify.rs:212 Merged arm drops the `Infer` guard
-  <what is wrong and why, the concrete fix, and the test case the skill asks for>
+  <what is wrong and why, the concrete fix, and the test case the skill asks for with the failure
+  it produced on the commit>
 - improve : src/ccl/simplify.rs:240 Comment narrates the old loop
   <what should change, and the replacement>
 

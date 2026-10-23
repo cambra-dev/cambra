@@ -14,7 +14,11 @@ The change is the commit with change id `{{CHANGE}}` in the jj workspace `{{WS}}
 with `{{SKILL}}/scripts/in-workspace.sh {{WS}} 1800 cargo test <name>`, which uses the workspace's
 cargo target and a timeout.
 
-Do not edit any file in `{{WS}}`, and do not run jj commands that write. Write every log, backup
+Where no existing test settles a behaviour risk, write one. Try it in a temporary commit, following
+`{{SKILL}}/prompts/temporary-test-commit.md`. A test that fails on `{{CHANGE}}` and passed before
+it is evidence for `REJECT` or `REVISE`; one that passes rules the risk out.
+
+Apart from that commit, do not edit any file in `{{WS}}`, and do not run jj commands that write. Write every log, backup
 copy (`*.orig`) and temp file under `{{SCRATCH}}`. Never use the session scratchpad or `/tmp`.
 
 The stated intent: {{INTENT}}
@@ -67,6 +71,8 @@ Return exactly this:
 verdict: ACCEPT | REVISE | REJECT
 reason: <one or two sentences, naming the code>
 behaviour risks checked: <each risk → the test or reasoning that rules it out, or "unresolved">
+tests tried: <each test you wrote: its file, its text, and its result on {{CHANGE}}; or "none">
 simpler?: <before vs after, in decisions/cases/indirections>
-revise points: <for REVISE only: numbered, each small and concrete; anything larger is a REJECT>
+revise points: <for REVISE only: numbered, each small and concrete; anything larger is a REJECT.
+  A point a tried test supports names the test, so the implementer can add it>
 ```

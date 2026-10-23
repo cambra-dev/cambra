@@ -66,8 +66,10 @@ Two scripts set what a build or gate needs:
 run's Step 0 closes a draft whose CI failed and marks one whose CI passed ready for review, so a
 draft stays a draft for at most a day after its CI finishes.
 
-A run pushes its PRs as one GitHub stack, in the order it attempted them. Each attempt starts on
-the one pushed before it, so each PR's branch holds every commit below it, and a reviewer reads the
+A run pushes its PRs as one GitHub stack, in the order it attempted them. Each run starts a fresh
+stack on the `main@origin` its Step 1 fetched, and never builds on an earlier run's PRs, including
+an earlier run the same day. A stack therefore holds at most one run's attempts. Each attempt starts
+on the one pushed before it, so each PR's branch holds every commit below it, and a reviewer reads the
 day's simplifications in order. When a member is closed or fails CI, the next run's Step 0 drops it
 and rebases the members above it (Step 0, `settle_drafts.py`).
 
@@ -284,7 +286,7 @@ then `workspace.sh remove attempt`, then start the next. A pushed commit survive
 because its bookmark keeps it; a discarded one is abandoned and its commit id goes in the log.
 
 `TIP` is the bookmark of the attempt this run pushed last, `simplify-agent/<D>-<slug>`, and
-`main@origin` before the first push. Each attempt starts on `TIP`, so the day's PRs form one stack.
+`main@origin` before the first push. It never names a bookmark from an earlier run. Each attempt starts on `TIP`, so the day's PRs form one stack.
 A discarded attempt leaves `TIP` where it was.
 
 ### Review guard
@@ -302,6 +304,10 @@ Steps 6 and 7, runs inside this guard:
 
 Any difference voids the review: discard the attempt, whatever the verdict, and log it as
 `discarded: reviewer edited the workspace`.
+
+Either reviewer may try a new test in a temporary commit on top of `@`, and abandons it and
+returns `@` to where it was before it reports (`prompts/temporary-test-commit.md`). Done that way, the commit ids
+match and the guard passes. A temporary commit left behind voids the review like any other edit.
 
 ## Step 5 — Implementer
 
