@@ -14,6 +14,8 @@ tags: [cambra, simplification, daily-run]
 
 ## Pushed
 
+{{The stack's number and link, when the run pushed two or more PRs. Rows are bottom first.}}
+
 | PR | change | diff | staff review |
 |---|---|---|---|
 | [#N](url) — title <!-- doc-refs-ignore: template placeholder --> | {{one sentence naming the code}} | +a −b, net production ±n | {{n addressed in `fix-commit-id` / none}} |
@@ -24,7 +26,7 @@ Architectural findings go under "Structural findings".}}
 
 ## Attempted, not pushed
 
-### {{subject in words}} — abandoned: {{reason class}} | discarded: reviewer {{REJECT}} | discarded: staff review {{declined `incorrect` finding}} | discarded: reviewer edited the workspace
+### {{subject in words}} — abandoned: {{reason class}} | discarded: reviewer {{REJECT}} | discarded: staff review {{declined `incorrect` finding}} | discarded: reviewer edited the workspace | discarded: CI failed | discarded: stack repair
 
 - **Locations:** `path:lines`
 - **What happened:** {{two sentences}}

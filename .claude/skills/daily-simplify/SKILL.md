@@ -62,8 +62,16 @@ Two scripts set what a build or gate needs:
 - `$SKILL/scripts/gate.sh <ws> <log-prefix>` runs `./ci.sh fast` through `in-workspace.sh` and
   writes `<log-prefix>.log`.
 
-`fast` is the only gate the run executes. GitHub CI runs the full gate on each draft PR, and the
-next run's Step 0 closes a draft whose CI failed, so a failing draft stays open for at most a day.
+`fast` is the only gate the run executes. GitHub CI runs the full gate on each draft PR. The next
+run's Step 0 closes a draft whose CI failed. A draft whose CI passed stays a draft until a human
+marks it ready for review.
+
+A run pushes its PRs as one GitHub stack, in the order it attempted them. Each run starts a fresh
+stack on the `main@origin` its Step 1 fetched, and never builds on an earlier run's PRs, including
+an earlier run the same day. A stack therefore holds at most one run's attempts. Each attempt starts
+on the one pushed before it, so each PR's branch holds every commit below it, and a reviewer reads the
+day's simplifications in order. When a member is closed or fails CI, the next run's Step 0 drops it
+and rebases the members above it (Step 0, `settle_drafts.py`).
 
 Each attempt's agents write their logs, backup copies and temp files under that attempt's
 `SCRATCH`, never under the session scratchpad or `/tmp`. A scratch directory is named by slug
@@ -108,8 +116,8 @@ $SKILL/scripts/workspace.sh paths          # SRCS, REPO, CACHE, VAULT, LOGDIR; T
 $SKILL/scripts/preflight.sh $LOGDIR/D.md   # in triage-only mode: $CACHE/runs/D/triage-only.md
 $SKILL/scripts/workspace.sh list           # stale simplify-* workspaces
 gh auth status 2>&1 | head -3
-$SKILL/scripts/close-failed.sh             # in triage-only mode: --dry-run
 mkdir -p $RUN
+python3 -I $SKILL/scripts/settle_drafts.py $RUN   # in triage-only mode: --dry-run
 python3 -I $SKILL/scripts/history.py $RUN/history.md   # every simplify PR, in any state
 ls -t $LOGDIR/                             # recent run logs
 ```
@@ -118,9 +126,19 @@ ls -t $LOGDIR/                             # recent run logs
   with them, and sweeps each cargo target down to a size limit. Record the free disk it prints under
   "Run notes". When less than 50 GB is free, it exits 3 after writing the reason to the day's log:
   stop the run there, with no further steps.
-- `close-failed.sh` closes each earlier run's draft whose GitHub CI failed, and prints one line per
-  PR. Log each one under "Attempted, not pushed" as `discarded: CI failed`, with the failed checks
-  and the PR link. It runs before `history.py`, so today's history already shows those PRs closed.
+- `settle_drafts.py` settles earlier runs' PRs one stack at a time, bottom to top, and prints one
+  line per PR it changes. Its docstring gives the rules. It runs before `history.py`, so today's
+  history already shows each PR in its new state.
+  - The lowest member whose CI failed is closed. Log it under "Attempted, not pushed" as
+    `discarded: CI failed`, with the failed checks and the PR link. CI results above it, and above
+    a member whose CI has not finished, are not read: those branches carry its commits.
+  - A member that is closed, by CI or by a human, is dropped from its stack. The members above it
+    are rebased past it, pushed, and re-formed into one stack. A member the rebase leaves
+    conflicted or empty is closed too; log it under "Attempted, not pushed" as `discarded: stack
+    repair`, with the reason the script printed.
+  - `repair skipped` means a jj or `gh stack` call in the repair failed, and names the call and
+    its error. The script goes on to the next stack. Record it under "Run notes"; a human
+    re-forms that stack.
 - If `$RUN/superseded.md` exists, the scheduler stopped a run still in progress to start this one.
   Copy its note into "Run notes".
 - If stale `simplify-*` workspaces exist, a previous run crashed or was superseded. For each one,
@@ -135,7 +153,9 @@ ls -t $LOGDIR/                             # recent run logs
   - a simplify PR a human closed without merging, with the closing comment as the reason. This
     entry is permanent: the run never re-proposes a candidate a human closed, unless its cited
     code has changed and the closing comment's reason no longer holds;
-  - a simplify PR `close-failed.sh` closed for a CI failure in the last 14 days;
+  - a simplify PR `settle_drafts.py` closed in the last 14 days. One it closed for a stack repair
+    is re-proposed when its candidate still holds: the PR below it, not the candidate, was the
+    reason;
   - a candidate a log records as discarded, abandoned or rejected in the last 14 days.
 - `$RUN/history.md` also holds the review comments on recently merged simplify PRs. They are
   guidance for the finders (Step 3), not history entries.
@@ -151,7 +171,8 @@ $SKILL/scripts/workspace.sh add scout      # prints the workspace dir, SCOUT
 
 `add` creates workspace `simplify-scout` at `$SRCS/cambra-simplify-scout`. Its working copy is a new
 empty commit whose parent is the freshly fetched `main@origin`. Record the `main@origin` commit id
-in the log. Every workspace this run creates uses that same base.
+in the log. The first attempt uses that same base, and each later one starts on the attempt pushed
+before it (Step 5).
 
 ## Step 2 — Seed signals
 
@@ -263,6 +284,10 @@ Take the selected candidates one at a time, in rank order. For each, run Steps 5
 then `workspace.sh remove attempt`, then start the next. A pushed commit survives the removal
 because its bookmark keeps it; a discarded one is abandoned and its commit id goes in the log.
 
+`TIP` is the bookmark of the attempt this run pushed last, `simplify-agent/<D>-<slug>`, and
+`main@origin` before the first push. It never names a bookmark from an earlier run. Each attempt starts on `TIP`, so the day's PRs form one stack.
+A discarded attempt leaves `TIP` where it was.
+
 ### Review guard
 
 A reviewer reads the attempt's commits but must not change them. jj snapshots the working copy
@@ -275,14 +300,24 @@ Steps 6 and 7, runs inside this guard:
    `jj -R $WS log -r 'main@origin..@' --no-graph -T 'commit_id ++ "\n"'`.
 2. After the reviewer returns, run the same command and compare. It runs without
    `--ignore-working-copy`, so it snapshots any edit the reviewer left behind and the ids change.
+3. Abandon any temporary test commit the reviewer left, by the change id it reviewed:
+   `$SKILL/../staff-rust-review/scripts/review-test.sh -R $WS clean <change>`.
 
-Any difference voids the review: discard the attempt, whatever the verdict, and log it as
-`discarded: reviewer edited the workspace`.
+Any difference in step 2 voids the review: discard the attempt, whatever the verdict, and log it
+as `discarded: reviewer edited the workspace`.
+
+Either reviewer may try a new test in two temporary commits, one on the change and one on its
+parent, made and removed with `review-test.sh` ("Trying a test in a temporary commit" in the
+`staff-rust-review` skill). Done that way, `@` returns to where it was and the guard passes. A
+temporary commit left at `@` voids the review like any other edit. One left on the parent is not
+an ancestor of `@`, so step 2 cannot see it; it changes no commit under review, and step 3
+abandons it. `review-test.sh` describes each temporary commit with the change id it tests, so
+step 3 abandons only that review's commits and no other child of the same parents.
 
 ## Step 5 — Implementer
 
 ```bash
-$SKILL/scripts/workspace.sh add attempt    # prints the workspace dir, WS
+$SKILL/scripts/workspace.sh add attempt $TIP   # prints the workspace dir, WS
 mkdir -p $RUN/scratch-<slug>               # SCRATCH
 ```
 
@@ -393,10 +428,11 @@ change id when one was kept, `<change>` otherwise.
 
 For an accepted attempt, running jj with `-R $WS`:
 
-1. **Re-fetch** (`workspace.sh fetch`). If `main@origin` moved since Step 1, run
-   `jj -R $WS rebase -b @ -d main@origin`, which moves both commits. CI runs on the branch tip,
-   not on a merge with `main`, so a green check on a stale base says nothing about the code once
-   it merges.
+1. **Re-fetch** (`workspace.sh fetch`). For the run's first push only (`TIP` is `main@origin`):
+   if `main@origin` moved since Step 1, run `jj -R $WS rebase -b @ -d main@origin`, which moves
+   both commits. CI runs on the branch tip, not on a merge with `main`, so a green check on a stale
+   base says nothing about the code once it merges. A later attempt stays on `TIP`: rebasing it
+   would rewrite the PRs already pushed below it.
 2. **Run the gate:** `$SKILL/scripts/gate.sh $WS $SCRATCH/gate-final`. It must pass.
 3. **Write the title and body.** Use the repo's `pr-description` skill
    (`$REPO/.claude/skills/pr-description/SKILL.md`). Read it, then have a cold subagent draft the
@@ -410,9 +446,20 @@ For an accepted attempt, running jj with `-R $WS`:
    ```bash
    jj -R $WS describe -r <change> -m "<title>" -m "<body>"   # the fix commit keeps its own
    jj -R $WS git push --named simplify-agent/<D>-<slug>=<tip>   # fails if the bookmark exists
-   gh pr create --repo cambra-dev/cambra --draft --base main \
+   gh pr create --repo cambra-dev/cambra --draft --base <TIP's branch, or main> \
      --head simplify-agent/<D>-<slug> --title "<title>" --body-file <file>
    ```
+
+   From the run's second PR on, link every PR the run has pushed, bottom first. The first link
+   creates the stack, and each later one appends the new PR to it:
+
+   ```bash
+   $SKILL/scripts/gh-stack.sh $RUN link <PR URL> <PR URL> …
+   ```
+
+   Pass the URLs, not the branch names: `link` pushes a branch argument from the scratch clone.
+   Do not pass `--open`; the PRs stay drafts until Step 0 of the next run reads their CI. Set
+   `TIP` to `simplify-agent/<D>-<slug>`.
 
 5. If the PR resolves or advances a vault issue, name the issue beside the PR in the log. The run
    does not edit the vault.
@@ -459,7 +506,7 @@ Then reply with the following. In an unattended run the reply lands in `$RUN/ses
 the log is the record anyone reads:
 
 - the log path;
-- the draft PR links;
+- the draft PR links and the stack's number;
 - one line per attempt that did not ship.
 
 ## Rules that hold throughout
