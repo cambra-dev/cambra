@@ -12,10 +12,10 @@ members are walked bottom to top:
   dropped.
 
 An open member is judged by `check` alone: it is the one required check, and it already accounts
-for skipped jobs. The first open member whose `check` has not passed ends the walk's CI verdicts:
-every member above carries its commits, so their results say nothing about their own changes.
-Closed members above it are still dropped. No member is marked ready for review; a human promotes
-a simplify PR.
+for skipped jobs. The first open member whose `check` has not passed ends the walk's CI verdicts,
+and so does the first drop: every member above carries its commits, so their results say nothing
+about their own changes. Closed members above either are still dropped. No member is marked ready
+for review; a human promotes a simplify PR.
 
 When open members remain above a drop, the stack is repaired:
 
@@ -78,6 +78,7 @@ def plan(members, verdicts, contains):
         if m["state"] == "CLOSED":
             if any(contains(m["headRefOid"], o["headRefOid"]) for o in above):
                 out.drops.append(m)
+                judging = False
             continue
         if not judging:
             continue
@@ -85,6 +86,8 @@ def plan(members, verdicts, contains):
         if v[0] == "fail":
             out.close_ci.append((m, v[1]))
             out.drops.append(m)
+        # Every member above carries this one's commits, so their results say nothing about their
+        # own changes until this one has passed.
         judging = v[0] == "pass"
     if out.drops:
         lowest = out.drops[0]["position"]

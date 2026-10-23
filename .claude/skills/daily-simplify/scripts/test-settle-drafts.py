@@ -69,6 +69,10 @@ check("a closed member no open head carries is history, not a drop",
       nums(p.drops) == [3] and nums(p.rebase) == [4])
 
 ms = [member(1, 1), member(2, 2, "CLOSED"), member(3, 3)]
+p = sd.plan(ms, {1: ("pass",), 3: ("fail", "repo_checks")}, always)
+check("a failure above a human-closed member is rebased, not closed",
+      not p.close_ci and nums(p.drops) == [2] and nums(p.rebase) == [3])
+
 p = sd.plan(ms, {1: ("pending",), 3: ("pass",)}, always)
 check("a closed member above a pending one is still dropped",
       nums(p.drops) == [2] and nums(p.rebase) == [3])
