@@ -1825,14 +1825,22 @@ set during structural normalization does not itself infer those expression trees
 
 #### A shared hole naming a domain states an equation
 
-Lowering uses a shared hole to identify a comprehension's domain with its source's domain.
-The forward annotation constraint alone places one bound at the contravariant domain position;
-it does not establish equality between all domains mentioning that variable.
-`bind_annotation` adds the reverse relation where that shared id names a data domain.
+Lowering uses a shared hole to identify a comprehension's domain with the domain of the
+collection it walks. The forward annotation constraint alone places one bound at the contravariant
+domain position; it does not establish equality between all domains mentioning that variable.
 
-The extra equation is restricted to this annotation identity. A domain variable used for another
-purpose can collect distinct domains, as in a conditional collection or a domain-generic consumer.
-It is not equated with every contribution merely because the position is invariant.
+The variable a shared hole normalizes to when it is written as a function annotation's domain
+names one domain (`InferVar::names_domain`, marked by `normalize_annotation`). An invariant domain
+edge between that variable and a domain is an equation, drawn in both directions
+(`domains_equate`). The mark is set when the variable is minted and copied when it is freshened,
+so the equation holds on whichever edge the domains meet. The collection a comprehension walks is
+an `Iterable::elements` call, whose type is a variable until the
+[collection rule](#a-collection-is-answered-off-the-table) relates it to the source, and the
+source's domain reaches the annotation through that variable.
+
+The equation is restricted to that variable. A domain variable used for another purpose can
+collect distinct domains, as in a conditional collection or a domain-generic consumer. It is not
+equated with every contribution merely because the position is invariant.
 
 The equation is also excluded for a bound witness. Relating a free variable to that reference
 would let the witness escape its sum. Entering a sum instead requires a
@@ -3128,6 +3136,49 @@ The comparisons have a product rule (`Trait::is_structural`): `Equatable` on any
 no order, so a record reaching an `Orderable` position is rejected; arithmetic has no product
 reading at all.
 
+### A collection is answered off the table
+
+`Iterable(𝐶, Elements=𝐸)` holds of a structural collection with `𝐸` the collection itself. A loop's
+source `𝑐` lowers to `𝑐 ▷ Iterable::elements` (`lower_loop_source`), and over a data function, a
+sum, or a feed handle that call returns its argument. No row states it, so it is a **collection
+rule**: a candidate beside the rows, whose state an obligation records (`CollectionRule`). Only a
+trait with a collection reading has the rule (`Trait::reads_collections`), and only `Iterable` has
+one.
+
+- **The first collection applies it.** A contribution that is a function or an append history
+  clears the rows and relates the operand's variable to `Elements` (`narrow_collection`). Later
+  contributions reach `Elements` along that edge. A contribution is delivered without the edge
+  substitutions it was recorded under, so a copy of it would name a dependent source's discharged
+  binder free: a group-by's group names its key binder.
+- **A base or a nominal type rules it out**, as it rules out the product rule. A collection
+  arriving after either is rejected, and a base or a nominal type arriving after a collection is
+  rejected.
+- **An upper bound decides it as a lower bound does.** Only a collection is below a collection. A
+  structural upper bound on a watched variable is delivered to an obligation that reads
+  collections (`notify_upper`), and `link_watches` replays a linked variable's structural bounds on
+  both sides. A bounded annotation `xs <: Map(K, V)` gives its variable no lower bound at all.
+- **While the rule may answer, the rows do not agree.** The rule associates the operand, which no
+  row states, so `agreed_assoc` settles nothing for an obligation whose rule is open. Otherwise a
+  program with one `Iterable` instance would deposit that instance's `Elements` on every loop
+  before the loop's source arrives.
+- **The requirement sweep skips the obligation** while the rule may answer, as it skips one the
+  product rule answered: the rule accepts every collection, which an intersection of bases cannot
+  state.
+- **Coalescing removes the call.** `𝑐 ▷ Iterable::elements` whose operand resolves to a
+  structural collection is replaced by `𝑐` before any other rule reads it, in the tree and in
+  each predicate copy (`elements_of_a_collection`). A message's predicate copy drops it the same
+  way, so a diagnostic spells the source as the program does. A call a declared instance answers
+  is replaced by that instance's function, as any trait function's is
+  ([Trait functions](#trait-functions)).
+
+A comprehension's encoding states two facts about the collection it walks, and states them on the
+`elements` call: its kind, and, for an unfiltered single generator, the equation between its
+domain and the comprehension's
+([A shared hole naming a domain states an equation](#a-shared-hole-naming-a-domain-states-an-equation)).
+The call's type is a variable, so the annotation names its own binder. A dependent source's
+codomain reads the source's binder, and the annotation's codomain variable is minted in the scope
+of the binder it names, which the codomain edge renames the source's to.
+
 ### Refinements are transparent
 
 `{𝑇 | 𝑝}` satisfies a trait exactly when `𝑇` does. This holds by construction: satisfaction is judged on each bound contribution as it arrives, and refinements are peeled at that moment, when the base exists. Peeling at emission instead would have nothing to work on, an operand usually being still a variable there.
@@ -3140,17 +3191,21 @@ Growing `𝐹` above zero would not change this. Choosing between two functions 
 
 An obligation is a monotone fact, resolved as the graph fills in rather than by a sweep at the end of solving — the shape [`FunKindVar`](#46-data-vs-compute-functions) already uses for kinds. Each operand position carries a **candidate set** of instances that only ever shrinks; each associated type is deposited on its position as an ordinary lower bound once every surviving candidate agrees on it. Order therefore does not matter.
 
-A contribution arriving at a position is one of four things, and each has its own outcome:
+A contribution arriving at a position is one of six things, and each has its own outcome:
 
 | contribution | example | outcome |
 |---|---|---|
 | a **base** or a **nominal type** | `Int`, `Two(Int)` | narrows the candidate set by its head, and by a nominal type's arguments where the instances differ below it ([An instance's arguments](#an-instances-arguments)) |
-| **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately | nothing to say |
+| **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately, to every trait but `Iterable` | nothing to say |
 | a **product** | a tuple, a record | answered componentwise by a structural trait, rejected by every other ([A product is answered off the table](#a-product-is-answered-off-the-table)) |
-| **determined, and none of these** | a variant, a function | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
+| a **collection** | a function, a sum; a feed handle, to `Iterable` | answered by `Iterable` as itself, rejected by every other trait ([A collection is answered off the table](#a-collection-is-answered-off-the-table)) |
+| **determined, and none of these** | a variant | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
 | a **type parameter** | `T` in `def f(T, x: T)` | answered by a `requires` assumption naming it; otherwise its bound is offered in its place, and with no bound, `MissingRequirement` ([type-parameters.md, "Obligations under assumptions"](type-parameters.md#obligations-under-assumptions)) |
 
-The last is a rejection and not silence, because "no base here" is true of both it and the second. A collection that merely failed to narrow would leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position to strand, so nothing downstream would object either.
+A variant's rejection, and a collection's by every trait but `Iterable`, is not silence, because "no
+base here" is true of both it and the second row. A collection that merely failed to narrow would
+leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position to strand, so nothing
+downstream would object either.
 
 A position that stays in the second row for the whole program — nothing ever determines it — is not a rejection either. Its obligation simply never narrows, and the variable is reported as unresolved rather than as a missing instance.
 
@@ -3237,7 +3292,8 @@ base a lower bound offers is the base the watched variable resolves to. `extrude
 
 `link_watches` replays what the lower variable already carries when it links an obligation to it: its
 bases, and its type parameters, so an operator on an unbounded parameter is refused whichever edge
-arrives first.
+arrives first. An obligation that reads collections is also given the variable's structural bounds,
+lower and upper ([A collection is answered off the table](#a-collection-is-answered-off-the-table)).
 
 That the list is closed is an argument about today's code, not something the compiler enforces, and a missed delivery is quiet: the obligation never narrows, so a type is left undetermined and surfaces phases later on an interior node. `verify_narrowing_is_complete` checks the argument instead of trusting it — after emission, every watched operand is resolved against the completed graph, and a resolved base must already have narrowed its obligation. `a_concrete_operand_reaches_its_obligation` has a case per mechanism, except the barrier-variable copies, which no case reaches with a watch on them.
 

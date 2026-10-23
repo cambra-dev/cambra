@@ -1800,3 +1800,35 @@ fn orderable_requires_equatable() {
         "No requirement states that `T` is Equatable",
     );
 }
+
+/// A nominal type a module makes `Iterable`, whose `Elements` is the list it wraps.
+const BAG: &str = indoc! {"
+    type Bag = List(Int)
+    impl Iterable(Bag, Elements=List(Int)):
+        def elements(b):
+            b.extract()
+"};
+
+/// A loop walks its source's `Elements`: an instance's `elements` for a nominal type, and the
+/// collection itself for a structural one, which the instance in scope does not answer for
+/// (`docs/chl-spec.md`, "Trait requirements").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_comprehension_over_the_type("sum([x + 1 for x in Bag::new(box([1, 2, 3]))])", 9)]
+#[case::a_called_elements(
+    "sum([x for x in summon(Iterable(_))::elements(Bag::new(box([1, 2])))])",
+    3
+)]
+#[case::a_structural_collection_beside_the_instance("sum([x for x in [4, 5]])", 9)]
+#[case::a_structural_elements_is_the_identity("sum(summon(Iterable(_))::elements([4, 5]))", 9)]
+#[case::a_definition_over_either(
+    indoc! {"
+        def total(c):
+            sum([x for x in c])
+        total(Bag::new(box([1, 2, 3]))) + total([4, 5])
+    "},
+    15
+)]
+fn a_loop_walks_its_sources_elements(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(&format!("{BAG}\n{code}"), Value::Int(expected));
+}

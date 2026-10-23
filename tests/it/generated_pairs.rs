@@ -52,11 +52,15 @@ use panic_message::panic_message;
 /// outside this list and [`UNDEFINED`] to agreement and every cell here to its kind, so a fix
 /// that makes one agree removes it, and a cell that starts failing another way fails the grid.
 const BROKEN: &[(&str, &str, &str)] = &[
+    ("function_body", "groupby_sum", "CompilerRejects"),
     ("function_body", "rows_sum", "CompilerPanics"),
+    ("generator_yield", "groupby_sum", "CompilerRejects"),
     ("generator_yield", "rows_sum", "CompilerPanics"),
     ("groupby_tuple_key", "rec_comp", "CompilerPanics"),
     ("groupby_tuple_key", "rec_filtered", "CompilerPanics"),
     ("groupby_tuple_key", "rec_list", "CompilerPanics"),
+    ("lambda_body", "groupby_sum", "CompilerPanics"),
+    ("lambda_body_in_loop", "groupby_sum", "CompilerPanics"),
     (
         "loop_source_in_loop",
         "binder_filtered_comp[i]",
@@ -76,6 +80,8 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("nested_mut_source", "map_arrow", "CompilerPanics"),
     ("nested_mut_source", "map_lit", "CompilerPanics"),
     ("nested_mut_source", "union", "CompilerRejects"),
+    ("nominal_key_groupby", "groupby_sum", "CompilerPanics"),
+    ("nominal_key_join", "groupby_sum", "CompilerRejects"),
     ("nominal_key_join", "rows_sum", "CompilerPanics"),
     ("record_in_list", "comp_sum", "CompilerRejects"),
     ("record_in_list", "filtered_sum", "CompilerRejects"),
@@ -100,6 +106,7 @@ const BROKEN: &[(&str, &str, &str)] = &[
         "terminal_in_agg[pool]",
         "CompilerRejects",
     ),
+    ("trait_instance_body", "groupby_sum", "CompilerRejects"),
     ("trait_instance_body", "rows_sum", "CompilerPanics"),
     ("txn_reply", "generator_max", "CompilerRejects"),
     ("txn_write_rhs", "generator_max", "CompilerRejects"),
