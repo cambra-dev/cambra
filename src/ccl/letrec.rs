@@ -35,6 +35,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::ccl::{Builtin, Name, ProjKey, TypedBinding, TypedExpr, TypedExprNode};
+use crate::util::cyclic_components;
 
 /// A non-causal cycle in a letrec group's reference graph: following these
 /// bindings' bodies leads back to the start without ever passing through a
@@ -91,22 +92,28 @@ pub fn check_letrec_causal(
     // contains at least one reference to binding `j` outside a guard's
     // history slot. (Causal-only edges never appear here — an edge is
     // causal exactly when *every* reference along it is causal.)
-    let noncausal: Vec<BTreeSet<usize>> = bindings
+    // Each list is in ascending index order, which fixes the order the
+    // cycles, and so the errors, come out in (`cyclic_components`).
+    let noncausal: Vec<Vec<usize>> = bindings
         .iter()
         .map(|(_, def)| {
             let mut refs = BTreeSet::new();
             collect_noncausal_refs(def, &group, &mut refs);
-            refs.iter().map(|n| index_of[n]).collect()
+            let targets: BTreeSet<usize> = refs.iter().map(|n| index_of[n]).collect();
+            targets.into_iter().collect()
         })
         .collect();
 
-    let errors: Vec<LetRecCausalityError> = noncausal_cycles(&noncausal)
+    let errors: Vec<LetRecCausalityError> = cyclic_components(&noncausal)
         .into_iter()
-        .map(|component| LetRecCausalityError {
-            cycle: component
-                .into_iter()
-                .map(|i| bindings[i].0.name.clone())
-                .collect(),
+        .map(|mut component| {
+            component.sort_unstable();
+            LetRecCausalityError {
+                cycle: component
+                    .into_iter()
+                    .map(|i| bindings[i].0.name.clone())
+                    .collect(),
+            }
         })
         .collect();
     if errors.is_empty() {
@@ -330,75 +337,6 @@ fn with_shadowed(live: &BTreeSet<Name>, names: &[Name], f: impl FnOnce(&BTreeSet
     }
 }
 
-/// The cyclic strongly connected components of the non-causal-edge subgraph:
-/// every SCC with more than one node, plus every single node with a
-/// self-loop. Each is one violation of "the non-causal subgraph is acyclic".
-/// Tarjan's algorithm; components come out with members in index order.
-fn noncausal_cycles(adj: &[BTreeSet<usize>]) -> Vec<Vec<usize>> {
-    struct Tarjan<'a> {
-        adj: &'a [BTreeSet<usize>],
-        index: Vec<Option<usize>>,
-        lowlink: Vec<usize>,
-        on_stack: Vec<bool>,
-        stack: Vec<usize>,
-        next_index: usize,
-        cycles: Vec<Vec<usize>>,
-    }
-    impl Tarjan<'_> {
-        fn visit(&mut self, v: usize) {
-            self.index[v] = Some(self.next_index);
-            self.lowlink[v] = self.next_index;
-            self.next_index += 1;
-            self.stack.push(v);
-            self.on_stack[v] = true;
-            for &w in &self.adj[v] {
-                match self.index[w] {
-                    None => {
-                        self.visit(w);
-                        self.lowlink[v] = self.lowlink[v].min(self.lowlink[w]);
-                    }
-                    Some(w_index) if self.on_stack[w] => {
-                        self.lowlink[v] = self.lowlink[v].min(w_index);
-                    }
-                    Some(_) => {}
-                }
-            }
-            if self.lowlink[v] == self.index[v].expect("v was just indexed") {
-                let mut component = Vec::new();
-                loop {
-                    let w = self.stack.pop().expect("SCC stack underflow");
-                    self.on_stack[w] = false;
-                    component.push(w);
-                    if w == v {
-                        break;
-                    }
-                }
-                let is_cycle = component.len() > 1 || self.adj[v].contains(&v);
-                if is_cycle {
-                    component.sort_unstable();
-                    self.cycles.push(component);
-                }
-            }
-        }
-    }
-    let n = adj.len();
-    let mut t = Tarjan {
-        adj,
-        index: vec![None; n],
-        lowlink: vec![0; n],
-        on_stack: vec![false; n],
-        stack: Vec::new(),
-        next_index: 0,
-        cycles: Vec::new(),
-    };
-    for v in 0..n {
-        if t.index[v].is_none() {
-            t.visit(v);
-        }
-    }
-    t.cycles
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +460,22 @@ mod tests {
         let errs = check_letrec_causal(&bindings).expect_err("time slot is non-causal");
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].cycle, vec![Name::raw("x")]);
+    }
+
+    /// Two disjoint cycles come out in the order `cyclic_components` documents:
+    /// neither reaches the other, so the search finishes them in successor
+    /// order. `root` lists `z` (index 1) before `y` (index 2), so `[z]` comes
+    /// first.
+    #[test]
+    fn noncausal_cycles_are_reported_in_search_order() {
+        let bindings = vec![
+            binding("root", add(Expr::var("z"), Expr::var("y"))),
+            binding("z", add(Expr::var("z"), int(1))),
+            binding("y", add(Expr::var("y"), int(1))),
+        ];
+        let errs = check_letrec_causal(&bindings).expect_err("two non-causal self-loops");
+        let cycles: Vec<Vec<Name>> = errs.into_iter().map(|e| e.cycle).collect();
+        assert_eq!(cycles, vec![vec![Name::raw("z")], vec![Name::raw("y")]]);
     }
 
     /// A fully-non-causal two-binding cycle is rejected, reporting both names.
