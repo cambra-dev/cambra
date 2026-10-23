@@ -61,8 +61,8 @@
 //! # Vocabulary
 //!
 //! Throughout this module, a **channel** is the expression that
-//! resolves a deferred binding: the value the cluster's let-wrap
-//! ultimately binds to `d_i`.  For a single `<<` feed the channel is
+//! resolves a deferred binding: the value the cluster's letrec group
+//! binds to `d_i`.  For a single `<<` feed the channel is
 //! that feed's value, lifted to `Fun(Unit, T)` at top level whatever `T`
 //! is; for multiple feeds it is their `++`-union; for feeds
 //! inside an iteration scope it is the companion `Apply`/`Compose`/
@@ -82,11 +82,11 @@
 //!    `++` ([`TypedExprNode::Copair`]); lift scalar feeds
 //!    to `Fun(Unit, T)`; emit refined-source channels for filter-feed
 //!    Case shapes.
-//! 3. **Topological emission.**  Emit the cluster's `let d_i =
-//!    <channel_i> in …` bindings at the cluster wrap site in
-//!    topological order — a defer whose channel references another
-//!    cluster defer is bound *after* the one it references
-//!    ([`bind_cluster_at_scope`]).
+//! 3. **Letrec emission.**  Bind the cluster's channels as one
+//!    `Feed`-kind `LetRec` group at the cluster wrap site
+//!    ([`bind_cluster_at_scope`]). Every channel is in scope of the
+//!    others, so the group needs no binding order.
+//!    [`check_letrec_causal`] rejects a reference cycle among them.
 //!
 //! There is deliberately no α-renaming step: uniquification runs before
 //! channelization, so a channel's captured free variable can never be shadowed
@@ -484,10 +484,9 @@ fn is_lift_shape(bound_expr: &Expr) -> bool {
 /// through any `ExprStmt`/`Let` chains).
 ///
 /// Rewrites to: `let y = Defer in body_x[x → y] with Var(y) replaced
-/// by body_y`.  The substitution `x → Var(y)` is done via
-/// [`channelize_substitute`], which also renames the *target* name of
-/// `Feed`/`Define` nodes when the replacement is a `Var` — so
-/// `Feed("x", …)` becomes `Feed("y", …)` automatically.
+/// by body_y`.  The rename `x → y` is done via [`channelize_rename`],
+/// which also renames the target name of `Feed`/`Define` nodes, so
+/// `Feed("x", …)` becomes `Feed("y", …)`.
 ///
 /// Also handles an optional `ExprStmt` prefix on `bound_expr`: the
 /// heads of any leading ExprStmts become a prefix that's prepended to
@@ -740,21 +739,12 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
     }
 }
 
-/// Substitute every free `Var(name)` in `expr` with `replacement`.
-///
-/// Replace every free occurrence of `Var(name)` with `replacement` during
-/// channelization, renaming `Feed`/`Define` targets along the way: when
-/// `replacement` is a `Var(new_name)`, handle uses of `name` become
-/// `new_name` — the α-renaming that makes alias-inlining for defer handles
-/// correct.
+/// Rename every free occurrence of `from` in `expr` to `to`: `Var`s,
+/// `Feed`/`Define` targets, and refinement predicates in type slots (`Cast`
+/// targets, annotations). A binder of `from` ends the rename in its scope.
 ///
 /// A thin wrapper over the uniform engine's in-place mode
-/// ([`crate::ccl::subst::Subst::rewrite_expr`]). Unlike the pre-port
-/// version, the engine also rewrites type-carried refinement predicates
-/// (`Cast` targets, annotations), so a channelize rename now reaches a
-/// predicate that closes over the renamed binder instead of leaving a stale
-/// reference; and a `Case` pattern binding correctly shadows `name` in its
-/// branch.
+/// ([`crate::ccl::subst::Subst::rewrite_expr`]).
 fn channelize_rename(expr: Expr, from: &Name, to: &Name) -> Expr {
     let mut expr = expr;
     // A **rename**, not a discharge of a bare variable. Both rewrite the same
@@ -1479,9 +1469,8 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
 
 /// Recursively walk `expr`, looking for `let d = Defer in body` bindings.
 ///
-/// When found, processes the binding via [`channelize_defer`] (feed path) or
-/// inlines the define value directly (define path).  All other nodes are
-/// recursed into structurally.
+/// When found, collects the cluster of consecutive defers and processes it via
+/// [`channelize_cluster`].  All other nodes are recursed into structurally.
 fn channelize_expr(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located<DeferError>> {
     // One stack frame per node over the whole tree; grow on demand, as the other
     // pass-level walks do.
@@ -1505,10 +1494,9 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
             body,
         } if matches!(bound_expr.node, TypedExprNode::Defer) => {
             // Collect the entire cluster of consecutive `let d_i = Defer`
-            // bindings so they can be channelized together with
-            // topological ordering — cross-defer channel references like
-            // `define(x, y)` work in either direction only when the
-            // emitted let-chain orders bindings by their data dependencies.
+            // bindings so their channels bind as one letrec group, each in
+            // scope of the others: cross-defer channel references like
+            // `define(x, y)` then resolve in either direction.
             //
             // Stripping one defer at a time and stacking the bindings in
             // processing order breaks for at least one of `x ≪= y; y ≪=
@@ -1581,7 +1569,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                 // Read before the lift consumes the binding.
                 let (outer, lvl) = handle_chan_dom(&binding.ty)
                     .unwrap_or_else(|| (binding.name.clone(), crate::ccl::ChanLevel(0)));
-                // The lift *mints*: `channelize_substitute` replaces the inner
+                // The lift *mints*: `replace_result_var` replaces the inner
                 // scope's trailing `Var` with the outer body, and any `ExprStmt`
                 // prefix is rebuilt onto the lifted spine. Those products stand in
                 // for this `let`, which the lift consumes, so the recording names it.
@@ -1731,17 +1719,13 @@ fn handle_element(ty: &Type) -> Option<Type> {
 /// Process a cluster of consecutive `let d_i = Defer in …` bindings.
 ///
 /// Walks `body` once per defer to extract its feeds/defines, then emits
-/// the bindings at the body's terminal in *topological order* — a defer
-/// whose channel value references another cluster defer is bound *after*
-/// the referenced defer.  This makes both `x ≪= y; y ≪= [0, 1]` (x
-/// depends on y) and `x ≪= [0, 1]; y ≪= x` (y depends on x) emit a
-/// well-scoped let-chain without requiring letrec or substitution.
+/// the channels as one `Feed`-kind letrec group ([`bind_cluster_at_scope`]),
+/// so both `x ≪= y; y ≪= [0, 1]` and `x ≪= [0, 1]; y ≪= x` are well scoped.
 ///
-/// Each defer's channel is built using the same rules as
-/// [`channelize_defer`]: a single feed passes through, multiple feeds
-/// union via [`TypedExprNode::Copair`], a `Define` value is
-/// used directly, and top-level scalar feeds are lifted to `Fun(Unit,
-/// T)` via the `λ __unused → V` wrap inside `extract_for_defer`.
+/// A single feed is the channel itself; multiple feeds union via
+/// [`TypedExprNode::Copair`]; a `Define` value is used directly; a top-level
+/// scalar feed is lifted to `Fun(Unit, T)` by the `λ __unused → V` wrap
+/// inside `extract_for_defer`.
 fn channelize_cluster(
     defer_names: &[Name],
     chan_names: &HashMap<Name, Name>,
@@ -1827,8 +1811,7 @@ fn channelize_cluster(
     assert_no_shadowed_captures(&rewritten, &channels);
     // The cluster becomes a **mutually-scoped `Feed`-kind letrec group** —
     // the model's "feeds are the letrec's outputs" — so binding order inside
-    // the group is immaterial and no topological sort is needed at emission.
-    // What a sort used to reject, the letrec causality rule now rejects:
+    // the group is immaterial. The letrec causality rule rejects a cycle:
     // channels carry no guard, so a reference cycle among them
     // (`x <<= y; y <<= x`) has no well-founded solution — the same law that
     // governs overwrite recursion, applied by the same checker.
@@ -1860,8 +1843,8 @@ fn channelize_cluster(
 /// Debug invariant: channelization relies on **Barendregt uniqueness**
 /// (`uniquify` runs before it), so a channel's captured free variable is never
 /// rebound by a `Let` on the wrap-to-feed spine — a body binder and a captured
-/// outer variable never share a `uid`, so the emitted `let d = channel` can't
-/// be shadow-captured. (A channel legitimately referencing a body-*internal*
+/// outer variable never share a `uid`, so a channel bound in the emitted
+/// letrec group can't be shadow-captured. (A channel legitimately referencing a body-*internal*
 /// binding — e.g. an accumulator — is excluded: such a name is bound in
 /// `body`, hence not free in it, so it never lands in the checked set.) A
 /// violation would mean a duplicate binder `uid` reached channelization (e.g. an
@@ -1903,8 +1886,8 @@ fn assert_no_shadowed_captures(body: &Expr, channels: &HashMap<Name, Expr>) {
 }
 
 /// Walk `expr` through `Let` / `ExprStmt` bodies to the scope where the
-/// cluster's `let d_i = channel_i` bindings belong, then emit them there in
-/// topological order ([`emit_cluster_then`]). The bindings land at the body's
+/// cluster's letrec group belongs, then emit it there
+/// ([`emit_cluster_letrec`]). The bindings land at the body's
 /// terminal, *or* earlier — just above the first `Let` whose bound expression
 /// references a cluster name — so a cross-referencing defer is always bound
 /// before its use (the cross-cluster case in the module docs).
@@ -2450,7 +2433,7 @@ fn extract_for_defer_impl(
             TypedExprNode::Lit(Lit::Unit)
         }
         // Pass through Feed/Define for *other* defers — they'll be processed
-        // by a different `channelize_defer` call.
+        // by a different `extract_for_defer` call.
         node @ (TypedExprNode::Feed { .. } | TypedExprNode::Define { .. }) => node,
         // Channelization runs *before* lambda elimination (see
         // `design/lowering.md`, "The `channelize` step (feed channelization)"), and
