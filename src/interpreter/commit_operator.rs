@@ -5096,8 +5096,8 @@ fn one_component(position: Position) -> Path {
 ///
 /// The driver reads the source when it has news and answers every other pull from this, so
 /// a pull that emits one position costs that position rather than the rows still to come.
-/// Both maps shed what the driver passes: an emitted position leaves `items`, and a
-/// release leaves neither.
+/// Both maps shed what the driver passes: the induction driver's emitted position leaves
+/// `items`, and a release leaves both.
 #[derive(Default)]
 struct DecodedSource {
     /// The items the source delivers, in drive order ([`decode_source_paths`]).
@@ -5109,6 +5109,21 @@ struct DecodedSource {
 }
 
 impl DecodedSource {
+    /// What `src` holds, with `levels_above` collection levels standing above its positions.
+    fn read(src: &Tile, levels_above: usize) -> Self {
+        Self {
+            items: decode_source_paths(src, levels_above + 1)
+                .into_iter()
+                .collect(),
+            held: src
+                .paths_at(CurryLevel::new(levels_above))
+                .into_iter()
+                .map(Path::from)
+                .collect(),
+            terminal: src.is_terminal(),
+        }
+    }
+
     /// The smallest delivered path above `after`.
     fn next_delivered(&self, after: Option<&Path>) -> Option<&Path> {
         let from = after.map_or(Unbounded, Excluded);
@@ -5316,17 +5331,7 @@ impl TileProducer for InductionDriverProducer {
             let src = self
                 .source_producer
                 .get(self.source_producer.tiling().universal_guard());
-            self.source = DecodedSource {
-                items: decode_source_paths(&src, levels_above + 1)
-                    .into_iter()
-                    .collect(),
-                held: src
-                    .paths_at(CurryLevel::new(levels_above))
-                    .into_iter()
-                    .map(Path::from)
-                    .collect(),
-                terminal: src.is_terminal(),
-            };
+            self.source = DecodedSource::read(&src, levels_above);
             // The rows of one level the source will gain no more items beneath — one of the
             // two halves of a row being answerable as a whole, `rows_folded_at` below being
             // the other. Read at the level itself: a standing level's rows are not the level
@@ -5751,6 +5756,9 @@ impl TileOperator for TransactDriver {
             .sharing(inputs.gate),
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
+            source_news: inputs.source_news,
+            source: DecodedSource::default(),
+            source_complete: Predicate::False,
             consumer: inputs.consumer,
             wakeups: scheduler.wakeup_queue(),
             read_keys: self.read_keys.clone(),
@@ -5773,6 +5781,12 @@ struct TransactDriverProducer {
     base: ProducerBase,
     store_producer: Box<dyn TileProducer>,
     source_producer: Box<dyn TileProducer>,
+    /// Whether the source has notified since it was last read.
+    source_news: Notified,
+    /// The source as of its last read, with a position a path of one component.
+    source: DecodedSource,
+    /// What the source called complete as of its last read.
+    source_complete: Predicate,
     /// This driver's consumer, re-armed through [`wakeups`](Self::wakeups) while a
     /// transaction remains to attempt — the one-step-per-pull cycle driver. The
     /// cycle is its own trigger: an attempt becomes emittable when the store's
@@ -5844,6 +5858,7 @@ impl TransactDriverProducer {
                 Predicate::at_or_below_in(through.value().clone(), &self.source_positions());
             self.source_producer
                 .release(TileGuard::Function(FunctionGuard::Domain(prefix)));
+            self.source.forget_through(&one_component(through.clone()));
             self.source_released_through = Some(through);
         }
     }
@@ -5897,41 +5912,60 @@ impl TileProducer for TransactDriverProducer {
     impl_producer_base!();
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // Re-read the source each pull: a live source (an HTTP request stream)
-        // grows over time, and positions are absolute, so `get` returns whatever
-        // the source still offers under stable append-only positions. The drive
-        // does release a prefix — `release_impl` withdraws each item as it
-        // finishes — so what is offered shrinks off the front, which is why an
-        // item is named by its domain position rather than by a column index.
-        let src = self
-            .source_producer
-            .get(self.source_producer.tiling().universal_guard());
+        // Read the source when it has notified, and not otherwise: a live source (an HTTP
+        // request stream) grows over time under stable append-only positions, a tile only
+        // grows between its notifications and the drive's own releases, and a release removes
+        // what the driver has finished with, so the last read still answers. The drive
+        // releases a prefix — `release_impl` withdraws each item as it finishes — which is why
+        // an item is named by its domain position rather than by a column index. Without the
+        // cache each pull decodes and sorts every item not yet released.
+        if self.source_news.take() {
+            let src = self
+                .source_producer
+                .get(self.source_producer.tiling().universal_guard());
+            self.source = DecodedSource::read(&src, 0);
+            self.source_complete = match &src {
+                Tile::DataFunction {
+                    domain_predicate, ..
+                } => domain_predicate.clone(),
+                _ => Predicate::False,
+            };
+            // A source may honour a release a pull late, so a read can still show what the
+            // drive has already released.
+            if let Some(released) = &self.source_released_through {
+                self.source.forget_through(&one_component(released.clone()));
+            }
+            // Invariant: no item at or below the attempt cursor arrives after the drive has
+            // passed it, unless a release already covers it. A filtered row is released
+            // without moving the cursor, so the cursor can lag the release.
+            debug_assert!(
+                self.source
+                    .items
+                    .keys()
+                    .all(|p| { self.current.as_ref().is_none_or(|c| p[0] > *c.value()) }),
+                "transaction source delivered an item at or below the attempt cursor {:?}: {:?}",
+                self.current,
+                self.source.items.keys().collect::<Vec<_>>()
+            );
+        }
         // The source is *complete* only when its tile is terminal. A batch source
         // (a list) is terminal on the first pull; a live source (an HTTP request
         // stream) never is, so a momentarily drained one must not read as done.
-        let source_complete = src.is_terminal();
+        let source_complete = self.source.terminal;
         // Positioned, so an item is named by where it sits in the source's own
         // domain rather than by where it sits in the columns still on offer. The
-        // lowest position at or above the cursor is the next item: the cursor is
+        // lowest position above the cursor is the next item: the cursor is
         // the attempt in flight until its ack, and the ack both advances it and
         // withdraws the position from the source.
-        let items = decode_source_positioned(&src);
-        let next_item = items
-            .iter()
-            .find(|(pos, _)| self.current.as_ref().is_none_or(|c| pos > c));
+        let current = self.current.clone().map(one_component);
+        let next_item = self.source.next_delivered(current.as_ref()).cloned();
         // A filtered row is finished once the drive reads past it: nothing attempts it, so no
         // ack releases it. The attempt in flight, if any, is the next item, so it stays
         // offered.
-        let complete = match &src {
-            Tile::DataFunction {
-                domain_predicate, ..
-            } => domain_predicate.clone(),
-            _ => Predicate::False,
-        };
         let read_through = source_read_through(
-            &src,
-            next_item.map(|(pos, _)| pos),
-            &complete,
+            &self.source.held,
+            next_item.as_ref(),
+            &self.source_complete,
             &self.source_positions(),
         );
         self.release_source_through(read_through);
@@ -5948,11 +5982,12 @@ impl TileProducer for TransactDriverProducer {
             .map(|k| store_current(&store, k).map(|(_, v)| v))
             .collect();
 
-        if let Some((pos, item)) = next_item
+        if let Some(path) = &next_item
             && let Some(frontier) = frontier
+            && let pos = Position::new(path[0].clone())
             && self.latest_emit.as_ref() != Some(&(pos.clone(), frontier.clone()))
         {
-            let (pos, item) = (pos.clone(), item.clone());
+            let item = self.source.items[path].clone();
             // The body reads snapshot position `i` as `p.i`. A read key with no
             // value yet gets the item as a stand-in of the right extent. Load-
             // bearing assumption: a body that writes an *absent* key is
@@ -6190,10 +6225,10 @@ fn last_position_below(
     positions.into_iter().filter(|p| p < bound).max()
 }
 
-/// The highest position of `src` a drive has read past without running it: one the tile
+/// The highest position of `held` a drive has read past without running it: one the source
 /// holds, filtered rows included, below `next` (the next position the drive will run, or
-/// `None` when there is none), and which the source calls complete along with every position
-/// before it.
+/// `None` when there is none), and which the source calls `complete` along with every position
+/// before it. `held` and `next` are paths of one component.
 ///
 /// A filtered row stays in the tile, marked deleted, and the drive never runs it, so no
 /// decision or ack releases it; the drive releases it on reading past it. The completeness
@@ -6201,16 +6236,16 @@ fn last_position_below(
 /// out of order may still send a position below one it holds, and a drive placed across a
 /// reload resumes past whatever its predecessor released.
 fn source_read_through(
-    src: &Tile,
-    next: Option<&Position>,
+    held: &BTreeSet<Path>,
+    next: Option<&Path>,
     complete: &Predicate,
     positions: &Extent,
 ) -> Option<Position> {
-    domain_positions(src)
-        .into_iter()
-        .filter(|p| next.is_none_or(|n| p < n))
-        .filter(|p| complete.subsumes(&Predicate::at_or_below_in(p.value().clone(), positions)))
-        .max()
+    // A position complete along with everything before it, so the highest such position
+    // below `next` is the first one found from above.
+    held.range::<Path, _>((Unbounded, next.map_or(Unbounded, Excluded)))
+        .rfind(|p| complete.subsumes(&Predicate::at_or_below_in(p[0].clone(), positions)))
+        .map(|p| Position::new(p[0].clone()))
 }
 
 /// Every position of a collection tile's domain. Empty for any other tile.
