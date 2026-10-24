@@ -363,11 +363,12 @@ pub(super) trait Typing {
     /// binder, whose channel is keyed by the loop's position, so the binder is `𝑘 ▷ source`
     /// at the key `𝑘` ([`InferCtx::require_feed`](super::context::InferCtx::require_feed)).
     /// `position_binder` is the loop's position, the binder of `λ 𝑟 → (𝑟 ▷ source) ▷ (λ 𝑥 →
-    /// body)`, which is `𝑘` there. Check trusts the recorded types and keeps nothing.
+    /// body)` or a `for` loop's `position`, which is `𝑘` there. Check trusts the recorded
+    /// types and keeps nothing.
     fn note_loop_source(
         &mut self,
         _binder: &Name,
-        _position_binder: Option<&Name>,
+        _position_binder: &Name,
         _source: &Expr,
         _position: &Type,
         _item: &Type,
@@ -460,6 +461,16 @@ pub(super) trait Typing {
     fn as_function(
         &mut self,
         t: &Type,
+        at: &dyn Fn() -> String,
+    ) -> Result<(Type, Type), LocatedInferError>;
+
+    /// [`Typing::as_function`] for a consumer binding `binder` to each position: the
+    /// codomain is spelled at `binder`, so an element type that reads its position reads
+    /// `binder`. The consumer puts `binder` in scope over the codomain.
+    fn as_function_at(
+        &mut self,
+        t: &Type,
+        binder: &Name,
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError>;
 
@@ -566,14 +577,27 @@ pub(super) trait Typing {
     /// that never meet: a collection reaching both mints its own index at each
     /// ([`crate::ccl::ty::FunKindVar::binder_ids`]), every arm renames onto both, and the
     /// two names arrive at one position with nothing relating them.
+    ///
+    /// `recorded` is the application's own type, which Check reads instead of discharging
+    /// again where [`Typing::reads_recorded_dependent_results`] says so.
     fn apply(
         &mut self,
         fn_ty: &Type,
         arg_ty: &Type,
         argument: &Expr,
+        recorded: &Type,
         kind: Option<&crate::ccl::ty::FunKind>,
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError>;
+
+    /// Whether a result whose rebuilt type would quote a term, a dependent application's, a
+    /// chain's that names its positions, a `let`'s whose body reads its binder, or a
+    /// `Transact`'s whose taps read their rows, is the type the pass recorded. True for Check
+    /// after planning, which respells the terms such a type quotes (`src/ccl/design/type-inference.md`, "After planning, a dependent
+    /// result is the recorded one"). The edges into the result are checked either way.
+    fn reads_recorded_dependent_results(&self) -> bool {
+        false
+    }
 
     /// The value a keyed access `𝑐[𝑘]` reads: `codomain` with the collection's key
     /// binder discharged to the key term, or `codomain` unchanged when the collection's

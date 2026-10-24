@@ -442,7 +442,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // `target` is the only place the type is visible, so render it inline.
         // `Realize` renders as `realize(value)`: born after inference, so its target is
         // always `expr.ty` and inlining it would duplicate what callers already suffix.
-        TypedExprNode::Realize { value, .. } => (
+        TypedExprNode::Realize(value) => (
             Precedence::Atom,
             format!("realize({})", fmt(value, Precedence::Lowest, opts)),
         ),
@@ -642,8 +642,10 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             )
         }
 
-        // Direct-mirror statement loop: `for i in xs do body`.
-        TypedExprNode::For { target, iter, body } => (
+        // Direct-mirror statement loop: `for i in xs do body`. The position is the compiler's.
+        TypedExprNode::For {
+            target, iter, body, ..
+        } => (
             Precedence::Lowest,
             format!(
                 "for {} in {} do {}",

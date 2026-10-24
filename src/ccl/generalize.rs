@@ -1210,11 +1210,10 @@ fn drop_facts_naming(
 /// parameters outside their `Poly`. A generalized parameter comes only from a parametric builtin's
 /// type, so a morphism built from such parts is generic in it the same way.
 pub(crate) fn close_free_params(root: &mut crate::ccl::Expr) {
+    // A parameter whose `Poly` a pass replaced is declared again from its own bound
+    // (`close_go`), so a tree declaring none can still read one.
     let mut declared = HashMap::new();
     collect_params(root, &mut declared);
-    if declared.is_empty() {
-        return;
-    }
     close_go(root, &declared);
 }
 
@@ -1270,7 +1269,7 @@ fn close_go(e: &mut crate::ccl::Expr, declared: &HashMap<TypeParamId, crate::ccl
 }
 
 /// The generalized parameters `ty` reads that no `Poly` in it binds, in first-occurrence order.
-fn free_params(ty: &Type) -> Vec<Rc<crate::ccl::ty::TypeParam>> {
+pub(crate) fn free_params(ty: &Type) -> Vec<Rc<crate::ccl::ty::TypeParam>> {
     fn go(ty: &Type, bound: &mut Vec<TypeParamId>, out: &mut Vec<Rc<crate::ccl::ty::TypeParam>>) {
         match ty {
             Type::Param(p)

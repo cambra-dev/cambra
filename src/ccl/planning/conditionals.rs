@@ -592,20 +592,12 @@ fn realize(
     // sum opened, the witness still named — and realizing that without an assertion shifts
     // the enclosing composition's domain from the witness to the union. The condition is
     // therefore about what the type *says*, not which constructor says it.
-    // The realization stages the conditional it replaces, so a type quoting the conditional
-    // (a consumer's `σ₁(𝑐)`) and this node compare as one term: normal form reads a `Realize`
-    // as what it stages.
-    let staged = Rc::new(std::mem::take(expr));
     let asserted = if mentions_witness {
         original
     } else {
         union.ty.clone()
     };
-    *expr = Expr::new(TypedExprNode::Realize {
-        value: Box::new(union),
-        staged,
-    })
-    .with_ty(asserted);
+    *expr = Expr::new(TypedExprNode::Realize(Box::new(union))).with_ty(asserted);
     true
 }
 
@@ -1097,7 +1089,7 @@ mod tests {
             expr.ty
         );
         assert!(
-            matches!(expr.node, TypedExprNode::Realize { .. }),
+            matches!(expr.node, TypedExprNode::Realize(_)),
             "the assertion is carried by a `Realize` node, got {:?}",
             expr.node
         );

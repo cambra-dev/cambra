@@ -271,9 +271,8 @@ pub(super) struct InferCtx {
 
 /// A loop variable's source, as a feed crossing the variable reads it at the channel's key.
 struct LoopSource {
-    /// The binder of the source's type where it is dependent: the chain scopes it over the
-    /// loop's body, and it names the position ([`Typing::note_loop_source`]).
-    position_binder: Option<Name>,
+    /// The loop's position, bound over its body ([`Typing::note_loop_source`]).
+    position_binder: Name,
     source: Expr,
     /// The type of the source's positions, its domain.
     position: Type,
@@ -1248,7 +1247,7 @@ impl InferCtx {
             .collect();
         let position_binders: Vec<&Name> = loops
             .iter()
-            .filter_map(|x| self.loop_sources[x].position_binder.as_ref())
+            .map(|x| &self.loop_sources[x].position_binder)
             .collect();
         let in_transaction = self
             .open_transactions
@@ -1336,13 +1335,10 @@ impl InferCtx {
                         source.clone_preserving_ids(),
                     )
                     .with_ty(item.clone());
-                    std::iter::once((x.clone(), read))
-                        .chain(
-                            position_binder
-                                .iter()
-                                .map(|b| (b.clone(), position.clone_preserving_ids())),
-                        )
-                        .collect::<Vec<_>>()
+                    [
+                        (x.clone(), read),
+                        (position_binder.clone(), position.clone_preserving_ids()),
+                    ]
                 })
                 .collect()
         };
@@ -1832,7 +1828,7 @@ impl Typing for InferCtx {
     fn note_loop_source(
         &mut self,
         binder: &Name,
-        position_binder: Option<&Name>,
+        position_binder: &Name,
         source: &Expr,
         position: &Type,
         item: &Type,
@@ -1840,7 +1836,7 @@ impl Typing for InferCtx {
         self.loop_sources.insert(
             binder.clone(),
             LoopSource {
-                position_binder: position_binder.cloned(),
+                position_binder: position_binder.clone(),
                 source: source.clone_preserving_ids(),
                 position: position.clone(),
                 item: item.clone(),
@@ -1993,6 +1989,22 @@ impl Typing for InferCtx {
         Ok((d, c))
     }
 
+    fn as_function_at(
+        &mut self,
+        t: &Type,
+        binder: &Name,
+        at: &dyn Fn() -> String,
+    ) -> Result<(Type, Type), LocatedInferError> {
+        // A named demand, as `apply`'s: the codomain edge relates `t`'s binder to `binder`,
+        // and the codomain is minted where `binder` is in scope.
+        let kind = crate::ccl::ty::FunKind::fresh_var();
+        let d = self.fresh_part(&kind);
+        let c = self.scoped(binder, &d, |ctx| ctx.fresh_part(&kind));
+        let shape = Type::pi_kinded(binder.clone(), d.clone(), c.clone(), kind);
+        self.require_sub(t, &shape, at)?;
+        Ok((d, c))
+    }
+
     fn provide_function(
         &mut self,
         t: &Type,
@@ -2061,6 +2073,7 @@ impl Typing for InferCtx {
         fn_ty: &Type,
         arg_ty: &Type,
         argument: &Expr,
+        _recorded: &Type,
         kind: Option<&crate::ccl::ty::FunKind>,
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError> {

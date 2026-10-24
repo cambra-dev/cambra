@@ -58,8 +58,7 @@ use crate::ccl::{
     BaseType, BindingTransparency, Branch, Builtin, Expr, F_WRITES, HistoryKind, Lit, Name, Type,
     TypedBinding, TypedExprNode,
     ccl_utils::{
-        COMMIT_SELECTOR, refresh_let_binder, strip_refinements, synthesize_arm_predicate,
-        typed_compose, unit_expr,
+        COMMIT_SELECTOR, refresh_let_binder, strip_refinements, synthesize_arm_predicate, unit_expr,
     },
     letrec::check_letrec_causal,
     provenance::{self, NodeId, RecordingGuard, RewriteLabel},
@@ -809,6 +808,7 @@ fn rewrite(mut expr: Expr) -> Expr {
     if let TypedExprNode::ExprStmt { expr: effect, body } = expr.node {
         let site = StmtSite::new(stmt_id, effect.node_id());
         if let TypedExprNode::For {
+            position,
             target,
             iter,
             body: loop_body,
@@ -831,7 +831,7 @@ fn rewrite(mut expr: Expr) -> Expr {
             // `body_has_feed` here to guess what `transform_loop` would decide
             // ~140 lines away.
             let _g = site.enter(LOOP_LABEL, provenance::Nature::Expansion);
-            return transform_loop(site, target, *iter, *loop_body, *body);
+            return transform_loop(site, *position, target, *iter, *loop_body, *body);
         }
         // A `MutWrite` outside any `For` is a *sequential* mutation — a
         // top-level `cnt += 1`, or an inlined pass-by-reference writer
@@ -1446,7 +1446,7 @@ fn take_sources(e: &mut Expr, sources: &HashSet<Name>, out: &mut Vec<PrefixBindi
 /// The domain a loop over `iter` ranges over, spelled for types outside the source's own: a
 /// sum's witnesses projected through the source (`src/ccl/design/collections.md`, "A `for`
 /// loop over a sum"). A plain collection's domain is its own.
-fn loop_domain(iter: &Expr) -> Type {
+pub(crate) fn loop_domain(iter: &Expr) -> Type {
     let fun = source_fun(&iter.ty);
     let (domain, _) = fun_parts(&fun);
     let Some(witnesses) = fun.sum() else {
@@ -1705,6 +1705,7 @@ fn feed_each(defer: Name, collection: Expr) -> Expr {
 /// `__hist ≫ .__to_<feed>` feeding each value ([`hoist_feeds`]) for `channelize` to route.
 fn transform_loop(
     loop_site: StmtSite,
+    position: TypedBinding,
     target: TypedBinding,
     iter: Expr,
     loop_body: Expr,
@@ -1731,8 +1732,8 @@ fn transform_loop(
             // out by `channelize` into one refined-source channel per feeding arm —
             // the same path a non-transactional conditional feed takes. The
             // plain-map hoist below (`transform_feed_only_loop`) only handles
-            // straight-line feeds, so re-emit a conditional-feed loop as a generator
-            // `iter ≫ (λ target → body)` `Compose` for `channelize` to fan out,
+            // straight-line feeds, so re-emit a conditional-feed loop as the loop
+            // `λ 𝑟 → (𝑟 ▷ iter) ▷ (λ target → body)` at its position for `channelize` to fan out,
             // rather than flattening it here. (A mutable variable read in the feed value stays
             // in the arm value; `rewrite_as_of_reads` handles it post-channelize, as
             // for the straight-line read-only reply.)
@@ -1751,14 +1752,14 @@ fn transform_loop(
                 let body = strip_trailing_unit(loop_body.clone());
                 let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), body);
                 lambda.ty = Type::fun(target.ty.clone(), loop_body.ty.clone());
-                let map = typed_compose(vec![iter, lambda]);
+                let map = crate::ccl::ccl_utils::indexed_loop(Some(position.name), iter, lambda);
                 let cont = rewrite(cont);
                 let cont_ty = cont.ty.clone();
                 let mut stmt = Expr::expr_stmt(map, cont);
                 stmt.ty = cont_ty;
                 return stmt;
             }
-            return transform_feed_only_loop(loop_site, target, iter, loop_body, cont);
+            return transform_feed_only_loop(loop_site, &position, target, iter, loop_body, cont);
         }
         return rewrite(cont);
     }
@@ -1774,7 +1775,7 @@ fn transform_loop(
     // Fold the accumulators into a decision-factored history binding, then wrap it
     // in a nested `LetRec`: re-point the continuation's trailing reads at the
     // extracted finals, recurse into it, prepend the reads, and hoist the feeds.
-    let fold = fold_induction_loop(&target, &iter, loop_body, &value_tys);
+    let fold = fold_induction_loop(&position, &target, &iter, loop_body, &value_tys);
     let mut cont = cont;
     for (acc, x_final) in &fold.renames {
         rename_uses(&mut cont, acc, x_final);
@@ -1898,6 +1899,7 @@ impl InductionFold {
 /// the caller builds it over the widest tree it holds, so that a mutable variable read
 /// only *downstream* of the loop still contributes its `Mut(V, D)`.
 pub(crate) fn fold_induction_loop(
+    position: &TypedBinding,
     target: &TypedBinding,
     iter: &Expr,
     loop_body: Expr,
@@ -1910,7 +1912,15 @@ pub(crate) fn fold_induction_loop(
         "fold_induction_loop: caller must guard on a non-empty accumulator set"
     );
 
-    let (_, item_ty) = fun_parts(&iter.ty);
+    let r = position.name.clone();
+    // The item at the position: a group's reads its key.
+    let item_ty = {
+        let source = source_fun(&iter.ty);
+        let Type::Fun { name, codomain, .. } = &source else {
+            panic!("letrec phase: loop source is not a function: {source}")
+        };
+        crate::ccl::subst::codomain_renamed(name.as_ref(), &r, codomain)
+    };
     let domain_ty = loop_domain(iter);
     let acc_tys: Vec<Type> = accs.iter().map(|a| a.ty.clone()).collect();
     // The proposed write set, labelled by the accumulators' own names. A
@@ -1928,7 +1938,6 @@ pub(crate) fn fold_induction_loop(
     );
 
     let h = Name::fresh("__hist");
-    let r = Name::fresh("__pos");
     let p = Name::fresh("__p");
     let prev = Name::fresh("__prev");
 
@@ -2161,12 +2170,12 @@ pub(crate) fn fold_induction_loop(
 /// which is where the outer-indexed as-of join gets the position it reads at.
 fn transform_feed_only_loop(
     loop_site: StmtSite,
+    position: &TypedBinding,
     target: TypedBinding,
     iter: Expr,
     loop_body: Expr,
     cont: Expr,
 ) -> Expr {
-    let (domain_ty, _item_ty) = fun_parts(&iter.ty);
     let mut prefix: Vec<PrefixBinding> = Vec::new();
     let mut feeds: Vec<(Name, Expr, StmtSite)> = Vec::new();
     collect_feed_only(loop_body, &mut prefix, &mut feeds);
@@ -2189,18 +2198,17 @@ fn transform_feed_only_loop(
         let g = site.enter(FEED_LABEL, provenance::Nature::Expansion);
         loop_site.blamed_in(&g);
 
-        // The loop with this feed alone in its body, `iter ≫ (λ target → Feed(defer, value))`,
-        // which `channelize` routes as it does any loop's feed.
+        // The loop with this feed alone in its body,
+        // `λ 𝑟 → (𝑟 ▷ iter) ▷ (λ target → Feed(defer, value))`, which `channelize` routes as
+        // it does any loop's feed. Each binds a position of its own.
         let unit = Type::Base(BaseType::Unit);
         let mut feed = Expr::feed(defer, value);
         feed.ty = unit.clone();
         let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), feed);
-        lambda.ty = Type::fun(target.ty.clone(), unit.clone());
-        // A loop over the source is a read of `iter`, so it is whatever `iter` is.
-        let each = crate::ccl::ccl_utils::chain_typed(
-            vec![iter.clone(), lambda],
-            Type::fun_like(&iter.ty, domain_ty.clone(), unit),
-        );
+        lambda.ty = Type::fun(target.ty.clone(), unit);
+        let own = position.name.refreshed();
+        let lambda = Subst::rename(position.name.clone(), own.clone()).apply_expr(&lambda);
+        let each = crate::ccl::ccl_utils::indexed_loop(Some(own), iter.clone(), lambda);
         // As above: `expr_stmt` carries the continuation's type itself.
         body_out = Expr::expr_stmt(each, body_out);
     }
@@ -2833,6 +2841,7 @@ fn transform_chain(
                 // discharge against the read-your-writes environment in hand here,
                 // and each accumulator's new environment value is its final read.
                 TypedExprNode::For {
+                    position,
                     target,
                     iter,
                     body: inner_body,
@@ -2849,7 +2858,8 @@ fn transform_chain(
                     if inner_accs.is_empty() && !body_has_feed(&inner_body) {
                         return transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
                     }
-                    let fold = fold_induction_loop(&target, &iter, *inner_body, &value_tys);
+                    let fold =
+                        fold_induction_loop(&position, &target, &iter, *inner_body, &value_tys);
                     // Both halves of a binding: a binder's declared type is written in
                     // the enclosing scope, so an inner loop correlated with this one's
                     // binder carries it there too — in the refinement on its own iteration
@@ -3682,6 +3692,7 @@ mod tests {
         }
 
         let mut for_node = Expr::new(TypedExprNode::For {
+            position: Box::new(TypedBinding::new_unannotated(Name::fresh("pos"))),
             target: TypedBinding {
                 name: i.clone(),
                 ty: int.clone(),
@@ -3837,7 +3848,13 @@ mod tests {
         else {
             unreachable!("the introduction's body is the loop statement")
         };
-        let TypedExprNode::For { target, iter, body } = effect.node else {
+        let TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } = effect.node
+        else {
             unreachable!("the statement's effect is the loop")
         };
         // The write statement inside the loop body, and the marker that is its
@@ -3860,7 +3877,7 @@ mod tests {
                 "transact.cross_domain_fold",
                 provenance::Nature::Expansion,
             );
-            let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
+            let fold = fold_induction_loop(&position, &target, &iter, *body, &value_tys);
             let view = fold.acc_view(0);
             let mut ids = Vec::new();
             fn collect(e: &Expr, out: &mut Vec<NodeId>) {
@@ -3916,7 +3933,13 @@ mod tests {
         else {
             unreachable!("the introduction's body is the loop statement")
         };
-        let TypedExprNode::For { target, iter, body } = effect.node else {
+        let TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } = effect.node
+        else {
             unreachable!("the statement's effect is the loop")
         };
         // Both write statements, in spine order — the order `collect_writes`
@@ -3946,7 +3969,7 @@ mod tests {
                 "transact.cross_domain_fold",
                 provenance::Nature::Expansion,
             );
-            let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
+            let fold = fold_induction_loop(&position, &target, &iter, *body, &value_tys);
             assert_eq!(fold.accs.len(), 1, "two writes to one variable is one slot");
             assert_eq!(
                 fold.accs[0].writes.len(),

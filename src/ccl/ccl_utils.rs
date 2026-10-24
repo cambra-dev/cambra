@@ -634,11 +634,6 @@ pub(crate) fn predicate_term(term: &Expr) -> Expr {
 /// - a value `Case` eliminated over its input, `𝑥 ▷ (⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ))`, reads back
 ///   as `{ 𝑔ᵢ → 𝑥 ▷ 𝑒ᵢ }`, each guard its leg's first-match gate with the earlier guards peeled
 ///   off ([`read_fan_out`]);
-/// - a staged form reads as what it stages, since an application only reaches keys in its
-///   function's domain: `curry_over` as `curry` of its morphism; `𝑥 ▷ (𝑚 ▷ filter_values)`,
-///   `𝑥 ▷ (𝑝 ▷ iterate)` and `𝑥 ▷ (𝑐 ▷ map_domain)` as `𝑥`, and a chain `iterate ≫ 𝑓` as `𝑓`; `𝑎 ▷ (𝑓 ▷ strength_over)` as
-///   `λ 𝑘 → (𝑎, 𝑘 ▷ (𝑎 ▷ 𝑓))`; `𝑥 ▷ (𝑢 ▷ (𝑝 ▷ restrict))` as `𝑥`; and `𝑥 ▷ (𝑐 ▷ map(𝑔))` as
-///   `(𝑥 ▷ 𝑐) ▷ 𝑔`;
 /// - a projection out of a tuple or record former reads the component.
 ///
 /// Type-blind, as predicate equality is: type slots ride along, and the nodes the rewrite
@@ -660,11 +655,6 @@ fn normalize(mut e: Expr, fuel: &mut usize) -> Expr {
              either a reduction rule loops or the predicate outgrew the bound"
         )
     });
-    // A realization reads as the conditional it stages: its legs are that conditional's
-    // value, split by arm.
-    if let TypedExprNode::Realize { staged, .. } = &e.node {
-        return normalize(staged.clone_preserving_ids(), fuel);
-    }
     e.map_children(|c| normalize(c, fuel));
     reduce_head(e, fuel)
 }
@@ -686,27 +676,7 @@ fn reduce_head(e: Expr, fuel: &mut usize) -> Expr {
         TypedExprNode::Case {
             scrutinee: Some(_), ..
         } => match_by_tags(e),
-        // A chain headed by planning's `iterate` is the rest of the chain: `iterate` maps each
-        // key to itself, as it does applied.
-        TypedExprNode::Compose(steps) if steps.len() > 1 && is_iterate(&steps[0]) => {
-            let rest: Vec<Expr> = steps[1..].iter().map(Expr::clone_preserving_ids).collect();
-            match <[Expr; 1]>::try_from(rest) {
-                Ok([only]) => only,
-                Err(rest) => Expr::throwaway(TypedExprNode::Compose(rest)).with_ty(e.ty.clone()),
-            }
-        }
         _ => e,
-    }
-}
-
-/// Whether `e` is planning's `iterate`, bare or over its predicate (`𝑝 ▷ iterate`).
-fn is_iterate(e: &Expr) -> bool {
-    match &e.node {
-        TypedExprNode::Builtin(Builtin::Iterate) => true,
-        TypedExprNode::Apply { function, .. } => {
-            matches!(function.node, TypedExprNode::Builtin(Builtin::Iterate))
-        }
-        _ => false,
     }
 }
 
@@ -769,54 +739,8 @@ fn reduce_application(
                 };
                 Some(Expr::throwaway(node).with_ty(ty.clone()))
             }
-            // A staged form reads as what it stages. `curry_over` is `curry(𝑔)` with each
-            // row's keys beside it, and `𝑚 ▷ filter_values` is the identity restricted to the
-            // elements `𝑚` keeps. An application reaches only keys in its function's domain,
-            // which the type guarantees, so neither restriction changes the value read.
-            TypedExprNode::Builtin(Builtin::FilterValues) => Some(a()),
-            // Planning's other staging reads the same way. `iterate` and `map_domain` map
-            // each key to itself, and `strength_over` pairs its input with each value of the
-            // collection its function gives for it, under that value's key.
-            TypedExprNode::Builtin(Builtin::Iterate | Builtin::MapDomain) => Some(a()),
-            // An iteration source narrowed by a filter, `𝑢 ▷ (𝑝 ▷ restrict)`, maps each key it
-            // keeps to itself, as its upstream does.
-            TypedExprNode::Apply {
-                function: restrict, ..
-            } if matches!(restrict.node, TypedExprNode::Builtin(Builtin::Restrict)) => Some(a()),
-            TypedExprNode::Builtin(Builtin::StrengthOver) => {
-                let k = Name::fresh("__strength_key");
-                let k_var = Expr::throwaway(TypedExprNode::Var(k.clone())).with_ty(Type::Hole);
-                let collection = applied(a(), inner.clone_preserving_ids(), Type::Hole, fuel);
-                let element = applied(k_var, collection, Type::Hole, fuel);
-                let body =
-                    Expr::throwaway(TypedExprNode::Tuple(vec![a(), element])).with_ty(Type::Hole);
-                let param = TypedBinding {
-                    name: k,
-                    ty: Type::Hole,
-                    user_annotation: None,
-                    transparency: BindingTransparency::Transparent,
-                };
-                Some(
-                    Expr::throwaway(TypedExprNode::Lambda {
-                        param,
-                        body: Box::new(body),
-                    })
-                    .with_ty(ty.clone()),
-                )
-            }
-            // `map(𝑔)` keeps a collection's keys and maps its values by `𝑔`.
-            TypedExprNode::Apply {
-                argument: g,
-                function: map,
-            } if matches!(map.node, TypedExprNode::Builtin(Builtin::Map)) => {
-                let at = applied(a(), inner.clone_preserving_ids(), Type::Hole, fuel);
-                Some(applied(at, g.clone_preserving_ids(), ty.clone(), fuel))
-            }
-            TypedExprNode::Builtin(Builtin::Curry | Builtin::CurryOver) => {
-                let inner = match &combinator.node {
-                    TypedExprNode::Builtin(Builtin::CurryOver) => pair(inner)?.1,
-                    _ => inner.clone_preserving_ids(),
-                };
+            TypedExprNode::Builtin(Builtin::Curry) => {
+                let inner = inner.clone_preserving_ids();
                 let y = Name::fresh("__curried");
                 let y_var = Expr::throwaway(TypedExprNode::Var(y.clone())).with_ty(Type::Hole);
                 let both =
@@ -2847,11 +2771,12 @@ pub fn free_names_in_value(expr: &Expr) -> HashSet<Name> {
 /// through one: a refinement is a term in a type position, and a domain
 /// restriction built from it reaches the operator graph. A predicate stands
 /// where its type slot does, so a name it reads is free only where no binder
-/// enclosing that slot within `expr` binds it.
+/// enclosing that slot within `expr` binds it, and no binder of the type itself: a Pi
+/// binder over its codomain, a dependent tuple's component over the ones after it
+/// ([`crate::ccl::subst::type_free_vars`], the type walk [`count_free`] follows too).
 ///
-/// Self-referential predicates terminate on the same `visited` discipline as
-/// [`count_free`], and the refinement element binder is excluded in type
-/// position for the reason given on [`count_free_in_type_with_visited`].
+/// A predicate term shared by `Rc` across slots is read once, and element references are
+/// excluded: each is bound by a refinement.
 pub fn free_names(expr: &Expr) -> HashSet<Name> {
     free_names_counting(expr, true)
 }
@@ -2868,17 +2793,21 @@ fn free_names_counting(expr: &Expr, writes: bool) -> HashSet<Name> {
         e: &Expr,
         writes: bool,
         bound: &mut Vec<Name>,
-        visited: &mut HashSet<PredicateId>,
+        visited: &mut BTreeSet<PredicateId>,
         out: &mut HashSet<Name>,
     ) {
+        // A type reads names under its own binders, which the type walk every free-variable
+        // query shares respects ([`crate::ccl::subst::type_free_vars`]). A binder's declared
+        // type sits in the enclosing scope, so what it reads is read under the binders in
+        // force here.
         e.walk_type_slots(|ty| {
-            walk_refined_predicates(ty, visited, &mut |pred, vis| {
-                // A binder's declared type sits in the enclosing scope, so the
-                // predicate is walked under the binders in force *here*.
-                let mut inner = HashSet::new();
-                go(pred, writes, bound, vis, &mut inner);
-                out.extend(inner.into_iter().filter(|n| n.elem_index().is_none()));
-            });
+            let mut in_type = BTreeSet::new();
+            crate::ccl::subst::collect_type_free_vars(ty, visited, &mut in_type);
+            out.extend(
+                in_type
+                    .into_iter()
+                    .filter(|n| n.elem_index().is_none() && !bound.contains(n)),
+            );
         });
         // A `VarRef` is a `Var`'s name or a write's target.
         let counts = writes || matches!(e.node, TypedExprNode::Var(_));
@@ -2898,7 +2827,13 @@ fn free_names_counting(expr: &Expr, writes: bool) -> HashSet<Name> {
         });
     }
     let mut out = HashSet::new();
-    go(expr, writes, &mut Vec::new(), &mut HashSet::new(), &mut out);
+    go(
+        expr,
+        writes,
+        &mut Vec::new(),
+        &mut BTreeSet::new(),
+        &mut out,
+    );
     out
 }
 
@@ -3426,15 +3361,12 @@ mod tests {
                 Type::Base(BaseType::Int),
             ))
         };
-        Expr::new(TypedExprNode::Realize {
-            value: Box::new(
-                Expr::new(TypedExprNode::Copair(vec![arm(2), arm(3)])).with_ty(Type::data_fun(
-                    Type::UIntRange(2),
-                    Type::Base(BaseType::Int),
-                )),
-            ),
-            staged: Rc::new(arm(2)),
-        })
+        Expr::new(TypedExprNode::Realize(Box::new(
+            Expr::new(TypedExprNode::Copair(vec![arm(2), arm(3)])).with_ty(Type::data_fun(
+                Type::UIntRange(2),
+                Type::Base(BaseType::Int),
+            )),
+        )))
         .with_ty(Type::data_fun(
             Type::UIntRange(2),
             Type::Base(BaseType::Int),
@@ -3640,22 +3572,6 @@ mod tests {
             "{}",
             crate::ccl::symbolic::symbolic(&fanned)
         );
-    }
-
-    /// A chain headed by planning's `iterate` is the rest of the chain.
-    #[test]
-    fn an_iterate_led_chain_reads_as_its_tail() {
-        let collection = || Expr::var("xs");
-        for head in [
-            Expr::builtin(Builtin::Iterate),
-            Expr::apply(Expr::lit(Lit::Bool(true)), Expr::builtin(Builtin::Iterate)),
-        ] {
-            let chain = Expr::compose(vec![head, collection()]);
-            assert!(crate::ccl::eq_term_modulo_ty_slots(
-                &normal_form(&chain),
-                &normal_form(&collection())
-            ));
-        }
     }
 
     /// A unary operator morphism applied reads as the operator.

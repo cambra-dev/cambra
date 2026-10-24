@@ -24,8 +24,8 @@
 //!   in the node's own scope.
 //! - [`LetRec`](TypedExprNode::LetRec) — *every* group binder scopes over
 //!   *every* binding's definition and over `body` (mutual recursion).
-//! - [`For`](TypedExprNode::For) — `target` scopes over `body`; `iter` sits
-//!   outside.
+//! - [`For`](TypedExprNode::For) — `position` and `target` scope over `body`;
+//!   `iter` sits outside.
 //! - [`Case`](TypedExprNode::Case) — each branch's `pattern.binding` scopes
 //!   over that branch's `guard` and `body`, and nothing else; the scrutinee and
 //!   the other branches are outside it.
@@ -102,9 +102,10 @@ pub enum Binders<'a> {
     /// No binder: the child sits in the node's own scope.
     Ambient,
     /// A single binder — a [`Lambda`](TypedExprNode::Lambda) param, a
-    /// [`Let`](TypedExprNode::Let) binding, a [`For`](TypedExprNode::For)
-    /// target, a [`Case`](TypedExprNode::Case) branch's payload.
+    /// [`Let`](TypedExprNode::Let) binding, a [`Case`](TypedExprNode::Case) branch's payload.
     One(&'a TypedBinding),
+    /// Two binders, outer first: a [`For`](TypedExprNode::For)'s position and target.
+    Two(&'a TypedBinding, &'a TypedBinding),
     /// A whole mutually-recursive group: every member scopes over every child
     /// the group covers (see [`LetRec`](TypedExprNode::LetRec)).
     Group(&'a [(TypedBinding, TypedExpr)]),
@@ -126,6 +127,7 @@ impl<'a> Binders<'a> {
         match self {
             Binders::Ambient => false,
             Binders::One(b) => &b.name == name,
+            Binders::Two(a, b) => &a.name == name || &b.name == name,
             Binders::Group(g) => g.iter().any(|(b, _)| &b.name == name),
             Binders::Generators(gs) => gs.iter().any(|g| &g.target.name == name),
         }
@@ -136,13 +138,15 @@ impl<'a> Binders<'a> {
     pub fn iter(self) -> impl Iterator<Item = &'a TypedBinding> {
         const EMPTY: &[(TypedBinding, TypedExpr)] = &[];
         const NO_GENERATORS: &[Generator] = &[];
-        let (one, group, generators) = match self {
-            Binders::Ambient => (None, EMPTY, NO_GENERATORS),
-            Binders::One(b) => (Some(b), EMPTY, NO_GENERATORS),
-            Binders::Group(g) => (None, g, NO_GENERATORS),
-            Binders::Generators(gs) => (None, EMPTY, gs),
+        let (two, one, group, generators) = match self {
+            Binders::Ambient => (None, None, EMPTY, NO_GENERATORS),
+            Binders::One(b) => (None, Some(b), EMPTY, NO_GENERATORS),
+            Binders::Two(a, b) => (Some(a), Some(b), EMPTY, NO_GENERATORS),
+            Binders::Group(g) => (None, None, g, NO_GENERATORS),
+            Binders::Generators(gs) => (None, None, EMPTY, gs),
         };
-        one.into_iter()
+        two.into_iter()
+            .chain(one)
             .chain(group.iter().map(|(b, _)| b))
             .chain(generators.iter().map(|g| &g.target))
     }
@@ -156,7 +160,7 @@ impl<'a> Binders<'a> {
     pub fn is_empty(self) -> bool {
         match self {
             Binders::Ambient => true,
-            Binders::One(_) => false,
+            Binders::One(_) | Binders::Two(..) => false,
             Binders::Group(g) => g.is_empty(),
             Binders::Generators(gs) => gs.is_empty(),
         }
@@ -174,6 +178,9 @@ impl<'a> Binders<'a> {
         match (self, other) {
             (Binders::Ambient, Binders::Ambient) => true,
             (Binders::One(a), Binders::One(b)) => std::ptr::eq(a, b),
+            (Binders::Two(a0, a1), Binders::Two(b0, b1)) => {
+                std::ptr::eq(a0, b0) && std::ptr::eq(a1, b1)
+            }
             (Binders::Group(a), Binders::Group(b)) => {
                 a.as_ptr() == b.as_ptr() && a.len() == b.len()
             }
@@ -297,7 +304,7 @@ where
         }
         // `target` is a type; its refinement predicate is reached by the
         // caller's type walk, not here (see the module docs).
-        N::Cast { value, .. } | N::Realize { value, .. } => open(f, value),
+        N::Cast { value, .. } | N::Realize(value) => open(f, value),
         N::BinOp { left, right, .. } => {
             open(f, left);
             open(f, right);
@@ -353,8 +360,8 @@ where
         // ---- Binding nodes --------------------------------------------------
         N::Lambda { param, body } => under(f, body, Binders::One(param)),
 
-        // `bound_expr`, `init` or `iter` sits outside the binder's scope; the binder scopes
-        // over `body`. A `MutDecl`'s seed cannot reference the variable it seeds.
+        // `bound_expr` or `init` sits outside the binder's scope; the binder scopes over
+        // `body`. A `MutDecl`'s seed cannot reference the variable it seeds.
         N::Let {
             binding,
             bound_expr: e,
@@ -363,11 +370,6 @@ where
         | N::MutDecl {
             binding,
             init: e,
-            body,
-        }
-        | N::For {
-            target: binding,
-            iter: e,
             body,
         } => {
             open(f, e);
@@ -381,6 +383,17 @@ where
                 under(f, def, group);
             }
             under(f, body, group);
+        }
+
+        // The source sits outside the loop; the position and target scope over `body`.
+        N::For {
+            position,
+            target,
+            iter,
+            body,
+        } => {
+            open(f, iter);
+            under(f, body, Binders::Two(position, target));
         }
 
         N::Case {
@@ -572,7 +585,7 @@ where
         | N::Error
         | N::Apply { .. }
         | N::Cast { .. }
-        | N::Realize { .. }
+        | N::Realize(_)
         | N::BinOp { .. }
         | N::UnaryOp(..)
         | N::Aggregate { .. }
@@ -631,10 +644,7 @@ mod tests {
             var("x"),
             node(N::Builtin(Builtin::Id)),
             TypedExpr::apply(var("f"), var("a")),
-            node(N::Realize {
-                value: Box::new(var("v")),
-                staged: std::rc::Rc::new(var("v")),
-            }),
+            node(N::Realize(Box::new(var("v")))),
             node(N::Cast {
                 value: Box::new(var("v")),
                 target: Type::Hole,
@@ -711,6 +721,7 @@ mod tests {
             TypedExpr::letrec(vec![(bind("f"), var("g")), (bind("g"), var("f"))], var("f")),
             TypedExpr::def_group(vec![(bind("f"), var("g")), (bind("g"), var("a"))], var("f")),
             node(N::For {
+                position: Box::new(bind("q")),
                 target: bind("t"),
                 iter: Box::new(var("xs")),
                 body: Box::new(var("t")),
@@ -832,7 +843,7 @@ mod tests {
         N::Apply { .. } => "Apply",
         N::Cast { .. } => "Cast",
         N::Comprehension { .. } => "Comprehension",
-        N::Realize { .. } => "Realize",
+        N::Realize(_) => "Realize",
         N::BinOp { .. } => "BinOp",
         N::UnaryOp(..) => "UnaryOp",
         N::Lambda { .. } => "Lambda",
@@ -1100,14 +1111,15 @@ mod tests {
             binders_of(&TypedExpr::lambda("p", Type::Hole, var("p"))),
             vec![vec!["p".to_string()]],
         );
-        // For: `iter` outside, `body` under the target.
+        // For: `iter` outside, `body` under the position and the target.
         assert_eq!(
             binders_of(&node(N::For {
+                position: Box::new(bind("q")),
                 target: bind("t"),
                 iter: Box::new(var("xs")),
                 body: Box::new(var("t")),
             })),
-            vec![Vec::<String>::new(), vec!["t".to_string()]],
+            vec![Vec::<String>::new(), vec!["q".to_string(), "t".to_string()]],
         );
         // LetRec: the whole group over every definition and the body.
         let group = vec!["f".to_string(), "g".to_string()];
