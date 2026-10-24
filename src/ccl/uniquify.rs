@@ -349,14 +349,21 @@ impl Uniquifier {
                 self.unbind(base);
             }
 
-            // The loop target binds only in the body; the source sees the
-            // outer scope.
-            TypedExprNode::For { target, iter, body } => {
+            // The loop's position and target bind only in the body; the source
+            // sees the outer scope.
+            TypedExprNode::For {
+                position,
+                target,
+                iter,
+                body,
+            } => {
                 self.expr(iter);
+                let outer = self.bind_name(position, None);
                 self.binding_tys(target);
-                let base = self.bind(target);
+                let inner = self.bind(target);
                 self.expr(body);
-                self.unbind(base);
+                self.unbind(inner);
+                self.unbind(outer);
             }
 
             // Non-recursive: the bound expression or seed is walked in the outer scope, then
@@ -572,21 +579,26 @@ impl Uniquifier {
     /// module docs) is left as-is and binds nothing: its bound variables were
     /// resolved when it was minted.
     fn bind(&mut self, b: &mut TypedBinding) -> Option<String> {
-        self.bind_in(b, None)
+        self.bind_name(&mut b.name, None)
     }
 
     /// [`Self::bind`], minting the binder with `home` as its [`Name::home`].
     fn bind_in(&mut self, b: &mut TypedBinding, home: Option<Arc<Home>>) -> Option<String> {
-        if !b.name.is_raw() {
+        self.bind_name(&mut b.name, home)
+    }
+
+    /// [`Self::bind_in`] for a binder that is a name alone, a `For`'s position.
+    fn bind_name(&mut self, name: &mut Name, home: Option<Arc<Home>>) -> Option<String> {
+        if !name.is_raw() {
             return None;
         }
-        let base = b.name.base().to_string();
+        let base = name.base().to_string();
         let fresh = Name::fresh_in(&base, home);
         self.env
             .entry(base.clone())
             .or_default()
             .push(fresh.clone());
-        b.name = fresh;
+        *name = fresh;
         Some(base)
     }
 
@@ -707,15 +719,14 @@ fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
 #[cfg(debug_assertions)]
 fn assert_all_binders_minted(expr: &Expr) {
     fn go(e: &Expr) {
-        // `walk_binders` is the exhaustive enumeration of binding *slots* (kept
+        // `walk_bound_names` is the exhaustive enumeration of binding *slots* (kept
         // in step with `crate::ccl::scope`'s scoping rules by that module's
         // corpus test), so this check covers a newly-added binding form for
         // free — it cannot fall through a wildcard arm.
-        e.walk_binders(|b| {
+        e.walk_bound_names(|name| {
             assert!(
-                matches!(b.name, Name::Unique { .. }),
-                "uniquify must mint every binding site to a Unique name; `{:?}` is not",
-                b.name
+                matches!(name, Name::Unique { .. }),
+                "uniquify must mint every binding site to a Unique name; `{name:?}` is not",
             );
         });
         e.walk_children(go);

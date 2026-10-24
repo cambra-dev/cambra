@@ -637,11 +637,12 @@ pub(crate) fn predicate_term(term: &Expr) -> Expr {
 /// - a value `Case` eliminated over its input, `𝑥 ▷ (⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ))`, reads back
 ///   as `{ 𝑔ᵢ → 𝑥 ▷ 𝑒ᵢ }`, each guard its leg's first-match gate with the earlier guards peeled
 ///   off ([`read_fan_out`]);
-/// - a staged form reads as what it stages, since an application only reaches keys in its
-///   function's domain: `curry_over` as `curry` of its morphism; `𝑥 ▷ (𝑚 ▷ filter_values)`,
-///   `𝑥 ▷ (𝑝 ▷ iterate)` and `𝑥 ▷ (𝑐 ▷ map_domain)` as `𝑥`, and a chain `iterate ≫ 𝑓` as `𝑓`; `𝑎 ▷ (𝑓 ▷ strength_over)` as
-///   `λ 𝑘 → (𝑎, 𝑘 ▷ (𝑎 ▷ 𝑓))`; `𝑥 ▷ (𝑢 ▷ (𝑝 ▷ restrict))` as `𝑥`; and `𝑥 ▷ (𝑐 ▷ map(𝑔))` as
-///   `(𝑥 ▷ 𝑐) ▷ 𝑔`;
+/// - a form planning stages reads as what it stages, since an application only reaches keys in
+///   its function's domain: `curry_over` as `curry` of its morphism; `𝑥 ▷ (𝑚 ▷ filter_values)`,
+///   `𝑥 ▷ (𝑝 ▷ iterate)`, `𝑥 ▷ (𝑐 ▷ map_domain)`, `𝑥 ▷ (𝑢 ▷ (𝑝 ▷ restrict))` and
+///   `𝑥 ▷ (𝑘 ▷ (𝑓 ▷ converse))` as `𝑥`; a chain `iterate ≫ 𝑓` as `𝑓`;
+///   `𝑎 ▷ (𝑓 ▷ strength_over)` as `λ 𝑘 → (𝑎, 𝑘 ▷ (𝑎 ▷ 𝑓))`; `𝑥 ▷ (𝑐 ▷ map(𝑔))` as `(𝑥 ▷ 𝑐) ▷ 𝑔`;
+///   and a `Realize` as the conditional it stages;
 /// - a projection out of a tuple or record former reads the component.
 ///
 /// Type-blind, as predicate equality is: type slots ride along, and the nodes the rewrite
@@ -772,20 +773,27 @@ fn reduce_application(
                 };
                 Some(Expr::throwaway(node).with_ty(ty.clone()))
             }
-            // A staged form reads as what it stages. `curry_over` is `curry(𝑔)` with each
-            // row's keys beside it, and `𝑚 ▷ filter_values` is the identity restricted to the
-            // elements `𝑚` keeps. An application reaches only keys in its function's domain,
-            // which the type guarantees, so neither restriction changes the value read.
+            // A staged form reads as what it stages
+            // (`src/ccl/design/type-inference.md`, "Predicates are compared by normal form").
+            // `𝑚 ▷ filter_values` is the identity on the elements `𝑚` keeps. Its stamped type
+            // is the unrefined `𝐷 ⤇ 𝐷`, so the reading holds where the enclosing refinement
+            // keeps the argument among them.
             TypedExprNode::Builtin(Builtin::FilterValues) => Some(a()),
-            // Planning's other staging reads the same way. `iterate` and `map_domain` map
-            // each key to itself, and `strength_over` pairs its input with each value of the
-            // collection its function gives for it, under that value's key.
+            // `iterate` and `map_domain` map each key of their domain to itself.
             TypedExprNode::Builtin(Builtin::Iterate | Builtin::MapDomain) => Some(a()),
-            // An iteration source narrowed by a filter, `𝑢 ▷ (𝑝 ▷ restrict)`, maps each key it
-            // keeps to itself, as its upstream does.
+            // `𝑢 ▷ (𝑝 ▷ restrict)` maps each key it keeps to itself, as its upstream does, and
+            // `𝑘 ▷ (𝑓 ▷ converse)` maps each key of `𝑘`'s fiber under `𝑓` to itself. Each one's
+            // type states the domain it is the identity on.
             TypedExprNode::Apply {
-                function: restrict, ..
-            } if matches!(restrict.node, TypedExprNode::Builtin(Builtin::Restrict)) => Some(a()),
+                function: transformer,
+                ..
+            } if matches!(
+                transformer.node,
+                TypedExprNode::Builtin(Builtin::Restrict | Builtin::Converse)
+            ) =>
+            {
+                Some(a())
+            }
             TypedExprNode::Builtin(Builtin::StrengthOver) => {
                 let k = Name::fresh("__strength_key");
                 let k_var = Expr::throwaway(TypedExprNode::Var(k.clone())).with_ty(Type::Hole);
@@ -1132,7 +1140,7 @@ impl Substitution<'_> {
             _ => {}
         }
         let mut binders = Vec::new();
-        body.walk_binders(|b| binders.push(b.name.clone()));
+        body.walk_bound_names(|name| binders.push(name.clone()));
         if binders.contains(x) {
             return body;
         }
@@ -2590,15 +2598,22 @@ fn count_free_with_visited(name: &Name, expr: &Expr, visited: &mut HashSet<Predi
     // matching position of `expr.ty` (the usual case, and increasingly so as
     // sharing improves) is still counted once.
     let mut in_type = 0;
-    expr.walk_type_slots(|ty| in_type += count_free_in_type_with_visited(name, ty, visited));
+    expr.walk_ambient_type_slots(|ty| {
+        in_type += count_free_in_type_with_visited(name, ty, visited);
+    });
     // The term spine is a fold over the shared scoping walk: a child whose
     // binder list mentions `name` is shadowed and contributes nothing;
-    // everything else recurses. Variable-key labels (`KeyRef`) are not variable
-    // occurrences, so they do not count.
+    // everything else recurses, and so does a type slot under the node's binders.
+    // Variable-key labels (`KeyRef`) are not variable occurrences, so they do not count.
     let mut in_node = 0;
     for_each_scoped_item(expr, &mut |item| match item {
         ScopedItem::VarRef(n) => in_node += (n == name) as usize,
         ScopedItem::KeyRef(_) => {}
+        ScopedItem::TypeSlot { ty, binders } => {
+            if !binders.shadows(name) {
+                in_type += count_free_in_type_with_visited(name, ty, visited);
+            }
+        }
         ScopedItem::Child {
             expr: child,
             binders,
@@ -2755,11 +2770,11 @@ fn free_among_go(live: &BTreeSet<Name>, expr: &Expr, out: &mut BTreeSet<Name>) {
         return;
     }
     // A binder's declared type is in the *enclosing* scope, so every candidate is
-    // unshadowed in a type slot — the same rule (and the same reason) as
-    // `count_free`, which walks slots before applying any shadowing. Each name
+    // unshadowed in a type slot in the node's own scope — the same rule (and the same
+    // reason) as `count_free`, which walks slots before applying any shadowing. Each name
     // gets its own `visited` set via `is_free_in_type`, which is what terminates
     // on a self-referential refinement.
-    expr.walk_type_slots(|ty| {
+    expr.walk_ambient_type_slots(|ty| {
         for name in live {
             if !out.contains(name) && is_free_in_type(name, ty) {
                 out.insert(name.clone());
@@ -2774,6 +2789,13 @@ fn free_among_go(live: &BTreeSet<Name>, expr: &Expr, out: &mut BTreeSet<Name>) {
         }
         // A register key is a field label, not a variable occurrence.
         ScopedItem::KeyRef(_) => {}
+        ScopedItem::TypeSlot { ty, binders } => {
+            for name in live {
+                if !binders.shadows(name) && !out.contains(name) && is_free_in_type(name, ty) {
+                    out.insert(name.clone());
+                }
+            }
+        }
         ScopedItem::Child {
             expr: child,
             binders,
@@ -2827,10 +2849,10 @@ pub fn free_names_in_value(expr: &Expr) -> HashSet<Name> {
             }
             // A key label names a field of the history record the node denotes, not a
             // variable use — the same exclusion `count_free_in_value` makes.
-            ScopedItem::KeyRef(_) => {}
+            ScopedItem::KeyRef(_) | ScopedItem::TypeSlot { .. } => {}
             ScopedItem::Child { expr, binders } => {
                 let depth = bound.len();
-                bound.extend(binders.iter().map(|b| b.name.clone()));
+                bound.extend(binders.names().cloned());
                 go(expr, bound, out);
                 bound.truncate(depth);
             }
@@ -2851,12 +2873,13 @@ pub fn free_names_in_value(expr: &Expr) -> HashSet<Name> {
 /// through one: a refinement is a term in a type position, and a domain
 /// restriction built from it reaches the operator graph. A predicate stands
 /// where its type slot does, so a name it reads is free only where no binder
-/// enclosing that slot within `expr` binds it.
+/// enclosing that slot within `expr` binds it, and no binder of the type itself: a Pi
+/// binder over its codomain, a dependent tuple's component over the ones after it
+/// ([`crate::ccl::subst::type_free_vars`], the type walk [`count_free`] follows too).
 ///
-/// Self-referential predicates terminate on the same `visited` discipline as
-/// [`count_free`]. A predicate's element references are read as from outside its
-/// refinement, as [`count_free`] counts them: its own element is bound, and
-/// `__elem^𝑛` for `𝑛 > 0` is `__elem^(𝑛-1)` there.
+/// A predicate's element references are read as from outside its refinement, as
+/// [`count_free`] counts them: its own element is bound, and `__elem^𝑛` for `𝑛 > 0` is
+/// `__elem^(𝑛-1)` there.
 pub fn free_names(expr: &Expr) -> HashSet<Name> {
     free_names_counting(expr, true)
 }
@@ -2873,31 +2896,29 @@ fn free_names_counting(expr: &Expr, writes: bool) -> HashSet<Name> {
         e: &Expr,
         writes: bool,
         bound: &mut Vec<Name>,
-        visited: &mut HashSet<PredicateId>,
+        visited: &mut BTreeSet<PredicateId>,
         out: &mut HashSet<Name>,
     ) {
-        e.walk_type_slots(|ty| {
-            walk_refined_predicates(ty, visited, &mut |pred, vis| {
-                // A binder's declared type sits in the enclosing scope, so the
-                // predicate is walked under the binders in force *here*. Outside the
-                // refinement its own element is bound and an enclosing one's index is one
-                // lower. A predicate reading an enclosing element reads a different one at
-                // each depth it is shared at, so it is walked at each.
-                let mut inner = HashSet::new();
-                go(pred, writes, bound, vis, &mut inner);
-                let mut outer_elem = false;
-                out.extend(inner.into_iter().filter_map(|n| match n.elem_index() {
-                    Some(0) => None,
-                    Some(up) => {
-                        outer_elem = true;
-                        Some(Name::elem_at(up - 1))
-                    }
-                    None => Some(n),
-                }));
-                if outer_elem {
-                    vis.remove(&std::ptr::from_ref(pred));
-                }
-            });
+        // A type reads names under its own binders, which the type walk every free-variable
+        // query shares respects ([`crate::ccl::subst::type_free_vars`]), and reads a
+        // refinement's element references as from outside it: its own element bound, an
+        // enclosing one's index one lower. A binder's declared type sits in the enclosing
+        // scope, so what it reads is read under the binders in force here, and a slot under the
+        // node's own binders under those too.
+        let mut in_slot = |ty: &Type, under: &[&Name], bound: &[Name]| {
+            let mut in_type = BTreeSet::new();
+            crate::ccl::subst::collect_type_free_vars(ty, visited, &mut in_type);
+            out.extend(
+                in_type
+                    .into_iter()
+                    .filter(|n| !bound.contains(n) && !under.contains(&n)),
+            );
+        };
+        e.walk_ambient_type_slots(|ty| in_slot(ty, &[], bound));
+        for_each_scoped_item(e, &mut |item| {
+            if let ScopedItem::TypeSlot { ty, binders } = item {
+                in_slot(ty, &binders.names().collect::<Vec<_>>(), bound);
+            }
         });
         // A `VarRef` is a `Var`'s name or a write's target.
         let counts = writes || matches!(e.node, TypedExprNode::Var(_));
@@ -2907,17 +2928,23 @@ fn free_names_counting(expr: &Expr, writes: bool) -> HashSet<Name> {
                     out.insert(n.clone());
                 }
             }
-            ScopedItem::KeyRef(_) => {}
+            ScopedItem::KeyRef(_) | ScopedItem::TypeSlot { .. } => {}
             ScopedItem::Child { expr, binders } => {
                 let depth = bound.len();
-                bound.extend(binders.iter().map(|b| b.name.clone()));
+                bound.extend(binders.names().cloned());
                 go(expr, writes, bound, visited, out);
                 bound.truncate(depth);
             }
         });
     }
     let mut out = HashSet::new();
-    go(expr, writes, &mut Vec::new(), &mut HashSet::new(), &mut out);
+    go(
+        expr,
+        writes,
+        &mut Vec::new(),
+        &mut BTreeSet::new(),
+        &mut out,
+    );
     out
 }
 
@@ -2929,7 +2956,7 @@ pub(crate) fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
     let mut sum = 0;
     for_each_scoped_item(expr, &mut |item| match item {
         ScopedItem::VarRef(n) => sum += (n == name) as usize,
-        ScopedItem::KeyRef(_) => {}
+        ScopedItem::KeyRef(_) | ScopedItem::TypeSlot { .. } => {}
         ScopedItem::Child {
             expr: child,
             binders,

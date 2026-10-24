@@ -95,7 +95,7 @@ pub fn own_hash(e: &TypedExpr, scope: &[(&Name, u64)]) -> ContentHash {
     for_each_scoped_item(e, &mut |item| match item {
         ScopedItem::VarRef(name) => hash_name_ref(name, env, free, &mut h),
         ScopedItem::KeyRef(name) => hash_key_ref(name, &mut h),
-        ScopedItem::Child { .. } => {}
+        ScopedItem::Child { .. } | ScopedItem::TypeSlot { .. } => {}
     });
     hash_opt_type(e.user_annotation.as_ref(), env, wenv, free, &mut h);
     ContentHash(h.finish())
@@ -684,12 +684,14 @@ fn hash_rel<'a>(
     for_each_scoped_item(e, &mut |item| match item {
         ScopedItem::VarRef(name) => hash_name_ref(name, env, free, &mut h),
         ScopedItem::KeyRef(name) => hash_key_ref(name, &mut h),
+        // A binder's type is hashed with its binding (`hash_payload`).
+        ScopedItem::TypeSlot { .. } => {}
         ScopedItem::Child {
             expr: child,
             binders,
         } => {
             let depth = env.len();
-            env.extend(binders.iter().map(|b| &b.name));
+            env.extend(binders.names());
             let hashed = hash_rel(child, env, wenv, free);
             env.truncate(depth);
             children.push(hashed);

@@ -24,8 +24,8 @@
 //!   in the node's own scope.
 //! - [`LetRec`](TypedExprNode::LetRec) — *every* group binder scopes over
 //!   *every* binding's definition and over `body` (mutual recursion).
-//! - [`For`](TypedExprNode::For) — `target` scopes over `body`; `iter` sits
-//!   outside.
+//! - [`For`](TypedExprNode::For) — `position` and `target` scope over `body`,
+//!   and `position` over `target`'s type; `iter` sits outside.
 //! - [`Case`](TypedExprNode::Case) — each branch's `pattern.binding` scopes
 //!   over that branch's `guard` and `body`, and nothing else; the scrutinee and
 //!   the other branches are outside it.
@@ -69,19 +69,24 @@
 //! - **A scope lists every binder covering its children**, including ones an
 //!   earlier scope of the same node already listed. A `Comprehension` is the
 //!   one node whose scopes nest: each extends the one before it, and its last
-//!   scope lists exactly [`TypedExpr::walk_binders`]. Every other node's scopes
-//!   are disjoint, and their concatenation is `walk_binders`.
+//!   scope lists exactly [`TypedExpr::walk_bound_names`]. Every other node's scopes
+//!   are disjoint, and their concatenation is `walk_bound_names`.
 //!
 //! # What does *not* live here
 //!
-//! Type slots. A node's `ty`, its `user_annotation`, a `Cast`'s `target` and
-//! the refinement predicates they carry are reached by the type walks each pass
-//! owns (`count_free_in_type`, `collect_type_fv`, `hash_type`, …), because the
-//! passes disagree about them on purpose — `count_free` counts occurrences in
-//! predicates, `is_free_in_value` deliberately does not. This module is about
-//! the *term* spine's binding structure only, matching `walk_children`.
+//! Type slots in the node's own scope. A node's `ty`, its `user_annotation`, a
+//! `Cast`'s `target`, a binder's type and the refinement predicates they carry
+//! are reached by the type walks each pass owns (`count_free_in_type`,
+//! `collect_type_fv`, `hash_type`, …), because the passes disagree about them on
+//! purpose — `count_free` counts occurrences in predicates, `is_free_in_value`
+//! deliberately does not. Those slots are
+//! [`TypedExpr::walk_ambient_type_slots`]'s. A slot that a binder of the node
+//! scopes over, a `For` target's type under the position, is yielded here as a
+//! [`ScopedItem::TypeSlot`], so a walk reading names in types reads it under that
+//! binder. Every other item is about the *term* spine's binding structure,
+//! matching `walk_children`.
 
-use super::{Generator, Name, TypedBinding, TypedExpr, TypedExprNode};
+use super::{Generator, Name, Type, TypedBinding, TypedExpr, TypedExprNode};
 
 /// The binders a node puts in scope over one of its children.
 ///
@@ -102,9 +107,13 @@ pub enum Binders<'a> {
     /// No binder: the child sits in the node's own scope.
     Ambient,
     /// A single binder — a [`Lambda`](TypedExprNode::Lambda) param, a
-    /// [`Let`](TypedExprNode::Let) binding, a [`For`](TypedExprNode::For)
-    /// target, a [`Case`](TypedExprNode::Case) branch's payload.
+    /// [`Let`](TypedExprNode::Let) binding, a [`Case`](TypedExprNode::Case) branch's payload.
     One(&'a TypedBinding),
+    /// A [`For`](TypedExprNode::For)'s position and target, the position outer: what its body
+    /// sits under.
+    Loop(&'a Name, &'a TypedBinding),
+    /// A [`For`](TypedExprNode::For)'s position alone: what its target's type sits under.
+    Position(&'a Name),
     /// A whole mutually-recursive group: every member scopes over every child
     /// the group covers (see [`LetRec`](TypedExprNode::LetRec)).
     Group(&'a [(TypedBinding, TypedExpr)]),
@@ -126,25 +135,31 @@ impl<'a> Binders<'a> {
         match self {
             Binders::Ambient => false,
             Binders::One(b) => &b.name == name,
+            Binders::Loop(p, b) => p == name || &b.name == name,
+            Binders::Position(p) => p == name,
             Binders::Group(g) => g.iter().any(|(b, _)| &b.name == name),
             Binders::Generators(gs) => gs.iter().any(|g| &g.target.name == name),
         }
     }
 
-    /// The binders, innermost last — the order a consumer maintaining an
+    /// The names bound, innermost last — the order a consumer maintaining an
     /// environment stack pushes them in.
-    pub fn iter(self) -> impl Iterator<Item = &'a TypedBinding> {
+    pub fn names(self) -> impl Iterator<Item = &'a Name> {
         const EMPTY: &[(TypedBinding, TypedExpr)] = &[];
         const NO_GENERATORS: &[Generator] = &[];
-        let (one, group, generators) = match self {
-            Binders::Ambient => (None, EMPTY, NO_GENERATORS),
-            Binders::One(b) => (Some(b), EMPTY, NO_GENERATORS),
-            Binders::Group(g) => (None, g, NO_GENERATORS),
-            Binders::Generators(gs) => (None, EMPTY, gs),
+        let (position, one, group, generators) = match self {
+            Binders::Ambient => (None, None, EMPTY, NO_GENERATORS),
+            Binders::One(b) => (None, Some(b), EMPTY, NO_GENERATORS),
+            Binders::Loop(p, b) => (Some(p), Some(b), EMPTY, NO_GENERATORS),
+            Binders::Position(p) => (Some(p), None, EMPTY, NO_GENERATORS),
+            Binders::Group(g) => (None, None, g, NO_GENERATORS),
+            Binders::Generators(gs) => (None, None, EMPTY, gs),
         };
-        one.into_iter()
-            .chain(group.iter().map(|(b, _)| b))
-            .chain(generators.iter().map(|g| &g.target))
+        position
+            .into_iter()
+            .chain(one.map(|b| &b.name))
+            .chain(group.iter().map(|(b, _)| &b.name))
+            .chain(generators.iter().map(|g| &g.target.name))
     }
 
     /// Does this scope introduce nothing? True for [`Binders::Ambient`] — the
@@ -156,7 +171,7 @@ impl<'a> Binders<'a> {
     pub fn is_empty(self) -> bool {
         match self {
             Binders::Ambient => true,
-            Binders::One(_) => false,
+            Binders::One(_) | Binders::Loop(..) | Binders::Position(_) => false,
             Binders::Group(g) => g.is_empty(),
             Binders::Generators(gs) => gs.is_empty(),
         }
@@ -174,6 +189,10 @@ impl<'a> Binders<'a> {
         match (self, other) {
             (Binders::Ambient, Binders::Ambient) => true,
             (Binders::One(a), Binders::One(b)) => std::ptr::eq(a, b),
+            (Binders::Loop(a0, a1), Binders::Loop(b0, b1)) => {
+                std::ptr::eq(a0, b0) && std::ptr::eq(a1, b1)
+            }
+            (Binders::Position(a), Binders::Position(b)) => std::ptr::eq(a, b),
             (Binders::Group(a), Binders::Group(b)) => {
                 a.as_ptr() == b.as_ptr() && a.len() == b.len()
             }
@@ -204,6 +223,16 @@ pub enum ScopedItem<'a> {
     /// the history record the node denotes, so free-variable analyses skip it
     /// while a consumer that cares about every name a node mentions folds it in.
     KeyRef(&'a Name),
+    /// A type slot of the node that `binders`, binders of the node itself, scope over: a
+    /// [`For`](TypedExprNode::For) target's type and annotation, under the position. The
+    /// node's other slots are [`TypedExpr::walk_ambient_type_slots`]'s, and the two
+    /// enumerations together are [`TypedExpr::walk_type_slots`].
+    TypeSlot {
+        /// The slot.
+        ty: &'a Type,
+        /// The binders of the node that scope over it.
+        binders: Binders<'a>,
+    },
 }
 
 /// Visit each direct child of `e` together with the binders that scope over it,
@@ -353,8 +382,8 @@ where
         // ---- Binding nodes --------------------------------------------------
         N::Lambda { param, body } => under(f, body, Binders::One(param)),
 
-        // `bound_expr`, `init` or `iter` sits outside the binder's scope; the binder scopes
-        // over `body`. A `MutDecl`'s seed cannot reference the variable it seeds.
+        // `bound_expr` or `init` sits outside the binder's scope; the binder scopes over
+        // `body`. A `MutDecl`'s seed cannot reference the variable it seeds.
         N::Let {
             binding,
             bound_expr: e,
@@ -363,11 +392,6 @@ where
         | N::MutDecl {
             binding,
             init: e,
-            body,
-        }
-        | N::For {
-            target: binding,
-            iter: e,
             body,
         } => {
             open(f, e);
@@ -381,6 +405,23 @@ where
                 under(f, def, group);
             }
             under(f, body, group);
+        }
+
+        // The source sits outside the loop; the position and target scope over `body`.
+        N::For {
+            position,
+            target,
+            iter,
+            body,
+        } => {
+            for ty in std::iter::once(&target.ty).chain(&target.user_annotation) {
+                f(ScopedItem::TypeSlot {
+                    ty,
+                    binders: Binders::Position(position),
+                });
+            }
+            open(f, iter);
+            under(f, body, Binders::Loop(position, target));
         }
 
         N::Case {
@@ -471,9 +512,9 @@ where
     // there is nothing to collect and nothing to group — go straight to the
     // mutable child walk. This is the overwhelmingly common node, and skipping
     // the collection pass is what keeps the adapter from costing every node in
-    // the tree a second traversal and a `Vec`. `binds_any` is `walk_binders`,
+    // the tree a second traversal and a `Vec`. `binds_any` is `walk_bound_names`,
     // whose agreement with the scoping rules is
-    // `declared_binders_match_walk_binders` below.
+    // `declared_binders_match_walk_bound_names` below.
     if !e.binds_any() {
         let mut opened = false;
         e.walk_children_mut(|c| {
@@ -498,7 +539,7 @@ where
         for_each_scoped_item(&*e, &mut |item| {
             if let ScopedItem::Child { binders, .. } = item {
                 if !prev.is_some_and(|p| p.is_same_scope(binders)) {
-                    runs.push((children, binders.iter().map(|b| b.name.clone()).collect()));
+                    runs.push((children, binders.names().cloned().collect()));
                     prev = Some(binders);
                 }
                 children += 1;
@@ -712,6 +753,7 @@ mod tests {
             TypedExpr::letrec(vec![(bind("f"), var("g")), (bind("g"), var("f"))], var("f")),
             TypedExpr::def_group(vec![(bind("f"), var("g")), (bind("g"), var("a"))], var("f")),
             node(N::For {
+                position: Box::new(Name::raw("q")),
                 target: bind("t"),
                 iter: Box::new(var("xs")),
                 body: Box::new(var("t")),
@@ -913,26 +955,26 @@ mod tests {
         }
     }
 
-    /// The scoped walk and [`TypedExpr::walk_binders`] must agree on which
+    /// The scoped walk and [`TypedExpr::walk_bound_names`] must agree on which
     /// bindings a node declares — the former by scope, the latter by slot.
     ///
-    /// A node's scopes are disjoint, and their concatenation is `walk_binders`,
+    /// A node's scopes are disjoint, and their concatenation is `walk_bound_names`,
     /// except a `Comprehension`'s: its binders come into scope one generator at
     /// a time, so each scope extends the one before it and the last one is
-    /// `walk_binders`. Checking the concatenation everywhere else is what
+    /// `walk_bound_names`. Checking the concatenation everywhere else is what
     /// catches a binder slot listed in two scopes that should be disjoint, such
     /// as a `Case` payload leaking into a sibling branch.
     #[test]
-    fn declared_binders_match_walk_binders() {
-        fn ptrs(b: Binders<'_>) -> Vec<*const TypedBinding> {
-            b.iter().map(|b| b as *const _).collect()
+    fn declared_binders_match_walk_bound_names() {
+        fn ptrs(b: Binders<'_>) -> Vec<*const Name> {
+            b.names().map(|n| n as *const _).collect()
         }
         for e in corpus() {
-            let mut declared: Vec<*const TypedBinding> = Vec::new();
-            e.walk_binders(|b| declared.push(b));
+            let mut declared: Vec<*const Name> = Vec::new();
+            e.walk_bound_names(|n| declared.push(n));
 
             let runs = scope_runs(&e);
-            let scoped: Vec<*const TypedBinding> = if matches!(e.node, N::Comprehension { .. }) {
+            let scoped: Vec<*const Name> = if matches!(e.node, N::Comprehension { .. }) {
                 for w in runs.windows(2) {
                     assert!(
                         ptrs(w[1]).starts_with(&ptrs(w[0])),
@@ -947,6 +989,36 @@ mod tests {
                 declared,
                 scoped,
                 "binder declaration diverged for `{}`",
+                variant_name(&e.node)
+            );
+        }
+    }
+
+    /// The type slots the scoped walk yields under a node's binders and the ones in the node's
+    /// own scope are, together, every slot [`TypedExpr::walk_type_slots`] reaches, each once.
+    #[test]
+    fn type_slots_split_between_the_scopes() {
+        for e in corpus() {
+            let mut every: Vec<*const Type> = Vec::new();
+            e.walk_type_slots(|t| every.push(t));
+            let mut split: Vec<*const Type> = Vec::new();
+            e.walk_ambient_type_slots(|t| split.push(t));
+            for_each_scoped_item(&e, &mut |item| {
+                if let ScopedItem::TypeSlot { ty, binders } = item {
+                    assert!(
+                        !binders.is_empty(),
+                        "a scoped type slot of `{}` sits under no binder",
+                        variant_name(&e.node)
+                    );
+                    split.push(ty);
+                }
+            });
+            every.sort();
+            split.sort();
+            assert_eq!(
+                every,
+                split,
+                "type slots diverged for `{}`",
                 variant_name(&e.node)
             );
         }
@@ -976,10 +1048,10 @@ mod tests {
     #[test]
     fn scopes_are_consecutive_and_entered_once() {
         for e in corpus() {
-            let opened: Vec<Vec<*const TypedBinding>> = scope_runs(&e)
+            let opened: Vec<Vec<*const Name>> = scope_runs(&e)
                 .into_iter()
                 .filter(|s| !s.is_empty())
-                .map(|s| s.iter().map(|b| b as *const _).collect())
+                .map(|s| s.names().map(|n| n as *const _).collect())
                 .collect();
             let entered = opened.len();
             let mut distinct = opened;
@@ -1003,7 +1075,7 @@ mod tests {
                 let mut v = Vec::new();
                 for_each_scoped_item(&e, &mut |item| {
                     if let ScopedItem::Child { binders, .. } = item {
-                        v.push(binders.iter().map(|b| b.name.clone()).collect());
+                        v.push(binders.names().cloned().collect());
                     }
                 });
                 v
@@ -1060,7 +1132,7 @@ mod tests {
             for_each_scoped_item(&e, &mut |item| match item {
                 ScopedItem::VarRef(n) => expected.push(("var", n.clone())),
                 ScopedItem::KeyRef(n) => expected.push(("key", n.clone())),
-                ScopedItem::Child { .. } => {}
+                ScopedItem::Child { .. } | ScopedItem::TypeSlot { .. } => {}
             });
             let mut actual: Vec<(&str, Name)> = Vec::new();
             let mut e = e;
@@ -1085,7 +1157,7 @@ mod tests {
             let mut v = Vec::new();
             for_each_scoped_item(e, &mut |item| {
                 if let ScopedItem::Child { binders, .. } = item {
-                    v.push(binders.iter().map(|b| b.name.base().to_string()).collect());
+                    v.push(binders.names().map(|n| n.base().to_string()).collect());
                 }
             });
             v
@@ -1101,14 +1173,15 @@ mod tests {
             binders_of(&TypedExpr::lambda("p", Type::Hole, var("p"))),
             vec![vec!["p".to_string()]],
         );
-        // For: `iter` outside, `body` under the target.
+        // For: `iter` outside, `body` under the position and the target.
         assert_eq!(
             binders_of(&node(N::For {
+                position: Box::new(Name::raw("q")),
                 target: bind("t"),
                 iter: Box::new(var("xs")),
                 body: Box::new(var("t")),
             })),
-            vec![Vec::<String>::new(), vec!["t".to_string()]],
+            vec![Vec::<String>::new(), vec!["q".to_string(), "t".to_string()]],
         );
         // LetRec: the whole group over every definition and the body.
         let group = vec!["f".to_string(), "g".to_string()];
@@ -1143,7 +1216,7 @@ mod tests {
             for_each_scoped_item(e, &mut |item| match item {
                 ScopedItem::VarRef(n) => vars.push(n.base().to_string()),
                 ScopedItem::KeyRef(n) => keys.push(n.base().to_string()),
-                ScopedItem::Child { .. } => {}
+                ScopedItem::Child { .. } | ScopedItem::TypeSlot { .. } => {}
             });
         };
         record(&TypedExpr::feed("d", var("v")));

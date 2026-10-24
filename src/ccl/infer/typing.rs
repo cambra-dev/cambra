@@ -402,11 +402,12 @@ pub(super) trait Typing {
     /// binder, whose channel is keyed by the loop's position, so the binder is `𝑘 ▷ source`
     /// at the key `𝑘` ([`InferCtx::require_feed`](super::context::InferCtx::require_feed)).
     /// `position_binder` is the loop's position, the binder of `λ 𝑟 → (𝑟 ▷ source) ▷ (λ 𝑥 →
-    /// body)`, which is `𝑘` there. Check trusts the recorded types and keeps nothing.
+    /// body)` or a `for` loop's `position`, which is `𝑘` there. Check trusts the recorded
+    /// types and keeps nothing.
     fn note_loop_source(
         &mut self,
         _binder: &Name,
-        _position_binder: Option<&Name>,
+        _position_binder: &Name,
         _source: &Expr,
         _position: &Type,
         _item: &Type,
@@ -499,6 +500,16 @@ pub(super) trait Typing {
     fn as_function(
         &mut self,
         t: &Type,
+        at: &dyn Fn() -> String,
+    ) -> Result<(Type, Type), LocatedInferError>;
+
+    /// [`Typing::as_function`] for a consumer binding `binder` to each position: the
+    /// codomain is spelled at `binder`, so an element type that reads its position reads
+    /// `binder`. The consumer puts `binder` in scope over the codomain.
+    fn as_function_at(
+        &mut self,
+        t: &Type,
+        binder: &Name,
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError>;
 

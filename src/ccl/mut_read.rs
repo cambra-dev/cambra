@@ -354,11 +354,7 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
             expr
         }
 
-        TypedExprNode::For {
-            target: _,
-            iter,
-            body,
-        } => {
+        TypedExprNode::For { iter, body, .. } => {
             **iter = operand(std::mem::take(iter), muts, open, minted);
             **body = loop_body(std::mem::take(body), muts, open, minted);
             expr

@@ -5051,8 +5051,8 @@ fn eq_term_modulo_ty_slots_go(
                 kind: k2,
             },
         ) => k1 == k2 && eq_term_modulo_ty_slots_go(i1, i2, pairs),
-        // `bound_expr`, `init` or `iter` sits outside the binder's scope; the binder scopes
-        // over `body`.
+        // `bound_expr` or `init` sits outside the binder's scope; the binder scopes over
+        // `body`.
         (
             N::Let {
                 binding: bd1,
@@ -5076,21 +5076,32 @@ fn eq_term_modulo_ty_slots_go(
                 init: e2,
                 body: b2,
             },
-        )
-        | (
-            N::For {
-                target: bd1,
-                iter: e1,
-                body: b1,
-            },
-            N::For {
-                target: bd2,
-                iter: e2,
-                body: b2,
-            },
         ) => {
             eq_term_modulo_ty_slots_go(e1, e2, pairs)
                 && eq_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])
+        }
+        (
+            N::For {
+                position: p1,
+                target: t1,
+                iter: it1,
+                body: b1,
+            },
+            N::For {
+                position: p2,
+                target: t2,
+                iter: it2,
+                body: b2,
+            },
+            // The source is evaluated outside the loop; the position and target are bound over
+            // the body.
+        ) => {
+            eq_term_modulo_ty_slots_go(it1, it2, pairs) && {
+                pairs.push(((**p1).clone(), (**p2).clone()));
+                let equal = eq_under_binder(pairs, &t1.name, &t2.name, &[(b1, b2)]);
+                pairs.pop();
+                equal
+            }
         }
         (
             N::MutWrite {
@@ -5361,9 +5372,16 @@ fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
             hash_term_modulo_ty_slots(init, state, scope);
             hash_under_binder(state, scope, &binding.name, &[body]);
         }
-        TypedExprNode::For { target, iter, body } => {
+        TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } => {
             hash_term_modulo_ty_slots(iter, state, scope);
+            scope.push((**position).clone());
             hash_under_binder(state, scope, &target.name, &[body]);
+            scope.pop();
         }
         TypedExprNode::Case {
             scrutinee,
@@ -6391,9 +6409,9 @@ mod tests {
 
     /// A predicate reading a definition planning restaged equals one reading it unplanned.
     /// `𝑦 ▷ (𝑥 ▷ ((𝐹, 𝑔) ▷ curry_over))` reads as `𝑦 ▷ (𝑥 ▷ (𝑔 ▷ curry))`, and
-    /// `𝑥 ▷ (𝑚 ▷ filter_values)` and `𝑥 ▷ (𝑢 ▷ (𝑝 ▷ restrict))` as `𝑥`: an application reaches
-    /// only keys in its function's domain, so the restriction a staged form adds changes no
-    /// value read.
+    /// `𝑥 ▷ (𝑚 ▷ filter_values)`, `𝑥 ▷ (𝑢 ▷ (𝑝 ▷ restrict))` and `𝑥 ▷ (𝑘 ▷ (𝑓 ▷ converse))` as
+    /// `𝑥`: an application reaches only keys in its function's domain, so the restriction a
+    /// staged form adds changes no value read.
     #[test]
     fn a_staged_form_compares_as_what_it_stages() {
         let apply = |argument: TypedExpr, function: TypedExpr| TypedExpr::apply(argument, function);
@@ -6431,6 +6449,16 @@ mod tests {
             ),
         );
         assert_eq!(compare(narrowed), compare(TypedExpr::var("x")));
+
+        // A group's fiber under `converse` maps each of its keys to itself.
+        let grouped = apply(
+            TypedExpr::var("x"),
+            apply(
+                TypedExpr::var("k"),
+                apply(TypedExpr::var("f"), builtin(Builtin::Converse)),
+            ),
+        );
+        assert_eq!(compare(grouped), compare(TypedExpr::var("x")));
     }
 
     /// A rewrite that makes two refinements equal leaves a *set*, not a bag.

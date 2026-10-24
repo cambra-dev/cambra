@@ -3015,9 +3015,9 @@ cnt
 // A loop's iteration domain
 // ---------------------------------------------------------------------------
 //
-// A `mut` loop runs at its source's own keys, so a map drives one as a list does. A
-// `groupby` does not yet, for a reason that arises before its domain is reached. Each case
-// names the comprehension over the same collection, which compiles.
+// A `mut` loop runs at its source's own keys, so a map or a `groupby` drives one as a list
+// does, for a `groupby` loop with no `:=` loop inside or around it. Each case names the
+// comprehension over the same collection, which compiles.
 
 /// A `mut` loop over a **map**, whose keys are its positions. The store records the
 /// positions it was driven at — `"a"` then `"b"` — and folds the accumulator over them,
@@ -3073,14 +3073,13 @@ fn a_mut_loop_over_nested_collections_runs_once_per_row(#[case] code: &str, #[ca
     check_scalar(code, Value::Int(expected));
 }
 
-/// A `mut` loop over a **`groupby`**, which fails earlier and louder than the map: the
-/// partition's key binder escapes into an open bound during inference rather than
-/// reaching the domain check at all. Recorded beside the map case because both are "a
-/// loop over a collection whose domain is not a position", and only one of them says
-/// so. Answers 150 when both are lifted.
+/// A `mut` loop over a **`groupby`**, whose positions are the group keys. Each group's
+/// domain reads its key, which the loop binds as its position.
+/// `sum([sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)])` answers 150
+/// as well.
 #[test]
-fn a_mut_loop_over_a_groupby_escapes_its_key_binder() {
-    check_compile_error(
+fn a_mut_loop_over_a_groupby_carries_its_accumulator() {
+    check_scalar(
         indoc! {r#"
             sales = [(region="west", amount=100), (region="east", amount=50)]
             total := 0
@@ -3088,7 +3087,39 @@ fn a_mut_loop_over_a_groupby_escapes_its_key_binder() {
                 total += sum([s.amount for s in g])
             total
         "#},
-        "is free in the lower bound",
+        cambra::interpreter::Value::Int(150),
+    );
+}
+
+/// A `:=` loop **inside** a `groupby` `:=` loop does not compile yet: letrec recognition finds
+/// the inner writer's parameter reading the outer loop's position.
+#[test]
+fn a_mut_loop_inside_a_groupby_loop_is_not_compiled_yet() {
+    check_compile_error(
+        indoc! {r#"
+            n := 0
+            for g in groupby([1, 2, 3, 4, 5], \e -> e // 2):
+                for i in [1, 2]:
+                    n += i
+            n
+        "#},
+        "a nested writer's parameter is the (enclosing, position) pair",
+    );
+}
+
+/// A `groupby` `:=` loop **inside** a `:=` loop does not compile yet: letrec recognition
+/// takes the inner loop's domain to be a plain one, and a group's domain reads its key.
+#[test]
+fn a_groupby_loop_inside_a_mut_loop_is_not_compiled_yet() {
+    check_compile_error(
+        indoc! {r#"
+            n := 0
+            for i in [1, 2]:
+                for g in groupby([1, 2, 3, 4, 5], \e -> e // 2):
+                    n += sum(g)
+            n
+        "#},
+        "letrec recognition produced an invalid tree",
     );
 }
 

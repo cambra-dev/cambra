@@ -668,6 +668,23 @@ impl Typing for CheckCtx {
         }
     }
 
+    fn as_function_at(
+        &mut self,
+        t: &Type,
+        binder: &Name,
+        at: &dyn Fn() -> String,
+    ) -> Result<(Type, Type), LocatedInferError> {
+        let fun_binder = match t.read_view().as_ref() {
+            Type::Fun { name, .. } => name.clone(),
+            _ => None,
+        };
+        let (d, c) = self.as_function(t, at)?;
+        Ok((
+            d,
+            crate::ccl::subst::codomain_renamed(fun_binder.as_ref(), binder, &c),
+        ))
+    }
+
     fn provide_function(
         &mut self,
         t: &Type,
@@ -1033,7 +1050,12 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::LetRec { bindings, body } => emit_letrec(bindings, body, ctx)?,
 
-        TypedExprNode::For { target, iter, body } => emit_for(target, iter, body, ctx)?,
+        TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } => emit_for(position, target, iter, body, ctx)?,
 
         // A `Defer` leaf's type was minted during inference (`Feed(ρ)`);
         // like `Var`, the recorded type carries the full load — trust it.

@@ -1522,16 +1522,26 @@ fn inline_and_beta_reduce(
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
 
-        // The loop target shadows `name` inside the body only; the source
+        // The loop's binders shadow `name` inside the body only; the source
         // still substitutes.
-        TypedExprNode::For { target, iter, body } => {
+        TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } => {
             let iter = Box::new(inline_and_beta_reduce(*iter, name, lambda, scope, memo));
-            let body = if &target.name == name {
+            let body = if &target.name == name || &*position == name {
                 body
             } else {
                 Box::new(inline_and_beta_reduce(*body, name, lambda, scope, memo))
             };
-            TypedExprNode::For { target, iter, body }
+            TypedExprNode::For {
+                position,
+                target,
+                iter,
+                body,
+            }
         }
 
         // All remaining variants: pure structural recursion.  Atoms have

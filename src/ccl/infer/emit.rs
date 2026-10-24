@@ -387,7 +387,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             ty?
         }
 
-        TypedExprNode::For { target, iter, body } => emit_for(target, iter, body, ctx)?,
+        TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } => emit_for(position, target, iter, body, ctx)?,
 
         // The write target's lookup is Emit-specific, like `Feed`'s: the
         // written value must flow into the mutable variable's binding type.
@@ -1111,7 +1116,7 @@ pub(super) fn emit_apply<C: Typing>(
         } = &argument.node
         && let TypedExprNode::Var(r) = &position.node
     {
-        ctx.note_loop_source(&param.name, Some(r), source, &position.ty, &raw_arg_ty);
+        ctx.note_loop_source(&param.name, r, source, &position.ty, &raw_arg_ty);
     }
     // A function position is a value position, so a mutable variable mention there reads
     // (`src/ccl/design/mutability.md`, "A mutable variable read is an explicit operation").
@@ -1854,9 +1859,17 @@ pub(super) fn emit_disjoint_join<C: Typing>(
         _ => None,
     };
     let dom_var = ctx.fresh();
+    // Every arm is reached with the join's input, which instantiates a generalized type, as a
+    // chain's input does at its head (`compose_chain`).
+    let incoming = recorded.domain();
     let mut codomains: Vec<(Type, Vec<crate::ccl::ty::Witness>)> = Vec::new();
     for e in exprs.iter_mut() {
         let ty = emit_value_read(e, ctx)?;
+        let ty = match &incoming {
+            Some(input) => ctx.instantiate_generalized(&ty, input),
+            None => ty,
+        };
+        let ty = ctx.open_generic(ty);
         let (dom, cod) = ctx.as_function(&ty, &|| "DisjointJoin element".to_string())?;
         // One shared domain: each operand's domain flows into the same variable, so
         // operands over genuinely different index sets are a type error here rather
@@ -1897,12 +1910,12 @@ pub(super) fn emit_disjoint_join<C: Typing>(
     // rule disagree with the pass that built the node. A join with no function type to
     // read is a collection: the node *is* the merged map.
     let fun_kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data(None));
-    Ok(Type::Fun {
+    Ok(ctx.requantify_opened(Type::Fun {
         name: binder,
         fun_kind,
         domain: Box::new(dom_var),
         codomain: Box::new(cod_var),
-    })
+    }))
 }
 
 /// Aggregate (`Sum`, `Max`): the scheme is the full operator type
@@ -2690,6 +2703,7 @@ pub(super) fn emit_mut_decl<C: Typing>(
 /// rule; the unified phase (src/ccl/design/mutability.md) eliminates the
 /// node before anything downstream runs.
 pub(super) fn emit_for<C: Typing>(
+    position: &Name,
     target: &mut TypedBinding,
     iter: &mut Expr,
     body: &mut Expr,
@@ -2697,28 +2711,38 @@ pub(super) fn emit_for<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     let iter_ty = emit_value_read(iter, ctx)?;
     let iter_label = symbolic(iter);
-    let (position_ty, item_ty) =
-        ctx.as_function(&iter_ty, &|| format!("for-loop source `{iter_label}`"))?;
+    // The element is the source's value at the position, so its type is the codomain at the
+    // position's name: a group's reads its key.
+    let (position_ty, item_ty) = ctx.as_function_at(&iter_ty, position, &|| {
+        format!("for-loop source `{iter_label}`")
+    })?;
 
-    // The target binds at the source's element type — same binder discipline
-    // as `emit_lambda`'s param (normalize the slot so references share vars).
-    let target_simple = ctx.normalize(&target.ty);
-    target.ty = target_simple.clone();
-    let target_label = target.name.clone();
+    // The position ranges over the source's domain, a part of the demand as an application's
+    // binder is (`Typing::apply`): a sum's domain is its witness, which only the demand's
+    // binders name. The position has no slot; a pass after inference reads its type off the
+    // resolved source, with the witnesses projected through it
+    // (`crate::ccl::mut_elim::loop_domain`).
     // The element type left the source's Σ behind, so the edge carries it.
     let source_binders = iter_ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
-    ctx.require_sub_under(&item_ty, &source_binders, &target_simple, &[], &|| {
-        format!("for-loop target `{target_label}`")
-    })?;
-    if let Some(ann) = target.user_annotation.clone() {
-        ctx.bind_annotation(&target_simple, &ann)?;
-    }
+    let target_label = target.name.clone();
+    // The target's type may read the position, so its slot is minted in the position's scope.
+    ctx.scoped(position, &position_ty, |ctx| {
+        // The target binds at the element type, normalized as `emit_lambda`'s param is.
+        let target_simple = ctx.normalize(&target.ty);
+        target.ty = target_simple.clone();
+        ctx.require_sub_under(&item_ty, &source_binders, &target_simple, &[], &|| {
+            format!("for-loop target `{target_label}`")
+        })?;
+        if let Some(ann) = target.user_annotation.clone() {
+            ctx.bind_annotation(&target_simple, &ann)?;
+        }
 
-    // A `for` reaching inference as a loop node writes mutable variables declared outside
-    // it: one that only feeds is a loop over its source's positions
-    // (`crate::ccl::comprehension`, `index_loop`).
-    ctx.note_loop_source(&target.name, None, iter, &position_ty, &target_simple);
-    ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))?;
+        // A `for` reaching inference as a loop node writes mutable variables declared
+        // outside it: one that only feeds is a loop over its source's positions
+        // (`crate::ccl::comprehension`, `index_loop`).
+        ctx.note_loop_source(&target.name, position, iter, &position_ty, &target_simple);
+        ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))
+    })?;
     Ok(Type::Base(BaseType::Unit))
 }
 
