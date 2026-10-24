@@ -1923,6 +1923,13 @@ fn emit_let_definition<C: Typing>(
     } else {
         LetScheme::Monomorphic
     };
+    if defined && generalize {
+        let noted = match &binding.user_annotation {
+            Some(poly @ Type::Poly(_)) => poly,
+            _ => &scheme_ty,
+        };
+        ctx.note_scheme(&binding.name, noted);
+    }
     Ok((scheme, defined))
 }
 

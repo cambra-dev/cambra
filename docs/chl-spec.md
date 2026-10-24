@@ -4660,7 +4660,9 @@ restrict what a type may mention.
 ### 9.14 Checking a module on its own
 
 A module is checked once, alone, with no root and nothing that uses it. `cambra check lib.cambra`
-runs that check and prints the module's interface (**[Planned]**).
+runs that check and prints the module's interface. **[Planned]** The interface writes each type with
+the alias names its module wrote: a member annotated `base: Count` is printed `base: Count`, not
+with the type `Count` names.
 
 - **Parameters are typed binders.** A value parameter has its annotated type, with each `_` in it
   the type its uses infer. A type parameter is opaque apart from its bound. One with no bound is

@@ -294,6 +294,61 @@ impl Interface {
         self.inferred_parameters().any(|p| p == parameter)
     }
 
+    /// Whether `name` is a public value member.
+    pub fn is_public(&self, name: &str) -> bool {
+        self.members.get(name).is_some_and(|member| member.public)
+    }
+
+    /// The interface as `cambra check` prints it (`docs/chl-spec.md`, "9.14
+    /// Checking a module on its own"): each parameter, then each public member
+    /// in the order declared, a value with its contract from `contracts`, by
+    /// spelling, and then whether the module performs IO or declares state.
+    pub fn written(&self, contracts: &HashMap<SmolStr, String>) -> String {
+        let mut lines = vec![format!("module {}", self.module)];
+        for parameter in &self.parameters {
+            let stated = match &parameter.kind {
+                ParameterKind::Module { ty, .. } => format!(": {ty}"),
+                ParameterKind::Type {
+                    bound: Some(bound), ..
+                } => format!(" <: {}", crate::ccl::chl_print::chl_type(bound)),
+                ParameterKind::Value(Some(ty)) => {
+                    format!(": {}", crate::ccl::chl_print::chl_type(ty))
+                }
+                ParameterKind::Type { bound: None, .. } | ParameterKind::Value(None) => {
+                    String::new()
+                }
+            };
+            let default = if parameter.default { " = …" } else { "" };
+            lines.push(format!("param {}{stated}{default}", parameter.name));
+        }
+        let mut members: Vec<(Span, String)> = Vec::new();
+        for (name, member) in &self.members {
+            if member.public {
+                let contract = contracts.get(name).map_or("…", String::as_str);
+                members.push((member.declared, format!("pub {name}: {contract}")));
+            }
+        }
+        for (name, member) in &self.types {
+            if member.public {
+                members.push((member.declared, format!("pub {name} = {}", member.ty)));
+            }
+        }
+        for (name, member) in &self.modules {
+            if member.public {
+                let line = format!("pub {name} = {}", member.module);
+                members.push((member.declared, line));
+            }
+        }
+        members.sort_by_key(|(span, _)| span.start);
+        lines.extend(members.into_iter().map(|(_, line)| line));
+        match self.unimportable {
+            Some(Unimportable::Io(_)) => lines.push("performs IO".to_string()),
+            Some(Unimportable::State(_)) => lines.push("declares mutable state".to_string()),
+            None => {}
+        }
+        lines.join("\n") + "\n"
+    }
+
     /// The interface of a module that importing is an error for. Each import of
     /// it is refused, so its members are never reached.
     pub(super) fn unimportable(module: ModulePath, why: Unimportable) -> Self {
