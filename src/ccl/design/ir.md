@@ -36,7 +36,7 @@ inside dependent types (`ccl/names.rs`):
 | `Raw(String)` | Source spelling before uniquification; lexical scope distinguishes equal spellings. |
 | `Unique { base, uid, home }` | Source binder minted by `uniquify`; `uid` distinguishes binding sites, while `base` retains the source spelling and `home` the imported module or run whose top-level member it binds ([docs/modules.md, "Names carry their home"](../../../docs/modules.md#names-carry-their-home)). |
 | `Synthetic { kind, uid }` | Compiler binder with a fresh `uid`; `kind` identifies its origin (`Pair`, `Mono`, `FloatedDefer`, `SolverArg`, or `Component`). |
-| `Reserved(ReservedName)` | Special name; the shared refinement-element binder is `__elem`. |
+| `Reserved(ReservedName)` | Special name: `__elem^𝑛`, a reference to a refinement's element, indexed by the refinements between it and that refinement ([type-inference.md, "A refinement's element is referenced by index"](type-inference.md#a-refinements-element-is-referenced-by-index)). |
 | `PiBound(PiRef)` | Bound reference in a function type's codomain; its de Bruijn index determines equality, while its spelling hint is display metadata. It is never a term binder. |
 
 Lowering can produce two `Let` binders spelled `x` for successive source assignments. The

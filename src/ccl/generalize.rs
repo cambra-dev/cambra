@@ -502,7 +502,7 @@ fn walk(
         if failed.is_some()
             || !crate::ccl::subst::type_free_vars(ty)
                 .iter()
-                .any(|n| !scope.contains(n))
+                .any(|n| n.elem_index().is_none() && !scope.contains(n))
         {
             return;
         }

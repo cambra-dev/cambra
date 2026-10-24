@@ -405,6 +405,8 @@ impl Printer {
     fn expr_inner<'a>(&mut self, e: &'a Expr, env: &Env<'a>) -> (Prec, String) {
         match &e.node {
             TypedExprNode::Lit(lit) => (Prec::Atom, lit_text(lit)),
+            // `_` is the predicate's own element. CHL has no spelling for an enclosing
+            // refinement's, `__elem^𝑛`, which `spelling` declines and the fallback marks.
             TypedExprNode::Var(name) if name.is_elem() => (Prec::Atom, "_".to_string()),
             TypedExprNode::Var(name) => {
                 if let Some((_, bound, depth)) = env.iter().rev().find(|(n, _, _)| *n == name) {

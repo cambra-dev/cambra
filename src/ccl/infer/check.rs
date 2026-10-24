@@ -130,6 +130,10 @@ pub(super) struct CheckCtx {
     /// check: `checked_predicates` keys by address, and a copy freed mid-walk lends its
     /// address to a later predicate, which would then be skipped as already checked.
     opened_types: Vec<Type>,
+    /// The scratch lambdas [`check_slot_predicates`] checked, kept alive for the rest of the
+    /// check for the reason `opened_types` is: renaming a predicate's element rebuilds the
+    /// nested predicates that read it, and `checked_predicates` holds their addresses.
+    scratch_lambdas: Vec<Expr>,
     /// The program's instances, which say what a nominal type's comparisons are.
     instances: Rc<InstanceTable>,
     /// The generalized parameters a chain left generic ([`Typing::open_generic`]), which a chain's
@@ -178,6 +182,7 @@ impl CheckCtx {
             opaque_binders: HashMap::new(),
             checked_predicates: Default::default(),
             opened_types: Vec::new(),
+            scratch_lambdas: Vec::new(),
             instances,
             opened_params: Vec::new(),
         }
@@ -1103,9 +1108,12 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 /// comparing types compares it whole and never asks whether it type-checks. A projection
 /// inside it naming a witness the enclosing type does not is one defect only this catches.
 ///
-/// Checked in the form it denotes and the form planning will compile, `λ __elem : base →
-/// predicate` ([`crate::ccl::planning::predicates::fn_of_bare_predicate`]), because a bare
-/// predicate is open in `__elem` and would report an unbound variable on its own.
+/// Checked in the form it denotes and the form planning will compile,
+/// `λ 𝑒 : base → predicate[__elem ↦ 𝑒]` with `𝑒` fresh
+/// ([`crate::ccl::planning::predicates::fn_of_bare_predicate`]), because a bare predicate is
+/// open in `__elem` and would report an unbound variable on its own. The rename reaches a
+/// nested refinement's `__elem^1`, so a query under that refinement assumes what `𝑒` ranges
+/// over.
 ///
 /// Run from [`check_node`], at the node whose slot holds the type, so the predicate is
 /// typed in the scope it is written in: its free names are the binders enclosing that node,
@@ -1113,7 +1121,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 /// type slots would type every predicate at the root, where the binder of an enclosing
 /// lambda a nested filter reads is out of scope. The predicate's own subterms — a filter
 /// nested inside it, say — are then reached by the rules walking the scratch lambda, under
-/// `__elem` and the predicate's own binders.
+/// `𝑒` and the predicate's own binders.
 fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
     fn in_type(ty: &Type, ctx: &mut CheckCtx) {
         // **A Σ binds its witnesses over everything below it**, the predicate on its domain
@@ -1138,17 +1146,21 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
                 }
                 // **The scratch lambda never enters a tree, so it consumes no identity.**
                 // It exists only to give the predicate the binder it is open in — a bare
-                // predicate would report `__elem` unbound — and is dropped when the check
-                // returns. Minting it would put a birth with no recording open into the
-                // record a phase scope is auditing, and cloning its body the ordinary way
-                // would put a copy there too: `TypedExpr`'s `Clone` freshens. A check
-                // reads, and must not perturb the record it may be reporting on
-                // ([`TypedExpr::throwaway`]).
-                let body = r.predicate.as_ref().clone_preserving_ids();
+                // predicate would report `__elem` unbound. Minting it would put a birth with
+                // no recording open into the record a phase scope is auditing, and cloning
+                // its body or renaming its element the ordinary way would put copies there
+                // too: `TypedExpr`'s `Clone` freshens. A check reads, and must not perturb
+                // the record it may be reporting on ([`TypedExpr::throwaway`]).
+                let param = Name::fresh("elem");
+                let mut body = r.predicate.as_ref().clone_preserving_ids();
+                provenance::preserving_ids(|| {
+                    crate::ccl::subst::Subst::rename(Name::elem(), param.clone())
+                        .rewrite_expr(&mut body)
+                });
                 let bound_ty = Type::fun((**base).clone(), body.ty.clone());
                 let mut bound = Expr::throwaway(TypedExprNode::Lambda {
                     param: TypedBinding {
-                        name: Name::elem(),
+                        name: param,
                         ty: (**base).clone(),
                         user_annotation: None,
                         transparency: BindingTransparency::Transparent,
@@ -1166,6 +1178,7 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
                         crate::ccl::symbolic::symbolic_typed(&r.predicate)
                     );
                 }
+                ctx.scratch_lambdas.push(bound);
             }
         }
         // Under each binder the predicates read it by name, as a term does, and it is in

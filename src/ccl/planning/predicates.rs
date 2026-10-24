@@ -42,8 +42,8 @@ use crate::ccl::RefinementSet;
 // it and leave it in lambda form.
 
 // The refinement's **base** is the memo's context (`PredMemo<Type>`), because
-// compilation reads it: `fn_of_bare_predicate` eta-expands `λ __elem : base →
-// bare`, and `bare_predicate_of_fn` stamps it on the element var. An entry is
+// compilation reads it: `fn_of_bare_predicate` eta-expands `λ 𝑒 : base →
+// bare[__elem ↦ 𝑒]`, and `bare_predicate_of_fn` stamps it on the element var. An entry is
 // therefore reused only for an occurrence over an equal base. That holds in
 // practice — a shared `Rc` is only ever created by copying one refinement — but
 // nothing enforces it, and keying on the base means a mismatch *recompiles*
@@ -179,7 +179,7 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
 /// The point-free predicate function `p : base ⇒ Bool` underlying a refinement's
 /// bare predicate `__elem ▷ p` (the inverse of [`ccl_utils::bare_predicate_of_fn`]).
 /// Fast-pathed when the bare predicate is already that single application; otherwise
-/// η-expands to `λ __elem → bare` and lambda-eliminates to point-free.
+/// η-expands to `λ 𝑒 → bare[__elem ↦ 𝑒]`, `𝑒` fresh, and lambda-eliminates to point-free.
 ///
 /// The fast path returns `p` as it stands, and lambda elimination leaves predicates alone, so
 /// `p` can still hold a lambda. The one predicate of that shape is a membership refinement, a
@@ -208,6 +208,7 @@ pub(crate) fn fn_of_bare_predicate(
 ) -> Expr {
     if let TypedExprNode::Apply { argument, function } = &bare.node
         && matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
+        && crate::ccl::subst::free_elem_indices(function).is_empty()
     {
         if crate::ccl::channelize::holds_defer(function) {
             return eliminate_lifted((**function).clone())
@@ -225,7 +226,13 @@ pub(crate) fn fn_of_bare_predicate(
     };
     // Only the *kind* is declared. The shape is whatever the η-expansion built, so a bare
     // predicate that is already function-valued keeps the codomain it has.
-    let lam = Expr::lambda(Name::elem(), base.clone(), bare.clone());
+    //
+    // The parameter is a fresh name: element references are bound by refinements alone, and
+    // no lambda binds one. The rename reaches a nested refinement's `__elem^1` too
+    // (`src/ccl/design/type-inference.md`, "A refinement's element is referenced by index").
+    let param = Name::fresh("elem");
+    let body = crate::ccl::subst::Subst::rename(Name::elem(), param.clone()).apply_expr(bare);
+    let lam = Expr::lambda(param, base.clone(), body);
     let lam = match &lam.ty {
         Type::Fun {
             name,

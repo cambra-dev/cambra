@@ -236,14 +236,14 @@ pub(super) fn reached_types(
     Rc::new(arguments)
 }
 
-/// A name a refinement in `ty` reads other than its element, if one does.
+/// A name a refinement in `ty` reads other than an element reference, if one does.
 pub(super) fn value_named(ty: &Type) -> Option<Name> {
     fn walk(ty: &Type, visited: &mut HashSet<crate::ccl::PredicateId>, found: &mut Option<Name>) {
         walk_refined_predicates(ty, visited, &mut |predicate, _| {
             if found.is_none() {
                 *found = free_names(predicate)
                     .into_iter()
-                    .find(|name| !name.is_elem());
+                    .find(|name| name.elem_index().is_none());
             }
         });
         ty.walk_children(|child| walk(child, visited, found));

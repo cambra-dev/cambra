@@ -556,6 +556,10 @@ mod tests {
                 "the other side is the element too, so nothing names the partition",
                 equals(extraction("c", "key"), Expr::var(Name::elem())),
             ),
+            (
+                "the other side is an enclosing refinement's element, not a key binder",
+                equals(extraction("c", "key"), Expr::var(Name::elem_at(1))),
+            ),
         ];
         for (why, pred) in cases {
             assert!(partition_key_of(&pred).is_none(), "{why}");
