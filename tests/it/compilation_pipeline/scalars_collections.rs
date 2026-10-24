@@ -328,12 +328,9 @@ fn test_folded_collection_elements(#[case] code: &str, #[case] expected: Value) 
     check_scalar(code, expected);
 }
 
-// A definition the body's type **discharges** does not fold, and the program still runs.
-// `^+` records what it computed, so `x`'s definition ends up inside the refinement the
-// `let` carries; the post-planning wall re-runs that discharge over the definition the
-// tree holds by then and compares the two refinements structurally
-// (`src/ccl/planning/const_fold.rs`, "A definition the body's type discharges"). Folding
-// the definition leaves `4` on one side of that comparison and `1 ^+ 3` on the other.
+// A definition the body's type reads does not fold, and the program still runs. `^+` records
+// what it computed, so `x`'s definition ends up inside the refinement `y`'s type carries
+// (`src/ccl/planning/const_fold.rs`, the module docs' "What does not fold").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_discharged_definition_survives_planning() {
@@ -414,8 +411,8 @@ fn an_element_built_from_a_record_constant_is_rejected() {
         sum([p.a + p.b])"});
 }
 
-/// The `discharged` guard skips the whole **subtree**, so an unrelated downstream `^+`
-/// stops an otherwise-foldable element compiling.
+/// The guard on a definition a type reads skips the whole **subtree**, so an unrelated
+/// downstream `^+` stops an otherwise-foldable element compiling.
 ///
 /// What makes `y`'s definition discharged is `z`, which reads it — so the same program with
 /// `z = y + 1` folds the element and answers 7. The guard is the module doc's bound at "What

@@ -349,14 +349,22 @@ impl Uniquifier {
                 self.unbind(base);
             }
 
-            // The loop target binds only in the body; the source sees the
-            // outer scope.
-            TypedExprNode::For { target, iter, body } => {
+            // The loop's position and target bind only in the body; the source
+            // sees the outer scope.
+            TypedExprNode::For {
+                position,
+                target,
+                iter,
+                body,
+            } => {
                 self.expr(iter);
+                self.binding_tys(position);
+                let outer = self.bind(position);
                 self.binding_tys(target);
-                let base = self.bind(target);
+                let inner = self.bind(target);
                 self.expr(body);
-                self.unbind(base);
+                self.unbind(inner);
+                self.unbind(outer);
             }
 
             // Non-recursive: the bound expression or seed is walked in the outer scope, then

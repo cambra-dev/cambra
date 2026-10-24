@@ -2057,7 +2057,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         // Born after inference, so nothing here resolves — but its child is an ordinary
         // term and still needs the walk.
-        TypedExprNode::Realize { value, .. } => coalesce_node(value, level, ctx),
+        TypedExprNode::Realize(value) => coalesce_node(value, level, ctx),
         TypedExprNode::BinOp { left, right, .. } => {
             coalesce_node(left, level, ctx);
             coalesce_node(right, level, ctx);
@@ -2326,13 +2326,20 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // A `Begin` block: recurse into its body chain; the block's own `Unit`
         // type needs no resolution and it binds no name.
         TypedExprNode::Begin { body } => coalesce_node(body, level, ctx),
-        TypedExprNode::For { target, iter, body } => {
+        TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } => {
             coalesce_node(iter, level, ctx);
-            // The loop target binds only inside the body.
-            let target_name = target.name.clone();
-            with_shadows(ctx, [target_name], |ctx| coalesce_node(body, level, ctx));
-            // Binder slot: resolve the target's element type in place, like
-            // `Loop` params (`emit_for` wrote the slot var).
+            // The loop's position and target bind only inside the body.
+            let names = [position.name.clone(), target.name.clone()];
+            with_shadows(ctx, names, |ctx| coalesce_node(body, level, ctx));
+            // The position ranges over the resolved source's domain, a sum's witnesses
+            // projected through the source. The target's slot resolves in place, like `Loop`
+            // params (`emit_for` wrote the slot var).
+            position.ty = crate::ccl::mut_elim::loop_domain(iter);
             resolve_binder_slot(&mut target.ty, || "For target".to_string(), level, ctx);
         }
         // `Transact` is born by `planning::plan_loops`, after inference (and

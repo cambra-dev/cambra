@@ -13,6 +13,10 @@ use crate::{
 // For-loop lowering — For CCL node
 // ---------------------------------------------------------------------------
 
+/// The spelling of the position a `For` binds beside its target. Source-disjoint, as every
+/// `__` spelling lowering mints is; uniquification gives each loop its own.
+pub(super) const LOOP_POSITION: &str = "__pos";
+
 /// Return `true` if any statement in `stmts` contains a `yield` expression
 /// (checked recursively through `if` guards and nested `for` loops).
 ///
@@ -1285,6 +1289,7 @@ fn lower_nested_loop(
     })?;
     Ok(ctx.tag_image(
         Expr::new(TypedExprNode::For {
+            position: Box::new(TypedBinding::new_unannotated(LOOP_POSITION)),
             target: TypedBinding {
                 name: iter_var.into(),
                 ty: Type::Hole,
@@ -1380,6 +1385,7 @@ pub(super) fn lower_direct_mirror_loop(
     // `ExprStmt` splicing it before the continuation is manufactured.
     let for_node = ctx.tag_image(
         Expr::new(TypedExprNode::For {
+            position: Box::new(TypedBinding::new_unannotated(LOOP_POSITION)),
             target: TypedBinding {
                 name: iter_var.into(),
                 ty: Type::Hole,

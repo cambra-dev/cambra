@@ -136,6 +136,8 @@ pub(super) struct CheckCtx {
     /// type is quantified over where it reads them. Parameters are unique, so the list only
     /// grows.
     opened_params: Vec<crate::ccl::ty::PolyParam>,
+    /// Checking planning's output ([`Typing::reads_recorded_dependent_results`]).
+    planned: bool,
 }
 
 /// The environment a Check query runs in: the lexical scope at the query, plus
@@ -180,6 +182,7 @@ impl CheckCtx {
             opened_types: Vec::new(),
             instances,
             opened_params: Vec::new(),
+            planned: false,
         }
     }
 
@@ -507,6 +510,10 @@ impl Typing for CheckCtx {
         crate::ccl::generalize::instantiate(ty, incoming)
     }
 
+    fn reads_recorded_dependent_results(&self) -> bool {
+        self.planned
+    }
+
     fn open_generic(&mut self, ty: Type) -> Type {
         match ty {
             Type::Poly(p)
@@ -665,6 +672,23 @@ impl Typing for CheckCtx {
         }
     }
 
+    fn as_function_at(
+        &mut self,
+        t: &Type,
+        binder: &Name,
+        at: &dyn Fn() -> String,
+    ) -> Result<(Type, Type), LocatedInferError> {
+        let fun_binder = match t.read_view().as_ref() {
+            Type::Fun { name, .. } => name.clone(),
+            _ => None,
+        };
+        let (d, c) = self.as_function(t, at)?;
+        Ok((
+            d,
+            crate::ccl::subst::codomain_renamed(fun_binder.as_ref(), binder, &c),
+        ))
+    }
+
     fn provide_function(
         &mut self,
         t: &Type,
@@ -741,6 +765,7 @@ impl Typing for CheckCtx {
         fn_ty: &Type,
         arg_ty: &Type,
         argument: &Expr,
+        recorded: &Type,
         _kind: Option<&crate::ccl::ty::FunKind>,
         at: &dyn Fn() -> String,
     ) -> Result<Type, LocatedInferError> {
@@ -775,7 +800,11 @@ impl Typing for CheckCtx {
         // the same argument term.
         let result = match function.as_ref() {
             Type::Fun { name: Some(b), .. } => {
-                crate::ccl::subst::discharge_codomain(b, argument, &codomain)
+                let discharged = crate::ccl::subst::discharge_codomain(b, argument, &codomain);
+                if self.planned && discharged != codomain {
+                    return Ok(recorded.clone());
+                }
+                discharged
             }
             _ => codomain,
         };
@@ -955,12 +984,14 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // relation it claims — a gated tagged union realizing a sum — is one no typing rule
         // can check, so re-deriving from the value would only rediscover that they differ.
         // The child is still walked: it is an ordinary term and its own subtree must check.
-        TypedExprNode::Realize { value, .. } => {
+        TypedExprNode::Realize(value) => {
             ctx.subexpr(value)?;
             expr.ty.clone()
         }
 
-        TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
+        TypedExprNode::Apply { function, argument } => {
+            emit_apply(function, argument, &recorded_ty, ctx)?
+        }
 
         TypedExprNode::BinOp { left, op, right } => {
             let sig = ctx.schemes.binop(*op);
@@ -983,7 +1014,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             binding,
             bound_expr,
             body,
-        } => emit_let(binding, bound_expr, body, ctx)?,
+        } => emit_let(binding, bound_expr, body, &recorded_ty, ctx)?,
 
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")
@@ -1029,11 +1060,24 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             writers,
             domain,
             parameter,
-        } => emit_transact(keys, writers, domain, parameter.as_ref(), node_id, ctx)?,
+        } => emit_transact(
+            keys,
+            writers,
+            domain,
+            parameter.as_ref(),
+            &recorded_ty,
+            node_id,
+            ctx,
+        )?,
 
         TypedExprNode::LetRec { bindings, body } => emit_letrec(bindings, body, ctx)?,
 
-        TypedExprNode::For { target, iter, body } => emit_for(target, iter, body, ctx)?,
+        TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } => emit_for(position, target, iter, body, ctx)?,
 
         // A `Defer` leaf's type was minted during inference (`Feed(ρ)`);
         // like `Var`, the recorded type carries the full load — trust it.
@@ -1308,17 +1352,33 @@ pub(crate) fn check_located_against(
     // The walk opens a type's binders to reach the predicates beneath them, once per node
     // that carries the type, so one memo keeps each opened predicate one allocation and
     // `checked_predicates` checks it once.
-    crate::ccl::subst::with_conversion_memo(|| check_located_memoized(expr, sources, instances))
+    crate::ccl::subst::with_conversion_memo(|| {
+        check_located_memoized(expr, sources, instances, false)
+    })
+}
+
+/// [`check_located_against`] for planning's output, where a dependent result is the recorded
+/// one ([`Typing::reads_recorded_dependent_results`]).
+pub(crate) fn check_planned_located(
+    expr: &Expr,
+    sources: &HashMap<String, Type>,
+    instances: &Rc<InstanceTable>,
+) -> Result<(), Vec<LocatedInferError>> {
+    crate::ccl::subst::with_conversion_memo(|| {
+        check_located_memoized(expr, Some(sources), instances, true)
+    })
 }
 
 fn check_located_memoized(
     expr: &Expr,
     sources: Option<&HashMap<String, Type>>,
     instances: &Rc<InstanceTable>,
+    planned: bool,
 ) -> Result<(), Vec<LocatedInferError>> {
     let mut cloned = expr.clone_preserving_ids();
     let mut ctx = CheckCtx::new(cloned.node_id(), Rc::clone(instances));
     ctx.sources = sources.cloned();
+    ctx.planned = planned;
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —
     // `emit_case`'s `EmptyCase`, `emit_node`'s `UnboundVariable` — so the returned

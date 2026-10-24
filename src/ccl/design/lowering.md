@@ -197,8 +197,10 @@ name with its assembled domain and erases the `Feed` history wrapper. This does 
 second inference pass. The strict post-channelization type check verifies the result. See
 [Feed handles as invariant histories](type-inference.md#feed-handles-as-invariant-histories).
 
-For a structured mutation loop, `emit_for` checks that the source is a function, binds its element
-type to the loop target, and checks the body as a statement. The `For` node has type `Unit`.
+For a structured mutation loop, `emit_for` checks that the source is a function, binds its domain to
+the loop's position and its codomain at the position to the loop target, and checks the body as a
+statement. A group's element type reads its key, which is the position. The `For` node has type
+`Unit`.
 `mut_elim` constructs the later decision record and its `__to_<defer>` feed fields.
 
 ## `if` and `match` in value position

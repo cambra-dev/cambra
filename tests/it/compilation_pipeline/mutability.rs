@@ -2824,9 +2824,8 @@ cnt
 // A loop's iteration domain
 // ---------------------------------------------------------------------------
 //
-// A `mut` loop runs at its source's own keys, so a map drives one as a list does. A
-// `groupby` does not yet, for a reason that arises before its domain is reached. Each case
-// names the comprehension over the same collection, which compiles.
+// A `mut` loop runs at its source's own keys, so a map or a `groupby` drives one as a list
+// does. Each case names the comprehension over the same collection, which compiles.
 
 /// A `mut` loop over a **map**, whose keys are its positions. The store records the
 /// positions it was driven at — `"a"` then `"b"` — and folds the accumulator over them,
@@ -2882,22 +2881,21 @@ fn a_mut_loop_over_nested_collections_runs_once_per_row(#[case] code: &str, #[ca
     check_scalar(code, Value::Int(expected));
 }
 
-/// A `mut` loop over a **`groupby`**, which fails earlier and louder than the map: the
-/// partition's key binder escapes into an open bound during inference rather than
-/// reaching the domain check at all. Recorded beside the map case because both are "a
-/// loop over a collection whose domain is not a position", and only one of them says
-/// so. Answers 150 when both are lifted.
+/// A `mut` loop over a **`groupby`**, whose positions are the group keys. Each group's
+/// domain reads its key, which the loop binds as its position.
+/// `sum([sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)])` answers 150
+/// as well.
 #[test]
-fn a_mut_loop_over_a_groupby_escapes_its_key_binder() {
-    check_compile_error(
+fn a_mut_loop_over_a_groupby_carries_its_accumulator() {
+    check_scalar(
         indoc! {r#"
-            sales = [(region="west", amount=100), (region="east", amount=50)]
+            sales = [(region=1, amount=100), (region=2, amount=50)]
             total := 0
             for g in groupby(sales, \r -> r.region):
                 total += sum([s.amount for s in g])
             total
         "#},
-        "is free in the lower bound",
+        cambra::interpreter::Value::Int(150),
     );
 }
 

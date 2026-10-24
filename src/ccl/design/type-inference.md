@@ -804,6 +804,21 @@ refined type must leave the node reconstructable under the checking rules; see
 Post-planning checks use structural predicate equality. Semantic entailment at that stage requires
 an SMT encoding for point-free expressions.
 
+#### After planning, a dependent result is the recorded one
+
+The check after planning takes a result from the node's recorded type, instead of rebuilding it,
+wherever rebuilding would put a term into the type:
+
+- a dependent application, `𝐵(𝑎)` for `𝑓 : (𝑥 : 𝐴) ⇒ 𝐵(𝑥)` applied to `𝑎`, puts in `𝑎`;
+- a chain that names its positions puts in the morphisms before each named position;
+- a `let` whose body type reads its binder puts in the definition at the scope's exit;
+- a `Transact` whose taps read their rows puts in each writer's source.
+
+Planning rewrites those terms, and after planning nothing reads a type's predicates, so a rebuilt
+type differs from the recorded one only in how a quoted term is written. The check still relates the
+argument to the domain, each morphism in a chain to the next, a `let`'s body to its scope, and each
+writer to its store (`Typing::reads_recorded_dependent_results`).
+
 ---
 
 ## 3. Specialization and Predicate Ownership
@@ -1246,17 +1261,11 @@ while a type's copy keeps its lambdas. The normal form is the spelling every suc
   the first-match predicate `π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`, and peeling the earlier guards off it
   leaves `𝑔ᵢ`. A type quoting a conditional chosen per row then compares equal to the point-free
   definition lambda elimination wrote for it;
-- an applied staged form reads as what it stages. Planning writes `curry(𝑔)` over a dependent
-  domain as `(𝐹, 𝑔) ▷ curry_over`, which reads as `curry(𝑔)`, and a filter as `𝑚 ▷ filter_values`,
-  the identity restricted to what `𝑚` keeps, which reads as `id`. A correlated site's keys and
-  pairing read the same way: `𝑝 ▷ iterate`, an iteration source narrowed by a filter
-  (`𝑢 ▷ (𝑝 ▷ restrict)`) and `𝑐 ▷ map_domain` map each key to itself, so a chain `iterate ≫ 𝑓`
-  reads as `𝑓` unapplied too, `𝑎 ▷ (𝑓 ▷ strength_over)`
-  is `λ 𝑘 → (𝑎, 𝑘 ▷ (𝑎 ▷ 𝑓))`, and `𝑥 ▷ (𝑐 ▷ map(𝑔))` is `(𝑥 ▷ 𝑐) ▷ 𝑔`. An application reaches
-  only keys in its function's domain, so no restriction changes the value
-  read, and a type that reads a definition planning restaged still compares equal to the copy
-  that reads it unplanned;
 - a projection out of a tuple or record former reads the component.
+
+Planning's rewrites have no reading back. A type the check after planning would rebuild by
+putting a term planning rewrote into it is the recorded one instead
+([After planning, a dependent result is the recorded one](#after-planning-a-dependent-result-is-the-recorded-one)).
 
 Normalizing is term-level: it leaves type slots as they are and mints no node identity, so an
 equality can run it. A consumer that reads a predicate as a term rather than comparing it, the SMT

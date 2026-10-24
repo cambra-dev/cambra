@@ -780,7 +780,7 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
             true
         }
         // A realization is the union it holds, gated legs and all.
-        TypedExprNode::Realize { value, .. } => is_iteration_bearing(value),
+        TypedExprNode::Realize(value) => is_iteration_bearing(value),
         // `unbox(𝑐)` is `𝑐`'s value over the domain its witness names, keys and all, so it
         // iterates exactly when `𝑐` does: an `iterate` over its projected domain would
         // enumerate the witness's whole bound (`src/ccl/design/collections.md`, "A projection

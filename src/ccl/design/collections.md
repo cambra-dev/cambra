@@ -549,11 +549,12 @@ read from mutable storage has already had its determined witness erased. Such a 
 a sum-typed element position; `reject_rows_fixed_elsewhere` reports the mismatch.
 
 A conditional is realized where it stands. The `Case` is replaced in place by its union, under a
-`Realize` that asserts the `Case`'s type and keeps the `Case` as the term it stages. Every consumer
-reads the conditional through `unbox`, over the projected domain `σ₁(𝑐)` of the `Case` term `𝑐`, so a
-consumer's types quote the conditional rather than name its witness. Normal form reads a `Realize`
-as the term it stages (`ccl_utils::normal_form`), so those types and the realized tree compare as
-one term. A `let`-bound conditional is realized once, in its binding, and its consumers share it.
+`Realize` that asserts the `Case`'s type. Every consumer reads the conditional through `unbox`, over
+the projected domain `σ₁(𝑐)` of the `Case` term `𝑐`, so a consumer's types quote the conditional
+rather than name its witness. The check after planning takes a result quoting the conditional as
+recorded rather than rebuilding it from the realized tree
+([After planning, a dependent result is the recorded one](type-inference.md#after-planning-a-dependent-result-is-the-recorded-one)).
+A `let`-bound conditional is realized once, in its binding, and its consumers share it.
 
 Unboxed arms sharing a domain need no sum; boxed arms sharing a domain still have a
 one-candidate sum during inference. A same-domain boxed conditional is realized, not erased:
