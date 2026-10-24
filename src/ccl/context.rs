@@ -12,18 +12,22 @@ use crate::ccl::load::{LoadError, LoadedProgram};
 use crate::chl_parser::ast::Span;
 use crate::chl_parser::parser::ParseError;
 use crate::chl_parser::source_map::{SourceMap, report_config};
+use crate::chl_parser::{FileId, ModulePath};
 use log::debug;
 
 use crate::{
     ccl::{
         Expr, Name, Type, anf, channelize, comprehension,
         infer::{
-            InferError, LocatedInferError, TypeInferenceContext, check_mut_discipline,
-            check_mut_write_targets, check_pre_channelize, check_pre_channelize_located, infer,
-            typecheck, typecheck_planned,
+            InferError, LocatedInferError, TypeInferenceContext, check_module,
+            check_mut_discipline, check_mut_write_targets, check_pre_channelize,
+            check_pre_channelize_located, infer, typecheck, typecheck_planned,
         },
         inline, lambda_elim,
-        lower::{LoweredRoute, LoweringContext, LoweringError, modules::lower_program},
+        lower::{
+            LoweredRoute, LoweringContext, LoweringError,
+            modules::{InferredArgument, ModuleCheck, lower_program},
+        },
         mut_elim, mut_read, opaque_output,
         panes::gate_leaks,
         planning,
@@ -381,6 +385,16 @@ impl<'a> Blame<'a> {
             projection,
             derived: SourceProjection::new(),
             program: Span::new(root, 0, sources.text(root).len()),
+        }
+    }
+
+    /// A blame over the same lowering projection, with no phase projections:
+    /// one for another tree, which its own phases derive.
+    fn fresh(&self) -> Blame<'a> {
+        Blame {
+            projection: self.projection,
+            derived: SourceProjection::new(),
+            program: self.program,
         }
     }
 
@@ -2046,6 +2060,7 @@ fn run_frontend(
     // projection. It must fully drain before the first phase (`Infer`) session opens.
     let lowering_session = LoweringSession::install();
     let lower_result = lower_program(program, ctx.lowering_ctx());
+    let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
@@ -2085,10 +2100,16 @@ fn run_frontend(
     // copy sites (uncurry's template discharge, the chained-comparison operand
     // freshens) are what make this a live risk at this boundary.
     assert_unique_node_ids(&expr, "post-lowering");
+    for check in &checks {
+        assert_unique_node_ids(&check.tree, "post-lowering module check");
+    }
 
     let lowering_log = lowering_session.into_log();
     let lowering_projection = {
-        let output_ids = collect_tree_ids(&expr);
+        let mut output_ids = collect_tree_ids(&expr);
+        for check in &checks {
+            output_ids.extend(collect_tree_ids(&check.tree));
+        }
         let (projection, leaks) = fold_lowering(&lowering_log, &output_ids);
         gate_leaks(&leaks, "lowering");
         projection
@@ -2117,6 +2138,7 @@ fn run_frontend(
     let expr = run_passes(
         ctx,
         expr,
+        checks,
         stop,
         capture,
         record,
@@ -2132,15 +2154,188 @@ fn run_frontend(
     })
 }
 
+/// Check each module on its own, in link order, against `checks`, its check
+/// tree (`docs/modules.md`, "Checking a module on its own"): the passes before
+/// inference, then inference. Return every error the checks raise, each once.
+///
+/// A check's error in another module's code is that module's own when its check
+/// raised it too, and is reported there. Otherwise the checked module's use
+/// raised it, and it carries a secondary label at the module's statement that
+/// reaches that code. Two errors are one when they stand at one span and read
+/// alike as their module writes them ([`error_key`]).
+fn check_modules(
+    ctx: &mut GlobalContext,
+    checks: Vec<ModuleCheck>,
+    blame: &Blame<'_>,
+) -> Vec<CompileError> {
+    let mut own: HashMap<FileId, HashSet<(Span, String)>> = HashMap::new();
+    let mut seen: HashSet<(Span, String)> = HashSet::new();
+    let mut reported = Vec::new();
+    // The type each module's check infers for each of its unannotated value
+    // parameters. The link order checks a module before every module that
+    // passes it an argument.
+    let mut inferred: HashMap<(ModulePath, SmolStr), Type> = HashMap::new();
+    for check in checks {
+        let mut blame = blame.fresh();
+        let mut tree = uniquify::run(check.tree);
+        annotate_arguments(&mut tree, &check.arguments, &inferred);
+        tree = anf::run(tree);
+        tree = mut_read::run(tree);
+        let derivation = DerivationSession::install();
+        tree = comprehension::run(tree, ctx.lowering_ctx().shared_holes());
+        blame.derive(&derivation.into_log(), Phase::Comprehension);
+        let checked = check_module(&mut tree, ctx.inference_ctx(), &check.params);
+        if checked.is_ok() {
+            note_parameter_types(
+                &tree,
+                &check.module,
+                &check.inferred_parameters,
+                &mut inferred,
+            );
+        }
+        let Err(errors) = checked else {
+            continue;
+        };
+        let respelling = mut_read::read_respelling(&tree);
+        let errors = errors
+            .into_iter()
+            .map(|mut located| {
+                located.error.map_types(&|ty| respelling.apply_type(ty));
+                located
+            })
+            .collect();
+        for mut error in blame.infer(errors, &tree) {
+            let CompileError::Infer {
+                error: infer_error,
+                span,
+                related,
+            } = &mut error
+            else {
+                unreachable!("`Blame::infer` makes inference errors");
+            };
+            let key = error_key(*span, infer_error);
+            if span.file == check.file {
+                own.entry(check.file).or_default().insert(key.clone());
+            } else if own
+                .get(&span.file)
+                .is_some_and(|errors| errors.contains(&key))
+            {
+                continue;
+            } else if let Some(statement) = check.reached_by.get(&span.file) {
+                related.push((*statement, "brought in here"));
+            }
+            if seen.insert(key) {
+                reported.push(error);
+            }
+        }
+    }
+    reported
+}
+
+/// What makes two checks' errors one error: its span, and its message with each name
+/// written without its home, as the name's module writes it. Each check holds its own
+/// copy of a module, so one error raised in two checks names the module's members
+/// through two homes (`lo` in the module's own check, `b::lo` where a run `b` of it
+/// is checked) and by two uids, which neither the message nor equality would ignore.
+fn error_key(span: Span, error: &InferError) -> (Span, String) {
+    fn without_homes(ty: &Type) -> Type {
+        use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates_mut};
+        use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
+        fn rename(expr: &mut Expr) {
+            for_each_scoped_item_mut(expr, &mut |item| match item {
+                ScopedItemMut::VarRef(name) => {
+                    if let Name::Unique { home, .. } = name {
+                        *home = None;
+                    }
+                }
+                ScopedItemMut::Child(child) => rename(child),
+                ScopedItemMut::KeyRef(_) | ScopedItemMut::Scope(_) => {}
+            });
+        }
+        let mut ty = ty.clone();
+        walk_refined_predicates_mut(&mut ty, &PredMemo::new(), &(), &mut |predicate, _| {
+            rename(predicate);
+            true
+        });
+        ty
+    }
+    let mut error = error.clone();
+    error.map_types(&without_homes);
+    (span, format!("{error:?}"))
+}
+
+/// Note the type `tree`, the inferred check tree of `module`, gives each of
+/// `parameters`, the module's value parameters annotated with `_`, at the `let` of
+/// `Abstract` that binds it. A type
+/// its uses leave open, or that reads a refinement or a type parameter, is not
+/// noted: an argument for such a parameter is checked through the module's
+/// uses, as a use of a coupled member is (`docs/modules.md`, "Checking a module
+/// on its own").
+fn note_parameter_types(
+    tree: &Expr,
+    module: &ModulePath,
+    parameters: &[SmolStr],
+    inferred: &mut HashMap<(ModulePath, SmolStr), Type>,
+) {
+    fn walk(
+        expr: &Expr,
+        module: &ModulePath,
+        parameters: &[SmolStr],
+        inferred: &mut HashMap<(ModulePath, SmolStr), Type>,
+    ) {
+        if let crate::ccl::TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &expr.node
+            && matches!(bound_expr.node, crate::ccl::TypedExprNode::Abstract)
+            && binding.name.home().is_none()
+            && let Some(parameter) = parameters
+                .iter()
+                .find(|p| p.as_str() == binding.name.base())
+            && !binding.ty.holds_an_unresolved_position()
+            && !binding.ty.holds_type(&|ty| matches!(ty, Type::Param(_)))
+        {
+            inferred.insert((module.clone(), parameter.clone()), binding.ty.clone());
+        }
+        expr.walk_children(|child| walk(child, module, parameters, inferred));
+    }
+    walk(tree, module, parameters, inferred);
+}
+
+/// Annotate the `let` of each of `arguments` in `tree` with the type its
+/// parameter's own module's check inferred, from `inferred`, so a mismatch is
+/// the argument's error.
+fn annotate_arguments(
+    tree: &mut Expr,
+    arguments: &[InferredArgument],
+    inferred: &HashMap<(ModulePath, SmolStr), Type>,
+) {
+    if arguments.is_empty() {
+        return;
+    }
+    if let crate::ccl::TypedExprNode::Let { binding, .. } = &mut tree.node
+        && let Some(argument) = arguments.iter().find(|argument| {
+            binding.name.base() == argument.binder && binding.name.home() == argument.home.as_ref()
+        })
+        && let Some(ty) = inferred.get(&(argument.module.clone(), argument.parameter.clone()))
+    {
+        binding.user_annotation = Some(ty.clone());
+    }
+    tree.walk_children_mut(|child| annotate_arguments(child, arguments, inferred));
+}
+
 /// The phase sequence, from the α-uniquified tree to `stop`'s output.
 ///
 /// Split out of [`run_frontend`] only so each phase boundary can `return` the
 /// tree; the two are one pipeline. Every phase ends with one
 /// [`at_phase_output`] call, which is both where a pane is taken and where a
 /// stop happens.
+#[allow(clippy::too_many_arguments)]
 fn run_passes(
     ctx: &mut GlobalContext,
     mut expr: Expr,
+    checks: Vec<ModuleCheck>,
     stop: Phase,
     capture: &[Phase],
     record: bool,
@@ -2227,6 +2422,13 @@ fn run_passes(
     }
 
     debug!("Lowered:\n{}", symbolic(&expr));
+
+    // Each module is checked on its own before the linked program is inferred,
+    // and a module whose check fails stops the compile with its errors.
+    let check_errors = check_modules(ctx, checks, &blame);
+    if !check_errors.is_empty() {
+        return Err(check_errors);
+    }
 
     // Inference runs on the user-shaped tree — before channelize — so type
     // errors are reported against the program the user wrote, not the
@@ -3214,7 +3416,7 @@ Error: lowering error
             .match_indices(expected)
             .nth(nth)
             .unwrap_or_else(|| panic!("{expected:?} occurs fewer than {} times", nth + 1));
-        let expected_span = Span::new(chl_parser::FileId::ROOT, start, start + expected.len());
+        let expected_span = Span::new(FileId::ROOT, start, start + expected.len());
         let loaded = LoadedProgram::test(code);
         let errs = compile_err(&loaded);
         let spans: Vec<Span> = errs

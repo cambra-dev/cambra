@@ -3034,7 +3034,7 @@ impl Type {
     /// the term copy alone leaves the two unequal where inference dedups them by
     /// structural equality (`crate::ccl::anf`, the refined `Cast` contract).
     pub fn carries_refinement(&self) -> bool {
-        matches!(self, Type::Refinement(..)) || self.any_child(Type::carries_refinement)
+        self.holds_type(&|ty| matches!(ty, Type::Refinement(..)))
     }
 
     /// The type whose shape this one has: a nominal type's
@@ -3055,7 +3055,7 @@ impl Type {
 
     /// Whether a [`Type::Nominal`] occurs anywhere in this type.
     pub fn mentions_nominal(&self) -> bool {
-        matches!(self, Type::Nominal(..)) || self.any_child(Type::mentions_nominal)
+        self.holds_type(&|ty| matches!(ty, Type::Nominal(..)))
     }
 
     pub fn peel_refinements(&self) -> &Type {
@@ -3552,15 +3552,17 @@ impl Type {
     /// set. Answering "unresolved" instead abstains, which costs a refusal this has no
     /// measured caller for and never costs correctness.
     pub fn holds_an_unresolved_position(&self) -> bool {
-        matches!(
-            self,
-            Type::Infer(_)
-                | Type::Hole
-                | Type::SharedHole(_)
-                | Type::BoundedHole(_)
-                | Type::BarrierVar(_)
-                | Type::Refinement(..)
-        ) || self.any_child(Type::holds_an_unresolved_position)
+        self.holds_type(&|ty| {
+            matches!(
+                ty,
+                Type::Infer(_)
+                    | Type::Hole
+                    | Type::SharedHole(_)
+                    | Type::BoundedHole(_)
+                    | Type::BarrierVar(_)
+                    | Type::Refinement(..)
+            )
+        })
     }
 
     /// Every [`Refinement`] riding this type or any of its nested type children,
@@ -3761,6 +3763,14 @@ impl Type {
             }
         });
         found
+    }
+
+    /// Whether this type, or a type in its own structure, satisfies `hit`: this type, then
+    /// each child [`Self::walk_children`] reaches, at any depth. Refinement predicates are
+    /// not entered, so a type a predicate's own nodes carry is not reached; that needs
+    /// `crate::ccl::ccl_utils::walk_refined_predicates`.
+    pub fn holds_type<F: Fn(&Type) -> bool + ?Sized>(&self, hit: &F) -> bool {
+        hit(self) || self.any_child(|child| child.holds_type(hit))
     }
 }
 
@@ -4208,10 +4218,7 @@ pub fn instantiate_witness(ty: &Type, binder: &WitnessId, candidate: &Type) -> T
 /// Whether `ty` mentions `binder` anywhere. Binder ids are globally unique, so any
 /// occurrence is this binder's and no scope tracking is needed to recognise one.
 pub(crate) fn mentions_witness(ty: &Type, binder: &WitnessId) -> bool {
-    fn go(ty: &Type, binder: &WitnessId) -> bool {
-        matches!(ty, Type::WitnessRef(w) if w == binder) || ty.any_child(|c| go(c, binder))
-    }
-    go(ty, binder)
+    ty.holds_type(&|ty| matches!(ty, Type::WitnessRef(w) if w == binder))
 }
 
 /// A renaming of witness references, applied by [`Type::rename_witnesses`].
@@ -5001,8 +5008,7 @@ pub fn application_order<'a>(
 /// comprehension that form is inside the inner one's lowering rather than at this site.
 fn dependency_order(refinements: &[Refinement]) -> Vec<&Refinement> {
     fn reads_narrowed_by(ty: &Type, earlier: &Refinement) -> bool {
-        matches!(ty, Type::Refinement(_, set) if set.contains(earlier))
-            || ty.any_child(|child| reads_narrowed_by(child, earlier))
+        ty.holds_type(&|ty| matches!(ty, Type::Refinement(_, set) if set.contains(earlier)))
     }
     fn predicate_reads(pred: &TypedExpr, earlier: &Refinement) -> bool {
         let mut found = false;

@@ -44,6 +44,30 @@ pub use api::*;
 pub use check::check;
 pub use schemes::OperatorSchemes;
 
+/// A type parameter of a module checked on its own, and how the check holds it
+/// (`docs/modules.md`, "Checking a module on its own").
+#[derive(Debug, Clone)]
+pub enum ModuleCheckParam {
+    /// `T` with no kind written: one inference variable for the whole module,
+    /// which its uses bound.
+    Inferred(Rc<crate::ccl::ty::TypeParam>),
+    /// `T <: B`, or an abstract type member of a Module type: opaque, known only
+    /// through its bound, if it has one.
+    Opaque {
+        param: Rc<crate::ccl::ty::TypeParam>,
+        bound: Option<Type>,
+    },
+}
+
+impl ModuleCheckParam {
+    /// The declared parameter the module writes.
+    pub fn param(&self) -> &Rc<crate::ccl::ty::TypeParam> {
+        match self {
+            ModuleCheckParam::Inferred(param) | ModuleCheckParam::Opaque { param, .. } => param,
+        }
+    }
+}
+
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
@@ -528,6 +552,15 @@ pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
 ) -> Result<Type, Vec<LocatedInferError>> {
+    run_with_params(expr, sources, &[])
+}
+
+/// [`run`] with a module's type parameters `params` open throughout `expr`.
+pub(crate) fn run_with_params(
+    expr: &mut Expr,
+    sources: &HashMap<String, Type>,
+    params: &[ModuleCheckParam],
+) -> Result<Type, Vec<LocatedInferError>> {
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
         let pre = InferCtx::new(HashMap::new(), expr.node_id());
@@ -539,6 +572,7 @@ pub(crate) fn run(
         // node whose rule raised it, and the root is the outermost such node.
         InferCtx::new(translated, expr.node_id())
     };
+    sub_ctx.open_module_params(params).map_err(|e| vec![e])?;
 
     // Pass 1: emit constraints. The high-value variants
     // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.

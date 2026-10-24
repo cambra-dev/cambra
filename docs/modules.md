@@ -1,8 +1,8 @@
 # Modules
 
-> **Status: [Sketched].** A proposed implementation. The first four items of the [Implementation
-> stack](#implementation-stack) are implemented, and the sixth, runs and value parameters
-> ([Runs](#runs)).
+> **Status: [Sketched].** A proposed implementation. Items 1 to 4, 6 and 7 of the [Implementation
+> stack](#implementation-stack) are implemented, and the first part of item 5, [checking a module
+> on its own](#checking-a-module-on-its-own).
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -65,9 +65,10 @@ with the ids it had, and two runs holding one predicate's ids would collide.
 
 **The per-module check runs parsing, lowering, uniquification, and inference** (`Phase::Lower`,
 `Phase::Uniquify`, `Phase::Infer` in `src/ccl/context.rs`), plus the run-site checks of the
-module's own `run` statements: argument types. Lowering's own refusals
-are part of it: the mutation-statement rules, the out-of-block `Txn` read gate, visibility, and a
-duplicate literal route within the module.
+module's own `run` and `import` statements ([Checking a module on its
+own](#checking-a-module-on-its-own)). Lowering's own refusals are part of it: the
+mutation-statement rules, the out-of-block `Txn` read gate, visibility, and a duplicate literal
+route within the module.
 
 **Every later pass runs only on the linked tree**, because it needs the bodies of called functions
 inlined or the run tree assembled:
@@ -82,19 +83,55 @@ inlined or the run tree assembled:
 | operator conversion (`Phase::Convert`) | a route or source the engine cannot open |
 
 An error from a link-time pass is a real error, not a compiler defect, and is reported where
-[chl-spec.md, "9.14 Checking a module on its own"](chl-spec.md#914-checking-a-module-on-its-own) says: at its span, naming the run, with a secondary label at the statement that brought the
-run into the program.
+[chl-spec.md, "9.14 Checking a module on its own"](chl-spec.md#914-checking-a-module-on-its-own)
+says: at its span, naming the run, with a secondary label at the statement that brought the run
+into the program.
 
-Linking also runs inference over the whole tree once more. That run specializes and propagates
-refinements across modules. It reports nothing located inside a module body, because the
-per-module inference already accepted every body. An error there is a compiler defect, asserted in
-debug.
+Linking also runs inference over the whole tree once more, once every module's check has passed.
+That run specializes and propagates refinements across modules. It can still refuse code inside a
+module body where several modules' uses of one coupled member meet, as a monomorphic member two
+importers settle does, or where a run's argument meets an unbounded type parameter.
 
-That guarantee holds only if an inferred type states every requirement its body imposes. Today one
-kind of requirement is enforced only when a concrete type is delivered: a trait requirement on a
-generic parameter ([type-inference.md, "Checking a definition
-alone"](../src/ccl/design/type-inference.md#checking-a-definition-alone)). Making it
-part of the generalized type is a dependency ([Dependencies](#dependencies)).
+## Checking a module on its own
+
+Each module the root reaches is checked once, on its own, before the linked program is inferred
+(`ProgramLowering::check`, `check_modules` in `src/ccl/context.rs`). Its check tree is the module
+linked as though it were the root, with its own parameters abstract:
+
+- **The module's chain**, copied. A value parameter, and each value entry of a Module-typed
+  parameter, is a `let` of `Abstract` at its type, a value known only by its type
+  ([ir.md, "`Abstract` — a value known only by its
+  type"](../src/ccl/design/ir.md#abstract--a-value-known-only-by-its-type)). A feed entry is a `let`
+  of `Defer`. A default with an annotation is checked against it.
+- **Its type parameters** are opened for the whole check (`infer::check_module`). `T <: B`, and an
+  abstract type member of a Module-typed parameter, is an opened parameter, opaque apart from its
+  bound. A bare `T` is one inference variable at the module's level.
+- **Its runs and imports** are created as linking creates them, bodies included, registering no
+  sink or route. An exactly annotated member is bound at its annotation, so a use sees no body. An
+  unannotated or `<:` member is inferred with the module's uses of it.
+- **Its run-site checks.** Each type argument, and each type member of a module argument, is
+  compared with what its parameter states, as the declaring module writes both (`TypeCheck`): an
+  `Abstract` at the argument's type flows into a `let` at the bound, and for an exact entry the
+  other way too. A run's checks stand below its `Run` node and an import's at the head of the
+  module.
+- **Its arguments for inferred parameters.** A module's check notes the type it infers for each of
+  its value parameters annotated with `_` (`note_parameter_types` in `src/ccl/context.rs`), and the
+  check of a module passing it an argument annotates the argument's `let` with that type
+  (`annotate_arguments`, `ModuleCheck::arguments`), so a bad argument is reported at the argument.
+  A type the uses leave open, or one that reads a refinement or a type parameter, is not noted, and
+  such an argument is checked through the uses, as a coupled member is.
+
+The root has a check of its own only when it has parameters or its runs and imports have checks or
+pass arguments for inferred parameters. Otherwise the linked program's inference is its check.
+
+Errors from every check are merged, each reported once. Two errors are one when they stand at one
+span and read alike with each name written without its home (`error_key`), since each check holds
+its own copy of a module, whose members it names through that copy's run. A check's error in another
+module's code is that module's own when its own check raised it. Otherwise the checked module's use
+raised it, and it carries a secondary label at the module's `import` or `run` statement that brings
+that code in (`ModuleCheck::reached_by`). A module whose check fails stops the compile before
+linking's inference. A module is checked against its dependencies' bodies, so each check infers them
+again; keeping each module's inferred schemes for its users would remove that cost.
 
 The compiler's own test harness enables trailing expressions, which
 [chl-spec.md, "9.17 No trailing expressions"](chl-spec.md#917-no-trailing-expressions) refuses, through a
@@ -196,19 +233,21 @@ in place.
 
 ```
 root file
-  → load       parse the root; follow its imports and runs to files; parse each once,
-               with its own FileId
-  → graph      build the module graph; refuse cycles; compute link order
-  → lower      once per module, in link order, against the interfaces of the modules it imports
-               and runs. Produces a chain, with each `run` statement a `Run` node, and an interface
-  → check      once per module: inference over the module alone, as chl-spec.md's "9.14
-               Checking a module on its own" requires
-  → run sites  each import against the IO its module performs and the state it declares; each
-               run's arguments against its module's parameter types
-  → link       create each shared import, one per imported module and distinct set of arguments, in
-               link order, and the root's run, which creates each run it declares at its `run`
-               statement; each run a uniquified copy of its module's chain
-  → infer …    over the linked tree: specialization and refinement propagation
+  → load     parse the root; follow its imports and runs to files; parse each once, with its own
+             FileId
+  → graph    build the module graph; refuse cycles; compute link order
+  → lower    once per module, in link order, against the interfaces of the modules it imports and
+             runs, each import's shared import decided before its importer lowers. Produces a chain,
+             with each `run` statement a `Run` node, and an interface. An import of a module that
+             performs IO or declares state is refused here
+  → link     create each shared import, one per imported module and distinct set of arguments, in
+             link order, and the root's run, which creates each run it declares at its `run`
+             statement; each run a uniquified copy of its module's chain
+  → check    once per module: its check tree, its chain with its parameters abstract, its runs,
+             the shared imports it reaches, and its arguments' checks, inferred alone, as
+             chl-spec.md's "9.14 Checking a module on its own" requires
+  → infer …  over the linked tree, once every check passes: specialization and refinement
+             propagation
 ```
 
 Each run is a copy of its module's chain, uniquified alone, so every binder of the copy is its own
@@ -216,8 +255,8 @@ Each run is a copy of its module's chain, uniquified alone, so every binder of t
 already has for lowering's pre-cloned subtrees ([`src/ccl/uniquify.rs`](../src/ccl/uniquify.rs),
 "Mint before copy"): the runs already created inside it stay settled.
 
-Errors in one file do not stop loading, lowering, or checking the others. Every module's errors are
-reported together.
+Errors in one file do not stop loading or lowering the others, and every module's errors are
+reported together. A lowering error stops the compile before any module is checked.
 
 ### Loading
 
@@ -351,10 +390,11 @@ members reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
   double-underscore name, `__run::eu::port`, at the parameter's annotated type spelled through the
   run name, so a mismatch is reported at the argument. Creating the run points each parameter with
   an argument at that name, and refuses one with neither an argument nor a default at the `run`
-  statement. A parameter annotated with `_` takes the type the module's uses infer, so a bad argument
-  for one is reported where the module uses it, until a module is checked alone. A value parameter
-  without an annotation is refused (`refuse_module_syntax`). The root takes every parameter's
-  default, and a parameter without one is an error there.
+  statement. A parameter annotated with `_` takes the type its module's check infers, so a bad
+  argument for one is reported at the argument too ([Checking a module on its
+  own](#checking-a-module-on-its-own)). A value parameter without an annotation is refused
+  (`refuse_module_syntax`). The root takes every parameter's default, and a parameter without one
+  is an error there.
 - **A type parameter is an alias of a declared `Type::Param`** from its statement down, as a `def`'s
   is, and binds no `let` (`LoweringContext::declare_type_parameter`). The interface records its
   bound and its default. A `run` statement's type arguments are lowered ahead of the module's
@@ -365,10 +405,10 @@ members reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
   before the run is uniquified, since a default is the run's own type, and each argument after.
   Linking puts a `let type` of each argument, `__run::n::T`, where the `Run` node stood, so the
   declaring module's uniquification resolves the argument's refinements where they are written, and
-  the run's copy shares the resolved predicates. Nothing compares an argument with its parameter's
-  bound, and each use of `T` is checked against each argument, so a body relying on more than its
-  bound is accepted while every argument provides it. Both wait on checking a module on its own, at
-  the `Run` node.
+  the run's copy shares the resolved predicates. In a run's copy, a use of `T` is checked against
+  the argument. The module's own check holds `T` opaque apart from its bound, and the declaring
+  module's check compares each argument with that bound ([Checking a module on its
+  own](#checking-a-module-on-its-own)).
 - **Refused:** `@RenamedFrom`, a `run` in an imported module, and a nominal `type` declaration,
   an associated function or an `impl` block in any module but the root (`module_nominal_refusals`).
   `pub` on a `run` is a parse error, since a module returns a run by binding it to a public member
@@ -472,9 +512,9 @@ one Module type take two arguments (`instantiate`). Inside the module `audit::Ev
 entry writes. Linking passes each abstract member as a run's type argument under its spelling,
 `__run::s::audit::Event`: the declaring module reads the argument's member where the `run`
 statement stands (`LoweringContext::declare_run_types`), an import reads it where its key is
-decided, and a default reads it where the parameter is declared. Nothing compares the argument's
-member with an exact entry's type or an abstract entry's bound. A value entry over the member, as
-`keep: Count => Count`, compares the argument's member through its type. A Module-typed parameter
+decided, and a default reads it where the parameter is declared. The declaring module's check
+compares the argument's member with an exact entry's type or an abstract entry's bound ([Checking a
+module on its own](#checking-a-module-on-its-own)). A Module-typed parameter
 that a `run` statement passes to another run is declared in the pass that lowers the run's type
 arguments, so one declared below the statement is an error at it.
 
@@ -586,12 +626,13 @@ source cache is keyed by `FileId`, so a single report can label several files. S
 
 An inference error's span resolves through the lowering projection, as it does today.
 
-A module lowers once, so a lowering error is reported once however many runs the module has. An
-inference error in a module that runs more than once, or is imported with more than one set of
-arguments, is reported once per run, each report identical, since inference sees each run's copy.
-The label naming the run whose copy failed, with a secondary label at its `run` statement or
-`import` ([chl-spec.md, "9.14 Checking a module on its
-own"](chl-spec.md#914-checking-a-module-on-its-own)), is not implemented.
+A module lowers once, so a lowering error is reported once however many runs the module has, and
+its check reports its inference errors once ([Checking a module on its
+own](#checking-a-module-on-its-own)). An error linking's inference raises in a module that runs more
+than once, or is imported with more than one set of arguments, is reported once per run, each
+report identical, since inference sees each run's copy. The label naming the run whose copy failed,
+with a secondary label at its `run` statement or `import` ([chl-spec.md, "9.14 Checking a module on
+its own"](chl-spec.md#914-checking-a-module-on-its-own)), is not implemented.
 
 ---
 
@@ -759,8 +800,11 @@ One PR per item, each updating the spec and design docs it touches:
    4. **`Mut`-parameter functions**, and the refusal of importing a module that declares state:
       state belongs to runs ([chl-spec.md, "9.7 Importing asserts no IO and no
       state"](chl-spec.md#97-importing-asserts-no-io-and-no-state)).
-5. **Per-module checking.** Inference over one module against the interfaces it uses, contracts in
-   the interface, `cambra check`.
+5. **Per-module checking**, in two parts:
+   1. **The check.** Each module inferred on its own, with its parameters abstract and its
+      dependencies' bodies, and the run-site checks of its arguments.
+   2. **Diagnostics and `cambra check`.** A link-time error naming the run whose copy failed, each
+      reported once, and `cambra check` printing a module's interface.
 6. **Runs and parameters**, in two parts:
    1. **Runs without parameters.** A run per `run` statement at its statement, a run's
       `Unique::home`, run members, state and IO in runs, sink and history keys qualified by run
@@ -806,9 +850,7 @@ the [Implementation stack](#implementation-stack).
   composed in one transaction. The lexical read gate refuses a `Txn` read in a `def` outside a `with
   begin():` of its own until then.
 - **Trait requirements in generalized types.** A requirement a body places on a generic parameter is
-  part of the inferred type, so a use that fails it is rejected at the use. The guarantee of
-  [chl-spec.md, "9.14 Checking a module on its own"](chl-spec.md#914-checking-a-module-on-its-own) rests on
-  it.
+  part of the inferred type, so a use that fails it is rejected at the use.
 - **Refinements over mutable state.** A refinement whose predicate reads a mutable variable,
   `{String where _ in stock.keys()}` over `stock: Mut(Map(String, Int), Txn)`, names a key set that
   changes with each commit. The compiler cannot name a mutable map's key set in a type today, in one
