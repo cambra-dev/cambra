@@ -41,6 +41,7 @@ mod predicate_sharing_review;
 mod programs;
 mod reserve_port;
 mod subtype_transitivity_fuzz;
+mod symbolic_nary;
 mod test_layout;
 mod test_sink;
 mod type_check;

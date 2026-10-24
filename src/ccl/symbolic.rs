@@ -655,61 +655,20 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             format!("source({name}, {})", source_projection_label(keys)),
         ),
 
-        // N-ary compose: render as `f₀ ≫ f₁ ≫ … ≫ fₙ₋₁` at Compose precedence.
-        // Left element at Compose (left-associative); each subsequent element
-        // one level tighter to force parens on a nested same-precedence compose.
-        TypedExprNode::Compose(elts) => {
-            let mut it = elts.iter();
-            let first = fmt(
-                it.next().expect("Compose is non-empty"),
-                Precedence::Compose,
-                opts,
-            );
-            let rest = it
-                .map(|e| fmt(e, Precedence::Compose.next_highest(), opts))
-                .collect::<Vec<_>>()
-                .join(" ≫ ");
-            (Precedence::Compose, format!("{first} ≫ {rest}"))
-        }
+        TypedExprNode::Compose(elts) => fmt_nary(elts, Precedence::Compose, "≫", "Compose", opts),
 
-        // N-ary collection union: render as `c₀ ⊎ c₁ ⊎ … ⊎ cₙ₋₁`.
-        // We use `⊎` (multiset union) in the symbolic form rather than the
-        // CHL surface `++` to disambiguate from `Concat` (which also uses
-        // `++`); the two operate on disjoint type domains (collection vs.
-        // string) but a single symbol would still confuse readers of dumps.
-        // Precedence matches `And` so that arithmetic and comparisons bind
-        // tighter — same level used by the historical `BinOp` form.
-        // N-ary disjoint join: `c₀ ⊔ c₁ ⊔ …`. `⊔` is the join in the
-        // partial-function order — the operands are partial maps over one domain,
-        // merged where their domains are disjoint — as against `⊎` above, which
-        // copairs operands over *distinct* domains into their coproduct.
+        // `⊔` is the join in the partial-function order: the operands are partial maps over one
+        // domain, merged where their domains are disjoint. `Copair` copairs operands over
+        // distinct domains into their coproduct and renders `⊎`.
         TypedExprNode::DisjointJoin(operands) => {
-            let mut it = operands.iter();
-            let first = fmt(
-                it.next().expect("DisjointJoin is non-empty"),
-                Precedence::And,
-                opts,
-            );
-            let rest = it
-                .map(|e| fmt(e, Precedence::And.next_highest(), opts))
-                .collect::<Vec<_>>()
-                .join(" ⊔ ");
-            (Precedence::And, format!("{first} ⊔ {rest}"))
+            fmt_nary(operands, Precedence::And, "⊔", "DisjointJoin", opts)
         }
 
-        TypedExprNode::Copair(operands) => {
-            let mut it = operands.iter();
-            let first = fmt(
-                it.next().expect("Copair is non-empty"),
-                Precedence::And,
-                opts,
-            );
-            let rest = it
-                .map(|e| fmt(e, Precedence::And.next_highest(), opts))
-                .collect::<Vec<_>>()
-                .join(" ⊎ ");
-            (Precedence::And, format!("{first} ⊎ {rest}"))
-        }
+        // `⊎` (multiset union) rather than the CHL surface `++`, which `Concat` also spells; the
+        // two take disjoint type domains (collection and string), and one symbol for both would
+        // still be ambiguous in a dump. `And` precedence makes arithmetic and comparisons bind
+        // tighter.
+        TypedExprNode::Copair(operands) => fmt_nary(operands, Precedence::And, "⊎", "Copair", opts),
 
         TypedExprNode::Proj(key) => (Precedence::Atom, format!(".{key}")),
 
@@ -749,6 +708,29 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Render an n-ary left-associative node as `e₀ sym e₁ sym … sym eₙ₋₁` at `prec`. The first
+/// operand renders at `prec` and each later one a level tighter, so a nested operand at the same
+/// precedence is parenthesized in every position but the first.
+fn fmt_nary(
+    operands: &[Expr],
+    prec: Precedence,
+    sym: &str,
+    node: &str,
+    opts: &SymbolicOpts,
+) -> (Precedence, String) {
+    let mut it = operands.iter();
+    let first = fmt(
+        it.next().unwrap_or_else(|| panic!("{node} is non-empty")),
+        prec,
+        opts,
+    );
+    let rest = it
+        .map(|e| fmt(e, prec.next_highest(), opts))
+        .collect::<Vec<_>>()
+        .join(&format!(" {sym} "));
+    (prec, format!("{first} {sym} {rest}"))
+}
 
 /// Render `func` in the function position of an application.
 ///
