@@ -664,10 +664,9 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             fmt_nary(operands, Precedence::And, "⊔", "DisjointJoin", opts)
         }
 
-        // `⊎` (multiset union) rather than the CHL surface `++`, which `Concat` also spells; the
-        // two take disjoint type domains (collection and string), and one symbol for both would
-        // still be ambiguous in a dump. `And` precedence makes arithmetic and comparisons bind
-        // tighter.
+        // `Copair` renders `⊎` rather than its CHL spelling `++`, because this form already renders
+        // `Concat` as `++` (`BinOpKind::sym`). `And` precedence makes arithmetic and comparisons
+        // bind tighter.
         TypedExprNode::Copair(operands) => fmt_nary(operands, Precedence::And, "⊎", "Copair", opts),
 
         TypedExprNode::Proj(key) => (Precedence::Atom, format!(".{key}")),
@@ -1037,6 +1036,43 @@ mod tests {
             Expr::compose(vec![Expr::var("f"), Expr::var("g")]),
         ),
         "x ▷ (f ≫ g)"
+    )]
+    // N-ary nodes: a nested operand at the node's own precedence takes parens after the first.
+    #[case(
+        Expr::compose(vec![Expr::compose(vec![Expr::var("f"), Expr::var("g")]), Expr::var("h")]),
+        "f ≫ g ≫ h"
+    )]
+    #[case(
+        Expr::compose(vec![Expr::var("f"), Expr::compose(vec![Expr::var("g"), Expr::var("h")])]),
+        "f ≫ (g ≫ h)"
+    )]
+    #[case(Expr::copair(vec![Expr::var("a"), Expr::var("b"), Expr::var("c")]), "a ⊎ b ⊎ c")]
+    #[case(
+        Expr::copair(vec![Expr::disjoint_join(vec![Expr::var("a"), Expr::var("b")]), Expr::var("c")]),
+        "a ⊔ b ⊎ c"
+    )]
+    #[case(
+        Expr::copair(vec![Expr::var("a"), Expr::disjoint_join(vec![Expr::var("b"), Expr::var("c")])]),
+        "a ⊎ (b ⊔ c)"
+    )]
+    #[case(Expr::disjoint_join(vec![Expr::var("a"), Expr::var("b")]), "a ⊔ b")]
+    #[case(
+        Expr::disjoint_join(vec![
+            Expr::disjoint_join(vec![Expr::var("a"), Expr::var("b")]),
+            Expr::var("c"),
+        ]),
+        "a ⊔ b ⊔ c"
+    )]
+    #[case(
+        Expr::disjoint_join(vec![Expr::var("a"), Expr::copair(vec![Expr::var("b"), Expr::var("c")])]),
+        "a ⊔ (b ⊎ c)"
+    )]
+    #[case(
+        Expr::copair(vec![
+            Expr::binop(Expr::var("a"), BinOpKind::Arithmetic(ArithmeticKind::Add), Expr::var("b")),
+            Expr::var("c"),
+        ]),
+        "a + b ⊎ c"
     )]
     // Apply: Compose-with-nested-Apply in func position — the motivating
     // bug case. The inner `(mul, 1 ▷ const) ▷ zip` must stay inside the
