@@ -1461,12 +1461,20 @@ pub fn check_module(
         .collect();
     // A monomorphic binding's type is the one its uses settled.
     let mut at = &*expr;
-    while let TypedExprNode::Let { binding, body, .. }
-    | TypedExprNode::MutDecl { binding, body, .. } = &at.node
-    {
-        if reported.contains(&binding.name) && !contracts.contains_key(&binding.name) {
-            let written = crate::ccl::chl_print::chl_type(&binding.ty);
-            contracts.insert(binding.name.clone(), written);
+    loop {
+        let (binders, body): (Vec<&TypedBinding>, &Expr) = match &at.node {
+            TypedExprNode::Let { binding, body, .. }
+            | TypedExprNode::MutDecl { binding, body, .. } => (vec![binding], body),
+            TypedExprNode::DefGroup { bindings, body } => {
+                (bindings.iter().map(|(binding, _)| binding).collect(), body)
+            }
+            _ => break,
+        };
+        for binding in binders {
+            if reported.contains(&binding.name) && !contracts.contains_key(&binding.name) {
+                let written = crate::ccl::chl_print::chl_type(&binding.ty);
+                contracts.insert(binding.name.clone(), written);
+            }
         }
         at = body;
     }

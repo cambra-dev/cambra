@@ -21,7 +21,7 @@ use smol_str::SmolStr;
 use super::stmts::{is_builtin_type_name, is_mut_annotation, lower_type_expr};
 use super::{LoweringContext, LoweringError};
 use crate::ccl::nominal::{NominalCtor, NominalDecl};
-use crate::ccl::ty::{PolyParam, PolyType, TypeKind, TypeParam};
+use crate::ccl::ty::{PolyParam, PolyType, TypeKind, TypeParam, TypeParamId};
 use crate::ccl::{
     Expr, Lit, MethodCandidate, Name, Pattern, PatternHead, Type, TypedBinding, TypedExprNode,
 };
@@ -159,7 +159,14 @@ pub(super) fn declare_nominal_types(
                 params.push(TypeParam::declared(param.node.clone()));
             }
         }
-        ctx.nominal_types.push(NominalDecl::declared(
+        // A declaration is at its module's path, and the root's at the empty one.
+        let module = ctx
+            .module
+            .labels
+            .as_ref()
+            .map_or_else(Vec::new, |path| path.segments().to_vec());
+        ctx.nominal_types.push(NominalDecl::declared_in(
+            module,
             name.node.clone(),
             params,
             name.span,
@@ -409,6 +416,378 @@ fn lower_parameter_type(
     Ok(lowered)
 }
 
+/// Record on each nominal type the module declares the module's type parameters it reaches
+/// ([`NominalDecl::implicit`]): those its constructors' parameter types name, those the type
+/// slots of its associated functions name, and those each nominal type either names
+/// reaches, transitively. `chain` is the module's lowered top level, whose spine binds the
+/// associated functions. Each type keeps the parameters in the order the module declares
+/// them, so every instance lines its arguments up alike.
+pub(super) fn settle_implicit(chain: &Expr, ctx: &LoweringContext) {
+    let module_params = module_type_params(ctx);
+    let decls = &ctx.nominal_types;
+    let local = |d: &NominalDecl| {
+        decls
+            .iter()
+            .position(|l| l.module == d.module && l.name == d.name)
+    };
+    // What each declaration names directly: the module's parameters, and the local
+    // declarations whose parameters it reaches in turn.
+    let mut reached: Vec<HashSet<TypeParamId>> = vec![HashSet::new(); decls.len()];
+    let mut names: Vec<HashSet<usize>> = vec![HashSet::new(); decls.len()];
+    let mut visit = |i: usize, ty: &Type, reached: &mut Vec<HashSet<TypeParamId>>| {
+        each_param_and_decl(ty, &mut |found| match found {
+            Found::Param(id) if module_params.iter().any(|p| p.id == id) => {
+                reached[i].insert(id);
+            }
+            Found::Param(_) => {}
+            Found::Decl(d) => match local(d) {
+                Some(j) if j != i => {
+                    names[i].insert(j);
+                }
+                Some(_) => {}
+                None => {
+                    for arg in d.implicit_args() {
+                        each_param_and_decl(&arg, &mut |inner| {
+                            if let Found::Param(id) = inner
+                                && module_params.iter().any(|p| p.id == id)
+                            {
+                                reached[i].insert(id);
+                            }
+                        });
+                    }
+                }
+            },
+        });
+    };
+    for (i, decl) in decls.iter().enumerate() {
+        for ctor in &decl.body().ctors {
+            for (_, ty) in &ctor.params {
+                visit(i, ty, &mut reached);
+            }
+        }
+    }
+    for (name, function) in spine_functions(chain) {
+        let Some(i) = ctx
+            .associated_functions
+            .iter()
+            .find(|f| member_binding(&f.decl, &f.name) == name)
+            .and_then(|f| local(&f.decl))
+        else {
+            continue;
+        };
+        for_each_type_in(function, &mut |ty| visit(i, ty, &mut reached));
+    }
+    loop {
+        let mut changed = false;
+        for i in 0..decls.len() {
+            for j in names[i].clone() {
+                let inherited: Vec<TypeParamId> = reached[j].iter().copied().collect();
+                for id in inherited {
+                    changed |= reached[i].insert(id);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (decl, reached) in decls.iter().zip(reached) {
+        decl.set_implicit(
+            module_params
+                .iter()
+                .filter(|p| reached.contains(&p.id))
+                .cloned()
+                .collect(),
+        );
+    }
+}
+
+/// One error per associated function of the module that reaches, through the bindings and
+/// functions of the module's top level, its state, a source, a value parameter, a value
+/// member of a Module-typed parameter, or a member of a run the module declares. Every run
+/// of a module shares a type that reaches no type parameter, so each run's copy of the
+/// type's functions must be the same function (`docs/chl-spec.md`, "Associated functions
+/// and methods"). `chain` is the module's lowered top level.
+pub(super) fn associated_reach_errors(chain: &Expr, ctx: &LoweringContext) -> Vec<LoweringError> {
+    if ctx.associated_functions.is_empty() {
+        return Vec::new();
+    }
+    // A copy with every binder minted, so a reference reads the binder it resolves to.
+    let chain = crate::ccl::uniquify::run_in(chain.clone_preserving_ids(), &HashMap::new(), None);
+    let value_params: HashSet<&str> = ctx
+        .parameters
+        .iter()
+        .filter(|p| matches!(p.kind, super::modules::ParameterKind::Value(_)))
+        .map(|p| p.name.as_str())
+        .collect();
+    let module_params: Vec<&str> = ctx
+        .parameters
+        .iter()
+        .filter(|p| matches!(p.kind, super::modules::ParameterKind::Module { .. }))
+        .map(|p| p.name.as_str())
+        .collect();
+    let mut top: HashMap<Name, TopLevel<'_>> = HashMap::new();
+    let mut at = &chain;
+    loop {
+        match &at.node {
+            TypedExprNode::MutDecl { binding, body, .. } => {
+                top.insert(binding.name.clone(), TopLevel::Is(Forbidden::State));
+                at = body;
+            }
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                let base = binding.name.base();
+                let kind = if value_params.contains(base) {
+                    TopLevel::Is(Forbidden::ValueParameter)
+                } else if let Some(parameter) = module_params.iter().find(|p| {
+                    base.strip_prefix(**p)
+                        .is_some_and(|rest| rest.starts_with("::"))
+                }) {
+                    TopLevel::Is(Forbidden::ModuleParameter(parameter))
+                } else if matches!(bound_expr.node, TypedExprNode::Defer) {
+                    TopLevel::Is(Forbidden::Feed)
+                } else {
+                    TopLevel::Defined(bound_expr)
+                };
+                top.insert(binding.name.clone(), kind);
+                at = body;
+            }
+            TypedExprNode::DefGroup { bindings, body } => {
+                for (binding, def) in bindings {
+                    top.insert(binding.name.clone(), TopLevel::Defined(def));
+                }
+                at = body;
+            }
+            TypedExprNode::ExprStmt { body, .. }
+            | TypedExprNode::LetType { body, .. }
+            | TypedExprNode::Run { body, .. } => at = body,
+            _ => break,
+        }
+    }
+    let runs: HashSet<&str> = ctx
+        .module
+        .qualifiers
+        .iter()
+        .filter(|(_, q)| q.kind == super::modules::QualifierKind::Run)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let mut errors = Vec::new();
+    for function in &ctx.associated_functions {
+        let binding = member_binding(&function.decl, &function.name);
+        let Some((_, TopLevel::Defined(def))) = top.iter().find(|(name, _)| name.base() == binding)
+        else {
+            continue;
+        };
+        let mut seen: HashSet<Name> = HashSet::new();
+        let mut through: Vec<String> = Vec::new();
+        if let Some((what, reached)) = first_reached(def, &top, &runs, &mut seen, &mut through) {
+            let through = match through.as_slice() {
+                [] => String::new(),
+                path => format!(", through `{}`", path.join("` → `")),
+            };
+            errors.push(LoweringError::unsupported(
+                function.span,
+                format!(
+                    "the associated function `{binding}` reads {}{through}; an associated \
+                     function reaches no state, no source, and no value a run gives its \
+                     module, since every run of the module shares the type",
+                    reached.describe(&what)
+                ),
+            ));
+        }
+    }
+    errors
+}
+
+/// A top-level binding, as [`associated_reach_errors`] follows it.
+enum TopLevel<'a> {
+    /// A binding an associated function may not reach.
+    Is(Forbidden<'a>),
+    /// A value or a function whose definition is followed.
+    Defined(&'a Expr),
+}
+
+/// What an associated function may not reach.
+#[derive(Clone, Copy)]
+enum Forbidden<'a> {
+    State,
+    Feed,
+    Source,
+    ValueParameter,
+    /// A value member of the Module-typed parameter named.
+    ModuleParameter(&'a str),
+    /// A member of the run named, which the module declares.
+    Run(&'a str),
+}
+
+impl Forbidden<'_> {
+    /// How a diagnostic names `what`, which is one of these.
+    fn describe(self, what: &str) -> String {
+        match self {
+            Forbidden::State => format!("`{what}`, a mutable variable of its module"),
+            Forbidden::Feed => format!("`{what}`, a feed of its module"),
+            Forbidden::Source => format!("the source `{what}`"),
+            Forbidden::ValueParameter => format!("`{what}`, a value parameter of its module"),
+            Forbidden::ModuleParameter(p) => {
+                format!("`{what}`, a member of the Module-typed parameter `{p}`")
+            }
+            Forbidden::Run(run) => format!("`{what}`, a member of the run `{run}`"),
+        }
+    }
+}
+
+/// The first thing `expr` reaches that an associated function may not, with how it is
+/// spelled, following each top-level definition it reads once. `through` collects the
+/// definitions followed on the way.
+fn first_reached<'a>(
+    expr: &'a Expr,
+    top: &'a HashMap<Name, TopLevel<'a>>,
+    runs: &HashSet<&'a str>,
+    seen: &mut HashSet<Name>,
+    through: &mut Vec<String>,
+) -> Option<(String, Forbidden<'a>)> {
+    let read = match &expr.node {
+        TypedExprNode::Source(name, _) => return Some((name.clone(), Forbidden::Source)),
+        TypedExprNode::Var(name)
+        | TypedExprNode::MutWrite { name, .. }
+        | TypedExprNode::Feed { name, .. }
+        | TypedExprNode::Define { name, .. } => Some(name),
+        _ => None,
+    };
+    if let Some(name) = read {
+        if name.is_raw()
+            && let Some((qualifier, _)) = name.base().split_once("::")
+            && let Some(run) = runs.get(qualifier)
+        {
+            return Some((name.base().to_string(), Forbidden::Run(run)));
+        }
+        match top.get(name) {
+            Some(TopLevel::Is(reached)) => return Some((name.base().to_string(), *reached)),
+            Some(TopLevel::Defined(def)) if seen.insert(name.clone()) => {
+                through.push(name.base().to_string());
+                if let Some(found) = first_reached(def, top, runs, seen, through) {
+                    return Some(found);
+                }
+                through.pop();
+            }
+            _ => {}
+        }
+    }
+    let mut found = None;
+    expr.walk_children(|child| {
+        if found.is_none() {
+            found = first_reached(child, top, runs, seen, through);
+        }
+    });
+    found
+}
+
+/// The type parameters at the module's top level, in the order it declares them: each
+/// `param T`, then the abstract type members of each Module-typed parameter.
+fn module_type_params(ctx: &LoweringContext) -> Vec<Rc<TypeParam>> {
+    let mut parameters: Vec<&super::modules::Parameter> = ctx.parameters.iter().collect();
+    parameters.sort_by_key(|p| p.declared.start);
+    let mut params: Vec<Rc<TypeParam>> = parameters
+        .iter()
+        .filter_map(|p| match &p.kind {
+            super::modules::ParameterKind::Type { param, .. } => Some(Rc::clone(param)),
+            _ => None,
+        })
+        .collect();
+    let mut viewed: Vec<(String, Rc<TypeParam>)> = Vec::new();
+    for qualifier in ctx.module.qualifiers.values() {
+        if qualifier.kind != super::modules::QualifierKind::Parameter {
+            continue;
+        }
+        if let Some(view) = &qualifier.view {
+            collect_view_params(&qualifier.name.to_string(), view, &mut viewed);
+        }
+    }
+    viewed.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, param) in viewed {
+        if !params.iter().any(|p| p.id == param.id) {
+            params.push(param);
+        }
+    }
+    params
+}
+
+/// Each abstract type member of `view`, at every depth, spelled under `prefix`.
+fn collect_view_params(
+    prefix: &str,
+    view: &super::modules::ModuleView,
+    out: &mut Vec<(String, Rc<TypeParam>)>,
+) {
+    for (name, ty) in &view.types {
+        if let Type::Param(param) = ty {
+            out.push((format!("{prefix}::{name}"), Rc::clone(param)));
+        }
+    }
+    for (name, inner) in &view.modules {
+        collect_view_params(&format!("{prefix}::{name}"), inner, out);
+    }
+}
+
+/// What [`each_param_and_decl`] finds in a type.
+enum Found<'a> {
+    Param(TypeParamId),
+    Decl(&'a NominalDecl),
+}
+
+/// Call `f` on each type parameter and each nominal declaration `ty` names, at any depth.
+fn each_param_and_decl<'a>(ty: &'a Type, f: &mut dyn FnMut(Found<'a>)) {
+    match ty {
+        Type::Param(param) => f(Found::Param(param.id)),
+        Type::Nominal(decl, _) => f(Found::Decl(decl)),
+        _ => {}
+    }
+    ty.walk_children(|child| each_param_and_decl(child, f));
+}
+
+/// The functions bound on `chain`'s spine, by binder: each `let` and each binding of a
+/// `DefGroup`.
+fn spine_functions(chain: &Expr) -> Vec<(String, &Expr)> {
+    let mut out = Vec::new();
+    let mut at = chain;
+    loop {
+        match &at.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                out.push((binding.name.base().to_string(), bound_expr.as_ref()));
+                at = body;
+            }
+            TypedExprNode::DefGroup { bindings, body } => {
+                out.extend(bindings.iter().map(|(b, e)| (b.name.base().to_string(), e)));
+                at = body;
+            }
+            TypedExprNode::MutDecl { body, .. }
+            | TypedExprNode::ExprStmt { body, .. }
+            | TypedExprNode::LetType { body, .. }
+            | TypedExprNode::Run { body, .. } => at = body,
+            _ => return out,
+        }
+    }
+}
+
+/// Call `f` on every type `expr` carries at any depth: its nodes' type slots and its
+/// binders' types.
+fn for_each_type_in(expr: &Expr, f: &mut dyn FnMut(&Type)) {
+    expr.walk_type_slots(&mut *f);
+    expr.walk_binders(|b| {
+        f(&b.ty);
+        if let Some(annotation) = &b.user_annotation {
+            f(annotation);
+        }
+    });
+    expr.walk_children(|child| for_each_type_in(child, f));
+}
+
 /// Wrap `body` in the binding of each function the module's declarations declare: each
 /// constructor that declares parameters, and the `extract` of a single-constructor form.
 pub(super) fn bind_constructors(body: Expr, ctx: &mut LoweringContext) -> Expr {
@@ -643,41 +1022,149 @@ fn member(decl: &NominalDecl, name: &str, ctx: &LoweringContext) -> Option<(Memb
         .map(|f| (Member::Associated { arity: f.arity }, f.span))
 }
 
-/// Whether `q` is a name qualified by one type, `Shape::circle`: a member of a nominal
-/// type rather than of another module, whose qualifier is lowercase
-/// (`docs/chl-spec.md`, "9.6 Qualified references").
-pub(super) fn names_a_type_member(q: &QualifiedName) -> bool {
-    matches!(q.qualifier.as_slice(), [ty] if chl_parser::ast::is_type_name(&ty.node))
+/// A nominal type as the module being lowered names it.
+pub(super) struct Named {
+    pub decl: Rc<NominalDecl>,
+    /// For another module's type: how this module spells the qualifier its members are
+    /// reached through, `shop`, and its associated functions as that module's interface
+    /// records them.
+    foreign: Option<(
+        crate::ccl::names::QualifiedName,
+        HashMap<SmolStr, super::modules::AssociatedMember>,
+    )>,
 }
 
-/// The declaration and member `q` names, `Shape::circle`.
+impl Named {
+    /// The member named `name`, if the type declares one this module may name: another
+    /// module's private associated function is an error.
+    fn member(
+        &self,
+        name: &str,
+        span: Span,
+        ctx: &LoweringContext,
+    ) -> Result<Member, LoweringError> {
+        let decl = &self.decl;
+        let found = match &self.foreign {
+            None => member(decl, name, ctx).map(|(m, _)| m),
+            Some((qualifier, functions)) => match functions.get(name) {
+                Some(function) if !function.public => {
+                    return Err(LoweringError::unsupported(
+                        span,
+                        format!(
+                            "`{qualifier}::{}::{name}` is private to its module",
+                            decl.name
+                        ),
+                    )
+                    .with_related(function.declared, "declared here without `pub`"));
+                }
+                Some(function) => Some(Member::Associated {
+                    arity: function.arity,
+                }),
+                None => member(decl, name, ctx)
+                    .map(|(m, _)| m)
+                    .filter(|m| !matches!(m, Member::Associated { .. })),
+            },
+        };
+        found.ok_or_else(|| {
+            LoweringError::unsupported(
+                span,
+                format!(
+                    "`{}` declares no constructor or function `{name}`",
+                    decl.name
+                ),
+            )
+        })
+    }
+
+    /// The name a reference to the member `name` reads: the binding its module's chain
+    /// binds, spelled through the qualifier for another module's type.
+    fn reference(&self, name: &str, ctx: &mut LoweringContext) -> String {
+        match &self.foreign {
+            None => member_reference(&self.decl, name, ctx),
+            Some((qualifier, _)) => {
+                format!("{qualifier}::{}", member_binding(&self.decl, name))
+            }
+        }
+    }
+}
+
+/// The nominal type `path` names, `Shape` or `shop::Shape`: one the module declares or the
+/// compiler provides, or a public one of the module its qualifier names. `None` when that
+/// module has errors of its own, which are reported where they stand.
+pub(super) fn resolve_type(
+    path: &[Spanned<SmolStr>],
+    ctx: &LoweringContext,
+) -> Result<Option<Named>, LoweringError> {
+    let (ty, qualifier) = path.split_last().expect("a type path names its type");
+    let Some(first) = qualifier.first() else {
+        if !ctx.nominal_types.iter().any(|d| d.name == ty.node)
+            && let Some((found, qualifier)) = ctx.used_nominal.get(&ty.node)
+        {
+            return Ok(Some(Named {
+                decl: Rc::clone(&found.decl),
+                foreign: Some((qualifier.clone(), found.functions.clone())),
+            }));
+        }
+        return match ctx.nominal_type(&ty.node) {
+            Some(decl) => Ok(Some(Named {
+                decl,
+                foreign: None,
+            })),
+            None => Err(LoweringError::unsupported(
+                ty.span,
+                format!("`{}` is not a nominal type this module declares", ty.node),
+            )),
+        };
+    };
+    let reached = ctx.qualifier_path(qualifier, first.span.join(ty.span))?;
+    let spelled = crate::ccl::names::QualifiedName::of_segments(qualifier);
+    Ok(reached
+        .reach_nominal(&spelled, &ty.node, first.span.join(ty.span))?
+        .map(|found| Named {
+            decl: found.decl,
+            foreign: Some((reached.name.clone(), found.functions)),
+        }))
+}
+
+/// Whether `q` is a name qualified by a type, `Shape::circle` or `shop::Shape::circle`: a
+/// member of a nominal type rather than of a module. A module's name is lowercase, so the
+/// type is the qualifier's last segment and the only capitalized one (`docs/chl-spec.md`,
+/// "9.6 Qualified references").
+pub(super) fn names_a_type_member(q: &QualifiedName) -> bool {
+    matches!(
+        q.qualifier.split_last(),
+        Some((ty, modules))
+            if chl_parser::ast::is_type_name(&ty.node)
+                && !modules.iter().any(|m| chl_parser::ast::is_type_name(&m.node))
+    )
+}
+
+/// The type and member `q` names, `Shape::circle`, or `None` when the type's module has
+/// errors of its own.
 fn resolve_member(
     q: &QualifiedName,
     span: Span,
     ctx: &LoweringContext,
-) -> Result<(Rc<NominalDecl>, Member), LoweringError> {
-    let [ty] = q.qualifier.as_slice() else {
-        unreachable!("`refuse_module_syntax` lets through only a name qualified by one type")
+) -> Result<Option<(Named, Member)>, LoweringError> {
+    let Some(named) = resolve_type(&q.qualifier, ctx).map_err(|e| {
+        if q.qualifier.len() == 1 {
+            let ty = &q.qualifier[0];
+            LoweringError::unsupported(
+                ty.span,
+                format!(
+                    "`{}` is not a nominal type this module declares, so `{}::{}` names nothing",
+                    ty.node, ty.node, q.name.node
+                ),
+            )
+        } else {
+            e
+        }
+    })?
+    else {
+        return Ok(None);
     };
-    let Some(decl) = ctx.nominal_type(&ty.node) else {
-        return Err(LoweringError::unsupported(
-            ty.span,
-            format!(
-                "`{}` is not a nominal type this module declares, so `{}::{}` names nothing",
-                ty.node, ty.node, q.name.node
-            ),
-        ));
-    };
-    match member(&decl, &q.name.node, ctx) {
-        Some((m, _)) => Ok((decl, m)),
-        None => Err(LoweringError::unsupported(
-            span,
-            format!(
-                "`{}` declares no constructor or function `{}`",
-                decl.name, q.name.node
-            ),
-        )),
-    }
+    let member = named.member(&q.name.node, span, ctx)?;
+    Ok(Some((named, member)))
 }
 
 /// Lower a name qualified by a type, `Shape::circle`: the value a constructor without
@@ -687,13 +1174,15 @@ pub(super) fn lower_member(
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let (decl, member) = resolve_member(q, span, ctx)?;
+    let Some((named, member)) = resolve_member(q, span, ctx)? else {
+        return Ok(Expr::error());
+    };
     match member {
         Member::Constructor { arity: 0 } => {
             let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), span, "lower.nominal_ctor_unit");
-            Ok(Expr::nominal_ctor(decl, q.name.node.as_str(), unit))
+            Ok(Expr::nominal_ctor(named.decl, q.name.node.as_str(), unit))
         }
-        _ => Ok(Expr::var(member_reference(&decl, &q.name.node, ctx))),
+        _ => Ok(Expr::var(named.reference(&q.name.node, ctx))),
     }
 }
 
@@ -704,7 +1193,10 @@ pub(super) fn lower_member_call(
     args: &[Spanned<ChlExpr>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let (decl, member) = resolve_member(q, span, ctx)?;
+    let Some((named, member)) = resolve_member(q, span, ctx)? else {
+        return Ok(Expr::error());
+    };
+    let decl = &named.decl;
     let name = &q.name.node;
     match member.arity() {
         0 => Err(LoweringError::unsupported(
@@ -725,7 +1217,7 @@ pub(super) fn lower_member_call(
             ),
         )),
         _ => {
-            let binding = member_reference(&decl, name, ctx);
+            let binding = named.reference(name, ctx);
             super::exprs::lower_application(Name::raw(&binding), span, args, ctx)
         }
     }
@@ -812,15 +1304,20 @@ fn resolve_pattern_type(
     pattern: &ConstructorPattern,
     ctx: &LoweringContext,
 ) -> Result<Rc<NominalDecl>, LoweringError> {
-    let [ty] = pattern.type_path.as_slice() else {
-        unreachable!("`refuse_module_syntax` refuses a constructor pattern qualified by a module")
-    };
-    let Some(decl) = ctx.nominal_type(&ty.node) else {
+    let ty = pattern
+        .type_path
+        .last()
+        .expect("a constructor pattern names its type");
+    let Some(named) = resolve_type(&pattern.type_path, ctx)? else {
         return Err(LoweringError::unsupported(
             ty.span,
-            format!("`{}` is not a nominal type this module declares", ty.node),
+            format!(
+                "`{}`'s module has errors of its own, so its constructors are unknown",
+                ty.node
+            ),
         ));
     };
+    let decl = named.decl;
     if decl.ctor(&pattern.ctor.node).is_none() {
         return Err(LoweringError::unsupported(
             ty.span.join(pattern.ctor.span),
@@ -1320,6 +1817,48 @@ pub(super) fn lower_associated_def(
     Ok((member_binding(decl, name), func, annotation))
 }
 
+type QualifiedNameOf = crate::ccl::names::QualifiedName;
+
+/// Each public type of another module, reached through a qualifier of the module being
+/// lowered, that declares the public method `method`: its declaration, the parameters the
+/// method takes after `self`, and how this module spells the qualifier. An import's
+/// qualifier comes before a run's, since a run's name is in scope only below its statement,
+/// and each declaration is reached once.
+fn foreign_methods(
+    method: &str,
+    ctx: &LoweringContext,
+) -> Vec<(Rc<NominalDecl>, usize, QualifiedNameOf)> {
+    let mut qualifiers: Vec<&super::modules::Qualifier> = ctx
+        .module
+        .qualifiers
+        .values()
+        .filter(|q| q.view.is_none())
+        .collect();
+    qualifiers.sort_by_key(|q| (q.kind.sequential(), q.name.to_string()));
+    let mut found: Vec<(Rc<NominalDecl>, usize, QualifiedNameOf)> = Vec::new();
+    for qualifier in qualifiers {
+        let Some(interface) = qualifier.reachable() else {
+            continue;
+        };
+        let mut types: Vec<&super::modules::NominalMember> =
+            interface.nominal.values().filter(|ty| ty.public).collect();
+        types.sort_by(|a, b| a.decl.name.cmp(&b.decl.name));
+        for ty in types {
+            let params = match ty.functions.get(method) {
+                Some(function) if function.public && function.is_method => function.arity - 1,
+                Some(_) => continue,
+                None if method == "extract" && ty.decl.declares_extract => 0,
+                None => continue,
+            };
+            let decl = qualifier.instance(&ty.decl);
+            if !found.iter().any(|(owner, _, _)| *owner == decl) {
+                found.push((decl, params, qualifier.name.clone()));
+            }
+        }
+    }
+    found
+}
+
 /// Lower a method call `receiver.method(args)`: the application of a [`TypedExprNode::Method`]
 /// placeholder over every type that declares the method, to the receiver and the arguments
 /// (`src/ccl/design/nominal-types.md`, "Method calls").
@@ -1341,37 +1880,52 @@ pub(super) fn lower_method_call(
             ),
         ));
     }
-    // Each type declaring the method, with the parameters the method takes after `self`.
-    let mut owners: Vec<(Rc<NominalDecl>, usize)> = ctx
+    // The receiver lowers first, so an error in it is reported rather than a method no type
+    // in reach declares.
+    let receiver = super::lower_expr(receiver, ctx)?;
+    // Each type declaring the method, with the parameters the method takes after `self`, and
+    // the qualifier its binding is spelled through when another module declares it.
+    let mut owners: Vec<(Rc<NominalDecl>, usize, Option<QualifiedNameOf>)> = ctx
         .associated_functions
         .iter()
         .cloned()
         .chain(builtin_functions())
         .filter(|f| f.is_method && f.name == method.node)
-        .map(|f| (Rc::clone(&f.decl), f.arity - 1))
+        .map(|f| (Rc::clone(&f.decl), f.arity - 1, None))
         .collect();
     if method.node == "extract" {
         owners.extend(
             ctx.nominal_types
                 .iter()
                 .filter(|d| d.declares_extract)
-                .map(|d| (Rc::clone(d), 0)),
+                .map(|d| (Rc::clone(d), 0, None)),
         );
+    }
+    for (decl, params, qualifier) in foreign_methods(&method.node, ctx) {
+        if !owners.iter().any(|(owner, _, _)| *owner == decl) {
+            owners.push((decl, params, Some(qualifier)));
+        }
     }
     if owners.is_empty() {
         return Err(LoweringError::unsupported(
             method.span,
             format!(
-                "no type this module declares has a method `{0}`; the function a field holds \
-                 is called as `(r.{0})(…)`",
+                "no type this module declares or reaches has a method `{0}`; the function a \
+                 field holds is called as `(r.{0})(…)`",
                 method.node
             ),
         ));
     }
     let candidates = owners
         .into_iter()
-        .map(|(decl, params)| {
-            let reference = Expr::var(member_reference(&decl, &method.node, ctx));
+        .map(|(decl, params, qualifier)| {
+            let binding = match qualifier {
+                None => member_reference(&decl, &method.node, ctx),
+                Some(qualifier) => {
+                    format!("{qualifier}::{}", member_binding(&decl, &method.node))
+                }
+            };
+            let reference = Expr::var(binding);
             let function = ctx.tag_image(reference, method.span);
             MethodCandidate {
                 decl,
@@ -1388,7 +1942,6 @@ pub(super) fn lower_method_call(
         }),
         method.span,
     );
-    let receiver = super::lower_expr(receiver, ctx)?;
     let argument = if args.is_empty() {
         receiver
     } else {

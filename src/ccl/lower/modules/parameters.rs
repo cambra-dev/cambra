@@ -235,7 +235,7 @@ impl LoweringContext {
                 Reached::Value(Some(reference)) => {
                     Some((bound.clone(), reference.name.clone(), used.item))
                 }
-                Reached::Value(None) | Reached::Type(_) => None,
+                Reached::Value(None) | Reached::Type(_) | Reached::Nominal(_) => None,
             })
             .collect();
         used.sort_by(|l, r| l.0.cmp(&r.0));
@@ -471,7 +471,26 @@ impl LoweringContext {
         let qualifier = qualifier.clone();
         for item in uses {
             let bound = item.alias.as_ref().unwrap_or(&item.name);
-            if chl_parser::ast::is_type_name(&item.name.node) {
+            if qualifier.declares_nominal(&item.name.node) {
+                // A refused `use` item has no `use` name.
+                if !self.module.uses.contains_key(&bound.node) {
+                    continue;
+                }
+                let reached = qualifier.reach_nominal(
+                    &QualifiedName::new(run.clone()),
+                    &item.name.node,
+                    item.name.span,
+                );
+                if let Ok(Some(found)) = &reached {
+                    self.used_nominal
+                        .insert(bound.node.clone(), (found.clone(), qualifier.name.clone()));
+                }
+                if let (Ok(reached), Some(used)) = (reached, self.module.uses.get_mut(&bound.node))
+                {
+                    used.reached =
+                        Reached::Nominal(reached.map(|found| (found, qualifier.name.clone())));
+                }
+            } else if chl_parser::ast::is_type_name(&item.name.node) {
                 // A refused `use` item has no `use` name.
                 if !self.module.uses.contains_key(&bound.node) {
                     continue;

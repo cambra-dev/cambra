@@ -223,18 +223,15 @@ fn a_nominal_type_satisfies_no_trait() {
     }
 }
 
-/// A nominal value has no fields, even where its representation is a record.
-///
-/// The spec spells the call `Price::new(amount=3)`, the call's parentheses building the
-/// record argument. That form does not parse yet for any call, `f(amount=3)` included, so
-/// the record is written as a value.
+/// A nominal value has no fields, even where its representation is a record. The call's
+/// parentheses build the record argument (`docs/chl-spec.md`, "3.8 Function calls").
 #[test]
 fn a_nominal_value_has_no_fields() {
     check_compile_error(
         indoc! {r#"
             type Price = {amount: Int}
 
-            Price::new((amount=3)).amount
+            Price::new(amount=3).amount
         "#},
         "expected {amount: ?",
     );
@@ -440,7 +437,7 @@ fn a_nominal_type_joins_with_no_other_type() {
 
             pick(True)
         "#},
-        "Conflicting Types: OrderId | UserId",
+        "Conflicting Types: UserId | OrderId",
     );
     check_compile_error(
         indoc! {r#"
@@ -1246,7 +1243,7 @@ fn match_errors_name_what_is_wrong() {
 
                 f(1)
             "#},
-            "the qualified type `shop::Shape` is not supported yet",
+            "`shop` does not name a module here",
         ),
     ] {
         check_compile_error(src, needle);
@@ -1616,7 +1613,7 @@ fn method_errors_name_what_is_wrong() {
 
                 Price::new(1).cents()
             "#},
-            "no type this module declares has a method `cents`",
+            "no type this module declares or reaches has a method `cents`",
         ),
         (
             indoc! {r#"
@@ -1833,8 +1830,8 @@ fn method_errors_name_what_is_wrong() {
                 r = (f=\x -> x + 1)
                 r.f(1)
             "#},
-            "no type this module declares has a method `f`; the function a field holds is \
-             called as `(r.f)(…)`",
+            "no type this module declares or reaches has a method `f`; the function a field \
+             holds is called as `(r.f)(…)`",
         ),
     ] {
         check_compile_error(src, needle);

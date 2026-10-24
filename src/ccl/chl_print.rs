@@ -226,10 +226,10 @@ impl Printer {
                 format!("Feed({})", self.ty(value))
             }
             Type::Poly(poly) => self.poly(poly),
-            Type::Nominal(decl, args) if args.is_empty() => decl.name.to_string(),
+            Type::Nominal(decl, args) if args.is_empty() => decl.spelled(),
             Type::Nominal(decl, args) => {
                 let args: Vec<String> = args.iter().map(|t| self.ty(t)).collect();
-                format!("{}({})", decl.name, args.join(", "))
+                format!("{}({})", decl.spelled(), args.join(", "))
             }
             // No program writes one; this names both sides.
             Type::Split { input, output } => {

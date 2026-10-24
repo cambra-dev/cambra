@@ -235,6 +235,54 @@ fn a_checked_module_prints_its_interface() {
     );
 }
 
+/// A public nominal type prints as its module declares it, with each type parameter's
+/// variance and the module's type parameters whose arguments tell its runs' types apart,
+/// and each public associated function prints with its contract.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_prints_its_nominal_types() {
+    let program = program(
+        indoc! {"
+            param Receipt
+            pub type Box(T):
+                boxed(T)
+                empty
+            pub type Price = Int
+            pub def Price::doubled(self) => Int:
+                self.extract() * 2
+            def Price::hidden(self) => Int:
+                1
+            pub type Order:
+                placed(r: Receipt, total: Price)
+            impl Box(T):
+                pub def or_else(self, d: T) => T:
+                    match self:
+                        case Box::boxed(v):
+                            v
+                        case Box::empty:
+                            d
+        "},
+        &[],
+    );
+    let interface = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(
+        interface,
+        indoc! {"
+            module main
+            param Receipt
+            pub type Box(T):  # covariant in T
+                boxed(T)
+                empty
+            pub type Price = Int
+            pub Price::doubled: main::Price => Int
+            pub type Order:  # one type per argument of Receipt
+                placed(r: Receipt, total: main::Price)
+            pub Box::or_else: forall (T) {main::Box(T), T} => T
+        "}
+    );
+}
+
 /// A file whose check fails reports its errors, and prints no interface.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
