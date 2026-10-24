@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use cambra::interpreter::Value;
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use rstest_log::rstest;
 
 use super::helpers::*;
@@ -31,6 +31,15 @@ const SHOP: &str = indoc! {"
     type Secret = Int
     pub type Box(T) = T
     pub type Amount = {amount: Int}
+"};
+
+/// A module with a public type, its public method, and a private one.
+const SHOP_PRICE: &str = indoc! {"
+    pub type Price = Int
+    pub def Price::doubled(self) => Int:
+        self.extract() * 2
+    def Price::hidden(self) => Int:
+        1
 "};
 
 /// A type a module declares is used in that module, whether the module is imported or run.
@@ -185,6 +194,119 @@ fn a_public_associated_function_is_called_through_its_module(
 #[timeout(Duration::from_secs(10))]
 fn a_use_name_names_another_modules_type(#[case] root: &str, #[case] expected: i64) {
     check_program_scalar(&program(root, &[("shop", SHOP)]), Value::Int(expected));
+}
+
+/// A module whose public `p` holds a `lib::Price`, reaching `lib` through `reach`: an
+/// `import lib` or a `run lib as l`.
+fn holder(reach: &str, qualifier: &str) -> String {
+    formatdoc! {"
+        {reach}
+        pub p = {qualifier}::Price::new(3)
+    "}
+}
+
+/// A method call finds the method of a value's type even where the calling module neither
+/// imports nor runs the type's module, as when another module's member holds the value.
+#[rstest]
+#[case::through_an_import(
+    indoc! {"
+        import mid
+        mid::p.doubled()
+    "},
+    "import lib",
+    "lib"
+)]
+#[case::through_a_run(
+    indoc! {"
+        run mid as m
+        m::p.doubled()
+    "},
+    "run lib as l",
+    "l"
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_method_call_reaches_a_type_through_another_module(
+    #[case] root: &str,
+    #[case] reach: &str,
+    #[case] qualifier: &str,
+) {
+    check_program_scalar(
+        &program(
+            root,
+            &[("mid", &holder(reach, qualifier)), ("lib", SHOP_PRICE)],
+        ),
+        Value::Int(6),
+    );
+}
+
+/// The method a call finds through another module is the one of the instance the value has,
+/// whose run's argument the method's signature reads.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_method_call_through_another_module_takes_the_values_instance() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                run mid as m
+                m::p.wrap(5)
+            "},
+            &[
+                (
+                    "mid",
+                    indoc! {"
+                    run lib(T=Int) as l
+                    pub p = l::Box::new(1)
+                "},
+                ),
+                (
+                    "lib",
+                    indoc! {"
+                        param T
+                        pub type Box = Int
+                        pub def Box::wrap(self, x: T) => T:
+                            x
+                    "},
+                ),
+            ],
+        ),
+        Value::Int(5),
+    );
+}
+
+/// A method call above a `run` of the type's module takes a copy in scope at the call, not
+/// the run's, whose name is in scope only below its statement.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_method_call_above_a_run_takes_a_copy_in_scope() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import mid
+                x = mid::p.doubled()
+                run lib as l
+                x
+            "},
+            &[("mid", &holder("import lib", "lib")), ("lib", SHOP_PRICE)],
+        ),
+        Value::Int(6),
+    );
+}
+
+#[rstest]
+#[case::private("hidden")]
+#[case::undeclared("nothing")]
+#[timeout(Duration::from_secs(10))]
+fn a_method_call_through_another_module_reaches_only_public_methods(#[case] method: &str) {
+    assert_refused(
+        &program(
+            &formatdoc! {"
+                import mid
+                mid::p.{method}()
+            "},
+            &[("mid", &holder("import lib", "lib")), ("lib", SHOP_PRICE)],
+        ),
+        &format!("no type this module declares or reaches has a method `{method}`"),
+    );
 }
 
 /// A private type, and a private associated function of a public one, are their module's

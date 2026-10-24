@@ -191,10 +191,14 @@ lowering does not know. The parser keeps the call apart from a call of a field, 
 ```
 
 The placeholder, `TypedExprNode::Method`, holds the method's name, whether the call passes
-arguments after the receiver, and, as its children, a reference to each `N::m` the module declares
-and to each public `q::N::m` of a public type a qualifier `q` of the module reaches
-(`foreign_methods`), so `uniquify` resolves the candidates as it resolves any reference. ANF treats it as an atom, so it
-stays the application's function. No type in reach declaring `m` is a lowering error.
+arguments after the receiver, and, as its children, the candidates. Lowering adds a reference to
+each `N::m` the module declares and to each public `q::N::m` of a public type a qualifier `q` of the
+module reaches (`foreign_methods`), which `uniquify` resolves as it resolves any reference. Linking
+adds a reference to each run's copy of each public method of that name (`add_method_copies`), which
+reaches a type whose module the calling module neither imports nor runs. ANF treats the placeholder
+as an atom, so it stays the application's function. A method that no type the module declares or
+its qualifiers reach declares, and that no module lowered before it declares in public
+(`LoweringContext::reached_methods`), is a lowering error.
 
 Inference resolves the placeholder where it emits the application (`resolve_method`, called from
 `emit_apply`). The argument is emitted first, as for every application, so the receiver is typed by
@@ -211,10 +215,14 @@ comprehension's generator is one: its element reads each binder's type from the 
 is the argument, or the first component of its tuple type when the call passes arguments. That type
 names a nominal head, directly or through the bounds its variable has gathered, or the call is an
 error asking for an annotation on the receiver: no later use decides it (`docs/chl-spec.md`,
-"Associated functions and methods"). The head's candidate replaces the placeholder, and the
-application is emitted as any call of a `def`. The other candidates are dropped without being
-emitted, so one whose `def` stands later in the module than the call reports nothing. The chosen one
-is unbound there, as a module function called before its `def` is. Each candidate records the
+"Associated functions and methods"). The first candidate of the head's declaration whose binding
+is in scope at the call replaces the placeholder (`Typing::binds`), and the application is emitted
+as any call of a `def`. Every copy of a type's method is one function, since an associated function
+reaches nothing a run gives its module, so a run's copy and a shared import's are interchangeable.
+With none in scope, the first candidate lowering found is chosen, and it is unbound there, as a
+module function called above its `def` is. A copy linking added is never chosen out of scope. The
+other candidates are dropped without being emitted, so one whose `def` stands later in the module
+than the call reports nothing. Each candidate records the
 parameters its method declares after `self`, and a call passing another number of arguments is an
 error naming the method and both counts. A head with no candidate is an error naming the type and
 the method, and a type that is not nominal is an error saying it has no methods. No `Method` node

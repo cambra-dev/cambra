@@ -4580,9 +4580,6 @@ alias exports a spelling for a structural type, and the user's type is the same 
 nominal type exports the type itself: `mod::Price` is one type in every module that names it, and
 distinct from every other type of its shape.
 
-**[Planned]** — a method call on a value whose type a module declares that the calling module
-neither imports nor runs, as one another module's function returns.
-
 #### Nominal type identity
 
 A nominal type is identified by its module path, its name, its type arguments, and the arguments of

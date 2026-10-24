@@ -368,6 +368,12 @@ takes no type arguments is a type member as an alias is, so it fills a Module ty
 (`Qualifier::reach_type`, `Interface::missing`). A method call's candidates add
 each public method of each public type a qualifier of the module reaches, an import's qualifier
 before a run's, since a run's name is in scope only below its statement (`foreign_methods`).
+Linking records each run's copy of each public method (`ProgramLowering::method_copies`) and adds
+the copies of a call's method to its candidates once the program, or a module's check tree, is
+assembled (`add_method_copies`). Inference takes a copy only where its binding is in scope, so a
+call reaches the method of a value whose type comes from a module the calling module neither
+imports nor runs: the value comes from a run or a shared import that encloses the call, whose copy
+is in scope there.
 
 A type's identity takes the module's type parameters it reaches ([chl-spec.md, "Nominal type
 identity"](chl-spec.md#nominal-type-identity)). Once the module lowers, `settle_implicit` records

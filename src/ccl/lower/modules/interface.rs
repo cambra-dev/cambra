@@ -392,6 +392,26 @@ impl Interface {
         self.members.get(name).is_some_and(|member| member.public)
     }
 
+    /// The name of each public method of each public nominal type the module declares, the
+    /// single-constructor form's `extract` included.
+    pub(in crate::ccl::lower) fn public_methods(&self) -> impl Iterator<Item = SmolStr> + '_ {
+        self.nominal
+            .values()
+            .filter(|member| member.public)
+            .flat_map(|member| {
+                let extract = member
+                    .decl
+                    .declares_extract
+                    .then(|| SmolStr::new_static("extract"));
+                member
+                    .functions
+                    .iter()
+                    .filter(|(_, f)| f.public && f.is_method)
+                    .map(|(name, _)| name.clone())
+                    .chain(extract)
+            })
+    }
+
     /// Whether `binding`, `Price::discounted`, is a public associated function of a public
     /// nominal type the module declares.
     pub fn is_public_function(&self, binding: &str) -> bool {
