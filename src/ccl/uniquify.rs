@@ -49,7 +49,7 @@
 //! like any other. The pass removes each `LetType`, which has no job left once
 //! its predicates are resolved. The reserved [`crate::ccl::REFINEMENT_BINDER`] is
 //! bound by the refinement itself, never enters the environment, and stays
-//! raw — it is deliberately one shared name (see [`crate::ccl::Refinement`]).
+//! raw — one shared name per refinement depth (see [`crate::ccl::Refinement`]).
 //! Predicates are immutable `Rc<TypedExpr>`, so uniquifying one **rebuilds**
 //! it. A predicate term shared by `Rc` across occurrences (lowering's clones
 //! share predicate terms deliberately) is rebuilt **once** — keyed by

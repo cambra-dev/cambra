@@ -1319,6 +1319,17 @@ fn counting_the_groups_of_a_group_by() {
     );
 }
 
+/// A filter over a group-by's groups. The filter's predicate reads each group at the element
+/// it tests, and the group's domain, a refinement of its own, reads that element one
+/// refinement out. The groups sum to 1, 5 and 4.
+#[test]
+fn a_filter_over_the_groups_of_a_group_by() {
+    check_scalar(
+        r"sum([sum(g) for g in groupby([1, 2, 3, 4], \e -> e // 2) if sum(g) > 3])",
+        Value::Int(9),
+    );
+}
+
 /// A group-by in a conditional's guard: the guard becomes each leg's filter, which planning
 /// lifts from its uncompiled predicate and plans as the tree, so the group-by is recognized there
 /// too.

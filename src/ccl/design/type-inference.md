@@ -2222,6 +2222,28 @@ filtered comprehensions can have alpha-equivalent predicate lambdas with differe
 uids. Name-only comparison would split their refinements and cause an invariant data-domain
 mismatch. `test_case_with_filtered_comprehension_arms_passes_consistency_wall` exercises that case.
 
+#### A refinement's element is referenced by index
+
+A reference to a refinement's element is `__elem^𝑛` (`Name::elem_at`). `𝑛` counts the refinements
+between the reference and the refinement whose element it reads, and `__elem` is `𝑛 = 0`. A type
+inside a predicate reads the predicate's element as `__elem^1`. The filter in
+`[g for g in groupby(xs, 𝑓) if 𝑝(g)]` is `__elem ▷ 𝑠 ▷ (λ g → 𝑝(g))`, with
+`g : {𝐼 | __elem ▷ xs ▷ 𝑓 == __elem^1} ⤇ 𝑇`.
+
+The index identifies the element, as a Pi index identifies a function, so refinement equality and
+normal forms compare predicates structurally. Placing a term under `𝑚` more refinements adds `𝑚` to
+each element index the term reads free (`subst::shift_elems`):
+
+- A substitution entering a refinement shifts its keys and its terms by one
+  (`Subst::under_element`).
+- Opening a function shifts the argument it places inside a refinement by the refinements entered
+  (`PiWalk`).
+- A free-variable walk leaving a refinement drops that refinement's `__elem` and lowers each other
+  index by one.
+
+A function made from a predicate names its parameter where the predicate's types read the element
+(`fn_of_bare_predicate` in `src/ccl/planning/predicates.rs`).
+
 #### `let` binders and scope exit
 
 When a result type leaves a transparent let binder's scope, references to the binder are replaced
@@ -2483,12 +2505,8 @@ their witness half applied when they are stored (`Bound::with_subst`), and here 
 `𝛼[σ]` again.
 
 A substitution crossing into a refinement's predicate passes under the refinement's element binder,
-`__elem`. An entry whose term reads `__elem` names the enclosing element, which has no spelling
-there, so `Subst::under_element` makes it `Mapping::Unspellable`. Acting on an occurrence of its
-binder fails. A variable whose telescope holds the binder suspends on the entry like any other, so
-the failure happens when the variable resolves to content reading the binder, and content that does
-not read it is unchanged. Whether a variable reads a binder its telescope holds is unknown until it
-resolves, so this is the earliest point the outcome is decided.
+where every element reference it acts on or puts in place is one refinement further out
+([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).
 
 Compaction already applies a substitution to a variable met in a type's structure, by walking the
 variable's bounds under it. A variable met in a type slot of a term the type quotes is different.
@@ -3943,16 +3961,10 @@ projection read `𝑥`. Product β removes the pairing with the projection, so i
 ### Lifting a filter onto the pair
 
 The nested-lambda rule writes a lifted filter over the pair's element, `𝑎 ↦ __elem.0`. A
-refinement nested in the filter's subterm types binds `__elem` to its own element, so the
-substitution would capture there, and no spelling names the enclosing element from inside it.
-
-A subterm whose type restates the pair's own dependent tuple, the key
-`𝑎.1 : {𝐾 | __elem ∈ 𝑀(𝑎.0)}`, holds such a refinement. The rule removes those restated facts
-first; the pair's first component has the tuple's type, which states them. Where a nested
-refinement still reads `𝑎`, a filter in the key function reading the loop binder, the rule binds `𝑎`
-instead of substituting it: the lifted filter is `__elem.0 ▷ (λ 𝑎 → 𝑝)`, and the nested refinement
-reads a binder of the filter's own term. A substitution that would capture still fails, where
-it reaches an occurrence (`Mapping::Unspellable`).
+refinement nested in the filter's subterm types reads it as `__elem^1.0`, one refinement out
+([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).
+A filter reading `𝑎` where the pair is otherwise not dependent is not lifted: it stays on the
+second component, which makes the pair the dependent tuple `(𝑎 : 𝐴) × {𝐾 | 𝑝(𝑎, ·)}`.
 
 ### Iterating a dependent tuple
 
@@ -3989,10 +4001,9 @@ family runs per row.
   kind's tuple of key types.
 - Iterating a dependent tuple whose second component is a filter or a per-row list domain.
 - Comparing two dependent tuples componentwise under subtyping, which compaction's atom does not.
-- A nested refinement cannot name an enclosing refinement's element, so the projection rule has no
-  spelling where the projected tuple is a refinement's own element, as in a lifted filter. Indexing
-  element references by the refinements crossed, as `Name::PiBound` indexes function binders,
-  gives it one.
+- The projection rule where the projected tuple is a refinement's own element, as in a lifted
+  filter. A nested refinement reads that element as `__elem^1`
+  ([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).
 - A pairing `⟨id, 𝑔⟩ ≫ ℎ` that reaches a type check without product β removing it compares a
   product against the dependent tuple `ℎ` takes. Typing the pairing at that dependent tuple and
   comparing types up to projections out of a pairing would accept it.

@@ -4368,7 +4368,8 @@ pub type PredicateId = *const TypedExpr;
 /// The single reserved binder every [`Refinement`] implicitly introduces. It
 /// is free in a refinement's predicate and ranges over the refined base type.
 /// Disjoint from user identifiers by construction (lowering never produces
-/// it); nested refinements share it and shadow positionally.
+/// it). A nested refinement reads an enclosing one's element by index
+/// ([`crate::ccl::Name::elem_at`]).
 pub const REFINEMENT_BINDER: &str = "__elem";
 
 /// A predicate over an operator's result, as a function of the operand terms of one use:
