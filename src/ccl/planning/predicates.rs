@@ -90,12 +90,7 @@ fn term_mentions_pair_binder(e: &Expr, referenced: &HashSet<Name>) -> bool {
         }),
         _ => false,
     };
-    if here {
-        return true;
-    }
-    let mut found = false;
-    e.walk_children(|c| found |= term_mentions_pair_binder(c, referenced));
-    found
+    here || e.any_child(|c| term_mentions_pair_binder(c, referenced))
 }
 
 /// Compile every refinement predicate reachable from `expr` by running the

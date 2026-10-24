@@ -202,15 +202,10 @@ fn peel_effectful_outputs(mut expr: Expr) -> Expr {
 
 /// Whether the subtree still contains a pre-phase marker node.
 fn contains_marker(expr: &Expr) -> bool {
-    if matches!(
+    matches!(
         expr.node,
         TypedExprNode::For { .. } | TypedExprNode::MutWrite { .. }
-    ) {
-        return true;
-    }
-    let mut found = false;
-    expr.walk_children(|c| found = found || contains_marker(c));
-    found
+    ) || expr.any_child(contains_marker)
 }
 
 /// Whether any type slot still carries a mutable `Type::History` — the
