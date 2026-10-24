@@ -59,12 +59,8 @@ pub fn disjoin(paths: impl IntoIterator<Item = Expr>, empty: bool, bool_ty: &Typ
 /// ([`BindingTransparency`](crate::ccl::BindingTransparency)), so a binding some
 /// type spells has a reader the term does not show.
 pub(crate) fn spelled_in_a_type(expr: &Expr, name: &Name) -> bool {
-    if crate::ccl::subst::type_free_vars(&expr.ty).contains(name) {
-        return true;
-    }
-    let mut found = false;
-    expr.walk_children(|c| found = found || spelled_in_a_type(c, name));
-    found
+    crate::ccl::subst::type_free_vars(&expr.ty).contains(name)
+        || expr.any_child(|c| spelled_in_a_type(c, name))
 }
 
 /// A `Unit` literal stamped with `Base(Unit)` — the value of a mutable write, and
@@ -565,15 +561,10 @@ pub(crate) fn strip_iterate_markers(e: &Expr) -> Expr {
 /// The guard on [`discharge_transparent_lets`], so a predicate already in that
 /// form keeps its `Rc` rather than being rebuilt into an equal copy.
 fn binds_a_transparent_let(e: &Expr) -> bool {
-    if matches!(
+    matches!(
         &e.node,
         TypedExprNode::Let { binding, .. } if binding.transparency == BindingTransparency::Transparent
-    ) {
-        return true;
-    }
-    let mut found = false;
-    e.walk_children(|c| found |= binds_a_transparent_let(c));
-    found
+    ) || e.any_child(binds_a_transparent_let)
 }
 
 /// Substitute away a predicate's transparent `let` bindings
