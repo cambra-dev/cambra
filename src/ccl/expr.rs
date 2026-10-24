@@ -33,10 +33,9 @@ pub const F_WRITES: Label = Label::fixed("writes");
 // sibling route's commit leaves the tap `` `idle `` rather than appending a value
 // the program never fed.
 //
-// The tag sits in the one place that cannot disagree with the value. A `Bool` gate
-// beside a same-position value would require the value to answer at every
-// committing position, which a domain-restricting feed value (an arm's
-// `variant_project`) cannot do.
+// The tag sits in the one place that cannot disagree with the value; see
+// `crate::ccl::ccl_utils::writer_decision_record` for why a companion `Bool` gate
+// cannot carry a domain-restricted feed value.
 /// The tag of a tap that fired at this position, carrying the fed value.
 pub const V_FIRED: Label = Label::fixed("fired");
 /// The tag of a tap that did not fire at this position. Nullary: a tap that did
