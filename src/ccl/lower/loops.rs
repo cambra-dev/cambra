@@ -392,6 +392,7 @@ fn lower_for_body_stmts_scoped(
                 target,
                 value,
                 transparency,
+                ..
             } => {
                 refuse_nested_sink(target, value, stmt.span)?;
                 let assignment = AssignmentBindings::of(target, *transparency, stmt.span, ctx)?;
@@ -416,6 +417,7 @@ fn lower_for_body_stmts_scoped(
                 target,
                 annotation,
                 value,
+                ..
             } => {
                 let name = extract_name_target(target, "annotated assignment")?;
                 if mutation_scope.contains(&name) {
@@ -1423,6 +1425,7 @@ fn lower_loop_body_chain_scoped(
                 target,
                 value,
                 transparency,
+                ..
             } => {
                 refuse_nested_sink(target, value, stmt.span)?;
                 let assignment = AssignmentBindings::of(target, *transparency, stmt.span, ctx)?;
@@ -1524,6 +1527,7 @@ fn lower_loop_body_chain_scoped(
                 target,
                 annotation,
                 value,
+                ..
             } => {
                 let name = extract_name_target(target, "annotated assignment")?;
                 if mut_annotation_parts(&annotation.ty, ctx).is_some() {

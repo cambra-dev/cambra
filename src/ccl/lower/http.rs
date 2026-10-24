@@ -1,28 +1,32 @@
 //! `http_serve`: recognizing `requests, responses = http_serve(port, method, path)`, and
 //! lowering it to a `Source` binding and a `Defer` binding whose sink is the route's reply
-//! sink.
+//! sink. Each argument is a constant (`docs/chl-spec.md`, "9.19 Constants"), so a module's
+//! route may take its address from a `const` parameter, and each run of the module serves
+//! the address its arguments give ([`HttpRoute::at`]).
 //!
 //! [`sink_declaration`](super::sink_declaration) recognizes the statement through
 //! [`http_serve_decl`], and [`lower_middle_stmt`](super::lower_middle_stmt) lowers it through
 //! [`lower_http_serve`] at the top level only.
 
+use super::constants::Refused;
 use super::*;
+use crate::ccl::constant::ConstTerm;
 use crate::chl_parser::SurfaceBuiltin;
-use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Lit as ChlLit, Span, Spanned};
+use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Span, Spanned};
 use crate::interpreter::HttpServerDataSource;
 
-/// `requests, responses = http_serve(port, method, path)`, with its names and string-literal
-/// arguments read off.
+/// `requests, responses = http_serve(port, method, path)`, with its names and arguments read
+/// off.
 pub(super) struct HttpServeDecl {
     requests: String,
     responses: String,
-    port: String,
-    method: String,
-    path: String,
+    port: Spanned<ChlExpr>,
+    method: Spanned<ChlExpr>,
+    path: Spanned<ChlExpr>,
 }
 
 /// The declaration, when `target` is a 2-element name tuple and `value` is a call to
-/// `http_serve` with exactly 3 string-literal arguments.
+/// `http_serve` with exactly 3 arguments.
 pub(super) fn http_serve_decl(
     target: &Spanned<AssignTarget>,
     value: &Spanned<ChlExpr>,
@@ -54,16 +58,12 @@ pub(super) fn http_serve_decl(
     let [port, method, path] = args.as_slice() else {
         return None;
     };
-    let string = |a: &Spanned<ChlExpr>| match &a.node {
-        ChlExpr::Lit(ChlLit::String(s)) => Some(s.to_string()),
-        _ => None,
-    };
     Some(HttpServeDecl {
         requests: requests.to_string(),
         responses: responses.to_string(),
-        port: string(port)?,
-        method: string(method)?,
-        path: string(path)?,
+        port: port.clone(),
+        method: method.clone(),
+        path: path.clone(),
     })
 }
 
@@ -77,7 +77,9 @@ pub(super) fn http_serve_decl(
 /// ```
 ///
 /// The route is recorded as a [`DeclaredSink`] and registered for each run of the module
-/// ([`LoweringContext::register_sinks`]).
+/// ([`LoweringContext::register_sinks`]). An address that reads a `const` parameter names the
+/// source by the statement ([`RouteAddress::Constant`]), and each run's copy is renamed to
+/// the address the run gives it.
 // TODO we shouldn't need to special-case this.  Instead, we should support multi-return
 // in general.
 pub(super) fn lower_http_serve(
@@ -94,20 +96,63 @@ pub(super) fn lower_http_serve(
         method,
         path,
     } = decl;
-    let port_u16: u16 = port.parse().map_err(|_| {
-        LoweringError::unsupported(
-            args_span,
-            format!("http_serve port must be a u16, got {port:?}"),
-        )
-    })?;
-    let source_name = http_requests_source_name(&port, &method, &path);
+    let mut terms = Vec::new();
+    for arg in [&port, &method, &path] {
+        match ctx.const_term(arg, span.start) {
+            Ok(term) => terms.push(term),
+            Err(Refused(Some(error))) => return Err(error),
+            // A constant in error, reported at its binding: the route has no address, so the
+            // names bind values that report nothing more.
+            Err(Refused(None)) => {
+                let requests_expr = ctx.tag_machinery(Expr::error(), span, "lower.http_serve");
+                let responses_expr = ctx.tag_machinery(Expr::error(), span, "lower.http_serve");
+                let inner_let = ctx.tag_machinery(
+                    Expr::let_bind(responses, responses_expr, body),
+                    span,
+                    "lower.http_serve",
+                );
+                return Ok(ctx.tag_image(Expr::let_bind(requests, requests_expr, inner_let), span));
+            }
+        }
+    }
+    let terms: [ConstTerm; 3] = terms.try_into().expect("three arguments");
+    let route = match &terms {
+        [
+            ConstTerm::Lit(Lit::String(port)),
+            ConstTerm::Lit(Lit::String(method)),
+            ConstTerm::Lit(Lit::String(path)),
+        ] => HttpRoute::fixed(port, method, path)
+            .map_err(|e| LoweringError::unsupported(args_span, e))?,
+        // An argument that reads no parameter is the same in every run, so one that is no
+        // string is refused here, once, rather than at each run.
+        _ if let Some(other) = terms
+            .iter()
+            .find(|t| t.params().is_empty() && !matches!(t, ConstTerm::Lit(Lit::String(_)))) =>
+        {
+            return Err(LoweringError::unsupported(
+                args_span,
+                format!("http_serve's arguments are strings, and one is `{other}`"),
+            ));
+        }
+        _ => {
+            let [port, method, path] = terms;
+            let route = HttpRoute {
+                source_name: format!("__http_route_{}_{}", span.file.index(), span.start),
+                address: RouteAddress::Constant { port, method, path },
+            };
+            // A module checked alone reads its requests' type off the source by this name.
+            ctx.declare_unopened_routes(&[DeclaredSink::Http {
+                route: Box::new(route.clone()),
+                responses: responses.clone(),
+                span,
+                args_span,
+            }]);
+            route
+        }
+    };
+    let source_name = route.source_name.clone();
     ctx.declared_sinks.push(DeclaredSink::Http {
-        route: HttpRoute {
-            source_name: source_name.clone(),
-            port: port_u16,
-            method,
-            path,
-        },
+        route: Box::new(route),
         responses: responses.clone(),
         span,
         args_span,
@@ -139,9 +184,70 @@ pub(super) fn lower_http_serve(
 #[derive(Debug, Clone)]
 pub(super) struct HttpRoute {
     source_name: String,
-    port: u16,
-    method: String,
-    path: String,
+    address: RouteAddress,
+}
+
+/// Where a route listens.
+#[derive(Debug, Clone)]
+pub(super) enum RouteAddress {
+    Fixed {
+        port: u16,
+        method: String,
+        path: String,
+    },
+    /// An address over the module's `const` parameters, which each run gives values.
+    Constant {
+        port: ConstTerm,
+        method: ConstTerm,
+        path: ConstTerm,
+    },
+}
+
+impl HttpRoute {
+    /// The route at the address `port`, `method` and `path`, or why it has none: a port is a
+    /// number below 65536.
+    fn fixed(port: &str, method: &str, path: &str) -> Result<HttpRoute, String> {
+        let port_u16: u16 = port
+            .parse()
+            .map_err(|_| format!("http_serve port must be a u16, got {port:?}"))?;
+        Ok(HttpRoute {
+            source_name: http_requests_source_name(port, method, path),
+            address: RouteAddress::Fixed {
+                port: port_u16,
+                method: method.to_string(),
+                path: path.to_string(),
+            },
+        })
+    }
+
+    /// The name of the source its requests arrive on.
+    pub(super) fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    /// The route a run whose `const` parameters take `consts` serves, with the name its
+    /// requests' source has in the module's chain, which the run's copy is renamed from;
+    /// `None` for a route whose address is fixed. An address that is no string here is
+    /// the error.
+    pub(super) fn at(
+        &self,
+        consts: &HashMap<crate::ccl::TypeParamId, ConstTerm>,
+    ) -> Option<Result<(HttpRoute, String), String>> {
+        let RouteAddress::Constant { port, method, path } = &self.address else {
+            return None;
+        };
+        let string = |term: &ConstTerm| match term.substituted(consts) {
+            Ok(ConstTerm::Lit(Lit::String(s))) => Ok(s.to_string()),
+            Ok(other) => Err(format!(
+                "a route's address is a string, and this run gives `{other}`"
+            )),
+            Err(no_value) => Err(no_value.0),
+        };
+        Some((|| {
+            let route = HttpRoute::fixed(&string(port)?, &string(method)?, &string(path)?)?;
+            Ok((route, self.source_name.clone()))
+        })())
+    }
 }
 
 impl LoweringContext {
@@ -176,10 +282,11 @@ impl LoweringContext {
     ) -> Result<Arc<dyn DataSink>, LoweringError> {
         let HttpRoute {
             source_name,
-            port,
-            method,
-            path,
+            address,
         } = route;
+        let RouteAddress::Fixed { port, method, path } = address else {
+            unreachable!("a route is registered at the address its run gives it (`HttpRoute::at`)")
+        };
         if !self.http_routes_this_pass.insert(source_name.clone()) {
             let route = format!("port={port}, method={method}, path={path}");
             let (earlier_span, earlier_run) = self.http_route_sites[source_name].clone();

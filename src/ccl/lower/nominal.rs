@@ -18,8 +18,10 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
+use super::constants::Refused;
 use super::stmts::{is_builtin_type_name, is_mut_annotation, lower_type_expr};
 use super::{LoweringContext, LoweringError};
+use crate::ccl::ccl_utils::strip_refinements;
 use crate::ccl::nominal::{NominalCtor, NominalDecl};
 use crate::ccl::ty::{PolyParam, PolyType, TypeKind, TypeParam, TypeParamId};
 use crate::ccl::{
@@ -401,19 +403,168 @@ fn lower_parameter_type(
              inference, which no declaration has",
         ));
     }
-    // The constructor functions are bound around the whole module (`bind_constructors`),
-    // where no module binding is in scope.
-    if let Some(name) = crate::ccl::subst::type_free_vars(&lowered).first() {
-        return Err(LoweringError::unsupported(
-            ty.span,
-            format!(
-                "a refinement in a constructor's parameter type names `{}`; naming a module \
-                 binding there is not supported yet",
-                name.base()
-            ),
-        ));
+    // A refinement in a declaration names only `_` and constants (`docs/chl-spec.md`, "6.4
+    // Refinement syntax"). Each `const` binding it names is replaced by its term, so the
+    // type reads only the module's `const` parameters, which the constructor functions are
+    // bound below (`bind_constructors`).
+    let mut lowered = lowered;
+    for name in crate::ccl::subst::type_free_vars(&lowered) {
+        let base = SmolStr::from(name.base());
+        if ctx.constants.param(&base).is_some() {
+            continue;
+        }
+        let term = if let Some((qualifier, member)) = base.split_once("::") {
+            // Another module's constant, as this module writes it.
+            ctx.qualified_const(qualifier, member, ty.span)
+        } else if ctx.constants.is_constant(&base) {
+            ctx.constants.term_of(&base).ok_or(Refused(None))
+        } else if let Some(term) = ctx.used_const(&base, ty.span) {
+            // Another module's constant, through a `use` name.
+            term
+        } else {
+            return Err(LoweringError::unsupported(
+                ty.span,
+                format!(
+                    "a refinement in a constructor's parameter type names `{base}`, which is \
+                     not a constant; a refinement in a declaration names only `_` and \
+                     constants, such as `const {base} = …`"
+                ),
+            ));
+        };
+        let term = match term {
+            Ok(term) => term,
+            Err(Refused(Some(error))) => return Err(error),
+            // A constant in error, reported where it stands: the type keeps no refinement,
+            // and reports nothing more.
+            Err(Refused(None)) => return Ok(strip_refinements(&lowered)),
+        };
+        if !predicate_holds(&term) {
+            return Err(LoweringError::unsupported(
+                ty.span,
+                format!(
+                    "this refinement reads `{base}`, whose value is `{term}`; a tuple, a \
+                     record or a list constant in a declaration's refinement is not \
+                     supported yet"
+                ),
+            ));
+        }
+        replace_in_predicates(&mut lowered, &base, &mut || {
+            predicate_term(&term, ty.span, ctx)
+        });
     }
     Ok(lowered)
+}
+
+/// Whether a predicate can hold `term` ([`predicate_term`]).
+fn predicate_holds(term: &crate::ccl::constant::ConstTerm) -> bool {
+    use crate::ccl::constant::ConstTerm;
+    match term {
+        ConstTerm::Lit(_) | ConstTerm::Param(_) => true,
+        ConstTerm::BinOp(_, l, r) => predicate_holds(l) && predicate_holds(r),
+        ConstTerm::Neg(t) | ConstTerm::Not(t) => predicate_holds(t),
+        ConstTerm::If(c, t, e) => predicate_holds(c) && predicate_holds(t) && predicate_holds(e),
+        ConstTerm::Tuple(_) | ConstTerm::Record(_) | ConstTerm::List(_) => false,
+        // A field or an element of a constant reads a tuple, a record or a list.
+        ConstTerm::Field(..) | ConstTerm::Element(..) => false,
+    }
+}
+
+/// `term`, which [`predicate_holds`], as a predicate reads it, each node an image of
+/// `span`.
+fn predicate_term(
+    term: &crate::ccl::constant::ConstTerm,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    use crate::ccl::UnaryOpKind;
+    use crate::ccl::constant::ConstTerm;
+    let expr = match term {
+        ConstTerm::Lit(lit) => Expr::lit(lit.clone()),
+        ConstTerm::Param(param) => Expr::var(Name::raw(param.spelling.as_str())),
+        ConstTerm::BinOp(op, l, r) => {
+            let l = predicate_term(l, span, ctx);
+            let r = predicate_term(r, span, ctx);
+            Expr::binop(l, *op, r)
+        }
+        ConstTerm::Neg(t) => Expr::unary(UnaryOpKind::Neg, predicate_term(t, span, ctx)),
+        ConstTerm::Not(t) => Expr::unary(UnaryOpKind::Not, predicate_term(t, span, ctx)),
+        // As a ternary lowers: the first branch whose guard holds.
+        ConstTerm::If(c, t, e) => {
+            let guard = predicate_term(c, span, ctx);
+            let then = predicate_term(t, span, ctx);
+            let otherwise = predicate_term(e, span, ctx);
+            let always = ctx.tag_machinery(Expr::lit(Lit::Bool(true)), span, "lower.ternary_else");
+            Expr::new(TypedExprNode::Case {
+                scrutinee: None,
+                branches: vec![
+                    crate::ccl::Branch {
+                        pattern: None,
+                        guard,
+                        body: then,
+                    },
+                    crate::ccl::Branch {
+                        pattern: None,
+                        guard: always,
+                        body: otherwise,
+                    },
+                ],
+            })
+        }
+        _ => unreachable!("a predicate holds `{term}`"),
+    };
+    ctx.tag_image(expr, span)
+}
+
+/// `ty` with each free reference to the raw name `name` in its predicates replaced by a
+/// term `with` builds. Rebuilding a predicate copies it, and a copy mints nothing, so every
+/// term is built before the rebuild that places it.
+fn replace_in_predicates(ty: &mut Type, name: &str, with: &mut dyn FnMut() -> Expr) {
+    use crate::ccl::scope::{
+        ScopedItem, ScopedItemMut, for_each_scoped_item, for_each_scoped_item_mut,
+    };
+    let name = Name::raw(name);
+    fn count(expr: &Expr, name: &Name) -> usize {
+        if matches!(&expr.node, TypedExprNode::Var(n) if n == name) {
+            return 1;
+        }
+        let mut n = 0;
+        for_each_scoped_item(expr, &mut |item| {
+            if let ScopedItem::Child { expr, binders } = item
+                && !binders.shadows(name)
+            {
+                n += count(expr, name);
+            }
+        });
+        n
+    }
+    fn replace(expr: &mut Expr, name: &Name, terms: &mut Vec<Expr>) {
+        if matches!(&expr.node, TypedExprNode::Var(n) if n == name) {
+            *expr = terms.pop().expect("a term is built for each reference");
+            return;
+        }
+        let mut shadowed = false;
+        for_each_scoped_item_mut(expr, &mut |item| match item {
+            ScopedItemMut::VarRef(_) | ScopedItemMut::KeyRef(_) => {}
+            ScopedItemMut::Scope(binders) => shadowed = binders.iter().any(|b| b == name),
+            ScopedItemMut::Child(child) if !shadowed => replace(child, name, terms),
+            ScopedItemMut::Child(_) => {}
+        });
+    }
+    let mut occurrences = 0;
+    crate::ccl::ccl_utils::walk_refined_predicates(ty, &mut HashSet::new(), &mut |predicate, _| {
+        occurrences += count(predicate, &name);
+    });
+    let mut terms: Vec<Expr> = (0..occurrences).map(|_| with()).collect();
+    crate::ccl::ccl_utils::walk_refined_predicates_mut(
+        ty,
+        &crate::ccl::ccl_utils::PredMemo::new(),
+        &(),
+        &mut |predicate, _| {
+            replace(predicate, &name, &mut terms);
+            true
+        },
+    );
+    debug_assert!(terms.is_empty(), "every term built is placed");
 }
 
 /// Record on each nominal type the module declares the module's type parameters it reaches
@@ -422,8 +573,14 @@ fn lower_parameter_type(
 /// reaches, transitively. `chain` is the module's lowered top level, whose spine binds the
 /// associated functions. Each type keeps the parameters in the order the module declares
 /// them, so every instance lines its arguments up alike.
-pub(super) fn settle_implicit(chain: &Expr, ctx: &LoweringContext) {
+pub(super) fn settle_implicit(
+    chain: &Expr,
+    associated_consts: &HashMap<String, HashSet<TypeParamId>>,
+    ctx: &LoweringContext,
+) {
     let module_params = module_type_params(ctx);
+    let module_consts = module_const_params(ctx);
+    let is_module_const = |id: TypeParamId| module_consts.iter().any(|p| p.id == id);
     let decls = &ctx.nominal_types;
     let local = |d: &NominalDecl| {
         decls
@@ -434,7 +591,17 @@ pub(super) fn settle_implicit(chain: &Expr, ctx: &LoweringContext) {
     // declarations whose parameters it reaches in turn.
     let mut reached: Vec<HashSet<TypeParamId>> = vec![HashSet::new(); decls.len()];
     let mut names: Vec<HashSet<usize>> = vec![HashSet::new(); decls.len()];
-    let mut visit = |i: usize, ty: &Type, reached: &mut Vec<HashSet<TypeParamId>>| {
+    // The `const` parameters each declaration reaches, by id, tracked as `reached` is.
+    let mut consts: Vec<HashSet<TypeParamId>> = vec![HashSet::new(); decls.len()];
+    let mut visit = |i: usize,
+                     ty: &Type,
+                     reached: &mut Vec<HashSet<TypeParamId>>,
+                     consts: &mut Vec<HashSet<TypeParamId>>| {
+        for name in crate::ccl::subst::type_free_vars(ty) {
+            if let Some(param) = ctx.constants.param(name.base()) {
+                consts[i].insert(param.id);
+            }
+        }
         each_param_and_decl(ty, &mut |found| match found {
             Found::Param(id) if module_params.iter().any(|p| p.id == id) => {
                 reached[i].insert(id);
@@ -455,6 +622,13 @@ pub(super) fn settle_implicit(chain: &Expr, ctx: &LoweringContext) {
                             }
                         });
                     }
+                    for arg in d.const_args() {
+                        for param in arg.params() {
+                            if is_module_const(param.id) {
+                                consts[i].insert(param.id);
+                            }
+                        }
+                    }
                 }
             },
         });
@@ -462,7 +636,7 @@ pub(super) fn settle_implicit(chain: &Expr, ctx: &LoweringContext) {
     for (i, decl) in decls.iter().enumerate() {
         for ctor in &decl.body().ctors {
             for (_, ty) in &ctor.params {
-                visit(i, ty, &mut reached);
+                visit(i, ty, &mut reached, &mut consts);
             }
         }
     }
@@ -475,7 +649,10 @@ pub(super) fn settle_implicit(chain: &Expr, ctx: &LoweringContext) {
         else {
             continue;
         };
-        for_each_type_in(function, &mut |ty| visit(i, ty, &mut reached));
+        for_each_type_in(function, &mut |ty| visit(i, ty, &mut reached, &mut consts));
+        if let Some(read) = associated_consts.get(&name) {
+            consts[i].extend(read.iter().copied());
+        }
     }
     loop {
         let mut changed = false;
@@ -485,13 +662,17 @@ pub(super) fn settle_implicit(chain: &Expr, ctx: &LoweringContext) {
                 for id in inherited {
                     changed |= reached[i].insert(id);
                 }
+                let inherited: Vec<TypeParamId> = consts[j].iter().copied().collect();
+                for id in inherited {
+                    changed |= consts[i].insert(id);
+                }
             }
         }
         if !changed {
             break;
         }
     }
-    for (decl, reached) in decls.iter().zip(reached) {
+    for ((decl, reached), consts) in decls.iter().zip(reached).zip(consts) {
         decl.set_implicit(
             module_params
                 .iter()
@@ -499,26 +680,50 @@ pub(super) fn settle_implicit(chain: &Expr, ctx: &LoweringContext) {
                 .cloned()
                 .collect(),
         );
+        decl.set_implicit_consts(
+            module_consts
+                .iter()
+                .filter(|p| consts.contains(&p.id))
+                .cloned()
+                .collect(),
+        );
     }
 }
 
+/// The `const` parameters of the module, in the order it declares them.
+fn module_const_params(ctx: &LoweringContext) -> Vec<crate::ccl::constant::ConstParam> {
+    let mut parameters: Vec<&super::modules::Parameter> = ctx.parameters.iter().collect();
+    parameters.sort_by_key(|p| p.declared.start);
+    parameters
+        .iter()
+        .filter_map(|p| Some(p.constant()?.param.clone()))
+        .collect()
+}
+
 /// One error per associated function of the module that reaches, through the bindings and
-/// functions of the module's top level, its state, a source, a value parameter, a value
-/// member of a Module-typed parameter, or a member of a run the module declares. Every run
-/// of a module shares a type that reaches no type parameter, so each run's copy of the
-/// type's functions must be the same function (`docs/chl-spec.md`, "Associated functions
-/// and methods"). `chain` is the module's lowered top level.
-pub(super) fn associated_reach_errors(chain: &Expr, ctx: &LoweringContext) -> Vec<LoweringError> {
+/// functions of the module's top level, its state, a source, a value parameter without
+/// `const`, a value member of a Module-typed parameter, or a member of a run the module
+/// declares. Every run of a module shares a type that reaches no parameter, so each run's
+/// copy of the type's functions must be the same function (`docs/chl-spec.md`, "Associated
+/// functions and methods"). `chain` is the module's lowered top level.
+///
+/// With the errors, the `const` parameters each associated function reaches, by its
+/// binding, which join its type's identity ([`settle_implicit`]).
+pub(super) fn associated_reach(
+    chain: &Expr,
+    ctx: &LoweringContext,
+) -> (Vec<LoweringError>, HashMap<String, HashSet<TypeParamId>>) {
+    let mut consts = HashMap::new();
     if ctx.associated_functions.is_empty() {
-        return Vec::new();
+        return (Vec::new(), consts);
     }
     // A copy with every binder minted, so a reference reads the binder it resolves to.
     let chain = crate::ccl::uniquify::run_in(chain.clone_preserving_ids(), &HashMap::new(), None);
-    let value_params: HashSet<&str> = ctx
+    let value_params: HashMap<&str, Option<TypeParamId>> = ctx
         .parameters
         .iter()
-        .filter(|p| matches!(p.kind, super::modules::ParameterKind::Value(_)))
-        .map(|p| p.name.as_str())
+        .filter(|p| matches!(p.kind, super::modules::ParameterKind::Value { .. }))
+        .map(|p| (p.name.as_str(), p.constant().map(|c| c.param.id)))
         .collect();
     let module_params: Vec<&str> = ctx
         .parameters
@@ -540,8 +745,11 @@ pub(super) fn associated_reach_errors(chain: &Expr, ctx: &LoweringContext) -> Ve
                 body,
             } => {
                 let base = binding.name.base();
-                let kind = if value_params.contains(base) {
-                    TopLevel::Is(Forbidden::ValueParameter)
+                let kind = if let Some(constant) = value_params.get(base) {
+                    match constant {
+                        Some(id) => TopLevel::Const(*id),
+                        None => TopLevel::Is(Forbidden::ValueParameter),
+                    }
                 } else if let Some(parameter) = module_params.iter().find(|p| {
                     base.strip_prefix(**p)
                         .is_some_and(|rest| rest.starts_with("::"))
@@ -583,7 +791,10 @@ pub(super) fn associated_reach_errors(chain: &Expr, ctx: &LoweringContext) -> Ve
         };
         let mut seen: HashSet<Name> = HashSet::new();
         let mut through: Vec<String> = Vec::new();
-        if let Some((what, reached)) = first_reached(def, &top, &runs, &mut seen, &mut through) {
+        let mut read = HashSet::new();
+        let found = first_reached(def, &top, &runs, &mut seen, &mut through, &mut read);
+        consts.insert(binding.clone(), read);
+        if let Some((what, reached)) = found {
             let through = match through.as_slice() {
                 [] => String::new(),
                 path => format!(", through `{}`", path.join("` → `")),
@@ -593,19 +804,22 @@ pub(super) fn associated_reach_errors(chain: &Expr, ctx: &LoweringContext) -> Ve
                 format!(
                     "the associated function `{binding}` reads {}{through}; an associated \
                      function reaches no state, no source, and no value a run gives its \
-                     module, since every run of the module shares the type",
+                     module other than a `const` parameter's, since every run of the module \
+                     shares the type",
                     reached.describe(&what)
                 ),
             ));
         }
     }
-    errors
+    (errors, consts)
 }
 
-/// A top-level binding, as [`associated_reach_errors`] follows it.
+/// A top-level binding, as [`associated_reach`] follows it.
 enum TopLevel<'a> {
     /// A binding an associated function may not reach.
     Is(Forbidden<'a>),
+    /// A `const` parameter, by id, which an associated function may reach.
+    Const(TypeParamId),
     /// A value or a function whose definition is followed.
     Defined(&'a Expr),
 }
@@ -630,7 +844,9 @@ impl Forbidden<'_> {
             Forbidden::State => format!("`{what}`, a mutable variable of its module"),
             Forbidden::Feed => format!("`{what}`, a feed of its module"),
             Forbidden::Source => format!("the source `{what}`"),
-            Forbidden::ValueParameter => format!("`{what}`, a value parameter of its module"),
+            Forbidden::ValueParameter => {
+                format!("`{what}`, a value parameter of its module without `const`")
+            }
             Forbidden::ModuleParameter(p) => {
                 format!("`{what}`, a member of the Module-typed parameter `{p}`")
             }
@@ -641,13 +857,14 @@ impl Forbidden<'_> {
 
 /// The first thing `expr` reaches that an associated function may not, with how it is
 /// spelled, following each top-level definition it reads once. `through` collects the
-/// definitions followed on the way.
+/// definitions followed on the way, and `consts` each `const` parameter reached.
 fn first_reached<'a>(
     expr: &'a Expr,
     top: &'a HashMap<Name, TopLevel<'a>>,
     runs: &HashSet<&'a str>,
     seen: &mut HashSet<Name>,
     through: &mut Vec<String>,
+    consts: &mut HashSet<TypeParamId>,
 ) -> Option<(String, Forbidden<'a>)> {
     let read = match &expr.node {
         TypedExprNode::Source(name, _) => return Some((name.clone(), Forbidden::Source)),
@@ -666,9 +883,12 @@ fn first_reached<'a>(
         }
         match top.get(name) {
             Some(TopLevel::Is(reached)) => return Some((name.base().to_string(), *reached)),
+            Some(TopLevel::Const(id)) => {
+                consts.insert(*id);
+            }
             Some(TopLevel::Defined(def)) if seen.insert(name.clone()) => {
                 through.push(name.base().to_string());
-                if let Some(found) = first_reached(def, top, runs, seen, through) {
+                if let Some(found) = first_reached(def, top, runs, seen, through, consts) {
                     return Some(found);
                 }
                 through.pop();
@@ -679,7 +899,7 @@ fn first_reached<'a>(
     let mut found = None;
     expr.walk_children(|child| {
         if found.is_none() {
-            found = first_reached(child, top, runs, seen, through);
+            found = first_reached(child, top, runs, seen, through, consts);
         }
     });
     found
@@ -792,16 +1012,27 @@ fn for_each_type_in(expr: &Expr, f: &mut dyn FnMut(&Type)) {
 /// constructor that declares parameters, and the `extract` of a single-constructor form.
 pub(super) fn bind_constructors(body: Expr, ctx: &mut LoweringContext) -> Expr {
     let decls = ctx.nominal_types.clone();
+    // A declaration whose refinements read a `const` parameter has its functions bound
+    // below the parameter's `let`, where the name is in scope.
+    let (reading, closed): (Vec<_>, Vec<_>) = decls
+        .iter()
+        .map(|decl| (decl, const_params_read(decl, ctx)))
+        .partition(|(_, read)| !read.is_empty());
+    let read: HashSet<String> = reading
+        .iter()
+        .flat_map(|(_, read)| read.iter().cloned())
+        .collect();
     let mut acc = body;
-    for decl in decls.iter().rev() {
-        if decl.declares_extract {
-            acc = bind_extract(decl, acc, ctx);
-        }
-        for ctor in decl.body().ctors.iter().rev() {
-            if !ctor.params.is_empty() {
-                acc = bind_constructor(decl, ctor, acc, ctx);
+    if !read.is_empty() {
+        acc = below_last_let(acc, &read, &mut |mut acc| {
+            for (decl, _) in reading.iter().rev() {
+                acc = bind_functions(decl, acc, ctx);
             }
-        }
+            acc
+        });
+    }
+    for (decl, _) in closed.iter().rev() {
+        acc = bind_functions(decl, acc, ctx);
     }
     // A compiler-provided declaration's members are bound only where the module names them
     // (`LoweringContext::builtin_members_used`).
@@ -814,6 +1045,70 @@ pub(super) fn bind_constructors(body: Expr, ctx: &mut LoweringContext) -> Expr {
         };
     }
     acc
+}
+
+/// `acc` in the binding of each function `decl` declares: each constructor that declares
+/// parameters, and the `extract` of a single-constructor form.
+fn bind_functions(decl: &Rc<NominalDecl>, mut acc: Expr, ctx: &mut LoweringContext) -> Expr {
+    if decl.declares_extract {
+        acc = bind_extract(decl, acc, ctx);
+    }
+    for ctor in decl.body().ctors.iter().rev() {
+        if !ctor.params.is_empty() {
+            acc = bind_constructor(decl, ctor, acc, ctx);
+        }
+    }
+    acc
+}
+
+/// The `const` parameters of the module that `decl`'s constructors' refinements read.
+fn const_params_read(decl: &NominalDecl, ctx: &LoweringContext) -> HashSet<String> {
+    let mut read = HashSet::new();
+    for ctor in &decl.body().ctors {
+        for (_, ty) in &ctor.params {
+            for name in crate::ccl::subst::type_free_vars(ty) {
+                if ctx.constants.param(name.base()).is_some() {
+                    read.insert(name.base().to_string());
+                }
+            }
+        }
+    }
+    read
+}
+
+/// `chain` with the body of the last `let` on its spine that binds one of `names` replaced
+/// by `wrap` of it, or all of `chain` by `wrap` of it when none does.
+fn below_last_let(
+    mut chain: Expr,
+    names: &HashSet<String>,
+    wrap: &mut dyn FnMut(Expr) -> Expr,
+) -> Expr {
+    // How many spine steps down the last such `let` stands.
+    let mut last = None;
+    let mut at = &chain;
+    let mut depth = 0;
+    loop {
+        if let TypedExprNode::Let { binding, .. } = &at.node
+            && names.contains(binding.name.base())
+        {
+            last = Some(depth);
+        }
+        match super::modules::spine_body(at) {
+            Some(rest) => at = rest,
+            None => break,
+        }
+        depth += 1;
+    }
+    let Some(last) = last else {
+        return wrap(chain);
+    };
+    let mut at = &mut chain;
+    for _ in 0..=last {
+        at = super::modules::spine_body_mut(at).expect("the spine is as deep as walked");
+    }
+    let taken = std::mem::take(at);
+    *at = wrap(taken);
+    chain
 }
 
 /// `N::c`, the function `λ __ctor_arg : payload → N::c(__ctor_arg)` a constructor that

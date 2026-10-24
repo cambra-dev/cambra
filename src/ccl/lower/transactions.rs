@@ -264,6 +264,7 @@ fn lower_tx_block_scoped(
                 target,
                 value,
                 transparency,
+                ..
             } => {
                 refuse_nested_sink(target, value, stmt.span)?;
                 let assignment = AssignmentBindings::of(target, *transparency, stmt.span, ctx)?;

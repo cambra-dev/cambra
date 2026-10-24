@@ -664,6 +664,7 @@ mod tests {
                 arguments: Vec::new(),
                 modules: Vec::new(),
                 types: Vec::new(),
+                consts: Vec::new(),
                 body: Box::new(var("rest")),
             }),
             TypedExpr::mut_decl(

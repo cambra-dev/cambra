@@ -476,31 +476,32 @@ symbols:
   module catalog 7:1-7:39 (name 7:8-7:15)
   module us 8:1-8:21 (name 8:19-8:21)
   variable region 9:1-9:28 (name 9:7-9:13)
-  function quote 11:1-12:35 (name 11:9-11:14)
-  variable bigger 14:1-14:53 (name 14:1-14:7)
-  variable reqs 16:1-16:48 (name 16:1-16:5)
-  variable resps 16:1-16:48 (name 16:7-16:12)
-  variable total 18:1-19:21 (name 19:1-19:6)
-  variable events 21:1-21:17 (name 21:1-21:7)
-  function bump 25:1-34:29 (name 25:5-25:9)
-  function evens 36:1-38:16 (name 36:5-36:10)
-  variable opaque 47:1-47:16 (name 47:1-47:7)
-  variable pairs 48:1-48:59 (name 48:1-48:6)
-  variable escapes 49:1-49:29 (name 49:1-49:8)
-  variable totals 50:1-50:46 (name 50:1-50:7)
-  variable inc 51:1-51:18 (name 51:1-51:4)
-  variable held 52:1-52:28 (name 52:1-52:5)
-  variable apply 53:1-53:22 (name 53:1-53:6)
+  variable ceiling 10:1-10:19 (name 10:7-10:14)
+  function quote 12:1-13:35 (name 12:9-12:14)
+  variable bigger 15:1-15:53 (name 15:1-15:7)
+  variable reqs 17:1-17:48 (name 17:1-17:5)
+  variable resps 17:1-17:48 (name 17:7-17:12)
+  variable total 19:1-20:21 (name 20:1-20:6)
+  variable events 22:1-22:17 (name 22:1-22:7)
+  function bump 26:1-35:29 (name 26:5-26:9)
+  function evens 37:1-39:16 (name 37:5-37:10)
+  variable opaque 48:1-48:16 (name 48:1-48:7)
+  variable pairs 49:1-49:59 (name 49:1-49:6)
+  variable escapes 50:1-50:29 (name 50:1-50:8)
+  variable totals 51:1-51:46 (name 51:1-51:7)
+  variable inc 52:1-52:18 (name 52:1-52:4)
+  variable held 53:1-53:28 (name 53:1-53:5)
+  variable apply 54:1-54:22 (name 54:1-54:6)
 folds:
   1-5 comment
-  11-12
-  25-34
-  26-27
-  28-29
-  30-31
-  36-38
-  37-38
-  40-45
-  41-45
-  42-43
-  44-45
+  12-13
+  26-35
+  27-28
+  29-30
+  31-32
+  37-39
+  38-39
+  41-46
+  42-46
+  43-44
+  45-46

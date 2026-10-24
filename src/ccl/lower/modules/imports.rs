@@ -18,7 +18,7 @@ pub(super) struct ImportSite {
 /// its module's type parameters, as the importer writes them.
 pub(super) struct Imported {
     pub(super) shared: SharedImport,
-    pub(super) types: TypeArguments,
+    pub(super) types: ReachedArguments,
 }
 
 /// An argument to an `import` as written, before its shared import is decided
@@ -363,14 +363,34 @@ impl<'a> ProgramLowering<'a> {
                     arguments: key.into(),
                 };
                 let qualifier = QualifiedName::new(name.clone());
-                let reached = self
-                    .lowered
-                    .get(file)
-                    .cloned()
-                    .flatten()
-                    .map_or_else(TypeArguments::default, |lowered| {
-                        reached_types(&lowered.interface, &qualifier, &types)
-                    });
+                let reached = self.lowered.get(file).cloned().flatten().map_or_else(
+                    ReachedArguments::default,
+                    |lowered| {
+                        let mut reached = reached_types(&lowered.interface, &qualifier, &types);
+                        // Each `const` parameter takes the import's literal or its
+                        // default, which creating the shared import computes again and
+                        // reports any error of.
+                        let consts = &mut Rc::make_mut(&mut reached).consts;
+                        for parameter in &lowered.interface.parameters {
+                            let Some(constant) = parameter.constant() else {
+                                continue;
+                            };
+                            let term = match site.get(&parameter.name) {
+                                Some((_, KeyArgument::Lit(value))) => {
+                                    Some(ConstTerm::Lit(value.clone()))
+                                }
+                                _ => constant
+                                    .default
+                                    .as_ref()
+                                    .and_then(|default| default.substituted(consts).ok()),
+                            };
+                            if let Some(term) = term {
+                                consts.insert(constant.param.id, term);
+                            }
+                        }
+                        reached
+                    },
+                );
                 let checks = type_checks(std::mem::take(&mut checked), &qualifier, &reached);
                 self.import_checks
                     .entry(importer)

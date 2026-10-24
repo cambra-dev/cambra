@@ -283,6 +283,36 @@ fn a_checked_module_prints_its_nominal_types() {
     );
 }
 
+/// A `const` parameter and a public `const` member print with `const`, a type reaching a
+/// `const` parameter names it among the parameters whose arguments tell its runs' types apart,
+/// and a refinement prints the term of each constant it reads, a ternary included.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_prints_its_constants() {
+    let program = program(
+        indoc! {"
+            const param max_rate: Int = 5
+            pub const limit = max_rate * 2
+            pub type Capped = {Int where _ <= limit}
+            const tier = 10 if max_rate > 3 else 1
+            pub type Tiered = {Int where _ <= tier}
+        "},
+        &[],
+    );
+    let interface = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(
+        interface,
+        indoc! {"
+            module main
+            const param max_rate: Int = …
+            pub const limit: Int
+            pub type Capped = {Int where _ <= max_rate * 2}  # one type per argument of max_rate
+            pub type Tiered = {Int where _ <= (10 if max_rate > 3 else 1)}  # one type per argument of max_rate
+        "}
+    );
+}
+
 /// A file whose check fails reports its errors, and prints no interface.
 #[rstest]
 #[timeout(Duration::from_secs(10))]

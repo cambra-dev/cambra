@@ -22,6 +22,7 @@ mod helpers;
 mod chl_types;
 mod comprehensions;
 mod conditionals;
+mod constants;
 mod feeds_cases;
 mod generators_udf_poly;
 mod joins_aggregates_groupby;
