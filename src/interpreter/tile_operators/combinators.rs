@@ -6,7 +6,7 @@ use std::iter::repeat_n;
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::{
-    ColumnValue, Consumer, Extent, Scheduler, Value, shared_consumer, tuple_field,
+    ColumnValue, Consumer, Extent, Scheduler, Value, live_keys, shared_consumer, tuple_field,
 };
 
 /// Inverts a function operator, producing a lookup-function from codomain to domain.
@@ -194,9 +194,8 @@ fn converse_collection(input_tile: Tile) -> (Tile, Vec<(Value, Value)>) {
             ..
         } => {
             held = match &*codomain {
-                Tile::Scalar(values) => (0..domain.len())
-                    .filter(|row| !deleted.contains(*row))
-                    .map(|row| (values.index_at(row), domain.index_at(row)))
+                Tile::Scalar(values) => live_keys(&domain, &deleted)
+                    .map(|(row, key)| (values.index_at(row), key))
                     .collect(),
                 _ => Vec::new(),
             };
