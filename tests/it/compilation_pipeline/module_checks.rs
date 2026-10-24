@@ -158,3 +158,36 @@ fn an_argument_for_an_open_parameter_is_checked_through_its_uses() {
     ));
     assert!(errors.contains("scale.cambra"), "{errors}");
 }
+
+/// An error linking raises in a run's copy names that run at its `run`
+/// statement, and copies that raise it alike are one error, labelled at each.
+#[rstest]
+#[case::one_run(
+    indoc! {r#"
+        run adder(T=String, x="a") as a
+        run adder(T=Int, x=1) as b
+        b::y
+    "#},
+    &["the run `a`, whose copy fails"]
+)]
+#[case::two_runs(
+    indoc! {r#"
+        run adder(T=String, x="a") as a
+        run adder(T=String, x="b") as b
+        1
+    "#},
+    &["the run `a`, whose copy fails", "the run `b`, whose copy fails"]
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_link_time_error_names_its_run(#[case] root: &str, #[case] labels: &[&str]) {
+    let errors = compile_errors(&program(root, &[("adder", ADDER)]));
+    assert!(errors.contains("adder.cambra:3:9"), "{errors}");
+    for label in labels {
+        assert!(errors.contains(label), "{errors}");
+    }
+    assert!(
+        !errors.contains("the run `b`") || labels.len() == 2,
+        "{errors}"
+    );
+    assert_eq!(errors.matches("Error:").count(), 1, "{errors}");
+}
