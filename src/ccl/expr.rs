@@ -33,15 +33,13 @@ pub const F_WRITES: Label = Label::fixed("writes");
 // sibling route's commit leaves the tap `` `idle `` rather than appending a value
 // the program never fed.
 //
-// The tag carries what a companion `Bool` gate used to, and carries it in the one
-// place that cannot disagree with the value. A gate beside a same-position value
-// required the value to answer at every committing position, which a
-// domain-restricting feed value (an arm's `variant_project`) cannot do — see
-// `feed_reading_payload_error` in `src/ccl/lower/loops.rs`.
+// The tag sits in the one place that cannot disagree with the value; see
+// `crate::ccl::ccl_utils::writer_decision_record` for why a companion `Bool` gate
+// cannot carry a domain-restricted feed value.
 /// The tag of a tap that fired at this position, carrying the fed value.
 pub const V_FIRED: Label = Label::fixed("fired");
 /// The tag of a tap that did not fire at this position. Nullary: a tap that did
-/// not fire has no value, which is what the gate it replaces only implied.
+/// not fire has no value.
 pub const V_IDLE: Label = Label::fixed("idle");
 
 // Field names of a **commit-record** binding — the intermediate representation
@@ -1000,9 +998,8 @@ pub struct TypedExpr {
     ///
     /// The hazard the constructors close is the *phantom birth* — minting an id
     /// and then overwriting it, so `on_mint` fires for an id that ends up on no
-    /// node. That is now unrepresentable: `with_node_id` is deleted,
-    /// [`freshen_node_id`](Self::freshen_node_id) is fresh-only, and there is no
-    /// `set_node_id(arbitrary)`.
+    /// node. No method overwrites a node's id after construction, so no method
+    /// call produces a phantom birth.
     ///
     /// So the thing to grep for is not a write to this field but
     /// `node_id: NodeId::fresh()` inside a literal — a *mint* that bypasses
@@ -1830,8 +1827,7 @@ impl TypedExpr {
             TypedExprNode::Record(fields) => fields.iter().for_each(|(_, e)| f(e)),
             // `domain` is a `Type`, not an `Expr` child, so the expr-walker
             // skips it (its type residue is reached via `expr.ty` walks). Child
-            // order mirrors `walk_transact`: each key's init, then each writer's
-            // source and body.
+            // order: each key's init, then each writer's source and body.
             TypedExprNode::Transact { keys, writers, .. } => {
                 for k in keys {
                     f(&k.init);
@@ -2039,7 +2035,6 @@ impl TypedExpr {
             }
             TypedExprNode::Record(fields) => fields.iter_mut().for_each(|(_, e)| f(e)),
             // `domain` is a `Type`, not an `Expr` child (see `walk_children`).
-            // Child order mirrors `walk_transact`.
             TypedExprNode::Transact { keys, writers, .. } => {
                 for k in keys {
                     f(&mut k.init);
