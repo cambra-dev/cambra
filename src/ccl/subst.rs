@@ -143,21 +143,6 @@ pub enum Mapping {
     /// that term ([`Subst::in_data_domain`]); a value's refinement is still dropped
     /// (`src/ccl/design/type-inference.md`, "A history's value may depend on its position").
     Join(Option<Rc<TypedExpr>>),
-    /// The entry a substitution held, a discharge or a rename, whose term has no spelling at
-    /// this position: it reads an enclosing refinement's element, and the position is under a nested refinement, which
-    /// binds `__elem` to its own element ([`Subst::under_element`]). Acting on an occurrence
-    /// fails; an entry acting on nothing is no capture.
-    ///
-    /// The entry rides a suspension like any other ([`Subst::suspended`]), so a variable
-    /// whose resolution reads the binder fails when it is forced, and one whose resolution
-    /// does not is left alone.
-    ///
-    /// TODO: let a refinement name an enclosing refinement's element, with element
-    /// references indexed by the refinements crossed as `Name::PiBound` indexes function
-    /// binders. The term then reads the enclosing element one level out and this species
-    /// goes away. Every reader of `__elem` — substitution, the SMT encoding, predicate
-    /// compilation, and the closing and opening walks — would read the index.
-    Unspellable(Box<Mapping>),
 }
 
 /// A substitution's entries by what their images read ([`Subst::image_table`]).
@@ -237,16 +222,6 @@ fn assert_preserves_typedness(replacement: &TypedExpr, occurrence_ty: &Type) {
 }
 
 impl Mapping {
-    /// Whether the term this mapping puts at its binder reads the enclosing refinement's
-    /// element.
-    fn reads_elem(&self) -> bool {
-        match self {
-            Mapping::Discharge(t) => is_free(&Name::elem(), t),
-            Mapping::Rename(to) => to.is_elem(),
-            Mapping::Join(_) | Mapping::Unspellable(_) => false,
-        }
-    }
-
     /// The variable this mapping sends its binder to, when it sends it to a bare variable:
     /// a rename's target, or a discharge whose term is a variable.
     fn var_target(&self) -> Option<Binder> {
@@ -256,7 +231,7 @@ impl Mapping {
                 TypedExprNode::Var(n) => Some(n.clone()),
                 _ => None,
             },
-            Mapping::Join(_) | Mapping::Unspellable(_) => None,
+            Mapping::Join(_) => None,
         }
     }
 
@@ -271,7 +246,6 @@ impl Mapping {
             Mapping::Join(_) => {
                 unreachable!("a joined binder has no term; its occurrence stays")
             }
-            Mapping::Unspellable(m) => unspellable(m),
         };
         assert_preserves_typedness(&out, occurrence_ty);
         out
@@ -289,27 +263,10 @@ impl Mapping {
             Mapping::Join(_) => {
                 unreachable!("a joined binder has no term; its occurrence stays")
             }
-            Mapping::Unspellable(m) => unspellable(m),
         };
         assert_preserves_typedness(&out, occurrence_ty);
         out
     }
-}
-
-/// The failure of acting on an [`Mapping::Unspellable`] entry.
-fn unspellable(entry: &Mapping) -> ! {
-    let term = match entry {
-        Mapping::Rename(to) => to.to_string(),
-        Mapping::Discharge(t) => crate::ccl::symbolic::symbolic(t),
-        Mapping::Join(_) | Mapping::Unspellable(_) => {
-            unreachable!("only a discharge or a rename is made unspellable")
-        }
-    };
-    panic!(
-        "a substitution reaches a binder under a nested refinement, and the term it puts there, \
-         `{term}`, reads the enclosing refinement's element, which has no spelling under a \
-         refinement that binds `__elem` to its own element (see `Mapping::Unspellable`)"
-    )
 }
 
 /// `domain`, taken from a `Compose`'s head, spelled in the **composition's own**
@@ -700,7 +657,7 @@ impl Subst {
     pub fn renamed(&self, binder: &Name) -> Option<&Binder> {
         match self.binders.get(binder)? {
             Mapping::Rename(to) => Some(to),
-            Mapping::Discharge(_) | Mapping::Join(_) | Mapping::Unspellable(_) => None,
+            Mapping::Discharge(_) | Mapping::Join(_) => None,
         }
     }
 
@@ -760,13 +717,6 @@ impl Subst {
                 Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
                     crate::ccl::ccl_utils::free_names(t).into_iter().collect()
                 }
-                Mapping::Unspellable(m) => match &**m {
-                    Mapping::Rename(to) => vec![to.clone()],
-                    Mapping::Discharge(t) => {
-                        crate::ccl::ccl_utils::free_names(t).into_iter().collect()
-                    }
-                    Mapping::Join(_) | Mapping::Unspellable(_) => Vec::new(),
-                },
                 Mapping::Join(None) => Vec::new(),
             })
             .chain(
@@ -780,7 +730,7 @@ impl Subst {
                 WitnessMapping::Discharge(t) => type_free_vars(t).into_iter().collect(),
                 WitnessMapping::Rename(_) => Vec::new(),
             }))
-            .filter(|n| n.pi_bound_index().is_none() && !n.is_elem())
+            .filter(|n| n.pi_bound_index().is_none() && n.elem_index().is_none())
             .collect();
         let telescope = v
             .telescope
@@ -836,9 +786,9 @@ impl Subst {
                 Some(Mapping::Discharge(t) | Mapping::Join(Some(t))) => out.extend(
                     crate::ccl::ccl_utils::free_names(t)
                         .into_iter()
-                        .filter(|m| m.pi_bound_index().is_none() && !m.is_elem()),
+                        .filter(|m| m.pi_bound_index().is_none() && m.elem_index().is_none()),
                 ),
-                Some(Mapping::Join(None) | Mapping::Unspellable(_)) => {}
+                Some(Mapping::Join(None)) => {}
             }
         }
         out
@@ -893,8 +843,7 @@ impl Subst {
                     out.insert(n.clone());
                     out.extend(expr_free_vars(t));
                 }
-                // An unspellable binder fails where it is reached.
-                Some(Mapping::Join(None) | Mapping::Unspellable(_)) | None => {
+                Some(Mapping::Join(None)) | None => {
                     out.insert(n.clone());
                 }
             }
@@ -917,7 +866,7 @@ impl Subst {
                     f(&mut term);
                     *t = Rc::new(term);
                 }
-                Mapping::Rename(_) | Mapping::Join(None) | Mapping::Unspellable(_) => {}
+                Mapping::Rename(_) | Mapping::Join(None) => {}
             }
         }
         // A payload is a template, so it is copied at its own identities, as a discharge's is.
@@ -1037,43 +986,46 @@ impl Subst {
                                 _ => false,
                             },
                             (Mapping::Join(_), _) | (_, Mapping::Join(_)) => false,
-                            (Mapping::Unspellable(_), _) | (_, Mapping::Unspellable(_)) => false,
                         }
                 })
     }
 
-    /// Whether `t` reads, free, a binder this substitution has no spelling for: one whose entry
-    /// is unspellable, or, inside a refinement `t` carries, one whose term reads the enclosing
-    /// refinement's element, which has no spelling there ([`Self::under_element`]). A variable
-    /// in `t` that may read one is not a read: the entry suspends on it.
-    fn unspellable_in(&self, t: &TypedExpr) -> bool {
-        if self
-            .binders
-            .iter()
-            .any(|(k, m)| matches!(m, Mapping::Unspellable(_)) && is_free(k, t))
-        {
-            return true;
-        }
-        let reading: Vec<&Binder> = self
-            .binders
-            .iter()
-            .filter(|(_, m)| m.reads_elem())
-            .map(|(k, _)| k)
-            .collect();
-        !reading.is_empty() && refinement_reads_any(t, &reading, &mut HashSet::new())
-    }
-
     /// This substitution inside a refinement's predicate, where `__elem` is that
-    /// refinement's own element: the element is shadowed, and an entry whose term reads the
-    /// enclosing element has no spelling there ([`Mapping::Unspellable`]). A join puts no
-    /// term at an occurrence, so it stays.
+    /// refinement's own element: every element reference the substitution acts on or puts in
+    /// place is one refinement further out there.
     fn under_element(&self) -> Subst {
-        let mut out = self.shadow(&Name::elem());
-        for m in out.binders.values_mut() {
-            if m.reads_elem() {
-                let entry = std::mem::replace(m, Mapping::Join(None));
-                *m = Mapping::Unspellable(Box::new(entry));
+        fn out(n: &Name) -> Option<Name> {
+            n.elem_index().map(|up| Name::elem_at(up + 1))
+        }
+        let shifted = |t: &Rc<TypedExpr>| {
+            if free_elem_indices(t).is_empty() {
+                None
+            } else {
+                Some(Rc::new(shift_elems(t, 1)))
             }
+        };
+        let mut changed = false;
+        let binders = self
+            .binders
+            .iter()
+            .map(|(k, m)| {
+                let key = out(k);
+                let entry = match m {
+                    Mapping::Rename(to) => out(to).map(Mapping::Rename),
+                    Mapping::Discharge(t) => shifted(t).map(Mapping::Discharge),
+                    Mapping::Join(Some(t)) => shifted(t).map(|t| Mapping::Join(Some(t))),
+                    Mapping::Join(None) => None,
+                };
+                changed |= key.is_some() || entry.is_some();
+                (
+                    key.unwrap_or_else(|| k.clone()),
+                    entry.unwrap_or_else(|| m.clone()),
+                )
+            })
+            .collect();
+        let mut out = self.clone();
+        if changed {
+            out.binders = binders;
         }
         out
     }
@@ -1085,10 +1037,6 @@ impl Subst {
             Mapping::Rename(to) => to == name,
             Mapping::Discharge(t) => is_free(name, t),
             Mapping::Join(at_key) => at_key.as_ref().is_some_and(|t| is_free(name, t)),
-            Mapping::Unspellable(m) => {
-                Subst::of_binders(BTreeMap::from([(name.clone(), (**m).clone())]))
-                    .range_mentions(name)
-            }
         })
     }
 
@@ -1170,14 +1118,7 @@ impl Subst {
                 // binder it names, so does the key determine it, at its definition read at
                 // the key.
                 Some(Mapping::Discharge(t)) if b.joins_in(t) => b.join_through(t),
-                // A definition reading a binder `b` has no spelling for has none either, and
-                // fails where an occurrence of `k` is reached rather than here, where
-                // nothing has read it yet.
-                Some(Mapping::Discharge(t)) if b.unspellable_in(t) => {
-                    Mapping::Unspellable(Box::new(Mapping::Discharge(Rc::clone(t))))
-                }
                 Some(Mapping::Discharge(t)) => Mapping::Discharge(Rc::new(b.apply_expr(t))),
-                Some(Mapping::Unspellable(m)) => Mapping::Unspellable(m.clone()),
                 Some(Mapping::Join(None)) => Mapping::Join(None),
                 Some(Mapping::Join(Some(t))) => b.join_through(t),
                 None => match b.binders.get(&k) {
@@ -1190,7 +1131,7 @@ impl Subst {
             let is_identity = match &composed {
                 Mapping::Rename(to) => *to == k,
                 Mapping::Discharge(t) => is_var_named(t, &k),
-                Mapping::Join(_) | Mapping::Unspellable(_) => false,
+                Mapping::Join(_) => false,
             };
             if !is_identity {
                 m.insert(k, composed);
@@ -1277,7 +1218,7 @@ impl Subst {
                         Some(n) => Mapping::Rename(n),
                         None => v.clone(),
                     },
-                    Mapping::Rename(_) | Mapping::Join(_) | Mapping::Unspellable(_) => v.clone(),
+                    Mapping::Rename(_) | Mapping::Join(_) => v.clone(),
                 };
                 (k.clone(), v)
             })
@@ -1522,13 +1463,6 @@ impl Subst {
                     crate::ccl::ccl_utils::free_names(t).into_iter().collect()
                 }
                 Mapping::Join(None) => BTreeSet::new(),
-                Mapping::Unspellable(inner) => match &**inner {
-                    Mapping::Rename(to) => BTreeSet::from([to.clone()]),
-                    Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
-                        crate::ccl::ccl_utils::free_names(t).into_iter().collect()
-                    }
-                    Mapping::Join(None) | Mapping::Unspellable(_) => BTreeSet::new(),
-                },
             }
         };
         ImageTable {
@@ -1770,10 +1704,7 @@ impl Subst {
     /// the in-place mode visit every name occurrence in the tree without a
     /// [`Name`] clone per node.
     fn retarget(&self, name: &Name) -> Option<Name> {
-        match self.binders.get(name)? {
-            Mapping::Unspellable(m) => unspellable(m),
-            m => m.var_target(),
-        }
+        self.binders.get(name)?.var_target()
     }
 
     /// The handle-rename half of [`Self::apply_handle_use`], shared with the
@@ -2155,13 +2086,9 @@ impl Subst {
     }
 
     fn force_refinement_scoped(&self, r: &crate::ccl::Refinement) -> crate::ccl::Refinement {
-        // The refinement is a binding form for the implicit REFINEMENT_BINDER,
-        // so the substitution acts *under* that binder: shadow it (drop it from
-        // the domain) before rewriting the predicate. Unlike an ordinary binder
-        // it is never α-renamed — every refinement shares the one global name,
-        // and a predicate only ever references its *own* element through it. An
-        // entry whose term reads the element has no spelling here
-        // ([`Self::under_element`]).
+        // The refinement binds its element, so the substitution acts under that binder,
+        // where each element reference it acts on or puts in place is one refinement
+        // further out ([`Self::under_element`]).
         // A joined binder has no term to put in the predicate: a caller that reaches here
         // with a refinement naming one is keeping it ([`Mapping::Join`]).
         let restricted = self.without_joins().under_element();
@@ -2598,6 +2525,29 @@ pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
     out
 }
 
+/// The indices of the element references `t` reads free: `0` for the element of the
+/// refinement whose predicate holds `t`, one more per refinement further out.
+pub fn free_elem_indices(t: &TypedExpr) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    collect_expr_fv(t, &mut BTreeSet::new(), &mut BTreeSet::new(), &mut out);
+    out.iter().filter_map(Name::elem_index).collect()
+}
+
+/// `t` placed under `by` more refinements: every element reference it reads free is `by`
+/// refinements further out.
+pub fn shift_elems(t: &TypedExpr, by: u32) -> TypedExpr {
+    let free = free_elem_indices(t);
+    if by == 0 || free.is_empty() {
+        return t.clone();
+    }
+    Subst::of_binders(
+        free.into_iter()
+            .map(|up| (Name::elem_at(up), Mapping::Rename(Name::elem_at(up + by))))
+            .collect(),
+    )
+    .apply_expr(t)
+}
+
 /// Collect the free term-variable names of one refinement's predicate — the
 /// per-refinement counterpart of [`type_free_vars`], for a caller deciding
 /// which refinements of a set name a given binder.
@@ -2631,35 +2581,11 @@ pub(crate) fn holds_infer_var(e: &TypedExpr) -> bool {
     in_expr(e, &mut HashSet::new())
 }
 
-/// Whether a refinement predicate in one of `e`'s type slots, at any depth, names one of
-/// `names` free. Each predicate is read once.
-fn refinement_reads_any(
-    e: &TypedExpr,
-    names: &[&Binder],
-    visited: &mut HashSet<PredicateId>,
-) -> bool {
-    fn in_type(ty: &Type, names: &[&Binder], visited: &mut HashSet<PredicateId>) -> bool {
-        ty.refinements().iter().any(|r| {
-            visited.insert(r.predicate_id()) && names.iter().any(|n| is_free(n, &r.predicate))
-        }) || {
-            let mut found = false;
-            ty.walk_children(|c| found |= !found && in_type(c, names, visited));
-            found
-        }
-    }
-    let mut found = false;
-    e.walk_type_slots(|t| found |= !found && in_type(t, names, visited));
-    e.walk_children(|c| found |= !found && refinement_reads_any(c, names, visited));
-    found
-}
-
 pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
     let mut out = BTreeSet::new();
     let mut bound = BTreeSet::new();
     let mut visited = BTreeSet::new();
-    with_binders(&mut bound, [Name::elem()], |bnd| {
-        collect_expr_fv(&r.predicate, bnd, &mut visited, &mut out)
-    });
+    collect_predicate_fv(r, &mut bound, &mut visited, &mut out);
     out
 }
 
@@ -2670,6 +2596,32 @@ pub fn expr_free_vars(e: &TypedExpr) -> BTreeSet<Binder> {
     let mut visited = BTreeSet::new();
     collect_expr_fv(e, &mut bound, &mut visited, &mut out);
     out
+}
+
+/// Collect the free names of `r`'s predicate as seen from outside the refinement: its own
+/// element is bound there, and an enclosing refinement's element is one refinement nearer.
+fn collect_predicate_fv(
+    r: &crate::ccl::Refinement,
+    bound: &mut BTreeSet<Binder>,
+    visited: &mut BTreeSet<PredicateId>,
+    out: &mut BTreeSet<Binder>,
+) {
+    let mut inner = BTreeSet::new();
+    collect_expr_fv(&r.predicate, bound, visited, &mut inner);
+    let mut outer_elem = false;
+    out.extend(inner.into_iter().filter_map(|n| match n.elem_index() {
+        Some(0) => None,
+        Some(up) => {
+            outer_elem = true;
+            Some(Name::elem_at(up - 1))
+        }
+        None => Some(n),
+    }));
+    // A predicate reading an enclosing element reads a different one at each depth it is
+    // shared at, so it is walked at each.
+    if outer_elem {
+        visited.remove(&r.predicate_id());
+    }
 }
 
 /// Whether `ty`'s structural skeleton contains an unresolved [`Type::Infer`]
@@ -2770,9 +2722,7 @@ fn collect_type_fv(
             // is bound — not free — inside the predicate.
             for r in refinements {
                 if visited.insert(r.predicate_id()) {
-                    with_binders(bound, [Name::elem()], |bnd| {
-                        collect_expr_fv(&r.predicate, bnd, visited, out)
-                    });
+                    collect_predicate_fv(r, bound, visited, out);
                 }
             }
             collect_type_fv(base, bound, visited, out);
@@ -2934,8 +2884,8 @@ pub fn close_pi_binder(binder: &Name, ty: &Type) -> Type {
     // their interior type slots, and interior term binders' shadowing.
     debug_assert!(
         !binder.is_elem(),
-        "a Pi binder is never the refinement element binder, which \
-         `is_free_in_type` reports as never free",
+        "a Pi binder is never a refinement's element, which a function made from a \
+         predicate names (`fn_of_bare_predicate`)",
     );
     debug_assert!(
         binder.pi_bound_index().is_none(),
@@ -3329,7 +3279,10 @@ struct PiWalk<'a> {
     /// too: one term reachable at two depths is two different rewrites. Keyed
     /// by the shadow that can change the result as well ([`Self::shadow_key`]),
     /// so that a predicate shared under many binders converts once.
-    memo: HashMap<(PredicateId, u32, Vec<Name>), Rc<TypedExpr>>,
+    memo: HashMap<(PredicateId, u32, u32, Vec<Name>), Rc<TypedExpr>>,
+    /// Refinements entered: a term opening puts here reads an enclosing element this many
+    /// refinements further out.
+    elems: u32,
     /// Term binders a predicate's interior introduces, innermost last. A
     /// reference to one of these is bound by the predicate's own lambda, not
     /// by an enclosing function, so closing leaves it alone
@@ -3345,6 +3298,7 @@ impl<'a> PiWalk<'a> {
             changed: 0,
             memo: HashMap::new(),
             shadowed: Vec::new(),
+            elems: 0,
         }
     }
 
@@ -3393,7 +3347,9 @@ impl<'a> PiWalk<'a> {
             }
             Type::Refinement(base, refinements) => {
                 self.ty(base, depth);
+                self.elems += 1;
                 refinements.rewrite_each(|_, r| self.quoted(r, depth));
+                self.elems -= 1;
             }
             Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
             // Component `𝑘` sits inside the scopes of the `𝑘` components before it.
@@ -3455,7 +3411,7 @@ impl<'a> PiWalk<'a> {
         let pass_key = self
             .conversion_key()
             .map(|c| (Rc::as_ptr(r.quoted()), c, depth, shadow.clone()));
-        let key = (Rc::as_ptr(r.quoted()), depth, shadow);
+        let key = (Rc::as_ptr(r.quoted()), depth, self.elems, shadow);
         let from_pass = pass_key.as_ref().and_then(|k| {
             CONVERSION_MEMO.with(|m| {
                 m.borrow()
@@ -3561,6 +3517,9 @@ impl<'a> PiWalk<'a> {
                 {
                     let occurrence_ty = e.ty.clone();
                     *e = target.as_expr_preserving(e.node_id, &occurrence_ty);
+                    if self.elems > 0 && !free_elem_indices(e).is_empty() {
+                        *e = shift_elems(e, self.elems);
+                    }
                     self.changed += 1;
                     // A `Discharge` replaces the occurrence with a foreign
                     // term, whose own indices are relative to wherever it was
@@ -4961,14 +4920,17 @@ mod locally_nameless_tests {
     }
 
     /// A substitution whose terms read `__elem`, reaching an occurrence of its binder inside
-    /// a nested refinement, fails rather than capture the nested element
-    /// ([`Mapping::Unspellable`]).
+    /// a nested refinement, reads the enclosing element there one refinement out rather than
+    /// capture the nested one.
     #[test]
-    #[should_panic(expected = "reads the enclosing refinement's element")]
     fn a_substitution_reading_the_element_does_not_capture() {
         let x = Name::fresh("x");
         let lifted = TypedExpr::apply(TypedExpr::var(Name::elem()), TypedExpr::proj_index(0));
-        Subst::discharge(x.clone(), lifted).apply_type(&refined(TypedExpr::var(x)));
+        let ty = Subst::discharge(x.clone(), lifted).apply_type(&refined(TypedExpr::var(x)));
+        assert_eq!(
+            crate::ccl::symbolic::symbolic(predicate_of(&ty)),
+            "__elem^1.0"
+        );
     }
 
     /// The same substitution passes a nested refinement that does not read its binder: an

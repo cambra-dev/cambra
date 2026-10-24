@@ -496,7 +496,7 @@ fn walk(
     e.walk_type_slots_mut(|ty| {
         if !crate::ccl::subst::type_free_vars(ty)
             .iter()
-            .any(|n| !scope.contains(n) && !everywhere.contains(n))
+            .any(|n| n.elem_index().is_none() && !scope.contains(n) && !everywhere.contains(n))
         {
             return;
         }
