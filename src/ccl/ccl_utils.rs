@@ -1025,7 +1025,7 @@ struct Substitution<'a> {
     replacement: &'a Expr,
     /// The names `replacement` reads, which no binder the walk enters may bind; computed when
     /// the walk first meets a binder.
-    free: Option<HashSet<Name>>,
+    free: Option<BTreeSet<Name>>,
     /// The cast-target predicates rewritten so far, by allocation, so a predicate shared
     /// across occurrences is rewritten once and stays shared. Each entry holds its origin,
     /// so the address it is keyed by is not reused while the walk lasts.
@@ -2462,73 +2462,19 @@ pub fn refine_with_bare(base: Type, bare_predicate: &Expr) -> Type {
 /// any refinement predicates carried by the expression's type.
 ///
 /// A variable is *free* at a use site when no binder inside `expr` shadows the
-/// name on the path to that use; the count is the number of such free uses.
-/// The shadowing rules are not restated here — the walk folds over
-/// [`crate::ccl::scope::for_each_scoped_item`], which declares them once for the
-/// whole crate. Consequently [`TypedExprNode::Feed`] / [`TypedExprNode::Define`]
-/// / [`TypedExprNode::MutWrite`] target names count as occurrences (they are
-/// *uses* of the handle / mutable variable), while a
-/// [`TypedExprNode::Transact`] mutable variable key does not (it is a field label).
+/// name on the path to that use, and no binder of a type it stands in; the count is the
+/// number of such free uses ([`crate::ccl::free_names`], which states the binding rules
+/// once). [`TypedExprNode::Feed`] / [`TypedExprNode::Define`] /
+/// [`TypedExprNode::MutWrite`] target names count as occurrences (they are *uses* of the
+/// handle / mutable variable), while a [`TypedExprNode::Transact`] mutable variable key does
+/// not (it is a field label). A predicate shared by `Rc` across slots counts once.
 ///
-/// A [`Type::Refinement`] is a binding form too: it binds its element in its
-/// predicate, so an element reference `__elem^𝑛` inside it reads an enclosing element
-/// at `𝑛 - 1` and is counted there. Every other name in a predicate is a free
-/// reference to the enclosing lexical scope and is counted.
-///
-/// Used by:
-/// - [`is_free`] — the bool wrapper for "does `name` appear at all?"
-/// - [`crate::ccl::channelize`] — to detect when a defer's value
-///   references another defer in the same cluster, and to decide
-///   whether feed values reference other channels (cluster membership).
-/// - [`crate::ccl::lambda_elim`] — to decide whether a lambda's body
-///   captures its parameter (`const`-lift if not) and to test refinement
-///   predicate occurrences for the let-in-lambda hoisting rules.
+/// Several passes skip work when [`is_free`] says no (`inline_in_type_predicates`' early
+/// return, `subst`'s inert-subtree and vacuous-predicate checks), so a type slot the walk
+/// did not read would be one those passes silently decline to rewrite: it reads every slot
+/// [`Expr::walk_type_slots`] does.
 pub fn count_free(name: &Name, expr: &Expr) -> usize {
-    count_free_with_visited(name, expr, &mut HashSet::new())
-}
-
-/// Recursive worker for [`count_free`].  Threads a `visited` set of
-/// already-walked predicate terms ([`PredicateId`]) so that
-/// self-referential refinements (a Lambda param `xs` whose type contains a
-/// refinement whose predicate references `xs`) terminate cleanly.  Each
-/// predicate term is walked at most once per top-level [`count_free`] call —
-/// its free-var count is collected on first encounter and short-circuited on
-/// subsequent encounters.
-fn count_free_with_visited(name: &Name, expr: &Expr, visited: &mut HashSet<PredicateId>) -> usize {
-    // Every type slot the node carries counts, via the same
-    // [`Expr::walk_type_slots`] the rewriting passes use. Getting this set wrong
-    // is not a cosmetic under-count: several passes *skip work* when `is_free`
-    // says no (`inline_in_type_predicates`' early return, `subst`'s inert-subtree
-    // and vacuous-predicate checks), so a slot this walk cannot see is a slot
-    // those passes silently decline to rewrite. Enumerating it here by hand is how
-    // it fell out of step with `walk_type_slots` in the first place.
-    //
-    // A binder's declared type is in the *enclosing* scope — a binder does not
-    // bind in its own type — so occurrences there are unshadowed and count, which
-    // is why this runs before the shadowing logic below. Occurrences are
-    // deduplicated by `visited`, so a predicate riding both a binder slot and the
-    // matching position of `expr.ty` (the usual case, and increasingly so as
-    // sharing improves) is still counted once.
-    let mut in_type = 0;
-    expr.walk_type_slots(|ty| in_type += count_free_in_type_with_visited(name, ty, visited));
-    // The term spine is a fold over the shared scoping walk: a child whose
-    // binder list mentions `name` is shadowed and contributes nothing;
-    // everything else recurses. Variable-key labels (`KeyRef`) are not variable
-    // occurrences, so they do not count.
-    let mut in_node = 0;
-    for_each_scoped_item(expr, &mut |item| match item {
-        ScopedItem::VarRef(n) => in_node += (n == name) as usize,
-        ScopedItem::KeyRef(_) => {}
-        ScopedItem::Child {
-            expr: child,
-            binders,
-        } => {
-            if !binders.shadows(name) {
-                in_node += count_free_with_visited(name, child, visited);
-            }
-        }
-    });
-    in_node + in_type
+    crate::ccl::free_names::count(name, expr, crate::ccl::free_names::EVERY_READ)
 }
 
 /// Returns `true` if `name` appears free anywhere in `expr` — either in
@@ -2737,28 +2683,8 @@ pub fn is_free_in_value(name: &Name, expr: &Expr) -> bool {
 /// establish by construction, and one whose violation is otherwise found much later —
 /// a reference that escaped its binder survives every typecheck and surfaces as an
 /// unrecognised variable in op-conversion.
-pub fn free_names_in_value(expr: &Expr) -> HashSet<Name> {
-    fn go(e: &Expr, bound: &mut Vec<Name>, out: &mut HashSet<Name>) {
-        for_each_scoped_item(e, &mut |item| match item {
-            ScopedItem::VarRef(n) => {
-                if !bound.contains(n) {
-                    out.insert(n.clone());
-                }
-            }
-            // A key label names a field of the history record the node denotes, not a
-            // variable use — the same exclusion `count_free_in_value` makes.
-            ScopedItem::KeyRef(_) => {}
-            ScopedItem::Child { expr, binders } => {
-                let depth = bound.len();
-                bound.extend(binders.iter().map(|b| b.name.clone()));
-                go(expr, bound, out);
-                bound.truncate(depth);
-            }
-        });
-    }
-    let mut out = HashSet::new();
-    go(expr, &mut Vec::new(), &mut out);
-    out
+pub fn free_names_in_value(expr: &Expr) -> BTreeSet<Name> {
+    crate::ccl::free_names::names(expr, crate::ccl::free_names::VALUE_READS)
 }
 
 /// Every name free in `expr`, in its term structure **and** inside the
@@ -2777,64 +2703,27 @@ pub fn free_names_in_value(expr: &Expr) -> HashSet<Name> {
 ///
 /// A predicate term shared by `Rc` across slots is read once, and element references are
 /// excluded: each is bound by a refinement.
-pub fn free_names(expr: &Expr) -> HashSet<Name> {
-    free_names_counting(expr, true)
+pub fn free_names(expr: &Expr) -> BTreeSet<Name> {
+    free_names_reading(expr, crate::ccl::free_names::EVERY_READ)
 }
 
 /// [`free_names`] without the names a `Feed`, `Define` or `MutWrite` writes: the variables
 /// `expr` reads. A write's target is a handle bound elsewhere, which a caller copying the
 /// bindings a term reads must not copy.
-pub fn free_reads(expr: &Expr) -> HashSet<Name> {
-    free_names_counting(expr, false)
+pub fn free_reads(expr: &Expr) -> BTreeSet<Name> {
+    free_names_reading(
+        expr,
+        crate::ccl::free_names::Reads {
+            writes: false,
+            ..crate::ccl::free_names::EVERY_READ
+        },
+    )
 }
 
-fn free_names_counting(expr: &Expr, writes: bool) -> HashSet<Name> {
-    fn go(
-        e: &Expr,
-        writes: bool,
-        bound: &mut Vec<Name>,
-        visited: &mut BTreeSet<PredicateId>,
-        out: &mut HashSet<Name>,
-    ) {
-        // A type reads names under its own binders, which the type walk every free-variable
-        // query shares respects ([`crate::ccl::subst::type_free_vars`]). A binder's declared
-        // type sits in the enclosing scope, so what it reads is read under the binders in
-        // force here.
-        e.walk_type_slots(|ty| {
-            let mut in_type = BTreeSet::new();
-            crate::ccl::subst::collect_type_free_vars(ty, visited, &mut in_type);
-            out.extend(
-                in_type
-                    .into_iter()
-                    .filter(|n| n.elem_index().is_none() && !bound.contains(n)),
-            );
-        });
-        // A `VarRef` is a `Var`'s name or a write's target.
-        let counts = writes || matches!(e.node, TypedExprNode::Var(_));
-        for_each_scoped_item(e, &mut |item| match item {
-            ScopedItem::VarRef(n) => {
-                if counts && !bound.contains(n) {
-                    out.insert(n.clone());
-                }
-            }
-            ScopedItem::KeyRef(_) => {}
-            ScopedItem::Child { expr, binders } => {
-                let depth = bound.len();
-                bound.extend(binders.iter().map(|b| b.name.clone()));
-                go(expr, writes, bound, visited, out);
-                bound.truncate(depth);
-            }
-        });
-    }
-    let mut out = HashSet::new();
-    go(
-        expr,
-        writes,
-        &mut Vec::new(),
-        &mut BTreeSet::new(),
-        &mut out,
-    );
-    out
+fn free_names_reading(expr: &Expr, reads: crate::ccl::free_names::Reads) -> BTreeSet<Name> {
+    let mut names = crate::ccl::free_names::names(expr, reads);
+    names.retain(|n| n.elem_index().is_none());
+    names
 }
 
 /// Value-only worker for [`is_free_in_value`]: the same fold over
@@ -2842,20 +2731,7 @@ fn free_names_counting(expr: &Expr, writes: bool) -> HashSet<Name> {
 /// slots (so a refinement on a `Lambda` param — which lives in the type — is
 /// ignored).
 pub(crate) fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
-    let mut sum = 0;
-    for_each_scoped_item(expr, &mut |item| match item {
-        ScopedItem::VarRef(n) => sum += (n == name) as usize,
-        ScopedItem::KeyRef(_) => {}
-        ScopedItem::Child {
-            expr: child,
-            binders,
-        } => {
-            if !binders.shadows(name) {
-                sum += count_free_in_value(name, child);
-            }
-        }
-    });
-    sum
+    crate::ccl::free_names::count(name, expr, crate::ccl::free_names::VALUE_READS)
 }
 
 /// Returns `true` if `name` appears free inside a refinement predicate
@@ -2867,96 +2743,8 @@ pub(crate) fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
 /// it to detect when a term substitution would need to reach into a
 /// type-carried predicate (e.g. a `cast`-introduced domain refinement that
 /// closes over the substituted variable).
-///
-/// **Always `false` for [`crate::ccl::REFINEMENT_BINDER`]** — a type's only
-/// binding form is the refinement, and every `__elem` occurrence sits under the
-/// refinement that binds it, so the element binder is never a free reference to
-/// anything a substitution could supply.
 pub fn is_free_in_type(name: &Name, ty: &Type) -> bool {
-    count_free_in_type_with_visited(name, ty, &mut HashSet::new()) > 0
-}
-
-/// Recursive worker for the type-walking side of [`count_free`].  The
-/// `visited` set ([`walk_refined_predicates`]) dedups a predicate term shared
-/// by `Rc` across occurrences — counted once, matching the by-`Rc` dedup the
-/// substitute-vs-preserve decision keys on.
-fn count_free_in_type_with_visited(
-    name: &Name,
-    ty: &Type,
-    visited: &mut HashSet<PredicateId>,
-) -> usize {
-    // An element reference is bound by the refinements it sits in: inside one more, the same
-    // element is one index further out (`count_free_in_type_go`).
-    count_free_in_type_go(name, ty, visited)
-}
-
-/// [`count_free_in_type_with_visited`] past the element binder: the occurrences of
-/// `name` in `ty`'s refinement predicates that no binder inside `ty` binds.
-///
-/// A type binds a term name in two places, as [`crate::ccl::subst::type_free_vars`]
-/// reads them: a named function's Pi binder over its codomain, and a dependent tuple's
-/// named component over the components after it. A live codomain refers to its binder
-/// by name (`src/ccl/design/type-inference.md`, "A binder reference is stored in one of
-/// two forms"), so such a reference is bound, and counting it would report a capture
-/// that cannot happen.
-fn count_free_in_type_go(name: &Name, ty: &Type, visited: &mut HashSet<PredicateId>) -> usize {
-    match ty {
-        Type::Fun {
-            name: Some(binder),
-            fun_kind,
-            domain,
-            ..
-        } if binder == name => {
-            let mut count = 0;
-            for w in fun_kind.witnesses() {
-                for t in w.types() {
-                    count += count_free_in_type_go(name, t, visited);
-                }
-            }
-            count + count_free_in_type_go(name, domain, visited)
-        }
-        Type::DepTuple(components) => {
-            let mut count = 0;
-            for (component, component_ty) in components {
-                count += count_free_in_type_go(name, component_ty, visited);
-                if component.as_ref() == Some(name) {
-                    break;
-                }
-            }
-            count
-        }
-        _ => {
-            let mut count = 0;
-            if let Type::Refinement(_, refinements) = ty {
-                for refinement in refinements {
-                    match name.elem_index() {
-                        // The refinement binds its own element, so the one `name` reads is an
-                        // index further out inside it. A predicate shared at two depths reads
-                        // two different elements, so the walk dedups within one depth alone.
-                        Some(up) => {
-                            count += count_free_with_visited(
-                                &Name::elem_at(up + 1),
-                                &refinement.predicate,
-                                &mut HashSet::new(),
-                            )
-                        }
-                        None if visited.insert(refinement.predicate_id()) => {
-                            count += count_free_with_visited(name, &refinement.predicate, visited);
-                        }
-                        None => {}
-                    }
-                }
-            }
-            // A projection's sum is a term the type quotes, counted as a predicate is.
-            if let Type::WitnessProjection(p) = ty
-                && visited.insert(Rc::as_ptr(&p.term))
-            {
-                count += count_free_with_visited(name, &p.term, visited);
-            }
-            ty.walk_children(|child| count += count_free_in_type_go(name, child, visited));
-            count
-        }
-    }
+    crate::ccl::free_names::count_in_type(name, ty) > 0
 }
 
 /// Walk every [`Type::Refinement`] reachable from `ty` and invoke `f`
@@ -2974,7 +2762,7 @@ fn count_free_in_type_go(name: &Name, ty: &Type, visited: &mut HashSet<Predicate
 /// This helper is the single source of truth for the
 /// type-walk + visited-set pattern used by [`crate::ccl::infer::check_fully_typed`]
 /// and [`crate::ccl::lambda_elim`]'s post-pass type-refinement walk. It binds
-/// nothing, so a walk that must respect a Pi binder (`count_free_in_type_go`)
+/// nothing, so a walk that must respect a type's binders ([`crate::ccl::free_names`])
 /// walks the type itself.
 /// See [`walk_refined_predicates_mut`] for the rebuilding variant used by
 /// [`crate::ccl::inline`].
