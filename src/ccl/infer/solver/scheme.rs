@@ -111,10 +111,13 @@ impl PolyScheme {
     /// for each requirement: both are checked at every use, at the use's types
     /// (`src/ccl/design/type-parameters.md`, "Instantiation"). A variable minted for
     /// a parameter stands in `telescope`, the use site's, since a parameter has no
-    /// variable a copy could inherit a scope from.
+    /// variable a copy could inherit a scope from. Every other variable stands there too,
+    /// under the binders its original stood under inside the definition
+    /// ([`FreshenCache::use_telescope`]).
     pub fn instantiate_with_params(&self, current_level: Level, telescope: &Telescope) -> Instance {
         let mut cache = FreshenCache::new();
         cache.param_telescope = Some(telescope.clone());
+        cache.use_telescope = Some(telescope.clone());
         let at = FreshenLevel::At(current_level);
         let ty = freshen_above(self.level, &self.body, at, &mut cache);
         let requires = self
@@ -158,10 +161,10 @@ impl PolyScheme {
     /// program scope, so inheriting their (empty) telescopes would leave the
     /// instantiation's variables scope-free at a position that has scope, and
     /// a dependent refinement flowing into an operand variable would be an open
-    /// record. A *let*-generalized scheme keeps plain
-    /// [`instantiate`](Self::instantiate): its clone stands where the
-    /// definition stood, and the definition-site telescopes are the contract
-    /// (see `src/ccl/design/type-inference.md`, "Freshening and `SpecKey`").
+    /// record. A *let*-generalized scheme instantiates through
+    /// [`instantiate_with_params`](Self::instantiate_with_params), whose variables keep the
+    /// binders the definition's own stood under, entered after the use site's
+    /// ([`FreshenCache::use_telescope`]).
     pub fn instantiate_in(&self, current_level: Level, telescope: &Telescope) -> Type {
         let mut cache = FreshenCache::new();
         cache.site_telescope = Some(telescope.clone());
@@ -186,7 +189,8 @@ pub struct FreshenCache {
     /// the template's own functions, so an original's telescope holds only those
     /// functions' binders, and the copy enters each after the site's as this
     /// instantiation names it ([`binders`](Self::binders)). Unset for specialization
-    /// clones, which stand where their definition stood.
+    /// clones, which stand where their definition stood or under the binders their use
+    /// entered ([`entered_binders`](Self::entered_binders)).
     pub site_telescope: Option<Telescope>,
     /// Original quantified var → its fresh replacement.
     pub vars: HashMap<InferVarId, Rc<InferVar>>,
@@ -235,6 +239,17 @@ pub struct FreshenCache {
     /// at instantiation. A parameter has no variable of its own whose telescope a
     /// copy could inherit.
     pub param_telescope: Option<Telescope>,
+    /// The scope a let-generalized binding's instantiation stands in: the use site's, which
+    /// holds the definition site's and every binder entered between the two. Each variable
+    /// minted stands there with the binders its original stood under inside the definition
+    /// entered after it, so an argument whose type reads a binder of the use site flows into
+    /// the instance ([`PolyScheme::instantiate_with_params`]).
+    pub use_telescope: Option<Telescope>,
+    /// The binders a specialization clone stands under besides its definition's: those
+    /// between the definition and the use that the use's instance reads, which the clone is
+    /// placed under (`infer::solve::specialize_use`). Each variable minted stands where its
+    /// original did with these entered.
+    pub entered_binders: Vec<crate::ccl::Name>,
     /// Obligation copies a specialization reset because they assumed one of the
     /// specialized binding's own type parameters
     /// ([`TraitObligation::reset_for_specialization`]). `specialize_use` redelivers
@@ -719,7 +734,17 @@ pub fn freshen_above(
                         t.extended(renamed)
                     })
                 }
-                None => tv.telescope.clone(),
+                None => match &cache.use_telescope {
+                    Some(site) => {
+                        let mut inside: Vec<_> = tv.telescope.iter().cloned().collect();
+                        inside.reverse();
+                        site.rescoped(|_| false, inside)
+                    }
+                    None if cache.entered_binders.is_empty() => tv.telescope.clone(),
+                    None => tv
+                        .telescope
+                        .rescoped(|_| false, cache.entered_binders.iter().cloned()),
+                },
             };
             let v = InferVar::fresh_over(new_level, &telescope, fun_kind);
             // The kinds the original sits under are this copy's kinds, whichever this walk

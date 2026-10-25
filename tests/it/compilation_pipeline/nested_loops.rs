@@ -843,6 +843,25 @@ fn a_per_iteration_binding_read_by_the_inner_loop() {
     );
 }
 
+/// A nested loop over rows whose domains read the position of the comprehension that built
+/// them: each row of `[[z for z in [1, 2, 3] if z > w] for w in [1, 2]]` keeps the elements
+/// above its own `w`, 2+3 and then 3. The inner history is generic in the row's domain, which
+/// its writer's parameter and source state by parameters of their own types
+/// (`src/ccl/design/type-parameters.md`, "Generalized types").
+#[test]
+fn a_loop_over_rows_whose_domains_read_their_position() {
+    check_scalar(
+        indoc! {r"
+            total := 0
+            for xs in [[z for z in [1, 2, 3] if z > w] for w in [1, 2]]:
+                for x in xs:
+                    total += x
+            total
+        "},
+        Value::Int(8),
+    );
+}
+
 /// A refinement on the **inner** source that reads the outer binder — a correlated
 /// filter, so the inner domain differs per outer row and is narrower than the collection
 /// it filters: 2+3, then 3, then nothing. The inner history's type depends on the enclosing

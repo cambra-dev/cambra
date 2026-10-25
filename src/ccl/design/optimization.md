@@ -78,14 +78,8 @@ application remains. Substitution respects binders that shadow the function
 name and also visits refinement predicates stored in type slots, where a use may otherwise be
 missed by the ordinary expression walk.
 
-An anonymous lambda applied to a variable is reduced when its parameter type reads an enclosing
-lambda's binder (`beta_reduce_variable_arguments`). Left to lambda elimination, such a redex
-pairs two binders that denote one value into a dependent tuple, and every type that reads either
-then has two spellings
-([One binder for one value](type-inference.md#one-binder-for-one-value)). A variable argument
-makes the reduction a rename, which duplicates no work. Every other anonymous application is left
-for later passes: lambda elimination's rules read its shape, and a group-by's partition applied
-to its key is recognized as a lambda of its own.
+An anonymous application is left for later passes: lambda elimination's rules read its shape,
+and a group-by's partition applied to its key is recognized as a lambda of its own.
 
 Beta-reduction has a further condition for a refined outer parameter: the argument's type must
 entail the parameter's refinements. The pass asserts when it cannot establish that condition,
@@ -250,6 +244,10 @@ does not match this filter rule and takes the general lambda-elimination path.
 
 For `λ x → let v = def in body`, elimination keeps a `Let`: its bound expression becomes
 `λx→def`, and free uses of `v` in the body become `x ▷ v` before that body is eliminated.
+A collection `def` that reads `x` is the exception. It is a value per input, so elimination reads
+the `Let` as the application `def ▷ (λ v → body)`, and the application and nested-lambda rules
+carry `v` beside the input as data. Lifted, it would be a collection-valued function of the input,
+read at each use by applying it, which operator conversion has no operator for.
 The bound function therefore varies with the surrounding input. Operator conversion fans
 that input to both the bound expression and the body. A `Let`'s type is reclosed over its
 new definition if a refinement in the result refers to the binder. The current `Let` node
@@ -280,8 +278,8 @@ once, by the outer sum, and no dependent pair is needed. An `𝑆` whose keys ar
 its input, `(𝑥 : 𝐴) ⇒ (σ(𝑥 ▷ 𝑝) ⤇ 𝑉)`, keeps its binder, and `map(𝑔)` reads the projection by it.
 Operator conversion compiles `strength_over` to `Product::per_row_values_at`, which pairs each row
 with the values of its own collection. Both rules are scoped to a generator's source, a morphism to a sum or
-one ending in `unbox` (`over_a_witness`), because planning's recurrence recognition reads a history
-through the unrewritten form. A history over a projected domain has the type an unboxed source has,
+one ending in `unbox` (`over_a_witness`), followed by any `map`s a filter on the generator leaves,
+because planning's recurrence recognition reads a history through the unrewritten form. A history over a projected domain has the type an unboxed source has,
 so the source is recognized by its last morphism.
 
 A correlated inner comprehension over a collection every row reads is the same shape with that
@@ -504,11 +502,17 @@ iteration walk sees the function's own domain and cannot materialize this inner 
 When each added predicate reads that input collection, planning converts the added
 conditions into a value predicate 𝑞 and inserts one `map(filter_values(𝑞))` before the function.
 A predicate reads the input by the function's binder: `[v for v in r.xs if v > 1]` over rows `r`
-narrows `.xs ≫ map(id)`, whose `map` reads its input as its own binder. The value predicate does
-not read the input, since the filter is handed the values alone.
+narrows `.xs ≫ map(id)`, whose `map` reads its input as its own binder. A spelling of the binder
+that reads back to it counts (`ccl_utils::normal_form`): simplification leaves `(𝑔 ▷ ⟨id, 𝑓⟩).0`
+where a pairing it removed stood. The value predicate does not read the input, since the filter
+is handed the values alone. The function may head a chain, whose input comes from outside it, or
+stand alone, a component of a `zip` that pairs a filtered comprehension with an aggregate of the
+same row: the filter goes before it, in a chain built in its place for the second.
 The operator filters each group's elements independently. `reject_unmaterialized_narrowings`
-refuses a narrowing no per-group filter materializes, since operator conversion would compile the
-site without its filter.
+refuses a narrowing no per-group filter materializes, at every element of a chain and at a site
+standing alone, since operator conversion would compile the site without its filter. A
+`curry_over` site whose morphism begins with `filter_values`, a correlated filter on the pair,
+performs its narrowing.
 
 ### Projection pruning
 

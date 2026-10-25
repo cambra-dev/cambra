@@ -1702,15 +1702,16 @@ ys = [x ^+ i for i in [1,2]]
     )
 }
 
-/// TODO: Make comprehension bindings opaque.
+/// A comprehension over a comprehension whose elements read a mutable variable: the inner
+/// element's refinement names the read, and the outer element's names the inner's.
 #[test]
 fn nesting_a_comprehension_carries_mut_into_refinement() {
-    check_compile_error(
+    check_tile(
         indoc! {r#"
 x := 3
 [y ^+ 1 for y in [x ^+ i for i in [1,2]]]
         "#},
-        "Barendregt violation: substitution range mentions binder `Synthetic { kind: IterRecord,",
+        make_int_list(&[5, 6]),
     )
 }
 
