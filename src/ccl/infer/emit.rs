@@ -3758,7 +3758,10 @@ fn emit_transact_writer<C: Typing>(
     // so the source is an iteration source under that context: peel the context function
     // and the iteration source is what a top-level `Transact`'s is.
     let s_ty = match parameter {
-        Some(_) => {
+        // A source generic in the enclosing rows' domain is read at the enclosing value the
+        // parameter states (`src/ccl/design/type-parameters.md`, "Generalized types").
+        Some(p) => {
+            let s_ty = ctx.instantiate_generalized(&s_ty, &enclosing_component(p));
             ctx.as_function(&s_ty, &|| "nested transaction source".to_string())?
                 .1
         }
@@ -3856,6 +3859,9 @@ pub(super) fn emit_transact<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     use std::collections::HashMap;
+    // A parameter generic in the enclosing rows' domain is read at its body, as the node is
+    // (`src/ccl/design/type-parameters.md`, "Generalized types").
+    let parameter = parameter.map(crate::ccl::generalize::body);
     // A nested `Transact`'s histories run over each enclosing position's own domain, the
     // parameter's position component, which reads the enclosing value by the parameter's name.
     let (enclosing, domain) = match parameter {

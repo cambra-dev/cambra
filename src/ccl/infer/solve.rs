@@ -220,6 +220,11 @@ pub(super) struct CoalesceCtx {
     /// cannot be answered by, since a definition does not reach itself
     /// ([`use_instance_function`]).
     defining: Vec<Name>,
+    /// The specializations placed under a binder rather than at their definition, each
+    /// with the binder it stands under: a use's instance reads that binder, entered between
+    /// the definition and the use ([`specialize_use`]). The walk leaving the binder splices
+    /// them around its body ([`splice_placed`]).
+    placed: Vec<Placed>,
     /// The levels of the type parameters held opaque by the definitions being checked
     /// alone, innermost last ([`typecheck_discarded_definition`]). A use there can
     /// carry one into a specialization of a binding declared further out, so
@@ -655,6 +660,8 @@ struct SpecializeFrame {
     /// requirement and the associated type: what a specialization defines it as, the
     /// instance's type at the clone's operands, rather than solving for it.
     members: Vec<(TypeParamId, Rc<TraitRequirement>, Assoc)>,
+    /// The binding's transparency, which every specialization of it carries.
+    transparency: BindingTransparency,
     /// Whether this binding is itself inside a subtree being discarded — recorded
     /// from [`CoalesceCtx::discarding`] when the frame is pushed, the one moment
     /// the answer is unambiguous.
@@ -792,6 +799,17 @@ struct Specialization {
     /// too ([`SpecializeFrame::held`]): its types are the same, so the clone's errors
     /// are its own.
     raised: Vec<(Option<NodeId>, LocatedInferError)>,
+}
+
+/// A specialization placed under a binder between its definition and its use
+/// ([`CoalesceCtx::placed`]).
+struct Placed {
+    /// The binder the specialization stands under, the innermost one its instance reads.
+    binder: Name,
+    /// The generalized binding it specializes.
+    frame_name: Name,
+    transparency: BindingTransparency,
+    spec: Specialization,
 }
 
 /// Find the scope entry a free use of `name` refers to: scanning innermost-
@@ -1538,6 +1556,7 @@ pub(super) fn coalesce_pass(
         pred_memo: PredMemo::new(),
         discarding: false,
         specializing: Vec::new(),
+        placed: Vec::new(),
         opaque_params_at: Vec::new(),
         assumptions: Vec::new(),
         occurrences: OccurrenceIndex::default(),
@@ -2075,7 +2094,10 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // below — so what this function's binders correspond to is readable, and it is
             // what every type inside its body is written against.
             ctx.binders.push(&param_name, param.ty.clone());
-            with_shadows(ctx, [param_name], |ctx| coalesce_node(body, level, ctx));
+            with_shadows(ctx, [param_name.clone()], |ctx| {
+                coalesce_node(body, level, ctx)
+            });
+            splice_placed(ctx, &[param_name], body);
             ctx.binders.pop();
             ctx.lambda_params.pop();
             // `param.ty` is resolved from the lambda's coalesced domain in
@@ -2125,7 +2147,10 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             );
             let binding_name = binding.name.clone();
             ctx.binders.push_let(binding, bound_expr);
-            with_shadows(ctx, [binding_name], |ctx| coalesce_node(body, level, ctx));
+            with_shadows(ctx, [binding_name.clone()], |ctx| {
+                coalesce_node(body, level, ctx)
+            });
+            splice_placed(ctx, &[binding_name], body);
             ctx.binders.pop();
         }
         TypedExprNode::LetType { .. } => {
@@ -2146,7 +2171,10 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             resolve_binder_slot(&mut binding.ty, || format!("mutable `{name}`"), level, ctx);
             let binding_name = binding.name.clone();
             ctx.binders.push(&binding_name, binding.ty.clone());
-            with_shadows(ctx, [binding_name], |ctx| coalesce_node(body, level, ctx));
+            with_shadows(ctx, [binding_name.clone()], |ctx| {
+                coalesce_node(body, level, ctx)
+            });
+            splice_placed(ctx, &[binding_name], body);
             ctx.binders.pop();
         }
         TypedExprNode::List(elts)
@@ -2265,10 +2293,11 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 // A pattern's payload binding scopes the branch's guard and
                 // body, shadowing an outer generalized binding of its name.
                 let pattern_name = b.pattern.as_ref().map(|p| p.binding.name.clone());
-                with_shadows(ctx, pattern_name, |ctx| {
+                with_shadows(ctx, pattern_name.clone(), |ctx| {
                     coalesce_node(&mut b.guard, level, ctx);
                     coalesce_node(&mut b.body, level, ctx);
                 });
+                assert_none_placed(ctx, pattern_name.as_slice(), "pattern");
                 // Binder slot: resolve the pattern's payload-binding type.
                 // `emit_case` wrote the per-tag narrowed var into
                 // `Pattern::binding.ty`; run it through the same pipeline used
@@ -2335,7 +2364,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_node(iter, level, ctx);
             // The loop's position and target bind only inside the body.
             let names = [position.name.clone(), target.name.clone()];
-            with_shadows(ctx, names, |ctx| coalesce_node(body, level, ctx));
+            with_shadows(ctx, names.clone(), |ctx| coalesce_node(body, level, ctx));
+            splice_placed(ctx, &names, body);
             // The position ranges over the resolved source's domain, a sum's witnesses
             // projected through the source. The target's slot resolves in place, like `Loop`
             // params (`emit_for` wrote the slot var).
@@ -2355,12 +2385,13 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // body (mutual recursion), so all of them shadow outer
             // generalized bindings throughout the group.
             let names: Vec<Name> = bindings.iter().map(|(b, _)| b.name.clone()).collect();
-            with_shadows(ctx, names, |ctx| {
+            with_shadows(ctx, names.clone(), |ctx| {
                 for (_, def) in bindings.iter_mut() {
                     coalesce_node(def, level, ctx);
                 }
                 coalesce_node(body, level, ctx);
             });
+            assert_none_placed(ctx, &names, "letrec");
             // Binder slots: resolve each declared type in place (`emit_letrec`
             // normalized the slot, possibly to a fresh var for a `Hole`).
             for (binding, _) in bindings.iter_mut() {
@@ -3053,6 +3084,23 @@ fn names_no_variable(ty: &Type) -> bool {
     closed
 }
 
+/// The names the arguments reaching a use read: each parameter's domain as the values flowing
+/// into it make it, through a curried function's codomains.
+fn argument_reads(ty: &Type) -> std::collections::BTreeSet<Name> {
+    let mut read = std::collections::BTreeSet::new();
+    let mut at = ty;
+    while let Type::Fun {
+        domain, codomain, ..
+    } = at.peel_refinements()
+    {
+        if let Ok(arg) = coalesce_positive(domain) {
+            read.extend(crate::ccl::subst::type_free_vars(&arg));
+        }
+        at = codomain;
+    }
+    read
+}
+
 /// What a failed specialization pin reports its edge as.
 const PIN_LABEL: &str = "monomorphization specialization";
 
@@ -3133,10 +3181,71 @@ pub(super) fn specialize_use(
     let shares = |s: &Specialization| {
         s.instantiation == instantiation || (shareable && s.shareable && s.key == key)
     };
+    // **A use whose instance reads a binder entered between the definition and the use** —
+    // a definition applied to a group, whose type reads the group's key — has a
+    // specialization whose types read that binder, so it stands under it rather than where
+    // the definition stands: under the innermost such binder, with every binder from the
+    // definition to there entered in its variables' scopes. See
+    // `src/ccl/design/type-inference.md`, "A specialization stands where its types are in
+    // scope".
+    //
+    // What the instance reads includes its arguments: the pin gives the clone each argument's
+    // type, and an argument failing its parameter's demand (its candidates meeting the
+    // parameter's kind at none) leaves the resolved instance reading less than it does.
+    let mut read = crate::ccl::subst::type_free_vars(&resolved);
+    read.extend(argument_reads(&use_expr.ty));
+    let between: Vec<Name> = ctx.scope[frame_idx + 1..]
+        .iter()
+        .filter_map(|entry| match entry {
+            ScopeEntry::Shadow(n) => Some(n.clone()),
+            ScopeEntry::Generalized(_) => None,
+        })
+        .collect();
+    let placement = between
+        .iter()
+        .rposition(|n| read.contains(n))
+        .map(|innermost| (between[innermost].clone(), between[..=innermost].to_vec()));
+    if let Some((binder, _)) = &placement {
+        let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
+            unreachable!("lookup_generalized returns indices of Generalized entries only");
+        };
+        let frame_name = frame.name.clone();
+        let survives = surviving_use(ctx, frame_idx);
+        if let Some(placed) = ctx
+            .placed
+            .iter_mut()
+            .find(|p| p.frame_name == frame_name && p.binder == *binder && shares(&p.spec))
+        {
+            placed.spec.referenced |= survives;
+            let (name, ty) = (placed.spec.name.clone(), placed.spec.def.ty.clone());
+            let at_use = use_expr.node_id();
+            let enclosing = ctx.specializing.clone();
+            let shared: Vec<HeldError> = placed
+                .spec
+                .raised
+                .iter()
+                .map(|(origin, error)| HeldError {
+                    at_use,
+                    origin: *origin,
+                    enclosing: enclosing.clone(),
+                    error: error.clone(),
+                })
+                .collect();
+            let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
+                unreachable!("lookup_generalized returns indices of Generalized entries only");
+            };
+            frame.held.extend(shared);
+            use_expr.node = TypedExprNode::Var(name);
+            use_expr.ty = ty;
+            return;
+        }
+    }
     let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
         unreachable!("lookup_generalized returns indices of Generalized entries only");
     };
-    if let Some(spec) = frame.specs.iter().find(|s| shares(s)) {
+    if placement.is_none()
+        && let Some(spec) = frame.specs.iter().find(|s| shares(s))
+    {
         // Equal instantiations identify copies of one use only while inference instantiates
         // every use with fresh variables. Two uses in the tree itself are distinct, so where
         // the key would not share, one of the two is a predicate's copy, or both are calls of
@@ -3291,6 +3400,10 @@ pub(super) fn specialize_use(
     copied_nodes(&frame.def, &clone, &mut origins);
     let mut fresh = FreshenCache {
         own_params: Some(Rc::clone(&frame.own_params)),
+        entered_binders: placement
+            .as_ref()
+            .map(|(_, entered)| entered.clone())
+            .unwrap_or_default(),
         ..FreshenCache::new()
     };
     // Quantified channel-domain names must instantiate to the SAME names the
@@ -3453,11 +3566,18 @@ pub(super) fn specialize_use(
     // answered by the same instance at other types, `Area(Two(T))`'s `area` calling `Area`
     // at `T`, so its frame stays in scope and that call specializes it again. No source
     // names the binding, so nothing else reaches it.
-    let suspended = if ctx.instance_functions.contains(&base_name) {
-        ctx.scope.split_off(frame_idx + 1)
+    let kept_to = if ctx.instance_functions.contains(&base_name) {
+        frame_idx + 1
     } else {
-        ctx.scope.split_off(frame_idx)
+        frame_idx
     };
+    let suspended = ctx.scope.split_off(kept_to);
+    // A placed clone stands under the binders its variables entered, so a use inside it whose
+    // instance reads one of them is placed there too.
+    if let Some((_, entered)) = &placement {
+        ctx.scope
+            .extend(entered.iter().cloned().map(ScopeEntry::Shadow));
+    }
     ctx.specializing.push(ActiveSpecialization {
         name: base_name.clone(),
         key: key.clone(),
@@ -3481,6 +3601,7 @@ pub(super) fn specialize_use(
         ctx.in_predicate = in_predicate;
     }
     ctx.specializing.pop();
+    ctx.scope.truncate(kept_to);
     ctx.scope.extend(suspended);
     if pin_succeeded {
         let raised = ctx.errors.split_off(before);
@@ -3512,6 +3633,28 @@ pub(super) fn specialize_use(
     let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
         unreachable!("suspended entries were restored above the frame");
     };
+    if let Some((binder, _)) = placement {
+        let (frame_name, transparency) = (frame.name.clone(), frame.transparency);
+        ctx.placed.push(Placed {
+            binder,
+            frame_name,
+            transparency,
+            spec: Specialization {
+                key,
+                shareable,
+                instantiation,
+                #[cfg(debug_assertions)]
+                quoted: ctx.in_predicate > 0,
+                #[cfg(debug_assertions)]
+                instance_call,
+                name: spec_name,
+                def: clone,
+                referenced,
+                raised: kept,
+            },
+        });
+        return;
+    }
     // The entry is keyed on the pre-pin key computed above — *not* on
     // `clone.ty`. A clone type is the pin's output and a candidate's key is its
     // input; keying an entry on one and the lookup on the other is what made this
@@ -3612,6 +3755,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             bound_at_annotation,
             own_params,
             members,
+            transparency,
             inside_discarded: ctx.discarding,
             held: Vec::new(),
             failed_uses: Vec::new(),
@@ -3724,31 +3868,71 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     );
     let mut result = body;
     for spec in frame.specs.into_iter().rev().filter(|s| s.referenced) {
-        // The discharge only does work when the specialization binder is free
-        // in the body type's refinement predicates; skip cloning `spec.def`
-        // otherwise (it is still moved into the rebuilt `let` below).
-        let body_ty = if transparency == BindingTransparency::Transparent
-            && crate::ccl::subst::type_free_vars(&result.ty).contains(&spec.name)
-        {
-            crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone_preserving_ids())
-                .apply_type(&result.ty)
-        } else {
-            result.ty.clone()
-        };
-        result = Expr::new(TypedExprNode::Let {
-            binding: TypedBinding {
-                name: spec.name,
-                ty: spec.def.ty.clone(),
-                user_annotation: None,
-                transparency,
-            },
-            bound_expr: Box::new(spec.def),
-            body: Box::new(result),
-        })
-        .with_ty(body_ty);
+        result = specialization_let(spec, transparency, result);
     }
     *expr = result;
     expr.user_annotation = saved_annotation;
+}
+
+/// `body` under the `let` binding `spec`'s clone, its type closed over the binder.
+fn specialization_let(spec: Specialization, transparency: BindingTransparency, body: Expr) -> Expr {
+    // The discharge only does work when the specialization binder is free
+    // in the body type's refinement predicates; skip cloning `spec.def`
+    // otherwise (it is still moved into the rebuilt `let` below).
+    let body_ty = if transparency == BindingTransparency::Transparent
+        && crate::ccl::subst::type_free_vars(&body.ty).contains(&spec.name)
+    {
+        crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone_preserving_ids())
+            .apply_type(&body.ty)
+    } else {
+        body.ty.clone()
+    };
+    Expr::new(TypedExprNode::Let {
+        binding: TypedBinding {
+            name: spec.name,
+            ty: spec.def.ty.clone(),
+            user_annotation: None,
+            transparency,
+        },
+        bound_expr: Box::new(spec.def),
+        body: Box::new(body),
+    })
+    .with_ty(body_ty)
+}
+
+/// Splice the specializations placed under `binders` around `body`, the scope those
+/// binders bind ([`CoalesceCtx::placed`]): the walk has left it, so every use under it has
+/// been specialized.
+fn splice_placed(ctx: &mut CoalesceCtx, binders: &[Name], body: &mut Expr) {
+    let (here, rest): (Vec<Placed>, Vec<Placed>) = std::mem::take(&mut ctx.placed)
+        .into_iter()
+        .partition(|p| binders.contains(&p.binder));
+    ctx.placed = rest;
+    if here.is_empty() {
+        return;
+    }
+    let _chain = crate::ccl::provenance::enter(
+        body.node_id(),
+        "mono.place_let",
+        crate::ccl::provenance::Nature::Expansion,
+    );
+    let mut result = std::mem::take(body);
+    for placed in here.into_iter().rev().filter(|p| p.spec.referenced) {
+        result = specialization_let(placed.spec, placed.transparency, result);
+    }
+    *body = result;
+}
+
+/// Panic if a specialization was placed under one of `binders`, whose scope is not one body
+/// a `let` can wrap: a `match` arm's guard and body, or a `letrec`'s bindings and body.
+fn assert_none_placed(ctx: &CoalesceCtx, binders: &[Name], what: &str) {
+    if let Some(p) = ctx.placed.iter().find(|p| binders.contains(&p.binder)) {
+        panic!(
+            "a specialization of `{}` reads the {what} binder `{}`, and placing a \
+             specialization under that binder is not supported yet",
+            p.frame_name, p.binder
+        );
+    }
 }
 
 /// The inference variables `ty` reaches: those it mentions and, transitively, those

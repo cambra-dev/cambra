@@ -896,6 +896,30 @@ already materialized types. Constraining that concrete result against another li
 stronger operation and can reject a use whose own clone would have coalesced compatibly.
 A separate non-recording subsumption check is not implemented for this purpose.
 
+#### A specialization stands where its types are in scope
+
+A use instantiates the binding's scheme at the use site's telescope, with the binders the
+definition's own variables stood under inside the definition entered after it
+(`FreshenCache::use_telescope`). An argument whose type reads a binder entered between the
+definition and the use flows into the instance: a definition applied to a group, whose domain
+reads the group's key.
+
+A specialization typed at such an instance reads that binder, so it cannot stand where the
+definition does. `specialize_use` places it under the innermost binder between the definition and
+the use that the resolved instance or an argument reaching it reads (`argument_reads`). The pin
+gives the clone each argument's type, so an argument whose candidates meet its parameter's kind at
+none, which leaves the resolved instance reading less, still places the clone where its membership
+is decided. Its variables stand where the definition's did, with
+every binder from the definition to that one entered (`FreshenCache::entered_binders`), and the
+walk of the clone sees those binders as in scope, so a use inside the clone that reads one of them
+is placed there too. The clone is recorded on `CoalesceCtx::placed` with its binder. The walk
+leaving the binder's body splices the clones placed under it around that body (`splice_placed`),
+outermost first in the order they were made, so a clone that a later one calls encloses it. Uses
+under the same binder share a placed clone by the rules a definition-site clone is shared by. A
+binder whose scope is not one body, a `match` pattern's or a `letrec`'s, takes no placed clone:
+placing one there panics. A use whose instance reads no such binder is specialized at the
+definition, as before.
+
 #### Coalesce ordering and read stability
 
 Specialization runs during coalescing so that parents consume specialized child types on their
@@ -2437,7 +2461,11 @@ type carries, so the term reads through it.
 
 A refinement naming a keyed binder is decided by position, as for any joined binder, except that a
 collection's domain reads the term instead of having no join. The value at `𝑘` is then a collection
-whose keys depend on `𝑘`, which is what lets a loop feed rows filtered by its variable.
+whose keys depend on `𝑘`, which is what lets a loop feed rows filtered by its variable. A witness
+projection `σᵢ(𝑡)` is a collection's domain wherever it stands, so it reads the term too, whether or
+not the function around it is known to be a collection when the exit reaches it. So does a sum's
+elimination through a term, which becomes such a projection (`Subst::then`). A loop over boxed rows
+feeds each row at its own keys this way.
 
 Channelize builds the same key (`flatten_nested_contribution`). Where an inner loop's keys depend on
 an outer loop's value, through its source or its filter, the key is the dependent tuple of the
@@ -2475,7 +2503,10 @@ nested chain splices its elements in place.
 
 A chain's own type is a function of its input alone. Each position its codomain reads is written
 as the input carried there: `(𝑥₀ : 𝐷) ⇒ 𝐶[𝑥ᵢ ↦ 𝑥₀ ▷ 𝑒₀ ≫ … ≫ 𝑒ᵢ₋₁]`, where leading morphisms that map
-each position to itself (`id`, an iteration source, `filter_values`) drop out of the read.
+each position to itself (`id`, an iteration source, `filter_values`) drop out of the read. The
+quoted morphisms keep their types, whose binders can share a name with a binder of the type that
+quotes them, so a substitution through the type checks for capture only at the binders whose
+scope it acts inside (`Subst::under_binder`).
 Emission discharges a codomain not resolved yet by suspension
 ([A substitution reaching a variable suspends on it](#a-substitution-reaching-a-variable-suspends-on-it)).
 After inference every pass that builds or rebuilds a chain types it by the same rule
@@ -2483,7 +2514,9 @@ After inference every pass that builds or rebuilds a chain types it by the same 
 
 Lambda elimination states an operation's dependent result over the operation's own input,
 `(𝑞 : (Int, Int)) ⇒ {Int | __elem == 𝑞.0 ^+ 𝑞.1}`, rather than over the eliminated parameter its
-operands were written with (`operation_type`).
+operands were written with (`operation_type`). An application whose result reads the parameter
+states `apply`'s type the same way, over the pair of argument and function:
+`(𝑞 : (𝐴, (𝑘 : 𝐴) ⤇ 𝐶(𝑘))) ⇒ 𝐶(𝑞.0)`.
 
 #### Discharge is application
 
@@ -3881,11 +3914,7 @@ that reads the enclosing binder only as the comparand `𝑘` stays the Pi-consta
 ### One binder for one value
 
 Two binders that denote one value give every type that reads either two spellings, and types
-compare structurally, so the two spellings disagree. Lowering a comprehension over a group-by
-applies the partition to the key iterating it, `𝑟 ▷ (λ 𝑘 → …)`, which is such a pair. `inline`
-β-reduces a lambda applied to a variable when the lambda's parameter type reads an enclosing
-lambda's binder, which spells `𝑘` as `𝑟` everywhere
-(`src/ccl/design/optimization.md`, "Substitution and beta-reduction").
+compare structurally, so the two spellings disagree.
 
 A lambda applied to a term becomes, after lambda elimination, a pairing `⟨id, 𝑔⟩ ≫ ℎ` whose pair
 `𝑥 = (𝑎, 𝑔(𝑎))` is bound by the dependent projection that starts `ℎ`. The types after the
@@ -3899,7 +3928,10 @@ The nested-lambda rule writes a lifted filter over the pair's element, `𝑎 ↦
 refinement nested in the filter's subterm types reads it as `__elem^1.0`, one refinement out
 ([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).
 A filter reading `𝑎` where the pair is otherwise not dependent is not lifted: it stays on the
-second component, which makes the pair the dependent tuple `(𝑎 : 𝐴) × {𝐾 | 𝑝(𝑎, ·)}`.
+second component, which makes the pair the dependent tuple `(𝑎 : 𝐴) × {𝐾 | 𝑝(𝑎, ·)}`. Planning
+applies it as `filter_values` over the pair of `𝑎` and the keys (`planning/correlated.rs`,
+`emit_component_filter`). Keys that read `𝑎`, a boxed row's `σ₁(𝑎)`, keep that pair the dependent
+tuple `(𝑎 : 𝐴) × 𝐾(𝑎)`.
 
 ### Iterating a dependent tuple
 
@@ -3914,15 +3946,28 @@ A membership component `{𝐾 | 𝑘 ∈ 𝑀(𝑥)}` has the image of `𝑀(�
 `(λ 𝑥 → 𝑀(𝑥)) ≫ converse ≫ map_domain`, with `𝑀(𝑥)` written in the indexed form a
 comprehension reaches lambda elimination in, `λ 𝑟 → 𝑟 ▷ 𝑠 ▷ 𝑓` for the chain `𝑠 ≫ 𝑓`. The
 first morphism binds `𝑥`, whether or not its codomain reads it, since the keys `map_domain` yields
-are stated at `𝑥`. A second component of any other shape, and a tuple of more than two components
-under one `curry`, are refused.
+are stated at `𝑥`. A witness projection through the row, `σᵢ(𝑡(𝑥))`, has the row's own keys
+([A `for` loop over a sum](collections.md#a-for-loop-over-a-sum)). A second component of any other
+shape, and a tuple of more than two components under one `curry`, are refused.
+
+A site over a plain pair whose element is read out of a collection the enclosing value carries,
+`(.1, .0 ≫ 𝑝) ▷ zip ≫ apply` for projections `𝑝`, takes that collection's keys per row as well:
+`𝐹` is `𝑝 ≫ map_domain`, the identity's where `𝑝` is empty (`row_collection`). The collection's
+domain is a generalized parameter, which differs per row, so it is matched with the projection's
+type instantiated at the site's input. A body that reads no element names no collection, and the
+site's own type does: its inner domain, a generalized parameter, is the domain of a collection the
+enclosing value holds, which `collection_typed_at` finds through the enclosing value's tuple
+components. A site whose inner domain is a generalized parameter that no such collection has is
+refused, since enumerating the parameter's bound would look each row up at keys it lacks.
 
 ### At run time
 
-A dependent tuple has no extent, and op-conversion refuses one (`extent_of`). Each value of the
-first component has its own keys, so the tuple's entries are a family of collections rather than
-one collection, and planning rewrites a site that ranges over one into a site over that family
-before any operator is built ([Iterating a dependent tuple](#iterating-a-dependent-tuple)). A
+A dependent tuple's extent bounds its keys component by component (`extent_of`), as a plain
+tuple's does: a component that reads an earlier one does so in which keys it holds, and its bound
+is its kind's. Which keys exist is the data's, so the tuple's entries are a family of collections
+rather than one collection, and planning rewrites a site that ranges over one into a site over
+that family before any operator is built
+([Iterating a dependent tuple](#iterating-a-dependent-tuple)). A
 nested `Tile::DataFunction` already keeps a separate run of keys per row, and `Converse` and
 `MapDomain` act beneath standing levels, each row's collection on its own, which is how a key
 family runs per row.

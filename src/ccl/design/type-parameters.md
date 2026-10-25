@@ -419,6 +419,8 @@ lambda elimination, after loop recognition, and after planning:
   application's, each generalized on its own.
 - A quantifier over a curried function's codomain, or over a product's components there, moves
   outside the function where its bounds do not read the function's binder.
+- A `let` or `letrec` binder's type is the morphism its definition is, and is generalized as that
+  type is: an inner loop's history over rows whose domains read the outer loop's position.
 
 A part read under a binder of the type's own, a position of the collection the morphism receives,
 is generalized with that binder read by name, so the parameter stands for the part at every
@@ -428,11 +430,21 @@ stay distinct.
 Check instantiates a generalized type where it is used: at a chain edge from the codomain before it,
 at a chain's head from the chain's input, and at an application from the argument
 (`generalize::instantiate`). It matches the type's domain against what it receives, with every
-binder of that type read by name, and closes the result again. A parameter the input does not fix
-stays generic: the morphism is read at its body, and the result is generalized over it again. A
-generic node is checked at its body. Subtyping aligns a generic side with the other first
-(`generalize::align`). A builtin's type is trusted whole. After planning, `close_free_params` wraps
-each type a rebuild left reading a generalized parameter that nothing binds.
+binder of that type read by name, and closes the result again. A parameter bound to a type is
+matched through its bound too, against that type's structure, or against its bound where the type is
+itself a generalized parameter: in `∀ (𝐷 <: 0..8, 𝑃 <: ((𝐷 ⤇ Int), 𝐷)). 𝑃 ⇒ (𝐷 ⤇ Int)` the input
+fixes `𝐷` only through `𝑃`'s bound. A bound that is a bare parameter fixes nothing. A parameter the
+input does not fix stays generic: the morphism is read at its body, and the result is generalized
+over it again. A generic node is checked at its body, and so are its other type slots: a nested
+`Transact`'s parameter is read at its body, and its source is instantiated at the parameter's
+enclosing component. Subtyping aligns a generic side with the other first
+(`generalize::align`), its parameters renamed apart from those the other side reads, and aligns the
+instance's own generic components in turn, as a pair of generic morphisms has. A builtin's type is
+trusted whole. After loop recognition and after planning, `close_free_params` wraps each type
+slot a rebuild left reading a generalized parameter that nothing binds. Loop recognition reads a
+generic history at its body and builds the `Transact` from its parts, reading the writer's
+parameter, which the source slot's own type states, in the history's parameters
+(`generalize::renamed_by_match`).
 
 ---
 

@@ -935,3 +935,155 @@ fn alias_of_a_monomorphic_binding_is_monomorphic() {
 fn a_generalized_sibling_shares_a_monomorphic_binding(#[case] code: &str) {
     check_compile_error(code, "Conflicting Types: Int | String");
 }
+
+/// A definition applied to each group of a group-by is specialized at the group's type, which
+/// reads the group's key. That specialization stands under the key's binder rather than where
+/// the definition does (`src/ccl/design/type-inference.md`, "A specialization stands where its
+/// types are in scope"). Two uses at one type share it, and a definition the specialized one
+/// calls is placed beside it.
+#[rstest]
+#[case::whole(
+    indoc! {r#"
+        def big(g):
+            [z * 2 for z in g]
+    "#},
+    r"[big(g) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    "[() -> [[2, 4], [2 -> 6, 3 -> 8, 4 -> 10], [5 -> 12, 6 -> 14, 7 -> 16]]]"
+)]
+#[case::filtered(
+    indoc! {r#"
+        def big(g):
+            [z * 2 for z in g if z > 1]
+    "#},
+    r"[big(g) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    "[() -> [[1 -> 4], [2 -> 6, 3 -> 8, 4 -> 10], [5 -> 12, 6 -> 14, 7 -> 16]]]"
+)]
+#[case::through_a_binding(
+    indoc! {r#"
+        def big(g):
+            h = [y for y in g if y > 1]
+            [sum([y for y in h if y > x]) for x in h]
+    "#},
+    r"[big(g) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    "[() -> [[1 -> 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]]"
+)]
+#[case::with_a_second_argument(
+    indoc! {r#"
+        def above(g, t):
+            [z for z in g if z > t]
+    "#},
+    r"[above(g, 2) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    "[() -> [[], [2 -> 3, 3 -> 4, 4 -> 5], [5 -> 6, 6 -> 7, 7 -> 8]]]"
+)]
+#[case::calling_another_definition(
+    indoc! {r#"
+        def small(g):
+            [z + 1 for z in g if z > 1]
+        def big(g):
+            sum(small(g))
+    "#},
+    r"[big(g) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    "[() -> [3, 15, 24]]"
+)]
+#[case::used_twice(
+    indoc! {r#"
+        def big(g):
+            [z * 2 for z in g]
+    "#},
+    r"[(big(g), big(g)) for g in groupby([1, 2, 3, 4], \e -> e // 3)]",
+    "[() -> [(_0: [2, 4], _1: [2, 4]), (_0: [2 -> 6, 3 -> 8], _1: [2 -> 6, 3 -> 8])]]"
+)]
+fn a_definition_applied_to_each_group(
+    #[case] definitions: &str,
+    #[case] row: &str,
+    #[case] expected: &str,
+) {
+    check_sink(
+        &format!("{definitions}out = test_sink()\nout << {row}\n"),
+        expected,
+    );
+}
+
+/// **Not compiled yet: a definition applied under a `match` pattern's binder to a value whose
+/// type reads that binder.** The specialization reads `t`, so it is placed under `t`'s binder
+/// (`src/ccl/design/type-inference.md`, "A specialization stands where its types are in
+/// scope"), and a pattern binder scopes a guard and a body, which no one `let` wraps. Pinned on
+/// the panic; the program answers 14.
+#[rstest]
+#[case::applied_in_place(indoc! {r"
+    def big(g):
+        sum([z * 2 for z in g])
+    xs = [1, 2, 3, 4]
+    v = `some(2)
+    match v:
+        case `some(t):
+            big([x for x in xs if x > t])
+        case `none(_):
+            0
+"})]
+#[case::through_a_binding(indoc! {r"
+    def big(g):
+        sum([z * 2 for z in g])
+    xs = [1, 2, 3, 4]
+    v = `some(2)
+    match v:
+        case `some(t):
+            ys = [x for x in xs if x > t]
+            big(ys)
+        case `none(_):
+            0
+"})]
+fn a_definition_applied_under_a_pattern_binder_it_reads(#[case] code: &str) {
+    check_compile_error(
+        code,
+        "reads the pattern binder `t`, and placing a specialization under that binder is not \
+         supported yet",
+    );
+}
+
+/// **A specialization stands under the binders its arguments read**, not only those its resolved
+/// instance reads (`src/ccl/design/type-inference.md`, "A specialization stands where its types
+/// are in scope"). A comprehension over a box is keyed by its source's projected witness, which
+/// the meet with `f`'s `UIntRanges` keeps where the source's candidates are dense ranges, so `g`'s
+/// specialization stands under the source's binder: `ys`, or the temporary binding an inline
+/// source. Filtered, the argument fails `f`'s `List` and the resolved instance's domain admits
+/// nothing, so it reads no binder; the pin still gives the clone the argument, and placing it by
+/// what the argument reads lets the membership refuse it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_definition_specialized_for_an_argument_reading_a_binder_stands_under_it() {
+    check_scalar(
+        indoc! {r"
+            def f(c: List(Int)):
+                sum(c)
+            def g(c):
+                f(c)
+            ys: List(Int) = box([1, 2, 3])
+            g(box([x + 1 for x in ys]))
+        "},
+        Value::Int(9),
+    );
+    check_scalar(
+        indoc! {r"
+            def f(c: List(Int)):
+                sum(c)
+            def g(c):
+                f(c)
+            g(box([x + 1 for x in box([1, 2, 3])]))
+        "},
+        Value::Int(9),
+    );
+    let msg = compile_panic(indoc! {r"
+        def f(c: List(Int)):
+            sum(c)
+        def g(c):
+            f(c)
+        ys = [1, 2, 3]
+        g(box([x for x in ys if x > 1]))
+    "});
+    let expected = "Type mismatch for collection annotation: expected Σ (σ : UIntRanges). (σ ⤇ _), found {0..3 |";
+    assert!(
+        msg.starts_with("compilation failed:") && msg.contains(expected),
+        "expected a compile error containing {expected:?}; got: {msg}"
+    );
+}

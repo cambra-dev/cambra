@@ -1241,6 +1241,7 @@ fn discharged_witness(ty: &Type, s: &Subst) -> Option<Type> {
 fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
     use crate::ccl::ty::FunKind;
     let (term, rest) = s.top_elim()?;
+
     match ty {
         Type::Infer(_) => None,
         Type::Refinement(base, refinements) => {

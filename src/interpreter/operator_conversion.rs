@@ -1791,6 +1791,18 @@ the compilation declined outlives it here"
                     .collect();
                 Ok(Extent::record(fields?))
             }
+            // An extent bounds the keys, and a component that reads an earlier one does so
+            // in which keys it holds, not in its bound: a projected witness's bound is its
+            // kind's (the `WitnessProjection` arm below). So a dependent tuple's keys are
+            // bounded as a tuple's are, component by component.
+            Type::DepTuple(cs) => {
+                let fields: Result<HashMap<SmolStr, Extent>, _> = cs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, t))| Ok((tuple_field(i), self.extent_of(t)?)))
+                    .collect();
+                Ok(Extent::record(fields?))
+            }
             Type::Record(named) => {
                 let fields: Result<HashMap<SmolStr, Extent>, _> = named
                     .iter()

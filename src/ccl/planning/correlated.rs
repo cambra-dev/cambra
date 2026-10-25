@@ -136,7 +136,9 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
             expr.ty.clone(),
         )));
     }
-    let Some(Type::Tuple(pair)) = g.ty.domain() else {
+    // A generic morphism's domain may be a parameter, whose structure is its bound's.
+    let g_domain = g.ty.domain().unwrap_or(Type::Hole);
+    let Type::Tuple(pair) = crate::ccl::generalize::shape(&g_domain) else {
         return Err(format!(
             "a curried morphism takes the pair of what it is curried over and what it \
              iterates, so its domain is a two-element tuple; got {}",
@@ -154,6 +156,44 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
     // pair as well, which [`emit_pair_filter`] has applied, so the collection is matched — and
     // its keys enumerated — at the component's membership alone.
     let inner_domain = collection_domain(component);
+    // **A collection the row carries**: the body reads the element out of the enclosing
+    // value, not out of a collection every row shares, so each row's keys are that
+    // collection's own. The site pairs each enclosing value with them, as a dependent
+    // tuple's family does. A body that reads no element names no collection, and the
+    // site's type does: a domain that differs per row is the domain of a collection the
+    // enclosing value holds.
+    let carried = inner_source(g, &inner_domain)
+        .is_none()
+        .then(|| {
+            row_collection(g, &g_domain, &inner_domain)
+                .or_else(|| collection_typed_at(enclosing, &inner_domain))
+        })
+        .flatten();
+    if let Some(path) = carried {
+        let keys_ty = Type::data_fun(inner_domain.clone(), inner_domain.clone());
+        let map_domain = Expr::builtin(Builtin::MapDomain).with_ty(Type::fun(
+            path.last().map_or_else(
+                || enclosing.clone(),
+                |p| p.ty.codomain().unwrap_or(Type::Hole),
+            ),
+            keys_ty.clone(),
+        ));
+        let family = if path.is_empty() {
+            map_domain
+        } else {
+            let mut steps = path;
+            steps.push(map_domain);
+            Expr::compose(steps).with_ty(Type::fun(enclosing.clone(), keys_ty))
+        };
+        let family_ty = family.ty.clone();
+        let pair = Expr::tuple(vec![family, g.as_ref().clone_preserving_ids()])
+            .with_ty(Type::Tuple(vec![family_ty, g.ty.clone()]));
+        return Ok(Some(apply_primitive(
+            pair,
+            Builtin::CurryOver,
+            expr.ty.clone(),
+        )));
+    }
     let keys = match inner_source(g, &inner_domain) {
         Some(source) => {
             // A **recorded copy**: the source stays where it is inside `𝑔`, which applies it
@@ -181,6 +221,15 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
                  the whole key type, which nothing enumerates"
             ));
         }
+        // A generalized parameter is a domain that differs per row; `iterate` would enumerate its
+        // bound, every key any row could hold, and look each row up at keys it lacks.
+        None if matches!(inner_domain.peel_refinements(), Type::Param(p) if p.generalized) => {
+            return Err(format!(
+                "a correlated inner comprehension whose domain differs per row, over a \
+                 collection the enclosing value does not hold, is not supported yet: its \
+                 domain is {inner_domain}, the enclosing value {enclosing}"
+            ));
+        }
         None => make_iterate(trivially_true_predicate(inner_domain.clone())),
     };
     // **A dependent site** — a correlated filter narrows the inner domain by the outer
@@ -189,7 +238,7 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
     // node, `(const(𝐾), 𝑔) ▷ curry_over`, under `curry`'s own type, and op-conversion builds
     // the same operators the chain compiles to. The keys are the family every row shares,
     // `const(𝐾)`, as a dependent tuple's are the family [`keys_family`] builds.
-    if crate::ccl::subst::is_dependent(&expr.ty) {
+    if crate::ccl::subst::is_dependent(crate::ccl::generalize::opened(&expr.ty)) {
         let collection = keys.ty.clone();
         let family = apply_primitive(
             keys,
@@ -462,6 +511,82 @@ fn collection_domain(component: &Type) -> Type {
     }
 }
 
+/// The projections out of the enclosing value that reach the collection `g` applies at the
+/// pair's second component, where that collection is the enclosing value's own: `g` reads the
+/// element as `(.1, .0 ≫ path) ▷ zip ≫ apply`. Empty where the enclosing value is the
+/// collection.
+///
+/// The collection is read at `incoming`, `g`'s domain: a generalized type names its own
+/// parameters, and only instantiated at the pair `g` is handed does its domain read `g`'s.
+fn row_collection(g: &Expr, incoming: &Type, inner_domain: &Type) -> Option<Vec<Expr>> {
+    if let TypedExprNode::Apply { function, .. } = &g.node
+        && is_builtin(function, Builtin::Curry)
+    {
+        return None;
+    }
+    if let TypedExprNode::Compose(elements) = &g.node
+        && let [pairing, apply, ..] = elements.as_slice()
+        && is_builtin(apply, Builtin::Apply)
+        && let TypedExprNode::Apply {
+            argument: components,
+            function: zip,
+        } = &pairing.node
+        && is_builtin(zip, Builtin::Zip)
+        && let TypedExprNode::Tuple(parts) = &components.node
+        && let [key, collection] = parts.as_slice()
+        && matches!(&key.node, TypedExprNode::Proj(ProjKey::Index(1)))
+        && crate::ccl::generalize::instantiate(&collection.ty, incoming)
+            .codomain()
+            .and_then(|c| c.domain())
+            .is_some_and(|d| &d == inner_domain)
+    {
+        let steps: Vec<&Expr> = match &collection.node {
+            TypedExprNode::Compose(steps) => steps.iter().collect(),
+            _ => vec![collection],
+        };
+        if let [head, rest @ ..] = steps.as_slice()
+            && matches!(&head.node, TypedExprNode::Proj(ProjKey::Index(0)))
+            && rest
+                .iter()
+                .all(|s| matches!(s.node, TypedExprNode::Proj(_)))
+        {
+            // A recorded copy: the path stays where it is inside `𝑔`.
+            let _frame = provenance::copy_frame("planning.correlated_source");
+            return Some(rest.iter().map(|s| (*s).clone()).collect());
+        }
+    }
+    let mut found = None;
+    g.walk_children(|child| {
+        if found.is_none() {
+            found = row_collection(child, incoming, inner_domain);
+        }
+    });
+    found
+}
+
+/// The projections out of a value of type `enclosing` that reach a collection over
+/// `inner_domain`, where that domain differs per row: a generalized parameter, which names one
+/// domain within the type it is read from. Empty where the enclosing value is the collection.
+fn collection_typed_at(enclosing: &Type, inner_domain: &Type) -> Option<Vec<Expr>> {
+    if !matches!(inner_domain.peel_refinements(), Type::Param(p) if p.generalized) {
+        return None;
+    }
+    match crate::ccl::generalize::shape(enclosing) {
+        Type::Fun {
+            fun_kind, domain, ..
+        } if fun_kind.resolved().is_data() && domain.as_ref() == inner_domain => Some(Vec::new()),
+        Type::Tuple(components) => components.iter().enumerate().find_map(|(i, component)| {
+            let mut path = collection_typed_at(component, inner_domain)?;
+            path.insert(
+                0,
+                Expr::proj_index(i).with_ty(Type::fun(enclosing.clone(), component.clone())),
+            );
+            Some(path)
+        }),
+        _ => None,
+    }
+}
+
 /// The collection `g` applies at the pair's second component, whose domain is the one the
 /// curried collection is over.
 ///
@@ -578,12 +703,12 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
     Ok(true)
 }
 
-/// Emit the filter a dependent pair's second component carries, where that filter is what
-/// makes it dependent: `(𝑎 : 𝐴) × {𝐾 | 𝑝(𝑎, ·)}`, a correlated filter that `lambda_elim` keeps
-/// on the component. Each row ranges over `𝐾`'s keys, so the site runs over the product
-/// `(𝐴, 𝐾)`, and `filter_values` keeps the pairs `𝑝` holds for, `λ 𝑞 → 𝑝(𝑞.0, 𝑞.1)`. The
-/// pairs it keeps are the dependent tuple's elements, so it is typed from the product to the
-/// dependent tuple, and `𝑔` keeps the domain it was written at.
+/// Emit the filter a dependent pair's second component carries: `(𝑎 : 𝐴) × {𝐾 | 𝑝(𝑎, ·)}`, a
+/// correlated filter that `lambda_elim` keeps on the component. Each row ranges over `𝐾`'s keys,
+/// so the site runs over the product `(𝐴, 𝐾)`, or `(𝑎 : 𝐴) × 𝐾(𝑎)` where the keys read the row,
+/// and `filter_values` keeps the pairs `𝑝` holds for, `λ 𝑞 → 𝑝(𝑞.0, 𝑞.1)`. The pairs it keeps are
+/// the dependent tuple's elements, so it is typed from the product to the dependent tuple, and
+/// `𝑔` keeps the domain it was written at.
 fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String> {
     let Some(Type::DepTuple(components)) = g.ty.domain().map(|d| d.peel_refinements().clone())
     else {
@@ -620,50 +745,60 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
             .cloned()
             .collect(),
     );
-    debug_assert!(
-        !crate::ccl::subst::type_free_vars(&keys).contains(&a),
-        "a filtered component's keys are the same for every row: {keys}"
-    );
     let dependent = g.ty.domain().expect("matched a function's domain");
-    let product = Type::Tuple(vec![first.clone(), keys.clone()]);
-    let at = |index: usize, ty: &Type| {
+    // **Keys reading the row**, each row's own collection (a boxed row's `σ₁(𝑎)`), keep the
+    // product dependent: `(𝑎 : 𝐴) × 𝐾(𝑎)`, whose second component is typed at the first.
+    let product = Type::dep_tuple(vec![(Some(a.clone()), first.clone()), (None, keys.clone())]);
+    let reads_row = matches!(product, Type::DepTuple(_));
+    let proj = |of: Expr, index: usize, ty: &Type| {
         Expr::apply(
-            Expr::var(Name::elem()).with_ty(product.clone()),
+            of,
             Expr::proj_index(index).with_ty(Type::fun(product.clone(), ty.clone())),
         )
         .with_ty(ty.clone())
     };
+    let component_at = |p: &Name, index: usize| {
+        product
+            .component_type(index, |j, ty| {
+                proj(Expr::var(p).with_ty(product.clone()), j, ty)
+            })
+            .expect("a pair has two components")
+    };
+    let at = |index: usize| {
+        let ty = component_at(&Name::elem(), index);
+        // `.1` out of a dependent pair is a Pi: its own binder reads the pair it is handed.
+        let proj_ty = if reads_row && index == 1 {
+            let own = Name::fresh("__pair");
+            Type::pi(own.clone(), product.clone(), component_at(&own, index))
+        } else {
+            Type::fun(product.clone(), ty.clone())
+        };
+        Expr::apply(
+            Expr::var(Name::elem()).with_ty(product.clone()),
+            Expr::proj_index(index).with_ty(proj_ty),
+        )
+        .with_ty(ty)
+    };
     let mut chain = std::mem::replace(g, Expr::builtin(Builtin::Id));
     // The chain keeps `𝑔`'s binder: a row whose keys depend on the pair reads it in the
-    // codomain, which is stored closed against it.
+    // codomain, which is stored closed against it. A generic type is read at its body
+    // (`crate::ccl::generalize::close_free_params` closes what is built from it).
     let Type::Fun {
         name: binder,
         codomain,
         ..
-    } = chain.ty.peel_refinements().clone()
+    } = crate::ccl::generalize::opened(&chain.ty).clone()
     else {
         unreachable!("matched a function")
     };
     let mut kept = Type::fun(product.clone(), dependent.clone());
     for predicate in filters {
-        // The element read first, then `𝑎`. A nested refinement reading `𝑎` binds `__elem`
-        // to its own element, so there `𝑎` is bound by a lambda applied to `.0` rather than
-        // written as `__elem.0` (`src/ccl/design/type-inference.md`, "Lifting a filter onto
-        // the pair").
+        // The element read first, then `𝑎`, which a nested refinement reads as `__elem^1.0`
+        // (`src/ccl/design/type-inference.md`, "Lifting a filter onto the pair").
         let on_element =
-            crate::ccl::subst::Subst::discharge(Name::elem(), at(1, &keys)).apply_expr(&predicate);
-        let over_pair = if ccl_utils::count_free(&a, &on_element)
-            > ccl_utils::count_free_in_value(&a, &on_element)
-        {
-            let ty = on_element.ty.clone();
-            Expr::apply(
-                at(0, first),
-                Expr::lambda(a.clone(), first.clone(), on_element),
-            )
-            .with_ty(ty)
-        } else {
-            crate::ccl::subst::Subst::discharge(a.clone(), at(0, first)).apply_expr(&on_element)
-        };
+            crate::ccl::subst::Subst::discharge(Name::elem(), at(1)).apply_expr(&predicate);
+        let over_pair =
+            crate::ccl::subst::Subst::discharge(a.clone(), at(0)).apply_expr(&on_element);
         let p = plan_lifted(
             fn_of_bare_predicate(&product, &over_pair, &[]),
             PlanningPhase::EmitCorrelatedFilters,

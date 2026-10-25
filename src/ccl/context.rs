@@ -2697,7 +2697,10 @@ fn run_passes(
     // typecheck between them mints nothing, so splitting would buy a window in
     // which a recording writes nothing and nothing says why.
     let join_planned = recorded(capture_provenance, Phase::Planning, || {
+        // Loop recognition reads a generic history at its body, as planning reads any generic
+        // type, and closes what it builds from the parts the same way.
         let mut recognized = planning::plan_loops(lambda_elim);
+        crate::ccl::generalize::close_free_params(&mut recognized);
         crate::ccl::generalize::generalize_out_of_scope(&mut recognized);
         debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
         if let Err(errs) = typecheck_in(&recognized, &instances) {

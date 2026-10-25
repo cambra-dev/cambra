@@ -1824,6 +1824,40 @@ fn rows_keyed_by_the_loops_around_the_feed(#[case] source: &str, #[case] expecte
     for g in groupby(sales, \r -> r.region):
         out << [s.amount for s in g]
 "#}, r#"["east" -> [0 -> 1, 2 -> 3], "west" -> [1 -> 2]]"#)]
+#[case::through_a_definition(indoc! {r#"
+    def big(g):
+        [z * 2 for z in g if z > 1]
+    out = test_sink()
+    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+        out << big(g)
+"#}, "[[1 -> 4], [2 -> 6, 3 -> 8, 4 -> 10], [5 -> 12, 6 -> 14, 7 -> 16]]")]
+#[case::summed_per_element(indoc! {r#"
+    out = test_sink()
+    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+        out << [sum([y for y in g]) for x in g]
+"#}, "[[3, 3], [2 -> 12, 3 -> 12, 4 -> 12], [5 -> 21, 6 -> 21, 7 -> 21]]")]
+#[case::rows_of_a_binding_in_the_loop(indoc! {r#"
+    out = test_sink()
+    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+        h = [y for y in g if y > 1]
+        out << [z * 2 for z in h]
+"#}, "[[1 -> 4], [2 -> 6, 3 -> 8, 4 -> 10], [5 -> 12, 6 -> 14, 7 -> 16]]")]
+#[case::a_binding_in_the_loop_filtered_by_its_element(indoc! {r#"
+    out = test_sink()
+    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+        h = [y for y in g if y > 1]
+        out << [sum([y for y in h if y > x]) for x in h]
+"#}, "[[1 -> 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]")]
+#[case::each_row_filtered_by_its_element(indoc! {r#"
+    out = test_sink()
+    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+        out << [sum([y for y in g if y > x]) for x in g]
+"#}, "[[2, 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]")]
+#[case::filtered_rows_each_filtered_by_its_element(indoc! {r#"
+    out = test_sink()
+    for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3):
+        out << [sum([y for y in g if y > x]) for x in g if x > 1]
+"#}, "[[1 -> 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]")]
 #[case::keyed_by_an_enclosing_loop(indoc! {r#"
     out = test_sink()
     for i in [1, 2]:
@@ -1943,6 +1977,75 @@ fn a_feed_under_a_dependent_nest(#[case] source: &str, #[case] expected: &str) {
     out << sum([sum(b) for b in o])
 "#}, "[() -> 11]")]
 fn boxed_rows_fed_from_a_loop(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
+/// A loop over rows feeds a filtered comprehension over each row beside an aggregate of the row,
+/// in a tuple or a record. The row's type quotes the pairing that reads the row twice, whose
+/// type binds the loop's variable as the row's own type does.
+#[rstest]
+#[case::in_a_tuple(indoc! {r#"
+    out = test_sink()
+    for g in [[1, 2, 3], [4, 5, 6]]:
+        out << ([z for z in g if z > 1], sum(g))
+"#}, "[(_0: [1 -> 2, 2 -> 3], _1: 6), (_0: [4, 5, 6], _1: 15)]")]
+#[case::in_a_record(indoc! {r#"
+    out = test_sink()
+    for g in [[1, 2, 3], [4, 5, 6]]:
+        out << (kept=[z for z in g if z > 1], n=sum([z for z in g if z < 3]))
+"#}, "[(kept: [1 -> 2, 2 -> 3], n: 3), (kept: [4, 5, 6], n: 0)]")]
+fn a_loop_over_rows_feeds_a_filtered_comprehension_beside_an_aggregate(
+    #[case] source: &str,
+    #[case] expected: &str,
+) {
+    check_sink(source, expected);
+}
+
+/// A loop over boxed rows feeds a comprehension over each row, whose keys are the row's own: the
+/// fed row's domain is the row's witness, which leaves the loop read at the channel's key.
+#[rstest]
+#[case::whole(indoc! {r#"
+    out = test_sink()
+    for g in [box([1, 2, 3]), box([4, 5])]:
+        out << [x for x in g]
+"#}, "[[1, 2, 3], [4, 5]]")]
+#[case::filtered(indoc! {r#"
+    out = test_sink()
+    for g in [box([1, 2, 3]), box([4, 5])]:
+        out << [x for x in g if x > 1]
+"#}, "[[1 -> 2, 2 -> 3], [4, 5]]")]
+#[case::each_row_filtered_by_its_element(indoc! {r#"
+    out = test_sink()
+    for g in [box([1, 2, 3]), box([4, 5])]:
+        out << [sum([y for y in g if y > x]) for x in g]
+"#}, "[[5, 3, 0], [5, 0]]")]
+#[case::filtered_rows_each_filtered_by_its_element(indoc! {r#"
+    out = test_sink()
+    for g in [box([1, 2, 3]), box([4, 5])]:
+        out << [sum([y for y in g if y > x]) for x in g if x > 1]
+"#}, "[[1 -> 3, 2 -> 0], [5, 0]]")]
+#[case::over_a_filtered_comprehension(indoc! {r#"
+    out = test_sink()
+    for g in [box([1, 2, 3]), box([4, 5])]:
+        out << [z * 2 for z in [y for y in g if y > 1]]
+"#}, "[[1 -> 4, 2 -> 6], [8, 10]]")]
+#[case::through_a_definition(indoc! {r#"
+    def big(g):
+        [z * 2 for z in g if z > 1]
+    out = test_sink()
+    for g in [box([1, 2, 3]), box([4, 5])]:
+        out << big(g)
+"#}, "[[1 -> 4, 2 -> 6], [8, 10]]")]
+#[case::over_a_binding_in_the_loop(indoc! {r#"
+    out = test_sink()
+    for g in [box([1, 2, 3]), box([4, 5])]:
+        h = [y for y in g if y > 1]
+        out << [z * 2 for z in h]
+"#}, "[[1 -> 4, 2 -> 6], [8, 10]]")]
+fn a_loop_over_boxed_rows_feeds_each_rows_comprehension(
+    #[case] source: &str,
+    #[case] expected: &str,
+) {
     check_sink(source, expected);
 }
 

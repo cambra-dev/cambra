@@ -1220,8 +1220,8 @@ fn per_region_product(fields: &[(&str, [i64; 2])]) -> Tile {
     ))
 }
 
-/// A filtered per-group aggregate on its own applies its filter. This is the control for
-/// [`a_filtered_per_group_aggregate_in_a_product_drops_its_filter`].
+/// A filtered per-group aggregate on its own applies its filter, as one in a product does
+/// ([`a_filtered_per_group_aggregate_in_a_product_keeps_its_filter`]).
 #[test]
 fn a_bare_filtered_per_group_aggregate_keeps_its_filter() {
     check_tile(
@@ -1230,38 +1230,53 @@ fn a_bare_filtered_per_group_aggregate_keeps_its_filter() {
     );
 }
 
-/// **This test pins a defect, not a decision — it should start failing when the defect is
-/// fixed.**
-///
-/// A filtered per-group aggregate placed in a tuple or a record answers the unfiltered sum:
-/// `sum([s.amount for s in g if s.qty > 2])` is north `40` and west `300` where it should be
-/// north `0` and west `200`, the values
-/// [`a_bare_filtered_per_group_aggregate_keeps_its_filter`] gets for the same aggregate
-/// alone. Once fixed, each case's filtered component (`F` in its product) asserts `[0, 200]`.
-///
-/// In the post-planning tree both forms carry the filter as a refinement of the
-/// aggregate's input, `__elem ▷ (g ≫ (.qty, 2 ▷ const) ▷ zip ≫ gt)`.
-/// `insert_per_group_filters` (`src/ccl/planning/per_group_filter.rs`) inserts a
-/// `map(filter_values(𝑞))` for the bare form and none for these, and the program compiles and
-/// runs with the refinement unmaterialized.
+/// A filtered per-group aggregate placed in a tuple or a record keeps its filter, as it does
+/// alone ([`a_bare_filtered_per_group_aggregate_keeps_its_filter`]): north `0` and west `200`
+/// beside the unfiltered `40` and `300`. In a product the aggregate's input heads the chain of a
+/// `zip` component, `(𝑚 ≫ sum, …) ▷ zip`, and the per-group filter is inserted at that head
+/// (`src/ccl/planning/per_group_filter.rs`).
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::beside_a_constant(
     "(1, F)",
-    per_region_product(&[("_0", [1, 1]), ("_1", [40, 300])])
+    per_region_product(&[("_0", [1, 1]), ("_1", [0, 200])])
 )]
-#[case::one_tuple("(F,)", per_region_product(&[("_0", [40, 300])]))]
-#[case::record_field("(k=F)", per_region_product(&[("k", [40, 300])]))]
+#[case::one_tuple("(F,)", per_region_product(&[("_0", [0, 200])]))]
+#[case::record_field("(k=F)", per_region_product(&[("k", [0, 200])]))]
 #[case::beside_the_unfiltered_sum(
     "(F, sum([s.amount for s in g]))",
-    per_region_product(&[("_0", [40, 300]), ("_1", [40, 300])])
+    per_region_product(&[("_0", [0, 200]), ("_1", [40, 300])])
 )]
-fn a_filtered_per_group_aggregate_in_a_product_drops_its_filter(
+fn a_filtered_per_group_aggregate_in_a_product_keeps_its_filter(
     #[case] product: &str,
     #[case] pinned: Tile,
 ) {
     let body = product.replace("F", "sum([s.amount for s in g if s.qty > 2])");
     check_tile(&per_region_program(&body), pinned);
+}
+
+/// A filtered comprehension over each row beside an aggregate of the row keeps its filter: the
+/// two read the row through the components of one `zip`, in a tuple or as a binary operator's
+/// operands, whether the comprehension is aggregated or stands as a collection.
+#[rstest]
+#[case::in_a_tuple(
+    "(sum([z for z in g if z > 1]), sum(g))",
+    "[() -> [(_0: 5, _1: 6), (_0: 15, _1: 15)]]"
+)]
+#[case::added_to_the_unfiltered_sum("sum([z for z in g if z > 1]) + sum(g)", "[() -> [11, 30]]")]
+#[case::added_to_the_maximum("sum([z for z in g if z > 1]) + max(g)", "[() -> [8, 21]]")]
+#[case::a_collection_in_a_tuple(
+    "([z for z in g if z > 1], sum(g))",
+    "[() -> [(_0: [1 -> 2, 2 -> 3], _1: 6), (_0: [4, 5, 6], _1: 15)]]"
+)]
+fn a_filtered_comprehension_beside_another_over_each_row_keeps_its_filter(
+    #[case] row: &str,
+    #[case] expected: &str,
+) {
+    check_sink(
+        &format!("out = test_sink()\nout << [{row} for g in [[1, 2, 3], [4, 5, 6]]]\n"),
+        expected,
+    );
 }
 
 /// A filter inside each group, over elements that hold a collection of their own: the filter
@@ -1332,6 +1347,39 @@ fn a_filter_over_the_groups_of_a_group_by() {
 )]
 fn a_group_by_in_a_guard(#[case] program: &str) {
     check_scalar(program, Value::Int(1));
+}
+
+/// A comprehension over each group of a group-by ranges over the group's own keys, which differ
+/// per group. A filter on the group's elements is a per-group filter. A filter reading the outer
+/// element makes the inner comprehension correlated, each element summing the elements of its
+/// group greater than it.
+#[rstest]
+#[case::filtered(
+    r"out << [[y for y in g if y > 1] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    "[() -> [[1 -> 2], [2 -> 3, 3 -> 4, 4 -> 5], [5 -> 6, 6 -> 7, 7 -> 8]]]"
+)]
+#[case::filtered_beside_the_sum(
+    r"out << [([y for y in g if y > 1], sum(g)) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    "[() -> [(_0: [1 -> 2], _1: 3), (_0: [2 -> 3, 3 -> 4, 4 -> 5], _1: 12), (_0: [5 -> 6, 6 -> 7, 7 -> 8], _1: 21)]]"
+)]
+#[case::summed_per_element(
+    r"out << [[sum([y for y in g]) for x in g] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    "[() -> [[3, 3], [2 -> 12, 3 -> 12, 4 -> 12], [5 -> 21, 6 -> 21, 7 -> 21]]]"
+)]
+#[case::summed_per_filtered_element(
+    r"out << [[sum([y for y in g]) for x in g if x > 1] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    "[() -> [[1 -> 3], [2 -> 12, 3 -> 12, 4 -> 12], [5 -> 21, 6 -> 21, 7 -> 21]]]"
+)]
+#[case::correlated(
+    r"out << [[sum([y for y in g if y > x]) for x in g] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    "[() -> [[2, 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]]"
+)]
+#[case::correlated_over_filtered_elements(
+    r"out << [[sum([y for y in g if y > x]) for x in g if x > 1] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    "[() -> [[1 -> 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]]"
+)]
+fn a_comprehension_over_each_group_of_a_group_by(#[case] row: &str, #[case] expected: &str) {
+    check_sink(&format!("out = test_sink()\n{row}\n"), expected);
 }
 
 /// A group-by in the middle operand of a chained comparison, which lowering places in both
@@ -1427,12 +1475,9 @@ fn a_group_by_under_a_loop_not_compiled_yet(#[case] code: &str, #[case] gap: &st
     check_compile_error(code, gap);
 }
 
-/// A per-group count whose body does not read the row, `sum([1 for s in g])`, does not compile:
-/// generalizing the lifted `curry` meets a collection domain that reads the comprehension's
-/// iteration binder `__iter_record`, which the morphism's input does not carry. A body that reads
-/// the row compiles (`a_binop_pairs_two_projections_at_the_grouped_row`).
+/// A per-group count whose body does not read the row, `sum([1 for s in g])`. The body that reads
+/// the row is `a_binop_pairs_two_projections_at_the_grouped_row`.
 #[test]
-#[should_panic(expected = "reads a binder no term binder around it binds")]
 fn a_per_group_count_that_ignores_the_row() {
     check_tile(
         &per_region_program("sum([1 for s in g])"),

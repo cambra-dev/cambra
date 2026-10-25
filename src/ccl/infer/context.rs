@@ -1549,8 +1549,9 @@ impl Typing for InferCtx {
     fn instantiate(&mut self, scheme: &PolyScheme) -> Type {
         // `Typing::instantiate` is the operator-scheme path: the template's
         // variables stand nowhere, so the instantiation takes this position's
-        // telescope. (A let-generalized binding instantiates directly via
-        // `PolyScheme::instantiate` and keeps its definition-site telescopes.)
+        // telescope. (A let-generalized binding instantiates through
+        // `PolyScheme::instantiate_with_params`, at the use site's telescope with the
+        // binders inside the definition entered after it.)
         scheme.instantiate_in(self.level, &self.telescope)
     }
 
