@@ -776,7 +776,9 @@ under different parents identify different groups. A group's terminal flag is se
 the whole outer collection need not be complete. Output levels retain their respective input
 completion predicates. Paths are sorted lexicographically to rebuild contiguous child runs, and
 incomparable keys at the same level cause a panic. An extremum group without an identity is omitted
-until it receives an element; completion of such an empty group panics.
+until it receives an element; completion of such an empty group panics. A key above the groups'
+level with nothing beneath it holds an empty collection of groups, so no accumulator's path reaches
+it; the output keeps it by path as a key with nothing beneath.
 
 A release removes every accumulator whose complete path it covers. Unreleased ancestor keys remain
 in the output even when they no longer contain an accumulator. Input release is restated through

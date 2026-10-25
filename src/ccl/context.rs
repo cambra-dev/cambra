@@ -1476,7 +1476,7 @@ pub(crate) fn collect_main_tree_ids(expr: &Expr) -> HashSet<NodeId> {
 /// Uniqueness covers the same domains with different sharing rules; see
 /// `src/ccl/design/provenance.md`, "Walking the ids".
 pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
-    fn from_expr(e: &Expr, acc: &mut HashSet<NodeId>) {
+    fn from_expr(e: &Expr, acc: &mut HashSet<NodeId>, quoted: &mut HashSet<*const Expr>) {
         acc.insert(e.node_id());
         // Delegating to `walk_type_slots` is what keeps the two in step, and they
         // must be: the rewriting passes reach predicates through that walk, so a
@@ -1486,13 +1486,20 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
         // `f: (Int => {Int where _ == 9}) = …` is the shape: the predicate rides
         // the `let` binder's annotation and nothing else.
         // Every term the node quotes (a refinement's predicate, a projection's sum, the
-        // conditional a realization stages) carries ids the projections must explain.
-        e.walk_quoted_terms(&mut |term| from_expr(term, acc));
-        e.walk_children(|c| from_expr(c, acc));
+        // conditional a realization stages) carries ids the projections must explain. A term
+        // shared by `Rc` across slots carries the same ids wherever it is reached, so it is
+        // walked once: walked again from every slot, the walk is exponential in how deeply
+        // shared predicates nest.
+        e.walk_quoted_terms(&mut |term| {
+            if quoted.insert(Rc::as_ptr(term)) {
+                from_expr(term, acc, quoted);
+            }
+        });
+        e.walk_children(|c| from_expr(c, acc, quoted));
     }
 
     let mut acc = HashSet::new();
-    from_expr(expr, &mut acc);
+    from_expr(expr, &mut acc, &mut HashSet::new());
     acc
 }
 
@@ -2775,7 +2782,10 @@ fn run_passes(
     // typecheck between them mints nothing, so splitting would buy a window in
     // which a recording writes nothing and nothing says why.
     let join_planned = recorded(capture_provenance, Phase::Planning, || {
+        // Loop recognition reads a generic history at its body, as planning reads any generic
+        // type, and closes what it builds from the parts the same way.
         let mut recognized = planning::plan_loops(lambda_elim);
+        crate::ccl::generalize::close_free_params(&mut recognized);
         crate::ccl::generalize::generalize_out_of_scope(&mut recognized).map_err(|u| u.0)?;
         debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
         if let Err(errs) = typecheck_in(&recognized, &instances) {

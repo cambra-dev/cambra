@@ -262,6 +262,40 @@ fn a_jagged_nested_collection_is_consumed_at_each_rows_own_domain(
     check_scalar(code, expected);
 }
 
+/// A comprehension over each row of a jagged collection, correlated with its element: each
+/// element sums the elements of its row greater than it. A filter on the row's elements that
+/// empties a row maps that row to `[]`.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case::correlated(
+    "out << [[sum([y for y in g if y > x]) for x in g] for g in [box([1, 2, 3]), box([4, 5])]]",
+    "[() -> [[5, 3, 0], [5, 0]]]"
+)]
+#[case::correlated_over_a_row_filtered_to_empty(
+    "out << [[sum([y for y in g if y > x]) for x in g if x > 3] for g in [box([1, 2, 3]), box([4, 5])]]",
+    "[() -> [[], [5, 0]]]"
+)]
+fn a_comprehension_over_each_jagged_row(#[case] row: &str, #[case] expected: &str) {
+    check_sink(&format!("out = test_sink()\n{row}\n"), expected);
+}
+
+/// A collection per element of each jagged row, each holding the row's elements greater than
+/// the element. It panics in substitution. It answers `[[[1 -> 2, 2 -> 3], [2 -> 3], []], [[1 ->
+/// 5], []]]`.
+#[test]
+#[should_panic(
+    expected = "Barendregt violation: substitution range mentions binder `Synthetic { kind: Pair"
+)]
+fn a_collection_per_element_of_each_jagged_row_not_compiled_yet() {
+    check_sink(
+        indoc! {r"
+            out = test_sink()
+            out << [[[y for y in g if y > x] for x in g] for g in [box([1, 2, 3]), box([4, 5])]]
+        "},
+        "[() -> [[[1 -> 2, 2 -> 3], [2 -> 3], []], [[1 -> 5], []]]]",
+    );
+}
+
 /// **A comprehension over a collection whose domain is the witness composes with it.** A
 /// `List(List(𝑇))` annotation binds a described kind at both levels, so the outer collection's
 /// domain is a witness rather than an extent. The comprehension needs no iteration source over
