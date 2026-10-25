@@ -94,9 +94,7 @@ use crate::ccl::ccl_utils::{
     PredMemo, free_among, is_free, is_free_in_type, strip_iterate_markers,
 };
 use crate::ccl::provenance::NodeId;
-use crate::ccl::scope::{
-    ScopedItem, ScopedItemMut, for_each_scoped_item, for_each_scoped_item_mut,
-};
+use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
 use crate::ccl::{Branch, Name, PredicateId, Type, TypedBinding, TypedExpr, TypedExprNode};
 
 /// A term binder name.
@@ -2516,41 +2514,19 @@ fn is_var_named(e: &TypedExpr, name: &Name) -> bool {
 
 // ---- contexts: the *checking* device (free vars ⊆ context) ----
 
-/// Collect the free term-variable names of `ty` — the term binders its
-/// refinement predicates reference, minus any bound by an enclosing Pi binder
-/// or by a binder inside the predicates themselves.
-///
-/// One scope-aware accumulating walk: it threads the set of in-scope binders
-/// (so it subtracts shadowing binders as it descends) and a visited-set of
-/// [`PredicateId`]s (so self-referential predicate type slots terminate),
-/// gathering every free variable in a single pass. This is the accumulating
-/// dual of [`crate::ccl::ccl_utils::count_free`]'s by-name query — O(n) in the
-/// type/predicate size, where the old "collect every name, then re-run a
-/// by-name occurrence walk per name" was O(n²).
+/// The free term-variable names of `ty`: the names the terms it quotes read that no binder
+/// of `ty` or of those terms binds ([`crate::ccl::free_names`]).
 pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
-    let mut out = BTreeSet::new();
-    let mut bound = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    collect_type_fv(ty, &mut bound, &mut visited, &mut out);
-    out
-}
-
-/// [`type_free_vars`] into `out`, sharing `visited` with the caller's walk: a predicate term
-/// shared by `Rc` across several slots is read once.
-pub(crate) fn collect_type_free_vars(
-    ty: &Type,
-    visited: &mut BTreeSet<PredicateId>,
-    out: &mut BTreeSet<Binder>,
-) {
-    collect_type_fv(ty, &mut BTreeSet::new(), visited, out);
+    crate::ccl::free_names::names_in_type(ty)
 }
 
 /// The indices of the element references `t` reads free: `0` for the element of the
 /// refinement whose predicate holds `t`, one more per refinement further out.
 pub fn free_elem_indices(t: &TypedExpr) -> BTreeSet<u32> {
-    let mut out = BTreeSet::new();
-    collect_expr_fv(t, &mut BTreeSet::new(), &mut BTreeSet::new(), &mut out);
-    out.iter().filter_map(Name::elem_index).collect()
+    crate::ccl::free_names::names(t, crate::ccl::free_names::EVERY_READ)
+        .iter()
+        .filter_map(Name::elem_index)
+        .collect()
 }
 
 /// `t` placed under `by` more refinements: every element reference it reads free is `by`
@@ -2602,46 +2578,12 @@ pub(crate) fn holds_infer_var(e: &TypedExpr) -> bool {
 }
 
 pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
-    let mut out = BTreeSet::new();
-    let mut bound = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    collect_predicate_fv(r, &mut bound, &mut visited, &mut out);
-    out
+    crate::ccl::free_names::names_in_refinement(r)
 }
 
 /// The free term-variable names of `e`, those in its sub-expressions' type slots included.
 pub fn expr_free_vars(e: &TypedExpr) -> BTreeSet<Binder> {
-    let mut out = BTreeSet::new();
-    let mut bound = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    collect_expr_fv(e, &mut bound, &mut visited, &mut out);
-    out
-}
-
-/// Collect the free names of `r`'s predicate as seen from outside the refinement: its own
-/// element is bound there, and an enclosing refinement's element is one refinement nearer.
-fn collect_predicate_fv(
-    r: &crate::ccl::Refinement,
-    bound: &mut BTreeSet<Binder>,
-    visited: &mut BTreeSet<PredicateId>,
-    out: &mut BTreeSet<Binder>,
-) {
-    let mut inner = BTreeSet::new();
-    collect_expr_fv(&r.predicate, bound, visited, &mut inner);
-    let mut outer_elem = false;
-    out.extend(inner.into_iter().filter_map(|n| match n.elem_index() {
-        Some(0) => None,
-        Some(up) => {
-            outer_elem = true;
-            Some(Name::elem_at(up - 1))
-        }
-        None => Some(n),
-    }));
-    // A predicate reading an enclosing element reads a different one at each depth it is
-    // shared at, so it is walked at each.
-    if outer_elem {
-        visited.remove(&r.predicate_id());
-    }
+    crate::ccl::free_names::names(e, crate::ccl::free_names::EVERY_READ)
 }
 
 /// Whether `ty`'s structural skeleton contains an unresolved [`Type::Infer`]
@@ -2658,164 +2600,6 @@ fn collect_predicate_fv(
 /// not by this test.
 pub fn type_contains_infer(ty: &Type) -> bool {
     ty.holds_type(&|ty| matches!(ty, Type::Infer(_) | Type::BarrierVar(_)))
-}
-
-/// Insert each of `names` into `bound` for the duration of `f`, restoring the
-/// set afterward. Only names that were *newly* inserted are removed, so a
-/// binder that shadows an already-in-scope name of the same spelling does not
-/// spuriously un-bind the outer one on the way back up.
-fn with_binders<R>(
-    bound: &mut BTreeSet<Binder>,
-    names: impl IntoIterator<Item = Binder>,
-    f: impl FnOnce(&mut BTreeSet<Binder>) -> R,
-) -> R {
-    let added: Vec<Binder> = names
-        .into_iter()
-        .filter(|n| bound.insert(n.clone()))
-        .collect();
-    let r = f(bound);
-    for n in added {
-        bound.remove(&n);
-    }
-    r
-}
-
-fn collect_type_fv(
-    ty: &Type,
-    bound: &mut BTreeSet<Binder>,
-    visited: &mut BTreeSet<PredicateId>,
-    out: &mut BTreeSet<Binder>,
-) {
-    match ty {
-        // A bounded annotation binds nothing, so its bound's free variables are
-        // free in it — a name referenced only from inside an annotation is still
-        // referenced.
-        Type::BoundedHole(t) => collect_type_fv(t, bound, visited, out),
-        Type::Base(_)
-        | Type::UIntRange(_)
-        | Type::DataSource(_)
-        | Type::ChanDom(..)
-        | Type::Txn
-        | Type::Hole
-        | Type::SharedHole(_)
-        // A witness reference is type-level, never a free term variable.
-        | Type::WitnessRef(_)
-        // So is a type parameter; its bound is a child of the `Poly` below.
-        | Type::Param(_)
-        | Type::BarrierVar(_)
-        | Type::Infer(_) => {}
-        Type::Poly(poly) => {
-            for t in poly.types() {
-                collect_type_fv(t, bound, visited, out);
-            }
-        }
-        // The projected sum is a term the type quotes, walked once as a predicate is. It
-        // binds no element: the term is the collection, not a condition on a key.
-        Type::WitnessProjection(p) => {
-            if visited.insert(Rc::as_ptr(&p.term)) {
-                collect_expr_fv(&p.term, bound, visited, out);
-            }
-        }
-        Type::Fun {
-            name,
-            fun_kind,
-            domain,
-            codomain,
-        } => {
-            // A witness binder binds no *term* variable, so the kinds' free term vars
-            // are collected under the enclosing binders, with nothing subtracted.
-            for w in fun_kind.witnesses() {
-                for t in w.types() {
-                    collect_type_fv(t, bound, visited, out);
-                }
-            }
-            collect_type_fv(domain, bound, visited, out);
-            // A `Some` name is the Pi binder, bound in the codomain.
-            with_binders(bound, name.clone(), |bnd| {
-                collect_type_fv(codomain, bnd, visited, out)
-            });
-        }
-        Type::Refinement(base, refinements) => {
-            // Walk each predicate term at most once (a term shared by `Rc`
-            // across occurrences is a DAG — dedup, not cycle-breaking). The
-            // refinement binds the implicit REFINEMENT_BINDER over `base`, so it
-            // is bound — not free — inside the predicate.
-            for r in refinements {
-                if visited.insert(r.predicate_id()) {
-                    collect_predicate_fv(r, bound, visited, out);
-                }
-            }
-            collect_type_fv(base, bound, visited, out);
-        }
-        Type::Tuple(ts) => ts
-            .iter()
-            .for_each(|t| collect_type_fv(t, bound, visited, out)),
-        // A component's name is bound in the components after it.
-        Type::DepTuple(cs) => {
-            fn rest(
-                cs: &[(Option<Name>, Type)],
-                bound: &mut BTreeSet<Binder>,
-                visited: &mut BTreeSet<PredicateId>,
-                out: &mut BTreeSet<Binder>,
-            ) {
-                let Some(((name, t), later)) = cs.split_first() else {
-                    return;
-                };
-                collect_type_fv(t, bound, visited, out);
-                with_binders(bound, name.clone(), |bnd| rest(later, bnd, visited, out));
-            }
-            rest(cs, bound, visited, out)
-        }
-        Type::Nominal(_, ts) => ts
-            .iter()
-            .for_each(|t| collect_type_fv(t, bound, visited, out)),
-        Type::Split { input, output } => {
-            collect_type_fv(input, bound, visited, out);
-            collect_type_fv(output, bound, visited, out);
-        }
-        Type::Record(fs) => fs
-            .iter()
-            .for_each(|(_, t)| collect_type_fv(t, bound, visited, out)),
-        Type::Variant(tags, _) => tags
-            .iter()
-            .for_each(|(_, t)| collect_type_fv(t, bound, visited, out)),
-        Type::History { function, .. } => collect_type_fv(function, bound, visited, out),
-    }
-}
-
-/// Collect the free term-variable names of an expression — the accumulating
-/// dual of [`crate::ccl::ccl_utils::count_free`]'s by-name query, and the same
-/// fold over [`crate::ccl::scope::for_each_scoped_item`], so the two cannot
-/// disagree about what binds where. Also descends into each sub-expression's
-/// type slot, since predicate sub-terms may carry further refinements.
-fn collect_expr_fv(
-    e: &TypedExpr,
-    bound: &mut BTreeSet<Binder>,
-    visited: &mut BTreeSet<PredicateId>,
-    out: &mut BTreeSet<Binder>,
-) {
-    // Every type slot, a binder's declared type and a cast's target included, in the scope
-    // around the node: a binder does not bind in its own type.
-    e.walk_type_slots(|ty| collect_type_fv(ty, bound, visited, out));
-    for_each_scoped_item(e, &mut |item| match item {
-        ScopedItem::VarRef(n) => {
-            // A `PiBound` is a bound reference to a function of the enclosing
-            // type, not a free name — it is never free and never in a context.
-            if n.pi_bound_index().is_none() && !bound.contains(n) {
-                out.insert(n.clone());
-            }
-        }
-        // A mutable variable key is a field label, not a variable occurrence.
-        ScopedItem::KeyRef(_) => {}
-        ScopedItem::Child {
-            expr: child,
-            binders,
-        } => {
-            with_binders(bound, binders.iter().map(|b| b.name.clone()), |bnd| {
-                collect_expr_fv(child, bnd, visited, out)
-            });
-        }
-    });
 }
 
 /// Every stored dependent function in `ty` whose codomain still references its

@@ -464,7 +464,7 @@ fn substitute_go(ty: &Type, bound: &HashMap<TypeParamId, Type>) -> Type {
 // equality and hashing do not read (matching the solver's allow).
 #[allow(clippy::mutable_key_type)]
 pub(crate) fn generalize_out_of_scope(root: &mut crate::ccl::Expr) {
-    let everywhere = crate::ccl::well_scoped::free_names(root);
+    let everywhere = crate::ccl::ccl_utils::free_names_in_value(root);
     let mut cache = HashMap::new();
     let memo = crate::ccl::ccl_utils::PredMemo::new();
     walk(root, &mut Vec::new(), &everywhere, &mut cache, &memo);

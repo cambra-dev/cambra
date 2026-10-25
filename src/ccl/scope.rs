@@ -76,10 +76,10 @@
 //!
 //! Type slots. A node's `ty`, its `user_annotation`, a `Cast`'s `target` and
 //! the refinement predicates they carry are reached by the type walks each pass
-//! owns (`count_free_in_type`, `collect_type_fv`, `hash_type`, …), because the
-//! passes disagree about them on purpose — `count_free` counts occurrences in
-//! predicates, `is_free_in_value` deliberately does not. This module is about
-//! the *term* spine's binding structure only, matching `walk_children`.
+//! owns (`hash_type`, …). The binders inside a type, and which names a type reads free, are
+//! [`crate::ccl::free_names`]'s, which asks whether to read type slots at all:
+//! `count_free` counts occurrences in predicates, `is_free_in_value` deliberately does not.
+//! This module is about the *term* spine's binding structure only, matching `walk_children`.
 
 use super::{Generator, Name, TypedBinding, TypedExpr, TypedExprNode};
 

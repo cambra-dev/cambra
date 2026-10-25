@@ -754,23 +754,6 @@ fn move_into_list_elements(
     (body, moved)
 }
 
-/// Take the position slot of every `for` loop in `e`, in walk order. Each restates its loop's
-/// source domain (`crate::ccl::mut_elim::loop_domain`), so a read there is not an occurrence.
-fn take_loop_positions(e: &mut Expr, out: &mut Vec<Type>) {
-    if let TypedExprNode::For { position, .. } = &mut e.node {
-        out.push(std::mem::replace(&mut position.ty, Type::Hole));
-    }
-    e.walk_children_mut(|c| take_loop_positions(c, out));
-}
-
-/// Put back the slots [`take_loop_positions`] took, in the same walk order.
-fn restore_loop_positions(e: &mut Expr, slots: &mut impl Iterator<Item = Type>) {
-    if let TypedExprNode::For { position, .. } = &mut e.node {
-        position.ty = slots.next().expect("one slot per loop taken");
-    }
-    e.walk_children_mut(|c| restore_loop_positions(c, slots));
-}
-
 /// Restate each `for` loop's position slot in `e` that reads `name` from the loop's source.
 fn restate_loop_positions(name: &Name, e: &mut Expr) {
     if let TypedExprNode::For { position, iter, .. } = &mut e.node
@@ -1039,13 +1022,16 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             // read of a variable the body writes. A `for` loop's position restates its
             // source's domain, so a read there is not an occurrence: the slot is
             // restated from the source the temp moves into.
-            let mut body = body;
             let mut occurrences = count_free(&binding.name, &body);
             if occurrences > 1 && binding.name.is_anf_temp() {
-                let mut slots = Vec::new();
-                take_loop_positions(&mut body, &mut slots);
-                occurrences = count_free(&binding.name, &body);
-                restore_loop_positions(&mut body, &mut slots.into_iter());
+                occurrences = crate::ccl::free_names::count(
+                    &binding.name,
+                    &body,
+                    crate::ccl::free_names::Reads {
+                        loop_positions: false,
+                        ..crate::ccl::free_names::EVERY_READ
+                    },
+                );
             }
             if !binder_spelled_in_a_type
                 && binding.name.is_anf_temp()
@@ -1632,7 +1618,7 @@ fn beta_reduce(
 
 /// `body` with each `let` binding a name in `names` renamed fresh, so a term reading those
 /// names can be substituted into it without capture.
-fn refresh_lets_binding(mut body: Expr, names: &HashSet<Name>) -> Expr {
+fn refresh_lets_binding(mut body: Expr, names: &std::collections::BTreeSet<Name>) -> Expr {
     if names.is_empty() {
         return body;
     }

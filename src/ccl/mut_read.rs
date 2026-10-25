@@ -763,7 +763,7 @@ pub(crate) fn reveal(root: &mut Expr) {
     let mut definiens = Definiens::new();
     let mut last = Vec::new();
     number(root, &loops, &mut definiens, &mut last);
-    let everywhere = crate::ccl::well_scoped::free_names(root);
+    let everywhere = free_names_in_value(root);
     reveal_go(
         root,
         &mut Vec::new(),

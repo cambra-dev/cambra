@@ -22,12 +22,9 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
-#[cfg(debug_assertions)]
-use crate::ccl::{BindingTransparency, Type, TypedExprNode, subst::type_free_vars};
-use crate::ccl::{Expr, Name};
+use crate::ccl::{BindingTransparency, Expr, Name, Type, TypedExprNode, subst::type_free_vars};
 
 /// A name a type slot reads that nothing around the slot binds.
-#[cfg(debug_assertions)]
 #[derive(Debug, Clone)]
 struct Violation {
     name: Name,
@@ -66,9 +63,8 @@ impl Scope {
 
 /// Every name a type slot in `root` reads that neither a term binder around the slot, nor
 /// `root`'s own free names, nor an opaque `let` binds.
-#[cfg(debug_assertions)]
 fn violations(root: &Expr) -> Vec<Violation> {
-    let mut everywhere = free_names(root);
+    let mut everywhere = crate::ccl::ccl_utils::free_names_in_value(root);
     opaque_lets(root, &mut everywhere);
     let mut out = Vec::new();
     walk(root, &mut Scope::default(), &everywhere, &mut out);
@@ -77,7 +73,6 @@ fn violations(root: &Expr) -> Vec<Violation> {
 
 /// Panic on a type slot in `root` that reads a generalized type parameter no `Poly` in the slot
 /// binds.
-#[cfg(debug_assertions)]
 fn params_bound(root: &Expr, boundary: &str) {
     root.walk_type_slots(|ty| {
         if let Some(p) = crate::ccl::generalize::free_params(ty).first() {
@@ -94,7 +89,6 @@ fn params_bound(root: &Expr, boundary: &str) {
 
 /// Panic on any [`violations`] of `root` at `boundary`, or on a generalized type parameter read
 /// outside its `Poly` ([`params_bound`]).
-#[cfg(debug_assertions)]
 pub(crate) fn assert_well_scoped(root: &Expr, boundary: &str) {
     params_bound(root, boundary);
     let found = violations(root);
@@ -115,7 +109,6 @@ pub(crate) fn assert_well_scoped(root: &Expr, boundary: &str) {
 
 /// The innermost node, among the terms `ty` quotes, whose own type reads `name` free, with
 /// that type: where a leaked read was minted, which the outer slot only carries.
-#[cfg(debug_assertions)]
 fn innermost_reader(ty: &Type, name: &Name) -> Option<(String, Type)> {
     fn in_type(ty: &Type, name: &Name) -> Option<(String, Type)> {
         let mut found = None;
@@ -145,7 +138,6 @@ fn innermost_reader(ty: &Type, name: &Name) -> Option<(String, Type)> {
     in_type(ty, name)
 }
 
-#[cfg(debug_assertions)]
 fn walk(e: &Expr, scope: &mut Scope, everywhere: &BTreeSet<Name>, out: &mut Vec<Violation>) {
     // A `for` loop's target is typed under its position, which its element's type may read.
     let (position, target_slots): (Option<&Name>, Vec<*const Type>) = match &e.node {
@@ -180,29 +172,7 @@ fn walk(e: &Expr, scope: &mut Scope, everywhere: &BTreeSet<Name>, out: &mut Vec<
     });
 }
 
-/// The names `root`'s terms read that no binder in it binds: its sources and sinks.
-pub(crate) fn free_names(root: &Expr) -> BTreeSet<Name> {
-    fn go(e: &Expr, scope: &mut Scope, out: &mut BTreeSet<Name>) {
-        for_each_scoped_item(e, &mut |item| match item {
-            ScopedItem::VarRef(n) => {
-                if n.pi_bound_index().is_none() && !scope.contains(n) {
-                    out.insert(n.clone());
-                }
-            }
-            ScopedItem::KeyRef(_) => {}
-            ScopedItem::Child { expr, binders } => {
-                let names: Vec<Name> = binders.iter().map(|b| b.name.clone()).collect();
-                scope.with(&names, |scope| go(expr, scope, out));
-            }
-        });
-    }
-    let mut out = BTreeSet::new();
-    go(root, &mut Scope::default(), &mut out);
-    out
-}
-
 /// Every opaque `let` binder in `e`.
-#[cfg(debug_assertions)]
 fn opaque_lets(e: &Expr, out: &mut BTreeSet<Name>) {
     if let TypedExprNode::Let { binding, .. } = &e.node
         && binding.transparency == BindingTransparency::Opaque
