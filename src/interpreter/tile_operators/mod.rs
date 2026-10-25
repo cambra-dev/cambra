@@ -446,11 +446,21 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
             // key's value at every position it has decided. Its changelog is only how it
             // answers — reclaiming a released prefix keeps every carry source a live
             // position folds to, so the answers outside what was released do not move.
-            Tile::Store { .. } => {
+            Tile::Store {
+                state,
+                decided,
+                frontier,
+                ..
+            } => {
                 use crate::interpreter::commit_operator::{
                     store_decided_positions, store_frontier, store_seed_value, store_value_at,
                 };
                 use crate::interpreter::operator_conversion::store_key;
+                let part = |name: &str| {
+                    let mut l = label.to_vec();
+                    l.push(SmolStr::new(name));
+                    l
+                };
                 for (row, path) in rows.iter().enumerate() {
                     let Some(path) = path else { continue };
                     let one = tile.select_rows(&[row]);
@@ -460,22 +470,21 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                     // checks on its own.
                     let complete = true;
                     let entry = |value: EntryValue| Entry { value, complete };
-                    let at_label = |name: &str| {
-                        let mut l = label.to_vec();
-                        l.push(SmolStr::new(name));
-                        l
-                    };
                     entries.insert(
-                        (at_label("frontier"), path.clone()),
+                        (part("frontier"), path.clone()),
                         Entry {
                             value: EntryValue::Frontier(store_frontier(&one)),
                             complete: false,
                         },
                     );
-                    let Tile::Store { decided, .. } = &one else {
+                    let Tile::Store {
+                        decided: row_decided,
+                        ..
+                    } = &one
+                    else {
                         unreachable!("a store's rows are stores")
                     };
-                    let positions = store_decided_positions(decided, 0);
+                    let positions = store_decided_positions(row_decided, 0);
                     let names: Vec<SmolStr> = one.store_keys().cloned().collect();
                     for name in names {
                         let key = store_key(&crate::ccl::Label::from_runtime_key(&name));
@@ -483,7 +492,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                         // keeps it.
                         let seed = store_seed_value(&one, &key);
                         entries.insert(
-                            (at_label(&format!("seed.{name}")), path.clone()),
+                            (part(&format!("seed.{name}")), path.clone()),
                             Entry {
                                 complete: seed.is_some(),
                                 value: EntryValue::Value(seed),
@@ -493,7 +502,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                             let mut at = path.clone();
                             at.push(position.value().clone());
                             entries.insert(
-                                (at_label(&name), at),
+                                (part(&name), at),
                                 entry(EntryValue::Value(store_value_at(&one, position, &key))),
                             );
                         }
@@ -503,22 +512,8 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 // statement of its own, and that statement is held to the contract like any
                 // other collection's. A release of the store names its positions, which are
                 // each part's keys, so a reclaimed prefix leaves every part as released.
-                let Tile::Store {
-                    state,
-                    decided,
-                    frontier,
-                    ..
-                } = tile
-                else {
-                    unreachable!("matched as a store")
-                };
                 let Tile::Record { fields: logs, .. } = &**state else {
                     unreachable!("a store's state is a record of per-key changelogs")
-                };
-                let part = |name: &str| {
-                    let mut l = label.to_vec();
-                    l.push(SmolStr::new(name));
-                    l
                 };
                 for (name, log) in logs {
                     let label = part(&format!("#changelog.{name}"));
