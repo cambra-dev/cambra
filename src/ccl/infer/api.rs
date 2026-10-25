@@ -2248,13 +2248,7 @@ fn collect_anf_temps<'e>(expr: &'e Expr, out: &mut HashMap<Name, &'e Expr>) {
         bound_expr,
         ..
     } = &expr.node
-        && matches!(
-            binding.name,
-            Name::Synthetic {
-                kind: crate::ccl::names::SyntheticKind::AnfTemp,
-                ..
-            }
-        )
+        && binding.name.is_anf_temp()
     {
         out.insert(binding.name.clone(), bound_expr);
     }
