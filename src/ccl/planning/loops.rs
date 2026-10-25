@@ -1100,10 +1100,6 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         source,
         body: writer_body,
     };
-    // Only the key *names* are read downstream. Cloning the `TransactKey`s
-    // would deep-clone every seed expression and then discard the copies, which
-    // costs a stranded row per node of every accumulator seed.
-    let key_names_for_reads: Vec<Name> = keys.iter().map(|k| k.name.clone()).collect();
     let mut transact = Expr::new(TypedExprNode::Transact {
         keys,
         writers: vec![writer],
@@ -1128,9 +1124,6 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
             hist: &hist,
             hist_ty: &hist_ty,
             enclosing: enclosing.as_ref(),
-            keys: &key_names_for_reads,
-            acc_tys: &acc_tys,
-            domain_ty: &domain_ty,
         },
     );
     assert_eq!(
@@ -1149,9 +1142,6 @@ struct HistReads<'a> {
     hist: &'a Name,
     hist_ty: &'a Type,
     enclosing: Option<&'a Type>,
-    keys: &'a [Name],
-    acc_tys: &'a [Type],
-    domain_ty: &'a Type,
 }
 
 /// Key `field`'s history `Fun(D, V)` read off the `Transact`: the projection `__hist.field` of a
@@ -1433,13 +1423,7 @@ fn history_read_replacement(
     b: Option<&TypedExprNode>,
     reads: &HistReads<'_>,
 ) -> Option<(Expr, usize)> {
-    let HistReads {
-        hist_ty,
-        keys,
-        acc_tys,
-        domain_ty,
-        ..
-    } = *reads;
+    let hist_ty = reads.hist_ty;
     match (a, b) {
         // An accumulator read `` __hist ≫ variant_project(`commit) ≫ .writes ≫ .acc ``.
         // Both projections are named now that the write set is keyed by accumulator,
@@ -1448,13 +1432,7 @@ fn history_read_replacement(
             Some(TypedExprNode::Proj(ProjKey::Field(f))),
             Some(TypedExprNode::Proj(ProjKey::Field(acc))),
         ) if f == F_WRITES => {
-            let i = keys
-                .iter()
-                .position(|k| k.field_key() == *acc)
-                .unwrap_or_else(|| {
-                    panic!("letrec recognition: `.writes ≫ .{acc}` names no accumulator")
-                });
-            let field_ty = crate::ccl::ccl_utils::history_ty(domain_ty, &acc_tys[i]);
+            let field_ty = hist_ty_field(hist_ty, acc);
             Some((hist_field_read_of(reads, acc.clone(), field_ty), 2))
         }
         (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
