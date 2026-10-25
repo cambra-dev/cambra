@@ -76,15 +76,15 @@
 //!
 //! Type slots in the node's own scope. A node's `ty`, its `user_annotation`, a
 //! `Cast`'s `target`, a binder's type and the refinement predicates they carry
-//! are reached by the type walks each pass owns (`count_free_in_type`,
-//! `collect_type_fv`, `hash_type`, …), because the passes disagree about them on
-//! purpose — `count_free` counts occurrences in predicates, `is_free_in_value`
-//! deliberately does not. Those slots are
-//! [`TypedExpr::walk_ambient_type_slots`]'s. A slot that a binder of the node
-//! scopes over, a `For` target's type under the position, is yielded here as a
-//! [`ScopedItem::TypeSlot`], so a walk reading names in types reads it under that
-//! binder. Every other item is about the *term* spine's binding structure,
-//! matching `walk_children`.
+//! are reached by the type walks each pass owns (`hash_type`, …). The binders
+//! inside a type, and which names a type reads free, are
+//! [`crate::ccl::free_names`]'s, which asks whether to read type slots at all:
+//! `count_free` counts occurrences in predicates, `is_free_in_value` deliberately
+//! does not. Those slots are [`TypedExpr::walk_ambient_type_slots`]'s. A slot that
+//! a binder of the node scopes over, a `For` target's type under the position, is
+//! yielded here as a [`ScopedItem::TypeSlot`], so a walk reading names in types
+//! reads it under that binder. Every other item is about the *term* spine's
+//! binding structure, matching `walk_children`.
 
 use super::{Generator, Name, Type, TypedBinding, TypedExpr, TypedExprNode};
 

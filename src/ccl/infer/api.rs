@@ -2575,12 +2575,10 @@ fn collect_type_errors(
             // refinement) is a DAG, so this dedups it. (Immutable predicates
             // are acyclic — dedup, not cycle-breaking.)
             //
-            // The same visited-set pattern lives in
-            // [`crate::ccl::ccl_utils::count_free_in_type_with_visited`] and
-            // [`crate::ccl::lambda_elim`]'s own predicate walk (both via
-            // [`crate::ccl::ccl_utils::walk_refined_predicates`]). This site
-            // doesn't share the helper because it mixes per-node error checks
-            // with the refinement walk.
+            // The same visited-set pattern lives in `crate::ccl::free_names`'s `Walk::quoted`
+            // and in [`crate::ccl::lambda_elim`]'s own predicate walk (via
+            // [`crate::ccl::ccl_utils::walk_refined_predicates`]). This site doesn't share
+            // either because it mixes per-node error checks with the refinement walk.
             for refinement in refinements {
                 if seen_refinements.insert(refinement.predicate_id()) {
                     // A predicate holding its own `defer` is in source form until it is
