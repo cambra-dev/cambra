@@ -352,24 +352,24 @@ where
         // ---- Binding nodes --------------------------------------------------
         N::Lambda { param, body } => under(f, body, Binders::One(param)),
 
+        // `bound_expr`, `init` or `iter` sits outside the binder's scope (a seed cannot
+        // reference the variable it seeds); the binder scopes over `body`.
         N::Let {
             binding,
-            bound_expr,
+            bound_expr: e,
             body,
-        } => {
-            open(f, bound_expr);
-            under(f, body, Binders::One(binding));
         }
-
-        // A mutable variable introduction scopes exactly like a `let`: `init` sits outside
-        // the binder — a seed cannot reference the variable it seeds — and
-        // `binding` scopes over `body`, which is where its writes and reads live.
-        N::MutDecl {
+        | N::MutDecl {
             binding,
-            init,
+            init: e,
+            body,
+        }
+        | N::For {
+            target: binding,
+            iter: e,
             body,
         } => {
-            open(f, init);
+            open(f, e);
             under(f, body, Binders::One(binding));
         }
 
@@ -380,11 +380,6 @@ where
                 under(f, def, group);
             }
             under(f, body, group);
-        }
-
-        N::For { target, iter, body } => {
-            open(f, iter);
-            under(f, body, Binders::One(target));
         }
 
         N::Case {

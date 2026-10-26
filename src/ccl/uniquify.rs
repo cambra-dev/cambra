@@ -355,32 +355,20 @@ impl Uniquifier {
                 self.unbind(base);
             }
 
-            // Non-recursive `let`: the bound expression sees the outer scope.
+            // Non-recursive: the bound expression or seed is walked in the outer scope, then
+            // the name is minted over the body. A mutable variable's `MutWrite`s and reads
+            // live in that body and resolve to the α-unique name the write-target map keys on.
             TypedExprNode::Let {
                 binding,
-                bound_expr,
+                bound_expr: e,
                 body,
-            } => {
-                self.expr(bound_expr);
-                self.binding_tys(binding);
-                let home = if top_level { self.home.clone() } else { None };
-                let base = self.bind_in(binding, home);
-                self.top_level = top_level;
-                self.expr(body);
-                self.unbind(base);
             }
-
-            // A mutable variable introduction binds exactly like a `let`: the seed is
-            // walked *outside* the binder's scope (a seed cannot reference the
-            // register it seeds), then the name is minted over the body — which is
-            // where its `MutWrite`s and reads live, and they must resolve to this
-            // binder's α-unique name for the write-target map to key on.
-            TypedExprNode::MutDecl {
+            | TypedExprNode::MutDecl {
                 binding,
-                init,
+                init: e,
                 body,
             } => {
-                self.expr(init);
+                self.expr(e);
                 self.binding_tys(binding);
                 let home = if top_level { self.home.clone() } else { None };
                 let base = self.bind_in(binding, home);
