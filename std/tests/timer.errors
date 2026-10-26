@@ -1,0 +1,42 @@
+Error: lowering error
+    ╭─[tests/timer.cambra:13:9]
+    │
+ 13 │         expiries::register(line, time::now() + time::minutes(30))
+    │         ────────────────────────────┬────────────────────────────  
+    │                                     ╰────────────────────────────── a `with begin():` block supports mutable writes (`x := …`, `x += …`), local bindings (`x = …`), `if cond:` guards, `match` dispatch, and feeds (`out << e`). A declaration goes above the block, `@LoadFrom` included: its value is the predecessor's, read once at the swap
+────╯
+Error: lowering error
+    ╭─[<std>/time.cambra:44:5]
+    │
+ 44 │ pub type Instant = Int
+    │     ─────────┬─────────  
+    │              ╰─────────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/time.cambra:54:5]
+    │
+ 54 │ pub type Duration = Int
+    │     ──────────┬─────────  
+    │               ╰─────────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/time/timer.cambra:80:56]
+    │
+ 80 │ pub def register(key: Key, at: time::Instant) requires Transaction:
+    │                                                        ─────┬─────  
+    │                                                             ╰─────── `requires Transaction` is not supported yet: transactions as contextual parameters are not implemented
+────╯
+Error: lowering error
+    ╭─[<std>/time/timer.cambra:92:43]
+    │
+ 92 │ pub def cancel(key: Key) => Bool requires Transaction:
+    │                                           ─────┬─────  
+    │                                                ╰─────── `requires Transaction` is not supported yet: transactions as contextual parameters are not implemented
+────╯
+Error: lowering error
+     ╭─[<std>/time/timer.cambra:101:61]
+     │
+ 101 │ pub def pending(key: Key) => Option(time::Instant) requires Transaction:
+     │                                                             ─────┬─────  
+     │                                                                  ╰─────── `requires Transaction` is not supported yet: transactions as contextual parameters are not implemented
+─────╯
