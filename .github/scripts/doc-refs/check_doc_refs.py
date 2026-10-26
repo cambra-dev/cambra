@@ -7,10 +7,10 @@ Three checks, run together (see `.github/scripts/doc-refs/README.md`):
      to a file that exists, and when it carries a `#fragment` into a Markdown
      file, that anchor exists among the target's headings (GitHub slug rules).
 
-  B. prose -> doc section: every `<name>.md` mentioned in a Rust *comment* or in
-     doc prose resolves to a doc that exists, and any section title quoted
-     immediately after it (the checkable citation convention) exists as a
-     heading in that doc.
+  B. prose -> doc section: every `<name>.md` mentioned in a Rust *comment*, a
+     CHL comment, or doc prose resolves to a doc that exists, and any section
+     title quoted immediately after it (the checkable citation convention)
+     exists as a heading in that doc.
 
   C. doc -> source: every backtick source-path mention in doc prose (e.g.
      `ast.rs`, `src/ccl/lower/loops.rs`) resolves to a file that exists. A line
@@ -408,17 +408,22 @@ _DANGLING_QUOTE = re.compile(_GLUE + _WRAP + '"')
 
 
 def check_doc_citations(repo: Repo, problems: list[Problem]) -> int:
-    """Check B over both places the quoted-title convention is written: Rust
-    comments, and doc prose (a doc citing a *section* of another doc names it
-    the same way). A link is the better form in a doc and check A validates it
+    """Check B over every place the quoted-title convention is written: Rust
+    comments, CHL comments, and doc prose (a doc citing a *section* of another
+    doc names it the same way). A link is the better form in a doc and check A validates it
     end to end — but the quoted form is what rots unnoticed, so it is the one
     that needs checking."""
     checked = 0
     for rel in repo.files:
-        if rel.suffix not in (".rs", ".md"):
+        if rel.suffix not in (".rs", ".md", ".cambra"):
             continue
         text = repo.read(rel)
-        units = _rust_comments(text) if rel.suffix == ".rs" else [_doc_prose(text)]
+        if rel.suffix == ".rs":
+            units = _rust_comments(text)
+        elif rel.suffix == ".cambra":
+            units = _chl_comments(text)
+        else:
+            units = [_doc_prose(text)]
         for unit in units:
             for m in _MD_REF.finditer(unit.text):
                 written = m.group(1)
@@ -626,6 +631,33 @@ def _rust_comments(text: str):
             i = _skip_char_or_lifetime(text, i)
         else:
             i += 1
+
+
+# A CHL comment line: `#` as the line's first non-blank character. The marker
+# and the one space after it carry no prose.
+_CHL_COMMENT_LINE = re.compile(r"^[ \t]*# ?")
+
+
+def _chl_comments(text: str):
+    """Yield every run of consecutive full-line `#` comments in a CHL source as
+    a `Prose` run, markers stripped.
+
+    A comment trailing code on its line is not read: telling its `#` from one
+    inside a string literal needs the lexer, and the std and sketch sources
+    keep citations in full-line comments.
+    """
+    start_line, parts = 0, []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        m = _CHL_COMMENT_LINE.match(line)
+        if m is not None:
+            if not parts:
+                start_line = lineno
+            parts.append(line[m.end() :])
+        elif parts:
+            yield Prose(start_line, "\n".join(parts))
+            parts = []
+    if parts:
+        yield Prose(start_line, "\n".join(parts))
 
 
 def _skip_string(text: str, i: int) -> int:

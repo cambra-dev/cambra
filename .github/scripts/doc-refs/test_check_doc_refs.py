@@ -288,6 +288,50 @@ class TestDocProseCitations(CheckerCase):
         )
 
 
+class TestChlComments(CheckerCase):
+    """A citation in a CHL `#` comment is checked as one in a Rust comment is."""
+
+    DOC = "# Importing asserts no IO\n"
+
+    def test_wrapped_citation_in_a_chl_comment_passes(self):
+        self.assertClean(
+            {
+                "d.md": self.DOC,
+                "m.cambra": """
+                    # Imported, so it holds no state (d.md, "Importing
+                    # asserts no IO").
+                    pub def f() => Int:
+                        1
+                    """,
+            }
+        )
+
+    def test_stale_citation_in_a_chl_comment_is_caught(self):
+        self.assertOneProblem(
+            {
+                "d.md": self.DOC,
+                "m.cambra": """
+                    pub def f() => Int:
+                        1
+
+                    # See d.md, "Running".
+                    pub def g() => Int:
+                        2
+                    """,
+            },
+            "m.cambra:4",
+            'cited section "Running" not found',
+        )
+
+    def test_a_trailing_comment_is_not_read(self):
+        self.assertClean(
+            {
+                "d.md": self.DOC,
+                "m.cambra": 'x = "#"   # d.md, "Running"\n',
+            }
+        )
+
+
 class TestClaudeDirectory(CheckerCase):
     """The committed parts of `.claude/` are docs like any other; its uncommitted
     `worktrees/` holds whole checkouts and is never read."""

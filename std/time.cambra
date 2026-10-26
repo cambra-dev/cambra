@@ -1,0 +1,143 @@
+# Wall-clock time: the current instant, durations between instants, and conversions to and from
+# integer counts.
+#
+# `std::time` declares no state and opens no source, so a module imports it
+# (docs/chl-spec.md, "9.7 Importing asserts no IO and no state"). `wait_until` holds a loop's
+# element until an instant; a timer that can be replaced or cancelled is `std::time::timer`, a
+# separate module because it holds state.
+#
+# An `Instant` is a point on the UTC timeline. Instants read by different processes, before and
+# after a restart, compare as points on that timeline. `Instant` is unrelated to the builtin `Time`,
+# a position in the commit order (docs/chl-spec.md, "6. Types (informal sketch)"). `std::time` has
+# no calendar: a day is 86,400 seconds, and time zones, leap seconds and daylight saving are out of
+# scope.
+#
+# Both types count nanoseconds in an `Int`: an `Instant` since the Unix epoch, 1970-01-01T00:00:00Z,
+# and a `Duration` of elapsed time. The count is part of the contract, as Go's `time.Duration` is
+# an `int64` of nanoseconds, so `Duration::new` and `extract` are the conversions in nanoseconds,
+# and the named conversions below cover the other units. Only `now()` and `wait_until` read the
+# runtime.
+#
+# Example, a deadline 30 minutes after a request, kept for a later transaction to compare against:
+#
+#     import std::time
+#
+#     deadlines: Mut(Map(String, time::Instant), Txn) := empty_map()
+#
+#     for r in requests:
+#         with begin():
+#             deadlines[r.id] := time::now() + time::minutes(30)
+#
+# Status: proposed, not in the spec. The std root it belongs to is [Planned] (docs/chl-spec.md,
+# "9.16 The std root"). `[proposed]` marks each construct the compiler lacks.
+
+# A point on the UTC timeline: nanoseconds since the Unix epoch, negative before it.
+#
+# Instants compare with `==` and `!=`, and order with `<`, `<=`, `>` and `>=`.
+# `Instant + Duration` and `Instant - Duration` are `Instant`s, and `Instant - Instant` is a
+# `Duration`.
+#
+# [proposed] a nominal type declared in a module other than the root, which the compiler refuses
+# (docs/chl-spec.md, "Nominal type identity"); and the comparison traits and the operators on a
+# declared nominal type (docs/chl-spec.md, "A nominal type is opaque": which traits a declared
+# nominal type satisfies is Open).
+pub type Instant = Int
+
+# A length of time in nanoseconds: positive, zero or negative.
+#
+# Durations compare, add and subtract. `Duration * Int` is a `Duration`, and
+# `Duration // Duration` is the `Int` count of whole divisor lengths in the dividend, rounded toward
+# negative infinity as `Int` division is. Division by a zero `Duration` is undefined, as `Int`
+# division by zero is (docs/chl-spec.md, "Partiality is not yet defined [Open]").
+#
+# [proposed] as `Instant`.
+pub type Duration = Int
+
+# Returns the current instant, as read by the enclosing transaction.
+#
+# Every call in one transaction returns the same instant, so a decision commits with the one clock
+# reading it rests on. A call outside a `with begin():` block does not type-check, because no
+# transaction is in scope there.
+#
+# Readings come from the runtime's wall clock, which can step backwards. Two transactions' readings
+# are ordered by nothing: a transaction that commits after another may read an earlier instant.
+#
+# [proposed] `requires Transaction` (docs/chl-spec.md, "8.7 Direction [Decided]: transactions as
+# contextual parameters"), and binding the intrinsic `__now`, a name "9.15 Module files" refuses in
+# user modules.
+pub def now() => Instant requires Transaction:
+    __now()
+
+# Holds the enclosing loop's element until the clock passes `at`, then lets the loop body go on.
+#
+# The wait comes before any transaction in the body, and the transaction after it reads state that
+# may have changed while the element was held: the end of a wait is a reminder to check, never a
+# decision. An instant already passed does not hold the element. A held element is durable: one
+# held at a crash or a reload is held after it, and every element whose instant passed during
+# downtime goes on at once. Held elements of one loop go on in no defined order.
+#
+# An element goes on at a later instant than it arrived, so a cycle of feeds that crosses a
+# `wait_until` reads only earlier elements of itself, as a `get_prev_*` call does.
+#
+# [proposed] a call that holds its loop's element, valid in a loop body outside a transaction; a
+# cycle of feeds whose causal edge is `wait_until` (src/ccl/design/mutability.md,
+# "`LetRec`": its well-formedness rule admits only a `get_prev_*` call); and binding the intrinsic
+# `__wait_until`, a name "9.15 Module files" refuses in user modules.
+pub def wait_until(at: Instant):
+    __wait_until(at)
+
+# --- Durations ----------------------------------------------------------------------------------
+
+# Returns a duration of `n` nanoseconds.
+pub def nanoseconds(n: Int) => Duration:
+    Duration::new(n)
+
+# Returns a duration of `n` milliseconds.
+pub def milliseconds(n: Int) => Duration:
+    nanoseconds(1_000_000 * n)
+
+# Returns a duration of `n` seconds.
+pub def seconds(n: Int) => Duration:
+    nanoseconds(1_000_000_000 * n)
+
+# Returns a duration of `n` minutes.
+pub def minutes(n: Int) => Duration:
+    seconds(60 * n)
+
+# Returns a duration of `n` hours.
+pub def hours(n: Int) => Duration:
+    minutes(60 * n)
+
+# Returns a duration of `n` days of 86,400 seconds each.
+pub def days(n: Int) => Duration:
+    hours(24 * n)
+
+# Returns `d` in whole nanoseconds.
+pub def as_nanoseconds(d: Duration) => Int:
+    d.extract()
+
+# Returns `d` in whole milliseconds, rounded toward negative infinity.
+pub def as_milliseconds(d: Duration) => Int:
+    d.extract() // 1_000_000
+
+# Returns `d` in whole seconds, rounded toward negative infinity.
+pub def as_seconds(d: Duration) => Int:
+    d.extract() // 1_000_000_000
+
+# --- Unix time ----------------------------------------------------------------------------------
+
+# Returns the instant `n` nanoseconds after the Unix epoch.
+pub def from_unix_nanoseconds(n: Int) => Instant:
+    Instant::new(n)
+
+# Returns the instant `n` seconds after the Unix epoch.
+pub def from_unix_seconds(n: Int) => Instant:
+    from_unix_nanoseconds(1_000_000_000 * n)
+
+# Returns `t` as nanoseconds since the Unix epoch.
+pub def unix_nanoseconds(t: Instant) => Int:
+    t.extract()
+
+# Returns `t` as whole seconds since the Unix epoch, rounded toward negative infinity.
+pub def unix_seconds(t: Instant) => Int:
+    t.extract() // 1_000_000_000
