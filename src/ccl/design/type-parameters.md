@@ -206,7 +206,7 @@ and its **assumptions**: the requirements of the `requires` clauses in scope whe
 (`TraitObligation::assumptions`). `emit_let` puts a `Poly`'s requirements in scope over its
 right-hand side (`Typing::with_assumptions`), and `require_trait` gives each obligation those about
 its trait. An assumption is matched by equality: a contribution keeps the assumptions stating it at
-that position, a product compared with its record fields in a canonical order (`canonical_type`).
+that position, a product compared with its record fields in a canonical order (`Type::canonical`).
 
 A product of a generic use's variables, `{?𝑡, ?𝑢}` for a call of a definition requiring
 `Equatable({𝑇, 𝑈}, 𝑉)`, arrives when the use is instantiated, before its components have bounds,

@@ -14,7 +14,7 @@
 //! ([`ProgramLowering::create`]): a copy, with each `Run` replaced by the run it
 //! declares, uniquified with the run's home and a scope that maps each qualified
 //! spelling to the binder of the run it reaches. Each imported module has one
-//! shared run per distinct set of arguments its imports pass, the root has one
+//! shared import per distinct set of arguments its imports pass, the root has one
 //! run, and each `run` statement declares another.
 
 mod imports;
@@ -29,7 +29,7 @@ pub use interface::*;
 pub use link::*;
 pub(super) use parameters::*;
 pub use scope::*;
-use types::*;
+pub(super) use types::*;
 
 use super::{
     AliasAt, DeclaredSink, LoweringContext, LoweringError, LoweringResult, finish_program,
@@ -40,13 +40,15 @@ use crate::ccl::load::LoadedProgram;
 use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType};
 use crate::ccl::names::QualifiedName;
 use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
+use crate::ccl::ty::{TypeParam, TypeParamId};
 use crate::ccl::uniquify;
 use crate::ccl::{
-    Expr, Home, KeyArgument, Label, Lit, Name, RunPath, SharedRun, Type, TypedExprNode,
+    Expr, Home, KeyArgument, Label, Lit, Name, RunPath, SharedImport, Type, TypeKeys, TypedExprNode,
 };
 use crate::chl_parser::ast::{
     AssignTarget, Expr as ChlExpr, KeywordArg, Lit as ChlLit, Module as ChlModule,
-    QualifiedName as ParserQualifiedName, Span, Spanned, Stmt as ChlStmt, UnaryOp, WrittenPath,
+    QualifiedName as ParserQualifiedName, Span, Spanned, Stmt as ChlStmt, UnaryOp, UseItem,
+    VariantPayload, WrittenPath,
 };
 use crate::chl_parser::{FileId, ModulePath, SurfaceBuiltin};
 use smol_str::SmolStr;

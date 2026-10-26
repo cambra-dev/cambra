@@ -306,7 +306,7 @@ pub enum Stmt {
     /// `return value` (only valid inside a function body; not enforced here).
     Return(Option<Spanned<Expr>>),
 
-    /// `import a::b(arg=e, …) as c use f, T as U` — bind the shared run of a
+    /// `import a::b(arg=e, …) as c use f, T as U` — bind the shared import of a
     /// module at its arguments (`docs/chl-spec.md`, "9.2 Imports"). `args` is
     /// empty for both `import m` and `import m()`.
     Import {

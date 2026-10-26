@@ -3430,6 +3430,22 @@ impl Type {
     /// the binder's presence — the rebuilt function types ([`Type::compute_fun_or_hole`],
     /// [`Type::fun`]) are constructed with `name: None`. If those sites ever
     /// preserve binders on rebuilt types, this helper can retire.
+    /// `self` with every record's fields and every sum's arms in key order, recursively:
+    /// the form two spellings of one type share when they differ only in that order.
+    pub fn canonical(&self) -> Type {
+        fn sort(ty: &mut Type) {
+            ty.walk_children_mut(sort);
+            match ty {
+                Type::Record(fields) => fields.sort_by(|(a, _), (b, _)| a.cmp(b)),
+                Type::Variant(arms, _) => arms.sort_by(|(a, _), (b, _)| a.cmp(b)),
+                _ => {}
+            }
+        }
+        let mut ty = self.clone();
+        sort(&mut ty);
+        ty
+    }
+
     pub fn without_pi_names(&self) -> Type {
         match self {
             Type::Fun {

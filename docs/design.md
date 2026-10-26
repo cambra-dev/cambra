@@ -150,7 +150,7 @@ pipeline; individual pass contracts belong to the linked design documents.
 | Stage | Transformation |
 | --- | --- |
 | Load | `LoadedProgram::load`, before `run_frontend`: read the root and every module it imports or runs, parse each file to a recoverable CHL AST, and refuse module-graph cycles; see [loading](modules.md#loading) and [parser design](../chl-parser/design-chl-parser.md#stage-2--parser-parserrs). |
-| Lower | CHL AST to CCL, with annotations and source attribution; see [lowering](../src/ccl/design/lowering.md). Each module lowers once, to a chain of its top-level statements; linking creates each shared run and each run as its own uniquified copy of its module's chain, the shared runs around the root and each run at its `run` statement; see [a module lowers once](modules.md#a-module-lowers-once). |
+| Lower | CHL AST to CCL, with annotations and source attribution; see [lowering](../src/ccl/design/lowering.md). Each module lowers once, to a chain of its top-level statements; linking creates each shared import and each run as its own uniquified copy of its module's chain, the shared imports around the root and each run at its `run` statement; see [a module lowers once](modules.md#a-module-lowers-once). |
 | Uniquify | Give term binders distinct identities so later passes substitute without capture; see [structured names](../src/ccl/design/ir.md#structured-names-and-α-uniquification-barendregt-convention). |
 | A-normalize | `anf::run` names compound operands before inference. |
 | Name mutable reads | `mut_read::run` gives mutable reads immutable names that refinements can reference. |
