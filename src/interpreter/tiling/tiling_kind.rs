@@ -252,6 +252,8 @@ impl Tiling {
         }
     }
 
+    /// Whether a tile of this tiling fits in one column: a `Scalar`, or a `Record` of such
+    /// tilings at any depth, which `scalar_tile_to_column_value` turns into one column of records.
     pub fn is_scalar(&self) -> bool {
         match self {
             Tiling::Scalar(..) => true,

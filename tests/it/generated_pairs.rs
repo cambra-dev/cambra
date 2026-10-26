@@ -73,19 +73,6 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("nested_mut_source", "map_arrow", "CompilerPanics"),
     ("nested_mut_source", "map_lit", "CompilerPanics"),
     ("nested_mut_source", "union", "CompilerRejects"),
-    // The binder arm fuses into one column of records and the literal arm is a record of tiles;
-    // `UnionOperator::new` accepts arms of differing layout only one record level deep.
-    ("nested_record_branch", "nested_rec_lit", "CompilerPanics"),
-    (
-        "nested_record_comp_union",
-        "nested_rec_lit",
-        "CompilerPanics",
-    ),
-    (
-        "nested_record_mut_branch",
-        "nested_rec_lit",
-        "CompilerPanics",
-    ),
     ("record_in_list", "comp_sum", "CompilerRejects"),
     ("record_in_list", "filtered_sum", "CompilerRejects"),
     ("record_in_list", "generator_max", "CompilerRejects"),
@@ -1053,11 +1040,14 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "rec_comp_computed", ty: Ty::RecColl, needs: &[], decls: "", expr: "[(a=z * 2, b=z + 1) for z in [1, 2, 3]]" },
         Filler { name: "rec_comp_copied", ty: Ty::RecColl, needs: &[], decls: "", expr: "[(a=z, b=z // 2) for z in [1, 2, 3]]" },
         Filler { name: "rec_comp_of_rec", ty: Ty::RecColl, needs: &[], decls: "", expr: "[(a=r2.b, b=r2.a + r2.b) for r2 in [(a=1, b=2), (a=3, b=4)]]" },
-        // Nested records: a literal, one with computed fields, and one built from the binder and
-        // constants alone.
+        // Nested records: a literal, one with computed fields, one built from the binder and
+        // constants alone, and one whose inner field is an aggregate. The literal arrives as a
+        // record of tiles, and so does the one holding an aggregate, which ends the element-wise
+        // chain. The computed and copied ones fuse into one column of records.
         Filler { name: "nested_rec_lit", ty: Ty::NestedRec, needs: &[], decls: "", expr: "(a=1, n=(c=2, d=3))" },
         Filler { name: "nested_rec_computed", ty: Ty::NestedRec, needs: &[Ty::Int], decls: "", expr: "(a={b} + 1, n=(c={b} - 1, d=1))" },
         Filler { name: "nested_rec_copied", ty: Ty::NestedRec, needs: &[Ty::Int], decls: "", expr: "(a={b}, n=(c={b}, d=1))" },
+        Filler { name: "nested_rec_unfused", ty: Ty::NestedRec, needs: &[Ty::Int], decls: "", expr: "(a={b} + 1, n=(c=sum([z2 * {b} for z2 in [1, 2]]), d=1))" },
 
         // --- reading both binders in scope
         Filler { name: "two_binders", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "{b} + {c}" },
