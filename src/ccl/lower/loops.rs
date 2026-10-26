@@ -815,9 +815,8 @@ fn mutation_target_name(stmt: &Spanned<ChlStmt>) -> Option<&str> {
 /// The accumulator scans below walk statements, and a block right-hand side
 /// puts statements inside an expression, so a write in one of its branches is
 /// invisible to them without this. It is a loop-carried write like any other:
-/// `push_bindings_into_writing_cases` pushes the binding into the branches,
-/// which puts the write on a spine `transform_chain` merges into the writer
-/// decision.
+/// `WriterWalk` walks the bound `Case`'s branches as a statement `if`'s and
+/// merges the value it binds.
 fn block_value_stmt(stmt: &Spanned<ChlStmt>) -> Option<&Spanned<ChlStmt>> {
     let value = match &stmt.node {
         ChlStmt::Assign { value, .. }
@@ -859,7 +858,7 @@ pub(super) fn find_mutation_loop_vars(
 
 /// Recurse the accumulator scan into `if`/`elif`/`else` branches, `match` arms and inner
 /// `for` loops: a `+=` / `:=` under a conditional is still a loop-carried accumulator
-/// (`mut_elim::transform_chain` merges the paths into one writer decision), and one inside an
+/// (`mut_elim::WriterWalk` merges the paths into one writer decision), and one inside an
 /// inner loop is a write the nested recurrence carries. `with begin()` blocks are not entered:
 /// they carry their own transactional keys.
 fn collect_mutation_loop_vars(
@@ -1588,7 +1587,7 @@ fn lower_loop_body_chain_scoped(
             }
             // `if p: … [else: …]` — a conditional write path. Lowered to a
             // statement-position filter-`Case` (`[gᵢ → branchᵢ; true → else|unit]`).
-            // `mut_elim::transform_chain` merges its branches into one writer
+            // `mut_elim::WriterWalk` merges its branches into one writer
             // decision with a per-accumulator value-`Case`. See
             // `src/ccl/design/mutability.md`, "Value-selecting `Case` and
             // conditional induction writes (partially implemented)".
@@ -1680,7 +1679,7 @@ fn lower_loop_body_chain_scoped(
 /// lowered through [`lower_loop_body_chain`] (so nested writes and feeds lower
 /// identically to top-level ones); a missing `else` becomes an implicit
 /// `true → unit` carry-forward branch — the position where the accumulator
-/// keeps its previous value. `mut_elim::transform_chain` merges this `Case`'s
+/// keeps its previous value. `mut_elim::WriterWalk` merges this `Case`'s
 /// branches into one writer decision with a per-accumulator value-`Case`.
 fn build_loop_if_case(
     branches: &[IfBranch],
@@ -2222,7 +2221,7 @@ x";
     fn test_mutation_nested_in_if_else_now_lowers() {
         // A mutation nested under an `if`/`else` is a conditional induction
         // write — no longer rejected. Both legs become branches of the
-        // statement-position filter-`Case`, which `mut_elim::transform_chain`
+        // statement-position filter-`Case`, which `mut_elim::WriterWalk`
         // merges into one writer decision with a per-accumulator value-`Case`.
         let code = "\
 x := 0
@@ -2290,7 +2289,7 @@ f";
     /// A conditional induction write `if p: x += i` lowers the loop body to
     /// a statement-position filter-`Case` — the write leg under the guard and an
     /// implicit `true → unit` carry-forward branch — with the accumulator write a
-    /// `MutWrite` marker inside the guarded branch. `mut_elim::transform_chain`
+    /// `MutWrite` marker inside the guarded branch. `mut_elim::WriterWalk`
     /// merges these branches into one writer decision with a per-accumulator value-`Case`.
     #[test]
     fn test_lower_conditional_induction_write() {

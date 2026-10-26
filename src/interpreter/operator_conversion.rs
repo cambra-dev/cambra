@@ -465,6 +465,12 @@ pub struct OpConversionContext {
     /// Each entry is what that iteration was opened over, which is what lifts a reference
     /// made under it ([`lift_into_iteration`]).
     iterations: Vec<OpenIteration>,
+    /// How many key-narrowing steps ([`narrows_keys`](crate::ccl::simplify::narrows_keys)) of
+    /// an enclosing chain stand between
+    /// the term being converted and the input it is fed. A binding records it
+    /// ([`LetBinding::narrowed`]); a reference made under more of them holds a subset of
+    /// the binding's keys, so it reads the binding at those keys only.
+    narrowed: usize,
 }
 
 /// A nested iteration open around the term being converted.
@@ -820,6 +826,14 @@ pub(crate) struct LetBinding {
     /// than this reads a tile keyed by an iteration it is not running over, so it is
     /// lifted rather than read through ([`BindingKind`]).
     pub(crate) depth: usize,
+    /// How many key-narrowing steps stood above it
+    /// ([`OpConversionContext::narrowed`](field@OpConversionContext::narrowed)).
+    pub(crate) narrowed: usize,
+    /// The level its values stand at, or `None` for a binding made before any root conversion
+    /// set one. A reference converted deeper than this, after lifting through the iterations
+    /// opened since, stands under a comprehension's map and is lifted into it
+    /// ([`lift_into_map`]).
+    pub(crate) level: Option<CurryLevel>,
 }
 
 /// RAII scope guard for [`OpConversionContext`].
@@ -1126,8 +1140,16 @@ records one and the only site a `Transact` reaches"
             let fan = entry.fan().clone();
             self.record(node, entry);
             let depth = self.iterations.len();
-            self.scopes
-                .bind(name.clone(), LetBinding { fan, kind, depth });
+            self.scopes.bind(
+                name.clone(),
+                LetBinding {
+                    fan,
+                    kind,
+                    depth,
+                    narrowed: self.narrowed,
+                    level: self.level,
+                },
+            );
             return Ok(());
         }
 
@@ -1150,8 +1172,16 @@ records one and the only site a `Transact` reaches"
         // reader's decision, made where the operator would be taken.
         self.record(node, Recorded::Operator(fan.clone()));
         let depth = self.iterations.len();
-        self.scopes
-            .bind(name.clone(), LetBinding { fan, kind, depth });
+        self.scopes.bind(
+            name.clone(),
+            LetBinding {
+                fan,
+                kind,
+                depth,
+                narrowed: self.narrowed,
+                level: self.level,
+            },
+        );
         Ok(())
     }
 
@@ -1862,6 +1892,8 @@ fn convert_impl_inner(
         TypedExprNode::Compose(elems) => {
             let mut result = input;
             let mut rest = elems.as_slice();
+            // The steps after one that narrows the keys see a subset of the chain's input.
+            let mut narrowed_here = 0;
             // A nested store's read heads the chain as two elements, `__hist ≫ .k` or its
             // zip with the steps on its values, and is the leaf the rest takes.
             if let [head @ .., _] = elems.as_slice()
@@ -1903,8 +1935,13 @@ fn convert_impl_inner(
                     continue;
                 }
                 result = Some(convert_impl(elem, result.take(), ctx)?);
+                if crate::ccl::simplify::narrows_keys(elem) {
+                    ctx.narrowed += 1;
+                    narrowed_here += 1;
+                }
                 rest = after;
             }
+            ctx.narrowed -= narrowed_here;
             Ok(result.unwrap())
         }
 
@@ -2639,35 +2676,59 @@ fn convert_impl_inner(
         ),
 
         TypedExprNode::Var(name) => {
-            if let Some(binding) = ctx.lookup(name) {
-                let (kind, depth) = (binding.kind, binding.depth);
-                let op = binding.fan.slot();
-                // Aligned bindings already vary in lockstep with the
-                // surrounding iteration — return the FanOut slot directly.
-                // Free bindings are standalone functions; under an
-                // iteration we apply them pointwise via `MapResult`.
-                match (kind, input) {
-                    // An aligned use reads its binding directly, so the slot
-                    // the enclosing `Let` fanned for this position is surplus.
-                    // Dropping it here is all it takes: the graph is walked from
-                    // the sinks, and nothing holds this slot.
-                    (BindingKind::Aligned, _) if depth == ctx.iterations.len() => Ok(op),
-                    // Aligned to an iteration **outside** this one: the tile is keyed by
-                    // that iteration's positions where the consumer here runs over these,
-                    // so it is lifted once per iteration between the two. Read through,
-                    // the two domains disagree at whatever pairs them.
-                    (BindingKind::Aligned, _) => ctx.iterations[depth..]
+            let Some(binding) = ctx.lookup(name) else {
+                return Err(ConversionError::Unsupported(format!(
+                    "unrecognised Var({name}) in λ-free CCL"
+                )));
+            };
+            let op = binding.fan.slot();
+            let depth = binding.depth;
+            match binding.kind {
+                // A free binding is a standalone function: under an iteration it is applied
+                // pointwise via `MapResult`.
+                BindingKind::Free => Ok(match input {
+                    None => op,
+                    Some(input) => Box::new(MapResult::new_at(input, op, ctx.level())),
+                }),
+                BindingKind::Aligned => {
+                    // Aligned to an iteration outside this one: the tile is keyed by that
+                    // iteration's positions where the consumer here runs over these, so it is
+                    // lifted once per iteration between the two. Read through, the two
+                    // domains disagree at whatever pairs them.
+                    let op = ctx.iterations[depth..]
                         .iter()
-                        .try_fold(op, lift_into_iteration),
-                    (BindingKind::Free, None) => Ok(op),
-                    (BindingKind::Free, Some(input)) => {
-                        Ok(Box::new(MapResult::new_at(input, op, ctx.level())))
+                        .try_fold(op, lift_into_iteration)?;
+                    let lifted_level = binding
+                        .level
+                        .map(|bound_at| bound_at.index() + (ctx.iterations.len() - depth));
+                    match input {
+                        // Deeper still, the reference stands under a comprehension's map,
+                        // whose input holds a collection beneath each of the binding's rows.
+                        // Read through, the binding is one level short of whatever pairs it
+                        // with the map's values.
+                        Some(input)
+                            if let Some(from) = lifted_level
+                                && ctx.level().index() > from =>
+                        {
+                            lift_into_map(op, input, from, ctx.level())
+                        }
+                        // Under a key-narrowing step it was not bound under — a `Case` arm's
+                        // `filter_values`, a `variant_project` — the binding holds keys the
+                        // reader's input does not. Pairing the two keeps the binding's values
+                        // at the input's keys, which `Zip` intersects.
+                        Some(input)
+                            if depth == ctx.iterations.len() && ctx.narrowed > binding.narrowed =>
+                        {
+                            let level = ctx.level();
+                            proj_field(zip_arms_at(vec![input, op], level), 1, level)
+                        }
+                        // Read through: the binding already varies in lockstep with the
+                        // surrounding iteration, so the slot the enclosing `Let` fanned for
+                        // this position is surplus. Dropping it is all it takes: the graph is
+                        // walked from the sinks, and nothing holds this slot.
+                        _ => Ok(op),
                     }
                 }
-            } else {
-                Err(ConversionError::Unsupported(format!(
-                    "unrecognised Var({name}) in λ-free CCL"
-                )))
             }
         }
 
@@ -5395,6 +5456,27 @@ fn lift_into_iteration(
         &tuple_field(0),
         CurryLevel::new(open.paired.index() + 1),
     )
+}
+
+/// Lift `op`, holding one value per row at `from`, into the keys `input` holds beneath each
+/// of those rows, one level at a time down to `to`: the reference a comprehension's map makes
+/// to a binding outside it.
+///
+/// As in [`lift_into_iteration`], the binding stays the one tile it already is, paired with
+/// the keys under each of its rows ([`Product`]) and read back off the pair. Only the keys of
+/// `input` are read: at a row, the map's input is the binding's own row paired with each
+/// element (`strength_over`), so the binding's value there is the value the reference wants.
+fn lift_into_map(
+    op: Box<dyn TileOperator>,
+    input: Box<dyn TileOperator>,
+    from: usize,
+    to: CurryLevel,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let keys = Rc::new(FanOut::new(input));
+    (from..to.index()).try_fold(op, |op, level| {
+        let paired = Box::new(Product::per_row_at(op, keys.slot(), CurryLevel::new(level)));
+        proj_named_field(paired, &tuple_field(0), CurryLevel::new(level + 1))
+    })
 }
 
 /// Build an operator that extracts a named field from the record codomain of `input`.

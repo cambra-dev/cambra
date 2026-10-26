@@ -81,14 +81,13 @@ inferred, always spelled at the introduction). A `:=` inside a `for` body introd
 domain is nested within the enclosing loop's, and the nested `Transact` is what carries it: the
 introduction seeds the read-your-writes environment, an inner `for` that writes it folds it into its
 own recurrence, and a statement after that loop reads the final value. `body_introduced_mut_vars`
-in `lower/loops.rs` names them and `transform_chain`'s `MutDecl` arm in `mut_elim.rs` seeds them.
+in `lower/loops.rs` names them and the `MutDecl` arm of `mut_elim.rs`'s `WriterWalk` seeds them.
 The variable restarts at its seed on the next iteration, the seed being re-evaluated there; the
 write set the enclosing loop carries never names it, so the enclosing store has no key for it.
 
-The scope is the block that writes it, so an `if` branch introduces one of its own. The chain
-`splice_after_unit` carries onto each branch goes *inside* the introduction, as it does inside a
-`let`: spliced after it instead, the whole introduction sits in effect position, where the walk
-dispatches on the effect and meets a `MutDecl` it has no arm for.
+The scope is the block that writes it, so an `if` branch introduces one of its own. The walk seeds
+it in that branch's environment, and the merge after the `if` covers only the variables bound before
+the `if`, so the introduction ends with the branch.
 
 Three introductions have no nested `Transact` to carry them. A **transactional** one inside a `for`
 body would need a `Txn` order per iteration, so it is rejected at lowering. One inside a loop that
@@ -805,39 +804,83 @@ Stateless programs never build a letrec — the phase degenerates to plain feed 
 
 #### Loop-body bindings
 
-A binding the loop body introduces stays a binding in the writer body. The walk that builds the
-writer (`mut_elim`'s `transform_chain`) threads a read-your-writes environment, and inlining a
-binding into that environment copies its value into every read: the chain `aₖ = aₖ₋₁ + aₖ₋₁` then
-costs a factor of two per binding, so the writer body is exponential in the loop body's length.
+One walk builds every writer body: `mut_elim`'s `WriterWalk`, for a mutation loop
+(`fold_induction_loop`) and for a `with begin():` block (`transact_phase::build_writer`). It threads
+a read-your-writes environment, and a binding the body introduces stays a binding in the writer
+body. Inlining a binding into that environment copies its value into every read, so the chain
+`aₖ = aₖ₋₁ + aₖ₋₁` costs a factor of two per binding and the writer body is exponential in the
+body's length. The same holds for a write's value, which the next write may read twice
+(`x := x + x`), for the initial value of a variable the body declares, and for the value an `if`
+merges for a variable, which the next `if` reads in each of its arms: the walk binds each to a
+fresh binder and the environment holds a read of it.
 
-Where the binding stands is decided by the domain its reads compile at, not by scope. Op-conversion
-compiles a `let`'s bound expression at the domain of the `let` and shares that one producer with
-every read, so a `let` is transparent to domain restriction only where nothing under it restricts.
-A value-`Case` arm restricts — `lambda_elim` compiles it to `filter_values(π̂) ≫ 𝑒` — so a read of
-an outer binding inside an arm takes values at the positions the arm excludes, and the union of the
-arms claims one domain key twice. A nested lambda is the same shape one level along: its body
-iterates at its own domain.
+A statement-`if` walks each branch from the environment it meets, then merges every variable a
+branch changed into `Case[𝑔ᵢ → 𝑣ᵢ; …; true → 𝑣]` over the branch guards, where `𝑣` is the value
+before the `if`. A branch's own bindings stay apart from the block's, because binding them around
+the decision would evaluate them on rows that never take the branch. Each value leaving the branch
+takes the ones it reads with it (`close_over`): a written value the merge reads, a feed, and a
+commit path. A binding the value reads once is substituted for the read.
 
-So each maximal sub-expression of the decision that restricts nothing is given the bindings it
-reads (`sink_prefix`), and a value the merge lifts out of a branch — a write set becoming a `Case`
-arm, a feed becoming a field on the top decision record — takes its bindings with it. The copies
-are bounded by those regions and by the number of bindings, where inlining is bounded by two to
-that number.
+Where two values leaving one branch read the same binding, each would take its own copy: an inner
+loop in a branch would run once per variable it writes. The walk then merges the `if` into one
+value instead (`WriterWalk::merge_as_tuple`): `__merge = Case[𝑔ᵢ → (𝑣ᵢ₁, …, 𝑣ᵢₙ, 𝑟ᵢ)]`, with the
+value a `let`-bound `if` ends in as one more slot. `𝑣ᵢⱼ` is what branch `𝑖` leaves the `𝑗`-th
+changed variable holding, and `𝑟ᵢ` is the path within the branch on which it commits. Each arm's
+tuple takes the branch's bindings once, and each variable, the commit gate and the bound value read
+their slot. A feed in the branch still takes its own copy, since an arm that does not reach it has no
+value of its type for a slot.
 
-Each copy is α-renamed. `lambda_elim` lifts a `let` out of the lambda that encloses it, so two
-copies in sibling positions of one writer body reach the same scope, where two bindings of one name
-shadow and the first copy's reads resolve to the second copy's value.
+A `let` bound to an `if` or a `match` whose branches write is walked the same way, and the value
+it binds merges as a variable does: `Case[𝑔ᵢ → 𝑣ᵢ]` over the values the branches end in, each
+taking its branch's bindings. Inside a writer body nothing pushes such a binding, or the statements
+after a statement `if`, into the branches (`mut_elim::push_writing_cases` and `flatten_spine`): a
+copy of the continuation per branch doubles the body at every `if`. Outside one, at the top level
+and in a function body, `push_binding_into_case` and `push_continuation_into_case` push them, since
+no writer walk merges the branches there.
 
-Two kinds of binding are inlined rather than kept:
+A branch records its commit and fire paths relative to itself. A path `𝑝` leaving branch `𝑖` becomes
+`Case[π̂ᵢ → 𝑝; true → false]` (`mut_elim::conjoin_path`), with `𝑝` closed over the branch's
+bindings. `lambda_elim` compiles the `Case` to restricts, so the branch's bindings and its nested
+guards are evaluated only where `π̂ᵢ` holds: `if i != 0: if 10 // i > 3: …` never divides by zero.
 
-- A **write**'s value (`x := 𝑒`), which advances the read-your-writes environment rather than
-  binding a name. Each write has one reader — the next write to that variable, or the write set —
-  so a `let` buys no sharing and costs op-conversion a fan-out of the writer input.
+A binding is read where it stands. Op-conversion compiles a `let`'s bound expression at the domain
+of the `let` and shares that one producer with every read. A read after a step that drops keys,
+such as the `filter_values(π̂) ≫ 𝑒` a value-`Case` arm compiles to, takes the producer's values at
+the reader's keys only. A read under a comprehension's map, one level deeper than the binding, takes
+them paired with the keys beneath each of the binding's rows
+([Let-bindings and `BindingKind`](../../interpreter/design-operators.md#let-bindings-and-bindingkind)).
+So a `Case` arm, a lambda, an aggregate and a cast all read the shared producer, and `sink_prefix`
+leaves the binding in place for them. A binding no read is left of is dropped.
+
+An inner loop's writer is the exception: it takes a copy of the bindings it reads (`close_over`),
+because a binding of the enclosing writer that combines one of the writer around it with the
+enclosing loop's own position (`v = t + j`), read in the inner loop, never completes when
+op-conversion lifts it through both iterations. A copy
+holds each binding once, as a `let` inside the writer where the binding is read more than once, so
+it is bounded by the number of bindings. The `let`s of a copy are α-renamed, since two copies in
+sibling positions of one writer body reach the same scope, where two bindings of one name shadow.
+
+The inner loop's history lambda (`λ __pos → let __prev = … ▷ get_prev_seq in …`) takes no copy.
+`sink_prefix` descends into it and gives copies to the lambdas, aggregates and casts beneath it, the
+inner writer among them. Its seed is the value entering the inner loop, evaluated at the enclosing
+position, where the binding stands. `lambda_elim` lifts a `let` out of the lambda that encloses it,
+to a function of the lambda's parameter, so a copy placed in the seed would make the seed read
+`__pos`, which letrec recognition refuses.
+
+The walk inlines four kinds of binding rather than keeping them:
+
 - An **opaque** binding (`x ^= 𝑒`), the read segment's snapshot `mut_read` mints. A refined mutable
   variable's contribution predicate names that binder — `{Int | __elem == __anf ^+ 1}` on the value
   the next segment writes — so keeping the binder leaves the predicate pointing at a `let` the
   point-free rebuild turns into a function of the writer parameter, whose codomain then references
   an enclosing function with no binder to open at (`subst::open_codomain`).
+- A value whose **type names a term**, such as that refined contribution, because a binder of that
+  type carries the name out of the value, into the tap type of a feed that reads it.
+- A value that **is a lambda or a cast**: bound at the writer's domain, a comprehension's collection
+  has a type reading the writer's parameter, which `lambda_elim` does not eliminate the parameter
+  from. An aggregate is kept, since its type is its result's.
+- A **literal**: it costs nothing to copy, and a list literal bound to a name reaches op-conversion
+  without the `iterate` planning puts before one it meets in place.
 
 ## Worked example
 
@@ -1332,25 +1375,28 @@ Every fan-out shares one first-match encoding, `πᵢ = 𝑔ᵢ ∧ ¬⋁ⱼ˂�
 `ccl_utils`, shared between channelize, the value fan-outs, and the transaction path walk).
 
 A **conditional induction write** takes a different, simpler route than the value fan-out: it rides
-the induction accumulator's own `` {`commit{writes} | `abort} `` **decision variant** rather than a union of
-restricted sources. `lower_loop_body_chain` lowers `if 𝑝: acc += e` to a statement-position `Case`
-(`[𝑝 → acc += e; true → unit]`), and `mut_elim::transform_chain`'s `Case` arm merges its
-branches into **one uniform, carry-complete writer decision over the full loop source**: a committing
-position is `` `commit(⟨writes⟩) `` and a full-carry (non-writing) position is `` `abort ``. The commit
-selector is `⋁ⱼ π̂ⱼ` (the disjunction of the writing branches' first-match guards — the value-`Case`
-guard that picks the `` `commit `` arm; `ccl_utils::wrap_decision_variant` folds it into the tag), and
-each accumulator's `writesᵢ = Case[π̂ⱼ → wⱼᵢ; …; true → snapshotᵢ]` — a per-accumulator value-`Case`
-whose trailing `true` arm is the **carry** (the entering accumulator). `` `abort `` positions are dropped
-from the changelog store (`InductionStore`, see `../../interpreter/design-operators.md`) — sparse —
-and the carry arm keeps the `` `commit `` payload **dense** (total at every committing position). So the `Overwrite`/`Feed` distinction and
-the carry-forward live *inside one decision on one writer* — no per-leg restricted source, no
-complement leg, and none of the cyclic-convergence hazard a restricted-source multi-leg realization
-carried. Recognition packages it as an ordinary single-writer `Transact`; op-conversion routes it to
-the changelog store, and reads fold the changelog densely (`StoreDenseRead`). The per-accumulator value-`Case` is value-selecting inside the writer lambda,
-compiled to the **value-preserving `filter_values` union-of-restricts** (`⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`;
-`Builtin::FilterValues` → the `Filter` tile op, flat-merged with `UnionOperator::new_flat`) — an
-off-path arm is never evaluated, so a **partial op** (`//`) in a written value never faults at a
-guard-rejected position. See `../../interpreter/design-operators.md`.
+the induction accumulator's own `` {`commit{writes} | `abort} `` **decision variant** rather than a
+union of restricted sources. `lower_loop_body_chain` lowers `if 𝑝: acc += e` to a statement-position
+`Case` (`[𝑝 → acc += e; true → unit]`), and the writer walk (`mut_elim::WriterWalk`, which builds a
+`with begin():` block's decision the same way) merges its branches into **one uniform,
+carry-complete writer decision over the full loop source**: a committing position is
+`` `commit(⟨writes⟩) `` and a full-carry (non-writing) position is `` `abort ``. The commit selector
+is the disjunction of the paths every write and feed is reached on
+(`ccl_utils::wrap_decision_variant` folds it into the tag), and each accumulator a branch writes
+merges to `Case[𝑔ⱼ → wⱼᵢ; …; true → 𝑣ᵢ]`, a value-`Case` whose trailing `true` arm is the
+**carry** (the accumulator's value before the `if`). `` `abort `` positions are dropped from the
+changelog store (`InductionStore`, see `../../interpreter/design-operators.md`), so it is sparse,
+and the carry arm keeps the `` `commit `` payload **dense** (total at every committing position). So
+the `Overwrite`/`Feed` distinction and the carry-forward live *inside one decision on one writer* —
+no per-leg restricted source, no complement leg, and none of the cyclic-convergence hazard a
+restricted-source multi-leg realization carried. Recognition packages it as an ordinary
+single-writer `Transact`; op-conversion routes it to the changelog store, and reads fold the
+changelog densely (`StoreDenseRead`). The per-accumulator value-`Case` is value-selecting inside
+the writer lambda, compiled to the **value-preserving `filter_values` union-of-restricts**
+(`⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`; `Builtin::FilterValues` → the `Filter` tile op, flat-merged with
+`UnionOperator::new_flat`) — an off-path arm is never evaluated, so a **partial op** (`//`) in a
+written value never faults at a guard-rejected position. See
+`../../interpreter/design-operators.md`.
 
 Both a **finite** loop and an **async** (streaming) source drive an induction accumulator — the
 model treats a finite domain as a stream that terminates (§Liveness) — and every induction accumulator
@@ -1426,10 +1472,10 @@ The value-`Case` positions ride the same union-of-restricts:
 ### General in-transaction conditionals (and conditional writes)
 
 A `with begin():` block admits `if`/`elif`/`else`, multiple sibling `if` guards, and `match`
-dispatch, compiled by a uniform **path-based** walk
-(`transact_phase::walk_block`/`walk_case`). A `match` reaches the walk as a guard-`Case`: the phase
-rewrites its arms to `variant_is` tests at the strip
-(`ccl_utils::statement_tag_cases_to_guards`), so an arm is a path like any other.
+dispatch, compiled by a uniform **path-based** walk (`mut_elim::WriterWalk`, the walk a mutation
+loop's body takes too). A `match` reaches the walk as a guard-`Case`: the phase rewrites its arms to
+`variant_is` tests at the strip (`ccl_utils::statement_tag_cases_to_guards`), so an arm is a path
+like any other.
 
 A **path** is one straight-line route through the block's branch structure: the statements a single
 execution runs, given a choice of arm at every branch it passes through. Nested and sibling
@@ -1439,7 +1485,9 @@ adjusted (`π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`). A path
 transaction's *snapshot* alone — resolved through whatever the path has already written
 (read-your-writes), but never reading a later commit tick, which is what keeps the whole block one
 serialization point. The block's **spine** — the statements outside every
-`if` — is the path condition `true`; descending into an arm narrows it to `path ∧ π̂`. Paths are
+`if` — is the path condition `true`; descending into an arm narrows it to `path ∧ π̂`. The walk
+builds the conjunction from the inside out: a path `𝑝` within the arm leaves it as
+`Case[π̂ → 𝑝; true → false]`, so `𝑝` is evaluated only where `π̂` holds. Paths are
 mutually exclusive and, taken together with the implicit empty arm of a guard that matches nothing,
 exhaustive: exactly one path runs per transaction.
 
@@ -1448,7 +1496,8 @@ one decision variant, whose `` `commit ``/`` `abort `` tag is a path condition, 
 `` `fired ``/`` `idle `` tag is that tap's own path condition, and whose per-key writes are `Case`s
 over the local branch guards — so every path is evaluated in
 one straight-line writer body and one transaction is still one decision. Walking a block threads
-`(path, env)` (read-your-writes) and the block denotes
+the read-your-writes environment, each arm recording its paths relative to itself, and the block
+denotes
 `` snapshot ⇒ {`commit{writes, __to_<defer>*} | `abort} `` — a decision **variant**
 (`ccl_utils::wrap_decision_variant`) where:
 

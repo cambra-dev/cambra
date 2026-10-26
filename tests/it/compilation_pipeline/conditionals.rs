@@ -1024,9 +1024,10 @@ fn a_conditional_element_reading_an_enclosing_binder(#[case] source: &str, #[cas
 // ---------------------------------------------------------------------------
 // Conditional induction writes — `if p: acc += e` in a mutation loop.
 //
-// `lower_loop_body_chain` lowers the `if` to a statement-`Case`; `transform_chain`
+// `lower_loop_body_chain` lowers the `if` to a statement-`Case`; `WriterWalk`
 // merges its branches into one writer decision — a single conditional write is
-// `{commit: ĝ, writes: prev+e}` (a `!commit` position carries in the changelog).
+// `{commit: ĝ, writes: Case[ĝ → prev + e; true → prev]}` (a `!commit` position
+// carries in the changelog).
 // One writer over the full source → a single-writer `Transact` → the changelog
 // `InductionStore`, read densely and reduced to the final accumulator.
 // ---------------------------------------------------------------------------
@@ -1171,6 +1172,74 @@ a",
 )]
 fn test_conditional_induction_write(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
+}
+
+/// A binding whose value is a conditional, reading an earlier binding inside an arm. The
+/// `if`/`else` compiles to a domain restrict, so the earlier binding travels into each arm
+/// rather than being read at the loop's domain.
+#[test]
+fn a_binding_read_inside_a_conditional_binding_s_arm() {
+    let source = indoc! {r#"
+        total := 0
+        out = test_sink()
+        for x in [1, 2, 3, 4]:
+            a = x * 10
+            b = (total + a if x > 2 else a)
+            total := b
+            out << b
+    "#};
+    check_sink(source, "[10, 20, 50, 90]");
+}
+
+/// A nested guard holding a partial op its enclosing guard protects. The commit gate reads
+/// the inner guard only where the outer one holds, so `10 // i` never divides by zero.
+#[test]
+fn a_nested_guard_is_evaluated_only_under_its_enclosing_guard() {
+    let source = indoc! {r#"
+        x := 0
+        for i in [0, 1, 2]:
+            if i != 0:
+                if 10 // i > 3:
+                    x += 1
+        x
+    "#};
+    check_scalar(source, Value::Int(2));
+}
+
+/// A branch's binding, read twice by the paths below it, is evaluated only where the branch
+/// is taken: `t` is `12 // i`, which divides by zero at the position the outer guard refuses.
+#[test]
+fn a_branch_binding_read_by_nested_guards_is_evaluated_only_in_the_branch() {
+    let source = indoc! {r#"
+        x := 0
+        for i in [0, 1, 2, 3, 4]:
+            if i != 0:
+                t = 12 // i
+                if t != 4:
+                    if 12 // (t - 4) < 0:
+                        x += t
+        x
+    "#};
+    check_scalar(source, Value::Int(3));
+}
+
+/// A branch's binding read by two variables the branch writes. Both leave the branch in
+/// one merged value, which is evaluated only where the branch is taken: `t` divides by
+/// zero at `i = 2`.
+#[test]
+fn a_branch_binding_two_writes_read_is_evaluated_only_in_the_branch() {
+    let source = indoc! {r#"
+        out = test_sink()
+        x := 0
+        y := 0
+        for i in [1, 2, 3]:
+            if i != 2:
+                t = 10 // (i - 2)
+                x += t
+                y += t * t
+            out << x * 100 + y
+    "#};
+    check_sink(source, "[-900, -900, 200]");
 }
 
 // Two **separate** accumulators in one loop — one unconditional, one conditional.

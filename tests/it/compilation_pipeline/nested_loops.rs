@@ -436,9 +436,9 @@ fn a_flat_loop_around_a_transaction_still_commits() {
 /// inner recurrence runs per outer row, so 30 after the first row and 60 after the
 /// second.
 ///
-/// A generator's yield rides the enclosing decision, so the record the fields attach to
-/// sits under the `letrec` the inner `Transact` binds — which is why `attach_feed_fields`
-/// descends through a `letrec` as it does through a `let`.
+/// A generator's yield rides the enclosing decision as a tap, beside a write set that reads
+/// the inner loop's final value, so the decision record sits under the `letrec` the inner
+/// `Transact` binds.
 #[test]
 fn a_nested_loop_inside_a_generator_yields_per_outer_row() {
     check_scalar(
@@ -760,10 +760,9 @@ fn a_filtered_outer_source_with_a_conditional_inner_write() {
 // loops, a refinement on an iteration source, and an element that is a record or tuple
 // rather than a scalar.
 
-/// Inner loops in **both legs** of a conditional, so a branch decision carries a
-/// recurrence. A branch decision is `(let | letrec)* in {commit, writes}` for that
-/// reason — the shape `decision_writes` reads and `wrap_decision_variant` wraps. 100 for
-/// the first row, 10+20 for each of the others.
+/// Inner loops in **both legs** of a conditional, so the value leaving each branch carries
+/// a recurrence: it takes the branch's inner-loop history with it, kept whole as a `letrec`
+/// (`close_over`). 100 for the first row, 10+20 for each of the others.
 #[test]
 fn inner_loops_in_both_legs_of_a_conditional() {
     check_scalar(
@@ -1251,6 +1250,101 @@ fn a_conditional_write_between_the_loops_seeds_each_inner_run() {
     );
 }
 
+/// A write between the loops whose value is a conditional: the inner loop's seed is a value
+/// `Case` over the enclosing position.
+#[test]
+fn a_conditional_value_written_between_the_loops_seeds_each_inner_run() {
+    check_scalar(
+        indoc! {r"
+            total := 0
+            for x in [1, 2, 3]:
+                total := (total + 10 if x > 1 else total)
+                for y in [1, 2]:
+                    total += y
+            total
+        "},
+        Value::Int(29),
+    );
+}
+
+/// A write between the loops of a value reading the enclosing body's bindings, each read
+/// twice: the inner loop's seed reads the written value's binding at the enclosing position.
+#[test]
+fn a_seed_reading_a_chain_of_the_enclosing_body() {
+    check_scalar(
+        indoc! {r"
+            x := 0
+            for i in [1, 2, 3]:
+                t = i + 1
+                u = t + t
+                x := u + u
+                for j in [1, 2]:
+                    x += j
+            x
+        "},
+        Value::Int(19),
+    );
+}
+
+/// The same, writing a comprehension's sum: the aggregate stays a binding of the enclosing
+/// body, read by the seed where it stands, and reads the body's bindings under its map.
+#[test]
+fn a_seed_reading_a_comprehension_over_the_enclosing_body() {
+    check_sink(
+        indoc! {r#"
+            out = test_sink()
+            x := 0
+            for i in [1, 2, 3]:
+                t = i + 1
+                u = t + t
+                x := sum([z + u + u for z in [1, 2]])
+                for j in [1, 2]:
+                    x += j
+                out << x
+        "#},
+        "[22, 30, 38]",
+    );
+}
+
+/// A comprehension after the inner loop reads its final value, a binding of the enclosing
+/// body, under the comprehension's map.
+#[test]
+fn a_comprehension_reads_what_the_inner_loop_left() {
+    check_sink(
+        indoc! {r#"
+            out = test_sink()
+            x := 0
+            for i in [1, 2, 3]:
+                for j in [1, 2]:
+                    x += j
+                x += sum([z + x for z in [1, 2, 3]])
+                out << x
+        "#},
+        "[18, 90, 378]",
+    );
+}
+
+/// An inner loop in a branch writing two variables, which leave the branch in one merged
+/// value, and a branch binding the inner loop reads.
+#[test]
+fn an_inner_loop_in_a_branch_writes_each_variable_it_writes() {
+    check_sink(
+        indoc! {r#"
+            out = test_sink()
+            x := 0
+            y := 0
+            for i in [1, 2, 3]:
+                if i > 1:
+                    t = i * 10
+                    for j in [1, 2]:
+                        x += j + t
+                        y += t
+                out << x * 1000 + y
+        "#},
+        "[0, 43040, 106100]",
+    );
+}
+
 /// The same, writing the binder where the condition holds.
 #[test]
 fn a_conditional_write_between_the_loops_may_read_the_enclosing_binder() {
@@ -1411,7 +1505,8 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     "#},
     indoc! {r#"
         let s : Int = 0
-        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, Int), [0, 1]) (s = .0) { [s]⇒[s] over iterate ▷ const ▷ strength_over ≫ (.1 ≫ [10, 20]) ▷ map do (writes: (s: (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
+        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, Int), [0, 1]) (s = .0) { [s]⇒[s] over iterate ▷ const ▷ strength_over ≫ (.1 ≫ [10, 20]) ▷ map do let s : ((((Int, Int), [0, 1]), (Int, Int)) ⇒ Int) = (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add
+        in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
         in let s : ((Int, Int) ⇒ Int) = __hist ≫ .s ≫ final_read
         in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
         in let s : Int = __hist.s ▷ final_read
@@ -1428,7 +1523,8 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     "#},
     indoc! {r#"
         let s : Int = 0
-        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [[1, 2], [3, 4]] do let __hist : ((Int, ([0, 1] ⤇ Int)) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, ([0, 1] ⤇ Int)), [0, 1]) (s = .0) { [s]⇒[s] over .1 do .1 ≫ (writes: (s: add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
+        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [[1, 2], [3, 4]] do let __hist : ((Int, ([0, 1] ⤇ Int)) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, ([0, 1] ⤇ Int)), [0, 1]) (s = .0) { [s]⇒[s] over .1 do .1 ≫ (let s : ((Int, Int) ⇒ Int) = add
+        in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit)) }
         in let s : ((Int, ([0, 1] ⤇ Int)) ⇒ Int) = __hist ≫ .s ≫ final_read
         in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
         in let s : Int = __hist.s ▷ final_read
@@ -1445,7 +1541,8 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     "},
     indoc! {"
         let total : Int = 0
-        in let __hist : {total: ([0, 2] ⤇ Int)} = transact (total = 0) { [total]⇒[total] over iterate ≫ [1, 2, 3] do ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ (writes: (total: ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ add ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ .0) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ `abort(unit) ▷ const }
+        in let __hist : {total: ([0, 2] ⤇ Int)} = transact (total = 0) { [total]⇒[total] over iterate ≫ [1, 2, 3] do let total : ((Int, Int) ⇒ Int) = ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ add ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ .0
+        in ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ (writes: (total: total) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ `abort(unit) ▷ const }
         in let total : Int = __hist.total ▷ final_read
         in total
     "}

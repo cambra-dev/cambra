@@ -129,7 +129,7 @@
 //! `Feed` and `Define` are recognized the same way and get the same
 //! treatment. `mut_elim`'s `collect_feed_only` walks a read-only `with
 //! begin():` block expecting each statement's effect to *be* the `Feed`, and
-//! `transform_chain` the same on a loop body; a binding sealed around one
+//! `WriterWalk` the same on a loop body; a binding sealed around one
 //! plants a `Let` in the effect slot neither sees through. Threading the
 //! binding past the `ExprStmt` reorders nothing — the feeds keep their
 //! positions on the spine, which is what `channelize`'s outermost-first
@@ -812,7 +812,7 @@ fn atomize_list(elts: Vec<Expr>, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Vec
 ///
 /// `Case`, `Feed` and `Define` carry the same contract and get the same
 /// treatment: `push_continuation_into_case` requires the effect to be the
-/// `Case`, and `mut_elim`'s `collect_feed_only` and `transform_chain` require
+/// `Case`, and `mut_elim`'s `collect_feed_only` and `WriterWalk` require
 /// it to be the `Feed`. Threading reorders nothing, because what moves is the
 /// hoisted binding and not the statements: the feeds keep their spine
 /// positions, which is what `channelize`'s outermost-first collection reads.

@@ -294,6 +294,92 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
 
+/// A binding whose value is a conditional, reading an earlier binding inside an arm. The
+/// `if`/`else` compiles to a domain restrict, so the earlier binding travels into each arm
+/// rather than being read at the writer's domain. One writer commits its positions in order.
+#[test]
+fn a_binding_read_inside_a_conditional_binding_s_arm() {
+    let source = indoc! {r#"
+        m: Mut(Int, Txn) := 0
+        out = test_sink()
+        for r in [1, 2, 3, 4]:
+            with begin():
+                a = r * 10
+                b = (m + a if r > 2 else a)
+                m := b
+                out << b
+    "#};
+    check_sink(source, "[t1 -> 10, t2 -> 20, t3 -> 50, t4 -> 90]");
+}
+
+/// A nested guard holding a partial op its enclosing guard protects. The commit gate and the
+/// feed's fire path read the inner guard only where the outer one holds.
+#[test]
+fn a_nested_guard_is_evaluated_only_under_its_enclosing_guard() {
+    let source = indoc! {r#"
+        pool: Mut(Int, Txn) := 0
+        out = test_sink()
+        for i in [0, 1, 2, 3]:
+            with begin():
+                if i != 0:
+                    if 10 // i > 3:
+                        pool := pool + 1
+                        out << pool
+    "#};
+    check_sink(source, "[t1 -> 1, t2 -> 2]");
+}
+
+/// The value of an `if` or `match` whose branches write merges as a written variable does,
+/// and the write commits only where its branch runs.
+#[rstest]
+#[case::if_value(indoc! {r#"
+    pool: Mut(Int, Txn) := 100
+    out = test_sink()
+    for i in [1, 2, 3]:
+        with begin():
+            t = if i > 1:
+                    pool := pool + i
+                    pool * 2
+                else:
+                    0
+            out << t
+"#}, "[t1 -> 0, t2 -> 204, t3 -> 210]")]
+#[case::match_value(indoc! {r#"
+    pool: Mut(Int, Txn) := 0
+    out = test_sink()
+    for i in [1, 2, 3]:
+        with begin():
+            o = Option::some(i) if i != 2 else Option::none
+            t = match o:
+                    case Option::some(v):
+                        pool := pool + v
+                        v
+                    case Option::none:
+                        0
+            out << t + pool
+"#}, "[t1 -> 2, t2 -> 1, t3 -> 7]")]
+fn a_writing_branch_value_merges_as_a_variable(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
+/// A binding read by a `match` arm that ignores its payload. The arm is the input at
+/// the positions tagged `none`, so the binding is read there only, not at every key.
+#[test]
+fn a_binding_read_inside_a_match_arm_that_ignores_its_payload() {
+    let source = indoc! {r#"
+        m: Mut(Int, Txn) := 0
+        out = test_sink()
+        for r in [1, 2, 3, 4]:
+            with begin():
+                a = r * 10
+                o = Option::some(r)
+                b = (match o: case Option::some(v): v + a case Option::none: a)
+                m := b
+                out << b
+    "#};
+    check_sink(source, "[t1 -> 11, t2 -> 22, t3 -> 33, t4 -> 44]");
+}
+
 // ---------------------------------------------------------------------------
 // Multiple variables in one transaction + read-your-writes (multi-key mutable variable)
 // ---------------------------------------------------------------------------

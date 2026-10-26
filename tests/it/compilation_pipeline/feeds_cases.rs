@@ -267,9 +267,9 @@ o"#,
 )]
 // Pass-by-reference writer that *feeds before it writes*: `o << c` precedes
 // `c += 1` in the writer body, inlined per iteration. The Feed-headed spliced
-// body left a `unit; unit` tail on the loop spine that `transform_chain` once
-// rejected; it now drops the no-op units and reads `x` before each write, so
-// the channel latches 0, 1, 2 (the pre-write values) over the three iterations.
+// body leaves a `unit; unit` tail on the loop spine; the writer walk drops the
+// no-op units and reads `x` before each write, so the channel latches 0, 1, 2
+// (the pre-write values) over the three iterations.
 #[case::pbr_feed_before_write(
 r#"
 def fw(c: Mut(Int), o: Feed(Int)):
@@ -1014,6 +1014,10 @@ x
 }
 
 /// TODO: Support mut reads in refined ops used with feeds.
+///
+/// The fed value's type names the writer's parameter, `{Int | __elem == __p.0 ^+ 1}`. A debug
+/// build stops at `lambda_elim`'s type check and a release one at the open-bound check; both
+/// name that type.
 #[test]
 fn refined_read_used_with_feed() {
     check_compile_error(
@@ -1026,7 +1030,7 @@ for p in [1, 2, 3]:
     x += 1
 o
         "#},
-        "Barendregt violation: substitution range mentions binder",
+        "__elem == __p.0 ^+ 1",
     )
 }
 

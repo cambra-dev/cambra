@@ -505,9 +505,10 @@ than on syntax. Four steps:
 
 1. **strip** — consume every `Begin`, building one writer site per writing block: its
    read/write footprint, its loop source, and a `` `commit ``/`` `abort `` decision lambda
-   built by read-your-writes substitution. An in-block `<<` becomes a `__to_<defer>` tap on
-   the `` `commit `` payload. A *read-only* block leaves no writer site, but its footprint
-   is kept — it is a reason two variables share a store.
+   built by threading read-your-writes, the block's bindings kept as bindings
+   ([Loop-body bindings](../src/ccl/design/mutability.md#loop-body-bindings)). An in-block
+   `<<` becomes a `__to_<defer>` tap on the `` `commit `` payload. A *read-only* block leaves
+   no writer site, but its footprint is kept — it is a reason two variables share a store.
 2. **partition** — union-find over those footprints, so a program gets one store per set of
    variables some block actually relates, rather than one store overall. A block is the only
    thing that forces two variables together, and for two reasons that land on the same set:

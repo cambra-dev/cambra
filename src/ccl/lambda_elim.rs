@@ -3320,13 +3320,14 @@ mod tests {
         // The commit arm reads `c.time`, so it takes the zip path; the abort arm
         // is constant in both binders, so it stays on the payload-only path.
         //
-        // Simplification has fused the left component `id ≫ .0 ≫ .time` down to
-        // `.time`, which is the clearest possible statement of the point: it is a
-        // morphism out of **`c`**, running beside the scrutinee chain rather than
-        // after it. Nothing derived from `c.decision` could have produced it.
+        // The left component reads `.time` off the first half of the pair, a
+        // morphism out of `c` running beside the scrutinee chain rather than after
+        // it. Simplification keeps the pair: projecting `.0` out of it would drop
+        // the `variant_project`, which narrows the keys (`simplify::narrows_keys`).
         assert_eq!(
             elim_and_typecheck("c", c_ty, case),
-            "(.time, .decision ≫ variant_project(`commit)) ▷ zip \
+            "((id, .decision ≫ variant_project(`commit)) ▷ zip ≫ .0 ≫ .time, \
+             .decision ≫ variant_project(`commit)) ▷ zip \
              ⊔ .decision ≫ variant_project(`abort) ≫ (0, 0) ▷ const"
         );
     }
