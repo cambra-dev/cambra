@@ -23,6 +23,7 @@ use cambra::ccl::uniquify;
 use cambra::ccl::{BaseType, Expr, Lit, Refinement, Type, TypedExprNode};
 use cambra::chl_parser;
 use cambra::chl_parser::FileId;
+use indoc::indoc;
 use std::rc::Rc;
 
 /// Parse → lower → uniquify → comprehension → opaque output → infer `code` (the
@@ -162,6 +163,26 @@ fn nested_comprehension_shares_predicate_rcs() {
             for b in [e + f for e in ['d', 'e'] for f in ['f'] if e < f]
         if a != b]",
     );
+}
+
+/// A filtered collection read under a binder keeps its filter predicate as one `Rc`, whether
+/// it stands there or is bound outside it: its type's variables stand under that binder, so
+/// each substitution crossing it copies the predicate, and the copies must share again.
+#[test]
+fn a_filtered_source_read_under_a_binder_shares_predicate_rcs() {
+    for code in [
+        "[[a + b for b in [e for e in ['d', 'e'] if e < 'f']] for a in ['x']]",
+        indoc! {"
+            ys = [e for e in ['d', 'e'] if e < 'f']
+            [b for b in ys]
+        "},
+        indoc! {"
+            ys = [e for e in ['d', 'e'] if e < 'f']
+            [[a + b for b in ys] for a in ['x']]
+        "},
+    ] {
+        assert_no_split(code);
+    }
 }
 
 /// Sharing must survive at every nesting depth, not just the one depth a fixture

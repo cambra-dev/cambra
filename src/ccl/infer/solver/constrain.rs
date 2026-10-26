@@ -1670,9 +1670,38 @@ fn constrain_go_impl(
         // index, the way a codomain reads its function's binder, so the component names are
         // spellings and take no part (`src/ccl/design/type-inference.md`, "4.8 Dependent
         // tuples").
+        //
+        // During inference a component reads the ones before it by **name**, as a codomain reads
+        // its function's binder, so each side's names are aligned onto the other's for the
+        // components after them, as the function arm aligns a codomain (`sl.aligned`). A
+        // side closed to indices opens at its names where the other side is live, for the
+        // reason the function arm opens a closed codomain: only a live side records bounds,
+        // and a dangling index would land in one.
         (Type::DepTuple(a), Type::DepTuple(b)) if a.len() == b.len() => {
-            for ((_, t0), (_, t1)) in a.iter().zip(b) {
-                constrain_go(t0, t1, sl, sr, cache, scope)?;
+            let opened = |cs: &[(Option<Name>, Type)], other: &Type| -> Vec<Type> {
+                let closed = cs
+                    .iter()
+                    .enumerate()
+                    .any(|(k, (_, t))| crate::ccl::subst::references_binder_within(t, k as u32));
+                if closed
+                    && (cache.derivation.opens_unconditionally()
+                        || crate::ccl::subst::type_contains_infer(other))
+                {
+                    crate::ccl::subst::open_tuple_components(cs, |j, _| {
+                        let name = cs[j].0.clone().unwrap_or_else(|| {
+                            panic!("a component a later one reads by index names a binder: {lhs}")
+                        });
+                        crate::ccl::subst::Mapping::Rename(name)
+                    })
+                } else {
+                    cs.iter().map(|(_, t)| t.clone()).collect()
+                }
+            };
+            let (a_opened, b_opened) = (opened(a, rhs), opened(b, lhs));
+            let mut aligned = sl.clone();
+            for (k, (t0, t1)) in a_opened.iter().zip(&b_opened).enumerate() {
+                constrain_go(t0, t1, &aligned, sr, cache, scope)?;
+                aligned = aligned.aligned(&a[k].0, &b[k].0);
             }
             Ok(())
         }
@@ -2433,10 +2462,14 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
-        // A dependent tuple is born after inference, outside every generalized `let`,
-        // and the solver holds it as an atom.
-        | Type::DepTuple(_)
         | Type::SharedHole(_) => ty.clone(),
+        // Componentwise, as a tuple is: a component's names stay its binders.
+        Type::DepTuple(components) => Type::DepTuple(
+            components
+                .iter()
+                .map(|(name, t)| (name.clone(), extrude(t, pol, target_level, cache)))
+                .collect(),
+        ),
         // `constrain_go` refuses an edge carrying a parameter below its level before
         // it extrudes (`escaping_param`), and the level short-circuit above returns
         // every other parameter unchanged.
@@ -2524,7 +2557,10 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         // Invariant payload: polarity is meaningless under invariance, so
         // both children are extruded with two-way proxies (a history is read
         // *and* written) instead of the polar one-way approximation below.
-        Type::History { function, history_kind } => {
+        Type::History {
+            function,
+            history_kind,
+        } => {
             let Type::Fun {
                 name,
                 fun_kind,

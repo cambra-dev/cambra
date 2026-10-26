@@ -1610,8 +1610,12 @@ impl Subst {
         );
         let node = match &e.node {
             Var(n) => match self.binders.get(n) {
-                // The replacement carries its own type/annotation, so return it
-                // wholesale rather than rebuilding `e`.
+                // A renamed reference stands where the occurrence stood, so it takes the
+                // occurrence's type under this same substitution: the type can name a binder
+                // the substitution discharges at once with the rename.
+                Some(repl @ Mapping::Rename(_)) => return repl.as_expr(&self.apply_type(&e.ty)),
+                // A discharged term carries its own type/annotation, so return it wholesale
+                // rather than rebuilding `e`.
                 Some(repl) if !matches!(repl, Mapping::Join(_)) => return repl.as_expr(&e.ty),
                 _ => Var(n.clone()),
             },
@@ -1907,7 +1911,12 @@ impl Subst {
             // id — a *preserve*, so the root inherits the occurrence's
             // span/attribution (the use-site), unique per occurrence by
             // construction.
-            let occurrence_ty = e.ty.clone();
+            // A renamed reference takes the occurrence's type under this substitution, as in
+            // the transport mode.
+            let occurrence_ty = match repl {
+                Mapping::Rename(_) => self.apply_type(&e.ty),
+                _ => e.ty.clone(),
+            };
             *e = repl.as_expr_preserving(e.node_id, &occurrence_ty);
             return;
         }
@@ -2279,7 +2288,9 @@ impl Subst {
         // A substituted predicate is a genuinely new term (the transport mode
         // builds rather than rewrites), so `born` is the right spelling; the
         // vacuous case returned above kept the source's `Rc` instead.
-        crate::ccl::Refinement::born(Rc::new(new_pred))
+        let new_pred = Rc::new(new_pred);
+        crate::ccl::ccl_utils::record_derivation(&r.predicate, &new_pred);
+        crate::ccl::Refinement::born(new_pred)
     }
 
     /// This substitution with `binder` removed from its source domain (the
@@ -3860,6 +3871,28 @@ mod tests {
         let mut rewritten = var("e").with_ty(ty.clone());
         rename.rewrite_expr(&mut rewritten);
         assert_eq!(rewritten.ty, ty);
+    }
+
+    /// A reference the substitution renames stands where the occurrence stood, so it takes the
+    /// occurrence's type under the whole substitution, in both modes: a rename beside a
+    /// discharge of a binder that type reads leaves no reference to the discharged binder, as
+    /// a level of a flattened nest renamed onto `uncurry`'s keys reads an outer element.
+    #[test]
+    fn a_renamed_reference_takes_its_type_under_the_whole_substitution() {
+        let projected = |term: TypedExpr| {
+            Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(Rc::new(term), 0))
+        };
+        let subst = Subst::of_binders(BTreeMap::from([
+            (Name::from("r"), Mapping::Rename(Name::from("k"))),
+            (Name::from("xs"), Mapping::Discharge(Rc::new(var("row")))),
+        ]));
+        let occurrence = var("r").with_ty(projected(var("xs")));
+        let expected = projected(var("row"));
+        assert_eq!(subst.apply_expr(&occurrence).ty, expected);
+        let mut rewritten = occurrence.clone();
+        subst.rewrite_expr(&mut rewritten);
+        assert_eq!(rewritten.ty, expected);
+        assert!(matches!(&rewritten.node, TypedExprNode::Var(n) if *n == Name::from("k")));
     }
 
     /// A witness projection is a collection's domain wherever it stands, so a binder it projects

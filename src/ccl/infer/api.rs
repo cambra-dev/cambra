@@ -45,6 +45,9 @@ pub struct InferArena {
     /// (dropping elsewhere would tear down the wrong thread's slot). Also
     /// unconstructible outside this module's `new`.
     _not_send_sync: std::marker::PhantomData<*const ()>,
+    /// The run's predicate derivations, which coalesce reads to share equal copies of one
+    /// predicate.
+    _derivations: crate::ccl::ccl_utils::RecordingDerivations,
 }
 
 impl InferArena {
@@ -73,6 +76,7 @@ impl InferArena {
         #[cfg(debug_assertions)]
         crate::ccl::infer::solver::traits::unseal_emission();
         InferArena {
+            _derivations: crate::ccl::ccl_utils::RecordingDerivations::start(),
             _not_send_sync: std::marker::PhantomData,
         }
     }

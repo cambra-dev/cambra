@@ -1332,6 +1332,22 @@ Its programs use distinct authored filters, so an equal group identifies a split
 independently authored equal predicates. `distinct_predicate_rcs` supports allocation-count checks;
 neither check proves global interning or measures downstream compilation cost.
 
+#### Copies of one predicate share after coalesce
+
+A substitution crossing a binder copies a predicate whose type slots hold variables under that
+binder, even where the predicate reads nothing the substitution maps: the variables may resolve to
+types that read it (`Subst::force_refinement`). One predicate read under such a binder reaches
+coalesce as several copies, one per substitution, and each copy coalesces apart.
+
+Each inference run records what every predicate copy and every coalesce rebuild was derived from
+(`ccl_utils::record_derivation`, held by `InferArena`). Coalesce follows a coalesced predicate to
+its origin and points it at a predicate already coalesced from the same origin that equals it and
+reads the same names and witnesses (`share_with_its_origin` in `infer/solve.rs`). Term equality
+compares a refinement nested in a type slot type-blind, and two copies made under different
+substitutions can differ there in a name they read, so the reads are compared as well: the shared
+predicate is in scope at every slot that holds it. Predicates with different origins stay apart
+even when equal, so two equal filters written in two places keep their own terms.
+
 #### One known exception, scoped and unfixed: generic instantiation
 
 `freshen_refinement_predicate` in `infer/solver/scheme.rs` clones the predicate, freshens its
@@ -3874,13 +3890,18 @@ refinement: a group-by under a loop whose key reads the loop's binder has keys
 `{𝐾 | 𝑘 ∈ 𝑀(𝑎)}`. A pair whose second component reads nothing of the first is the `Tuple` it
 always was.
 
-Inference introduces no dependent tuple, and a program cannot write one. `channelize` keys a feed
-under nested loops by one when an inner loop's keys depend on an outer loop's value
+A program cannot write a dependent tuple. Inference introduces one through `uncurry(𝑛)`, which
+flattens a comprehension over several generators ([ir.md, "Several
+generators"](ir.md#several-generators)). Its scheme keys the flattened collection by
+`(𝑘₁ : 𝛼₁) × … × 𝛼ₙ`, each `𝛼ᵢ` a variable standing under `𝑘₁ … 𝑘ᵢ₋₁`, so a generator whose source
+reads an outer element, as in `[x for xs in xss for x in xs]`, keys the result by a tuple whose
+component reads the outer key. The scheme builds the `DepTuple` whether or not a component reads
+an earlier one; compaction collapses it to the plain tuple where none does. The value `𝜈` stands
+under every key binder too, and the result reads it through the flattened tuple's projections,
+`(𝑝 : (𝑘₁ : 𝛼₁) × …) ⤇ 𝜈[𝑘ᵢ ↦ 𝑝.𝑖]`, which emission puts in at each use
+(`schemes::uncurried_value_at_its_tuple`). `channelize` keys a feed under nested loops by a
+dependent tuple when an inner loop's keys depend on an outer loop's value
 ([A history's value may depend on its position](#a-historys-value-may-depend-on-its-position)).
-One further birth is [Planned]: a source value whose domain depends on an outer element, such as
-`[x for xs in xss for x in xs]`, typed during inference as a sum
-`Σ (σ : SubtypesOf((UInt, UInt))). σ ⤇ 𝑉` whose witness at the term that builds it is a dependent
-tuple.
 
 ### Representation
 
@@ -3931,20 +3952,26 @@ opening the codomain at the name.
 
 ### Flattening
 
-`flatten_domain` reshapes keys, `((𝑖, 𝑗), 𝑘)` into `(𝑖, 𝑗, 𝑘)`, and channelize uses it to give a
-feed under three loops its flat key (`docs/chl-spec.md`, "8.4 Feeds are the second form of
-mutability"). Its type rule takes `(𝑝 : (𝑎 : 𝐴) × 𝐵(𝑎)) × 𝐶(𝑝.0, 𝑝.1)` to
-`(𝑎 : 𝐴) × (𝑏 : 𝐵(𝑎)) × 𝐶(𝑎, 𝑏)`, rewriting `𝐶`'s reads of `𝑝.0` and `𝑝.1` into references to
-the new components (`channelize::spliced`). The reshaping is an operation in the types as at run
-time.
+`flatten_domain` reshapes keys, `((𝑖, 𝑗), 𝑘)` into `(𝑖, 𝑗, 𝑘)`. Its type rule takes
+`(𝑝 : (𝑎 : 𝐴) × 𝐵(𝑎)) × 𝐶(𝑝.0, 𝑝.1)` to `(𝑎 : 𝐴) × (𝑏 : 𝐵(𝑎)) × 𝐶(𝑎, 𝑏)`, rewriting `𝐶`'s reads
+of `𝑝.0` and `𝑝.1` into references to the new components. The reshaping is an operation in the
+types as at run time. A feed under several loops takes its flat key (`docs/chl-spec.md`, "8.4
+Feeds are the second form of mutability") from one `uncurry(𝑛)` over its levels instead
+(`feed_nest::flatten_nested_contribution`), as a comprehension over several generators does
+([ir.md, "Several generators"](ir.md#several-generators)).
 
 ### Subtyping
 
-A dependent tuple never takes part in source inference, but it reaches the solver: the post-pass
-type check instantiates builtin schemes and copairings with fresh variables, and a dependent
-tuple can sit in their bounds. Compaction holds one as an atom (`AtomKey::DepTuple`), keyed by its
-α-invariant content hash, so two dependent tuples meet where they are equal up to binder names and
-nowhere else. As a collection's domain it is invariant, like every domain.
+Two dependent tuples of one length relate component by component (`constrain_go`). During
+inference a component reads the ones before it by name, as a codomain reads its function's
+binder, so each side's names are aligned onto the other's for the components after them, and a
+side closed to indices opens at its names where the other side holds variables. Compaction keeps
+a dependent tuple in a slot of its own (`CompactType::dep_tuple`), component `𝑘` compacted under
+the binders of the `𝑘` components before it. A plain tuple's components close their references to
+binders around the tuple `𝑘` less deep, so the two slots do not merge, and a position meeting both
+names two shapes. Materialization builds the tuple with `Type::dep_tuple`, which collapses it to
+the plain tuple where no component reads an earlier one. As a collection's domain it is
+invariant, like every domain.
 
 ### A refinement on a collection's domain is data
 
@@ -4024,6 +4051,13 @@ are stated at `𝑥`. A witness projection through the row, `σᵢ(𝑡(𝑥))`,
 ([A `for` loop over a sum](collections.md#a-for-loop-over-a-sum)). A second component of any other
 shape, and a tuple of more than two components under one `curry`, are refused.
 
+A domain whose keys are a dependent tuple is enumerated as a family too, where an iteration site
+ranges over it, as a filtered flattening does (`iterate::domain_keys`). The first component's
+keys, composed with the family `𝐹`, flatten with `uncurry(2)` and take their keys as their values
+by `map_domain`. A tuple of more components is the tuple of all but the last, as one component,
+and the last read at that prefix's projections; the pairs this enumerates splice back into one
+tuple through `[0] ▷ flatten_domain`.
+
 A site over a plain pair whose element is read out of a collection the enclosing value carries,
 `(.1, .0 ≫ 𝑝) ▷ zip ≫ apply` for projections `𝑝`, takes that collection's keys per row as well:
 `𝐹` is `𝑝 ≫ map_domain`, the identity's where `𝑝` is empty (`row_collection`). The collection's
@@ -4053,8 +4087,6 @@ family runs per row.
   `dom(𝑐)` indexes `𝑐`.
 - A dependent tuple as the witness of a `SubtypesOf` kind needs a membership check against the
   kind's tuple of key types.
-- Iterating a dependent tuple whose second component is a filter or a per-row list domain.
-- Comparing two dependent tuples componentwise under subtyping, which compaction's atom does not.
 - The projection rule where the projected tuple is a refinement's own element, as in a lifted
   filter. A nested refinement reads that element as `__elem^1`
   ([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).

@@ -340,6 +340,13 @@ fn for_each_child(
     for child in ct.var.iter_mut().flat_map(|v| v.tags.values_mut()) {
         f(child, pol)?;
     }
+    for child in ct
+        .dep_tuple
+        .iter_mut()
+        .flat_map(|d| d.components.iter_mut())
+    {
+        f(child, pol)?;
+    }
     if let Some(cf) = &mut ct.fun {
         for w in &mut cf.binders {
             match &mut w.type_kind {
@@ -407,6 +414,7 @@ impl Parametrize<'_> {
             || ct.var.is_some()
             || ct.fun.is_some()
             || ct.history_slot.is_some()
+            || ct.dep_tuple.is_some()
             || !ct.nominal.is_empty();
         if quantified.is_empty() {
             // Nothing reached this position: it is unconstrained, which a parameter

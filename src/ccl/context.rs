@@ -3098,9 +3098,11 @@ fn compile_version(
     Ok(program)
 }
 
-/// Replace every `unbox(𝑐)` whose argument binds no witness by `𝑐`, predicates included: a
-/// plain collection is the sum over no binders, and `unbox` of it is the collection
-/// (`src/ccl/design/collections.md`, "Typing").
+/// Replace every `unbox(𝑐)` whose argument binds no witness by `𝑐`, in predicates and the
+/// terms projections quote included: a plain collection is the sum over no binders, and
+/// `unbox` of it is the collection (`src/ccl/design/collections.md`, "Typing"). A projection
+/// compares by its term's normal form, which reads `unbox` as the identity, so dropping one
+/// changes no projection's identity.
 ///
 /// One memo for the whole pass, so a predicate shared across type slots is rebuilt once and
 /// stays shared ([`crate::ccl::ccl_utils::PredMemo`]).
@@ -3113,8 +3115,8 @@ fn drop_plain_unboxes_in(expr: &mut Expr, memo: &crate::ccl::ccl_utils::PredMemo
     let mut dropped = false;
     expr.walk_type_slots_mut(|ty| {
         dropped |=
-            crate::ccl::ccl_utils::walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
-                drop_plain_unboxes_in(pred, memo)
+            crate::ccl::ccl_utils::walk_quoted_terms_mut(ty, memo, &(), &mut |term, memo| {
+                drop_plain_unboxes_in(term, memo)
             });
     });
     expr.walk_children_mut(|child| dropped |= drop_plain_unboxes_in(child, memo));

@@ -2348,12 +2348,24 @@ fn convert_impl_inner(
             Ok(Box::new(MapDomain::new(convert_impl(argument, None, ctx)?)))
         }
 
-        // uncurry flattens two collection levels into one with a pair domain.
+        // uncurry(n) flattens n collection levels into one keyed by n-tuples: the outer two
+        // levels pair, and each pairing past the first pairs the tuple already built with the
+        // next level's key, which `[0] ▷ flatten_domain` splices open. With an input, the
+        // flattened collection is read at the input's keys, as every collection-typed
+        // application is (the general arm below); a filtered flattening whose keys only the
+        // data holds plans that way.
         TypedExprNode::Apply { argument, function }
-            if as_builtin(function) == Some(Builtin::Uncurry) =>
+            if input.is_none()
+                && let Some(Builtin::Uncurry(n)) = as_builtin(function) =>
         {
-            expect_no_input(input, "uncurry")?;
-            Ok(Box::new(Uncurry::new(convert_impl(argument, None, ctx)?)))
+            let mut op = convert_impl(argument, None, ctx)?;
+            for step in 0..n - 1 {
+                op = Box::new(Uncurry::new(op));
+                if step > 0 {
+                    op = Box::new(FlattenTupleDomain::new(op, vec![0]));
+                }
+            }
+            Ok(op)
         }
 
         // iterate(p): the chain-head iteration-source marker emitted by
@@ -3166,6 +3178,19 @@ fn convert_impl_inner(
                     "final_or_default composed over {} — only its applied form is a reduction",
                     input.tiling()
                 ))),
+                // Composed, `uncurry(n)` flattens each row's nested collection beneath the levels
+                // that stand above it: a flattening an enclosing comprehension maps over its rows.
+                // It pairs and splices as the applied form does, each step at those levels.
+                Builtin::Uncurry(n) => {
+                    let mut op: Box<dyn TileOperator> = input;
+                    for step in 0..n - 1 {
+                        op = Box::new(Uncurry::new_at(op, ctx.level()));
+                        if step > 0 {
+                            op = Box::new(FlattenTupleDomain::new_at(op, vec![0], ctx.level()));
+                        }
+                    }
+                    Ok(op)
+                }
                 // `apply` over `(key, collection)` rows reads each key in its row's collection.
                 // A collection is a data function, so applying one at a key its type keeps in
                 // the domain is the total lookup. A compute function has no compiled form as a

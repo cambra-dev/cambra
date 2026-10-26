@@ -35,8 +35,7 @@
 //! |------|---------|-----------|-----------------|
 //! | Compose identity | `… ≫ id ≫ …` / `… ≫ id ≫ …` | remove `id` | ✓ |
 //! | Const reduce | `f ≫ g ▷ const` | `g ▷ const` | ✗ (drops `f`) |
-//! | Product beta (fst) | `⟨f, g⟩ ≫ .0` | `f` | ✗ (drops `g`) |
-//! | Product beta (snd) | `⟨f, g⟩ ≫ .1` | `g` | ✗ (drops `f`) |
+//! | Product beta | `⟨f₀, …, fₙ⟩ ≫ .i` | `fᵢ` | ✗ (drops siblings) |
 //! | Literal tuple projection | `(e₀, …, eₙ).i` | `eᵢ` | ✗ (drops siblings) |
 //! | CCC universal | `⟨.1, .0 ≫ curry(f)⟩ ≫ apply` | `f` | ✗ (drops structure) |
 //! | Exponential beta | `⟨g, curry(h)⟩ ≫ apply` | `⟨id, g⟩ ≫ h` | ✗ (restructures) |
@@ -47,13 +46,14 @@
 //! | Apply-constant-valued | `⟨x, h ≫ const⟩ ≫ apply` | `h` | ✗ (drops `x`) |
 //! | Product eta | `⟨f ≫ .0, f ≫ .1⟩` | `f` | ✗ (collapses) |
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` | ✓ |
-//! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
+//! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify), zips of any arity | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
+//! | Uncurry of a nest | `(s ≫ curry(g)) ▷ uncurry(n)` and the forms in [`try_uncurry_curried`] | `⟨⟨.0 ≫ s, .1⟩, .2, …⟩ ≫ (g ▷ uncurry(n − 1))` | ✗ (drops structure) |
 //! | ANF morphism binding | `let x = 𝑚 in 𝑏` (`x` an ANF temp, `𝑚` a morphism, used once) | `𝑏[x := 𝑚]` | ✓ |
 
 use crate::ccl::ccl_utils::{
     PredMemo, apply_primitive, count_free, is_builtin, walk_quoted_terms_mut,
 };
-use crate::ccl::lambda_elim::{id, strength_over, zip_pair};
+use crate::ccl::lambda_elim::{id, strength_over, typed_tuple, zip_pair};
 use crate::ccl::ty::FunKind;
 use crate::ccl::{Builtin, Expr, Name, ProjKey, Type, TypedExpr, TypedExprNode};
 
@@ -280,13 +280,13 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
     // invariant is a property of the *nodes*, not of pass timing.
     if !contains_iteration {
         changed |= ruled("simplify.const_reduce", expr, try_const_reduce);
-        changed |= ruled("simplify.product_beta_fst", expr, try_product_beta_fst);
-        changed |= ruled("simplify.product_beta_snd", expr, try_product_beta_snd);
+        changed |= ruled("simplify.product_beta", expr, try_product_beta);
         changed |= ruled(
             "simplify.literal_tuple_projection",
             expr,
             try_literal_tuple_projection,
         );
+        changed |= ruled("simplify.uncurry_curried", expr, try_uncurry_curried);
         changed |= ruled("simplify.ccc_universal", expr, try_ccc_universal);
         changed |= ruled("simplify.exponential_beta", expr, try_exponential_beta);
         changed |= ruled("simplify.exponential_eta", expr, try_exponential_eta);
@@ -411,6 +411,68 @@ fn as_zip(expr: &Expr) -> Option<(&Expr, &Expr)> {
         return Some((&elts[0], &elts[1]));
     }
     None
+}
+
+/// The arms of `expr` if it is a zip of any arity, `(𝑓₀, …, 𝑓ₙ) ▷ zip`.
+fn as_zip_arms(expr: &Expr) -> Option<&[Expr]> {
+    if let TypedExprNode::Apply { argument, function } = &expr.node
+        && is_builtin(function, Builtin::Zip)
+        && let TypedExprNode::Tuple(elts) = &argument.node
+        && elts.len() >= 2
+    {
+        return Some(elts);
+    }
+    None
+}
+
+/// Takes a zip [`as_zip_arms`] accepted apart into its arms.
+fn into_zip_arms(expr: Expr) -> Vec<Expr> {
+    let TypedExprNode::Apply { argument, .. } = expr.node else {
+        unreachable!("into_zip_arms takes a zip")
+    };
+    let TypedExprNode::Tuple(elts) = argument.node else {
+        unreachable!("a zip's argument is a tuple")
+    };
+    elts
+}
+
+/// `(𝑓₀, …, 𝑓ₙ) ▷ zip` at `fun_kind`: [`zip_pair`] for two arms, which also types a dependent
+/// pair; otherwise over the arms' shared domain, to the tuple of their codomains, under the
+/// first binder an arm names.
+fn zip_of(arms: Vec<Expr>, fun_kind: &FunKind) -> Expr {
+    if let Ok([f, g]) = <[Expr; 2]>::try_from(arms.clone()) {
+        return zip_pair(f, g, fun_kind);
+    }
+    let ty = arms
+        .iter()
+        .map(|a| match a.ty.peel_refinements() {
+            Type::Fun {
+                name,
+                domain,
+                codomain,
+                ..
+            } => Some((name.clone(), (**domain).clone(), (**codomain).clone())),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|typed| {
+            let domain = typed.first()?.1.clone();
+            let name = typed.iter().find_map(|(n, _, _)| n.clone());
+            let codomain = Type::Tuple(typed.into_iter().map(|(_, _, c)| c).collect());
+            Some(match name {
+                Some(n) => Type::pi_kinded(n, domain, codomain, fun_kind.clone()),
+                None => Type::Fun {
+                    name: None,
+                    fun_kind: fun_kind.clone(),
+                    domain: Box::new(domain),
+                    codomain: Box::new(codomain),
+                },
+            })
+        })
+        .unwrap_or(Type::Hole);
+    let tuple = typed_tuple(arms);
+    let zip = Expr::builtin(Builtin::Zip).with_ty(Type::compute_fun_or_hole(&tuple.ty, &ty));
+    Expr::apply(tuple, zip).with_ty(ty)
 }
 
 /// Returns the inner `f` if `expr` is `curry(f)` i.e.
@@ -741,12 +803,45 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
                 .ty
                 .codomain()
                 .map(|c| crate::ccl::subst::open_codomain(&source.ty, &c));
+            // A function whose result reads its input, as `unbox`'s keys read the sum it
+            // unboxes, maps each value to its own result type: `map(𝑓)` takes the collection
+            // `𝑐` to the collection whose value at `𝑎` has `𝑓`'s codomain at `𝑎 ▷ 𝑐`.
             let mapped_ty = match collection {
-                Some(collection) => match (collection.domain(), f.ty.codomain()) {
-                    (Some(domain), Some(codomain)) => Type::fun(
-                        collection.clone(),
-                        Type::fun_like(&collection, domain, codomain),
-                    ),
+                Some(collection) => match (collection.domain(), f.ty.peel_refinements()) {
+                    (
+                        Some(domain),
+                        Type::Fun {
+                            name: Some(input),
+                            codomain,
+                            ..
+                        },
+                    ) if crate::ccl::subst::codomain_depends_on(input, codomain) => {
+                        let c = Name::fresh("__mapped");
+                        let a = Name::fresh("__key");
+                        let value = collection.codomain().unwrap_or(Type::Hole);
+                        let at = Expr::apply(
+                            Expr::var(&a).with_ty(domain.clone()),
+                            Expr::var(&c).with_ty(collection.clone()),
+                        )
+                        .with_ty(value);
+                        let result = crate::ccl::subst::discharge_codomain(input, &at, codomain);
+                        let kind = collection
+                            .fun_kind()
+                            .cloned()
+                            .unwrap_or(FunKind::Data(None));
+                        Type::pi(
+                            c,
+                            collection.clone(),
+                            Type::pi_kinded(a, domain, result, kind),
+                        )
+                    }
+                    (Some(domain), _) => match f.ty.codomain() {
+                        Some(codomain) => Type::fun(
+                            collection.clone(),
+                            Type::fun_like(&collection, domain, codomain),
+                        ),
+                        None => Type::Hole,
+                    },
                     _ => Type::Hole,
                 },
                 None => Type::Hole,
@@ -918,7 +1013,7 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         | Builtin::MapDomain
         | Builtin::Compose
         | Builtin::Converse
-        | Builtin::Uncurry
+        | Builtin::Uncurry(_)
         | Builtin::Restrict
         | Builtin::Iterate
         | Builtin::PermuteDomain
@@ -1061,18 +1156,19 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
 /// and a type naming a binder no node binds is not one.
 type Rebinding = Option<(Name, Vec<Expr>)>;
 
-/// Whether `left ≫ right` is `⟨…⟩ ≫ .index`, the window product beta rewrites.
-fn is_product_beta_window(left: &Expr, right: &Expr, index: usize) -> bool {
-    is_proj_idx(right, index) && as_zip(left).is_some()
+/// Whether `left ≫ right` is `⟨𝑓₀, …, 𝑓ₙ⟩ ≫ .𝑖` with `𝑖 ≤ 𝑛`, the window product beta rewrites.
+fn is_product_beta_window(left: &Expr, right: &Expr) -> bool {
+    matches!(&right.node, TypedExprNode::Proj(ProjKey::Index(i))
+        if as_zip_arms(left).is_some_and(|arms| *i < arms.len()))
 }
 
-fn product_beta_rebinding(expr: &Expr, index: usize) -> Option<(usize, Rebinding)> {
+fn product_beta_rebinding(expr: &Expr) -> Option<(usize, Rebinding)> {
     let TypedExprNode::Compose(elts) = &expr.node else {
         return None;
     };
     let i = elts
         .windows(2)
-        .position(|w| is_product_beta_window(&w[0], &w[1], index))?;
+        .position(|w| is_product_beta_window(&w[0], &w[1]))?;
     match elts[i + 1].ty.peel_refinements() {
         Type::Fun {
             name: Some(x),
@@ -1102,30 +1198,167 @@ fn rebind_after(expr: &mut Expr, from: usize, rebinding: Rebinding) {
     }
 }
 
-/// Product beta: `⟨f₀, f₁, …⟩ ≫ .index  ⟹  f_index`, at the first window of the chain
-/// that is one. The rule and [`product_beta_rebinding`] find that window by the same test, so
-/// the chain after it is rebound exactly when the rule fires there.
-fn try_product_beta(expr: &mut Expr, index: usize) -> bool {
-    let Some((i, rebinding)) = product_beta_rebinding(expr, index) else {
+/// Product beta: `⟨f₀, f₁, …⟩ ≫ .i  ⟹  fᵢ`, at the first window of the chain that is one.
+/// The rule and [`product_beta_rebinding`] find that window by the same test, so the chain
+/// after it is rebound exactly when the rule fires there.
+fn try_product_beta(expr: &mut Expr) -> bool {
+    let Some((i, rebinding)) = product_beta_rebinding(expr) else {
         return false;
     };
-    let fired = try_pairwise_in_compose(
-        expr,
-        |left, right| is_product_beta_window(left, right, index),
-        |left, _proj, _mint_kind| {
-            let (f, g) = into_zip(left);
-            vec![if index == 0 { f } else { g }]
-        },
-    );
+    let fired = try_pairwise_in_compose(expr, is_product_beta_window, |left, proj, _mint_kind| {
+        let TypedExprNode::Proj(ProjKey::Index(index)) = proj.node else {
+            unreachable!("the window ends in a positional projection")
+        };
+        vec![into_zip_arms(left).swap_remove(index)]
+    });
     if fired {
         rebind_after(expr, i + 1, rebinding);
     }
     fired
 }
 
-/// Product beta (first): `⟨f, g⟩ ≫ .0  ⟹  f`
-fn try_product_beta_fst(expr: &mut Expr) -> bool {
-    try_product_beta(expr, 0)
+/// Uncurrying a collection-valued morphism lambda elimination built
+/// (`src/ccl/design/optimization.md`, "`uncurry` of an eliminated nest"). At `𝑛 = 2`, at a pair
+/// `(𝑎, 𝑏)`:
+/// - `curry(𝑔) ▷ uncurry ⟹ 𝑔`;
+/// - `(𝑠 ≫ curry(𝑔)) ▷ uncurry ⟹ (.0 ≫ 𝑠, .1) ▷ zip ≫ 𝑔`, both `𝑔(𝑠(𝑎), 𝑏)`;
+/// - `(𝑠 ≫ ⟨𝑡 ▷ const, curry(𝑔)⟩ ≫ compose) ▷ uncurry ⟹ (.0 ≫ 𝑠, .1 ≫ 𝑡) ▷ zip ≫ 𝑔`, both
+///   `𝑔(𝑠(𝑎), 𝑡(𝑏))`: a generator over a sum composed with its source;
+/// - `(𝑠 ≫ 𝑐 ▷ const) ▷ uncurry ⟹ .1 ≫ 𝑐`, both `𝑐(𝑏)`: an inner collection reading nothing of
+///   the outer element. The pair's domain is the type's, so dropping `𝑠` keeps it.
+///
+/// At `𝑛 > 2` each law pairs the first two keys as it does at `𝑛 = 2` and leaves
+/// `uncurry(𝑛 − 1)` of what remains, over that pair beside the other keys: `𝑔` becomes
+/// `(⟨…⟩, .2, …, .(𝑛−1)) ▷ zip ≫ (𝑔 ▷ uncurry(𝑛 − 1))`, and the constant inner collection
+/// `(.1, …, .(𝑛−1)) ▷ zip ≫ (𝑐 ▷ uncurry(𝑛 − 1))`.
+fn try_uncurry_curried(expr: &mut Expr) -> bool {
+    /// The chain's elements before the curried tail, whether the tail composes a collection
+    /// in front of the curried morphism, as a count of the elements it spans.
+    fn tail(elts: &[Expr]) -> Option<usize> {
+        match elts {
+            [.., last] if as_curry(last).is_some() => Some(1),
+            [.., pair, compose]
+                if is_builtin(compose, Builtin::Compose)
+                    && as_zip(pair)
+                        .is_some_and(|(t, g)| as_const(t).is_some() && as_curry(g).is_some()) =>
+            {
+                Some(2)
+            }
+            _ => None,
+        }
+    }
+    let TypedExprNode::Apply { argument, function } = &expr.node else {
+        return false;
+    };
+    let TypedExprNode::Builtin(Builtin::Uncurry(n)) = function.node else {
+        return false;
+    };
+    let ty = expr.ty.clone();
+    let Some(Type::Tuple(parts)) = ty.domain().map(|d| d.peel_refinements().clone()) else {
+        return false;
+    };
+    if parts.len() != n {
+        return false;
+    }
+    let Some(value) = ty.codomain() else {
+        return false;
+    };
+    let keys = Type::Tuple(parts.clone());
+    let proj = |i: usize| Expr::proj_index(i).with_ty(Type::fun(keys.clone(), parts[i].clone()));
+    let kind = ty.fun_kind().cloned().unwrap_or(FunKind::Data(None));
+    // `uncurry(𝑘)` of `𝑓`, keyed by `𝑓`'s own key beside `rest`; `𝑓` itself at `𝑘 = 1`.
+    let flattened = |f: Expr, k: usize, rest: &[Type]| {
+        if k == 1 {
+            return f;
+        }
+        let first = f.ty.domain().unwrap_or(Type::Hole);
+        let tuple = Type::Tuple(std::iter::once(first).chain(rest.iter().cloned()).collect());
+        apply_primitive(f, Builtin::Uncurry(k), Type::data_fun(tuple, value.clone()))
+    };
+    let last = match &argument.node {
+        TypedExprNode::Compose(elts) => elts.last(),
+        _ => Some(argument.as_ref()),
+    };
+    // Dropping the outer collection drops the only term that enumerates the keys, so a tuple
+    // with a component whose keys only a collection holds keeps the chain
+    // ([`keys_only_in_the_data`]): planning enumerates those tuples through this very term.
+    if !keys_only_in_the_data(expr)
+        && let Some(c) = last.and_then(as_const)
+    {
+        let c = c.clone_preserving_ids();
+        let read = if n == 2 {
+            proj(1)
+        } else {
+            zip_of((1..n).map(proj).collect(), &kind)
+        };
+        let inner = flattened(c, n - 1, &parts[2..]);
+        *expr = Expr::compose(vec![read, inner]).with_ty(ty);
+        return true;
+    }
+    let spans = match &argument.node {
+        TypedExprNode::Compose(elts) => tail(elts),
+        _ => as_curry(argument).map(|_| 1),
+    };
+    let Some(spans) = spans else {
+        return false;
+    };
+    let TypedExpr {
+        node: TypedExprNode::Apply { argument, .. },
+        ..
+    } = take(expr)
+    else {
+        unreachable!("matched an application above")
+    };
+    let mut elts = match argument.node {
+        TypedExprNode::Compose(elts) => elts,
+        node => vec![TypedExpr { node, ..*argument }],
+    };
+    let tail_elts = elts.split_off(elts.len() - spans);
+    let (t, g) = if spans == 1 {
+        let [curried] = <[Expr; 1]>::try_from(tail_elts).expect("one element");
+        (None, into_argument(curried))
+    } else {
+        let [pair_elt, _compose] = <[Expr; 2]>::try_from(tail_elts).expect("two elements");
+        let (t, curried) = into_zip(pair_elt);
+        (Some(into_argument(t)), into_argument(curried))
+    };
+    let g = flattened(g, n - 1, &parts[2..]);
+    if n == 2 && elts.is_empty() && t.is_none() {
+        *expr = g.with_ty(ty);
+        return true;
+    }
+    let read = |p: Expr, through: Option<Expr>| match through {
+        None => p,
+        Some(c) => {
+            let c_codomain = c.ty.codomain().unwrap_or(Type::Hole);
+            Expr::compose(vec![p, c]).with_ty(Type::fun(keys.clone(), c_codomain))
+        }
+    };
+    let s = match <[Expr; 1]>::try_from(elts) {
+        Ok([only]) => Some(only),
+        Err(elts) if elts.is_empty() => None,
+        Err(elts) => {
+            let s_ty = match (
+                elts.first().and_then(|e| e.ty.domain()),
+                elts.last().and_then(|e| e.ty.codomain()),
+            ) {
+                (Some(d), Some(c)) => Type::fun(d, c),
+                _ => Type::Hole,
+            };
+            Some(Expr::compose(elts).with_ty(s_ty))
+        }
+    };
+    let pairing = zip_pair(read(proj(0), s), read(proj(1), t), &kind);
+    let reshaped = if n == 2 {
+        pairing
+    } else {
+        zip_of(
+            std::iter::once(pairing).chain((2..n).map(proj)).collect(),
+            &kind,
+        )
+    };
+    *expr = Expr::compose(vec![reshaped, g]).with_ty(ty);
+    true
 }
 
 /// Literal tuple projection: `(e₀, …, eₙ).i  ⟹  eᵢ`
@@ -1173,11 +1406,6 @@ fn try_literal_tuple_projection(expr: &mut Expr) -> bool {
     };
     *expr = elts.swap_remove(i);
     true
-}
-
-/// Product beta (second): `⟨f, g⟩ ≫ .1  ⟹  g`
-fn try_product_beta_snd(expr: &mut Expr) -> bool {
-    try_product_beta(expr, 1)
 }
 
 /// CCC universal property: `⟨.1, .0 ≫ curry(f)⟩ ≫ apply  ⟹  f`
@@ -1520,7 +1748,8 @@ fn try_product_eta(expr: &mut Expr) -> bool {
 // Zip distribute rule
 // ---------------------------------------------------------------------------
 
-/// Zip distribute: `⟨f0, f1⟩ ≫ ⟨g, h⟩  ⟹  ⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩`
+/// Zip distribute: `⟨f0, f1⟩ ≫ ⟨g, h⟩  ⟹  ⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩`, for zips of any
+/// arity on either side.
 ///
 /// Distributes a zip composition across another zip, but only when the left side
 /// is itself a zip and the right-side arms will simplify nicely after the composition.
@@ -1530,10 +1759,10 @@ fn try_product_eta(expr: &mut Expr) -> bool {
 ///
 /// Operates pairwise in an n-ary compose; trailing elements are preserved.
 fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
-    // Returns true if both arms are simplifying, but not both are id.
+    // Returns true if every arm is simplifying, but not every arm is id.
     fn is_simplifying_zip(expr: &Expr) -> bool {
-        as_zip(expr)
-            .is_some_and(|(a, b)| is_simplifying(a) && is_simplifying(b) && !(is_id(a) && is_id(b)))
+        as_zip_arms(expr)
+            .is_some_and(|arms| arms.iter().all(is_simplifying) && !arms.iter().all(is_id))
     }
 
     /// Returns true if the arm is simplifying: id, projection, lifted const, or a zip with simplifying arms.
@@ -1572,11 +1801,9 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
         |left, right| {
             // Match: left is a zip, right is a zip with simplifying arms
             // But don't match if both arms are just id (which would create unnecessary complexity)
-            as_zip(left).is_some() && is_simplifying_zip(right)
+            as_zip_arms(left).is_some() && is_simplifying_zip(right)
         },
         |left, right, mint_kind| {
-            let (g, h) = into_zip(right);
-
             // Each distributed arm is the chain `left ≫ arm`, typed by the rule for chains
             // ([`crate::ccl::ccl_utils::chain_type`]) at the kind a minted morphism takes (see
             // `try_pairwise_in_compose`).
@@ -1590,11 +1817,12 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
                 };
                 Expr::compose(elts).with_ty(ty)
             };
-            // Distribution places `left` on both legs of the zip.
-            let h_left = left.clone();
-            let g_compose = arm_chain(left, g);
-            let h_compose = arm_chain(h_left, h);
-            vec![zip_pair(g_compose, h_compose, mint_kind)]
+            // Distribution places `left` on every leg of the zip.
+            let arms = into_zip_arms(right)
+                .into_iter()
+                .map(|arm| arm_chain(left.clone(), arm))
+                .collect();
+            vec![zip_of(arms, mint_kind)]
         },
     )
 }
