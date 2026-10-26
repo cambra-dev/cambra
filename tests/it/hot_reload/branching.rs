@@ -18,7 +18,8 @@
 //! of the port, so a case exercises every verb's status and body without a
 //! socket.
 
-use std::{cell::RefCell, rc::Rc};
+use cambra::interpreter::LockNow;
+use std::sync::{Arc, Mutex};
 
 use indoc::indoc;
 
@@ -797,9 +798,9 @@ const FOLD_VIA_OTHER_VIEW: &str = indoc! {r#"
 "#};
 
 /// A context with a test source `src` of integers registered.
-fn with_src() -> (GlobalContext, Rc<RefCell<TestDataSource>>) {
+fn with_src() -> (GlobalContext, Arc<Mutex<TestDataSource>>) {
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = Arc::new(Mutex::new(TestDataSource::new(
         "src",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -808,13 +809,13 @@ fn with_src() -> (GlobalContext, Rc<RefCell<TestDataSource>>) {
     (ctx, src)
 }
 
-fn add(src: &Rc<RefCell<TestDataSource>>, from: u64, values: &[i64]) {
+fn add(src: &Arc<Mutex<TestDataSource>>, from: u64, values: &[i64]) {
     let rows: Vec<(Value, Value)> = (from..)
         .zip(values)
         .map(|(i, v)| (Value::UInt(i), Value::Int(*v)))
         .collect();
     let last = from + u64::try_from(values.len()).expect("fits in u64") - 1;
-    let mut src = src.borrow_mut();
+    let mut src = src.lock_now();
     src.add_data(&rows);
     // Every position up to the last added is complete, which is what lets a
     // drive release the position it last decided.
@@ -867,7 +868,7 @@ fn fold_after(with_lagging_branch: bool, install: Install) -> (i64, Predicate) {
     add(&src, 2, &[4, 8]);
     pull(&mut ctx, &mut live, MAIN_BRANCH);
     assert_eq!(x_of(&live, MAIN_BRANCH), 15);
-    let agreed = src.borrow().get_released_predicate();
+    let agreed = src.lock_now().get_released_predicate();
 
     let installed = match install {
         Install::Reload => {

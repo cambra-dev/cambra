@@ -1321,7 +1321,7 @@ mod tests {
         producer.release(prefix.clone());
 
         assert_eq!(
-            released.borrow().as_slice(),
+            released.lock_now().as_slice(),
             &[prefix],
             "a domain release must reach the scrutinee unchanged"
         );
@@ -1370,7 +1370,7 @@ mod tests {
         producer.release(prefix.clone());
 
         assert_eq!(
-            released.borrow().as_slice(),
+            released.lock_now().as_slice(),
             &[prefix],
             "a domain release must reach the payload unchanged, not be swallowed \
              as a whole-input read would"
@@ -1601,7 +1601,7 @@ mod variant_projection_tests {
         let (mut wrap, pulled) = wrapped_payloads();
         let morsel = wrap.get(keys_between(2, 4));
         assert_eq!(keys(&morsel), ColumnValue::UInts(vec![2, 3, 4]));
-        assert_eq!(*pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(*pulled.lock_now(), [keys_between(2, 4)]);
     }
 
     #[test]
@@ -1672,7 +1672,7 @@ mod variant_projection_tests {
         };
         assert_eq!(*domain, ColumnValue::UInts(vec![2, 4]));
         assert_eq!(**codomain, Tile::Scalar(ColumnValue::Ints(vec![20, 40])));
-        assert_eq!(*pulled.borrow(), [keys_between(2, 5)]);
+        assert_eq!(*pulled.lock_now(), [keys_between(2, 5)]);
     }
 
     /// The tags partition the stream, so the arms of one `match` pulled at one morsel hold
@@ -1735,7 +1735,7 @@ mod variant_projection_tests {
             panic!("a collection")
         };
         assert_eq!(*domain, ColumnValue::UInts(vec![2, 4]));
-        assert_eq!(*pulled.borrow(), [bare_tiling.universal_guard()]);
+        assert_eq!(*pulled.lock_now(), [bare_tiling.universal_guard()]);
         assert_conforms(|| Box::new(make().0), keys_between(1, 4));
 
         // The consumer releases a morsel before the next. The scrutinee has no keys to take the
@@ -1796,7 +1796,7 @@ mod variant_projection_tests {
             (0..domain.len()).all(|i| matches!(domain.index_at(i), Value::UInt(key) if key >= 5)),
             "only the second morsel's positions: {domain:?}"
         );
-        assert!(released.borrow().is_empty());
+        assert!(released.lock_now().is_empty());
     }
 
     #[test]
@@ -1814,7 +1814,7 @@ mod variant_projection_tests {
             **codomain,
             Tile::Scalar(ColumnValue::Bools(vec![true, false, true, false]))
         );
-        assert_eq!(*pulled.borrow(), [keys_between(2, 5)]);
+        assert_eq!(*pulled.lock_now(), [keys_between(2, 5)]);
     }
 
     #[test]
@@ -1829,7 +1829,7 @@ mod variant_projection_tests {
         let (mut is_commit, pulled) = is_commit();
         let nothing = is_commit.tiling().empty_guard();
         assert_eq!(is_commit.get(nothing), is_commit.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 
     #[test]
@@ -1837,7 +1837,7 @@ mod variant_projection_tests {
         let (mut commits, pulled) = commit_arm();
         let nothing = commits.tiling().empty_guard();
         assert_eq!(commits.get(nothing), commits.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 
     #[test]
@@ -1845,6 +1845,6 @@ mod variant_projection_tests {
         let (mut wrap, pulled) = wrapped_payloads();
         let nothing = wrap.tiling().empty_guard();
         assert_eq!(wrap.get(nothing), wrap.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 }

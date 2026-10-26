@@ -2,34 +2,33 @@
 //! (`cambra::interpreter::live_keys`). Each test reads a `Restrict` over a source whose last
 //! row the predicate rejects, and observes the reader through what it releases from the source.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use cambra::ccl::Type;
 use cambra::interpreter::tile_operators::{
     Converse, ExtractFinal, IterateExtent, MapResultWithSource, Restrict, TileOperator,
 };
 use cambra::interpreter::{
-    BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, FunctionGuard, Predicate, Scheduler,
-    TestDataSource, TileGuard, Value,
+    BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, FunctionGuard, LockNow, Predicate,
+    Scheduler, TestDataSource, TileGuard, Value,
 };
 
 /// A still-open source of flags `0 ↦ true, 1 ↦ true, 2 ↦ false`, and the `Restrict` keeping
 /// the keys flagged `true`: key `2` stays in its domain column, marked deleted.
-fn restricted_flags() -> (Rc<RefCell<TestDataSource>>, Restrict) {
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+fn restricted_flags() -> (Arc<Mutex<TestDataSource>>, Restrict) {
+    let src = Arc::new(Mutex::new(TestDataSource::new(
         "flags",
         Type::Base(BaseType::Bool),
         Extent::Base(BaseType::Bool),
     )));
-    src.borrow_mut().add_data(&[
+    src.lock_now().add_data(&[
         (Value::UInt(0), Value::Bool(true)),
         (Value::UInt(1), Value::Bool(true)),
         (Value::UInt(2), Value::Bool(false)),
     ]);
-    src.borrow_mut()
+    src.lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(2)));
-    let dyn_src: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = src.clone();
+    let dyn_src: Arc<Mutex<dyn DataSourceDomainExtentImpl>> = src.clone();
     let flags = MapResultWithSource::new(
         dyn_src.clone(),
         Box::new(IterateExtent::new(Extent::DataSourceDomain(dyn_src))),
@@ -50,7 +49,7 @@ fn extract_final_releases_below_the_highest_live_position() {
     );
     producer.get(producer.tiling().universal_guard());
     assert_eq!(
-        src.borrow().get_released_predicate(),
+        src.lock_now().get_released_predicate(),
         Predicate::at_or_below(Value::UInt(0)),
     );
 }
@@ -69,5 +68,5 @@ fn converse_holds_no_deleted_row() {
     producer.get(producer.tiling().universal_guard());
     let value_two = Predicate::from_column_value(&ColumnValue::from_uints(vec![2]));
     producer.release(TileGuard::Function(FunctionGuard::Domain(value_two)));
-    assert_eq!(src.borrow().get_released_predicate(), Predicate::False);
+    assert_eq!(src.lock_now().get_released_predicate(), Predicate::False);
 }

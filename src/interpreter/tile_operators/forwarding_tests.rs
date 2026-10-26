@@ -43,9 +43,9 @@ fn received(build: &dyn Fn() -> Built, notified: usize, region: &Projection) -> 
     let guard = operator.tiling().universal_guard();
     let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
     // Some inputs notify when they are subscribed.
-    regions.borrow_mut().clear();
+    regions.lock_now().clear();
     notify_input(&inputs[notified], region);
-    let seen = regions.borrow_mut();
+    let seen = regions.lock_now();
     seen.clone()
 }
 
@@ -122,8 +122,8 @@ fn restrict_carries_no_region_between_notifications() {
 
 fn map_result_with_source() -> Built {
     use crate::interpreter::TestDataSource;
-    use std::{cell::RefCell, rc::Rc};
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    use std::sync::{Arc, Mutex};
+    let source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         crate::ccl::Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -745,7 +745,7 @@ macro_rules! fan_out_with_two_slots {
                 logs.push(regions);
             }
             for regions in &logs {
-                regions.borrow_mut().clear();
+                regions.lock_now().clear();
             }
             (logs, producers, consumer)
         };
@@ -757,7 +757,7 @@ fn a_fan_out_forwards_a_region_to_every_live_slot_unchanged() {
     fan_out_with_two_slots!(logs, _producers, consumer);
     notify_input(&consumer, &region());
     for regions in &logs {
-        assert_eq!(*regions.borrow_mut(), [region()]);
+        assert_eq!(*regions.lock_now(), [region()]);
     }
 }
 
@@ -768,9 +768,9 @@ fn a_fan_out_suppresses_a_second_notification_until_a_pull_reopens_it() {
     fan_out_with_two_slots!(logs, producers, consumer);
     notify_input(&consumer, &region());
     notify_input(&consumer, &another_region());
-    assert_eq!(*logs[0].borrow_mut(), [region()]);
+    assert_eq!(*logs[0].lock_now(), [region()]);
     let guard = producers[0].tiling().universal_guard();
     producers[0].get(guard);
     notify_input(&consumer, &another_region());
-    assert_eq!(*logs[0].borrow_mut(), [region(), another_region()]);
+    assert_eq!(*logs[0].lock_now(), [region(), another_region()]);
 }

@@ -1,4 +1,5 @@
 use crate::ccl::Label;
+use crate::interpreter::LockNow;
 use bit_set::BitSet;
 use log::trace;
 use smol_str::SmolStr;
@@ -56,9 +57,9 @@ use crate::{
     util::ScopeStack,
 };
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
-    rc::Rc,
+    sync::Arc,
+    sync::Mutex,
 };
 
 /// Converts a λ-eliminated CCL expression into an operator graph.
@@ -175,7 +176,7 @@ fn compile_let_binding(
             // Memoized, as every shared computed input is: a `FanOut` passes each slot's
             // pull to its input, and this input is the enclosing drive, which every reader
             // of the `Transact` pulls once per lap.
-            let fan = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+            let fan = Arc::new(FanOut::new(Box::new(Memo::new(input))));
             ctx.bind_nested_store(&binding.name, bound_expr, keys, writers, fan.slot())?;
             return Ok(Some(fan.slot()));
         }
@@ -185,7 +186,7 @@ fn compile_let_binding(
 
     let (bound_input, body_input) = match input {
         Some(input) => {
-            let fan_out = Rc::new(FanOut::new(input));
+            let fan_out = Arc::new(FanOut::new(input));
             (Some(fan_out.slot()), Some(fan_out.slot()))
         }
         None => (None, None),
@@ -377,7 +378,7 @@ struct StoreReadInfo {
     site: ContentHash,
     /// The cyclic store fan — a [`FanOut`] over the store body stream; every
     /// read is a slot of this one fan.
-    fan: Rc<FanOut>,
+    fan: Arc<FanOut>,
     /// Per-variable read info, keyed by the variable's [`Name::field_key`].
     keys: HashMap<Label, KeyReadInfo>,
     /// Which engine backs the store (selects the read projection).
@@ -429,7 +430,7 @@ pub struct OpConversionContext {
     /// How much of the previous version's graph this compilation kept.
     reuse: ReuseTally,
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
-    sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    sources: HashMap<String, Arc<Mutex<dyn DataSourceDomainExtentImpl>>>,
     /// Every mutable variable's identity, by the `Transact` node that declares
     /// it, from [`state_identities`] over the tree about to be converted.
     /// Installed by [`set_var_paths`](Self::set_var_paths) before conversion
@@ -479,7 +480,7 @@ pub struct OpConversionContext {
 pub(crate) struct OpenIteration {
     /// The curried source: one inner collection per enclosing position, which is the keys a
     /// binding from outside is spread over.
-    source: Rc<FanOut>,
+    source: Arc<FanOut>,
     /// The level the iteration adds beneath its enclosing positions, which a lifted binding is
     /// paired at ([`Product::per_row_at`]).
     paired: CurryLevel,
@@ -501,7 +502,7 @@ pub(crate) struct OpenIteration {
 /// variable, and the next compilation keeps from it.
 ///
 /// A branch's entry holds one of these (`src/ccl/design/program-evolution.md`,
-/// "The branch table"). Every [`Recorded`] holds its operator by `Rc`, so a
+/// "The branch table"). Every [`Recorded`] holds its operator by `Arc`, so a
 /// clone builds nothing and the two copies hold the same operators.
 #[derive(Default, Clone)]
 pub struct OperatorMap {
@@ -563,11 +564,11 @@ impl OperatorMap {
     /// What an entry holds: an operator is alive while some operator map lists
     /// it, which is what a branch's operator count and its sharing are counted
     /// over.
-    pub fn operators(&self) -> Vec<Rc<FanOut>> {
-        let mut out: Vec<Rc<FanOut>> = Vec::new();
+    pub fn operators(&self) -> Vec<Arc<FanOut>> {
+        let mut out: Vec<Arc<FanOut>> = Vec::new();
         for entry in self.entries.values() {
             let fan = entry.fan();
-            if !out.iter().any(|held| Rc::ptr_eq(held, fan)) {
+            if !out.iter().any(|held| Arc::ptr_eq(held, fan)) {
                 out.push(fan.clone());
             }
         }
@@ -772,7 +773,7 @@ impl Correspondence {
 #[derive(Clone)]
 enum Recorded {
     /// A `Let` binding's operator, or a writer's iteration input.
-    Operator(Rc<FanOut>),
+    Operator(Arc<FanOut>),
     /// A `Transact` store, which every mutable-variable read projects.
     Store(StoreReadInfo),
 }
@@ -780,7 +781,7 @@ enum Recorded {
 impl Recorded {
     /// The fan-out every use of this node branches off. A store's is its own
     /// cyclic fan, which is why the two arms are not a fan plus a payload.
-    fn fan(&self) -> &Rc<FanOut> {
+    fn fan(&self) -> &Arc<FanOut> {
         match self {
             Recorded::Operator(fan) => fan,
             Recorded::Store(info) => &info.fan,
@@ -815,7 +816,7 @@ pub struct ReuseTally {
 /// One `Let` binding in scope during conversion.
 pub(crate) struct LetBinding {
     /// The fan-out every use of the binding branches off.
-    pub(crate) fan: Rc<FanOut>,
+    pub(crate) fan: Arc<FanOut>,
     /// Whether the binding was compiled inside an iteration scope.
     pub(crate) kind: BindingKind,
     /// **Which** iteration it was compiled inside, as a depth. A reference made deeper
@@ -899,7 +900,7 @@ impl OpConversionContext {
     pub fn register_source(
         &mut self,
         name: impl Into<String>,
-        impl_: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        impl_: Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
     ) {
         self.sources.insert(name.into(), impl_);
     }
@@ -907,7 +908,7 @@ impl OpConversionContext {
     pub fn get_source(
         &self,
         name: &str,
-    ) -> Result<Rc<RefCell<dyn DataSourceDomainExtentImpl>>, ConversionError> {
+    ) -> Result<Arc<Mutex<dyn DataSourceDomainExtentImpl>>, ConversionError> {
         self.sources
             .get(name)
             .cloned()
@@ -1146,7 +1147,7 @@ records one and the only site a `Transact` reaches"
             self.rebuilt.insert(name.clone());
         }
         let bound_op = convert_impl(bound_expr, bound_input, self)?;
-        let fan = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
+        let fan = Arc::new(FanOut::new(Box::new(Memo::new(bound_op))));
         // An `Aligned` operator is offered to the next version even though it
         // will not be kept: the offer is keyed by the node, and declining is the
         // reader's decision, made where the operator would be taken.
@@ -1281,7 +1282,7 @@ records one and the only site a `Transact` reaches"
             }
         }
         let op = build(self)?;
-        let fan = Rc::new(FanOut::new(op));
+        let fan = Arc::new(FanOut::new(op));
         self.record(node, Recorded::Operator(fan.clone()));
         Ok(IterationInput {
             op: fan.slot(),
@@ -1322,7 +1323,7 @@ records one and the only site a `Transact` reaches"
     /// skips the predicates of a `Cast` target, which live in a `Type` — and that
     /// is sound in both directions here: conversion discards a cast target
     /// (`convert_impl`), so no entry is ever recorded inside one.
-    fn keep_region(&mut self, term: &Expr, kept: &Rc<FanOut>) {
+    fn keep_region(&mut self, term: &Expr, kept: &Arc<FanOut>) {
         kept.with_input(record_kept_operators);
         fn nodes_below(e: &Expr, out: &mut Vec<NodeId>) {
             e.walk_children(|child| {
@@ -2335,7 +2336,7 @@ fn convert_impl_inner(
             // writer re-pulls the body once per proposal — without the memo the two
             // fan slots desync (one sees a position the other has already
             // consumed).
-            let fan = Rc::new(FanOut::new(Box::new(Memo::new(upstream))));
+            let fan = Arc::new(FanOut::new(Box::new(Memo::new(upstream))));
             let pred_op = convert_impl(argument, Some(fan.slot()), ctx)?;
             Ok(Box::new(Filter::new_at(fan.slot(), pred_op, masked)))
         }
@@ -3742,7 +3743,7 @@ fn build_commit_store(
     let setters: Vec<_> = (0..writers.len())
         .map(|k| commit.writer_input_setter(k))
         .collect();
-    let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
+    let store_fan = Arc::new(FanOut::new_cyclic(Box::new(commit)));
 
     for ((set_writer, w), taps) in setters.into_iter().zip(writers.iter()).zip(per_writer_taps) {
         // Attribute this writer's operators to the writer, not to the binding
@@ -3799,7 +3800,7 @@ fn build_commit_store(
         // attempt still in flight — and so this is the one fan whose input is **not**
         // memoized. A `Memo` releases its input as soon as it caches, which reaches the
         // driver as an ack for an attempt no slot has finished.
-        let driver_fan = Rc::new(FanOut::new(Box::new(driver)));
+        let driver_fan = Arc::new(FanOut::new(Box::new(driver)));
         // The body releases each row as it consumes it, which is its half of that intersection.
         // A `Memo` over the driver's slot makes that release for any body shape: a body that
         // reads its input once has no fan of its own, and without the release a superseded
@@ -3942,7 +3943,7 @@ fn source_start(domain: &Type, ctx: &OpConversionContext) -> Option<Position> {
     // resumes after is the one below. A collection offers every position it has, so
     // a drive over one resumes after nothing.
     let next = ctx.sources.get(name).map_or(0, |source| {
-        source.borrow().first_position_for_a_new_producer()
+        source.lock_now().first_position_for_a_new_producer()
     });
     next.checked_sub(1).map(|p| Position::new(Value::UInt(p)))
 }
@@ -4738,7 +4739,7 @@ fn split_nested_source(tiling: &Tiling, standing: usize) -> Option<(Vec<Extent>,
 /// rows: one seed per row, a row whose inner loop runs no position included.
 fn convert_nested_seeds(
     keys: &[TransactKey],
-    enclosing_fan: &Rc<FanOut>,
+    enclosing_fan: &Arc<FanOut>,
     ctx: &mut OpConversionContext,
 ) -> Result<Vec<Box<dyn TileOperator>>, ConversionError> {
     keys.iter()
@@ -4774,7 +4775,7 @@ fn build_nested_induction_store(
     // `Memo`: a `FanOut` passes every slot's pull to its input, and without the cache each
     // reader recomputes the input once per lap. None of these fans' releases is read as a
     // drive's progress, which is what keeps a `Memo` off an iteration source.
-    let enclosing_fan = Rc::new(FanOut::new(Box::new(Memo::new(enclosing_input))));
+    let enclosing_fan = Arc::new(FanOut::new(Box::new(Memo::new(enclosing_input))));
 
     // `ᴘ ⇒ (Pos ⥤ item)` against the enclosing positions: one inner collection per row. Both
     // source shapes planning emits converge here — a `curry_over` for an inner source the
@@ -4795,7 +4796,7 @@ fn build_nested_induction_store(
             source_nested.tiling()
         )));
     };
-    let source_fan = Rc::new(FanOut::new(Box::new(Memo::new(source_nested))));
+    let source_fan = Arc::new(FanOut::new(Box::new(Memo::new(source_nested))));
     // The body takes `(ᴘ, Pos)`, so each row's parameter is paired with the keys of **its
     // own** collection ([`Product::per_row_at`]).
     // The `Transact`'s rows stand beneath the levels left standing, and the pairing adds the
@@ -4813,7 +4814,7 @@ fn build_nested_induction_store(
     // What a nested body takes beside its slots is the **whole pair** `(ᴘ, Pos)`, which is
     // what elimination gave it and what the seed is a morphism of — not `ᴘ` alone.
     let enclosing_extent = pairs.tiling().deepest_values().extent();
-    let pairs_fan = Rc::new(FanOut::new(Box::new(Memo::new(pairs))));
+    let pairs_fan = Arc::new(FanOut::new(Box::new(Memo::new(pairs))));
     // The driver takes the source **curried**, one inner collection per enclosing position,
     // because that is where per-row completeness is stated: the outer level's
     // `domain_predicate` names the rows that will gain no more items, and flattening to
@@ -4846,7 +4847,7 @@ fn build_nested_induction_store(
         // the body with it at an enclosing boundary, and the store folds a carry to it at
         // a position that writes nothing. One reader would leave the other disagreeing —
         // which is the shape of every "write between the loops" case.
-        let seed_fan = Rc::new(FanOut::new(Box::new(Memo::new(seed))));
+        let seed_fan = Arc::new(FanOut::new(Box::new(Memo::new(seed))));
         seed_ops.push(seed_fan.slot());
         store_seed_ops.push((rk.clone(), seed_fan.slot()));
         let prior = keys_map.insert(
@@ -4901,7 +4902,7 @@ fn build_nested_induction_store(
         None,
     );
     let set_body = store.body_input_setter();
-    let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+    let fan = Arc::new(FanOut::new_cyclic(Box::new(store)));
     // The two things a nested drive adds: the enclosing parameter its body takes, and
     // where each accumulator restarts at an enclosing position boundary. The positions it
     // sequences are the inner half of the pair domain.
@@ -5063,7 +5064,7 @@ resolves to the other's value",
     // Cyclic: the driver reads this store's changelog back to recover each
     // position's previous accumulator, so one fan slot feeds the cycle and the
     // rest serve the downstream `__hist.k` dense reads.
-    let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+    let fan = Arc::new(FanOut::new_cyclic(Box::new(store)));
     let driver = InductionDriver::new(
         // The driver is placed inside this store by `set_body` below, so its
         // read of the store's changelog is a recurrence rather than a reader.
@@ -5336,7 +5337,7 @@ fn strength_over_at(
     ) -> Result<Box<dyn TileOperator>, ConversionError>,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let level = ctx.level();
-    let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+    let fan_out = Arc::new(FanOut::new(Box::new(Memo::new(input))));
     let collections = collections(fan_out.slot(), ctx)?;
     Ok(Box::new(Product::per_row_values_at(
         fan_out.slot(),
@@ -5585,8 +5586,7 @@ fn apply_compare_by_key(
     level: CurryLevel,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let record_extent = value_extent_at(input.tiling(), level);
-    let fn_value =
-        Value::ComputableFunction(FunctionDef::CompareByKey(kind, std::sync::Arc::new(key)));
+    let fn_value = Value::ComputableFunction(FunctionDef::CompareByKey(kind, Arc::new(key)));
     let fn_extent = Extent::Function {
         domain: Box::new(record_extent),
         codomain: Box::new(Extent::Base(BaseType::Bool)),
@@ -5610,13 +5610,13 @@ fn map_order_key(
     let key_extent = key.key_extent(element);
     let (function, domain, codomain) = if to_key {
         (
-            FunctionDef::ToOrderKey(std::sync::Arc::new(key.clone())),
+            FunctionDef::ToOrderKey(Arc::new(key.clone())),
             element.clone(),
             key_extent,
         )
     } else {
         (
-            FunctionDef::FromOrderKey(std::sync::Arc::new(key.clone())),
+            FunctionDef::FromOrderKey(Arc::new(key.clone())),
             key_extent,
             element.clone(),
         )
@@ -5725,7 +5725,7 @@ fn union_operand_ops(
                 .level()
                 .enclosing()
                 .expect("a fed disjoint join partitions the keys its input stands at, and a scalar has none");
-            let fan = Rc::new(FanOut::new(Box::new(Memo::new(inp))));
+            let fan = Arc::new(FanOut::new(Box::new(Memo::new(inp))));
             let ops = operands
                 .iter()
                 .map(|e| convert_impl(e, Some(fan.slot()), ctx))
@@ -5860,7 +5860,7 @@ fn zip_pair(expr: &Expr) -> Option<(&Expr, &Expr)> {
 /// reads none (`is_leaf_zip_arm`).
 enum ZipReaders {
     Lone(Option<Box<dyn TileOperator>>),
-    Fan(Rc<FanOut>),
+    Fan(Arc<FanOut>),
 }
 
 impl ZipReaders {
@@ -5871,7 +5871,7 @@ impl ZipReaders {
     ) -> Self {
         match arms.filter(|e| !is_leaf_zip_arm(e, ctx)).count() {
             1 => Self::Lone(Some(input)),
-            _ => Self::Fan(Rc::new(FanOut::new(Box::new(Memo::new(input))))),
+            _ => Self::Fan(Arc::new(FanOut::new(Box::new(Memo::new(input))))),
         }
     }
 

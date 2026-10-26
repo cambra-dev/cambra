@@ -524,7 +524,7 @@ Input producers are constructed by their own operators' subscriptions.
 Probe keys are `(node_id, producer_id)`. `alloc_id` counts by producer display name, so two
 producer types built for one operator could collide; `ProbeTable` checks conflicting names
 with a debug assertion. Observations are rendered with a row limit after `get_impl` and the
-wrapper checks, without changing the tile returned to the consumer. No probe-table borrow is
+wrapper checks, without changing the tile returned to the consumer. No probe-table lock is
 held across `get_impl`, whose upstream pulls may use the same table.
 
 An empty probe slot records nothing. Connection lifetime is specified by
@@ -629,7 +629,7 @@ no further restriction.
 
 An output change discovered during a pull must wake readers that may still hold the previous
 result. That wake is deferred through `WakeupQueue`, not delivered synchronously inside
-`get`: a feedback path could re-enter a producer while its `RefCell` is borrowed.
+`get`: a feedback path could re-enter a producer while its cell is locked.
 
 A notification carries the region of the notifying producer's outermost keys that changed:
 `Consumer::notify(arrived: &Projection)`. A producer that cannot name the region sends `Everything`, and
@@ -690,7 +690,7 @@ forwarding to fan-out slots. Clearing does not depend on whether the pull reads 
 Without this suppression, a change can reach a sink once per path through the graph, and cyclic
 notification paths can continue indefinitely.
 
-`forwarding_consumer` delivers through the gate when its consumer can be borrowed. On reentry,
+`forwarding_consumer` delivers through the gate when its consumer can be locked. On reentry,
 it drops the notification if the gate is set: no pull has occurred since forwarding. Otherwise
 it queues the notification, because a pull during the current cascade may have missed the new
 change. Sharing notification handles does not share tile data; tiles still pass through `get`.
@@ -747,9 +747,9 @@ readers: the graph walk, and `TileOperator::inspect`, which renders an operator'
 same answer rather than from a second hand-written list. An input stated nowhere is an edge the pane
 does not have, and — when it is the only path to a subtree — a subtree the pane loses, so the method
 is required rather than defaulted. It is a visitor rather than a returned list because two inputs
-sit behind a `RefCell`: a fan slot's input and a `CycleSlot`'s contents both borrow for the extent
-of the call. What an operator adds beyond its inputs — a constant's value, a variant arm's tag —
-is `inspect_annotation`, so the two questions stay apart.
+sit behind an `RwLock`: a fan slot's input and a `CycleSlot`'s contents both lock for
+the extent of the call. What an operator adds beyond its inputs — a constant's value, a variant
+arm's tag — is `inspect_annotation`, so the two questions stay apart.
 
 `inspect` follows `Value` edges only. A `Share` edge would draw the shared subtree once per slot,
 and restricting to `Value` is also what makes the recursion terminate without a cycle guard, since

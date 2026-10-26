@@ -42,12 +42,14 @@
 //! parameterized by an iteration input that is not part of the term, so the term
 //! does not identify it.
 
-use crate::interpreter::Projection;
+use crate::interpreter::{LockNow, Projection};
 use std::{
-    cell::Cell,
     collections::{HashMap, HashSet},
     fmt,
-    rc::{Rc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::ccl::load::LoadedProgram;
@@ -125,7 +127,7 @@ struct Branch {
     main_producer: Option<Box<dyn TileProducer>>,
     /// Set by the `main` output's consumer and by an install, cleared by the
     /// pull that answers it.
-    main_notified: Rc<Cell<bool>>,
+    main_notified: Arc<AtomicBool>,
     /// Whether the `main` output has released everything, after which the
     /// driver stops pulling it.
     main_finished: bool,
@@ -172,7 +174,7 @@ impl Branch {
         self.main_producer = None;
         for output in &self.program.outputs {
             if let Some(consumer) = &output.sink_consumer {
-                consumer.borrow_mut().detach();
+                consumer.lock_now().detach();
             }
         }
         self.program.outputs.clear();
@@ -189,7 +191,7 @@ impl Branch {
         self.main_finished = false;
         self.sinks_done = false;
         // The new graph has subscribed and nothing has pulled it yet.
-        self.main_notified.set(true);
+        self.main_notified.store(true, Ordering::Release);
     }
 }
 
@@ -203,13 +205,13 @@ fn driving(mut program: CompiledProgram) -> (CompiledProgram, Option<Box<dyn Til
 /// The consumer a branch's `main` output is subscribed with: it marks the
 /// branch as having something to pull, then wakes the driver.
 fn branch_main_consumer(
-    notified: &Rc<Cell<bool>>,
+    notified: &Arc<AtomicBool>,
     main_consumer: MainConsumerFactory<'_>,
 ) -> Box<dyn Consumer> {
     let notified = notified.clone();
     let mut wake = main_consumer();
     Box::new(move || {
-        notified.set(true);
+        notified.store(true, Ordering::Release);
         wake.notify(&Projection::Everything);
     })
 }
@@ -532,7 +534,7 @@ impl LiveProgram {
         loaded: &LoadedProgram,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<Self, Vec<CompileError>> {
-        let main_notified = Rc::new(Cell::new(false));
+        let main_notified = Arc::new(AtomicBool::new(false));
         let program = compile_program(
             ctx,
             loaded,
@@ -598,13 +600,13 @@ impl LiveProgram {
     ) -> bool {
         let mut pulled = false;
         for branch in &mut self.branches {
-            if branch.main_finished || !branch.main_notified.get() {
+            if branch.main_finished || !branch.main_notified.load(Ordering::Acquire) {
                 continue;
             }
             let Some(producer) = branch.main_producer.as_mut() else {
                 continue;
             };
-            branch.main_notified.set(false);
+            branch.main_notified.store(false, Ordering::Release);
             pulled = true;
             if pull(&branch.name, producer.as_mut()) {
                 branch.main_finished = true;
@@ -659,7 +661,7 @@ impl LiveProgram {
             }
             for theirs in consumers(other) {
                 debug_assert!(
-                    !own.iter().any(|mine| Rc::ptr_eq(mine, &theirs)),
+                    !own.iter().any(|mine| Arc::ptr_eq(mine, &theirs)),
                     "each sink consumer belongs to exactly one entry, but `{}` and `{}` share one",
                     self.branches[at].name,
                     other.name,
@@ -670,7 +672,7 @@ impl LiveProgram {
 
     /// Every branch, in creation order.
     pub fn branches(&self) -> Vec<BranchSummary> {
-        let held: Vec<Vec<Rc<FanOut>>> = self
+        let held: Vec<Vec<Arc<FanOut>>> = self
             .branches
             .iter()
             .map(|b| b.operator_map.operators())
@@ -683,7 +685,7 @@ impl LiveProgram {
                     .iter()
                     .filter(|fan| {
                         held.iter().enumerate().any(|(other, ops)| {
-                            other != at && ops.iter().any(|o| Rc::ptr_eq(o, fan))
+                            other != at && ops.iter().any(|o| Arc::ptr_eq(o, fan))
                         })
                     })
                     .count();
@@ -733,7 +735,7 @@ impl LiveProgram {
                 .operator_map
                 .operators()
                 .iter()
-                .map(Rc::downgrade)
+                .map(Arc::downgrade)
                 .collect(),
         )
     }
@@ -1017,7 +1019,7 @@ the lagging branch first"
         let p = &self.branches[from];
         ctx.carry_release_from(&p.source_producers());
         ctx.offer_predecessor(&p.operator_map);
-        let main_notified = Rc::new(Cell::new(false));
+        let main_notified = Arc::new(AtomicBool::new(false));
         let program = compile_replacement(
             ctx,
             loaded,
@@ -1033,7 +1035,7 @@ the lagging branch first"
         };
         let version = self.tombstones.remove(name).unwrap_or(0) + 1;
         let (program, main_producer) = driving(program);
-        main_notified.set(true);
+        main_notified.store(true, Ordering::Release);
         self.branches.push(Branch {
             name: name.to_string(),
             origin: Some(origin.clone()),

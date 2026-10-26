@@ -2446,7 +2446,7 @@ mod tests {
             Predicate::point(Value::Int(10)),
         )));
         // Row 0 was released upstream; row 1 joins group 10 and row 2 starts group 20.
-        *next.borrow_mut() = input_at(vec![1, 2], vec![10, 20]);
+        *next.lock_now() = input_at(vec![1, 2], vec![10, 20]);
         let mut out = producer.get(producer.tiling().universal_guard());
         out.compact();
         let Tile::DataFunction { domain, .. } = &out else {
@@ -3261,8 +3261,8 @@ mod filter_projection_tests {
         let (mut filter, input_pulled, predicate_pulled) = keep_even_positions();
         let morsel = filter.get(keys_between(2, 5));
         assert_eq!(int_entries(&morsel), [(2, 20), (4, 40)]);
-        assert_eq!(*input_pulled.borrow(), [keys_between(2, 5)]);
-        assert_eq!(*predicate_pulled.borrow(), [keys_between(2, 5)]);
+        assert_eq!(*input_pulled.lock_now(), [keys_between(2, 5)]);
+        assert_eq!(*predicate_pulled.lock_now(), [keys_between(2, 5)]);
         let Tile::DataFunction {
             domain_predicate, ..
         } = &morsel
@@ -3309,8 +3309,8 @@ mod filter_projection_tests {
         assert_eq!(int_entries(&kept), [(0, 0), (2, 20), (4, 40), (6, 60)]);
         filter.release(kept.to_guard());
         let everything = || keys_between(0, ROWS - 1);
-        assert_eq!(*input_released.borrow(), [everything()]);
-        assert_eq!(*predicate_released.borrow(), [everything()]);
+        assert_eq!(*input_released.lock_now(), [everything()]);
+        assert_eq!(*predicate_released.lock_now(), [everything()]);
     }
 
     /// `[x for x in (evens ++ odds) if p(x)]` while the odd arm has decided only `0..=3`: the
@@ -3395,8 +3395,8 @@ mod filter_projection_tests {
         );
 
         filter.release(first.to_guard());
-        *input_cell.borrow_mut() = column(vec![4, 5, 7], from_4.clone(), value);
-        *predicate_cell.borrow_mut() = column(vec![4, 5, 7], Predicate::True, answer);
+        *input_cell.lock_now() = column(vec![4, 5, 7], from_4.clone(), value);
+        *predicate_cell.lock_now() = column(vec![4, 5, 7], Predicate::True, answer);
         let second = filter.get(keys_between(0, ROWS - 1));
         assert_eq!(int_entries(&second), [(5, 50)]);
         let Tile::DataFunction {
@@ -3413,7 +3413,7 @@ mod filter_projection_tests {
         let (mut filter, input_pulled, predicate_pulled) = keep_even_positions();
         let nothing = filter.tiling().empty_guard();
         assert_eq!(filter.get(nothing), filter.tiling().empty_tile());
-        assert!(input_pulled.borrow().is_empty() && predicate_pulled.borrow().is_empty());
+        assert!(input_pulled.lock_now().is_empty() && predicate_pulled.lock_now().is_empty());
     }
 }
 
@@ -3480,7 +3480,7 @@ mod restrict_projection_tests {
         let (mut restrict, pulled) = every_third();
         let morsel = restrict.get(keys_between(2, 7));
         assert_eq!(live_keys(&morsel), [3, 6]);
-        assert_eq!(*pulled.borrow(), [keys_between(2, 7)]);
+        assert_eq!(*pulled.lock_now(), [keys_between(2, 7)]);
     }
 
     #[test]
@@ -3495,7 +3495,7 @@ mod restrict_projection_tests {
         let (mut restrict, pulled) = every_third();
         let nothing = restrict.tiling().empty_guard();
         assert_eq!(restrict.get(nothing), restrict.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 }
 
@@ -3547,7 +3547,7 @@ mod map_domain_projection_tests {
         };
         assert_eq!(*domain, ColumnValue::UInts(vec![1, 2, 3]));
         assert_eq!(**codomain, Tile::Scalar(ColumnValue::UInts(vec![1, 2, 3])));
-        assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
+        assert_eq!(*pulled.lock_now(), [keys_between(1, 3)]);
     }
 
     /// The groups a `Converse` makes, each member listed by the key it stands at: the outer keys
@@ -3601,7 +3601,7 @@ mod map_domain_projection_tests {
             panic!("a collection")
         };
         assert_eq!(*domain, ColumnValue::Ints(vec![1, 3]));
-        assert_eq!(*pulled.borrow(), [groups_one_and_three()]);
+        assert_eq!(*pulled.lock_now(), [groups_one_and_three()]);
     }
 
     #[test]
@@ -3615,7 +3615,7 @@ mod map_domain_projection_tests {
         let (mut keys, pulled) = keys_of_a_stream();
         let nothing = keys.tiling().empty_guard();
         assert_eq!(keys.get(nothing), keys.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 }
 
@@ -3704,7 +3704,7 @@ mod uncurry_projection_tests {
         let morsel = uncurry.get(guard);
         assert_eq!(pair_count(&morsel), 3);
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.lock_now(),
             [TileGuard::Function(FunctionGuard::Domain(
                 groups_one_and_three()
             ))]
@@ -3719,7 +3719,10 @@ mod uncurry_projection_tests {
         let guard = pairs(Predicate::True, Predicate::point(Value::UInt(1)));
         let morsel = uncurry.get(guard);
         assert_eq!(pair_count(&morsel), 1, "only the pair (2, 1)");
-        assert_eq!(*pulled.borrow(), [uncurry.input.tiling().universal_guard()]);
+        assert_eq!(
+            *pulled.lock_now(),
+            [uncurry.input.tiling().universal_guard()]
+        );
     }
 
     #[test]
@@ -3741,7 +3744,7 @@ mod uncurry_projection_tests {
         let (mut uncurry, pulled) = paired_groups();
         let nothing = uncurry.tiling().empty_guard();
         assert_eq!(uncurry.get(nothing), uncurry.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 }
 
@@ -3833,8 +3836,8 @@ mod product_projection_tests {
             panic!("a collection per row")
         };
         assert_eq!(keys.len(), 2 + 3, "rows 1 and 2 hold two and three keys");
-        assert_eq!(*outer_pulled.borrow(), [keys_between(1, 2)]);
-        assert_eq!(*inner_pulled.borrow(), [keys_between(1, 2)]);
+        assert_eq!(*outer_pulled.lock_now(), [keys_between(1, 2)]);
+        assert_eq!(*inner_pulled.lock_now(), [keys_between(1, 2)]);
     }
 
     #[test]
@@ -3911,7 +3914,7 @@ mod product_projection_tests {
         let (mut product, outer_pulled, inner_pulled) = rows_and_their_keys();
         let nothing = product.tiling().empty_guard();
         assert_eq!(product.get(nothing), product.tiling().empty_tile());
-        assert!(outer_pulled.borrow().is_empty() && inner_pulled.borrow().is_empty());
+        assert!(outer_pulled.lock_now().is_empty() && inner_pulled.lock_now().is_empty());
     }
 }
 
@@ -4015,7 +4018,7 @@ mod converse_projection_tests {
             [(1, vec![0, 2, 5]), (3, vec![3, 6])]
         );
         assert_eq!(
-            *pulled.borrow(),
+            *pulled.lock_now(),
             [converse.input.tiling().universal_guard()]
         );
     }
@@ -4027,7 +4030,7 @@ mod converse_projection_tests {
         let (mut converse, _, released) = bucketize();
         converse.get(groups(&[1]));
         converse.release(groups(&[1]));
-        let freed = released.borrow().clone();
+        let freed = released.lock_now().clone();
         assert_eq!(freed.len(), 1);
         let TileGuard::Function(FunctionGuard::Domain(rows)) = &freed[0] else {
             panic!("a domain release of the rows, got {freed:?}")
@@ -4091,7 +4094,7 @@ mod converse_projection_tests {
         };
         let (mut converse, pulled) = make();
         converse.get(keys_between(1, 1));
-        assert_eq!(*pulled.borrow(), [keys_between(1, 1)]);
+        assert_eq!(*pulled.lock_now(), [keys_between(1, 1)]);
         assert_conforms(|| Box::new(make().0), keys_between(1, 1));
     }
 
@@ -4100,6 +4103,6 @@ mod converse_projection_tests {
         let (mut converse, pulled, _) = bucketize();
         let nothing = converse.tiling().empty_guard();
         assert_eq!(converse.get(nothing), converse.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 }

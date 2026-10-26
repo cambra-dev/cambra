@@ -27,12 +27,13 @@
 //! answer: empty readings outnumber row-carrying ones by orders of magnitude.
 //! Each probe therefore holds its last row-carrying reading beside its newest.
 
+use crate::interpreter::LockNow;
 use smol_str::SmolStr;
 use std::{
-    cell::RefCell,
     collections::{HashMap, hash_map::Entry},
     fmt::{self, Write as _},
-    rc::Rc,
+    sync::Arc,
+    sync::Mutex,
 };
 
 use crate::{
@@ -66,30 +67,30 @@ pub struct ProbeSlot(
     // because the driver reads one table and every producer writes it, and the
     // producer graph has no `&self` traversal that would let the driver collect
     // per-producer buffers instead.
-    Rc<RefCell<Option<ProbeTable>>>,
+    Arc<Mutex<Option<ProbeTable>>>,
 );
 
 impl ProbeSlot {
     /// Start probing with an empty [`ProbeTable`], if not already probing.
     pub fn enable(&self) {
         self.0
-            .borrow_mut()
+            .lock_now()
             .get_or_insert_with(ProbeTable::with_defaults);
     }
 
     /// Stop probing and drop every reading taken so far.
     pub fn disable(&self) {
-        *self.0.borrow_mut() = None;
+        *self.0.lock_now() = None;
     }
 
     /// Whether producers are taking readings.
     pub fn is_enabled(&self) -> bool {
-        self.0.borrow().is_some()
+        self.0.lock_now().is_some()
     }
 
     /// Read the table, or `None` while probing is off.
     pub fn with_table<R>(&self, read: impl FnOnce(&ProbeTable) -> R) -> Option<R> {
-        self.0.borrow().as_ref().map(read)
+        self.0.lock_now().as_ref().map(read)
     }
 
     /// Take a reading of `tile` for one producer. A no-op while probing is off.
@@ -101,28 +102,28 @@ impl ProbeSlot {
         tile: &Tile,
         obsolete: &TileGuard,
     ) {
-        if let Some(table) = self.0.borrow_mut().as_mut() {
+        if let Some(table) = self.0.lock_now().as_mut() {
             table.observe_named(node_id, producer_id, name, tile, obsolete);
         }
     }
 
     /// Detach one producer's probe, when that producer is dropped.
     ///
-    /// Nothing drops a producer while the table is borrowed: `observe_named`
-    /// holds a mutable borrow only for the call, and a frame render holds a
-    /// shared one while it iterates, building no producers and dropping none. A
-    /// failed borrow is that invariant breaking. It panics in debug builds only,
-    /// since this runs in `Drop` and a panic there during an unwind aborts.
+    /// Nothing drops a producer while the table is locked: `observe_named` and a
+    /// frame render each hold the lock only for their call, and a render builds
+    /// no producers and drops none. A failed lock is that invariant breaking. It
+    /// panics in debug builds only, since this runs in `Drop` and a panic there
+    /// during an unwind aborts.
     pub(crate) fn detach(&self, node_id: Option<NodeId>, producer_id: usize) {
-        match self.0.try_borrow_mut() {
-            Ok(mut slot) => {
+        match self.0.try_lock_now() {
+            Some(mut slot) => {
                 if let Some(table) = slot.as_mut() {
                     table.detach(node_id, producer_id);
                 }
             }
-            Err(_) => debug_assert!(
+            None => debug_assert!(
                 false,
-                "a producer was dropped while the probe table was borrowed, so its \
+                "a producer was dropped while the probe table was locked, so its \
                  probe outlives it",
             ),
         }
@@ -159,7 +160,7 @@ pub struct Reading {
     pub producer_id: usize,
     /// The producer's display name, e.g. `"MapResultWithSource#1"`, shared by
     /// every reading of one probe.
-    pub producer: Rc<str>,
+    pub producer: Arc<str>,
     /// The tile's variant name.
     pub shape: &'static str,
     /// The region of the domain the output is complete for, in its `Debug`
@@ -220,15 +221,15 @@ pub struct ProbeTable {
 /// consumer releases after the `get` that carried the rows, so both advance on
 /// readings that carry nothing.
 ///
-/// A reading is held behind an `Rc`, so the two share one allocation when the
+/// A reading is held behind an `Arc`, so the two share one allocation when the
 /// newest reading carried rows.
 struct Probe {
     /// The producer's display name, computed once when the probe is attached.
-    name: Rc<str>,
+    name: Arc<str>,
     /// The newest reading, empty or not.
-    newest: Rc<Reading>,
+    newest: Arc<Reading>,
     /// The newest reading that carried rows.
-    last_flow: Option<Rc<Reading>>,
+    last_flow: Option<Arc<Reading>>,
 }
 
 /// One probe's last flow, and its newest reading beside it.
@@ -317,15 +318,15 @@ impl ProbeTable {
                     name(),
                     "two producers share the probe key ({node_id:?}, {producer_id})",
                 );
-                Rc::clone(&probe.name)
+                Arc::clone(&probe.name)
             }
             None => name().into(),
         };
-        let reading = Rc::new(Reading {
+        let reading = Arc::new(Reading {
             seq: self.next_seq,
             node_id,
             producer_id,
-            producer: Rc::clone(&name),
+            producer: Arc::clone(&name),
             shape: rendered.shape,
             completeness: rendered.completeness,
             obsolete: (!obsolete.is_empty()).then(|| bounded(|out| write!(out, "{obsolete:?}"))),
@@ -334,7 +335,7 @@ impl ProbeTable {
             total: rendered.total,
         });
         self.next_seq += 1;
-        let flow = (!reading.is_empty()).then(|| Rc::clone(&reading));
+        let flow = (!reading.is_empty()).then(|| Arc::clone(&reading));
         if flow.is_some() {
             self.next_flow += 1;
         }

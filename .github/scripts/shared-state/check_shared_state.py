@@ -87,8 +87,6 @@ EXPECTED_EXCEPTIONS = [
     # and `DataSink::process` takes `&self`.
     ("src/interpreter/test_sink.rs", "cell of `Option<Tile>`"),
     ("src/interpreter/mod.rs", "shared cell of `C`"),
-    # `Notified::Flag`, the one-bit input-notified flag; see its type doc.
-    ("src/interpreter/tile_operators/mod.rs", "shared cell of `bool`"),
     # `Arrivals`, the regions an input has notified since a `Memo` last took them; see its
     # type doc. The notification carries a region, which a one-bit flag cannot hold.
     ("src/interpreter/tile_operators/mod.rs", "shared cell of `Projection`"),
@@ -100,7 +98,6 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/operator_graph.rs", "ambient mutable state"),
     ("src/interpreter/tile_operators/cycle_slot.rs", "shared cell of `Option<Box<T>>`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `bool`"),
-    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `usize`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),

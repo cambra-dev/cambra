@@ -4,15 +4,11 @@
 //! and are used by [`crate::ccl::context`] to wire compiled sink operators into
 //! the scheduler.
 
-use crate::interpreter::Projection;
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver, Sender},
-    },
+use crate::interpreter::{LockNow, Projection};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+    mpsc::{self, Receiver, Sender},
 };
 
 use crate::interpreter::{
@@ -25,7 +21,7 @@ use crate::interpreter::{
 ///
 /// [`SinkConsumer::new`] hands one clone to the consumer and returns the other
 /// to the caller so it can be filled once [`crate::interpreter::tile_operators::TileOperator::subscribe`] completes.
-pub type ProducerSlot = Rc<RefCell<Option<Box<dyn TileProducer>>>>;
+pub type ProducerSlot = Arc<Mutex<Option<Box<dyn TileProducer>>>>;
 
 // ---------------------------------------------------------------------------
 // Completion notification
@@ -110,11 +106,11 @@ impl SinkConsumer {
         done: DoneNotifier,
         wakeups: WakeupQueue,
     ) -> (Self, ProducerSlot) {
-        let slot: ProducerSlot = Rc::new(RefCell::new(None));
+        let slot: ProducerSlot = Arc::new(Mutex::new(None));
         let producer = slot.clone();
         let mut done = Some(done);
-        let pull: SharedConsumer = Rc::new(RefCell::new(move || {
-            if let Some(prod) = producer.borrow_mut().as_mut() {
+        let pull: SharedConsumer = Arc::new(Mutex::new(move || {
+            if let Some(prod) = producer.lock_now().as_mut() {
                 let guard = prod.tiling().universal_guard();
                 let tile = prod.get(guard);
                 sink.process(&tile);
@@ -139,7 +135,7 @@ impl SinkConsumer {
     /// at once: the version a reload replaces hands its state to its successor, and one
     /// replaced before it was ever pulled has opened none to hand on.
     pub fn pull_now(&self) {
-        self.pull.borrow_mut().notify(&Projection::Everything);
+        self.pull.lock_now().notify(&Projection::Everything);
     }
 
     /// Stop dispatching and release the producer chain behind this consumer.
@@ -153,7 +149,7 @@ impl SinkConsumer {
     /// the producer slot also drops the operators behind it, which is what lets
     /// the fan-outs they subscribed to see those subscriptions end.
     pub fn detach(&mut self) {
-        *self.producer.borrow_mut() = None;
+        *self.producer.lock_now() = None;
     }
 }
 

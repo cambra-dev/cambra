@@ -26,11 +26,12 @@
 //! thread-CPU time too — ratio ≈ 1.00 — so a CPU-time bound buys nothing over wall.)
 //! Most tests get 10s; the three heaviest compiles get 30s.
 
+use cambra::interpreter::LockNow;
 use smol_str::SmolStr;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use bit_set::BitSet;
 use cambra::ccl::Expr;
@@ -58,7 +59,7 @@ pub(crate) fn operator_kinds_over_source1(code: &str) -> Vec<&'static str> {
     use cambra::interpreter::{BaseType, Extent, TestDataSource};
 
     let mut ctx = GlobalContext::default();
-    ctx.register_source(Rc::new(RefCell::new(TestDataSource::new(
+    ctx.register_source(Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(cambra::ccl::BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -141,14 +142,17 @@ pub(crate) fn run_program_with_ctx(
     ctx: &mut GlobalContext,
     loaded: &LoadedProgram,
 ) -> (Expr, Tile) {
-    let notified = Rc::new(RefCell::new(false));
+    let notified = Arc::new(Mutex::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
+        *notified_clone.lock_now() = true;
     });
     let mut compiled = compile_program(ctx, loaded, consumer).unwrap_or_render(loaded);
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow(), "expected notification (pipeline path)");
+    assert!(
+        *notified.lock_now(),
+        "expected notification (pipeline path)"
+    );
     let producer = compiled
         .main_mut()
         .and_then(|o| o.producer.as_mut())

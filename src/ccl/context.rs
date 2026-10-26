@@ -3,10 +3,11 @@
 // builtins
 // ---------------------------------------------------------------------------
 
+use crate::interpreter::LockNow;
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
-use std::{cell::RefCell, rc::Rc};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::ccl::load::{LoadError, LoadedProgram};
 use crate::chl_parser::ast::Span;
@@ -743,7 +744,7 @@ struct HttpRoute {
 #[derive(Default)]
 pub struct SourceSinkRegistry {
     /// Every open source, by the name `Source(name)` resolves against.
-    sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    sources: HashMap<String, Arc<Mutex<dyn DataSourceDomainExtentImpl>>>,
     /// Every open `http_serve` route, by the route's source name. Keyed by route
     /// rather than by response-binding name, which a new version may spell
     /// differently.
@@ -828,7 +829,7 @@ impl SourceSinkRegistry {
             // answered: a request already in flight has no version left to
             // compute its reply.
             if let Some(source) = self.sources.remove(&name) {
-                source.borrow_mut().answer_in_flight();
+                source.lock_now().answer_in_flight();
             }
             // The scheduler's handle is the last long-lived reference to the
             // source, and nothing else drops one, so it goes with the route.
@@ -968,7 +969,7 @@ impl GlobalContext {
             scheduler: Scheduler::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
         };
-        let stdin = Rc::new(RefCell::new(StdinDataSource::new()));
+        let stdin = Arc::new(Mutex::new(StdinDataSource::new()));
         result.register_source(stdin);
         result
     }
@@ -1014,7 +1015,7 @@ impl GlobalContext {
     pub fn carry_release_from(&mut self, predecessor: &HashSet<String>) {
         for source in self.sources_and_sinks.sources.values() {
             source
-                .borrow_mut()
+                .lock_now()
                 .carry_release_to_new_producers(predecessor);
         }
     }
@@ -1130,8 +1131,8 @@ impl GlobalContext {
     /// operator-conversion registration happen later in [`compile_program`] when
     /// [`LoweringContext::take_sources`] is called and every accumulated source
     /// (pre-registered and discovered) is registered in one uniform pass.
-    pub fn register_source(&mut self, source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {
-        let name = source.borrow().get_id().to_string();
+    pub fn register_source(&mut self, source: Arc<Mutex<dyn DataSourceDomainExtentImpl>>) {
+        let name = source.lock_now().get_id().to_string();
         self.lowering.register_source(name.clone(), source.clone());
         self.sources_and_sinks.sources.insert(name, source);
     }
@@ -1193,7 +1194,7 @@ pub struct CompiledOutput {
     pub producer: Option<Box<dyn TileProducer>>,
     /// `Some` for sink outputs — the [`SinkConsumer`] subscribed to the
     /// operator that dispatches to the registered [`crate::interpreter::DataSink`].
-    pub sink_consumer: Option<Rc<RefCell<SinkConsumer>>>,
+    pub sink_consumer: Option<Arc<Mutex<SinkConsumer>>>,
 }
 
 impl CompiledOutput {
@@ -1390,7 +1391,6 @@ pub enum Phase {
 pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)> {
     use crate::ccl::ty::Type;
     use std::collections::{HashMap, HashSet};
-    use std::rc::Rc;
 
     // One entry per *distinct* predicate term, keyed by `Rc` pointer: a term
     // riding many type slots is one term and shares its ids with itself.
@@ -2288,8 +2288,8 @@ pub fn check_program(
         projection
     };
     for (_name, source) in ctx.lowering_ctx().take_sources() {
-        let name = source.borrow().get_id().to_string();
-        let output_type = source.borrow().output_type();
+        let name = source.lock_now().get_id().to_string();
+        let output_type = source.lock_now().output_type();
         ctx.inference_ctx().register_source_type(&name, output_type);
     }
     let root = program.sources().root();
@@ -2396,8 +2396,8 @@ fn run_passes(
     // Mutable variable every source (pre-registered + discovered during lowering) with
     // inference and operator-conversion now that the full source set is known.
     for (_name, source) in ctx.lowering_ctx().take_sources() {
-        let name = source.borrow().get_id().to_string();
-        let output_type = source.borrow().output_type();
+        let name = source.lock_now().get_id().to_string();
+        let output_type = source.lock_now().output_type();
         // The source's data-function type is constructed inside
         // `register_source_type` from the element type — the `Data` kind is
         // intrinsic, not stamped here.
@@ -2956,7 +2956,7 @@ fn compile_version(
             let notifier = notifiers.pop().unwrap();
             let (sink_consumer, producer_slot) =
                 SinkConsumer::new(sink, notifier, ctx.scheduler().sink_pull_queue());
-            let consumer_rc = Rc::new(RefCell::new(sink_consumer));
+            let consumer_rc = Arc::new(Mutex::new(sink_consumer));
             let sink_producer =
                 op.subscribe(universal, Box::new(consumer_rc.clone()), ctx.scheduler());
             debug!(
@@ -2969,13 +2969,13 @@ fn compile_version(
                     }
                 )
             );
-            *producer_slot.borrow_mut() = Some(sink_producer);
+            *producer_slot.lock_now() = Some(sink_producer);
             // Pull the sink now it has something to pull. A first compile is carried
             // by the source reporting its data as new; a *replacement* is not,
             // because the version it replaces has already taken that report, so
             // without this pull a reload lands with unfinished work and nothing
             // pulls it until the next arrival.
-            consumer_rc.borrow().pull_now();
+            consumer_rc.lock_now().pull_now();
             outputs.push(CompiledOutput {
                 name,
                 op,

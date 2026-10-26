@@ -13,7 +13,7 @@
 
 use cambra::chl_parser::FileId;
 use std::collections::HashSet;
-use std::{cell::RefCell, rc::Rc};
+use std::sync::{Arc, Mutex};
 
 use cambra::ccl::{
     Expr, FieldKey, HistoryKind, Lit, PredicateId, Type, TypeKind, TypedExprNode,
@@ -110,7 +110,7 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
             Type::Base(bt) => Extent::Base(bt.clone()),
             _ => panic!("infer_program_with_sources: unsupported elem_ty {elem_ty:?}"),
         };
-        let stub = Rc::new(RefCell::new(TestDataSource::new(
+        let stub = Arc::new(Mutex::new(TestDataSource::new(
             name,
             elem_ty.clone(),
             output_extent,
@@ -150,7 +150,7 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
             Type::Base(bt) => Extent::Base(bt.clone()),
             _ => panic!("infer_program_with_sources_err: unsupported elem_ty {elem_ty:?}"),
         };
-        let stub = Rc::new(RefCell::new(TestDataSource::new(
+        let stub = Arc::new(Mutex::new(TestDataSource::new(
             name,
             elem_ty.clone(),
             output_extent,

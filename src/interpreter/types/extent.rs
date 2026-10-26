@@ -1,8 +1,9 @@
 //! Extent (the runtime type of an operator) and the data-source/sink traits
 //! that an [`Extent::DataSourceDomain`] is built around.
 
+use crate::interpreter::LockNow;
 use smol_str::SmolStr;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::Arc, sync::Mutex};
 
 use intervalsets::{Interval, IntervalSet};
 
@@ -32,13 +33,13 @@ pub enum Extent {
     /// Created from a CCL `UIntRange(n)` type as the full set `[0, n)`, and
     /// shrunk directly as individual elements or sub-intervals are released.
     UIntRange(IntervalSet<u64>),
-    DataSourceDomain(Rc<RefCell<dyn DataSourceDomainExtentImpl>>),
+    DataSourceDomain(Arc<Mutex<dyn DataSourceDomainExtentImpl>>),
     /// A restricted extent: wraps another extent with a restriction predicate.
     Restricted {
         base: Box<Extent>,
         // shared-state-ok: part of the extent *value*, shared with its own clones so
         // a release narrows every view of one extent. Extents are types, not operators.
-        restriction: Rc<RefCell<Restriction>>,
+        restriction: Arc<Mutex<Restriction>>,
     },
 }
 
@@ -66,12 +67,12 @@ impl PartialEq for Extent {
                     base: b2,
                     restriction: r2,
                 },
-            ) => b1 == b2 && Rc::ptr_eq(r1, r2),
+            ) => b1 == b2 && Arc::ptr_eq(r1, r2),
             // Union equality is order-sensitive (structural).
             (Extent::Union(u1), Extent::Union(u2)) => u1 == u2,
             (Extent::UIntRange(s1), Extent::UIntRange(s2)) => s1 == s2,
             (Extent::DataSourceDomain(d1), Extent::DataSourceDomain(d2)) => {
-                d1.borrow().get_id() == d2.borrow().get_id()
+                Arc::ptr_eq(d1, d2) || d1.lock_now().get_id() == d2.lock_now().get_id()
             }
             _ => false,
         }
@@ -161,10 +162,7 @@ impl Extent {
     /// wake-up against each source here, decides from it whether to subscribe, and
     /// hands each source back its release record when the producer goes. All
     /// three read this one answer, so no walk can reach an arm the others miss.
-    pub fn for_each_source(
-        &self,
-        f: &mut impl FnMut(&Rc<RefCell<dyn DataSourceDomainExtentImpl>>),
-    ) {
+    pub fn for_each_source(&self, f: &mut impl FnMut(&Arc<Mutex<dyn DataSourceDomainExtentImpl>>)) {
         match self {
             Extent::DataSourceDomain(source) => f(source),
             Extent::Record(fields) => {
@@ -237,11 +235,15 @@ impl Extent {
             (Extent::UIntRange(s1), Extent::UIntRange(s2)) => !s2.has_difference(s1),
 
             // DataSourceDomain: identity check
-            (Extent::DataSourceDomain(d1), Extent::DataSourceDomain(d2)) => d1 == d2,
+            (Extent::DataSourceDomain(_), Extent::DataSourceDomain(_)) => self == other,
 
             // If self is not a DataSourceDomain, then check if it is larger than the inner extent
             // of other.
-            (_, Extent::DataSourceDomain(d2)) => self.includes(&d2.borrow().element_extent()),
+            // The lock is released before the recursion, which may lock a source itself.
+            (_, Extent::DataSourceDomain(d2)) => {
+                let element = d2.lock_now().element_extent();
+                self.includes(&element)
+            }
 
             // Two restricted extents sharing the same restriction object are subsets
             // of the same predicate; inclusion then reduces to base inclusion.
@@ -254,7 +256,7 @@ impl Extent {
                     base: b2,
                     restriction: r2,
                 },
-            ) => Rc::ptr_eq(r1, r2) && b1.includes(b2),
+            ) => Arc::ptr_eq(r1, r2) && b1.includes(b2),
 
             // An unrestricted extent includes a restricted one iff it includes the
             // base, because the restricted set is always a subset of the base.
@@ -337,7 +339,7 @@ pub fn project_leaves(mut values: ColumnValue, paths: &[FieldPath]) -> ColumnVal
     }
 }
 
-pub trait DataSourceDomainExtentImpl {
+pub trait DataSourceDomainExtentImpl: Send {
     fn get_id(&self) -> &str;
     fn check_for_new_data(&mut self) -> bool;
     /// Returns the current yield predicate: the region of domain values
@@ -488,13 +490,6 @@ pub trait DataSourceDomainExtentImpl {
     }
 }
 
-impl PartialEq for dyn DataSourceDomainExtentImpl {
-    fn eq(&self, other: &Self) -> bool {
-        self.get_id() == other.get_id()
-    }
-}
-impl Eq for dyn DataSourceDomainExtentImpl {}
-
 impl std::fmt::Display for BaseType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.keyword())
@@ -524,7 +519,7 @@ impl std::fmt::Display for Extent {
                 false,
             ),
             Extent::UIntRange(set) => write!(f, "{set}"),
-            Extent::DataSourceDomain(source) => write!(f, "Source({})", source.borrow().get_id()),
+            Extent::DataSourceDomain(source) => write!(f, "Source({})", source.lock_now().get_id()),
             Extent::Restricted { base, .. } => write!(f, "Restricted({base})"),
         }
     }
@@ -573,13 +568,13 @@ impl Extent {
     pub fn restricted(base: Extent) -> Self {
         Extent::Restricted {
             base: Box::new(base),
-            restriction: Rc::new(RefCell::new(Restriction::new())),
+            restriction: Arc::new(Mutex::new(Restriction::new())),
         }
     }
 
     /// Return the restriction handle if this is an [`Extent::Restricted`] extent.
     // shared-state-ok: hands out the extent's own restriction handle (see the field).
-    pub fn restriction(&mut self) -> Option<Rc<RefCell<Restriction>>> {
+    pub fn restriction(&mut self) -> Option<Arc<Mutex<Restriction>>> {
         match self {
             Extent::Restricted { restriction, .. } => Some(restriction.clone()),
             _ => None,

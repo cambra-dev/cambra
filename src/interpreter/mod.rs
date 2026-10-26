@@ -14,6 +14,7 @@ mod scheduler;
 pub mod sinks;
 mod stdio;
 mod stream_buffer;
+mod sync;
 // Test-only surface: `test_sink()` exists for tests to observe a program through, so it is
 // built only where a test is.
 #[cfg(any(test, feature = "test-helpers"))]
@@ -30,6 +31,9 @@ pub use http_server::HttpServerDataSource;
 pub use scalar_expr::ScalarProgram;
 pub use scheduler::*;
 pub use stdio::*;
+#[cfg(test)]
+pub(crate) use sync::SyncCell;
+pub use sync::{LockNow, ReadNow};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use test_sink::*;
 pub use test_source::*;
@@ -38,8 +42,8 @@ pub use types::*;
 pub use unary_op::*;
 
 use smol_str::{SmolStr, format_smolstr};
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 // ============================================================================
 // Consumer Protocol
@@ -51,18 +55,18 @@ use std::rc::Rc;
 /// that cannot name it sends [`Projection::Everything`]. Deferred or coalesced notifications
 /// need not correspond one-to-one with changed results, and coalescing unites their regions.
 /// See `src/interpreter/design-operators.md`, "The notification contract".
-pub trait Consumer {
+pub trait Consumer: Send {
     /// Notify the consumer that the keys `arrived` changed, and that it should pull again if it
     /// reads this producer.
     fn notify(&mut self, arrived: &Projection);
 }
 
-/// Blanket implementation: Rc<RefCell<C>> implements Consumer when C does.
+/// Blanket implementation: Arc<Mutex<C>> implements Consumer when C does.
 // shared-state-ok: this is what makes a shared *notification* handle a consumer;
 // a wakeup carries no value, so it is not a dataflow edge.
-impl<C: Consumer> Consumer for Rc<RefCell<C>> {
+impl<C: Consumer> Consumer for Arc<Mutex<C>> {
     fn notify(&mut self, arrived: &Projection) {
-        self.borrow_mut().notify(arrived)
+        self.lock_now().notify(arrived)
     }
 }
 
@@ -70,7 +74,7 @@ impl<C: Consumer> Consumer for Rc<RefCell<C>> {
 /// This allows closures to be used as consumers.
 impl<F> Consumer for F
 where
-    F: FnMut(),
+    F: FnMut() + Send,
 {
     fn notify(&mut self, _arrived: &Projection) {
         self()

@@ -1,10 +1,11 @@
+use crate::interpreter::LockNow;
 use bit_set::BitSet;
 use intervalsets::{
     Bounding, Interval, IntervalSet,
     ops::{Difference, Intersection},
 };
 use smol_str::SmolStr;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::Arc, sync::Mutex};
 
 use super::*;
 use crate::ccl::TagMap;
@@ -39,7 +40,7 @@ impl IterateExtent {
         scheduler: &mut Scheduler,
     ) {
         extent.for_each_source(&mut |source| {
-            scheduler.add_source_handle(source.clone(), Rc::downgrade(&consumer));
+            scheduler.add_source_handle(source.clone(), Arc::downgrade(&consumer));
         });
     }
 }
@@ -99,14 +100,14 @@ impl TileOperator for IterateExtent {
 fn retire_producer_from_extent(extent: &Extent, producer: &str) {
     extent.for_each_source(&mut |source| {
         // A drop runs wherever the last owner goes, so the source may already
-        // be borrowed by a call further up that stack. Keeping the record is
-        // the conservative outcome — the source retains more than it must —
-        // and the borrow succeeding is the case worth knowing about.
-        match source.try_borrow_mut() {
-            Ok(mut source) => source.retire_producer(producer),
-            Err(_) => debug_assert!(
+        // be locked by a call further up that stack. Keeping the record is
+        // the conservative outcome, the source retaining more than it must,
+        // and the lock succeeding is the case worth knowing about.
+        match source.try_lock_now() {
+            Some(mut source) => source.retire_producer(producer),
+            None => debug_assert!(
                 false,
-                "{producer} dropped while its source was borrowed, so its \
+                "{producer} dropped while its source was locked, so its \
 release record outlives it",
             ),
         }
@@ -138,12 +139,12 @@ struct IterateExtentProducer {
     /// dropped is pruned on the next
     /// [`check_for_notifications`](Scheduler::check_for_notifications).
     /// `None` when the extent needs no source subscription.
-    _source_wakeup: Option<Rc<RefCell<dyn Consumer>>>,
+    _source_wakeup: Option<Arc<Mutex<dyn Consumer>>>,
 }
 
 fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
     match extent {
-        Extent::DataSourceDomain(source) => source.borrow().get_yield_predicate(),
+        Extent::DataSourceDomain(source) => source.lock_now().get_yield_predicate(),
         // For a cross-product, the domain_predicate must be the conjunction (AND / Record) of
         // each field's predicate.  Only pairs where EVERY field's value has already been
         // committed by its source can be guaranteed to have already been delivered; a pair
@@ -232,7 +233,7 @@ fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
             }
         },
         Extent::DataSourceDomain(source) => {
-            source.borrow_mut().release(releaser, pred.clone());
+            source.lock_now().release(releaser, pred.clone());
         }
         Extent::UIntRange(remaining) => match pred {
             Predicate::True => {
@@ -299,7 +300,7 @@ fn iterate_extent(extent: &Extent, producer: &str) -> ColumnValue {
                 .collect();
             ColumnValue::from_uints(values)
         }
-        Extent::DataSourceDomain(source_impl) => source_impl.borrow_mut().get_elements(producer),
+        Extent::DataSourceDomain(source_impl) => source_impl.lock_now().get_elements(producer),
         Extent::Record(fields) => iterate_record(fields, producer),
         Extent::Union(arms) => iterate_union(arms, producer),
         Extent::Restricted { .. } => {
@@ -417,20 +418,20 @@ mod tests {
         use crate::ccl::FieldKey;
         use crate::interpreter::{DataSourceDomainExtentImpl, test_source::TestDataSource};
 
-        let src = Rc::new(RefCell::new(TestDataSource::new(
+        let src = Arc::new(Mutex::new(TestDataSource::new(
             "s",
             crate::ccl::Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
         )));
-        let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = src.clone();
+        let as_domain: Arc<Mutex<dyn DataSourceDomainExtentImpl>> = src.clone();
         let extent = Extent::Union(TagMap::from_arms(vec![(
             FieldKey::Name("only".into()),
             Extent::DataSourceDomain(as_domain),
         )]));
 
-        src.borrow_mut().release("p", Predicate::True);
+        src.lock_now().release("p", Predicate::True);
         assert_eq!(
-            src.borrow().get_released_predicate(),
+            src.lock_now().get_released_predicate(),
             Predicate::True,
             "`p` holds a record for the retire to find"
         );
@@ -438,7 +439,7 @@ mod tests {
         retire_producer_from_extent(&extent, "p");
 
         assert_eq!(
-            src.borrow().get_released_predicate(),
+            src.lock_now().get_released_predicate(),
             Predicate::False,
             "`p` is gone, so its record is gone: an empty agreement, not `p`'s last one"
         );
@@ -730,15 +731,15 @@ mod projection_tests {
     /// head says nothing about positions that may still arrive in the morsel.
     #[test]
     fn a_live_source_head_is_complete_only_over_what_has_arrived() {
-        let source = Rc::new(RefCell::new(TestDataSource::new(
+        let source = Arc::new(Mutex::new(TestDataSource::new(
             "s",
             crate::ccl::Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
         )));
-        let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = source.clone();
+        let as_domain: Arc<Mutex<dyn DataSourceDomainExtentImpl>> = source.clone();
         let mut head = head(Extent::DataSourceDomain(as_domain));
-        source.borrow_mut().release(&head.name(), Predicate::False);
-        source.borrow_mut().add_data(&[
+        source.lock_now().release(&head.name(), Predicate::False);
+        source.lock_now().add_data(&[
             (Value::UInt(0), Value::Int(10)),
             (Value::UInt(1), Value::Int(20)),
             (Value::UInt(2), Value::Int(30)),
@@ -746,7 +747,7 @@ mod projection_tests {
             (Value::UInt(4), Value::Int(50)),
         ]);
         source
-            .borrow_mut()
+            .lock_now()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(4)));
 
         let inside = head.get(keys_between(1, 2));

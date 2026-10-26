@@ -1,9 +1,10 @@
 //! Records: literals, computed fields, field access, records inside list
 //! comprehensions, and joins producing record outputs.
 
-use std::cell::RefCell;
+use cambra::interpreter::LockNow;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bit_set::BitSet;
@@ -182,12 +183,12 @@ fn test_datasource_named_record_join() {
         ("id".into(), Extent::Base(BaseType::Int)),
         ("label".into(), Extent::Base(BaseType::String)),
     ]));
-    let src1 = Rc::new(RefCell::new(TestDataSource::new(
+    let src1 = Arc::new(Mutex::new(TestDataSource::new(
         "src1",
         record_type.clone(),
         record_extent.clone(),
     )));
-    let src2 = Rc::new(RefCell::new(TestDataSource::new(
+    let src2 = Arc::new(Mutex::new(TestDataSource::new(
         "src2",
         record_type,
         record_extent,
@@ -195,7 +196,7 @@ fn test_datasource_named_record_join() {
     ctx.register_source(src1.clone());
     ctx.register_source(src2.clone());
 
-    src1.borrow_mut().add_data(&[
+    src1.lock_now().add_data(&[
         (
             Value::UInt(0),
             Value::Record(HashMap::from([
@@ -211,10 +212,10 @@ fn test_datasource_named_record_join() {
             ])),
         ),
     ]);
-    src1.borrow_mut()
+    src1.lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
 
-    src2.borrow_mut().add_data(&[
+    src2.lock_now().add_data(&[
         (
             Value::UInt(0),
             Value::Record(HashMap::from([
@@ -230,20 +231,20 @@ fn test_datasource_named_record_join() {
             ])),
         ),
     ]);
-    src2.borrow_mut()
+    src2.lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
 
-    let notified = Rc::new(RefCell::new(false));
+    let notified = Arc::new(Mutex::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
+        *notified_clone.lock_now() = true;
     });
     let code = "[(x.label, y.label) for x in src1() for y in src2() if x.id == y.id]";
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    assert!(*notified.lock_now());
 
     let tile = sort_function_by_domain(producer.get(producer.tiling().universal_guard()));
     // Only (id=1, "a") × (id=1, "x") should match

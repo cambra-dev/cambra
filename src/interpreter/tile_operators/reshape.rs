@@ -1381,7 +1381,7 @@ mod projection_tests {
             keyed_rows(&cut),
             (vec![vec![1, 1], vec![0, 1]], vec![11, 13])
         );
-        assert!(pulled.borrow()[0].is_universal());
+        assert!(pulled.lock_now()[0].is_universal());
     }
 
     #[test]
@@ -1389,7 +1389,7 @@ mod projection_tests {
         let (mut swapped, pulled) = swapped_pairs();
         let tile = swapped.get(swapped.tiling().empty_guard());
         assert_eq!(tile, swapped.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 
     /// `((a, b), c)` keys flattened to `(a, b, c)`: the rows `((0,0),0) ((0,1),1) ((1,0),0)`
@@ -1438,7 +1438,7 @@ mod projection_tests {
             keyed_rows(&cut),
             (vec![vec![0, 1], vec![0, 0], vec![0, 0]], vec![10, 12])
         );
-        assert!(pulled.borrow()[0].is_universal());
+        assert!(pulled.lock_now()[0].is_universal());
     }
 
     #[test]
@@ -1446,6 +1446,6 @@ mod projection_tests {
         let (mut flat, pulled) = flattened_triples();
         let tile = flat.get(flat.tiling().empty_guard());
         assert_eq!(tile, flat.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 }

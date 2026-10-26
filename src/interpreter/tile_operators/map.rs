@@ -1,5 +1,6 @@
+use crate::interpreter::LockNow;
 use bit_set::BitSet;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::Arc, sync::Mutex};
 
 use super::*;
 use crate::interpreter::operator_graph::value;
@@ -992,7 +993,7 @@ fn projected_extent(paths: &[FieldPath], values: Extent) -> Extent {
 pub struct MapResultWithSource {
     input: Box<dyn TileOperator>,
     /// The data source providing both domain keys and value lookup.
-    source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+    source: Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
     /// The paths to the leaves of the source's values this reads, none for the whole value
     /// ([`DataSourceDomainExtentImpl::get_fields`]).
     fields: Vec<FieldPath>,
@@ -1008,7 +1009,7 @@ impl MapResultWithSource {
     /// The output tiling is derived from the source's
     /// [`output_value_extent`](DataSourceDomainExtentImpl::output_value_extent).
     pub fn new(
-        source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        source: Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
         input: Box<dyn TileOperator>,
     ) -> Self {
         Self::projecting(source, input, Vec::new())
@@ -1017,12 +1018,13 @@ impl MapResultWithSource {
     /// [`new`](Self::new) reading only the leaves at `fields` of the source's values: the whole
     /// value for none, that leaf alone for one, and the tuple of them for several.
     pub fn projecting(
-        source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        source: Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
         input: Box<dyn TileOperator>,
         fields: Vec<FieldPath>,
     ) -> Self {
         let source_domain_extent = Extent::DataSourceDomain(source.clone());
-        let output_extent = projected_extent(&fields, source.borrow().output_value_extent());
+        let value_extent = source.lock_now().output_value_extent();
+        let output_extent = projected_extent(&fields, value_extent);
         let tiling = change_tiling_result(input.tiling(), move |codomain_extent| {
             assert_eq!(source_domain_extent, *codomain_extent);
             Tiling::Scalar(output_extent)
@@ -1075,7 +1077,7 @@ struct MapResultWithSourceProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     /// The data source used for both domain enumeration and value lookup.
-    source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+    source: Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
     /// The paths to the leaves of the source's values this reads
     /// ([`MapResultWithSource::projecting`]).
     fields: Vec<FieldPath>,
@@ -1140,7 +1142,7 @@ impl MapResultWithSourceProducer {
     fn new(
         base: ProducerBase,
         input: Box<dyn TileProducer>,
-        source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        source: Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
         fields: Vec<FieldPath>,
         result_correlation: Option<Vec<TilePathStep>>,
     ) -> Self {
@@ -1158,7 +1160,7 @@ impl MapResultWithSourceProducer {
         // need.
         result
             .source
-            .borrow_mut()
+            .lock_now()
             .release(&result.name(), Predicate::False);
         result
     }
@@ -1225,7 +1227,7 @@ impl TileProducer for MapResultWithSourceProducer {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new(self.name())
-            .annotate(self.source.borrow().get_id().to_string())
+            .annotate(self.source.lock_now().get_id().to_string())
             .with_tiling(self.tiling().to_string())
             .child("input", self.input.inspect(opts))
     }
@@ -1241,7 +1243,7 @@ impl TileProducer for MapResultWithSourceProducer {
         if self.input.tiling().levels() > 1 {
             self.last_nested_input = HeldBeneathKeys::of(&input_tile);
         }
-        let source = self.source.borrow();
+        let source = self.source.lock_now();
         let fields = &self.fields;
 
         process_tile_result(self.tiling(), input_tile, move |codomain| {
@@ -1253,7 +1255,7 @@ impl TileProducer for MapResultWithSourceProducer {
         let Some(correlation) = self.result_correlation.clone() else {
             if obsolete_guard.is_universal() {
                 self.source
-                    .borrow_mut()
+                    .lock_now()
                     .release(&self.name(), Predicate::True);
             }
             self.input.release(obsolete_guard);
@@ -1262,9 +1264,7 @@ impl TileProducer for MapResultWithSourceProducer {
         match &obsolete_guard {
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
                 let extracted_pred = extract_predicate(pred, &correlation).clone();
-                self.source
-                    .borrow_mut()
-                    .release(&self.name(), extracted_pred);
+                self.source.lock_now().release(&self.name(), extracted_pred);
             }
             TileGuard::Function(FunctionGuard::Codomain(g))
                 if matches!(**g, TileGuard::Function(FunctionGuard::Domain(_))) =>
@@ -1281,14 +1281,12 @@ impl TileProducer for MapResultWithSourceProducer {
                     );
                     let keys = self.released_beneath_every_key(pred);
                     let extracted_pred = extract_predicate(&keys, &correlation[1..]).clone();
-                    self.source
-                        .borrow_mut()
-                        .release(&self.name(), extracted_pred);
+                    self.source.lock_now().release(&self.name(), extracted_pred);
                 }
             }
             g if g.is_universal() => {
                 self.source
-                    .borrow_mut()
+                    .lock_now()
                     .release(&self.name(), Predicate::True);
             }
             g if g.is_empty() => {}
@@ -1309,7 +1307,7 @@ mod tests {
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
 
     /// Build a `MapResultProducer` whose `function` operand records its releases.
-    fn map_result_with_function_spy() -> (MapResultProducer, Rc<RefCell<Vec<TileGuard>>>, Tiling) {
+    fn map_result_with_function_spy() -> (MapResultProducer, Arc<Mutex<Vec<TileGuard>>>, Tiling) {
         let in_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
@@ -1364,9 +1362,9 @@ mod tests {
         let (mut producer, released, tiling) = map_result_with_function_spy();
         producer.release(tiling.universal_guard());
         assert!(
-            released.borrow().iter().any(|g| g.is_universal()),
+            released.lock_now().iter().any(|g| g.is_universal()),
             "a universal release means no further pull, so the function is free: {:?}",
-            released.borrow()
+            released.lock_now()
         );
     }
 
@@ -1379,9 +1377,9 @@ mod tests {
             Predicate::at_or_below(Value::UInt(0)),
         )));
         assert!(
-            released.borrow().is_empty(),
+            released.lock_now().is_empty(),
             "the function is still being read: {:?}",
-            released.borrow()
+            released.lock_now()
         );
     }
 
@@ -1735,7 +1733,7 @@ mod tests {
             "row 1 has not arrived, so nothing beneath it is complete: {xs_stated:?}"
         );
         // The debug completeness check in `get` compares this pull with the last.
-        *next.borrow_mut() = input_at(vec![0, 1], 1);
+        *next.lock_now() = input_at(vec![0, 1], 1);
         let _ = producer.get(producer.tiling().universal_guard());
     }
 
@@ -1811,7 +1809,7 @@ mod tests {
             !inner_stated.contains_path(&[Value::UInt(0), Value::UInt(1)]),
             "[0, 1] was withheld, yet the inner level calls it complete: {out:?}"
         );
-        *next.borrow_mut() = f_at(vec![5, 6]);
+        *next.lock_now() = f_at(vec![5, 6]);
         let _ = producer.get(producer.tiling().universal_guard());
     }
 
@@ -1956,7 +1954,7 @@ mod tests {
         let first = producer.get(producer.tiling().universal_guard());
         assert_eq!(stated(&first), Predicate::at_or_below(Value::UInt(0)));
         // Pull 2: key 1 arrives live, and the constant is still not terminal.
-        *next.borrow_mut() = input_at(vec![0, 1], vec![1, 10], 1);
+        *next.lock_now() = input_at(vec![0, 1], vec![1, 10], 1);
         let second = producer.get(producer.tiling().universal_guard());
         assert!(second.is_empty(), "no row before the constant: {second:?}");
         assert_eq!(
@@ -1974,14 +1972,14 @@ mod tests {
         one_guard: bool,
     ) -> Vec<Predicate> {
         use crate::interpreter::{DataSourceDomainExtentImpl, test_source::TestDataSource};
-        let src = Rc::new(RefCell::new(TestDataSource::new(
+        let src = Arc::new(Mutex::new(TestDataSource::new(
             "source_key",
             crate::ccl::Type::Base(BaseType::String),
             Extent::Base(BaseType::String),
         )));
-        src.borrow_mut()
+        src.lock_now()
             .add_data(&[(Value::UInt(10), Value::String("x".into()))]);
-        let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = src.clone();
+        let as_domain: Arc<Mutex<dyn DataSourceDomainExtentImpl>> = src.clone();
         let key_extent = Extent::DataSourceDomain(as_domain.clone());
         let in_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
@@ -2029,13 +2027,13 @@ mod tests {
                 ))),
             ))));
             agreed.push(Predicate::False);
-            agreed.push(src.borrow().get_released_predicate());
+            agreed.push(src.lock_now().get_released_predicate());
             return agreed;
         }
         producer.release(beneath(0));
-        agreed.push(src.borrow().get_released_predicate());
+        agreed.push(src.lock_now().get_released_predicate());
         producer.release(beneath(1));
-        agreed.push(src.borrow().get_released_predicate());
+        agreed.push(src.lock_now().get_released_predicate());
         agreed
     }
 
@@ -2148,7 +2146,7 @@ mod projection_tests {
                 &function_consumer
             };
             notify_input(operand, &morsel);
-            let seen = regions.borrow_mut();
+            let seen = regions.lock_now();
             seen.clone()
         };
         assert_eq!(notified(true), std::slice::from_ref(&morsel));
@@ -2191,7 +2189,7 @@ mod projection_tests {
             &input_consumer,
             &Projection::of(&keys_between(2, 4)).expect("keys"),
         );
-        assert_eq!(*regions.borrow_mut(), [Projection::Everything]);
+        assert_eq!(*regions.lock_now(), [Projection::Everything]);
     }
 
     /// Applied to a scalar at the outermost level, the function's keys are the result's, so a
@@ -2217,7 +2215,7 @@ mod projection_tests {
             &input_consumer,
             &Projection::of(&keys_between(2, 4)).expect("keys"),
         );
-        assert_eq!(*regions.borrow_mut(), [Projection::Everything]);
+        assert_eq!(*regions.lock_now(), [Projection::Everything]);
     }
 
     /// The logs of a `MapResult` over two spies: the guards its input and its function operand
@@ -2274,8 +2272,8 @@ mod projection_tests {
         let (mut map, logs) = lookup_over_positions();
         let morsel = map.get(keys_between(2, 4));
         assert_eq!(int_entries(&morsel), [(2, 120), (3, 130), (4, 140)]);
-        assert_eq!(*logs.input_pulled.borrow(), [keys_between(2, 4)]);
-        assert_eq!(*logs.function_pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(*logs.input_pulled.lock_now(), [keys_between(2, 4)]);
+        assert_eq!(*logs.function_pulled.lock_now(), [keys_between(2, 4)]);
         let Tile::DataFunction {
             domain_predicate, ..
         } = &morsel
@@ -2295,8 +2293,8 @@ mod projection_tests {
         let (mut map, logs) = lookup_over_positions();
         map.get(keys_between(0, 3));
         map.release(keys_between(0, 3));
-        assert_eq!(*logs.input_released.borrow(), [keys_between(0, 3)]);
-        assert_eq!(*logs.function_released.borrow(), [keys_between(0, 3)]);
+        assert_eq!(*logs.input_released.lock_now(), [keys_between(0, 3)]);
+        assert_eq!(*logs.function_released.lock_now(), [keys_between(0, 3)]);
         let next = map.get(keys_between(4, 9));
         assert_eq!(
             int_entries(&next),
@@ -2327,14 +2325,14 @@ mod projection_tests {
         );
         let morsel = map.get(keys_between(0, 1));
         assert_eq!(int_entries(&morsel), [(0, 190), (1, 180)]);
-        assert_eq!(*logs.input_pulled.borrow(), [keys_between(0, 1)]);
+        assert_eq!(*logs.input_pulled.lock_now(), [keys_between(0, 1)]);
         assert_eq!(
-            *logs.function_pulled.borrow(),
+            *logs.function_pulled.lock_now(),
             [table().1.universal_guard()],
             "the table is pulled in full"
         );
         map.release(keys_between(0, 1));
-        assert!(logs.function_released.borrow().is_empty());
+        assert!(logs.function_released.lock_now().is_empty());
     }
 
     /// `map(-)` applies a scalar function value: the projection is the stream's, and the
@@ -2360,9 +2358,9 @@ mod projection_tests {
         );
         let morsel = map.get(keys_between(3, 5));
         assert_eq!(int_entries(&morsel), [(3, -4), (4, -5), (5, -6)]);
-        assert_eq!(*logs.input_pulled.borrow(), [keys_between(3, 5)]);
+        assert_eq!(*logs.input_pulled.lock_now(), [keys_between(3, 5)]);
         assert_eq!(
-            *logs.function_pulled.borrow(),
+            *logs.function_pulled.lock_now(),
             [negate_tiling.universal_guard()]
         );
     }
@@ -2372,8 +2370,8 @@ mod projection_tests {
         let (mut map, logs) = lookup_over_positions();
         let nothing = map.tiling().empty_guard();
         assert_eq!(map.get(nothing), map.tiling().empty_tile());
-        assert!(logs.input_pulled.borrow().is_empty());
-        assert!(logs.function_pulled.borrow().is_empty());
+        assert!(logs.input_pulled.lock_now().is_empty());
+        assert!(logs.function_pulled.lock_now().is_empty());
     }
 
     /// The groups `Converse` makes: group `k` holds the positions that map to `k`, and
@@ -2457,7 +2455,7 @@ mod projection_tests {
             panic!("a collection, got {answer:?}")
         };
         assert_eq!(*domain, ColumnValue::UInts(vec![0]), "group 1's key 0 only");
-        assert_eq!(*logs.input_pulled.borrow(), [key.universal_guard()]);
+        assert_eq!(*logs.input_pulled.lock_now(), [key.universal_guard()]);
     }
 
     fn groups_one_and_three() -> TileGuard {
@@ -2478,9 +2476,9 @@ mod projection_tests {
             ColumnValue::Ints(vec![1, 3]),
             "groups 1 and 3 only"
         );
-        assert_eq!(*logs.input_pulled.borrow(), [groups_one_and_three()]);
+        assert_eq!(*logs.input_pulled.lock_now(), [groups_one_and_three()]);
         assert_eq!(
-            *logs.function_pulled.borrow(),
+            *logs.function_pulled.lock_now(),
             [table().1.universal_guard()]
         );
     }
@@ -2562,9 +2560,9 @@ mod const_projection_tests {
             broadcast(MapResultToConstMode::Replace, seven(true));
         let morsel = map.get(keys_between(2, 4));
         assert_eq!(int_entries(&morsel), [(2, 7), (3, 7), (4, 7)]);
-        assert_eq!(*input_pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(*input_pulled.lock_now(), [keys_between(2, 4)]);
         assert_eq!(
-            *constant_pulled.borrow(),
+            *constant_pulled.lock_now(),
             [Tiling::Scalar(Extent::Base(BaseType::Int)).universal_guard()]
         );
     }
@@ -2596,7 +2594,7 @@ mod const_projection_tests {
             broadcast(MapResultToConstMode::Replace, seven(true));
         let nothing = map.tiling().empty_guard();
         assert_eq!(map.get(nothing), map.tiling().empty_tile());
-        assert!(input_pulled.borrow().is_empty() && constant_pulled.borrow().is_empty());
+        assert!(input_pulled.lock_now().is_empty() && constant_pulled.lock_now().is_empty());
     }
 }
 
@@ -2617,12 +2615,12 @@ mod source_projection_tests {
     /// A source holding `10, 20, 30, 40, 50` at positions `0..5`, and the producer reading it
     /// over a stream of its positions, which `spy` stands in for the domain iteration of.
     fn read_source() -> (MapResultWithSourceProducer, GuardLog) {
-        let source = Rc::new(RefCell::new(TestDataSource::new(
+        let source = Arc::new(Mutex::new(TestDataSource::new(
             "s",
             crate::ccl::Type::Base(BaseType::Int),
             Extent::Base(BaseType::Int),
         )));
-        source.borrow_mut().add_data(
+        source.lock_now().add_data(
             &(0..ROWS)
                 .map(|i| (Value::UInt(i), Value::Int(10 * (i as i64 + 1))))
                 .collect::<Vec<_>>(),
@@ -2660,7 +2658,7 @@ mod source_projection_tests {
         let (mut read, pulled) = read_source();
         let morsel = read.get(keys_between(1, 3));
         assert_eq!(int_entries(&morsel), [(1, 20), (2, 30), (3, 40)]);
-        assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
+        assert_eq!(*pulled.lock_now(), [keys_between(1, 3)]);
     }
 
     #[test]
@@ -2675,6 +2673,6 @@ mod source_projection_tests {
         let (mut read, pulled) = read_source();
         let nothing = read.tiling().empty_guard();
         assert_eq!(read.get(nothing), read.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 }

@@ -13,7 +13,7 @@ use super::*;
 use crate::ccl::constant::ConstTerm;
 use crate::chl_parser::SurfaceBuiltin;
 use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Span, Spanned};
-use crate::interpreter::HttpServerDataSource;
+use crate::interpreter::{HttpServerDataSource, LockNow};
 
 /// `requests, responses = http_serve(port, method, path)`, with its names and arguments read
 /// off.
@@ -260,7 +260,7 @@ impl LoweringContext {
                 DeclaredSink::Http { route, .. } => {
                     let name = &route.source_name;
                     if !self.sources.contains_key(name) {
-                        let source = Rc::new(RefCell::new(UnopenedRoute::new(name.clone())));
+                        let source = Arc::new(Mutex::new(UnopenedRoute::new(name.clone())));
                         self.sources.insert(name.clone(), source);
                     }
                 }
@@ -345,7 +345,7 @@ impl LoweringContext {
         Ok(match self.http_routes.get(source_name) {
             Some(existing) => existing.sink.clone(),
             None if self.endpoints == Endpoints::Inherited => {
-                let source_obj = Rc::new(RefCell::new(UnopenedRoute::new(source_name.clone())));
+                let source_obj = Arc::new(Mutex::new(UnopenedRoute::new(source_name.clone())));
                 self.sources.insert(source_name.clone(), source_obj);
                 Arc::new(UnopenedRouteSink)
             }
@@ -363,13 +363,13 @@ impl LoweringContext {
                     e.insert(Arc::new(server));
                 }
                 let server = self.shared_servers[port].clone();
-                let source_obj = Rc::new(RefCell::new(HttpServerDataSource::new(
+                let source_obj = Arc::new(Mutex::new(HttpServerDataSource::new(
                     &server,
                     method.clone(),
                     path.clone(),
                     source_name.clone(),
                 )));
-                let sink: Arc<dyn DataSink> = source_obj.borrow().sink();
+                let sink: Arc<dyn DataSink> = source_obj.lock_now().sink();
                 self.sources.insert(source_name.clone(), source_obj);
                 self.http_routes.insert(
                     source_name.clone(),

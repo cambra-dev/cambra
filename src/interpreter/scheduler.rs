@@ -1,7 +1,8 @@
+use crate::interpreter::LockNow;
 use std::{
-    cell::RefCell,
     collections::HashMap,
-    rc::{Rc, Weak},
+    sync::Mutex,
+    sync::{Arc, Weak},
 };
 
 use crate::interpreter::{
@@ -11,7 +12,7 @@ use crate::interpreter::{
 
 /// A consumer handle shared by notification forwarders and deferred wakeups.
 /// It carries notifications, not tile data.
-pub type SharedConsumer = Rc<RefCell<dyn Consumer>>;
+pub type SharedConsumer = Arc<Mutex<dyn Consumer>>;
 
 /// One operator's consumer, shared between its inputs, behind a gate: a [`Notified`] flag
 /// set when a notification passes and cleared when the operator is pulled.
@@ -62,7 +63,7 @@ impl Consumer for Gated {
 impl GatedConsumer {
     /// `consumer` behind `gate`, which the operator's producer must clear on every pull.
     pub fn new(consumer: Box<dyn Consumer>, gate: Notified) -> Self {
-        let shared: SharedConsumer = Rc::new(RefCell::new(Gated {
+        let shared: SharedConsumer = Arc::new(Mutex::new(Gated {
             admit: gate.clone(),
             consumer,
         }));
@@ -76,7 +77,7 @@ impl GatedConsumer {
 
     /// Notify the operator's consumer now, through the gate.
     pub fn notify(&self, arrived: &Projection) {
-        self.shared.borrow_mut().notify(arrived);
+        self.shared.lock_now().notify(arrived);
     }
 }
 
@@ -94,8 +95,8 @@ pub fn shared_consumer(consumer: Box<dyn Consumer>) -> (GatedConsumer, Gate) {
 /// A fresh `Box<dyn Consumer>` forwarding to `shared` — what `subscribe` wants for
 /// an input whose notifications should reach the operator's own consumer.
 ///
-/// The closure is not ceremony: a `Box<Rc<RefCell<dyn Consumer>>>` is not itself a
-/// `Consumer`, because the blanket impl over `Rc<RefCell<C>>` needs a *sized* `C`,
+/// The closure is not ceremony: a `Box<Arc<Mutex<dyn Consumer>>>` is not itself a
+/// `Consumer`, because the blanket impl over `Arc<Mutex<C>>` needs a *sized* `C`,
 /// and `dyn Consumer` is not. Wrapping the wake in a closure gives the blanket
 /// impl something sized to bite on.
 ///
@@ -171,10 +172,10 @@ impl Consumer for Forwarding {
         // pulled the operator since the notification in progress passed, so that one already
         // says everything this would. Deferring it would deliver it again on the next drain,
         // and around a cycle again on every poll after.
-        match shared.try_borrow_mut() {
-            Ok(mut consumer) => consumer.notify(region),
-            Err(_) if gate.is_set() => {}
-            Err(_) => self.wakeups.request(shared.clone()),
+        match shared.try_lock_now() {
+            Some(mut consumer) => consumer.notify(region),
+            None if gate.is_set() => {}
+            None => self.wakeups.request(shared.clone()),
         }
     }
 }
@@ -183,7 +184,7 @@ impl Consumer for Forwarding {
 /// Consumers are deduplicated by handle identity. A request during a drain waits for the
 /// next drain. See `src/interpreter/design-operators.md`, "The notification contract".
 #[derive(Clone, Default)]
-pub struct WakeupQueue(Rc<RefCell<Vec<SharedConsumer>>>);
+pub struct WakeupQueue(Arc<Mutex<Vec<SharedConsumer>>>);
 
 impl WakeupQueue {
     /// Request that `consumer` be notified at the next
@@ -191,8 +192,8 @@ impl WakeupQueue {
     /// stack has fully unwound.
     pub fn request(&self, consumer: SharedConsumer) {
         // Notifications request another read; repeated requests do not count separate changes.
-        let mut queued = self.0.borrow_mut();
-        if queued.iter().any(|waiting| Rc::ptr_eq(waiting, &consumer)) {
+        let mut queued = self.0.lock_now();
+        if queued.iter().any(|waiting| Arc::ptr_eq(waiting, &consumer)) {
             return;
         }
         queued.push(consumer);
@@ -203,12 +204,12 @@ impl WakeupQueue {
     /// producer re-arming); that lands in the now-empty queue and is delivered
     /// by the next drain, not this one.
     fn take(&self) -> Vec<SharedConsumer> {
-        std::mem::take(&mut *self.0.borrow_mut())
+        std::mem::take(&mut *self.0.lock_now())
     }
 
     /// Whether a wakeup is waiting for the next drain.
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.borrow().is_empty()
+        self.0.lock_now().is_empty()
     }
 }
 
@@ -227,8 +228,8 @@ pub struct Scheduler {
 }
 
 type SourceHandle = (
-    Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-    Vec<Weak<RefCell<dyn Consumer>>>,
+    Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
+    Vec<Weak<Mutex<dyn Consumer>>>,
 );
 
 impl Scheduler {
@@ -242,7 +243,7 @@ impl Scheduler {
     /// retained window needs the same handles and has nowhere else to get them.
     pub fn sources(
         &self,
-    ) -> impl Iterator<Item = (&str, &Rc<RefCell<dyn DataSourceDomainExtentImpl>>)> + '_ {
+    ) -> impl Iterator<Item = (&str, &Arc<Mutex<dyn DataSourceDomainExtentImpl>>)> + '_ {
         self.source_handles
             .iter()
             .map(|(name, (handle, _))| (name.as_str(), handle))
@@ -308,13 +309,13 @@ impl Scheduler {
     /// operator any version ever subscribed alive and being notified.
     pub fn add_source_handle(
         &mut self,
-        handle: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-        consumer: Weak<RefCell<dyn Consumer>>,
+        handle: Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
+        consumer: Weak<Mutex<dyn Consumer>>,
     ) {
-        let id = handle.borrow().get_id().to_string();
+        let id = handle.lock_now().get_id().to_string();
         if let Some(entry) = self.source_handles.get_mut(&id) {
             assert!(
-                Rc::ptr_eq(&handle, &entry.0),
+                Arc::ptr_eq(&handle, &entry.0),
                 "two sources are registered as `{id}`, so a poll of one wakes the \
 other's subscribers",
             );
@@ -363,7 +364,7 @@ other's subscribers",
             // Prune first, so a source whose every subscriber is gone stops
             // accumulating dead registrations across program reloads.
             consumers.retain(|c| c.strong_count() > 0);
-            if source.borrow_mut().check_for_new_data() {
+            if source.lock_now().check_for_new_data() {
                 woken.extend(consumers.iter().filter_map(Weak::upgrade));
             }
         }
@@ -376,19 +377,19 @@ other's subscribers",
     pub fn deliver(&mut self, mut delivery: Delivery) -> bool {
         let mut delivered = false;
         for consumer in std::mem::take(&mut delivery.0) {
-            consumer.borrow_mut().notify(&Projection::Everything);
+            consumer.lock_now().notify(&Projection::Everything);
             delivered = true;
         }
         // Take the queue after source delivery, outside its notification cascades.
         // Requests created while this snapshot drains remain queued for the next drain.
         for consumer in self.wakeups.take() {
-            consumer.borrow_mut().notify(&Projection::Everything);
+            consumer.lock_now().notify(&Projection::Everything);
             delivered = true;
         }
         // Then pull every sink the wakes above reached, once each, so a change reaches a
         // sink in the call that delivers it.
         for pull in self.sink_pulls.take() {
-            pull.borrow_mut().notify(&Projection::Everything);
+            pull.lock_now().notify(&Projection::Everything);
             delivered = true;
         }
         delivered
@@ -553,10 +554,10 @@ mod tests {
         let (gated, gate) = shared_consumer(Box::new(log));
         gated.notify(&keys(0, 3));
         gated.notify(&keys(10, 12));
-        assert_eq!(*regions.borrow_mut(), [keys(0, 3)]);
+        assert_eq!(*regions.lock_now(), [keys(0, 3)]);
         assert!(gate.0.take());
         gated.notify(&keys(30, 31));
-        assert_eq!(*regions.borrow_mut(), [keys(0, 3), keys(30, 31)]);
+        assert_eq!(*regions.lock_now(), [keys(0, 3), keys(30, 31)]);
     }
 
     /// A forwarder sends `Everything` unless its operator's keys are its input's.
@@ -568,18 +569,18 @@ mod tests {
         forwarding_consumer(&gated, &wakeups).notify(&keys(2, 4));
         assert!(gate.0.take());
         forwarding_consumer_keeping_keys(&gated, &wakeups).notify(&keys(2, 4));
-        assert_eq!(*regions.borrow_mut(), [Projection::Everything, keys(2, 4)]);
+        assert_eq!(*regions.lock_now(), [Projection::Everything, keys(2, 4)]);
     }
 
     /// A closure consumer takes the notification and ignores its region.
     #[test]
     fn a_closure_consumer_ignores_the_region() {
-        let count = Rc::new(RefCell::new(0));
+        let count = Arc::new(Mutex::new(0));
         let count_c = count.clone();
-        let mut consumer: Box<dyn Consumer> = Box::new(move || *count_c.borrow_mut() += 1);
+        let mut consumer: Box<dyn Consumer> = Box::new(move || *count_c.lock_now() += 1);
         consumer.notify(&keys(2, 4));
         consumer.notify(&Projection::Everything);
-        assert_eq!(*count.borrow_mut(), 2);
+        assert_eq!(*count.lock_now(), 2);
     }
 
     /// `widening` sends `Everything` whatever region it is notified of.
@@ -590,7 +591,7 @@ mod tests {
         consumer.notify(&keys(2, 4));
         consumer.notify(&Projection::Everything);
         assert_eq!(
-            *regions.borrow_mut(),
+            *regions.lock_now(),
             [Projection::Everything, Projection::Everything]
         );
     }
@@ -607,7 +608,7 @@ mod tests {
             input.notify(region);
             assert!(gate.0.take());
         }
-        assert_eq!(*regions.borrow_mut(), sent);
+        assert_eq!(*regions.lock_now(), sent);
     }
 
     /// The walk at rest names an operator whose gate is closed while a producer that pulls it
@@ -668,10 +669,10 @@ mod tests {
     /// second arm, whose data changed after the pull.
     #[test]
     fn a_reentrant_wake_after_a_pull_in_the_cascade_is_not_lost() {
-        use std::cell::Cell;
-        let data = Rc::new(Cell::new(0u32));
-        let seen = Rc::new(Cell::new(0u32));
-        let feedback: Rc<RefCell<Option<Box<dyn Consumer>>>> = Rc::new(RefCell::new(None));
+        use crate::interpreter::SyncCell;
+        let data = Arc::new(SyncCell::new(0u32));
+        let seen = Arc::new(SyncCell::new(0u32));
+        let feedback: Arc<Mutex<Option<Box<dyn Consumer>>>> = Arc::new(Mutex::new(None));
         let (d, s, fb) = (data.clone(), seen.clone(), feedback.clone());
         let gate = Notified::clear();
         let pulled = gate.clone();
@@ -681,7 +682,7 @@ mod tests {
             s.set(d.get());
             // The rest of the cascade, once: arm B's data changes, and its notification
             // re-enters the operator this notification is still inside.
-            let rest = fb.borrow_mut().take();
+            let rest = fb.lock_now().take();
             if let Some(mut arm_b) = rest {
                 d.set(d.get() + 1);
                 arm_b.notify(&Projection::Everything);
@@ -690,7 +691,7 @@ mod tests {
         let shared = GatedConsumer::new(downstream, gate);
         let mut scheduler = Scheduler::new();
         let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
-        *feedback.borrow_mut() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
+        *feedback.lock_now() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
         arm_a.notify(&Projection::Everything);
         scheduler.check_for_notifications();
         assert_eq!(
@@ -704,8 +705,8 @@ mod tests {
     /// it stops at the gate; the operator's pull lets the next one through.
     #[test]
     fn a_shared_consumer_passes_one_notification_per_pull() {
-        use std::cell::Cell;
-        let notified = Rc::new(Cell::new(0u32));
+        use crate::interpreter::SyncCell;
+        let notified = Arc::new(SyncCell::new(0u32));
         let n = notified.clone();
         let (shared, gate) = shared_consumer(Box::new(move || n.set(n.get() + 1)));
         let scheduler = Scheduler::new();
@@ -733,14 +734,14 @@ mod tests {
     /// everything it would, and a deferred copy would go around again on every poll.
     #[test]
     fn a_reentrant_wake_with_no_pull_since_is_dropped() {
-        use std::cell::Cell;
-        let notified = Rc::new(Cell::new(0u32));
-        let feedback: Rc<RefCell<Option<Box<dyn Consumer>>>> = Rc::new(RefCell::new(None));
+        use crate::interpreter::SyncCell;
+        let notified = Arc::new(SyncCell::new(0u32));
+        let feedback: Arc<Mutex<Option<Box<dyn Consumer>>>> = Arc::new(Mutex::new(None));
         let (n, fb) = (notified.clone(), feedback.clone());
         let downstream: Box<dyn Consumer> = Box::new(move || {
             n.set(n.get() + 1);
             // The cycle: arm B's notification re-enters the operator this one is inside.
-            let rest = fb.borrow_mut().take();
+            let rest = fb.lock_now().take();
             if let Some(mut arm_b) = rest {
                 arm_b.notify(&Projection::Everything);
             }
@@ -749,7 +750,7 @@ mod tests {
         let (shared, _gate) = shared_consumer(downstream);
         let mut scheduler = Scheduler::new();
         let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
-        *feedback.borrow_mut() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
+        *feedback.lock_now() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
         arm_a.notify(&Projection::Everything);
         assert!(
             scheduler.wakeups.is_empty(),
@@ -768,7 +769,7 @@ mod tests {
         struct WakesOnSecondPull {
             base: ProducerBase,
             pulls: usize,
-            woken: Rc<RefCell<bool>>,
+            woken: Arc<Mutex<bool>>,
             queue: WakeupQueue,
         }
         impl TileProducer for WakesOnSecondPull {
@@ -783,11 +784,11 @@ mod tests {
                 if self.pulls == 2 {
                     let woken = self.woken.clone();
                     self.queue
-                        .request(Rc::new(RefCell::new(move || *woken.borrow_mut() = true)));
+                        .request(Arc::new(Mutex::new(move || *woken.lock_now() = true)));
                 }
                 // Nothing until woken: a scalar holding a value is its whole answer, so the
                 // pull before the wakeup answers what the first did by having none.
-                let values = match *self.woken.borrow_mut() {
+                let values = match *self.woken.lock_now() {
                     true => vec![2],
                     false => Vec::new(),
                 };
@@ -799,7 +800,7 @@ mod tests {
         let mut producer = WakesOnSecondPull {
             base: ProducerBase::unowned(0, &Tiling::Scalar(Extent::Base(BaseType::Int))),
             pulls: 0,
-            woken: Rc::new(RefCell::new(false)),
+            woken: Arc::new(Mutex::new(false)),
             queue: scheduler.wakeup_queue(),
         };
         let tile = pull_laps(&mut scheduler, &mut producer, 8, |t| {
@@ -809,7 +810,7 @@ mod tests {
     }
 
     /// A source with new data, and a consumer that counts its notifications.
-    fn polled_source() -> (Scheduler, Rc<RefCell<u32>>, SharedConsumer) {
+    fn polled_source() -> (Scheduler, Arc<Mutex<u32>>, SharedConsumer) {
         use crate::{
             ccl::Type,
             interpreter::{BaseType, Extent, TestDataSource},
@@ -820,11 +821,11 @@ mod tests {
             Extent::Base(BaseType::Int),
         );
         source.set_has_data(true);
-        let count = Rc::new(RefCell::new(0u32));
+        let count = Arc::new(Mutex::new(0u32));
         let count_c = count.clone();
-        let consumer: SharedConsumer = Rc::new(RefCell::new(move || *count_c.borrow_mut() += 1));
+        let consumer: SharedConsumer = Arc::new(Mutex::new(move || *count_c.lock_now() += 1));
         let mut scheduler = Scheduler::new();
-        scheduler.add_source_handle(Rc::new(RefCell::new(source)), Rc::downgrade(&consumer));
+        scheduler.add_source_handle(Arc::new(Mutex::new(source)), Arc::downgrade(&consumer));
         (scheduler, count, consumer)
     }
 
@@ -835,9 +836,9 @@ mod tests {
     fn a_poll_wakes_no_consumer_until_it_is_delivered() {
         let (mut scheduler, count, _consumer) = polled_source();
         let delivery = scheduler.poll_sources();
-        assert_eq!(*count.borrow_mut(), 0, "polling notifies nobody");
+        assert_eq!(*count.lock_now(), 0, "polling notifies nobody");
         scheduler.deliver(delivery);
-        assert_eq!(*count.borrow_mut(), 1);
+        assert_eq!(*count.lock_now(), 1);
     }
 
     #[test]
@@ -856,21 +857,21 @@ mod tests {
     #[test]
     fn wakeup_is_deferred_and_delivered_once() {
         let mut scheduler = Scheduler::new();
-        let count = Rc::new(RefCell::new(0u32));
+        let count = Arc::new(Mutex::new(0u32));
         let count_c = count.clone();
-        let consumer: Rc<RefCell<dyn Consumer>> =
-            Rc::new(RefCell::new(move || *count_c.borrow_mut() += 1));
+        let consumer: Arc<Mutex<dyn Consumer>> =
+            Arc::new(Mutex::new(move || *count_c.lock_now() += 1));
 
         scheduler.wakeup_queue().request(consumer);
         // Deferred: nothing fires until the scheduler is polled.
-        assert_eq!(*count.borrow_mut(), 0);
+        assert_eq!(*count.lock_now(), 0);
 
         scheduler.check_for_notifications();
-        assert_eq!(*count.borrow_mut(), 1);
+        assert_eq!(*count.lock_now(), 1);
 
         // Drained: a second poll with no new request delivers nothing.
         scheduler.check_for_notifications();
-        assert_eq!(*count.borrow_mut(), 1);
+        assert_eq!(*count.lock_now(), 1);
     }
 
     /// A wakeup requested *during* delivery lands in the next drain, not the
@@ -881,26 +882,25 @@ mod tests {
     fn wakeup_requested_during_delivery_defers_to_next_poll() {
         let mut scheduler = Scheduler::new();
         let queue = scheduler.wakeup_queue();
-        let log = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
 
         let log_b = log.clone();
-        let b: Rc<RefCell<dyn Consumer>> =
-            Rc::new(RefCell::new(move || log_b.borrow_mut().push("b")));
+        let b: Arc<Mutex<dyn Consumer>> = Arc::new(Mutex::new(move || log_b.lock_now().push("b")));
 
         // A logs "a" and, mid-delivery, requests B.
         let log_a = log.clone();
         let queue_c = queue.clone();
-        let a: Rc<RefCell<dyn Consumer>> = Rc::new(RefCell::new(move || {
-            log_a.borrow_mut().push("a");
+        let a: Arc<Mutex<dyn Consumer>> = Arc::new(Mutex::new(move || {
+            log_a.lock_now().push("a");
             queue_c.request(b.clone());
         }));
 
         queue.request(a);
         scheduler.check_for_notifications(); // delivers A; A's request for B defers
-        assert_eq!(*log.borrow_mut(), vec!["a"]);
+        assert_eq!(*log.lock_now(), vec!["a"]);
         scheduler.check_for_notifications(); // now delivers B
-        assert_eq!(*log.borrow_mut(), vec!["a", "b"]);
+        assert_eq!(*log.lock_now(), vec!["a", "b"]);
         scheduler.check_for_notifications(); // nothing left
-        assert_eq!(*log.borrow_mut(), vec!["a", "b"]);
+        assert_eq!(*log.lock_now(), vec!["a", "b"]);
     }
 }

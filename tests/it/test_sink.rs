@@ -4,8 +4,8 @@
 //! expression, so it compiles down the sink-record path (`convert_record_fields_to_operators`),
 //! which a program otherwise reaches only through `http_serve`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use cambra::interpreter::LockNow;
+use std::sync::{Arc, Mutex};
 
 use cambra::ccl::Type;
 use cambra::ccl::context::{GlobalContext, compile_program, render_errors};
@@ -473,7 +473,7 @@ fn a_collection_keyed_by_strings() {
 #[test]
 fn a_sink_accumulates_across_two_deliveries() {
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = Arc::new(Mutex::new(TestDataSource::new(
         "nums",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -481,9 +481,8 @@ fn a_sink_accumulates_across_two_deliveries() {
     ctx.register_source(src.clone());
     let sink = ctx.register_test_sink("out");
 
-    src.borrow_mut()
-        .add_data(&[(Value::UInt(0), Value::Int(1))]);
-    src.borrow_mut()
+    src.lock_now().add_data(&[(Value::UInt(0), Value::Int(1))]);
+    src.lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(0)));
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -506,9 +505,8 @@ fn a_sink_accumulates_across_two_deliveries() {
         "the first delivery is not the whole value"
     );
 
-    src.borrow_mut()
-        .add_data(&[(Value::UInt(1), Value::Int(2))]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.lock_now().add_data(&[(Value::UInt(1), Value::Int(2))]);
+    src.lock_now().set_yield_predicate(Predicate::True);
     let mut completed = false;
     for _ in 0..200 {
         ctx.scheduler().check_for_notifications();
@@ -531,7 +529,7 @@ fn a_sink_accumulates_across_two_deliveries() {
 #[test]
 fn a_sink_accumulates_across_a_reload() {
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = Arc::new(Mutex::new(TestDataSource::new(
         "nums",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -554,11 +552,11 @@ fn a_sink_accumulates_across_a_reload() {
 
     let mut live = LiveProgram::start(&mut ctx, &LoadedProgram::test(version(10)), &consumer)
         .expect("v1 compiles");
-    src.borrow_mut().add_data(&[
+    src.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(1)),
         (Value::UInt(1), Value::Int(2)),
     ]);
-    src.borrow_mut()
+    src.lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
     pump(&mut ctx);
 
@@ -569,11 +567,11 @@ fn a_sink_accumulates_across_a_reload() {
         &consumer,
     )
     .expect("v2 replaces v1");
-    src.borrow_mut().add_data(&[
+    src.lock_now().add_data(&[
         (Value::UInt(2), Value::Int(3)),
         (Value::UInt(3), Value::Int(4)),
     ]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.lock_now().set_yield_predicate(Predicate::True);
     let mut completed = false;
     for _ in 0..200 {
         ctx.scheduler().check_for_notifications();
@@ -638,7 +636,7 @@ fn a_collection_fed_from_inside_a_loop_does_not_compile() {
 #[test]
 fn a_correlated_loop_over_a_streaming_source_waits_for_both_deliveries() {
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = Arc::new(Mutex::new(TestDataSource::new(
         "nums",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -646,9 +644,8 @@ fn a_correlated_loop_over_a_streaming_source_waits_for_both_deliveries() {
     ctx.register_source(src.clone());
     let sink = ctx.register_test_sink("out");
 
-    src.borrow_mut()
-        .add_data(&[(Value::UInt(0), Value::Int(1))]);
-    src.borrow_mut()
+    src.lock_now().add_data(&[(Value::UInt(0), Value::Int(1))]);
+    src.lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(0)));
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -671,9 +668,8 @@ fn a_correlated_loop_over_a_streaming_source_waits_for_both_deliveries() {
         "a sum over a source that may still deliver is not complete"
     );
 
-    src.borrow_mut()
-        .add_data(&[(Value::UInt(1), Value::Int(2))]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.lock_now().add_data(&[(Value::UInt(1), Value::Int(2))]);
+    src.lock_now().set_yield_predicate(Predicate::True);
     let mut completed = false;
     for _ in 0..400 {
         ctx.scheduler().check_for_notifications();

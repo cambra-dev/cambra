@@ -10,8 +10,8 @@
 //! the driver with **bounded** waits, so a lost-wakeup regression fails the test
 //! rather than hanging it.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use cambra::interpreter::LockNow;
+use std::sync::{Arc, Mutex};
 
 use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::ccl::load::LoadedProgram;
@@ -25,9 +25,9 @@ use cambra::interpreter::{
 fn drive_main_output(code: &str) -> Tile {
     const CAP: usize = 1000;
 
-    let new_data = Rc::new(RefCell::new(false));
+    let new_data = Arc::new(Mutex::new(false));
     let nd = new_data.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || *nd.borrow_mut() = true);
+    let consumer: Box<dyn Consumer> = Box::new(move || *nd.lock_now() = true);
 
     let mut ctx = GlobalContext::default();
     let mut compiled = match compile_program(&mut ctx, &LoadedProgram::test(code), consumer) {
@@ -51,7 +51,7 @@ fn drive_main_output(code: &str) -> Tile {
         // Wait for data — bounded, so a never-arriving wakeup fails loudly
         // instead of spinning forever.
         let mut waited = 0;
-        while !*new_data.borrow() {
+        while !*new_data.lock_now() {
             waited += 1;
             assert!(
                 waited < CAP,
@@ -59,7 +59,7 @@ fn drive_main_output(code: &str) -> Tile {
             );
             ctx.scheduler().check_for_notifications();
         }
-        *new_data.borrow_mut() = false;
+        *new_data.lock_now() = false;
 
         let tile = producer.get(universal.clone());
         let release_guard = match &tile {

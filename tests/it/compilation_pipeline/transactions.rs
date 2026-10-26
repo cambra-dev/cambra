@@ -18,8 +18,8 @@
 //! Translated from the prototype's transaction suite (its `txn x = e` introducer
 //! is the `x: Mut(V, Txn) := e` annotation here).
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use cambra::interpreter::LockNow;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bit_set::BitSet;
@@ -2128,7 +2128,7 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     "#};
 
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -2142,7 +2142,7 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
 
     // One request arrives, and the source is left **open** — no
     // terminal yield predicate — so `b`'s writer never drains.
-    src.borrow_mut()
+    src.lock_now()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
     ctx.scheduler().check_for_notifications();
     let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
@@ -2187,7 +2187,7 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     "#};
 
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -2203,7 +2203,7 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     );
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
-    src.borrow_mut()
+    src.lock_now()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
     ctx.scheduler().check_for_notifications();
     let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
@@ -2244,7 +2244,7 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
     "#};
 
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -2260,8 +2260,7 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
     );
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
-    src.borrow_mut()
-        .add_data(&[(Value::UInt(0), Value::Int(5))]);
+    src.lock_now().add_data(&[(Value::UInt(0), Value::Int(5))]);
     ctx.scheduler().check_for_notifications();
     let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
     assert_eq!(
@@ -2379,8 +2378,8 @@ fn live_reply_combines_request_and_store() {
     use cambra::ccl::context::CompileResultExt;
     use cambra::ccl::{BaseType, Type};
     use cambra::interpreter::{Extent, TestDataSource, Value, sort_function_by_domain};
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     let code = indoc! {r#"
         resps = defer()
@@ -2394,7 +2393,7 @@ fn live_reply_combines_request_and_store() {
         resps
     "#};
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -2412,11 +2411,11 @@ fn live_reply_combines_request_and_store() {
         ctx.scheduler().check_for_notifications();
     }
 
-    src.borrow_mut().add_data(&[
+    src.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(5)),
         (Value::UInt(1), Value::Int(15)),
     ]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.lock_now().set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
 
     let mut result = pull_laps(ctx.scheduler(), &mut *producer, 65, Tile::is_terminal);
@@ -3100,19 +3099,19 @@ fn broadcast_off_async_source_sibling_loop() {
         out
     "#};
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = Arc::new(Mutex::new(TestDataSource::new(
         "src",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    src.borrow_mut().add_data(&[
+    src.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(1)),
         (Value::UInt(1), Value::Int(2)),
         (Value::UInt(2), Value::Int(3)),
     ]);
     // A *complete* finite source: all keys available, no more coming — so the
     // sibling loop terminates and `cnt`'s final (3) is decided.
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.lock_now().set_yield_predicate(Predicate::True);
     ctx.register_source(src.clone());
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -3267,7 +3266,7 @@ fn live_read_progresses_past_deny() {
         resps
     "#};
     let mut ctx = GlobalContext::default();
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+    let src = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -3279,17 +3278,17 @@ fn live_read_progresses_past_deny() {
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     // Request 0 (req = 100) arrives first and latches whatever the store has then.
-    src.borrow_mut()
+    src.lock_now()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
-    src.borrow_mut()
+    src.lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(0u64)));
     // Drive the cyclic store — with its interior deny — to completion, then deliver
     // request 1 (req = 200). Arrival order is what makes its observation assertable:
     // it latches after the writer has drained.
     let _ = pull_laps(ctx.scheduler(), &mut *producer, 32, |_| false);
-    src.borrow_mut()
+    src.lock_now()
         .add_data(&[(Value::UInt(1), Value::Int(200))]);
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.lock_now().set_yield_predicate(Predicate::True);
     let mut result = pull_laps(ctx.scheduler(), &mut *producer, 32, |_| false);
     result.compact();
 

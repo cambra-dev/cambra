@@ -276,7 +276,7 @@ fn a_use_name_spelled_like_a_source_is_refused() {
     use cambra::ccl::{BaseType, Type};
     use cambra::interpreter::{Extent, TestDataSource};
     let mut ctx = cambra::ccl::context::GlobalContext::default();
-    ctx.register_source(std::rc::Rc::new(std::cell::RefCell::new(
+    ctx.register_source(std::sync::Arc::new(std::sync::Mutex::new(
         TestDataSource::new(
             "orders",
             Type::Base(BaseType::Int),
