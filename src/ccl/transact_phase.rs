@@ -24,8 +24,8 @@
 //! 1. **strips** every such `For` site, building one [`WriterSite`] per site
 //!    (its read/write footprint, its loop source, and a
 //!    `` {`commit{writes, __to_<defer>*} | `abort} `` decision lambda built from the
-//!    block by read-your-writes substitution — each in-block `<<` feed rides the
-//!    `` `commit `` payload as a `__to_<defer>` tap). This is the **same** writer/key
+//!    block by threading read-your-writes ([`WriterWalk`]) — each in-block `<<` feed
+//!    rides the `` `commit `` payload as a `__to_<defer>` tap). This is the **same** writer/key
 //!    building the direct fold used; only the assembly below differs.
 //! 2. **partitions** the keys into commit stores ([`partition_keys`]) and
 //!    **assembles** one `LetRec` per store (see [`plan_store`]): one **history** binding
@@ -76,13 +76,13 @@ use crate::ccl::Label;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
-    BaseType, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES, FieldKey,
-    HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::{free_names_in_value, is_free, is_free_in_value, synthesize_arm_predicate},
+    Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES, FieldKey, HistoryKind,
+    Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
+    ccl_utils::{free_names_in_value, is_free, is_free_in_value},
     feed_nest::LoopFeed,
     mut_elim::{
-        binding, close_recurrence_group, conjoin_path, fold_induction_loop, hoist_feeds,
-        mut_var_value_tys, proj_of, tvar,
+        FeedSite, WriterParam, WriterWalk, binding, close_recurrence_group, fold_induction_loop,
+        hoist_feeds, mut_var_value_tys, tvar,
     },
     provenance,
     provenance::{Located, NodeId},
@@ -621,21 +621,6 @@ struct RawSite {
     enclosing_writes: HashSet<Name>,
 }
 
-/// A per-transaction feed (`out << e`) collected from a `with begin():` block:
-/// the target defer, the fresh `__to_<defer>` tap field the writer decision's
-/// `` `commit `` payload carries beside `writes`, and the tap value's type. The writer
-/// decision computes the tap value alongside the write set (read-your-writes at
-/// the feed's position); the phase hoists `Feed(defer, __hist ▷ .__to_<defer>)`
-/// into the mutable variable body so `channelize` routes it as an ordinary channel
-/// contribution — mirroring `mut_elim`'s in-loop induction feeds. The tap
-/// commits with the transaction (a denied `` `abort `` contributes no reply, since
-/// the engine appends nothing for an aborted decision).
-struct FeedSite {
-    defer: Name,
-    field: Label,
-    value_ty: Type,
-}
-
 /// One commit store's writer sites and their in-block feeds, as [`run`] collects
 /// them before the store is planned.
 ///
@@ -643,7 +628,9 @@ struct FeedSite {
 /// block was stripped from — the node its products parent on, which rides beside
 /// [`WriterSite`] rather than on it because that type is shared IR that planning
 /// rebuilds from a `Transact`. `site_feeds[j]` holds site `j`'s feeds, so
-/// the two vectors stay index-parallel.
+/// the two vectors stay index-parallel. The phase hoists each as
+/// `Feed(defer, __hist ▷ .__to_<defer>)` for `channelize` to route, and a tap commits
+/// with its transaction: an aborted decision appends nothing, so it contributes no reply.
 type StoreWriters = (Vec<(NodeId, WriterSite)>, Vec<Vec<FeedSite>>);
 
 /// Rewrite every `with begin():` writer of a `Mut(_, Txn)` mutable variable into one shared
@@ -664,10 +651,11 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     if txn_mut_vars.is_empty() && !contains_begin(&expr) {
         return Ok(expr);
     }
-    // A write inside a `Case` bound by a `Let` is off the statement spine this
-    // walk reads, so its advance would be scoped to the branch and dropped.
-    // Push the binding into the branches first, the same normalization the
-    // letrec phase applies through `flatten_spine`.
+    // A write inside a `Case` bound by a `Let` outside a writer body is off the
+    // statement spine, so its advance would be scoped to the branch and dropped.
+    // Push the binding into the branches first, the same normalization the letrec
+    // phase applies through `flatten_spine`. Inside a `with begin():` block the
+    // writer walk merges the `Case` instead.
     let expr = crate::ccl::mut_elim::push_bindings_into_writing_cases(expr);
     // A statement whose effect is a `Let` hides that binding from the rest of
     // the spine, which is where this phase places the stores' `Transact`s that
@@ -1158,7 +1146,7 @@ fn strip(
         // ``match m: case `tag(w): <writes>`` in the block reaches here as a
         // statement-position tag-`Case`. Convert the whole block once rather than
         // at each consumer: `collect_footprint` separates a guard's spine reads
-        // from an arm's conditional ones, and `walk_block` scopes each arm's
+        // from an arm's conditional ones, and the writer walk scopes each arm's
         // writes to its path — neither reads a `Pattern`, and after the rewrite an
         // arm's scrutinee test sits in the guard where the footprint scan wants it
         // ([`statement_tag_cases_to_guards`](crate::ccl::ccl_utils::statement_tag_cases_to_guards)).
@@ -1557,7 +1545,7 @@ pub fn check_no_induction_only_transactions(
 ///
 /// [`partition_spine`] lifts only *top-level spine* induction writes out onto the
 /// enclosing loop; a write nested inside a statement-`Case` (an `if`) stays in the
-/// block. There, `walk_case` has no `write_key` for it (`allowed_writes` holds
+/// block. There, the writer walk has no `write_key` for it (`allowed_writes` holds
 /// only the transactional mutable variables), so its value would be folded into the env and
 /// **silently dropped** from the decision record — the worst failure for a DB
 /// substrate, and one a `debug_assert` alone would let through in release. Catch
@@ -2091,7 +2079,7 @@ fn first_non_txn_write(block: &Expr, txn_mut_vars: &HashSet<Name>) -> Option<Nam
 ///
 /// A key written **conditionally** — inside a statement-`Case` arm (`if p: k :=
 /// e`) — also joins the *read* set. On a control-flow path where that arm does
-/// not fire, `walk_case` rejoins `k` to its **carry** value (the previous
+/// not fire, the writer walk merges `k` to its **carry** value (the previous
 /// committed value), which is only expressible as `k`'s read snapshot. A
 /// read-modify-write (`k := k + e`) already reads `k`, so this only adds the
 /// *absolute* conditional write (`k := e`) that would otherwise have no snapshot
@@ -2139,12 +2127,15 @@ fn collect_footprint(block: &Expr, txn_mut_vars: &HashSet<Name>) -> (Vec<Name>, 
                 }
                 return;
             }
-            // A statement-position `Case` (an `if`/`elif`/`else` routing writes):
-            // its arms' writes are conditional.
+            // A `Case` (an `if`/`elif`/`else` or a `match` routing writes, in statement
+            // position or bound by a `let`): its arms' writes are conditional.
             TypedExprNode::Case {
-                scrutinee: None,
+                scrutinee,
                 branches,
             } => {
+                if let Some(scrutinee) = scrutinee {
+                    walk(scrutinee, txn_mut_vars, in_case, reads, writes);
+                }
                 for b in branches {
                     // A guard is evaluated on the spine (its reads are unconditional
                     // snapshots), but arm bodies are conditional.
@@ -2161,10 +2152,11 @@ fn collect_footprint(block: &Expr, txn_mut_vars: &HashSet<Name>) -> (Vec<Name>, 
     (reads, writes)
 }
 
-/// Build one [`WriterSite`] from a stripped site: its ``{`commit{writes} | `abort}`` decision lambda over the snapshot-tuple parameter, plus its footprint
-/// and source. The decision reads mutable variable snapshots and the loop item off the tuple,
-/// threads read-your-writes by substitution, and picks the `` `commit ``/`` `abort `` tag
-/// on the disjunction of any `if` guards' write paths.
+/// Build one [`WriterSite`] from a stripped site: its ``{`commit{writes} | `abort}``
+/// decision lambda over the snapshot tuple ([`WriterParam`]), plus its footprint and source.
+/// The decision reads mutable variable snapshots and the loop item off the tuple, threads
+/// read-your-writes ([`WriterWalk`]), and picks the `` `commit ``/`` `abort `` tag on the
+/// disjunction of the paths every write and feed is reached on.
 fn build_writer(
     site: RawSite,
     key_init: &HashMap<Name, MutVarDecl>,
@@ -2219,18 +2211,14 @@ fn build_writer(
         build_zip_source(&site.source, &orig_item_ty, &site_accs)
     };
 
-    let mut dom_tys = read_tys.clone();
-    dom_tys.push(item_ty.clone());
-    let tuple_ty = Type::Tuple(dom_tys);
-
-    let p = Name::fresh("__txp");
-    // Seed the read-your-writes environment: each read key at its snapshot
-    // parameter `p.i`, the loop item at the trailing position `p.m`.
+    // Seed the read-your-writes environment: each read key at its snapshot slot, the
+    // loop item at the trailing one.
+    let param = WriterParam::new(Name::fresh("__txp"), read_tys, item_ty.clone());
     let mut env: HashMap<Name, Expr> = HashMap::new();
     for (i, rk) in site.read_keys.iter().enumerate() {
-        env.insert(rk.clone(), proj_of(&p, &tuple_ty, i, &read_tys[i]));
+        env.insert(rk.clone(), param.snapshot(i));
     }
-    let item = proj_of(&p, &tuple_ty, site.read_keys.len(), &item_ty);
+    let item = param.item();
     if site_accs.is_empty() {
         env.insert(site.target.name.clone(), item);
     } else {
@@ -2252,86 +2240,29 @@ fn build_writer(
         env.insert(acc.clone(), tvar(final_var, vty.clone()));
     }
 
-    // The path condition of the block's entry — the empty conjunction, `true`.
-    let true_path = {
-        let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
-        t.ty = Type::Base(BaseType::Bool);
-        t
-    };
-    // Each write/feed records the control-flow path it fires on; the transaction
-    // commits on their disjunction (`ccl_utils::disjoin`). A spine write's path is `true`,
-    // so a write beside a guard commits unconditionally (the guard scopes only its
-    // own arm's writes) — the path-scoped deny semantics.
-    let mut commit_paths: Vec<Expr> = Vec::new();
-    // In-block `<<` feeds, each resolved to its read-your-writes value at its
-    // position in the block. Collected as `(defer, __to_<defer>_k field, value,
-    // path)` — the control-flow path is the tap's fire condition.
-    let mut collected_feeds: Vec<(Name, Label, Expr, Expr)> = Vec::new();
+    // Each write and feed records the control-flow path it is reached on; the
+    // transaction commits on their disjunction. A spine write's path is `true`, so a
+    // write beside a guard commits unconditionally (the guard scopes only its own arm's
+    // writes) — the path-scoped deny semantics.
+    //
     // The legal `MutWrite` targets inside this block: exactly the site's write
-    // keys (transactional mutable variables `collect_footprint` recorded). `walk_block`
-    // asserts every write it sees is one of these — see its `MutWrite` arm.
+    // keys (transactional mutable variables `collect_footprint` recorded), the only
+    // ones the decision's write set holds.
     let allowed_writes: HashSet<Name> = site.write_keys.iter().cloned().collect();
-    walk_block(
-        &site.block,
-        &mut env,
-        &true_path,
-        &mut commit_paths,
-        &mut collected_feeds,
-        feed_counter,
-        &allowed_writes,
-    );
-    let commit = crate::ccl::ccl_utils::disjoin(commit_paths, true, &Type::Base(BaseType::Bool));
-
-    // The decision `writes` is keyed by the variables written, matching
-    // `emit_transact_writer`. A write key never assigned in the block keeps its
-    // snapshot (unchanged).
-    let write_tys: Vec<Type> = site.write_keys.iter().map(value_ty).collect();
-    let write_fields: Vec<(Label, Expr)> = site
+    let writes = site
         .write_keys
         .iter()
-        .map(|wk| {
-            let val = env.get(wk).cloned().unwrap_or_else(|| {
-                panic!("transact_phase: write key `{wk}` never assigned in its block")
-            });
-            (wk.field_key(), val)
-        })
+        .map(|wk| (wk.clone(), value_ty(wk)))
         .collect();
-    let mut writes = Expr::new(TypedExprNode::Record(write_fields));
-    writes.ty = Type::Record(
-        site.write_keys
-            .iter()
-            .map(|wk| wk.field_key())
-            .zip(write_tys.clone())
-            .collect(),
-    );
+    let mut walk = WriterWalk::new(env, feed_counter, Some(&allowed_writes), writes);
+    let mut kept = Vec::new();
+    walk.walk(site.block, &mut kept);
 
-    // Decision record `{commit, writes, __to_<defer>*}` — built by the shared
-    // `writer_decision_record` (the one place the tap encoding lives, so the
-    // induction writer and this transaction writer stay in lockstep). The in-block
-    // feeds ride as `__to_<defer>` taps, each holding its read-your-writes value
-    // under `` `fired `` on the positions its own path admits; `feed_sites` records
-    // the defer/field/type the phase hoists.
-    let feed_sites: Vec<FeedSite> = collected_feeds
-        .iter()
-        .map(|(defer, field, val, _)| FeedSite {
-            defer: defer.clone(),
-            field: field.clone(),
-            value_ty: val.ty.clone(),
-        })
-        .collect();
-    let feeds: Vec<(Label, Expr, Expr)> = collected_feeds
-        .into_iter()
-        .map(|(_, field, val, fpath)| (field, val, fpath))
-        .collect();
-    let decision = crate::ccl::ccl_utils::writer_decision_record(commit.clone(), writes, &feeds);
-    // Wrap the `{commit, writes, __to_<defer>*}` record into the decision **variant**
-    // `` Case[commit → `commit(⟨writes, taps⟩); true → `abort] ``: the whole-transaction
-    // grant/deny is the tag, the (dense) payload rides `commit`.
-    let decision = crate::ccl::ccl_utils::wrap_decision_variant(decision);
-    let decision_ty = decision.ty.clone();
-
-    let mut body = Expr::lambda(p, tuple_ty.clone(), decision);
-    body.ty = Type::fun(tuple_ty, decision_ty);
+    // The decision variant over `{commit, writes, __to_<defer>*}`, keyed by the variables
+    // written: the whole-transaction grant/deny is the tag, the (dense) payload rides
+    // `commit`. An empty block commits. The in-block feeds ride as `__to_<defer>` taps,
+    // each `` `fired `` on the positions its own path admits.
+    let (body, feeds) = walk.body(kept, param, true);
 
     (
         WriterSite {
@@ -2340,7 +2271,7 @@ fn build_writer(
             source,
             body,
         },
-        feed_sites,
+        feeds,
     )
 }
 
@@ -2394,235 +2325,6 @@ fn build_zip_source(source: &Expr, item_ty: &Type, accs: &[(Name, Expr, Type)]) 
     // planning asserts is swept.
     lam.ty = Type::fun_like(&source.ty, dom, new_item_ty.clone());
     (lam, new_item_ty)
-}
-
-/// Walk the block chain, threading the read-your-writes environment (`env`) and
-/// the running commit condition (`commit`). Each `MutWrite`/`Let` updates `env`
-/// by substitution; each `if cond:` guard conjoins `cond` into `commit` and
-/// applies its (unconditionally-evaluated) branch writes, gated at runtime by
-/// `commit` (a denied transaction proposes nothing). Each `<<` feed resolves its
-/// value in the current (post-write) `env` and records it into `feeds` as a
-/// `__to_<defer>_k` tap contribution — `feed_counter` names it uniquely across the
-/// shared mutable variable's writers.
-fn walk_block(
-    block: &Expr,
-    env: &mut HashMap<Name, Expr>,
-    path: &Expr,
-    commit_paths: &mut Vec<Expr>,
-    feeds: &mut Vec<(Name, Label, Expr, Expr)>,
-    feed_counter: &mut usize,
-    allowed_writes: &HashSet<Name>,
-) {
-    match &block.node {
-        TypedExprNode::Lit(Lit::Unit) => {}
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            let bound = Subst::discharge_env_in_place((**bound_expr).clone(), env);
-            env.insert(binding.name.clone(), bound);
-            walk_block(
-                body,
-                env,
-                path,
-                commit_paths,
-                feeds,
-                feed_counter,
-                allowed_writes,
-            );
-        }
-        // Unreachable, as in `splice_block` / `partition_spine`. The rule it would
-        // implement is known — the seed enters the read-your-writes environment
-        // exactly as a `Let`'s bound value does — but a block-local mutable variable also
-        // needs a decision this pass cannot make alone: whether its writes join the
-        // enclosing commit or are private to the block.
-        TypedExprNode::MutDecl { .. } => todo!(
-            "walk_block: a mutable variable declared inside a `with begin():` block — \
-             lowering cannot produce one yet"
-        ),
-        TypedExprNode::ExprStmt { expr, body } => {
-            match &expr.node {
-                TypedExprNode::MutWrite { name, value, .. } => {
-                    // Every `MutWrite` in a stripped `with begin():` block must
-                    // target a transactional mutable variable the site records as a write
-                    // key. `build_writer` only emits `write_keys` into the
-                    // decision `writes` tuple, so a write to any other name would
-                    // be silently folded into `env` and dropped — the worst
-                    // failure for a DB substrate. A spine induction write is lifted
-                    // by `partition_spine`, and a *guarded* one is rejected before
-                    // the phase by `check_no_guarded_induction_write_in_block`, so
-                    // by here every write must be a recorded key; assert as a
-                    // backstop.
-                    debug_assert!(
-                        allowed_writes.contains(name),
-                        "transact_phase: `MutWrite` to `{name}` inside a `with begin():` \
-                         block is not a recorded transactional write key — its write \
-                         would be silently dropped from the decision record"
-                    );
-                    let val = Subst::discharge_env_in_place(value.as_ref().clone(), env);
-                    env.insert(name.clone(), val);
-                    // This write commits on the current path (a spine write's path
-                    // is `true`); the disjunction over all writes is the commit.
-                    commit_paths.push(path.clone());
-                }
-                TypedExprNode::Case {
-                    scrutinee: None,
-                    branches,
-                } => walk_case(
-                    branches,
-                    env,
-                    path,
-                    commit_paths,
-                    feeds,
-                    feed_counter,
-                    allowed_writes,
-                ),
-                // `out << e` — a per-commit reply. Resolve `e` at this position
-                // (read-your-writes) and record it as a `__to_<defer>_k` tap on the
-                // decision. NB the tap value is emitted for *every* commit record,
-                // including a denied one (`commit: false`): the phase output does
-                // not itself gate the reply. "A denied transaction replies
-                // nothing" is enforced downstream by the commit engine, which
-                // skips a denied decision's entire write-set — taps included (see
-                // `commit_operator`'s `Some((false, _))` deny arm). This
-                // cross-boundary reliance is the reason the tap rides the same
-                // decision record as the writes rather than a separate stream.
-                //
-                // The reply rides the transaction's commit: the engine appends the
-                // tap only for a committed decision. A feed under a *single* guard
-                // (`if p: w; out << e`) fires exactly when the transaction commits
-                // (its path == commit). A feed under one arm of genuine cross-key
-                // *routing* (path ⊊ commit) would over-fire on a sibling route's
-                // commit — so the feed records its own `path`, and the decision
-                // assembler makes that path the tap's `` `fired `` condition,
-                // unless the path *is* the commit (then it wraps unconditionally).
-                TypedExprNode::Feed { name, value } => {
-                    let val = Subst::discharge_env_in_place(value.as_ref().clone(), env);
-                    let field = name.defer_tap_field(*feed_counter);
-                    *feed_counter += 1;
-                    feeds.push((name.clone(), field, val, path.clone()));
-                    // A read-only transaction commits to emit its reply.
-                    commit_paths.push(path.clone());
-                }
-                other => panic!(
-                    "transact_phase: unexpected statement in `with begin():` block: {other:?}"
-                ),
-            }
-            walk_block(
-                body,
-                env,
-                path,
-                commit_paths,
-                feeds,
-                feed_counter,
-                allowed_writes,
-            );
-        }
-        other => panic!("transact_phase: unexpected node in `with begin():` block: {other:?}"),
-    }
-}
-
-/// Walk a statement-position `if`/`elif`/`else` `Case` inside a block: fork each
-/// branch under its first-match path condition, walking it against a *cloned*
-/// read-your-writes environment; then **rejoin** each written key as a
-/// carry-forward value-`Case` over the branches (an arm that didn't write a key
-/// contributes its snapshot — keeping the `` `commit `` payload dense). Guards resolve
-/// against the incoming env (RYW). The rejoined `Case`s are value-selecting inside
-/// the writer lambda, so `lambda_elim` compiles them to the lazy `filter_values`
-/// union-of-restricts (an off-path partial op is never evaluated); sequencing after
-/// the join reads the merged value (RYW across the join). commit paths accumulate
-/// across the arms and select the writer's `` `commit ``/`` `abort `` tag.
-#[allow(clippy::too_many_arguments)]
-fn walk_case(
-    branches: &[crate::ccl::Branch],
-    env: &mut HashMap<Name, Expr>,
-    path: &Expr,
-    commit_paths: &mut Vec<Expr>,
-    feeds: &mut Vec<(Name, Label, Expr, Expr)>,
-    feed_counter: &mut usize,
-    allowed_writes: &HashSet<Name>,
-) {
-    // The rejoin below carries an unwritten key via its snapshot on the *final*
-    // arm, so the merged `Case` is total only if the branch list ends in the
-    // unconditional `true → else|unit` complement lowering appends. Assert it at
-    // this boundary — a non-exhaustive block `Case` would leave a key with no
-    // carry on the uncovered path.
-    debug_assert!(
-        branches
-            .last()
-            .is_some_and(|b| matches!(&b.guard.node, TypedExprNode::Lit(Lit::Bool(true)))),
-        "a `with begin():` block `Case` must end in the `true` complement (totality)"
-    );
-    let snapshot = env.clone();
-    // Per branch: (resolved guard, resulting env). The guard is resolved in the
-    // snapshot env (its reads see the pre-`Case` values — RYW).
-    let mut arm_results: Vec<(Expr, HashMap<Name, Expr>)> = Vec::with_capacity(branches.len());
-    let mut priors: Vec<Expr> = Vec::new();
-    for br in branches {
-        let guard = Subst::discharge_env_in_place(br.guard.clone(), &snapshot);
-        let pi = synthesize_arm_predicate(&guard, &priors);
-        priors.push(guard.clone());
-        let arm_path = conjoin_path(path, &pi);
-        let mut arm_env = snapshot.clone();
-        walk_block(
-            &br.body,
-            &mut arm_env,
-            &arm_path,
-            commit_paths,
-            feeds,
-            feed_counter,
-            allowed_writes,
-        );
-        arm_results.push((guard, arm_env));
-    }
-    // Rejoin every write key some arm changed: `env[k] = Case[gᵢ → arm_envᵢ[k]]`,
-    // first-match over the (raw, snapshot-resolved) branch guards. An arm that
-    // left `k` unchanged contributes its snapshot value (carry). Keys no arm
-    // touched keep their snapshot untouched.
-    for wk in allowed_writes {
-        let snap_v = snapshot.get(wk);
-        let changed = arm_results.iter().any(|(_, ae)| ae.get(wk) != snap_v);
-        if !changed {
-            continue;
-        }
-        // A key changed on some-but-not-all arms needs a snapshot to carry on the
-        // arms that leave it unchanged. `collect_footprint` finalizes every
-        // in-`Case` write into the read set, so `snap_v` is `Some` here unless
-        // every arm writes the key. Named so a footprint regression fails loudly
-        // rather than surfacing as the generic `.expect` below.
-        debug_assert!(
-            snap_v.is_some() || arm_results.iter().all(|(_, ae)| ae.get(wk).is_some()),
-            "rejoin: conditionally-written key {wk:?} has a carrying arm but no \
-             snapshot — collect_footprint must add in-`Case` writes to the read set"
-        );
-        let vty = snap_v
-            .map(|e| e.ty.clone())
-            .or_else(|| {
-                arm_results
-                    .iter()
-                    .find_map(|(_, ae)| ae.get(wk).map(|e| e.ty.clone()))
-            })
-            .expect("a changed write key has a value type");
-        let case_branches: Vec<crate::ccl::Branch> = arm_results
-            .iter()
-            .map(|(g, ae)| crate::ccl::Branch {
-                pattern: None,
-                guard: g.clone(),
-                body: ae
-                    .get(wk)
-                    .or(snap_v)
-                    .cloned()
-                    .expect("a rejoined write key has a per-arm or snapshot value"),
-            })
-            .collect();
-        let mut c = Expr::new(TypedExprNode::Case {
-            scrutinee: None,
-            branches: case_branches,
-        });
-        c.ty = vty;
-        env.insert(wk.clone(), c);
-    }
 }
 
 /// A mutable variable key's `let` declaration, as the phase folds it away.
@@ -3026,7 +2728,7 @@ fn plan_store(
             // The tap is the commit log read through the field, so it is a collection at
             // the log's kind — and `recognize_txn_group` takes the history record's tap
             // field type straight off this binding.
-            let tap_value_ty = crate::ccl::ccl_utils::tap_variant_ty(f.value_ty.clone());
+            let tap_value_ty = crate::ccl::ccl_utils::tap_variant_ty(f.value.ty.clone());
             let tap_ty = Type::fun_like(&by_time_ty, Type::Txn, tap_value_ty.clone());
             let by_time = apply_ty(
                 tvar(&commits[j], commits_ty.clone()),
@@ -3055,7 +2757,7 @@ fn plan_store(
                 defer: f.defer,
                 tap: tap_name,
                 tap_ty,
-                value_ty: f.value_ty.clone(),
+                value_ty: f.value.ty.clone(),
             });
         }
     }
@@ -3693,6 +3395,7 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::BaseType;
     use crate::ccl::{ArithmeticKind, BinOpKind, letrec::check_letrec_causal, symbolic::symbolic};
 
     /// A [`RawSite`] with only the fields [`partition_keys`] reads. The rest are

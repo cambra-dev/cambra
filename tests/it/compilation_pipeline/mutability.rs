@@ -425,9 +425,10 @@ x"#,
 )]
 // A **conditional feed** riding an accumulator loop: the `o << i` fires only on
 // the guard's route, so the tap stream carries just the fired positions (loop
-// positions 1, 2 where i = 20, 30). `transform_chain` gives the feed a
-// `to_o__fire` gate; the `InductionStore` omits the tap from a non-firing
-// position's delta, and `StoreDenseRead` (non-carry) reads only fired positions.
+// positions 1, 2 where i = 20, 30). The writer walk puts the feed's tap under
+// the guard's path, `` `fired `` there and `` `idle `` elsewhere; the
+// `InductionStore` omits the tap from a non-firing position's delta, and
+// `StoreDenseRead` (non-carry) reads only fired positions.
 #[case(
     r#"
 o: Feed(_)
@@ -440,10 +441,9 @@ o"#,
     Tile::data_function(ColumnValue::from_uints(vec![1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 30]))), Predicate::True, BitSet::new())
 )]
 // A **conditional write** with an unconditional feed after it: `cnt` increments
-// only when `i > 15`, and `o << cnt` fires every position. The post-`if` feed
-// duplicates onto both paths (mutually exclusive guards), so the tap rides two
-// disjoint fire routes: positions 1, 2 (guard held → cnt 1, 2) and position 0
-// (carry → cnt 0). As a function that is 0 ↦ 0, 1 ↦ 1, 2 ↦ 2.
+// only when `i > 15`, and `o << cnt` fires every position. The feed after the `if`
+// reads the merged `cnt` on the loop spine, so the tap is one route over every
+// position: 0 ↦ 0, 1 ↦ 1, 2 ↦ 2.
 #[case(
     r#"
 o: Feed(_)
@@ -453,12 +453,11 @@ for i in [10, 20, 30]:
         cnt := cnt + 1
     o << cnt
 o"#,
-    Tile::data_function(ColumnValue::positional_union(&[0, 0, 1], vec![ColumnValue::from_uints(vec![1, 2]), ColumnValue::from_uints(vec![0])]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 0]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
+    Tile::data_function(ColumnValue::from_uints(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 2]))), Predicate::True, BitSet::new())
 )]
 // A full `if/else` write with a trailing feed: each position takes exactly one
-// arm (`i < 2` → `x += i`, else `x += 100`) and feeds the post-arm `x`. The two
-// arms partition the loop domain, so the tap rides two disjoint routes. As a
-// function: 0 ↦ 0, 1 ↦ 1, 2 ↦ 101, 3 ↦ 201.
+// arm (`i < 2` → `x += i`, else `x += 100`) and feeds the merged `x` on the loop
+// spine: 0 ↦ 0, 1 ↦ 1, 2 ↦ 101, 3 ↦ 201.
 #[case(
     r#"
 o: Feed(_)
@@ -470,7 +469,7 @@ for i in [0, 1, 2, 3]:
         x := x + 100
     o << x
 o"#,
-    Tile::data_function(ColumnValue::positional_union(&[0, 0, 1, 1], vec![ColumnValue::from_uints(vec![0, 1]), ColumnValue::from_uints(vec![2, 3])]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 101, 201]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
+    Tile::data_function(ColumnValue::from_uints(vec![0, 1, 2, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 101, 201]))), Predicate::True, BitSet::new())
 )]
 // A `mut` accumulator over a **filtered** source. `restrict` keeps an element at
 // its original position, so `kept`'s domain is the subset `{1, 2}` of the
@@ -2280,7 +2279,7 @@ fn test_nested_conditional_write_carries_out_of_a_block_right_hand_side(
 
 // A branch's value reads what that branch wrote — the write is sequenced ahead
 // of the terminal on the branch's own spine, so the read-your-writes
-// environment `transform_chain` threads already carries it
+// environment `WriterWalk` threads already carries it
 // (`docs/chl-spec.md`, "4.3 Assignment forms").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -2304,6 +2303,82 @@ fn test_nested_conditional_write_carries_out_of_a_block_right_hand_side(
     t"}, Value::Int(15))]
 fn test_a_branch_value_reads_what_the_branch_wrote(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+// The value of an `if` or `match` whose branches write merges as a written variable does:
+// `Case[𝑔ᵢ → 𝑣ᵢ]` over the values the branches end in, read where it is bound.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::read_twice(indoc! {"
+    out = test_sink()
+    acc := 0
+    for i in [1, 2, 3]:
+        t = if i > 1:
+                acc += 1
+                i * 3
+            else:
+                i
+        acc += t + t
+        out << acc
+"}, "[2, 15, 34]")]
+#[case::elif(indoc! {"
+    out = test_sink()
+    acc := 0
+    for i in [1, 2, 3, 4]:
+        t = if i == 1:
+                acc += 10
+                acc
+            elif i == 2:
+                acc += 1
+                acc * 2
+            else:
+                0
+        out << t + acc
+"}, "[20, 33, 11, 11]")]
+#[case::match_arms(indoc! {"
+    out = test_sink()
+    acc := 0
+    for i in [1, 2, 3]:
+        o = Option::some(i) if i > 1 else Option::none
+        t = match o:
+                case Option::some(v):
+                    acc += v
+                    v * 10
+                case Option::none:
+                    0
+        out << t + acc
+"}, "[0, 22, 35]")]
+#[case::match_with_a_default_arm(indoc! {"
+    out = test_sink()
+    acc := 0
+    for i in [1, 2, 3]:
+        o = Option::some(i) if i > 1 else Option::none
+        t = match o:
+                case Option::some(v):
+                    acc += v
+                    ()
+                case _:
+                    ()
+        out << acc
+"}, "[0, 2, 5]")]
+#[case::nested(indoc! {"
+    out = test_sink()
+    acc := 0
+    for i in [1, 2, 3, 4]:
+        t = if i > 1:
+                u = if i > 2:
+                        acc += 100
+                        1
+                    else:
+                        acc += 10
+                        2
+                u + acc
+            else:
+                0
+        out << t
+"}, "[0, 12, 111, 211]")]
+fn a_writing_branch_value_merges_as_a_variable(#[case] code: &str, #[case] expected: &str) {
+    check_sink(code, expected);
 }
 
 // A write in a `match` arm reaches the same normalization an `if` branch's
