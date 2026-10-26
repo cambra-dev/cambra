@@ -941,7 +941,8 @@ fn list_element_errors(body: &str) -> Option<String> {
 /// An element that varies when the program runs is refused, naming the variable it varies with
 /// where the program wrote one. A mutable variable's read reaches the check as a read of the
 /// loop's accumulator record, which no name of the program's spells, so that refusal names
-/// none.
+/// none. Neither does one under two generators: lambda elimination reads the outer one through
+/// the pair it makes of the two binders, `__pair.0`.
 #[rstest]
 #[case::loop_variable(indoc! {"
     for x in [1, 2]:
@@ -987,6 +988,14 @@ fn list_element_errors(body: &str) -> Option<String> {
         q := q + 1
         out << [q, 1]
 "}, None)]
+#[case::a_source_chosen_by_an_outer_generator(
+    "out << [[x for x in xs] for y in [1, 2] for xs in [box([1]) if y > 1 else box([1, 2])]]\n",
+    None
+)]
+#[case::a_row_read_by_an_inner_generator(
+    "out << [x for y in [1, 2] for xs in [box([y, 2])] for x in xs]\n",
+    None
+)]
 fn a_varying_list_element_is_refused(#[case] body: &str, #[case] varies_with: Option<&str>) {
     let rendered = list_element_errors(body).expect("the program is refused");
     let expected = match varies_with {

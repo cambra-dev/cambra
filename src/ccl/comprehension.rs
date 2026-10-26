@@ -106,7 +106,14 @@ impl Rewrite<'_> {
             else {
                 unreachable!("matched a Comprehension immediately above")
             };
-            let encoded = encode(comprehension_id, generators, *element, self.holes);
+            // Several generators are the outermost comprehension of inner ones, flattened
+            // ([`encode_curried`]); one is its own encoding.
+            let encoded = match <[Generator; 1]>::try_from(generators) {
+                Ok([generator]) => encode(Some(comprehension_id), generator, *element, self.holes),
+                Err(generators) => {
+                    encode_curried(comprehension_id, generators, *element, self.holes)
+                }
+            };
             // A-normalize the encoding — the operand positions it mints are
             // what that pass is for, and a Σ-typed generator source has to be
             // named for its witness to have a binding position at all.
@@ -210,178 +217,73 @@ fn at_id(e: Expr, id: NodeId) -> Expr {
     out
 }
 
-/// Build the CCL encoding of one comprehension.
+/// Build the CCL encoding of a comprehension over one generator.
 ///
-/// Three shapes, by generator and guard count:
-///
-/// **Single generator, no guard** — identity encoding:
+/// Unfiltered, it is the source read at each position and mapped through the element:
 /// ```text
-/// λ __iter_record → __iter_record ▷ source ▷ (λ var → element)
+/// λ __iter_record → __iter_record ▷ (source ▷ unbox) ▷ (λ var → element)
 /// ```
 ///
-/// **Multiple generators / non-equality guards** — loop-join encoding. The
-/// outer lambda carries a [`Refinement`](crate::ccl::Refinement) predicate with
-/// the combined guard expression; the runtime filters via a correlation vector:
+/// Filtered, the same lambda sits under a cast to a domain refined by the filter, read at the
+/// refinement's element:
 /// ```text
-/// λ __iter_record : {T | pred} →
-///   __iter_record[0] ▷ source0 ▷ (λ var0 →
-///     __iter_record[1] ▷ source1 ▷ (λ var1 → element))
+/// cast({_ | __elem ▷ (source ▷ unbox) ▷ (λ var → filter)} ⤇ _, λ __iter_record → …)
 /// ```
 ///
-/// **Two generators, single equality guard** — hash-join encoding. The outer
-/// lambda carries the same refinement (an equality `build_var == probe_var`);
-/// join planning recognises the equality shape and translates it to an O(N+M)
-/// hash-join-based restriction.
-///
-/// The generator targets are distinct binders, which the encoding relies on:
-/// `uniquify` runs before this phase and gives every binder its own [`Name`].
+/// Several generators nest this encoding ([`encode_curried`]).
 ///
 /// The root is at `comprehension_id`; see the module docs, "Provenance", for
 /// what every other node is recorded against.
 fn encode(
-    comprehension_id: NodeId,
-    generators: Vec<Generator>,
+    comprehension_id: Option<NodeId>,
+    generator: Generator,
     element: Expr,
     holes: &mut SharedHoleMint,
 ) -> Expr {
-    debug_assert!(
-        !generators.is_empty(),
-        "a comprehension has at least one generator"
-    );
-    debug_assert!(
-        generators.iter().enumerate().all(|(i, g)| generators[..i]
-            .iter()
-            .all(|h| h.target.name != g.target.name)),
-        "a comprehension's generator targets are distinct binders after uniquify, found {:?}",
-        generators
-            .iter()
-            .map(|g| &g.target.name)
-            .collect::<Vec<_>>()
-    );
     let element_id = element.node_id();
-    // Every node not minted under a generator's own recording below is the
+    // Every node not minted under the generator's own recording below is the
     // element's: the outer lambda, the cast, the predicate.
     let _element_frame = provenance::enter(element_id, "comprehension.encode", Nature::Machinery);
-    let single_gen = generators.len() == 1;
     let outer_var = Name::iter_record();
-
-    // ---- Step 1: split the generators into binders, sources and one guard ----
-    // All guards combine into a single loop-join predicate (used when hash join
-    // is not applicable — non-equality, 3+ generators, or multiple guards), in
-    // source order across every generator.
-    let mut gen_bindings: Vec<TypedBinding> = Vec::new();
-    let mut gen_sources: Vec<Expr> = Vec::new();
-    let mut pred_op: Option<Expr> = None;
-    for Generator {
-        target,
+    let Generator {
+        target: binding,
         iter,
         guards,
-    } in generators
-    {
-        gen_bindings.push(target);
-        gen_sources.push(iter);
-        for guard in guards {
-            pred_op = Some(match pred_op {
-                Some(lhs) => Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), guard),
-                None => guard,
-            });
-        }
-    }
-    // Read before step 3 drains the sources into the body.
-    let gen_ids: Vec<NodeId> = gen_sources.iter().map(Expr::node_id).collect();
+    } = generator;
+    let pred_op = guards
+        .into_iter()
+        .reduce(|lhs, guard| Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), guard));
+    let source_id = iter.node_id();
+    let source = iter;
 
-    // Sources for the loop-join restriction lambda are copies of the sources the
-    // body chain uses. Taken here, before step 3 stamps the body copies with
-    // their annotations and drains them — a copy of a minted tree stays
-    // structurally equal to its origin, which is what lets inference dedup the
-    // predicate-side refinements against the body-side ones.
-    let mut pred_sources: Vec<Expr> = if pred_op.is_some() {
-        gen_sources.clone()
-    } else {
-        Vec::new()
-    };
+    // The filter's copy of the source is taken before the body's is stamped: a copy of a
+    // minted tree stays structurally equal to its origin, which is what lets inference dedup
+    // the predicate-side refinements against the body-side ones.
+    let pred_source = pred_op.as_ref().map(|_| source.clone());
 
-    // ---- Step 2: build the outer iteration variable ----------------------------
-    // Single generator: iterate directly over that source's index domain.
-    // Multiple generators: pack all index domains into a Record so the body can
-    // address each one via RecordField and the runtime produces the cartesian
-    // product.
-    // With a guard: wrap in Restricted so the runtime filters via a correlation
-    // vector computed from the predicate (see step 4).
+    // An **unfiltered** comprehension iterates exactly its source's domain, and nothing in
+    // the encoded shape says so: the `▷` records only `__iter_record <: dom(source)`, the
+    // direction an argument flows. One `SharedHole` states the equality, on the two positions
+    // the claim is about — the comprehension's own `data_fun` domain and the source's. Both
+    // are concrete `Data`, and a data domain is invariant
+    // (`src/ccl/design/type-inference.md`, "Data domains are invariant"), so the one-way
+    // `inferred <: ann` edge each annotation records becomes two and the two domains are
+    // identified rather than ordered. A filtered comprehension's domain is `{D | pred}`, a
+    // strict subset of its source's, so it keeps its `Hole`.
     //
-    // Helper: build the index argument for generator `i` — for the Phase-5
-    // loop-join predicate chain only. Single-gen: a bare VarRef to the outer
-    // variable. Multi-gen: a projection of the i-th field from the outer record.
-    let make_idx_arg = |var: Name, i: usize| -> Expr {
-        let vref = Expr::var(var);
-        if single_gen {
-            vref
-        } else {
-            Expr::apply(vref, Expr::proj_index(i))
-        }
-    };
-
-    // ---- Step 3: build the body as a nested Apply/Lambda chain ----------------
-    // Working innermost-first (reverse order) we wrap the accumulated expression:
-    //   body = Apply(Lambda(iter_var_i, body), Apply(source_i, idx_arg_i))
-    // An **unfiltered single-generator** comprehension iterates *exactly* its
-    // source's domain, and nothing in the encoded shape says so: the `▷` records
-    // only `__iter_record <: dom(source)`, the direction an argument flows. One
-    // `SharedHole` states the equality, on the two positions the claim is about —
-    // the comprehension's own `data_fun` domain and the source's. Both are
-    // concrete `Data`, and a data domain is *invariant*
-    // (`src/ccl/design/type-inference.md`, "Data domains are invariant"), so the
-    // one-way `inferred <: ann` edge each annotation records becomes two and the
-    // two domains are identified rather than merely ordered.
-    //
-    // Restricted to this shape because it is the only one where the equality
-    // holds: a *filtered* comprehension's domain is `{D | pred}`, a strict subset
-    // of its source's, and a *multi-generator* one's is a product of all of them.
-    // Those keep their `Hole` and stay ordered by the argument edge alone.
-    //
-    // The position shared is the source **read**, `unbox(source)`, not the source: a sum's
-    // own domain is its binder, and the read's is the witness the value carries, so a name
-    // the source's annotation carries is not the read's.
-    let iter_dom = (single_gen && pred_op.is_none()).then(|| holes.fresh());
-    // **The result is a collection built over its sources.** Each generator's source gets
-    // a kind of its own and the result records that it is built over it: a comprehension
-    // binds one index position per index position of each source, which is a
-    // concatenation and not a join. One variable shared across the generators says
-    // something else — that they are one kind — which conflates two sources into one
-    // index, and leaves the second index to be recovered from the shape of the domain
-    // tuple by whatever walks it.
-    // Every source is read through `unbox`, whose result is plain data, so the result is.
+    // The position shared is the source read, `unbox(source)`, not the source: a sum's own
+    // domain is its binder, and the read's is the witness the value carries, so a name the
+    // source's annotation carries is not the read's.
+    let iter_dom = pred_op.is_none().then(|| holes.fresh());
+    // The source is read through `unbox`, whose result is plain data, so the result is.
     let result_kind = FunKind::Data(None);
     let unbox = |source: Expr| Expr::apply(source, Expr::builtin(crate::ccl::Builtin::Unbox));
-    let mut body_expr: Expr = element;
-    for (i, (binding, source)) in gen_bindings
-        .iter()
-        .zip(gen_sources.drain(..))
-        .enumerate()
-        .rev()
-    {
-        // This generator's plumbing is its source's: the index read, the
-        // application of the source, and the per-element lambda.
+    let body_expr = {
+        // The generator's plumbing is its source's: the index read, the application of the
+        // source, and the per-element lambda.
         let _generator_frame =
-            provenance::enter(gen_ids[i], "comprehension.generator", Nature::Machinery);
-        let idx_arg = make_idx_arg(outer_var.clone(), i);
-        // **A comprehension is a collection built over its generators.** It binds one
-        // position per position of each source, so this is a *built over* relation and not a
-        // bound: a bound would claim the result is another spelling of its source, pair
-        // positions that are not the same position, and give a multi-generator comprehension
-        // the arity of its widest source rather than the sum.
-        //
-        // **Every generator, including one that needs no stamp.** Positions are absolute, so
-        // a generator left out shifts every later one onto the wrong source; a source that
-        // contributes no position has to contribute that, not nothing.
-        //
-        // In **generator order**: the loop nests the applications back to front, and the
-        // outermost binder is the first generator's, so a source goes in front of the ones
-        // already recorded.
-        //
-        // The two branches differ in where the kind comes from, and in whether the shared
-        // domain still has to be stamped: an annotation naming a domain is where the id
-        // came from, and re-stamping would discard it.
+            provenance::enter(source_id, "comprehension.generator", Nature::Machinery);
+        let position = Expr::var(outer_var.clone());
         let read = unbox(source);
         // Named, so a source whose element reads its key (a group-by's group) keeps that
         // dependence under a binder: the annotation's codomain is minted where the key is in
@@ -395,67 +297,199 @@ fn encode(
             }),
             None => read,
         };
-        let indexed_source = Expr::apply(idx_arg, read);
-        let per_elem = per_element_lambda(binding, body_expr);
-        body_expr = Expr::apply(indexed_source, per_elem);
-    }
-    // ---- Step 4: attach the restriction ---------------------------------------
-    let core = if let Some(pred_op) = pred_op {
-        // Non-equality or multi-guard: loop-join restriction predicate.
-        // The refinement's element is the implicit REFINEMENT_BINDER (the
-        // record over which the correlation vector ranges); the predicate is a
-        // bare boolean expression, not a lambda.
-        let mut pred_expr: Expr = pred_op;
-        for (i, (binding, pred_source)) in gen_bindings
-            .iter()
-            .zip(pred_sources.drain(..))
-            .enumerate()
-            .rev()
-        {
-            pred_expr = Expr::apply(
-                Expr::apply(make_idx_arg(Name::elem(), i), unbox(pred_source)),
-                per_element_lambda(binding, pred_expr),
+        let indexed_source = Expr::apply(position, read);
+        Expr::apply(indexed_source, per_element_lambda(&binding, element))
+    };
+    let core = match (pred_op, pred_source) {
+        (Some(pred_op), Some(pred_source)) => {
+            // The refinement's element is the reserved `REFINEMENT_BINDER`, the position the
+            // filter is read at; the predicate is a bare boolean expression, not a lambda.
+            let pred_expr = Expr::apply(
+                Expr::apply(Expr::var(Name::elem()), unbox(pred_source)),
+                per_element_lambda(&binding, pred_op),
             );
+            // A refined parameter is `cast(refined_data_fun, λ outer_var → body_expr)`, a
+            // type-level assertion of the predicate-refined domain. The refinement is carried
+            // by the cast's target type; the Cast arm in `infer::emit` constructs the refined
+            // result from it.
+            //
+            // The lambda under the cast is the same collection the cast re-views, so it
+            // carries the `Data` stamp the unfiltered branch puts on its lambda. The cast
+            // target's `Data` alone is not enough: a cast re-views its value at the target's
+            // kind, so a `Compute` lambda underneath is a second, contradictory answer to what
+            // this function is, one that survives into elimination, where the point-free form
+            // of the collection inherits the lambda's kind and reads as a capability.
+            let unrefined_lambda = Expr::lambda(outer_var, Type::Hole, body_expr)
+                .with_user_annotation(Type::Fun {
+                    name: None,
+                    fun_kind: result_kind.clone(),
+                    domain: Box::new(Type::Hole),
+                    codomain: Box::new(Type::Hole),
+                });
+            let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole, result_kind);
+            make_cast(unrefined_lambda, target_ty)
         }
-        // A refined parameter is a `cast(refined_data_fun, λ outer_var →
-        // body_expr)` — a pure type-level assertion of the predicate-refined
-        // domain.  The refinement is carried by the cast's target type; the
-        // Cast Apply arm in `infer::emit` constructs the refined result
-        // from it, and the generic annotation handler infers the predicate's
-        // sub-expressions.
-        //
-        // The lambda under the cast is the *same collection* the cast re-views,
-        // so it carries the same `Data` provenance stamp the unfiltered branch
-        // puts on its lambda (below). The cast target's `Data` alone is not
-        // enough: a cast re-views its value at the target's kind, so a `Compute`
-        // lambda underneath is a second, contradictory answer to what this function
-        // is — one that survives into elimination, where the point-free form of
-        // the collection inherits the lambda's kind and reads as a capability.
-        let unrefined_lambda =
-            Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
-                name: None,
-                fun_kind: result_kind.clone(),
-                domain: Box::new(Type::Hole),
-                codomain: Box::new(Type::Hole),
-            });
-        let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole, result_kind);
-        make_cast(unrefined_lambda, target_ty)
-    } else {
-        // A comprehension is a **data collection** (a map over its source's
-        // domain): stamp it `Data` by provenance. The `data_fun(_, _)` annotation
-        // is a concrete-kind stamp (`emit_node`), the unfiltered counterpart of
-        // the filtered branch's `refined_data_fun` (also `Data`) cast target — so a
-        // comprehension is data-by-construction, not by a domain guess. (The
-        // filtered branch above stamps its own lambda the same way, under a cast
-        // whose `refined_data_fun` target then refines the domain.)
-        Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
+        // A comprehension is a data collection, a map over its source's domain: the
+        // `data_fun(_, _)` annotation is a concrete-kind stamp (`emit_node`), the unfiltered
+        // counterpart of the filtered branch's `refined_data_fun` cast target.
+        _ => Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
             name: None,
             fun_kind: result_kind,
             domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
             codomain: Box::new(Type::Hole),
-        })
+        }),
+    };
+    match comprehension_id {
+        Some(id) => at_id(core, id),
+        None => core,
+    }
+}
+
+/// Bind an inner level's `source` ahead of the level ([`flattened_nest`]), unless it is plain or
+/// already a name: the source is replaced by the name, and the binding is returned.
+fn bind_ahead(source: &mut Expr, id: NodeId) -> Option<(Name, Expr)> {
+    // A list literal, a comprehension, and a cast to a plain collection (a filtered
+    // comprehension already encoded, inner ones going first) are plain by construction: no
+    // witness to project, so nothing in the domain names them.
+    let plain = match &source.node {
+        TypedExprNode::List(_) | TypedExprNode::Comprehension { .. } => true,
+        TypedExprNode::Cast { target, .. } => matches!(
+            target.peel_refinements(),
+            Type::Fun {
+                fun_kind: FunKind::Data(None),
+                ..
+            }
+        ),
+        _ => false,
+    };
+    if plain || anf::is_atomic_term(source) {
+        return None;
+    }
+    let _source_frame = provenance::enter(id, "comprehension.source_ahead", Nature::Machinery);
+    let name = Name::anf_temp();
+    let bound = std::mem::replace(source, Expr::var(name.clone()));
+    Some((name, bound))
+}
+
+/// Build the encoding of a comprehension over several generators: the comprehension over the
+/// first generator of the comprehensions over the rest, flattened by `uncurry(𝑛)` into one
+/// collection keyed by the tuple of their positions (`src/ccl/design/ir.md`, "Several
+/// generators").
+///
+/// ```text
+/// [𝑒 for 𝑎 in 𝑆 for 𝑏 in 𝑇]  ⟹  uncurry([[𝑒 for 𝑏 in 𝑇] for 𝑎 in 𝑆])
+/// ```
+///
+/// Each level is a one-generator encoding ([`encode`]). The filters of every generator form one
+/// filter over the flattened tuples, stated as the same nest over the filter's value and read at
+/// `__elem`. A-normalization, which runs before this phase, binds the sources ahead of the whole
+/// nest, so the filter's copies read the names the levels read.
+fn encode_curried(
+    comprehension_id: NodeId,
+    generators: Vec<Generator>,
+    element: Expr,
+    holes: &mut SharedHoleMint,
+) -> Expr {
+    let arity = generators.len();
+    debug_assert!(arity >= 2, "a curried encoding nests several generators");
+    debug_assert!(
+        generators.iter().enumerate().all(|(i, g)| generators[..i]
+            .iter()
+            .all(|h| h.target.name != g.target.name)),
+        "a comprehension's generator targets are distinct binders after uniquify, found {:?}",
+        generators
+            .iter()
+            .map(|g| &g.target.name)
+            .collect::<Vec<_>>()
+    );
+    let element_id = element.node_id();
+    let _element_frame = provenance::enter(element_id, "comprehension.encode", Nature::Machinery);
+    let mut bindings: Vec<TypedBinding> = Vec::new();
+    let mut sources: Vec<Expr> = Vec::new();
+    let mut pred_op: Option<Expr> = None;
+    for Generator {
+        target,
+        iter,
+        guards,
+    } in generators
+    {
+        bindings.push(target);
+        sources.push(iter);
+        for guard in guards {
+            pred_op = Some(match pred_op {
+                Some(lhs) => Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), guard),
+                None => guard,
+            });
+        }
+    }
+    let ids: Vec<NodeId> = sources.iter().map(Expr::node_id).collect();
+    let pred_sources: Vec<Expr> = if pred_op.is_some() {
+        sources.clone()
+    } else {
+        Vec::new()
+    };
+    let flat = flattened_nest(&bindings, sources, &ids, element, holes, true);
+    let core = match pred_op {
+        None => flat,
+        // **The filter is the same nest over the filter's value, read at the key.** Its keys
+        // are the element's, so reading it at `__elem` asks the filter of the position the
+        // element stands at, and a domain whose inner levels read the outer keys types the
+        // read as it types the element: by `uncurry`'s dependent scheme, with no positional
+        // projection to type ahead of knowing the domain's shape.
+        Some(pred_op) => {
+            let filter = flattened_nest(&bindings, pred_sources, &ids, pred_op, holes, false);
+            let pred_expr = Expr::apply(Expr::var(Name::elem()), filter);
+            make_cast(
+                flat,
+                refined_data_fun(Type::Hole, pred_expr, Type::Hole, FunKind::Data(None)),
+            )
+        }
     };
     at_id(core, comprehension_id)
+}
+
+/// The nest of one-generator encodings ([`encode`]) over `sources`, innermost level first so
+/// each level's element is the level inside it, with `element` innermost, flattened by
+/// `uncurry(𝑛)`.
+///
+/// `bind_levels_ahead` binds an inner level's source that may be a sum ahead of that level,
+/// inside the element binder its source reads: the level's domain is the source's
+/// projection, which stands in the level lambda's parameter type, so a source A-normalization
+/// named inside the level would be named out of the domain's scope. A-normalization binds the
+/// nest's other sources ahead of the whole nest, for the same reason (`crate::ccl::anf`). Not in
+/// a filter, which holds no binding of its own.
+fn flattened_nest(
+    bindings: &[TypedBinding],
+    sources: Vec<Expr>,
+    ids: &[NodeId],
+    element: Expr,
+    holes: &mut SharedHoleMint,
+    bind_levels_ahead: bool,
+) -> Expr {
+    let arity = bindings.len();
+    let mut body = element;
+    for (i, (binding, source)) in bindings.iter().zip(sources).enumerate().rev() {
+        let _generator_frame =
+            provenance::enter(ids[i], "comprehension.generator", Nature::Machinery);
+        let mut source = source;
+        let ahead = if bind_levels_ahead && i > 0 {
+            bind_ahead(&mut source, ids[i])
+        } else {
+            None
+        };
+        let level = Generator {
+            target: binding.clone(),
+            iter: source,
+            guards: Vec::new(),
+        };
+        body = encode(None, level, body, holes);
+        if let Some((name, bound)) = ahead {
+            let _source_frame =
+                provenance::enter(ids[i], "comprehension.source_ahead", Nature::Machinery);
+            body = Expr::let_bind(name, bound, body);
+        }
+    }
+    Expr::apply(body, Expr::builtin(crate::ccl::Builtin::Uncurry(arity)))
 }
 
 /// `λ target → body` at a generator's binder.
@@ -531,12 +565,19 @@ mod tests {
         "[x for x in [10, 20] if x > 10]",
         "cast(({_ | __elem ▷ ([10, 20] ▷ unbox) ▷ (λ x → x > 10)} ⤇ _), λ __iter_record → __iter_record ▷ ([10, 20] ▷ unbox) ▷ (λ x → x))"
     )]
-    // Two generators and an equality guard: the product is indexed positionally,
-    // and the equality in the refinement is what join planning reads for a hash
+    // Two generators and an equality filter: the comprehension over `x` of the comprehensions
+    // over `y`, flattened by `uncurry` into pairs of positions. The filter is the same nest over
+    // the filter's value, read at the pair, where join planning reads the equality for a hash
     // join.
     #[case(
         "[x + y for x in [1, 2] for y in [3, 4] if x == y]",
-        "cast(({_ | __elem.0 ▷ ([1, 2] ▷ unbox) ▷ (λ x → __elem.1 ▷ ([3, 4] ▷ unbox) ▷ (λ y → x == y))} ⤇ _), λ __iter_record → __iter_record.0 ▷ ([1, 2] ▷ unbox) ▷ (λ x → __iter_record.1 ▷ ([3, 4] ▷ unbox) ▷ (λ y → x + y)))"
+        "cast(({_ | __elem ▷ ((λ __iter_record → __iter_record ▷ ([1, 2] ▷ unbox) ▷ (λ x → λ __iter_record → __iter_record ▷ ([3, 4] ▷ unbox) ▷ (λ y → x == y))) ▷ uncurry)} ⤇ _), (λ __iter_record → __iter_record ▷ ([1, 2] ▷ unbox) ▷ (λ x → λ __iter_record → __iter_record ▷ ([3, 4] ▷ unbox) ▷ (λ y → x + y))) ▷ uncurry)"
+    )]
+    // Three generators: three levels flattened by one `uncurry(3)` into the triples of
+    // positions, the filter over all three.
+    #[case(
+        "[x + y + z for x in [1] for y in [2] for z in [3] if x < z]",
+        "cast(({_ | __elem ▷ ((λ __iter_record → __iter_record ▷ ([1] ▷ unbox) ▷ (λ x → λ __iter_record → __iter_record ▷ ([2] ▷ unbox) ▷ (λ y → λ __iter_record → __iter_record ▷ ([3] ▷ unbox) ▷ (λ z → x < z)))) ▷ uncurry(3))} ⤇ _), (λ __iter_record → __iter_record ▷ ([1] ▷ unbox) ▷ (λ x → λ __iter_record → __iter_record ▷ ([2] ▷ unbox) ▷ (λ y → λ __iter_record → __iter_record ▷ ([3] ▷ unbox) ▷ (λ z → x + y + z)))) ▷ uncurry(3))"
     )]
     // A per-element conditional stays a value `Case` in the per-element lambda,
     // which lambda elimination compiles over the element stream.

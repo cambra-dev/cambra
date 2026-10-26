@@ -2784,6 +2784,14 @@ impl Type {
     /// "Representation").
     pub fn dep_tuple(mut components: Vec<(Option<crate::ccl::Name>, Self)>) -> Self {
         crate::ccl::subst::close_tuple_components(&mut components);
+        Self::closed_dep_tuple(components)
+    }
+
+    /// [`Type::dep_tuple`] of components already closed, each reading the components before
+    /// it by index: the plain tuple where none reads another, as a rewrite of a dependent
+    /// tuple's components can leave it. Nothing is closed by name, so a free name spelled like
+    /// a component stays free.
+    pub fn closed_dep_tuple(components: Vec<(Option<crate::ccl::Name>, Self)>) -> Self {
         let dependent = components
             .iter()
             .enumerate()

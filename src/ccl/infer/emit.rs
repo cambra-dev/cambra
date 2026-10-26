@@ -184,8 +184,17 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                 // refinement flowing into an operand variable (a filtered
                 // collection meeting `box`'s parameter) must find the names it
                 // references in that variable's scope.
-                let scheme = scheme.clone();
-                ctx.instantiate(&scheme)
+                let scheme = scheme.into_owned();
+                let instantiated = ctx.instantiate(&scheme);
+                match b {
+                    crate::ccl::Builtin::Uncurry(_) => {
+                        crate::ccl::infer::schemes::uncurried_value_at_its_tuple(
+                            instantiated,
+                            expr.node_id(),
+                        )
+                    }
+                    _ => instantiated,
+                }
             } else {
                 ctx.normalize_annotation(&expr.ty)
             }

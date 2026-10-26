@@ -579,7 +579,10 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
         // than to the pass: the walk above has already visited these predicates
         // under `memo` and recorded them unchanged, and a hit there is served
         // without running the rewrite at all.
-        move_into_list_elements(*body, &binding.name, &bound_expr, &PredMemo::new())
+        // A type's copy of a list follows a list that moves, and with none to move the types
+        // stay as they are ([`move_into_list_elements`]).
+        let types = a_list_element_reads(&binding.name, &body);
+        move_into_list_elements(*body, &binding.name, &bound_expr, &PredMemo::new(), types)
     };
 
     // Drop the `Let` only when this rewrite moved the definiens and left no reader
@@ -625,13 +628,19 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
 /// "Duplication"). Each copy is flattened where it lands
 /// ([`flatten_anf_bindings`]).
 ///
-/// A predicate's copy of the list is rewritten too, by recursing into it with
+/// With `types`, a predicate's copy of the list is rewritten too, by recursing into it with
 /// this same function. Where the `Let` sits inside the comprehension the copy
 /// carries its own `Let` and [`inline_list_element_reads`]'s recursion reaches
 /// it; where the `Let` sits outside, the copy holds a free read of `name` and
 /// only this walk reaches that. Rewriting one side alone leaves the node's type
 /// describing a collection its value no longer is, which op-conversion rejects
 /// at whichever side still names the binder.
+///
+/// The caller passes `types` only where a value list moves ([`a_list_element_reads`]). A type
+/// can read `name` in a list no value spells that way: a dependent application's codomain
+/// reads its argument at the parameter, `[{ 𝑦 > 1 → … }]` in the function read
+/// `[{ __anf > 1 → … }]` in the application's type. That copy follows no list that moves, and
+/// rewriting it alone leaves the type disagreeing with the one the application's parts derive.
 ///
 /// Shadowing needs no tracking: uniquify gives every binder its own identity, so
 /// `name` is not re-bound under the `Let` that binds it. [`inline_and_beta_reduce`]
@@ -641,6 +650,7 @@ fn move_into_list_elements(
     name: &Name,
     definiens: &Expr,
     memo: &PredMemo,
+    types: bool,
 ) -> (Expr, bool) {
     let mut moved = false;
     if let TypedExprNode::List(elts) = &mut body.node {
@@ -655,27 +665,43 @@ fn move_into_list_elements(
             }
         }
     }
-    body.walk_type_slots_mut(|ty| {
-        walk_quoted_terms_mut(ty, memo, &(), &mut |pred, memo| {
-            // A predicate the binder does not occur in is reported unchanged, so
-            // it keeps its origin `Rc` and stays pointer-shared with its
-            // occurrences on other nodes rather than being reallocated at each.
-            if !is_free(name, pred) {
-                return false;
-            }
-            let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
-            let (rewritten, pred_moved) = move_into_list_elements(old, name, definiens, memo);
-            *pred = rewritten;
-            moved |= pred_moved;
-            pred_moved
+    if types {
+        body.walk_type_slots_mut(|ty| {
+            walk_quoted_terms_mut(ty, memo, &(), &mut |pred, memo| {
+                // A predicate the binder does not occur in is reported unchanged, so
+                // it keeps its origin `Rc` and stays pointer-shared with its
+                // occurrences on other nodes rather than being reallocated at each.
+                if !is_free(name, pred) {
+                    return false;
+                }
+                let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
+                let (rewritten, pred_moved) =
+                    move_into_list_elements(old, name, definiens, memo, true);
+                *pred = rewritten;
+                moved |= pred_moved;
+                pred_moved
+            });
         });
-    });
+    }
     body.map_children(|child| {
-        let (child, child_moved) = move_into_list_elements(child, name, definiens, memo);
+        let (child, child_moved) = move_into_list_elements(child, name, definiens, memo, types);
         moved |= child_moved;
         child
     });
     (body, moved)
+}
+
+/// Whether a list literal in `e`'s value, outside its types, has an element reading `name`: one
+/// [`move_into_list_elements`] moves `name`'s definiens into.
+fn a_list_element_reads(name: &Name, e: &Expr) -> bool {
+    if let TypedExprNode::List(elts) = &e.node
+        && elts.iter().any(|elt| is_free(name, elt))
+    {
+        return true;
+    }
+    let mut found = false;
+    e.walk_children(|c| found = found || a_list_element_reads(name, c));
+    found
 }
 
 /// Restate each `for` loop's position slot in `e` that reads `name` from the loop's source.

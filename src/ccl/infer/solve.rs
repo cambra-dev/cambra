@@ -184,6 +184,11 @@ pub(super) struct CoalesceCtx {
     /// single coalesced `Rc` on the way out, instead of splitting into one
     /// independently-coalesced copy per node. See [`PredMemo`].
     pred_memo: PredMemo,
+    /// The coalesced predicates made from each origin ([`crate::ccl::ccl_utils::derivation_origin`]), the
+    /// origin kept alive beside them: copies of one predicate a transport made apart coalesce
+    /// apart, and one equal to a predicate already here takes its allocation instead
+    /// (`src/ccl/design/type-inference.md`, "Copies of one predicate share after coalesce").
+    coalesced_by_origin: HashMap<crate::ccl::PredicateId, CoalescedFromOrigin>,
     /// The node whose coalesce rule is running, maintained by
     /// [`coalesce_node`] on both exit paths. The same discipline `emit_node` and
     /// `check_node` use; seeded with the tree's root at construction.
@@ -521,6 +526,15 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                     .zip(ys)
                     .all(|(x, y)| types_agree_modulo_unread(x, y, refinements))
         }
+        // A component's name is a spelling, not part of the type (`src/ccl/design/
+        // type-inference.md`, "Representation"), so components agree by position.
+        (Type::DepTuple(xs), Type::DepTuple(ys)) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys)
+                    .all(|((_, x), (_, y))| types_agree_modulo_unread(x, y, refinements))
+        }
         (Type::Record(xs), Type::Record(ys)) => {
             xs.len() == ys.len()
                 && xs.iter().zip(ys).all(|((nx, x), (ny, y))| {
@@ -799,6 +813,21 @@ struct Specialization {
     /// too ([`SpecializeFrame::held`]): its types are the same, so the clone's errors
     /// are its own.
     raised: Vec<(Option<NodeId>, LocatedInferError)>,
+}
+
+/// The names and the witnesses a predicate reads free ([`share_with_its_origin`]).
+type PredicateReads = (
+    std::collections::BTreeSet<Name>,
+    std::collections::BTreeSet<crate::ccl::ty::WitnessId>,
+);
+
+/// The coalesced predicates made from one origin ([`CoalesceCtx::coalesced_by_origin`]).
+struct CoalescedFromOrigin {
+    /// Kept so the key's address stays allocated for the walk; never read.
+    #[allow(dead_code)]
+    origin: Rc<Expr>,
+    /// Each coalesced predicate with what it reads.
+    made: Vec<(Rc<Expr>, PredicateReads)>,
 }
 
 /// A specialization placed under a binder between its definition and its use
@@ -1554,6 +1583,7 @@ pub(super) fn coalesce_pass(
         lambda_params: Vec::new(),
         errors: Vec::new(),
         pred_memo: PredMemo::new(),
+        coalesced_by_origin: HashMap::new(),
         discarding: false,
         specializing: Vec::new(),
         placed: Vec::new(),
@@ -2965,6 +2995,7 @@ fn coalesce_type_predicates_go(
             let memo = ctx.pred_memo.clone();
             let base = inner.clone();
             refinements.rewrite_each(|_, r| {
+                let entered = Rc::clone(&r.predicate);
                 memo.rebuild(r, &(), |pred| {
                     #[cfg(debug_assertions)]
                     {
@@ -2978,7 +3009,9 @@ fn coalesce_type_predicates_go(
                     crate::ccl::ccl_utils::type_element_reads_from_base(pred, &base);
                     true
                 });
+                crate::ccl::ccl_utils::record_derivation(&entered, &r.predicate);
                 *r = scope.close(r);
+                share_with_its_origin(ctx, r);
             });
         }
         Type::Fun {
@@ -3017,6 +3050,12 @@ fn coalesce_type_predicates_go(
                 scope.enter(name.clone());
             }
             (0..n).for_each(|_| scope.exit());
+            // A component's determined projection is its one candidate (the arm below), which
+            // can leave no component reading another.
+            let rebuilt = Type::closed_dep_tuple(cs.clone());
+            if !matches!(rebuilt, Type::DepTuple(_)) {
+                *ty = rebuilt;
+            }
         }
         Type::Record(fs) => fs
             .iter_mut()
@@ -3060,6 +3099,37 @@ fn coalesce_type_predicates_go(
         Type::Poly(poly) => Rc::make_mut(poly)
             .types_mut()
             .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
+    }
+}
+
+/// Point `r` at a coalesced predicate made from its origin that equals it and reads the same
+/// names and witnesses, or record it as one ([`CoalesceCtx::coalesced_by_origin`]). Equality
+/// compares refinements nested in type slots type-blind, and two copies made under different
+/// substitutions can differ there in the names they read, so both reads are compared too: the
+/// allocation kept is in scope wherever the discarded one was.
+fn share_with_its_origin(ctx: &mut CoalesceCtx, r: &mut crate::ccl::Refinement) {
+    let origin = crate::ccl::ccl_utils::derivation_origin(&r.predicate);
+    let made = &mut ctx
+        .coalesced_by_origin
+        .entry(Rc::as_ptr(&origin))
+        .or_insert_with(|| CoalescedFromOrigin {
+            origin: Rc::clone(&origin),
+            made: Vec::new(),
+        })
+        .made;
+    if made.iter().any(|(p, _)| Rc::ptr_eq(p, &r.predicate)) {
+        return;
+    }
+    let reads = (
+        crate::ccl::free_names::names_in_refinement(r),
+        crate::ccl::ccl_utils::free_witnesses(&r.predicate),
+    );
+    match made
+        .iter()
+        .find(|(p, p_reads)| **p == *r.predicate && *p_reads == reads)
+    {
+        Some((p, _)) => *r = crate::ccl::Refinement::sharing(p),
+        None => made.push((Rc::clone(&r.predicate), reads)),
     }
 }
 

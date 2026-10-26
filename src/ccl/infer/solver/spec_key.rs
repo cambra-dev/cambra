@@ -92,6 +92,12 @@ struct KeyView {
     /// Record/tuple fields, unioned. Tuples and records share this representation
     /// keyed by `Index` / `Name`, exactly as `compact_type` normalizes them.
     rec: BTreeMap<FieldKey, KeyView>,
+    /// A dependent tuple's components, unioned position by position, each keyed under the
+    /// binders before it as `compact_go` compacts it. Kept apart from [`rec`](Self::rec) for
+    /// the reason compaction keeps its slots apart: the two close references to the
+    /// binders around the tuple at different depths. The names are spellings and not part
+    /// of the key.
+    dep_tuple: Vec<KeyView>,
     /// Variant tags, unioned.
     var: BTreeMap<FieldKey, KeyView>,
     /// History contributions, keyed by kind so an `Overwrite` and an `Append`
@@ -124,6 +130,7 @@ impl PartialEq for KeyView {
             && same_refinements(&self.refinements, &other.refinements)
             && self.fun == other.fun
             && self.rec == other.rec
+            && self.dep_tuple == other.dep_tuple
             && self.var == other.var
             && self.history == other.history
             && self.nominal == other.nominal
@@ -162,6 +169,18 @@ impl KeyView {
             }
         }
         union_map(&mut self.rec, other.rec);
+        if self.dep_tuple.is_empty() {
+            self.dep_tuple = other.dep_tuple;
+        } else if !other.dep_tuple.is_empty() {
+            assert_eq!(
+                self.dep_tuple.len(),
+                other.dep_tuple.len(),
+                "two dependent tuples of different lengths key one position"
+            );
+            for (mine, theirs) in self.dep_tuple.iter_mut().zip(other.dep_tuple) {
+                mine.union(theirs);
+            }
+        }
         union_map(&mut self.var, other.var);
         for (kind, (value, domain)) in other.history {
             match self.history.entry(kind) {
@@ -285,6 +304,10 @@ impl fmt::Display for KeyView {
         if !self.rec.is_empty() {
             let fields: Vec<String> = self.rec.iter().map(|(k, v)| format!("{k}: {v}")).collect();
             parts.push(format!("({})", fields.join(", ")));
+        }
+        if !self.dep_tuple.is_empty() {
+            let components: Vec<String> = self.dep_tuple.iter().map(|v| format!("{v}")).collect();
+            parts.push(format!("({})", components.join(" × ")));
         }
         if !self.var.is_empty() {
             let tags: Vec<String> = self.var.iter().map(|(k, v)| format!(".{k}: {v}")).collect();
@@ -435,7 +458,6 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Param(_)
-        | Type::DepTuple(_)
         | Type::Txn => KeyView::from_atom(
             AtomKey::from_type(ty).expect("every atomic type classifies as an AtomKey"),
         ),
@@ -559,6 +581,24 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 }
             }
             acc
+        }
+        // Component `𝑘` keys under the binders of the `𝑘` components before it, as
+        // `compact_go` compacts it.
+        Type::DepTuple(cs) => {
+            let mut acc = subst_acc.clone();
+            let mut components = Vec::with_capacity(cs.len());
+            for (name, t) in cs {
+                components.push(key_go(t, pol, &acc, ctx));
+                ctx.scope.enter(name.clone());
+                if let Some(b) = name {
+                    acc = acc.shadow(b);
+                }
+            }
+            cs.iter().for_each(|_| ctx.scope.exit());
+            KeyView {
+                dep_tuple: components,
+                ..Default::default()
+            }
         }
         Type::Tuple(ts) => KeyView {
             rec: ts
