@@ -1,0 +1,73 @@
+# Excerpt of a sketch of `std::http`: `http::http_client`, the outbound mirror of `http::serve`,
+# with its types and the runtime's promises.
+#
+# `std::http` is not yet in std/. A program reaches it as `import std::http`, which also binds
+# `http::serve`, `http::ok` and the rest (docs/chl-spec.md, "9.16 The std root").
+#
+# Example, a client constructor's body (../lib.cambra has three):
+#
+#     import std::http
+#     import std::time
+#     import std::wf
+#
+#     def build(CK: Type) => wf::Client(wf::Attempt(CK), lib::Email, http::Outcome(lib::Emailed)):
+#         writes_feed = defer()
+#         http_writes, http_replies = http::http_client(wf::Attempt(CK), (
+#             http::base_url="https://api.resend.com",
+#             http::headers={"Authorization": "Bearer " + api_key,
+#                            "Content-Type": "application/json"},
+#             http::timeout=time::seconds(30)))
+#         for k -> e in writes_feed:
+#             http_writes[k] << (http::method="POST", http::path="/emails", http::headers={},
+#                                http::body=email_json(e))
+#         replies = defer()
+#         for k -> reply in http_replies:
+#             replies[k] << decode_emailed(reply)
+#         wf::Client(writes_feed=writes_feed, cancels_feed=defer(), replies=replies)
+#
+# Status: proposed, not in the spec. Does not compile; `[proposed]` marks each construct the
+# compiler lacks.
+
+import std::time
+
+# One client's fixed configuration: the minimum the providers in ../lib.cambra need.
+#
+# - `headers` are sent on every request, before the request's own headers. Auth goes here.
+# - `timeout` bounds one request; a request past it replies `timeout.
+#
+# A remote idempotency key is not configuration: the caller puts it in a request's own `headers`,
+# with a value it chooses per write (`lib::resend`).
+pub Config = {
+    base_url: String,
+    headers: Map(String, String),
+    timeout: time::Duration,
+}
+
+# One request. `path` is appended to `base_url`. `body` is already encoded; JSON or form encoding
+# is the caller's.
+pub Request = {method: String, path: String, headers: Map(String, String), body: String}
+pub Response = {status: Int, body: String}
+
+# The reply to one write. `connection_failed`: the connection could not be opened, or was lost.
+# `timeout`: no reply in time. Whether to retry a status is the caller's policy (`std::retry`).
+pub Reply = {`response{Response} | `connection_failed | `timeout}
+
+# A reply with a 2xx body decoded into `Ok`.
+# [proposed] a parameterised type alias (docs/chl-spec.md, "6.7 Type-alias statements", Open).
+pub Outcome(Ok) = {`ok{Ok} | `status{Response} | `connection_failed | `timeout}
+
+# `http_writes, http_replies = http::http_client(K, config)` opens an outbound HTTP client: a
+# special form, recognized by what `http::http_client` resolves to, as `http::serve` is.
+# `http_writes` is a `Feed(K, Request)` that is only fed, and `http_replies` a `Feed(K, Reply)`
+# holding the reply to the write at key `k` at `k`. The caller chooses `K`.
+#
+# - A write is sent on commit: once if the transaction that feeds it commits, never if it aborts.
+# - Every write gets exactly one reply, at its key. Replies arrive unordered. Replies still owed
+#   carry across a reload; a crash loses them, and the caller's deadline (`retry::RetryConfig`)
+#   resends.
+# - The runtime never retries, and a key holds one write. A retry is a new write under a new key.
+#
+# [proposed] the form, its key type parameter, keyed feeds, and calling it from inside a `def`
+# rather than only at the top level; and binding the intrinsic `__http_client`, for which std
+# source has no surface syntax.
+pub http_client = __http_client

@@ -1,0 +1,275 @@
+# The workflow library's shared types: runs, call keys, the client contract, and call outcomes.
+#
+# `std::wf` declares no state and opens no source, so a module imports it (docs/chl-spec.md,
+# "9.7 Importing asserts no IO and no state"). The stateful parts are its submodules, each run:
+#
+# - `std::wf::workflow`: a run table, its limits, and `for_each`, the workflow body.
+# - `std::wf::effect`: one effect, with `send_request`, `outcomes` and client cancellation.
+# - `std::wf::schedule`: a child workflow with a run per slot.
+# - `std::wf::detached`: the parent of a workflow that has none (imported).
+#
+# A workflow body is dataflow, split by the compiler at each `send_request`, and `causes E` resolves
+# at compile time (docs/libs/workflow_library.md, "Bodies").
+#
+# Example:
+#
+#     import std::wf
+#
+#     run std::wf::workflow(State=BillWorkflowState, timeout=…, stale_after=…) as bills
+#     run std::wf::effect(workflow=bills, client=sms_client, config=…) as send_sms
+#
+#     def chase(bill) causes wf::WorkflowCancellationException(_):
+#         match send_sms::send_request(lib::to=…, lib::body=…):
+#             case `ok(sent):
+#                 with begin():
+#                     bills::complete(bill.id)
+#             case `err(f):
+#                 …
+#
+#     bills::for_each(chase)
+#
+# Status: proposed, not in the spec (docs/libs/workflow_library.md). The
+# std root it belongs to is [Planned] (docs/chl-spec.md, "9.16 The std root"). `[proposed]` marks
+# each construct the compiler lacks.
+
+import std::retry
+import std::time
+
+# --- Traits -------------------------------------------------------------------------------------
+
+# [proposed] declared traits and instances: docs/chl-spec.md, "Trait requirements", builds in the
+# operator traits and leaves declaring a trait or an instance Open.
+
+# A workflow's state type. `get_run_id` derives the run's id from the state, so equal states name
+# the same run, and it is the only source of run ids (docs/libs/workflow_library.md, "Runs").
+pub trait WorkflowState(S):
+    def get_run_id(self: S) => String
+
+# A type a function may raise: `causes E` and `raise e` require `IsException(E)`.
+pub trait IsException(E)
+
+# --- Runs ---------------------------------------------------------------------------------------
+
+# How a run ended, or `running. A run ends exactly once. A dependent child run whose parent ends is
+# `cancelled with the reason "parent ended".
+pub type RunState = {
+    `running
+    | `completed{at: time::Instant}
+    | `cancelled{at: time::Instant, reason: String}
+    | `timed_out{at: time::Instant}
+    | `stale{at: time::Instant, idle_since: time::Instant}
+}
+
+# One run as a workflow body receives it. `Id` is the run's id type, which each
+# `std::wf::workflow` run declares for itself (`RunId`).
+pub type Started(Id, State) = {id: Id, state: State, at: time::Instant}
+pub type Ended(Id) = {id: Id, state: RunState}
+
+# Whether a parent run's end ends a child workflow's runs (docs/libs/workflow_library.md,
+# "Child workflows").
+pub ChildLifecycle = {`dependent | `independent}
+
+# The members of a `std::wf::workflow` run that effects, schedules and child workflows use. `RunId`
+# is the run's own nominal id type, known only by its kind (docs/libs/workflow_library.md, "Runs").
+# Every function but `id` and `id_string` runs in the caller's transaction.
+# [proposed] a parameterised alias of a Module type, `requires Transaction` and `causes` in a
+# function type, and a type parameter on a member (`Out`) (docs/chl-spec.md, "9.8 Module types").
+pub Workflow(State) = Module{
+    RunId: Type,
+    id: State => RunId,
+    id_string: RunId => String,
+    live: RunId => Bool requires Transaction,
+    status: RunId => Option(RunState) requires Transaction,
+    get: RunId => Option(State) requires Transaction,
+    touch: RunId => () requires Transaction,
+    for_each: (Started(RunId, State) => Out causes WorkflowCancellationException(_)) => (),
+    started: Source(Started(RunId, State)),   # kept while the run is running
+    ended: Source(Ended(RunId)),
+}
+
+# --- What a loop added by a reload reads --------------------------------------------------------
+
+# A collection keeps an element until every loop that reads it has released it, and a collection
+# that no loop reads is compiled away. A loop that a reload adds reads only what is still held. The
+# library needs more than that from three collections: a workflow's `started` (every running run),
+# an effect's `failed` (every failure not yet resolved) and its `outcomes` (every outcome a body
+# step waits on). Each declaration says in a `[proposed]` comment what it needs held.
+#
+# Open: how. The same information is in a `Txn` variable that survives reloads (a workflow's
+# `runs`, an effect's `calls`), but a loop that a reload adds has no way to read it
+# (docs/libs/workflow_library.md, "What a loop added by a reload reads").
+
+# The state of one run of a `std::wf::schedule`: its parent run's state and its slot. Its run id
+# is the slot, under the parent's id: `bill-42/2026-10-16T09:00Z`.
+pub type Slot(P) = {parent: P, slot: time::Instant}
+
+impl WorkflowState(Slot(P)):
+    def get_run_id(self) => String:
+        string(self.slot)
+
+# What a schedule does when a slot comes due while earlier work for the same parent run exists
+# (docs/libs/workflow_library.md, "Schedules").
+pub OnDue = {`all | `latest | `replace | `skip}
+
+# --- Exceptions ---------------------------------------------------------------------------------
+
+# Raised by an effect's `send_request` when the call's run ended before the call settled. `run` is
+# the run id as text, `status` its end state, and `call` the effect's `Cancelled` record. Catching
+# it does not continue the run: a handler's call on an effect of the ended run raises again
+# (docs/libs/workflow_library.md, "Bodies").
+#
+# TODO a `cancelling` run state between a run's cancellation and its end, in which the run's
+# effects still admit calls: a detached scope, as Temporal's detached cancellation scopes, so a
+# handler can make compensating calls on the run's own effects. Until then the client compensates
+# (`Client`, `cancels_feed`).
+# [proposed] an exception type with a type parameter, caught by `except` whatever the parameter.
+pub type WorkflowCancellationException(C) = {run: String, status: RunState, call: C}
+
+impl IsException(WorkflowCancellationException(C))
+
+# --- Keys ---------------------------------------------------------------------------------------
+
+# A call site's label, which keeps two call sites of one effect apart: declared once at the top
+# level, named at the call site as `send_sms::requests@sms_fixed << …`
+# (docs/libs/workflow_library.md, "Keys").
+# [proposed] labels as values, and `@label` at a call site.
+pub type Label = {name: String}
+
+pub def label(name: String) => Label:
+    Label(name=name)
+
+# The key of one effect call, built by the compiler from the call site's domain; no program
+# constructs one. A key derived from another call key keeps its `rest` and extends its `labels`, so
+# a retry's key has the type of the key it retries (docs/libs/workflow_library.md, "Keys").
+# [proposed] a constructor only the modules under `std::wf` may call: docs/chl-spec.md, "6.8
+# Nominal types and methods [Decided]" and "9.5 Visibility", make methods and members private, not
+# constructors.
+pub type CallKey(Id, D) = {run: Id, rest: D, labels: List(Label)}
+
+# Whether the call site that issued this call, or one it derives from, carries `l`.
+pub def has_label(Id, D, self: CallKey(Id, D), l: Label) => Bool:
+    l in self.labels
+
+# One attempt of one call: the key an effect gives its client, so each attempt is a write with a
+# reply of its own. `generation` counts the call's earlier attempts the remote answered with a
+# failure; a client builds the remote idempotency key from `key` and `generation`
+# (docs/libs/workflow_library.md, "Retry").
+pub type Attempt(K) = {key: K, attempt: Int, generation: Int}
+
+# A source whose elements each carry a durable key derived from the element, never from its
+# arrival; it delivers one element per key. A keyed feed, `Feed(K, T)`, holds at most one element
+# per key and drops a write at a key it holds (docs/libs/workflow_library.md, "Keys").
+# [proposed] a std source type, `keyed`, and keyed feeds.
+pub type KeyedSource(K, T)
+
+pub def keyed(T, K, source: Source(T), by: T => K) => KeyedSource(K, T):
+    __keyed(source, by)
+
+# Returns the key of the call site a `std::wf` function was inlined into, with the label written at
+# the call, `send_sms::send_request@sms_fixed(…)`. Each inlined call is its own call site.
+# [proposed] an intrinsic only the modules under `std::wf` may call; `@label` on a call; and `Id`
+# and `D` determined by the use (docs/chl-spec.md, "Type parameters", Direction [Decided] —
+# determined by the use).
+pub def call_key(Id, D) => CallKey(Id, D):
+    __call_key()
+
+# --- Clients ------------------------------------------------------------------------------------
+
+# The contract an effect's client meets (docs/libs/workflow_library.md, "Effects", "Retry").
+#
+# - `replies` holds exactly one reply per write of `writes_feed`, at the write's key.
+# - A client never retries: each write is one request, and the effect's attempts are the only
+#   retries. A client does not deduplicate or keep state across writes.
+# - The effect writes an in-flight attempt to `cancels_feed` when the attempt's run ends. The
+#   attempt is still owed one reply, which carries what the client did: dropped the queued request,
+#   cancelled at the remote, compensated, or nothing. A cancellation for an attempt already replied
+#   to changes nothing.
+#
+# TODO make client a trait so users can implement it inline
+# TODO put generalized client/sink retry functionality into sinks
+# TODO effects have another layer of retry configuration
+# TODO trait syntax pub Client(K, Request, Response) = Trait{
+#     # TODO keyed feed for associating replies with writes
+#     # workflow can include key domain in this, general client library lets client caller choose
+#     # keyspace
+#     def get_writes_feed(self) => Feed(K, Request),
+#     def get_replies(self) => Feed(K, Response),
+# }
+# [proposed] keyed feeds.
+pub type Client(K, Request, Response) = {
+    writes_feed: Feed(K, Request),
+    cancels_feed: Feed(K, ()),
+    replies: Feed(K, Response),
+}
+
+impl Client(K, Request, Response):
+    def get_writes_feed(self) => Feed(K, Request):
+        self.writes_feed
+    def get_replies(self) => Feed(K, Response):
+        self.replies
+
+# A client constructor, which an effect takes in place of a client.
+#
+# - `build` makes the effect's own client for its call key type `CK`, so no two effects share one.
+# - Two effects' call keys can be equal as text, so a constructor whose remote takes an idempotency
+#   key takes what keeps its effects' remote keys apart as an argument.
+# - `retry_logic` is the API's classification of a reply, unless `retry::RetryConfig` overrides it.
+# - `cancel_logic` classifies the reply to an attempt the effect cancelled.
+#
+# [proposed] a function whose parameter is a type.
+pub ClientCtor(Request, Response, Ok) = {
+    build: (CK: Type) => Client(Attempt(CK), Request, Response),
+    retry_logic: Response => retry::RetryState(Ok),
+    cancel_logic: Response => CancelOutcome,
+}
+
+# --- Effects ------------------------------------------------------------------------------------
+
+# An effect's configuration: the retry policy its calls run under.
+pub EffectConfig(Response, Ok) = {policy: retry::RetryConfig(Response, Ok)}
+
+pub def config(Response, Ok, policy: retry::RetryConfig(Response, Ok)) => EffectConfig(Response, Ok):
+    (policy=policy)
+
+# Why a call failed: `retry_logic` refused a reply, the attempts ran out, or `call_timeout` passed.
+# A call fails at most once: a retry is a new call.
+pub FailReason = {`failed | `exhausted | `timed_out}
+pub LastReply(Response) = {`reply{Response} | `no_reply}
+
+# A call the effect gave up on. `maybe_performed` is whether any attempt went unanswered; it never
+# resets (docs/libs/workflow_library.md, "Retry").
+pub type Failure(K, Request, Response) = {
+    key: K,
+    request: Request,
+    last: LastReply(Response),
+    attempts: Int,
+    reason: FailReason,
+    maybe_performed: Bool,
+}
+
+# What the remote did with a call its run's end stopped.
+#
+# - `not_performed`: no attempt was sent, the remote answered every attempt with a failure, or it
+#   confirmed the cancellation.
+# - `performed`: the remote performed the call, and nothing undid it.
+# - `compensated`: the remote performed the call, and the client's compensating call undid it.
+# - `unknown`: an attempt went unanswered.
+pub CancelOutcome = {`not_performed | `performed | `compensated | `unknown}
+
+# A request or call its run's end stopped. `last` is the reply to the attempt in flight at the
+# end, or the latest reply before it.
+pub type Cancelled(K, Request, Response) = {
+    key: K,
+    request: Request,
+    status: RunState,
+    last: LastReply(Response),
+    outcome: CancelOutcome,
+}
+
+# The one outcome of an admitted call: its element on exactly one of the effect's `responses`,
+# `failed` and `cancelled`. `send_request` reads it by key.
+pub Outcome(K, Request, Response, Ok) = {
+    `ok{Ok}
+    | `failed{Failure(K, Request, Response)}
+    | `cancelled{Cancelled(K, Request, Response)}
+}

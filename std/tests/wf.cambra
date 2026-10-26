@@ -1,0 +1,40 @@
+# A program that runs the workflow library: one workflow run per input line, a daily schedule of
+# child runs under each, and an effect that echoes a run's line back through a client of its own.
+
+import std::retry
+import std::time
+import std::wf
+
+Echo = {line: String}
+
+run std::wf::workflow(State=Echo, timeout=`after(time::days(1)), stale_after=`never) as echoes
+
+run std::wf::schedule(parent=echoes, every=time::days(1)) as daily
+
+def echo_client(CK: Type) => wf::Client(wf::Attempt(CK), String, String):
+    (writes_feed=defer(), cancels_feed=defer(), replies=defer())
+
+def echo_retry(reply: String) => retry::RetryState(String):
+    `ok(reply)
+
+def echo_cancel(reply: String) => wf::CancelOutcome:
+    `unknown
+
+client = (build=echo_client, retry_logic=echo_retry, cancel_logic=echo_cancel)
+
+run std::wf::effect(workflow=echoes, client=client, config=wf::config(retry::default_retry())) as echo
+
+for line in stdin():
+    with begin():
+        echoes::start((line=line))
+
+def reply(r) causes wf::WorkflowCancellationException(_):
+    match echo::send_request(r.state.line):
+        case `ok(_):
+            with begin():
+                echoes::complete(r.id)
+        case `err(_):
+            with begin():
+                echoes::cancel(r.id, "echo failed")
+
+echoes::for_each(reply)

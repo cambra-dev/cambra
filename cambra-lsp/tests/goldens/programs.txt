@@ -459,6 +459,492 @@ diagnostics:
 symbols:
   variable i 1:1-1:6 (name 1:1-1:2)
 folds:
+== tests/programs/workflows/bill-reminder-v1.cambra
+diagnostics:
+  21:8-21:10 found '::', expected '(', or ':'
+    21:1-21:8 while parsing statement
+  30:1-30:5 found 'indent', expected statement, or 'newline'
+  43:34-43:35 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    43:1-43:34 while parsing statement
+    43:32-43:34 while parsing expression
+  48:33-48:34 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    48:1-48:33 while parsing statement
+    48:31-48:33 while parsing expression
+  57:39-57:40 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    57:1-57:39 while parsing statement
+    57:31-57:39 while parsing expression
+  59:38-59:39 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    59:1-59:38 while parsing statement
+    59:30-59:38 while parsing expression
+  66:1-66:5 found 'indent', expected statement, or 'newline'
+  69:1-69:5 found 'indent', expected statement, or 'newline'
+  74:24-74:30 found 'identifier', expected 'requires', '=>', or ':'
+    74:1-74:23 while parsing statement
+symbols:
+  module std::env 9:1-9:16 (name 9:8-9:16)
+  module lib 10:1-10:11 (name 10:8-10:11)
+  module std::retry 11:1-11:18 (name 11:8-11:18)
+  module std::http 12:1-12:17 (name 12:8-12:17)
+  module std::time 13:1-13:17 (name 13:8-13:17)
+  module std::wf 14:1-14:15 (name 14:8-14:15)
+  variable BillId 16:1-16:16 (name 16:1-16:7)
+  module std::wf::workflow 27:1-29:73 (name 27:5-27:22)
+  module daily 35:1-35:83 (name 35:78-35:83)
+  variable track_reqs 40:1-40:64 (name 40:1-40:11)
+  variable track_resps 40:1-40:64 (name 40:13-40:24)
+  variable paid_reqs 41:1-41:67 (name 41:1-41:10)
+  variable paid_resps 41:1-41:67 (name 41:12-41:22)
+  function contact 54:1-55:62 (name 54:5-54:12)
+  module std::wf::effect 64:1-65:63 (name 64:5-64:20)
+  module std::wf::effect 67:1-68:63 (name 67:5-67:20)
+folds:
+  1-7 comment
+  25-26 comment
+  27-29
+  32-34 comment
+  37-39 comment
+  54-55
+  57-58
+  59-62
+  64-65
+  67-68
+  71-73 comment
+  79-81
+== tests/programs/workflows/bill-reminder-v2.cambra
+diagnostics:
+  27:8-27:10 found '::', expected '(', or ':'
+    27:1-27:8 while parsing statement
+  36:1-36:5 found 'indent', expected statement, or 'newline'
+  49:34-49:35 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    49:1-49:34 while parsing statement
+    49:32-49:34 while parsing expression
+  54:33-54:34 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    54:1-54:33 while parsing statement
+    54:31-54:33 while parsing expression
+  63:39-63:40 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    63:1-63:39 while parsing statement
+    63:31-63:39 while parsing expression
+  65:38-65:39 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    65:1-65:38 while parsing statement
+    65:30-65:38 while parsing expression
+  72:1-72:5 found 'indent', expected statement, or 'newline'
+  75:1-75:5 found 'indent', expected statement, or 'newline'
+  80:24-80:30 found 'identifier', expected 'requires', '=>', or ':'
+    80:1-80:23 while parsing statement
+  103:37-103:38 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    103:1-103:37 while parsing statement
+    103:29-103:37 while parsing expression
+  105:34-105:35 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    105:1-105:34 while parsing statement
+    105:26-105:34 while parsing expression
+  111:1-111:5 found 'indent', expected statement, or 'newline'
+  114:1-114:5 found 'indent', expected statement, or 'newline'
+  120:24-120:30 found 'identifier', expected 'requires', '=>', or ':'
+    120:1-120:23 while parsing statement
+symbols:
+  module std::env 15:1-15:16 (name 15:8-15:16)
+  module lib 16:1-16:11 (name 16:8-16:11)
+  module std::retry 17:1-17:18 (name 17:8-17:18)
+  module std::http 18:1-18:17 (name 18:8-18:17)
+  module std::time 19:1-19:17 (name 19:8-19:17)
+  module std::wf 20:1-20:15 (name 20:8-20:15)
+  variable BillId 22:1-22:16 (name 22:1-22:7)
+  module std::wf::workflow 33:1-35:73 (name 33:5-33:22)
+  module daily 41:1-41:83 (name 41:78-41:83)
+  variable track_reqs 46:1-46:64 (name 46:1-46:11)
+  variable track_resps 46:1-46:64 (name 46:13-46:24)
+  variable paid_reqs 47:1-47:67 (name 47:1-47:10)
+  variable paid_resps 47:1-47:67 (name 47:12-47:22)
+  function contact 60:1-61:62 (name 60:5-60:12)
+  module std::wf::effect 70:1-71:63 (name 70:5-70:20)
+  module std::wf::effect 73:1-74:63 (name 73:5-73:20)
+  module every_other_day 101:1-101:92 (name 101:77-101:92)
+  module std::wf::effect 109:1-110:63 (name 109:5-109:20)
+  module std::wf::effect 112:1-113:63 (name 112:5-112:20)
+  function sms_body 116:1-117:9 (name 116:5-116:13)
+folds:
+  1-13 comment
+  31-32 comment
+  33-35
+  38-40 comment
+  43-45 comment
+  60-61
+  63-64
+  65-68
+  70-71
+  73-74
+  77-79 comment
+  85-87
+  96-100 comment
+  103-104
+  105-107
+  109-110
+  112-113
+  116-117
+  125-126
+== tests/programs/workflows/bill-reminder-v3.cambra
+diagnostics:
+  26:8-26:10 found '::', expected '(', or ':'
+    26:1-26:8 while parsing statement
+  35:1-35:5 found 'indent', expected statement, or 'newline'
+  48:34-48:35 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    48:1-48:34 while parsing statement
+    48:32-48:34 while parsing expression
+  53:33-53:34 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    53:1-53:33 while parsing statement
+    53:31-53:33 while parsing expression
+  62:39-62:40 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    62:1-62:39 while parsing statement
+    62:31-62:39 while parsing expression
+  64:38-64:39 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    64:1-64:38 while parsing statement
+    64:30-64:38 while parsing expression
+  71:1-71:5 found 'indent', expected statement, or 'newline'
+  74:1-74:5 found 'indent', expected statement, or 'newline'
+  79:24-79:30 found 'identifier', expected 'requires', '=>', or ':'
+    79:1-79:23 while parsing statement
+  100:37-100:38 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    100:1-100:37 while parsing statement
+    100:29-100:37 while parsing expression
+  102:34-102:35 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    102:1-102:34 while parsing statement
+    102:26-102:34 while parsing expression
+  108:1-108:5 found 'indent', expected statement, or 'newline'
+  111:1-111:5 found 'indent', expected statement, or 'newline'
+  117:24-117:30 found 'identifier', expected 'requires', '=>', or ':'
+    117:1-117:23 while parsing statement
+  137:29-137:31 found '::', expected ')'
+    136:5-137:29 while parsing statement
+  157:53-157:54 found ':', expected binary operator, comparison operator, boolean operator, postfix operation, 'else', '^+', or '**'
+    157:1-157:53 while parsing statement
+    157:15-157:53 while parsing expression
+  163:63-163:64 found ':', expected binary operator, comparison operator, boolean operator, postfix operation, 'else', '^+', or '**'
+    163:1-163:63 while parsing statement
+    163:18-163:63 while parsing expression
+  168:57-168:58 found ':', expected binary operator, comparison operator, boolean operator, postfix operation, 'else', '^+', or '**'
+    168:1-168:57 while parsing statement
+    168:15-168:57 while parsing expression
+symbols:
+  module std::env 14:1-14:16 (name 14:8-14:16)
+  module lib 15:1-15:11 (name 15:8-15:11)
+  module std::retry 16:1-16:18 (name 16:8-16:18)
+  module std::http 17:1-17:17 (name 17:8-17:17)
+  module std::time 18:1-18:17 (name 18:8-18:17)
+  module std::wf 19:1-19:15 (name 19:8-19:15)
+  variable BillId 21:1-21:16 (name 21:1-21:7)
+  module std::wf::workflow 32:1-34:73 (name 32:5-32:22)
+  module daily 40:1-40:83 (name 40:78-40:83)
+  variable track_reqs 45:1-45:64 (name 45:1-45:11)
+  variable track_resps 45:1-45:64 (name 45:13-45:24)
+  variable paid_reqs 46:1-46:67 (name 46:1-46:10)
+  variable paid_resps 46:1-46:67 (name 46:12-46:22)
+  function contact 59:1-60:62 (name 59:5-59:12)
+  module std::wf::effect 69:1-70:63 (name 69:5-69:20)
+  module std::wf::effect 72:1-73:63 (name 72:5-72:20)
+  module every_other_day 98:1-98:92 (name 98:77-98:92)
+  module std::wf::effect 106:1-107:63 (name 106:5-106:20)
+  module std::wf::effect 109:1-110:63 (name 109:5-109:20)
+  function sms_body 113:1-114:25 (name 113:5-113:13)
+  function body_too_long 135:1-140:18 (name 135:5-135:18)
+  variable sms_fixed 144:1-144:35 (name 144:1-144:10)
+  variable ops_alerts 147:1-147:25 (name 147:5-147:15)
+  function needs_resend 149:1-150:78 (name 149:5-149:17)
+folds:
+  1-12 comment
+  30-31 comment
+  32-34
+  37-39 comment
+  42-44 comment
+  59-60
+  62-63
+  64-67
+  69-70
+  72-73
+  76-78 comment
+  84-86
+  95-97 comment
+  100-101
+  102-104
+  106-107
+  109-110
+  113-114
+  122-123
+  132-134 comment
+  135-140
+  142-143 comment
+  149-150
+  152-156 comment
+== tests/programs/workflows/bill-reminder-v4.cambra
+diagnostics:
+  23:8-23:10 found '::', expected '(', or ':'
+    23:1-23:8 while parsing statement
+  32:1-32:5 found 'indent', expected statement, or 'newline'
+  45:34-45:35 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    45:1-45:34 while parsing statement
+    45:32-45:34 while parsing expression
+  50:33-50:34 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    50:1-50:33 while parsing statement
+    50:31-50:33 while parsing expression
+  59:39-59:40 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    59:1-59:39 while parsing statement
+    59:31-59:39 while parsing expression
+  61:38-61:39 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    61:1-61:38 while parsing statement
+    61:30-61:38 while parsing expression
+  68:1-68:5 found 'indent', expected statement, or 'newline'
+  71:1-71:5 found 'indent', expected statement, or 'newline'
+  76:24-76:30 found 'identifier', expected 'requires', '=>', or ':'
+    76:1-76:23 while parsing statement
+  97:37-97:38 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    97:1-97:37 while parsing statement
+    97:29-97:37 while parsing expression
+  99:34-99:35 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    99:1-99:34 while parsing statement
+    99:26-99:34 while parsing expression
+  105:1-105:5 found 'indent', expected statement, or 'newline'
+  108:1-108:5 found 'indent', expected statement, or 'newline'
+  114:24-114:30 found 'identifier', expected 'requires', '=>', or ':'
+    114:1-114:23 while parsing statement
+  135:12-135:13 found '=', expected '<:', or ':'
+    134:1-135:11 while parsing statement
+  141:64-141:65 found ':', expected binary operator, comparison operator, boolean operator, postfix operation, 'else', '^+', or '**'
+    141:1-141:64 while parsing statement
+    141:18-141:64 while parsing expression
+  148:58-148:59 found ':', expected binary operator, comparison operator, boolean operator, postfix operation, 'else', '^+', or '**'
+    148:1-148:58 while parsing statement
+    148:15-148:58 while parsing expression
+symbols:
+  module std::env 11:1-11:16 (name 11:8-11:16)
+  module lib 12:1-12:11 (name 12:8-12:11)
+  module std::retry 13:1-13:18 (name 13:8-13:18)
+  module std::http 14:1-14:17 (name 14:8-14:17)
+  module std::time 15:1-15:17 (name 15:8-15:17)
+  module std::wf 16:1-16:15 (name 16:8-16:15)
+  variable BillId 18:1-18:16 (name 18:1-18:7)
+  module std::wf::workflow 29:1-31:73 (name 29:5-29:22)
+  module daily 37:1-37:83 (name 37:78-37:83)
+  variable track_reqs 42:1-42:64 (name 42:1-42:11)
+  variable track_resps 42:1-42:64 (name 42:13-42:24)
+  variable paid_reqs 43:1-43:67 (name 43:1-43:10)
+  variable paid_resps 43:1-43:67 (name 43:12-43:22)
+  function contact 56:1-57:62 (name 56:5-56:12)
+  module std::wf::effect 66:1-67:63 (name 66:5-66:20)
+  module std::wf::effect 69:1-70:63 (name 69:5-69:20)
+  module every_other_day 95:1-95:92 (name 95:77-95:92)
+  module std::wf::effect 103:1-104:63 (name 103:5-103:20)
+  module std::wf::effect 106:1-107:63 (name 106:5-106:20)
+  function sms_body 110:1-111:25 (name 110:5-110:13)
+  variable sms_resent 135:1-135:37 (name 135:1-135:11)
+  variable ops_alerts 138:1-138:25 (name 138:5-138:15)
+folds:
+  1-9 comment
+  27-28 comment
+  29-31
+  34-36 comment
+  39-41 comment
+  56-57
+  59-60
+  61-64
+  66-67
+  69-70
+  73-75 comment
+  81-83
+  92-94 comment
+  97-98
+  99-101
+  103-104
+  106-107
+  110-111
+  119-120
+  129-133 comment
+  145-147 comment
+== tests/programs/workflows/bill-reminder.cambra
+diagnostics:
+  21:8-21:10 found '::', expected '(', or ':'
+    21:1-21:8 while parsing statement
+  29:1-29:5 found 'indent', expected statement, or 'newline'
+  35:1-35:5 found 'indent', expected statement, or 'newline'
+  44:34-44:35 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    44:1-44:34 while parsing statement
+    44:32-44:34 while parsing expression
+  49:33-49:34 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    49:1-49:33 while parsing statement
+    49:31-49:33 while parsing expression
+  59:27-59:28 found '.', expected expression
+    59:1-59:26 while parsing statement
+  60:39-60:40 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    60:1-60:39 while parsing statement
+    60:31-60:39 while parsing expression
+  62:37-62:38 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    62:1-62:37 while parsing statement
+    62:29-62:37 while parsing expression
+  64:38-64:39 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    64:1-64:38 while parsing statement
+    64:30-64:38 while parsing expression
+  67:34-67:35 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    67:1-67:34 while parsing statement
+    67:26-67:34 while parsing expression
+  71:73-71:74 found '.', expected ')', or something else
+    71:1-71:72 while parsing statement
+  74:1-74:5 found 'indent', expected statement, or 'newline'
+  77:1-77:5 found 'indent', expected statement, or 'newline'
+  80:1-80:5 found 'indent', expected statement, or 'newline'
+  83:1-83:5 found 'indent', expected statement, or 'newline'
+  92:28-92:34 found 'identifier', expected 'requires', '=>', or ':'
+    92:1-92:27 while parsing statement
+symbols:
+  module std::env 5:1-5:16 (name 5:8-5:16)
+  module lib 6:1-6:11 (name 6:8-6:11)
+  module std::retry 7:1-7:18 (name 7:8-7:18)
+  module std::http 8:1-8:17 (name 8:8-8:17)
+  module std::time 9:1-9:17 (name 9:8-9:17)
+  module std::wf 10:1-10:15 (name 10:8-10:15)
+  variable BillId 12:1-12:16 (name 12:1-12:7)
+  module std::wf::workflow 26:1-28:73 (name 26:5-26:22)
+  module std::wf::schedule 34:1-34:102 (name 34:5-34:22)
+  variable track_reqs 41:1-41:64 (name 41:1-41:11)
+  variable track_resps 41:1-41:64 (name 41:13-41:24)
+  variable paid_reqs 42:1-42:67 (name 42:1-42:10)
+  variable paid_resps 42:1-42:67 (name 42:12-42:22)
+  module std::wf::effect 72:1-73:63 (name 72:5-72:20)
+  module std::wf::effect 75:1-76:63 (name 75:5-75:20)
+  module std::wf::effect 78:1-79:63 (name 78:5-78:20)
+  module std::wf::effect 81:1-82:63 (name 81:5-81:20)
+folds:
+  1-3 comment
+  16-18 comment
+  26-28
+  31-33 comment
+  37-40 comment
+  56-58 comment
+  60-61
+  62-63
+  64-66
+  67-69
+  72-73
+  75-76
+  78-79
+  81-82
+  86-88 comment
+  93-98 comment
+== tests/programs/workflows/lib.cambra
+diagnostics:
+  41:27-42:63 `{…}` is type syntax: a record type `{field: T}` or a tuple type `{T, U}`; a map is written `[k -> v]`
+    39:9-41:27 while parsing statement
+    41:27-41:27 while parsing expression
+  45:9-45:10 found '.', expected statement, or 'newline'
+    37:5-46:1 while parsing statement
+  46:31-46:32 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    46:9-46:31 while parsing statement
+    46:20-46:31 while parsing expression
+  68:27-69:63 `{…}` is type syntax: a record type `{field: T}` or a tuple type `{T, U}`; a map is written `[k -> v]`
+    66:9-68:27 while parsing statement
+    68:27-68:27 while parsing expression
+  75:46-76:91 `{…}` is type syntax: a record type `{field: T}` or a tuple type `{T, U}`; a map is written `[k -> v]`
+    74:13-75:46 while parsing statement
+    75:46-75:46 while parsing expression
+  82:31-82:32 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    82:9-82:31 while parsing statement
+    82:20-82:31 while parsing expression
+  101:5-101:6 found '.', expected statement
+    100:1-102:1 while parsing statement
+  117:27-118:80 `{…}` is type syntax: a record type `{field: T}` or a tuple type `{T, U}`; a map is written `[k -> v]`
+    115:9-117:27 while parsing statement
+    117:27-117:27 while parsing expression
+  121:9-121:10 found '.', expected statement, or 'newline'
+    113:5-122:1 while parsing statement
+  122:31-122:32 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    122:9-122:31 while parsing statement
+    122:20-122:31 while parsing expression
+  127:5-127:6 found '.', expected statement
+    126:5-128:1 while parsing statement
+symbols:
+  module std::http 15:1-15:17 (name 15:8-15:17)
+  module std::retry 16:1-16:18 (name 16:8-16:18)
+  module std::time 17:1-17:17 (name 17:8-17:17)
+  module std::wf 18:1-18:15 (name 18:8-18:15)
+  variable Chat 21:1-21:28 (name 21:5-21:9)
+  variable Composed 22:1-22:30 (name 22:5-22:13)
+  variable Email 25:1-25:56 (name 25:5-25:10)
+  variable Emailed 26:1-26:27 (name 26:5-26:12)
+  variable Sms 29:1-29:37 (name 29:5-29:8)
+  variable Sent 30:1-30:25 (name 30:5-30:9)
+  function openai_chat 35:1-47:91 (name 35:9-35:20)
+    function build 37:5-46:79 (name 37:9-37:14)
+  function resend 61:1-83:76 (name 61:9-61:15)
+    function build 63:5-82:83 (name 63:9-63:14)
+  function resend_retry 88:1-96:43 (name 88:9-88:21)
+  function resend_error 100:1-101:8 (name 100:5-100:17)
+  function remote_key 105:1-106:64 (name 105:5-105:15)
+  function twilio 111:1-123:91 (name 111:9-111:15)
+    function build 113:5-122:79 (name 113:9-113:14)
+  function twilio_error 126:1-127:8 (name 126:9-126:21)
+  function http_cancel_logic 132:1-139:25 (name 132:5-132:22)
+folds:
+  1-13 comment
+  32-34 comment
+  35-36
+  36-47
+  37-46
+  39-43
+  39-44
+  41-42
+  49-60 comment
+  61-62
+  62-83
+  63-82
+  66-70
+  66-71
+  68-69
+  73-77
+  74-77
+  75-76
+  79-80
+  85-87 comment
+  88-96
+  89-96
+  90-94
+  91-92
+  93-94
+  95-96
+  98-99 comment
+  100-101
+  103-104 comment
+  105-106
+  108-110 comment
+  111-112
+  112-123
+  113-122
+  115-119
+  115-120
+  117-118
+  126-127
+  129-131 comment
+  132-139
+  133-139
+  134-135
+  136-137
+  138-139
+== tests/programs/workflows/stdlib/http.cambra
+diagnostics:
+  57:80-58:1 invalid assignment target
+    57:5-57:80 while parsing statement
+    57:19-57:80 while parsing expression
+symbols:
+  module std::time 31:1-31:17 (name 31:8-31:17)
+  variable Config 40:1-44:2 (name 40:5-40:11)
+  variable Request 48:1-48:89 (name 48:5-48:12)
+  variable Response 49:1-49:43 (name 49:5-49:13)
+  variable Reply 53:1-53:66 (name 53:5-53:10)
+  variable http_client 73:1-73:32 (name 73:5-73:16)
+folds:
+  1-29 comment
+  33-39 comment
+  40-43
+  46-47 comment
+  51-52 comment
+  55-56 comment
+  59-72 comment
 == editors/sample-lexes-only.cambra
 diagnostics:
   5:5-5:6 found '>', expected expression, or '-'

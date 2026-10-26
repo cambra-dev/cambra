@@ -15,7 +15,7 @@ failures it passes to the client as `Attempt.generation`. The client supplies it
 classification of replies and builds the remote idempotency key, and keeps no state across writes.
 Neither the client nor the protocol client retries.
 The protocol client sends one request. `EffectConfig` holds only `policy` today
-(`std/wf.cambra`).
+([std/wf.cambra](../../std/wf.cambra)).
 
 ## Settings
 

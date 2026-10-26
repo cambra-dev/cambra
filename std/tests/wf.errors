@@ -1,0 +1,955 @@
+Error: parse error
+    ╭─[tests/wf.cambra:31:14]
+    │
+ 31 │ def reply(r) causes wf::WorkflowCancellationException(_):
+    │ ──────┬───── ───┬──  
+    │       ╰────────────── while parsing statement
+    │                 │    
+    │                 ╰──── found 'identifier', expected 'requires', '=>', or ':'
+────╯
+Error: parse error
+    ╭─[<std>/retry.cambra:39:70]
+    │
+ 39 │ pub RetryState(Ok) = {`ok{Ok} | `retriable{answered: Bool} | `failed}
+    │     ────────────────────────────────┬────────┬───────────────────────┬  
+    │                                     ╰─────────────────────────────────── while parsing statement
+    │                                              │                       │  
+    │                                              ╰────────────────────────── while parsing expression
+    │                                                                      │  
+    │                                                                      ╰── invalid assignment target
+────╯
+Error: parse error
+    ╭─[<std>/retry.cambra:61:2]
+    │
+ 56 │ ╭───▶ pub RetryConfig(Response, Ok) = {
+    │ │                                     ▲   
+    │ │ ╭───────────────────────────────────╯   
+    ┆ ┆ ┆   
+ 61 │ │ ├─▶ }
+    │ │ │   ▲┬  
+    │ │ ╰─────── while parsing expression
+    │ │     ││  
+    │ ╰─────┴─── while parsing statement
+    │        │  
+    │        ╰── invalid assignment target
+────╯
+Error: parse error
+    ╭─[<std>/wf.cambra:45:11]
+    │
+ 45 │ pub trait WorkflowState(S):
+    │     ──┬── ──────┬──────  
+    │       ╰────────────────── while parsing statement
+    │       │         │        
+    │       ╰────────────────── while parsing expression
+    │                 │        
+    │                 ╰──────── found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', or '::'
+────╯
+Error: parse error
+    ╭─[<std>/wf.cambra:49:11]
+    │
+ 49 │ pub trait IsException(E)
+    │     ──┬── ─────┬─────  
+    │       ╰──────────────── while parsing statement
+    │       │        │       
+    │       ╰──────────────── while parsing expression
+    │                │       
+    │                ╰─────── found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+────╯
+Error: parse error
+    ╭─[<std>/wf.cambra:81:25]
+    │
+ 77 │ ╭─▶ pub Workflow(State) = Module{
+    ┆ ┆   
+ 81 │ ├─▶     live: RunId => Bool requires Transaction,
+    │ │                      ──┬─ ────┬───                
+    │ │                        ╰────────────────────────── while parsing expression
+    │ │                               │                   
+    │ ╰─────────────────────────────────────────────────── while parsing statement
+    │                                 │                   
+    │                                 ╰─────────────────── found 'requires', expected binary operator, comparison operator, boolean operator, postfix operation, 'where', 'if', '<<', '^+', '->', '=>', '**', '}', ',', or '::'
+────╯
+Error: parse error
+     ╭─[<std>/wf.cambra:106:24]
+     │
+ 106 │ impl WorkflowState(Slot(P)):
+     │ ───────────┬───────────┬  
+     │            ╰────────────── while parsing statement
+     │                        │  
+     │                        ╰── found '(', expected ')', or ','
+─────╯
+Error: parse error
+     ╭─[<std>/wf.cambra:126:46]
+     │
+ 126 │ pub type WorkflowCancellationException(C) = {run: String, status: RunState, call: C}
+     │     ────────────────────────────────────────┬─┬─────────────────┬───────────────────  
+     │                                             ╰───────────────────────────────────────── while parsing statement
+     │                                               │                 │                     
+     │                                               ╰─────────────────────────────────────── found 'run', expected expression, 'where', 'match', '}', or ','
+     │                                                                 │                     
+     │                                                                 ╰───────────────────── while parsing expression
+─────╯
+Error: parse error
+     ╭─[<std>/wf.cambra:128:47]
+     │
+ 128 │ impl IsException(WorkflowCancellationException(C))
+     │ ───────────────────────┬──────────────────────┬  
+     │                        ╰───────────────────────── while parsing statement
+     │                                               │  
+     │                                               ╰── found '(', expected ')', or ','
+─────╯
+Error: parse error
+     ╭─[<std>/wf.cambra:139:15]
+     │
+ 139 │     Label(name=name)
+     │     ─────┬──┬─┬  
+     │          ╰─────── while parsing statement
+     │             │ │  
+     │             ╰──── while parsing expression
+     │               │  
+     │               ╰── found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+─────╯
+Error: parse error
+     ╭─[<std>/wf.cambra:147:28]
+     │
+ 147 │ pub type CallKey(Id, D) = {run: Id, rest: D, labels: List(Label)}
+     │     ────────────────────────┬─────┬──────────┬───────────────────  
+     │                             ╰────────────────────────────────────── found 'run', expected expression, 'where', 'match', '}', or ','
+     │                                   │          │                     
+     │                                   ╰──────────────────────────────── while parsing statement
+     │                                              │                     
+     │                                              ╰───────────────────── while parsing expression
+─────╯
+Error: parse error
+     ╭─[<std>/wf.cambra:151:7]
+     │
+ 151 │     l in self.labels
+     │     ┬ ─┬  
+     │     ╰───── while parsing statement
+     │     │  │  
+     │     ╰───── while parsing expression
+     │        │  
+     │        ╰── found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '**', '=', ',', ':', ':=', '::', or ';'
+─────╯
+Error: parse error
+     ╭─[<std>/wf.cambra:163:27]
+     │
+ 163 │ pub type KeyedSource(K, T)
+     │     ───────────┬──────────┬  
+     │                ╰───────────── while parsing statement
+     │                           │  
+     │                           ╰── found 'newline', expected '=', or ':'
+─────╯
+Error: parse error
+     ╭─[<std>/wf.cambra:224:2]
+     │
+ 220 │ ╭───▶ pub ClientCtor(Request, Response, Ok) = {
+     │ │                                             ▲   
+     │ │ ╭───────────────────────────────────────────╯   
+     ┆ ┆ ┆   
+ 224 │ │ ├─▶ }
+     │ │ │   ▲┬  
+     │ │ ╰─────── while parsing expression
+     │ │     ││  
+     │ ╰─────┴─── while parsing statement
+     │        │  
+     │        ╰── invalid assignment target
+─────╯
+Error: parse error
+     ╭─[<std>/wf.cambra:229:76]
+     │
+ 229 │ pub EffectConfig(Response, Ok) = {policy: retry::RetryConfig(Response, Ok)}
+     │     ───────────────────────────────────┬──────────────┬────────────────────┬  
+     │                                        ╰────────────────────────────────────── while parsing statement
+     │                                                       │                    │  
+     │                                                       ╰─────────────────────── while parsing expression
+     │                                                                            │  
+     │                                                                            ╰── invalid assignment target
+─────╯
+Error: parse error
+     ╭─[<std>/wf.cambra:237:57]
+     │
+ 237 │ pub LastReply(Response) = {`reply{Response} | `no_reply}
+     │     ──────────────────────────┬──────────┬──────────────┬  
+     │                               ╰──────────────────────────── while parsing statement
+     │                                          │              │  
+     │                                          ╰───────────────── while parsing expression
+     │                                                         │  
+     │                                                         ╰── invalid assignment target
+─────╯
+Error: parse error
+     ╭─[<std>/wf.cambra:275:2]
+     │
+ 271 │ ╭───▶ pub Outcome(K, Request, Response, Ok) = {
+     │ │                                             ▲   
+     │ │ ╭───────────────────────────────────────────╯   
+     ┆ ┆ ┆   
+ 275 │ │ ├─▶ }
+     │ │ │   ▲┬  
+     │ │ ╰─────── while parsing expression
+     │ │     ││  
+     │ ╰─────┴─── while parsing statement
+     │        │  
+     │        ╰── invalid assignment target
+─────╯
+Error: parse error
+    ╭─[<std>/wf/workflow.cambra:84:53]
+    │
+ 84 │ pub def id(state: State, parent_run: Option(PRunId) = `none) => RunId:
+    │     ───────────────────────┬────────────────┬────── ┬  
+    │                            ╰─────────────────────────── while parsing statement
+    │                                             │       │  
+    │                                             ╰────────── while parsing expression
+    │                                                     │  
+    │                                                     ╰── found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', or ','
+────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:100:56]
+     │
+ 100 │ pub def start(state: State, parent_run: Option(PRunId) = `none) => StartResult requires Transaction:
+     │     ─────────────────────────┬─────────────────┬────── ┬  
+     │                              ╰──────────────────────────── while parsing statement
+     │                                                │       │  
+     │                                                ╰────────── while parsing expression
+     │                                                        │  
+     │                                                        ╰── found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', or ','
+─────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:115:10]
+     │
+ 115 │     if i in runs:
+     │     ──┬┬ ─┬  
+     │       ╰────── while parsing statement
+     │        │  │  
+     │        ╰───── while parsing expression
+     │           │  
+     │           ╰── found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:122:10]
+     │
+ 122 │     if i in runs:
+     │     ──┬┬ ─┬  
+     │       ╰────── while parsing statement
+     │        │  │  
+     │        ╰───── while parsing expression
+     │           │  
+     │           ╰── found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:130:10]
+     │
+ 130 │     if i not in runs:
+     │     ──┬┬ ─┬─  
+     │       ╰─────── while parsing statement
+     │        │  │   
+     │        ╰────── while parsing expression
+     │           │   
+     │           ╰─── found 'not', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:144:14]
+     │
+ 143 │ ╭─▶     sorted([i for i -> r in runs if r.parent == `some(p) and live(i)],
+ 144 │ ├─▶            by=(i) => runs[i].started_at)
+     │ │              ─┬┬                             
+     │ │               ╰────────────────────────────── while parsing expression
+     │ │                │                             
+     │ ╰────────────────────────────────────────────── while parsing statement
+     │                  │                             
+     │                  ╰───────────────────────────── found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:160:29]
+     │
+ 160 │         runs[i] := (runs[i] with last_activity=time::now())
+     │         ───────────────┬──────┬──┬─────────────────────────  
+     │                        ╰───────────────────────────────────── while parsing expression
+     │                               │  │                           
+     │                               ╰────────────────────────────── found 'with', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', 'for', '<<', '^+', '->', '=>', '**', ')', '?', or ','
+     │                                  │                           
+     │                                  ╰─────────────────────────── while parsing statement
+─────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:176:10]
+     │
+ 176 │     if i in runs and runs[i].status == wf::`running:
+     │     ──┬┬ ─┬  
+     │       ╰────── while parsing statement
+     │        │  │  
+     │        ╰───── while parsing expression
+     │           │  
+     │           ╰── found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:197:14]
+     │
+ 196 │ ╭─▶     match (a, b):
+ 197 │ ├─▶         case (`some(x), `some(y)):
+     │ │                ┬                       
+     │ ╰──────────────────────────────────────── while parsing statement
+     │                  │                       
+     │                  ╰─────────────────────── found '(', expected 'this', '`', or something else
+─────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:214:8]
+     │
+ 214 │     (r with wake=w)
+     │     ─────┬─┬───────  
+     │          ╰─────────── found 'with', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', 'for', '<<', '^+', '->', '=>', '**', '=', ')', ',', or '::'
+     │            │         
+     │            ╰───────── while parsing statement
+     │            │         
+     │            ╰───────── while parsing expression
+─────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:238:58]
+     │
+ 238 │             for i -> r in runs if r.parent == `some(e.id):
+     │             ──────────────────────┬──────┬───────────────┬  
+     │                                   ╰───────────────────────── while parsing statement
+     │                                          │               │  
+     │                                          ╰────────────────── while parsing expression
+     │                                                          │  
+     │                                                          ╰── found ':', expected binary operator, comparison operator, boolean operator, postfix operation, 'else', '^+', or '**'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:253:43]
+     │
+ 253 │         for r in wf::keyed(cancel_reqs, by=(r) => r.headers["Idempotency-Key"]):
+     │         ─────────────────┬───────────────┬┬  
+     │                          ╰─────────────────── while parsing statement
+     │                                          ││  
+     │                                          ╰─── while parsing expression
+     │                                           │  
+     │                                           ╰── found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/workflow.cambra:275:18]
+     │
+ 274 │ pub def for_each(Out, body: wf::Started(RunId, State) => Out
+     │     ────────────────────────────┬─────────────────────────┬─  
+     │                                 ╰───────────────────────────── while parsing statement
+     │                                                           │   
+     │                                                           ╰─── while parsing expression
+ 275 │                  causes wf::WorkflowCancellationException(_)):
+     │                  ───┬──  
+     │                     ╰──── found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+─────╯
+Error: parse error
+    ╭─[<std>/wf/schedule.cambra:41:1]
+    │
+ 41 │     as runs
+    │ ──┬─  
+    │   ╰─── found 'indent', expected statement, or 'newline'
+────╯
+Error: parse error
+    ╭─[<std>/wf/schedule.cambra:74:17]
+    │
+ 74 │         if s.id not in next:
+    │         ───┬─┬─ ─┬─  
+    │            ╰───────── while parsing statement
+    │              │   │   
+    │              ╰─────── while parsing expression
+    │                  │   
+    │                  ╰─── found 'not', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
+────╯
+Error: parse error
+    ╭─[<std>/wf/schedule.cambra:93:34]
+    │
+ 93 │         if parent::live(p) and p in next and next[p] == t.at:
+    │         ────────────┬┬────────── ─┬  
+    │                     ╰──────────────── while parsing statement
+    │                      │            │  
+    │                      ╰─────────────── while parsing expression
+    │                                   │  
+    │                                   ╰── found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
+────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:132:89]
+     │
+ 132 │ pub def send_request(request: Request) => Result(Ok, wf::Failure(K, Request, Response)) causes wf::WorkflowCancellationException(wf::Cancelled(K, Request, Response)):
+     │     ─────────────────────────────────────────┬──────────────────┬────────────────────── ───┬──  
+     │                                              ╰────────────────────────────────────────────────── while parsing statement
+     │                                                                 │                          │    
+     │                                                                 ╰─────────────────────────────── while parsing expression
+     │                                                                                            │    
+     │                                                                                            ╰──── found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', 'requires', '<<', '^+', '->', '=>', '**', or ':'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:152:21]
+     │
+ 152 │             calls[k.run][k] := `resolved
+     │             ────┬──┬─┬─  
+     │                 ╰──────── while parsing statement
+     │                    │ │   
+     │                    ╰───── while parsing expression
+     │                      │   
+     │                      ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:162:29]
+     │
+ 162 │         if workflow::live(k.run):
+     │         ──────────┬────────┬─┬─  
+     │                   ╰────────────── while parsing statement
+     │                            │ │   
+     │                            ╰───── while parsing expression
+     │                              │   
+     │                              ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:182:56]
+     │
+ 182 │                         stop(k, w.request, end_state(k.run), `reply(reply),
+     │                         ───────────────┬──────────────┬─┬─  
+     │                                        ╰──────────────────── while parsing statement
+     │                                                       │ │   
+     │                                                       ╰───── while parsing expression
+     │                                                         │   
+     │                                                         ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:185:43]
+     │
+ 181 │ ╭─▶                     if w.cancel_sent:
+     ┆ ┆   
+ 185 │ ├─▶                     elif workflow::live(k.run):
+     │ │                                           ─┬─┬─     
+     │ │                                            ╰──────── while parsing expression
+     │ │                                              │      
+     │ ╰───────────────────────────────────────────────────── while parsing statement
+     │                                                │      
+     │                                                ╰────── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:197:39]
+     │
+ 180 │ ╭─▶                 if w.in_flight and a.attempt == w.attempts:
+     ┆ ┆   
+ 197 │ ├─▶                 elif workflow::live(k.run):
+     │ │                                       ─┬─┬─     
+     │ │                                        ╰──────── while parsing expression
+     │ │                                          │      
+     │ ╰───────────────────────────────────────────────── while parsing statement
+     │                                            │      
+     │                                            ╰────── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:216:45]
+     │
+ 216 │                         if workflow::live(k.run) and not w.cancel_sent:
+     │                         ──────────┬────────┬─┬─  
+     │                                   ╰────────────── while parsing statement
+     │                                            │ │   
+     │                                            ╰───── while parsing expression
+     │                                              │   
+     │                                              ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:221:43]
+     │
+ 215 │ ╭─▶                     if w.in_flight:
+     ┆ ┆   
+ 221 │ ├─▶                     elif workflow::live(k.run):
+     │ │                                           ─┬─┬─     
+     │ │                                            ╰──────── while parsing expression
+     │ │                                              │      
+     │ ╰───────────────────────────────────────────────────── while parsing statement
+     │                                                │      
+     │                                                ╰────── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:235:17]
+     │
+ 235 │         if e.id in calls:
+     │         ───┬─┬─ ─┬  
+     │            ╰──────── while parsing statement
+     │              │   │  
+     │              ╰────── while parsing expression
+     │                  │  
+     │                  ╰── found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:252:10]
+     │
+ 252 │     if k.run not in calls or k not in calls[k.run]:
+     │     ──┬─┬─┬─  
+     │       ╰─────── while parsing statement
+     │         │ │   
+     │         ╰───── while parsing expression
+     │           │   
+     │           ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:266:15]
+     │
+ 266 │ def end_state(run: RunId) => wf::RunState requires Transaction:
+     │ ───────┬───────┬─  
+     │        ╰─────────── while parsing statement
+     │                │   
+     │                ╰─── found 'run', expected parameter name, or ')'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:289:40]
+     │
+ 286 │ ╭─▶     match logic(reply):
+     ┆ ┆   
+ 289 │ ├─▶         case retry::`retriable(answered=False):
+     │ │                                          ┬          
+     │ ╰───────────────────────────────────────────────────── while parsing statement
+     │                                            │          
+     │                                            ╰────────── found '=', expected ')'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:295:10]
+     │
+ 295 │     if k.run in calls:
+     │     ──┬─┬─┬─  
+     │       ╰─────── while parsing statement
+     │         │ │   
+     │         ╰───── while parsing expression
+     │           │   
+     │           ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:302:24]
+     │
+ 302 │     a = wf::Attempt(key=k, attempt=w.attempts + 1, generation=w.generation)
+     │     ─────────┬───────┬─┬  
+     │              ╰──────────── while parsing statement
+     │                      │ │  
+     │                      ╰──── while parsing expression
+     │                        │  
+     │                        ╰── found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:304:13]
+     │
+ 304 │     calls[k.run][k] := `waiting((w with attempts=a.attempt, in_flight=True, wake=deadline))
+     │     ────┬──┬─┬─  
+     │         ╰──────── while parsing statement
+     │            │ │   
+     │            ╰───── while parsing expression
+     │              │   
+     │              ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:319:17]
+     │
+ 319 │         calls[k.run][k] := `waiting((w with in_flight=False, last=last,
+     │         ────┬──┬─┬─  
+     │             ╰──────── while parsing statement
+     │                │ │   
+     │                ╰───── while parsing expression
+     │                  │   
+     │                  ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:334:23]
+     │
+ 334 │     workflow::touch(k.run)
+     │     ─────────┬───────┬─┬─  
+     │              ╰───────────── while parsing statement
+     │                      │ │   
+     │                      ╰───── while parsing expression
+     │                        │   
+     │                        ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:335:13]
+     │
+ 335 │     calls[k.run][k] := `done(v)
+     │     ────┬──┬─┬─  
+     │         ╰──────── while parsing statement
+     │            │ │   
+     │            ╰───── while parsing expression
+     │              │   
+     │              ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:342:23]
+     │
+ 342 │     workflow::touch(k.run)
+     │     ─────────┬───────┬─┬─  
+     │              ╰───────────── while parsing statement
+     │                      │ │   
+     │                      ╰───── while parsing expression
+     │                        │   
+     │                        ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+     ╭─[<std>/wf/effect.cambra:345:13]
+     │
+ 345 │     calls[k.run][k] := `failed(f)
+     │     ────┬──┬─┬─  
+     │         ╰──────── while parsing statement
+     │            │ │   
+     │            ╰───── while parsing expression
+     │              │   
+     │              ╰─── found 'run', expected field name or index
+─────╯
+Error: parse error
+    ╭─[<std>/wf/detached.cambra:27:16]
+    │
+ 27 │     RunId(value="")
+    │     ─────┬──┬──┬  
+    │          ╰──────── while parsing statement
+    │             │  │  
+    │             ╰───── while parsing expression
+    │                │  
+    │                ╰── found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+────╯
+Error: parse error
+    ╭─[<std>/wf/detached.cambra:45:18]
+    │
+ 44 │ pub def for_each(Out, body: wf::Started(RunId, None) => Out
+    │     ───────────────────────────┬─────────────────────────┬─  
+    │                                ╰───────────────────────────── while parsing statement
+    │                                                          │   
+    │                                                          ╰─── while parsing expression
+ 45 │                  causes wf::WorkflowCancellationException(_)):
+    │                  ───┬──  
+    │                     ╰──── found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+────╯
+Error: loading error
+    ╭─[<std>/retry.cambra:32:8]
+    │
+ 32 │ import std::http
+    │        ────┬────  
+    │            ╰────── no module `std::http`: the std root has no module `http`
+────╯
+Error: loading error
+    ╭─[<std>/wf/workflow.cambra:23:8]
+    │
+ 23 │ import std::http
+    │        ────┬────  
+    │            ╰────── no module `std::http`: the std root has no module `http`
+────╯
+Error: lowering error
+    ╭─[tests/wf.cambra:14:1]
+    │
+ 14 │ ╭─▶ def echo_client(CK: Type) => wf::Client(wf::Attempt(CK), String, String):
+    ┆ ┆   
+ 16 │ ├─▶ 
+    │ │      
+    │ ╰────── function/lambda with no parameters not supported
+────╯
+Error: lowering error
+    ╭─[tests/wf.cambra:17:34]
+    │
+ 17 │ def echo_retry(reply: String) => retry::RetryState(String):
+    │                                  ────────┬────────  
+    │                                          ╰────────── a type application must have a simple name head (e.g. `List(…)`)
+────╯
+Error: lowering error
+    ╭─[tests/wf.cambra:29:9]
+    │
+ 29 │         echoes::start((line=line))
+    │         ─────────────┬────────────  
+    │                      ╰────────────── a `with begin():` block supports mutable writes (`x := …`, `x += …`), local bindings (`x = …`), `if cond:` guards, `match` dispatch, and feeds (`out << e`). A declaration goes above the block, `@LoadFrom` included: its value is the predecessor's, read once at the swap
+────╯
+Error: lowering error
+    ╭─[<std>/retry.cambra:70:5]
+    │
+ 70 │ ╭─▶ pub def default_retry(Response, Ok) => RetryConfig(Response, Ok):
+    ┆ ┆   
+ 75 │ ├─▶ # answers a rate limit with 429 and an outage with 5xx.
+    │ │                                                             
+    │ ╰───────────────────────────────────────────────────────────── function/lambda with no parameters not supported
+────╯
+Error: lowering error
+    ╭─[<std>/retry.cambra:76:59]
+    │
+ 76 │ pub def transient_http_retry(Ok, o: http::Outcome(Ok)) => RetryState(Ok):
+    │                                                           ───────┬──────  
+    │                                                                  ╰──────── unknown type application: `RetryState(…)`
+────╯
+Error: lowering error
+    ╭─[<std>/time.cambra:44:5]
+    │
+ 44 │ pub type Instant = Int
+    │     ─────────┬─────────  
+    │              ╰─────────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/time.cambra:54:5]
+    │
+ 54 │ pub type Duration = Int
+    │     ──────────┬─────────  
+    │               ╰─────────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/wf.cambra:55:5]
+    │
+ 55 │ ╭─▶ pub type RunState = {
+    ┆ ┆   
+ 61 │ ├─▶ }
+    │ │       
+    │ ╰─────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/wf.cambra:65:5]
+    │
+ 65 │ pub type Started(Id, State) = {id: Id, state: State, at: time::Instant}
+    │     ──────────────────────────────────┬─────────────────────────────────  
+    │                                       ╰─────────────────────────────────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/wf.cambra:66:5]
+    │
+ 66 │ pub type Ended(Id) = {id: Id, state: RunState}
+    │     ─────────────────────┬─────────────────────  
+    │                          ╰─────────────────────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+     ╭─[<std>/wf.cambra:104:5]
+     │
+ 104 │ pub type Slot(P) = {parent: P, slot: time::Instant}
+     │     ────────────────────────┬───────────────────────  
+     │                             ╰───────────────────────── a nominal type in a module other than the root is not supported yet
+─────╯
+Error: lowering error
+     ╭─[<std>/wf.cambra:126:5]
+     │
+ 126 │ pub type WorkflowCancellationException(C) = {run: String, status: RunState, call: C}
+     │     ────────────────────────────────────────┬────────────────────────────────────────  
+     │                                             ╰────────────────────────────────────────── a nominal type in a module other than the root is not supported yet
+─────╯
+Error: lowering error
+     ╭─[<std>/wf.cambra:136:5]
+     │
+ 136 │ pub type Label = {name: String}
+     │     ──────────────┬─────────────  
+     │                   ╰─────────────── a nominal type in a module other than the root is not supported yet
+─────╯
+Error: lowering error
+     ╭─[<std>/wf.cambra:147:5]
+     │
+ 147 │ pub type CallKey(Id, D) = {run: Id, rest: D, labels: List(Label)}
+     │     ───────────────────────────────┬──────────────────────────────  
+     │                                    ╰──────────────────────────────── a nominal type in a module other than the root is not supported yet
+─────╯
+Error: lowering error
+     ╭─[<std>/wf.cambra:157:5]
+     │
+ 157 │ pub type Attempt(K) = {key: K, attempt: Int, generation: Int}
+     │     ─────────────────────────────┬────────────────────────────  
+     │                                  ╰────────────────────────────── a nominal type in a module other than the root is not supported yet
+─────╯
+Error: lowering error
+     ╭─[<std>/wf.cambra:199:5]
+     │
+ 199 │ ╭─▶ pub type Client(K, Request, Response) = {
+     ┆ ┆   
+ 203 │ ├─▶ }
+     │ │       
+     │ ╰─────── a nominal type in a module other than the root is not supported yet
+─────╯
+Error: lowering error
+     ╭─[<std>/wf.cambra:205:1]
+     │
+ 205 │ ╭─▶ impl Client(K, Request, Response):
+     ┆ ┆   
+ 219 │ ├─▶ # [proposed] a function whose parameter is a type.
+     │ │                                                        
+     │ ╰──────────────────────────────────────────────────────── an `impl` block in a module other than the root is not supported yet
+─────╯
+Error: lowering error
+     ╭─[<std>/wf.cambra:241:5]
+     │
+ 241 │ ╭─▶ pub type Failure(K, Request, Response) = {
+     ┆ ┆   
+ 248 │ ├─▶ }
+     │ │       
+     │ ╰─────── a nominal type in a module other than the root is not supported yet
+─────╯
+Error: lowering error
+     ╭─[<std>/wf.cambra:261:5]
+     │
+ 261 │ ╭─▶ pub type Cancelled(K, Request, Response) = {
+     ┆ ┆   
+ 267 │ ├─▶ }
+     │ │       
+     │ ╰─────── a nominal type in a module other than the root is not supported yet
+─────╯
+Error: lowering error
+    ╭─[<std>/wf/workflow.cambra:47:5]
+    │
+ 47 │ pub type RunId = {value: String}
+    │     ──────────────┬──────────────  
+    │                   ╰──────────────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/wf/workflow.cambra:53:1]
+    │
+ 53 │ ╭─▶ type Run = {
+    ┆ ┆   
+ 60 │ ├─▶ }
+    │ │       
+    │ ╰─────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:29:15]
+    │
+ 29 │ param parent: wf::Workflow(PState)
+    │               ──────┬─────  
+    │                     ╰─────── a type application must have a simple name head (e.g. `List(…)`)
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:43:5]
+    │
+ 43 │ pub RunId = runs::RunId
+    │     ─────────┬─────────  
+    │              ╰─────────── `RunId` is capitalized, so `RunId = …` declares a type alias and its right-hand side must be a type: `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:44:10]
+    │
+ 44 │ pub id = runs::id
+    │          ──┬─  
+    │            ╰─── `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:45:17]
+    │
+ 45 │ pub id_string = runs::id_string
+    │                 ──┬─  
+    │                   ╰─── `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:46:15]
+    │
+ 46 │ pub started = runs::started
+    │               ──┬─  
+    │                 ╰─── `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:47:13]
+    │
+ 47 │ pub ended = runs::ended
+    │             ──┬─  
+    │               ╰─── `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:48:11]
+    │
+ 48 │ pub get = runs::get
+    │           ──┬─  
+    │             ╰─── `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:49:14]
+    │
+ 49 │ pub status = runs::status
+    │              ──┬─  
+    │                ╰─── `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:50:12]
+    │
+ 50 │ pub live = runs::live
+    │            ──┬─  
+    │              ╰─── `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:51:13]
+    │
+ 51 │ pub touch = runs::touch
+    │             ──┬─  
+    │               ╰─── `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:52:16]
+    │
+ 52 │ pub complete = runs::complete
+    │                ──┬─  
+    │                  ╰─── `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:53:14]
+    │
+ 53 │ pub cancel = runs::cancel
+    │              ──┬─  
+    │                ╰─── `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:54:16]
+    │
+ 54 │ pub for_each = runs::for_each
+    │                ──┬─  
+    │                  ╰─── `runs` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:56:1]
+    │
+ 56 │ PRunId = parent::RunId
+    │ ───────────┬──────────  
+    │            ╰──────────── `PRunId` is capitalized, so `PRunId = …` declares a type alias and its right-hand side must be a type: `parent` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:60:15]
+    │
+ 60 │ next: Mut(Map(PRunId, time::Instant), Txn) := empty_map()
+    │               ───┬──  
+    │                  ╰──── unknown type annotation: PRunId
+────╯
+Error: lowering error
+    ╭─[<std>/wf/schedule.cambra:72:10]
+    │
+ 72 │ for s in parent::started:
+    │          ───┬──  
+    │             ╰──── `parent` does not name a module here: it is not an import name, a run name, a parameter of Module type, or a top-level member bound to a module
+────╯
+Error: lowering error
+     ╭─[<std>/wf/schedule.cambra:93:9]
+     │
+  93 │ ╭─▶         if parent::live(p) and p in next and next[p] == t.at:
+     ┆ ┆   
+ 116 │ ├─▶             wakes::cancel(p)
+     │ │                                  
+     │ ╰────────────────────────────────── a `with begin():` block supports mutable writes (`x := …`, `x += …`), local bindings (`x = …`), `if cond:` guards, `match` dispatch, and feeds (`out << e`). A declaration goes above the block, `@LoadFrom` included: its value is the predecessor's, read once at the swap
+─────╯
+Error: lowering error
+    ╭─[<std>/wf/effect.cambra:74:1]
+    │
+ 74 │ ╭─▶ type CallState = {
+    ┆ ┆   
+ 79 │ ├─▶ }
+    │ │       
+    │ ╰─────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/wf/detached.cambra:21:1]
+    │
+ 21 │ type None = {}
+    │ ───────┬───────  
+    │        ╰───────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/wf/detached.cambra:23:5]
+    │
+ 23 │ pub type RunId = {value: String}
+    │     ──────────────┬──────────────  
+    │                   ╰──────────────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/time/timer.cambra:80:56]
+    │
+ 80 │ pub def register(key: Key, at: time::Instant) requires Transaction:
+    │                                                        ─────┬─────  
+    │                                                             ╰─────── `requires Transaction` is not supported yet: transactions as contextual parameters are not implemented
+────╯
+Error: lowering error
+    ╭─[<std>/time/timer.cambra:92:43]
+    │
+ 92 │ pub def cancel(key: Key) => Bool requires Transaction:
+    │                                           ─────┬─────  
+    │                                                ╰─────── `requires Transaction` is not supported yet: transactions as contextual parameters are not implemented
+────╯
+Error: lowering error
+     ╭─[<std>/time/timer.cambra:101:61]
+     │
+ 101 │ pub def pending(key: Key) => Option(time::Instant) requires Transaction:
+     │                                                             ─────┬─────  
+     │                                                                  ╰─────── `requires Transaction` is not supported yet: transactions as contextual parameters are not implemented
+─────╯

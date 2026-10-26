@@ -1,0 +1,88 @@
+# v1 of the bill reminder's versions: every day until a bill is paid, compose a reminder with the
+# LLM and email it. v2 to v4 are each reloaded over the version before
+# (docs/libs/workflow_library.md, "Example: the bill reminder's versions"). Does not compile;
+# `[proposed]` marks what the compiler lacks.
+#
+# One bill is one run of `bills`. Each day of a bill is one run of the child workflow `daily`, and
+# both email effects belong to `daily`, so each day composes and sends one email under its own key.
+
+run std::env as env
+import lib         # lib.cambra beside this file: the providers' request and reply types
+import std::retry
+import std::http   # sketched in stdlib/http.cambra
+import std::time
+import std::wf
+
+BillId = String
+
+# [proposed] declared traits, and `impl` of a library trait for a user type.
+type Bill = {bill_id: BillId}
+
+impl wf::WorkflowState(Bill):
+    def get_run_id(self) => String:
+        "bill-" + self.bill_id
+
+# A bill is chased for at most a year, and ends `stale after 30 days in which no effect sent or
+# settled a call for it. An operator cancels one bill's run through the workflow's cancel route.
+run std::wf::workflow(State=Bill, timeout=`after(time::days(365)),
+                      stale_after=`after(time::days(30)),
+                      control=`serve(port="8080", path="/bills/cancel"))
+    as bills
+
+# One run per bill per day, the first when the bill is tracked. `replace: a day still sending when
+# the next comes due is cancelled, so a bill never has two reminders in flight, and after downtime
+# it gets one reminder, not one per missed day.
+run std::wf::schedule(parent=bills, every=time::days(1), on_due=`replace) as daily
+
+# Tracking a bill starts its run; paying it completes the run, which cancels its days. Each route is
+# keyed by the client's idempotency key, so a resent request is one request.
+# [proposed] typed request rows on `http::serve`.
+track_reqs, track_resps = http::serve("8080", "POST", "/bills")
+paid_reqs, paid_resps = http::serve("8080", "POST", "/bills/paid")
+
+for r in wf::keyed(track_reqs, by=(r) => r.headers["Idempotency-Key"]):   # r: {bill_id}
+    with begin():
+        bills::start(Bill(bill_id=r.bill_id))
+        track_resps << (bill_id=r.bill_id)
+
+for r in wf::keyed(paid_reqs, by=(r) => r.headers["Idempotency-Key"]):    # r: {bill_id}
+    with begin():
+        bills::complete(bills::id(Bill(bill_id=r.bill_id)))
+        paid_resps << (bill_id=r.bill_id)
+
+# Customer lookup is out of scope: the addresses are derived from the bill id.
+def contact(bill_id: BillId) => {email: String, phone: String}:
+    (email=bill_id + "@example.com", phone="+1555" + bill_id)
+
+email_chat = lib::openai_chat(base_url=env::var("OPENAI_BASE_URL"),
+                              api_key=env::var("OPENAI_API_KEY"), model="gpt-5-mini")
+mailman_client = lib::resend(base_url=env::var("RESEND_BASE_URL"),
+                             api_key=env::var("RESEND_API_KEY"),
+                             from="Bills <bills@example.com>",
+                             key_prefix=env::var("DEPLOYMENT") + "/send_email")
+
+run std::wf::effect(workflow=daily, client=email_chat,
+                    config=wf::config(retry::default_retry()))
+    as compose_email
+run std::wf::effect(workflow=daily, client=mailman_client,
+                    config=wf::config(retry::default_retry()))
+    as send_email
+
+# A day is done once its email is sent. A failed call leaves the day running until the next day
+# replaces it.
+# [proposed] `causes` syntax for effects and exceptions.
+def email_for_day(day) causes wf::WorkflowCancellationException(_):
+    match compose_email::send_request(lib::prompt="bill-reminder-email"):
+        case `err(f):
+            pass
+        case `ok(composed):
+            match send_email::send_request(lib::to=contact(day.state.parent.bill_id).email,
+                                           lib::subject="Your bill is due",
+                                           lib::text=composed.lib::text):
+                case `err(f):
+                    pass
+                case `ok(_):
+                    with begin():
+                        daily::complete(day.id)
+
+daily::for_each(email_for_day)

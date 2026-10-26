@@ -1,0 +1,354 @@
+# One effect: a client it builds for itself, the retry policy it calls it under, and an
+# idempotency set that sends each call at most once per key.
+#
+# The module declares state, so a program runs it, once per effect: `run std::wf::effect(…) as
+# send_sms` (docs/chl-spec.md, "9.7 Importing asserts no IO and no state").
+#
+# A call's key comes from the call site's domain (docs/libs/workflow_library.md, "Keys").
+# `requests` and the outputs are public, so a program can feed an effect and loop over its outputs,
+# as a retry loop over `failed` does.
+#
+# Every transaction here reads the run's status (`workflow::live`, `workflow::status`) before it
+# touches a call, so no call is admitted or sent after its run's end commits. `workflow::ended`
+# triggers cleanup and client cancellation only (docs/libs/workflow_library.md, "How a run ends").
+#
+# Example:
+#
+#     import std::wf
+#
+#     run std::wf::effect(workflow=reminders, client=sms_client, config=…) as send_sms
+#
+#     def text(rem) causes wf::WorkflowCancellationException(_):
+#         match send_sms::send_request(lib::to=…, lib::body=…):
+#             case `ok(sent):
+#                 with begin():
+#                     reminders::complete(rem.id)
+#             case `err(f):
+#                 …     # f.reason: `failed, `exhausted or `timed_out
+#
+#     reminders::for_each(text)
+#
+# Status: proposed, not in the spec (docs/libs/workflow_library.md, "Effects"). `[proposed]` marks
+# each construct the compiler lacks.
+
+import std::retry
+import std::time
+import std::wf
+
+# [proposed] each type parameter inferred: `State` from `workflow`, `Request` and `Response` from
+# `client`, `Ok` from `config`, and `D` from the effect's call sites, as the sum of their `rest`
+# types (`wf::CallKey`). docs/chl-spec.md, "9.4 Parameters", infers from the other arguments
+# without saying whether a Module's type members count, and nothing infers a parameter from the
+# places a run's feed is fed.
+param State
+param D
+param Request
+param Response
+param Ok
+param workflow: wf::Workflow(State)
+param client: wf::ClientCtor(Request, Response, Ok)
+param config: wf::EffectConfig(Response, Ok)
+
+RunId = workflow::RunId
+K = wf::CallKey(RunId, D)
+Outcome = wf::Outcome(K, Request, Response, Ok)
+
+c = client.build(K)
+
+def logic(reply: Response) => retry::RetryState(Ok):
+    match config.policy.retry_logic:
+        case `some(f):
+            f(reply)
+        case `none:
+            client.retry_logic(reply)
+
+# A call in flight or backing off. `wake` is its pending wake in `wakes`: the in-flight attempt's
+# deadline, or the end of the backoff. `cancel_sent` records that the run ended with an attempt in
+# flight and the effect wrote the attempt to `cancels_feed`.
+Waiting = {request: Request, attempts: Int, in_flight: Bool, last: wf::LastReply(Response),
+           maybe_performed: Bool, generation: Int, since: time::Instant, wake: time::Instant,
+           cancel_sent: Bool}
+
+# `resolved` is a failed call the program has handled (`resolve`): its key stays held, and its
+# failure has left `failed`.
+type CallState = {
+    `waiting{Waiting}
+    | `done{Ok}
+    | `failed{wf::Failure(K, Request, Response)}
+    | `resolved
+}
+
+# Grouped by run, so the end of a run deletes one row. Read only inside transactions.
+calls: Mut(Map(RunId, Map(K, CallState)), Txn) := empty_map()
+
+# One pending wake per waiting call.
+run std::time::timer(Key=K) as wakes
+
+# --- Feeds --------------------------------------------------------------------
+
+# The caller's input, a keyed feed. `send_request` writes it at the call site's key; a program's
+# own `requests << r` takes the key from its loop's domain.
+# [proposed] keyed feeds.
+pub requests = defer()   # Feed(K, Request)
+
+# Every admitted call's one outcome, written with the call's element on the matching public
+# collection below. `send_request` reads it at its call's key, and the step of a body after a
+# `send_request` is a loop over it, joined by call key.
+# [proposed] a keyed read of a feed, `outcomes[k]`; and `outcomes` holding an outcome until its
+# run ends, so a body step that a reload changes finds the outcome it waits on
+# (docs/libs/workflow_library.md, "What a loop added by a reload reads").
+outcomes = defer()       # Feed(K, Outcome)
+
+# The public outputs: each admitted call lands on exactly one, in the transaction that settles or
+# stops it (docs/libs/workflow_library.md, "Outputs").
+# [proposed] `failed` as a dead-letter queue: holding a failure until the program resolves it
+# (`resolve`) or its run ends, whether or not a loop reads it, so a loop that a later version adds
+# reads the failures from before it
+# (docs/libs/workflow_library.md, "What a loop added by a reload reads").
+pub responses = defer()  # Feed(K, Ok)
+pub failed = defer()     # Feed(K, wf::Failure(K, Request, Response))
+pub cancelled = defer()  # Feed(K, wf::Cancelled(K, Request, Response))
+
+# --- send_request -------------------------------------------------------------
+
+# Calls the effect at the call site's key and evaluates to the call's outcome. The result exists
+# once the effect settles the call, so whatever reads it runs after the call, and nothing else does.
+#
+# - A success is `ok`. A failure the retry policy gave up on is `err`, carrying the `wf::Failure`.
+#   The policy's retries all happen before the outcome exists.
+# - A call its run's end stopped raises `wf::WorkflowCancellationException`, carrying the
+#   `wf::Cancelled` record.
+#   TODO a handler's own call on this effect is keyed to the ended run, so the `requests` loop stops
+#   it as `not_performed`. A `cancelling` run state would admit it as a detached scope
+#   (`wf::WorkflowCancellationException`).
+# - It does not read the run: a check here would be a transaction with no data dependency on the
+#   call. The loops check the run in the transactions that admit and settle the call.
+# - A call that succeeded returns `ok` even if the run ends a moment later.
+#
+# The compiler splits the calling body here (docs/libs/workflow_library.md, "Bodies").
+# [proposed] a function of a run called by its run name, `send_sms::send_request(…)`; keyword
+# arguments forming the one record parameter; a write to a keyed feed at a key; and a parameterised
+# exception type.
+pub def send_request(request: Request) => Result(Ok, wf::Failure(K, Request, Response)) causes wf::WorkflowCancellationException(wf::Cancelled(K, Request, Response)):
+    k = wf::call_key()
+    requests[k] << request
+    match outcomes[k]:
+        case `ok(v):
+            `ok(v)
+        case `failed(f):
+            `err(f)
+        case `cancelled(x):
+            raise wf::WorkflowCancellationException(run=workflow::id_string(k.run),
+                                                    status=x.status, call=x)
+
+# Marks the failed call at `k` handled. Its key stays held, so feeding `k` again sends nothing. A
+# key whose call has not failed changes nothing.
+# [proposed] releasing the call's failure from `failed` when it is resolved, so no loop that a
+# later version adds reads it
+# (docs/libs/workflow_library.md, "What a loop added by a reload reads").
+pub def resolve(k: K) requires Transaction:
+    match state(k):
+        case `failed(_):
+            calls[k.run][k] := `resolved
+        case _:
+            pass
+
+# --- Loops --------------------------------------------------------------------
+
+# A request arrives once per key: `requests` is a keyed feed, two call sites never share a key, and
+# a committed step does not run again. A key the effect already holds sends nothing.
+for k -> r in requests:
+    with begin():
+        if workflow::live(k.run):
+            if absent(k):
+                workflow::touch(k.run)
+                now = time::now()
+                transmit(k, (request=r, attempts=0, in_flight=False, last=`no_reply,
+                             maybe_performed=False, generation=0, since=now, wake=now,
+                             cancel_sent=False))
+        elif absent(k):
+            stop(k, r, end_state(k.run), `no_reply, wf::`not_performed)
+
+# The reply to the attempt in flight settles the call; a late reply to an earlier attempt settles
+# it only if it is an `ok`. After the run's end the reply stops the call, classified by
+# `cancel_logic` if a cancellation was sent and by `reply_outcome` otherwise.
+for a -> reply in c.replies:
+    with begin():
+        k = a.key
+        match state(k):
+            case `waiting(w):
+                if w.in_flight and a.attempt == w.attempts:
+                    if w.cancel_sent:
+                        stop(k, w.request, end_state(k.run), `reply(reply),
+                             client.cancel_logic(reply))
+                        forget(k)
+                    elif workflow::live(k.run):
+                        match logic(reply):
+                            case retry::`ok(v):
+                                succeed(k, v)
+                            case retry::`retriable(answered):
+                                backoff_or_fail(k, w, `reply(reply), answered)
+                            case retry::`failed:
+                                fail(k, w, `reply(reply), w.maybe_performed, wf::`failed)
+                    else:
+                        stop(k, w.request, end_state(k.run), `reply(reply),
+                             reply_outcome(w, reply))
+                        forget(k)
+                elif workflow::live(k.run):
+                    match logic(reply):
+                        case retry::`ok(v):
+                            succeed(k, v)
+                        case _:
+                            pass
+            case _:
+                pass
+
+# A call's wake. A deadline with no reply is an unanswered retriable failure, and the end of a
+# backoff sends the next attempt; after the run's end, either stops the call. A wake that is not the
+# call's pending one does nothing.
+for t in wakes::fired:
+    with begin():
+        k = t.key
+        match state(k):
+            case `waiting(w):
+                if w.wake == t.at:
+                    if w.in_flight:
+                        if workflow::live(k.run) and not w.cancel_sent:
+                            backoff_or_fail(k, w, w.last, False)
+                        else:
+                            stop(k, w.request, end_state(k.run), w.last, wf::`unknown)
+                            forget(k)
+                    elif workflow::live(k.run):
+                        transmit(k, w)
+                    else:
+                        stop(k, w.request, end_state(k.run), w.last, idle_outcome(w))
+                        forget(k)
+            case _:
+                pass
+
+# A run's end. A call in backoff stops now; one with an attempt in flight is cancelled at its client
+# and stopped by that attempt's reply or deadline. Settled and failed entries are deleted, which
+# releases their `outcomes` and `failed` elements.
+# [proposed] a `for` over a `Txn` map inside a transaction.
+for e in workflow::ended:
+    with begin():
+        if e.id in calls:
+            for k -> st in calls[e.id]:
+                match st:
+                    case `waiting(w):
+                        if w.in_flight:
+                            c.cancels_feed[wf::Attempt(key=k, attempt=w.attempts,
+                                                       generation=w.generation)] << ()
+                            calls[k.run][k] := `waiting((w with cancel_sent=True))
+                        else:
+                            stop(k, w.request, e.state, w.last, idle_outcome(w))
+                            forget(k)
+                    case _:
+                        forget(k)
+
+# --- Internals ----------------------------------------------------------------
+
+def state(k: K) => {`absent} | CallState requires Transaction:
+    if k.run not in calls or k not in calls[k.run]:
+        `absent
+    else:
+        calls[k.run][k]
+
+def absent(k: K) => Bool requires Transaction:
+    match state(k):
+        case `absent:
+            True
+        case _:
+            False
+
+# The status a stopped call records. A dependent child run is not live once its parent has ended,
+# though its own end is recorded a transaction later, so a `running status here means that end.
+def end_state(run: RunId) => wf::RunState requires Transaction:
+    match workflow::status(run):
+        case `some(wf::`running):
+            wf::`cancelled(at=time::now(), reason="parent ended")
+        case `some(s):
+            s
+        case `none:
+            wf::`cancelled(at=time::now(), reason="unknown run")
+
+# What the remote did with a call stopped with no attempt in flight: nothing if no attempt was sent
+# or every attempt was answered with a failure; unknown after any unanswered attempt.
+def idle_outcome(w: Waiting) => wf::CancelOutcome:
+    if w.attempts == 0 or not w.maybe_performed:
+        wf::`not_performed
+    else:
+        wf::`unknown
+
+# What the remote did with a call stopped by the reply to its attempt in flight, when no
+# cancellation was sent.
+def reply_outcome(w: Waiting, reply: Response) => wf::CancelOutcome:
+    match logic(reply):
+        case retry::`ok(_):
+            wf::`performed
+        case retry::`retriable(answered=False):
+            wf::`unknown
+        case _:
+            idle_outcome(w)
+
+def forget(k: K) requires Transaction:
+    if k.run in calls:
+        del calls[k.run][k]
+        if len(calls[k.run]) == 0:
+            del calls[k.run]
+    wakes::cancel(k)
+
+def transmit(k: K, w: Waiting) requires Transaction:
+    a = wf::Attempt(key=k, attempt=w.attempts + 1, generation=w.generation)
+    deadline = time::now() + config.policy.deadline
+    calls[k.run][k] := `waiting((w with attempts=a.attempt, in_flight=True, wake=deadline))
+    c.writes_feed[a] << w.request
+    wakes::register(k, deadline)
+
+def backoff_or_fail(k: K, w: Waiting, last: wf::LastReply(Response),
+                    answered: Bool) requires Transaction:
+    b = config.policy.backoff
+    maybe_performed = w.maybe_performed or not answered
+    g = w.generation + 1 if answered else w.generation
+    resend_at = time::now() + b.first * b.factor ** (w.attempts - 1)
+    if w.attempts >= b.attempts:
+        fail(k, w, last, maybe_performed, wf::`exhausted)
+    elif past_call_timeout(w, resend_at):
+        fail(k, w, last, maybe_performed, wf::`timed_out)
+    else:
+        calls[k.run][k] := `waiting((w with in_flight=False, last=last,
+                                      maybe_performed=maybe_performed, generation=g,
+                                      wake=resend_at))
+        wakes::register(k, resend_at)
+
+def past_call_timeout(w: Waiting, at: time::Instant) => Bool:
+    match config.policy.call_timeout:
+        case `after(d):
+            at >= w.since + d
+        case `never:
+            False
+
+# The three settling writes. Each writes the call's outcome and its element on the matching public
+# feed in one transaction.
+def succeed(k: K, v: Ok) requires Transaction:
+    workflow::touch(k.run)
+    calls[k.run][k] := `done(v)
+    wakes::cancel(k)
+    responses[k] << v
+    outcomes[k] << `ok(v)
+
+def fail(k: K, w: Waiting, last: wf::LastReply(Response), maybe_performed: Bool,
+         reason: wf::FailReason) requires Transaction:
+    workflow::touch(k.run)
+    f = (key=k, request=w.request, last=last, attempts=w.attempts, reason=reason,
+         maybe_performed=maybe_performed)
+    calls[k.run][k] := `failed(f)
+    wakes::cancel(k)
+    failed[k] << f
+    outcomes[k] << `failed(f)
+
+def stop(k: K, request: Request, status: wf::RunState, last: wf::LastReply(Response),
+         outcome: wf::CancelOutcome) requires Transaction:
+    x = (key=k, request=request, status=status, last=last, outcome=outcome)
+    cancelled[k] << x
+    outcomes[k] << `cancelled(x)

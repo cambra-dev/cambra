@@ -1,0 +1,49 @@
+# The parent of a workflow that has none: a `wf::Workflow` with no runs.
+#
+# It is `std::wf::workflow`'s default `parent`, so a workflow declared without one is top level.
+# `std::wf::workflow` imports it, so it declares no feed and no mutable variable (docs/chl-spec.md,
+# "9.7 Importing asserts no IO and no state"): `started` and `ended` are empty lists. Every
+# function answers as for a run the workflow does not hold.
+#
+# Example:
+#
+#     import std::wf::detached
+#
+#     param parent: wf::Workflow(PState) = detached
+#
+# Status: proposed, not in the spec. `[proposed]` marks each construct the compiler lacks: a
+# default for a Module-typed parameter (docs/chl-spec.md, "9.4 Parameters", gives value parameters
+# defaults and says nothing of Module-typed ones), and an empty list where a Module type names a
+# `Source`.
+
+import std::wf
+
+type None = {}
+
+pub type RunId = {value: String}
+
+# Returns an id that names no run, so every function below answers as for an unknown run.
+pub def id(s: None) => RunId:
+    RunId(value="")
+
+pub def id_string(i: RunId) => String:
+    i.value
+
+pub def live(i: RunId) => Bool requires Transaction:
+    False
+
+pub def status(i: RunId) => Option(wf::RunState) requires Transaction:
+    `none
+
+pub def get(i: RunId) => Option(None) requires Transaction:
+    `none
+
+pub def touch(i: RunId) requires Transaction:
+    pass
+
+pub def for_each(Out, body: wf::Started(RunId, None) => Out
+                 causes wf::WorkflowCancellationException(_)):
+    pass
+
+pub started: List(wf::Started(RunId, None)) = []
+pub ended: List(wf::Ended(RunId)) = []
