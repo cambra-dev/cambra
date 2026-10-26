@@ -17,6 +17,7 @@
 //! shared import per distinct set of arguments its imports pass, the root has one
 //! run, and each `run` statement declares another.
 
+mod check;
 mod imports;
 mod interface;
 mod link;
@@ -24,6 +25,7 @@ mod parameters;
 mod scope;
 mod types;
 
+pub use check::*;
 use imports::*;
 pub use interface::*;
 pub use link::*;

@@ -122,6 +122,7 @@ impl LoweringContext {
         self.declared_sinks.clear();
         self.parameters.clear();
         self.run_type_arguments.clear();
+        self.run_type_checks.clear();
         // A `use` type name is in scope throughout its module. One whose module
         // has errors of its own names no type, and stands for any. A `use` name
         // for a function with a `Mut` parameter takes the curried call shape the

@@ -1012,12 +1012,6 @@ fn erase_chan_domains_in_type(
     changed
 }
 
-/// Whether `ty`'s own structure holds a type satisfying `hit`. Refinement predicates are
-/// not walked, which is the reach of [`erase_chan_domains_in_type`].
-fn structure_holds_type(ty: &Type, hit: &dyn Fn(&Type) -> bool) -> bool {
-    hit(ty) || ty.any_child(|c| structure_holds_type(c, hit))
-}
-
 /// Whether any refinement predicate reachable from `ty` holds a type satisfying `hit` in
 /// one of its own node slots. Such a slot is a slot like any other, so a refinement sitting
 /// in one contributes its predicate too, at whatever depth. That re-entry mirrors the one
@@ -1103,7 +1097,7 @@ fn slot_holds_type(
     hit: &dyn Fn(&Type) -> bool,
     visited: &mut HashSet<PredicateId>,
 ) -> bool {
-    structure_holds_type(ty, hit) || predicates_hold_type(ty, hit, visited)
+    ty.holds_type(hit) || predicates_hold_type(ty, hit, visited)
 }
 
 /// Erase channel types inside `ty`'s refinement **predicates**, which
