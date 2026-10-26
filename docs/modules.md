@@ -59,7 +59,9 @@ trees structurally ([src/ccl/design/diffing.md](../src/ccl/design/diffing.md)).
 Linking puts one shared import per imported module and distinct set of arguments, in link order,
 around the root, and each run at its `run` statement in the module that declares it
 ([Runs](#runs)). Each is created from its module's lowering, which happens once ([A module lowers
-once](#a-module-lowers-once)).
+once](#a-module-lowers-once)). Each copy of a module after the first in a tree copies the
+module's refinement predicates too (`copy_predicates`), since uniquifying rebuilds a predicate
+with the ids it had, and two runs holding one predicate's ids would collide.
 
 **The per-module check runs parsing, lowering, uniquification, and inference** (`Phase::Lower`,
 `Phase::Uniquify`, `Phase::Infer` in `src/ccl/context.rs`), plus the run-site checks of the
@@ -366,8 +368,7 @@ members reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
   the run's copy shares the resolved predicates. Nothing compares an argument with its parameter's
   bound, and each use of `T` is checked against each argument, so a body relying on more than its
   bound is accepted while every argument provides it. Both wait on checking a module on its own, at
-  the `Run` node. A type member of a Module type, and a type member reached through a Module-typed
-  parameter, are refused.
+  the `Run` node.
 - **Refused:** `@RenamedFrom`, a `run` in an imported module, and a nominal `type` declaration,
   an associated function or an `impl` block in any module but the root (`module_nominal_refusals`).
   `pub` on a `run` is a parse error, since a module returns a run by binding it to a public member
@@ -441,7 +442,7 @@ A qualifier spells a member reached through it as the module it names is spelled
 binding needs no names of its own.
 
 A Module-typed parameter lowers once, before any argument exists
-(`LoweringContext::declare_module_parameters`). Its Module type gives it a view (`ModuleView`) and
+(`LoweringContext::declare_module_parameter`). Its Module type gives it a view (`ModuleView`) and
 a `let` per value entry at the head of its module's chain, `audit::count`, at the entry's type. A
 reference through it resolves to that `let`, so the module sees the entry's type, and a member the
 Module type does not name is an error at the reference. A binding of the parameter, or of a path
@@ -464,9 +465,22 @@ feed entry, `Feed(T)`, is a feed handle with its domain left to inference, and `
 feeds the argument's feed through the `let`. A binding exported in an interface carries its
 spelling and its view, so a module reaching `h::k` reaches what `k` does in `h`.
 
-Not implemented: an entry that is a `Txn` variable or a type member, an argument's member with a
-`Mut` parameter, and a label through a Module-typed parameter, whose module is the argument's and
-is not known where the module lowers.
+A type member of a Module type is a `TypeEntry`, an alias for the entries after it. An exact one,
+`Name = T`, is `T`. An abstract one, `Name <: T` or `Name: K`, is a declared `Type::Param`, and
+each Module-typed parameter takes the Module type with a fresh one for each, so two parameters of
+one Module type take two arguments (`instantiate`). Inside the module `audit::Event` is what the
+entry writes. Linking passes each abstract member as a run's type argument under its spelling,
+`__run::s::audit::Event`: the declaring module reads the argument's member where the `run`
+statement stands (`LoweringContext::declare_run_types`), an import reads it where its key is
+decided, and a default reads it where the parameter is declared. Nothing compares the argument's
+member with an exact entry's type or an abstract entry's bound. A value entry over the member, as
+`keep: Count => Count`, compares the argument's member through its type. A Module-typed parameter
+that a `run` statement passes to another run is declared in the pass that lowers the run's type
+arguments, so one declared below the statement is an error at it.
+
+Not implemented: an entry that is a `Txn` variable, an argument's member with a `Mut` parameter,
+and a label through a Module-typed parameter, whose module is the argument's and is not known where
+the module lowers.
 
 ### `use` names are environment entries, not bindings
 
@@ -761,7 +775,8 @@ One PR per item, each updating the spec and design docs it touches:
       run's feed.
    3. **Type parameters**, and a type as an argument to a run or an import.
    4. **Type members of Module types**, `Module{Receipt <: {id: String}}`, and a type member reached
-      through a Module-typed parameter, `payments::Receipt`.
+      through a Module-typed parameter, `payments::Receipt`
+      ([A Module type is not a `Type`](#a-module-type-is-not-a-type)).
    5. **Inferred type arguments.** A type parameter a `run` or an `import` leaves out, inferred from
       the types of its other arguments ([chl-spec.md, "9.4 Parameters"](chl-spec.md#94-parameters)).
 8. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`

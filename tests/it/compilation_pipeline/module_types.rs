@@ -430,12 +430,12 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
     "},
     "or a top-level member bound to a module"
 )]
-#[case::a_type_member(
+#[case::a_type_member_with_a_type_for_a_kind(
     indoc! {"
         C = Module{T: Int}
         1
     "},
-    "a type member of a Module type is not supported yet"
+    "`T: …` states the kind of the type member `T`, `Type` or `SubtypesOf(T)`"
 )]
 #[case::a_binder_named_like_the_parameter(
     indoc! {"
@@ -705,5 +705,262 @@ fn an_import_passing_a_module_reaches_one_shared_import_per_argument() {
     assert_eq!(
         shared_imports(&program),
         expected.iter().map(|s| s.to_string()).collect()
+    );
+}
+
+/// A module whose type member is a refinement, a value of it, and a function
+/// over it.
+const POSITIVE: &str = indoc! {"
+    pub Count = {Int where _ > 0}
+    pub start: Count = 3
+    pub def keep(c: Count) => Count:
+        c
+"};
+
+/// A module whose type member is `Int`, a value of it, and a function over it.
+const INTS: &str = indoc! {"
+    pub Count = Int
+    pub start: Count = 0
+    pub def keep(c: Count) => Count:
+        c
+"};
+
+/// A module that knows its parameter's `Count` only through a bound, so it
+/// takes its values from the parameter.
+const BOUNDED: &str = indoc! {"
+    param n: Module{Count <: Int, start: Count, keep: Count => Count}
+    pub v: n::Count = n::keep(n::start)
+"};
+
+/// Each Module-typed parameter takes its argument's type members: `Name <: T`
+/// and `Name: K` the argument's own, `Name = T` the written `T`
+/// (`docs/chl-spec.md`, "9.8 Module types").
+#[rstest]
+#[case::a_bounded_member(indoc! {"
+    run positive as p
+    run bounded(n=p) as b
+    b::v
+"}, 3)]
+#[case::a_kinded_member(indoc! {"
+    run positive as p
+    run kinded(n=p) as k
+    k::v
+"}, 3)]
+#[case::a_subtypes_of_kind(indoc! {"
+    run positive as p
+    run subtyped(n=p) as k
+    k::v
+"}, 3)]
+#[case::an_exact_member(indoc! {"
+    run ints as i
+    run exact(n=i) as e
+    e::w
+"}, 0)]
+#[case::an_imported_argument(indoc! {"
+    import positive
+    import bounded(n=positive)
+    bounded::v
+"}, 3)]
+#[case::a_parameter_passed_on(indoc! {"
+    run positive as p
+    run relay(n=p) as r
+    r::v
+"}, 3)]
+#[case::a_nested_entry(indoc! {"
+    run outer as o
+    run nested(n=o) as x
+    x::v
+"}, 3)]
+#[case::a_nested_entry_beside_a_run_of_its_module(indoc! {"
+    run positive as p
+    run outer as o
+    run nested(n=o) as x
+    x::v + p::keep(p::start)
+"}, 6)]
+#[case::two_runs_of_a_module_with_a_refinement(indoc! {"
+    run positive as a
+    run positive as b
+    x: a::Count = a::keep(a::start)
+    y: b::Count = b::keep(b::start)
+    x + y
+"}, 6)]
+#[case::the_roots_default(
+    indoc! {"
+        import positive
+        param n: Module{Count <: Int, start: Count, keep: Count => Count} = positive
+        x: n::Count = n::keep(n::start)
+        x
+    "},
+    3
+)]
+#[case::two_parameters_of_one_module_type(
+    indoc! {"
+        run ints as i
+        run positive as p
+        run pair(a=i, b=p) as q
+        q::w
+    "},
+    0
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_module_typed_parameter_takes_its_arguments_type_members(
+    #[case] root: &str,
+    #[case] expected: i64,
+) {
+    check_program_scalar(
+        &program(
+            root,
+            &[
+                ("positive", POSITIVE),
+                ("ints", INTS),
+                ("bounded", BOUNDED),
+                (
+                    "kinded",
+                    indoc! {"
+                        param n: Module{Count: Type, start: Count, keep: Count => Count}
+                        pub v = n::keep(n::start)
+                    "},
+                ),
+                (
+                    "subtyped",
+                    indoc! {"
+                        param n: Module{Count: SubtypesOf(Int), start: Count, keep: Count => Count}
+                        pub v = n::keep(n::start)
+                    "},
+                ),
+                (
+                    "exact",
+                    indoc! {"
+                        param n: Module{Count = Int, keep: Count => Count}
+                        pub w: n::Count = 0
+                    "},
+                ),
+                (
+                    "relay",
+                    indoc! {"
+                        param n: Module{Count <: Int, start: Count, keep: Count => Count}
+                        run bounded(n=n) as b
+                        pub v = b::v
+                    "},
+                ),
+                (
+                    "pair",
+                    indoc! {"
+                        Num = Module{Count <: Int, start: Count, keep: Count => Count}
+                        param a: Num
+                        param b: Num
+                        pub w: a::Count = a::keep(a::start)
+                        pub v: b::Count = b::keep(b::start)
+                    "},
+                ),
+                (
+                    "outer",
+                    indoc! {"
+                        run positive as p
+                        pub inner = p
+                    "},
+                ),
+                (
+                    "nested",
+                    indoc! {"
+                        param n: Module{inner: Module{Count <: Int, start: Count, keep: Count => Count}}
+                        pub v: n::inner::Count = n::inner::keep(n::inner::start)
+                    "},
+                ),
+            ],
+        ),
+        Value::Int(expected),
+    );
+}
+
+#[rstest]
+#[case::a_value_outside_the_arguments_member(
+    indoc! {"
+        run positive as p
+        run zero(n=p) as z
+        1
+    "},
+    "annotated as {Int where _ > 0}, but inferred as {Int where _ == 0}"
+)]
+#[case::an_exact_member_the_argument_does_not_fit(
+    indoc! {"
+        run positive as p
+        run exact(n=p) as e
+        1
+    "},
+    "annotated as Int => Int, but inferred as {Int where _ > 0} => {Int where _ > 0}"
+)]
+#[case::a_missing_type_member(
+    indoc! {"
+        run plain as p
+        run bounded(n=p) as b
+        1
+    "},
+    "this module does not fit the parameter's Module type: module `plain` has no type member \
+     `Count`"
+)]
+#[case::a_missing_type_member_of_an_import(
+    indoc! {"
+        import plain
+        import bounded(n=plain)
+        1
+    "},
+    "module `plain` has no type member `Count`"
+)]
+#[case::an_entry_before_its_type_member(
+    indoc! {"
+        C = Module{keep: Count => Count, Count <: Int}
+        1
+    "},
+    "unknown type annotation: Count"
+)]
+#[case::a_value_member_written_with_a_bound(
+    indoc! {"
+        C = Module{count <: Int}
+        1
+    "},
+    "`count` is a value member, written `count: T`"
+)]
+#[case::an_argument_below_the_run(
+    indoc! {"
+        import positive
+        run bounded(n=m) as b
+        param m: Module{Count <: Int, start: Count, keep: Count => Count} = positive
+        b::v
+    "},
+    "the argument for `n` is declared below this statement"
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_misused_type_member_is_refused(#[case] root: &str, #[case] needle: &str) {
+    assert_refused(
+        &program(
+            root,
+            &[
+                ("positive", POSITIVE),
+                ("bounded", BOUNDED),
+                (
+                    "plain",
+                    indoc! {"
+                        pub def keep(c: Int) => Int:
+                            c
+                    "},
+                ),
+                (
+                    "zero",
+                    indoc! {"
+                        param n: Module{Count <: Int, keep: Count => Count}
+                        pub w: n::Count = 0
+                    "},
+                ),
+                (
+                    "exact",
+                    indoc! {"
+                        param n: Module{Count = Int, keep: Count => Count}
+                        pub w: n::Count = 0
+                    "},
+                ),
+            ],
+        ),
+        needle,
     );
 }

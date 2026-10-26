@@ -835,11 +835,10 @@ pub enum Expr {
     /// value position (a record *value* is `(x=1, y=2)`, [`Expr::Record`]).
     BraceRecord(Vec<RecordField>),
 
-    /// A Module type: `Module{name: T, …}`, the type of a module's public
-    /// members (`docs/chl-spec.md`, "9.8 Module types"). Each entry is a
-    /// member's name and its type. `Module` is not a keyword: followed by
-    /// braces, it writes this form.
-    ModuleType(Vec<RecordField>),
+    /// A Module type: `Module{name: T, Name = T, …}`, the type of a module's
+    /// public members (`docs/chl-spec.md`, "9.8 Module types"). `Module` is not
+    /// a keyword: followed by braces, it writes this form.
+    ModuleType(Vec<ModuleTypeEntry>),
 
     /// A colon-free brace group: `{T, U}` (no `key: value` entries).
     ///
@@ -1067,6 +1066,31 @@ pub struct RecordField {
     /// for the current module's label.
     pub qualifier: Vec<Spanned<SmolStr>>,
     pub value: Spanned<Expr>,
+}
+
+/// One entry of a Module type: a member's name, how the entry states it, and
+/// the type or kind it states (`docs/chl-spec.md`, "9.8 Module types").
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleTypeEntry {
+    pub name: SmolStr,
+    pub name_span: Span,
+    /// The module the name is qualified by. Empty for a well-formed entry,
+    /// which names a member of the module the Module type describes.
+    pub qualifier: Vec<Spanned<SmolStr>>,
+    pub form: EntryForm,
+    pub value: Spanned<Expr>,
+}
+
+/// How a Module type entry states its member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryForm {
+    /// `name: T`, a value member of type `T`, or `Name: K`, a type member of
+    /// the kind `K`.
+    Annotated,
+    /// `Name = T`, a type member that is `T`.
+    Exact,
+    /// `Name <: T`, a type member below `T`.
+    Bounded,
 }
 
 /// A name with a non-empty `::` qualifier, `cart::total` (an [`Expr::Qualified`]).
