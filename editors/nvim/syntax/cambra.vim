@@ -30,7 +30,7 @@ syn match cambraFeed "<<=\="
 syn match cambraBuiltin "\<\%(sum\|max\|min\|groupby\|set\|map\|box\|empty_map\|await_final\|defer\|begin\|http_serve\|test_sink\|stdin\)\>"
 
 syn match cambraLambda "\\"
-syn match cambraNumber "\<\d\+\>"
+syn match cambraNumber "\<\d\+\%(_\d\+\)*\>"
 syn match cambraType "\<\u\w*\>"
 " The type hole `_` directly after an annotation's `:`, `<:` or `=>`, or after
 " the `{` that opens a type literal. A `=>` whose `=` ends an operator before
