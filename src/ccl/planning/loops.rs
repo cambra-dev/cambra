@@ -117,7 +117,7 @@ pub(crate) fn plan_loops(expr: Expr) -> Expr {
         }
         // An induction group is a single writer: a plain `mut` loop, and — since
         // the conditional case folds to one commit-gated writer with a
-        // value-`Case` write set over the full source (`transform_chain`'s `Case`
+        // value-`Case` write set over the full source (`WriterWalk`'s `Case`
         // arm) rather than per-leg restricted bindings — a conditional write too.
         debug_assert_eq!(
             bindings.len(),
@@ -213,20 +213,7 @@ fn unwrap_seed_record(e: Expr) -> (Expr, bool) {
 /// ([`unwrap_seed_record`]), and which guard. The view slot (the causal history
 /// read) is validated by `check_letrec_causal` and discarded here — the
 /// engine reconstructs every read from the history record itself.
-fn split_causal_compose(mut guard: Expr) -> (Expr, bool, Builtin) {
-    // A seed reading a binding of the enclosing body arrives under that binding:
-    // `mut_elim::sink_prefix` re-binds, around each restriction-free part of a decision,
-    // the prefix bindings it reads, and the guard is one such part. Each binding is a
-    // morphism of the writer's argument, as the guard is, so inlining it states the same
-    // guard.
-    while let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        body,
-    } = guard.node
-    {
-        guard = crate::ccl::lambda_elim::substitute(*body, &binding.name, &bound_expr);
-    }
+fn split_causal_compose(guard: Expr) -> (Expr, bool, Builtin) {
     let TypedExprNode::Compose(mut elts) = guard.node else {
         panic!("letrec recognition: guard is not a compose");
     };
@@ -830,12 +817,50 @@ fn collapse_snapshot_sources(
 /// there whether or not the inner loop runs any position, which is what lets the store open
 /// every enclosing position. The pair is read at the head of a morphism: `.0` reads the
 /// enclosing component and `.1` the position, a `const` reads neither, and a `zip` reads it
-/// in each leg.
+/// in each leg. A value-`Case` seed (`if 𝑐: total += 10` between the loops) is a disjoint join
+/// of `filter_values(π̂ᵢ) ≫ 𝑣ᵢ` arms; it is restated arm by arm, a filter whose predicate reads
+/// only the enclosing component becoming a filter of the enclosing position.
 fn onto_enclosing(e: Expr, enclosing: &Type) -> Option<Expr> {
     let codomain = e.ty.codomain()?;
     let ty = Type::fun_like(&e.ty, enclosing.clone(), codomain);
     match e.node {
         TypedExprNode::Proj(ProjKey::Index(0)) => Some(Expr::builtin(Builtin::Id).with_ty(ty)),
+        TypedExprNode::DisjointJoin(arms) => {
+            let arms = arms
+                .into_iter()
+                .map(|arm| onto_enclosing(arm, enclosing))
+                .collect::<Option<Vec<Expr>>>()?;
+            Some(Expr::disjoint_join(arms).with_ty(ty))
+        }
+        // `filter_values(𝑝) ≫ 𝑟` keeps the pair at the rows `𝑝` admits, so `𝑟` still reads the
+        // pair: both are restated.
+        TypedExprNode::Compose(elts)
+            if elts.first().is_some_and(|head| {
+                matches!(&head.node, TypedExprNode::Apply { function, .. }
+                    if matches!(function.node, TypedExprNode::Builtin(Builtin::FilterValues)))
+            }) =>
+        {
+            let pair = e.ty.domain()?;
+            let mut elts = elts.into_iter();
+            let TypedExprNode::Apply { argument, .. } = elts.next()?.node else {
+                unreachable!("matched as a `filter_values` application")
+            };
+            let predicate = onto_enclosing(*argument, enclosing)?;
+            let filter = apply_primitive(
+                predicate,
+                Builtin::FilterValues,
+                Type::fun(enclosing.clone(), enclosing.clone()),
+            );
+            let rest: Vec<Expr> = elts.collect();
+            if rest.is_empty() {
+                return Some(filter);
+            }
+            let rest_cod = rest.last()?.ty.codomain()?;
+            let rest =
+                crate::ccl::ccl_utils::chain_typed(rest, Type::fun_like(&e.ty, pair, rest_cod));
+            let rest = onto_enclosing(rest, enclosing)?;
+            Some(crate::ccl::ccl_utils::chain_typed(vec![filter, rest], ty))
+        }
         TypedExprNode::Compose(elts) => {
             let mut elts = elts.into_iter();
             let head = onto_enclosing(elts.next()?, enclosing)?;

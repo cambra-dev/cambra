@@ -85,7 +85,7 @@ pub(crate) fn unit_expr() -> Expr {
 ///
 /// Both consumers dispatch on a guard and neither reads a `Pattern`: the
 /// induction writer merges the arms into one decision ([`crate::ccl::mut_elim`]'s
-/// `transform_chain`), and the feed fan-out refines the loop source once per
+/// `WriterWalk`), and the feed fan-out refines the loop source once per
 /// feeding arm ([`crate::ccl::channelize`]'s `try_extract_fanout_feed`). The
 /// rewrite runs in a phase rather than at lowering because both builtins are
 /// minted after inference.
@@ -184,8 +184,7 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
 /// `commit` must already be the writer's *final* commit gate — including every
 /// feed's fire path, so a feed-only committing position appends a change carrying
 /// the tap (the caller folds fires into `commit` before calling; see
-/// `transact_phase`'s `commit_paths` and `mut_elim::attach_feed_fields`'s widen).
-/// `transact_phase`'s `commit_paths` and `letrec_phase`'s widen).
+/// `mut_elim::WriterWalk::body`, which disjoins every write's and feed's path).
 pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(Label, Expr, Expr)]) -> Expr {
     let mut fields: Vec<(Label, Expr)> = Vec::with_capacity(2 + feeds.len() * 2);
     fields.push((COMMIT_SELECTOR, commit.clone()));
@@ -240,12 +239,16 @@ pub fn tap_idle(value_ty: Type) -> Expr {
 }
 
 /// A tap under a `fire` path narrower than the record's commit:
-/// `` { fire → `fired(value); true → `idle } ``.
+/// `` { fire → `fired(value); true → `idle } ``, or `` `fired(value) `` where `fire` is the
+/// literal `true`.
 ///
 /// A two-arm value-`Case`, the shape a conditional write already takes, so
 /// `lambda_elim`'s C-form compiles it with no new machinery — and the `` `idle ``
 /// arm is what re-totals the tap over the positions `value` does not answer at.
-fn tap_gated(fire: Expr, value: Expr) -> Expr {
+pub(crate) fn tap_gated(fire: Expr, value: Expr) -> Expr {
+    if matches!(fire.node, TypedExprNode::Lit(Lit::Bool(true))) {
+        return tap_fired(value);
+    }
     let fired = tap_fired(value);
     let ty = fired.ty.clone();
     let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
@@ -342,7 +345,7 @@ pub fn commit_project(decision_ty: &Type) -> Expr {
 ///
 /// Applied to a whole body when that body has more than one consumer, rather than
 /// at each consumption point: the induction writer converts as it walks
-/// ([`crate::ccl::mut_elim`]'s `transform_chain`), but a feed-only loop body goes
+/// ([`crate::ccl::mut_elim`]'s `WriterWalk`), but a feed-only loop body goes
 /// to `channelize`'s fan-out and a transaction block goes to both a footprint scan
 /// and a decision walk, and a consumer left un-taught reads a `Pattern` it has no
 /// arm for.
