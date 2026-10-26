@@ -62,16 +62,7 @@ impl UnionOperator {
     fn inner_tilings(inputs: &[Box<dyn TileOperator>], level: CurryLevel) -> Vec<Tiling> {
         inputs
             .iter()
-            .map(|op| {
-                let mut t = op.tiling();
-                for _ in 0..level.index() {
-                    let Tiling::DataFunction { codomain, .. } = t else {
-                        panic!("UnionOperator: no {level} in {}", op.tiling())
-                    };
-                    t = codomain;
-                }
-                t.clone()
-            })
+            .map(|op| op.tiling().values_at(level).clone())
             .collect()
     }
 
@@ -448,7 +439,6 @@ impl UnionProducer {
             .map(|tile| tile.rows_by_path(enclosing))
             .collect();
         let paths = standing.paths_at(enclosing);
-        let empty_group = self.tiling().values_at(self.level).empty_tile();
         standing.per_group(self.tiling(), self.level, &mut |row| {
             // An arm that has not reached this row holds nothing of it, but still says
             // whether more may come: complete where the arm calls the row complete, and not
@@ -527,13 +517,7 @@ impl TileProducer for UnionProducer {
             // both ends: the domain the arms share, and the codomain shape the
             // decision field carries. Under a standing level the same description sits
             // `level` levels in, and the merge runs once per row of the level above.
-            let mut merged_at = self.tiling();
-            for _ in 0..self.level.index() {
-                let Tiling::DataFunction { codomain, .. } = merged_at else {
-                    panic!("a flat union has a standing level it does not tile for")
-                };
-                merged_at = codomain;
-            }
+            let merged_at = self.tiling().values_at(self.level);
             let (domain_extent, codomain_tiling) = match merged_at {
                 Tiling::DataFunction { domain, codomain } => (domain.clone(), (**codomain).clone()),
                 other => panic!("a flat union tiling is a function, got {other}"),
