@@ -35,8 +35,8 @@
 //! |------|---------|-----------|-----------------|
 //! | Compose identity | `… ≫ id ≫ …` / `… ≫ id ≫ …` | remove `id` | ✓ |
 //! | Const reduce | `f ≫ g ▷ const` | `g ▷ const` | ✗ (drops `f`) |
-//! | Product beta (fst) | `⟨f, g⟩ ≫ .0` | `f` | ✗ (drops `g`) |
-//! | Product beta (snd) | `⟨f, g⟩ ≫ .1` | `g` | ✗ (drops `f`) |
+//! | Product beta (fst) | `⟨f, g⟩ ≫ .0` (`g` keeps the keys) | `f` | ✗ (drops `g`) |
+//! | Product beta (snd) | `⟨f, g⟩ ≫ .1` (`f` keeps the keys) | `g` | ✗ (drops `f`) |
 //! | Literal tuple projection | `(e₀, …, eₙ).i` | `eᵢ` | ✗ (drops siblings) |
 //! | CCC universal | `⟨.1, .0 ≫ curry(f)⟩ ≫ apply` | `f` | ✗ (drops structure) |
 //! | Exponential beta | `⟨g, curry(h)⟩ ≫ apply` | `⟨id, g⟩ ≫ h` | ✗ (restructures) |
@@ -934,6 +934,34 @@ fn narrows_domain_irrecoverably(expr: &Expr) -> bool {
     }
 }
 
+/// Whether the morphism `expr`, composed after a collection, drops some of its keys: a
+/// [`narrows_domain_irrecoverably`] step or a `restrict`, or a chain, a `zip` or a `let` body
+/// holding one. A `zip` intersects its arms' keys, so one narrowing arm narrows the pair:
+/// `⟨id, 𝑠 ≫ variant_project(𝑐)⟩` holds only the positions tagged `𝑐`.
+pub(crate) fn narrows_keys(expr: &Expr) -> bool {
+    if narrows_domain_irrecoverably(expr) {
+        return true;
+    }
+    match &expr.node {
+        TypedExprNode::Apply { function, argument } => {
+            if is_builtin(function, Builtin::Restrict) {
+                return true;
+            }
+            if !is_builtin(function, Builtin::Zip) {
+                return false;
+            }
+            match &argument.node {
+                TypedExprNode::Tuple(arms) => arms.iter().any(narrows_keys),
+                TypedExprNode::Record(fields) => fields.iter().any(|(_, arm)| narrows_keys(arm)),
+                _ => false,
+            }
+        }
+        TypedExprNode::Compose(steps) => steps.iter().any(narrows_keys),
+        TypedExprNode::Let { body, .. } => narrows_keys(body),
+        _ => false,
+    }
+}
+
 /// Whether the morphism `expr`, composed after a collection, leaves that collection's keys as
 /// they were: no key is dropped and none is added.
 ///
@@ -1139,8 +1167,13 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
 type Rebinding = Option<(Name, Vec<Expr>)>;
 
 /// Whether `left ≫ right` is `⟨…⟩ ≫ .index`, the window product beta rewrites.
+///
+/// The component the projection drops must not narrow the keys ([`narrows_keys`]): the
+/// pair holds only the keys every component holds, so `⟨id, 𝑠 ≫ variant_project(𝑐)⟩ ≫ .0`
+/// is the input at the positions tagged `𝑐`, not the whole input.
 fn is_product_beta_window(left: &Expr, right: &Expr, index: usize) -> bool {
-    is_proj_idx(right, index) && as_zip(left).is_some()
+    is_proj_idx(right, index)
+        && as_zip(left).is_some_and(|(f, g)| !narrows_keys(if index == 0 { g } else { f }))
 }
 
 fn product_beta_rebinding(expr: &Expr, index: usize) -> Option<(usize, Rebinding)> {

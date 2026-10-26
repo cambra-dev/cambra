@@ -267,9 +267,9 @@ o"#,
 )]
 // Pass-by-reference writer that *feeds before it writes*: `o << c` precedes
 // `c += 1` in the writer body, inlined per iteration. The Feed-headed spliced
-// body left a `unit; unit` tail on the loop spine that `transform_chain` once
-// rejected; it now drops the no-op units and reads `x` before each write, so
-// the channel latches 0, 1, 2 (the pre-write values) over the three iterations.
+// body leaves a `unit; unit` tail on the loop spine; the writer walk drops the
+// no-op units and reads `x` before each write, so the channel latches 0, 1, 2
+// (the pre-write values) over the three iterations.
 #[case::pbr_feed_before_write(
 r#"
 def fw(c: Mut(Int), o: Feed(Int)):
@@ -1950,4 +1950,121 @@ fn boxed_rows_fed_from_a_loop(#[case] source: &str, #[case] expected: &str) {
 "#}, "[(_0: 0, _1: 0) -> [2 -> 3, 3 -> 4], (_0: 0, _1: 1) -> [3 -> 4], (_0: 1, _1: 0) -> [3 -> 4], (_0: 1, _1: 1) -> []]")]
 fn a_feed_under_a_loop_writing_a_mutable_variable(#[case] source: &str, #[case] expected: &str) {
     check_sink(source, expected);
+}
+
+/// A feed in a branch that writes, reading a binding the branch's other values read as well:
+/// the branch leaves as one merged tuple holding the feed's tap beside them, so the feed reads
+/// the binding the variable does (`src/ccl/design/mutability.md`, "Loop-body bindings"). A
+/// feed under a condition of its own within the branch reads that condition off the tuple
+/// too, and a partial operation in its value is evaluated only where the condition holds.
+#[rstest]
+#[case::the_value_written(indoc! {"
+    t := 0
+    ys: Feed(_)
+    zs: Feed(_)
+    for x in [1, 2]:
+        if t == 0:
+            t := x * 7919
+            ys << t
+        zs << t
+    sum(ys) + sum(zs)
+"}, 23757)]
+#[case::the_value_written_in_a_block(indoc! {"
+    t: Mut(Int, Txn) := 0
+    ys: Feed(_)
+    zs: Feed(_)
+    for x in [1, 2]:
+        with begin():
+            if t == 0:
+                t := x * 7919
+                ys << t
+            zs << t
+    sum(ys) + sum(zs)
+"}, 23757)]
+#[case::the_value_written_in_a_match_arm(indoc! {"
+    t := 0
+    ys: Feed(_)
+    zs: Feed(_)
+    for x in [1, 2]:
+        match `some(x):
+            case `some(y):
+                t := y * 7919
+                ys << t
+            case `none(_):
+                t += 1
+        zs << t
+    sum(ys) + sum(zs)
+"}, 47514)]
+#[case::under_a_condition_reading_the_binding(indoc! {"
+    t := 0
+    ys: Feed(_)
+    for x in [1, 2, 3]:
+        if x > 1:
+            u = x * 10
+            t += u
+            if u > 25:
+                ys << u
+    sum(ys) + t
+"}, 80)]
+#[case::under_a_condition_reading_the_binding_in_a_block(indoc! {"
+    t: Mut(Int, Txn) := 0
+    ys: Feed(_)
+    for x in [1, 2, 3]:
+        with begin():
+            if x > 1:
+                u = x * 10
+                t := t + u
+                if u > 25:
+                    ys << u
+    sum(ys) + await_final(t)
+"}, 80)]
+#[case::a_partial_value_under_a_condition(indoc! {"
+    t := 0
+    ys: Feed(_)
+    for x in [0, 1, 2]:
+        if x < 5:
+            u = x + 1
+            t += u
+            if x != 0:
+                ys << 10 // x + u
+    sum(ys) + t
+"}, 26)]
+#[case::by_two_feeds(indoc! {"
+    n := 0
+    ys: Feed(_)
+    zs: Feed(_)
+    for x in [1, 2]:
+        n += 1
+        if x > 1:
+            u = x * 3
+            ys << u
+            zs << u + 1
+    sum(ys) + sum(zs) + n
+"}, 15)]
+#[case::in_an_elif(indoc! {"
+    t := 0
+    ys: Feed(_)
+    for x in [1, 2, 3]:
+        if x == 1:
+            t += 100
+        elif x == 2:
+            u = x * 7
+            t += u
+            ys << u
+        else:
+            t += 1
+    sum(ys) + t
+"}, 129)]
+#[case::from_an_inner_loop(indoc! {"
+    s := 0
+    ys: Feed(_)
+    for i in [1, 2]:
+        if i > 1:
+            for j in [1, 2]:
+                s += j
+                ys << j * 10
+    sum(ys) + s
+"}, 33)]
+fn a_feed_in_a_writing_branch_shares_its_bindings(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
 }
