@@ -4212,13 +4212,8 @@ impl TileProducer for AsOfProducer {
         // `CommitProducer` GCs the `FanOut`-intersected prefix. The
         // release names the last change strictly below the frontier, so the frontier's
         // own change survives and the fold still finds each key's value.
-        if let Some(f) = &frontier
-            && let Some(below) = last_position_below(source_tile.store_change_positions(), f)
-        {
-            self.source
-                .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::at_or_below(below.into_value()),
-                )));
+        if let Some(f) = &frontier {
+            release_store_below(&mut *self.source, &source_tile, f);
         }
         // Terminality gate. This reader samples one watermark per pull — it does not
         // drive the store to a fixpoint itself — and relies on being re-pulled (via the
@@ -5969,6 +5964,15 @@ impl TileProducer for TransactDriverProducer {
             .iter()
             .map(|k| store_current(&store, k).map(|(_, v)| v))
             .collect();
+        // Release the store below the decided frontier: this driver reads only the frontier
+        // and each key's latest value at or below it, which the store's reclaim keeps, so the
+        // changelog behind the frontier is dead to it. The release names the last change
+        // strictly below the frontier, so the frontier's own change survives. Without it this
+        // slot holds the `FanOut`'s meet where the store began, and every pull of the loop
+        // re-reads a changelog as long as the loop has run.
+        if let Some(f) = &frontier {
+            release_store_below(&mut *self.store_producer, &store, f);
+        }
 
         if let Some(path) = &next_item
             && let Some(frontier) = frontier
@@ -6198,6 +6202,24 @@ fn newest_body_position(tile: &Tile) -> Option<Position> {
     (0..domain.len())
         .map(|i| Position::new(domain.index_at(i)))
         .max()
+}
+
+/// Release a store's changelog at or below `through` on this consumer's slot of the store.
+///
+/// The commit store reclaims a version once every slot behind its `FanOut` has released it.
+fn release_store_through(store: &mut dyn TileProducer, through: &Position) {
+    store.release(TileGuard::Function(FunctionGuard::Domain(
+        Predicate::at_or_below(through.value().clone()),
+    )));
+}
+
+/// Release a store's changelog through its last change strictly below `bound`, which leaves
+/// the change at `bound` itself for the fold to find. A store with no change below `bound`
+/// releases nothing.
+fn release_store_below(store: &mut dyn TileProducer, tile: &Tile, bound: &Position) {
+    if let Some(below) = last_position_below(tile.store_change_positions(), bound) {
+        release_store_through(store, &below);
+    }
 }
 
 /// The largest of `positions` strictly below `bound`, or `None` where none is.
@@ -6780,22 +6802,16 @@ impl TileProducer for TransactWriterProducer {
         // nothing on its own slot, so the intersection — hence GC — stays
         // pinned while it is live; that is correct, as it may answer an as-of
         // query at any past request position.
-        let release_through: Option<Position> = if self.read_keys.is_empty() {
-            snapshot.clone()
-        } else {
-            olds_at
-                .iter()
-                .filter_map(|o| o.as_ref().map(|(t, _)| t.clone()))
-                .min()
-                .and_then(|oldest_read| {
-                    last_position_below(store_tile.store_change_positions(), &oldest_read)
-                })
-        };
-        if let Some(through) = release_through {
-            self.store_producer
-                .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::at_or_below(through.into_value()),
-                )));
+        if self.read_keys.is_empty() {
+            if let Some(through) = &snapshot {
+                release_store_through(&mut *self.store_producer, through);
+            }
+        } else if let Some(oldest_read) = olds_at
+            .iter()
+            .filter_map(|o| o.as_ref().map(|(t, _)| t))
+            .min()
+        {
+            release_store_below(&mut *self.store_producer, &store_tile, oldest_read);
         }
         // The decisions for every live attempt. Which one to act on is settled
         // below, off the driver: the driver emits a row once per `(item, frontier)`,
