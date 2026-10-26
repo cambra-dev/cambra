@@ -352,8 +352,8 @@ where
         // ---- Binding nodes --------------------------------------------------
         N::Lambda { param, body } => under(f, body, Binders::One(param)),
 
-        // `bound_expr`, `init` or `iter` sits outside the binder's scope (a seed cannot
-        // reference the variable it seeds); the binder scopes over `body`.
+        // `bound_expr`, `init` or `iter` sits outside the binder's scope; the binder scopes
+        // over `body`. A `MutDecl`'s seed cannot reference the variable it seeds.
         N::Let {
             binding,
             bound_expr: e,
