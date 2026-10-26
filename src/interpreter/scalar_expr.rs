@@ -8,16 +8,19 @@
 //!
 //! A [`ScalarProgram`] is a straight-line program over slots: instruction 𝑖 names slot 𝑖, and
 //! its operands name earlier slots. A value that two operations read is one slot, computed once.
-//! Every `Input` reads a column of a base type and every `Const` is a value of one, so a program
-//! has no record: [`fuse_prefix`] takes a comparison of two records apart into a comparison per
-//! field.
+//! Every `Input` reads a column of a base type and every `Const` is a value of one, and no
+//! operation reads a record: [`fuse_prefix`] takes a comparison of two records apart into a
+//! comparison per field. The last instruction is the result: an operation, or, for a chain that
+//! ends in a `zip`, a `Record` of the columns its fields name, so a product is built only as the
+//! result, one column of records.
 //!
 //! `eval` works through the input in blocks of [`BLOCK_ROWS`] rows. An `Input` or a `Const` is
-//! read in place, as a region of the input or one value repeated. Every operation but the last
-//! writes one block-sized column into a slot of its own, which later blocks reuse, so the
-//! intermediates of a chain are a few kilobytes each, allocated once per `eval`, and each
-//! kernel runs over columns that are still in cache. The last instruction appends to the result
-//! column.
+//! read in place, as a region of the input or one value repeated. An operation writes one
+//! block-sized column into a slot of its own, which later blocks reuse, so the intermediates of a
+//! chain are a few kilobytes each, allocated once per `eval`, and each kernel runs over columns
+//! that are still in cache. The last instruction appends to the result instead: an operation by its
+//! kernel, and a `Record` by copying each field's block from the slot, input region or constant
+//! the field names.
 
 use std::collections::HashMap;
 use std::mem::replace;
@@ -49,12 +52,18 @@ enum Instr {
     Const(Value),
     Bin(InterpreterBinOp, Slot, Slot),
     Un(UnaryOpKind, Slot),
+    /// A column of records, one field per slot named, sorted by field name. A tuple's fields are
+    /// `_0`, `_1`, …, which sort as strings: `_10` before `_2`.
+    ///
+    /// No operation reads a `Record`. A `Record` is the last instruction or a field of a later
+    /// `Record` ([`ScalarProgram::records_build_only_the_result`]).
+    Record(Vec<(SmolStr, Slot)>),
 }
 
 /// A function of one column, as a straight-line program over slots.
 ///
-/// The last instruction is the output. Every instruction is an operand of a later one or the
-/// output, so equal functions have equal programs.
+/// The last instruction is the result. Every instruction is an operand of a later one or the
+/// result, so equal functions have equal programs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScalarProgram {
     instrs: Vec<Instr>,
@@ -97,8 +106,8 @@ struct Scratch<'a> {
     input: &'a ColumnValue,
     /// The slot of an operation is `Units(0)` until its instruction first writes it; no
     /// operation's result is a `Units` column, so the marker is unambiguous. The slot of an
-    /// `Input` or a `Const` stays unwritten, and so does the last instruction's, whose kernel
-    /// appends to the result.
+    /// `Input`, a `Const` or a `Record` stays unwritten, and so does the last instruction's, which
+    /// runs into the result ([`Scratch::block`]).
     slots: Vec<ColumnValue>,
     /// The current block: the rows `start..start + len` of the input.
     start: usize,
@@ -126,28 +135,65 @@ impl<'a> Scratch<'a> {
             Instr::Bin(..) | Instr::Un(..) => self.slots[slot]
                 .view()
                 .unwrap_or_else(|| panic!("the result s{slot} is a column of a base type")),
+            Instr::Record(_) => unreachable!("no instruction reads the record s{slot}"),
         }
     }
 
-    /// Run `program` over the rows `start..start + len` and append the block's result to `out`.
+    /// Run `program` over the rows `start..start + len` and append the block's result to `out`,
+    /// the result column of [`ScalarProgram::empty_output`], with room for the whole input
+    /// reserved.
     ///
-    /// The last instruction's kernel appends straight to `out`, so the result is written once,
-    /// with no slot of its own and no copy out of one. `out` is the result column of
-    /// [`ScalarProgram::empty_output`], with room for the whole input reserved.
+    /// Every operation but the last runs into its own slot. No instruction reads the last one, so
+    /// it runs into `out`: an operation by its kernel, with no slot of its own, and a `Record` by
+    /// copying each field's block from the slot, input region or constant the field names.
     fn block(&mut self, program: &ScalarProgram, start: usize, len: usize, out: &mut ColumnValue) {
         self.start = start;
         self.len = len;
-        let (last, body) = program
-            .instrs
-            .split_last()
-            .expect("a program has an output instruction");
-        for (slot, instr) in body.iter().enumerate() {
-            self.run(program, slot, instr);
+        let last = program.instrs.len() - 1;
+        for slot in 0..last {
+            self.run_into_slot(program, slot);
         }
-        match last {
-            Instr::Un(op, a) => {
-                apply_unaryop_views(*op, &self.view(program, *a as usize), out);
+        self.run(program, last, out);
+    }
+
+    /// Run instruction `slot` into its own slot, if it is an operation. An `Input`, a `Const` or a
+    /// `Record` writes no slot: [`Scratch::view`] reads the first two in place, and
+    /// [`Scratch::run`] appends a record field by field.
+    fn run_into_slot(&mut self, program: &ScalarProgram, slot: usize) {
+        let instr = &program.instrs[slot];
+        if !matches!(instr, Instr::Bin(..) | Instr::Un(..)) {
+            return;
+        }
+        let mut column = self.slot_column(program, slot, instr);
+        self.run(program, slot, &mut column);
+        self.slots[slot] = column;
+    }
+
+    /// The column an operation writes its block into: its slot's buffer, cleared, or on the first
+    /// block a new empty column of the operation's result type.
+    fn slot_column(&mut self, program: &ScalarProgram, slot: usize, instr: &Instr) -> ColumnValue {
+        let mut column = take(&mut self.slots[slot]);
+        if !matches!(column, ColumnValue::Units(_)) {
+            column.clear();
+            return column;
+        }
+        match instr {
+            // `neg` and `not` keep their operand's type.
+            Instr::Un(_, a) => self.view(program, *a as usize).empty_like(),
+            Instr::Bin(op, a, _) => binop_result_column(*op, &self.view(program, *a as usize)),
+            Instr::Input { .. } | Instr::Const(_) | Instr::Record(_) => {
+                unreachable!("only an operation writes a slot")
             }
+        }
+    }
+
+    /// Append the block of operation or `Record` `slot` to `out`, a column of its type. An
+    /// operation runs its kernel over its operands' blocks. A `Record` appends each field: a field
+    /// that is itself a `Record` the same way, since a `Record` writes no slot, and any other field
+    /// by copying its block from the slot, input region or constant it names.
+    fn run(&self, program: &ScalarProgram, slot: usize, out: &mut ColumnValue) {
+        match &program.instrs[slot] {
+            Instr::Un(op, a) => apply_unaryop_views(*op, &self.view(program, *a as usize), out),
             Instr::Bin(op, a, b) => {
                 let (a, b) = (
                     self.view(program, *a as usize),
@@ -155,41 +201,25 @@ impl<'a> Scratch<'a> {
                 );
                 apply_binop_views(*op, &a, &b, out);
             }
-            Instr::Input { .. } | Instr::Const(_) => {
-                unreachable!("the output of a prefix is an operation, which `root_of` checks")
-            }
-        }
-    }
-
-    /// Write the block of an operation into `slot`. An `Input` or a `Const` is read in place.
-    fn run(&mut self, program: &ScalarProgram, slot: usize, instr: &Instr) {
-        match instr {
-            Instr::Input { .. } | Instr::Const(_) => {}
-            Instr::Un(op, a) => {
-                let mut out = take(&mut self.slots[slot]);
-                let a = self.view(program, *a as usize);
-                if matches!(out, ColumnValue::Units(_)) {
-                    out = a.empty_like();
-                } else {
-                    out.clear();
+            Instr::Record(fields) => {
+                let ColumnValue::Records(columns) = out else {
+                    panic!("a record is appended to a record column, got {out:?}")
+                };
+                for (name, field) in fields {
+                    let column = columns
+                        .get_mut(name)
+                        .unwrap_or_else(|| panic!("the result has a column for the field {name}"));
+                    let field = *field as usize;
+                    match &program.instrs[field] {
+                        Instr::Record(_) => self.run(program, field, column),
+                        _ => column.extend_from_view(self.view(program, field)),
+                    }
                 }
-                apply_unaryop_views(*op, &a, &mut out);
-                self.slots[slot] = out;
             }
-            Instr::Bin(op, a, b) => {
-                let mut out = take(&mut self.slots[slot]);
-                let (a, b) = (
-                    self.view(program, *a as usize),
-                    self.view(program, *b as usize),
-                );
-                if matches!(out, ColumnValue::Units(_)) {
-                    out = binop_result_column(*op, &a);
-                } else {
-                    out.clear();
-                }
-                apply_binop_views(*op, &a, &b, &mut out);
-                self.slots[slot] = out;
-            }
+            Instr::Input { .. } | Instr::Const(_) => unreachable!(
+                "s{slot} runs only as an operation, the last instruction or a field that is a \
+                 `Record`, and the last instruction is an operation or a `Record`"
+            ),
         }
     }
 }
@@ -226,8 +256,8 @@ impl ScalarProgram {
         out
     }
 
-    /// The empty column the result is appended to: a column of the output instruction's type,
-    /// found from the input's columns and the instructions' types without evaluating any block.
+    /// The empty column the result is appended to: a column of the last instruction's type, found
+    /// from the input's columns and the instructions' types without evaluating any block.
     fn empty_output(&self, input: &ColumnValue) -> ColumnValue {
         let mut empties: Vec<ColumnValue> = Vec::with_capacity(self.instrs.len());
         for instr in &self.instrs {
@@ -242,10 +272,42 @@ impl ScalarProgram {
                         .expect("an operand is a column of a base type");
                     binop_result_column(*op, &operand)
                 }
+                Instr::Record(fields) => ColumnValue::Records(
+                    fields
+                        .iter()
+                        .map(|(name, field)| (name.clone(), empties[*field as usize].clone()))
+                        .collect(),
+                ),
             };
             empties.push(empty);
         }
-        empties.pop().expect("a program has an output instruction")
+        empties.pop().expect("a program has a last instruction")
+    }
+
+    /// Whether the last instruction is an operation or a `Record`, every `Record` is the last
+    /// instruction or a field of a later `Record`, and no operation reads one, so that a record is
+    /// built only into the result.
+    fn records_build_only_the_result(&self) -> bool {
+        let is_record = |slot: &Slot| matches!(self.instrs[*slot as usize], Instr::Record(_));
+        let last = self.instrs.len() - 1;
+        let result_is_built = !matches!(self.instrs[last], Instr::Input { .. } | Instr::Const(_));
+        result_is_built
+            && self
+                .instrs
+                .iter()
+                .enumerate()
+                .all(|(slot, instr)| match instr {
+                    Instr::Bin(_, a, b) => !is_record(a) && !is_record(b),
+                    Instr::Un(_, a) => !is_record(a),
+                    Instr::Record(_) => {
+                        slot == last
+                            || self.instrs[slot + 1..].iter().any(|later| {
+                                matches!(later, Instr::Record(fields)
+                            if fields.iter().any(|(_, field)| *field as usize == slot))
+                            })
+                    }
+                    Instr::Input { .. } | Instr::Const(_) => true,
+                })
     }
 }
 
@@ -258,6 +320,16 @@ impl std::fmt::Display for Instr {
             Instr::Un(op, a) => write!(f, "{op:?}(s{a})"),
             Instr::Bin(op, a, b) => {
                 write!(f, "{}(s{a}, s{b})", crate::pretty_graph::fmt_binop(op))
+            }
+            Instr::Record(fields) => {
+                write!(f, "(")?;
+                for (i, (name, field)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}: s{field}")?;
+                }
+                write!(f, ")")
             }
         }
     }
@@ -293,17 +365,21 @@ enum Val {
     /// A closed value, the same at every position, with its extent: held as a value until an
     /// operation reads a base value of it as a column, or a comparison takes a record apart.
     Const(Value, Extent),
-    /// The arms of a `zip`, which a binary operation takes its operands from.
+    /// The arms of a `zip` of a tuple, which a binary operation takes its operands from.
     Tuple(Vec<Val>),
+    /// The arms of a `zip` of a record, by name.
+    Record(Vec<(SmolStr, Val)>),
 }
 
 struct Parser {
-    /// The instructions emitted so far. Instructions are appended and never removed.
+    /// The instructions emitted so far. Instructions are appended, and removed only by
+    /// [`Parser::truncate`].
     instrs: Vec<Instr>,
     /// The `Input` instruction of each path read so far, so a path read twice is one slot.
     reads: HashMap<Vec<SmolStr>, Slot>,
     /// How many operations the chain read so far: every element that is neither the
-    /// identity nor a composition of others. Fusing replaces that many operators with one.
+    /// identity nor a composition of others. A prefix is taken only when it reads two or more
+    /// ([`fuse_prefix`]).
     ops: usize,
 }
 
@@ -311,6 +387,13 @@ impl Parser {
     fn emit(&mut self, instr: Instr) -> Slot {
         self.instrs.push(instr);
         (self.instrs.len() - 1) as Slot
+    }
+
+    /// Remove every instruction from `len` on, and the reads they made, returning the parser to
+    /// the state it had when it held `len` instructions.
+    fn truncate(&mut self, len: usize) {
+        self.instrs.truncate(len);
+        self.reads.retain(|_, slot| (*slot as usize) < len);
     }
 
     /// The column a value stands for, read into a slot: a computed column, a path of the input, or
@@ -332,7 +415,7 @@ impl Parser {
             Val::Const(value, extent) if has_view(extent) => {
                 Some((self.emit(Instr::Const(value.clone())), extent.clone()))
             }
-            Val::Read(..) | Val::Const(..) | Val::Tuple(_) => None,
+            Val::Read(..) | Val::Const(..) | Val::Tuple(_) | Val::Record(_) => None,
         }
     }
 
@@ -343,10 +426,19 @@ impl Parser {
         Some(Val::Const(value, extent))
     }
 
-    /// The fields of a record `v` that is read from the input or is a constant, each as the value
-    /// of that field. A value that is not a record has none.
+    /// The fields of a record `v`, each as the value of that field: the arms of a product built in
+    /// the chain, a tuple's by [`tuple_field`] name, and the fields of a record read from the input
+    /// or held as a constant. A value that is not a record has none.
     fn fields_of(v: &Val) -> Option<HashMap<SmolStr, Val>> {
         match v {
+            Val::Tuple(items) => Some(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| (tuple_field(i), item.clone()))
+                    .collect(),
+            ),
+            Val::Record(arms) => Some(arms.iter().cloned().collect()),
             Val::Read(path, extent) => Some(
                 extent
                     .record_fields()?
@@ -411,9 +503,9 @@ impl Parser {
         }
     }
 
-    /// A field of the chain's input. A projection of a product built in the chain,
-    /// `⟨f, g⟩ ≫ .0`, is a product beta redex that `simplify` reduces before conversion, so it is
-    /// not read.
+    /// A field of the chain's input. A projection of a product built in the chain is not read, and
+    /// ends the prefix: `simplify` reduces `⟨f, g⟩ ≫ .0` before conversion, and not a projection of
+    /// a record or of a wider tuple.
     fn project(v: Val, key: &ProjKey) -> Option<Val> {
         let Val::Read(mut path, extent) = v else {
             return None;
@@ -469,6 +561,11 @@ impl Parser {
                         .map(|arm| self.step(arm, cur.clone()))
                         .collect::<Option<Vec<_>>>()
                         .map(Val::Tuple),
+                    TypedExprNode::Record(arms) => arms
+                        .iter()
+                        .map(|(name, arm)| Some((name.runtime_key(), self.step(arm, cur.clone())?)))
+                        .collect::<Option<Vec<_>>>()
+                        .map(Val::Record),
                     _ => None,
                 },
                 _ => None,
@@ -477,17 +574,51 @@ impl Parser {
         }
     }
 
-    /// The slot a chain ending at `v` yields. A projection of the input is nothing to compute,
+    /// What a chain ending at `v` yields. A projection of the input is nothing to compute,
     /// whatever its path: the projection's own conversion takes the field without copying it, and
-    /// the prefix ends at an operation, so an `Input` is emitted only for an operation that reads
-    /// it. A constant has no root for the same reason, since `simplify` has already reduced
-    /// `f ≫ c ▷ const`. A product ends as a tile of its fields rather than as one column, which a
-    /// column function cannot build, so a product has none.
+    /// the prefix ends at an operation or a product, so an `Input` is emitted only for an
+    /// operation or a field that reads it. A constant has no root for the same reason, since
+    /// `simplify` has already reduced `f ≫ c ▷ const`. A product is one column of records.
+    ///
+    /// The root is the last instruction, with its extent. An operation's value is the instruction
+    /// its element emitted last, and a product's `Record` is emitted after its fields'.
     fn root_of(&mut self, v: &Val) -> Option<(Slot, Extent)> {
         match v {
-            Val::Slot(..) => self.column(v),
-            Val::Read(..) | Val::Const(..) | Val::Tuple(_) => None,
+            Val::Slot(slot, extent) => {
+                debug_assert_eq!(
+                    *slot as usize + 1,
+                    self.instrs.len(),
+                    "an element that yields a computed value emits its operation last"
+                );
+                Some((*slot, extent.clone()))
+            }
+            Val::Tuple(_) | Val::Record(_) => self.output(v),
+            Val::Read(..) | Val::Const(..) => None,
         }
+    }
+
+    /// `v` as a column of the result, with its extent. A record ([`Parser::fields_of`]) is a
+    /// `Record` of its fields' columns, down to columns of base types; anything else is its
+    /// column. A field with no column to read, such as one of `Unit` type, has none, and neither
+    /// has a product with no field, which has no column to count its rows.
+    fn output(&mut self, v: &Val) -> Option<(Slot, Extent)> {
+        let mut fields: Vec<(SmolStr, Val)> = match Self::fields_of(v) {
+            Some(fields) => fields.into_iter().collect(),
+            None => return self.column(v),
+        };
+        if fields.is_empty() {
+            return None;
+        }
+        // In name order, so that equal chains give equal programs.
+        fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let mut named = Vec::with_capacity(fields.len());
+        let mut extents = HashMap::with_capacity(fields.len());
+        for (name, field) in fields {
+            let (slot, extent) = self.output(&field)?;
+            named.push((name.clone(), slot));
+            extents.insert(name, extent);
+        }
+        Some((self.emit(Instr::Record(named)), Extent::Record(extents)))
     }
 }
 
@@ -530,11 +661,13 @@ fn is_plain(extent: &Extent) -> bool {
 /// The recognizer reads the identity, projections, closed constants, binary and unary
 /// operations, and `zip`s of such chains. The prefix ends before the first other element: an
 /// aggregate, a lookup, a conditional, a store read, or a constant that is not closed has a
-/// domain or a value outside the input column. A prefix of one operation keeps its own
-/// conversion, since fusing it would replace one operator with one. A binary operation takes its
-/// operands from a `zip`, so a prefix that holds one is at least two operations: `x + 1` fuses,
-/// and the single-operation prefixes are a lone unary operation (`neg`, `not`), a projection and
-/// a constant.
+/// domain or a value outside the input column. A chosen prefix ends at an operation, or at a
+/// `zip`, whose result is one column of records (`Parser::root_of`), and reads at least two
+/// operations, counting every element but the identity and a composition. A binary operation
+/// takes its operands from a `zip`, so a prefix that holds one is at least two operations:
+/// `x + 1` fuses. A prefix of one operation keeps its own conversion: a lone unary operation
+/// (`neg`, `not`), a projection or a constant is one operator either way, and a lone `zip` of
+/// identities, such as `(x, x)`, keeps its `Memo`, `FanOut`s and `Zip`.
 pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
     if !is_plain(input) {
         return None;
@@ -545,33 +678,41 @@ pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
         ops: 0,
     };
     let mut cur = Val::Read(Vec::new(), input.clone());
-    // The chosen prefix: how many elements it consumes, how many instructions it keeps, and its
-    // output extent.
-    let mut best: Option<(usize, usize, Extent)> = None;
+    // The chosen prefix: how many elements it consumes, how many instructions it holds before
+    // its output reads the fields of a product, and the value it ends at.
+    let mut best: Option<(usize, usize, Val)> = None;
     for (k, e) in chain.iter().enumerate() {
         let Some(next) = parser.step(e, cur.clone()) else {
             break;
         };
         cur = next;
-        if parser.ops >= 2
-            && let Some((output, extent)) = parser.root_of(&cur)
-        {
-            debug_assert_eq!(
-                output as usize + 1,
-                parser.instrs.len(),
-                "the output of a prefix is the instruction emitted last: no element projects an \
-                 arm of a zip away, because `simplify` reduces `⟨f, g⟩ ≫ .0` before conversion"
-            );
-            best = Some((k + 1, parser.instrs.len(), extent));
+        if parser.ops >= 2 {
+            // The output of a product emits its `Record`s and reads its fields' `Input`s and
+            // `Const`s into slots, none of which the rest of the chain reads: they are removed
+            // here and emitted again once the prefix is chosen.
+            let len = parser.instrs.len();
+            if parser.root_of(&cur).is_some() {
+                best = Some((k + 1, len, cur.clone()));
+            }
+            parser.truncate(len);
         }
     }
-    let (consumed, len, codomain) = best?;
+    let (consumed, len, root) = best?;
     // Instructions past the prefix belong to an element the parse then abandoned.
-    parser.instrs.truncate(len);
+    parser.truncate(len);
+    let (_, codomain) = parser
+        .root_of(&root)
+        .expect("the root is read from the state it was chosen in");
+    let program = ScalarProgram {
+        instrs: parser.instrs,
+    };
+    debug_assert!(
+        program.records_build_only_the_result(),
+        "a `Record` is the last instruction or a field of a later one, and no operation reads \
+         one; got {program}"
+    );
     Some(Fused {
-        program: ScalarProgram {
-            instrs: parser.instrs,
-        },
+        program,
         domain: input.clone(),
         codomain,
         consumed,
@@ -856,13 +997,13 @@ mod tests {
     }
 
     /// A record against a base value, two records with no field in common, and an ordering of two
-    /// records are not compared, so the chain stays unfused.
+    /// records are not compared, so the prefix ends before the comparison.
     #[test]
     fn a_comparison_without_a_field_to_compare_is_not_fused() {
         let (record, other) = (tuple_of_ints(2), record_of("x", int()));
         let fuses = |input: &Extent, constant: Expr, op: CompareKind| {
             let chain = vec![zip(vec![id(), constant]), binop(BinOpKind::Compare(op))];
-            fuse_prefix(&chain, input).is_some()
+            fuse_prefix(&chain, input).is_some_and(|fused| fused.consumed == chain.len())
         };
         assert!(fuses(&record, closed_tuple(&[1, 2]), CompareKind::Equals));
         assert!(!fuses(&record, constant(1), CompareKind::Equals));
@@ -895,6 +1036,58 @@ mod tests {
             vec![false; n]
         );
         assert_eq!(compare(CompareKind::NotEquals, vec![a, b]), vec![true; n]);
+    }
+
+    /// A product built in the chain is taken apart like a record read or held as a constant, so
+    /// `(a: (z: x * 2) == (z: x + 1))` is one program whose only `Record` is the result.
+    #[test]
+    fn a_product_built_in_the_chain_is_compared_field_by_field() {
+        let eq = Expr::compose(vec![
+            zip(vec![
+                zip_record(vec![("z", arith(ArithmeticKind::Mul, 2))]),
+                zip_record(vec![("z", arith(ArithmeticKind::Add, 1))]),
+            ]),
+            binop(BinOpKind::Compare(CompareKind::Equals)),
+        ]);
+        let chain = vec![zip_record(vec![("a", eq)])];
+        let fused = fuse_prefix(&chain, &int()).expect("both records are built in the chain");
+        let records = fused
+            .program
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, Instr::Record(_)))
+            .count();
+        assert_eq!(records, 1, "{}", fused.program);
+        let out = fused.program.eval(&ColumnValue::Ints(vec![0, 1, 2]));
+        assert_eq!(
+            field_of(&out, "a"),
+            &ColumnValue::Bools(vec![false, true, false])
+        );
+    }
+
+    /// A tuple built in the chain compares with one read from the input, position by position:
+    /// `(x.1 - 1, x.1) == x` over the rows `(i % 2, 2)`.
+    #[test]
+    fn a_tuple_built_in_the_chain_compares_with_one_read() {
+        let second_minus_one = Expr::compose(vec![
+            zip(vec![Expr::proj_index(1), constant(1)]),
+            binop(BinOpKind::Arithmetic(ArithmeticKind::Sub)),
+        ]);
+        let built = zip(vec![second_minus_one, Expr::proj_index(1)]);
+        let compare = |op| {
+            let chain = vec![
+                zip(vec![built.clone(), id()]),
+                binop(BinOpKind::Compare(op)),
+            ];
+            let fused = fuse_prefix(&chain, &tuple_of_ints(2)).expect("the tuple is taken apart");
+            bools(fused.program.eval(&tuples(2, 5)))
+        };
+        let is_one: Vec<bool> = (0..5).map(|i| i % 2 == 1).collect();
+        assert_eq!(compare(CompareKind::Equals), is_one);
+        assert_eq!(
+            compare(CompareKind::NotEquals),
+            is_one.iter().map(|b| !b).collect::<Vec<_>>()
+        );
     }
 
     /// A nested record is not equal when any base field differs: `!=` is joined by `or` at every
@@ -1066,10 +1259,341 @@ mod tests {
         assert_eq!(fuse_prefix(&chain, &int()).unwrap().consumed, 2);
     }
 
-    /// A zip that ends the chain is a tile of fields, which one column cannot be.
+    /// `zip` of a record with the arms `arms`, by name.
+    fn zip_record(arms: Vec<(&str, Expr)>) -> Expr {
+        let arms = arms
+            .into_iter()
+            .map(|(name, arm)| (name.into(), arm))
+            .collect();
+        Expr::apply(
+            Expr::new(TypedExprNode::Record(arms)),
+            Expr::builtin(Builtin::Zip),
+        )
+    }
+
+    /// `x op n` as a chain element.
+    fn arith(op: ArithmeticKind, n: i64) -> Expr {
+        Expr::compose(vec![
+            zip(vec![id(), constant(n)]),
+            binop(BinOpKind::Arithmetic(op)),
+        ])
+    }
+
+    fn record_of_extents(fields: Vec<(&str, Extent)>) -> Extent {
+        Extent::Record(
+            fields
+                .into_iter()
+                .map(|(name, extent)| (SmolStr::from(name), extent))
+                .collect(),
+        )
+    }
+
+    /// The column of field `name` of a column of records.
+    fn field_of<'c>(column: &'c ColumnValue, name: &str) -> &'c ColumnValue {
+        let ColumnValue::Records(fields) = column else {
+            panic!("expected a column of records, got {column:?}")
+        };
+        &fields[name]
+    }
+
+    /// A chain that ends in a `zip` yields one column of records, a field per arm, and an arm
+    /// that reads the input or a constant is a field like any other.
     #[test]
-    fn a_product_result_is_not_fused() {
-        assert!(fuse_prefix(&[zip(vec![id(), constant(1)])], &int()).is_none());
+    fn a_tuple_result_is_one_column_of_records() {
+        let chain = vec![zip(vec![arith(ArithmeticKind::Add, 1), id(), constant(7)])];
+        let fused = fuse_prefix(&chain, &int()).expect("every arm is element-wise");
+        assert_eq!(fused.consumed, 1);
+        assert_eq!(fused.codomain, tuple_of_ints(3));
+        let out = fused.program.eval(&ColumnValue::Ints(vec![1, 2]));
+        assert_eq!(field_of(&out, "_0"), &ColumnValue::Ints(vec![2, 3]));
+        assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![1, 2]));
+        assert_eq!(field_of(&out, "_2"), &ColumnValue::Ints(vec![7, 7]));
+    }
+
+    /// A record `zip` names its fields, and an arm that is itself a `zip` is a column of records
+    /// inside the result: `(a: x + 1, b: (c: x - 1, d: 1))`.
+    #[test]
+    fn a_nested_record_result_is_a_record_column_inside_one() {
+        let chain = vec![zip_record(vec![
+            ("a", arith(ArithmeticKind::Add, 1)),
+            (
+                "b",
+                zip_record(vec![
+                    ("c", arith(ArithmeticKind::Sub, 1)),
+                    ("d", constant(1)),
+                ]),
+            ),
+        ])];
+        let fused = fuse_prefix(&chain, &int()).expect("every arm is element-wise");
+        let inner = record_of_extents(vec![("c", int()), ("d", int())]);
+        assert_eq!(
+            fused.codomain,
+            record_of_extents(vec![("a", int()), ("b", inner)])
+        );
+        let out = fused.program.eval(&ColumnValue::Ints(vec![5, 10]));
+        assert_eq!(field_of(&out, "a"), &ColumnValue::Ints(vec![6, 11]));
+        let b = field_of(&out, "b");
+        assert_eq!(field_of(b, "c"), &ColumnValue::Ints(vec![4, 9]));
+        assert_eq!(field_of(b, "d"), &ColumnValue::Ints(vec![1, 1]));
+    }
+
+    /// A field that holds a record read from the input is a record column of its base fields,
+    /// each read from the input.
+    #[test]
+    fn a_record_field_read_from_the_input_is_copied_field_by_field() {
+        let pair = tuple_of_ints(2);
+        let first_plus_one = Expr::compose(vec![
+            zip(vec![Expr::proj_index(0), constant(1)]),
+            binop(BinOpKind::Arithmetic(ArithmeticKind::Add)),
+        ]);
+        let chain = vec![zip(vec![id(), first_plus_one, constant(100)])];
+        let fused = fuse_prefix(&chain, &pair).expect("one field is computed");
+        assert_eq!(
+            fused.codomain,
+            record_of_extents(vec![("_0", pair), ("_1", int()), ("_2", int())])
+        );
+        let out = fused.program.eval(&tuples(2, 3));
+        assert_eq!(field_of(&out, "_0"), &tuples(2, 3));
+        assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![1, 2, 1]));
+        assert_eq!(field_of(&out, "_2"), &ColumnValue::Ints(vec![100; 3]));
+    }
+
+    /// A field that holds a closed record is a record column of its base values, each repeated.
+    #[test]
+    fn a_record_constant_field_is_repeated_field_by_field() {
+        let record = Expr::apply(
+            Expr::tuple(vec![
+                Expr::lit(Lit::Int(1)),
+                Expr::lit(Lit::String("s".into())),
+            ]),
+            Expr::builtin(Builtin::Const),
+        );
+        let chain = vec![zip(vec![arith(ArithmeticKind::Add, 1), record])];
+        let fused = fuse_prefix(&chain, &int()).expect("one field is computed");
+        let n = BLOCK_ROWS + 3;
+        let out = fused.program.eval(&ramp(n));
+        let constant = field_of(&out, "_1");
+        assert_eq!(field_of(constant, "_0"), &ColumnValue::Ints(vec![1; n]));
+        assert_eq!(
+            field_of(constant, "_1"),
+            &ColumnValue::Strings(vec!["s".into(); n])
+        );
+    }
+
+    /// A nested record of computed fields is built block by block:
+    /// `(a: x + 1, b: (c: x * 2, d: x))` over more than two blocks holds every row's fields.
+    #[test]
+    fn a_nested_computed_record_spans_blocks() {
+        let chain = vec![zip_record(vec![
+            ("a", arith(ArithmeticKind::Add, 1)),
+            (
+                "b",
+                zip_record(vec![("c", arith(ArithmeticKind::Mul, 2)), ("d", id())]),
+            ),
+        ])];
+        let fused = fuse_prefix(&chain, &int()).expect("every arm is element-wise");
+        let n = 2 * BLOCK_ROWS + 3;
+        let input = ramp(n);
+        let xs: Vec<i64> = (0..n as i64).map(|i| i * 7 % 3000).collect();
+        let out = fused.program.eval(&input);
+        let plus_one = xs.iter().map(|x| x + 1).collect();
+        assert_eq!(field_of(&out, "a"), &ColumnValue::Ints(plus_one));
+        let b = field_of(&out, "b");
+        let doubled = xs.iter().map(|x| x * 2).collect();
+        assert_eq!(field_of(b, "c"), &ColumnValue::Ints(doubled));
+        assert_eq!(field_of(b, "d"), &input);
+    }
+
+    /// A product of reads and constants is one column of records, its fields copied and repeated:
+    /// `(x, 1)` replaces the `MapResultToConst` that pairs the constant with `x`. A `zip` of
+    /// identities is one operation, so `(x, x)` keeps its own conversion.
+    #[test]
+    fn a_product_of_reads_and_constants_fuses() {
+        let chain = vec![zip(vec![id(), constant(1)])];
+        let fused = fuse_prefix(&chain, &int()).expect("a zip and a constant are two operations");
+        let out = fused.program.eval(&ColumnValue::Ints(vec![4, 5]));
+        assert_eq!(field_of(&out, "_0"), &ColumnValue::Ints(vec![4, 5]));
+        assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![1, 1]));
+        let pair = tuple_of_ints(2);
+        let swapped = vec![zip(vec![
+            Expr::proj_index(1),
+            Expr::proj_index(0),
+            closed_tuple(&[1, 2]),
+        ])];
+        let fused = fuse_prefix(&swapped, &pair).expect("two projections and a constant");
+        let out = fused.program.eval(&tuples(2, 3));
+        assert_eq!(field_of(&out, "_0"), &ColumnValue::Ints(vec![2; 3]));
+        assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![0, 1, 0]));
+        assert!(fuse_prefix(&[zip(vec![id(), id()])], &int()).is_none());
+    }
+
+    /// A field with no column to read declines the product: a `Units` column has no view.
+    #[test]
+    fn a_product_with_a_unit_field_is_not_fused() {
+        let unit = record_of_extents(vec![("u", Extent::Base(BaseType::Unit)), ("x", int())]);
+        let x_plus_one = Expr::compose(vec![
+            zip(vec![Expr::proj_field("x"), constant(1)]),
+            binop(BinOpKind::Arithmetic(ArithmeticKind::Add)),
+        ]);
+        let with_unit = vec![zip(vec![id(), x_plus_one.clone()])];
+        assert!(fuse_prefix(&with_unit, &unit).is_none());
+        let without = vec![zip(vec![Expr::proj_field("x"), x_plus_one])];
+        assert!(fuse_prefix(&without, &unit).is_some());
+    }
+
+    /// A computed value that two fields and an operation read is one slot, computed once and copied
+    /// into each field: `(x + 1) ≫ (id, id, id * 2)`, as `simplify` leaves
+    /// `[(y, y, y * 2) for y in [x + 1 for x in xs]]`.
+    #[test]
+    fn a_value_two_fields_name_is_computed_once() {
+        let chain = vec![
+            arith(ArithmeticKind::Add, 1),
+            zip(vec![id(), id(), arith(ArithmeticKind::Mul, 2)]),
+        ];
+        let fused = fuse_prefix(&chain, &int()).unwrap();
+        let adds = fused
+            .program
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, Instr::Bin(InterpreterBinOp::Arithmetic(_), ..)))
+            .count();
+        assert_eq!(adds, 2, "one `add` and one `mul`: {}", fused.program);
+        let out = fused.program.eval(&ColumnValue::Ints(vec![1, 2]));
+        assert_eq!(field_of(&out, "_0"), &ColumnValue::Ints(vec![2, 3]));
+        assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![2, 3]));
+        assert_eq!(field_of(&out, "_2"), &ColumnValue::Ints(vec![4, 6]));
+    }
+
+    /// A product the chain goes on to read is not an output, so the reads its fields would make
+    /// are not in the program: `(x, 1) ▷ zip ≫ add` is the input, the constant and the sum.
+    #[test]
+    fn a_product_the_chain_reads_on_leaves_no_instruction_behind() {
+        let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
+        let chain = vec![zip(vec![id(), constant(1)]), add];
+        let fused = fuse_prefix(&chain, &int()).unwrap();
+        assert_eq!(fused.consumed, 2);
+        assert_eq!(fused.program.instrs.len(), 3, "{}", fused.program);
+        assert!(
+            matches!(fused.program.instrs[2], Instr::Bin(..)),
+            "{}",
+            fused.program
+        );
+    }
+
+    /// A prefix that ends at a product, followed by an element the parse abandons after emitting
+    /// an operation, gives the program of the product alone.
+    #[test]
+    fn a_prefix_can_end_at_a_product() {
+        let product = zip(vec![arith(ArithmeticKind::Add, 1), id()]);
+        let alone = fuse_prefix(std::slice::from_ref(&product), &int()).unwrap();
+        let abandoned = zip(vec![
+            binop(BinOpKind::Arithmetic(ArithmeticKind::Add)),
+            Expr::builtin(Builtin::Sum),
+        ]);
+        let fused = fuse_prefix(&[product, abandoned], &int()).unwrap();
+        assert_eq!(fused.consumed, 1);
+        assert_eq!(fused.program, alone.program);
+    }
+
+    /// Every field is evaluated over each block, so the columns agree with a single pass for
+    /// lengths on and around a block.
+    #[test]
+    fn a_record_result_is_evaluated_block_by_block() {
+        let chain = vec![zip_record(vec![
+            ("plus", arith(ArithmeticKind::Add, 1)),
+            ("same", id()),
+            ("big", compare(CompareKind::Greater, 1000)),
+            ("seven", constant(7)),
+        ])];
+        let fused = fuse_prefix(&chain, &int()).unwrap();
+        for n in [
+            0,
+            1,
+            BLOCK_ROWS - 1,
+            BLOCK_ROWS,
+            BLOCK_ROWS + 1,
+            3 * BLOCK_ROWS + 37,
+        ] {
+            let ColumnValue::Ints(xs) = ramp(n) else {
+                unreachable!()
+            };
+            let out = fused.program.eval(&ColumnValue::Ints(xs.clone()));
+            let plus: Vec<i64> = xs.iter().map(|x| x + 1).collect();
+            let big: Vec<bool> = xs.iter().map(|&x| x > 1000).collect();
+            assert_eq!(field_of(&out, "plus"), &ColumnValue::Ints(plus), "n = {n}");
+            assert_eq!(field_of(&out, "same"), &ColumnValue::Ints(xs), "n = {n}");
+            assert_eq!(field_of(&out, "big"), &ColumnValue::Bools(big), "n = {n}");
+            assert_eq!(
+                field_of(&out, "seven"),
+                &ColumnValue::Ints(vec![7; n]),
+                "n = {n}"
+            );
+        }
+    }
+
+    /// A nested product is a `Record` that a later `Record` names, and the outer one is the last
+    /// instruction. A `Record` that an operation reads, or that nothing names before the end,
+    /// breaks the invariant `fuse_prefix` asserts, and so does a program whose last instruction is
+    /// an `Input` or a `Const`.
+    #[test]
+    fn a_record_is_only_the_result_or_a_field_of_one() {
+        let chain = vec![zip_record(vec![
+            ("a", arith(ArithmeticKind::Add, 1)),
+            ("b", zip_record(vec![("c", id()), ("d", constant(1))])),
+        ])];
+        let program = fuse_prefix(&chain, &int()).unwrap().program;
+        assert!(program.records_build_only_the_result(), "{program}");
+        let records: Vec<usize> = program
+            .instrs
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, instr)| matches!(instr, Instr::Record(_)).then_some(slot))
+            .collect();
+        assert_eq!(records.len(), 2, "{program}");
+        assert_eq!(records[1], program.instrs.len() - 1, "{program}");
+        let read = ScalarProgram {
+            instrs: vec![
+                Instr::Input { path: Vec::new() },
+                Instr::Record(vec![("a".into(), 0)]),
+                Instr::Un(UnaryOpKind::Neg, 1),
+            ],
+        };
+        assert!(!read.records_build_only_the_result());
+        let unnamed = ScalarProgram {
+            instrs: vec![
+                Instr::Input { path: Vec::new() },
+                Instr::Record(vec![("a".into(), 0)]),
+                Instr::Un(UnaryOpKind::Neg, 0),
+            ],
+        };
+        assert!(!unnamed.records_build_only_the_result());
+        let bare_read = ScalarProgram {
+            instrs: vec![Instr::Input { path: Vec::new() }],
+        };
+        assert!(!bare_read.records_build_only_the_result());
+    }
+
+    /// The output lists a record's fields in name order, whatever order the `zip` lists them in.
+    #[test]
+    fn a_record_result_lists_its_fields_in_name_order() {
+        let arms = || {
+            vec![
+                ("b", arith(ArithmeticKind::Mul, 2)),
+                ("a", arith(ArithmeticKind::Add, 1)),
+            ]
+        };
+        let listed = fuse_prefix(&[zip_record(arms())], &int()).unwrap();
+        let reversed = fuse_prefix(&[zip_record(arms().into_iter().rev().collect())], &int());
+        let Some(Instr::Record(fields)) = listed.program.instrs.last() else {
+            panic!("a record output, got {}", listed.program)
+        };
+        let names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        let out = listed.program.eval(&ColumnValue::Ints(vec![3]));
+        assert_eq!(
+            reversed.unwrap().program.eval(&ColumnValue::Ints(vec![3])),
+            out
+        );
     }
 
     #[test]

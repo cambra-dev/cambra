@@ -54,9 +54,6 @@ use panic_message::panic_message;
 const BROKEN: &[(&str, &str, &str)] = &[
     ("function_body", "rows_sum", "CompilerPanics"),
     ("generator_yield", "rows_sum", "CompilerPanics"),
-    ("groupby_tuple_key", "rec_comp", "CompilerPanics"),
-    ("groupby_tuple_key", "rec_filtered", "CompilerPanics"),
-    ("groupby_tuple_key", "rec_list", "CompilerPanics"),
     (
         "loop_source_in_loop",
         "binder_filtered_comp[i]",
@@ -76,6 +73,19 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("nested_mut_source", "map_arrow", "CompilerPanics"),
     ("nested_mut_source", "map_lit", "CompilerPanics"),
     ("nested_mut_source", "union", "CompilerRejects"),
+    // The binder arm fuses into one column of records and the literal arm is a record of tiles;
+    // `UnionOperator::new` accepts arms of differing layout only one record level deep.
+    ("nested_record_branch", "nested_rec_lit", "CompilerPanics"),
+    (
+        "nested_record_comp_union",
+        "nested_rec_lit",
+        "CompilerPanics",
+    ),
+    (
+        "nested_record_mut_branch",
+        "nested_rec_lit",
+        "CompilerPanics",
+    ),
     ("record_in_list", "comp_sum", "CompilerRejects"),
     ("record_in_list", "filtered_sum", "CompilerRejects"),
     ("record_in_list", "generator_max", "CompilerRejects"),
@@ -144,6 +154,8 @@ enum Ty {
     Rec,
     /// A collection of those records.
     RecColl,
+    /// A record with an integer field `a` and a record field `n` of integers `c` and `d`.
+    NestedRec,
     /// A collection of strings.
     StrColl,
     /// A tagged value, `some` or `none`.
@@ -477,6 +489,32 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             r = {}
             out << r.a + r.b
+        "#}},
+        Skeleton { name: "nested_record_feed", hole: Ty::NestedRec, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            out << {}
+        "#}},
+        // A nested record beside another of the same type: one arm of a conditional, of a
+        // concatenation and of a conditional write, where the other arm is a literal built from
+        // the binder.
+        Skeleton { name: "nested_record_branch", hole: Ty::NestedRec, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2, 3]:
+                out << ({} if i > 1 else (a=i, n=(c=i, d=0)))
+        "#}},
+        Skeleton { name: "nested_record_comp_union", hole: Ty::NestedRec, scope: &[("x", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            out << [{} for x in [1, 2]] ++ [(a=y, n=(c=y, d=2)) for y in [5, 6]]
+        "#}},
+        Skeleton { name: "nested_record_mut_branch", hole: Ty::NestedRec, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            p := (a=0, n=(c=0, d=0))
+            for i in [1, 2, 3]:
+                if i > 1:
+                    p := {}
+                else:
+                    p := (a=i, n=(c=i, d=i))
+            out = test_sink()
+            out << p
         "#}},
         Skeleton { name: "mut_reads_itself", hole: Ty::Int, scope: &[("acc", Ty::Int)], body: indoc! {r#"
             acc := 1
@@ -990,6 +1028,18 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "rec_list", ty: Ty::RecColl, needs: &[], decls: "", expr: "[(a=1, b=2), (a=3, b=2)]" },
         Filler { name: "rec_comp", ty: Ty::RecColl, needs: &[], decls: "", expr: "[(a=z, b=1) for z in [1, 2, 3]]" },
         Filler { name: "rec_filtered", ty: Ty::RecColl, needs: &[], decls: "", expr: "[r2 for r2 in [(a=1, b=2), (a=3, b=2)] if r2.a > 1]" },
+        // Records of element-wise arms, which operator conversion fuses into one map yielding a
+        // column of records: computed fields, a field copied from the input, and fields of a
+        // record.
+        Filler { name: "rec_binder_computed", ty: Ty::Rec, needs: &[Ty::Int], decls: "", expr: "(a={b} - 1, b={b} * {b})" },
+        Filler { name: "rec_comp_computed", ty: Ty::RecColl, needs: &[], decls: "", expr: "[(a=z * 2, b=z + 1) for z in [1, 2, 3]]" },
+        Filler { name: "rec_comp_copied", ty: Ty::RecColl, needs: &[], decls: "", expr: "[(a=z, b=z // 2) for z in [1, 2, 3]]" },
+        Filler { name: "rec_comp_of_rec", ty: Ty::RecColl, needs: &[], decls: "", expr: "[(a=r2.b, b=r2.a + r2.b) for r2 in [(a=1, b=2), (a=3, b=4)]]" },
+        // Nested records: a literal, one with computed fields, and one built from the binder and
+        // constants alone.
+        Filler { name: "nested_rec_lit", ty: Ty::NestedRec, needs: &[], decls: "", expr: "(a=1, n=(c=2, d=3))" },
+        Filler { name: "nested_rec_computed", ty: Ty::NestedRec, needs: &[Ty::Int], decls: "", expr: "(a={b} + 1, n=(c={b} - 1, d=1))" },
+        Filler { name: "nested_rec_copied", ty: Ty::NestedRec, needs: &[Ty::Int], decls: "", expr: "(a={b}, n=(c={b}, d=1))" },
 
         // --- reading both binders in scope
         Filler { name: "two_binders", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "{b} + {c}" },

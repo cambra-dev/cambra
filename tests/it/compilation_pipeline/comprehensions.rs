@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bit_set::BitSet;
-use cambra::interpreter::{ColumnValue, Predicate, Tile, Value, tuple_field};
+use cambra::interpreter::{
+    ColumnValue, Predicate, Tile, Value, sort_function_by_domain, tuple_field,
+};
 use indoc::indoc;
 use rstest_log::rstest;
 
@@ -57,10 +59,10 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
 #[case("[y.0 for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
 #[case(
     "[(y, 100) for y in [(10, 'a'), (20, 'b')]]",
-    Tile::data_function(ColumnValue::UInts(vec![0, 1]), Box::new(Tile::record(HashMap::from([
+    Tile::data_function(ColumnValue::UInts(vec![0, 1]), Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
             (
                 tuple_field(0),
-                Tile::Scalar(ColumnValue::Records(HashMap::from([
+                ColumnValue::Records(HashMap::from([
                     (tuple_field(0), ColumnValue::Ints(vec![10, 20])),
                     (
                         tuple_field(1),
@@ -69,10 +71,10 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
                             "b".into(),
                         ]),
                     ),
-                ]))),
+                ])),
             ),
-            (tuple_field(1), Tile::Scalar(ColumnValue::Ints(vec![100, 100]))),
-        ]))), Predicate::True, BitSet::new())
+            (tuple_field(1), ColumnValue::Ints(vec![100, 100])),
+        ])))), Predicate::True, BitSet::new())
 )]
 fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -1065,37 +1067,121 @@ fn an_emptied_row_keeps_its_place(#[case] program: &str, #[case] expected: &[i64
 /// or zips the arms' columns.
 #[test]
 fn a_conjunction_of_element_wise_arms_compiles_to_one_map() {
-    use std::{cell::RefCell, rc::Rc};
-
-    use cambra::ccl::Type;
-    use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
-    use cambra::ccl::load::LoadedProgram;
-    use cambra::interpreter::Consumer;
-
-    let mut ctx = GlobalContext::default();
-    ctx.register_source(Rc::new(RefCell::new(
-        cambra::interpreter::TestDataSource::new(
-            "source1",
-            Type::Base(cambra::ccl::BaseType::Int),
-            cambra::interpreter::Extent::Base(cambra::interpreter::BaseType::Int),
-        ),
-    )));
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let program = LoadedProgram::test("sum([x for x in source1() if x > 500 and x < 1500])");
-    let compiled = compile_program(&mut ctx, &program, consumer).unwrap_or_render(&program);
-    let kinds: Vec<&str> = compiled
-        .operator_graph
-        .nodes()
-        .iter()
-        .filter_map(|node| match node {
-            cambra::interpreter::operator_graph::GraphNode::Operator { kind, .. } => Some(*kind),
-            _ => None,
-        })
-        .collect();
+    let kinds = operator_kinds_over_source1("sum([x for x in source1() if x > 500 and x < 1500])");
     for fan_out in ["MapResultToConst", "Memo", "FanOutSlot", "Zip"] {
         assert!(
             !kinds.contains(&fan_out),
             "an element-wise chain over one input needs no {fan_out}, got {kinds:?}"
         );
     }
+}
+
+/// A tuple or a record of element-wise arms, nested or not, is one map yielding one column of
+/// records: nothing fans the input out, maps each arm, or zips the arms' columns.
+#[rstest]
+#[case::tuple("[(x + 1, x * 2) for x in source1()]")]
+#[case::record("[(n=x, doubled=x * 2) for x in source1()]")]
+#[case::nested_record("[(a=x + 1, b=(c=x - 1, d=1)) for x in source1()]")]
+#[case::nested_tuple("[(x + 1, (x, x * 2)) for x in source1()]")]
+#[case::read_and_constant("[(x, 1) for x in source1()]")]
+fn a_product_of_element_wise_arms_compiles_to_one_map(#[case] code: &str) {
+    assert_eq!(
+        operator_kinds_over_source1(code),
+        [
+            "IterateExtent",
+            "MapResultWithSource",
+            "Constant",
+            "MapResult"
+        ],
+    );
+}
+
+/// A comparison of two products built per element is taken apart into its fields' comparisons,
+/// so the chain is one map: no `MapResult` builds the products and another compares them.
+#[rstest]
+#[case::records_in_a_record("[(a=(z=x * 2) == (z=x + 1)) for x in source1()]")]
+#[case::tuples("[(x * 2, x) != (x + x, x + 1) for x in source1()]")]
+fn a_comparison_of_products_built_per_element_compiles_to_one_map(#[case] code: &str) {
+    assert_eq!(
+        operator_kinds_over_source1(code),
+        [
+            "IterateExtent",
+            "MapResultWithSource",
+            "Constant",
+            "MapResult"
+        ],
+    );
+}
+
+/// An arm outside the element-wise set keeps the product on the `Zip` path.
+#[test]
+fn a_product_with_a_collection_arm_keeps_its_zip() {
+    let kinds =
+        operator_kinds_over_source1("[(a=x + 1, b=[y + 1 for y in [1, 2]]) for x in source1()]");
+    assert!(
+        kinds.contains(&"Zip"),
+        "an arm that is not element-wise keeps the zip, got {kinds:?}"
+    );
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::tuple(
+    "[(x + 1, x * 2) for x in [1, 2, 3]]",
+    vec![("_0", vec![2, 3, 4]), ("_1", vec![2, 4, 6])]
+)]
+#[case::a_field_reading_the_input_and_a_constant(
+    "[(x, x * 2 + 1, 5) for x in [1, 2, 3]]",
+    vec![("_0", vec![1, 2, 3]), ("_1", vec![3, 5, 7]), ("_2", vec![5, 5, 5])]
+)]
+#[case::filtered(
+    "[(x * 2, x + 1) for x in [1, 2, 3, 4] if x > 2]",
+    vec![("_0", vec![6, 8]), ("_1", vec![4, 5])]
+)]
+#[case::record_of_record_fields(
+    "[(a=p.b, b=p.a + p.b) for p in [(a=1, b=2), (a=3, b=4)]]",
+    vec![("a", vec![2, 4]), ("b", vec![3, 7])]
+)]
+fn a_fused_product_holds_each_arms_column(
+    #[case] code: &str,
+    #[case] fields: Vec<(&str, Vec<i64>)>,
+) {
+    let tile = sort_function_by_domain(run_pipeline(code));
+    for (field, column) in fields {
+        assert_eq!(
+            extract_record_field(tile.clone(), field),
+            ColumnValue::Ints(column),
+            "field {field} of {code}"
+        );
+    }
+}
+
+/// A record field that is itself a record of element-wise arms is a column of records inside
+/// the result's column.
+#[test]
+fn a_fused_nested_record_holds_a_record_column() {
+    let tile = sort_function_by_domain(run_pipeline(
+        "[(a=x + 1, b=(c=x - 1, d=1)) for x in [1, 2, 3, 4]]",
+    ));
+    assert_eq!(
+        extract_record_field(tile.clone(), "a"),
+        ColumnValue::Ints(vec![2, 3, 4, 5])
+    );
+    let ColumnValue::Records(b) = extract_record_field(tile, "b") else {
+        panic!("field b is a column of records");
+    };
+    assert_eq!(b["c"], ColumnValue::Ints(vec![0, 1, 2, 3]));
+    assert_eq!(b["d"], ColumnValue::Ints(vec![1, 1, 1, 1]));
+}
+
+/// A fused column of records bound once and read twice is projected field by field downstream.
+#[test]
+fn a_bound_fused_product_is_read_by_field() {
+    check_tile(
+        indoc! {"
+            ts = [(x + 1, x * 2) for x in [1, 2, 3]]
+            sum([t.0 for t in ts]) + sum([t.1 for t in ts])
+        "},
+        Tile::Scalar(ColumnValue::Ints(vec![21])),
+    );
 }

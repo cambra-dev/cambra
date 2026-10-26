@@ -512,7 +512,7 @@ boundary and is rejected.
 | `id`, `map(g)` | Pass the input through; `map` compiles `g` with that input |
 | `const(c)` | `MapResultToConst` on the input |
 | `zip(f, g)` | Share input through `FanOut` and combine results with `Zip`, unless the enclosing chain is element-wise (see [Element-wise chains](#element-wise-chains)) |
-| `zip((a: f, b: g))` | `zip_arms_named_at` selects `Zip` or `MakeRecord` |
+| `zip((a: f, b: g))` | `zip_arms_named_at` selects `Zip` or `MakeRecord`, unless the enclosing chain is element-wise (see [Element-wise chains](#element-wise-chains)) |
 | `.n`, `.field` | Project a tuple or record field |
 | `add`, `neg`, and other scalar builtins | Apply the corresponding scalar operator |
 | `(true ▷ const) ▷ iterate` | `IterateExtent` over the declared domain |
@@ -534,17 +534,30 @@ scalar builtins, and `zip`s of such chains, and converts it to
 `fuse_prefix`). The program is a straight-line sequence of instructions over slots, so a value that
 two operations read is computed once, and a field path is read from the input as one slice. The
 arms of a `zip` in the prefix read the same input, so the fused chain has no `Memo`, `FanOut`, `Zip`
-or intermediate pair. A prefix of fewer than two operations converts as before, since fusing it
-would replace one operator with one. A comparison of two records, `==` or `!=`, is read as one
-comparison per field both records carry, joined by `and` or `or`. A record against a non-record,
-two records with no field in common, and an ordering of records have no program, and the prefix
-ends before them.
+or intermediate pair. A prefix of fewer than two operations, counting every element but `id` and a
+composition, converts as before: a lone unary operation, projection or constant is one operator
+either way, and a lone `zip` of identities, such as `(x, x)`, keeps its `Memo`, `FanOut`s and
+`Zip`. A comparison of two records, `==` or `!=`, is read as one comparison per field both records
+carry, joined by `and` or `or`. Each record is read from the input, a constant, or built by a `zip`
+in the prefix. A record against a non-record, two records with no field in common, and an ordering
+of records have no program, and the prefix ends before them.
 
 The prefix ends before the first element outside that set. An aggregate, a lookup, a conditional,
 a store read, or a constant that is not closed stays an operator. Conversion also declines when
 the input is a bare product, whose fields are tiles, or when its values at the current level hold
-a collection, since neither is a column. A chain that ends in a `zip` is a tile of fields and
-stays on the `Zip` path; only a chain that ends in one column fuses.
+a collection, since neither is a column.
+
+Of the prefixes the parse reads, conversion takes the longest that ends at an operation or at a
+`zip`. A prefix that ends at a `zip` yields one column of records, `Tiling::Scalar` of a record
+extent, with a field per arm: `_0`, `_1`, … for a tuple and the arm's name for a record. An arm
+that is itself a `zip` is a column of records inside it. An arm that reads a record from the input,
+or is a record constant, is the record column of its base fields, copied or repeated block by
+block. A field of `Unit` type has no column to read, so a product holding one is not taken. The
+`Zip` path yields a record of tiles where the fused map yields a column of records, which is the
+tiling `Tiling::from_extent` gives a record of base values. A projection reads either layout
+(`selects_a_tile`). `Converse` inverts only a column. A `groupby` keyed by a product that fuses,
+such as `(e.a, e.b)`, groups by the fused column, and a key that keeps its `Zip`, such as
+`(e.a, sum(xs))`, is a record of tiles that `Converse` rejects.
 
 `build_product` uses the node's extent to distinguish a record of tiles from a collection of
 records. A record extent uses `MakeRecord`; a function extent uses `zip_arms_named_at`, which

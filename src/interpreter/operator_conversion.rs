@@ -1890,8 +1890,18 @@ fn convert_impl_inner(
                     let input = result.take().expect("fusable_prefix read an input");
                     // The map replaces the chain up to its last element, whose result it
                     // yields, so that element is the expression it belongs to.
-                    let _scope =
-                        crate::ccl::provenance::converting(rest[fused.consumed - 1].node_id());
+                    let last = &rest[fused.consumed - 1];
+                    debug_assert!(
+                        last.ty
+                            .codomain()
+                            .and_then(|ty| ctx.extent_of(&ty).ok())
+                            .is_some_and(|want| extent_shapes_agree(&fused.codomain, &want)),
+                        "the fused prefix yields {}, where its last element {} has type {}",
+                        fused.codomain,
+                        symbolic(last),
+                        last.ty
+                    );
+                    let _scope = crate::ccl::provenance::converting(last.node_id());
                     result = Some(apply_scalar_expr(
                         input,
                         fused.program,
