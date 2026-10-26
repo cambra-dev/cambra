@@ -2,7 +2,8 @@
 # Manage the daily-simplify jj workspaces.
 #
 #   workspace.sh fetch                 jj git fetch; print main@origin
-#   workspace.sh add <name>            new workspace on a fresh commit atop main@origin; prints its dir
+#   workspace.sh add <name> [<base>]   new workspace on a fresh commit atop <base>, by default
+#                                      main@origin; prints its dir
 #   workspace.sh remove <name>         forget + delete; abandons the workspace's unbookmarked commits
 #   workspace.sh remove-all            remove every simplify-* workspace jj knows about
 #   workspace.sh list                  every simplify-* workspace jj knows about
@@ -55,6 +56,7 @@ case "${cmd}" in
     ;;
   add)
     short="${2:-}"; check_name "${short}"
+    base="${3:-main@origin}"
     name="$(ws_name "${short}")"; dir="$(ws_dir "${short}")"
     if "${JJ[@]}" workspace list -T 'name ++ "\n"' | grep -qx "${name}"; then
       die "workspace ${name} already exists; run: workspace.sh remove ${short}"
@@ -62,12 +64,12 @@ case "${cmd}" in
     [[ -e "${dir}" ]] && die "${dir} exists but jj does not track it; inspect and delete it by hand"
     # `workspace add` cannot check out under --ignore-working-copy: it registers the workspace
     # at an empty root commit and then errors. Tolerate exactly that error, then move the new
-    # workspace onto main@origin from inside it, which snapshots only the new (empty) checkout.
+    # workspace onto <base> from inside it, which snapshots only the new (empty) checkout.
     # The root-based commit is empty and undescribed, so `jj new` abandons it.
     if ! err="$("${JJ[@]}" workspace add --name "${name}" "${dir}" 2>&1)"; then
       grep -q 'must be able to update the working copy' <<< "${err}" || die "${err}"
     fi
-    jj -R "${dir}" --config ui.editor=true new 'main@origin' >&2
+    jj -R "${dir}" --config ui.editor=true new "${base}" >&2
     mkdir -p "${CACHE}/target-${short}"
     echo "${dir}"
     ;;
@@ -112,7 +114,7 @@ case "${cmd}" in
     echo "${CACHE}/target-${short}"
     ;;
   *)
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

@@ -11,11 +11,23 @@ if you cannot find one.
 
 The change is the commit with change id `{{CHANGE}}` in the jj workspace `{{WS}}`. Read it with
 `jj -R {{WS}} diff -r {{CHANGE}}`, then read the surrounding code in `{{WS}}`. You may run tests
-with `{{SKILL}}/scripts/in-workspace.sh {{WS}} 1800 cargo test <name>`, which uses the workspace's
-cargo target and a timeout.
+with `{{SKILL}}/scripts/in-workspace.sh {{WS}} 1800 cargo test …`, which uses the workspace's
+cargo target and a timeout. Scope each run to the one test binary that holds the test:
+`cargo test --test it <name>` for an integration test, `cargo test -p <crate> --lib <name>` for a
+unit test ("Build and Test Scope" in `{{WS}}/.claude/skills/staff-rust-review/SKILL.md`).
 
-Do not edit any file in `{{WS}}`, and do not run jj commands that write. Write every log, backup
-copy (`*.orig`) and temp file under `{{SCRATCH}}`. Never use the session scratchpad or `/tmp`.
+Where no existing test settles a behaviour risk, write one. Try it in temporary commits on
+`{{CHANGE}}` and on its parent, as "Trying a test in a temporary commit" in the same skill
+describes, with `-R {{WS}}` on every jj and `review-test.sh` command and cargo run through
+`in-workspace.sh` as above. The orchestrator compares the workspace's commit ids before and after
+your review: a temporary commit left at `@` voids the review. A test that fails on `{{CHANGE}}` and
+passes on its parent is evidence for `REJECT` or `REVISE`. One that passes on `{{CHANGE}}` rules the
+risk out. One that fails on both shows a bug the change did not introduce: name it under "behaviour
+risks checked" and do not count it against the change.
+
+Apart from those commits, do not edit any file in `{{WS}}`, and do not run jj commands that write.
+Write every log, backup copy (`*.orig`) and temp file under `{{SCRATCH}}`. Never use the session
+scratchpad or `/tmp`.
 
 The stated intent: {{INTENT}}
 
@@ -67,6 +79,9 @@ Return exactly this:
 verdict: ACCEPT | REVISE | REJECT
 reason: <one or two sentences, naming the code>
 behaviour risks checked: <each risk → the test or reasoning that rules it out, or "unresolved">
+tests tried: <each test you wrote: its file, its text, and its results on {{CHANGE}} and on its
+  parent; or "none">
 simpler?: <before vs after, in decisions/cases/indirections>
-revise points: <for REVISE only: numbered, each small and concrete; anything larger is a REJECT>
+revise points: <for REVISE only: numbered, each small and concrete; anything larger is a REJECT.
+  A point a tried test supports names the test, so the implementer can add it>
 ```
