@@ -11,7 +11,7 @@ use indoc::{formatdoc, indoc};
 use rstest_log::rstest;
 
 use super::helpers::*;
-use super::modules::{assert_refused, compile_errors, program};
+use super::modules::{assert_refused, compile_errors, program, report_count};
 
 /// A module of values and functions.
 const COUNTER: &str = indoc! {"
@@ -289,7 +289,7 @@ fn a_run_in_an_imported_module_is_refused() {
         errors.contains("an imported module declares no run"),
         "{errors}"
     );
-    assert_eq!(errors.matches("Error:").count(), 1, "{errors}");
+    assert_eq!(report_count(&errors), 1, "{errors}");
 }
 
 /// The root serving a route a run serves is refused at the root's `http_serve`, naming
@@ -628,4 +628,27 @@ fn a_parameter_takes_a_polymorphic_function() {
         ),
         Value::Int(1),
     );
+}
+
+/// A module feeds a run's public feed through its run name, in a loop or once
+/// (`docs/chl-spec.md`, "9.9 Running").
+#[rstest]
+#[case::in_a_loop(indoc! {"
+    run audit as a
+    for x in [1, 2]:
+        a::events << x
+    a::total
+"}, 3)]
+#[case::once(indoc! {"
+    run audit as a
+    a::events << 5
+    a::total
+"}, 5)]
+#[timeout(Duration::from_secs(10))]
+fn a_module_feeds_a_runs_feed(#[case] root: &str, #[case] expected: i64) {
+    let audit = indoc! {"
+        pub events = defer()
+        pub total = sum([e for e in events])
+    "};
+    check_program_scalar(&program(root, &[("audit", audit)]), Value::Int(expected));
 }

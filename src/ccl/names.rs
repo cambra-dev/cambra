@@ -49,7 +49,7 @@
 
 use crate::ccl::ops::Lit;
 use crate::chl_parser::ModulePath;
-use crate::chl_parser::ast::QualifiedName as ParserQualifiedName;
+use crate::chl_parser::ast::{QualifiedName as ParserQualifiedName, Spanned};
 use smol_str::SmolStr;
 use std::fmt;
 use std::sync::Arc;
@@ -247,7 +247,17 @@ impl fmt::Display for Home {
 pub struct SharedRun {
     pub module: ModulePath,
     /// Each argument, by its parameter, in parameter-name order.
-    pub arguments: Arc<[(SmolStr, Lit)]>,
+    pub arguments: Arc<[(SmolStr, KeyArgument)]>,
+}
+
+/// An argument an import passes, as its shared run's key holds it: a constant
+/// (`docs/chl-spec.md`, "9.2 Imports").
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum KeyArgument {
+    Lit(Lit),
+    /// An import name, passed as a value of its Module type: the shared run it
+    /// reaches.
+    Module(SharedRun),
 }
 
 impl SharedRun {
@@ -274,11 +284,14 @@ impl fmt::Display for SharedRun {
                 f.write_str(", ")?;
             }
             match value {
-                Lit::Int(n) => write!(f, "{parameter}={n}")?,
-                Lit::String(s) => write!(f, "{parameter}={s:?}")?,
-                Lit::Bool(true) => write!(f, "{parameter}=True")?,
-                Lit::Bool(false) => write!(f, "{parameter}=False")?,
-                Lit::Unit => unreachable!("no import argument is the unit constant"),
+                KeyArgument::Lit(Lit::Int(n)) => write!(f, "{parameter}={n}")?,
+                KeyArgument::Lit(Lit::String(s)) => write!(f, "{parameter}={s:?}")?,
+                KeyArgument::Lit(Lit::Bool(true)) => write!(f, "{parameter}=True")?,
+                KeyArgument::Lit(Lit::Bool(false)) => write!(f, "{parameter}=False")?,
+                KeyArgument::Lit(Lit::Unit) => {
+                    unreachable!("no import argument is the unit constant")
+                }
+                KeyArgument::Module(run) => write!(f, "{parameter}={run}")?,
             }
         }
         f.write_str(")")
@@ -734,7 +747,10 @@ impl fmt::Display for Name {
 /// it. A reference lowers to the raw name its segments join with `::`
 /// ([`Self::raw`]), which the scope a run is uniquified in maps to the binder
 /// it reaches (`raw_scope` in `src/ccl/lower/modules/link.rs`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// The empty name spells nothing. It is what a module's own Module-typed
+/// parameter's entries are spelled under (`Qualifier::view_base`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct QualifiedName(Vec<SmolStr>);
 
 impl QualifiedName {
@@ -760,6 +776,29 @@ impl QualifiedName {
         let mut segments = self.0.clone();
         segments.push(name.into());
         QualifiedName(segments)
+    }
+
+    /// The spelling of `segments`, as written.
+    pub fn of_segments(segments: &[Spanned<SmolStr>]) -> Self {
+        QualifiedName(
+            segments
+                .iter()
+                .map(|segment| segment.node.clone())
+                .collect(),
+        )
+    }
+
+    /// This spelling without the segments of `prefix` before it, if it starts
+    /// with them and has more: `c::count` under `c` is `count`.
+    pub fn strip_prefix(&self, prefix: &QualifiedName) -> Option<QualifiedName> {
+        let rest = self.0.strip_prefix(prefix.0.as_slice())?;
+        (!rest.is_empty()).then(|| QualifiedName(rest.to_vec()))
+    }
+
+    /// The first segment, and the spelling of the rest, empty for one segment.
+    pub fn split_first(&self) -> Option<(&SmolStr, QualifiedName)> {
+        let (first, rest) = self.0.split_first()?;
+        Some((first, QualifiedName(rest.to_vec())))
     }
 
     /// `rest` spelled through this one.

@@ -89,6 +89,7 @@ use std::{
 use crate::{
     ccl::{
         Branch, Expr, Lit, Name, RunPath, SharedHoleMint, Type, TypedExprNode,
+        module_type::AliasType,
         nominal::NominalDecl,
         provenance::{Nature, RewriteLabel},
     },
@@ -102,6 +103,8 @@ use crate::{
     },
 };
 use smol_str::SmolStr;
+
+use crate::chl_parser::SurfaceBuiltin;
 
 mod comprehension;
 mod exprs;
@@ -426,7 +429,8 @@ pub struct LoweringContext {
     /// each one binds, innermost declaration last.
     ///
     /// An alias names an existing type rather than making a new one, so the
-    /// entry holds the already-lowered [`Type`] and a use site substitutes it
+    /// entry holds the already-lowered [`Type`], or Module type, and a use site
+    /// substitutes it
     /// (`docs/chl-spec.md`, "6.7 Type-alias statements"). The declaration
     /// lowers to a [`TypedExprNode::LetType`] holding that type, which is where
     /// its predicates' names resolve; uniquify then removes it, so no later
@@ -523,6 +527,13 @@ pub struct LoweringContext {
     /// Each parameter of the module being lowered, recorded as its `param`
     /// statement lowers.
     pub(super) parameters: Vec<modules::Parameter>,
+    /// Every binder the module being lowered writes, with its span, for the rule
+    /// that none takes a name that denotes a module ([`module_name_binders`]).
+    pub(super) module_binders: Vec<(SmolStr, Span)>,
+    /// Each name a binder of the module being lowered takes against that rule,
+    /// whose error the binder reports: a reference spelled like it reports
+    /// nothing more.
+    pub(super) refused_module_binders: HashSet<SmolStr>,
 }
 
 /// A sink a module declares: lowering binds its name, and each run of the
@@ -561,14 +572,14 @@ pub(super) struct DeclaredAlias {
     /// name in scope throughout: a type parameter in its definition, or a `use`
     /// type name in its module.
     statement: Option<Span>,
-    ty: Type,
+    ty: AliasType,
 }
 
 /// What a capitalized name means as a type at a use
 /// ([`LoweringContext::type_alias`]).
 pub(super) enum AliasAt<'a> {
-    /// The alias in scope there names this type.
-    InScope(&'a Type),
+    /// The alias in scope there names this type or Module type.
+    InScope(&'a AliasType),
     /// An alias of the name is declared in an enclosing block, below the use.
     Below,
     /// No enclosing block declares an alias of the name.
@@ -975,7 +986,7 @@ impl LoweringContext {
         &mut self,
         name: impl Into<String>,
         statement: Span,
-        ty: Type,
+        ty: AliasType,
     ) {
         self.type_aliases
             .entry(name.into())
@@ -989,7 +1000,7 @@ impl LoweringContext {
     /// Bind `name` to `ty` throughout the scope being lowered: a type parameter
     /// throughout its definition (`docs/chl-spec.md`, "Type parameters"), or a
     /// `use` type name throughout its module.
-    pub(super) fn declare_type_throughout(&mut self, name: impl Into<String>, ty: Type) {
+    pub(super) fn declare_type_throughout(&mut self, name: impl Into<String>, ty: AliasType) {
         self.type_aliases
             .entry(name.into())
             .or_default()
@@ -1016,7 +1027,7 @@ impl LoweringContext {
 
     /// The type of the alias `name` that `statement` declares, or `None` when its
     /// declaration was refused.
-    pub(super) fn declared_type_alias(&self, name: &str, statement: Span) -> Option<&Type> {
+    pub(super) fn declared_type_alias(&self, name: &str, statement: Span) -> Option<&AliasType> {
         self.type_aliases
             .get(name)?
             .iter()
@@ -1208,11 +1219,16 @@ fn lower_expr_inner(
                     ),
                 ));
             }
+            // The reference most likely means the refused binder spelled like it.
+            if ctx.refused_module_binders.contains(name) {
+                return Ok(Expr::error());
+            }
             if ctx.names_a_module(name) {
                 return Err(LoweringError::unsupported(
                     expr.span,
                     format!(
-                        "`{name}` names a module, and a module as a value is not supported yet"
+                        "`{name}` names a module, which is a value only as a run argument or a \
+                         binding"
                     ),
                 ));
             }
@@ -1300,6 +1316,12 @@ fn lower_expr_inner(
             expr.span,
             "`{…}` is type syntax (a record type `{name: T}`); \
              a record value is written `(name=value)`",
+        )),
+        // A Module type names the type of a module, not a value.
+        ChlExpr::ModuleType(_) => Err(LoweringError::unsupported(
+            expr.span,
+            "`Module{…}` is a Module type, the type of a module; it is written as a \
+             parameter's type or an alias, not as a value",
         )),
         // A refinement `{T where p}` is structural *type* syntax; it names a
         // type, not a value. (Accepted in annotation position — see
@@ -1528,24 +1550,35 @@ pub fn sink_site(module: &ChlModule) -> Option<Span> {
 }
 
 /// The first statement at `module`'s top level that declares or writes mutable
-/// state: a mutable variable, a write to one, a loaded declaration, or a
-/// deferred output's definition. Such a module is run and not imported
-/// (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state").
+/// state: a mutable variable, a write to one, a loaded declaration, a feed
+/// (`defer()`), or a deferred output's definition. Such a module is run and not
+/// imported (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state"): a
+/// feed at an import's module would collect what every importer feeds it.
 pub fn state_site(module: &ChlModule) -> Option<Span> {
     module.body.iter().find_map(|stmt| {
         let inner = match &stmt.node {
             ChlStmt::Pub { stmt, .. } => &stmt.node,
             other => other,
         };
-        matches!(
-            inner,
+        let state = match inner {
             ChlStmt::MutAssign { .. }
-                | ChlStmt::AugAssign { .. }
-                | ChlStmt::LoadFrom { .. }
-                | ChlStmt::Define { .. }
-        )
-        .then_some(stmt.span)
+            | ChlStmt::AugAssign { .. }
+            | ChlStmt::LoadFrom { .. }
+            | ChlStmt::Define { .. } => true,
+            ChlStmt::Assign { value, .. } | ChlStmt::AnnAssign { value, .. } => {
+                is_defer_call(value)
+            }
+            _ => false,
+        };
+        state.then_some(stmt.span)
     })
+}
+
+/// Whether `value` is a call of the builtin `defer`, which declares a feed.
+fn is_defer_call(value: &Spanned<ChlExpr>) -> bool {
+    matches!(&value.node, ChlExpr::Call { func, .. }
+        if matches!(&func.node, ChlExpr::Name(id)
+            if SurfaceBuiltin::from_name(id) == Some(SurfaceBuiltin::Defer)))
 }
 
 fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered) -> LoweringResult {
@@ -1553,7 +1586,17 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
     // lowering site has to account for it.
     let syntax = module_syntax::refuse_module_syntax(module);
     let mut errors = syntax.errors;
-    errors.extend(module_name_binders(&syntax.binders, ctx));
+    errors.extend(
+        module_name_binders(&syntax.binders, ctx, |kind| {
+            !matches!(
+                kind,
+                modules::QualifierKind::Parameter | modules::QualifierKind::Binding
+            )
+        })
+        .into_iter()
+        .map(|(_, error)| error),
+    );
+    ctx.module_binders = syntax.binders;
     let members = modules::top_level_bindings(&module.body);
     errors.extend(modules::public_names_bound_twice(&members));
     errors.extend(use_name_members(&members, ctx));
@@ -1605,26 +1648,55 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
     LoweringResult { value, errors }
 }
 
-/// One error per binder spelled like an import name or a run name: `m::f` names
-/// a module's member, so a binder spelled `m` would give one spelling two
-/// meanings in one scope (`docs/chl-spec.md`, "9.6 Qualified references").
-fn module_name_binders(binders: &[(SmolStr, Span)], ctx: &LoweringContext) -> Vec<LoweringError> {
+/// One error per binder spelled like a name that denotes a module, other than
+/// a member bound to a module itself: `m::f` names a module's member, so a binder
+/// spelled `m` would give one spelling two meanings in one scope
+/// (`docs/chl-spec.md`, "9.6 Qualified references").
+///
+/// `kinds` selects the names checked: an import's, a run's, and a `use` name's
+/// are in scope before the module lowers, and a parameter's and a binding's once
+/// they are declared ([`LoweringContext::declare_module_parameters`]). Each
+/// error comes with the name its binder takes.
+pub(super) fn module_name_binders(
+    binders: &[(SmolStr, Span)],
+    ctx: &LoweringContext,
+    kinds: impl Fn(modules::QualifierKind) -> bool,
+) -> Vec<(SmolStr, LoweringError)> {
     binders
         .iter()
         .filter_map(|(name, span)| {
-            let qualifier = ctx.module.qualifiers.get(name.as_str())?;
-            let (what, note) = if qualifier.run {
-                ("a run name", "run here")
-            } else {
-                ("an import name", "imported here")
+            let qualifier = ctx
+                .module
+                .qualifiers
+                .get(name.as_str())
+                .filter(|q| kinds(q.kind))?;
+            let own =
+                qualifier.statement.start <= span.start && span.end <= qualifier.statement.end;
+            // A member bound to a module, and a parameter of Module type, bind the name
+            // their own statement gives the qualifier.
+            if matches!(
+                qualifier.kind,
+                modules::QualifierKind::Binding | modules::QualifierKind::Parameter
+            ) && own
+            {
+                return None;
+            }
+            let what = qualifier.kind.describe();
+            let note = match qualifier.kind {
+                modules::QualifierKind::Import => "imported here",
+                modules::QualifierKind::Run => "run here",
+                modules::QualifierKind::Parameter => "the parameter",
+                modules::QualifierKind::Binding => "bound here",
+                modules::QualifierKind::Use { .. } => "bound by `use` here",
             };
-            Some(
+            Some((
+                name.clone(),
                 LoweringError::unsupported(
                     *span,
                     format!("`{name}` is {what}, so no binder in its module takes it"),
                 )
                 .with_related(qualifier.statement, note),
-            )
+            ))
         })
         .collect()
 }
