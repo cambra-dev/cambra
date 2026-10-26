@@ -300,7 +300,11 @@ eliminated by an additional set of simplifying rules:
   is the uncurried form of `f`: it pairs the inner argument with `f` of the outer argument,
   then applies. Currying recovers `f` exactly — this is the CCC identity
   `curry(uncurry(f)) = f`. Useful when `curry` is applied to a body whose only reference to
-  the inner variable is via a single `apply`.
+  the inner variable is via a single `apply`. A curry whose codomain narrows the collection by a
+  refinement that reads the outer argument `x` keeps a `map(id)` to carry that narrowing. With
+  `f` present, the narrowing is restated over `f`'s result by reading each `x ▷ f` in the
+  predicate as the `map`'s own binder. The rule declines where the predicate reads `x` other
+  than through `f`.
 - **Curry-compose**: `curry(f ≫ g)  ⟹  curry(f) ≫ map(g)`. Follows from
   `map(g)(h) = h ≫ g`: the curried function `curry(f)(k) = λi → f(k,i)` post-composed with
   `g` is `λi → g(f(k,i))`, which is exactly `curry(f ≫ g)(k)`. This lets a suffix of the

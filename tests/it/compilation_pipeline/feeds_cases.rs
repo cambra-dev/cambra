@@ -996,10 +996,10 @@ fn a_defer_error_in_a_predicate_is_a_compile_error(
     expect_feed_error(&code, "deferred collection error");
 }
 
-/// TODO: Support refined writes to vars used with feeds.
+/// A refined write to a mutable variable a feed reads.
 #[test]
 fn refined_write_used_with_feed() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 x: Mut({Int where _ >= 0}) := 0
 o = defer()
@@ -1009,14 +1009,14 @@ for p in [1,2,3]:
     o << x
 x
         "#},
-        "open bound recorded",
+        Value::Int(3),
     )
 }
 
-/// TODO: Support mut reads in refined ops used with feeds.
+/// A refined operation on a mutable variable's read, fed to a channel.
 #[test]
 fn refined_read_used_with_feed() {
-    check_compile_error(
+    check_tile(
         indoc! {r#"
 x := 0
 o = defer()
@@ -1026,7 +1026,7 @@ for p in [1, 2, 3]:
     x += 1
 o
         "#},
-        "Barendregt violation: substitution range mentions binder",
+        make_int_list(&[1, 2, 3]),
     )
 }
 

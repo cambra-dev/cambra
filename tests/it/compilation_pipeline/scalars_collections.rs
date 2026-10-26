@@ -401,20 +401,18 @@ fn an_element_built_from_a_compound_constant_is_rejected() {
         sum([p.0 + p.1])"});
 }
 
-/// The `discharged` guard skips the whole **subtree**, so an unrelated downstream `^+`
-/// stops an otherwise-foldable element compiling.
-///
-/// What makes `y`'s definition discharged is `z`, which reads it — so the same program with
-/// `z = y + 1` folds the element and answers 7. The guard is the module doc's bound at "What
-/// does not fold"; this narrows a gap rather than opening one, the element having been
-/// rejected before the pass existed.
+/// A downstream `^+` reading `y` leaves `y`'s literal element foldable: refinement erasure
+/// removes the refinement that would record `y`'s definition before planning folds it
+/// (`src/ccl/planning/const_fold.rs`, "What does not fold").
 #[test]
-#[should_panic(expected = "constant folding did not reduce this one")]
-fn a_downstream_refined_sum_stops_an_element_folding() {
-    run_pipeline(indoc! {r"
+fn a_downstream_refined_sum_folds_its_element() {
+    check_scalar(
+        indoc! {r"
         y = sum([1 + 2, 3])
         z = y ^+ 1
-        z"});
+        z"},
+        Value::Int(7),
+    );
 }
 
 /// The same program under `+`, which records nothing and leaves the definition foldable.

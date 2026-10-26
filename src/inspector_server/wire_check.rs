@@ -78,6 +78,7 @@ const ALLOWED_VIA: &[&str] = &[
     "Inline",
     "Transact",
     "Letrec",
+    "EraseRefinements",
     "Channelize",
     "AsOfRead",
     "LambdaElim",

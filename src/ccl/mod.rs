@@ -15,6 +15,7 @@ pub mod constant;
 pub mod content_hash;
 pub mod context;
 pub mod diff;
+pub mod erase_refinements;
 pub mod feed_nest;
 pub mod infer;
 pub mod inline;

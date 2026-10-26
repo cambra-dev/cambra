@@ -350,18 +350,17 @@ fn a_let_bound_row_at_a_jagged_position_is_read_in_place(#[case] code: &str) {
     check_scalar(code, Value::Int(7));
 }
 
-/// **A row read from a mutable variable is rejected by name** at a jagged position. Its `box`
-/// is erased where the variable is introduced, while the position merging it keeps the sum, so
-/// the row stands fixed before it reaches the list.
+/// A row read from a mutable variable at a jagged position. Its `box` is erased where the
+/// variable is introduced, while the position merging it keeps the sum.
 #[test]
-fn a_row_read_from_a_mutable_variable_at_a_jagged_position_is_unsupported() {
-    check_compile_error(
+fn a_row_read_from_a_mutable_variable_at_a_jagged_position() {
+    check_scalar(
         indoc! {r"
             x := box([1, 2])
             y = x
             sum([max(r) for r in [y, box([3, 4, 5])]])
         "},
-        "a row read from a mutable variable",
+        Value::Int(7),
     );
 }
 

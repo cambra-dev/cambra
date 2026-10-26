@@ -943,7 +943,7 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
     );
 }
 
-/// A correlated filter with **no aggregate over it** does not compile, where the same filter
+/// A correlated filter with **no aggregate over it** fails a debug build, where the same filter
 /// under a `sum` does (`a_correlated_inner_comprehension_runs_per_outer_row`,
 /// `correlated_filter`). The one predicate ends up spelled two ways — the term reads the outer
 /// list through the iteration record, while the copy in the type reads it through a `let` —
@@ -954,8 +954,10 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
 /// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)} ⤇ Int)
 /// ```
 ///
-/// That check is `debug_assertions`-gated. Without it the tree reaches the post-lambda-elim
-/// wall, which reports the same disagreement as a collection-domain mismatch.
+/// That check is `debug_assertions`-gated and compares refinements structurally. Without it
+/// the program compiles and answers `[[2, 3], [6]]`, each inner list keyed by its source
+/// positions. The post-lambda-elim check is refinement-blind
+/// (`crate::ccl::infer::RefinementBlind`), so it does not see the disagreement.
 ///
 /// The fault is below the re-basing rewrite rather than in it: the rewrite that reaches one
 /// occurrence does not reach the other (`refinements-dependent-projection-of-a-refined-pair`
@@ -966,15 +968,13 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
     debug_assertions,
     should_panic(expected = "lambda elimination changed a node's type")
 )]
-#[cfg_attr(
-    not(debug_assertions),
-    should_panic(expected = "Type mismatch for collection domain")
-)]
-fn a_correlated_filter_without_an_aggregate_does_not_compile() {
-    check_tile(
-        "[[v * r for v in [1, 2, 3] if v > r] for r in [1, 2]]",
-        // `[[2, 3], [6]]` if it compiled.
-        make_int_list(&[]),
+fn a_correlated_filter_without_an_aggregate_compiles_only_without_debug_assertions() {
+    check_sink(
+        indoc! {r#"
+            out = test_sink()
+            out << [[v * r for v in [1, 2, 3] if v > r] for r in [1, 2]]
+        "#},
+        "[() -> [[1 -> 2, 2 -> 3], [2 -> 6]]]",
     );
 }
 

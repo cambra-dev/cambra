@@ -127,6 +127,67 @@ pub(super) struct CheckCtx {
     /// check: `checked_predicates` keys by address, and a copy freed mid-walk lends its
     /// address to a later predicate, which would then be skipped as already checked.
     opened_types: Vec<Type>,
+    /// Whether this check runs inside a [`RefinementBlind`] scope, read once at
+    /// construction. When set, every subtyping edge compares its two sides with their
+    /// refinements stripped.
+    refinement_blind: bool,
+}
+
+/// Remove every [`Type::Refinement`] layer of `ty`, except inside a Σ's witness kinds,
+/// which [`strip_refinements`] keeps for the reason it states.
+///
+/// In place rather than through [`strip_refinements`], which rebuilds each function
+/// type through [`Type::fun_like`] and so re-closes its Pi binder. A rule-derived lambda
+/// type is open in its binder, and the scratch lambda [`check_slot_predicates`] types a
+/// predicate under binds `__elem`, which no Pi binder may be.
+fn strip_refinements_in_place(ty: &mut Type) {
+    match ty {
+        Type::Refinement(base, _) => {
+            *ty = std::mem::replace(base.as_mut(), Type::Hole);
+            strip_refinements_in_place(ty);
+        }
+        Type::Fun {
+            domain, codomain, ..
+        } => {
+            strip_refinements_in_place(domain);
+            strip_refinements_in_place(codomain);
+        }
+        other => other.walk_children_mut(strip_refinements_in_place),
+    }
+}
+
+thread_local! {
+    static REFINEMENT_BLIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A scope in which every post-inference check is refinement-blind: a subtyping edge
+/// relates the two types' unrefined shapes and decides no refinement entailment.
+///
+/// [`crate::ccl::erase_refinements`] leaves refinements on data function domains only,
+/// so from that phase on an argument no longer carries the refinement a refined domain
+/// demands, and a literal's recorded type no longer carries the singleton its rule
+/// derives. The pipeline enters this scope after that phase. A scope rather than a
+/// parameter because planning type-checks the fragments it builds through
+/// [`crate::ccl::infer::typecheck`] at every rewrite, below any signature the
+/// pipeline passes a flag through.
+///
+/// Restores the previous setting on drop, so scopes nest.
+#[must_use = "the check is refinement-blind only while the guard lives"]
+pub struct RefinementBlind {
+    previous: bool,
+}
+
+impl RefinementBlind {
+    pub fn enter() -> Self {
+        let previous = REFINEMENT_BLIND.with(|blind| blind.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for RefinementBlind {
+    fn drop(&mut self) {
+        REFINEMENT_BLIND.with(|blind| blind.set(self.previous));
+    }
 }
 
 /// The environment a Check query runs in: the lexical scope at the query, plus
@@ -169,6 +230,28 @@ impl CheckCtx {
             opaque_binders: HashMap::new(),
             checked_predicates: Default::default(),
             opened_types: Vec::new(),
+            refinement_blind: REFINEMENT_BLIND.with(std::cell::Cell::get),
+        }
+    }
+
+    /// The two sides of a subtyping edge as this check relates them: unchanged, or
+    /// stripped of every refinement inside a [`RefinementBlind`] scope
+    /// ([`strip_refinements_in_place`]).
+    fn edge_sides<'t>(
+        &self,
+        sub: &'t Type,
+        sup: &'t Type,
+    ) -> (std::borrow::Cow<'t, Type>, std::borrow::Cow<'t, Type>) {
+        use std::borrow::Cow;
+        if self.refinement_blind {
+            let stripped = |ty: &Type| {
+                let mut ty = ty.clone();
+                strip_refinements_in_place(&mut ty);
+                Cow::Owned(ty)
+            };
+            (stripped(sub), stripped(sup))
+        } else {
+            (Cow::Borrowed(sub), Cow::Borrowed(sup))
         }
     }
 
@@ -447,8 +530,9 @@ impl Typing for CheckCtx {
         // `{Int | __elem >= 0}` is the shape that needs it: the two predicates match
         // nowhere structurally, and the entailment holds given the type `__read` is
         // bound at.
+        let (sub, sup) = self.edge_sides(sub, sup);
         let mut cache = self.cache();
-        let outcome = constrain_subtype_in(sub, sup, &mut cache, &self.scope());
+        let outcome = constrain_subtype_in(&sub, &sup, &mut cache, &self.scope());
         if let Err(e) = outcome {
             let located = self.raise(map_constrain_err(e, &at()));
             self.errors.push(located);
@@ -616,10 +700,11 @@ impl Typing for CheckCtx {
         sup_binders: &[crate::ccl::ty::Witness],
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
+        let (sub, sup) = self.edge_sides(sub, sup);
         let mut cache = self.cache();
         let outcome = constrain_subtype_under_in(
-            sub,
-            sup,
+            &sub,
+            &sup,
             sub_binders,
             sup_binders,
             &mut cache,

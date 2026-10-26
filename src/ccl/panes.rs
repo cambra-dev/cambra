@@ -149,6 +149,7 @@ pub(crate) const PANES: [PaneSpec; 7] = [
             Phase::Inline,
             Phase::Transact,
             Phase::Letrec,
+            Phase::EraseRefinements,
             Phase::Channelize,
         ],
         gated: true,
@@ -743,7 +744,7 @@ mod tests {
         }
     }
 
-    /// Require no structural leaks across the Inline/Transact/Letrec/Channelize pair.
+    /// Require no structural leaks across the Inline/Transact/Letrec/EraseRefinements/Channelize pair.
     /// Selected rewriting fixtures must also have deaths, preventing an unchanged
     /// tree from satisfying every assertion.
     #[test]
