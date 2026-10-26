@@ -52,7 +52,6 @@ use panic_message::panic_message;
 /// outside this list and [`UNDEFINED`] to agreement and every cell here to its kind, so a fix
 /// that makes one agree removes it, and a cell that starts failing another way fails the grid.
 const BROKEN: &[(&str, &str, &str)] = &[
-    ("function_body", "rows_sum", "CompilerPanics"),
     ("loop_source_in_loop", "cond_coll", "CompilerPanics"),
     ("loop_source_in_loop", "dup_union", "CompilerRejects"),
     ("loop_source_in_loop", "union", "CompilerRejects"),
@@ -80,7 +79,6 @@ const BROKEN: &[(&str, &str, &str)] = &[
         "terminal_in_agg[pool]",
         "CompilerRejects",
     ),
-    ("trait_instance_body", "rows_sum", "CompilerPanics"),
     ("txn_reply", "generator_max", "CompilerRejects"),
     ("txn_write_rhs", "generator_max", "CompilerRejects"),
 ];

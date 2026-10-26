@@ -373,6 +373,11 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Atom, format!("variant_wrap(`{tag})"))
         }
 
+        // The binary flattening keeps the bare name; a wider one names its arity.
+        TypedExprNode::Builtin(Builtin::Uncurry(n)) if *n != 2 => {
+            (Precedence::Atom, format!("uncurry({n})"))
+        }
+
         TypedExprNode::Builtin(Builtin::VariantIs(tag)) => {
             (Precedence::Atom, format!("variant_is(`{tag})"))
         }

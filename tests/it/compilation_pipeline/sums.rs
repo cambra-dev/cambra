@@ -255,6 +255,15 @@ fn a_filter_over_a_box_that_already_carries_one() {
     "sum([max([v for v in r if v < 4]) for r in [box([1, 2]), box([3, 4, 5])]])",
     Value::Int(5)
 )]
+// **Inside a `def`**, generalized over its parameter.
+#[case(
+    indoc! {r"
+        def f(n):
+            sum([sum(r2) for r2 in [box([1, 2]), box([3])]])
+        f(3)
+    "},
+    Value::Int(6)
+)]
 fn a_jagged_nested_collection_is_consumed_at_each_rows_own_domain(
     #[case] code: &str,
     #[case] expected: Value,
@@ -660,24 +669,6 @@ fn a_feed_over_a_conditional_chosen_per_row_is_keyed_by_its_arm(
 "}, Value::Int(12))]
 fn a_loop_over_a_comprehension_over_a_sum(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
-}
-
-/// Not yet compiled: jagged rows summed inside a `def`. The same expression at top level
-/// compiles (`a_jagged_nested_collection_is_consumed_at_each_rows_own_domain`), so the witness listing that comes out empty
-/// is lost generalizing over the `def`, not in the comprehension. The generated grid's
-/// `function_body/rows_sum` and `generator_yield/rows_sum` cells are this program.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[should_panic(expected = "post-inference produced an invalid tree")]
-fn a_def_body_summing_jagged_rows_does_not_compile() {
-    check_scalar(
-        indoc! {r"
-            def f(n):
-                sum([sum(r2) for r2 in [box([1, 2]), box([3])]])
-            f(3)
-        "},
-        Value::Int(6),
-    );
 }
 
 /// **A comprehension over a boxed collection is not boxed** (`docs/chl-spec.md`, "7.4 `box`"):

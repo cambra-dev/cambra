@@ -805,6 +805,182 @@ fn a_correlated_inner_comprehension_without_an_aggregate() {
     );
 }
 
+/// A comprehension over several generators is keyed by the flat tuple of their positions, one
+/// component per generator, at any number of them and over boxed sources alike.
+#[rstest]
+#[case::four_generators(indoc! {r#"
+    out = test_sink()
+    out << [a + b + c + d for a in [1, 2] for b in [10] for c in [100, 200] for d in [1000]]
+"#}, "[() -> [(_0: 0, _1: 0, _2: 0, _3: 0) -> 1111, (_0: 0, _1: 0, _2: 1, _3: 0) -> 1211, \
+       (_0: 1, _1: 0, _2: 0, _3: 0) -> 1112, (_0: 1, _1: 0, _2: 1, _3: 0) -> 1212]]")]
+#[case::filtered_between_generators(indoc! {r#"
+    out = test_sink()
+    out << [(x, y, z) for x in [1, 2, 3] for y in [1, 2, 3] if x < y for z in [1, 2, 3] if y < z]
+"#}, "[() -> [(_0: 0, _1: 1, _2: 2) -> (_0: 1, _1: 2, _2: 3)]]")]
+#[case::over_boxed_sources(indoc! {r#"
+    c: Bool = True
+    out = test_sink()
+    out << [x + y + z for x in (box([1]) if c else box([1, 2])) for y in [10, 20] for z in (box([100]) if c else box([100, 200]))]
+"#}, "[() -> [(_0: 0, _1: 0, _2: 0) -> 111, (_0: 0, _1: 1, _2: 0) -> 121]]")]
+fn several_generators_key_by_the_tuple_of_positions(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
+/// A comprehension whose inner generator ranges over the outer element is keyed by a dependent
+/// tuple: each outer key has its own inner keys, the positions of the row it selects.
+#[rstest]
+#[case::over_boxed_rows(indoc! {r#"
+    out = test_sink()
+    out << [x for xs in [box([1, 2]), box([3])] for x in xs]
+"#}, "[() -> [(_0: 0, _1: 0) -> 1, (_0: 0, _1: 1) -> 2, (_0: 1, _1: 0) -> 3]]")]
+#[case::over_groups(indoc! {r#"
+    out = test_sink()
+    out << [x for g in groupby([1, 2, 3, 4], \e -> e // 2) for x in g]
+"#}, "[() -> [(_0: 0, _1: 0) -> 1, (_0: 1, _1: 1) -> 2, (_0: 1, _1: 2) -> 3, (_0: 2, _1: 3) -> 4]]")]
+#[case::summed(indoc! {r#"
+    out = test_sink()
+    out << sum([x for xs in [box([1, 2]), box([3])] for x in xs])
+"#}, "[() -> 6]")]
+#[case::in_a_definition(indoc! {r#"
+    def f(xss):
+        [x for xs in xss for x in xs]
+    out = test_sink()
+    out << sum(f([box([1, 2]), box([3])]))
+"#}, "[() -> 6]")]
+#[case::filtered(indoc! {r#"
+    out = test_sink()
+    out << [x for xs in [box([1, 2, 3]), box([4, 5])] for x in xs if x > 2]
+"#}, "[() -> [(_0: 0, _1: 2) -> 3, (_0: 1, _1: 0) -> 4, (_0: 1, _1: 1) -> 5]]")]
+#[case::over_a_field_of_the_row(indoc! {r#"
+    rows = [(id=1, tags=box([10, 20])), (id=2, tags=box([30]))]
+    out = test_sink()
+    out << [t for r in rows for t in r.tags]
+"#}, "[() -> [(_0: 0, _1: 0) -> 10, (_0: 0, _1: 1) -> 20, (_0: 1, _1: 0) -> 30]]")]
+#[case::over_a_field_of_the_row_filtered(indoc! {r#"
+    rows = [(id=1, tags=box([10, 20])), (id=2, tags=box([30]))]
+    out = test_sink()
+    out << [r.id + t for r in rows for t in r.tags if t > 10]
+"#}, "[() -> [(_0: 0, _1: 1) -> 21, (_0: 1, _1: 0) -> 32]]")]
+#[case::three_levels(indoc! {r#"
+    out = test_sink()
+    out << [x for xss in [box([box([1, 2]), box([3])]), box([box([4])])] for xs in xss for x in xs]
+"#}, "[() -> [(_0: 0, _1: 0, _2: 0) -> 1, (_0: 0, _1: 0, _2: 1) -> 2, (_0: 0, _1: 1, _2: 0) -> 3, \
+       (_0: 1, _1: 0, _2: 0) -> 4]]")]
+#[case::values_over_the_inner_keys(indoc! {r#"
+    out = test_sink()
+    out << [[x for x in xs] for xss in [box([box([1, 2]), box([3])]), box([box([4])])] for xs in xss]
+"#}, "[() -> [(_0: 0, _1: 0) -> [1, 2], (_0: 0, _1: 1) -> [3], (_0: 1, _1: 0) -> [4]]]")]
+#[case::beside_an_independent_generator(indoc! {r#"
+    out = test_sink()
+    out << [x * 10 + i for xs in [box([1, 2]), box([3])] for x in xs for i in [0, 1] if x > i]
+"#}, "[() -> [(_0: 0, _1: 0, _2: 0) -> 10, (_0: 0, _1: 1, _2: 0) -> 20, (_0: 0, _1: 1, _2: 1) -> 21, \
+       (_0: 1, _1: 0, _2: 0) -> 30, (_0: 1, _1: 0, _2: 1) -> 31]]")]
+fn an_inner_generator_over_the_outer_element_keys_by_a_dependent_tuple(
+    #[case] source: &str,
+    #[case] expected: &str,
+) {
+    check_sink(source, expected);
+}
+
+/// Dependent comprehensions that do not compile yet: each reads a row of boxed collections at
+/// its key, and the operator for that reading takes rows whose values are one column. Each case
+/// names the value it must answer.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 2 + 3 + 4.
+#[case::three_levels_filtered(
+    "sum([x for xss in [box([box([1, 2]), box([3])]), box([box([4])])] for xs in xss for x in xs if x > 1])"
+)]
+// (1 + 2 + 3 + 4) * 2 + 4.
+#[case::three_levels_after_an_independent_generator(
+    "sum([x + i for i in [0, 1] for xss in [box([box([1, 2]), box([3])]), box([box([4])])] for xs in xss for x in xs])"
+)]
+// 1 + 2 + 3 + 4 + 5.
+#[case::four_levels(
+    "sum([x for xsss in [box([box([box([1, 2]), box([3])]), box([box([4])])]), box([box([box([5])])])] for xss in xsss for xs in xss for x in xs])"
+)]
+fn a_dependent_comprehension_reading_a_row_of_collections_is_refused(#[case] program: &str) {
+    check_compile_error(
+        program,
+        "`apply` reading a collection whose values are not one column is not supported yet",
+    );
+}
+
+/// A comprehension keyed by a dependent tuple and one keyed by a plain tuple are collections
+/// over different domains, so a conditional choosing between them is refused, whatever the
+/// condition.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::over_a_declared_condition("c: Bool = True")]
+#[case::over_an_inferred_condition("c = True")]
+fn a_dependent_and_a_product_comprehension_do_not_join(#[case] condition: &str) {
+    check_compile_error(
+        &indoc::formatdoc! {r#"
+            {condition}
+            a = [x for xs in [box([1, 2]), box([3])] for x in xs]
+            b = [x + y for x in [1, 2] for y in [3]]
+            d = a if c else b
+            sum(d)
+        "#},
+        "won't infer an untagged sum from a collision",
+    );
+}
+
+/// A mismatch between dependent tuples names their components as the program reads them: a
+/// component nothing reads is unnamed, a key binder the compiler minted is written `k`, and the
+/// differing widths get the tuple-width hint.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_mismatch_between_dependent_tuples_names_no_minted_binder() {
+    let message = compile_panic(indoc! {r#"
+        c: Bool = True
+        a = [x for xs in [box([1, 2]), box([3])] for x in xs]
+        b = [x for xss in [box([box([1, 2]), box([3])]), box([box([4])])] for xs in xss for x in xs]
+        d = a if c else b
+        sum(d)
+    "#});
+    assert!(!message.contains("__uncurry"), "{message}");
+    assert!(
+        message.contains("expected (k : 0..2) × σ₁(k ▷ "),
+        "{message}"
+    );
+    assert!(
+        message.contains("found (k : 0..2) × (k1 : σ₁(k ▷ "),
+        "{message}"
+    );
+    assert!(
+        message.contains("hint: a tuple's width is part of its type"),
+        "{message}"
+    );
+}
+
+/// **Three generators under an outer comprehension** flatten each row's nest beneath the row:
+/// `uncurry(3)` composed over the rows pairs and splices at that level
+/// (`src/ccl/design/optimization.md`, "`uncurry` of an eliminated nest"). The outer rows' values
+/// are the per-row sums.
+#[rstest]
+#[case::reading_the_row_in_the_element(
+    "[sum([x + y + z + r for x in [1, 2] for y in [10, 20] for z in [100, 200]]) for r in [1000, 2000]]",
+    "[9332, 17332]"
+)]
+#[case::over_the_row(
+    "[sum([x + y + z for x in r for y in [10, 20] for z in [100, 200]]) for r in [[1, 2], [3, 4]]]",
+    "[1332, 1348]"
+)]
+#[case::over_boxed_rows(
+    "[sum([x + y + z for x in xs for y in [10, 20] for z in [100, 200]]) for xs in box([box([1, 2]), box([3])])]",
+    "[1332, 672]"
+)]
+fn three_generators_under_an_outer_comprehension_flatten_per_row(
+    #[case] program: &str,
+    #[case] expected: &str,
+) {
+    check_sink(
+        &format!("out = test_sink()\nout << {program}\n"),
+        &format!("[() -> {expected}]"),
+    );
+}
+
 /// Rows filtered by the outer binder of a comprehension, with no aggregate over them: each
 /// row keeps its own keys.
 #[rstest]

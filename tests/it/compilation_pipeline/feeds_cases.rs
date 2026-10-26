@@ -1894,14 +1894,9 @@ fn a_loop_over_a_group_by_feeds_a_row_per_group(#[case] source: &str, #[case] ex
 }
 
 /// A loop over a group-by feeding a correlated comprehension over a filtered and mapped binding
-/// of the group, itself filtered. It panics in substitution. It answers `[[], [2 -> 0, 4 -> 30],
-/// [5 -> 0, 6 -> 60, 7 -> 130]]`.
+/// of the group, itself filtered.
 #[test]
-#[should_panic(
-    expected = "Barendregt violation: substitution range mentions binder `Synthetic { kind: \
-                IterRecord"
-)]
-fn a_correlated_comprehension_over_a_mapped_binding_in_a_group_loop_not_compiled_yet() {
+fn a_correlated_comprehension_over_a_mapped_binding_in_a_group_loop() {
     check_sink(
         indoc! {r#"
             out = test_sink()

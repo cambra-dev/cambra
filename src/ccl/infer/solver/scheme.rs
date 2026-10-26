@@ -491,9 +491,28 @@ pub fn freshen_above(
         | Type::DataSource(_)
         | Type::Txn
         | Type::Hole
-        // Born after inference, outside every generalized `let`: nothing in it is quantified.
-        | Type::DepTuple(_)
         | Type::SharedHole(_) => ty.clone(),
+        // `uncurry`'s scheme names its components as a function names its binder, so each
+        // instantiation names its own, the way the `Fun` arm below renames, and the variables
+        // under them follow ([`FreshenCache::binders`]).
+        Type::DepTuple(components) => Type::DepTuple(
+            components
+                .iter()
+                .map(|(name, t)| {
+                    let name = match (name, &cache.site_telescope) {
+                        (Some(n), Some(_)) => Some(
+                            cache
+                                .binders
+                                .entry(n.clone())
+                                .or_insert_with(|| crate::ccl::Name::fresh(n.base()))
+                                .clone(),
+                        ),
+                        _ => name.clone(),
+                    };
+                    (name, freshen_above(lim, t, target, cache))
+                })
+                .collect(),
+        ),
         // A channel domain minted inside the generalized definition
         // (level > lim) is *quantified* exactly like a variable — each
         // instantiation is its own channel. But a rigid name cannot be
@@ -603,9 +622,10 @@ pub fn freshen_above(
         // Both children recurse (mirror `Fun`): freshening the `domain` is
         // what lets a `Mut` param's fresh domain var generalize, so each call
         // site instantiates its own domain (induction index vs. `Txn`).
-        Type::History { function, history_kind } => {
-            Type::history_over(freshen_above(lim, function, target, cache), *history_kind)
-        }
+        Type::History {
+            function,
+            history_kind,
+        } => Type::history_over(freshen_above(lim, function, target, cache), *history_kind),
         // A witness reference names a binder, not a variable, so what freshening owes it
         // is the α-conversion its binder got. A written sum's binder is re-minted by
         // [`Type::alpha_convert_sum`] on the way out of the `Fun` arm; a kind variable's is
@@ -759,7 +779,13 @@ pub fn freshen_above(
             }
             v.inherit_witness_placement_renamed(
                 tv,
-                |k| cache.fun_kind_vars.get(&k.uid).cloned().unwrap_or_else(|| Rc::clone(k)),
+                |k| {
+                    cache
+                        .fun_kind_vars
+                        .get(&k.uid)
+                        .cloned()
+                        .unwrap_or_else(|| Rc::clone(k))
+                },
                 |w| cache.witnesses.get(w).copied().unwrap_or(*w),
             );
             if tv.names_domain() {
@@ -789,6 +815,7 @@ pub fn freshen_above(
                     self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
                     ty: freshen_above(lim, &b.ty, target, cache),
                     ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
+                    rendered: Default::default(),
                 })
                 .collect();
             let new_ups: Vec<_> = ups
@@ -798,6 +825,7 @@ pub fn freshen_above(
                     self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
                     ty: freshen_above(lim, &b.ty, target, cache),
                     ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
+                    rendered: Default::default(),
                 })
                 .collect();
             // Every instantiation gets its own copy of the kinding constraints. A
@@ -818,7 +846,9 @@ pub fn freshen_above(
             // A suspension's kinds are decided on it, and so on its copy
             // ([`crate::ccl::infer_var::SuspendedMembership`]).
             for m in crate::ccl::infer_var::suspended_memberships_of(tv) {
-                let kind = m.kind.map_children(|t| freshen_above(lim, t, target, cache));
+                let kind = m
+                    .kind
+                    .map_children(|t| freshen_above(lim, t, target, cache));
                 let witnesses = m
                     .witnesses
                     .map_types(|t| freshen_above(lim, t, target, cache));
@@ -864,11 +894,7 @@ pub fn freshen_above(
             }
             // Registered before the bounds are copied, so a bound that reaches this
             // barrier variable again resolves to the copy.
-            let fresh = BarrierVar::fresh(
-                Rc::clone(&barrier.opaque),
-                Vec::new(),
-                Vec::new(),
-            );
+            let fresh = BarrierVar::fresh(Rc::clone(&barrier.opaque), Vec::new(), Vec::new());
             cache.barrier_vars.insert(barrier.uid, Rc::clone(&fresh));
 
             // Snapshot bounds before recursing, as the `Infer` arm does.
@@ -879,6 +905,7 @@ pub fn freshen_above(
                 self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
                 ty: freshen_above(lim, &b.ty, target, cache),
                 ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
+                rendered: Default::default(),
             };
             let new_lows: Vec<_> = lows.iter().map(&mut freshen_bound).collect();
             let new_ups: Vec<_> = ups

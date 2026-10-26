@@ -337,8 +337,12 @@ fn flatten_result_correlation(
 ///
 /// For example, with domain `(_0: (_0: A, (_0: B, _1: C)), _1: (_0: D), _2: E)` and `indices_to_flatten = [0, 1]`,
 /// the output domain is `(_0: A, _1: (_0: B, _1: C), _2: D, _3: E)`.
+///
+/// The collection flattened can stand beneath enclosing levels ([`FlattenTupleDomain::new_at`]):
+/// each enclosing row's group is flattened on its own, and the standing levels stay as they are.
 pub struct FlattenTupleDomain {
-    /// Output tiling: `DataFunction` with a single-level `Record` domain.
+    /// Output tiling: `DataFunction` with a single-level `Record` domain at `level`, beneath the
+    /// standing levels above it.
     base: OperatorBase,
     /// Input operator whose domain is a `Record`.
     input: Box<dyn TileOperator>,
@@ -346,6 +350,8 @@ pub struct FlattenTupleDomain {
     ///
     /// `inner_field_key_opt = Some(k)` for flattened fields; `None` for pass-through fields.
     field_map: Vec<(SmolStr, Option<SmolStr>)>,
+    /// The level whose keys are flattened — see [`FlattenTupleDomain::new_at`].
+    level: CurryLevel,
 }
 
 impl FlattenTupleDomain {
@@ -356,7 +362,18 @@ impl FlattenTupleDomain {
     /// is not a `DataFunction` with a `Record` domain, or if a field marked for flattening is
     /// not a `Record`.
     pub fn new(input: Box<dyn TileOperator>, indices_to_flatten: Vec<usize>) -> Self {
-        let Tiling::DataFunction { domain, codomain } = input.tiling() else {
+        Self::new_at(input, indices_to_flatten, CurryLevel::OUTERMOST)
+    }
+
+    /// [`FlattenTupleDomain::new`] at `level`, leaving every level above it standing: the
+    /// collection whose keys are flattened is each enclosing row's group there, as an
+    /// [`Uncurry`] beneath standing levels pairs each row's group.
+    pub fn new_at(
+        input: Box<dyn TileOperator>,
+        indices_to_flatten: Vec<usize>,
+        level: CurryLevel,
+    ) -> Self {
+        let Tiling::DataFunction { domain, codomain } = input.tiling().values_at(level) else {
             panic!(
                 "FlattenTupleDomain requires a collection input, got {}",
                 input.tiling()
@@ -398,14 +415,15 @@ impl FlattenTupleDomain {
             }
         }
 
-        let tiling = Tiling::DataFunction {
+        let flat = Tiling::DataFunction {
             domain: Extent::Record(flat_extent),
             codomain: codomain.clone(),
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new(with_values_at(input.tiling(), level, flat)),
             input,
             field_map,
+            level,
         }
     }
 }
@@ -434,10 +452,16 @@ impl TileOperator for FlattenTupleDomain {
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
             field_map: self.field_map.clone(),
+            level: self.level,
+            empty_level: self.tiling().values_at(self.level).empty_at_no_rows(),
         })
     }
 
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        // Beneath standing levels the input is an `Uncurry` there, which states none.
+        if self.level != CurryLevel::OUTERMOST {
+            return None;
+        }
         flatten_result_correlation(self.input.result_correlation()?, &self.field_map)
     }
 }
@@ -451,6 +475,10 @@ struct FlattenTupleDomainProducer {
     ///
     /// `inner_field_key_opt = Some(k)` for flattened fields; `None` for pass-through fields.
     field_map: Vec<(SmolStr, Option<SmolStr>)>,
+    /// The level whose keys are flattened — see [`FlattenTupleDomain::new_at`].
+    level: CurryLevel,
+    /// The flattened level to answer with where no enclosing row has been reached.
+    empty_level: Tile,
 }
 
 impl TileProducer for FlattenTupleDomainProducer {
@@ -462,51 +490,19 @@ impl TileProducer for FlattenTupleDomainProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
-        let Tile::DataFunction {
-            row_starts,
-            domain,
-            mut codomain,
-            domain_predicate,
-            deleted,
-        } = input_tile
-        else {
-            panic!("FlattenTupleDomain expected a collection");
-        };
-        let ColumnValue::Records(outer_cols) = domain else {
-            panic!("FlattenTupleDomain expected Records domain column");
-        };
-
-        let flat_domain = ColumnValue::Records(
-            self.field_map
-                .iter()
-                .enumerate()
-                .map(|(out_idx, (outer_k, inner_k_opt))| {
-                    let col = match inner_k_opt {
-                        None => outer_cols
-                            .get(outer_k)
-                            .cloned()
-                            .unwrap_or_else(|| panic!("missing outer column {outer_k}")),
-                        Some(inner_k) => match outer_cols.get(outer_k) {
-                            Some(ColumnValue::Records(inner_map)) => inner_map
-                                .get(inner_k)
-                                .cloned()
-                                .unwrap_or_else(|| panic!("missing inner column {inner_k}")),
-                            _ => panic!("outer column {outer_k} is not a Records ColumnValue"),
-                        },
-                    };
-                    (tuple_field(out_idx), col)
-                })
-                .collect(),
-        );
-
-        let field_map = &self.field_map;
-        let flat_pred = flatten_predicate(&domain_predicate, field_map);
-        // A collection beneath names its paths through this level's keys, which are now flat.
-        codomain.map_level_predicates(&mut |depth, pred| {
-            pred.with_component_restated(depth + 1, 0, &|keys| flatten_predicate(keys, field_map))
-        });
-
-        Tile::grouped(row_starts, flat_domain, codomain, flat_pred, deleted)
+        if self.level == CurryLevel::OUTERMOST {
+            return flatten_level(input_tile, &self.field_map);
+        }
+        // Flatten beneath the standing levels, which stand unchanged: a row's group is a
+        // collection in its own right, flattened as a whole tile is.
+        input_tile.regroup_beneath(
+            self.level,
+            self.empty_level.clone(),
+            &mut |row| match input_tile.group_at(self.level, row) {
+                Some(group) => flatten_level(group.into_owned(), &self.field_map),
+                None => self.empty_level.clone(),
+            },
+        )
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -515,11 +511,70 @@ impl TileProducer for FlattenTupleDomainProducer {
     }
 }
 
+/// A collection keyed by tuples of tuples, with the fields `field_map` names spliced into one
+/// tuple: the whole of what [`FlattenTupleDomain`] does to a tile that is exactly that
+/// collection. Beneath standing levels it is done to each enclosing row's group.
+fn flatten_level(tile: Tile, field_map: &[(SmolStr, Option<SmolStr>)]) -> Tile {
+    let Tile::DataFunction {
+        row_starts,
+        domain,
+        mut codomain,
+        domain_predicate,
+        deleted,
+    } = tile
+    else {
+        panic!("FlattenTupleDomain expected a collection");
+    };
+    let ColumnValue::Records(outer_cols) = domain else {
+        panic!("FlattenTupleDomain expected Records domain column");
+    };
+
+    let flat_domain = ColumnValue::Records(
+        field_map
+            .iter()
+            .enumerate()
+            .map(|(out_idx, (outer_k, inner_k_opt))| {
+                let col = match inner_k_opt {
+                    None => outer_cols
+                        .get(outer_k)
+                        .cloned()
+                        .unwrap_or_else(|| panic!("missing outer column {outer_k}")),
+                    Some(inner_k) => match outer_cols.get(outer_k) {
+                        Some(ColumnValue::Records(inner_map)) => inner_map
+                            .get(inner_k)
+                            .cloned()
+                            .unwrap_or_else(|| panic!("missing inner column {inner_k}")),
+                        _ => panic!("outer column {outer_k} is not a Records ColumnValue"),
+                    },
+                };
+                (tuple_field(out_idx), col)
+            })
+            .collect(),
+    );
+
+    let flat_pred = flatten_predicate(&domain_predicate, field_map);
+    // A collection beneath names its paths through this level's keys, which are now flat.
+    codomain.map_level_predicates(&mut |depth, pred| {
+        pred.with_component_restated(depth + 1, 0, &|keys| flatten_predicate(keys, field_map))
+    });
+
+    Tile::grouped(row_starts, flat_domain, codomain, flat_pred, deleted)
+}
+
 impl FlattenTupleDomainProducer {
     /// The input guard naming what `guard` names over the flat keys: the region of keys
     /// restated over the nested keys, and what it names beneath them restated alike, as
     /// [`get_impl`](TileProducer::get_impl) restated the levels beneath on the way out.
     fn unflatten_guard(&self, guard: TileGuard) -> TileGuard {
+        if self.level != CurryLevel::OUTERMOST {
+            let at = self.level.index();
+            return crate::interpreter::tiling::through_standing_levels(
+                guard,
+                at,
+                self.input.tiling(),
+                &mut |arm| self.unflatten_beneath(arm, at),
+            );
+        }
         let field_map = &self.field_map;
         match guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
@@ -543,6 +598,28 @@ impl FlattenTupleDomainProducer {
                     all.union(&self.unflatten_guard(arm))
                 }),
             g => unreachable!("FlattenTupleDomain's tiling is a collection, released by {g:?}"),
+        }
+    }
+
+    /// One arm of a guard released at the flattened level `at`, beneath the standing levels,
+    /// restated over the nested keys. Paths there name every level from the outermost, so the
+    /// restated component is `at`.
+    fn unflatten_beneath(&self, arm: TileGuard, at: usize) -> TileGuard {
+        let field_map = &self.field_map;
+        let unflatten = |keys: &Predicate| unflatten_predicate(keys, field_map);
+        match arm {
+            TileGuard::Function(FunctionGuard::Domain(pred)) => TileGuard::Function(
+                FunctionGuard::Domain(pred.with_component_restated(at, at, &unflatten)),
+            ),
+            TileGuard::Function(FunctionGuard::Codomain(inner)) => TileGuard::Function(
+                FunctionGuard::Codomain(Box::new(inner.map_level_predicates(
+                    &mut |depth, pred| pred.with_component_restated(at + 1 + depth, at, &unflatten),
+                ))),
+            ),
+            g => unreachable!(
+                "FlattenTupleDomain's tiling is a collection at {}, released by {g:?}",
+                self.level
+            ),
         }
     }
 }
@@ -803,6 +880,8 @@ mod tests {
             base: ProducerBase::unowned(FlattenTupleDomainProducer::alloc_id(), &flat_tiling),
             input: Box::new(TestTileProducer::new(input_tile, nested_outer_tiling())),
             field_map,
+            level: CurryLevel::OUTERMOST,
+            empty_level: flat_tiling.empty_at_no_rows(),
         };
         let result = producer.get(producer.tiling().universal_guard());
         let Tile::DataFunction {
@@ -820,6 +899,120 @@ mod tests {
         assert_eq!(cols[&tuple_field(1)], ColumnValue::Ints(vec![30, 40]));
         assert_eq!(cols[&tuple_field(2)], ColumnValue::Ints(vec![50, 60]));
         assert_eq!(domain_predicate, Predicate::True);
+    }
+
+    /// `nested_outer_extent` keys under a standing level of two rows, one key each:
+    /// `{ _0: { _0: [10,20], _1: [30,40] }, _1: { _0: [50,60] } }`, the first under row 0 and the
+    /// second under row 1, and the producer flattening the inner level.
+    fn flatten_beneath_a_standing_level() -> FlattenTupleDomainProducer {
+        let uint = || Extent::Base(BaseType::UInt);
+        let input_tiling = Tiling::data_function(uint(), nested_outer_tiling());
+        let flat_tiling = Tiling::data_function(uint(), flat_three_int_tiling());
+        let groups = Tile::grouped(
+            vec![0, 1],
+            ColumnValue::Records(HashMap::from([
+                (
+                    tuple_field(0),
+                    ColumnValue::Records(HashMap::from([
+                        (tuple_field(0), ColumnValue::Ints(vec![10, 20])),
+                        (tuple_field(1), ColumnValue::Ints(vec![30, 40])),
+                    ])),
+                ),
+                (
+                    tuple_field(1),
+                    ColumnValue::Records(HashMap::from([(
+                        tuple_field(0),
+                        ColumnValue::Ints(vec![50, 60]),
+                    )])),
+                ),
+            ])),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let input_tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(groups),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let level = CurryLevel::new(1);
+        FlattenTupleDomainProducer {
+            base: ProducerBase::unowned(FlattenTupleDomainProducer::alloc_id(), &flat_tiling),
+            input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
+            field_map: vec![
+                (tuple_field(0), Some(tuple_field(0))),
+                (tuple_field(0), Some(tuple_field(1))),
+                (tuple_field(1), Some(tuple_field(0))),
+            ],
+            level,
+            empty_level: flat_tiling.values_at(level).empty_at_no_rows(),
+        }
+    }
+
+    /// Beneath a standing level each row's group is flattened, and the standing level keeps its
+    /// keys and each row its group.
+    #[test]
+    fn flatten_producer_flattens_each_group_beneath_a_standing_level() {
+        let mut producer = flatten_beneath_a_standing_level();
+        let result = producer.get(producer.tiling().universal_guard());
+        let Tile::DataFunction {
+            domain: rows,
+            codomain,
+            ..
+        } = result
+        else {
+            panic!("expected a collection");
+        };
+        assert_eq!(rows, ColumnValue::UInts(vec![0, 1]));
+        let Tile::DataFunction {
+            row_starts, domain, ..
+        } = *codomain
+        else {
+            panic!("expected a collection beneath the standing level");
+        };
+        assert_eq!(row_starts, vec![0, 1]);
+        let ColumnValue::Records(cols) = domain else {
+            panic!("expected record keys");
+        };
+        assert_eq!(cols[&tuple_field(0)], ColumnValue::Ints(vec![10, 20]));
+        assert_eq!(cols[&tuple_field(1)], ColumnValue::Ints(vec![30, 40]));
+        assert_eq!(cols[&tuple_field(2)], ColumnValue::Ints(vec![50, 60]));
+    }
+
+    /// A release of flat keys under one standing row names the nested keys under that row; the
+    /// standing level passes through.
+    #[test]
+    fn flatten_release_beneath_a_standing_level_unflattens_under_the_row() {
+        let producer = flatten_beneath_a_standing_level();
+        let p = |n: i64| Predicate::point(Value::Int(n));
+        let flat = Predicate::Record(HashMap::from([
+            (tuple_field(0), p(10)),
+            (tuple_field(1), p(30)),
+            (tuple_field(2), p(50)),
+        ]));
+        let nested = Predicate::Record(HashMap::from([
+            (
+                tuple_field(0),
+                Predicate::Record(HashMap::from([
+                    (tuple_field(0), p(10)),
+                    (tuple_field(1), p(30)),
+                ])),
+            ),
+            (
+                tuple_field(1),
+                Predicate::Record(HashMap::from([(tuple_field(0), p(50))])),
+            ),
+        ]));
+        let under_row = |keys: Predicate| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(Predicate::qualified(Predicate::point(Value::UInt(0)), keys)),
+            ))))
+        };
+        assert_eq!(
+            producer.unflatten_guard(under_row(flat)),
+            TileGuard::flatten_or(vec![under_row(nested)])
+        );
     }
 
     /// `FlattenTupleDomainProducer::get_impl` passes through non-flattened outer fields unchanged.
@@ -871,6 +1064,8 @@ mod tests {
             base: ProducerBase::unowned(FlattenTupleDomainProducer::alloc_id(), &out_tiling),
             input: Box::new(TestTileProducer::new(input_tile, pass_through_tiling)),
             field_map,
+            level: CurryLevel::OUTERMOST,
+            empty_level: out_tiling.empty_at_no_rows(),
         };
         let result = producer.get(producer.tiling().universal_guard());
         let Tile::DataFunction { domain, .. } = result else {

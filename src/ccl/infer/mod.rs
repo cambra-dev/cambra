@@ -265,7 +265,68 @@ fn kind_mismatch_reason(lhs: &Type, rhs: &Type) -> &'static str {
 pub(super) fn coalesce_for_error(ty: &Type) -> Type {
     let mut resolved = resolve_var_type(ty).unwrap_or(Type::Hole);
     resolve_predicate_types(&mut resolved);
+    respell_tuple_binders(&mut resolved);
     resolved
+}
+
+/// Write each dependent tuple in `ty` with the component names a reader can use: a component
+/// no later one reads is unnamed, as a plain tuple's are, and a name the compiler minted that a
+/// later component reads, as `uncurry`'s scheme names its keys, is respelled `k`, numbered where
+/// the type already holds that spelling (the spelling `chl_print` gives a minted key binder).
+fn respell_tuple_binders(ty: &mut Type) {
+    let mut taken: HashSet<String> = crate::ccl::subst::type_free_vars(ty)
+        .iter()
+        .map(|n| n.base().to_string())
+        .collect();
+    respell_in(ty, &mut taken);
+
+    fn respell_in(ty: &mut Type, taken: &mut HashSet<String>) {
+        ty.walk_children_mut(|child| respell_in(child, taken));
+        let Type::DepTuple(components) = ty else {
+            return;
+        };
+        // Open every component at a placeholder per earlier component, so a later component
+        // reads an earlier one by a name whether it was open or closed.
+        let placeholders: Vec<Name> = (0..components.len())
+            .map(|_| Name::fresh("__respelled"))
+            .collect();
+        let mut opened = crate::ccl::subst::open_tuple_components(components, |j, _| {
+            crate::ccl::subst::Mapping::Rename(placeholders[j].clone())
+        });
+        let mut names: Vec<Option<Name>> = Vec::with_capacity(components.len());
+        for i in 0..components.len() {
+            let own = components[i].0.clone();
+            let read = opened[i + 1..].iter().any(|t| {
+                let free = crate::ccl::subst::type_free_vars(t);
+                free.contains(&placeholders[i]) || own.as_ref().is_some_and(|n| free.contains(n))
+            });
+            let name = match own {
+                _ if !read => None,
+                Some(n) if !n.base().starts_with("__") => Some(n),
+                _ => {
+                    let spelling = std::iter::once("k".to_string())
+                        .chain((1..).map(|i| format!("k{i}")))
+                        .find(|s| !taken.contains(s))
+                        .expect("an unbounded sequence of spellings has one not taken");
+                    taken.insert(spelling.clone());
+                    Some(Name::from(spelling.as_str()))
+                }
+            };
+            if let Some(to) = &name {
+                let renames = std::iter::once(&placeholders[i])
+                    .chain(components[i].0.as_ref())
+                    .filter(|from| *from != to);
+                for from in renames {
+                    let rename = crate::ccl::subst::Subst::rename(from.clone(), to.clone());
+                    for later in &mut opened[i + 1..] {
+                        *later = rename.apply_type(later);
+                    }
+                }
+            }
+            names.push(name);
+        }
+        *components = names.into_iter().zip(opened).collect();
+    }
 }
 
 /// Resolve every node type inside `ty`'s refinement predicates, on a copy of each
@@ -419,6 +480,15 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             fed_elsewhere: false,
         },
         ConstrainError::DataDomainMismatch { lhs, rhs, cause } => {
+            // A side whose bounds do not coalesce holds the conflict itself: two domains reached
+            // one of its variables, and the comparison only exposed them. The report is that
+            // conflict, since the side would otherwise render as `_`.
+            if let Some(conflict) = [&lhs, &rhs]
+                .into_iter()
+                .find_map(|t| resolve_var_type(t).err())
+            {
+                return map_coalesce_err(conflict, ctx_label);
+            }
             let (found, expected) = (coalesce_for_error(&lhs), coalesce_for_error(&rhs));
             // Where the two render alike, the report is the sub-comparison that found
             // them unequal ([`ConstrainError::DataDomainMismatch`]'s `cause`, whose doc
