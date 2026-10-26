@@ -158,3 +158,74 @@ fn an_argument_for_an_open_parameter_is_checked_through_its_uses() {
     ));
     assert!(errors.contains("scale.cambra"), "{errors}");
 }
+
+/// An error linking raises in a run's copy names that run at its `run`
+/// statement, and copies that raise it alike are one error, labelled at each:
+/// whether inference merges them, as it does a bounds conflict, or linking does,
+/// across their inference variables.
+#[rstest]
+#[case::one_run(
+    ADDER,
+    indoc! {r#"
+        run m(T=String, x="a") as a
+        run m(T=Int, x=1) as b
+        b::y
+    "#},
+    &["the run `a`, whose copy fails"],
+    &["the run `b`"]
+)]
+#[case::two_runs(
+    ADDER,
+    indoc! {r#"
+        run m(T=String, x="a") as a
+        run m(T=String, x="b") as b
+        1
+    "#},
+    &["the run `a`, whose copy fails", "the run `b`, whose copy fails"],
+    &[]
+)]
+#[case::a_bounds_conflict(
+    indoc! {"
+        param T
+        param x: T
+        pub y = [x, 1]
+    "},
+    indoc! {r#"
+        run m(T=String, x="a") as a
+        run m(T=String, x="b") as b
+        1
+    "#},
+    &["the run `a`, whose copy fails", "the run `b`, whose copy fails"],
+    &[]
+)]
+#[case::inference_variables(
+    indoc! {"
+        param T
+        param x: T
+        pub y = x.name
+    "},
+    indoc! {"
+        run m(T=Int, x=1) as a
+        run m(T=Int, x=2) as b
+        1
+    "},
+    &["the run `a`, whose copy fails", "the run `b`, whose copy fails"],
+    &[]
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_link_time_error_names_its_run(
+    #[case] module: &str,
+    #[case] root: &str,
+    #[case] labels: &[&str],
+    #[case] absent: &[&str],
+) {
+    let errors = compile_errors(&program(root, &[("m", module)]));
+    assert!(errors.contains("m.cambra:3:9"), "{errors}");
+    for label in labels {
+        assert!(errors.contains(label), "{errors}");
+    }
+    for label in absent {
+        assert!(!errors.contains(label), "{errors}");
+    }
+    assert_eq!(report_count(&errors), 1, "{errors}");
+}

@@ -60,6 +60,7 @@ pub(super) trait Typing {
         LocatedInferError {
             error,
             node_id: self.current_node(),
+            also: Box::default(),
             related: RelatedPositions::default(),
         }
     }

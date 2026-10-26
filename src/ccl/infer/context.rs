@@ -1158,6 +1158,7 @@ impl Typing for InferCtx {
         Some(LocatedInferError {
             error: crate::ccl::infer::map_coalesce_err(err, name.base()),
             node_id: binding.defined_at,
+            also: Box::default(),
             related: crate::ccl::infer::RelatedPositions::default(),
         })
     }
