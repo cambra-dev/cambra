@@ -105,6 +105,22 @@ fn next_frame_version(socket: &mut WebSocket<TcpStream>, deadline: Instant) -> u
     }
 }
 
+/// Read probe frames on `socket` until one carries version 2, failing the test
+/// if an earlier one carries any version but 1, or if none arrives before
+/// `deadline`.
+///
+/// Frames of version 1 can precede it: one published before the reload is
+/// still in flight when the reload is answered.
+fn await_reloaded_frame(socket: &mut WebSocket<TcpStream>, deadline: Instant) {
+    loop {
+        let version = next_frame_version(socket, deadline);
+        if version == 2 {
+            return;
+        }
+        assert_eq!(version, 1, "a frame names a version `main` has run");
+    }
+}
+
 /// A reload of `main` replaces the served payload with the new version's, and
 /// creating another branch does not.
 #[test]
@@ -181,14 +197,7 @@ fn probe_frames_follow_a_reload_of_main_after_the_payload_does() {
     assert!(reloaded.starts_with("reloaded"), "{reloaded}");
     writeln!(input, "y").expect("feeding stdin");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let version = next_frame_version(&mut socket, deadline);
-        if version == 2 {
-            break;
-        }
-        assert_eq!(version, 1, "a frame names a version `main` has run");
-    }
+    await_reloaded_frame(&mut socket, Instant::now() + Duration::from_secs(10));
     assert_eq!(
         version(&snapshot(inspect)),
         2,
@@ -201,6 +210,10 @@ fn probe_frames_follow_a_reload_of_main_after_the_payload_does() {
 /// anchors, and a client connecting is handed it. The new version holds no
 /// constant, so with nothing on `stdin` none of its operators takes a reading
 /// that carries rows.
+///
+/// The first version can publish a frame of its own before the reload. Each
+/// constant's first reading carries its row, and the driver takes it with
+/// probing on when the client connects before the driver's first pass.
 #[test]
 fn a_reload_of_main_publishes_a_frame_before_any_input() {
     let inspect = reserve_test_port();
@@ -214,11 +227,6 @@ fn a_reload_of_main_publishes_a_frame_before_any_input() {
     let reloaded = control(launched.control, "/reload", "[line for line in stdin()]\n");
     assert!(reloaded.starts_with("reloaded"), "{reloaded}");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    assert_eq!(
-        next_frame_version(&mut socket, deadline),
-        2,
-        "the first frame after a reload with no input names the new version"
-    );
+    await_reloaded_frame(&mut socket, Instant::now() + Duration::from_secs(10));
     assert_eq!(version(&snapshot(inspect)), 2);
 }
