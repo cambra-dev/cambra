@@ -21,7 +21,7 @@ they communicate by one calling `get` on the other and receiving a
 Concretely:
 
 - Adding a new way for an operator to read from another (e.g., "the body
-  reads the prev-acc directly from a `Rc<RefCell<...>>` instead of
+  reads the prev-acc directly from an `Arc<Mutex<...>>` instead of
   through `get`") is a violation, even if it works on the test cases at
   hand.  Cyclic graphs go through `FanOut::new_cyclic` and the
   re-entrancy machinery on `FanOutShared` — see [`FanOutReentrancy`]'s

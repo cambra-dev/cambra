@@ -359,8 +359,7 @@ impl TileProducer for ExtractFinalProducer {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::interpreter::tile_operators::{FunctionGuard, Predicate};
@@ -371,12 +370,12 @@ mod tests {
     /// exercises `ExtractFinal`'s incremental (pre-terminal) release path.
     struct PartialSource {
         tiling: Tiling,
-        releases: Rc<RefCell<Vec<u64>>>,
+        releases: Arc<Mutex<Vec<u64>>>,
     }
 
     struct PartialSourceProducer {
         base: ProducerBase,
-        releases: Rc<RefCell<Vec<u64>>>,
+        releases: Arc<Mutex<Vec<u64>>>,
     }
 
     impl TileOperator for PartialSource {
@@ -412,7 +411,7 @@ mod tests {
             if let TileGuard::Function(FunctionGuard::Domain(released)) = &obsolete_guard
                 && let Some(Value::UInt(w)) = released.as_at_or_below()
             {
-                self.releases.borrow_mut().push(w);
+                self.releases.lock_now().push(w);
             }
         }
     }
@@ -574,7 +573,7 @@ mod tests {
     #[test]
     fn extract_final_releases_below_the_running_max() {
         let value_tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
-        let releases = Rc::new(RefCell::new(Vec::<u64>::new()));
+        let releases = Arc::new(Mutex::new(Vec::<u64>::new()));
         let source = PartialSource {
             tiling: Tiling::data_function(Extent::Base(BaseType::UInt), value_tiling.clone()),
             releases: releases.clone(),
@@ -591,7 +590,7 @@ mod tests {
             "a non-terminal source stays non-terminal"
         );
         assert_eq!(
-            releases.borrow().last().copied(),
+            releases.lock_now().last().copied(),
             Some(1),
             "ExtractFinal must release below the running max (positions 0, 1), keeping position 2"
         );
@@ -633,8 +632,8 @@ mod projection_tests {
         let (mut last, pulled) = final_of_finished_stream();
         let tile = last.get(last.tiling().universal_guard());
         assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![30])));
-        assert_eq!(pulled.borrow().len(), 1);
-        assert!(pulled.borrow()[0].is_universal());
+        assert_eq!(pulled.lock_now().len(), 1);
+        assert!(pulled.lock_now()[0].is_universal());
     }
 
     #[test]
@@ -642,7 +641,7 @@ mod projection_tests {
         let (mut last, pulled) = final_of_finished_stream();
         let tile = last.get(last.tiling().empty_guard());
         assert_eq!(tile, last.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 
     #[test]

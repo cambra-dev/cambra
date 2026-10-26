@@ -1,6 +1,7 @@
 //! The [`Predicate`] type: subset-of-an-extent descriptions used by guards, plus
 //! the column-value conversions and the function domain-sort helper.
 
+use crate::interpreter::LockNow;
 use smol_str::SmolStr;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -1323,7 +1324,7 @@ impl Predicate {
     fn applies_to_level(&self, extent: &Extent) -> bool {
         // Resolve transparent extent wrappers before matching.
         let extent = match extent {
-            Extent::DataSourceDomain(src) => src.borrow().element_extent(),
+            Extent::DataSourceDomain(src) => src.lock_now().element_extent(),
             Extent::Restricted { base, .. } => *base.clone(),
             other => other.clone(),
         };

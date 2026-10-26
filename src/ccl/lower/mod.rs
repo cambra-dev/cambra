@@ -80,10 +80,9 @@
 //!   `cfg(test)` or the `test-helpers` feature.
 
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -365,7 +364,7 @@ pub struct LoweringContext {
     /// (registered-source recognition) submodules can read and mutate the map
     /// directly; external callers go through the `register_source` /
     /// `take_sources` methods.
-    pub(super) sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    pub(super) sources: HashMap<String, Arc<Mutex<dyn DataSourceDomainExtentImpl>>>,
 
     /// Sink bindings discovered during lowering, keyed by the CCL `Let`-binding name
     /// that holds the deferred responses computation (e.g. `"responses"`).  Each entry
@@ -747,7 +746,7 @@ impl LoweringContext {
     pub fn register_source(
         &mut self,
         name: impl Into<String>,
-        source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        source: Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
     ) {
         self.sources.insert(name.into(), source);
     }
@@ -772,7 +771,7 @@ impl LoweringContext {
     /// the map in place, so it may be called before the drain.
     pub fn registered_sources(
         &self,
-    ) -> impl Iterator<Item = (&str, &Rc<RefCell<dyn DataSourceDomainExtentImpl>>)> {
+    ) -> impl Iterator<Item = (&str, &Arc<Mutex<dyn DataSourceDomainExtentImpl>>)> {
         self.sources.iter().map(|(n, s)| (n.as_str(), s))
     }
 
@@ -811,7 +810,7 @@ impl LoweringContext {
     /// running program has and may add to it.
     pub fn adopt_sources_and_sinks(
         &mut self,
-        sources: impl IntoIterator<Item = (String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>)>,
+        sources: impl IntoIterator<Item = (String, Arc<Mutex<dyn DataSourceDomainExtentImpl>>)>,
         routes: impl IntoIterator<Item = (String, LoweredRoute)>,
         servers: impl IntoIterator<Item = (u16, Arc<SharedHttpServer>)>,
     ) {
@@ -836,7 +835,7 @@ impl LoweringContext {
     /// after `lower_stmts` returns and pass each entry to
     /// [`GlobalContext`](crate::ccl::context::GlobalContext) for uniform
     /// registration with inference and operator-conversion.
-    pub fn take_sources(&mut self) -> HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>> {
+    pub fn take_sources(&mut self) -> HashMap<String, Arc<Mutex<dyn DataSourceDomainExtentImpl>>> {
         std::mem::take(&mut self.sources)
     }
 
@@ -1902,7 +1901,7 @@ pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<Lowe
 #[cfg(test)]
 pub(crate) mod test_helpers {
     //! Shared test fixtures for the `lower` submodules' inline `mod tests`.
-    use std::{cell::RefCell, rc::Rc};
+    use std::sync::{Arc, Mutex};
 
     use crate::{
         ccl::{
@@ -1925,9 +1924,9 @@ pub(crate) mod test_helpers {
     }
 
     /// Create a minimal registered source for tests that only care about name recognition.
-    pub(crate) fn stub_source(name: &str) -> Rc<RefCell<dyn DataSourceDomainExtentImpl>> {
+    pub(crate) fn stub_source(name: &str) -> Arc<Mutex<dyn DataSourceDomainExtentImpl>> {
         use crate::interpreter::{BaseType, Extent, TestDataSource};
-        Rc::new(RefCell::new(TestDataSource::new(
+        Arc::new(Mutex::new(TestDataSource::new(
             name,
             Type::Base(BaseType::String),
             Extent::Base(BaseType::String),

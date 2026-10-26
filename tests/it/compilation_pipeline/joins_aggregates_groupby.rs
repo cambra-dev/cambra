@@ -2,10 +2,11 @@
 //! `test_new_compile` symbolic-CCL parity matrix (asserting both the lowered
 //! CCL shape and the runtime tile).
 
+use cambra::interpreter::LockNow;
 use smol_str::SmolStr;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bit_set::BitSet;
@@ -655,19 +656,17 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
     let mut ctx = GlobalContext::default();
 
     // Register testsource1 for source-based test cases.
-    let data_source = Rc::new(RefCell::new(TestDataSource::new(
+    let data_source = Arc::new(Mutex::new(TestDataSource::new(
         "testsource1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    data_source.borrow_mut().add_data(&[
+    data_source.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(0)),
         (Value::UInt(1), Value::Int(10)),
         (Value::UInt(2), Value::Int(20)),
     ]);
-    data_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    data_source.lock_now().set_yield_predicate(Predicate::True);
     ctx.register_source(data_source);
 
     let (expr, result) = run_pipeline_with_ctx(&mut ctx, code);

@@ -2465,7 +2465,7 @@ fn a_rejected_reload_leaves_the_program_serving() {
 /// register, so its recompile fails while the new version compiles.
 #[test]
 fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
-    use std::{cell::RefCell, rc::Rc};
+    use std::sync::{Arc, Mutex};
 
     use cambra::{
         ccl::Type,
@@ -2481,7 +2481,7 @@ fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
         total
     "};
     let mut ctx = GlobalContext::default();
-    ctx.register_source(Rc::new(RefCell::new(TestDataSource::new(
+    ctx.register_source(Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),

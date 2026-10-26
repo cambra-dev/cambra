@@ -254,7 +254,7 @@ claims an element for itself. What a client receives when several replies race i
 ### What a branch holds
 
 **An operator lives as long as some branch holds it.** An entry holds each `Recorded::Operator` by
-its `Rc<FanOut>`, and each fan-out owns the chain under it, per [Nothing inside a fan-out owns
+its `Arc<FanOut>`, and each fan-out owns the chain under it, per [Nothing inside a fan-out owns
 it](#nothing-inside-a-fan-out-owns-it). Dropping an operator from one entry therefore frees it only
 when no other entry holds it.
 
@@ -1214,7 +1214,7 @@ holds a weak reference.
 - **Fan-out slots.** `FanOutShared::subscribers` holds a weak reference per slot, and the strong
   side lives in the `FanOutProducer` that slot handed out. A dead slot is skipped and renumbered per
   [Guards intersect at a fan-out](#guards-intersect-at-a-fan-out).
-- **Scheduler wake-ups.** `Scheduler::add_source_handle` records a `Weak<RefCell<dyn Consumer>>`,
+- **Scheduler wake-ups.** `Scheduler::add_source_handle` records a `Weak<Mutex<dyn Consumer>>`,
   and the `IterateExtentProducer` that registered it owns the strong side. A source handle outlives
   a version and the subscriptions against it do not. A strong registration would keep every operator
   any version ever subscribed alive and notified.

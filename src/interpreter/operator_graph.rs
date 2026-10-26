@@ -38,6 +38,7 @@
 //! [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
 //! [`TileOperator::visit_inputs`]: crate::interpreter::tile_operators::TileOperator::visit_inputs
 
+use crate::interpreter::LockNow;
 use smol_str::SmolStr;
 use std::cell::RefCell;
 
@@ -215,7 +216,7 @@ impl OperatorGraph {
     /// stored copy could only disagree with it.
     ///
     /// Two kinds of node qualify. A **sink**: nothing subscribes it. A **fan
-    /// input**: the `Rc<FanOut>` holding it is dropped when conversion ends, so
+    /// input**: the `Arc<FanOut>` holding it is dropped when conversion ends, so
     /// only its slots survive, and each names it with a `Share` — and a
     /// binding whose variable is never used has a fan with no slots at all,
     /// so nothing names it.
@@ -543,7 +544,9 @@ pub fn source_nodes(graph: &OperatorGraph) -> std::collections::HashMap<String, 
             continue;
         };
         domain.for_each_source(&mut |source| {
-            let ids = out.entry(source.borrow().get_id().to_string()).or_default();
+            let ids = out
+                .entry(source.lock_now().get_id().to_string())
+                .or_default();
             if !ids.contains(id) {
                 ids.push(*id);
             }

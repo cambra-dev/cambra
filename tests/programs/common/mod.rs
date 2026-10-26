@@ -61,12 +61,13 @@
 //! }
 //! ```
 
+use cambra::interpreter::LockNow;
 use std::{
-    cell::RefCell,
     io::Write,
     panic::{self, AssertUnwindSafe},
     process::{Command, Stdio},
-    rc::Rc,
+    sync::Arc,
+    sync::Mutex,
 };
 
 use cambra::ccl::load::LoadedProgram;
@@ -254,16 +255,16 @@ pub fn expect_stdin_program(program_name: &str, stdin_input: &str, expected_subs
 /// (e.g. a sink-only program — those use [`compile_sink`] instead).
 pub(crate) fn run_to_tile(source: &str) -> Tile {
     let mut ctx = GlobalContext::default();
-    let notified = Rc::new(RefCell::new(false));
+    let notified = Arc::new(Mutex::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
+        *notified_clone.lock_now() = true;
     });
     let loaded = LoadedProgram::test(source);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     ctx.scheduler().check_for_notifications();
     assert!(
-        *notified.borrow(),
+        *notified.lock_now(),
         "expected consumer notification after compile_program"
     );
     let producer = compiled

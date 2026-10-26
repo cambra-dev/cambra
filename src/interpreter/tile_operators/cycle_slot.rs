@@ -1,7 +1,7 @@
 //! Late wiring for cyclic operator graphs.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::interpreter::ReadNow;
+use std::sync::{Arc, RwLock};
 
 /// An operator input filled once construction is done, so a cycle can be built.
 ///
@@ -14,17 +14,17 @@ use std::rc::Rc;
 /// channel: the graph stays static and complete, and data still crosses it at `get`
 /// time as a tile (see `src/interpreter/CLAUDE.md`, "Core invariant: data flows
 /// between operators as Tiles, nothing else"). Reach for this rather than a
-/// hand-rolled `Rc<RefCell<…>>` — it is the shape `./ci.sh shared_state` recognises
+/// hand-rolled `Arc<Mutex<…>>` — it is the shape `./ci.sh shared_state` recognises
 /// as legitimate, so a hand-rolled one has to justify itself instead.
 pub struct CycleSlot<T: ?Sized>(
     // shared-state-ok: the single definition of the late-wiring cell. It holds an
     // operator, wired once, not values passed between operators.
-    Rc<RefCell<Option<Box<T>>>>,
+    Arc<RwLock<Option<Box<T>>>>,
 );
 
 impl<T: ?Sized> CycleSlot<T> {
     pub fn new() -> Self {
-        Self(Rc::new(RefCell::new(None)))
+        Self(Arc::new(RwLock::new(None)))
     }
 
     /// A one-shot filler for this slot, detached from the operator that owns it
@@ -35,10 +35,10 @@ impl<T: ?Sized> CycleSlot<T> {
         let slot = self.0.clone();
         move |op: Box<T>| {
             debug_assert!(
-                slot.borrow().is_none(),
+                slot.read_now().is_none(),
                 "a cycle slot is wired once; refilling it would drop a live input"
             );
-            *slot.borrow_mut() = Some(op);
+            *slot.write_now() = Some(op);
         }
     }
 
@@ -47,7 +47,7 @@ impl<T: ?Sized> CycleSlot<T> {
     /// How the graph walk reads a late-wired edge. It runs before `subscribe`,
     /// which is the only other reader and which empties the slot.
     pub(crate) fn peek(&self, f: &mut dyn FnMut(&T)) {
-        if let Some(op) = self.0.borrow().as_deref() {
+        if let Some(op) = self.0.read_now().as_deref() {
             f(op);
         }
     }
@@ -60,7 +60,7 @@ impl<T: ?Sized> CycleSlot<T> {
     /// first `take` emptied it). A slot holds an operator, and an operator is
     /// subscribed once.
     pub fn take(&self) -> Option<Box<T>> {
-        self.0.borrow_mut().take()
+        self.0.write_now().take()
     }
 }
 

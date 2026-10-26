@@ -3,9 +3,10 @@
 //! incremental global aggregate, mutation loop over a source, and incremental
 //! group-by aggregates.
 
-use std::cell::RefCell;
+use cambra::interpreter::LockNow;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bit_set::BitSet;
@@ -43,32 +44,32 @@ use smol_str::SmolStr;
 #[case("[(x, 0).0 for x in testsource1() if True]")]
 fn test_test_source(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
-    let data_source = Rc::new(RefCell::new(TestDataSource::new(
+    let data_source = Arc::new(Mutex::new(TestDataSource::new(
         "testsource1",
         Type::Base(BaseType::String),
         Extent::Base(BaseType::String),
     )));
     ctx.register_source(data_source.clone());
 
-    data_source.borrow_mut().add_data(&[
+    data_source.lock_now().add_data(&[
         (Value::UInt(10), Value::String("foo".into())),
         (Value::UInt(20), Value::String("bar".into())),
     ]);
 
-    let notified = Rc::new(RefCell::new(false));
+    let notified = Arc::new(Mutex::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
+        *notified_clone.lock_now() = true;
     });
 
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    assert!(*notified.lock_now());
 
     let tile = producer.get(producer.tiling().universal_guard());
-    *notified.borrow_mut() = false;
+    *notified.lock_now() = false;
 
     // Extract domain and codomain; sort by domain key for deterministic comparison.
     let Tile::DataFunction {
@@ -94,18 +95,14 @@ fn test_test_source(#[case] code: &str) {
 
     // Changing the yield guard is news without new data: it closes the source here, which
     // readers holding a cached tile would otherwise never learn.
-    data_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    data_source.lock_now().set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    assert!(*notified.lock_now());
     // Restating the guard it already has changes nothing, and must not notify.
-    *notified.borrow_mut() = false;
-    data_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    *notified.lock_now() = false;
+    data_source.lock_now().set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
-    assert!(!*notified.borrow());
+    assert!(!*notified.lock_now());
 }
 
 /// Filtering a data source while in non-terminal state: only elements that
@@ -114,28 +111,28 @@ fn test_test_source(#[case] code: &str) {
 #[test]
 fn test_source_filter_nonterminal() {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    test_source.borrow_mut().add_data(&[
+    test_source.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
     ctx.register_source(test_source.clone());
 
-    let notified = Rc::new(RefCell::new(false));
+    let notified = Arc::new(Mutex::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
+        *notified_clone.lock_now() = true;
     });
     let code = "[s for s in source1() if s < 15]";
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    assert!(*notified.lock_now());
 
     let mut tile = producer.get(producer.tiling().universal_guard());
     tile.compact();
@@ -169,12 +166,12 @@ fn test_inner_join(#[case] code: &str) {
         (tuple_field(0), Extent::Base(BaseType::Int)),
         (tuple_field(1), Extent::Base(BaseType::String)),
     ]));
-    let data_source1 = Rc::new(RefCell::new(TestDataSource::new(
+    let data_source1 = Arc::new(Mutex::new(TestDataSource::new(
         "testsource1",
         record_type.clone(),
         record_extent.clone(),
     )));
-    let data_source2 = Rc::new(RefCell::new(TestDataSource::new(
+    let data_source2 = Arc::new(Mutex::new(TestDataSource::new(
         "testsource2",
         record_type,
         record_extent,
@@ -182,7 +179,7 @@ fn test_inner_join(#[case] code: &str) {
     ctx.register_source(data_source1.clone());
     ctx.register_source(data_source2.clone());
 
-    data_source1.borrow_mut().add_data(&[(
+    data_source1.lock_now().add_data(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -190,9 +187,9 @@ fn test_inner_join(#[case] code: &str) {
         ])),
     )]);
     data_source1
-        .borrow_mut()
+        .lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
-    data_source2.borrow_mut().add_data(&[(
+    data_source2.lock_now().add_data(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -200,13 +197,13 @@ fn test_inner_join(#[case] code: &str) {
         ])),
     )]);
     data_source2
-        .borrow_mut()
+        .lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
 
-    let notified = Rc::new(RefCell::new(false));
+    let notified = Arc::new(Mutex::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
+        *notified_clone.lock_now() = true;
     });
 
     // let mut producer = ctx.compile_program(code, consumer).unwrap_or_render("<test>", code);
@@ -214,10 +211,10 @@ fn test_inner_join(#[case] code: &str) {
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    assert!(*notified.lock_now());
 
     let tile = producer.get(producer.tiling().universal_guard());
-    *notified.borrow_mut() = false;
+    *notified.lock_now() = false;
 
     // Extract rows from a DataFunction tile where:
     //   domain   = Records { _0: UInts (src1 key), _1: UInts (src2 key) }
@@ -295,7 +292,7 @@ fn test_inner_join(#[case] code: &str) {
         vec![((10, 10), (100, "a1".into(), "b1".into()))]
     );
 
-    data_source1.borrow_mut().add_data(&[(
+    data_source1.lock_now().add_data(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(200)),
@@ -303,9 +300,9 @@ fn test_inner_join(#[case] code: &str) {
         ])),
     )]);
     data_source1
-        .borrow_mut()
+        .lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
-    data_source2.borrow_mut().add_data(&[(
+    data_source2.lock_now().add_data(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -313,13 +310,13 @@ fn test_inner_join(#[case] code: &str) {
         ])),
     )]);
     data_source2
-        .borrow_mut()
+        .lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
 
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    assert!(*notified.lock_now());
     let tile = producer.get(producer.tiling().universal_guard());
-    *notified.borrow_mut() = false;
+    *notified.lock_now() = false;
 
     // After second batch: (10,10)→(100,"a1","b1") and (10,20)→(100,"a1","b2").
     // src1[20] (_0=200) does not match any src2 row via the x._0==y._0 filter.
@@ -331,7 +328,7 @@ fn test_inner_join(#[case] code: &str) {
         ]
     );
 
-    data_source1.borrow_mut().add_data(&[(
+    data_source1.lock_now().add_data(&[(
         Value::UInt(30),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
@@ -339,13 +336,13 @@ fn test_inner_join(#[case] code: &str) {
         ])),
     )]);
     data_source1
-        .borrow_mut()
+        .lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(30u64)));
 
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    assert!(*notified.lock_now());
     let tile = producer.get(producer.tiling().universal_guard());
-    *notified.borrow_mut() = false;
+    *notified.lock_now() = false;
 
     assert_eq!(
         extract_join_rows(tile),
@@ -365,12 +362,12 @@ fn test_inner_join(#[case] code: &str) {
 fn test_incremental_join_simple(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
 
-    let src1 = Rc::new(RefCell::new(TestDataSource::new(
+    let src1 = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    let src2 = Rc::new(RefCell::new(TestDataSource::new(
+    let src2 = Arc::new(Mutex::new(TestDataSource::new(
         "source2",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -378,27 +375,27 @@ fn test_incremental_join_simple(#[case] code: &str) {
     ctx.register_source(src1.clone());
     ctx.register_source(src2.clone());
 
-    src1.borrow_mut()
+    src1.lock_now()
         .add_data(&[(Value::UInt(1), Value::Int(100))]);
-    src1.borrow_mut()
+    src1.lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
-    src2.borrow_mut()
+    src2.lock_now()
         .add_data(&[(Value::UInt(10), Value::Int(100))]);
-    src2.borrow_mut()
+    src2.lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
 
-    let notified = Rc::new(RefCell::new(false));
+    let notified = Arc::new(Mutex::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
+        *notified_clone.lock_now() = true;
     });
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    assert!(*notified.lock_now());
     let tile = producer.get(producer.tiling().universal_guard());
-    *notified.borrow_mut() = false;
+    *notified.lock_now() = false;
 
     // Unpack Function where:
     //   domain   = Records { _0: UInts (src1 domain key), _1: UInts (src2 domain key) }
@@ -430,26 +427,26 @@ fn test_incremental_join_simple(#[case] code: &str) {
     assert_eq!(extract_rows(tile), vec![((1, 10), 200)]);
 
     // Phase 2: extend src1 with a second element; src2 is unchanged.
-    src2.borrow_mut()
+    src2.lock_now()
         .add_data(&[(Value::UInt(20), Value::Int(100))]);
-    src2.borrow_mut()
+    src2.lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
 
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    assert!(*notified.lock_now());
     let tile = producer.get(producer.tiling().universal_guard());
 
     // Cross-product of src1={10, 30} × src2={20}: two pairs.
     assert_eq!(extract_rows(tile), vec![((1, 10), 200), ((1, 20), 200)]);
 
     // Phase 3: extend src2 with a second element; src1 is unchanged.
-    src1.borrow_mut()
+    src1.lock_now()
         .add_data(&[(Value::UInt(2), Value::Int(100))]);
-    src1.borrow_mut()
+    src1.lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::from(2u64)));
 
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow());
+    assert!(*notified.lock_now());
     let tile = producer.get(producer.tiling().universal_guard());
 
     // Cross-product of src1={10, 30} × src2={20}: two pairs.
@@ -471,7 +468,7 @@ fn test_incremental_global_aggregate() {
     let code = "sum(source1())";
     let mut ctx = GlobalContext::default();
 
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -483,7 +480,7 @@ fn test_incremental_global_aggregate() {
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
-    test_source.borrow_mut().add_data(&[
+    test_source.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
@@ -496,7 +493,7 @@ fn test_incremental_global_aggregate() {
 
     // Second batch: adds 30 more; running total 60, still not terminal.
     test_source
-        .borrow_mut()
+        .lock_now()
         .add_data(&[(Value::UInt(2), Value::Int(30))]);
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
@@ -506,9 +503,7 @@ fn test_incremental_global_aggregate() {
     );
 
     // Signal that the source is exhausted; the accumulated sum should now be emitted.
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.lock_now().set_yield_predicate(Predicate::True);
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
         result,
@@ -517,7 +512,7 @@ fn test_incremental_global_aggregate() {
     );
 
     assert_eq!(
-        test_source.borrow().get_released_predicate(),
+        test_source.lock_now().get_released_predicate(),
         Predicate::True
     );
 }
@@ -533,12 +528,12 @@ fn test_incremental_global_aggregate() {
 fn test_a_projection_after_a_source_is_read_from_the_source() {
     let code = "sum([a + b.0 for a in source2() for b in source3() if a == b.1])";
     let mut ctx = GlobalContext::default();
-    let ints = Rc::new(RefCell::new(TestDataSource::new(
+    let ints = Arc::new(Mutex::new(TestDataSource::new(
         "source2",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    let pairs = Rc::new(RefCell::new(TestDataSource::new(
+    let pairs = Arc::new(Mutex::new(TestDataSource::new(
         "source3",
         Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)]),
         Extent::Record(HashMap::from([
@@ -563,10 +558,10 @@ fn test_a_projection_after_a_source_is_read_from_the_source() {
             )
         })
         .collect();
-    ints.borrow_mut().add_data(&int_rows);
-    pairs.borrow_mut().add_data(&pair_rows);
+    ints.lock_now().add_data(&int_rows);
+    pairs.lock_now().add_data(&pair_rows);
     for source in [&ints, &pairs] {
-        source.borrow_mut().set_yield_predicate(Predicate::True);
+        source.lock_now().set_yield_predicate(Predicate::True);
     }
     let map = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
@@ -598,7 +593,7 @@ fn test_a_projection_after_a_source_is_read_from_the_source() {
 fn test_two_projections_of_a_source_are_read_from_the_source_together() {
     let code = "sum([b.2 - b.0 for b in source3()])";
     let mut ctx = GlobalContext::default();
-    let triples = Rc::new(RefCell::new(TestDataSource::new(
+    let triples = Arc::new(Mutex::new(TestDataSource::new(
         "source3",
         Type::Tuple(vec![Type::Base(BaseType::Int); 3]),
         Extent::Record(HashMap::from(
@@ -616,8 +611,8 @@ fn test_two_projections_of_a_source_are_read_from_the_source_together() {
             )
         })
         .collect();
-    triples.borrow_mut().add_data(&rows);
-    triples.borrow_mut().set_yield_predicate(Predicate::True);
+    triples.lock_now().add_data(&rows);
+    triples.lock_now().set_yield_predicate(Predicate::True);
     let map = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
     let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
@@ -674,7 +669,7 @@ fn test_a_source_reads_the_fields_its_planned_chain_projects() {
     ];
     for (code, reads, expected) in cases {
         let mut ctx = GlobalContext::default();
-        let source = Rc::new(RefCell::new(TestDataSource::new(
+        let source = Arc::new(Mutex::new(TestDataSource::new(
             "source3",
             Type::Tuple(vec![Type::Base(BaseType::Int); width]),
             Extent::Record(
@@ -684,8 +679,8 @@ fn test_a_source_reads_the_fields_its_planned_chain_projects() {
             ),
         )));
         ctx.register_source(source.clone());
-        source.borrow_mut().add_data(&rows);
-        source.borrow_mut().set_yield_predicate(Predicate::True);
+        source.lock_now().add_data(&rows);
+        source.lock_now().set_yield_predicate(Predicate::True);
         let map = LoadedProgram::test(code);
         let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
         let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
@@ -758,7 +753,7 @@ fn test_a_source_reads_the_nested_leaves_its_planned_chain_projects() {
     ];
     for (code, reads, expected) in cases {
         let mut ctx = GlobalContext::default();
-        let source = Rc::new(RefCell::new(TestDataSource::new(
+        let source = Arc::new(Mutex::new(TestDataSource::new(
             "nest",
             Type::Tuple(vec![int(), Type::Tuple(vec![int(), int()]), int()]),
             Extent::Record(HashMap::from([
@@ -774,8 +769,8 @@ fn test_a_source_reads_the_nested_leaves_its_planned_chain_projects() {
             ])),
         )));
         ctx.register_source(source.clone());
-        source.borrow_mut().add_data(&rows);
-        source.borrow_mut().set_yield_predicate(Predicate::True);
+        source.lock_now().add_data(&rows);
+        source.lock_now().set_yield_predicate(Predicate::True);
         let map = LoadedProgram::test(code);
         let mut compiled = compile_program(&mut ctx, &map, Box::new(|| {})).unwrap_or_render(&map);
         let algebra = cambra::ccl::symbolic::symbolic(&compiled.ast);
@@ -810,7 +805,7 @@ for i in source1():
         x := x + i
 x";
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -822,14 +817,12 @@ x";
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
-    test_source.borrow_mut().add_data(&[
+    test_source.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
         (Value::UInt(2), Value::Int(30)),
     ]);
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.lock_now().set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
 
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
@@ -858,7 +851,7 @@ for i in source1():
     o << cnt
 o";
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -869,14 +862,12 @@ o";
         compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
-    test_source.borrow_mut().add_data(&[
+    test_source.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
         (Value::UInt(2), Value::Int(30)),
     ]);
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.lock_now().set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
 
     let result = pull_laps(ctx.scheduler(), &mut *producer, 16, Tile::is_terminal);
@@ -910,17 +901,17 @@ for i in source1():
 x";
     let mut ctx = GlobalContext::default();
 
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
     ctx.register_source(test_source.clone());
 
-    let notified = Rc::new(RefCell::new(false));
+    let notified = Arc::new(Mutex::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
+        *notified_clone.lock_now() = true;
     });
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
@@ -934,26 +925,29 @@ x";
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
     // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
-    test_source.borrow_mut().add_data(&[
+    test_source.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow(), "first batch should fire a notification");
+    assert!(
+        *notified.lock_now(),
+        "first batch should fire a notification"
+    );
     assert_eq!(
         pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
         empty,
         "after first batch: should produce no output yet"
     );
-    *notified.borrow_mut() = false;
+    *notified.lock_now() = false;
 
     // Second batch: adds 30; running total 60, still not terminal.
     test_source
-        .borrow_mut()
+        .lock_now()
         .add_data(&[(Value::UInt(2), Value::Int(30))]);
     ctx.scheduler().check_for_notifications();
     assert!(
-        *notified.borrow(),
+        *notified.lock_now(),
         "second batch should fire a notification"
     );
     assert_eq!(
@@ -961,14 +955,12 @@ x";
         empty,
         "after second batch: should produce no output yet"
     );
-    *notified.borrow_mut() = false;
+    *notified.lock_now() = false;
 
     // Signal that the source is exhausted; the loop's final accumulator
     // (10 + 20 + 30 = 60) should now be emitted.  Pull until the cycle
     // converges to a non-empty scalar (capped to catch regressions).
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.lock_now().set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
     let result = pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
     assert_eq!(
@@ -980,7 +972,7 @@ x";
     // The mutation loop should have released every position back to the
     // source by the end, mirroring `sum(source1())`'s release behaviour.
     assert_eq!(
-        test_source.borrow().get_released_predicate(),
+        test_source.lock_now().get_released_predicate(),
         Predicate::True
     );
 }
@@ -1002,7 +994,7 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
         x
     "};
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -1019,14 +1011,14 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
         let through = rows.last().expect("a batch has a row").0;
-        source.borrow_mut().add_data(&data);
+        source.lock_now().add_data(&data);
         source
-            .borrow_mut()
+            .lock_now()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(through)));
     };
     let released_through = |key: u64| {
         source
-            .borrow()
+            .lock_now()
             .get_released_predicate()
             .subsumes(&Predicate::at_or_below(Value::UInt(key)))
     };
@@ -1038,12 +1030,12 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
     assert!(
         released_through(1),
         "the driver should have run its first positions before the next batch arrives: {:?}",
-        source.borrow().get_released_predicate()
+        source.lock_now().get_released_predicate()
     );
     assert!(
         !released_through(3),
         "nothing past the first batch exists yet: {:?}",
-        source.borrow().get_released_predicate()
+        source.lock_now().get_released_predicate()
     );
 
     // The second batch arrives under a driver that has already emitted. Its positions are
@@ -1053,14 +1045,14 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
     assert!(
         released_through(4),
         "the driver should read the rows that arrived after its first iterations: {:?}",
-        source.borrow().get_released_predicate()
+        source.lock_now().get_released_predicate()
     );
 
     // A third batch, to read again once more, and then the source closes.
     deliver(&[(5, 60)]);
     pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
     assert!(released_through(5));
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source.lock_now().set_yield_predicate(Predicate::True);
     let mut total = pull_laps(ctx.scheduler(), &mut *producer, 256, Tile::is_terminal);
     total.compact();
     assert_eq!(
@@ -1068,7 +1060,7 @@ fn test_a_source_growing_under_a_running_induction_driver_is_read_again() {
         Tile::Scalar(ColumnValue::Ints(vec![10 + 20 + 30 + 40 + 50 + 60])),
         "every batch is summed, including the ones that arrived mid-run"
     );
-    assert_eq!(source.borrow().get_released_predicate(), Predicate::True);
+    assert_eq!(source.lock_now().get_released_predicate(), Predicate::True);
 }
 
 /// A source that grows while the transaction driver is running.
@@ -1088,7 +1080,7 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
         await_final(total)
     "};
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -1105,14 +1097,14 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
         let through = rows.last().expect("a batch has a row").0;
-        source.borrow_mut().add_data(&data);
+        source.lock_now().add_data(&data);
         source
-            .borrow_mut()
+            .lock_now()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(through)));
     };
     let released_through = |key: u64| {
         source
-            .borrow()
+            .lock_now()
             .get_released_predicate()
             .subsumes(&Predicate::at_or_below(Value::UInt(key)))
     };
@@ -1122,12 +1114,12 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     assert!(
         released_through(1),
         "the driver should have committed its first items before the next batch arrives: {:?}",
-        source.borrow().get_released_predicate()
+        source.lock_now().get_released_predicate()
     );
     assert!(
         !released_through(3),
         "nothing past the first batch exists yet: {:?}",
-        source.borrow().get_released_predicate()
+        source.lock_now().get_released_predicate()
     );
 
     // The second batch arrives under a driver that has already attempted items. Its items
@@ -1137,10 +1129,10 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     assert!(
         released_through(4),
         "the driver should read the items that arrived after its first attempts: {:?}",
-        source.borrow().get_released_predicate()
+        source.lock_now().get_released_predicate()
     );
 
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source.lock_now().set_yield_predicate(Predicate::True);
     let mut total = pull_laps(ctx.scheduler(), &mut *producer, 512, Tile::is_terminal);
     total.compact();
     assert_eq!(
@@ -1151,7 +1143,7 @@ fn test_a_source_growing_under_a_running_transaction_driver_is_read_again() {
     assert!(
         released_through(4),
         "every committed item is released: {:?}",
-        source.borrow().get_released_predicate()
+        source.lock_now().get_released_predicate()
     );
 }
 
@@ -1167,7 +1159,7 @@ for r in [z for z in source1() if z > 99]:
         pool := 7
 await_final(pool)";
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -1179,25 +1171,23 @@ await_final(pool)";
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
-    test_source.borrow_mut().add_data(&[
+    test_source.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
     test_source
-        .borrow_mut()
+        .lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
     ctx.scheduler().check_for_notifications();
     pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
     assert_eq!(
-        test_source.borrow().get_released_predicate(),
+        test_source.lock_now().get_released_predicate(),
         Predicate::at_or_below(Value::UInt(1)),
         "both filtered rows are released while the source is live"
     );
 
     // No block ran, so the store still holds its seed.
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.lock_now().set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
     assert_eq!(
         pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
@@ -1217,7 +1207,7 @@ for i in source1():
     x := 7
 x";
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -1229,7 +1219,7 @@ x";
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
-    test_source.borrow_mut().add_data(&[
+    test_source.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
@@ -1240,16 +1230,14 @@ x";
         "a source that is not done yields no accumulator"
     );
 
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.lock_now().set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
     assert_eq!(
         pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
         Tile::Scalar(ColumnValue::Ints(vec![7])),
     );
     assert_eq!(
-        test_source.borrow().get_released_predicate(),
+        test_source.lock_now().get_released_predicate(),
         Predicate::True
     );
 }
@@ -1264,7 +1252,7 @@ for i in source1():
     x := 7
 x";
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -1276,9 +1264,7 @@ x";
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
 
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.lock_now().set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
     assert_eq!(
         pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
@@ -1291,27 +1277,30 @@ fn test_incremental_aggregates() {
     let code = "[sum(x) for x in groupby(source1(), \\x -> x // 10)]";
     let mut ctx = GlobalContext::default();
 
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
     ctx.register_source(test_source.clone());
 
-    let notified = Rc::new(RefCell::new(false));
+    let notified = Arc::new(Mutex::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
+        *notified_clone.lock_now() = true;
     });
     let loaded = LoadedProgram::test(code);
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow(), "expected notification (pipeline path)");
-    *notified.borrow_mut() = false;
+    assert!(
+        *notified.lock_now(),
+        "expected notification (pipeline path)"
+    );
+    *notified.lock_now() = false;
 
-    test_source.borrow_mut().add_data(&[
+    test_source.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
@@ -1327,7 +1316,7 @@ fn test_incremental_aggregates() {
         )
     );
 
-    test_source.borrow_mut().add_data(&[
+    test_source.lock_now().add_data(&[
         (Value::UInt(2), Value::Int(10)),
         (Value::UInt(3), Value::Int(30)),
     ]);
@@ -1342,9 +1331,7 @@ fn test_incremental_aggregates() {
         )
     );
 
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.lock_now().set_yield_predicate(Predicate::True);
 
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
@@ -1358,7 +1345,7 @@ fn test_incremental_aggregates() {
     );
 
     assert_eq!(
-        test_source.borrow().get_released_predicate(),
+        test_source.lock_now().get_released_predicate(),
         Predicate::True
     );
 }
@@ -1381,20 +1368,18 @@ fn test_incremental_aggregates() {
 )]
 fn test_source_backed_collection_component(#[case] code: &str, #[case] expected: i64) {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    test_source.borrow_mut().add_data(&[
+    test_source.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
     // The table a product holds is the whole table, so the source states that it
     // has delivered all of it.
-    test_source
-        .borrow_mut()
-        .set_yield_predicate(Predicate::True);
+    test_source.lock_now().set_yield_predicate(Predicate::True);
     ctx.register_source(test_source.clone());
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -1421,7 +1406,7 @@ fn test_source_backed_collection_component(#[case] code: &str, #[case] expected:
 #[case::bare_source("source1()")]
 fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -1435,15 +1420,15 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
     // One lap is one delivery followed by one pull. A `Memo` re-reads only after a
     // delivery, so a component read through a `let` answers the previous tile to a
     // pull that skipped one.
-    let mut pull = |source: &Rc<RefCell<TestDataSource>>, rows: &[(u64, i64)], done: bool| {
-        source.borrow_mut().add_data(
+    let mut pull = |source: &Arc<Mutex<TestDataSource>>, rows: &[(u64, i64)], done: bool| {
+        source.lock_now().add_data(
             &rows
                 .iter()
                 .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
                 .collect::<Vec<_>>(),
         );
         if done {
-            source.borrow_mut().set_yield_predicate(Predicate::True);
+            source.lock_now().set_yield_predicate(Predicate::True);
         }
         let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 1, |_| false);
         tile.compact();
@@ -1492,7 +1477,7 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
 #[case::bare_source("source1()")]
 fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -1504,7 +1489,7 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     let mut pull_and_release = |rows: &[(u64, i64)]| {
-        test_source.borrow_mut().add_data(
+        test_source.lock_now().add_data(
             &rows
                 .iter()
                 .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
@@ -1547,7 +1532,7 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
 /// source has released.
 fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64], laps: usize) -> Predicate {
     let mut ctx = GlobalContext::default();
-    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+    let test_source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -1562,9 +1547,9 @@ fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64], laps: usize) 
         .enumerate()
         .map(|(i, v)| (Value::uint_from_row(i), Value::Int(*v)))
         .collect();
-    test_source.borrow_mut().add_data(&rows);
+    test_source.lock_now().add_data(&rows);
     test_source
-        .borrow_mut()
+        .lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(rows.len() - 1)));
     ctx.scheduler().check_for_notifications();
     for _ in 0..laps {
@@ -1574,7 +1559,7 @@ fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64], laps: usize) 
         }
         ctx.scheduler().check_for_notifications();
     }
-    test_source.borrow().get_released_predicate()
+    test_source.lock_now().get_released_predicate()
 }
 
 /// An induction loop over a live source filtered to nothing releases every row, as the
@@ -1659,7 +1644,7 @@ fn run_in_batches(code: &str, batches: &[(&[(u64, i64)], u64)]) -> Tile {
 /// say what arrived before the source closed.
 fn run_in_batches_seeing(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<Tile>, Tile) {
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -1675,15 +1660,15 @@ fn run_in_batches_seeing(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<T
             .iter()
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
-        source.borrow_mut().add_data(&data);
+        source.lock_now().add_data(&data);
         source
-            .borrow_mut()
+            .lock_now()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(*upto)));
         let mut seen = pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
         seen.compact();
         each.push(seen);
     }
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source.lock_now().set_yield_predicate(Predicate::True);
     let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 256, Tile::is_terminal);
     assert!(
         tile.is_terminal(),
@@ -1863,7 +1848,7 @@ fn a_collection_per_row_over_a_streamed_source() {
 fn a_collection_per_row_released_as_it_is_read() {
     let code = "[[y * x for y in source1()] for x in [1, 2]]";
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -1879,8 +1864,8 @@ fn a_collection_per_row_released_as_it_is_read() {
             .iter()
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
             .collect();
-        source.borrow_mut().add_data(&data);
-        source.borrow_mut().set_yield_predicate(yielded);
+        source.lock_now().add_data(&data);
+        source.lock_now().set_yield_predicate(yielded);
         let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 256, until);
         tile.compact();
         producer.release(tile.to_guard());

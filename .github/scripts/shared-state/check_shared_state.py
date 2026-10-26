@@ -87,8 +87,6 @@ EXPECTED_EXCEPTIONS = [
     # and `DataSink::process` takes `&self`.
     ("src/interpreter/test_sink.rs", "cell of `Option<Tile>`"),
     ("src/interpreter/mod.rs", "shared cell of `C`"),
-    # `Notified::Flag`, the one-bit input-notified flag; see its type doc.
-    ("src/interpreter/tile_operators/mod.rs", "shared cell of `bool`"),
     # The operator-graph recorder, twice: the `thread_local!` and the cell inside
     # it each match the ambient-state shape. Necessary because `OperatorBase::new`
     # runs inside operator constructors, which take no context parameter; what
@@ -97,7 +95,6 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/operator_graph.rs", "ambient mutable state"),
     ("src/interpreter/tile_operators/cycle_slot.rs", "shared cell of `Option<Box<T>>`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `bool`"),
-    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `usize`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),

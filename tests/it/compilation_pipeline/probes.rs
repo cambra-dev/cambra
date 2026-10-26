@@ -2,9 +2,10 @@
 //! `/api/live`, checked against the operator graph it serves on
 //! `/api/snapshot`.
 
-use std::cell::RefCell;
+use cambra::interpreter::LockNow;
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use cambra::ccl::Type;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
@@ -28,16 +29,16 @@ fn every_probed_node_is_an_operator_of_the_served_graph() {
         seen
     "#};
     let mut ctx = GlobalContext::default();
-    let lines = Rc::new(RefCell::new(TestDataSource::new(
+    let lines = Arc::new(Mutex::new(TestDataSource::new(
         "lines",
         Type::Base(BaseType::String),
         Extent::Base(BaseType::String),
     )));
-    lines.borrow_mut().add_data(&[
+    lines.lock_now().add_data(&[
         (Value::UInt(0), Value::String("hello".into())),
         (Value::UInt(1), Value::String("world".into())),
     ]);
-    lines.borrow_mut().set_yield_predicate(Predicate::True);
+    lines.lock_now().set_yield_predicate(Predicate::True);
     ctx.register_source(lines.clone());
 
     let loaded = LoadedProgram::test(code);

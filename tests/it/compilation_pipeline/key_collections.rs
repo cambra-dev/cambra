@@ -6,8 +6,8 @@
 //! iteration's values already are its keys, so `simplify` rewrites that term to `iterate`
 //! (`try_map_domain_of_iteration`). Each case pins the planned term and what it computes.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use cambra::interpreter::LockNow;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cambra::ccl::context::GlobalContext;
@@ -22,17 +22,17 @@ use super::helpers::*;
 /// Plan and run `code` with `testsource1` registered: the keys 0, 1, 2 holding 0, 10, 20.
 fn plan_and_run(code: &str) -> (String, cambra::interpreter::Tile) {
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = Arc::new(Mutex::new(TestDataSource::new(
         "testsource1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    source.borrow_mut().add_data(&[
+    source.lock_now().add_data(&[
         (Value::UInt(0), Value::Int(0)),
         (Value::UInt(1), Value::Int(10)),
         (Value::UInt(2), Value::Int(20)),
     ]);
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source.lock_now().set_yield_predicate(Predicate::True);
     ctx.register_source(source);
     let (expr, result) = run_pipeline_with_ctx(&mut ctx, code);
     (symbolic(&expr), result)

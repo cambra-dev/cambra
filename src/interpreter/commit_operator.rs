@@ -7074,6 +7074,7 @@ fn rows_folded_at(level: usize, undecided: &[&Path]) -> Predicate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interpreter::LockNow;
     // The consumer helpers own shared-cell construction for the operators here; the
     // fixtures below build their own recording cells, hence the direct imports.
     use crate::ccl::{FieldKey, TagMap, V_ABORT, V_COMMIT};
@@ -7082,7 +7083,7 @@ mod tests {
     use crate::interpreter::tiling::{one_row_decided, row_frontier};
     use crate::interpreter::validate_tile;
     use rstest::rstest;
-    use std::{cell::RefCell, rc::Rc};
+    use std::{sync::Arc, sync::Mutex};
 
     /// A fixture producer's answer with the released region subtracted — the
     /// post-condition [`TileProducer::get`] asserts. A fixture stands in for a real
@@ -7396,7 +7397,7 @@ mod tests {
     struct FilteredLiveSource {
         tiling: Tiling,
         tile: Tile,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        released: Arc<Mutex<Vec<TileGuard>>>,
     }
 
     impl FilteredLiveSource {
@@ -7415,7 +7416,7 @@ mod tests {
             Self {
                 tiling,
                 tile,
-                released: Rc::default(),
+                released: Arc::default(),
             }
         }
     }
@@ -7443,7 +7444,7 @@ mod tests {
     struct RecordingSourceProducer {
         base: ProducerBase,
         tile: Tile,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        released: Arc<Mutex<Vec<TileGuard>>>,
     }
 
     impl TileProducer for RecordingSourceProducer {
@@ -7459,7 +7460,7 @@ mod tests {
             self.tile.clone()
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
-            self.released.borrow_mut().push(obsolete_guard);
+            self.released.lock_now().push(obsolete_guard);
         }
     }
 
@@ -7477,7 +7478,7 @@ mod tests {
             None,
         );
         let set_body = store.body_input_setter();
-        let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+        let fan = Arc::new(FanOut::new_cyclic(Box::new(store)));
         let source = FilteredLiveSource::new(&[10, 20]);
         let released = source.released.clone();
         let driver = InductionDriver::new(
@@ -7501,9 +7502,9 @@ mod tests {
         }
         let both = |g: &TileGuard| (0..2).all(|p| g.covers_path(&[Value::UInt(p)]));
         assert!(
-            released.borrow().iter().any(both),
+            released.lock_now().iter().any(both),
             "the driver releases both filtered rows: {:?}",
-            released.borrow()
+            released.lock_now()
         );
     }
 
@@ -7671,10 +7672,47 @@ mod tests {
         }
     }
 
+    /// A producer walk from a fan's reader slot holds the fan's state while it recurses, so
+    /// the recurrence slot it reaches around the cycle reports no input; the reader slot
+    /// reports the fan's producer, which is the producer the walk is already inside.
+    /// See `src/interpreter/design-parallel.md`, "Thread-safe handles".
+    #[test]
+    fn a_recurrence_slot_reached_around_its_cycle_reports_no_input() {
+        let (fan, _acc) = induction_cycle(&[1, 2, 3], 10, 0);
+        let mut sched = Scheduler::new();
+        let mut slot = fan.slot();
+        let reader = slot.subscribe(fan.tiling().universal_guard(), Box::new(|| {}), &mut sched);
+        fn walk(
+            p: &dyn TileProducer,
+            seen: &mut HashSet<String>,
+            edges: &mut Vec<(String, usize)>,
+        ) {
+            if !seen.insert(p.name()) {
+                return;
+            }
+            let mut count = 0;
+            p.visit_input_producers(&mut |_, _| count += 1);
+            if p.name().starts_with("FanOut") {
+                edges.push((p.name(), count));
+            }
+            p.visit_input_producers(&mut |_, input| walk(input, seen, edges));
+        }
+        let mut edges = Vec::new();
+        walk(&*reader, &mut HashSet::new(), &mut edges);
+        assert_eq!(
+            edges[0].1, 1,
+            "the reader slot reports the fan's producer: {edges:?}"
+        );
+        assert!(
+            edges.iter().skip(1).all(|(_, count)| *count == 0),
+            "a slot reached around the cycle reports no input: {edges:?}"
+        );
+    }
+
     /// Wire a single-accumulator induction cycle: store → body → driver → cyclic
     /// fan → store. Returns the fan (its slots are the store's readers) and
     /// the accumulator key.
-    fn induction_cycle(items: &[i64], threshold: i64, init: i64) -> (Rc<FanOut>, Value) {
+    fn induction_cycle(items: &[i64], threshold: i64, init: i64) -> (Arc<FanOut>, Value) {
         let acc = acct("acc");
         let store = InductionStore::new(
             vec![(
@@ -7691,7 +7729,7 @@ mod tests {
             None,
         );
         let set_body = store.body_input_setter();
-        let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+        let fan = Arc::new(FanOut::new_cyclic(Box::new(store)));
         let driver = InductionDriver::new(
             fan.slot(),
             Box::new(ItemSource::new(items)),
@@ -8746,7 +8784,7 @@ mod tests {
         let writes = all_writers_write(&init, 1);
         let commit = CommitOperator::new(init.clone(), keyed_like(&init), writes);
         let set_writer = commit.writer_input_setter(0);
-        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
+        let store_fan = Arc::new(FanOut::new_cyclic(Box::new(commit)));
         // The body reads a slot of the store (the operator's own output).
         let body = CounterBody::new(store_fan.slot(), acct("n"), 3);
         set_writer(Box::new(body));
@@ -8778,13 +8816,13 @@ mod tests {
     /// A pass-through in front of a driver that records each tile it emits.
     struct DriverProbe {
         inner: Box<dyn TileOperator>,
-        seen: Rc<RefCell<DriverObservation>>,
+        seen: Arc<Mutex<DriverObservation>>,
     }
 
     struct DriverProbeProducer {
         base: ProducerBase,
         inner: Box<dyn TileProducer>,
-        seen: Rc<RefCell<DriverObservation>>,
+        seen: Arc<Mutex<DriverObservation>>,
     }
 
     impl TileOperator for DriverProbe {
@@ -8813,7 +8851,7 @@ mod tests {
         fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
             let tile = self.inner.get(projection_guard);
             if let Tile::DataFunction { domain, .. } = &tile {
-                let mut seen = self.seen.borrow_mut();
+                let mut seen = self.seen.lock_now();
                 seen.max_window = seen.max_window.max(domain.len());
                 // Positions are absolute and one per attempt, so the highest ever
                 // seen counts the attempts even after the window compacts.
@@ -8840,7 +8878,7 @@ mod tests {
     fn contending_writer_cycle(
         init: i64,
         draws: &[&[i64]],
-    ) -> (Rc<FanOut>, Vec<Rc<RefCell<DriverObservation>>>) {
+    ) -> (Arc<FanOut>, Vec<Arc<Mutex<DriverObservation>>>) {
         let pool = acct("pool");
         // Every writer's static footprint is the one shared key — which is what
         // makes them contend, and what keeps the store from closing `pool` until
@@ -8853,10 +8891,10 @@ mod tests {
         let setters: Vec<_> = (0..draws.len())
             .map(|w| commit.writer_input_setter(w))
             .collect();
-        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
+        let store_fan = Arc::new(FanOut::new_cyclic(Box::new(commit)));
         let mut seen = Vec::with_capacity(draws.len());
         for (items, set_writer) in draws.iter().zip(setters) {
-            let observation = Rc::new(RefCell::new(DriverObservation::default()));
+            let observation = Arc::new(Mutex::new(DriverObservation::default()));
             let driver = TransactDriver::new(
                 store_fan.slot(),
                 Box::new(ItemSource::new(items)),
@@ -8867,7 +8905,7 @@ mod tests {
                 // program.
                 None,
             );
-            let driver_fan = Rc::new(FanOut::new(Box::new(DriverProbe {
+            let driver_fan = Arc::new(FanOut::new(Box::new(DriverProbe {
                 inner: Box::new(driver),
                 seen: observation.clone(),
             })));
@@ -8933,7 +8971,7 @@ mod tests {
 
         let retries: Vec<u64> = seen
             .iter()
-            .map(|o| o.borrow().attempts.saturating_sub(1))
+            .map(|o| o.lock_now().attempts.saturating_sub(1))
             .collect();
         assert!(
             retries.iter().any(|&r| r >= 3),
@@ -8941,7 +8979,7 @@ mod tests {
              so the window bound below would hold vacuously"
         );
         for (w, observation) in seen.iter().enumerate() {
-            let max_window = observation.borrow().max_window;
+            let max_window = observation.lock_now().max_window;
             assert!(
                 max_window <= MAX_LIVE_ATTEMPTS,
                 "writer {w} retried {} times and its driver's window reached {max_window} \
@@ -9157,7 +9195,7 @@ mod tests {
         );
         let set_a = commit.writer_input_setter(0);
         let set_b = commit.writer_input_setter(1);
-        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
+        let store_fan = Arc::new(FanOut::new_cyclic(Box::new(commit)));
         set_a(Box::new(TokenWriter::new(
             store_fan.slot(),
             acct("pool"),
@@ -9204,7 +9242,7 @@ mod tests {
         );
         let set_a = commit.writer_input_setter(0);
         let set_b = commit.writer_input_setter(1);
-        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
+        let store_fan = Arc::new(FanOut::new_cyclic(Box::new(commit)));
         set_a(Box::new(TokenWriter::new(
             store_fan.slot(),
             acct("pool"),
@@ -9329,7 +9367,7 @@ mod tests {
         let writes = all_writers_write(&init, 1);
         let commit = CommitOperator::new(init.clone(), keyed_like(&init), writes);
         let set_writer = commit.writer_input_setter(0);
-        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
+        let store_fan = Arc::new(FanOut::new_cyclic(Box::new(commit)));
         set_writer(Box::new(CounterBody::new(store_fan.slot(), acct("n"), 3)));
 
         let mut reader = StoreReadAsOf::new(store_fan.slot(), acct("n"), 2);
@@ -9458,7 +9496,7 @@ mod tests {
         let commit = CommitOperator::new(init.clone(), keyed_like(&init), writes);
         let set_a = commit.writer_input_setter(0);
         let set_b = commit.writer_input_setter(1);
-        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
+        let store_fan = Arc::new(FanOut::new_cyclic(Box::new(commit)));
         set_a(Box::new(BankWriter::new(store_fan.slot(), a)));
         set_b(Box::new(BankWriter::new(store_fan.slot(), b)));
 
@@ -9745,7 +9783,7 @@ mod tests {
             &[(1, &[("alice", 70)]), (2, &[("alice", 40)])],
             Predicate::at_or_below(Value::UInt(2)),
         );
-        let recorder = Rc::new(RefCell::new(Vec::new()));
+        let recorder = Arc::new(Mutex::new(Vec::new()));
         let mut read = StoreFinalRead::new(
             Box::new(RecordingSource {
                 tiling: store_tiling(&["alice"]),
@@ -9759,7 +9797,7 @@ mod tests {
         let mut producer = read.subscribe(g, Box::new(|| {}), &mut sched);
         let _ = producer.get(producer.tiling().universal_guard());
         assert_eq!(
-            recorder.borrow().as_slice(),
+            recorder.lock_now().as_slice(),
             [TileGuard::Function(FunctionGuard::Domain(
                 Predicate::at_or_below(Value::UInt(2))
             ))],
@@ -9771,12 +9809,12 @@ mod tests {
     struct RecordingSource {
         tiling: Tiling,
         tile: Tile,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        released: Arc<Mutex<Vec<TileGuard>>>,
     }
     struct RecordingProducer {
         base: ProducerBase,
         tile: Tile,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        released: Arc<Mutex<Vec<TileGuard>>>,
     }
     impl TileOperator for RecordingSource {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
@@ -9807,7 +9845,7 @@ mod tests {
             self.tile.clone()
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
-            self.released.borrow_mut().push(obsolete_guard);
+            self.released.lock_now().push(obsolete_guard);
         }
     }
 
@@ -10283,11 +10321,11 @@ mod tests {
     /// A fixture whose tile the test changes between pulls.
     struct SharedSource {
         tiling: Tiling,
-        tile: Rc<RefCell<Tile>>,
+        tile: Arc<Mutex<Tile>>,
     }
     struct SharedSourceProducer {
         base: ProducerBase,
-        tile: Rc<RefCell<Tile>>,
+        tile: Arc<Mutex<Tile>>,
     }
     impl TileOperator for SharedSource {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
@@ -10314,7 +10352,7 @@ mod tests {
             &mut self.base
         }
         fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-            honoring_release(&self.tile.borrow(), self.obsolete_guard())
+            honoring_release(&self.tile.lock_now(), self.obsolete_guard())
         }
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
     }
@@ -10498,7 +10536,7 @@ mod tests {
             uint.clone(),
             Tiling::data_function(uint.clone(), Tiling::Scalar(value_extent())),
         );
-        let source = Rc::new(RefCell::new(source_of(vec![0], vec![1])));
+        let source = Arc::new(Mutex::new(source_of(vec![0], vec![1])));
         let pairs_tile = |values: Vec<i64>| {
             Tile::data_function(
                 ColumnValue::from_values(vec![pair(0, 0), pair(0, 1), pair(1, 0)], &pair_extent),
@@ -10513,16 +10551,16 @@ mod tests {
         let mut engines = Engines::unopened(&store_tiling);
         let render =
             |e: &Engines| render_engines(e, &store_tiling, &[Predicate::False, Predicate::False]);
-        let store = Rc::new(RefCell::new(render(&engines)));
+        let store = Arc::new(Mutex::new(render(&engines)));
         let (nested, inner) = InductionDriver::nested_parts(
             Box::new(SharedSource {
                 tiling: pairs_tiling.clone(),
-                tile: Rc::new(RefCell::new(pairs_tile(vec![100, 100, 200]))),
+                tile: Arc::new(Mutex::new(pairs_tile(vec![100, 100, 200]))),
             }),
             // One reseed per enclosing position.
             vec![Box::new(SharedSource {
                 tiling: Tiling::data_function(uint.clone(), Tiling::Scalar(value_extent())),
-                tile: Rc::new(RefCell::new(Tile::data_function(
+                tile: Arc::new(Mutex::new(Tile::data_function(
                     ColumnValue::from_uints(vec![0, 1]),
                     Box::new(Tile::Scalar(ColumnValue::from_ints(vec![0, 0]))),
                     Predicate::True,
@@ -10566,7 +10604,7 @@ mod tests {
                 CommitEngine::seeded_at(None, HashMap::from([(acc.clone(), int(0))]))
             })
             .step(pos(0), Some(HashMap::from([(acc.clone(), int(1))])));
-        *store.borrow_mut() = render(&engines);
+        *store.lock_now() = render(&engines);
         sched.check_for_notifications();
         let second = producer.get(producer.tiling().universal_guard());
         let paths = emitted(&second);
@@ -10646,11 +10684,11 @@ mod tests {
         let (nested, inner) = InductionDriver::nested_parts(
             Box::new(SharedSource {
                 tiling: pairs_tiling,
-                tile: Rc::new(RefCell::new(pairs)),
+                tile: Arc::new(Mutex::new(pairs)),
             }),
             vec![Box::new(SharedSource {
                 tiling: reseed_tiling,
-                tile: Rc::new(RefCell::new(reseed)),
+                tile: Arc::new(Mutex::new(reseed)),
             })],
             Vec::new(),
             value_extent(),
@@ -10659,11 +10697,11 @@ mod tests {
         let mut driver = InductionDriver::new(
             Box::new(SharedSource {
                 tiling: store_tiling.clone(),
-                tile: Rc::new(RefCell::new(store)),
+                tile: Arc::new(Mutex::new(store)),
             }),
             Box::new(SharedSource {
                 tiling: source_tiling,
-                tile: Rc::new(RefCell::new(source)),
+                tile: Arc::new(Mutex::new(source)),
             }),
             Some(nested),
             vec![acc],
@@ -10686,14 +10724,14 @@ mod tests {
     struct CountingSeed {
         tiling: Tiling,
         value: Value,
-        gets: Rc<RefCell<usize>>,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        gets: Arc<Mutex<usize>>,
+        released: Arc<Mutex<Vec<TileGuard>>>,
     }
     struct CountingSeedProducer {
         base: ProducerBase,
         value: Value,
-        gets: Rc<RefCell<usize>>,
-        released: Rc<RefCell<Vec<TileGuard>>>,
+        gets: Arc<Mutex<usize>>,
+        released: Arc<Mutex<Vec<TileGuard>>>,
     }
     impl TileOperator for CountingSeed {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
@@ -10722,22 +10760,22 @@ mod tests {
             &mut self.base
         }
         fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-            *self.gets.borrow_mut() += 1;
+            *self.gets.lock_now() += 1;
             if self.obsolete_guard().is_universal() {
                 return self.tiling().empty_tile();
             }
             Tile::Scalar(ColumnValue::single(self.value.clone()))
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
-            self.released.borrow_mut().push(obsolete_guard);
+            self.released.lock_now().push(obsolete_guard);
         }
     }
 
-    type Counters = (Rc<RefCell<usize>>, Rc<RefCell<Vec<TileGuard>>>);
+    type Counters = (Arc<Mutex<usize>>, Arc<Mutex<Vec<TileGuard>>>);
 
     fn counting_seed(init: i64) -> (CountingSeed, Counters) {
-        let gets = Rc::new(RefCell::new(0));
-        let released = Rc::new(RefCell::new(Vec::new()));
+        let gets = Arc::new(Mutex::new(0));
+        let released = Arc::new(Mutex::new(Vec::new()));
         (
             CountingSeed {
                 tiling: Tiling::Scalar(value_extent()),
@@ -10766,7 +10804,7 @@ mod tests {
             None,
         );
         let set_body = store.body_input_setter();
-        let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+        let fan = Arc::new(FanOut::new_cyclic(Box::new(store)));
         let driver = InductionDriver::new(
             fan.slot(),
             Box::new(ItemSource::new(&items)),
@@ -10790,21 +10828,21 @@ mod tests {
             sched.check_for_notifications();
             let t = producer.get(producer.tiling().universal_guard());
             if store_frontier(&t).is_some() {
-                gets_at_open.get_or_insert(*gets.borrow());
+                gets_at_open.get_or_insert(*gets.lock_now());
                 pulls_after_open += 1;
             }
             if t.is_terminal() {
                 break;
             }
         }
-        let after = *gets.borrow() - gets_at_open.expect("the store opened");
+        let after = *gets.lock_now() - gets_at_open.expect("the store opened");
         assert_eq!(
             after, 0,
             "an open store reads its seed again on every pull ({after} extra reads over \
              {pulls_after_open} pulls)"
         );
         assert!(
-            !released.borrow().is_empty(),
+            !released.lock_now().is_empty(),
             "an open store never released its seed stream"
         );
     }
@@ -10831,9 +10869,9 @@ mod tests {
         assert!(last.is_terminal(), "a store with no writers is terminal");
         assert_eq!(store_value_now(&last, &acc), Some(int(7)));
         assert!(
-            !released.borrow().is_empty(),
+            !released.lock_now().is_empty(),
             "a terminal commit store has never released its seed stream (pulled {} times)",
-            gets.borrow()
+            gets.lock_now()
         );
     }
 

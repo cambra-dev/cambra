@@ -1,6 +1,7 @@
 //! Columnar storage for vectorized execution: [`ColumnValue`] and the
 //! [`FuncBinding`] pairs that make up function-valued columns.
 
+use crate::interpreter::LockNow;
 use std::collections::HashMap;
 use std::iter;
 use std::mem::take;
@@ -396,7 +397,8 @@ impl ColumnValue {
                 ColumnValue::Records(fields)
             }
             Extent::DataSourceDomain(d) => {
-                ColumnValue::from_values(values, &d.borrow().element_extent())
+                let element = d.lock_now().element_extent();
+                ColumnValue::from_values(values, &element)
             }
             Extent::Union(sub_extents) => {
                 // Bucket each row by its tag, keeping the row index alongside the
@@ -522,7 +524,7 @@ impl ColumnValue {
     /// before comparison.
     pub fn is_compatible_with_extent(&self, extent: &Extent) -> bool {
         let extent = match extent {
-            Extent::DataSourceDomain(source) => source.borrow().element_extent(),
+            Extent::DataSourceDomain(source) => source.lock_now().element_extent(),
             Extent::Restricted { base, .. } => *base.clone(),
             other => other.clone(),
         };

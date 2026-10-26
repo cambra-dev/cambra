@@ -1,3 +1,4 @@
+use cambra::interpreter::LockNow;
 use std::{collections::HashMap, path::Path, thread, time::Duration};
 
 use cambra::{
@@ -356,7 +357,7 @@ impl Inspection {
         scheduler
             .sources()
             .filter_map(|(name, handle)| {
-                let source = handle.borrow();
+                let source = handle.lock_now();
                 let window = source.retained_window()?;
                 let keys = ColumnValue::from_uints(
                     window_tail(window.clone(), ROWS_PER_READING).collect(),

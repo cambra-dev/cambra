@@ -914,9 +914,9 @@ mod tests {
 
         producer.release(tiling.universal_guard());
         assert!(
-            released.borrow().iter().any(TileGuard::is_universal),
+            released.lock_now().iter().any(TileGuard::is_universal),
             "expected a universal release to reach the input, got {:?}",
-            released.borrow()
+            released.lock_now()
         );
         let _ = in_tiling;
     }
@@ -987,11 +987,11 @@ mod tests {
         // issued. Which guard covered it is the sibling test's subject, not this one's.
         assert!(
             released
-                .borrow()
+                .lock_now()
                 .iter()
                 .any(|g| g.is_universal() || *g == key_one),
             "the released key must be covered at the input, got {:?}",
-            released.borrow()
+            released.lock_now()
         );
         let second = producer.get(out_tiling.universal_guard());
         let Tile::DataFunction { domain, .. } = &second else {
@@ -1053,9 +1053,9 @@ mod tests {
         };
         producer.get(out_tiling.universal_guard());
         assert!(
-            !released.borrow().iter().any(TileGuard::is_universal),
+            !released.lock_now().iter().any(TileGuard::is_universal),
             "a bounded predicate is not released whole, got {:?}",
-            released.borrow()
+            released.lock_now()
         );
 
         let key_two = TileGuard::Function(FunctionGuard::Domain(Predicate::Intervals(
@@ -1066,9 +1066,9 @@ mod tests {
         )));
         producer.release(key_two.clone());
         assert!(
-            released.borrow().contains(&key_two),
+            released.lock_now().contains(&key_two),
             "the per-key release must reach the input, got {:?}",
-            released.borrow()
+            released.lock_now()
         );
     }
 
@@ -1280,13 +1280,13 @@ mod aggregate_projection_tests {
         assert_eq!(terminal, open());
 
         // The odd arm delivers row 5 without finishing: the sum takes it once and stays open.
-        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5], Predicate::exactly(&[Value::UInt(5)]));
+        *odd_cell.lock_now() = int_column(vec![1, 3, 5], Predicate::exactly(&[Value::UInt(5)]));
         let (partial, terminal) = total(producer.get(sum.tiling().universal_guard()));
         assert_eq!(partial, Tile::Scalar(ColumnValue::Ints(vec![16 + 5])));
         assert_eq!(terminal, open());
 
         // Both arms have now decided every position, so the sum is final.
-        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5, 7], Predicate::True);
+        *odd_cell.lock_now() = int_column(vec![1, 3, 5, 7], Predicate::True);
         let (last, terminal) = total(producer.get(sum.tiling().universal_guard()));
         assert_eq!(last, Tile::Scalar(ColumnValue::Ints(vec![(0..8).sum()])));
         assert_eq!(terminal, ColumnValue::Bools(vec![true]));
@@ -1307,8 +1307,8 @@ mod aggregate_projection_tests {
         };
         assert_eq!(*accumulator, Tile::Scalar(ColumnValue::Ints(vec![10])));
         assert_eq!(terminal, ColumnValue::Bools(vec![true]));
-        assert_eq!(pulled.borrow().len(), 1);
-        assert!(pulled.borrow()[0].is_universal());
+        assert_eq!(pulled.lock_now().len(), 1);
+        assert!(pulled.lock_now()[0].is_universal());
     }
 
     #[test]
@@ -1316,7 +1316,7 @@ mod aggregate_projection_tests {
         let (mut sum, pulled) = sum_of_finished_stream();
         let tile = sum.get(sum.tiling().empty_guard());
         assert_eq!(tile, sum.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 
     #[test]
@@ -1363,7 +1363,7 @@ mod extract_aggregate_projection_tests {
         let (mut extract, pulled) = extract_of_finished_sum();
         let tile = extract.get(extract.tiling().universal_guard());
         assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![10])));
-        assert!(pulled.borrow()[0].is_universal());
+        assert!(pulled.lock_now()[0].is_universal());
     }
 
     #[test]
@@ -1371,7 +1371,7 @@ mod extract_aggregate_projection_tests {
         let (mut extract, pulled) = extract_of_finished_sum();
         let tile = extract.get(extract.tiling().empty_guard());
         assert_eq!(tile, extract.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 
     #[test]
@@ -1462,7 +1462,7 @@ mod map_aggregate_projection_tests {
             sums(&morsel),
             vec![(Value::UInt(1), 3), (Value::UInt(2), 9)]
         );
-        assert_eq!(*pulled.borrow(), vec![keys_between(1, 2)]);
+        assert_eq!(*pulled.lock_now(), vec![keys_between(1, 2)]);
     }
 
     /// The consumer releases a morsel before the next, which drops the first morsel's
@@ -1481,7 +1481,7 @@ mod map_aggregate_projection_tests {
         let (mut sums_of, pulled) = sums_of_groups();
         let tile = sums_of.get(sums_of.tiling().empty_guard());
         assert_eq!(tile, sums_of.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 
     #[test]
@@ -1558,7 +1558,7 @@ mod map_extract_aggregate_projection_tests {
         let (mut extract, pulled) = finished_sums();
         let morsel = extract.get(keys_between(1, 2));
         assert_eq!(extracted(&morsel), vec![(Value::UInt(1), 3)]);
-        assert_eq!(*pulled.borrow(), vec![keys_between(1, 2)]);
+        assert_eq!(*pulled.lock_now(), vec![keys_between(1, 2)]);
     }
 
     /// Group 2 is still open, so it is not emitted and the statement, the input's, does not
@@ -1605,7 +1605,7 @@ mod map_extract_aggregate_projection_tests {
         let (mut extract, pulled) = finished_sums();
         let tile = extract.get(extract.tiling().empty_guard());
         assert_eq!(tile, extract.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 
     #[test]

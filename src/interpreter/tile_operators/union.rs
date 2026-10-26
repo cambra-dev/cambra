@@ -687,8 +687,8 @@ mod tests {
     use super::*;
     use crate::ccl::FieldKey;
     use crate::interpreter::{BaseType, ColumnValue, Extent};
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     // ── UnionProducer::release_impl ───────────────────────────────────────────
 
@@ -1147,17 +1147,17 @@ mod tests {
 
     /// Build a `UnionProducer` with two spy inputs that record what guard they receive.
     ///
-    /// Returns the producer plus `Rc<RefCell<Vec<TileGuard>>>` for each input.
+    /// Returns the producer plus `Arc<Mutex<Vec<TileGuard>>>` for each input.
     #[allow(clippy::type_complexity)]
     fn make_union_producer_with_spies() -> (
         UnionProducer,
-        Rc<RefCell<Vec<TileGuard>>>,
-        Rc<RefCell<Vec<TileGuard>>>,
+        Arc<Mutex<Vec<TileGuard>>>,
+        Arc<Mutex<Vec<TileGuard>>>,
     ) {
         struct SpyProducer {
             base: ProducerBase,
             tile: Tile,
-            log: Rc<RefCell<Vec<TileGuard>>>,
+            log: Arc<Mutex<Vec<TileGuard>>>,
         }
 
         impl TileProducer for SpyProducer {
@@ -1169,12 +1169,12 @@ mod tests {
                 self.tile.clone()
             }
             fn release_impl(&mut self, obsolete_guard: TileGuard) {
-                self.log.borrow_mut().push(obsolete_guard);
+                self.log.lock_now().push(obsolete_guard);
             }
         }
 
-        let log0: Rc<RefCell<Vec<TileGuard>>> = Rc::new(RefCell::new(Vec::new()));
-        let log1: Rc<RefCell<Vec<TileGuard>>> = Rc::new(RefCell::new(Vec::new()));
+        let log0: Arc<Mutex<Vec<TileGuard>>> = Arc::new(Mutex::new(Vec::new()));
+        let log1: Arc<Mutex<Vec<TileGuard>>> = Arc::new(Mutex::new(Vec::new()));
 
         let union_tiling = Tiling::data_function(
             Extent::Union(TagMap::from_positional(vec![
@@ -1211,11 +1211,11 @@ mod tests {
         let (mut producer, log0, log1) = make_union_producer_with_spies();
         producer.release(producer.tiling().empty_guard());
         assert!(
-            log0.borrow().is_empty(),
+            log0.lock_now().is_empty(),
             "input 0 should receive no release"
         );
         assert!(
-            log1.borrow().is_empty(),
+            log1.lock_now().is_empty(),
             "input 1 should receive no release"
         );
     }
@@ -1225,8 +1225,8 @@ mod tests {
     fn union_producer_release_universal_forwards_to_all_inputs() {
         let (mut producer, log0, log1) = make_union_producer_with_spies();
         producer.release(producer.tiling().universal_guard());
-        let l0 = log0.borrow();
-        let l1 = log1.borrow();
+        let l0 = log0.lock_now();
+        let l1 = log1.lock_now();
         assert_eq!(l0.len(), 1, "input 0 should receive exactly one release");
         assert_eq!(l1.len(), 1, "input 1 should receive exactly one release");
         assert!(
@@ -1253,8 +1253,8 @@ mod tests {
 
         producer.release(guard);
 
-        let l0 = log0.borrow();
-        let l1 = log1.borrow();
+        let l0 = log0.lock_now();
+        let l1 = log1.lock_now();
         assert_eq!(l0.len(), 1, "input 0 should receive exactly one release");
         assert_eq!(l1.len(), 1, "input 1 should receive exactly one release");
         assert_eq!(
@@ -1439,8 +1439,8 @@ mod projection_tests {
         let (mut union, even_pulled, odd_pulled) = merged_branches(true);
         let morsel = union.get(keys_between(2, 5));
         assert_eq!(int_entries(&morsel), vec![(2, 20), (3, 3), (4, 40), (5, 5)]);
-        assert_eq!(*even_pulled.borrow(), vec![keys_between(2, 5)]);
-        assert_eq!(*odd_pulled.borrow(), vec![keys_between(2, 5)]);
+        assert_eq!(*even_pulled.lock_now(), vec![keys_between(2, 5)]);
+        assert_eq!(*odd_pulled.lock_now(), vec![keys_between(2, 5)]);
     }
 
     /// The consumer releases a morsel before taking the next, and the branches are released
@@ -1452,7 +1452,7 @@ mod projection_tests {
         union.release(keys_between(0, 3));
         let next = union.get(keys_between(4, 7));
         assert_eq!(int_entries(&next), vec![(4, 40), (5, 5), (6, 60), (7, 7)]);
-        assert_eq!(even_pulled.borrow()[1], keys_between(4, 7));
+        assert_eq!(even_pulled.lock_now()[1], keys_between(4, 7));
     }
 
     #[test]
@@ -1520,7 +1520,7 @@ mod projection_tests {
             "only the odd arm's decided prefix is complete"
         );
 
-        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5, 7], Predicate::True);
+        *odd_cell.lock_now() = int_column(vec![1, 3, 5, 7], Predicate::True);
         let second = union.get(keys_between(0, 7));
         assert_eq!(
             int_entries(&second),
@@ -1566,12 +1566,12 @@ mod projection_tests {
 
         // The odd arm delivers some of what is left without finishing: row 5 arrives, the
         // range stays open, and row 5 is the only row delivered.
-        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5], Predicate::exactly(&[Value::UInt(5)]));
+        *odd_cell.lock_now() = int_column(vec![1, 3, 5], Predicate::exactly(&[Value::UInt(5)]));
         let partial = union.get(keys_between(0, ROWS - 1));
         assert_eq!(int_entries(&partial), vec![(5, 5)]);
         union.release(partial.to_guard());
 
-        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5, 7], Predicate::True);
+        *odd_cell.lock_now() = int_column(vec![1, 3, 5, 7], Predicate::True);
         let last = union.get(keys_between(0, ROWS - 1));
         assert_eq!(int_entries(&last), vec![(7, 7)]);
         let TileGuard::Function(FunctionGuard::Domain(asked)) = keys_between(0, ROWS - 1) else {
@@ -1582,7 +1582,7 @@ mod projection_tests {
 
     /// A flat union over two scripted arms, subscribed at the universal guard. The even arm
     /// holds `[0, 2, 4, 6]` and the odd arm `odd`, each with its own statement.
-    fn scripted_union(odd: Tile) -> (Box<dyn TileProducer>, Rc<std::cell::RefCell<Tile>>) {
+    fn scripted_union(odd: Tile) -> (Box<dyn TileProducer>, Arc<Mutex<Tile>>) {
         let (even, _) = ScriptedOp::new(
             int_column(vec![0, 2, 4, 6], Predicate::True),
             stream_tiling(),
@@ -1632,7 +1632,7 @@ mod projection_tests {
         if let Tile::DataFunction { codomain, .. } = &mut tile {
             **codomain = Tile::Scalar(ColumnValue::Ints(vec![1, 3, 600]));
         }
-        *odd_cell.borrow_mut() = tile;
+        *odd_cell.lock_now() = tile;
         let second = union.get(keys_between(0, ROWS - 1));
         assert!(
             int_entries(&second).is_empty(),
@@ -1645,7 +1645,7 @@ mod projection_tests {
         let (mut union, even_pulled, odd_pulled) = merged_branches(true);
         let tile = union.get(stream_tiling().empty_guard());
         assert!(int_entries(&tile).is_empty());
-        assert!(even_pulled.borrow().is_empty() && odd_pulled.borrow().is_empty());
+        assert!(even_pulled.lock_now().is_empty() && odd_pulled.lock_now().is_empty());
     }
 
     /// A tagged union keys its rows by arm, which a projection over plain keys does not

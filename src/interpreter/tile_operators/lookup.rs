@@ -768,7 +768,7 @@ mod tests {
             "the rows are open, so what they hold is named beneath them: {taken:?}"
         );
         lookup.release(taken.clone());
-        assert_eq!(*released.borrow(), vec![taken]);
+        assert_eq!(*released.lock_now(), vec![taken]);
     }
 
     /// A **one-level** stream is the same rule at depth zero: an undecided key's row is left
@@ -894,9 +894,9 @@ mod projection_tests {
                 (5, none()),
             ]
         );
-        assert_eq!(*key_pulls.borrow(), vec![keys_between(2, 5)]);
+        assert_eq!(*key_pulls.lock_now(), vec![keys_between(2, 5)]);
         let universal = Tiling::data_function(int(), Tiling::Scalar(int())).universal_guard();
-        assert_eq!(*collection_pulls.borrow(), vec![universal]);
+        assert_eq!(*collection_pulls.lock_now(), vec![universal]);
     }
 
     /// Consecutive morsels, with the first released before the second is taken, as a worker
@@ -916,7 +916,7 @@ mod projection_tests {
                 (7, none()),
             ]
         );
-        assert_eq!(key_pulls.borrow()[1], keys_between(4, 7));
+        assert_eq!(key_pulls.lock_now()[1], keys_between(4, 7));
     }
 
     #[test]
@@ -931,7 +931,7 @@ mod projection_tests {
         let (mut lookup, key_pulls, collection_pulls) = lookup_over_streams();
         let tile = lookup.get(lookup.tiling().empty_guard());
         assert!(answers(&tile).is_empty());
-        assert!(key_pulls.borrow().is_empty() && collection_pulls.borrow().is_empty());
+        assert!(key_pulls.lock_now().is_empty() && collection_pulls.lock_now().is_empty());
     }
 
     /// One key answers one value, which has no keys to project.

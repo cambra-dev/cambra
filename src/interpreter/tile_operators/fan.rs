@@ -1063,13 +1063,13 @@ mod tests {
     };
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
     use bit_set::BitSet;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     fn record_wrap_over(
         input_tile: Tile,
         input_tiling: Tiling,
         name: &str,
-    ) -> (RecordWrapProducer, Rc<RefCell<Vec<TileGuard>>>) {
+    ) -> (RecordWrapProducer, Arc<Mutex<Vec<TileGuard>>>) {
         let (spy, log) = ReleaseSpy::new(input_tile, input_tiling.clone());
         let level = CurryLevel::new(1);
         let record = Tiling::Record(
@@ -1129,9 +1129,9 @@ mod tests {
         let (mut producer, log) = record_wrap_over(tile, tiling, "f");
         producer.release(producer.tiling().universal_guard());
         assert!(
-            log.borrow().iter().any(|g| g.is_universal()),
+            log.lock_now().iter().any(|g| g.is_universal()),
             "the universal release reaches the input, saw {:?}",
-            log.borrow()
+            log.lock_now()
         );
     }
 
@@ -1143,7 +1143,7 @@ mod tests {
         let key_zero = Predicate::at_or_below(Value::UInt(0));
         producer.release(TileGuard::Function(FunctionGuard::Domain(key_zero.clone())));
         assert_eq!(
-            *log.borrow(),
+            *log.lock_now(),
             vec![TileGuard::Function(FunctionGuard::Domain(key_zero))],
             "key 0 of the record is key 0 of the input"
         );
@@ -1169,7 +1169,7 @@ mod tests {
             field,
         ))));
         assert_eq!(
-            *log.borrow(),
+            *log.lock_now(),
             vec![TileGuard::Function(FunctionGuard::Codomain(Box::new(
                 key_zero.clone()
             )))],
@@ -1201,7 +1201,7 @@ mod tests {
 
         producer.release(out_tiling.universal_guard());
         for (i, log) in logs.iter().enumerate() {
-            let seen = log.borrow();
+            let seen = log.lock_now();
             assert!(
                 seen.iter().any(|g| g.is_universal()),
                 "operand {i} should have been released universally, saw {seen:?}"
@@ -1223,7 +1223,7 @@ mod tests {
 
         producer.release(out_tiling.empty_guard());
         assert!(
-            log.borrow().is_empty(),
+            log.lock_now().is_empty(),
             "an empty release names nothing to free, so nothing is forwarded"
         );
     }
@@ -1269,14 +1269,14 @@ mod tests {
         producer.release(partial);
 
         assert_eq!(
-            *logs[0].borrow(),
+            *logs[0].lock_now(),
             vec![TileGuard::Scalar(Predicate::True)],
             "the named field's operand is released",
         );
         assert!(
-            logs[1].borrow().iter().all(TileGuard::is_empty),
+            logs[1].lock_now().iter().all(TileGuard::is_empty),
             "the other operand is not, got {:?}",
-            logs[1].borrow(),
+            logs[1].lock_now(),
         );
     }
 
@@ -1378,7 +1378,7 @@ mod tests {
             ])),
         )));
         assert_eq!(
-            *log.borrow(),
+            *log.lock_now(),
             vec![TileGuard::flatten_or(vec![rows, other_fields])],
         );
     }
@@ -1439,12 +1439,12 @@ mod tests {
         };
         producer.get(producer.tiling().universal_guard());
         assert!(
-            log.borrow()
+            log.lock_now()
                 .iter()
                 .any(|g| matches!(g, TileGuard::Record(fields)
                 if fields.get("xs").is_some_and(|g| names_key(g, 1, 0)))),
             "the field's row 1 is released: {:?}",
-            log.borrow(),
+            log.lock_now(),
         );
     }
 
@@ -1528,9 +1528,9 @@ mod tests {
         zip.get(zip.tiling().universal_guard());
         for log in [log_a, log_b] {
             assert!(
-                log.borrow().iter().any(|g| names_key(g, 1, 0)),
+                log.lock_now().iter().any(|g| names_key(g, 1, 0)),
                 "each input's row 1 is released: {:?}",
-                log.borrow(),
+                log.lock_now(),
             );
         }
     }
@@ -1666,20 +1666,20 @@ mod tests {
         // value there is whole once delivered, so it is released at its row — for that arm,
         // its key 0 — and the collection arm is released the inner key it delivered beneath
         // key 0.
-        let covers = |log: &Rc<RefCell<Vec<TileGuard>>>, path: &[Value]| {
-            log.borrow()
+        let covers = |log: &Arc<Mutex<Vec<TileGuard>>>, path: &[Value]| {
+            log.lock_now()
                 .iter()
                 .any(|g| TileGuard::flatten_or(vec![g.clone()]).covers_path(path))
         };
         assert!(
             covers(&released0, &[Value::UInt(0)]),
             "the scalar arm was not released its taken value: {:?}, from {guard:?}",
-            released0.borrow()
+            released0.lock_now()
         );
         assert!(
             covers(&released1, &[Value::UInt(0), Value::UInt(3)]),
             "the collection arm was not released its inner key: {:?}, from {guard:?}",
-            released1.borrow()
+            released1.lock_now()
         );
         // The row stays while its collection is open, holding no cell of the scalar field.
         let Tile::DataFunction {
@@ -1702,7 +1702,7 @@ mod tests {
             Predicate::point(Value::UInt(0)),
         )));
         for (log, tiling) in [(&released0, &arm0_tiling), (&released1, &arm1_tiling)] {
-            for g in log.borrow().iter() {
+            for g in log.lock_now().iter() {
                 assert!(
                     g.check_from(tiling),
                     "{g:?} is not a guard over the arm's tiling {tiling}"
@@ -1711,7 +1711,7 @@ mod tests {
             assert!(
                 covers(log, &[Value::UInt(0)]),
                 "an arm was not released key 0: {:?}",
-                log.borrow()
+                log.lock_now()
             );
         }
     }
@@ -1776,7 +1776,7 @@ mod projection_tests {
             panic!("a collection")
         };
         assert_eq!(domain.len(), 3);
-        assert_eq!(*pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(*pulled.lock_now(), [keys_between(2, 4)]);
     }
 
     #[test]
@@ -1836,7 +1836,7 @@ mod projection_tests {
         let (mut select, pulled) = amounts_of_records();
         let morsel = select.get(keys_between(1, 3));
         assert_eq!(int_entries(&morsel), [(1, 101), (2, 102), (3, 103)]);
-        assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
+        assert_eq!(*pulled.lock_now(), [keys_between(1, 3)]);
     }
 
     #[test]
@@ -1881,7 +1881,7 @@ mod projection_tests {
         let (mut select, pulled) = make();
         let morsel = select.get(keys_between(2, 3));
         assert_eq!(int_entries(&morsel), [(2, 2), (3, 3)]);
-        assert_eq!(*pulled.borrow(), [product_tiling.universal_guard()]);
+        assert_eq!(*pulled.lock_now(), [product_tiling.universal_guard()]);
         assert_conforms(|| Box::new(make().0), keys_between(2, 3));
     }
 
@@ -1931,8 +1931,8 @@ mod projection_tests {
             unreachable!("a morsel is a domain guard")
         };
         assert_eq!(*domain_predicate, stated);
-        assert_eq!(*a_pulled.borrow(), [keys_between(2, 4)]);
-        assert_eq!(*b_pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(*a_pulled.lock_now(), [keys_between(2, 4)]);
+        assert_eq!(*b_pulled.lock_now(), [keys_between(2, 4)]);
     }
 
     /// An arm that has delivered less pairs only the keys both hold, and the pair is complete
@@ -1970,7 +1970,7 @@ mod projection_tests {
         let (mut zip, a_pulled, b_pulled) = pair(ROWS as usize);
         let nothing = zip.tiling().empty_guard();
         assert_eq!(zip.get(nothing), zip.tiling().empty_tile());
-        assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
+        assert!(a_pulled.lock_now().is_empty() && b_pulled.lock_now().is_empty());
     }
 
     /// `(a: 1, b: 2)`: a record of two values, each pulled whole.
@@ -2007,8 +2007,8 @@ mod projection_tests {
         };
         assert_eq!(fields.len(), 2);
         let scalar = Tiling::Scalar(Extent::Base(BaseType::Int)).universal_guard();
-        assert_eq!(*a_pulled.borrow(), std::slice::from_ref(&scalar));
-        assert_eq!(*b_pulled.borrow(), [scalar]);
+        assert_eq!(*a_pulled.lock_now(), std::slice::from_ref(&scalar));
+        assert_eq!(*b_pulled.lock_now(), [scalar]);
     }
 
     #[test]
@@ -2016,7 +2016,7 @@ mod projection_tests {
         let (mut record, a_pulled, b_pulled) = two_values();
         let nothing = record.tiling().empty_guard();
         assert_eq!(record.get(nothing), record.tiling().empty_tile());
-        assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
+        assert!(a_pulled.lock_now().is_empty() && b_pulled.lock_now().is_empty());
     }
 
     #[test]
@@ -2031,6 +2031,6 @@ mod projection_tests {
         let (mut wrap, pulled) = wrapped();
         let nothing = wrap.tiling().empty_guard();
         assert_eq!(wrap.get(nothing), wrap.tiling().empty_tile());
-        assert!(pulled.borrow().is_empty());
+        assert!(pulled.lock_now().is_empty());
     }
 }

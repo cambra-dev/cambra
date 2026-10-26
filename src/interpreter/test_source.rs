@@ -3,19 +3,62 @@ use std::collections::HashMap;
 use log::trace;
 
 use crate::{
-    ccl::Type,
+    ccl::{Label, Type},
     interpreter::{
         BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, FieldPath, Value,
         producer_releases::ProducerReleases, tiling::Predicate,
     },
 };
 
+/// The element type of a test source, in the shapes a test gives one, held apart from
+/// [`Type`] because a source is `Send` and a [`Type`] is not: a [`Type`] carries inference
+/// state behind `Rc`, and a source is read on the thread that runs its program. The
+/// description is built from the [`Type`] a test passes and rebuilt into one when inference
+/// registers the source.
+enum TestSourceType {
+    Base(BaseType),
+    Tuple(Vec<TestSourceType>),
+    Record(Vec<(Label, TestSourceType)>),
+}
+
+impl TestSourceType {
+    fn of(ty: &Type) -> Self {
+        match ty {
+            Type::Base(base) => Self::Base(base.clone()),
+            Type::Tuple(items) => Self::Tuple(items.iter().map(Self::of).collect()),
+            Type::Record(fields) => Self::Record(
+                fields
+                    .iter()
+                    .map(|(label, ty)| (label.clone(), Self::of(ty)))
+                    .collect(),
+            ),
+            other => panic!(
+                "a test source's element type is a base type, a tuple or a record of them; \
+                 got {other}"
+            ),
+        }
+    }
+
+    fn to_type(&self) -> Type {
+        match self {
+            Self::Base(base) => Type::Base(base.clone()),
+            Self::Tuple(items) => Type::Tuple(items.iter().map(Self::to_type).collect()),
+            Self::Record(fields) => Type::Record(
+                fields
+                    .iter()
+                    .map(|(label, ty)| (label.clone(), ty.to_type()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// Handle for simulating an arbitrary source in a program.
 /// Allows for directly setting the yield predicate and data,
 /// as well as reading the obsolete predicates pushed back to it.
 pub struct TestDataSource {
     name: String,
-    output_type: Type,
+    output_type: TestSourceType,
     output_extent: Extent,
     yield_predicate: Predicate,
     has_data: bool,
@@ -27,7 +70,7 @@ impl TestDataSource {
     pub fn new(name: &str, output_type: Type, output_extent: Extent) -> Self {
         Self {
             name: name.to_string(),
-            output_type,
+            output_type: TestSourceType::of(&output_type),
             output_extent,
             yield_predicate: Predicate::False,
             has_data: false,
@@ -158,7 +201,7 @@ impl DataSourceDomainExtentImpl for TestDataSource {
     }
 
     fn output_type(&self) -> Type {
-        self.output_type.clone()
+        self.output_type.to_type()
     }
 
     fn get_yield_predicate(&self) -> Predicate {

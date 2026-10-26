@@ -5,6 +5,7 @@
 //! assertion. See `tests/it/hot_reload.rs` for what the programs are and what a
 //! reload may do to them.
 
+use cambra::interpreter::LockNow;
 use std::{
     thread,
     time::{Duration, Instant},
@@ -942,7 +943,7 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
     before: &[i64],
     after: &[i64],
 ) -> i64 {
-    use std::{cell::RefCell, rc::Rc};
+    use std::sync::{Arc, Mutex};
 
     use cambra::{
         ccl::load::LoadedProgram,
@@ -954,7 +955,7 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
     use super::serving::no_main;
 
     let mut ctx = GlobalContext::default();
-    let source = Rc::new(RefCell::new(TestDataSource::new(
+    let source = Arc::new(Mutex::new(TestDataSource::new(
         "source1",
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
@@ -977,9 +978,9 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
 
     let mut live =
         LiveProgram::start(&mut ctx, &LoadedProgram::test(v1), &no_main).expect("v1 compiles");
-    source.borrow_mut().add_data(&rows(0, before));
+    source.lock_now().add_data(&rows(0, before));
     source
-        .borrow_mut()
+        .lock_now()
         .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(
             before.len() - 1,
         )));
@@ -988,8 +989,8 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
     }
     live.reload(&mut ctx, MAIN_BRANCH, &LoadedProgram::test(v2), &no_main)
         .expect("v2 replaces v1");
-    source.borrow_mut().add_data(&rows(before.len(), after));
-    source.borrow_mut().set_yield_predicate(Predicate::True);
+    source.lock_now().add_data(&rows(before.len(), after));
+    source.lock_now().set_yield_predicate(Predicate::True);
     for _ in 0..500 {
         let tile = pull(&mut ctx, &mut live);
         if tile.is_terminal() {
