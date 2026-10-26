@@ -1,0 +1,88 @@
+# Retry policy for remote calls: how a reply is classified, how long to wait between attempts, and
+# when to stop.
+#
+# `std::retry` declares types and functions only, so a module imports it (docs/chl-spec.md,
+# "9.7 Importing asserts no IO and no state"). It declares policy and applies none: the caller that
+# retries a remote call reads a `RetryConfig` and decides each attempt by it. A remote's client
+# supplies the default classification of its replies, and a program overrides it with
+# `retry_logic`.
+#
+# Example, a classification for an API that answers 409 when it has already performed the request:
+#
+#     import std::http
+#     import std::retry
+#
+#     Emailed = {id: String}
+#
+#     def email_retry_logic(o: http::Outcome(Emailed)) => retry::RetryState(Emailed):
+#         match o:
+#             case http::`status(r):
+#                 if r.http::status == 409:
+#                     retry::`ok((id=""))
+#                 else:
+#                     retry::transient_http_retry(o)
+#             case _:
+#                 retry::transient_http_retry(o)
+#
+#     policy = (retry::default_retry() with retry_logic=`some(email_retry_logic))
+#
+# Status: proposed, not in the spec. The std root it belongs to is [Planned] (docs/chl-spec.md,
+# "9.16 The std root"). `[proposed]` marks each construct the compiler lacks.
+
+import std::http
+import std::time
+
+# What a classification makes of one reply. `ok carries the decoded success. `retriable says
+# whether the remote answered (a status such as 429 or 503) or not (a failed connection, a timeout):
+# after an unanswered attempt the remote may have performed the call. A `failed reply is answered.
+# [proposed] a parameterised type alias (docs/chl-spec.md, "6.7 Type-alias statements", Open).
+pub RetryState(Ok) = {`ok{Ok} | `retriable{answered: Bool} | `failed}
+
+# The wait before attempt n + 1 is `first · factor^(n-1)`. A call fails `exhausted after
+# `attempts` attempts.
+pub BackoffPolicy = {first: time::Duration, factor: Int, attempts: Int}
+
+# One call's retry policy.
+#
+# - `backoff` spaces the attempts and bounds their number.
+# - `retry_logic` is `none to use the client's classification, or `some to override it.
+# - `deadline` bounds the wait for one attempt's reply; an attempt with no reply by then counts as
+#   an unanswered retriable failure. It must outlast the protocol client's request timeout, or two
+#   attempts of one call are in flight at once, since neither the client nor the protocol client
+#   retries. Nothing checks this.
+# - `call_timeout` bounds the whole call, from when the caller admits it. No attempt starts after
+#   it passes, and the call fails `timed_out once no attempt is in flight, so a call ends
+#   within `call_timeout` plus one `deadline`. `never leaves `backoff.attempts` as the only bound.
+pub RetryConfig(Response, Ok) = {
+    backoff: BackoffPolicy,
+    retry_logic: Option(Response => RetryState(Ok)),
+    deadline: time::Duration,
+    call_timeout: {`after{time::Duration} | `never},
+}
+
+# Three attempts, 60 s then 240 s apart.
+pub default_backoff: BackoffPolicy = (first=time::seconds(60), factor=4, attempts=3)
+
+# Returns a policy of `default_backoff`, the client's classification, a 5-minute `deadline`, and
+# no `call_timeout`.
+# [proposed] `Response` and `Ok` determined by the use (docs/chl-spec.md, "Type parameters",
+# Direction [Decided] — determined by the use).
+pub def default_retry(Response, Ok) => RetryConfig(Response, Ok):
+    (backoff=default_backoff, retry_logic=`none, deadline=time::minutes(5), call_timeout=`never)
+
+# Classifies an HTTP reply, retrying what may succeed on another attempt: a failed connection, a
+# timeout, a 429 and a 5xx are retriable; any other status fails at once. It suits a remote that
+# answers a rate limit with 429 and an outage with 5xx.
+pub def transient_http_retry(Ok, o: http::Outcome(Ok)) => RetryState(Ok):
+    match o:
+        case http::`ok(v):
+            `ok(v)
+        case http::`connection_failed:
+            `retriable(answered=False)
+        case http::`timeout:
+            `retriable(answered=False)
+        case http::`status(r):
+            if r.http::status == 429 or r.http::status >= 500:
+                `retriable(answered=True)
+            else:
+                `failed

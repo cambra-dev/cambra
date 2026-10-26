@@ -16,6 +16,7 @@ A module's path is its file's path under this directory, with `std` in place of 
 | -- | -- | -- | -- |
 | `std::time` | [time.cambra](time.cambra) | `import std::time` | `Instant`, `Duration`, `now()`, durations, and conversions to integer counts and Unix time |
 | `std::time::timer` | [time/timer.cambra](time/timer.cambra) | `run std::time::timer(Key=K) as t` | Keyed one-shot timers: `register`, `cancel`, `pending`, `fired` |
+| `std::retry` | [retry.cambra](retry.cambra) | `import std::retry` | Retry policy: reply classification, backoff, deadlines, `transient_http_retry` |
 
 - **A module that declares state or performs IO is run; every other module is imported.** Importing
   asserts that a module declares no mutable variable or feed and opens no source

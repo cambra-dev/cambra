@@ -522,7 +522,7 @@ two layers also multiply: three layers of four attempts reach a database 64 time
 "Addressing Cascading Failures").
 
 **The effect's policy.** `retry::RetryConfig = {backoff, retry_logic, deadline, call_timeout}`
-(`std/retry.cambra`).
+([std/retry.cambra](../../std/retry.cambra)).
 
 - `retry_logic: Option(Response => RetryState(Ok))` overrides the client's classification, which
   sorts each reply into `` `ok ``, `` `retriable{answered} `` or `` `failed ``. `` `none `` uses
