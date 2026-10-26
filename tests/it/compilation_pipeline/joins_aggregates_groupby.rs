@@ -122,6 +122,21 @@ fn a_join_side_holding_a_union() {
     );
 }
 
+/// A predicate over several arms of a hash join is reindexed onto the join's flat domain: its
+/// `zip` application and the tuple of projections under it are rebuilt against that domain. The
+/// predicate keeps `x = z ∈ {2, 3}` with `y = 10z`, giving `(2 + 20 + 2) + (3 + 30 + 3)`.
+#[test]
+fn a_multi_arm_predicate_on_a_hash_join() {
+    check_scalar(
+        indoc! {"
+            sum([x + y + z
+                for x in [1, 2, 3] for y in [30, 20, 10] for z in [1, 2, 3]
+                if x == z if y == z * 10 if y - x > 15])
+        "},
+        Value::Int(60),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Aggregates
 // ---------------------------------------------------------------------------
