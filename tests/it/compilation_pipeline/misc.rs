@@ -21,6 +21,7 @@ use super::helpers::*;
 #[case("[1 + x + 1 for x in [1,2,3]]")]
 #[case("[(x, x).0 + 2 for x in [1,2,3]]")]
 #[case("[(x, 0) for x in [1,2,3]]")]
+#[case("[(a=x + 1) for x in [1,2,3]]")]
 #[case("[x for x in [1,2,3] if x + 1 < 2]")]
 #[case("1 + 2 + 3")]
 fn test_no_fan_outs(#[case] code: &str) {
