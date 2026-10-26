@@ -994,7 +994,7 @@ impl TileOperator for MapResultWithSource {
     }
 }
 
-/// Producer for [`MapNSource`]: maps each domain key to its output value on `get`.
+/// Producer for [`MapResultWithSource`]: maps each domain key to its output value on `get`.
 struct MapResultWithSourceProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,

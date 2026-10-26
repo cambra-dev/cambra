@@ -2168,10 +2168,6 @@ mod tests {
     fn uncurry_domain_predicate_transformation_with_true() {
         // Test that UncurryProducer.get() transforms domain_predicate correctly
         // when the input has Predicate::True
-        //
-        // Previously, Predicate::True was preserved directly.
-        // Now, it should be transformed into a Record predicate with both
-        // fields (_0 and _1) set to Predicate::True.
 
         let two_level_tile = Tile::data_function(
             ColumnValue::UInts(vec![1, 2, 3]),
@@ -2239,10 +2235,6 @@ mod tests {
     fn uncurry_domain_predicate_transformation_with_false() {
         // Test that UncurryProducer.get() transforms domain_predicate correctly
         // when the input has Predicate::False
-        //
-        // Previously, Predicate::False was preserved directly.
-        // Now, it should be transformed into a Record predicate with both
-        // fields (_0 and _1) set to Predicate::False.
 
         let two_level_tile = Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
