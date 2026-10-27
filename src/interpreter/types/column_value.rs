@@ -431,27 +431,6 @@ impl ColumnValue {
         }
     }
 
-    /// Sort `FunctionBindings` by their input values.
-    pub fn sort_by_inputs(&self) -> ColumnValue {
-        match self {
-            ColumnValue::FunctionBindings { inputs, outputs } => {
-                let n = inputs.len();
-                let mut indices: Vec<usize> = (0..n).collect();
-                indices.sort_by(|&a, &b| {
-                    inputs
-                        .index_at(a)
-                        .partial_cmp(&inputs.index_at(b))
-                        .expect("Cannot compare inputs")
-                });
-                ColumnValue::function_bindings(
-                    inputs.select_indices(indices.iter().cloned(), indices.len()),
-                    outputs.select_indices(indices.iter().cloned(), indices.len()),
-                )
-            }
-            other => other.clone(),
-        }
-    }
-
     /// Select elements at the given indices.
     pub fn select_indices(
         &self,
@@ -533,11 +512,6 @@ impl ColumnValue {
     /// Return `true` if this column contains no elements.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Return `true` if this column contains exactly one element.
-    pub fn is_single(&self) -> bool {
-        self.len() == 1
     }
 
     /// Return `true` if this column's element type is consistent with `extent`.
@@ -1023,13 +997,6 @@ impl ColumnValue {
         let indices = take(v);
         let n = indices.len();
         map.select_indices(indices.into_iter().map(row_index), n)
-    }
-
-    pub fn for_each_uint(&mut self, f: impl Fn(&mut u64)) {
-        match self {
-            ColumnValue::UInts(v) => v.iter_mut().for_each(f),
-            _ => panic!("Not UInts"),
-        }
     }
 
     /// Returns the booleans if this ColumnValue is a `Bools` column.
