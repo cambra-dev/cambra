@@ -289,8 +289,29 @@ impl TileProducer for ConverseProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
+    /// The answer is cut to the projection at any level, so every level is restated: the
+    /// standing levels name the input's keys, and the inverted level and those beneath it are cut
+    /// from the groups.
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
+    /// Inverting the outermost collection makes the values it holds the keys, and which rows
+    /// carry which value is known only once the rows are read: the input is read whole and the
+    /// groups cut after. The rows a cut group does not name stay unreleased at the input, so a
+    /// later pull reads them again. Beneath standing levels the input is pulled at the standing
+    /// keys the projection names ([`Projection::above`]), since the inverted level's keys are
+    /// the input's values.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(self);
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let input_guard = match self.level.enclosing() {
+            None => self.input.tiling().universal_guard(),
+            Some(_) => projection.above(self.level).guard(self.input.tiling()),
+        };
+        let input_tile = self.input.get(input_guard);
         let mut out = match self.level.enclosing() {
             None => {
                 debug_assert!(
@@ -329,6 +350,7 @@ impl TileProducer for ConverseProducer {
             }
             out.remove_guarded(released);
         }
+        out.restrict_to(&projection, self.tiling());
         out
     }
 
@@ -618,16 +640,28 @@ impl TileProducer for UncurryProducer {
         visit("input", &*self.input);
     }
 
+    /// It restates every level: a standing level's keys are its input's, and a key at or beneath
+    /// the pairs stands under a pair, which is a path of the outer and the inner key
+    /// ([`unpaired`]).
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
     /// Beneath standing levels the projection names keys the pairing leaves standing, so the
     /// input is pulled at it. Pairing the whole tile makes the pairs the keys: the projection
     /// is then over pairs, and what reaches the input is the admitted first components, which
     /// is every pair they head, and the pairs are cut after.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection(&self.name());
+        let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
         let input_guard = match (self.level == CurryLevel::OUTERMOST, &projection) {
+            (_, Projection::Keys { level, keys }) if *level >= self.level => Projection::keys_at(
+                CurryLevel::new(level.index() + 1),
+                unpaired(keys, *level, self.level),
+            )
+            .guard(self.input.tiling()),
             (false, _) => projection.guard(self.input.tiling()),
             (
                 true,
@@ -665,6 +699,52 @@ impl TileProducer for UncurryProducer {
         trace!("{} releasing up with: {input_guard:?}", self.name());
         self.input.release(input_guard);
     }
+}
+
+/// The keys `keys` admits at `level`, at or beneath the pairs an `Uncurry` makes at `pairs`, as keys
+/// of its input one level deeper: each path's pair is its outer key with its inner key beneath it.
+///
+/// # Panics
+///
+/// Where a path's pair is named by a predicate other than a record of its two components, which no
+/// projection of a pair level spells.
+fn unpaired(keys: &Predicate, level: CurryLevel, pairs: CurryLevel) -> Predicate {
+    // `admitted` admits paths whose last key stands at `depth`.
+    fn split(admitted: &Predicate, depth: usize, pairs: usize) -> Predicate {
+        match admitted {
+            Predicate::Or(arms) => {
+                Predicate::union_all(arms.iter().map(|arm| split(arm, depth, pairs)).collect())
+            }
+            Predicate::Qualified { enclosing, here } if depth > pairs => {
+                Predicate::qualified(split(enclosing, depth - 1, pairs), (**here).clone())
+            }
+            Predicate::Qualified { enclosing, here } => {
+                let (outer, inner) = components(here);
+                Predicate::qualified(Predicate::qualified((**enclosing).clone(), outer), inner)
+            }
+            unqualified if depth > pairs => unqualified.clone(),
+            pair => {
+                let (outer, inner) = components(pair);
+                Predicate::qualified(outer, inner)
+            }
+        }
+    }
+    fn components(pair: &Predicate) -> (Predicate, Predicate) {
+        match pair {
+            Predicate::True => (Predicate::True, Predicate::True),
+            Predicate::Record(fields) => {
+                let field = |at: usize| {
+                    fields
+                        .get(&tuple_field(at))
+                        .cloned()
+                        .unwrap_or(Predicate::True)
+                };
+                (field(0), field(1))
+            }
+            other => panic!("a pair is named by its two components, not {other:?}"),
+        }
+    }
+    split(keys, level.index(), pairs.index())
 }
 
 /// Pair a curried collection's two levels into one keyed by `(outer, inner)` pairs.
@@ -1728,6 +1808,59 @@ mod nested_projection_tests {
         ProjectionSpyOp, assert_conforms_beneath, ints_by_position, paths_guard, two_levels_of_ints,
     };
     use crate::interpreter::{BaseType, Extent, FunctionGuard, Predicate, Value};
+
+    /// Two rows of the keys `0..3`, each valued by a `UInt`, for a `Converse` to group by value
+    /// beneath the rows.
+    fn rows_of_uint_values() -> (Tile, Tiling) {
+        let uints = || Tiling::Scalar(Extent::Base(BaseType::UInt));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(Extent::uint_range(3), uints()),
+        );
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 3],
+                ColumnValue::UInts(vec![0, 1, 2, 0, 1, 2]),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1, 1, 1, 1, 0]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        (tile, tiling)
+    }
+
+    /// A converse beneath a standing level pulled at a path of its groups pulls its input at the
+    /// standing row the path runs through, and answers the whole answer cut to the path.
+    #[test]
+    fn a_converse_beneath_a_level_pulls_a_path_of_its_groups_at_its_row() {
+        use crate::interpreter::tile_operators::test_helpers::assert_conforms;
+        let at_one = paths_guard(Predicate::qualified(
+            Predicate::point(Value::UInt(0)),
+            Predicate::point(Value::UInt(1)),
+        ));
+        let make = || {
+            let (tile, tiling) = rows_of_uint_values();
+            let (spy, pulled, _) = ProjectionSpyOp::new(tile, tiling);
+            let mut converse = Converse::new_at(Box::new(spy), CurryLevel::new(1));
+            let guard = converse.tiling().universal_guard();
+            (
+                converse.subscribe(guard, Box::new(|| {}), &mut Scheduler::new()),
+                pulled,
+            )
+        };
+        let (mut producer, pulled) = make();
+        producer.get(at_one.clone());
+        assert_eq!(
+            *pulled.borrow(),
+            [TileGuard::Function(FunctionGuard::Domain(
+                Predicate::point(Value::UInt(0))
+            ))]
+        );
+        assert_conforms(|| make().0, at_one);
+    }
 
     /// The outer side of a product has no paired level, so a projection of the pairs pulls both
     /// sides at the rows its paths run through and cuts the pairs.
@@ -3913,6 +4046,76 @@ mod uncurry_projection_tests {
         domain.len()
     }
 
+    /// Groups 1 and 2 holding members `{0}` and `{1}`, each member holding keys `{5, 6}`, paired
+    /// at the outermost level: three levels in, two out.
+    fn paired_groups_of_collections() -> (UncurryProducer, GuardLog) {
+        let leaves = Tile::grouped(
+            vec![0, 2],
+            ColumnValue::UInts(vec![5, 6, 5, 6]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let groups = Tile::data_function(
+            ColumnValue::UInts(vec![1, 2]),
+            Box::new(Tile::grouped(
+                vec![0, 1],
+                ColumnValue::UInts(vec![0, 1]),
+                Box::new(leaves),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let uint = || Extent::Base(BaseType::UInt);
+        let leaf = || Tiling::data_function(uint(), Tiling::Scalar(Extent::Base(BaseType::Int)));
+        let in_tiling = Tiling::data_function(uint(), Tiling::data_function(uint(), leaf()));
+        let out = Tiling::data_function(
+            Extent::Record(
+                [(tuple_field(0), uint()), (tuple_field(1), uint())]
+                    .into_iter()
+                    .collect(),
+            ),
+            leaf(),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(groups, in_tiling);
+        (
+            UncurryProducer {
+                base: ProducerBase::unowned(UncurryProducer::alloc_id(), &out),
+                input: Box::new(input),
+                level: CurryLevel::OUTERMOST,
+                empty_pair: out.empty_at_no_rows(),
+            },
+            pulled,
+        )
+    }
+
+    /// A projection beneath the pairs names keys under a pair, which is the path of the pair's
+    /// outer key and its inner key: key 5 under the pair `(2, 1)` pulls key 5 under group 2's
+    /// member 1, and answers what a whole pull cut to it answers.
+    #[test]
+    fn a_projection_beneath_the_pairs_pulls_the_path_of_each_pair() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let pair = Predicate::Record(HashMap::from([
+            (tuple_field(0), point(2)),
+            (tuple_field(1), point(1)),
+        ]));
+        let codomain = |g: TileGuard| TileGuard::Function(FunctionGuard::Codomain(Box::new(g)));
+        let domain = |p: Predicate| TileGuard::Function(FunctionGuard::Domain(p));
+        let guard = codomain(domain(Predicate::qualified(pair, point(5))));
+        let (mut uncurry, pulled) = paired_groups_of_collections();
+        uncurry.get(guard.clone());
+        assert_eq!(
+            *pulled.borrow(),
+            [codomain(codomain(domain(Predicate::qualified(
+                Predicate::qualified(point(2), point(1)),
+                point(5),
+            ))))]
+        );
+        assert_conforms(|| Box::new(paired_groups_of_collections().0), guard);
+    }
+
     /// A morsel of pairs headed by groups 1 and 3 reads those groups of the grouping alone, and
     /// holds the pairs they head: `(1, 0)`, `(1, 2)` and `(3, 3)`.
     #[test]
@@ -3929,15 +4132,20 @@ mod uncurry_projection_tests {
         );
     }
 
-    /// A morsel that names the second component only cannot say which groups it needs, so the
-    /// grouping is read whole and the pairs are cut after.
+    /// A morsel that names the second component only names that member under every group, so
+    /// the grouping is read at it: the pair `(2, 1)`.
     #[test]
-    fn a_morsel_of_second_components_reads_the_grouping_whole_and_cuts_the_pairs() {
+    fn a_morsel_of_second_components_reads_that_member_under_every_group() {
         let (mut uncurry, pulled) = paired_groups();
         let guard = pairs(Predicate::True, Predicate::point(Value::UInt(1)));
         let morsel = uncurry.get(guard);
         assert_eq!(pair_count(&morsel), 1, "only the pair (2, 1)");
-        assert_eq!(*pulled.borrow(), [uncurry.input.tiling().universal_guard()]);
+        assert_eq!(
+            *pulled.borrow(),
+            [TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(1))))
+            )))]
+        );
     }
 
     #[test]
@@ -4130,5 +4338,194 @@ mod product_projection_tests {
         let nothing = product.tiling().empty_guard();
         assert_eq!(product.get(nothing), product.tiling().empty_tile());
         assert!(outer_pulled.borrow().is_empty() && inner_pulled.borrow().is_empty());
+    }
+}
+
+/// `Converse` as the bucketize step of a group-by uses it: the key stream `sales ≫ key` is
+/// inverted into the groups `key ⤇ (position ⤇ position)`, and a worker owns a range of groups.
+#[cfg(test)]
+mod converse_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, ints_by_position, keys_between,
+    };
+    use bit_set::BitSet;
+
+    const ROWS: u64 = 8;
+
+    /// The group of each position: `1, 2, 1, 3, 2, 1, 3, 2`, so group 1 holds positions
+    /// `{0, 2, 5}`, group 2 holds `{1, 4, 7}` and group 3 holds `{3, 6}`.
+    const GROUPS: [i64; 8] = [1, 2, 1, 3, 2, 1, 3, 2];
+
+    fn groups_tiling() -> Tiling {
+        Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(ROWS),
+                Tiling::Scalar(Extent::uint_range(ROWS)),
+            ),
+        )
+    }
+
+    fn bucketize() -> (ConverseProducer, GuardLog, GuardLog) {
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (keys, pulled, released) =
+            ProjectionSpy::new(ints_by_position(&GROUPS, true), in_tiling);
+        (
+            ConverseProducer {
+                base: ProducerBase::unowned(ConverseProducer::alloc_id(), &groups_tiling()),
+                input: Box::new(keys),
+                held: Vec::new(),
+                level: CurryLevel::OUTERMOST,
+                empty_level: groups_tiling()
+                    .values_at(CurryLevel::OUTERMOST)
+                    .empty_at_no_rows(),
+            },
+            pulled,
+            released,
+        )
+    }
+
+    fn groups(keys: &[i64]) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(
+            keys.iter()
+                .map(|k| Predicate::point(Value::Int(*k)))
+                .fold(Predicate::False, |all, one| all.union(&one)),
+        ))
+    }
+
+    /// Each group of `tile` as `(key, members)`, members in position order.
+    fn members_by_group(tile: &Tile) -> Vec<(i64, Vec<u64>)> {
+        let Tile::DataFunction {
+            domain: ColumnValue::Ints(keys),
+            codomain,
+            ..
+        } = tile
+        else {
+            panic!("groups keyed by integers, got {tile:?}")
+        };
+        let Tile::DataFunction {
+            row_starts,
+            domain: ColumnValue::UInts(members),
+            ..
+        } = codomain.as_ref()
+        else {
+            panic!("members per group, got {codomain:?}")
+        };
+        let mut groups: Vec<(i64, Vec<u64>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(group, key)| {
+                let end = row_starts.get(group + 1).copied().unwrap_or(members.len());
+                let mut held = members[row_starts[group]..end].to_vec();
+                held.sort_unstable();
+                (*key, held)
+            })
+            .collect();
+        groups.sort();
+        groups
+    }
+
+    /// A worker's groups: the keys are read from the rows, so the whole key stream is read and
+    /// the groups outside the range are cut.
+    #[test]
+    fn a_range_of_groups_reads_the_whole_key_stream_and_cuts_the_groups() {
+        let (mut converse, pulled, _) = bucketize();
+        let answer = converse.get(groups(&[1, 3]));
+        assert_eq!(
+            members_by_group(&answer),
+            [(1, vec![0, 2, 5]), (3, vec![3, 6])]
+        );
+        assert_eq!(
+            *pulled.borrow(),
+            [converse.input.tiling().universal_guard()]
+        );
+    }
+
+    /// The consumer releases the groups it took. That frees the rows they hold at the input and
+    /// no others, so the next range finds its own rows still there.
+    #[test]
+    fn releasing_a_range_of_groups_frees_its_rows_and_leaves_the_others() {
+        let (mut converse, _, released) = bucketize();
+        converse.get(groups(&[1]));
+        converse.release(groups(&[1]));
+        let freed = released.borrow().clone();
+        assert_eq!(freed.len(), 1);
+        let TileGuard::Function(FunctionGuard::Domain(rows)) = &freed[0] else {
+            panic!("a domain release of the rows, got {freed:?}")
+        };
+        for row in [0u64, 2, 5] {
+            assert!(rows.contains(&Value::UInt(row)), "row {row} is group 1's");
+        }
+        for row in [1u64, 3, 4, 6, 7] {
+            assert!(!rows.contains(&Value::UInt(row)), "row {row} is not");
+        }
+        let rest = converse.get(groups(&[2, 3]));
+        assert_eq!(
+            members_by_group(&rest),
+            [(2, vec![1, 4, 7]), (3, vec![3, 6])]
+        );
+    }
+
+    #[test]
+    fn a_range_of_groups_is_the_whole_pull_cut_to_it() {
+        for guard in [groups(&[1]), groups(&[2, 3]), groups(&[9])] {
+            assert_conforms(|| Box::new(bucketize().0), guard);
+        }
+    }
+
+    /// A group-by whose source varies per enclosing row inverts each row's collection on its
+    /// own: the outer keys stand, so the projection of rows reaches the rows.
+    #[test]
+    fn beneath_a_standing_level_the_projection_reaches_the_enclosing_rows() {
+        let rows = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 3],
+                ColumnValue::UInts(vec![0, 1, 2, 0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 6, 5, 7, 7]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(
+                Extent::uint_range(3),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let out = Tiling::data_function(Extent::uint_range(2), groups_tiling());
+        let make = || {
+            let (input, pulled, _) = ProjectionSpy::new(rows.clone(), in_tiling.clone());
+            (
+                ConverseProducer {
+                    base: ProducerBase::unowned(ConverseProducer::alloc_id(), &out),
+                    input: Box::new(input),
+                    held: Vec::new(),
+                    level: CurryLevel::new(1),
+                    empty_level: out.values_at(CurryLevel::new(1)).empty_at_no_rows(),
+                },
+                pulled,
+            )
+        };
+        let (mut converse, pulled) = make();
+        converse.get(keys_between(1, 1));
+        assert_eq!(*pulled.borrow(), [keys_between(1, 1)]);
+        assert_conforms(|| Box::new(make().0), keys_between(1, 1));
+    }
+
+    #[test]
+    fn nothing_inverts_nothing() {
+        let (mut converse, pulled, _) = bucketize();
+        let nothing = converse.tiling().empty_guard();
+        assert_eq!(converse.get(nothing), converse.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 }
