@@ -492,6 +492,7 @@ of a restatement with no spelling.
 | `VariantProject` | A union stream is pulled at the projection. A bare union has no keys of its own, so it is read whole and its positions are cut. |
 | `VariantIs` | The scrutinee is pulled at the projection, since every key in is a key out. |
 | `Filter` | The predicate and the input are pulled at the projection, since they share the keys of the level the mask names. |
+| `Restrict` | The predicate is pulled at the projection, since the restricted domain is the predicate's keys that pass. |
 
 ### Producer attribution and probes
 
