@@ -124,7 +124,8 @@ impl Projection {
         Projection::keys_at(level, self.at(level).minus(&other.at(level)))
     }
 
-    /// The projection naming what either names.
+    /// The projection naming what either names: the region a memo has read or must read
+    /// again.
     pub fn union(&self, other: &Projection) -> Projection {
         let level = self.deepest(other);
         Projection::keys_at(level, self.at(level).union(&other.at(level)))
@@ -644,6 +645,19 @@ mod tests {
         }
     }
 
+    /// Whether `projection` names the path `path`.
+    fn names(projection: &Projection, path: &[u64]) -> bool {
+        let path: Vec<Value> = path.iter().map(|k| Value::UInt(*k)).collect();
+        match projection {
+            Projection::Everything => true,
+            Projection::Nothing => false,
+            Projection::Keys { level, keys } => {
+                let deeper = path.len() - 1 - level.index();
+                keys.descend(deeper).contains_path(&path)
+            }
+        }
+    }
+
     /// Every key beneath an outermost key is that key, so the level above spells it.
     #[test]
     fn every_key_beneath_keys_is_those_keys() {
@@ -673,6 +687,27 @@ mod tests {
             ])
         );
         assert_eq!(Projection::of(&spelled), Ok(level_one(mixed)));
+    }
+
+    /// Two projections meet at the deeper level, where a key of the level above is every path
+    /// beneath it.
+    #[test]
+    fn projections_at_two_levels_meet_at_the_deeper() {
+        let keys_0_and_1 = Projection::admitting(positions(0, 1));
+        let row_0_to_1 = level_one(under(key(0), positions(0, 1)));
+        let left = keys_0_and_1.minus(&row_0_to_1);
+        for (path, named) in [
+            ([0, 0], false),
+            ([0, 1], false),
+            ([0, 2], true),
+            ([1, 0], true),
+            ([2, 0], false),
+        ] {
+            assert_eq!(names(&left, &path), named, "{path:?} in {left:?}");
+        }
+        assert_eq!(keys_0_and_1.intersect(&row_0_to_1), row_0_to_1);
+        assert_eq!(left.union(&row_0_to_1), keys_0_and_1);
+        assert_eq!(row_0_to_1.minus(&keys_0_and_1), Projection::Nothing);
     }
 
     /// `0 ↦ {0 ↦ 10, 1 ↦ 11, 2 ↦ 12}`, `1 ↦ {0 ↦ 20}`, `2 ↦ {0 ↦ 30}`: every key and every group
@@ -803,6 +838,24 @@ mod tests {
         );
         assert_eq!(low.minus(&Projection::Everything), Projection::Nothing);
         assert_eq!(low.minus(&Projection::Nothing), low);
+    }
+
+    #[test]
+    fn a_union_names_the_region_a_memo_has_read_or_must_read_again() {
+        let (low, high) = (
+            Projection::admitting(positions(0, 2)),
+            Projection::admitting(positions(5, 7)),
+        );
+        assert_eq!(
+            low.union(&high),
+            Projection::admitting(positions(0, 2).union(&positions(5, 7)))
+        );
+        assert_eq!(low.union(&Projection::Nothing), low);
+        assert_eq!(
+            Projection::Nothing.union(&Projection::Nothing),
+            Projection::Nothing
+        );
+        assert_eq!(low.union(&Projection::Everything), Projection::Everything);
     }
 
     #[test]
