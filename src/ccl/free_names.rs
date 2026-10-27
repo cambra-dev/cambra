@@ -251,6 +251,8 @@ impl<'m> Walk<'m> {
             // The projected sum is a term the type quotes. It binds no element: the term is
             // the collection, not a condition on a key.
             Type::WitnessProjection(p) => self.quoted(&p.term, false),
+            // A family's arguments are terms the type quotes, binding no element.
+            Type::FamilyApp(app) => app.args.iter().for_each(|a| self.quoted(&a.term, false)),
             Type::Fun {
                 name,
                 fun_kind,

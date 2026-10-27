@@ -2261,6 +2261,7 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         | Type::WitnessRef(_)
         | Type::WitnessProjection(_)
         | Type::Param(_)
+        | Type::FamilyApp(_)
         | Type::Txn => ty.clone(),
         Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(strip_refinements))),
         Type::Nominal(decl, args) => {
@@ -3153,6 +3154,11 @@ where
             changed |= memo.rebuild(refinement, context, |pred| f(pred, memo));
         }),
         Type::WitnessProjection(p) => changed |= memo.rebuild(p, context, |term| f(term, memo)),
+        Type::FamilyApp(app) => {
+            for arg in &mut app.args {
+                changed |= memo.rebuild(arg, context, |term| f(term, memo));
+            }
+        }
         _ => {}
     }
     ty.walk_children_mut(|child| changed |= walk_quoted_terms_mut(child, memo, context, f));

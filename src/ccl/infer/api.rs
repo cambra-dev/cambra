@@ -2236,6 +2236,8 @@ fn collect_type_errors(
         // binder's scope over what the type can no longer name, and that `Poly` stays
         // (`src/ccl/design/type-parameters.md`, "Generalized types").
         Type::Param(param) if param.generalized => {}
+        // A family is generalized, so it stays as its `Poly` does.
+        Type::FamilyApp(_) => {}
         Type::Param(param) => errors.push(InferError::Unsupported(format!(
             "type parameter `{}` survived inference at `{context_sym}`",
             param.spelling

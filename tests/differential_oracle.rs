@@ -500,12 +500,13 @@ fn atom_json(a: &AtomKey) -> Option<String> {
         // A witness reference is a name for whichever domain a Σ picked, and the model
         // has no witness — outside the fragment for the same reason `ChanDom` is. Nor
         // does it have type parameters, which exist only inside a polymorphic
-        // definition's body. A witness projection names a witness through a term,
-        // which the model has neither of.
+        // definition's body. A witness projection and a family's application name a
+        // type through a term, which the model has neither of.
         AtomKey::ChanDom(..)
         | AtomKey::Witness(..)
         | AtomKey::Param(..)
-        | AtomKey::Projection(..) => return None,
+        | AtomKey::Projection(..)
+        | AtomKey::Family(..) => return None,
     })
 }
 

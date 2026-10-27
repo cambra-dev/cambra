@@ -482,6 +482,7 @@ pub fn freshen_above(
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_) => ty.clone(),
+        Type::FamilyApp(_) => unreachable!("a generalized family is born after inference"),
         // `uncurry`'s scheme names its components as a function names its binder, so each
         // instantiation names its own, the way the `Fun` arm below renames, and the variables
         // under them follow ([`FreshenCache::binders`]).

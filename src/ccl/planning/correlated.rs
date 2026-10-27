@@ -223,7 +223,11 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
         }
         // A generalized parameter is a domain that differs per row; `iterate` would enumerate its
         // bound, every key any row could hold, and look each row up at keys it lacks.
-        None if matches!(inner_domain.peel_refinements(), Type::Param(p) if p.generalized) => {
+        None if inner_domain
+            .peel_refinements()
+            .generalized_param()
+            .is_some() =>
+        {
             return Err(format!(
                 "a correlated inner comprehension whose domain differs per row, over a \
                  collection the enclosing value does not hold, is not supported yet: its \
@@ -571,9 +575,7 @@ fn row_collection(g: &Expr, incoming: &Type, inner_domain: &Type) -> Option<Vec<
 /// `inner_domain`, where that domain differs per row: a generalized parameter, which names one
 /// domain within the type it is read from. Empty where the enclosing value is the collection.
 fn collection_typed_at(enclosing: &Type, inner_domain: &Type) -> Option<Vec<Expr>> {
-    if !matches!(inner_domain.peel_refinements(), Type::Param(p) if p.generalized) {
-        return None;
-    }
+    inner_domain.peel_refinements().generalized_param()?;
     match crate::ccl::generalize::shape(enclosing) {
         Type::Fun {
             fun_kind, domain, ..
