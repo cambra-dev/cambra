@@ -555,6 +555,7 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
 | `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
 | `Uncurry` | Beneath standing levels the input is pulled at the projection. Pairing the whole tile reads the groups whose first component the projection admits, and the pairs are cut after. |
 | `Product` | Both sides are pulled at the projection, since they are aligned row for row. The outer side has no paired level, so a projection at or beneath it pulls both sides at the rows its paths run through (`Projection::above`), and the pairs are cut. |
+| `Converse` | Every level is restated (`Restates::Every`). Beneath standing levels the input is pulled at the standing keys the projection names (`Projection::above`), and the groups are cut to it. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
 
 ### Producer attribution and probes
 
