@@ -503,6 +503,7 @@ of a restatement with no spelling.
 | `CheckedLookup` | A stream of keys, or of `(collection, key)` rows, is pulled at the projection, since each answer sits at its key's position; the collection is read whole, because every key is answered against all of it. One key has no keys to project and admits only `Everything` and `Nothing`. |
 | `ExtractFinal` | Admits `Everything` and `Nothing`. The last position of a stream is not known before the stream ends, so the source is read whole, and the one value or collection it yields is released whole. A key projection panics, including over a collection-valued final position, which is not implemented. |
 | `PermuteRecordDomain` | Reads its input whole and cuts the answer to the projection over the permuted keys: a region of record keys is componentwise, and the input's fields are renamed, so the projection is not forwarded. |
+| `FlattenTupleDomain` | Reads its input whole and cuts the answer to the projection over the flat keys, as `PermuteRecordDomain` does: the nested keys are restated flat, so the projection is not forwarded. |
 
 ### Producer attribution and probes
 
