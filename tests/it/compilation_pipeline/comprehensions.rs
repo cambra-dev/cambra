@@ -326,14 +326,24 @@ fn a_filtered_inner_comprehension_over_the_outer_row_keeps_its_filter(
 /// A filtered inner comprehension over a **projection of the outer row** does not compile.
 /// The filter reads the row while the collection it narrows is the projection, and no type
 /// relates the two, so the post-elimination type check rejects the program. Pinned as it
-/// fails; it answers 9.
+/// fails; `projected_row` answers 9.
+///
+/// Inside a `with begin():` block a mutable variable arrives as a projection of the block's
+/// snapshot tuple, so a filtered comprehension over a map-valued one is the same shape:
+/// `mut_var_in_block` reaches the same rejection, filtering `__txp.0`, and answers 10.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn a_filtered_inner_comprehension_over_a_projected_row_does_not_compile() {
-    check_compile_error(
-        "sum([sum([v for v in r.xs if v > 1]) for r in [(xs=[1, 2]), (xs=[3, 4])]])",
-        "post-lambda-elim produced an invalid tree",
-    );
+#[case::projected_row("sum([sum([v for v in r.xs if v > 1]) for r in [(xs=[1, 2]), (xs=[3, 4])]])")]
+#[case::mut_var_in_block(indoc! {r"
+    m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+    n: Mut(Int, Txn) := 0
+    for r in [1, 2]:
+        with begin():
+            n := sum([v for v in m if v > 0])
+    await_final(n)
+"})]
+fn a_filtered_inner_comprehension_over_a_projected_row_does_not_compile(#[case] code: &str) {
+    check_compile_error(code, "post-lambda-elim produced an invalid tree");
 }
 
 /// The same with **no outer aggregate**, so the narrowed collection per row is the answer's

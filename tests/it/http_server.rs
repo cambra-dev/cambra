@@ -537,3 +537,66 @@ fn a_retired_route_answers_a_request_it_had_accepted() {
         "the same answer the address gives once the route is gone",
     );
 }
+
+/// Compile `code`, send one request with `request`, and return the reply body, failing after five
+/// seconds without one.
+fn reply_to(code: &str, request: impl FnOnce() -> String + Send + 'static) -> String {
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(code);
+    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let _ = tx.send(request());
+    });
+    drive_until(&mut ctx, &rx, Duration::from_secs(5))
+}
+
+/// A reply fed in the loop body, after a block that writes a mutable variable, answers each
+/// request.
+#[test]
+fn a_reply_after_a_writing_block_answers_the_request() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        reqs, resps = http_serve("{port}", "POST", "/hit")
+        hits: Mut(Int, Txn) := 0
+        for req in reqs:
+            with begin():
+                hits := hits + 1
+            resps << "ok\n"
+    "#};
+    assert_eq!(
+        reply_to(&code, move || http_post(port, "/hit", "x")),
+        "ok\n"
+    );
+}
+
+/// A reply fed inside the block that writes a mutable variable never answers the request.
+///
+/// `docs/chl-spec.md`, "8.4 Feeds are the second form of mutability" admits a reply inside a
+/// block, sequenced after the commit and indexed by commit tick. The same in-block feed over a
+/// `stdin()` loop into a `defer()` replies (`progress_feed_inside_tx` in
+/// `tests/it/compilation_pipeline/transactions.rs` covers the literal-list loop), and the reply
+/// moved after the block answers (the sibling above).
+// Pinned on the failure rather than deferred: an `#[ignore]` reports the same green whether the
+// gap closed, regressed, or went away, and nothing runs ignored tests here. The hang is pinned on
+// `drive_until`'s timeout, which returns control to the test, where rstest's `#[timeout]` would
+// leave the driving thread running.
+#[test]
+#[should_panic(expected = "timed out after 5s waiting for HTTP response")]
+fn a_reply_inside_a_writing_block_answers_the_request() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        reqs, resps = http_serve("{port}", "POST", "/hit")
+        hits: Mut(Int, Txn) := 0
+        for req in reqs:
+            with begin():
+                hits := hits + 1
+                resps << "ok\n"
+    "#};
+    assert_eq!(
+        reply_to(&code, move || http_post(port, "/hit", "x")),
+        "ok\n"
+    );
+}
