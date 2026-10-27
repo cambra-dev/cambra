@@ -484,6 +484,7 @@ of a restatement with no spelling.
 | `MapResult` | A keyed input is pulled at the projection; a scalar input is a key looked up in the function, has no keys to project, and is read whole. A function operand that is a collection is pulled at the projection too where the input's values are its keys, the arguments stand at the first level, and the operand is a data function; its keys are released with the data's. Any other function operand is read whole. |
 | `MapResultToConst` | The input is pulled at the projection. The constant is read whole, since every row reads all of it. |
 | `MapResultWithSource` | The input is pulled at the projection, so a morsel reads only its own keys from the source. |
+| `RecordWrap` | The input is pulled at the projection. |
 
 ### Producer attribution and probes
 
