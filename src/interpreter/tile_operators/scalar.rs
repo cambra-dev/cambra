@@ -160,21 +160,26 @@ impl TileProducer for ConstantProducer {
         node.annotate(format!("{}", self.tiling()))
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    /// A collection constant answers the keys the projection admits, which is how a worker reads
+    /// the table a list literal denotes one morsel at a time. A scalar constant has one position,
+    /// so its projection is the whole value or nothing.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
         // A collection's consumers release the keys they are done with, so the whole
         // table is not what a later pull may return. `release` has already accumulated
         // every guard into `obsolete_guard`, and returning released rows is what `get`'s
         // post-condition forbids.
-        if self.tiling().is_data_function() {
+        let mut tile = if self.tiling().is_data_function() {
             let mut tile = self.tile.clone();
             tile.remove_guarded(self.obsolete_guard().clone());
-            return tile;
-        }
-        if self.released {
+            tile
+        } else if self.released {
             self.tiling().empty_tile()
         } else {
             self.tile.clone()
-        }
+        };
+        tile.restrict_to(&projection, self.tiling());
+        tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1311,5 +1316,103 @@ mod tests {
             "a domain release must reach the payload unchanged, not be swallowed \
              as a whole-input read would"
         );
+    }
+}
+
+/// How a constant is pulled in a morsel pipeline: a list literal is the function operand of a
+/// `map`, looked up at the keys of the morsel, and a function value is a scalar read whole.
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        int_entries, ints_by_position, keys_between,
+    };
+    use crate::interpreter::{BaseType, FunctionGuard};
+
+    /// The constant the literal `[10, 20, 30, 40, 50]` denotes.
+    fn list_literal() -> ConstantProducer {
+        let tile = ints_by_position(&[10, 20, 30, 40, 50], true);
+        let tiling = Tiling::data_function(
+            Extent::uint_range(5),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        ConstantProducer {
+            base: ProducerBase::unowned(ConstantProducer::alloc_id(), &tiling),
+            tile,
+            released: false,
+        }
+    }
+
+    fn completeness(tile: &Tile) -> Predicate {
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = tile
+        else {
+            panic!("a collection, got {tile:?}")
+        };
+        domain_predicate.clone()
+    }
+
+    /// Each worker's `map` looks the literal up at its own morsel, and the morsels together read
+    /// the whole table.
+    #[test]
+    fn a_list_literal_answers_the_morsel_it_is_looked_up_at() {
+        let mut literal = list_literal();
+        let first = literal.get(keys_between(0, 2));
+        assert_eq!(int_entries(&first), [(0, 10), (1, 20), (2, 30)]);
+        let TileGuard::Function(FunctionGuard::Domain(morsel)) = keys_between(0, 2) else {
+            unreachable!("a morsel is a domain guard")
+        };
+        assert_eq!(
+            completeness(&first),
+            morsel,
+            "the literal is decided in full, so the morsel is complete"
+        );
+        literal.release(keys_between(0, 2));
+        let rest = literal.get(keys_between(3, 9));
+        assert_eq!(int_entries(&rest), [(3, 40), (4, 50)]);
+    }
+
+    /// A lookup of scattered keys, as a `map` over a stream whose positions are not contiguous
+    /// makes it, answers those keys and no others.
+    #[test]
+    fn scattered_keys_are_answered_alone() {
+        let mut literal = list_literal();
+        let scattered = Predicate::point(Value::UInt(1)).union(&Predicate::point(Value::UInt(4)));
+        let tile = literal.get(TileGuard::Function(FunctionGuard::Domain(scattered)));
+        assert_eq!(int_entries(&tile), [(1, 20), (4, 50)]);
+    }
+
+    #[test]
+    fn a_released_key_is_not_answered_inside_a_projection() {
+        let mut literal = list_literal();
+        literal.release(keys_between(1, 1));
+        let tile = literal.get(keys_between(0, 2));
+        assert_eq!(int_entries(&tile), [(0, 10), (2, 30)]);
+    }
+
+    /// A function value, such as the `x ↦ x + 1` a `map` applies, is one position: the whole value
+    /// or nothing, and a release retires it.
+    #[test]
+    fn a_scalar_constant_is_read_whole_or_not_at_all() {
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let mut seven = ConstantProducer {
+            base: ProducerBase::unowned(ConstantProducer::alloc_id(), &tiling),
+            tile: Tile::Scalar(ColumnValue::Ints(vec![7])),
+            released: false,
+        };
+        assert_eq!(
+            seven.get(tiling.universal_guard()),
+            Tile::Scalar(ColumnValue::Ints(vec![7]))
+        );
+        seven.release(tiling.universal_guard());
+        assert_eq!(seven.get(tiling.empty_guard()), tiling.empty_tile());
+    }
+
+    #[test]
+    fn nothing_names_no_keys_of_a_collection() {
+        let mut literal = list_literal();
+        let nothing = literal.tiling().empty_guard();
+        assert_eq!(literal.get(nothing), literal.tiling().empty_tile());
     }
 }
