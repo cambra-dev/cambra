@@ -357,38 +357,6 @@ fn a_collection_feed_is_one_element() {
     "#});
 }
 
-/// Two records built per element compare field by field, the comparison a field of a third.
-#[test]
-fn records_built_per_element_compared() {
-    agree(indoc! {r#"
-        out = test_sink()
-        out << [(a=(z=x * 2) == (z=x + 1)) for x in [0, 1, 2, 3]]
-    "#});
-}
-
-/// A conditional whose arms are a record computed from the binder and a record of the binder
-/// itself.
-#[test]
-fn a_conditional_between_a_computed_record_and_one_of_the_binder() {
-    agree(indoc! {r#"
-        out = test_sink()
-        for i in [1, 2, 3]:
-            out << ((a=i - 1, b=i * i) if i > 1 else (a=i, b=i))
-    "#});
-}
-
-/// A function that returns a product, applied to a scalar.
-#[test]
-fn a_product_returned_for_a_scalar() {
-    agree(indoc! {r#"
-        def pair(x: Int) => {Int, Int}:
-            (x + 1, x * 2)
-
-        out = test_sink()
-        out << pair(sum([1, 2, 3]))
-    "#});
-}
-
 // These fold a comprehension's result to a scalar before it reaches a sink. They reach the
 // comprehension, filter, group-by and field-access machinery through that route.
 

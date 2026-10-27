@@ -534,13 +534,14 @@ scalar builtins, and `zip`s of such chains, and converts it to
 `fuse_prefix`). The program is a straight-line sequence of instructions over slots, so a value that
 two operations read is computed once, and a field path is read from the input as one slice. The
 arms of a `zip` in the prefix read the same input, so the fused chain has no `Memo`, `FanOut`, `Zip`
-or intermediate pair. A prefix of fewer than two operations, counting every element but `id` and a
-composition, converts as before: a lone unary operation, projection or constant is one operator
-either way, and a lone `zip` of identities, such as `(x, x)`, keeps its `Memo`, `FanOut`s and
-`Zip`. A comparison of two records, `==` or `!=`, is read as one comparison per field both records
-carry, joined by `and` or `or`. Each record is read from the input, a constant, or built by a `zip`
-in the prefix. A record against a non-record, two records with no field in common, and an ordering
-of records have no program, and the prefix ends before them.
+or intermediate pair. A prefix is taken only when it holds at least two operations: `id` and a
+composition count as none, a `zip` as two, and every other element as one. A `zip` alone meets the
+count, so `(x, x)` and the one-field `(a=x)` fuse. A lone unary operation keeps its own conversion,
+since it is one operator either way. A comparison of two records, `==` or `!=`, is read as one
+comparison per field both records carry, joined by `and` or `or`. Each record is read from the
+input, a constant, or built by a `zip` in the prefix. A record against a non-record, two records
+with no field in common, and an ordering of records have no program, and the prefix ends before
+them.
 
 The prefix ends before the first element outside that set. An aggregate, a lookup, a conditional,
 a store read, or a constant that is not closed stays an operator. Conversion also declines when
@@ -556,8 +557,8 @@ block. A field of `Unit` type has no column to read, so a product holding one is
 `Zip` path yields a record of tiles where the fused map yields a column of records, which is the
 tiling `Tiling::from_extent` gives a record of base values. A projection reads either layout
 (`selects_a_tile`). `Converse` inverts only a column. A `groupby` keyed by a product that fuses,
-such as `(e.a, e.b)`, groups by the fused column, and a key that keeps its `Zip`, such as
-`(e.a, sum(xs))`, is a record of tiles that `Converse` rejects.
+such as `(e.a, e.b)` or `(e, e)`, groups by the fused column. A key that keeps its `Zip`, such as
+`(e.a, sum(xs))`, is a record of tiles, on which `Converse` panics.
 
 `build_product` uses the node's extent to distinguish a record of tiles from a collection of
 records. A record extent uses `MakeRecord`; a function extent uses `zip_arms_named_at`, which

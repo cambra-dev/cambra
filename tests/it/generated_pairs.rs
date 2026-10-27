@@ -490,6 +490,12 @@ fn skeletons() -> Vec<Skeleton> {
             r = {}
             out << r.a + r.b
         "#}},
+        // A record beside a literal built from the binder, as one arm of a conditional.
+        Skeleton { name: "record_branch", hole: Ty::Rec, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2, 3]:
+                out << ({} if i > 1 else (a=i, b=i))
+        "#}},
         Skeleton { name: "nested_record_feed", hole: Ty::NestedRec, scope: &[], body: indoc! {r#"
             out = test_sink()
             out << {}
@@ -575,6 +581,11 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "bool_feed", hole: Ty::Bool, scope: &[], body: indoc! {r#"
             out = test_sink()
             out << {}
+        "#}},
+        // A boolean as the field of a record built per element.
+        Skeleton { name: "bool_record_element", hole: Ty::Bool, scope: &[("x", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            out << [(a={}) for x in [0, 1, 2, 3]]
         "#}},
 
         // Two binders at one hole: a filler that names both constructs it sits under.
@@ -789,7 +800,7 @@ fn skeletons() -> Vec<Skeleton> {
             out << t + sum(ch)
         "#}},
         // Four loops that all write `t`, so the feed's key splices twice. The record hole keeps
-        // the row to two cells, as each takes seconds to classify.
+        // the row to three cells, as each takes seconds to classify.
         Skeleton { name: "four_loop_feed_writing_every_loop", hole: Ty::Rec, scope: &[], body: indoc! {r#"
             t := 0
             ch = defer()
@@ -989,6 +1000,8 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "binder_conjunction", ty: Ty::Bool, needs: &[Ty::Int], decls: "", expr: "{b} > 1 and {b} < 3" },
         Filler { name: "binder_disjunction", ty: Ty::Bool, needs: &[Ty::Int], decls: "", expr: "{b} > 1 and {b} < 3 or {b} == 0" },
         Filler { name: "binder_negation", ty: Ty::Bool, needs: &[Ty::Int], decls: "", expr: "not ({b} > 1)" },
+        // Two records built from the binder, compared field by field.
+        Filler { name: "binder_records_compared", ty: Ty::Bool, needs: &[Ty::Int], decls: "", expr: "(z={b} * 2) == (z={b} + 1)" },
         Filler { name: "binder_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2]]" },
         Filler { name: "binder_filtered_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2, 3] if z2 > {b}]" },
         Filler { name: "map_arrow", ty: Ty::IntColl, needs: &[], decls: "", expr: "map([\"a\" -> 1, \"b\" -> 2])" },
@@ -1025,6 +1038,11 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "rec_lit", ty: Ty::Rec, needs: &[], decls: "", expr: "(a=1, b=2)" },
         Filler { name: "rec_computed", ty: Ty::Rec, needs: &[], decls: "", expr: "(a=sum([1, 2]), b=max([3, 4]))" },
         Filler { name: "rec_binder", ty: Ty::Rec, needs: &[Ty::Int], decls: "", expr: "(a={b}, b={b} * 2)" },
+        // A function returning a record, applied to a scalar.
+        Filler { name: "rec_call", ty: Ty::Rec, needs: &[], decls: indoc! {r#"
+            def helper_rec(hn: Int) => {a: Int, b: Int}:
+                (a=hn + 1, b=hn * 2)
+        "#}, expr: "helper_rec(sum([1, 2, 3]))" },
         Filler { name: "rec_list", ty: Ty::RecColl, needs: &[], decls: "", expr: "[(a=1, b=2), (a=3, b=2)]" },
         Filler { name: "rec_comp", ty: Ty::RecColl, needs: &[], decls: "", expr: "[(a=z, b=1) for z in [1, 2, 3]]" },
         Filler { name: "rec_filtered", ty: Ty::RecColl, needs: &[], decls: "", expr: "[r2 for r2 in [(a=1, b=2), (a=3, b=2)] if r2.a > 1]" },

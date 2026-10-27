@@ -377,9 +377,9 @@ struct Parser {
     instrs: Vec<Instr>,
     /// The `Input` instruction of each path read so far, so a path read twice is one slot.
     reads: HashMap<Vec<SmolStr>, Slot>,
-    /// How many operations the chain read so far: every element that is neither the
-    /// identity nor a composition of others. A prefix is taken only when it reads two or more
-    /// ([`fuse_prefix`]).
+    /// How many operations the chain read so far. The identity and a composition of others count
+    /// as none, a `zip` as two whatever its arity, and every other element as one. A prefix is
+    /// taken only when it reads two or more ([`fuse_prefix`]), so a `zip` alone is taken.
     ops: usize,
 }
 
@@ -521,12 +521,15 @@ impl Parser {
 
     /// Read `e` as a function applied to `cur`.
     fn step(&mut self, e: &Expr, cur: Val) -> Option<Val> {
-        if !matches!(
-            &e.node,
-            TypedExprNode::Compose(_) | TypedExprNode::Builtin(Builtin::Id)
-        ) {
-            self.ops += 1;
-        }
+        self.ops += match &e.node {
+            TypedExprNode::Compose(_) | TypedExprNode::Builtin(Builtin::Id) => 0,
+            TypedExprNode::Apply { function, .. }
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)) =>
+            {
+                2
+            }
+            _ => 1,
+        };
         match &e.node {
             TypedExprNode::Compose(elts) => elts.iter().try_fold(cur, |cur, e| self.step(e, cur)),
             TypedExprNode::Builtin(Builtin::Id) => Some(cur),
@@ -663,11 +666,10 @@ fn is_plain(extent: &Extent) -> bool {
 /// aggregate, a lookup, a conditional, a store read, or a constant that is not closed has a
 /// domain or a value outside the input column. A chosen prefix ends at an operation, or at a
 /// `zip`, whose result is one column of records (`Parser::root_of`), and reads at least two
-/// operations, counting every element but the identity and a composition. A binary operation
-/// takes its operands from a `zip`, so a prefix that holds one is at least two operations:
-/// `x + 1` fuses. A prefix of one operation keeps its own conversion: a lone unary operation
-/// (`neg`, `not`), a projection or a constant is one operator either way, and a lone `zip` of
-/// identities, such as `(x, x)`, keeps its `Memo`, `FanOut`s and `Zip`.
+/// operations (`Parser::ops`). A `zip` counts as two, so a prefix that ends at a `zip` meets the
+/// count, `(x, x)` and the one-field `(a=x)` included. A binary operation takes its operands from
+/// a `zip`, so `x + 1` meets it too. A lone unary operation (`neg`, `not`) keeps its own
+/// conversion, since it is one operator either way.
 pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
     if !is_plain(input) {
         return None;
@@ -997,18 +999,27 @@ mod tests {
     }
 
     /// A record against a base value, two records with no field in common, and an ordering of two
-    /// records are not compared, so the prefix ends before the comparison.
+    /// records are not compared, so the prefix ends before the comparison, at the `zip`.
     #[test]
-    fn a_comparison_without_a_field_to_compare_is_not_fused() {
+    fn a_comparison_without_a_field_to_compare_ends_the_prefix() {
         let (record, other) = (tuple_of_ints(2), record_of("x", int()));
-        let fuses = |input: &Extent, constant: Expr, op: CompareKind| {
+        let consumed = |input: &Extent, constant: Expr, op: CompareKind| {
             let chain = vec![zip(vec![id(), constant]), binop(BinOpKind::Compare(op))];
-            fuse_prefix(&chain, input).is_some_and(|fused| fused.consumed == chain.len())
+            fuse_prefix(&chain, input).map(|fused| fused.consumed)
         };
-        assert!(fuses(&record, closed_tuple(&[1, 2]), CompareKind::Equals));
-        assert!(!fuses(&record, constant(1), CompareKind::Equals));
-        assert!(!fuses(&other, closed_tuple(&[1, 2]), CompareKind::Equals));
-        assert!(!fuses(&record, closed_tuple(&[1, 2]), CompareKind::Less));
+        assert_eq!(
+            consumed(&record, closed_tuple(&[1, 2]), CompareKind::Equals),
+            Some(2)
+        );
+        assert_eq!(consumed(&record, constant(1), CompareKind::Equals), Some(1));
+        assert_eq!(
+            consumed(&other, closed_tuple(&[1, 2]), CompareKind::Equals),
+            Some(1)
+        );
+        assert_eq!(
+            consumed(&record, closed_tuple(&[1, 2]), CompareKind::Less),
+            Some(1)
+        );
     }
 
     /// A record compared to a record read from the input, or to another constant, is taken apart
@@ -1207,8 +1218,8 @@ mod tests {
     }
 
     /// Fusing one operation would replace one operator with one.
-    /// `x + 1` is the `zip` of the input with a constant and the `add`: two operations, so it
-    /// fuses, where `neg x` and `not x` are one.
+    /// `x + 1` holds a `zip`, which counts as two operations, so it fuses, where `neg x` and
+    /// `not x` are one.
     #[test]
     fn adding_a_constant_fuses_and_a_lone_unary_operation_does_not() {
         let add = binop(BinOpKind::Arithmetic(ArithmeticKind::Add));
@@ -1405,12 +1416,12 @@ mod tests {
     }
 
     /// A product of reads and constants is one column of records, its fields copied and repeated:
-    /// `(x, 1)` replaces the `MapResultToConst` that pairs the constant with `x`. A `zip` of
-    /// identities is one operation, so `(x, x)` keeps its own conversion.
+    /// `(x, 1)` replaces the `MapResultToConst` that pairs the constant with `x`, `(x, x)` the
+    /// `Memo`, `FanOut`s and `Zip` of its two reads, and `(a=x)` the `RecordWrap` of its one.
     #[test]
     fn a_product_of_reads_and_constants_fuses() {
         let chain = vec![zip(vec![id(), constant(1)])];
-        let fused = fuse_prefix(&chain, &int()).expect("a zip and a constant are two operations");
+        let fused = fuse_prefix(&chain, &int()).expect("a zip is two operations");
         let out = fused.program.eval(&ColumnValue::Ints(vec![4, 5]));
         assert_eq!(field_of(&out, "_0"), &ColumnValue::Ints(vec![4, 5]));
         assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![1, 1]));
@@ -1424,7 +1435,14 @@ mod tests {
         let out = fused.program.eval(&tuples(2, 3));
         assert_eq!(field_of(&out, "_0"), &ColumnValue::Ints(vec![2; 3]));
         assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![0, 1, 0]));
-        assert!(fuse_prefix(&[zip(vec![id(), id()])], &int()).is_none());
+        let fused = fuse_prefix(&[zip(vec![id(), id()])], &int()).expect("a zip of identities");
+        let out = fused.program.eval(&ColumnValue::Ints(vec![4, 5]));
+        assert_eq!(field_of(&out, "_0"), &ColumnValue::Ints(vec![4, 5]));
+        assert_eq!(field_of(&out, "_1"), &ColumnValue::Ints(vec![4, 5]));
+        let one_field = [zip_record(vec![("a", id())])];
+        let fused = fuse_prefix(&one_field, &int()).expect("a zip of one arm");
+        let out = fused.program.eval(&ColumnValue::Ints(vec![4, 5]));
+        assert_eq!(field_of(&out, "a"), &ColumnValue::Ints(vec![4, 5]));
     }
 
     /// A field with no column to read declines the product: a `Units` column has no view.

@@ -852,6 +852,22 @@ fn checked_lookup_of_a_product_value(#[case] code: &str, #[case] expected: Value
     "#},
     Value::Int(8)
 )]
+// A key built from the element alone, a pair of it or a one-field record of it, which fuses into
+// one column of records: `Converse` inverts only a column.
+#[case::group_by_a_pair_of_the_element(
+    indoc! {r#"
+        g = groupby([1, 1, 2], \x -> (x, x))
+        sum([sum(grp) for grp in g])
+    "#},
+    Value::Int(4)
+)]
+#[case::group_by_a_one_field_record_of_the_element(
+    indoc! {r#"
+        g = groupby([1, 1, 2], \x -> (k=x))
+        sum([sum(grp) for grp in g])
+    "#},
+    Value::Int(4)
+)]
 // A component every key shares, which is the ordinary shape of keyed data — every row
 // for one account, every order for one SKU. That component's type is its own singleton
 // rather than the join two distinct values would give, so these are the cases that read
