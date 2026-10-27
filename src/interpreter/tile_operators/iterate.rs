@@ -543,6 +543,50 @@ mod tests {
         assert!(remaining.contains(&9u64), "9 should remain");
     }
 
+    /// A finite range pulled at an interval renders that interval and calls it complete; a
+    /// key released earlier is absent from a later interval that overlaps it.
+    #[test]
+    fn a_finite_range_renders_the_admitted_interval() {
+        let extent = Extent::uint_range(10);
+        let tiling = Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone()));
+        let mut producer = IterateExtentProducer {
+            base: ProducerBase::unowned(0, &tiling),
+            extent,
+            released: Predicate::False,
+            _source_wakeup: None,
+        };
+        let interval = |first: u64, last: u64| {
+            let at_or_below = |v: u64| Predicate::at_or_below(Value::UInt(v));
+            TileGuard::Function(FunctionGuard::Domain(match first {
+                0 => at_or_below(last),
+                _ => at_or_below(last).minus(&at_or_below(first - 1)),
+            }))
+        };
+        let keys_of = |tile: &Tile| match tile {
+            Tile::DataFunction { domain, .. } => domain.clone(),
+            other => panic!("a collection, got {other:?}"),
+        };
+        let first = producer.get(interval(0, 4));
+        assert_eq!(
+            keys_of(&first),
+            ColumnValue::from_uints(vec![0, 1, 2, 3, 4])
+        );
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &first
+        else {
+            unreachable!()
+        };
+        assert!(domain_predicate.contains(&Value::UInt(4)));
+        assert!(!domain_predicate.contains(&Value::UInt(5)));
+        producer.release(interval(0, 4));
+        let overlapping = producer.get(interval(3, 7));
+        assert_eq!(
+            keys_of(&overlapping),
+            ColumnValue::from_uints(vec![5, 6, 7])
+        );
+    }
+
     #[test]
     fn iterate_extent_fragmented_uint_range() {
         // Simulate [0,5) with indices 1,2,3 already released → {[0,0],[4,4]}

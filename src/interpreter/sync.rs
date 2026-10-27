@@ -15,6 +15,10 @@ pub trait LockNow<T: ?Sized> {
     /// The guard, or `None` when the cell is already locked: the re-entry test a notification
     /// forwarder makes.
     fn try_lock_now(&self) -> Option<MutexGuard<'_, T>>;
+
+    /// The guard, waiting for another thread to release it: for a cell worker threads contend
+    /// on, which is never locked twice by one thread.
+    fn lock_wait(&self) -> MutexGuard<'_, T>;
 }
 
 impl<T: ?Sized> LockNow<T> for Mutex<T> {
@@ -39,6 +43,10 @@ impl<T: ?Sized> LockNow<T> for Mutex<T> {
             Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
             Err(TryLockError::WouldBlock) => None,
         }
+    }
+
+    fn lock_wait(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

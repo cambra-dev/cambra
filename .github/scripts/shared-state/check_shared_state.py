@@ -87,6 +87,9 @@ EXPECTED_EXCEPTIONS = [
     # and `DataSink::process` takes `&self`.
     ("src/interpreter/test_sink.rs", "cell of `Option<Tile>`"),
     ("src/interpreter/mod.rs", "shared cell of `C`"),
+    # The worker pool's dispatcher: the queue of work packages between a pipeline's head and
+    # the workers. A package names a morsel by its guard and carries no tile.
+    ("src/interpreter/parallel.rs", "cell of `DispatchState`"),
     # The operator-graph recorder, twice: the `thread_local!` and the cell inside
     # it each match the ambient-state shape. Necessary because `OperatorBase::new`
     # runs inside operator constructors, which take no context parameter; what
