@@ -487,6 +487,7 @@ of a restatement with no spelling.
 | `RecordWrap` | The input is pulled at the projection. |
 | `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. |
 | `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. |
+| `MakeRecord` | A record of values has no keys: the projection is the whole record or nothing, and a guard naming keys panics. |
 
 ### Producer attribution and probes
 
