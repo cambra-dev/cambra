@@ -895,8 +895,13 @@ impl TileProducer for VariantIsProducer {
         visit("scrutinee", &*self.input);
     }
 
+    /// Every key in is a key out, so the scrutinee is pulled at the projection.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let tile = self.input.get(projection_guard);
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let tile = self.input.get(scrutinee_guard(&*self.input, &projection));
         let (domain_col, domain_predicate, deleted, cv) = match tile {
             Tile::Scalar(cv) => (None, Predicate::True, BitSet::new(), cv),
             Tile::DataFunction {
@@ -944,15 +949,26 @@ impl TileProducer for VariantIsProducer {
             Some(d) => d.select_indices(positions.iter().copied(), positions.len()),
             None => ColumnValue::uints_from_rows(positions),
         };
-        Tile::data_function(
+        let mut out = Tile::data_function(
             out_domain,
             Box::new(Tile::Scalar(ColumnValue::Bools(answers))),
             domain_predicate,
             BitSet::new(),
-        )
+        );
+        // A bare union is read whole and keeps the positions a consumer released, which are taken
+        // back out here (`release_impl`); over a stream the cut repeats the input's.
+        if !self.base.obsolete_guard.is_empty() {
+            out.remove_guarded(self.base.obsolete_guard.clone());
+        }
+        out.restrict_to(&projection, self.tiling());
+        out
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        if !self.input.tiling().is_data_function() {
+            release_bare_scrutinee(&mut *self.input, &self.base.obsolete_guard);
+            return;
+        }
         // Every key in is a key out, so a released region of the output names
         // exactly the region of the scrutinee that produced it. `VariantProject`
         // forwards a release on the same key-preserving argument, over the
@@ -1768,6 +1784,105 @@ mod variant_projection_tests {
             Predicate::True.minus(&Predicate::at_or_below(Value::UInt(4))),
         )));
         assert_eq!(*released.borrow(), [bare_tiling.universal_guard()]);
+    }
+
+    /// `variant_is(commit)` over the decision stream: the gate a `match` arm is filtered by.
+    fn is_commit() -> (VariantIsProducer, GuardLog) {
+        let out = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Bool)),
+        );
+        let (scrutinee, pulled, _) = ProjectionSpy::new(decisions(), decisions_tiling());
+        (
+            VariantIsProducer {
+                base: ProducerBase::unowned(VariantIsProducer::alloc_id(), &out),
+                input: Box::new(scrutinee),
+                tag: commit(),
+            },
+            pulled,
+        )
+    }
+
+    /// A bare union has no keys to take a domain release: the released morsel stays out of the
+    /// answer, and the scrutinee is released whole once releases together name every position.
+    #[test]
+    fn a_tag_test_over_a_bare_union_cuts_released_positions_and_releases_it_whole() {
+        let Tile::DataFunction { codomain, .. } = decisions() else {
+            unreachable!("decisions are a stream")
+        };
+        // The output domain `VariantIs::new` builds over a bare union.
+        let out = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Bool)),
+        );
+        let (scrutinee, _, released) =
+            ProjectionSpy::new(*codomain, Tiling::Scalar(decision_extent()));
+        let mut is_commit = VariantIsProducer {
+            base: ProducerBase::unowned(VariantIsProducer::alloc_id(), &out),
+            input: Box::new(scrutinee),
+            tag: commit(),
+        };
+        is_commit.get(keys_between(1, 4));
+        is_commit.release(keys_between(1, 4));
+        let mut rest = is_commit.get(is_commit.tiling().universal_guard());
+        rest.compact();
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &rest
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(
+            *domain,
+            ColumnValue::UInts(vec![0, 5, 6, 7]),
+            "no released position"
+        );
+        assert_eq!(
+            **codomain,
+            Tile::Scalar(ColumnValue::Bools(vec![true, false, true, false]))
+        );
+        assert!(released.borrow().is_empty());
+        is_commit.release(keys_between(0, 0));
+        is_commit.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::True.minus(&Predicate::at_or_below(Value::UInt(4))),
+        )));
+        assert_eq!(
+            *released.borrow(),
+            [Tiling::Scalar(decision_extent()).universal_guard()]
+        );
+    }
+
+    #[test]
+    fn a_tag_test_reads_the_decisions_of_the_morsel() {
+        let (mut is_commit, pulled) = is_commit();
+        let morsel = is_commit.get(keys_between(2, 5));
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![2, 3, 4, 5]));
+        assert_eq!(
+            **codomain,
+            Tile::Scalar(ColumnValue::Bools(vec![true, false, true, false]))
+        );
+        assert_eq!(*pulled.borrow(), [keys_between(2, 5)]);
+    }
+
+    #[test]
+    fn a_tag_test_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 3), keys_between(6, 30)] {
+            assert_conforms(|| Box::new(is_commit().0), guard);
+        }
+    }
+
+    #[test]
+    fn nothing_tests_nothing() {
+        let (mut is_commit, pulled) = is_commit();
+        let nothing = is_commit.tiling().empty_guard();
+        assert_eq!(is_commit.get(nothing), is_commit.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 
     #[test]
