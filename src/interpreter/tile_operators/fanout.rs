@@ -1918,4 +1918,60 @@ mod projection_tests {
         let later = memo.get(keys_between(4, 7));
         assert_eq!(int_entries(&later), vec![(4, 4), (5, 5), (6, 6), (7, 7)]);
     }
+
+    /// `xs ▷ map(converse(xs))`: each position of a stream is mapped to the positions that hold
+    /// its value, which is a group-by read back at the stream. The stream is memoized and fanned
+    /// to both the argument leg and, through `Converse`, the function leg.
+    ///
+    /// `Converse` reads the stream whole, so the shared input is widened to the whole stream
+    /// once the function leg pulls it; the morsel's answer is cut at the map.
+    #[test]
+    fn a_morsel_of_a_map_over_a_converse_of_the_same_memoized_stream() {
+        use crate::interpreter::CurryLevel;
+        use crate::interpreter::tile_operators::{Converse, MapResult};
+
+        let values = [0i64, 1, 0, 1, 2, 2, 0, 1];
+        let (stream, pulled, _) = ProjectionSpyOp::new(ints_by_position(&values, true), ints());
+        let fan = FanOut::new(Box::new(Memo::new(Box::new(stream))));
+        let by_value = Converse::new(fan.slot());
+        let mut map = MapResult::new_at(fan.slot(), Box::new(by_value), CurryLevel::new(1));
+        let guard = map.tiling().universal_guard();
+        let mut sched = Scheduler::new();
+        let mut producer = map.subscribe(guard, Box::new(|| {}), &mut sched);
+
+        let morsel = producer.get(keys_between(2, 3));
+        let Tile::DataFunction { domain, .. } = &morsel else {
+            panic!("a collection, got {morsel:?}")
+        };
+        assert_eq!(
+            (0..domain.len())
+                .map(|i| domain.index_at(i))
+                .collect::<Vec<_>>(),
+            vec![Value::UInt(2), Value::UInt(3)]
+        );
+        // Position 2 holds value 0, shared with positions 0 and 6; position 3 holds 1, shared
+        // with 1 and 7.
+        let Tile::DataFunction {
+            row_starts,
+            domain: members,
+            ..
+        } = domain_codomain(&morsel)
+        else {
+            panic!("a group per position, got {morsel:?}")
+        };
+        assert_eq!(*row_starts, vec![0, 3]);
+        assert_eq!(*members, ColumnValue::UInts(vec![2, 0, 6, 3, 1, 7]));
+        // stream, and the shared input is pulled at what both have asked.
+        assert_eq!(
+            *pulled.borrow(),
+            vec![keys_between(2, 3), ints().universal_guard()]
+        );
+    }
+
+    fn domain_codomain(tile: &Tile) -> &Tile {
+        let Tile::DataFunction { codomain, .. } = tile else {
+            panic!("a collection, got {tile:?}")
+        };
+        codomain
+    }
 }
