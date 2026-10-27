@@ -485,6 +485,7 @@ of a restatement with no spelling.
 | `MapResultToConst` | The input is pulled at the projection. The constant is read whole, since every row reads all of it. |
 | `MapResultWithSource` | The input is pulled at the projection, so a morsel reads only its own keys from the source. |
 | `RecordWrap` | The input is pulled at the projection. |
+| `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. |
 
 ### Producer attribution and probes
 
