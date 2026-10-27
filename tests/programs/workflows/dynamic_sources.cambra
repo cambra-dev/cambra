@@ -1,0 +1,303 @@
+# Sketch: sources opened per runtime value (docs/libs/workflow_library.md, "Data-configured
+# sources"). Each block between `####` lines is a module file of its own in a real program; its
+# first comment line names the file. Does not compile; `[proposed]` marks what the compiler lacks.
+#
+# The program receives `(topic, message_type)` on a control route. Each pair subscribes to the
+# Kafka topic `topic`, whose record values decode as `message_type`, one of three types the program
+# knows; one message type may arrive on several topics. Every record updates per-customer totals,
+# and each update is written to a sink. Cancelling a topic unsubscribes it; opening it again starts
+# a new generation of it, a run of its own.
+#
+# Each opening is a run of the workflow `topics`, and a `for_each` body subscribes its topic, in the
+# style of bill-reminder.cambra. Each message type has a handler module that runs its own consumer,
+# so each type has its own offsets, retention and backlog, and a record is applied and its offset
+# advanced in one transaction. A type known only per record (a schema registry) would instead take
+# one consumer and a router loop.
+#
+# A field of a record another module declares is written with that module's import or run name,
+# `rec.ingress::topic` (docs/chl-spec.md, "9.12 Field labels and tags belong to a module"). Fields
+# of HTTP request rows are left unqualified, because that section leaves open which module owns
+# them.
+
+################################################################################
+# std/kafka/consumers.cambra
+################################################################################
+
+# Kafka subscriptions whose set is data: one run consumes every topic in `subscriptions` from one
+# cluster, assigning itself every partition of a subscribed topic and using no consumer group.
+#
+# The module declares state and opens a source, so a program runs it (docs/chl-spec.md, "9.7
+# Importing asserts no IO and no state").
+#
+# Status: proposed, not in the spec. The std root it belongs to is [Planned] (docs/chl-spec.md,
+# "9.16 The std root"). `[proposed]` marks each construct the compiler lacks.
+
+import std::wf
+
+# Bootstrap servers, "host:port,host:port".
+param brokers: String
+
+pub Start = {`earliest | `latest}
+pub Subscription = {start: Start, generation: Int}
+pub Offset = {topic: String, partition: Int, offset: Int}
+
+# One Kafka record. Records from one partition arrive in offset order; partitions and topics
+# interleave.
+pub Record = {topic: String, partition: Int, offset: Int, key: Bytes, value: Bytes}
+
+# The subscribed topics, written by the module that runs this one, in its own transactions, through
+# a qualified reference (docs/chl-spec.md, "9.9 Running").
+#
+# - A row added subscribes to its topic from the row's `start`; a row deleted unsubscribes and drops
+#   the topic's offsets.
+# - A row overwritten with a new `generation` drops the topic's offsets and starts again from its
+#   `start`, so a reopening that overwrites a row before the previous opening's cleanup deletes it
+#   still starts where it asked to.
+pub subscriptions: Mut(Map(String, Subscription), Txn) := empty_map()
+
+# The next offset per topic and partition, kept in this run rather than at the broker. A record is
+# released, and its offset advanced, when every loop that reads `records` has committed the
+# transaction that read it (src/ccl/design/program-evolution.md, "The release model"), so a record
+# is applied once and a crash resumes after the last commit. A reload pairs the offsets by run path
+# (docs/chl-spec.md, "9.18 Reloading a program of modules").
+offsets: Mut(Map({topic: String, partition: Int}, Int), Txn) := empty_map()
+
+# Every record of every subscribed topic, keyed by topic, partition and offset, so a record
+# redelivered after a crash carries the same key (docs/libs/workflow_library.md, "Keys").
+# [proposed] a std source whose connections follow a `Txn` map and that returns a
+# `wf::KeyedSource`. docs/chl-spec.md, "9.16 The std root", makes an `http::serve` address a string
+# literal and an address passed as a parameter Planned; a topic name that is data goes beyond both.
+pub records = __kafka_consumers(brokers, subscriptions, offsets)   # wf::KeyedSource(Offset, Record)
+
+################################################################################
+# shared.cambra
+################################################################################
+
+# What main and the handlers share. Imported, so it performs no IO.
+
+import std::wf
+
+pub MessageType = {`order | `refund | `shipment}
+
+# One opening of a topic, a run of its own with id `<topic>#<generation>`. Reopening a closed topic
+# starts a run of the next generation, so an ended run is never restarted.
+pub type Topic = {topic: String, generation: Int, message_type: MessageType}
+
+impl wf::WorkflowState(Topic):
+    def get_run_id(self) => String:
+        self.topic + "#" + string(self.generation)
+
+# Returns a topic's state, so other modules need not write this module's labels (`shared::topic=…`).
+pub def opening(name: String, generation: Int, t: MessageType) => Topic:
+    Topic(topic=name, generation=generation, message_type=t)
+
+# A change to one customer's totals.
+pub Delta = {revenue: Int, refunds: Int, items_shipped: Int}
+
+# The members of a `ledger` run that a handler uses.
+# [proposed] a Module type with `requires Transaction` members, as `wf::Workflow` (docs/chl-spec.md,
+# "9.8 Module types").
+pub Ledger = Module{
+    add: (customer: String, d: Delta) => () requires Transaction,
+}
+
+################################################################################
+# ledger.cambra
+################################################################################
+
+# Per-customer totals across every message type. Run once, and passed to every handler, so every
+# handler adds to one set of totals (docs/chl-spec.md, "9.9 Running").
+
+import shared
+
+totals: Mut(Map(String, shared::Delta), Txn) := empty_map()
+
+# Each customer's new totals, bound to a sink at the program boundary
+# (docs/chl-spec.md, "10. Sinks").
+pub report = defer()   # Feed({customer: String, totals: shared::Delta})
+
+# Adds `d` to the customer's totals and reports the result, in the caller's transaction.
+pub def add(customer: String, d: shared::Delta) requires Transaction:
+    t = totals.get(customer, (shared::revenue=0, shared::refunds=0, shared::items_shipped=0))
+    n = (shared::revenue=t.shared::revenue + d.shared::revenue,
+         shared::refunds=t.shared::refunds + d.shared::refunds,
+         shared::items_shipped=t.shared::items_shipped + d.shared::items_shipped)
+    totals[customer] := n
+    report << (customer=customer, totals=n)
+
+################################################################################
+# orders.cambra
+################################################################################
+
+# The handler for `order` topics: subscribes them on its own consumer and adds each order to the
+# ledger. refunds.cambra and shipments.cambra have the same shape, with their own record type,
+# decoding and `Delta`.
+#
+# Each handler is its own consumer, with its own connection, offsets and retention.
+
+# [proposed] a std JSON module (docs/chl-spec.md, "9.16 The std root").
+import std::json
+import shared
+import std::wf
+
+param brokers: String
+param topics: wf::Workflow(shared::Topic)
+param ledger: shared::Ledger
+
+Order = {customer: String, amount: Int}
+
+run std::kafka::consumers(brokers=brokers) as ingress
+
+# The run that owns each subscribed topic, which a record, carrying only its topic's name, counts
+# toward.
+owners: Mut(Map(String, topics::RunId), Txn) := empty_map()
+
+# Subscribes `topic` for `owner`, in the caller's transaction.
+#
+# - Generation 0 reads the topic's retained records.
+# - A later generation starts at the latest offset, so earlier generations' records are not counted
+#   twice and records produced while the topic was closed are skipped.
+pub def subscribe(topic: String, owner: topics::RunId, generation: Int) requires Transaction:
+    owners[topic] := owner
+    start = ingress::`earliest if generation == 0 else ingress::`latest
+    ingress::subscriptions[topic] := (ingress::start=start, ingress::generation=generation)
+
+# Unsubscribes `topic` only while `owner` owns it, in the caller's transaction. A reopening that
+# committed before this call owns the topic, and keeps its subscription.
+pub def unsubscribe(topic: String, owner: topics::RunId) requires Transaction:
+    if topic in owners and owners[topic] == owner:
+        del owners[topic]
+        del ingress::subscriptions[topic]
+
+# Records whose value does not decode as an `Order`, bound to a sink at the program boundary
+# (docs/chl-spec.md, "10. Sinks").
+pub undecodable = defer()   # Feed({topic: String, partition: Int, offset: Int, reason: String})
+
+# Applies each record to the ledger in the transaction that reads it, which advances its offset.
+# Every record here is an order: main subscribes only order topics through this module. A record
+# for a topic no run owns, or whose run has ended, is dropped, and its offset advances all the same.
+# Not a body: a body runs once per run, and a topic's run receives many records.
+# [proposed] JSON decoding into a named record type.
+for o -> rec in ingress::records:
+    with begin():
+        match owners.get(rec.ingress::topic):
+            case `some(i):
+                if topics::live(i):
+                    topics::touch(i)
+                    match json::decode(rec.ingress::value, Order):
+                        case json::`ok(order):
+                            ledger::add(order.customer, (shared::revenue=order.amount,
+                                                         shared::refunds=0,
+                                                         shared::items_shipped=0))
+                        case json::`bad(reason):
+                            undecodable << (topic=o.ingress::topic,
+                                            partition=o.ingress::partition,
+                                            offset=o.ingress::offset, reason=reason)
+            case `none:
+                pass
+
+################################################################################
+# main.cambra
+################################################################################
+
+# The root: the `topics` workflow, the routes that start and cancel its runs, and the body that
+# subscribes each run's topic through the handler for its message type.
+
+run std::env as env
+import std::http
+import shared
+import std::time
+import std::wf
+
+# --- Workflows ----------------------------------------------------------------
+
+# A run ends when an operator cancels it, or `stale after seven days with no record. No body
+# completes a run.
+run std::wf::workflow(State=shared::Topic, timeout=`never, stale_after=`after(time::days(7)))
+    as topics
+
+run ledger as ledger
+
+# One handler per message type. The `match`es below are exhaustive, so a type without a handler
+# does not compile.
+run orders(brokers=env::var("KAFKA_BROKERS"), topics=topics, ledger=ledger) as orders
+run refunds(brokers=env::var("KAFKA_BROKERS"), topics=topics, ledger=ledger) as refunds
+run shipments(brokers=env::var("KAFKA_BROKERS"), topics=topics, ledger=ledger) as shipments
+
+# The latest opening of each topic ever opened, live or ended. `id(state)` takes the whole state, so
+# the routes keep it to name a topic's current run, and the next opening reads its generation.
+current: Mut(Map(String, shared::Topic), Txn) := empty_map()
+
+# --- Routes -------------------------------------------------------------------
+
+# Opening a topic starts a run, whose body subscribes it; closing a topic cancels its run. Each
+# route is keyed by the operator's idempotency key, not the topic, because a source delivers one
+# element per key and keying by topic would drop a second request for a topic.
+# [proposed] path parameters and typed request rows on `http::serve`.
+open_reqs, open_resps = http::serve("8080", "POST", "/topics")
+close_reqs, close_resps = http::serve("8080", "DELETE", "/topics/{topic}")
+
+# A request for a topic whose current run is live answers "exists" and changes nothing. Otherwise
+# it starts the topic's next generation, which may have a different message type: generation 0 for
+# a new topic, one more than the last for a closed one. That run has never existed, so `start`
+# answers `started.
+for r in wf::keyed(open_reqs, by=(r) => r.headers["Idempotency-Key"]):   # r: {topic, message_type}
+    with begin():
+        reopen = r.topic in current
+        if reopen and topics::live(topics::id(current[r.topic])):
+            open_resps << (topic=r.topic, status="exists")
+        else:
+            g = current[r.topic].shared::generation + 1 if reopen else 0
+            t = shared::opening(r.topic, g, r.message_type)
+            topics::start(t)
+            current[r.topic] := t
+            open_resps << (topic=r.topic, status="subscribed", generation=g)
+
+# Closing a topic that is not open changes nothing.
+for r in wf::keyed(close_reqs, by=(r) => r.headers["Idempotency-Key"]):   # r: {topic}
+    with begin():
+        if r.topic in current:
+            topics::cancel(topics::id(current[r.topic]), "closed by operator")
+        close_resps << (topic=r.topic)
+
+# --- Workflow logic -----------------------------------------------------------
+
+# `for_each` is the loop over the live runs, with `wf::WorkflowCancellationException` caught
+# (`std::wf::workflow`).
+topics::for_each(subscribe)
+
+# Subscribes the run's topic through the handler for its message type, so the handler is picked
+# once per run. A run whose end commits before this step subscribes nothing: the cleanup loop below
+# may have run already, and nothing would delete the row.
+def subscribe(s) causes wf::WorkflowCancellationException(_):
+    t = s.wf::state
+    with begin():
+        if topics::live(s.wf::id):
+            match t.shared::message_type:
+                case shared::`order:
+                    orders::subscribe(t.shared::topic, s.wf::id, t.shared::generation)
+                case shared::`refund:
+                    refunds::subscribe(t.shared::topic, s.wf::id, t.shared::generation)
+                case shared::`shipment:
+                    shipments::subscribe(t.shared::topic, s.wf::id, t.shared::generation)
+
+def unsubscribe(i: topics::RunId, t: shared::Topic) requires Transaction:
+    match t.shared::message_type:
+        case shared::`order:
+            orders::unsubscribe(t.shared::topic, i)
+        case shared::`refund:
+            refunds::unsubscribe(t.shared::topic, i)
+        case shared::`shipment:
+            shipments::unsubscribe(t.shared::topic, i)
+
+# A run that ends, by a cancel or by going stale, unsubscribes its topic from its handler, unless a
+# later opening owns it. This is cleanup: each handler checks `live` itself. `get` answers an ended
+# run's state, because its row stays.
+# Not a body: a body sees its run's end only when an effect call raises, and this one calls none.
+for e in topics::ended:
+    with begin():
+        match topics::get(e.wf::id):
+            case `some(t):
+                unsubscribe(e.wf::id, t)
+            case `none:
+                pass

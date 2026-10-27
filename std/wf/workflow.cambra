@@ -71,6 +71,8 @@ run std::time::timer(Key=RunId) as wakes
 # (docs/libs/workflow_library.md, "What a loop added by a reload reads").
 pub started = defer()   # Feed(RunId, wf::Started(RunId, State))
 pub ended = defer()     # Feed(wf::Ended(RunId))
+# TODO `for_each_end(handler)`: a loop over `ended` that passes each ended run's id and state,
+# replacing the hand-written `ended` + `get` + `match` cleanup loop.
 
 # What `start` did: started the run, found an existing run (live or ended), or refused because the
 # parent run is not live.
@@ -271,6 +273,11 @@ match control:
 # (docs/libs/workflow_library.md, "Bodies").
 # [proposed] a function whose body is a loop over a feed, inlined into the module that calls it; a
 # function-typed parameter with a `causes` clause; `try`/`except`; and the split at `send_request`.
+# TODO a way for a body to wait for its run's end (e.g. `until_end(id)`, raising
+# `wf::WorkflowCancellationException`), so cleanup that has no effect call to raise from can sit in
+# the body that made the rows (tests/programs/workflows/dynamic_sources.cambra unsubscribes in a
+# loop over `ended` instead).
+# TODO check `live` before a body's first transaction, so a body that writes per-run rows need not.
 pub def for_each(Out, body: wf::Started(RunId, State) => Out
                  causes wf::WorkflowCancellationException(_)):
     for i -> s in started:
