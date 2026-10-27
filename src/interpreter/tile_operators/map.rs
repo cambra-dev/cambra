@@ -6,7 +6,7 @@ use crate::interpreter::operator_graph::value;
 use crate::interpreter::{FieldPath, tuple_field};
 use crate::{
     interpreter::{
-        ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Scheduler, Value,
+        ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Projection, Scheduler, Value,
         shared_consumer,
     },
     pretty_graph::VizOptions,
@@ -189,6 +189,14 @@ impl TileOperator for MapResult {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
+        let values_are_keys = self
+            .input
+            .result_correlation()
+            .is_some_and(|path| path.is_empty())
+            && matches!(
+                self.input.tiling(),
+                Tiling::DataFunction { codomain, .. } if !codomain.holds_a_level()
+            );
         let function_producer = subscribe_forwarding(&mut *self.function, &shared, scheduler);
         let input_producer = subscribe_forwarding(&mut *self.input, &shared, scheduler);
         Box::new(MapResultProducer {
@@ -201,6 +209,7 @@ impl TileOperator for MapResult {
             .sharing(gate),
             input: input_producer,
             function: function_producer,
+            values_are_keys,
             level: self.level,
         })
     }
@@ -220,13 +229,27 @@ struct MapResultProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     function: Box<dyn TileProducer>,
+    /// Whether each of the input's values is its own key: a one-level stream such as an
+    /// iteration's positions, which the function is then looked up at.
+    values_are_keys: bool,
     /// The level the arguments stand at.
     level: CurryLevel,
 }
 
 impl MapResultProducer {
-    /// The function applied at every argument the input holds.
-    fn apply(&mut self, projection_guard: TileGuard) -> Tile {
+    /// Whether a projection of the keys is also a projection of the function operand's keys: a
+    /// one-level stream whose values are its keys, mapped one level in, over a collection
+    /// operand. The keys a projection admits are then the keys the function is looked up at.
+    /// Anywhere else the lookups are not known before the input is read, and the operand is
+    /// read whole.
+    fn projection_reaches_function(&self) -> bool {
+        self.values_are_keys
+            && self.level == CurryLevel::new(1)
+            && self.function.tiling().is_data_function()
+    }
+
+    /// The function applied at every argument the input holds, for the keys `projection` names.
+    fn apply(&mut self, projection: &Projection) -> Tile {
         let f_tiling = self.function.tiling().clone();
         assert!(
             f_tiling.has_domain(),
@@ -235,11 +258,11 @@ impl MapResultProducer {
         let f_extent = f_tiling.extent();
         let (f_domain_extent, f_codomain_extent) = f_extent.split_function().unwrap();
         let i_tiling = self.input.tiling().clone();
-        let input_guard = match projection_guard {
-            TileGuard::Function(FunctionGuard::Domain(p)) => {
-                TileGuard::Function(FunctionGuard::Domain(p))
-            }
-            _ => i_tiling.universal_guard(),
+        // A scalar input is a key looked up in the function, and the keys the projection names
+        // are the function's own: the input has none, so it is read whole and the answer cut.
+        let input_guard = match i_tiling.is_data_function() {
+            true => projection.guard(&i_tiling),
+            false => i_tiling.universal_guard(),
         };
 
         let mut input_tile = self.input.get(input_guard);
@@ -256,7 +279,13 @@ impl MapResultProducer {
         if let Some(dropped) = dropped {
             self.input.release(dropped);
         }
-        let function_tile = self.function.get(self.function.tiling().universal_guard());
+        let function_guard = match projection {
+            Projection::Keys(_) if self.projection_reaches_function() => {
+                projection.guard(self.function.tiling())
+            }
+            _ => self.function.tiling().universal_guard(),
+        };
+        let function_tile = self.function.get(function_guard);
 
         // A function whose values are themselves a collection needs special-case handling:
         // the application adds a level, so it rebuilds the tile around it rather than
@@ -565,13 +594,20 @@ impl TileProducer for MapResultProducer {
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let mut out = self.apply(projection_guard);
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let mut out = self.apply(&projection);
         // Part of an output value released names no part of the input, so the input keeps
         // the row and the value is recomputed on the next pull (`release_impl`); what the
         // consumer let go is taken back out here.
         if !self.base.obsolete_guard.is_empty() {
             out.remove_guarded(self.base.obsolete_guard.clone());
         }
+        // Mapping keeps the input's keys, so the input already answered the projection; the
+        // cut states it for an input that answered more.
+        out.restrict_to(&projection, self.tiling());
         out
     }
 
@@ -589,6 +625,17 @@ impl TileProducer for MapResultProducer {
             input,
         );
         let done = upstream_guard.is_universal();
+        // Where a projection reached the function, the keys a released data region named are
+        // the keys it was looked up at, and are looked up no more.
+        if !done
+            && self.projection_reaches_function()
+            && matches!(
+                upstream_guard,
+                TileGuard::Function(FunctionGuard::Domain(_))
+            )
+        {
+            self.function.release(upstream_guard.clone());
+        }
         self.input.release(upstream_guard);
         // The **function** is re-read on every pull, so it can only be released
         // once there will be no next pull — which is what a universal release from
@@ -1266,6 +1313,7 @@ mod tests {
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &in_tiling),
             input: Box::new(input),
             function: Box::new(fn_spy),
+            values_are_keys: false,
             level: CurryLevel::new(1),
         };
         (producer, released, in_tiling)
@@ -1358,6 +1406,7 @@ mod tests {
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
             function: Box::new(function_producer),
+            values_are_keys: false,
             level: CurryLevel::new(1),
         };
 
@@ -1481,6 +1530,7 @@ mod tests {
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
             function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
+            values_are_keys: false,
             level: CurryLevel::new(1),
         };
 
@@ -1553,6 +1603,7 @@ mod tests {
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
             function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
+            values_are_keys: false,
             level: CurryLevel::new(1),
         };
         let result = map_result.get(map_result.tiling().universal_guard());
@@ -1622,6 +1673,7 @@ mod tests {
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
             input: Box::new(input),
             function: Box::new(TestTileProducer::new(f, fn_tiling)),
+            values_are_keys: false,
             level: CurryLevel::new(1),
         };
         let out = producer.get(producer.tiling().universal_guard());
@@ -1705,6 +1757,7 @@ mod tests {
             base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
             input: Box::new(TestTileProducer::new(input, in_tiling)),
             function: Box::new(function),
+            values_are_keys: false,
             level: CurryLevel::new(2),
         };
         let out = producer.get(producer.tiling().universal_guard());
@@ -1818,6 +1871,7 @@ mod tests {
                 in_tiling,
             )),
             function: Box::new(TestTileProducer::new(fn_tile, fn_tiling)),
+            values_are_keys: false,
             level: CurryLevel::new(1),
         };
         let out = producer.get(producer.tiling().universal_guard());
@@ -1972,5 +2026,326 @@ mod tests {
         let agreed = release_a_source_key_beneath_two_rows(Predicate::False, true);
         assert!(!agreed[0].contains(&Value::UInt(10)), "{agreed:?}");
         assert!(agreed[1].contains(&Value::UInt(10)), "{agreed:?}");
+    }
+}
+
+/// How `MapResult` is pulled in the patterns it is used in: a stream of positions looked up in a
+/// table (`xs ▷ map(c)`, read a morsel at a time), a stream whose values are not its keys, a
+/// scalar function applied to a stream, and the groups a `Converse` produces, whose members are
+/// looked up in the table the groups were built from.
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, int_entries, ints_by_position, keys_between,
+    };
+    use crate::interpreter::{BaseType, FunctionDef, UnaryOpKind};
+    use bit_set::BitSet;
+
+    const ROWS: u64 = 10;
+
+    /// The table `c` with `c[i] = 100 + 10 i`, the function operand of `map(c)`.
+    fn table() -> (Tile, Tiling) {
+        let values: Vec<i64> = (0..ROWS as i64).map(|i| 100 + 10 * i).collect();
+        (
+            ints_by_position(&values, true),
+            Tiling::data_function(
+                Extent::uint_range(ROWS),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        )
+    }
+
+    /// A stream whose value at each position is `values[position]`.
+    fn stream(values: Vec<u64>) -> (Tile, Tiling) {
+        (
+            Tile::data_function(
+                ColumnValue::UInts((0..values.len() as u64).collect()),
+                Box::new(Tile::Scalar(ColumnValue::UInts(values))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            Tiling::data_function(
+                Extent::uint_range(ROWS),
+                Tiling::Scalar(Extent::Base(BaseType::UInt)),
+            ),
+        )
+    }
+
+    fn output_tiling() -> Tiling {
+        Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
+    }
+
+    /// The logs of a `MapResult` over two spies: the guards its input and its function operand
+    /// were pulled with, and the guards released to each.
+    struct Logs {
+        input_pulled: GuardLog,
+        function_pulled: GuardLog,
+        input_released: GuardLog,
+        function_released: GuardLog,
+    }
+
+    fn map_result(
+        input: (Tile, Tiling),
+        function: (Tile, Tiling),
+        out: Tiling,
+        values_are_keys: bool,
+        level: CurryLevel,
+    ) -> (MapResultProducer, Logs) {
+        let (input, input_pulled, input_released) = ProjectionSpy::new(input.0, input.1);
+        let (function, function_pulled, function_released) =
+            ProjectionSpy::new(function.0, function.1);
+        (
+            MapResultProducer {
+                base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out),
+                input: Box::new(input),
+                function: Box::new(function),
+                values_are_keys,
+                level,
+            },
+            Logs {
+                input_pulled,
+                function_pulled,
+                input_released,
+                function_released,
+            },
+        )
+    }
+
+    /// `xs ▷ map(c)` over a stream of positions, whose values are its keys.
+    fn lookup_over_positions() -> (MapResultProducer, Logs) {
+        map_result(
+            stream((0..ROWS).collect()),
+            table(),
+            output_tiling(),
+            true,
+            CurryLevel::new(1),
+        )
+    }
+
+    /// A worker pulls its chain one morsel at a time. The morsel reaches the stream and the
+    /// table alike, so no pull reads the table whole.
+    #[test]
+    fn a_stream_of_positions_looks_up_only_its_morsel() {
+        let (mut map, logs) = lookup_over_positions();
+        let morsel = map.get(keys_between(2, 4));
+        assert_eq!(int_entries(&morsel), [(2, 120), (3, 130), (4, 140)]);
+        assert_eq!(*logs.input_pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(*logs.function_pulled.borrow(), [keys_between(2, 4)]);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        let TileGuard::Function(FunctionGuard::Domain(stated)) = keys_between(2, 4) else {
+            unreachable!("a morsel is a domain guard")
+        };
+        assert_eq!(*domain_predicate, stated, "complete over the morsel alone");
+    }
+
+    /// The consumer releases the morsel it took, which retires the keys looked up and lets the
+    /// next morsel be pulled: the table's completeness is stated per morsel.
+    #[test]
+    fn releasing_a_morsel_retires_the_table_keys_it_looked_up() {
+        let (mut map, logs) = lookup_over_positions();
+        map.get(keys_between(0, 3));
+        map.release(keys_between(0, 3));
+        assert_eq!(*logs.input_released.borrow(), [keys_between(0, 3)]);
+        assert_eq!(*logs.function_released.borrow(), [keys_between(0, 3)]);
+        let next = map.get(keys_between(4, 9));
+        assert_eq!(
+            int_entries(&next),
+            (4..10)
+                .map(|i| (i, 100 + 10 * i as i64))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_morsels_together_are_the_whole_pull() {
+        for guard in [keys_between(0, 3), keys_between(8, 20), keys_between(5, 5)] {
+            assert_conforms(|| Box::new(lookup_over_positions().0), guard);
+        }
+    }
+
+    /// A stream whose values are indexes into the table, not its own keys: the lookups are
+    /// known only once the stream is read, so the table is read whole and never released
+    /// for a part of the stream.
+    #[test]
+    fn a_stream_of_indexes_reads_the_table_whole() {
+        let (mut map, logs) = map_result(
+            stream(vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]),
+            table(),
+            output_tiling(),
+            false,
+            CurryLevel::new(1),
+        );
+        let morsel = map.get(keys_between(0, 1));
+        assert_eq!(int_entries(&morsel), [(0, 190), (1, 180)]);
+        assert_eq!(*logs.input_pulled.borrow(), [keys_between(0, 1)]);
+        assert_eq!(
+            *logs.function_pulled.borrow(),
+            [table().1.universal_guard()],
+            "the table is pulled in full"
+        );
+        map.release(keys_between(0, 1));
+        assert!(logs.function_released.borrow().is_empty());
+    }
+
+    /// `map(-)` applies a scalar function value: the projection is the stream's, and the
+    /// function is one value read whole.
+    #[test]
+    fn a_scalar_function_is_applied_to_the_projected_stream() {
+        let negate = Tile::Scalar(ColumnValue::single(Value::ComputableFunction(
+            FunctionDef::UnaryOp(UnaryOpKind::Neg),
+        )));
+        let negate_tiling = Tiling::Scalar(Extent::Function {
+            domain: Box::new(Extent::Base(BaseType::Int)),
+            codomain: Box::new(Extent::Base(BaseType::Int)),
+        });
+        let (mut map, logs) = map_result(
+            (
+                ints_by_position(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], true),
+                output_tiling(),
+            ),
+            (negate, negate_tiling.clone()),
+            output_tiling(),
+            false,
+            CurryLevel::new(1),
+        );
+        let morsel = map.get(keys_between(3, 5));
+        assert_eq!(int_entries(&morsel), [(3, -4), (4, -5), (5, -6)]);
+        assert_eq!(*logs.input_pulled.borrow(), [keys_between(3, 5)]);
+        assert_eq!(
+            *logs.function_pulled.borrow(),
+            [negate_tiling.universal_guard()]
+        );
+    }
+
+    #[test]
+    fn nothing_pulls_nothing() {
+        let (mut map, logs) = lookup_over_positions();
+        let nothing = map.tiling().empty_guard();
+        assert_eq!(map.get(nothing), map.tiling().empty_tile());
+        assert!(logs.input_pulled.borrow().is_empty());
+        assert!(logs.function_pulled.borrow().is_empty());
+    }
+
+    /// The groups `Converse` makes: group `k` holds the positions that map to `k`, and
+    /// `map(c)` looks each member up in the table the groups came from. The projection names
+    /// groups, which are the outer keys the map leaves standing, so it reaches the groups and
+    /// not the table: a member's position says nothing of which groups hold it.
+    fn lookup_over_groups() -> (MapResultProducer, Logs) {
+        // Group 1 holds positions 0 and 2, group 2 holds 1, group 3 holds 3.
+        let groups = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2, 3]),
+            Box::new(Tile::grouped(
+                vec![0, 2, 3],
+                ColumnValue::UInts(vec![0, 2, 1, 3]),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 2, 1, 3]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let groups_tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(ROWS),
+                Tiling::Scalar(Extent::Base(BaseType::UInt)),
+            ),
+        );
+        let out = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(ROWS),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        map_result(
+            (groups, groups_tiling),
+            table(),
+            out,
+            false,
+            CurryLevel::new(2),
+        )
+    }
+
+    /// `groupby(c)(1)`: a scalar key looked up in the groups. The keys the projection names are
+    /// the group's own, which the scalar input does not have, so it is read whole.
+    #[test]
+    fn a_projection_of_a_looked_up_group_reads_the_scalar_key_whole() {
+        let groups = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2]),
+            Box::new(Tile::grouped(
+                vec![0, 2],
+                ColumnValue::UInts(vec![0, 2, 1]),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 2, 1]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let groups_tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(ROWS),
+                Tiling::Scalar(Extent::Base(BaseType::UInt)),
+            ),
+        );
+        let key = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let out = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::UInt)),
+        );
+        let (mut map, logs) = map_result(
+            (Tile::Scalar(ColumnValue::Ints(vec![1])), key.clone()),
+            (groups, groups_tiling),
+            out,
+            false,
+            CurryLevel::OUTERMOST,
+        );
+        let answer = map.get(keys_between(0, 1));
+        let Tile::DataFunction { domain, .. } = &answer else {
+            panic!("a collection, got {answer:?}")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![0]), "group 1's key 0 only");
+        assert_eq!(*logs.input_pulled.borrow(), [key.universal_guard()]);
+    }
+
+    fn groups_one_and_three() -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::Int(1)).union(&Predicate::point(Value::Int(3))),
+        ))
+    }
+
+    #[test]
+    fn a_projection_of_groups_reaches_the_groups_and_reads_the_table_whole() {
+        let (mut map, logs) = lookup_over_groups();
+        let answer = map.get(groups_one_and_three());
+        let Tile::DataFunction { domain, .. } = &answer else {
+            panic!("a collection")
+        };
+        assert_eq!(
+            *domain,
+            ColumnValue::Ints(vec![1, 3]),
+            "groups 1 and 3 only"
+        );
+        assert_eq!(*logs.input_pulled.borrow(), [groups_one_and_three()]);
+        assert_eq!(
+            *logs.function_pulled.borrow(),
+            [table().1.universal_guard()]
+        );
+    }
+
+    #[test]
+    fn the_groups_projected_are_the_whole_pull_cut_to_them() {
+        assert_conforms(|| Box::new(lookup_over_groups().0), groups_one_and_three());
     }
 }
