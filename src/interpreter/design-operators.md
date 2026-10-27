@@ -517,6 +517,12 @@ as [Guard operations are exact](#guard-operations-are-exact) requires of a resta
 spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
 (`src/interpreter/design-path-projections.md`, "Representation").
 
+Each producer also declares, for each input, the deepest level a pull at the keys of level 𝑛 pulls
+that input at, or a whole read (`TileProducer::input_level`). The declaration is monotone in 𝑛. A
+debug build checks every pull against it in the `get` wrapper (`check_input_level`): no input is
+pulled beneath its declared level, and an input declared read whole is pulled whole. A pull may stop
+above the declaration, as `Uncurry` does for pairs named by their first component alone.
+
 - **The answer.** `Tile::restrict_to_keys` keeps the outermost keys 𝑝 admits, each with the value
   under it, and intersects the tile's `domain_predicate` with 𝑝. A group is whole under its key. A
   producer asked for part of its keys says nothing about the rest.
@@ -540,7 +546,7 @@ Each operator answers a projection as its row of this table states.
 | Operator | Projection |
 | --- | --- |
 | `IterateExtent` | A finite range is cut to the admitted interval before it is rendered. Every other extent renders whole and is cut after. |
-| `Constant` | A collection constant answers the admitted keys. A scalar constant answers the whole value or nothing. |
+| `Constant` | A collection constant answers the admitted keys at any level (`Restates::Every`), since it holds its whole tile. A scalar constant answers the whole value or nothing. |
 | `MapResult` | A keyed input is pulled at the projection; a scalar input is a key looked up in the function, has no keys to project, and is read whole. A function operand that is a collection is pulled at the projection too where the input's values are its keys, the arguments stand at the first level, and the operand is a data function; its keys are released with the data's. Any other function operand is read whole. Beneath the outermost keys the input is pulled at a projection above the level the function applies at (`Restates::Above`), and the function operand is read whole. |
 | `MapResultToConst` | The input is pulled at the projection. The constant is read whole, since every row reads all of it. A projection beneath the outermost keys is answered above the constant's level (`Restates::Above`), and one at or beneath it panics. |
 | `MapResultWithSource` | The input is pulled at the projection, at any level (`Restates::Every`), so a morsel reads only its own keys from the source. |
@@ -554,7 +560,7 @@ Each operator answers a projection as its row of this table states.
 | `Filter` | A predicate or input that is a collection is pulled at the projection, since they share the keys of the level the mask names. A side that is not a collection is read whole. With a collection predicate it takes a projection at any level down to the masked one (`Restates::Above`). The predicate holds no level beneath that one. With a function predicate, which masks the outermost keys, it takes a projection at any level (`Restates::Every`). |
 | `Restrict` | The predicate is pulled at the projection, since the restricted domain is the predicate's keys that pass. |
 | `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
-| `Uncurry` | Beneath standing levels the input is pulled at the projection. Pairing the whole tile reads the groups whose first component the projection admits, and the pairs are cut after. |
+| `Uncurry` | Above the pairs the input is pulled at the projection. At and beneath them a pair is its outer key with its inner key on the next input level, so the input is pulled one level deeper, at the paths the pairs spell; pairs named by their first component alone are pulled at the outer keys. The pairs are cut after. |
 | `Product` | Both sides are pulled at the projection, since they are aligned row for row. The outer side has no paired level, so a projection at or beneath it pulls both sides at the rows its paths run through (`Projection::above`), and the pairs are cut. |
 | `Converse` | Every level is restated (`Restates::Every`). Beneath standing levels the input is pulled at the standing keys the projection names (`Projection::above`), and the groups are cut to it. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
 | `FanOutSlot` | Pulls the shared input at its own projection and cuts its answer to it. A producer states completeness only for the region it returns, so slots at different regions each pull the one input at their own and a pull of one region retracts nothing it said of another (the debug check compares the last output inside the region pulled). A cyclic fan-out reads its input whole, because a sibling that re-enters mid-pull is answered from the cache of the last completed pull, which has to cover whatever region that sibling asks for. A projection beneath the outermost keys is read and cut as one of the outermost keys is. |

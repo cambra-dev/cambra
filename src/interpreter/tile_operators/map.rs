@@ -610,9 +610,11 @@ impl TileProducer for MapResultProducer {
         Restates::Above(self.level)
     }
 
-    /// The function operand is read whole beneath the outermost keys.
+    /// The function operand is pulled at the projection where the projection reaches it
+    /// ([`projection_reaches_function`](Self::projection_reaches_function)), and read whole
+    /// otherwise.
     fn input_level(&self, role: &str, level: CurryLevel) -> Option<CurryLevel> {
-        (role == "input").then_some(level)
+        (role == "input" || self.projection_reaches_function()).then_some(level)
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {

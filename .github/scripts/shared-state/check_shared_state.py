@@ -101,6 +101,11 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
+    # The record of pulls in progress that the `get` wrapper checks each input's pull
+    # against, twice: the `thread_local!` and the cell inside it. A debug build only;
+    # what crosses it is the level a producer declares for each input, never a tile.
+    ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
+    ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
     # The probe slot. Shared because the driver reads one table while every
