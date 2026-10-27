@@ -289,8 +289,21 @@ impl TileProducer for ConverseProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
+    /// Inverting the outermost collection makes the values it holds the keys, and which rows
+    /// carry which value is known only once the rows are read: the input is read whole and the
+    /// groups cut after. The rows a cut group does not name stay unreleased at the input, so a
+    /// later pull reads them again. Beneath standing levels the projection names keys the
+    /// inversion leaves standing, so the input is pulled at it.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let input_guard = match self.level.enclosing() {
+            None => self.input.tiling().universal_guard(),
+            Some(_) => projection.guard(self.input.tiling()),
+        };
+        let input_tile = self.input.get(input_guard);
         let mut out = match self.level.enclosing() {
             None => {
                 debug_assert!(
@@ -329,6 +342,7 @@ impl TileProducer for ConverseProducer {
             }
             out.remove_guarded(released);
         }
+        out.restrict_to(&projection, self.tiling());
         out
     }
 
@@ -3873,5 +3887,194 @@ mod product_projection_tests {
         let nothing = product.tiling().empty_guard();
         assert_eq!(product.get(nothing), product.tiling().empty_tile());
         assert!(outer_pulled.borrow().is_empty() && inner_pulled.borrow().is_empty());
+    }
+}
+
+/// `Converse` as the bucketize step of a group-by uses it: the key stream `sales ≫ key` is
+/// inverted into the groups `key ⤇ (position ⤇ position)`, and a worker owns a range of groups.
+#[cfg(test)]
+mod converse_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, ints_by_position, keys_between,
+    };
+    use bit_set::BitSet;
+
+    const ROWS: u64 = 8;
+
+    /// The group of each position: `1, 2, 1, 3, 2, 1, 3, 2`, so group 1 holds positions
+    /// `{0, 2, 5}`, group 2 holds `{1, 4, 7}` and group 3 holds `{3, 6}`.
+    const GROUPS: [i64; 8] = [1, 2, 1, 3, 2, 1, 3, 2];
+
+    fn groups_tiling() -> Tiling {
+        Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(ROWS),
+                Tiling::Scalar(Extent::uint_range(ROWS)),
+            ),
+        )
+    }
+
+    fn bucketize() -> (ConverseProducer, GuardLog, GuardLog) {
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (keys, pulled, released) =
+            ProjectionSpy::new(ints_by_position(&GROUPS, true), in_tiling);
+        (
+            ConverseProducer {
+                base: ProducerBase::unowned(ConverseProducer::alloc_id(), &groups_tiling()),
+                input: Box::new(keys),
+                held: Vec::new(),
+                level: CurryLevel::OUTERMOST,
+                empty_level: groups_tiling()
+                    .values_at(CurryLevel::OUTERMOST)
+                    .empty_at_no_rows(),
+            },
+            pulled,
+            released,
+        )
+    }
+
+    fn groups(keys: &[i64]) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(
+            keys.iter()
+                .map(|k| Predicate::point(Value::Int(*k)))
+                .fold(Predicate::False, |all, one| all.union(&one)),
+        ))
+    }
+
+    /// Each group of `tile` as `(key, members)`, members in position order.
+    fn members_by_group(tile: &Tile) -> Vec<(i64, Vec<u64>)> {
+        let Tile::DataFunction {
+            domain: ColumnValue::Ints(keys),
+            codomain,
+            ..
+        } = tile
+        else {
+            panic!("groups keyed by integers, got {tile:?}")
+        };
+        let Tile::DataFunction {
+            row_starts,
+            domain: ColumnValue::UInts(members),
+            ..
+        } = codomain.as_ref()
+        else {
+            panic!("members per group, got {codomain:?}")
+        };
+        let mut groups: Vec<(i64, Vec<u64>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(group, key)| {
+                let end = row_starts.get(group + 1).copied().unwrap_or(members.len());
+                let mut held = members[row_starts[group]..end].to_vec();
+                held.sort_unstable();
+                (*key, held)
+            })
+            .collect();
+        groups.sort();
+        groups
+    }
+
+    /// A worker's groups: the keys are read from the rows, so the whole key stream is read and
+    /// the groups outside the range are cut.
+    #[test]
+    fn a_range_of_groups_reads_the_whole_key_stream_and_cuts_the_groups() {
+        let (mut converse, pulled, _) = bucketize();
+        let answer = converse.get(groups(&[1, 3]));
+        assert_eq!(
+            members_by_group(&answer),
+            [(1, vec![0, 2, 5]), (3, vec![3, 6])]
+        );
+        assert_eq!(
+            *pulled.borrow(),
+            [converse.input.tiling().universal_guard()]
+        );
+    }
+
+    /// The consumer releases the groups it took. That frees the rows they hold at the input and
+    /// no others, so the next range finds its own rows still there.
+    #[test]
+    fn releasing_a_range_of_groups_frees_its_rows_and_leaves_the_others() {
+        let (mut converse, _, released) = bucketize();
+        converse.get(groups(&[1]));
+        converse.release(groups(&[1]));
+        let freed = released.borrow().clone();
+        assert_eq!(freed.len(), 1);
+        let TileGuard::Function(FunctionGuard::Domain(rows)) = &freed[0] else {
+            panic!("a domain release of the rows, got {freed:?}")
+        };
+        for row in [0u64, 2, 5] {
+            assert!(rows.contains(&Value::UInt(row)), "row {row} is group 1's");
+        }
+        for row in [1u64, 3, 4, 6, 7] {
+            assert!(!rows.contains(&Value::UInt(row)), "row {row} is not");
+        }
+        let rest = converse.get(groups(&[2, 3]));
+        assert_eq!(
+            members_by_group(&rest),
+            [(2, vec![1, 4, 7]), (3, vec![3, 6])]
+        );
+    }
+
+    #[test]
+    fn a_range_of_groups_is_the_whole_pull_cut_to_it() {
+        for guard in [groups(&[1]), groups(&[2, 3]), groups(&[9])] {
+            assert_conforms(|| Box::new(bucketize().0), guard);
+        }
+    }
+
+    /// A group-by whose source varies per enclosing row inverts each row's collection on its
+    /// own: the outer keys stand, so the projection of rows reaches the rows.
+    #[test]
+    fn beneath_a_standing_level_the_projection_reaches_the_enclosing_rows() {
+        let rows = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 3],
+                ColumnValue::UInts(vec![0, 1, 2, 0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 6, 5, 7, 7]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(
+                Extent::uint_range(3),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let out = Tiling::data_function(Extent::uint_range(2), groups_tiling());
+        let make = || {
+            let (input, pulled, _) = ProjectionSpy::new(rows.clone(), in_tiling.clone());
+            (
+                ConverseProducer {
+                    base: ProducerBase::unowned(ConverseProducer::alloc_id(), &out),
+                    input: Box::new(input),
+                    held: Vec::new(),
+                    level: CurryLevel::new(1),
+                    empty_level: out.values_at(CurryLevel::new(1)).empty_at_no_rows(),
+                },
+                pulled,
+            )
+        };
+        let (mut converse, pulled) = make();
+        converse.get(keys_between(1, 1));
+        assert_eq!(*pulled.borrow(), [keys_between(1, 1)]);
+        assert_conforms(|| Box::new(make().0), keys_between(1, 1));
+    }
+
+    #[test]
+    fn nothing_inverts_nothing() {
+        let (mut converse, pulled, _) = bucketize();
+        let nothing = converse.tiling().empty_guard();
+        assert_eq!(converse.get(nothing), converse.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 }
