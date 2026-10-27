@@ -496,6 +496,7 @@ of a restatement with no spelling.
 | `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
 | `Uncurry` | Beneath standing levels the input is pulled at the projection. Pairing the whole tile reads the groups whose first component the projection admits, and the pairs are cut after. |
 | `Product` | Both sides are pulled at the projection, since they are aligned row for row. |
+| `Converse` | Beneath standing levels the input is pulled at the projection. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
 
 ### Producer attribution and probes
 
