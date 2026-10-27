@@ -618,8 +618,27 @@ impl TileProducer for UncurryProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
+    /// Beneath standing levels the projection names keys the pairing leaves standing, so the
+    /// input is pulled at it. Pairing the whole tile makes the pairs the keys: the projection
+    /// is then over pairs, and what reaches the input is the admitted first components, which
+    /// is every pair they head, and the pairs are cut after.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let input_guard = match (self.level == CurryLevel::OUTERMOST, &projection) {
+            (false, _) => projection.guard(self.input.tiling()),
+            (true, Projection::Keys(Predicate::Record(components))) => {
+                let first = components
+                    .get(&tuple_field(0))
+                    .cloned()
+                    .unwrap_or(Predicate::True);
+                Projection::admitting(first).guard(self.input.tiling())
+            }
+            (true, _) => self.input.tiling().universal_guard(),
+        };
+        let input_tile = self.input.get(input_guard);
         // Pair beneath the standing levels, which stand unchanged: a row's group is a
         // curried collection in its own right, so the pairing below is the same one a
         // depth-zero `Uncurry` does to the whole tile.
@@ -631,6 +650,7 @@ impl TileProducer for UncurryProducer {
                 }
             });
         result.remove_guarded(self.base().obsolete_guard.clone());
+        result.restrict_to(&projection, self.tiling());
         result
     }
 
@@ -3550,6 +3570,132 @@ mod map_domain_projection_tests {
         let (mut keys, pulled) = keys_of_a_stream();
         let nothing = keys.tiling().empty_guard();
         assert_eq!(keys.get(nothing), keys.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+}
+
+/// `Uncurry` as a join reads a grouping: `K ⤇ (D ⤇ V)` becomes a collection keyed by the pairs
+/// `(k, d)`. A worker's morsel names pairs, and the first component of each is a key of the
+/// grouping.
+#[cfg(test)]
+mod uncurry_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms,
+    };
+    use bit_set::BitSet;
+
+    /// Groups 1, 2 and 3 holding members `{0, 2}`, `{1}` and `{3}` with values 10 to 40.
+    fn paired_groups() -> (UncurryProducer, GuardLog) {
+        let groups = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2, 3]),
+            Box::new(Tile::grouped(
+                vec![0, 2, 3],
+                ColumnValue::UInts(vec![0, 2, 1, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 30, 20, 40]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let in_tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(4),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let out = Tiling::data_function(
+            Extent::Record(
+                [
+                    (tuple_field(0), Extent::Base(BaseType::Int)),
+                    (tuple_field(1), Extent::uint_range(4)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(groups, in_tiling);
+        (
+            UncurryProducer {
+                base: ProducerBase::unowned(UncurryProducer::alloc_id(), &out),
+                input: Box::new(input),
+                level: CurryLevel::OUTERMOST,
+                empty_pair: out.empty_at_no_rows(),
+            },
+            pulled,
+        )
+    }
+
+    /// The pairs whose first component `first` admits and whose second `second` admits.
+    fn pairs(first: Predicate, second: Predicate) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::Record(
+            [(tuple_field(0), first), (tuple_field(1), second)]
+                .into_iter()
+                .collect(),
+        )))
+    }
+
+    fn groups_one_and_three() -> Predicate {
+        Predicate::point(Value::Int(1)).union(&Predicate::point(Value::Int(3)))
+    }
+
+    fn pair_count(tile: &Tile) -> usize {
+        let Tile::DataFunction { domain, .. } = tile else {
+            panic!("a collection, got {tile:?}")
+        };
+        domain.len()
+    }
+
+    /// A morsel of pairs headed by groups 1 and 3 reads those groups of the grouping alone, and
+    /// holds the pairs they head: `(1, 0)`, `(1, 2)` and `(3, 3)`.
+    #[test]
+    fn a_morsel_of_pairs_reads_the_groups_that_head_them() {
+        let (mut uncurry, pulled) = paired_groups();
+        let guard = pairs(groups_one_and_three(), Predicate::True);
+        let morsel = uncurry.get(guard);
+        assert_eq!(pair_count(&morsel), 3);
+        assert_eq!(
+            *pulled.borrow(),
+            [TileGuard::Function(FunctionGuard::Domain(
+                groups_one_and_three()
+            ))]
+        );
+    }
+
+    /// A morsel that names the second component only cannot say which groups it needs, so the
+    /// grouping is read whole and the pairs are cut after.
+    #[test]
+    fn a_morsel_of_second_components_reads_the_grouping_whole_and_cuts_the_pairs() {
+        let (mut uncurry, pulled) = paired_groups();
+        let guard = pairs(Predicate::True, Predicate::point(Value::UInt(1)));
+        let morsel = uncurry.get(guard);
+        assert_eq!(pair_count(&morsel), 1, "only the pair (2, 1)");
+        assert_eq!(*pulled.borrow(), [uncurry.input.tiling().universal_guard()]);
+    }
+
+    #[test]
+    fn a_morsel_of_pairs_is_the_whole_pull_cut_to_it() {
+        for guard in [
+            pairs(groups_one_and_three(), Predicate::True),
+            pairs(Predicate::True, Predicate::point(Value::UInt(1))),
+            pairs(
+                Predicate::point(Value::Int(1)),
+                Predicate::point(Value::UInt(2)),
+            ),
+        ] {
+            assert_conforms(|| Box::new(paired_groups().0), guard);
+        }
+    }
+
+    #[test]
+    fn nothing_pairs_nothing() {
+        let (mut uncurry, pulled) = paired_groups();
+        let nothing = uncurry.tiling().empty_guard();
+        assert_eq!(uncurry.get(nothing), uncurry.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
     }
 }
