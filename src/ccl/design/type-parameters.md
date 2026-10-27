@@ -26,7 +26,8 @@ type, both in `ccl/ty.rs`:
 
 - A `TypeParam` has an id, which equality, ordering and hashing use; the spelling the user wrote,
   for display; and, once opened, a level (`opened_at`) and the bound its kind gives it, normalized
-  at that level.
+  at that level. A generalized one also has an `arity`, nonzero for a family, whose occurrences are
+  `Type::FamilyApp`s applying it to that many terms ([Generalized types](#generalized-types)).
 - A `PolyType` holds its parameters in declaration order, each a `PolyParam` (a declared
   `TypeParam` and its kind); its `requires` clause, each requirement a `TraitRequirement` (a
   trait, its operand types and the types its associated types are, by name); and its body.
@@ -422,29 +423,39 @@ lambda elimination, after loop recognition, and after planning:
 - A `let` or `letrec` binder's type is the morphism its definition is, and is generalized as that
   type is: an inner loop's history over rows whose domains read the outer loop's position.
 
-A part read under a binder of the type's own, a position of the collection the morphism receives,
-is generalized with that binder read by name, so the parameter stands for the part at every
-position. A binder spelled like a name the type also reads free is renamed apart first, so the two
-stay distinct.
+A part that also reads binders of the type's own, positions of the collection the morphism
+receives or earlier components of a dependent tuple, is a type per value of those binders. Its
+parameter is a **family**: it takes one argument per such binder (`TypeParam::arity`), and each
+occurrence is a `Type::FamilyApp` applying it to them, rendered `𝐷₁(𝑘)`. `uncurry` over rows whose
+inner domains differ is stamped
+`∀ (𝐷, 𝐷₁(_)). ((𝑘 : 𝐷) ⤇ (𝐷₁(𝑘) ⤇ Int)) ⇒ ((𝑘 : 𝐷) × 𝐷₁(𝑘) ⤇ Int)`. The type is generalized
+with its binders read by name, function binders and tuple components alike, so a part stated under
+two binders spelled alike is one part. A refinement reading the type's own binders and nothing out
+of scope stays outside the parameter, around its occurrence. A binder spelled like a name the type
+also reads free is renamed apart first, so the two stay distinct.
 
 Check instantiates a generalized type where it is used: at a chain edge from the codomain before it,
 at a chain's head from the chain's input, and at an application from the argument
 (`generalize::instantiate`). It matches the type's domain against what it receives, with every
-binder of that type read by name, and closes the result again. A parameter bound to a type is
-matched through its bound too, against that type's structure, or against its bound where the type is
-itself a generalized parameter: in `∀ (𝐷 <: 0..8, 𝑃 <: ((𝐷 ⤇ Int), 𝐷)). 𝑃 ⇒ (𝐷 ⤇ Int)` the input
-fixes `𝐷` only through `𝑃`'s bound. A bound that is a bare parameter fixes nothing. A parameter the
-input does not fix stays generic: the morphism is read at its body, and the result is generalized
-over it again. A generic node is checked at its body, and so are its other type slots: a nested
-`Transact`'s parameter is read at its body, and its source is instantiated at the parameter's
-enclosing component. Subtyping aligns a generic side with the other first
-(`generalize::align`), its parameters renamed apart from those the other side reads, and aligns the
-instance's own generic components in turn, as a pair of generic morphisms has. A builtin's type is
-trusted whole. After loop recognition and after planning, `close_free_params` wraps each type
-slot a rebuild left reading a generalized parameter that nothing binds. Loop recognition reads a
-generic history at its body and builds the `Transact` from its parts, reading the writer's
-parameter, which the source slot's own type states, in the history's parameters
-(`generalize::renamed_by_match`).
+binder of both read by name, and closes the result again. Each binder of the generalized type is
+paired with the binder of the received type at the same position. A family applied to binders of the
+generalized type is bound to the type received there, over the binders they pair with, and an
+application in the generalized type is that type with those binders discharged to its arguments. Two
+applications of one family are one type where they apply it at the same values, and an application
+is below what the family's bound is below. A parameter bound to a type is matched through its bound
+too, against that type's structure, or against its bound where the type is itself a generalized
+parameter: in `∀ (𝐷 <: 0..8, 𝑃 <: ((𝐷 ⤇ Int), 𝐷)). 𝑃 ⇒ (𝐷 ⤇ Int)` the input fixes `𝐷` only through
+`𝑃`'s bound. A bound that is a bare parameter fixes nothing. A parameter the input does not fix
+stays generic: the morphism is read at its body, and the result is generalized over it again. A
+generic node is checked at its body, and so are its other type slots: a nested `Transact`'s
+parameter is read at its body, and its source is instantiated at the parameter's enclosing
+component. Subtyping aligns a generic side with the other first (`generalize::align`), its
+parameters renamed apart from those the other side reads, and aligns the instance's own generic
+components in turn, as a pair of generic morphisms has. A builtin's type is trusted whole. After
+loop recognition and after planning, `close_free_params` wraps each type slot a rebuild left reading
+a generalized parameter that nothing binds. Loop recognition reads a generic history at its body and
+builds the `Transact` from its parts, reading the writer's parameter, which the source slot's own
+type states, in the history's parameters (`generalize::renamed_by_match`).
 
 ---
 

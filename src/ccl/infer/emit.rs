@@ -621,6 +621,7 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         | Type::ChanDom(..)
         | Type::WitnessRef(_)
         | Type::WitnessProjection(_)
+        | Type::FamilyApp(_)
         | Type::Txn
         | Type::Hole
         | Type::BarrierVar(_)

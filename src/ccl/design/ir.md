@@ -527,6 +527,7 @@ durable forms are:
 | `DataSource`, `Txn` | An external source's nominal domain and the transaction sequencing domain. |
 | `WitnessRef` | Reference to a dependent-sum witness, inside the sum's own type; realization or erasure replaces it with a candidate. |
 | `WitnessProjection` | `σᵢ(𝑐)`, the `i`th witness of the sum the term `𝑐` holds: how a type outside the sum names it ([Projecting a sum's witness](collections.md#projecting-a-sums-witness)). |
+| `FamilyApp` | A generalized family applied to terms, `𝐷₁(𝑘)`: a type per value of the binders it is applied to ([Generalized types](type-parameters.md#generalized-types)). |
 
 A `Label` (`src/ccl/label.rs`) is a record field label or a variant tag: a spelling and the module
 it belongs to ([chl-spec.md, "9.12 Field labels and tags belong to a

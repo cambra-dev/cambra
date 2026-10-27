@@ -1332,6 +1332,20 @@ fn constrain_go_impl(
         // A type parameter is reflexively equal to itself, as the short-circuit above
         // decides when the edge carries no morphism.
         (Type::Param(a), Type::Param(b)) if a == b => Ok(()),
+        // Two applications of one generalized family are one type where they apply it at the same
+        // values, each read under its own side's substitution.
+        (Type::FamilyApp(a), Type::FamilyApp(b)) if a.param == b.param => {
+            if sl.apply_type(&Type::FamilyApp(a.clone()))
+                == sr.apply_type(&Type::FamilyApp(b.clone()))
+            {
+                Ok(())
+            } else {
+                Err(ConstrainError::Mismatch {
+                    lhs: Box::new(lhs.clone()),
+                    rhs: Box::new(rhs.clone()),
+                })
+            }
+        }
         // `Txn` is a nullary leaf: reflexively equal to itself, incomparable
         // to every other type (the catch-all `Mismatch` below).
         (Type::Txn, Type::Txn) => Ok(()),
@@ -2095,6 +2109,16 @@ fn constrain_go_impl(
                 }),
             }
         }
+        // A family's bound holds at every value it is applied to.
+        (Type::FamilyApp(app), _) if !matches!(rhs.peel_refinements(), Type::FamilyApp(b) if b.param == app.param) => {
+            match &app.param.bound {
+                Some(bound) => constrain_go(bound, rhs, sl, sr, cache, scope),
+                None => Err(ConstrainError::Mismatch {
+                    lhs: Box::new(lhs.clone()),
+                    rhs: Box::new(rhs.clone()),
+                }),
+            }
+        }
 
         // Feed handles are invariant in the payload: feeding writes into
         // the channel (contravariant capability) while reading consumes it
@@ -2509,7 +2533,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         Type::Refinement(inner, r) => {
             Type::refined(extrude(inner, pol, target_level, cache), r.clone())
         }
-        Type::WitnessRef(_) | Type::WitnessProjection(_) => ty.clone(),
+        Type::WitnessRef(_) | Type::WitnessProjection(_) | Type::FamilyApp(_) => ty.clone(),
         // Invariant payload: polarity is meaningless under invariance, so
         // both children are extruded with two-way proxies (a history is read
         // *and* written) instead of the polar one-way approximation below.

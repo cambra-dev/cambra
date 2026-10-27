@@ -3985,14 +3985,15 @@ and the last read at that prefix's projections; the pairs this enumerates splice
 tuple through `[0] ▷ flatten_domain`.
 
 A site over a plain pair whose element is read out of a collection the enclosing value carries,
-`(.1, .0 ≫ 𝑝) ▷ zip ≫ apply` for projections `𝑝`, takes that collection's keys per row as well:
-`𝐹` is `𝑝 ≫ map_domain`, the identity's where `𝑝` is empty (`row_collection`). The collection's
-domain is a generalized parameter, which differs per row, so it is matched with the projection's
-type instantiated at the site's input. A body that reads no element names no collection, and the
-site's own type does: its inner domain, a generalized parameter, is the domain of a collection the
-enclosing value holds, which `collection_typed_at` finds through the enclosing value's tuple
-components. A site whose inner domain is a generalized parameter that no such collection has is
-refused, since enumerating the parameter's bound would look each row up at keys it lacks.
+`(.1, .0 ≫ 𝑝) ▷ zip ≫ apply` for projections `𝑝`, takes that collection's keys per row as well: `𝐹`
+is `𝑝 ≫ map_domain`, the identity's where `𝑝` is empty (`row_collection`). The collection's domain
+is a generalized parameter, bare or a family's application (`Type::generalized_param`), which
+differs per row, so it is matched with the projection's type instantiated at the site's input. A
+body that reads no element names no collection, and the site's own type does: its inner domain, a
+generalized parameter, is the domain of a collection the enclosing value holds, which
+`collection_typed_at` finds through the enclosing value's tuple components. A site whose inner
+domain is a generalized parameter that no such collection has is refused, since enumerating the
+parameter's bound would look each row up at keys it lacks.
 
 ### At run time
 

@@ -464,6 +464,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         // bookkeeping, not identity - see `ChanLevel`).
         (Type::ChanDom(a, _), Type::ChanDom(b, _)) => a == b,
         (Type::Param(a), Type::Param(b)) => a == b,
+        (Type::FamilyApp(a), Type::FamilyApp(b)) => a == b,
         (Type::Nominal(d1, a1), Type::Nominal(d2, a2)) => {
             d1 == d2
                 && a1
@@ -1171,6 +1172,7 @@ fn for_each_positioned_var(
         | Type::Param(_)
         | Type::WitnessRef(_)
         | Type::WitnessProjection(_)
+        | Type::FamilyApp(_)
         | Type::Poly(_) => {}
     }
 }
@@ -3064,6 +3066,7 @@ fn coalesce_type_predicates_go(
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates_go(t, level, ctx, scope)),
         Type::History { function, .. } => coalesce_type_predicates_go(function, level, ctx, scope),
+        Type::FamilyApp(_) => unreachable!("a generalized family is born after inference"),
         // A projection quotes a term as a predicate does, so its slots resolve the same way
         // and it leaves closed against the functions entered.
         Type::WitnessProjection(p) => {
@@ -3080,7 +3083,7 @@ fn coalesce_type_predicates_go(
                 *ty = sole;
                 return;
             }
-            *p = scope.close_projection(p);
+            *p = scope.close_quoted(p);
         }
         // A barrier var survives coalescing only in a slot whose
         // resolution failed, as an `Infer` does, and

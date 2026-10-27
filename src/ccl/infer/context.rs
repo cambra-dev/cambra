@@ -781,6 +781,7 @@ impl InferCtx {
             // minted. Lowering scopes a parameter to the definition its `Poly`
             // annotates, and that definition is emitted with the `Poly` open, so every
             // declared occurrence normalized has one.
+            Type::FamilyApp(_) => unreachable!("a generalized family is born after inference"),
             Type::Param(param) if param.opened_at.is_none() => self
                 .opened_params
                 .iter()

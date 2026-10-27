@@ -1429,6 +1429,11 @@ pub enum Type {
     ///
     /// See `src/ccl/design/type-parameters.md`.
     Param(Rc<TypeParam>),
+    /// A generalized **family** parameter applied to the terms it is indexed by, `𝐷₁(𝑘₀)`: the
+    /// type the parameter stands for at those values of the binders the terms read
+    /// (`src/ccl/design/type-parameters.md`, "Generalized types"). Born after inference, so the
+    /// solver never meets one.
+    FamilyApp(FamilyApp),
     /// A **written polymorphic type**, `forall (T, U <: B) V`: type parameters with their
     /// bounds over a body type. Lowering produces one only as a whole `let`
     /// annotation; a `def` with type parameters is a `let` annotated with one whose
@@ -1491,6 +1496,10 @@ pub struct TypeParam {
     /// scope of a binder its instance named ([`TypeParam::generalized`]). Its `Poly` stays in the
     /// tree after inference.
     pub generalized: bool,
+    /// How many terms the parameter is applied to: a generalized **family** stands for a type per
+    /// value of the type's binders it reads, and each occurrence is a [`Type::FamilyApp`] of
+    /// that many. Zero for every other parameter, each occurrence a [`Type::Param`].
+    pub arity: usize,
 }
 
 impl TypeParam {
@@ -1503,6 +1512,7 @@ impl TypeParam {
             bound: None,
             bound_at: None,
             generalized: false,
+            arity: 0,
         })
     }
 
@@ -1510,6 +1520,16 @@ impl TypeParam {
     /// new position cannot, below `bound` (`src/ccl/design/type-parameters.md`, "Generalized
     /// types").
     pub fn generalized(spelling: impl Into<SmolStr>, bound: Option<Type>) -> Rc<TypeParam> {
+        Self::generalized_family(spelling, bound, 0)
+    }
+
+    /// A generalized parameter applied to `arity` terms, a type per value of the type's binders
+    /// they read, each below `bound` (`src/ccl/design/type-parameters.md`, "Generalized types").
+    pub fn generalized_family(
+        spelling: impl Into<SmolStr>,
+        bound: Option<Type>,
+        arity: usize,
+    ) -> Rc<TypeParam> {
         Rc::new(TypeParam {
             id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
             spelling: spelling.into(),
@@ -1517,6 +1537,7 @@ impl TypeParam {
             bound,
             bound_at: None,
             generalized: true,
+            arity,
         })
     }
 
@@ -1534,6 +1555,7 @@ impl TypeParam {
             bound,
             bound_at,
             generalized: false,
+            arity: 0,
         })
     }
 
@@ -2631,6 +2653,14 @@ fn fmt_type(
         Type::DataSource(name) => write!(f, "source({name})"),
         Type::ChanDom(name, _) => write!(f, "chan({name})"),
         Type::Param(param) => write!(f, "{}", param.spelling),
+        Type::FamilyApp(app) => {
+            let args: Vec<String> = app
+                .args
+                .iter()
+                .map(|a| symbolic::symbolic_under(&a.term, binders))
+                .collect();
+            write!(f, "{}({})", app.param.spelling, args.join(", "))
+        }
         Type::Nominal(decl, args) if args.is_empty() => write!(f, "{}", decl.spelled()),
         Type::Nominal(decl, args) => {
             let args: Vec<String> = args.iter().map(|t| at(t, binders).to_string()).collect();
@@ -2646,12 +2676,17 @@ fn fmt_type(
                 .params
                 .iter()
                 .filter(|p| !poly.is_member(&p.param))
-                .map(|p| match &p.kind {
-                    TypeKind::Type => p.param.spelling.to_string(),
-                    TypeKind::SubtypesOf(bound) => {
-                        format!("{} <: {}", p.param.spelling, at(bound, binders))
+                .map(|p| {
+                    // A family is written applied to as many holes as it takes terms.
+                    let name = match p.param.arity {
+                        0 => p.param.spelling.to_string(),
+                        n => format!("{}({})", p.param.spelling, vec!["_"; n].join(", ")),
+                    };
+                    match &p.kind {
+                        TypeKind::Type => name,
+                        TypeKind::SubtypesOf(bound) => format!("{name} <: {}", at(bound, binders)),
+                        other => format!("{name}: {other}"),
                     }
-                    other => format!("{}: {other}", p.param.spelling),
                 })
                 .collect();
             write!(
@@ -2800,6 +2835,16 @@ impl Type {
             Type::DepTuple(components)
         } else {
             Type::tuple(crate::ccl::subst::tuple_of_components(components))
+        }
+    }
+
+    /// The generalized parameter `self` is, bare or applied as a family
+    /// (`src/ccl/design/type-parameters.md`, "Generalized types").
+    pub fn generalized_param(&self) -> Option<&Rc<TypeParam>> {
+        match self {
+            Type::Param(p) if p.generalized => Some(p),
+            Type::FamilyApp(app) => Some(&app.param),
+            _ => None,
         }
     }
 
@@ -3762,6 +3807,7 @@ impl Type {
             | Type::WitnessRef(_)
             | Type::WitnessProjection(_)
             | Type::Param(_)
+            | Type::FamilyApp(_)
             | Type::Txn => self.clone(),
         }
     }
@@ -3827,6 +3873,7 @@ impl Type {
                 }
             }
             Type::WitnessProjection(p) => f(&p.term),
+            Type::FamilyApp(app) => app.args.iter().for_each(|a| f(&a.term)),
             _ => {}
         }
         self.walk_children(|c| c.walk_quoted_terms(f));
@@ -3856,6 +3903,7 @@ impl Type {
             | Type::WitnessRef(_)
             | Type::WitnessProjection(_)
             | Type::Param(_)
+            | Type::FamilyApp(_)
             | Type::Txn => {}
             // A `Poly`'s bounds are its children as its body is: a pass that rewrites
             // types (uniquify's α-renaming, `subst`) must reach a refinement in a bound.
@@ -3926,6 +3974,7 @@ impl Type {
             | Type::WitnessRef(_)
             | Type::WitnessProjection(_)
             | Type::Param(_)
+            | Type::FamilyApp(_)
             | Type::Txn => {}
             Type::Poly(poly) => Rc::make_mut(poly).types_mut().for_each(f),
             Type::Nominal(_, args) => args.iter_mut().for_each(f),
@@ -4234,6 +4283,82 @@ impl QuotedTerm for Refinement {
 }
 
 impl QuotedTerm for WitnessProjection {
+    fn quoted(&self) -> &Rc<TypedExpr> {
+        &self.term
+    }
+    fn requote(&mut self, to: Rc<TypedExpr>) {
+        self.term = to;
+    }
+}
+
+/// A generalized family parameter applied to its arguments ([`Type::FamilyApp`]): as many terms as
+/// the parameter's [`arity`](TypeParam::arity), each reading binders of the type around it.
+///
+/// Each argument is quoted as a refinement quotes its predicate, and compared and hashed with
+/// its type slots skipped.
+#[derive(Clone)]
+pub struct FamilyApp {
+    pub param: Rc<TypeParam>,
+    pub args: Vec<FamilyArg>,
+}
+
+/// One argument of a [`FamilyApp`].
+#[derive(Clone)]
+pub struct FamilyArg {
+    pub term: Rc<TypedExpr>,
+}
+
+impl FamilyApp {
+    pub fn new(param: Rc<TypeParam>, args: Vec<Rc<TypedExpr>>) -> Self {
+        debug_assert_eq!(
+            args.len(),
+            param.arity,
+            "family `{}` applied to {} terms, its arity {}",
+            param.spelling,
+            args.len(),
+            param.arity
+        );
+        FamilyApp {
+            param,
+            args: args.into_iter().map(|term| FamilyArg { term }).collect(),
+        }
+    }
+}
+
+impl PartialEq for FamilyApp {
+    fn eq(&self, other: &Self) -> bool {
+        self.param == other.param
+            && self.args.len() == other.args.len()
+            && self.args.iter().zip(&other.args).all(|(a, b)| {
+                Rc::ptr_eq(&a.term, &b.term) || eq_term_modulo_ty_slots(&a.term, &b.term)
+            })
+    }
+}
+
+impl Eq for FamilyApp {}
+
+impl std::hash::Hash for FamilyApp {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.param.hash(state);
+        for a in &self.args {
+            hash_term_modulo_ty_slots(&a.term, state, &mut Vec::new());
+        }
+    }
+}
+
+impl fmt::Debug for FamilyApp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FamilyApp")
+            .field("param", &self.param)
+            .field(
+                "args",
+                &self.args.iter().map(|a| &a.term).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl QuotedTerm for FamilyArg {
     fn quoted(&self) -> &Rc<TypedExpr> {
         &self.term
     }

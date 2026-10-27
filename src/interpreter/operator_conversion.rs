@@ -1771,6 +1771,18 @@ the compilation declined outlives it here"
     /// never produce empty, unsubscribed [`crate::interpreter::Restriction`] objects that would
     /// panic when iterated.
     pub fn extent_of(&self, ty: &Type) -> Result<Extent, ConversionError> {
+        // A generalized parameter stands for a domain chosen per use, below its bound, and a family
+        // for one chosen per use and per value of what it is applied to: the values either
+        // ranges over are the bound's (`src/ccl/design/type-parameters.md`, "Generalized types").
+        if let Some(p) = ty.generalized_param() {
+            let bound = p.bound.as_ref().ok_or_else(|| {
+                ConversionError::Unsupported(format!(
+                    "a domain generic over a sum's witness (`{}`) has no extent to convert",
+                    p.spelling
+                ))
+            })?;
+            return self.extent_of(bound);
+        }
         match ty {
             // Strip refinements at every level — Filter handles them instead.
             Type::Refinement(inner, _) => self.extent_of(inner),
@@ -1850,18 +1862,6 @@ the compilation declined outlives it here"
                     arms.push((k.clone(), self.extent_of(t)?));
                 }
                 Ok(Extent::Union(TagMap::from_arms(arms)))
-            }
-            // A generalized parameter stands for a domain chosen per use, below its bound: the
-            // values it ranges over are the bound's (`src/ccl/design/type-parameters.md`,
-            // "Generalized types").
-            Type::Param(p) if p.generalized => {
-                let bound = p.bound.as_ref().ok_or_else(|| {
-                    ConversionError::Unsupported(format!(
-                        "a domain generic over a sum's witness (`{}`) has no extent to convert",
-                        p.spelling
-                    ))
-                })?;
-                self.extent_of(bound)
             }
             // Leaf types — no refinements possible, handle inline.
             Type::Base(b) => Ok(Extent::Base(b.clone())),

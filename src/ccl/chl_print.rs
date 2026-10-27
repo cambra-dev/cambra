@@ -175,6 +175,8 @@ impl Printer {
                 Some((_, text)) => text.clone(),
                 None => p.spelling.to_string(),
             },
+            // A compiler-made family has no CHL spelling.
+            Type::FamilyApp(_) => self.fallback(ty),
             Type::Tuple(ts) => match ts.as_slice() {
                 [] => "{}".to_string(),
                 [only] => format!("{{{},}}", self.ty(only)),

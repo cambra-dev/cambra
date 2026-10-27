@@ -1083,6 +1083,7 @@ fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
         | Type::WitnessProjection(_)
         | Type::Param(_)
         | Type::BarrierVar(_)
+        | Type::FamilyApp(_)
         | Type::Poly(_) => false,
     }
 }
