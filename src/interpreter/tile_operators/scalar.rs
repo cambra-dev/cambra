@@ -897,11 +897,28 @@ impl TileProducer for VariantIsProducer {
         visit("scrutinee", &*self.input);
     }
 
+    /// A test keeps every level of its scrutinee and changes only the values beneath them, so it
+    /// cuts its answer at any level ([`get_impl`](Self::get_impl)).
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
+    /// Every key in is a key out, so the scrutinee is pulled at the projection, or whole where
+    /// the scrutinee does not restate the projection's level, and the answer is cut to the
+    /// projection after.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         // A test answers every position, so the scrutinee's levels, keys, groupings and
         // deletions stand as they are, and only its values change: each union value becomes
         // whether it carries the tag.
-        let mut tile = self.input.get(projection_guard);
+        let projection = projection_guard.projection_for(self);
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let pulled = match projection.level() {
+            Some(level) if self.input.restates().refuses(level) => Projection::Everything,
+            _ => projection.clone(),
+        };
+        let mut tile = self.input.get(scrutinee_guard(&*self.input, &pulled));
         let values = tile.deepest_values_mut();
         let Tile::Scalar(ColumnValue::Union(arms)) = &*values else {
             panic!("VariantIs expects a union input, got {values:?}")
@@ -920,10 +937,20 @@ impl TileProducer for VariantIsProducer {
         *values = Tile::Scalar(ColumnValue::Bools(
             (0..rows).map(|p| carried.contains(p)).collect(),
         ));
+        // A tag test over a bare union is a column with no keys of its own, which a consumer
+        // releases whole; over a stream the cut repeats the input's.
+        if !self.base.obsolete_guard.is_empty() {
+            tile.remove_guarded(self.base.obsolete_guard.clone());
+        }
+        tile.restrict_to(&projection, self.tiling());
         tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        if !self.input.tiling().is_data_function() {
+            release_bare_scrutinee(&mut *self.input, &self.base.obsolete_guard);
+            return;
+        }
         // Every key in is a key out, so a released region of the output names
         // exactly the region of the scrutinee that produced it. `VariantProject`
         // forwards a release on the same key-preserving argument, over the
@@ -1739,6 +1766,83 @@ mod variant_projection_tests {
             Predicate::True.minus(&Predicate::at_or_below(Value::UInt(4))),
         )));
         assert_eq!(*released.borrow(), [bare_tiling.universal_guard()]);
+    }
+
+    /// `variant_is(commit)` over the decision stream: the gate a `match` arm is filtered by.
+    fn is_commit() -> (VariantIsProducer, GuardLog) {
+        let out = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Bool)),
+        );
+        let (scrutinee, pulled, _) = ProjectionSpy::new(decisions(), decisions_tiling());
+        (
+            VariantIsProducer {
+                base: ProducerBase::unowned(VariantIsProducer::alloc_id(), &out),
+                input: Box::new(scrutinee),
+                tag: commit(),
+            },
+            pulled,
+        )
+    }
+
+    /// A tag test over a bare union answers a column of `Bool`s with no keys of its own, one per
+    /// position of the scrutinee, and a release of the whole answer releases the scrutinee whole.
+    #[test]
+    fn a_tag_test_over_a_bare_union_answers_a_column_and_releases_it_whole() {
+        let Tile::DataFunction { codomain, .. } = decisions() else {
+            unreachable!("decisions are a stream")
+        };
+        let out = Tiling::Scalar(Extent::Base(BaseType::Bool));
+        let (scrutinee, _, released) =
+            ProjectionSpy::new(*codomain, Tiling::Scalar(decision_extent()));
+        let mut is_commit = VariantIsProducer {
+            base: ProducerBase::unowned(VariantIsProducer::alloc_id(), &out),
+            input: Box::new(scrutinee),
+            tag: commit(),
+        };
+        let Tile::Scalar(ColumnValue::Bools(answers)) = is_commit.get(out.universal_guard()) else {
+            panic!("a tag test over a bare union answers a column of Bools")
+        };
+        assert_eq!(answers.len(), ROWS as usize);
+        is_commit.release(out.universal_guard());
+        assert!(
+            released.borrow().iter().any(TileGuard::is_universal),
+            "the scrutinee is released whole: {:?}",
+            released.borrow()
+        );
+    }
+
+    #[test]
+    fn a_tag_test_reads_the_decisions_of_the_morsel() {
+        let (mut is_commit, pulled) = is_commit();
+        let morsel = is_commit.get(keys_between(2, 5));
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![2, 3, 4, 5]));
+        assert_eq!(
+            **codomain,
+            Tile::Scalar(ColumnValue::Bools(vec![true, false, true, false]))
+        );
+        assert_eq!(*pulled.borrow(), [keys_between(2, 5)]);
+    }
+
+    #[test]
+    fn a_tag_test_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 3), keys_between(6, 30)] {
+            assert_conforms(|| Box::new(is_commit().0), guard);
+        }
+    }
+
+    #[test]
+    fn nothing_tests_nothing() {
+        let (mut is_commit, pulled) = is_commit();
+        let nothing = is_commit.tiling().empty_guard();
+        assert_eq!(is_commit.get(nothing), is_commit.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 
     #[test]

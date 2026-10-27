@@ -2278,6 +2278,8 @@ mod projection_tests {
                 names: vec![tuple_field(0), tuple_field(1)],
                 inputs: vec![Box::new(a), Box::new(b)],
                 level: CurryLevel::new(1),
+                emitted: Predicate::False,
+                held: vec![HashSet::new(); 2],
             },
             a_pulled,
             b_pulled,
