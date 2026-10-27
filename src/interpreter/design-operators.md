@@ -495,6 +495,46 @@ without delivering it is a debug assertion failure, except during unwinding; the
 buffered but no consumer has been woken. [The notification contract](#the-notification-contract)
 specifies forwarding and reentrancy.
 
+### Projection guards
+
+A projection guard names the part of a producer's tile that a `get` asks for. The producer
+returns that part and nothing outside it, and states completeness only for that part.
+
+A projection (`Projection`) is everything, nothing, or the keys of one collection level that a
+predicate 𝑝 admits (`Projection::Keys`). At the outermost level its guard is `Domain(𝑝)`. At level 𝑛
+beneath it, 𝑝 admits whole paths ([Qualified predicates](#qualified-predicates)), and its guard
+wraps the domain guard in 𝑛 codomain guards (`CurryLevel::wrap_guard`). Two projections meet at the
+deeper of their levels, where a key above is every path beneath it, and a region of every path
+beneath some keys is spelled at the level of those keys (`Projection::keys_at`). Any other guard is
+a release's shape. Each producer declares the levels whose keys it restates
+(`TileProducer::restates`). `Restates::Outermost`, the default, names the outermost keys only.
+`Restates::Above(𝑛)` names the outermost keys and the levels above 𝑛, for a producer that keeps its
+input's keys above its level 𝑛 and computes the values beneath them. `Restates::Every` names every
+level. A producer that declares more than the outermost keys reads its projection with
+`TileGuard::projection_for`, and any other with `TileGuard::projection`. Either panics with the
+guard on a shape that is no projection or that names keys at a level the producer does not restate,
+as [Guard operations are exact](#guard-operations-are-exact) requires of a restatement with no
+spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
+(`src/interpreter/design-path-projections.md`, "Representation").
+
+- **The answer.** `Tile::restrict_to_keys` keeps the outermost keys 𝑝 admits, each with the value
+  under it, and intersects the tile's `domain_predicate` with 𝑝. A group is whole under its key. A
+  producer asked for part of its keys says nothing about the rest.
+- **The input.** An operator whose outermost keys are its input's forwards 𝑝 to the input, so the
+  input produces only that part. Its answer is built from the input's, so it does not cut, and its
+  operator test compares the answer with the whole answer cut to 𝑝. An operator that builds its
+  answer from anything else cuts: accumulators held across pulls (`MapAggregate`), arms already
+  released (`UnionOperator`), or a cache read at a wider region (`FanOutSlot`, `Memo`). An operator
+  whose output keys are not its input's keys, such as `Converse`, pulls the input in full and cuts
+  its own output. An operator that cannot restate 𝑝 for an input pulls the input in full and still
+  cuts its output: pulling more is sound for a `get`, where a release that names more is not.
+- **Release between pulls.** The completeness contract compares a producer's consecutive answers,
+  and a pull of one projection states completeness over its keys only. A consumer that pulls two
+  projections of one producer releases the first before the second.
+- **Test double.** `ProjectionSpy` answers a fixed tile cut to the guard it is pulled with, and
+  logs each projection and release it receives. An operator test pulls the operator over it and
+  reads the log to see the guard the operator restated.
+
 ### Producer attribution and probes
 
 Each `subscribe` returns one producer attributed to the operator that constructs it.

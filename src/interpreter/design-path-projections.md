@@ -1,0 +1,42 @@
+# Projections that name a path
+
+A projection names the part of a producer's tile a pull asks for
+(`src/interpreter/design-operators.md`, "Projection guards"). This note specifies projections that
+name keys at any collection level, each under the path of keys above it. A producer declares the
+levels whose keys it restates (`TileProducer::restates`, a `Restates`), the outermost keys only by
+default, and one that declares more reads its projection with `TileGuard::projection_for`.
+
+## Representation
+
+A projection at level 𝑛 names keys of level 𝑛, each under the path of keys above it. Level 0 is
+the outermost collection, and one variant spells every level:
+
+```rust
+pub enum Projection {
+    Everything,
+    Nothing,
+    /// Keys of level `level`, beneath the paths `keys` qualifies them by.
+    Keys { level: CurryLevel, keys: Predicate },
+}
+```
+
+At level 0, `keys` names no enclosing path. Beneath it, `keys` is a predicate over whole paths,
+spelled with `Predicate::Qualified`, which already names keys under enclosing paths
+(`Predicate::exactly`, `contains_path`, `descend`). Its guard is the domain guard of `keys` wrapped
+in a codomain guard per level above it (`CurryLevel::wrap_guard`). `Projection::of` reads that
+guard back, and so does it read an `Or` of such guards at several levels.
+
+Two projections at different levels meet at the deeper one: the keys `k` at level 0 are the paths
+`(k, *)` at level 1, `Predicate::qualified(k, True)`. `intersect`, `minus` and `union` lift the
+shallower side and combine the qualified predicates componentwise, which `Predicate` already does
+for `Qualified` (`Componentwise::Qualified`). A result that admits whole keys of a level above
+normalizes back to that level, so level 0 stays the spelling of an outermost region. The lift is
+exact because a codomain guard naming every key beneath a key names that key: a release of it drops
+the key (`a_codomain_release_drops_only_the_keys_it_names_whole`).
+
+`Tile::restrict_to` cuts at level 𝑛: it keeps the rows of level 𝑛 whose path the predicate admits,
+and a key above where an admitted path passes through it. A statement beneath level 𝑛 is
+qualified by the paths kept (`within_paths`). A statement above level 𝑛 keeps the keys whose every
+path the predicate admits, which the arms of the projection's guard name above level 𝑛, and states
+the rest of what it said at level 𝑛, cut to the predicate.
+
