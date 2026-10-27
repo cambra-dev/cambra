@@ -8,7 +8,7 @@ use crate::interpreter::nest_levels;
 use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::AggregateKind,
-    interpreter::{ColumnValue, Consumer, Scheduler, Value},
+    interpreter::{ColumnValue, Consumer, Projection, Scheduler, Value},
 };
 
 /// Reduces a `DataFunction` input to a single scalar via an aggregation operation.
@@ -122,7 +122,17 @@ impl TileProducer for AggregateProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    /// An accumulator has no keys to project, so the projection is all of it or none. The
+    /// input is read whole whatever the consumer asks.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        match projection_guard.projection(&self.name()) {
+            Projection::Everything => {}
+            Projection::Nothing => return self.tiling().empty_tile(),
+            Projection::Keys(_) => panic!(
+                "{} is one accumulator, which has no keys to project: {projection_guard:?}",
+                self.name()
+            ),
+        }
         if self.released {
             return self.tiling().empty_tile();
         }
@@ -1174,5 +1184,141 @@ mod tests {
             "the input settles (0, 0) at this level, and the output says nothing: \
              {domain_predicate:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod aggregate_projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, ints_by_position, keys_between,
+    };
+    use crate::interpreter::{BaseType, Extent, Tile};
+
+    /// `sum(xs)` over a finished stream `[1, 2, 3, 4]`, with the stream's pulls logged.
+    fn sum_of_finished_stream() -> (AggregateProducer, GuardLog) {
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(4),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (stream, pulled, _) =
+            ProjectionSpy::new(ints_by_position(&[1, 2, 3, 4], true), in_tiling);
+        let tiling = Tiling::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        };
+        (
+            AggregateProducer::new(
+                ProducerBase::unowned(AggregateProducer::alloc_id(), &tiling),
+                Box::new(stream),
+            ),
+            pulled,
+        )
+    }
+
+    /// `sum(evens ++ odds)` while the odd arm delivers late. Each pull of the union returns
+    /// what the arms hold and have not had released, and the aggregate releases what it folded,
+    /// so a row is folded once however many times the union is pulled: the sum grows by the
+    /// rows that arrive and by nothing else.
+    #[test]
+    fn a_sum_over_a_union_folds_each_row_once_across_pulls() {
+        use crate::interpreter::tile_operators::UnionOperator;
+        use crate::interpreter::tile_operators::test_helpers::{ScriptedOp, int_column};
+        use crate::interpreter::{FunctionGuard, Predicate, Scheduler, Value};
+
+        let stream = Tiling::data_function(
+            Extent::uint_range(8),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let TileGuard::Function(FunctionGuard::Domain(through_3)) = keys_between(0, 3) else {
+            unreachable!("keys_between names a key region")
+        };
+        let (even, _) = ScriptedOp::new(
+            int_column(vec![0, 2, 4, 6], Predicate::True),
+            stream.clone(),
+        );
+        let (odd, odd_cell) = ScriptedOp::new(int_column(vec![1, 3], through_3), stream);
+        let union = UnionOperator::new_flat(
+            vec![Box::new(even), Box::new(odd)],
+            Extent::Base(BaseType::Int),
+        );
+        let mut sum = Aggregate::new(Box::new(union), AggregateKind::Sum);
+        let mut scheduler = Scheduler::new();
+        let mut producer = sum.subscribe(
+            sum.tiling().universal_guard(),
+            Box::new(|| {}),
+            &mut scheduler,
+        );
+        let total = |tile: Tile| {
+            let Tile::Aggregation {
+                accumulator,
+                terminal,
+                ..
+            } = tile
+            else {
+                panic!("an aggregation, got {tile:?}")
+            };
+            (*accumulator, terminal)
+        };
+        let open = || ColumnValue::Bools(vec![false]);
+
+        // The odd arm has decided `0..=3` only, so the sum is a running one.
+        let (first, terminal) = total(producer.get(sum.tiling().universal_guard()));
+        assert_eq!(
+            first,
+            Tile::Scalar(ColumnValue::Ints(vec![1 + 2 + 3 + 4 + 6]))
+        );
+        assert_eq!(terminal, open());
+
+        // Nothing has arrived since, so the same pull adds nothing and stays open.
+        let (again, terminal) = total(producer.get(sum.tiling().universal_guard()));
+        assert_eq!(again, first);
+        assert_eq!(terminal, open());
+
+        // The odd arm delivers row 5 without finishing: the sum takes it once and stays open.
+        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5], Predicate::exactly(&[Value::UInt(5)]));
+        let (partial, terminal) = total(producer.get(sum.tiling().universal_guard()));
+        assert_eq!(partial, Tile::Scalar(ColumnValue::Ints(vec![16 + 5])));
+        assert_eq!(terminal, open());
+
+        // Both arms have now decided every position, so the sum is final.
+        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5, 7], Predicate::True);
+        let (last, terminal) = total(producer.get(sum.tiling().universal_guard()));
+        assert_eq!(last, Tile::Scalar(ColumnValue::Ints(vec![(0..8).sum()])));
+        assert_eq!(terminal, ColumnValue::Bools(vec![true]));
+    }
+
+    /// The fold reads the whole stream, and what it answers is one terminal accumulator.
+    #[test]
+    fn a_sum_reads_the_whole_stream() {
+        let (mut sum, pulled) = sum_of_finished_stream();
+        let tile = sum.get(sum.tiling().universal_guard());
+        let Tile::Aggregation {
+            accumulator,
+            terminal,
+            ..
+        } = tile
+        else {
+            panic!("an aggregation")
+        };
+        assert_eq!(*accumulator, Tile::Scalar(ColumnValue::Ints(vec![10])));
+        assert_eq!(terminal, ColumnValue::Bools(vec![true]));
+        assert_eq!(pulled.borrow().len(), 1);
+        assert!(pulled.borrow()[0].is_universal());
+    }
+
+    #[test]
+    fn a_sum_asked_for_nothing_reads_nothing() {
+        let (mut sum, pulled) = sum_of_finished_stream();
+        let tile = sum.get(sum.tiling().empty_guard());
+        assert_eq!(tile, sum.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "one accumulator")]
+    fn a_key_projection_of_a_sum_is_rejected() {
+        let (mut sum, _) = sum_of_finished_stream();
+        sum.get(keys_between(0, 1));
     }
 }
