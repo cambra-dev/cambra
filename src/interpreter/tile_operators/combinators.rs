@@ -1569,10 +1569,16 @@ impl TileProducer for ProductProducer {
         visit("inner", &*self.inner);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut outer_tile = self.outer.get(self.outer.tiling().universal_guard());
+    /// The two sides are aligned row for row, so a projection of the rows is a projection of
+    /// each side.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let mut outer_tile = self.outer.get(projection.guard(self.outer.tiling()));
         outer_tile.compact();
-        let mut inner_tile = self.inner.get(self.inner.tiling().universal_guard());
+        let mut inner_tile = self.inner.get(projection.guard(self.inner.tiling()));
         inner_tile.compact();
         // The two sides are pulled from their own branches, so a row is matched by its path.
         let (outer_paths, inner_row_at) = match self.level.enclosing() {
@@ -3705,5 +3711,175 @@ mod uncurry_projection_tests {
         let nothing = uncurry.tiling().empty_guard();
         assert_eq!(uncurry.get(nothing), uncurry.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
+    }
+}
+
+/// `Product` as a correlated inner comprehension uses it: `[(x, y) for x in xs for y in ys_of(x)]`
+/// pairs each row of `xs` with the keys of the collection that row holds. A worker owns a range
+/// of the rows.
+#[cfg(test)]
+mod product_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, ints_by_position, keys_between,
+    };
+    use bit_set::BitSet;
+
+    /// Four rows `100, 200, 300, 400`, row `i` holding a collection over the keys `0..=i`.
+    fn rows_and_their_keys() -> (ProductProducer, GuardLog, GuardLog) {
+        let outer = ints_by_position(&[100, 200, 300, 400], true);
+        let outer_tiling = Tiling::data_function(
+            Extent::uint_range(4),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let sizes = [1usize, 2, 3, 4];
+        let starts: Vec<usize> = sizes
+            .iter()
+            .scan(0, |at, n| {
+                let start = *at;
+                *at += n;
+                Some(start)
+            })
+            .collect();
+        let keys: Vec<u64> = sizes.iter().flat_map(|n| 0..*n as u64).collect();
+        let values: Vec<i64> = (0..keys.len() as i64).collect();
+        let inner = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1, 2, 3]),
+            Box::new(Tile::grouped(
+                starts,
+                ColumnValue::UInts(keys),
+                Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let inner_tiling = Tiling::data_function(
+            Extent::uint_range(4),
+            Tiling::data_function(
+                Extent::uint_range(4),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let out_tiling = outer_tiling.append_level(
+            Extent::uint_range(4),
+            Tiling::Scalar(Extent::Record(HashMap::from([
+                (tuple_field(0), Extent::Base(BaseType::Int)),
+                (tuple_field(1), Extent::uint_range(4)),
+            ]))),
+        );
+        let (outer, outer_pulled, _) = ProjectionSpy::new(outer, outer_tiling);
+        let (inner, inner_pulled, _) = ProjectionSpy::new(inner, inner_tiling);
+        (
+            ProductProducer {
+                base: ProducerBase::unowned(ProductProducer::alloc_id(), &out_tiling),
+                outer: Box::new(outer),
+                inner: Box::new(inner),
+                level: CurryLevel::OUTERMOST,
+                empty_level: out_tiling.empty_at_no_rows(),
+                pair: out_tiling.deepest_values().clone(),
+                second: Paired::Key,
+            },
+            outer_pulled,
+            inner_pulled,
+        )
+    }
+
+    #[test]
+    fn a_range_of_rows_pulls_both_sides_at_it() {
+        let (mut product, outer_pulled, inner_pulled) = rows_and_their_keys();
+        let rows = product.get(keys_between(1, 2));
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &rows
+        else {
+            panic!("a collection of rows")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![1, 2]));
+        let Tile::DataFunction { domain: keys, .. } = codomain.as_ref() else {
+            panic!("a collection per row")
+        };
+        assert_eq!(keys.len(), 2 + 3, "rows 1 and 2 hold two and three keys");
+        assert_eq!(*outer_pulled.borrow(), [keys_between(1, 2)]);
+        assert_eq!(*inner_pulled.borrow(), [keys_between(1, 2)]);
+    }
+
+    #[test]
+    fn a_range_of_rows_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 1), keys_between(3, 9)] {
+            assert_conforms(|| Box::new(rows_and_their_keys().0), guard);
+        }
+    }
+
+    /// An outer row whose inner collection has not arrived has no pairs yet and is not in the
+    /// output, and the output states complete only the rows both sides settle: the inner side
+    /// may still deliver rows 1 and 2, and a statement covering them would have a consumer
+    /// release them before they exist.
+    #[test]
+    fn a_row_with_no_inner_collection_yet_is_not_stated_complete() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let outer_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
+        let outer = ints_by_position(&[100, 200, 300], true);
+        let inner_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let inner = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::from_uints(vec![0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::exactly(&[Value::UInt(0)]),
+            BitSet::new(),
+        );
+        let out_tiling = outer_tiling.append_level(
+            uint(),
+            Tiling::Scalar(Extent::Record(HashMap::from([
+                (tuple_field(0), int()),
+                (tuple_field(1), uint()),
+            ]))),
+        );
+        let mut producer = ProductProducer {
+            base: ProducerBase::unowned(ProductProducer::alloc_id(), &out_tiling),
+            outer: Box::new(ProjectionSpy::new(outer, outer_tiling).0),
+            inner: Box::new(ProjectionSpy::new(inner, inner_tiling).0),
+            level: CurryLevel::OUTERMOST,
+            empty_level: out_tiling.empty_at_no_rows(),
+            pair: out_tiling.deepest_values().clone(),
+            second: Paired::Key,
+        };
+        let out = producer.get(out_tiling.universal_guard());
+        let Tile::DataFunction {
+            domain,
+            domain_predicate,
+            ..
+        } = &out
+        else {
+            panic!("Product tiles as a collection, got {out:?}")
+        };
+        assert_eq!(
+            *domain,
+            ColumnValue::UInts(vec![0]),
+            "rows 1 and 2 have no pairs yet"
+        );
+        for withheld in [1, 2] {
+            assert!(
+                !domain_predicate.contains(&Value::UInt(withheld)),
+                "row {withheld} may still be paired, so it is not complete: {domain_predicate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_pairs_nothing() {
+        let (mut product, outer_pulled, inner_pulled) = rows_and_their_keys();
+        let nothing = product.tiling().empty_guard();
+        assert_eq!(product.get(nothing), product.tiling().empty_tile());
+        assert!(outer_pulled.borrow().is_empty() && inner_pulled.borrow().is_empty());
     }
 }
