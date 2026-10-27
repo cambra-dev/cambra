@@ -11,13 +11,14 @@ use intervalsets::{Bounding, Interval, IntervalSet};
 
 use crate::{
     ccl::{
+        AggregateKind,
         context::{CompiledProgram, GlobalContext},
         provenance::NodeId,
     },
     interpreter::{
         Extent, FunctionGuard, LockNow, Predicate, Tile, TileGuard, Tiling, Value,
         operator_graph::{EdgeKind, EdgeRole, GraphNode, OperatorGraph},
-        tile_operators::TileProducer,
+        tile_operators::{TileOperator, TileProducer},
     },
 };
 
@@ -69,14 +70,28 @@ impl fmt::Display for Unsupported {
     }
 }
 
-/// The one pipeline shape the plan admits: `IterateExtent` over a finite range `[0, rows)`,
-/// then any number of `MapResult`s whose function operand is a `Constant`, into the `main`
-/// sink. Every operator in it is streaming, so a worker's chain holds no state between
-/// morsels, and the sink is the only breaker.
-#[derive(Debug)]
+/// The pipeline shape the plan admits: `IterateExtent` over a finite range `[0, rows)`, then
+/// any number of `MapResult`s whose function operand is a `Constant`, into the breaker. Every
+/// operator in the chain is streaming, so a worker's chain holds no state between morsels.
 pub struct MainPipeline {
     /// The positions the source enumerates, `0..rows`.
     pub rows: u64,
+    /// What the chain ends in.
+    pub breaker: Breaker,
+}
+
+/// The breaker a morsel pipeline ends in: what the pool keeps between morsels, and how it
+/// answers the `main` output.
+pub enum Breaker {
+    /// The `main` sink itself: the collection, merged morsel by morsel.
+    Collect,
+    /// An `Aggregate` read by an `ExtractAggregate` into `main`: a fold the pool keeps as one
+    /// accumulator per worker and combines once every morsel is folded.
+    Fold {
+        kind: AggregateKind,
+        /// The accumulator's tiling, which seeds each worker's partial.
+        accumulator: Tiling,
+    },
 }
 
 /// Cut `graph` into the plan the pool runs, or say why it cannot.
@@ -100,6 +115,28 @@ pub fn plan_main(graph: &OperatorGraph) -> Result<MainPipeline, Unsupported> {
         }
     }
     let mut at = main.ok_or_else(|| Unsupported("the program has no `main` output".into()))?;
+    // The breaker is read off the top of the chain: an extract over a fold, or the sink.
+    let mut breaker = Breaker::Collect;
+    if let Some(GraphNode::Operator {
+        kind: "ExtractAggregate",
+        inputs,
+        ..
+    }) = by_id.get(&at)
+        && let [edge] = inputs.as_slice()
+        && let Some(GraphNode::Operator {
+            kind: "Aggregate",
+            tiling: Tiling::Aggregation { kind, accumulator },
+            inputs: fold_inputs,
+            ..
+        }) = by_id.get(&edge.subscribed)
+        && let [fold_edge] = fold_inputs.as_slice()
+    {
+        breaker = Breaker::Fold {
+            kind: *kind,
+            accumulator: (**accumulator).clone(),
+        };
+        at = fold_edge.subscribed;
+    }
     loop {
         match by_id.get(&at) {
             Some(GraphNode::Operator {
@@ -160,9 +197,10 @@ pub fn plan_main(graph: &OperatorGraph) -> Result<MainPipeline, Unsupported> {
                 };
                 return match set.intervals().as_slice() {
                     // An empty literal is the range `[0, 0)`.
-                    [] => Ok(MainPipeline { rows: 0 }),
+                    [] => Ok(MainPipeline { rows: 0, breaker }),
                     [one] if one.lval() == Some(&0) && one.rval().is_some() => Ok(MainPipeline {
                         rows: one.rval().map_or(0, |last| last + 1),
+                        breaker,
                     }),
                     _ => Err(Unsupported(format!(
                         "the source iterates `{tiling}`, and only a finite `[0, n)` is cut into \
@@ -182,15 +220,16 @@ pub fn plan_main(graph: &OperatorGraph) -> Result<MainPipeline, Unsupported> {
     }
 }
 
-/// Run `program`'s `main` output on `config.threads` workers and return the whole collection,
+/// Run `program`'s `main` output on `config.threads` workers and return what `main` holds,
 /// complete, or say why the program is not one the pool runs.
 ///
-/// Each worker owns one subscription of the chain. The pipeline's head publishes one
-/// [`WorkPackage`] per morsel into the [`Dispatcher`] and closes the pipeline; each worker takes
-/// packages from the dispatcher, pulls its chain at the package's guard, hands the tile to the
-/// collector, releases the morsel once the collector holds it, and acknowledges the package.
-/// The collector is the sink: it merges the workers' tiles and calls the collection complete
-/// once the dispatcher reports the pipeline done.
+/// Each worker owns one subscription of the chain under the breaker. The pipeline's head
+/// publishes one [`WorkPackage`] per morsel into the [`Dispatcher`] and closes the pipeline;
+/// each worker takes packages, pulls its chain at the package's guard, hands the tile to the
+/// breaker, releases the morsel once the breaker holds its rows, and acknowledges the package.
+/// A collection is merged into one shared tile, the sink; a fold is accumulated per worker and
+/// the partials are combined once every worker has returned: every package was acknowledged and
+/// every fold worker has handed in its partial.
 pub fn run_main(
     ctx: &mut GlobalContext,
     program: &mut CompiledProgram,
@@ -200,15 +239,23 @@ pub fn run_main(
     let output = program
         .main_mut()
         .ok_or_else(|| Unsupported("the program has no `main` output".into()))?;
-    let tiling = output.op.tiling().clone();
+    // The chain the workers subscribe: the whole output for a collection, the fold's input
+    // for a fold, reached through the extract and the fold the plan saw.
+    let chain_op: &mut dyn TileOperator = match pipeline.breaker {
+        Breaker::Collect => &mut *output.op,
+        Breaker::Fold { .. } => output
+            .op
+            .pool_input()
+            .and_then(TileOperator::pool_input)
+            .expect(
+                "the plan saw an extract over a fold, and both reach through to the fold's input",
+            ),
+    };
+    let tiling = chain_op.tiling().clone();
     // One chain per pipeline per worker, indexed by `PipelineId`: the plan has one pipeline.
     let mut chains: Vec<Vec<Box<dyn TileProducer>>> = (0..config.threads.max(1))
         .map(|_| {
-            vec![
-                output
-                    .op
-                    .subscribe(tiling.universal_guard(), Box::new(|| {}), ctx.scheduler()),
-            ]
+            vec![chain_op.subscribe(tiling.universal_guard(), Box::new(|| {}), ctx.scheduler())]
         })
         .collect();
     let dispatcher = Dispatcher::new(1);
@@ -217,7 +264,16 @@ pub fn run_main(
         rows: pipeline.rows,
         morsel_rows: config.morsel_rows.max(1),
     };
-    let collector = Mutex::new(tiling.empty_tile());
+    let breaker = match &pipeline.breaker {
+        Breaker::Collect => PoolBreaker::Collect {
+            collector: Mutex::new(tiling.empty_tile()),
+        },
+        Breaker::Fold { kind, accumulator } => PoolBreaker::Fold {
+            kind: *kind,
+            seed: kind.initial_accumulator(accumulator),
+            partials: Mutex::new(Vec::new()),
+        },
+    };
     // The chains are lent to the workers and dropped here, after the scope, one at a time:
     // a producer's drop detaches its probe with a lock that must not find the probe table
     // held by another worker's `get`.
@@ -226,8 +282,8 @@ pub fn run_main(
         // workers already running.
         let _fail = FailOnUnwind(&dispatcher);
         for worker_chains in chains.iter_mut() {
-            let (dispatcher, collector) = (&dispatcher, &collector);
-            scope.spawn(move || run_worker(worker_chains, dispatcher, collector));
+            let (dispatcher, breaker) = (&dispatcher, &breaker);
+            scope.spawn(move || run_worker(worker_chains, dispatcher, breaker));
         }
         // The head runs on the calling thread while the workers drain the dispatcher.
         head.run(&dispatcher);
@@ -237,38 +293,114 @@ pub fn run_main(
         dispatcher.is_done(MAIN_PIPELINE),
         "every worker returned, so the dispatcher drained a closed pipeline"
     );
-    let mut tile = collector
-        .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // The head published every row of `[0, rows)` and closed the pipeline, and every package
-    // was acknowledged after its rows were merged, so the statement the universal pull makes,
-    // `True`, is the collection's.
-    if let Tile::DataFunction {
-        domain_predicate, ..
-    } = &mut tile
-    {
-        *domain_predicate = Predicate::True;
+    Ok(breaker.finish())
+}
+
+/// The breaker's state while the workers run.
+enum PoolBreaker {
+    /// The collection, merged morsel by morsel.
+    Collect {
+        // shared-state-ok: the sink's own state. Every worker merges into it, and no operator
+        // reads it: it answers `main` once every worker has returned.
+        collector: Mutex<Tile>,
+    },
+    /// A fold: each worker folds its morsels into a partial of its own and hands the partial
+    /// in once, so nothing is shared on the morsel path.
+    Fold {
+        kind: AggregateKind,
+        seed: Tile,
+        // shared-state-ok: the breaker's own state, standing where the sink's cell stands for
+        // a collection. A worker hands its partial in once, after its last morsel, and no
+        // operator reads it: the combine runs after every worker has returned and answers
+        // `main`.
+        partials: Mutex<Vec<Tile>>,
+    },
+}
+
+impl PoolBreaker {
+    /// The answer once every worker has returned: complete, since the head published every row
+    /// of `[0, rows)`, every package was acknowledged after its rows reached the breaker, and
+    /// every fold worker has handed in its partial.
+    fn finish(self) -> Tile {
+        match self {
+            PoolBreaker::Collect { collector } => {
+                let mut tile = collector
+                    .into_inner()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // The statement the universal pull makes, `True`, is the collection's.
+                if let Tile::DataFunction {
+                    domain_predicate, ..
+                } = &mut tile
+                {
+                    *domain_predicate = Predicate::True;
+                }
+                tile
+            }
+            PoolBreaker::Fold {
+                kind,
+                seed,
+                partials,
+            } => {
+                let partials = partials
+                    .into_inner()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut total = seed;
+                for partial in &partials {
+                    kind.accumulate(&mut total, partial, 0, partial.rows());
+                }
+                // What `ExtractAggregate` emits once the fold is terminal.
+                kind.extract(total)
+            }
+        }
     }
-    Ok(tile)
 }
 
 /// One worker's loop: take a package, pull the morsel through the package's pipeline, hand
-/// the tile to the collector, release the morsel, acknowledge the package, until the
-/// dispatcher has none left.
+/// the tile to the breaker, release the morsel, acknowledge the package, until the dispatcher
+/// has none left. A fold worker then hands in its partial.
 fn run_worker(
     chains: &mut [Box<dyn TileProducer>],
     dispatcher: &Dispatcher,
-    collector: &Mutex<Tile>,
+    breaker: &PoolBreaker,
 ) {
     let _fail = FailOnUnwind(dispatcher);
+    let mut partial = match breaker {
+        PoolBreaker::Collect { .. } => None,
+        PoolBreaker::Fold { seed, .. } => Some(seed.clone()),
+    };
     while let Some(package) = dispatcher.next() {
         let chain = &mut chains[package.pipeline.0];
-        let tile = chain.get(package.guard.clone());
-        collector.lock_wait().merge(tile);
-        // The release is the sink's acknowledgement: the source may reclaim the morsel only
-        // once the collector holds its rows.
+        let mut tile = chain.get(package.guard.clone());
+        match (breaker, &mut partial) {
+            (PoolBreaker::Collect { collector }, _) => collector.lock_wait().merge(tile),
+            (PoolBreaker::Fold { kind, .. }, Some(partial)) => {
+                // What `AggregateProducer` folds: the values under the keys, deleted rows
+                // compacted away.
+                tile.compact();
+                let Tile::DataFunction {
+                    domain, codomain, ..
+                } = tile
+                else {
+                    panic!("a fold's input is a collection, got {tile:?}");
+                };
+                // A collection's merge rejects a key answered outside its morsel or twice;
+                // a fold would count it silently, so the check is made here.
+                debug_assert!(
+                    (0..domain.len()).all(|row| package.guard.covers_path(&[domain.index_at(row)])),
+                    "a morsel's chain answers keys inside the morsel only, got {domain:?} for {:?}",
+                    package.guard
+                );
+                kind.accumulate(partial, &codomain, 0, codomain.rows());
+            }
+            (PoolBreaker::Fold { .. }, None) => unreachable!("a fold worker holds a partial"),
+        }
+        // The release is the breaker's acknowledgement: the source may reclaim the morsel
+        // only once the collector or the worker's partial holds its rows.
         chain.release(package.guard.clone());
         dispatcher.ack(package);
+    }
+    if let (PoolBreaker::Fold { partials, .. }, Some(partial)) = (breaker, partial) {
+        partials.lock_wait().push(partial);
     }
 }
 

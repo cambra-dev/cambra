@@ -4,12 +4,14 @@
 
 use cambra::{
     ccl::{
+        AggregateKind,
         context::{GlobalContext, compile_program},
         load::LoadedProgram,
     },
     interpreter::{
-        ColumnValue, Consumer, FunctionGuard, Predicate, Tile, TileGuard, Value,
-        parallel::{Config, plan_main, run_main},
+        BaseType, ColumnValue, Consumer, Extent, FunctionGuard, Predicate, Tile, TileGuard, Tiling,
+        Value,
+        parallel::{Breaker, Config, plan_main, run_main},
     },
 };
 
@@ -17,6 +19,11 @@ use cambra::{
 fn program(rows: u64) -> String {
     let items: Vec<String> = (0..rows).map(|i| i.to_string()).collect();
     format!("[x + 1 for x in [{}]]", items.join(", "))
+}
+
+/// `fold([x + 1 for x in [0, 1, …, rows - 1]])`: the same chain into an aggregate.
+fn folded(fold: &str, rows: u64) -> String {
+    format!("{fold}({})", program(rows))
 }
 
 /// The collection as `(position, value)` pairs in position order, whatever order the tile
@@ -38,10 +45,10 @@ fn entries(tile: &Tile) -> Vec<(u64, i64)> {
     pairs
 }
 
-/// The program's `main` output pulled whole on this thread, as the scheduler loop pulls it.
-fn pulled_whole(rows: u64) -> Vec<(u64, i64)> {
+/// `source`'s `main` output pulled whole on this thread, as the scheduler loop pulls it.
+fn whole_pull(source: String) -> Tile {
     let mut ctx = GlobalContext::default();
-    let loaded = LoadedProgram::test(program(rows));
+    let loaded = LoadedProgram::test(source);
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
     ctx.scheduler().check_for_notifications();
@@ -54,7 +61,25 @@ fn pulled_whole(rows: u64) -> Vec<(u64, i64)> {
         tile.is_terminal(),
         "a literal source is complete on its first pull"
     );
-    entries(&tile)
+    tile
+}
+
+/// The collection program's `main` output pulled whole, as position-ordered pairs.
+fn pulled_whole(rows: u64) -> Vec<(u64, i64)> {
+    entries(&whole_pull(program(rows)))
+}
+
+/// `source` run on four workers with a morsel size that does not divide its rows.
+fn four_workers(source: String) -> Tile {
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(source);
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
+    let config = Config {
+        threads: 4,
+        morsel_rows: 7,
+    };
+    run_main(&mut ctx, &mut compiled, &config).expect("a morsel pipeline")
 }
 
 /// `Domain([first, last])`.
@@ -105,21 +130,45 @@ fn two_chains_pulled_at_disjoint_guards_merge_to_the_whole_pull() {
 #[test]
 fn four_workers_produce_what_one_pull_produces() {
     let rows = 1000;
-    let mut ctx = GlobalContext::default();
-    let loaded = LoadedProgram::test(program(rows));
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let mut compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
-    let config = Config {
-        threads: 4,
-        // Not a divisor of the row count, so the last morsel is short.
-        morsel_rows: 7,
-    };
-    let tile = run_main(&mut ctx, &mut compiled, &config).expect("a morsel pipeline");
+    let tile = four_workers(program(rows));
     assert!(
         tile.is_terminal(),
         "the collector calls the collection complete"
     );
     assert_eq!(entries(&tile), pulled_whole(rows));
+}
+
+/// A fold is kept per worker and combined once every morsel is folded: the three kinds a
+/// literal admits give what the one pull gives, and the result is terminal. With three rows
+/// and four workers, a worker takes no package and hands in its seed, which the combine must
+/// take as a unit.
+#[test]
+fn four_workers_fold_what_one_pull_folds() {
+    for fold in ["sum", "max", "min"] {
+        for rows in [1000, 3] {
+            let tile = four_workers(folded(fold, rows));
+            assert!(
+                tile.is_terminal(),
+                "{fold} over {rows}: the fold is complete: {tile:?}"
+            );
+            assert_eq!(tile, whole_pull(folded(fold, rows)), "{fold} over {rows}");
+        }
+    }
+}
+
+#[test]
+fn the_plan_reads_the_fold_off_the_extract() {
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(folded("sum", 3));
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
+    let pipeline = plan_main(&compiled.operator_graph).expect("a fold is a breaker the pool runs");
+    assert_eq!(pipeline.rows, 3);
+    let Breaker::Fold { kind, accumulator } = pipeline.breaker else {
+        panic!("a fold, not the sink");
+    };
+    assert_eq!(kind, AggregateKind::Sum);
+    assert_eq!(accumulator, Tiling::Scalar(Extent::Base(BaseType::Int)));
 }
 
 #[test]
@@ -138,14 +187,16 @@ fn one_worker_produces_what_one_pull_produces() {
 }
 
 #[test]
-fn a_program_with_a_breaker_is_not_a_morsel_pipeline() {
+fn a_program_with_another_breaker_is_not_a_morsel_pipeline() {
     let mut ctx = GlobalContext::default();
-    let loaded = LoadedProgram::test("sum([x + 1 for x in [1, 2, 3]])");
+    let loaded = LoadedProgram::test("[sum(g) for g in groupby([1, 2, 3, 4], \\x -> x // 2)]");
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
-    let refused = plan_main(&compiled.operator_graph).expect_err("an aggregate is a breaker");
+    let refused = plan_main(&compiled.operator_graph)
+        .err()
+        .expect("a group-by has breakers the pool does not run");
     assert!(
-        refused.to_string().contains("not a streaming operator"),
+        refused.to_string().contains("is not a streaming operator"),
         "{refused}"
     );
 }

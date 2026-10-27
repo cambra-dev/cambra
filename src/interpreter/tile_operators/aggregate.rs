@@ -49,6 +49,10 @@ impl TileOperator for Aggregate {
         visit(value("input", &*self.input));
     }
 
+    fn pool_input(&mut self) -> Option<&mut dyn TileOperator> {
+        Some(&mut *self.input)
+    }
+
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -216,6 +220,10 @@ impl TileOperator for ExtractAggregate {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
+    }
+
+    fn pool_input(&mut self) -> Option<&mut dyn TileOperator> {
+        Some(&mut *self.input)
     }
 
     fn subscribe(

@@ -120,6 +120,14 @@ pub trait TileOperator: Send + Sync {
         short_type_name::<Self>()
     }
 
+    /// The next operator on the path from this one to the chain a worker pool subscribes: an
+    /// `ExtractAggregate` answers its fold, an `Aggregate` the input it folds, and every other
+    /// operator `None`, which `run_main` never consults because `plan_main` admits only those
+    /// two above the chain (`src/interpreter/design-parallel.md`, "A fold as the breaker").
+    fn pool_input(&mut self) -> Option<&mut dyn TileOperator> {
+        None
+    }
+
     /// Constructs one producer for `consumer` over the requested `intent_guard` region.
     /// Its [`ProducerBase`] names this operator and holds `scheduler`'s probe slot.
     /// An input's producer comes from the input's own `subscribe`, which attributes it

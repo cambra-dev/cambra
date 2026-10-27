@@ -775,10 +775,10 @@ Ordered so that each step is measurable on its own and none is undone by the nex
    `~/.claude/projects/-Users-leon-dev-cambra/viz/`. This is the serial cost that would otherwise
    be parallelized as-is.
 5. **A worker pool and the first breaker.** The pool, the dispatcher with a range head, and the sink
-   as the breaker landed for `[x + 1 for x in xs]` over a literal list
-   (`src/interpreter/design-parallel.md`, "The morsel prototype"). Next: `Aggregate` over a source,
-   with `N` workers each folding their morsels into a per-worker partial and the extract combining.
-   Measures the chain's scaling with no exchange.
+   as the breaker landed for `[x + 1 for x in xs]` over a literal list, and `Aggregate` over it as
+   the first folding breaker, with a partial per worker combined at the end
+   (`src/interpreter/design-parallel.md`, "A fold as the breaker"). Next: the same over a source,
+   which is where the chain's scaling with no exchange is measured.
 6. **The grouped fold.** The planning rewrite that fuses `converse(c ≫ key) ≫ map(c ≫ v) ≫
    map_aggregate(kind)` into one fold over `pos ↦ (key, v)`, with thread-local tables and the
    sequential merge. This is the group-by's parallel form and removes the second memo reader.

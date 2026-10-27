@@ -67,42 +67,45 @@ set.
 ### The plan
 
 `plan_main` cuts the operator graph the way [docs/parallel-execution.md, "The pipeline
-plan"](../../docs/parallel-execution.md#the-pipeline-plan) describes, for one pipeline shape:
-`IterateExtent` over a finite range `[0, rows)`, any number of `MapResult`s whose function operand
-is a `Constant`, and the `main` sink. Every operator in the chain is streaming, so a worker's chain
-holds no state between morsels, and the sink is the one breaker. A graph with any other node on the
+plan"](../../docs/parallel-execution.md#the-pipeline-plan) describes, for one chain shape:
+`IterateExtent` over a finite range `[0, rows)`, then any number of `MapResult`s whose function
+operand is a `Constant`, into the breaker, which is the `main` sink or an `ExtractAggregate` over an
+`Aggregate` into it ([A fold as the breaker](#a-fold-as-the-breaker)). Every operator in the chain
+is streaming, so a worker's chain holds no state between morsels. A graph with any other node on the
 path, a source over anything but `[0, rows)`, or a sink besides `main` is refused with the reason,
-which the binary prints. The program this admits is `[x + 1 for x in xs]` over a literal list; a
-source over a data-source domain is the next shape.
+which the binary prints. The programs this admits are `[x + 1 for x in xs]` over a literal list and
+a `sum`, `max` or `min` of it; a source over a data-source domain is the next shape.
 
 ### The pool
 
-`run_main` subscribes the `main` operator once per worker, so each worker owns one producer chain,
-as [docs/parallel-execution.md, "Thread-confined chains, shared
+`run_main` subscribes the chain under the breaker once per worker, so each worker owns one producer
+chain, as [docs/parallel-execution.md, "Thread-confined chains, shared
 breakers"](../../docs/parallel-execution.md#thread-confined-chains-shared-breakers) asks. An
 operator is subscribed as many times as there are workers; nothing is cloned, because the chain is a
 tree of boxed operators each subscription walks afresh. A worker holds its chains in a vector
 indexed by `PipelineId`, which holds one entry, since the plan holds one pipeline. The threads are
 `std::thread::scope` threads over `run_worker`; the head runs on the calling thread inside the same
-scope, so the workers drain the dispatcher while the head fills it. The collector is the sink: a
-`Mutex<Tile>` the workers merge into with `Tile::merge`, which calls the collection complete once
-every worker has returned, every package acknowledged after its rows were merged.
+scope, so the workers drain the dispatcher while the head fills it. For a collection the breaker's
+state is the collector, the sink: a `Mutex<Tile>` the workers merge into with `Tile::merge`, which
+calls the collection complete once every worker has returned, every package acknowledged after its
+rows were merged. For a fold it is the partials of [A fold as the breaker](#a-fold-as-the-breaker).
 
 The chains are lent to the workers and dropped after the scope, one at a time on the thread that
 subscribed them: a producer's drop detaches its probe with a lock that must not find the probe table
 held by another worker's `get`.
 
-A worker releases a morsel on its chain only after the collector holds the morsel's tile. That
-release is the sink's acknowledgement ([docs/parallel-execution.md, "A release must mean durably
+A worker releases a morsel on its chain only after the breaker holds the morsel's rows: the
+collector's tile, or the worker's own partial for a fold. That release is the breaker's
+acknowledgement ([docs/parallel-execution.md, "A release must mean durably
 consumed"](../../docs/parallel-execution.md#a-release-must-mean-durably-consumed)), and it is also
 what keeps the chain's producers consistent with the completeness contract: a producer's next pull
 states a different interval complete, which it may do only where the previous one was released.
 
 The cells workers contend on take a blocking lock, `LockNow::lock_wait`: the probe table's
-`observe_named`, which every `get` calls, the collector, and the dispatcher's state. Every other
-cell keeps the panic-on-contention lock, because a worker's chain is its own and never shares a cell
-with another worker's; the probe table's readers are on the thread that runs the inspector, which a
-parallel run refuses.
+`observe_named`, which every `get` calls, the collector, the fold's partials, and the dispatcher's
+state. Every other cell keeps the panic-on-contention lock, because a worker's chain is its own and
+never shares a cell with another worker's; the probe table's readers are on the thread that runs the
+inspector, which a parallel run refuses.
 
 ### The dispatcher
 
@@ -118,7 +121,7 @@ calls:
 - `close` records that the pipeline's head publishes no more.
 - `next` answers the oldest queued package and counts it taken; with the queue empty it waits on
   the `Condvar` while a pipeline is open, and answers `None` once every pipeline is closed.
-- `ack` counts a taken package back, once its morsel is merged and released.
+- `ack` counts a taken package back, once the breaker holds its rows and the morsel is released.
 - `is_done` says whether a pipeline is closed with none of its packages queued or taken.
 - `fail` makes every `next` answer `None` from then on.
 
@@ -152,24 +155,48 @@ on three of them:
   operands"](../../docs/parallel-execution.md#function-operands) names, for the one case the
   correlation makes checkable.
 
+### A fold as the breaker
+
+A `main` output that is an `ExtractAggregate` over an `Aggregate` is a fold, and the plan reads the
+fold off those two nodes: `Breaker::Fold` carries the `AggregateKind` and the accumulator's tiling
+from the `Aggregate`'s own. The chain the workers subscribe is the fold's input, reached through
+`TileOperator::pool_input`, which `ExtractAggregate` answers with its fold and `Aggregate` with its
+input; every other operator answers `None`, which `run_main` never consults, since `plan_main`
+admits only those two above the chain.
+
+The fold is the per-worker state the target design gives `Aggregate` ([docs/parallel-execution.md,
+"Per-breaker state models"](../../docs/parallel-execution.md#per-breaker-state-models)): each worker
+seeds a partial with `AggregateKind::initial_accumulator`, folds every morsel's values into it with
+`accumulate`, the call `AggregateProducer` makes, and hands the partial in once, after its last
+morsel, so nothing is shared on the morsel path. Once every worker has returned, the partials are
+combined into the seed with the same `accumulate`, which is the combine `Tile::merge` performs on
+two aggregation tiles, and `extract` turns the total into the scalar `ExtractAggregate` emits. The
+partials are bare accumulators: the terminal flag `AggregateProducer` sets on its aggregation tile
+is never built on the pool, and the scalar `extract` answers is terminal by holding a value, which
+it does once every worker has returned. Every `AggregateKind` combines in any order, and its seed is
+a unit of the combine, so a worker that takes no package hands in a partial that changes nothing,
+and the partials are pushed in whichever order the workers finish.
+
 ### Tests
 
 `tests/it/parallel.rs`: two chains pulled at disjoint guards and merged equal the whole pull, and
 each chain's next pull past its released interval answers the rest; four workers over a thousand
-rows with a morsel size that does not divide them equal the whole pull and are terminal; one worker
-equals the whole pull; a program with an aggregate is refused. The three producers each have a unit
-test of the interval they hand out and the release that follows (`map.rs`, `scalar.rs`,
-`iterate.rs`). The dispatcher's unit tests in `parallel.rs`: a range head publishes disjoint morsels
-covering its range and closes; an empty range publishes nothing and is done; a taken package keeps
-its pipeline from being done until it is acknowledged; a waiting worker wakes on a publish and on a
-close; a panicking worker releases the waiting ones.
+rows with a morsel size that does not divide them equal the whole pull and are terminal, for the
+collection and for `sum`, `max` and `min` over it, and the folds again over three rows, where a
+worker takes no package; one worker equals the whole pull; the plan reads a fold off the extract; a
+group-by is refused. The three producers each have a unit test of the interval they hand out and the
+release that follows (`map.rs`, `scalar.rs`, `iterate.rs`). The dispatcher's unit tests in
+`parallel.rs`: a range head publishes disjoint morsels covering its range and closes; an empty range
+publishes nothing and is done; a taken package keeps its pipeline from being done until it is
+acknowledged; a waiting worker wakes on a publish and on a close; a panicking worker releases the
+waiting ones.
 
 ## Not yet implemented
 
-A breaker other than the sink, a source over a data-source domain, a pipeline plan over more than
-one pipeline, a dispatcher over more than one pipeline with heads that publish as rows arrive, and
-the sink pulls the scheduler loop queues. Before a data-source head lands, the `main` producer
-`compile_program` subscribes has to be owned by the pool: it registers a release record of `False`
-with the source, and a source agrees to reclaim only what every record releases, so an idle producer
-pins the source. Every program the plan refuses runs on the thread that compiled it, through
-`Scheduler::check_for_notifications` and the sink pulls it queues.
+A breaker other than the sink and a fold into `main`, a source over a data-source domain, a pipeline
+plan over more than one pipeline, a dispatcher over more than one pipeline with heads that publish
+as rows arrive, and the sink pulls the scheduler loop queues. Before a data-source head lands, the
+`main` producer `compile_program` subscribes has to be owned by the pool: it registers a release
+record of `False` with the source, and a source agrees to reclaim only what every record releases,
+so an idle producer pins the source. Every program the plan refuses runs on the thread that compiled
+it, through `Scheduler::check_for_notifications` and the sink pulls it queues.
