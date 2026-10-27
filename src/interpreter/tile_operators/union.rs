@@ -5,7 +5,9 @@ use crate::interpreter::live_keys;
 use crate::interpreter::operator_graph::value_at;
 use crate::{
     ccl::TagMap,
-    interpreter::{ColumnValue, Consumer, Extent, Scheduler, UnionArm, Value, shared_consumer},
+    interpreter::{
+        ColumnValue, Consumer, Extent, Projection, Scheduler, UnionArm, Value, shared_consumer,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -477,46 +479,9 @@ impl UnionProducer {
             flat_merge(per_arm, domain_extent, codomain_tiling)
         })
     }
-}
 
-impl TileProducer for UnionProducer {
-    impl_producer_base!();
-
-    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        for (i, p) in self.inputs.iter().enumerate() {
-            visit(&format!("_{i}"), &**p);
-        }
-    }
-
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let tiles: Vec<Tile> = self
-            .inputs
-            .iter_mut()
-            .map(|p| {
-                // An arm the consumer has fully released contributes nothing.
-                // `release_impl` below splits a per-variant guard, so one arm can be
-                // universally released while its siblings are still producing — and
-                // released positions must never reappear in this operator's output.
-                // The arm still has to *appear* here, since the arms are
-                // positional, so it contributes an empty but **decided** tile: empty
-                // because its positions are released, decided because nothing more
-                // will ever arrive from it (the default `empty_tile` reads as "not
-                // ready", which would hold the union non-terminal forever).
-                if p.obsolete_guard().is_universal() {
-                    let mut released = p.tiling().empty_tile();
-                    if let Tile::DataFunction {
-                        domain_predicate, ..
-                    } = &mut released
-                    {
-                        *domain_predicate = Predicate::True;
-                    }
-                    released
-                } else {
-                    p.get(p.tiling().universal_guard())
-                }
-            })
-            .collect();
-
+    /// The arms' tiles as one tile of the union's tiling.
+    fn combine(&self, tiles: Vec<Tile>) -> Tile {
         if self.flat {
             // The merged column is described by the operator's *declared* tiling at
             // both ends: the domain the arms share, and the codomain shape the
@@ -627,6 +592,63 @@ impl TileProducer for UnionProducer {
             combined_deleted,
         )
     }
+}
+
+impl TileProducer for UnionProducer {
+    impl_producer_base!();
+
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        for (i, p) in self.inputs.iter().enumerate() {
+            visit(&format!("_{i}"), &**p);
+        }
+    }
+
+    /// A flat union's arms are disjoint slices of one collection, so each is pulled at the
+    /// projection and the merge is cut to it. A tagged union's keys carry the arm's tag, and
+    /// splitting a projection per arm is not implemented: only `Everything` and `Nothing`
+    /// reach it.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        assert!(
+            self.flat || projection == Projection::Everything,
+            "{} keys its rows by arm, which a projection over the keys cannot name: \
+             {projection_guard:?}",
+            self.name()
+        );
+        let tiles: Vec<Tile> = self
+            .inputs
+            .iter_mut()
+            .map(|p| {
+                // An arm the consumer has fully released contributes nothing.
+                // `release_impl` below splits a per-variant guard, so one arm can be
+                // universally released while its siblings are still producing — and
+                // released positions must never reappear in this operator's output.
+                // The arm still has to *appear* here, since the arms are
+                // positional, so it contributes an empty but **decided** tile: empty
+                // because its positions are released, decided because nothing more
+                // will ever arrive from it (the default `empty_tile` reads as "not
+                // ready", which would hold the union non-terminal forever).
+                if p.obsolete_guard().is_universal() {
+                    let mut released = p.tiling().empty_tile();
+                    if let Tile::DataFunction {
+                        domain_predicate, ..
+                    } = &mut released
+                    {
+                        *domain_predicate = Predicate::True;
+                    }
+                    released
+                } else {
+                    p.get(projection.guard(p.tiling()))
+                }
+            })
+            .collect();
+        let mut merged = self.combine(tiles);
+        merged.restrict_to(&projection, self.tiling());
+        merged
+    }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         match obsolete_guard {
@@ -652,7 +674,10 @@ impl TileProducer for UnionProducer {
             }
             // A **flat** union has one flat domain (not per-variant tags), so a released
             // region over it forwards to every arm — each arm holds a disjoint subset of
-            // it and ignores the rest. That holds whatever shape the region takes: a
+            // it and ignores the rest. The release names every key the consumer held,
+            // including keys outside what an arm has decided, which is sound only because
+            // the arms are disjoint: an arm that later delivered a key a sibling held would
+            // lose it to this release, as released data. That holds whatever shape the region takes: a
             // prefix of the positions, the `Codomain` half of a nested release, or the
             // `Or` of the two that `to_guard` emits for a collection of collections.
             // The arms share the flat domain's keys and may hold their values in different
@@ -1360,5 +1385,248 @@ mod tests {
             !keys.contains_path(&[Value::UInt(0), Value::UInt(5)]),
             "arm 1 may still deliver key 5 under row 0, so (0, 5) is not complete: {keys:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, ScriptedProducer, assert_conforms, int_column, int_entries,
+        keys_between,
+    };
+    use crate::interpreter::{BaseType, ColumnValue, Extent};
+
+    const ROWS: u64 = 8;
+
+    fn stream_tiling() -> Tiling {
+        Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
+    }
+
+    /// One arm of a split stream: the rows `keys` of `0..ROWS`, stated complete.
+    fn arm(
+        keys: impl Iterator<Item = u64>,
+        value: impl Fn(u64) -> i64,
+    ) -> (ProjectionSpy, GuardLog) {
+        let keys: Vec<u64> = keys.collect();
+        let values = keys.iter().map(|&key| value(key)).collect();
+        let tile = Tile::data_function(
+            ColumnValue::from_uints(keys),
+            Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let (spy, pulled, _) = ProjectionSpy::new(tile, stream_tiling());
+        (spy, pulled)
+    }
+
+    /// What a collection tile states complete.
+    fn stated(tile: &Tile) -> Predicate {
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = tile
+        else {
+            panic!("a collection, got {tile:?}")
+        };
+        domain_predicate.clone()
+    }
+
+    /// `[if even(x) then x * 10 else x for x in xs]`: a case splits a stream into an arm per
+    /// branch, and the branches merge back into one flat stream.
+    fn merged_branches(flat: bool) -> (UnionProducer, GuardLog, GuardLog) {
+        let (even, even_pulled) = arm((0..ROWS).filter(|k| k % 2 == 0), |k| k as i64 * 10);
+        let (odd, odd_pulled) = arm((0..ROWS).filter(|k| k % 2 == 1), |k| k as i64);
+        let producer = UnionProducer {
+            base: ProducerBase::unowned(UnionProducer::alloc_id(), &stream_tiling()),
+            level: CurryLevel::OUTERMOST,
+            inputs: vec![Box::new(even), Box::new(odd)],
+            flat,
+        };
+        (producer, even_pulled, odd_pulled)
+    }
+
+    /// A morsel of the merged stream pulls every branch at that morsel and answers the
+    /// morsel's rows in key order, each from the branch that produced it.
+    #[test]
+    fn a_morsel_of_merged_branches_pulls_each_branch_at_the_morsel() {
+        let (mut union, even_pulled, odd_pulled) = merged_branches(true);
+        let morsel = union.get(keys_between(2, 5));
+        assert_eq!(int_entries(&morsel), vec![(2, 20), (3, 3), (4, 40), (5, 5)]);
+        assert_eq!(*even_pulled.borrow(), vec![keys_between(2, 5)]);
+        assert_eq!(*odd_pulled.borrow(), vec![keys_between(2, 5)]);
+    }
+
+    /// The consumer releases a morsel before taking the next, and the branches are released
+    /// with it, so the next morsel is pulled at its own rows.
+    #[test]
+    fn successive_morsels_of_merged_branches_are_disjoint() {
+        let (mut union, even_pulled, _) = merged_branches(true);
+        union.get(keys_between(0, 3));
+        union.release(keys_between(0, 3));
+        let next = union.get(keys_between(4, 7));
+        assert_eq!(int_entries(&next), vec![(4, 40), (5, 5), (6, 60), (7, 7)]);
+        assert_eq!(even_pulled.borrow()[1], keys_between(4, 7));
+    }
+
+    #[test]
+    fn the_morsels_together_are_the_whole_pull() {
+        for guard in [keys_between(0, 3), keys_between(2, 5), keys_between(5, 5)] {
+            assert_conforms(|| Box::new(merged_branches(true).0), guard);
+        }
+    }
+
+    /// A released arm contributes an empty tile that states every key decided. Once every arm is
+    /// released, a morsel is the empty merge and states completeness over the morsel only.
+    #[test]
+    fn a_morsel_after_every_arm_is_released_states_completeness_over_the_morsel() {
+        let (mut union, _, _) = merged_branches(true);
+        union.get(keys_between(0, 3));
+        union.release(stream_tiling().universal_guard());
+        let next = union.get(keys_between(4, 7));
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &next
+        else {
+            panic!("a collection, got {next:?}")
+        };
+        let TileGuard::Function(FunctionGuard::Domain(asked)) = keys_between(4, 7) else {
+            unreachable!("keys_between names a key region")
+        };
+        assert_eq!(*domain_predicate, asked);
+    }
+
+    /// One pull of `0..=7` while the odd arm has decided only `0..=3`. The merge answers what
+    /// both arms hold and states completeness for `0..=3` alone, so the consumer can tell that
+    /// `4..=7` is still open. The odd arm then grows over the rest, and the same ask answers the
+    /// whole range: the rows the arm held back appear in the second answer.
+    #[test]
+    fn an_arm_that_grows_after_the_ask_is_merged_on_the_next_pull() {
+        let TileGuard::Function(FunctionGuard::Domain(through_3)) = keys_between(0, 3) else {
+            unreachable!("keys_between names a key region")
+        };
+        let (even, _) = ScriptedProducer::new(
+            int_column(vec![0, 2, 4, 6], Predicate::True),
+            stream_tiling(),
+        );
+        let (odd, odd_cell) =
+            ScriptedProducer::new(int_column(vec![1, 3], through_3.clone()), stream_tiling());
+        let mut union = UnionProducer {
+            base: ProducerBase::unowned(UnionProducer::alloc_id(), &stream_tiling()),
+            level: CurryLevel::OUTERMOST,
+            inputs: vec![Box::new(even), Box::new(odd)],
+            flat: true,
+        };
+
+        let first = union.get(keys_between(0, 7));
+        assert_eq!(
+            int_entries(&first),
+            vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (6, 6)]
+        );
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &first
+        else {
+            panic!("a collection, got {first:?}")
+        };
+        assert_eq!(
+            *domain_predicate, through_3,
+            "only the odd arm's decided prefix is complete"
+        );
+
+        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5, 7], Predicate::True);
+        let second = union.get(keys_between(0, 7));
+        assert_eq!(
+            int_entries(&second),
+            (0..8).map(|k| (k, k as i64)).collect::<Vec<_>>()
+        );
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &second
+        else {
+            panic!("a collection, got {second:?}")
+        };
+        let TileGuard::Function(FunctionGuard::Domain(asked)) = keys_between(0, 7) else {
+            unreachable!("keys_between names a key region")
+        };
+        assert_eq!(
+            *domain_predicate, asked,
+            "every arm has now decided the whole ask"
+        );
+    }
+
+    /// A consumer that takes the merged stream more than once, releasing what it holds each
+    /// time, sees every row once: a row it released does not come back from either arm, however
+    /// often the union is pulled while an arm is still delivering.
+    #[test]
+    fn a_union_pulled_repeatedly_delivers_each_row_once() {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedOp;
+
+        let TileGuard::Function(FunctionGuard::Domain(through_3)) = keys_between(0, 3) else {
+            unreachable!("keys_between names a key region")
+        };
+        let (even, _) = ScriptedOp::new(
+            int_column(vec![0, 2, 4, 6], Predicate::True),
+            stream_tiling(),
+        );
+        let (odd, odd_cell) =
+            ScriptedOp::new(int_column(vec![1, 3], through_3.clone()), stream_tiling());
+        let mut operator = UnionOperator::new_flat(
+            vec![Box::new(even), Box::new(odd)],
+            Extent::Base(BaseType::Int),
+        );
+        let mut scheduler = Scheduler::new();
+        let mut union = operator.subscribe(
+            operator.tiling().universal_guard(),
+            Box::new(|| {}),
+            &mut scheduler,
+        );
+
+        let first = union.get(keys_between(0, ROWS - 1));
+        assert_eq!(
+            int_entries(&first),
+            vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (6, 6)]
+        );
+        union.release(first.to_guard());
+
+        // Nothing new has arrived, so nothing comes back, and the statement is still the odd
+        // arm's decided prefix.
+        let idle = union.get(keys_between(0, ROWS - 1));
+        assert!(int_entries(&idle).is_empty());
+        assert_eq!(stated(&idle), through_3);
+
+        // The odd arm delivers some of what is left without finishing: row 5 arrives, the
+        // range stays open, and row 5 is the only row delivered.
+        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5], Predicate::exactly(&[Value::UInt(5)]));
+        let partial = union.get(keys_between(0, ROWS - 1));
+        assert_eq!(int_entries(&partial), vec![(5, 5)]);
+        union.release(partial.to_guard());
+
+        *odd_cell.borrow_mut() = int_column(vec![1, 3, 5, 7], Predicate::True);
+        let last = union.get(keys_between(0, ROWS - 1));
+        assert_eq!(int_entries(&last), vec![(7, 7)]);
+        let TileGuard::Function(FunctionGuard::Domain(asked)) = keys_between(0, ROWS - 1) else {
+            unreachable!("keys_between names a key region")
+        };
+        assert_eq!(stated(&last), asked, "both arms have decided the whole ask");
+    }
+
+    #[test]
+    fn merged_branches_asked_for_nothing_pull_nothing() {
+        let (mut union, even_pulled, odd_pulled) = merged_branches(true);
+        let tile = union.get(stream_tiling().empty_guard());
+        assert!(int_entries(&tile).is_empty());
+        assert!(even_pulled.borrow().is_empty() && odd_pulled.borrow().is_empty());
+    }
+
+    /// A tagged union keys its rows by arm, which a projection over plain keys does not
+    /// name, so a morsel pull fails rather than answering a different region.
+    #[test]
+    #[should_panic(expected = "keys its rows by arm")]
+    fn a_tagged_union_rejects_a_key_projection() {
+        let (mut union, _, _) = merged_branches(false);
+        union.get(keys_between(0, 3));
     }
 }

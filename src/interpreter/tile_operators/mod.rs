@@ -1326,8 +1326,21 @@ pub(crate) mod test_helpers {
         }
     }
 
-    /// A [`TileProducer`] that answers each pull with whatever tile its shared cell holds,
-    /// so a test can change its input between pulls. What a producer states on one pull
+    /// A collection of `Int` keyed by `keys`, each key holding its own value, with `decided`
+    /// stated complete.
+    pub(crate) fn int_column(keys: Vec<u64>, decided: Predicate) -> Tile {
+        let values = keys.iter().map(|&key| key as i64).collect();
+        Tile::data_function(
+            ColumnValue::from_uints(keys),
+            Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+            decided,
+            BitSet::new(),
+        )
+    }
+
+    /// A [`TileProducer`] that answers each pull with the tile its shared cell holds, cut to
+    /// the projection and minus what has been released to it, so a test can change its input
+    /// between pulls. What a producer states on one pull
     /// constrains what it may answer on the next (`src/interpreter/design-operators.md`,
     /// "The completeness contract"), which a fixed tile cannot exercise.
     pub(crate) struct ScriptedProducer {
@@ -1357,11 +1370,62 @@ pub(crate) mod test_helpers {
             node
         }
 
-        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-            self.tile.borrow().clone()
+        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+            let mut tile = self.tile.borrow().clone();
+            tile.remove_guarded(self.obsolete_guard().clone());
+            tile.compact();
+            let projection = projection_guard.projection("ScriptedProducer");
+            tile.restrict_to(&projection, self.tiling());
+            tile
         }
 
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// An operator whose producer is a [`ScriptedProducer`] over a cell the test keeps, so a
+    /// test can feed a growing input through a real consumer. The producer answers the cell
+    /// minus what has been released to it.
+    pub(crate) struct ScriptedOp {
+        cell: std::rc::Rc<std::cell::RefCell<Tile>>,
+        tiling: Tiling,
+    }
+
+    impl ScriptedOp {
+        pub(crate) fn new(
+            tile: Tile,
+            tiling: Tiling,
+        ) -> (Self, std::rc::Rc<std::cell::RefCell<Tile>>) {
+            let cell = std::rc::Rc::new(std::cell::RefCell::new(tile));
+            (
+                Self {
+                    cell: cell.clone(),
+                    tiling,
+                },
+                cell,
+            )
+        }
+    }
+
+    impl TileOperator for ScriptedOp {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(super::InputEdgeSpec<'_>)) {}
+
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            mut consumer: Box<dyn super::Consumer>,
+            _scheduler: &mut super::Scheduler,
+        ) -> Box<dyn TileProducer> {
+            consumer.notify();
+            Box::new(ScriptedProducer {
+                base: ProducerBase::unowned(ScriptedProducer::alloc_id(), &self.tiling),
+                tile: self.cell.clone(),
+            })
+        }
     }
 
     /// A store's parts are collections held to the contract like any other: a decided set
