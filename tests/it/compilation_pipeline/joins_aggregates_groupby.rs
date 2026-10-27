@@ -457,16 +457,16 @@ fn a_bare_groupby_tail_is_driven() {
 #[case(
     "[(x, x) for x in [(x, x) for x in [1,2,3]]]",
     "iterate ≫ [1, 2, 3] ≫ (id, id) ▷ zip ≫ (id, id) ▷ zip:([0, 2] ⤇ ((Int, Int), (Int, Int)))",
-    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::record(HashMap::from([
-            ("_1".into(), Tile::record(HashMap::from([
-                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
-                ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
+            ("_1".into(), ColumnValue::Records(HashMap::from([
+                ("_1".into(), ColumnValue::Ints(vec![1, 2, 3])),
+                ("_0".into(), ColumnValue::Ints(vec![1, 2, 3])),
             ]))),
-            ("_0".into(), Tile::record(HashMap::from([
-                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
-                ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            ("_0".into(), ColumnValue::Records(HashMap::from([
+                ("_1".into(), ColumnValue::Ints(vec![1, 2, 3])),
+                ("_0".into(), ColumnValue::Ints(vec![1, 2, 3])),
             ]))),
-        ]))), Predicate::True, BitSet::new())
+        ])))), Predicate::True, BitSet::new())
 )]
 #[case(
     "[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]",
@@ -786,6 +786,36 @@ fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) 
     check_scalar(code, expected);
 }
 
+/// A map whose values are products built per element answers a checked lookup with the
+/// product as the `some` payload.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::present(
+    indoc! {"
+        m = map([(x, (x + 1, x * 2)) for x in [1, 2, 3]])
+        match m[2]?:
+            case Option::some(v):
+                v.0 * 100 + v.1
+            case Option::none:
+                0
+    "},
+    Value::Int(304)
+)]
+#[case::absent(
+    indoc! {"
+        m = map([(x, (x + 1, x * 2)) for x in [1, 2, 3]])
+        match m[9]?:
+            case Option::some(v):
+                v.0 * 100 + v.1
+            case Option::none:
+                0
+    "},
+    Value::Int(0)
+)]
+fn checked_lookup_of_a_product_value(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 /// A **product** keys a collection end to end: built, grouped, and looked up by a tuple or
 /// a record.
 ///
@@ -821,6 +851,22 @@ fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) 
         sum([sum([y.b for y in grp]) for grp in g])
     "#},
     Value::Int(8)
+)]
+// A key built from the element alone, a pair of it or a one-field record of it, which fuses into
+// one column of records: `Converse` inverts only a column.
+#[case::group_by_a_pair_of_the_element(
+    indoc! {r#"
+        g = groupby([1, 1, 2], \x -> (x, x))
+        sum([sum(grp) for grp in g])
+    "#},
+    Value::Int(4)
+)]
+#[case::group_by_a_one_field_record_of_the_element(
+    indoc! {r#"
+        g = groupby([1, 1, 2], \x -> (k=x))
+        sum([sum(grp) for grp in g])
+    "#},
+    Value::Int(4)
 )]
 // A component every key shares, which is the ordinary shape of keyed data — every row
 // for one account, every order for one SKU. That component's type is its own singleton

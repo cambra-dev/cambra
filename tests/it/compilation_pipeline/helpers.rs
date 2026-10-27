@@ -49,6 +49,34 @@ use super::panic_message::panic_message;
 // Helpers — CCL pipeline path
 // ---------------------------------------------------------------------------
 
+/// The kinds of the operators `code` compiles to, in graph order, with `source1` registered as a
+/// source of `Int`s: what a test of a program's shape reads, such as whether an element-wise chain
+/// became one map.
+pub(crate) fn operator_kinds_over_source1(code: &str) -> Vec<&'static str> {
+    use cambra::ccl::Type;
+    use cambra::interpreter::operator_graph::GraphNode;
+    use cambra::interpreter::{BaseType, Extent, TestDataSource};
+
+    let mut ctx = GlobalContext::default();
+    ctx.register_source(Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(cambra::ccl::BaseType::Int),
+        Extent::Base(BaseType::Int),
+    ))));
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let program = LoadedProgram::test(code);
+    let compiled = compile_program(&mut ctx, &program, consumer).unwrap_or_render(&program);
+    compiled
+        .operator_graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match node {
+            GraphNode::Operator { kind, .. } => Some(*kind),
+            GraphNode::Sink { .. } => None,
+        })
+        .collect()
+}
+
 /// The most values each kind of operator held at any lap of running `code` to its end, by
 /// the operator's name less its instance (`InductionStore`, `Memo`, …), summed over the
 /// instances of that kind at each lap ([`TileProducer::state_info`]).
@@ -307,18 +335,23 @@ pub(crate) fn make_record(fields: &[(&str, Value)]) -> Value {
     )
 }
 
-/// Extract a single named field from the record values of a collection tile.
+/// Extract a single named field from the record values of a collection tile, whether the
+/// records are a tile per field or one column of records.
 pub(crate) fn extract_record_field(tile: Tile, field: &str) -> ColumnValue {
     let Tile::DataFunction { codomain, .. } = tile else {
         panic!("expected a collection, got {tile:?}");
     };
-    let Tile::Record { mut fields, .. } = *codomain else {
-        panic!("expected Record codomain");
-    };
-    scalar_tile_to_column_value(fields.remove(field).unwrap_or_else(|| {
-        panic!(
-            "field {field:?} not found; available: {:?}",
-            fields.keys().collect::<Vec<_>>()
-        )
-    }))
+    let missing =
+        |names: Vec<&SmolStr>| -> ! { panic!("field {field:?} not found; available: {names:?}") };
+    match *codomain {
+        Tile::Record { mut fields, .. } => match fields.remove(field) {
+            Some(tile) => scalar_tile_to_column_value(tile),
+            None => missing(fields.keys().collect()),
+        },
+        Tile::Scalar(ColumnValue::Records(mut fields)) => match fields.remove(field) {
+            Some(column) => column,
+            None => missing(fields.keys().collect()),
+        },
+        other => panic!("expected records, got {other:?}"),
+    }
 }

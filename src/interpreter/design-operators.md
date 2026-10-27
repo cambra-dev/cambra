@@ -367,6 +367,10 @@ the pair `(acc, i)` used by a pointwise binary operation is assembled beneath th
 which its components were applied. Using that construction for a record of collections would
 change its shape into a collection of records.
 
+A product that ends an element-wise chain does not reach `build_product`. Conversion fuses the
+chain into one map, whose values are one column of records, `Tiling::Scalar` of a record extent
+([Element-wise chains](../ccl/design/optimization.md#element-wise-chains)).
+
 Fields can complete and release independently. A scalar field can be released while a sibling
 collection continues to grow; see [The release contract](#the-release-contract). Collections
 retain the incremental representation described below rather than becoming successive scalar
@@ -696,24 +700,30 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 not standalone operators): `BinOp(op)` over a `{_0, _1}` record column, `UnaryOp(op)` over one
 column, `RecordField(f)` projecting a field, and `Scalar(program)` over one column. `Scalar` is a
 `ScalarProgram` (`scalar_expr.rs`): a straight-line program over slots. Instruction 𝑖 names slot 𝑖
-and its operands name earlier slots. An instruction is `Input { path }` (the input column or a
-field path into it, a column of a base type, read as one slice), `Const(value)` (a value of a base
-type), `Bin(op, a, b)` or `Un(op, a)`. A program has no record. A comparison of two records, `==`
-or `!=`, is read as one comparison per field both records carry (`compared_fields`, which
-`compare_records` also calls for columns), joined by `and` for `==` and `or` for `!=`, and recursing
-into a field that is a record. A value that two operations read is one slot, so a computed subterm
-read twice is computed once, and two reads of one field path are one `Input`. The parser appends
-instructions and cuts the program at the chosen prefix, so equal chains give equal programs. A
-projection of a product built in the chain is a redex that `simplify` has reduced, so the parser
-reads projections of the input only. Evaluation works through the input in blocks of 1024 rows
+and its operands name earlier slots. An instruction is `Input { path }` (the input column or a field
+path into it, a column of a base type, read as one slice), `Const(value)` (a value of a base type),
+`Bin(op, a, b)`, `Un(op, a)` or `Record(fields)`, a column of records naming one slot per field in
+field-name order. A comparison of two records, `==` or `!=`, is read as one comparison per field
+both records carry (`compared_fields`, which `compare_records` also calls for columns), joined by
+`and` for `==` and `or` for `!=`, and recursing into a field that is a record. Each record is read
+from the input, a constant, or built by a `zip` in the chain.
+The last instruction is the result: an operation, or, for a chain that ends in a `zip`, a `Record`,
+nested to the depth of the `zip`s. A `Record` is only the last instruction or a field of a later
+`Record`, and no operation reads one. A value that two operations read is one slot, so a computed
+subterm read twice is computed once, and two reads of one field path are one `Input`. The parser
+appends instructions and cuts the program at the chosen prefix, so equal chains give equal programs.
+The parser reads projections of the input only, and a projection of a product built in the chain
+ends the prefix. `simplify` reduces such a projection of a two-arm tuple before conversion, and not
+one of a record or of a wider tuple. Evaluation works through the input in blocks of 1024 rows
 (`BLOCK_ROWS`) and runs the instructions in order for each block. An `Input` or a `Const` writes no
 slot: its block is read in place as a `ColumnView`, a region of the input or the constant's own
-value repeated over the block. Every operation writes its block-sized column into a slot of its own
-that later blocks reuse (the `_into` kernels). The last instruction's kernel appends each block's
-result straight to the result column, whose room is reserved once at the first block. Peak memory is
+value repeated over the block. An operation writes its block-sized column into a slot of its own
+that later blocks reuse (the `_into` kernels). The last instruction appends to the result instead:
+an operation by its kernel, and a `Record` by copying each field's block from the slot, input region
+or constant the field names. The result's room is reserved once at the first block. Peak memory is
 the input, the result, and the slots of one block, where a pass over whole columns would hold a
-full-length column per instruction. Conversion builds it from an element-wise chain of at least two
-operations ([Element-wise chains](../ccl/design/optimization.md#element-wise-chains)), so it
+full-length column per instruction. Conversion builds it from an element-wise chain of at least
+two operations ([Element-wise chains](../ccl/design/optimization.md#element-wise-chains)), so it
 replaces the operators of that chain, including the `Memo`, `FanOut`, per-arm `MapResult`s, `Zip`
 and combining `MapResult` where it contains a `zip`.
 
@@ -725,6 +735,7 @@ have no view. The kernels in `scalar_ops.rs` take views, so a region of the inpu
 copy and a repeated operand is read as one value, not as a column of copies. `apply_binop_views` and
 `apply_unaryop_views` apply an operation to views; `apply_binop_column` and `apply_unaryop_column`
 do the same for `ColumnValue`s, and `apply_binop_column` also compares two record columns.
+`ColumnValue::extend_from_view` appends a view's values to a column of its element type.
 
 **Value-selecting `Case` in a writer decision body** (a conditional induction write `if 𝑝: acc += a else: acc += b`, or a `with begin():` per-key routing merge — a gate that varies with the element at a site with **no visible iteration source**). `lambda_elim` compiles it to the same **union of domain-restricts** as every other value-`Case`, over the *fed* element stream: `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)`, first-match `π̂ᵢ`. `filter_values` (`Builtin::FilterValues` → the `Filter` tile operator, input stream + predicate) is a **value-preserving** filter — unlike `Restrict` (which returns the domain identity `{D|p}⤇{D|p}` for a source a map re-indexes), it keeps each surviving element's value `V`, so `eᵢ` maps the kept elements directly and a **partial op** (`//`) in `eᵢ` runs only where its guard holds — never eagerly at a rejected position (the retired `Select` computed both arms and faulted on the off-path one). The arms filter the *same* fed stream disjointly (first-match), so their union is a **flat merge** (`UnionOperator::new_flat`): it stays on one domain extent (not a tagged `Extent::Union`) and reassembles the full column sorted by domain key, co-iterating with the decision record's sibling `commit`/`writes` fields. The key is the arm's domain *value*, not a position: reassembly needs only a total order (to restore the fed order) and equality (to catch two arms claiming one key), and both hold for any single collection's keys, since its domain is one `Extent`. A `UInt` position is the common case; a fed stream whose own index set is a coproduct — a conditional-element comprehension, whose `Copair` domain is `Variant({Index(i): {D | π̂ᵢ}})` — carries `Union { tag, inner }` keys, which `Value`'s order compares lexicographically by tag then payload. Keys that are *not* mutually comparable mean the arms were fed different domains, which is a copairing rather than a disjoint join, and `flat_merge` says so. A sourceless value-`Case` (a top-level ternary) still takes the `UIntRange(1)`-driver C-form + `final_or_default` (a tagged union dispatch); the writer-body case differs only in filtering the fed stream rather than a synthetic driver.
 
