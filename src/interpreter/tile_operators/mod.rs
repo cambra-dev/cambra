@@ -927,6 +927,7 @@ pub trait TileProducer {
             gate.take();
         }
         self.base_mut().pulls += 1;
+        let projection = crate::interpreter::Projection::of(&projection_guard).ok();
         let mut result = self.get_impl(projection_guard);
         // Released scalar cells are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
@@ -950,7 +951,17 @@ pub trait TileProducer {
         );
         debug_assert!(validate_tile(&result), "Invalid tile: {result:?}");
         if cfg!(debug_assertions) {
-            if let Some(last) = &self.base().last_output
+            // A pull states completeness only for the region it returns, so the last output
+            // is compared inside that region: a producer asked for one region after another
+            // withdraws nothing it said of the first.
+            let last_in_region = self.base().last_output.as_ref().map(|last| {
+                let mut last = last.clone();
+                if let Some(projection) = &projection {
+                    last.restrict_to(projection, self.tiling());
+                }
+                last
+            });
+            if let Some(last) = &last_in_region
                 && let Some(violation) =
                     completeness_violation(&self.name(), last, &result, self.obsolete_guard())
             {
@@ -962,7 +973,23 @@ pub trait TileProducer {
                     )
                 );
             }
-            self.base_mut().last_output = Some(result.clone());
+            // The statement a later pull is held to holds each region's last answer: this pull
+            // replaces its own region and leaves the others as they were.
+            let stated = match (&projection, self.base_mut().last_output.take()) {
+                (Some(crate::interpreter::Projection::Nothing), Some(last)) => last,
+                (Some(region @ crate::interpreter::Projection::Keys { .. }), Some(mut last)) => {
+                    last.restrict_to(
+                        &crate::interpreter::Projection::Everything.minus(region),
+                        self.tiling(),
+                    );
+                    let mut answered = result.clone();
+                    answered.restrict_to(region, self.tiling());
+                    last.merge(answered);
+                    last
+                }
+                _ => result.clone(),
+            };
+            self.base_mut().last_output = Some(stated);
         }
         assert!(
             result.check_from(self.tiling()),
@@ -1536,6 +1563,63 @@ pub(crate) mod test_helpers {
             violation.contains("beneath a path it had called complete"),
             "{violation}"
         );
+    }
+
+    /// A stream of `0..8` whose answer holds the keys `from..=to` and states `stated` complete.
+    fn answered(from: u64, to: u64, stated: (u64, u64)) -> (Tile, Tiling) {
+        use crate::interpreter::{BaseType, ColumnValue, Extent, Predicate, Value};
+        use bit_set::BitSet;
+        let region = |first: u64, last: u64| {
+            Predicate::intervals(IntervalSet::from(Interval::closed(
+                Value::UInt(first),
+                Value::UInt(last),
+            )))
+        };
+        let tile = Tile::data_function(
+            ColumnValue::from_uints((from..=to).collect()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(
+                (from..=to).map(|key| key as i64).collect(),
+            ))),
+            region(stated.0, stated.1),
+            BitSet::new(),
+        );
+        let tiling = Tiling::data_function(
+            Extent::uint_range(8),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        (tile, tiling)
+    }
+
+    /// A producer pulled at one region after another keeps what it stated of each: a pull of a
+    /// disjoint region between two pulls of the first withdraws nothing, and answering the first
+    /// again as it did passes.
+    #[test]
+    fn a_producer_asked_for_two_regions_in_turn_may_repeat_its_first_answer() {
+        use crate::interpreter::tile_operators::test_helpers::{ScriptedProducer, keys_between};
+        let (first, tiling) = answered(0, 3, (0, 3));
+        let (mut producer, answer) = ScriptedProducer::new(first.clone(), tiling);
+        producer.get(keys_between(0, 3));
+        *answer.borrow_mut() = answered(4, 7, (4, 7)).0;
+        producer.get(keys_between(4, 7));
+        *answer.borrow_mut() = first;
+        producer.get(keys_between(0, 3));
+    }
+
+    /// An input that states a region complete, answers a pull of another region, and then
+    /// retracts the first when it is pulled there again has broken the contract, though the
+    /// pull before the retraction was at the other region.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "withdrew completion")]
+    fn a_producer_that_retracts_a_region_after_a_pull_of_another_is_reported() {
+        use crate::interpreter::tile_operators::test_helpers::{ScriptedProducer, keys_between};
+        let (first, tiling) = answered(0, 3, (0, 3));
+        let (mut producer, answer) = ScriptedProducer::new(first, tiling);
+        producer.get(keys_between(0, 3));
+        *answer.borrow_mut() = answered(4, 7, (4, 7)).0;
+        producer.get(keys_between(4, 7));
+        *answer.borrow_mut() = answered(0, 3, (0, 1)).0;
+        producer.get(keys_between(0, 3));
     }
 
     /// A [`TileProducer`] that answers with a fixed tile, less what it has been released, and
