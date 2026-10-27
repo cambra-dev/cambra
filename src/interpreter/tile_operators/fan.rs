@@ -304,16 +304,10 @@ impl TileProducer for ZipProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // Cost note: the presence-intersection path below runs
-        // unconditionally on every pull — N predicate intersections, N
-        // `to_remove` minuses, and one `remove_guarded` per input.  Non-
-        // cyclic zips over well-aligned inputs pay the same per-pull
-        // cost as the mutation-loop body's lagging-branch case (where the
-        // recursive_input legitimately trails the source branch).  If
-        // profiling later shows this on a hot path, consider gating the
-        // intersection on a `cyclic: bool` constructor flag (mirroring
-        // `FanOut::new` vs `FanOut::new_cyclic`) and keeping the simpler
-        // "all inputs agree" path for zips that can't lag.
+        // The presence intersection below runs on every pull, inputs that already agree
+        // included: N predicate intersections, N `to_remove` minuses and one `remove_guarded`
+        // per input.
+        //
         // An input's own deleted rows are dropped here and reach no consumer, so each input is
         // released through its own (below); a row only absent from another input may still
         // arrive there, so it is not.
@@ -1507,20 +1501,6 @@ mod tests {
     }
 
     // ── ZipProducer: asymmetric per-branch presence ────────────────────────
-    //
-    // Regression for the per-branch presence-intersection added to
-    // `ZipProducer::get_impl` for cyclic mutation loops, where one branch
-    // (the body) can have emitted more positions than another (a still-
-    // converging `recursive_input`).  Before the intersection step, the
-    // output tile carried whichever branch happened to be at index 0 of
-    // the inputs vec — fine for branches that always advance in lockstep,
-    // wrong as soon as they don't.
-    //
-    // We construct two `DataFunction` test tiles over the same domain
-    // type but with *different actual positions present* (branch A has
-    // positions [0, 1, 2]; branch B has only [0, 1]) and a `ZipProducer`
-    // directly over them, then check that the merged output is restricted
-    // to the intersection [0, 1].
 
     /// Two `DataFunction` inputs with different sets of present positions.
     /// The output should restrict to the intersection of those positions.

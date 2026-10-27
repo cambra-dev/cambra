@@ -900,7 +900,7 @@ pub trait TileProducer {
     ///
     /// The default implementation derives the display name from the concrete
     /// type name by stripping the `"Producer"` suffix, then appends `#<id>`.
-    /// For example, `MapApplyProducer` with id 3 → `"MapApply#3"`.
+    /// For example, `MapResultProducer` with id 3 → `"MapResult#3"`.
     fn name(&self) -> String {
         let raw = short_type_name::<Self>();
         let base = raw.strip_suffix("Producer").unwrap_or(raw);

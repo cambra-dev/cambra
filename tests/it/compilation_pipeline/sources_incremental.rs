@@ -899,8 +899,8 @@ o";
 /// - Re-reads its `domain` input as the source grows in batches.
 /// - Holds back the final emission until the source signals it's done.
 /// - Fires notifications when each batch arrives and again on terminal.
-/// - Releases positions back through `recursive_input` so the source is
-///   marked as fully consumed at the end.
+/// - Releases every source position by the end, so the source is marked as
+///   fully consumed.
 #[test_log::test]
 fn test_incremental_mutation_loop() {
     let code = "\
