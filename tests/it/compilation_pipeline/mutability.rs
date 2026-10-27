@@ -2381,6 +2381,123 @@ fn a_writing_branch_value_merges_as_a_variable(#[case] code: &str, #[case] expec
     check_sink(code, expected);
 }
 
+// Outside a loop, a writing `if` or `match` merges into one value: its branches end in what
+// it binds and what each variable they write holds, and the statements after it read that.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::statement_ifs(indoc! {"
+    x := 1
+    y := 0
+    i = 3
+    if i > 1:
+        x := x + x
+        y += 1
+    else:
+        y += 2
+    if i > 5:
+        x := x * 100
+    else:
+        y += 10
+    if x > 1:
+        x := x + y
+    else:
+        x := x - 1
+    x * 1000 + y
+"}, Value::Int(13011))]
+#[case::value_if(indoc! {"
+    acc := 0
+    i = 2
+    t = if i > 1:
+            acc += 5
+            acc * 3
+        else:
+            0
+    t + acc
+"}, Value::Int(20))]
+#[case::value_match(indoc! {"
+    acc := 0
+    o = Option::some(4)
+    t = match o:
+            case Option::some(v):
+                acc += v
+                v * 10
+            case Option::none:
+                0
+    t + acc
+"}, Value::Int(44))]
+#[case::nested(indoc! {"
+    acc := 0
+    i = 3
+    t = if i > 1:
+            u = if i > 2:
+                    acc += 100
+                    1
+                else:
+                    acc += 10
+                    2
+            u + acc
+        else:
+            0
+    t
+"}, Value::Int(101))]
+#[case::declaration_in_a_branch(indoc! {"
+    x := 1
+    i = 3
+    if i > 1:
+        z := 5
+        z += 1
+        x := x + z
+    else:
+        x := 0
+    x
+"}, Value::Int(7))]
+#[case::function_writing_in_an_if(indoc! {"
+    def bump(c: Mut(Int), i):
+        if i > 1:
+            c += i
+        else:
+            c += 100
+    acc := 5
+    bump(acc, 3)
+    bump(acc, 0)
+    acc
+"}, Value::Int(108))]
+// A written map is a sum, so this `if` keeps taking the statements after it into each branch.
+#[case::writing_a_map(indoc! {"
+    m: Mut(Map(Int, Int)) := box(map([(1, 10)]))
+    i = 3
+    if i > 1:
+        m := box(map([(2, 20), (3, 30)]))
+    else:
+        m := box(map([(4, 40)]))
+    sum(m)
+"}, Value::Int(50))]
+#[case::writing_a_map_beside_an_int(indoc! {"
+    m: Mut(Map(Int, Int)) := box(map([(1, 10)]))
+    n := 0
+    i = 3
+    if i > 1:
+        m := box(map([(2, 20), (3, 30)]))
+        n := 1
+    else:
+        m := box(map([(4, 40)]))
+        n := 2
+    sum(m) + n
+"}, Value::Int(51))]
+#[case::a_map_as_its_value(indoc! {"
+    m: Mut(Map(Int, Int)) := box(map([(1, 10)]))
+    i = 3
+    t = if i > 1:
+            m := box(map([(2, 20), (3, 30)]))
+            m
+        else:
+            m
+    sum(t)
+"}, Value::Int(50))]
+fn a_top_level_writing_if_merges_into_one_value(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 // A write in a `match` arm reaches the same normalization an `if` branch's
 // does. Lifting the write onto the arm's spine leaves the arm computing over a
 // name bound outside the `match`, which is point-free by the `const` lift in
