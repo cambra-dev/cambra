@@ -547,6 +547,7 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
 | `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. |
 | `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. A projection beneath the outermost keys is answered above the record's level (`Restates::Above`). |
 | `MakeRecord` | A record of values has no keys: the projection is the whole record or nothing, and a guard naming keys panics. |
+| `VariantWrap` | A payload stream is pulled at the projection. A payload that is itself a collection becomes one union column and is read whole. A projection beneath the outermost keys is answered above the wrapped level (`Restates::Above`). |
 
 ### Producer attribution and probes
 
