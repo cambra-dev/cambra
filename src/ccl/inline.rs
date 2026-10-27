@@ -72,7 +72,6 @@ use crate::ccl::{
         refresh_let_binder, spelled_in_a_type, walk_refined_predicates_mut,
     },
     lambda_elim::substitute,
-    names::SyntheticKind,
     provenance,
 };
 
@@ -475,9 +474,9 @@ fn move_into_list_elements(
 /// moves, so a binding anywhere else keeps its `Let` — and three conditions are
 /// the rest:
 ///
-/// - **A [`SyntheticKind::AnfTemp`] binder.** A binding a consumer recognizes — a
-///   source, a recurrence carrier — is recognized by its binding, and substituting
-///   one away strands that consumer.
+/// - **An A-normalization temp binder** ([`Name::is_anf_temp`]). A binding a
+///   consumer recognizes — a source, a recurrence carrier — is recognized by its
+///   binding, and substituting one away strands that consumer.
 /// - **One occurrence**, counting a refinement predicate's as well
 ///   ([`count_free`]), which makes the rewrite a move rather than a copy.
 /// - **No read of a variable the body writes** ([`reads_a_variable_written_in`]),
@@ -495,13 +494,8 @@ fn flatten_anf_bindings(mut elt: Expr) -> Expr {
     else {
         return elt;
     };
-    if !matches!(
-        binding.name,
-        Name::Synthetic {
-            kind: SyntheticKind::AnfTemp,
-            ..
-        }
-    ) || count_free(&binding.name, body) != 1
+    if !binding.name.is_anf_temp()
+        || count_free(&binding.name, body) != 1
         || reads_a_variable_written_in(bound_expr, body)
     {
         return elt;
@@ -583,13 +577,7 @@ fn anf_chain_builds_a_product(e: &Expr) -> bool {
     match &e.node {
         TypedExprNode::Tuple(_) | TypedExprNode::Record(_) | TypedExprNode::List(_) => true,
         TypedExprNode::Let { binding, body, .. } => {
-            matches!(
-                binding.name,
-                Name::Synthetic {
-                    kind: SyntheticKind::AnfTemp,
-                    ..
-                }
-            ) && anf_chain_builds_a_product(body)
+            binding.name.is_anf_temp() && anf_chain_builds_a_product(body)
         }
         _ => false,
     }
@@ -728,7 +716,7 @@ fn inline_impl(expr: Expr) -> Expr {
             // beta-reduction produced before the temp stood between the
             // projection and the former it projects.
             //
-            // Bounded to an [`SyntheticKind::AnfTemp`] binder and a product
+            // Bounded to an A-normalization temp binder and a product
             // former: a binding a consumer recognizes is recognized *by* its
             // binding, and a collection former's binding is what planning hangs
             // an iteration marker on.

@@ -571,11 +571,6 @@ impl Name {
 
     /// Is this a binder [`crate::ccl::anf`] minted for a hoisted
     /// sub-expression?
-    ///
-    /// Asked where a rewrite is bounded to this pass's own bindings:
-    /// [`crate::ccl::anf`]'s own peel of a chain it just built, and
-    /// [`crate::ccl::inline`]'s two rules that substitute a temp back into the
-    /// position it was hoisted out of.
     pub fn is_anf_temp(&self) -> bool {
         matches!(
             self,

@@ -52,7 +52,6 @@ use crate::ccl::ccl_utils::{
     PredMemo, apply_primitive, count_free, is_builtin, walk_refined_predicates_mut,
 };
 use crate::ccl::lambda_elim::{id, strength_over, zip_pair};
-use crate::ccl::names::SyntheticKind;
 use crate::ccl::ty::FunKind;
 use crate::ccl::{
     ArithmeticKind, BaseType, BinOpKind, Builtin, Expr, Name, ProjKey, Type, TypedExpr,
@@ -1379,7 +1378,8 @@ fn try_partial_lookup(expr: &mut Expr) -> bool {
 }
 
 /// A-normalization's morphism binding: `let x = 𝑚 in 𝑏  ⟹  𝑏[x := 𝑚]`, where `x` is an
-/// [`SyntheticKind::AnfTemp`] binder, `𝑚` is function-typed, and `x` occurs once in `𝑏`.
+/// A-normalization temp ([`Name::is_anf_temp`]), `𝑚` is function-typed, and `x` occurs
+/// once in `𝑏`.
 ///
 /// Point-free CCL has no compiled form for a binding whose value is a morphism.
 /// Op-conversion compiles a binding with the input available where the `let` sits
@@ -1423,13 +1423,8 @@ fn try_let_morphism_inline(expr: &mut Expr) -> bool {
     else {
         return false;
     };
-    if !matches!(
-        binding.name,
-        Name::Synthetic {
-            kind: SyntheticKind::AnfTemp,
-            ..
-        }
-    ) || !matches!(bound_expr.ty, Type::Fun { .. })
+    if !binding.name.is_anf_temp()
+        || !matches!(bound_expr.ty, Type::Fun { .. })
         || count_free(&binding.name, body) != 1
     {
         return false;
