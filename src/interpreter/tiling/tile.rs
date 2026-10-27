@@ -832,7 +832,7 @@ impl Tile {
     /// ([`Self::to_guard`]), so nothing reads them.
     pub(crate) fn withhold(&mut self, level: CurryLevel, keep: &[bool], withheld: &[&[Value]]) {
         for depth in 0..=level.index() {
-            let prefixes = Predicate::flatten_or(
+            let prefixes = Predicate::union_all(
                 withheld
                     .iter()
                     .map(|path| Predicate::exactly(&path[..=depth]))
@@ -5968,6 +5968,35 @@ mod tests {
         };
         codomain.retain_keys(&[true; 6]);
         assert_eq!(tile, three_groups());
+    }
+
+    /// A filter whose predicate has answered every entry it holds withholds none: `withhold`
+    /// then drops the rejected keys as `retain_keys` does and leaves the statement as it was.
+    #[test]
+    fn withhold_nothing_is_retain_keys() {
+        let stated = Predicate::at_or_below(Value::UInt(20));
+        let keep = [true, false, true];
+        let groups = || {
+            two_level_uint_int(
+                vec![10, 20, 30],
+                vec![0, 2, 5],
+                vec![0, 1, 2, 3, 4, 5],
+                vec![100, 110, 200, 210, 220, 300],
+                stated.clone(),
+            )
+        };
+        let mut withheld_none = groups();
+        withheld_none.withhold(CurryLevel::OUTERMOST, &keep, &[]);
+        let mut retained = groups();
+        retained.retain_keys(&keep);
+        assert_eq!(withheld_none, retained);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &withheld_none
+        else {
+            unreachable!("two_level_uint_int is a collection")
+        };
+        assert_eq!(*domain_predicate, stated);
     }
 
     #[test]

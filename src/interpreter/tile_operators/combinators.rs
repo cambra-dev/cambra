@@ -6,7 +6,7 @@ use std::iter::repeat_n;
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::{
-    ColumnValue, Consumer, Extent, Scheduler, Value, shared_consumer, tuple_field,
+    ColumnValue, Consumer, Extent, Projection, Scheduler, Value, shared_consumer, tuple_field,
 };
 
 /// Inverts a function operator, producing a lookup-function from codomain to domain.
@@ -884,9 +884,39 @@ impl TileProducer for FilterProducer {
         visit("predicate", &*self.predicate);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let pred_guard = self.predicate.tiling().universal_guard();
-        let i_guard = self.input.tiling().universal_guard();
+    /// The predicate and the input share the keys of the level the mask names, so both are
+    /// pulled at the projection.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+
+        self.filtered(&projection)
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        if matches!(self.predicate.tiling(), Tiling::DataFunction { .. }) {
+            // Both predicate and input share the same underlying domain source, so both
+            // must be released together; releasing only one leaves the other's upstream
+            // FanOutProducer release-guard stale, causing it to re-deliver already-consumed
+            // data while the other side returns nothing on the next get().
+            let keys = predicate_release(obsolete_guard.clone(), self.predicate.tiling());
+            self.predicate.release(keys);
+        }
+        self.input.release(obsolete_guard);
+    }
+}
+
+impl FilterProducer {
+    /// The input's rows the predicate keeps, for the keys `projection` names.
+    fn filtered(&mut self, projection: &Projection) -> Tile {
+        let guard_for = |tiling: &Tiling| match tiling.is_data_function() {
+            true => projection.guard(tiling),
+            false => tiling.universal_guard(),
+        };
+        let pred_guard = guard_for(self.predicate.tiling());
+        let i_guard = guard_for(self.input.tiling());
         let predicate_result = self.predicate.get(pred_guard);
         let input_result = self.input.get(i_guard);
 
@@ -958,18 +988,6 @@ impl TileProducer for FilterProducer {
             }
             _ => panic!("Invalid Filter input tiles"),
         }
-    }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if matches!(self.predicate.tiling(), Tiling::DataFunction { .. }) {
-            // Both predicate and input share the same underlying domain source, so both
-            // must be released together; releasing only one leaves the other's upstream
-            // FanOutProducer release-guard stale, causing it to re-deliver already-consumed
-            // data while the other side returns nothing on the next get().
-            let keys = predicate_release(obsolete_guard.clone(), self.predicate.tiling());
-            self.predicate.release(keys);
-        }
-        self.input.release(obsolete_guard);
     }
 }
 
@@ -3116,5 +3134,215 @@ mod tests {
             "row 0's inner collection is still arriving, so row 0 is not complete: \
              {domain_predicate:?}"
         );
+    }
+}
+
+/// `Filter` as a comprehension's guard uses it: `[x for x in xs if p(x)]` keeps the rows of the
+/// stream whose boolean answer, read from a predicate stream over the same keys, is true. A
+/// worker pulls both at one morsel.
+#[cfg(test)]
+mod filter_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, int_entries, ints_by_position, keys_between,
+    };
+    use bit_set::BitSet;
+
+    const ROWS: u64 = 8;
+
+    /// `[x for x in xs if x % 2 == 0]` over `xs = [0, 10, 20, …]`, the predicate stream holding
+    /// the answer at each position: even positions pass.
+    fn keep_even_positions() -> (FilterProducer, GuardLog, GuardLog) {
+        let values: Vec<i64> = (0..ROWS as i64).map(|i| 10 * i).collect();
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let answers = Tile::data_function(
+            ColumnValue::UInts((0..ROWS).collect()),
+            Box::new(Tile::Scalar(ColumnValue::Bools(
+                (0..ROWS).map(|i| i % 2 == 0).collect(),
+            ))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let pred_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Bool)),
+        );
+        let (input, input_pulled, _) =
+            ProjectionSpy::new(ints_by_position(&values, true), in_tiling.clone());
+        let (predicate, predicate_pulled, _) = ProjectionSpy::new(answers, pred_tiling);
+        (
+            FilterProducer {
+                base: ProducerBase::unowned(FilterProducer::alloc_id(), &in_tiling),
+                input: Box::new(input),
+                predicate: Box::new(predicate),
+                level: CurryLevel::OUTERMOST,
+            },
+            input_pulled,
+            predicate_pulled,
+        )
+    }
+
+    #[test]
+    fn a_filtered_morsel_keeps_the_passing_rows_and_pulls_both_sides_at_it() {
+        let (mut filter, input_pulled, predicate_pulled) = keep_even_positions();
+        let morsel = filter.get(keys_between(2, 5));
+        assert_eq!(int_entries(&morsel), [(2, 20), (4, 40)]);
+        assert_eq!(*input_pulled.borrow(), [keys_between(2, 5)]);
+        assert_eq!(*predicate_pulled.borrow(), [keys_between(2, 5)]);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        let TileGuard::Function(FunctionGuard::Domain(stated)) = keys_between(2, 5) else {
+            unreachable!("a morsel is a domain guard")
+        };
+        assert_eq!(*domain_predicate, stated, "complete over the morsel");
+    }
+
+    #[test]
+    fn a_filtered_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 3), keys_between(5, 40)] {
+            assert_conforms(|| Box::new(keep_even_positions().0), guard);
+        }
+    }
+
+    /// A rejected row is in no consumer's tile, so no guard of the consumer's names it. The
+    /// tile states the region it decided, rejected rows included, and a consumer releases that
+    /// region, so the input and the predicate both release the rejected positions with it.
+    #[test]
+    fn releasing_the_stated_region_releases_the_rejected_rows() {
+        let values: Vec<i64> = (0..ROWS as i64).map(|i| 10 * i).collect();
+        let (mut filter, _, _) = keep_even_positions();
+        let (input, _, input_released) = ProjectionSpy::new(
+            ints_by_position(&values, true),
+            filter.input.tiling().clone(),
+        );
+        let answers = Tile::data_function(
+            ColumnValue::UInts((0..ROWS).collect()),
+            Box::new(Tile::Scalar(ColumnValue::Bools(
+                (0..ROWS).map(|i| i % 2 == 0).collect(),
+            ))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let (predicate, _, predicate_released) =
+            ProjectionSpy::new(answers, filter.predicate.tiling().clone());
+        filter.input = Box::new(input);
+        filter.predicate = Box::new(predicate);
+        let kept = filter.get(keys_between(0, ROWS - 1));
+        assert_eq!(int_entries(&kept), [(0, 0), (2, 20), (4, 40), (6, 60)]);
+        filter.release(kept.to_guard());
+        let everything = || keys_between(0, ROWS - 1);
+        assert_eq!(*input_released.borrow(), [everything()]);
+        assert_eq!(*predicate_released.borrow(), [everything()]);
+    }
+
+    /// `[x for x in (evens ++ odds) if p(x)]` while the odd arm has decided only `0..=3`: the
+    /// union's tile holds the even rows and the odd rows so far, and states `0..=3` complete.
+    /// The predicate answers every position. The filter answers for the rows held and states
+    /// only `0..=3` complete. The consumer releases what it holds, `0..=3` and row 6, and the
+    /// rows that arrive afterwards are filtered by the predicate's answers for them.
+    #[test]
+    fn rows_a_union_delivers_late_are_filtered_and_complete_only_where_the_input_is() {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+
+        let column = |keys: Vec<u64>, decided: Predicate, value: fn(u64) -> Value| {
+            let values = keys.iter().map(|&key| value(key)).collect::<Vec<_>>();
+            let codomain = match values.first() {
+                Some(Value::Bool(_)) => ColumnValue::Bools(
+                    values
+                        .iter()
+                        .map(|v| matches!(v, Value::Bool(true)))
+                        .collect(),
+                ),
+                _ => ColumnValue::Ints(
+                    values
+                        .iter()
+                        .map(|v| match v {
+                            Value::Int(i) => *i,
+                            other => panic!("an int or a bool, got {other:?}"),
+                        })
+                        .collect(),
+                ),
+            };
+            Tile::data_function(
+                ColumnValue::from_uints(keys),
+                Box::new(Tile::Scalar(codomain)),
+                decided,
+                BitSet::new(),
+            )
+        };
+        let value = |key: u64| Value::Int(10 * key as i64);
+        // Positions 1, 4 and 7 fail.
+        let answer = |key: u64| Value::Bool(key % 3 != 1);
+        let TileGuard::Function(FunctionGuard::Domain(through_3)) = keys_between(0, 3) else {
+            unreachable!("keys_between names a key region")
+        };
+        let TileGuard::Function(FunctionGuard::Domain(from_4)) = keys_between(4, ROWS - 1) else {
+            unreachable!("keys_between names a key region")
+        };
+
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let pred_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Bool)),
+        );
+        let (input, input_cell) = ScriptedProducer::new(
+            column(vec![0, 1, 2, 3, 4, 6], through_3.clone(), value),
+            in_tiling.clone(),
+        );
+        let (predicate, predicate_cell) = ScriptedProducer::new(
+            column((0..ROWS).collect(), Predicate::True, answer),
+            pred_tiling,
+        );
+        let mut filter = FilterProducer {
+            base: ProducerBase::unowned(FilterProducer::alloc_id(), &in_tiling),
+            input: Box::new(input),
+            predicate: Box::new(predicate),
+            level: CurryLevel::OUTERMOST,
+        };
+
+        let first = filter.get(keys_between(0, ROWS - 1));
+        assert_eq!(int_entries(&first), [(0, 0), (2, 20), (3, 30), (6, 60)]);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &first
+        else {
+            panic!("a collection, got {first:?}")
+        };
+        assert_eq!(
+            *domain_predicate, through_3,
+            "positions 5 and 7 have not arrived, so only the input's decided prefix is complete"
+        );
+
+        filter.release(first.to_guard());
+        *input_cell.borrow_mut() = column(vec![4, 5, 7], from_4.clone(), value);
+        *predicate_cell.borrow_mut() = column(vec![4, 5, 7], Predicate::True, answer);
+        let second = filter.get(keys_between(0, ROWS - 1));
+        assert_eq!(int_entries(&second), [(5, 50)]);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &second
+        else {
+            panic!("a collection, got {second:?}")
+        };
+        assert_eq!(*domain_predicate, from_4);
+    }
+
+    #[test]
+    fn nothing_filters_nothing() {
+        let (mut filter, input_pulled, predicate_pulled) = keep_even_positions();
+        let nothing = filter.tiling().empty_guard();
+        assert_eq!(filter.get(nothing), filter.tiling().empty_tile());
+        assert!(input_pulled.borrow().is_empty() && predicate_pulled.borrow().is_empty());
     }
 }
