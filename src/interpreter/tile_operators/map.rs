@@ -1214,13 +1214,20 @@ impl TileProducer for MapResultWithSourceProducer {
             .child("input", self.input.inspect(opts))
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
+    /// The source is read at the keys the input answers, and the input is pulled at the
+    /// projection, so a morsel reads only its own rows from the source.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let input_tile = self.input.get(projection.guard(self.input.tiling()));
         if self.input.tiling().levels() > 1 {
             self.last_nested_input = HeldBeneathKeys::of(&input_tile);
         }
         let source = self.source.borrow();
         let fields = &self.fields;
+
         process_tile_result(self.tiling(), input_tile, move |codomain| {
             source.get_fields(codomain, fields)
         })
@@ -2469,5 +2476,84 @@ mod const_projection_tests {
         let nothing = map.tiling().empty_guard();
         assert_eq!(map.get(nothing), map.tiling().empty_tile());
         assert!(input_pulled.borrow().is_empty() && constant_pulled.borrow().is_empty());
+    }
+}
+
+/// A program over a live source reads it as `iterate ▷ map_with_source`: the source's domain
+/// supplies the keys, which this operator looks up, and a worker's morsel is a range of them.
+#[cfg(test)]
+mod source_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::test_source::TestDataSource;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, int_entries, keys_between,
+    };
+    use bit_set::BitSet;
+
+    const ROWS: u64 = 5;
+
+    /// A source holding `10, 20, 30, 40, 50` at positions `0..5`, and the producer reading it
+    /// over a stream of its positions, which `spy` stands in for the domain iteration of.
+    fn read_source() -> (MapResultWithSourceProducer, GuardLog) {
+        let source = Rc::new(RefCell::new(TestDataSource::new(
+            "s",
+            crate::ccl::Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        )));
+        source.borrow_mut().add_data(
+            &(0..ROWS)
+                .map(|i| (Value::UInt(i), Value::Int(10 * (i as i64 + 1))))
+                .collect::<Vec<_>>(),
+        );
+        let positions = Tile::data_function(
+            ColumnValue::UInts((0..ROWS).collect()),
+            Box::new(Tile::Scalar(ColumnValue::UInts((0..ROWS).collect()))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let in_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::UInt)),
+        );
+        let out = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(positions, in_tiling);
+        (
+            MapResultWithSourceProducer {
+                base: ProducerBase::unowned(MapResultWithSourceProducer::alloc_id(), &out),
+                input: Box::new(input),
+                source,
+                fields: Vec::new(),
+                result_correlation: None,
+                last_nested_input: None,
+            },
+            pulled,
+        )
+    }
+
+    #[test]
+    fn a_morsel_reads_only_its_rows_of_the_source() {
+        let (mut read, pulled) = read_source();
+        let morsel = read.get(keys_between(1, 3));
+        assert_eq!(int_entries(&morsel), [(1, 20), (2, 30), (3, 40)]);
+        assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
+    }
+
+    #[test]
+    fn the_morsels_are_the_whole_pull_cut_to_them() {
+        for guard in [keys_between(0, 1), keys_between(3, 9)] {
+            assert_conforms(|| Box::new(read_source().0), guard);
+        }
+    }
+
+    #[test]
+    fn nothing_reads_nothing() {
+        let (mut read, pulled) = read_source();
+        let nothing = read.tiling().empty_guard();
+        assert_eq!(read.get(nothing), read.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 }
