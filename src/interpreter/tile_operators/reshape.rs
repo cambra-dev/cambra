@@ -496,21 +496,28 @@ impl TileProducer for FlattenTupleDomainProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
-        if self.level == CurryLevel::OUTERMOST {
-            return flatten_level(input_tile, &self.field_map);
+    /// The keys are restated flat, so the input is read whole and the answer is cut to the
+    /// projection over the flat keys.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
         }
-        // Flatten beneath the standing levels, which stand unchanged: a row's group is a
-        // collection in its own right, flattened as a whole tile is.
-        input_tile.regroup_beneath(
-            self.level,
-            self.empty_level.clone(),
-            &mut |row| match input_tile.group_at(self.level, row) {
-                Some(group) => flatten_level(group.into_owned(), &self.field_map),
-                None => self.empty_level.clone(),
-            },
-        )
+        let input_tile = self.input.get(self.input.tiling().universal_guard());
+        let mut flat = if self.level == CurryLevel::OUTERMOST {
+            flatten_level(input_tile, &self.field_map)
+        } else {
+            // Flatten beneath the standing levels, which stand unchanged: a row's group is a
+            // collection in its own right, flattened as a whole tile is.
+            input_tile.regroup_beneath(self.level, self.empty_level.clone(), &mut |row| {
+                match input_tile.group_at(self.level, row) {
+                    Some(group) => flatten_level(group.into_owned(), &self.field_map),
+                    None => self.empty_level.clone(),
+                }
+            })
+        };
+        flat.restrict_to(&projection, self.tiling());
+        flat
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1572,6 +1579,65 @@ mod projection_tests {
         let (mut swapped, pulled) = swapped_pairs();
         let tile = swapped.get(swapped.tiling().empty_guard());
         assert_eq!(tile, swapped.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+
+    /// `((a, b), c)` keys flattened to `(a, b, c)`: the rows `((0,0),0) ((0,1),1) ((1,0),0)`
+    /// hold `10 11 12`.
+    fn flattened_triples() -> (FlattenTupleDomainProducer, GuardLog) {
+        let nested = Extent::Record(record_of(vec![
+            Extent::Record(record_of(vec![uint(), uint()])),
+            Extent::Record(record_of(vec![uint()])),
+        ]));
+        let in_tiling = Tiling::data_function(nested, Tiling::Scalar(Extent::Base(BaseType::Int)));
+        let (input, pulled, _) = ProjectionSpy::new(
+            Tile::data_function(
+                ColumnValue::Records(record_of(vec![
+                    ColumnValue::Records(record_of(vec![uints(&[0, 0, 1]), uints(&[0, 1, 0])])),
+                    ColumnValue::Records(record_of(vec![uints(&[0, 1, 0])])),
+                ])),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 12]))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            in_tiling,
+        );
+        let flat = Tiling::data_function(
+            Extent::Record(record_of(vec![uint(), uint(), uint()])),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        (
+            FlattenTupleDomainProducer {
+                base: ProducerBase::unowned(FlattenTupleDomainProducer::alloc_id(), &flat),
+                input: Box::new(input),
+                field_map: vec![
+                    (tuple_field(0), Some(tuple_field(0))),
+                    (tuple_field(0), Some(tuple_field(1))),
+                    (tuple_field(1), Some(tuple_field(0))),
+                ],
+                empty_level: flat.values_at(CurryLevel::OUTERMOST).empty_at_no_rows(),
+                level: CurryLevel::OUTERMOST,
+            },
+            pulled,
+        )
+    }
+
+    #[test]
+    fn a_projection_over_the_flat_keys_cuts_the_flattened_triples() {
+        let (mut flat, pulled) = flattened_triples();
+        let cut = flat.get(field_is(2, 0, 3));
+        assert_eq!(
+            keyed_rows(&cut),
+            (vec![vec![0, 1], vec![0, 0], vec![0, 0]], vec![10, 12])
+        );
+        assert!(pulled.borrow()[0].is_universal());
+    }
+
+    #[test]
+    fn flattened_triples_asked_for_nothing_pull_nothing() {
+        let (mut flat, pulled) = flattened_triples();
+        let tile = flat.get(flat.tiling().empty_guard());
+        assert_eq!(tile, flat.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
     }
 }
