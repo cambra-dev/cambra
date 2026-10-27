@@ -32,7 +32,7 @@ pub(super) enum ImportArgument<'a> {
     Type(&'a Spanned<ChlExpr>, Vec<Span>),
 }
 
-impl ProgramLowering<'_> {
+impl<'a> ProgramLowering<'a> {
     /// Decide the shared import each `import` of the module in `importer` reaches,
     /// once the modules it imports have lowered and before it lowers: record it
     /// by the statement, with the types it gives its module's type parameters

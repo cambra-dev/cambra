@@ -250,6 +250,12 @@ pub(super) trait Typing {
     /// Check has none to report.
     fn definition_alone_error(&self, name: &Name) -> Option<LocatedInferError>;
 
+    /// Note `ty`, the type the generalized binding `name` is bound at, while its
+    /// scheme is live, for a module check that reports its public members'
+    /// contracts (`docs/modules.md`, "Checking a module on its own"). Check
+    /// reports nothing.
+    fn note_scheme(&mut self, _name: &Name, _ty: &Type) {}
+
     /// Run `f` with a `let` binding in scope over the body, at the type
     /// `binding.ty` records. Unless `scheme` is [`LetScheme::Monomorphic`], Emit
     /// generalizes that type at the current level into a polymorphic scheme (so
