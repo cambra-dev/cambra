@@ -490,6 +490,7 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
 | Operator | Projection |
 | --- | --- |
 | `IterateExtent` | A finite range is cut to the admitted interval before it is rendered. Every other extent renders whole and is cut after. |
+| `Constant` | A collection constant answers the admitted keys. A scalar constant answers the whole value or nothing. |
 
 ### Producer attribution and probes
 
