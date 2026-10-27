@@ -4,7 +4,8 @@ A projection names the part of a producer's tile a pull asks for
 (`src/interpreter/design-operators.md`, "Projection guards"). This note specifies projections that
 name keys at any collection level, each under the path of keys above it. A producer declares the
 levels whose keys it restates (`TileProducer::restates`, a `Restates`), the outermost keys only by
-default, and one that declares more reads its projection with `TileGuard::projection_for`.
+default, and one that declares more reads its projection with `TileGuard::projection_for`. The `get`
+wrapper of a debug build panics on a pull at a level a producer does not restate.
 
 ## Representation
 
@@ -38,5 +39,5 @@ the key.
 and a key above where an admitted path passes through it. A statement beneath level 𝑛 is
 qualified by the paths kept (`within_paths`). A statement above level 𝑛 keeps the keys whose every
 path the predicate admits, which the arms of the projection's guard name above level 𝑛, and states
-the rest of what it said at level 𝑛, cut to the predicate.
+the rest of what it said at level 𝑛, cut to the predicate. `Tile::within` checks the same paths.
 
