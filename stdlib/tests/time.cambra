@@ -1,0 +1,23 @@
+# A program that imports `std::time`: each input line sets a deadline 30 minutes after the
+# transaction that reads it, and an alarm at the deadline records how long after the program
+# started the line expired, unless a later line with the same text moved its deadline.
+
+import std::time
+
+started = time::now()
+
+expiries, set_expiry = time::alarms()
+
+deadlines: Mut(Map(String, time::Instant), Txn) := empty_map()
+expired: Mut(Map(String, time::Duration), Txn) := empty_map()
+
+for line in stdin():
+    with begin():
+        deadline = time::now() + time::minutes(30)
+        deadlines[line] := deadline
+        set_expiry << (line=line, time::at=deadline)
+
+for e in expiries:
+    with begin():
+        if deadlines[e.line]? == Option::some(e.time::at):
+            expired[e.line] := time::now() - started

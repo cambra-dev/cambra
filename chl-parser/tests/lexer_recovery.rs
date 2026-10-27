@@ -6,7 +6,7 @@
 //!   reports, and the kinds of the statements it parses to. `CAMBRA_BLESS=1`
 //!   rewrites the goldens.
 //! - Every `.cambra` file under the repository's `tests/`, `editors/` and
-//!   `std/` lexes with no error, the corpus `./ci.sh editors` checks.
+//!   `stdlib/` lexes with no error, the corpus `./ci.sh editors` checks.
 //! - A seeded mutation fuzzer checks the stream invariants on mutated sources,
 //!   and that `parse_module` returns a module for each one.
 //!   `CAMBRA_FUZZ_SEED` picks the seed and `CAMBRA_FUZZ_N` the number of
@@ -144,10 +144,10 @@ fn every_repository_program_lexes_with_no_error() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = cambra_files(&root.join("tests"));
     files.extend(cambra_files(&root.join("editors")));
-    files.extend(cambra_files(&root.join("std")));
+    files.extend(cambra_files(&root.join("stdlib")));
     assert!(
         !files.is_empty(),
-        "no .cambra file under tests/, editors/ or std/"
+        "no .cambra file under tests/, editors/ or stdlib/"
     );
     for path in files {
         let errors = tokenize(FileId::ROOT, &read(&path)).errors;
@@ -401,7 +401,7 @@ fn mutated_sources_keep_the_stream_invariants() {
     let mut seeds: Vec<String> = cambra_files(&root.join("tests"))
         .into_iter()
         .chain(cambra_files(&root.join("editors")))
-        .chain(cambra_files(&root.join("std")))
+        .chain(cambra_files(&root.join("stdlib")))
         .chain(cambra_files(Path::new(CORPUS)))
         .map(|path| read(&path))
         .collect();

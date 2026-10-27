@@ -3876,7 +3876,8 @@ responses ([10. Sinks](#10-sinks)).
 | `http_serve(port, method, path)` | HTTP server, a source and a sink | Returns a `(requests, responses)` 2-tuple. The requests source yields request bodies; the responses sink is a feed. Called only as the whole right-hand side of a top-level `=` (see below). |
 
 Additional sources may be pre-registered by the host embedding (testing,
-demos, etc.).
+demos, etc.). `std::time` adds a clock read and an alarm source and sink
+([7.5 Time [Decided]](#75-time-decided)).
 
 `http_serve` opens its route when the program starts, so a call is the
 whole right-hand side of a `=` in the top-level block, and its three
@@ -4008,6 +4009,103 @@ nothing about which collection they are, so a value reaches one only by being bo
 `x: List(Int) = box([1, 2, 3])` binds, and `x: List(Int) = [1, 2, 3]` is an error. That
 is the same requirement as above rather than an alternative to it — the annotation keeps
 the elements and forgets which collection it was, and with it any proven lookup (§3.9).
+
+---
+
+### 7.5 Time [Decided]
+
+**[Decided]** — the rules of this section; the std root that holds `std::time` is **[Planned]**
+([9.16 The std root](#916-the-std-root)).
+
+`std::time` provides a reading of the wall clock, `time::now()`, and an alarm source and sink,
+`time::alarms()`. Its other members are library functions over the two types it declares:
+`time::Instant`, a point on the UTC timeline counted in nanoseconds since the Unix epoch, and
+`time::Duration`, a length of time in nanoseconds. `Instant` is unrelated to the builtin `Time`, a
+position in the commit order ([6. Types (informal sketch)](#6-types-informal-sketch)).
+
+#### `time::now()`
+
+`time::now()` returns the runtime's clock reading as an `Instant`.
+
+- **A reading is the system clock, best effort.** It is the later of the system wall clock and the
+  latest reading the runtime has handed out, so readings never decrease within one process. A
+  reading taken after a restart can be earlier than one taken before it. The runtime does not
+  correct the system clock: a backward step holds readings at the latest one until the system clock
+  passes it, and a forward step is adopted at once.
+- **Each evaluation of a call reads the clock.** A call is evaluated once per iteration of each
+  enclosing loop and once per attempt of an enclosing transaction. Two calls can return different
+  readings, including two calls in one transaction, and a transaction that retries reads the clock
+  again. A binding holds one reading: in `t = time::now()`, every use of `t` is the same instant.
+- **A call at a module's top level reads the clock once, when the program starts.** A reload keeps
+  the reading of a binding it keeps. A binding the reload adds or changes reads the clock when the
+  new version starts.
+- **A reading orders nothing.** A reading is not an event and creates no dependency edge
+  ([8.5 Ordering and concurrency](#85-ordering-and-concurrency)). Commit order never consults a
+  reading, so a transaction that commits after another can hold an earlier reading.
+- **A call is IO.** The compiler represents a call as a read of a clock source at the call's
+  position, not as an expression it may merge or duplicate. A module whose top-level evaluation
+  calls `time::now()`, directly or through a function, performs IO and is run
+  ([9.7 Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)).
+
+#### `time::alarms()`
+
+`time::alarms()` returns a source and a sink. Each row fed to the sink is held, and comes out of
+the source once the clock reads at or after the row's `time::at` field.
+
+```python
+import std::time
+
+expiries, set_expiry = time::alarms()
+
+sessions: Mut(Map(String, time::Instant), Txn) := empty_map()   # session id -> expiry
+expired = defer()
+
+for r in requests:
+    with begin():
+        expiry = time::now() + time::minutes(30)
+        sessions[r.session] := expiry
+        set_expiry << (session=r.session, time::at=expiry)
+
+for r in logouts:
+    with begin():
+        sessions[r.session] := time::now()
+
+for e in expiries:
+    with begin():
+        if sessions[e.session]? == Option::some(e.time::at):
+            expired << (session=e.session)
+```
+
+- **Binding.** The call is bound at a module's top level by tuple destructuring, as `http_serve` is
+  ([7.3 Sources](#73-sources)). The call opens a source, so it is IO in the calling module, and
+  `std::time` itself stays importable.
+- **Rows.** A row is the caller's own record with a field `time::at: time::Instant`. The label
+  belongs to `std::time` ([9.12 Field labels and tags belong to a
+  module](#912-field-labels-and-tags-belong-to-a-module)), and every other field is the caller's.
+  The rows the program feeds determine the row type, and the source's element type is that row
+  type.
+- **Holding.** A row fed inside a `with begin():` block is held only if the transaction commits
+  ([8.4 Feeds are the second form of mutability](#84-feeds-are-the-second-form-of-mutability)). A
+  row whose `at` has passed when it is held comes out at once.
+- **Release.** The runtime releases a row at a reading of the clock `time::now()` reads, and that
+  reading is at or after the row's `at`. Every reading taken after the release in the same process
+  is at or after it, so a transaction handling a released row `e` reads
+  `time::now() >= e.time::at`.
+- **Arrival.** A released row is an arrival on the source
+  ([8.5 Ordering and concurrency](#85-ordering-and-concurrency)): every loop over the source
+  receives it, and it orders what consumes it as any arrival does. Of two rows held at once, the
+  row with the earlier `at` arrives first, and rows with equal `at` arrive in an unspecified order.
+  A row held after another row's release can arrive after it with an earlier `at`.
+- **A release is a reminder to check, never a decision.** A row comes out whether or not a later
+  transaction superseded the decision that held it. The handler's transaction reads the state the
+  row refers to, as the example's comparison of `e.time::at` with the session's current expiry
+  does.
+- **No feed cycle.** A loop over the source that feeds the sink closes no cycle of feeds: the path
+  from the sink to the source passes through the runtime, as `http_serve`'s responses and requests
+  pass through a client.
+- **Reload keeps held rows; a process exit discards them.** The pair's identity is the module path
+  and name of the binding that holds it, as a mutable variable's is, and a reload that keeps the
+  binding keeps its held rows. Durable state is **[Tentative]** ([8.8 `@LoadFrom`](#88-loadfrom)).
 
 ## 8. Mutability, transactions, and feeds
 
@@ -4215,6 +4313,9 @@ Consequences a program may rely on:
   **not** commit in the order they appear in source; each block's position
   is fixed by its trigger event (a source arrival, or the loop index for a
   batch writer). A programmer's default lexical-order assumption is wrong.
+- **A clock reading orders nothing** (**[Decided]**). A `time::now()` reading is not an event,
+  and commit order never consults one. A row an alarm source releases is a source arrival
+  ([7.5 Time [Decided]](#75-time-decided)).
 - **Read-your-writes** within a block or iteration.
 - **Reply-after-commit / cross-endpoint monotonicity.** A reply fed from
   inside a block is sequenced after that commit; combined with arrival-order
@@ -5151,10 +5252,11 @@ prints. An annotation is how an author fixes the contract.
 
 The compiler's own modules live under a **std root**, and every std module's path begins with `std`:
 `import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.3
-Sources](#73-sources)). A path beginning with `std` names a module of the std root and never a file
-under the module root, so `std` is the only name the std root reserves, and adding a std module
-changes no user module's meaning. `std` alone names no module, and a root file named `std.cambra` is
-refused.
+Sources](#73-sources)), and `import std::time` binds `time`, then `time::now()` and
+`time::alarms()` ([7.5 Time [Decided]](#75-time-decided)). A path beginning with `std` names a
+module of the std root and never a file under the module root, so `std` is the only name the std
+root reserves, and adding a std module changes no user module's meaning. `std` alone names no
+module, and a root file named `std.cambra` is refused.
 
 A builtin source, sink, or special form a std module provides is recognized by what a name resolves
 to, not by how it is spelled. After `import std::http as web`, `reqs, resps = web::serve(…)` is the

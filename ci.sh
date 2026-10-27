@@ -124,10 +124,10 @@ ci_editors() {
     trap 'rm -rf "${tmp}"' EXIT
     # `|| exit 1` per command: `ci_all` calls this gate on the left of a `||`,
     # which disables errexit for this subshell too.
-    find tests editors std -name '*.cambra' | LC_ALL=C sort >"${tmp}/corpus" || exit 1
+    find tests editors stdlib -name '*.cambra' | LC_ALL=C sort >"${tmp}/corpus" || exit 1
     mapfile -t corpus <"${tmp}/corpus"
     if [[ "${#corpus[@]}" -eq 0 ]]; then
-      echo "ci_editors: no .cambra file under tests/, editors/ or std/ — nothing to check" >&2
+      echo "ci_editors: no .cambra file under tests/, editors/ or stdlib/ — nothing to check" >&2
       exit 1
     fi
     cargo run -q -p chl-parser --example dump_tokens -- "${corpus[@]}" >"${tmp}/spans.jsonl" || exit 1

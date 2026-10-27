@@ -1,0 +1,197 @@
+# Wall-clock time: the current instant, durations between instants, conversions to and from
+# integer counts, and alarms that deliver a row once the clock reaches its instant.
+#
+# `std::time` declares no state and opens no source, so a module imports it
+# (docs/chl-spec.md, "9.7 Importing asserts no IO and no state"). A call of `alarms` opens a
+# source in the calling module, so the IO belongs to the caller.
+#
+# An `Instant` is a point on the UTC timeline. Instants read by different processes, before and
+# after a restart, compare as points on that timeline. `Instant` is unrelated to the builtin `Time`,
+# a position in the commit order (docs/chl-spec.md, "6. Types (informal sketch)"). `std::time` has
+# no calendar: a day is 86,400 seconds, and time zones, leap seconds and daylight saving are out of
+# scope.
+#
+# Both types count nanoseconds in an `Int`: an `Instant` since the Unix epoch, 1970-01-01T00:00:00Z,
+# and a `Duration` of elapsed time. The count is part of the contract: `Duration::new` and
+# `extract` are the conversions in nanoseconds, and the named conversions below cover the other
+# units. Only `now()` and `alarms` read the runtime's clock.
+#
+# Example, a deadline 30 minutes after a request, kept for a later transaction to compare against:
+#
+#     import std::time
+#
+#     deadlines: Mut(Map(String, time::Instant), Txn) := empty_map()
+#
+#     for r in requests:
+#         with begin():
+#             deadlines[r.id] := time::now() + time::minutes(30)
+#
+# Status: [Decided] (docs/chl-spec.md, "7.5 Time [Decided]"). The std root it belongs to is
+# [Planned] (docs/chl-spec.md, "9.16 The std root"). `[proposed]` marks each construct the compiler
+# lacks.
+
+# A point on the UTC timeline: nanoseconds since the Unix epoch, negative before it.
+#
+# Instants compare with `==` and `!=`, and order with `<`, `<=`, `>` and `>=`.
+# `Instant + Duration` and `Instant - Duration` are `Instant`s, and `Instant - Instant` is a
+# `Duration`.
+#
+# [proposed] instances of the operator traits on a declared nominal type (docs/chl-spec.md, "A
+# nominal type is opaque", and "Declaring an instance", both Planned): the bodiless opt-in to
+# `Equatable` and `Orderable`, and `Addable(Instant, Duration, Output=Instant)`,
+# `Subtractable(Instant, Duration, Output=Instant)` and `Subtractable(Instant, Instant,
+# Output=Duration)`.
+pub type Instant = Int
+
+# A length of time in nanoseconds: positive, zero or negative.
+#
+# Durations compare, add and subtract. `Duration * Int` is a `Duration`, and
+# `Duration // Duration` is the `Int` count of whole divisor lengths in the dividend, rounded toward
+# negative infinity as `Int` division is. Division by a zero `Duration` is undefined, as `Int`
+# division by zero is (docs/chl-spec.md, "Partiality is not yet defined [Open]").
+#
+# [proposed] as `Instant`, with the instances `Addable(Duration, Duration, Output=Duration)`,
+# `Subtractable(Duration, Duration, Output=Duration)`, `Multipliable(Duration, Int,
+# Output=Duration)` and `Divisible(Duration, Duration, Output=Int)`.
+pub type Duration = Int
+
+# Returns the runtime's clock reading: the system wall clock, best effort.
+#
+# - A reading is the later of the system wall clock and the latest reading the runtime has handed
+#   out, so readings never decrease within one process. A reading taken after a restart can be
+#   earlier than one taken before it.
+# - Each evaluation of a call reads the clock: once per iteration of each enclosing loop, and once
+#   per attempt of an enclosing transaction. Two calls can return different readings, including two
+#   in one transaction, and a transaction that retries reads the clock again.
+# - A call at a module's top level reads the clock once, when the program starts. A reload keeps
+#   the reading of a binding it keeps.
+# - A reading orders nothing, and commit order never consults one: a transaction that commits after
+#   another can hold an earlier reading.
+# - A call is IO. A module whose top-level evaluation calls `now()` is run, not imported
+#   (docs/chl-spec.md, "9.7 Importing asserts no IO and no state").
+#
+# [proposed] a call the compiler represents as a read of a clock source at the call's position
+# (docs/chl-spec.md, "7.5 Time [Decided]"); a zero-argument call of a std builtin, where a `def`
+# with no parameters is refused (docs/chl-spec.md, "3.8 Function calls"); and binding the
+# intrinsic `__now`, a name "9.15 Module files" refuses in user modules.
+pub def now() => Instant:
+    __now()
+
+# Returns a source and a sink: each row fed to the sink comes out of the source once the clock
+# reaches the row's `at`.
+#
+# The row type `R` is the caller's own record, and `at` is this module's label, so a caller writes
+# `time::at`. `R` is determined by the rows the caller feeds.
+#
+# - A row fed inside a `with begin():` block is held only if that transaction commits. A row whose
+#   `at` has passed when it is held comes out at once.
+# - The runtime releases a row at a reading of the clock `now()` reads, at or after the row's `at`.
+#   Every later reading in the same process is at or after it, so a transaction handling a released
+#   row `e` reads `now() >= e.time::at`.
+# - A released row is an arrival on the source, and every loop over the source receives it. Of two
+#   rows held at once, the row with the earlier `at` arrives first; rows with equal `at` arrive in
+#   an unspecified order.
+# - A release is a reminder to check, never a decision: a row comes out whether or not a later
+#   transaction superseded the decision that held it, so the handler's transaction reads the state
+#   the row refers to.
+# - A reload that keeps the pair's binding keeps its held rows: the pair's identity is the module
+#   path and name of that binding, as a mutable variable's is. A process exit discards held rows.
+# - A loop over the source that feeds the sink closes no cycle of feeds: the path from the sink
+#   to the source passes through the runtime, as `http::serve`'s responses and requests pass
+#   through a client.
+# - The call is bound at a module's top level by tuple destructuring, as `http::serve` is
+#   (docs/chl-spec.md, "7.3 Sources").
+#
+# Example, sessions that expire 30 minutes after their latest request, and end early on logout.
+# Each request holds a new row, and a row that a later request or a logout superseded fails the
+# check and is dropped:
+#
+#     import std::time
+#
+#     expiries, set_expiry = time::alarms()
+#
+#     sessions: Mut(Map(String, time::Instant), Txn) := empty_map()   # session id -> expiry
+#     expired = defer()                                                # Feed({session: String})
+#
+#     for r in requests:
+#         with begin():
+#             expiry = time::now() + time::minutes(30)
+#             sessions[r.session] := expiry
+#             set_expiry << (session=r.session, time::at=expiry)
+#
+#     for r in logouts:
+#         with begin():
+#             sessions[r.session] := time::now()
+#
+#     for e in expiries:
+#         with begin():
+#             if sessions[e.session]? == Option::some(e.time::at):
+#                 expired << (session=e.session)
+#
+# [proposed] a builtin source and sink a std module provides, bound by tuple destructuring
+# (docs/chl-spec.md, "9.16 The std root"; docs/chl-spec.md, "7.5 Time [Decided]"), called with
+# no arguments (docs/chl-spec.md, "3.8 Function calls"), and bound through the intrinsic
+# `__alarms`, a name "9.15 Module files" refuses in user modules; a type for a
+# source, which the spec does not name; a type parameter determined by the use (docs/chl-spec.md,
+# "Type parameters"), bounded as in "Kinds and bounds"; a source's element type taken from the rows
+# fed to its sink, where today a source's type is fixed before inference; a sink whose held rows
+# the runtime feeds back into the graph; held rows kept across a reload, and their reload identity;
+# and a path through the runtime that closes no cycle of feeds.
+pub def alarms(R <: {at: Instant}) => {Source(R), Feed(R)}:
+    __alarms()
+
+# --- Durations ----------------------------------------------------------------------------------
+
+# Returns a duration of `n` nanoseconds.
+pub def nanoseconds(n: Int) => Duration:
+    Duration::new(n)
+
+# Returns a duration of `n` milliseconds.
+pub def milliseconds(n: Int) => Duration:
+    nanoseconds(1_000_000 * n)
+
+# Returns a duration of `n` seconds.
+pub def seconds(n: Int) => Duration:
+    nanoseconds(1_000_000_000 * n)
+
+# Returns a duration of `n` minutes.
+pub def minutes(n: Int) => Duration:
+    seconds(60 * n)
+
+# Returns a duration of `n` hours.
+pub def hours(n: Int) => Duration:
+    minutes(60 * n)
+
+# Returns a duration of `n` days of 86,400 seconds each.
+pub def days(n: Int) => Duration:
+    hours(24 * n)
+
+# Returns `d` in whole nanoseconds.
+pub def as_nanoseconds(d: Duration) => Int:
+    d.extract()
+
+# Returns `d` in whole milliseconds, rounded toward negative infinity.
+pub def as_milliseconds(d: Duration) => Int:
+    d.extract() // 1_000_000
+
+# Returns `d` in whole seconds, rounded toward negative infinity.
+pub def as_seconds(d: Duration) => Int:
+    d.extract() // 1_000_000_000
+
+# --- Unix time ----------------------------------------------------------------------------------
+
+# Returns the instant `n` nanoseconds after the Unix epoch.
+pub def from_unix_nanoseconds(n: Int) => Instant:
+    Instant::new(n)
+
+# Returns the instant `n` seconds after the Unix epoch.
+pub def from_unix_seconds(n: Int) => Instant:
+    from_unix_nanoseconds(1_000_000_000 * n)
+
+# Returns `t` as nanoseconds since the Unix epoch.
+pub def unix_nanoseconds(t: Instant) => Int:
+    t.extract()
+
+# Returns `t` as whole seconds since the Unix epoch, rounded toward negative infinity.
+pub def unix_seconds(t: Instant) => Int:
+    t.extract() // 1_000_000_000

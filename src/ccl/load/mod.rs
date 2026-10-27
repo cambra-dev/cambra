@@ -267,7 +267,7 @@ impl LoadedProgram {
 
     /// [`Self::load`] against the std root `std`, each module's path and source
     /// text, in place of the compiler's own. It loads the sources under the
-    /// repository's `std/`, which the compiler does not embed (`std/README.md`).
+    /// repository's `stdlib/src/`, which the compiler does not embed (`stdlib/README.md`).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn load_with_std(
         root: RootFile,
