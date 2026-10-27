@@ -156,6 +156,42 @@ impl Tile {
         self.map_level_predicates(&mut |depth, stated| within_keys(stated, keys, depth));
     }
 
+    /// Whether this tile holds only what `projection` names, or why it does not.
+    ///
+    /// A producer answers a pull with a tile inside the projection, so a cell outside it is a
+    /// producer that ignored the guard. Rows deleted but not yet compacted are released, so
+    /// they are not part of the answer. The check reads keys and cells and does not read the
+    /// completeness the tile states.
+    pub fn within(&self, projection: &Projection) -> Result<(), String> {
+        match projection {
+            Projection::Everything => Ok(()),
+            Projection::Nothing => {
+                let mut live = self.clone();
+                live.compact();
+                match live.cell_count() {
+                    0 => Ok(()),
+                    _ => Err("it holds cells, and the projection names none".into()),
+                }
+            }
+            Projection::Keys(keys) => {
+                let Tile::DataFunction {
+                    domain, deleted, ..
+                } = self
+                else {
+                    return Err("it is not a collection, so it has no keys to project".into());
+                };
+                match (0..domain.len())
+                    .filter(|row| !deleted.contains(*row))
+                    .map(|row| domain.index_at(row))
+                    .find(|key| !keys.contains(key))
+                {
+                    None => Ok(()),
+                    Some(key) => Err(format!("it holds the key {key:?}, which {keys:?} omits")),
+                }
+            }
+        }
+    }
+
     /// Cut this tile to `projection`.
     ///
     /// `Nothing` empties it at `tiling`, the tiling of the producer that made it.
@@ -396,5 +432,37 @@ mod tests {
         // the consumer released what it took.
         spy.release(tiling.universal_guard());
         assert_eq!(spy.get(tiling.empty_guard()), tiling.empty_tile());
+    }
+
+    #[test]
+    fn a_tile_is_within_the_keys_it_holds_and_not_beyond() {
+        let tile = ints_by_position(&[10, 20, 30, 40], true);
+        let admitting = |first, last| Projection::admitting(positions(first, last));
+        assert_eq!(tile.within(&admitting(0, 3)), Ok(()));
+        assert_eq!(tile.within(&Projection::Everything), Ok(()));
+        assert!(tile.within(&admitting(1, 2)).unwrap_err().contains("omits"));
+        assert!(tile.within(&Projection::Nothing).is_err());
+        assert_eq!(
+            ints_tiling(4).empty_tile().within(&Projection::Nothing),
+            Ok(())
+        );
+        let mut released = ints_by_position(&[10, 20], true);
+        released.remove_guarded(keys_between(0, 1));
+        assert_eq!(released.within(&Projection::Nothing), Ok(()));
+        assert_eq!(released.within(&admitting(5, 6)), Ok(()));
+        let scalar = Tile::Scalar(ColumnValue::Ints(vec![1]));
+        assert!(scalar.within(&admitting(0, 3)).is_err());
+    }
+
+    /// A producer that ignores the guard is caught by the `get` wrapper in a debug build, where
+    /// a pull for a morsel returns the whole tile.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "answered a pull at")]
+    fn get_rejects_an_answer_beyond_the_projection() {
+        use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+        let mut ignoring =
+            TestTileProducer::new(ints_by_position(&[10, 20, 30, 40], true), ints_tiling(4));
+        ignoring.get(keys_between(1, 2));
     }
 }

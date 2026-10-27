@@ -917,7 +917,8 @@ pub trait TileProducer {
     /// the result.
     /// Tiling conformance is asserted in every build; release, structural and completeness
     /// checks require debug assertions. Probe observations occur after those checks.
-    /// Projection is the implementation's responsibility.
+    /// A debug build also checks that the answer holds only what the projection guard names
+    /// ([`Tile::within`]); an operator that forwards the projection to its input answers inside it because the input does, and any other cuts its own answer.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
         // Cleared before the pull, so a notification arriving while it runs passes: the
@@ -926,7 +927,7 @@ pub trait TileProducer {
             gate.take();
         }
         self.base_mut().pulls += 1;
-        let projection = crate::interpreter::Projection::of(&projection_guard).ok();
+        let asked = cfg!(debug_assertions).then(|| projection_guard.clone());
         let mut result = self.get_impl(projection_guard);
         // Released scalar cells are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
@@ -949,14 +950,29 @@ pub trait TileProducer {
             self.tiling()
         );
         debug_assert!(validate_tile(&result), "Invalid tile: {result:?}");
+        if let Some(asked) = &asked {
+            // A guard that is not a projection is left to a producer that restates projections,
+            // which panics on it in `get_impl`; one that is, bounds the answer.
+            if let Ok(projection) = crate::interpreter::Projection::of(asked)
+                && let Err(outside) = result.within(&projection)
+            {
+                panic!(
+                    "{} answered a pull at {asked:?} with {result:?}, but {outside}",
+                    self.name()
+                );
+            }
+        }
         if cfg!(debug_assertions) {
             // A pull states completeness only for the region it returns, so the last output
             // is compared inside that region: a producer asked for one region after another
             // withdraws nothing it said of the first.
+            let region = asked
+                .as_ref()
+                .and_then(|asked| crate::interpreter::Projection::of(asked).ok());
             let last_in_region = self.base().last_output.as_ref().map(|last| {
                 let mut last = last.clone();
-                if let Some(projection) = &projection {
-                    last.restrict_to(projection, self.tiling());
+                if let Some(region) = &region {
+                    last.restrict_to(region, self.tiling());
                 }
                 last
             });
@@ -974,7 +990,7 @@ pub trait TileProducer {
             }
             // The statement a later pull is held to holds each region's last answer: this pull
             // replaces its own region and leaves the others as they were.
-            let stated = match (&projection, self.base_mut().last_output.take()) {
+            let stated = match (&region, self.base_mut().last_output.take()) {
                 (Some(crate::interpreter::Projection::Nothing), Some(last)) => last,
                 (Some(region @ crate::interpreter::Projection::Keys(_)), Some(mut last)) => {
                     last.restrict_to(
