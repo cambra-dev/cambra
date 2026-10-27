@@ -1,13 +1,16 @@
 use bit_set::BitSet;
-use intervalsets::{Bounding, Interval, IntervalSet, ops::Difference};
+use intervalsets::{
+    Bounding, Interval, IntervalSet,
+    ops::{Difference, Intersection},
+};
 use smol_str::SmolStr;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use super::*;
 use crate::ccl::TagMap;
 use crate::interpreter::{
-    BaseType, ColumnValue, Consumer, Extent, NotifyOrSubscribeResult, Scheduler, SharedConsumer,
-    UnionArm, Value, scheduler::shared_consumer,
+    BaseType, ColumnValue, Consumer, Extent, NotifyOrSubscribeResult, Projection, Scheduler,
+    SharedConsumer, UnionArm, Value, scheduler::shared_consumer,
 };
 
 /// Produces a function tile whose domain and codomain both equal `extent`.
@@ -348,15 +351,30 @@ impl Drop for IterateExtentProducer {
 impl TileProducer for IterateExtentProducer {
     impl_producer_base!();
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let values = iterate_extent(&self.extent, &self.name());
-        let domain_predicate = get_iterate_extent_predicate(&self.extent);
+    /// The extent's positions inside the projection. A finite range is cut before it is
+    /// rendered, so a morsel costs the morsel's size; every other extent renders whole and is
+    /// cut after, since a source's arrivals and a cross product's keys are not an interval of
+    /// positions.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let extent = match (&self.extent, &projection) {
+            (Extent::UIntRange(remaining), Projection::Keys(Predicate::Intervals(admitted))) => {
+                Extent::UIntRange(remaining.intersection(&predicate_intervals_to_u64(admitted)))
+            }
+            (extent, _) => extent.clone(),
+        };
+        let values = iterate_extent(&extent, &self.name());
+        let domain_predicate = get_iterate_extent_predicate(&extent);
         let mut tile = Tile::data_function(
             values.clone(),
             Box::new(Tile::Scalar(values)),
             domain_predicate,
             BitSet::new(),
         );
+        tile.restrict_to(&projection, self.tiling());
         // Filter out any domain rows that have already been released.
         // Values may also be removed from underlying sources for efficiency, but
         // this filter here is ultimately responsible for not returning released data.
@@ -607,5 +625,165 @@ mod tests {
             }
             other => panic!("Unexpected predicate for record extent with base types: {other:?}"),
         }
+    }
+}
+
+/// The projection a chain head is pulled with: a pipeline cuts its source into morsels, and a
+/// worker pulls its chain at one morsel at a time.
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::keys_between;
+    use crate::interpreter::{DataSourceDomainExtentImpl, test_source::TestDataSource};
+
+    fn head(extent: Extent) -> IterateExtentProducer {
+        let tiling = Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone()));
+        IterateExtentProducer {
+            base: ProducerBase::unowned(0, &tiling),
+            extent,
+            released: Predicate::False,
+            _source_wakeup: None,
+        }
+    }
+
+    /// The positions a head tile holds, which it keys and values alike.
+    fn positions(tile: &Tile) -> Vec<u64> {
+        let Tile::DataFunction {
+            domain: ColumnValue::UInts(keys),
+            ..
+        } = tile
+        else {
+            panic!("a collection of positions, got {tile:?}")
+        };
+        let mut keys = keys.clone();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn completeness(tile: &Tile) -> Predicate {
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = tile
+        else {
+            panic!("a collection, got {tile:?}")
+        };
+        domain_predicate.clone()
+    }
+
+    fn between(first: u64, last: u64) -> Predicate {
+        let TileGuard::Function(FunctionGuard::Domain(keys)) = keys_between(first, last) else {
+            unreachable!("a morsel is a domain guard")
+        };
+        keys
+    }
+
+    /// A chain over `iterate([0, 10))` is pulled one morsel at a time. Each morsel holds its own
+    /// positions and calls only them complete, and the morsels together are the whole range.
+    #[test]
+    fn a_range_head_answers_one_morsel_at_a_time() {
+        let mut head = head(Extent::uint_range(10));
+        let mut seen = Vec::new();
+        for (first, last) in [(0, 3), (4, 7), (8, 9)] {
+            let morsel = head.get(keys_between(first, last));
+            assert_eq!(positions(&morsel), (first..=last).collect::<Vec<_>>());
+            assert_eq!(
+                completeness(&morsel),
+                between(first, last),
+                "a morsel is complete over its own interval"
+            );
+            seen.extend(positions(&morsel));
+            // The next morsel is pulled after this one is released.
+            head.release(keys_between(first, last));
+        }
+        assert_eq!(seen, (0..10).collect::<Vec<_>>());
+    }
+
+    /// The last morsel of a range is usually cut past its end: the head answers the positions it
+    /// has, and the range is complete over the rest of the morsel because nothing lies there.
+    #[test]
+    fn a_morsel_past_the_end_holds_what_the_range_holds() {
+        let mut head = head(Extent::uint_range(10));
+        let morsel = head.get(keys_between(8, 20));
+        assert_eq!(positions(&morsel), [8, 9]);
+        assert_eq!(completeness(&morsel), between(8, 20));
+    }
+
+    #[test]
+    fn a_released_morsel_is_not_answered_again() {
+        let mut head = head(Extent::uint_range(10));
+        head.get(keys_between(0, 3));
+        head.release(keys_between(0, 3));
+        let rest = head.get(head.tiling().universal_guard());
+        assert_eq!(positions(&rest), (4..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn nothing_names_no_positions() {
+        let mut head = head(Extent::uint_range(10));
+        assert_eq!(
+            head.get(head.tiling().empty_guard()),
+            head.tiling().empty_tile()
+        );
+    }
+
+    /// The head of a program over a live source. A morsel is cut from what has arrived, and the
+    /// head says nothing about positions that may still arrive in the morsel.
+    #[test]
+    fn a_live_source_head_is_complete_only_over_what_has_arrived() {
+        let source = Rc::new(RefCell::new(TestDataSource::new(
+            "s",
+            crate::ccl::Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        )));
+        let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = source.clone();
+        let mut head = head(Extent::DataSourceDomain(as_domain));
+        source.borrow_mut().release(&head.name(), Predicate::False);
+        source.borrow_mut().add_data(&[
+            (Value::UInt(0), Value::Int(10)),
+            (Value::UInt(1), Value::Int(20)),
+            (Value::UInt(2), Value::Int(30)),
+            (Value::UInt(3), Value::Int(40)),
+            (Value::UInt(4), Value::Int(50)),
+        ]);
+        source
+            .borrow_mut()
+            .set_yield_predicate(Predicate::at_or_below(Value::UInt(4)));
+
+        let inside = head.get(keys_between(1, 2));
+        assert_eq!(positions(&inside), [1, 2]);
+        assert_eq!(completeness(&inside), between(1, 2));
+        head.release(keys_between(1, 2));
+
+        // Positions 5 to 9 have not arrived, so the morsel is complete over 3 and 4 only.
+        let straddling = head.get(keys_between(3, 9));
+        assert_eq!(positions(&straddling), [3, 4]);
+        assert_eq!(completeness(&straddling), between(3, 4));
+    }
+
+    /// A cross product's keys are records, which the projection cuts by field.
+    #[test]
+    fn a_cross_product_is_cut_by_the_fields_of_its_keys() {
+        let extent = Extent::Record(
+            [
+                (SmolStr::new("a"), Extent::uint_range(3)),
+                (SmolStr::new("b"), Extent::uint_range(2)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let mut head = head(extent);
+        let first_a = Predicate::Record(
+            [
+                (SmolStr::new("a"), Predicate::point(Value::UInt(0))),
+                (SmolStr::new("b"), Predicate::True),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let tile = head.get(TileGuard::Function(FunctionGuard::Domain(first_a)));
+        let Tile::DataFunction { domain, .. } = &tile else {
+            panic!("a collection")
+        };
+        assert_eq!(domain.len(), 2, "(0, 0) and (0, 1)");
     }
 }
