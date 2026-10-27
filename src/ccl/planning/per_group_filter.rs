@@ -28,7 +28,9 @@ use crate::ccl::{Refinement, application_order, subst::open_codomain};
 /// 𝑢 ≫ 𝑚   ⟹   𝑢 ≫ map(filter_values(𝑞₁ and … and 𝑞ₙ)) ≫ 𝑚'
 /// ```
 ///
-/// with `𝑚'` re-typed to take the narrowed collection. A refinement set narrows by the
+/// with `𝑚'` re-typed to take the narrowed collection. Every site in the chain is
+/// rewritten, `𝑢` may be empty, and a site at the head of its chain takes the chain's
+/// input: the arm `id ▷ map ≫ sum` of a `zip` is one. A refinement set narrows by the
 /// conjunction of its members, so a whole difference materializes as one filter
 /// over the conjoined value predicate rather than a chain of them, and every 𝑞ₖ stays
 /// stated against the collection the site is handed. The conjunction is built in
@@ -56,7 +58,8 @@ pub(super) fn insert_per_group_filters(
         }
     });
     result?;
-    let TypedExprNode::Compose(elts) = &expr.node else {
+    let id = expr.node_id();
+    let TypedExprNode::Compose(elts) = &mut expr.node else {
         return Ok(());
     };
     // The compose is what the recording names: the filter is spliced into it,
@@ -70,24 +73,34 @@ pub(super) fn insert_per_group_filters(
     // still copies. Those copies reach no output tree and compose away as transients
     // of this node, as `planning.hash_join`'s rejected attempts do.
     let _g = provenance::enter(
-        expr.node_id(),
+        id,
         "planning.per_group_filter",
         provenance::Nature::Machinery,
     );
-    let Some(site) = elts.iter().position(|e| per_group_filter_site(e).is_some()) else {
-        return Ok(());
-    };
-    // `site` is never 0: the morphism consumes a collection, so something upstream
-    // produces one.
-    if site == 0 {
-        return Ok(());
+    // A site at position 0 takes the chain's input, as in the `zip` arm `id ▷ map ≫ sum`,
+    // and the filter in front of it takes that same input.
+    let mut site = 0;
+    while site < elts.len() {
+        let Some((site_codomain, value_predicate)) = per_group_filter_site(&elts[site]) else {
+            site += 1;
+            continue;
+        };
+        materialize(elts, site, site_codomain, value_predicate, witnesses)?;
+        // The filter now sits at `site` and the re-typed site after it.
+        site += 2;
     }
-    let TypedExprNode::Compose(elts) = &mut expr.node else {
-        unreachable!("matched a Compose above")
-    };
-    let Some((site_codomain, value_predicate)) = per_group_filter_site(&elts[site]) else {
-        unreachable!("position found it")
-    };
+    Ok(())
+}
+
+/// Splice `map(filter_values(value_predicate))` in front of the site at `elts[site]` and
+/// re-type the site to take the narrowed collection.
+fn materialize(
+    elts: &mut Vec<Expr>,
+    site: usize,
+    site_codomain: Type,
+    value_predicate: Expr,
+    witnesses: &mut Witnesses,
+) -> Result<(), String> {
     // The filter evaluates its predicate per value, so it is planned as a `restrict`'s
     // predicate is ([`iterate::planned_restrict`]): a collection it aggregates is an
     // iteration site.
@@ -225,10 +238,10 @@ fn narrowing(expr: &Expr) -> Option<Narrowing> {
 /// The site keeps claiming a narrowing no operator performs, and op-conversion reads a
 /// collection's extent with its refinements stripped, so compiling it would drop the filter
 /// and answer as though it were absent. Runs after [`insert_per_group_filters`] over the same
-/// positions it inspects: the elements of a composition after the first.
+/// positions it inspects: the elements of a composition.
 pub(super) fn reject_unmaterialized_narrowings(expr: &Expr) -> Result<(), String> {
     if let TypedExprNode::Compose(elts) = &expr.node
-        && let Some(site) = elts.iter().skip(1).find(|e| narrowing(e).is_some())
+        && let Some(site) = elts.iter().find(|e| narrowing(e).is_some())
     {
         return Err(format!(
             "a filter on an inner collection that planning cannot materialize is not \

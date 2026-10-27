@@ -393,6 +393,29 @@ fn a_groupby_rollup() {
     "#});
 }
 
+/// A group-by body that builds a tuple or record of aggregates over the group, each under
+/// its own guard or none. Each guarded aggregate filters its own copy of the group: the
+/// guard's filter sits at the head of the arm's chain (`src/ccl/planning/per_group_filter.rs`).
+#[rstest]
+#[case::two_differently_guarded_sums_in_a_record(
+    "(lo=sum([x for x in g if x < 2]), hi=sum([x for x in g if x > 2]))"
+)]
+#[case::a_guarded_and_an_unguarded_sum_in_a_record(
+    "(lo=sum([x for x in g if x < 2]), all=sum([x for x in g]))"
+)]
+#[case::two_differently_guarded_sums_in_a_tuple(
+    "(sum([x for x in g if x < 2]), sum([x for x in g if x > 2]))"
+)]
+fn a_groupby_body_of_differently_guarded_aggregates(#[case] body: &str) {
+    agree(&format!(
+        indoc! {r#"
+            out = test_sink()
+            out << [{} for g in groupby([1, 2, 3, 4, 5, 6], \x -> x // 4)]
+        "#},
+        body
+    ));
+}
+
 /// A comprehension inside a loop that reads the loop variable: the correlated case.
 #[test]
 fn a_correlated_comprehension() {

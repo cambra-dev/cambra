@@ -461,6 +461,8 @@ function, where that refinement depends on the function's input collection. The 
 iteration walk sees the function's own domain and cannot materialize this inner one.
 When each added predicate reads that input collection, planning converts the added
 conditions into a value predicate 𝑞 and inserts one `map(filter_values(𝑞))` before the function.
+The function may head its chain, as it does in an arm of a `zip` (`(lo: id ▷ map ≫ sum, …) ▷ zip`),
+and every site in a chain gets its own filter.
 The operator filters each group's elements independently. `reject_unmaterialized_narrowings`
 refuses a narrowing no per-group filter materializes, since operator conversion would compile the
 site without its filter.

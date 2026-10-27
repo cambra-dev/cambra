@@ -1159,7 +1159,7 @@ fn per_region_product(fields: &[(&str, [i64; 2])]) -> Tile {
 }
 
 /// A filtered per-group aggregate on its own applies its filter. This is the control for
-/// [`a_filtered_per_group_aggregate_in_a_product_drops_its_filter`].
+/// [`a_filtered_per_group_aggregate_in_a_product_keeps_its_filter`].
 #[test]
 fn a_bare_filtered_per_group_aggregate_keeps_its_filter() {
     check_tile(
@@ -1168,38 +1168,32 @@ fn a_bare_filtered_per_group_aggregate_keeps_its_filter() {
     );
 }
 
-/// **This test pins a defect, not a decision — it should start failing when the defect is
-/// fixed.**
+/// A filtered per-group aggregate placed in a tuple or a record keeps its filter:
+/// `sum([s.amount for s in g if s.qty > 2])` is north `0` and west `200` there too, the values
+/// [`a_bare_filtered_per_group_aggregate_keeps_its_filter`] gets for the same aggregate alone.
 ///
-/// A filtered per-group aggregate placed in a tuple or a record answers the unfiltered sum:
-/// `sum([s.amount for s in g if s.qty > 2])` is north `40` and west `300` where it should be
-/// north `0` and west `200`, the values
-/// [`a_bare_filtered_per_group_aggregate_keeps_its_filter`] gets for the same aggregate
-/// alone. Once fixed, each case's filtered component (`F` in its product) asserts `[0, 200]`.
-///
-/// In the post-planning tree both forms carry the filter as a refinement of the
-/// aggregate's input, `__elem ▷ (g ≫ (.qty, 2 ▷ const) ▷ zip ≫ gt)`.
-/// `insert_per_group_filters` (`src/ccl/planning/per_group_filter.rs`) inserts a
-/// `map(filter_values(𝑞))` for the bare form and none for these, and the program compiles and
-/// runs with the refinement unmaterialized.
+/// In a product the aggregate is an arm of a `zip`, and the morphism whose type carries the
+/// filter, `__elem ▷ (g ≫ (.qty, 2 ▷ const) ▷ zip ≫ gt)`, heads that arm's chain.
+/// `insert_per_group_filters` (`src/ccl/planning/per_group_filter.rs`) materializes a site at
+/// any position of its chain, the head included.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::beside_a_constant(
     "(1, F)",
-    per_region_product(&[("_0", [1, 1]), ("_1", [40, 300])])
+    per_region_product(&[("_0", [1, 1]), ("_1", [0, 200])])
 )]
-#[case::one_tuple("(F,)", per_region_product(&[("_0", [40, 300])]))]
-#[case::record_field("(k=F)", per_region_product(&[("k", [40, 300])]))]
+#[case::one_tuple("(F,)", per_region_product(&[("_0", [0, 200])]))]
+#[case::record_field("(k=F)", per_region_product(&[("k", [0, 200])]))]
 #[case::beside_the_unfiltered_sum(
     "(F, sum([s.amount for s in g]))",
-    per_region_product(&[("_0", [40, 300]), ("_1", [40, 300])])
+    per_region_product(&[("_0", [0, 200]), ("_1", [40, 300])])
 )]
-fn a_filtered_per_group_aggregate_in_a_product_drops_its_filter(
+fn a_filtered_per_group_aggregate_in_a_product_keeps_its_filter(
     #[case] product: &str,
-    #[case] pinned: Tile,
+    #[case] expected: Tile,
 ) {
     let body = product.replace("F", "sum([s.amount for s in g if s.qty > 2])");
-    check_tile(&per_region_program(&body), pinned);
+    check_tile(&per_region_program(&body), expected);
 }
 
 /// A filter inside each group, over elements that hold a collection of their own: the filter
