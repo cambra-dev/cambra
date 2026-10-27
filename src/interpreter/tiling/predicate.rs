@@ -9,10 +9,10 @@ use bit_set::BitSet;
 use intervalsets::{
     Bounding, Interval, IntervalSet, MaybeEmpty, Side,
     numeric::Domain,
-    ops::{Complement, Contains, Difference, Intersection, Union},
+    ops::{Complement, Difference, Intersection, Union},
 };
 
-use super::interval_sets::single_interval_set;
+use super::interval_sets::{HoldsValue, right_ends_ascend, single_interval_set};
 use crate::{
     ccl::{BaseType, FieldKey, TagMap},
     interpreter::{
@@ -698,7 +698,7 @@ impl Predicate {
         match self {
             Predicate::True => true,
             Predicate::False => false,
-            Predicate::Intervals(s) => s.contains(value),
+            Predicate::Intervals(s) => s.holds(value),
             Predicate::Record(m) => match value {
                 Value::Record(fields) => m
                     .iter()
@@ -1471,16 +1471,20 @@ where
 /// `𝑥` has no predecessor to make them adjacent. Together they are `(-∞, 𝑦]`. Where the shared
 /// value is open on both sides it belongs to neither, which is a real gap and stays.
 fn canonical_runs(set: IntervalSet<Value>) -> IntervalSet<Value> {
-    let (merged, ordered) = normalize_and_join(set);
-    if ordered {
-        return IntervalSet::new_unchecked(merged);
+    let (mut merged, ordered) = normalize_and_join(set);
+    if !ordered {
+        // The crate's `intersection` with the type's range turns two equal half-bounded
+        // intervals into two equal finite ones. `IntervalSet::new` sorts and merges them.
+        let ordered;
+        (merged, ordered) = normalize_and_join(IntervalSet::new(merged));
+        debug_assert!(
+            ordered,
+            "canonical_runs: intervals of a set built by `IntervalSet::new` are sorted and disjoint: {merged:?}"
+        );
     }
-    // The crate's `intersection` with the type's range turns two equal half-bounded intervals into
-    // two equal finite ones. `IntervalSet::new` sorts and merges them.
-    let (merged, ordered) = normalize_and_join(IntervalSet::new(merged));
     debug_assert!(
-        ordered,
-        "canonical_runs: intervals of a set built by `IntervalSet::new` are sorted and disjoint: {merged:?}"
+        right_ends_ascend(&merged),
+        "canonical_runs: the right ends ascend, which `HoldsValue::holds` searches by: {merged:?}"
     );
     IntervalSet::new_unchecked(merged)
 }
@@ -1662,6 +1666,33 @@ mod tests {
                 .map(|(k, v)| (SmolStr::from(*k), v.clone()))
                 .collect(),
         )
+    }
+
+    /// `Predicate::intervals` drops the inverted `[5, 4]` that `Interval::open(4, 5)` builds over
+    /// `UInt`, so the right ends of its set ascend and `contains` finds the values of the interval
+    /// the inverted one sat in.
+    #[test]
+    fn an_inverted_interval_is_dropped_from_a_predicate() {
+        let u = Value::UInt;
+        let set = IntervalSet::new(vec![
+            Interval::closed(u(0), u(10)),
+            Interval::open(u(4), u(5)),
+            Interval::closed(u(12), u(14)),
+        ]);
+        let Predicate::Intervals(kept) = Predicate::intervals(set) else {
+            panic!("two disjoint runs stay an interval set");
+        };
+        assert_eq!(
+            kept.intervals(),
+            &[
+                Interval::closed(u(0), u(10)),
+                Interval::closed(u(12), u(14))
+            ]
+        );
+        let p = Predicate::Intervals(kept);
+        for (v, held) in [(3, true), (5, true), (10, true), (11, false), (13, true)] {
+            assert_eq!(p.contains(&u(v)), held, "{v}");
+        }
     }
 
     // ── Predicate::as_bool ────────────────────────────────────────────────────

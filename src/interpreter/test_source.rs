@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use intervalsets::ops::Contains;
 use log::trace;
 
 use crate::{
     ccl::Type,
     interpreter::{
         ColumnValue, DataSourceDomainExtentImpl, Extent, FieldPath, Value,
-        producer_releases::ProducerReleases, tiling::Predicate,
+        producer_releases::ProducerReleases,
+        tiling::{HoldsValue, Predicate},
     },
 };
 
@@ -209,7 +209,7 @@ fn key_matches_predicate(key: &Value, predicate: &Predicate) -> bool {
     match predicate {
         Predicate::True => true,
         Predicate::False => false,
-        Predicate::Intervals(intervals) => intervals.contains(key),
+        Predicate::Intervals(intervals) => intervals.holds(key),
         _ => panic!("Unsupported predicate type in TestDataSource release: {predicate:?}"),
     }
 }
