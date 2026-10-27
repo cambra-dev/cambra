@@ -821,18 +821,52 @@ impl TileProducer for MapResultToConstProducer {
         visit("constant", &*self.constant);
     }
 
+    /// The input is pulled at the projection, since each output row is the input's row paired
+    /// with the constant. The constant is read whole: every row reads all of it.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+
+        self.apply(&projection)
+    }
+
+    /// The input shares the output's levels down to `level`, and beneath them the output
+    /// holds the constant too, so only a release naming a whole value there reaches the
+    /// input ([`through_shared_levels`]): the output is rebuilt from the input's rows on
+    /// every pull, and a row the input gave back could not be rebuilt for what of it is still
+    /// held here.
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let upstream = crate::interpreter::tiling::through_shared_levels(
+            obsolete_guard,
+            self.level.index(),
+            self.input.tiling(),
+        );
+        let done = upstream.is_universal();
+        self.input.release(upstream);
+        // The constant is re-read on every pull, and every row reads all of it, so it is
+        // released once there will be no next pull, which is what a universal release says.
+        if done {
+            self.constant
+                .release(self.constant.tiling().universal_guard());
+        }
+    }
+}
+
+impl MapResultToConstProducer {
+    /// The output for the keys `projection` names.
+    fn apply(&mut self, projection: &Projection) -> Tile {
         let c_tiling = self.constant.tiling();
         assert!(
             !matches!(c_tiling, Tiling::Aggregation { .. } | Tiling::Store { .. }),
             "MapResultToConst broadcasts a value, got {c_tiling:?}"
         );
         let i_tiling = self.input.tiling().clone();
-        let input_guard = match projection_guard {
-            TileGuard::Function(FunctionGuard::Domain(p)) => {
-                TileGuard::Function(FunctionGuard::Domain(p))
-            }
-            _ => i_tiling.universal_guard(),
+        // A scalar input has no keys to project, so it is read whole and the answer cut.
+        let input_guard = match i_tiling.is_data_function() {
+            true => projection.guard(&i_tiling),
+            false => i_tiling.universal_guard(),
         };
         let input_tile = self.input.get(input_guard);
         // **Laziness — do not evaluate an off-path arm.** In the scalar value-`Case`
@@ -908,27 +942,6 @@ impl TileProducer for MapResultToConstProducer {
         // consumer has released beneath a row still open comes back unless it is left out.
         output.remove_guarded(self.obsolete_guard().clone());
         output
-    }
-
-    /// The input shares the output's levels down to `level`, and beneath them the output
-    /// holds the constant too, so only a release naming a whole value there reaches the
-    /// input ([`through_shared_levels`]): the output is rebuilt from the input's rows on
-    /// every pull, and a row the input gave back could not be rebuilt for what of it is still
-    /// held here.
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        let upstream = crate::interpreter::tiling::through_shared_levels(
-            obsolete_guard,
-            self.level.index(),
-            self.input.tiling(),
-        );
-        let done = upstream.is_universal();
-        self.input.release(upstream);
-        // The constant is re-read on every pull, and every row reads all of it, so it is
-        // released once there will be no next pull, which is what a universal release says.
-        if done {
-            self.constant
-                .release(self.constant.tiling().universal_guard());
-        }
     }
 }
 /// The extent of the leaves at `paths` of a source's values, given the extent of the values: the
@@ -2347,5 +2360,114 @@ mod projection_tests {
     #[test]
     fn the_groups_projected_are_the_whole_pull_cut_to_them() {
         assert_conforms(|| Box::new(lookup_over_groups().0), groups_one_and_three());
+    }
+}
+
+/// `MapResultToConst` as a comprehension over a stream uses it: `[7 for x in xs]` replaces each
+/// value with a constant, and `[(x, 2) for x in xs]` pairs each value with one. The stream is
+/// cut into morsels and the constant is the same for every row.
+#[cfg(test)]
+mod const_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, int_entries, ints_by_position, keys_between,
+    };
+
+    const ROWS: u64 = 10;
+
+    fn int_stream_tiling() -> Tiling {
+        Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
+    }
+
+    fn seven(complete: bool) -> (Tile, Tiling) {
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        match complete {
+            true => (Tile::Scalar(ColumnValue::Ints(vec![7])), tiling),
+            false => (tiling.empty_tile(), tiling),
+        }
+    }
+
+    fn broadcast(
+        mode: MapResultToConstMode,
+        constant: (Tile, Tiling),
+    ) -> (MapResultToConstProducer, GuardLog, GuardLog) {
+        let values: Vec<i64> = (0..ROWS as i64).map(|i| i * 3).collect();
+        let (input, input_pulled, _) =
+            ProjectionSpy::new(ints_by_position(&values, true), int_stream_tiling());
+        let (constant, constant_pulled, _) = ProjectionSpy::new(constant.0, constant.1);
+        let out = match mode {
+            MapResultToConstMode::Replace => int_stream_tiling(),
+            _ => Tiling::data_function(
+                Extent::uint_range(ROWS),
+                Tiling::Record(
+                    [
+                        (tuple_field(0), Tiling::Scalar(Extent::Base(BaseType::Int))),
+                        (tuple_field(1), Tiling::Scalar(Extent::Base(BaseType::Int))),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
+        };
+        (
+            MapResultToConstProducer {
+                base: ProducerBase::unowned(MapResultToConstProducer::alloc_id(), &out),
+                input: Box::new(input),
+                constant: Box::new(constant),
+                mode,
+                level: CurryLevel::new(1),
+            },
+            input_pulled,
+            constant_pulled,
+        )
+    }
+
+    /// Each worker's morsel of `[7 for x in xs]`: the stream is read at the morsel and the
+    /// constant whole.
+    #[test]
+    fn a_replaced_stream_reads_the_morsel_and_the_constant_whole() {
+        let (mut map, input_pulled, constant_pulled) =
+            broadcast(MapResultToConstMode::Replace, seven(true));
+        let morsel = map.get(keys_between(2, 4));
+        assert_eq!(int_entries(&morsel), [(2, 7), (3, 7), (4, 7)]);
+        assert_eq!(*input_pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(
+            *constant_pulled.borrow(),
+            [Tiling::Scalar(Extent::Base(BaseType::Int)).universal_guard()]
+        );
+    }
+
+    #[test]
+    fn a_paired_stream_is_the_whole_pull_cut_to_the_morsel() {
+        for mode in [
+            MapResultToConstMode::ZipLeft,
+            MapResultToConstMode::ZipRight,
+        ] {
+            for guard in [keys_between(0, 2), keys_between(8, 30)] {
+                assert_conforms(|| Box::new(broadcast(mode, seven(true)).0), guard);
+            }
+        }
+    }
+
+    /// A constant that has not landed yet, such as a scalar read from a loop that has not
+    /// converged, fabricates no rows: the projection answers nothing until it does.
+    #[test]
+    fn a_constant_that_has_not_landed_answers_nothing_for_any_morsel() {
+        let (mut map, _, _) = broadcast(MapResultToConstMode::Replace, seven(false));
+        let morsel = map.get(keys_between(0, 3));
+        assert!(int_entries(&morsel).is_empty());
+    }
+
+    #[test]
+    fn nothing_pulls_nothing() {
+        let (mut map, input_pulled, constant_pulled) =
+            broadcast(MapResultToConstMode::Replace, seven(true));
+        let nothing = map.tiling().empty_guard();
+        assert_eq!(map.get(nothing), map.tiling().empty_tile());
+        assert!(input_pulled.borrow().is_empty() && constant_pulled.borrow().is_empty());
     }
 }
