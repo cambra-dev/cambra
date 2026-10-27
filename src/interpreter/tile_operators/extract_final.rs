@@ -1,7 +1,7 @@
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::{
-    interpreter::{ColumnValue, Consumer, Scheduler, Value},
+    interpreter::{ColumnValue, Consumer, Projection, Scheduler, Value},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -188,7 +188,18 @@ impl TileProducer for ExtractFinalProducer {
         }
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    /// The final position of a stream is one value, or one collection that a release takes
+    /// whole, so the projection is all of it or none: the source is read whole whatever the
+    /// consumer asks, because the last position is not known before the stream ends.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        match projection_guard.projection(&self.name()) {
+            Projection::Everything => {}
+            Projection::Nothing => return self.tiling().empty_tile(),
+            Projection::Keys(_) => panic!(
+                "{} extracts one final value, which has no keys to project: {projection_guard:?}",
+                self.name()
+            ),
+        }
         // Every emission below is built at the **declared** extent rather than
         // from the value alone. A variant value carries only the tag it holds, so
         // a column built from it would have just that one arm — narrower than this
@@ -588,5 +599,60 @@ mod tests {
             Some(1),
             "ExtractFinal must release below the running max (positions 0, 1), keeping position 2"
         );
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpyOp, keys_between,
+    };
+    use crate::interpreter::{BaseType, Extent};
+
+    /// `final_or_default(xs, 0)` over a finished stream `[10, 20, 30]`, with the pulls of the
+    /// stream logged.
+    fn final_of_finished_stream() -> (Box<dyn TileProducer>, GuardLog) {
+        let int = || Extent::Base(BaseType::Int);
+        let tiling = Tiling::data_function(Extent::uint_range(3), Tiling::Scalar(int()));
+        let finished = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
+            Predicate::True,
+            bit_set::BitSet::new(),
+        );
+        let (stream, pulled, _) = ProjectionSpyOp::new(finished, tiling);
+        let mut op = ExtractFinal::new(
+            Box::new(stream),
+            Box::new(Constant::new(Value::Int(0), int())),
+        );
+        let guard = op.tiling().universal_guard();
+        let producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        (producer, pulled)
+    }
+
+    /// The last position is not known before the stream ends, so the source is read whole.
+    #[test]
+    fn the_stream_is_read_whole_to_find_its_last_position() {
+        let (mut last, pulled) = final_of_finished_stream();
+        let tile = last.get(last.tiling().universal_guard());
+        assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![30])));
+        assert_eq!(pulled.borrow().len(), 1);
+        assert!(pulled.borrow()[0].is_universal());
+    }
+
+    #[test]
+    fn asking_for_nothing_reads_nothing() {
+        let (mut last, pulled) = final_of_finished_stream();
+        let tile = last.get(last.tiling().empty_guard());
+        assert_eq!(tile, last.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "extracts one final value")]
+    fn a_key_projection_is_rejected() {
+        let (mut last, _) = final_of_finished_stream();
+        last.get(keys_between(0, 1));
     }
 }
