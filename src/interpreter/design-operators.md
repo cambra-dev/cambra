@@ -531,7 +531,8 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
   release that names more is not.
 - **Completeness between pulls.** The completeness contract compares a producer's answers inside the
   region pulled, and a pull of one projection states completeness over its keys only, so a pull of
-  another region withdraws nothing it said of the first.
+  another region withdraws nothing it said of the first. The debug check keeps the last statement of
+  each region.
 - **Check.** Every answer lies within the projection it was asked for: it holds no key the
   projection omits and no cell where the projection names nothing.
 
