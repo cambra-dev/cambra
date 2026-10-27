@@ -622,9 +622,8 @@ struct MapAggregateProducer {
     kind: AggregateKind,
     /// Running accumulators indexed by complete paths, outermost key first.
     accumulators: HashMap<Vec<Value>, Tile>,
-    /// Keys above the accumulators whose every accumulator was released without the key
-    /// itself: a key is there only through what it maps to, and a release naming part of
-    /// what lies beneath leaves it in place, holding nothing unreleased
+    /// Enclosing keys received empty or left empty by a release beneath them. Their presence
+    /// and completeness survive without an accumulator descendant
     /// (`src/interpreter/design-operators.md`, "The completeness contract").
     emptied_keys: HashSet<Vec<Value>>,
 }
@@ -645,8 +644,21 @@ impl TileProducer for MapAggregateProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut input_tile = self.input.get(self.input.tiling().universal_guard());
+    /// Every level of the output is a level of the input, and the aggregation folds only the
+    /// innermost beneath them.
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
+    /// The keys at every level are the input's, with each group beneath one whole, so the input
+    /// is pulled at the projection and the answer is cut to it: accumulators for keys pulled
+    /// earlier stay held, and a pull names the keys it wants.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(self);
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let mut input_tile = self.input.get(projection.guard(self.input.tiling()));
         trace!("{} received {input_tile:?}", self.name());
         let upstream_guard = input_tile.to_guard();
         input_tile.compact();
@@ -671,6 +683,16 @@ impl TileProducer for MapAggregateProducer {
             "MapAggregate folds a collection of collections, so the fold sits under a \
              level: {input_tile:?}"
         );
+        // An empty enclosing group has no accumulator path to preserve its key in `build`.
+        for level in 1..depth {
+            let children = input_tile.values_at(CurryLevel::new(level));
+            for (row, path) in input_tile.row_paths_at(level).into_iter().enumerate() {
+                let (from, to) = children.row_run(row);
+                if from == to {
+                    self.emptied_keys.insert(path);
+                }
+            }
+        }
         let level_predicates: Vec<Predicate> = (0..depth)
             .map(|level| {
                 let Tile::DataFunction {
@@ -764,6 +786,7 @@ impl TileProducer for MapAggregateProducer {
                 *domain_predicate = stated;
             }
         }
+        out.restrict_to(&projection, self.tiling());
         out
     }
 
@@ -1343,5 +1366,237 @@ mod extract_aggregate_projection_tests {
     fn a_key_projection_of_an_extracted_value_is_rejected() {
         let (mut extract, _) = extract_of_finished_sum();
         extract.get(keys_between(0, 1));
+    }
+}
+
+#[cfg(test)]
+mod map_aggregate_nested_projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        ProjectionSpyOp, assert_conforms_beneath,
+    };
+    use crate::interpreter::{BaseType, Extent, Tile};
+
+    /// `k ⤇ j ⤇ z ⤇ Int`: the keys 0 and 1, each holding the positions 0 to 2, each holding the
+    /// positions 0 and 1 valued `100k + 10j + z`, every level stated complete.
+    fn three_levels_of_ints() -> Box<dyn TileOperator> {
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(
+                Extent::uint_range(3),
+                Tiling::data_function(
+                    Extent::uint_range(2),
+                    Tiling::Scalar(Extent::Base(BaseType::Int)),
+                ),
+            ),
+        );
+        let values = (0..2)
+            .flat_map(|k| (0..3).flat_map(move |j| (0..2).map(move |z| 100 * k + 10 * j + z)))
+            .collect();
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 3],
+                ColumnValue::UInts(vec![0, 1, 2, 0, 1, 2]),
+                Box::new(Tile::grouped(
+                    vec![0, 2, 4, 6, 8, 10],
+                    ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                    Predicate::True,
+                    BitSet::new(),
+                )),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        Box::new(ProjectionSpyOp::new(tile, tiling).0)
+    }
+
+    /// The sum of each `(k, j)`'s positions, pulled at paths of `(k, j)`, answers what the whole
+    /// answer cut to those paths answers: a loop's round pulls a sum at its position's path.
+    #[test]
+    fn a_sum_of_each_path_answers_a_projection_of_paths() {
+        assert_conforms_beneath(|| {
+            Box::new(MapAggregate::new(
+                three_levels_of_ints(),
+                AggregateKind::Sum,
+            ))
+        });
+    }
+}
+
+#[cfg(test)]
+mod map_aggregate_projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, keys_between,
+    };
+    use crate::interpreter::{BaseType, Extent, Tile};
+
+    const GROUPS: u64 = 4;
+
+    /// `{k: sum(group) for k, group in groups}` over the groups `0: [1, 2]`, `1: [3]`,
+    /// `2: [4, 5]`, `3: [6]`, each stated whole, with the pulls of the groups logged.
+    fn sums_of_groups() -> (MapAggregateProducer, GuardLog) {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(GROUPS),
+            Tiling::data_function(uint(), Tiling::Scalar(int())),
+        );
+        let groups = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2, 3]),
+            Box::new(Tile::grouped(
+                vec![0, 2, 3, 5],
+                ColumnValue::from_uints(vec![0, 1, 0, 0, 1, 0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4, 5, 6]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(groups, in_tiling);
+        let out_tiling = Tiling::data_function(
+            Extent::uint_range(GROUPS),
+            Tiling::Aggregation {
+                kind: AggregateKind::Sum,
+                accumulator: Box::new(Tiling::Scalar(int())),
+            },
+        );
+        (
+            MapAggregateProducer {
+                base: ProducerBase::unowned(MapAggregateProducer::alloc_id(), &out_tiling),
+                input: Box::new(input),
+                kind: AggregateKind::Sum,
+                accumulators: HashMap::new(),
+                emptied_keys: HashSet::new(),
+            },
+            pulled,
+        )
+    }
+
+    /// The group keys and sums an answer holds.
+    fn sums(tile: &Tile) -> Vec<(Value, i64)> {
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("a collection, got {tile:?}")
+        };
+        let Tile::Aggregation { accumulator, .. } = &**codomain else {
+            panic!("an aggregation per key, got {codomain:?}")
+        };
+        let Tile::Scalar(ColumnValue::Ints(sums)) = &**accumulator else {
+            panic!("integer sums, got {accumulator:?}")
+        };
+        (0..domain.len())
+            .map(|i| (domain.index_at(i), sums[i]))
+            .collect()
+    }
+
+    #[test]
+    fn small_morsels_preserve_an_empty_enclosing_group() {
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let uint = || Extent::uint_range(2);
+        let input_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::data_function(uint(), int.clone())),
+        );
+        let output_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(
+                uint(),
+                Tiling::Aggregation {
+                    kind: AggregateKind::Sum,
+                    accumulator: Box::new(int),
+                },
+            ),
+        );
+        let source = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 0],
+                ColumnValue::UInts(vec![0]),
+                Box::new(Tile::grouped(
+                    vec![0],
+                    ColumnValue::UInts(vec![0]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                    Predicate::True,
+                    BitSet::new(),
+                )),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let (input, _, _) = ProjectionSpy::new(source, input_tiling);
+        let mut aggregate = MapAggregateProducer {
+            base: ProducerBase::unowned(MapAggregateProducer::alloc_id(), &output_tiling),
+            input: Box::new(input),
+            kind: AggregateKind::Sum,
+            accumulators: HashMap::new(),
+            emptied_keys: HashSet::new(),
+        };
+        let first = aggregate.get(keys_between(0, 0));
+        assert_eq!(
+            first.paths_at(CurryLevel::OUTERMOST),
+            vec![vec![Value::UInt(0)]]
+        );
+        assert!(first.paths_at(CurryLevel::new(1)).is_empty());
+        assert!(
+            first
+                .completion_at(CurryLevel::new(1))
+                .within(&[Value::UInt(0)], 0)
+                .is_true()
+        );
+        aggregate.release(keys_between(0, 0));
+        let next = aggregate.get(keys_between(1, 1));
+        assert_eq!(
+            next.paths_at(CurryLevel::new(1)),
+            vec![vec![Value::UInt(1), Value::UInt(0)]]
+        );
+    }
+
+    /// A morsel of groups pulls the input at the morsel and answers the morsel's sums, which is
+    /// what a worker that owns those groups reads.
+    #[test]
+    fn a_morsel_of_groups_is_summed_from_a_morsel_of_the_input() {
+        let (mut sums_of, pulled) = sums_of_groups();
+        let morsel = sums_of.get(keys_between(1, 2));
+        assert_eq!(
+            sums(&morsel),
+            vec![(Value::UInt(1), 3), (Value::UInt(2), 9)]
+        );
+        assert_eq!(*pulled.borrow(), vec![keys_between(1, 2)]);
+    }
+
+    /// The consumer releases a morsel before the next, which drops the first morsel's
+    /// accumulators, so the second's answer holds its own groups.
+    #[test]
+    fn successive_morsels_answer_their_own_groups() {
+        let (mut sums_of, _) = sums_of_groups();
+        sums_of.get(keys_between(0, 1));
+        sums_of.release(keys_between(0, 1));
+        let next = sums_of.get(keys_between(2, 3));
+        assert_eq!(sums(&next), vec![(Value::UInt(2), 9), (Value::UInt(3), 6)]);
+    }
+
+    #[test]
+    fn sums_asked_for_nothing_read_nothing() {
+        let (mut sums_of, pulled) = sums_of_groups();
+        let tile = sums_of.get(sums_of.tiling().empty_guard());
+        assert_eq!(tile, sums_of.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_morsels_together_are_the_whole_pull() {
+        for guard in [keys_between(0, 3), keys_between(2, 5), keys_between(5, 5)] {
+            assert_conforms(|| Box::new(sums_of_groups().0), guard);
+        }
     }
 }
