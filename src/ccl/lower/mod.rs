@@ -107,6 +107,7 @@ use smol_str::SmolStr;
 use crate::chl_parser::SurfaceBuiltin;
 
 mod comprehension;
+mod constants;
 mod exprs;
 mod functions;
 mod http;
@@ -236,6 +237,29 @@ impl LoweringError {
         match self {
             LoweringError::Unsupported { related, .. }
             | LoweringError::Internal { related, .. } => related,
+        }
+    }
+
+    /// Whether `other` is this error, at its span and with its message, whatever its labels.
+    pub fn differs_only_in_labels(&self, other: &LoweringError) -> bool {
+        match (self, other) {
+            (
+                LoweringError::Unsupported { span, message, .. },
+                LoweringError::Unsupported {
+                    span: other_span,
+                    message: other_message,
+                    ..
+                },
+            )
+            | (
+                LoweringError::Internal { span, message, .. },
+                LoweringError::Internal {
+                    span: other_span,
+                    message: other_message,
+                    ..
+                },
+            ) => span == other_span && message == other_message,
+            _ => false,
         }
     }
 }
@@ -542,11 +566,23 @@ pub struct LoweringContext {
     /// Each parameter of the module being lowered, recorded as its `param`
     /// statement lowers.
     pub(super) parameters: Vec<modules::Parameter>,
+    /// The top-level bindings and `const` parameters of the module being lowered, for
+    /// reading its constants ([`Self::const_term`]).
+    pub(super) constants: constants::ModuleConstants,
     /// The type arguments of each `run` statement of the module being lowered,
     /// by run name: each one's parameter, its span, and the type, lowered where
     /// the statement stands ([`Self::declare_run_types`]).
     pub(super) run_type_arguments:
         HashMap<SmolStr, Vec<(crate::ccl::names::QualifiedName, Span, Type)>>,
+    /// The term each `const` parameter takes from each `run` statement of the module being
+    /// lowered, by run name ([`Self::declare_run_types`]).
+    pub(super) run_const_arguments: HashMap<
+        SmolStr,
+        Vec<(
+            crate::ccl::constant::ConstParam,
+            crate::ccl::constant::ConstTerm,
+        )>,
+    >,
     /// The checks of each `run` statement's type arguments, by run name
     /// ([`Self::declare_run_types`]).
     pub(super) run_type_checks: HashMap<SmolStr, Vec<modules::TypeCheck>>,
@@ -572,7 +608,7 @@ enum DeclaredSink {
     /// `requests, responses = http_serve(…)` at `span`, its arguments at
     /// `args_span`: its route, and the binding its responses are read through.
     Http {
-        route: HttpRoute,
+        route: Box<HttpRoute>,
         responses: String,
         span: Span,
         args_span: Span,
@@ -592,6 +628,59 @@ impl DeclaredSink {
             DeclaredSink::Test { name, .. } => name,
         }
     }
+}
+
+/// `sinks`, a module's, as the run whose `const` parameters take `consts` declares them:
+/// each route at the address the run gives it ([`http::HttpRoute::at`]), its requests'
+/// source renamed in `chain`, the run's copy of the module. A route whose address has no
+/// value here is an error at `statement`, the run's.
+fn sinks_at(
+    sinks: &[DeclaredSink],
+    consts: &HashMap<crate::ccl::TypeParamId, crate::ccl::constant::ConstTerm>,
+    chain: &mut Expr,
+    statement: Span,
+    errors: &mut Vec<LoweringError>,
+) -> Vec<DeclaredSink> {
+    fn rename(expr: &mut Expr, from: &str, to: &str) {
+        if let TypedExprNode::Source(name, _) = &mut expr.node
+            && name == from
+        {
+            *name = to.to_string();
+        }
+        expr.walk_children_mut(|child| rename(child, from, to));
+    }
+    let mut out = Vec::new();
+    for sink in sinks {
+        match sink {
+            DeclaredSink::Http {
+                route,
+                responses,
+                span,
+                args_span,
+            } => match route.at(consts) {
+                None => out.push(sink.clone()),
+                Some(Ok((at, from))) => {
+                    rename(chain, &from, at.source_name());
+                    out.push(DeclaredSink::Http {
+                        route: Box::new(at),
+                        responses: responses.clone(),
+                        span: *span,
+                        args_span: *args_span,
+                    });
+                }
+                Some(Err(why)) => errors.push(
+                    LoweringError::unsupported(
+                        statement,
+                        format!("the route declared here has no address in this run: {why}"),
+                    )
+                    .with_related(*args_span, "the route's address"),
+                ),
+            },
+            #[cfg(any(test, feature = "test-helpers"))]
+            DeclaredSink::Test { .. } => out.push(sink.clone()),
+        }
+    }
+    out
 }
 
 /// A type name a block or a definition declares, and the type it names.

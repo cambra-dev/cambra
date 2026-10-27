@@ -139,7 +139,7 @@ match  case
 pass
 where
 forall requires
-import use    as     pub    run    param  this
+import use    as     pub    run    param  const  this
 ```
 
 `where` is the refinement predicate separator (§6.4). It is lexed so the name is
@@ -156,7 +156,8 @@ A lambda is written `\x -> body` (§3.10); `\` and `->` are punctuation
 reserved for future use.
 
 `import`, `use`, `as`, `pub`, `run`, `param` and `this` are the module keywords
-([9. Modules](#9-modules)).
+([9. Modules](#9-modules)). `const` marks a parameter whose argument is a link-time constant
+([9.19 Constants](#919-constants)).
 
 `match` and `case` introduce tag dispatch over a variant (§4.10).
 
@@ -434,7 +435,8 @@ begin():`, §8.2, `[Decided]`); any other context is rejected. `with` does
 > this list.)
 
 The module statements `import_stmt`, `run_stmt`, `param_stmt`, `renamed_from_stmt`, `discard_stmt`
-and `pub_stmt` parse, with the productions of [9. Modules](#9-modules).
+and `pub_stmt` parse, with the productions of [9. Modules](#9-modules), and so does `const` before a
+`param` ([9.19 Constants](#919-constants)).
 
 ### 2.3 Expression precedence
 
@@ -2681,7 +2683,10 @@ Key = {String where _ in ks}    # the strings `ks` holds, and no others
 
 A refined key type of that shape is what a total map's domain is (§6.3). A
 refinement with nothing in scope but `_` speaks only about its one anonymous
-subject.
+subject. A refinement inside a `type` declaration names only `_` and constants
+([9.19 Constants](#919-constants)), since the declaration's values keep its type for as long as
+they live ([Nominal type identity](#nominal-type-identity)). **[Planned]** — it may also call a
+function that may be called in a constant.
 
 ### 6.5 Variants
 
@@ -2913,7 +2918,10 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
 - **A parameter type may carry a refinement** ([6.4 Refinement syntax](#64-refinement-syntax)), and
   each construction discharges it. This is how a nominal type states a domain invariant once, for
   the contracts direction of [6. Types (informal sketch)](#6-types-informal-sketch):
-  `type Price = {Int where _ >= 0}`.
+  `type Price = {Int where _ >= 0}`. The predicate names `_` and constants,
+  `type Capped = {Int where _ <= limit}` under `limit = 10`
+  ([9.19 Constants](#919-constants)). **[Planned]** — a constant whose value is a tuple, a record
+  or a list, and a call to a function that may be called in a constant.
 - **Each type parameter's variance is computed from the parameter types of the constructors.** A
   parameter that appears only in covariant positions, such as `some(T)` or a field of a product, is
   covariant. One that appears only in contravariant positions, such as the domain of
@@ -3073,7 +3081,8 @@ method it means, and the method as an unapplied value has no other spelling.
   no value parameter, no member of a Module-typed parameter, and no member of a run the module
   declares, directly or through the module's bindings and functions, and an error names what it
   reads. A type parameter of the module that it reaches the same way is part of the type's
-  identity instead.
+  identity instead. So is a `const` parameter it reaches ([9.19 Constants](#919-constants)), so the
+  value parameters it may not read are those without `const`.
 - Whether a module other than the type's own may declare an associated function of it is **[Open]**.
 
 **An `impl` block declares a type's associated functions together.** It is shorthand for writing
@@ -3509,7 +3518,9 @@ reqs, resps = http_serve(port, method, path)
 ```
 
 This pattern (`identifier-tuple = http_serve(string, string, string)`)
-must appear in the top-level block. It binds two names:
+must appear in the top-level block. Each argument is a string constant
+([9.19 Constants](#919-constants)), so a module takes its route's address from a `const param`
+and each run serves the address its arguments give. It binds two names:
 
 - the `reqs` side is a streaming source: each element is the
   body of one incoming request to `(method, path)` on `port`.
@@ -3521,7 +3532,7 @@ must appear in the top-level block. It binds two names:
 
 Multiple `http_serve` calls in the same program that share a `port`
 share an HTTP listener; the `(port, method, path)` triple must be
-unique across the program.
+unique across the program, across all its runs.
 
 > **Direction [Open].** The HTTP module design is deliberately parked
 > (2026-06-29, Open/deferred):
@@ -4166,8 +4177,10 @@ module_path ::= ident ("::" ident)*
   and its type members are one type in both: `import sorted_map(K=String)` in two modules gives
   both one `sorted_map::Map`. An omitted argument is the parameter's default, so `import m` and
   `import m(x=1)` reach one shared import when `x` defaults to `1` (**[Planned]**). An argument may
-  be any constant ([9.19 Open questions](#919-open-questions)): a literal, a type, or
-  an import name passed as a value of its Module type ([9.8 Module types](#98-module-types)). A run
+  be a literal, a type, or an import name passed as a value of its Module type
+  ([9.8 Module types](#98-module-types)). **[Decided]** It may be any constant
+  ([9.19 Constants](#919-constants)), and two arguments with one value reach one
+  shared import. A run
   name may not: a shared import stands outside every run, and an import reaches no state ([9.7
   Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)).
 - An `import` stands at a module's top level. One inside a `def`, a loop, or a block is an error.
@@ -4208,7 +4221,8 @@ run inventory as inv use stock                        # binds `inv`, and `stock`
   run without parentheses.
 - A run stands at its statement in the declaring module, and performs its module's top level there.
   An argument is any expression over the names above the statement: the declaring module's members,
-  earlier runs' members, imports, and parameters. A run's public members are what it returns, so
+  earlier runs' members, imports, and parameters. A `const` parameter's argument is a constant
+  ([9.19 Constants](#919-constants)). A run's public members are what it returns, so
   `run index(docs=p::documents) as ix` passes one run's member to another. An import name in an
   argument denotes its shared import, and a run name its run, as a value of its Module type, which
   is how a module is passed to another.
@@ -4227,7 +4241,7 @@ run inventory as inv use stock                        # binds `inv`, and `stock`
 ### 9.4 Parameters
 
 ```ebnf
-param_stmt ::= "param" ident ":" type ["=" expr]
+param_stmt ::= ["const"] "param" ident ":" type ["=" expr]
              | "param" Ident ["<:" type] ["=" type]      (* Ident: a capitalized identifier *)
 ```
 
@@ -4267,6 +4281,11 @@ param payments: Module{charge: {amount: Int} => Receipt}
   parameter's is: `param k: _` leaves all of it to inference. The annotation is the whole annotation
   of the parameter's binding, so it may be polymorphic, `param f: forall (T) T => T`
   ([Polymorphic type annotations](#polymorphic-type-annotations)).
+- `const param` declares a value parameter whose argument, at every `run` and
+  `import`, is a constant, and whose default is one too
+  ([9.19 Constants](#919-constants)). It is the only kind of parameter a constant
+  may name. A type parameter and a Module parameter are fixed at link time already, and `const` on
+  either is an error.
 - A parameter of Module type is how a module takes another module. The argument is a name that
   denotes a module ([9.6 Qualified references](#96-qualified-references)), and Module subtyping is
   the check ([9.8 Module types](#98-module-types)). The parameter is a qualifier: `audit::events`
@@ -4452,7 +4471,7 @@ run storefront(audit=audit) as eu    # the run `audit` has `events` and may have
 
 An import name denotes its shared import, and a run name its run, as a Module value in two positions
 only: an argument, and a binding, `pub audit = a` ([9.3 Runs](#93-runs)). A Module value stored in
-data or returned from a function is **[Open]** ([9.19 Open questions](#919-open-questions)). A
+data or returned from a function is **[Open]** ([9.20 Open questions](#920-open-questions)). A
 Module-typed parameter therefore names exactly one shared import or run in each copy of its module.
 A `Txn` member reached through it is a bare variable reference, as through a run name
 (**[Planned]**).
@@ -4626,46 +4645,42 @@ type exactly when those parts agree.
   `eu::Order` is `shop(Receipt=stripe::Receipt)::Order`, as a diagnostic writes it, and differs
   from `us::Order`. `Price` reaches no parameter, so `eu::Price` and `us::Price` are one type. A run
   passing `Receipt=stripe::Receipt` reaches the same `Order` as `eu`.
-- **[Planned]** A declaration also reaches a parameter by naming a top-level binding whose
-  definition reaches it. A top-level binding is followed through its definition, and a `def`
-  through its body and every function that body calls. Terms appear in a declaration inside
-  refinement predicates and term arguments to type constructors, so those are where it names
-  bindings.
+- **A declaration also reaches a `const` parameter.** Its refinements name only `_` and constants
+  ([9.19 Constants](#919-constants)), and it reaches each `const` parameter they reach, a constant
+  binding through its definition. **[Planned]** — through a function its refinement calls, its
+  body and every function that body calls.
 
   ```python
-  param max_rate: Int
+  const param max_rate: Int
   limit = max_rate * 2
   def valid(r): r <= limit
 
   type Rate = {Int where _ <= max_rate * 2}   # names the parameter
   type Capped = {Int where _ <= limit}        # reaches it through `limit`
-  type Checked = {Int where valid(_)}         # through `valid`'s body, then `limit`
+  type Checked = {Int where valid(_)}         # [Planned]: through `valid`'s body, then `limit`
   ```
 
-  All three reach `max_rate`. A binding that reaches no parameter, such as `ten = 10`, is the same
-  at every set of arguments, and a declaration names it freely.
-- **[Planned]** **A declaration reaches no state and no source.** A declaration that reaches a
-  mutable variable, a feed or a source, of its own module or of an imported one, is an error naming
-  the binding that reaches it. Those change over time rather than per set of arguments, so a value
-  that met the declaration when built could fail it later.
-  `InStock = {String where _ in stock.keys()}` therefore stays an alias. Reaching state is an
-  effect, as IO is. Within a module the check follows a `def` through its body, and an imported
-  function is read through its module's interface, which records whether each public function
-  reaches state ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). Once
-  function types state their effects
-  ([6.9 Effects in function types [Tentative]](#69-effects-in-function-types-tentative)), the check
-  reads them from the function's type.
+  All three reach `max_rate`. A constant that reaches no parameter, such as `ten = 10`, is the same
+  at every set of arguments. A value parameter without `const` is no constant, so no declaration
+  names it and it never enters a type's identity.
+- **A declaration reaches no state and no source.** No constant reads a mutable
+  variable, a feed or a source, so a value that met the declaration when built meets it for as long
+  as it lives. `InStock = {String where _ in stock.keys()}` therefore stays an alias.
 - **Type arguments compare by type equality.** A type argument may be structural: two imports
   passing `{id: String, card: String}`, one through an alias and one written out, reach one `Order`.
   A type argument compares the same whether written or inferred at the `import` or `run`.
   **[Planned]** A Module argument compares by the shared import or run passed.
-- **[Open] — comparing value-parameter arguments.** Comparing them by term identity makes imports
-  given `30` and `10 + 20` reach two types, and comparing them by value would evaluate arguments
-  during type checking. The same question applies to an alias whose refinement names a top-level
-  binding ([6.4 Refinement syntax](#64-refinement-syntax)), and to type arguments that differ only
-  in a refinement: whether `{Int where _ >= 0}` and `{Int where 0 <= _}` are one type is
-  undecided, since [6. Types (informal sketch)](#6-types-informal-sketch) defines equality for
-  records and variants but not for refinements.
+- **A `const` argument compares by value.** Linking fixes every import's and run's arguments, so
+  `import shop(max_rate=30)` and `import shop(max_rate=10 + 20)` reach one `Capped`. In a module
+  checked alone ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)), an
+  argument that reads one of that module's own `const` parameters has no value yet and compares by
+  the parameter: two runs passing `max_rate=r` reach one type, and `max_rate=r` and
+  `max_rate=r + 0` reach two.
+- **[Open] — comparing refinements.** Whether `{Int where _ >= 0}` and `{Int where 0 <= _}` are
+  one type is undecided, both as type arguments and for an alias whose refinement names a
+  top-level binding ([6.4 Refinement syntax](#64-refinement-syntax)), since
+  [6. Types (informal sketch)](#6-types-informal-sketch) defines equality for records and variants
+  but not for refinements.
 - **A module is checked once against every argument.** Inside `shop`, `Receipt` is opaque, so the
   functions of `Order` hold for every argument's `Receipt`
   ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). A shared import takes
@@ -4695,7 +4710,10 @@ with the type `Count` names.
 
 - **Parameters are typed binders.** A value parameter has its annotated type, with each `_` in it
   the type its uses infer. A type parameter is opaque apart from its bound. One with no bound is
-  **coupled** to its arguments: the module's uses of it are checked at each argument.
+  **coupled** to its arguments: the module's uses of it are checked at each argument. The interface
+  states which value parameters are `const` and which public bindings are constants
+  ([9.19 Constants](#919-constants)).
+  **[Planned]** — and which public functions may be called in a constant.
 - **Imports are read through contracts.** A module sees each member another module exports through
   its contract, and whether the module performs IO or declares mutable state.
 - **A public member's contract is its type.** An exactly annotated member's contract is the
@@ -4704,7 +4722,8 @@ with the type `Count` names.
   type below the bound. An inferred type depends on the body, so a module using such a member is
   checked together with the member's body. Such a member is **coupled** to its uses.
 - **A run is checked at the `run` statement.** Each value argument is checked against its
-  parameter's type, and each type argument against its parameter's bound. A module argument's
+  parameter's type, and each type argument against its parameter's bound. A `const` parameter's
+  argument is checked to be a constant. A module argument's
   members are checked against the parameter's Module type: each value member against its entry,
   and each type member equal to an exact entry `Name = T`, or below a bound. A parameter whose
   annotation's `_` its uses leave open, as `k * k` leaves `param k: _`, is **coupled** to its
@@ -4769,9 +4788,8 @@ refused.
 A builtin source, sink, or special form a std module provides is recognized by what a name resolves
 to, not by how it is spelled. After `import std::http as web`, `reqs, resps = web::serve(…)` is the
 same form as `http::serve(…)`, and the bare name `http_serve` is gone. Its address arguments are
-string literals. **[Planned]** — an address passed as a parameter, fixed per run, needs a link-time
-constant, a value fixed once a run's arguments are bound, which the language does not define yet.
-Until it does, two runs of a module that serves a route serve the same address and conflict.
+constants ([9.19 Constants](#919-constants)), so a module that serves a route takes its address as
+a `const param` and each run serves its own.
 
 The prelude (`sum`, `max`, `groupby`, `stdin`, `defer`, `box`, `begin`, …) stays unqualified and in
 scope in every module.
@@ -4876,7 +4894,53 @@ source recompiled unchanged, because the name it loads is gone. How a later vers
 decorator already applied from one that names nothing, such as a mistyped `@LoadFrom`, is
 undecided.
 
-### 9.19 Open questions
+### 9.19 Constants
+
+A **constant** is a value fixed once the program is linked. It reads no source, no feed and no
+mutable variable, so it holds one value for the life of a run, whatever data arrives. `const` marks
+a parameter whose argument must be one ([9.4 Parameters](#94-parameters)). A binding carries no
+marker: it is a constant when its definition is one.
+
+```python
+const param max_rate: Int
+limit = max_rate * 2
+
+pub type Capped = {Int where _ <= limit}
+```
+
+- **A constant expression** is built from literals; constant bindings and `const` parameters in
+  scope, including another module's public constant binding, `cfg::port`; operators, a ternary,
+  and record, tuple and list literals over constants, and a field or element of one.
+  **[Planned]** — calls, with constant arguments, to functions that may be called in a constant. A
+  type, an import name and a run name are fixed at link time as well, and stand where a type or a
+  module is expected.
+- **A top-level `=` binding is a constant when its definition is a constant expression.**
+  `limit = max_rate * 2` is one; `n = len(xs)` is not, since a call is not a constant yet. A binding
+  that is not a constant is an ordinary value wherever no constant is required. Read where one is
+  required, it is an error at the read that names what its definition reads. A mutable variable, a
+  value parameter without `const`, and a function are never constants.
+- **A `const` parameter is the only binding a run gives a constant**, since the obligation falls on
+  every `run` and `import` of the module, and a module checked alone states it in its interface
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). `const` before any
+  other statement is an error.
+- **[Planned]** **A function may be called in a constant when its body reads only its own
+  parameters, constants, and functions that may be.** Functions carry no marker. The check follows
+  a `def` through its body and every function that body calls, and reads an imported function
+  through its module's interface, which records whether each public function may be
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). A call to one that may
+  not is an error naming the binding, source, feed or mutable variable its body reads.
+- **A read of a constant is known to be the constant**, in a module checked alone too, where a
+  `const` parameter has no value yet. There `Capped::new(max_rate)` meets
+  `{Int where _ <= max_rate}`, and in a module that writes `run shop(max_rate=r + 1) as a`, a value
+  of `{Int where _ <= r + 1}` meets `a::Capped`'s refinement.
+- **A constant is required where the language needs a value at link time:** in a refinement in a
+  `type` declaration, whose names other than `_` are constants
+  ([Nominal type identity](#nominal-type-identity)); and as a `const` parameter's argument
+  ([9.4 Parameters](#94-parameters)) and a route's address
+  ([7.4 Sources](#74-sources)). **[Decided]** — as an import's argument
+  ([9.2 Imports](#92-imports)).
+
+### 9.20 Open questions
 
 - **Read-only export.** A public `Txn` variable is writable by every module that reaches it. A
   modifier such as `pub(read)` would let a module publish it for reading while its writes, and so
@@ -4893,11 +4957,6 @@ undecided.
   coherence rule.
 - **Discarding and redeclaring one address.** A version that both writes `@Discard stock` and
   declares `stock` could mean a reset to the declared initial value, or be an error.
-- **Constants.** An import's arguments are constants, fixed when the program is linked, and so is
-  a route address passed as a parameter. Every expression whose value is fixed at link time is a
-  constant, along the lines of C++'s `constexpr`: a literal, a type, an import name or run name,
-  arithmetic over constants, a record or a list of them, and a member or an alias bound to one.
-  The rule that recognizes them is open.
 - **First-class Module values.** A Module value is written only as an argument or as a member
   bound to a run name or an import name. Storing one in data, returning one from a function, or
   choosing between two at run time would make a qualified reference's target depend on a value,

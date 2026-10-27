@@ -340,6 +340,9 @@ pub enum Stmt {
         name: Spanned<SmolStr>,
         annotation: Option<TypeAnnotation>,
         default: Option<Spanned<Expr>>,
+        /// The `const` keyword, on `const param x: T` (`docs/chl-spec.md`, "9.4
+        /// Parameters").
+        constant: Option<Span>,
     },
 
     /// `@Discard` on the line above a declaration head: what the version this

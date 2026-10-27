@@ -23,6 +23,11 @@ impl FileId {
     /// names its file by it without building a map, and the spans of two maps'
     /// roots compare equal.
     pub const ROOT: FileId = FileId(0);
+
+    /// The file's position in its [`SourceMap`], for a name that must tell two files apart.
+    pub fn index(self) -> u32 {
+        self.0
+    }
 }
 
 /// One file of a [`SourceMap`].

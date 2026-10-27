@@ -75,7 +75,7 @@ pub struct Qualifier {
     /// The types the run or shared import it reaches gives its module's type
     /// parameters, as this module writes them, which a type member reached
     /// through it takes ([`Qualifier::reach_type`]).
-    pub types: TypeArguments,
+    pub types: ReachedArguments,
 }
 
 /// How a [`Qualifier`]'s name is bound.
@@ -128,7 +128,9 @@ impl LoweringContext {
         self.mut_param_fns.clear();
         self.declared_sinks.clear();
         self.parameters.clear();
+        self.constants = Default::default();
         self.run_type_arguments.clear();
+        self.run_const_arguments.clear();
         self.run_type_checks.clear();
         // A `use` type name is in scope throughout its module. One whose module
         // has errors of its own names no type, and stands for any. A `use` name
@@ -800,11 +802,24 @@ impl Qualifier {
         }
         let types = found
             .types
+            .types
             .iter()
             .map(|(param, ty)| {
                 let mut ty = reroot(ty, &self.name);
                 substitute(&mut ty, &self.types);
                 (*param, ty)
+            })
+            .collect();
+        // A term with no value is reported where the run that passes it is created.
+        let consts = found
+            .types
+            .consts
+            .iter()
+            .map(|(param, term)| {
+                let term = term
+                    .substituted(&self.types.consts)
+                    .unwrap_or_else(|_| term.clone());
+                (*param, term)
             })
             .collect();
         Ok(Qualifier {
@@ -813,7 +828,7 @@ impl Qualifier {
             name: self.name.then(&found.name),
             view: found.view.clone(),
             view_base: self.name.clone(),
-            types: Rc::new(types),
+            types: Rc::new(Arguments { types, consts }),
             ..self.clone()
         })
     }
@@ -1003,7 +1018,7 @@ pub(super) fn module_scope(
                     name: QualifiedName::new(name.clone()),
                     view: None,
                     view_base: QualifiedName::default(),
-                    types: TypeArguments::default(),
+                    types: ReachedArguments::default(),
                 };
                 (name, qualifier, uses)
             }

@@ -35,9 +35,12 @@ pub(super) use types::*;
 
 use super::{
     AliasAt, DeclaredSink, LoweringContext, LoweringError, LoweringResult, finish_program,
-    library_statement_refusals, lower_module_body, lower_root, sink_site, state_site,
+    library_statement_refusals, lower_module_body, lower_root, sink_site, sinks_at, state_site,
 };
-use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates_mut};
+use crate::ccl::ccl_utils::{
+    PredMemo, free_names, walk_refined_predicates, walk_refined_predicates_mut,
+};
+use crate::ccl::constant::{ConstParam, ConstTerm};
 use crate::ccl::load::LoadedProgram;
 use crate::ccl::module_type::{AliasType, ModuleType, TypeEntryForm};
 use crate::ccl::names::QualifiedName;

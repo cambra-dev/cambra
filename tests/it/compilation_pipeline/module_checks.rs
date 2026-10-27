@@ -264,11 +264,11 @@ fn a_checked_module_prints_its_interface() {
             param scale: Int = …
             param T <: Int
             pub Count = {Int where _ > 0}
-            pub base: {Int where _ > 0}
+            pub base: {Int where _ > 0}  # a constant
             pub double: forall (A) A => Int requires Multipliable(A, Int, Output=Int)
             pub first: forall (U) {U, U} => U
             pub keep: T => T
-            pub total: Int
+            pub total: Int  # a constant
         "}
     );
 }
@@ -317,6 +317,36 @@ fn a_checked_module_prints_its_nominal_types() {
             pub type Order:  # one type per argument of Receipt
                 placed(r: Receipt, total: Price)
             pub Box::or_else: forall (T) {Box(T), T} => T
+        "}
+    );
+}
+
+/// A `const` parameter prints with `const` and a public constant binding with a note, a type
+/// reaching a `const` parameter names it among the parameters whose arguments tell its runs'
+/// types apart, and a refinement prints the term of each constant it reads, a ternary included.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_prints_its_constants() {
+    let program = program(
+        indoc! {"
+            const param max_rate: Int = 5
+            pub limit = max_rate * 2
+            pub type Capped = {Int where _ <= limit}
+            tier = 10 if max_rate > 3 else 1
+            pub type Tiered = {Int where _ <= tier}
+        "},
+        &[],
+    );
+    let interface = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(
+        interface,
+        indoc! {"
+            module main
+            const param max_rate: Int = …
+            pub limit: Int  # a constant
+            pub type Capped = {Int where _ <= max_rate * 2}  # one type per argument of max_rate
+            pub type Tiered = {Int where _ <= (10 if max_rate > 3 else 1)}  # one type per argument of max_rate
         "}
     );
 }
@@ -541,7 +571,7 @@ fn cambra_check_prints_an_interface_or_errors() {
         String::from_utf8_lossy(&checked.stdout),
         indoc! {"
             module lib
-            pub total: Int
+            pub total: Int  # a constant
         "}
     );
 

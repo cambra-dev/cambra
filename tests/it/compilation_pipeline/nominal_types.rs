@@ -698,12 +698,12 @@ fn declaration_errors_name_what_is_wrong() {
         ),
         (
             indoc! {r#"
-                limit = 10
+                limit := 10
                 type Rate = {Int where _ <= limit}
 
                 Rate::new(3)
             "#},
-            "names `limit`; naming a module binding there is not supported yet",
+            "`limit` is a mutable variable, so it is not a constant",
         ),
     ] {
         check_compile_error(src, needle);

@@ -267,8 +267,12 @@ a user's `` `some `` builds that module's own tag.
   so a module that declares one is run and not imported (`state_site`), and no import name reaches
   a feed.
 - **Routes are unique across runs.** Creating a run registers its routes. A route two runs serve is
-  an error at the second `run` statement, with a note at the first. A route address is a literal,
-  so two runs of one module that serves a route always conflict.
+  an error at the second `run` statement, with a note at the first. A route's address is a
+  constant, so a module takes it from a `const` parameter and each run serves the address its
+  arguments give. A route whose address reads a parameter names its requests' source by its
+  statement in the module's chain, and creating a run renames the run's copy to the source of
+  the address the run gives (`sinks_at`, `HttpRoute::at`). A module's check keeps the
+  statement's name, which a source that opens nothing answers to.
 - **A parameter is a `let` at the head of its module's chain**, of its default, or of an `Abstract`
   when it has none ([ir.md, "`Abstract` — a value known only by its
   type"](../src/ccl/design/ir.md#abstract--a-value-known-only-by-its-type)). The interface records
@@ -282,6 +286,21 @@ a user's `` `some `` builds that module's own tag.
   own](#checking-a-module-on-its-own)). A value parameter without an annotation is refused
   (`refuse_module_syntax`). The root takes every parameter's default, and a parameter without one
   is an error there.
+- **A `const` parameter takes a constant.** `declare_run_types` reads each `const` argument of a
+  `run` statement as a term over the declaring module's `const` parameters
+  (`LoweringContext::run_consts`, `src/ccl/lower/constants.rs`), refusing one that is not a
+  constant. The run name's qualifier records the terms, so a type reached through it is the
+  instance they give, and the `Run` node holds them. Creating the run substitutes the creating
+  run's values into them, and gives each parameter its term, its import's literal, or its default
+  over the parameters above it (`ProgramLowering::create`). The term reduces to a value once every
+  parameter it reads has one, which is what a type's identity compares, so runs given `5` and
+  `2 + 3` reach one type. A module's own check gives its parameters no values, so there a term
+  over them compares as written.
+- **A top-level `=` binding is a constant when its definition is one.** Before the module's
+  statements lower, `settle_constants` reads each binding's definition as a term, caching the term
+  or why the definition is not one, and reports nothing. A read that requires a constant reports
+  the cached reason at the read (`Refused::of_definition`), and the interface records each public
+  binding's result, so an importer's read reports the same reason.
 - **A type parameter is an alias of a declared `Type::Param`** from its statement down, as a `def`'s
   is, and binds no `let` (`LoweringContext::declare_type_parameter`). The interface records its
   bound and its default. A `run` statement's type arguments are lowered ahead of the module's
@@ -379,30 +398,35 @@ call reaches the method of a value whose type comes from a module the calling mo
 imports nor runs: the value comes from a run or a shared import that encloses the call, whose copy
 is in scope there.
 
-A type's identity takes the module's type parameters it reaches ([chl-spec.md, "Nominal type
-identity"](chl-spec.md#nominal-type-identity)). Once the module lowers, `settle_implicit` records
-them on the declaration (`NominalDecl::implicit`): those its constructors' parameter types name,
-those its associated functions reach, and those of every type of the module it names, transitively.
-A function reaches the type parameters the types of its definition name, and those of each top-level
-binding and function it reads, which `associated_reach` follows. A module's type parameters are its
-`param T`s and the abstract type members of its Module-typed parameters. Equality and hashing
-compare the implicit arguments with the path and the name. The module's own code names the
-declaration with each parameter standing for itself. `substitute` and `substitute_in` turn it into
-the instance an import's or a run's type arguments reach (`NominalDecl::substituted`), in a type and
-in the nodes that hold a declaration outside a type slot: a `NominalCtor`, a constructor pattern and
-a method candidate. A type reached through a qualifier is the instance that qualifier's type
-arguments reach (`Qualifier::instance`). The instance shares the declaration's body, and
-`instantiate` replaces its implicit parameters with its arguments. A diagnostic writes them on the
-module, as an import or a run passes them, `shop(Receipt=stripe::Receipt)::Order`
-(`NominalDecl::spelled`).
+A type's identity takes the module's type parameters and `const` parameters it reaches
+([chl-spec.md, "Nominal type identity"](chl-spec.md#nominal-type-identity)). Once the module lowers,
+`settle_implicit` records them on the declaration (`NominalDecl::implicit`,
+`NominalDecl::implicit_consts`): those its constructors' parameter types name, those its associated
+functions reach, and those of every type of the module it names, transitively. A function reaches
+the parameters the types of its definition name, those of each top-level binding and function it
+reads, and each `const` parameter it reads, all of which `associated_reach` follows
+(`AssociatedReach`). A module's type parameters are its `param T`s and the abstract type members of
+its Module-typed parameters. Equality and hashing compare the implicit arguments with the path and
+the name. The module's own code names the declaration with each parameter standing for itself.
+`substitute` and `substitute_in` turn it into the instance an import's or a run's type arguments
+and `const` terms reach (`NominalDecl::substituted`, `NominalDecl::substituted_consts`), in a type
+and in the nodes that hold a declaration outside a type slot: a `NominalCtor`, a constructor pattern
+and a method candidate. Both kinds of argument ride one `Arguments` map, so every site that
+substitutes an import's or a run's types substitutes its constants. A type reached through a
+qualifier is the instance that qualifier's arguments reach (`Qualifier::instance`). The instance
+shares the declaration's body, and `instantiate` replaces its implicit parameters with its
+arguments in a constructor's payload, so a type of the module that the payload names, `Order`'s
+`Amount`, is the instance of the same arguments. A diagnostic writes the arguments on the module,
+as an import or a run passes them, `shop(Receipt=stripe::Receipt)::Order` or
+`shop(max_rate=5)::Capped` (`NominalDecl::spelled`).
 
 The copies of a type's associated functions are one function only if they reach nothing an import or
-a run gives their module. `associated_reach` checks that on a uniquified copy of the module's chain,
-so a reference reads the binder it resolves to. It follows each top-level binding and function an
-associated function reads, and refuses one that reaches a mutable variable, a feed, a source, a
-value parameter, a value member of a Module-typed parameter, or a member of a run the module
-declares, naming the path it reaches it through. It returns the types of each definition it
-followed, which `settle_implicit` reads.
+a run gives their module but what the type's identity records. `associated_reach` checks that on a
+uniquified copy of the module's chain, so a reference reads the binder it resolves to. It follows
+each top-level binding and function an associated function reads, and refuses one that reaches a
+mutable variable, a feed, a source, a value parameter without `const`, a value member of a
+Module-typed parameter, or a member of a run the module declares, naming the path it reaches it
+through. Each type parameter and `const` parameter it reaches joins the type's identity.
 
 `cambra check` prints each public type as its module declares it, with each type parameter's
 variance and the module's type parameters whose arguments tell its instances apart, and each
@@ -494,10 +518,9 @@ interface records the member as that intrinsic. Lowering recognizes a special fo
 callee resolves to: `reqs, resps = http::serve(…)` is the `http_serve` tuple form because
 `http::serve` resolves to the intrinsic.
 
-An address argument of `http::serve` is a string literal, as recognition matches today. A
-parameter address waits on link-time constants ([Dependencies](#dependencies)). Route uniqueness
-across runs is checked as linking creates each run ([Runs](#runs)), since two runs of one module
-that serves a literal route serve the same address.
+An address argument of `http::serve` is a constant, as of `http_serve`. Route uniqueness across
+runs is checked as linking creates each run ([Runs](#runs)), since two runs of one module may serve
+one address.
 
 ### Registries keyed by spelling
 
@@ -535,6 +558,20 @@ module's refinement predicates too (`copy_predicates`), since uniquifying rebuil
 with the ids it had, and two runs holding one predicate's ids would collide. The first keeps the
 module's own, which its nominal types' declarations share, so a predicate inference reads off a
 declaration is one the tree holds.
+
+Once the tree is assembled, each `const` parameter of each copy is settled to the term its import or
+run gives it (`settle_const_params`): a literal, or, in a module's check tree, a term over the
+checked module's own `const` parameters. Each reference a predicate makes to the parameter reads
+the term, each operation over literals this leaves is folded, and each ternary whose condition this
+decides takes its arm. A refinement check compares terms, and a predicate that reached the argument
+only through the parameter's `let` would compare an unknown. The `let` of a scalar parameter is
+bound at the singleton of its term, `{Int | __elem == 𝑡}`, and holds the literal, or `Abstract` in
+a check tree, so a read of the parameter meets a refinement over it. A module's check binds each of
+its own `const` parameters through a binder spelled alike, of an `Abstract` value, just above the
+parameter's `let` (`read_through_atom`): the parameter's predicates read that binder and its
+singleton names it, since a `let`'s annotation lies outside the `let`'s own scope. A run that gives
+a tuple, a record or a list to a `const` parameter a predicate reads is an error at
+the run, since a predicate holds no such value yet (`compound_const_reads`).
 
 **The per-module check runs parsing, lowering, uniquification, and inference** (`Phase::Lower`,
 `Phase::Uniquify`, `Phase::Infer` in `src/ccl/context.rs`), plus the run-site checks of the
@@ -741,9 +778,7 @@ payload, with a diagnostic saying the inspector shows one file.
 ## Worked example: two storefronts and an audit log
 
 The example uses **[Decided]** surface that is not implemented (`Feed(…)` declarations, `in`
-guards, `!`) and surface this design adds. Its route address `port` is a parameter, which waits on
-link-time constants ([Dependencies](#dependencies)); until they exist, the two storefront runs
-serve one literal address and conflict.
+guards, `!`) and surface this design adds.
 
 `catalog.cambra`, a library:
 
@@ -782,7 +817,7 @@ import std::http
 import catalog
 import audit_api
 
-param port: String
+const param port: String
 param region: String
 param audit: audit_api::AuditLog
 
@@ -888,15 +923,13 @@ the [Implementation stack](#implementation-stack).
   changes with each commit. The compiler cannot name a mutable map's key set in a type today, in one
   file or several. Needed for a per-run type such as `InStock` ([chl-spec.md, "9.7 Importing
   asserts no IO and no state"](chl-spec.md#97-importing-asserts-no-io-and-no-state)).
-- **Link-time constants.** A value fixed once linking binds a run's arguments, such as a route
-  address passed as a parameter, and every argument to an import, which keys its shared import. A
-  run argument may be any expression, so this needs its own definition of which expressions are
-  link-time constants and when they are evaluated ([chl-spec.md, "9.19 Open
-  questions"](chl-spec.md#919-open-questions)). Until it exists a route address is a literal
-  ([Intrinsics resolve by identity](#intrinsics-resolve-by-identity)), and an import argument is a
-  literal, an import name, or a type built from built-in types and imported type members whose
-  refinements read no value. Comparing an omitted argument with one equal to its default needs the
-  default evaluated at link time too: until then they reach two shared imports, where chl-spec.md's
+- **Constants where an import resolves.** A link-time constant is a `const` parameter or a binding
+  whose definition is a constant ([chl-spec.md, "9.19 Constants"](chl-spec.md#919-constants)), and
+  linking gives each run's `const` parameters their values ([Runs](#runs)). An import's arguments
+  key its shared import before the importer lowers, so an import argument is a literal, an import
+  name, or a type built from built-in types and imported type members whose refinements read no
+  value. Comparing an omitted argument with one equal to its default needs the default evaluated
+  at link time too: until then they reach two shared imports, where chl-spec.md's
   "9.2 Imports" has them reach one ([Imports](#imports)).
 - **`Feed(…)` declarations** ([chl-spec.md, "8.4 Feeds are the second form of
   mutability"](chl-spec.md#84-feeds-are-the-second-form-of-mutability)), for a public feed with no
@@ -910,7 +943,8 @@ the [Implementation stack](#implementation-stack).
 
 ## Open questions
 
-The language's open questions are [chl-spec.md, "9.19 Open questions"](chl-spec.md#919-open-questions).
+The language's open questions are
+[chl-spec.md, "9.20 Open questions"](chl-spec.md#920-open-questions).
 
 - **Sharing members between runs.** Each run is a full copy of its module, so a function that reads
   no state is linked once per run. Sharing such members between runs would save that compile
