@@ -1873,6 +1873,19 @@ fn a_product_of_two_conditional_generators(#[case] c: &str, #[case] expected: i6
     );
 }
 
+/// Two of them over a condition the program computes, so it does not fold away and each
+/// conditional's legs are gated by its first-match choices.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+fn a_product_of_two_conditional_generators_over_a_computed_condition() {
+    check_scalar(
+        indoc! {r"
+            c = sum([1, 2]) > 2
+            sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in (box([10, 20]) if c else box([10, 20, 30]))])"},
+        Value::Int(66),
+    );
+}
+
 /// Three of them, so the site binds three indices and the scope the walk carries is three
 /// deep.
 #[rstest]

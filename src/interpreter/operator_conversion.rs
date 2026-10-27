@@ -6005,6 +6005,15 @@ fn union_operand_ops(
     input: Option<Box<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
+    // A flat union merges its arms by key and keeps no record of which arm delivered one, so
+    // its arms must be disjoint by how they were built; a debug build checks the shape here.
+    if cfg!(debug_assertions)
+        && matches!(shape, UnionShape::DisjointJoin { .. })
+        && let Some(gap) = crate::ccl::ccl_utils::disjoint_join_gap(operands)
+    {
+        let legs: Vec<String> = operands.iter().map(symbolic).collect();
+        panic!("a disjoint join's legs are not disjoint by construction: {gap}: {legs:?}");
+    }
     match input {
         None => {
             let ops = operands

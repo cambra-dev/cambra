@@ -1664,6 +1664,28 @@ fn a_feed_only_loop_filters_by_a_match_arm_binder_around_it() {
     );
 }
 
+/// A `match` arm that reads the loop's variable and not its payload keeps the positions its tag
+/// holds: at `i = 1` the scrutinee is `none`, so only the `none` arm answers. The arm zips the
+/// element beside the projected payload, and simplification keeps the projection although the
+/// arm reads nothing of it, since the zip inner-joins on it.
+#[test]
+fn a_match_arm_that_reads_only_the_loop_variable_keeps_its_tag() {
+    check_sink(
+        indoc! {r"
+            out = test_sink()
+            for i in [1, 2]:
+                scrut = (`some(7) if i > 1 else `none)
+                picked = match scrut:
+                    case `some(v):
+                        i * 2
+                    case `none:
+                        0
+                out << picked
+        "},
+        "[0, 4]",
+    );
+}
+
 /// A long nest's stores hold the same state however many enclosing positions it runs: each
 /// row's store is reclaimed once its readers release it, and each store's history once it is
 /// folded past (`src/interpreter/design-operators.md`, "Reclaiming the changelog"). Over
