@@ -490,6 +490,7 @@ of a restatement with no spelling.
 | `MakeRecord` | A record of values has no keys: the projection is the whole record or nothing, and a guard naming keys panics. |
 | `VariantWrap` | A payload stream is pulled at the projection. A payload that is itself a collection becomes one union column and is read whole. |
 | `VariantProject` | A union stream is pulled at the projection. A bare union has no keys of its own, so it is read whole and its positions are cut. |
+| `VariantIs` | The scrutinee is pulled at the projection, since every key in is a key out. |
 
 ### Producer attribution and probes
 
