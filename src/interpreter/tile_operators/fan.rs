@@ -778,10 +778,20 @@ impl TileProducer for MakeRecordProducer {
         }
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // Every operand is pulled whole ([`SelectFieldProducer`] says why a narrowed pull
-        // is unsound). An operand withholds what [`Self::release_impl`] told it a consumer
-        // finished with, so a field that settled early is not re-delivered.
+    /// A record of values has no keys to project: the projection is the whole record or
+    /// nothing, and a guard naming keys is a consumer's bug.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        match projection_guard.projection(&self.name()) {
+            Projection::Everything => {}
+            Projection::Nothing => return self.tiling().empty_tile(),
+            Projection::Keys(_) => panic!(
+                "{} is a record of values, which has no keys to project: {projection_guard:?}",
+                self.name()
+            ),
+        }
+        // Every operand is pulled whole ([`SelectFieldProducer`] says why a pull naming one
+        // field is unsound). An operand withholds what [`Self::release_impl`] told it a
+        // consumer finished with, so a field that settled early is not re-delivered.
         let fields: HashMap<SmolStr, Tile> = self
             .names
             .iter()
@@ -1981,6 +1991,59 @@ mod projection_tests {
         let nothing = zip.tiling().empty_guard();
         assert_eq!(zip.get(nothing), zip.tiling().empty_tile());
         assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
+    }
+
+    /// `(a: 1, b: 2)`: a record of two values, each pulled whole.
+    fn two_values() -> (MakeRecordProducer, GuardLog, GuardLog) {
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let spy = |value: i64| {
+            ProjectionSpy::new(Tile::Scalar(ColumnValue::Ints(vec![value])), scalar.clone())
+        };
+        let ((a, a_pulled, _), (b, b_pulled, _)) = (spy(1), spy(2));
+        let out = Tiling::Record(
+            ["a", "b"]
+                .into_iter()
+                .map(|name| (SmolStr::new(name), scalar.clone()))
+                .collect(),
+        );
+        (
+            MakeRecordProducer {
+                base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out),
+                names: vec![SmolStr::new("a"), SmolStr::new("b")],
+                inputs: vec![Box::new(a), Box::new(b)],
+            },
+            a_pulled,
+            b_pulled,
+        )
+    }
+
+    #[test]
+    fn a_record_of_values_pulls_each_value_whole() {
+        let (mut record, a_pulled, b_pulled) = two_values();
+        let whole = record.tiling().universal_guard();
+        let tile = record.get(whole);
+        let Tile::Record { fields, .. } = &tile else {
+            panic!("a record")
+        };
+        assert_eq!(fields.len(), 2);
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int)).universal_guard();
+        assert_eq!(*a_pulled.borrow(), std::slice::from_ref(&scalar));
+        assert_eq!(*b_pulled.borrow(), [scalar]);
+    }
+
+    #[test]
+    fn nothing_makes_no_record_and_pulls_no_value() {
+        let (mut record, a_pulled, b_pulled) = two_values();
+        let nothing = record.tiling().empty_guard();
+        assert_eq!(record.get(nothing), record.tiling().empty_tile());
+        assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "a record of values, which has no keys to project")]
+    fn a_projection_of_keys_is_refused_by_a_record_of_values() {
+        let (mut record, _, _) = two_values();
+        record.get(keys_between(0, 1));
     }
 
     #[test]
