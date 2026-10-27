@@ -15,13 +15,23 @@ representation through `Type::structure`.
 
 `Type::Nominal` holds the declaration by `Rc` and its type arguments as children. A walk over a
 type's children visits the arguments and does not enter the declaration, which is an identity.
-Equality, ordering and hashing on `NominalDecl` are by the path of the module that declares it and
-its name ([chl-spec.md, "Nominal type identity"](../../../docs/chl-spec.md#nominal-type-identity)),
-so one source declares the same types in every compilation. A compilation holds at most one
-declaration of a path, since lowering refuses a second. Two compilations may each hold one with
-different constructors, and these compare equal, so a comparison of one version's types with the
-next version's compares the declarations' bodies itself. The program's own declarations sit at the
-root module's path, which is empty.
+Equality and hashing on `NominalDecl` are by the path of the module that declares it, its name,
+and its implicit arguments
+([chl-spec.md, "Nominal type identity"](../../../docs/chl-spec.md#nominal-type-identity)), so one
+source declares the same types in every compilation. A compilation holds at most one declaration of
+a path, since lowering refuses a second. Two compilations may each hold one with different
+constructors, and these compare equal, so a comparison of one version's types with the next
+version's compares the declarations' bodies itself. The root module's declarations sit at its path,
+which is empty, and another module's at that module's path. A declaration has no order, since its
+implicit arguments are types, which have none, so the solver keys its nominal contributions by
+declaration in a `DeclMap`, which finds a key by equality and keeps its entries in insertion order.
+
+The implicit parameters are the type parameters of the declaring module that the type reaches,
+recorded once the module lowers (`NominalDecl::implicit`). The module's own code names the
+declaration with each standing for itself. The type arguments an import or a run passes make an
+instance whose implicit arguments are theirs (`NominalDecl::substituted`), sharing the declaration's
+body, so two imports or runs given different arguments hold two types ([modules.md, "Nominal types
+across modules"](../../../docs/modules.md#nominal-types-across-modules)).
 
 A `NominalDecl` holds its name, its type parameters, and its body, set once by `define`:
 
@@ -165,6 +175,12 @@ parameters' take none, and outside a block a parameterised type's is the type at
 type parameters, each named once. An associated function stands at a module's top level, and one
 with a `Mut` parameter is refused.
 
+`associated_reach` refuses an associated function that reaches the module's state, a source, a value
+parameter, a member of a Module-typed parameter, or a member of a run the module declares, through
+the module's bindings and functions: the copies of the module whose arguments the type does not tell
+apart share the type, so their copies of the function must be one function. A type parameter it
+reaches the same way joins the type's identity instead (`settle_implicit`).
+
 ### Method calls
 
 A method call `𝑥.m(𝑎…)` is the call `N::m(𝑥, 𝑎…)` for the `N` that `𝑥`'s type names, which
@@ -176,9 +192,10 @@ lowering does not know. The parser keeps the call apart from a call of a field, 
 ```
 
 The placeholder, `TypedExprNode::Method`, holds the method's name, whether the call passes
-arguments after the receiver, and, as its children, a reference to each `N::m` the module declares,
-so `uniquify` resolves the candidates as it resolves any reference. ANF treats it as an atom, so it
-stays the application's function. No type declaring `m` is a lowering error.
+arguments after the receiver, and, as its children, a reference to each `N::m` the module declares
+and to each public `q::N::m` of a public type a qualifier `q` of the module reaches
+(`foreign_methods`), so `uniquify` resolves the candidates as it resolves any reference. ANF treats it as an atom, so it
+stays the application's function. No type in reach declaring `m` is a lowering error.
 
 Inference resolves the placeholder where it emits the application (`resolve_method`, called from
 `emit_apply`). The argument is emitted first, as for every application, so the receiver is typed by

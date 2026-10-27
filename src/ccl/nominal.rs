@@ -88,9 +88,11 @@ pub fn builtin(name: &str) -> Option<Rc<NominalDecl>> {
     (name == OPTION).then(option)
 }
 
-/// A declared nominal type, identified by the path of the module that declares it and its
-/// name (`docs/chl-spec.md`, "Nominal type identity"). Equality, ordering and hashing are by
-/// that pair, so the same source declares the same types in every compilation.
+/// A declared nominal type, identified by the path of the module that declares it, its name,
+/// and the arguments of its implicit parameters (`docs/chl-spec.md`, "Nominal type
+/// identity"). Equality and hashing are by those, so the same source declares the same types
+/// in every compilation. A declaration has no order, since its arguments are types; a map
+/// keyed by one is a [`DeclMap`].
 ///
 /// Two declarations a compilation holds never share a path: lowering refuses a second
 /// declaration of a name. Two compilations can, and a declaration from one compares equal to
@@ -118,7 +120,16 @@ pub struct NominalDecl {
     /// Whether the declaration is the single-constructor form `type N = R`, the one form
     /// that declares `N::extract` (`docs/chl-spec.md`, "The single-constructor form").
     pub declares_extract: bool,
-    body: OnceCell<NominalBody>,
+    /// Shared with every instance of the declaration ([`NominalDecl::substituted`]).
+    body: Rc<OnceCell<NominalBody>>,
+    /// The type parameters of the declaring module that the type reaches, through its
+    /// constructors and its associated functions, set once that module has lowered. With
+    /// the module's path and the type's name, their arguments identify the type
+    /// (`docs/chl-spec.md`, "Nominal type identity"). Shared with every instance.
+    implicit: Rc<OnceCell<Vec<Rc<TypeParam>>>>,
+    /// The argument each of [`Self::implicit`] takes in this instance, or `None` for the
+    /// declaration as its own module names it, where each is the parameter itself.
+    implicit_args: Option<Vec<Type>>,
 }
 
 /// What a [`NominalDecl`] declares after its head.
@@ -252,7 +263,63 @@ impl NominalDecl {
             params,
             span,
             declares_extract,
-            body: OnceCell::new(),
+            body: Rc::new(OnceCell::new()),
+            implicit: Rc::new(OnceCell::new()),
+            implicit_args: None,
+        })
+    }
+
+    /// Record the declaring module's type parameters the type reaches ([`Self::implicit`]).
+    ///
+    /// # Panics
+    ///
+    /// When recorded twice.
+    pub fn set_implicit(&self, params: Vec<Rc<TypeParam>>) {
+        let set = self.implicit.set(params);
+        assert!(
+            set.is_ok(),
+            "`{}`'s implicit parameters set twice",
+            self.name
+        );
+    }
+
+    /// The declaring module's type parameters the type reaches: empty until that module has
+    /// lowered.
+    pub fn implicit(&self) -> &[Rc<TypeParam>] {
+        self.implicit.get().map_or(&[], Vec::as_slice)
+    }
+
+    /// The argument each implicit parameter takes: the parameter itself in the declaration
+    /// as its module names it.
+    pub fn implicit_args(&self) -> Vec<Type> {
+        match &self.implicit_args {
+            Some(args) => args.clone(),
+            None => self
+                .implicit()
+                .iter()
+                .map(|p| Type::Param(Rc::clone(p)))
+                .collect(),
+        }
+    }
+
+    /// The instance whose implicit arguments are this one's after `substitute`, or `None`
+    /// when `substitute` leaves them unchanged. A run or an import reaches the type through
+    /// it, so two imports or runs given different arguments reach two types.
+    pub fn substituted(&self, substitute: &mut dyn FnMut(&mut Type)) -> Option<Rc<NominalDecl>> {
+        let before = self.implicit_args();
+        let mut after = before.clone();
+        after.iter_mut().for_each(&mut *substitute);
+        (after != before).then(|| {
+            Rc::new(NominalDecl {
+                module: self.module.clone(),
+                name: self.name.clone(),
+                params: self.params.clone(),
+                span: self.span,
+                declares_extract: self.declares_extract,
+                body: Rc::clone(&self.body),
+                implicit: Rc::clone(&self.implicit),
+                implicit_args: Some(after),
+            })
         })
     }
 
@@ -333,6 +400,22 @@ impl NominalDecl {
             .collect()
     }
 
+    /// The type's name as a diagnostic writes it: qualified by its module, `shop::Price`,
+    /// unless the root or the compiler declares it, whose types a program names bare. An
+    /// instance's module is written with its implicit arguments, as an import or a run
+    /// passes them: `shop(Receipt=stripe::Receipt)::Order`. The root has one run, so its
+    /// instances are written bare too.
+    pub fn spelled(&self) -> String {
+        if self.module.is_empty() || self.is_builtin() {
+            return self.name.to_string();
+        }
+        let module = self.module.join("::");
+        match &self.implicit_args {
+            Some(_) => format!("{module}({})::{}", self.implicit_spelling(), self.name),
+            None => format!("{module}::{}", self.name),
+        }
+    }
+
     /// Whether the compiler provides the declaration ([`builtin`]).
     pub fn is_builtin(&self) -> bool {
         builtin(&self.name).is_some_and(|b| *b == *self)
@@ -354,11 +437,18 @@ impl NominalDecl {
             "`{}` applied to the wrong number of arguments",
             self.name
         );
+        let implicit_args = self.implicit_args();
         let map: HashMap<TypeParamId, (&Type, &Type)> = self
             .params
             .iter()
             .map(|p| p.id)
             .zip(args.iter().map(sides))
+            .chain(
+                self.implicit()
+                    .iter()
+                    .map(|p| p.id)
+                    .zip(implicit_args.iter().map(|a| (a, a))),
+            )
             .collect();
         let mut out = ty.clone();
         replace_params(&mut out, true, &map);
@@ -405,14 +495,31 @@ impl fmt::Debug for NominalDecl {
         for segment in &self.module {
             write!(f, "{segment}::")?;
         }
-        write!(f, "{}", self.name)
+        write!(f, "{}", self.name)?;
+        if self.implicit_args.is_some() {
+            write!(f, "{}", self.implicit_spelling())?;
+        }
+        Ok(())
     }
 }
 
 impl NominalDecl {
-    /// What identifies the declaration: its module's path, then its name.
-    fn identity(&self) -> (&[SmolStr], &SmolStr) {
-        (&self.module, &self.name)
+    /// What identifies the declaration: its module's path, its name, and its implicit
+    /// arguments.
+    fn identity(&self) -> (&[SmolStr], &SmolStr, Vec<Type>) {
+        (&self.module, &self.name, self.implicit_args())
+    }
+
+    /// The implicit arguments of an instance, as a diagnostic writes them after its
+    /// module: `Receipt=stripe::Receipt`.
+    fn implicit_spelling(&self) -> String {
+        let args: Vec<String> = self
+            .implicit()
+            .iter()
+            .zip(self.implicit_args())
+            .map(|(p, a)| format!("{}={a}", p.spelling))
+            .collect();
+        args.join(", ")
     }
 }
 
@@ -422,19 +529,110 @@ impl PartialEq for NominalDecl {
     }
 }
 impl Eq for NominalDecl {}
-impl PartialOrd for NominalDecl {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for NominalDecl {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.identity().cmp(&other.identity())
-    }
-}
 impl std::hash::Hash for NominalDecl {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.identity().hash(state);
+    }
+}
+
+/// A map keyed by nominal type, in the order its entries were inserted. A type has no
+/// order: two instances compare by their implicit arguments, which are types, and a type
+/// has equality but no order. So the map finds a key by equality, and compares two maps
+/// as sets of entries. A position of a type holds one type, or two when it has none, so the
+/// linear search costs nothing.
+#[derive(Debug, Clone)]
+pub struct DeclMap<V>(Vec<(Rc<NominalDecl>, V)>);
+
+impl<V> Default for DeclMap<V> {
+    fn default() -> Self {
+        DeclMap(Vec::new())
+    }
+}
+
+impl<V> DeclMap<V> {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, decl: &NominalDecl) -> Option<&V> {
+        self.0.iter().find(|(d, _)| **d == *decl).map(|(_, v)| v)
+    }
+
+    pub fn get_mut(&mut self, decl: &NominalDecl) -> Option<&mut V> {
+        self.0
+            .iter_mut()
+            .find(|(d, _)| **d == *decl)
+            .map(|(_, v)| v)
+    }
+
+    /// Insert `value` under `decl`, replacing the value an equal key held in its place.
+    pub fn insert(&mut self, decl: Rc<NominalDecl>, value: V) {
+        match self.get_mut(&decl) {
+            Some(held) => *held = value,
+            None => self.0.push((decl, value)),
+        }
+    }
+
+    pub fn remove(&mut self, decl: &NominalDecl) -> Option<V> {
+        let at = self.0.iter().position(|(d, _)| **d == *decl)?;
+        Some(self.0.remove(at).1)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Rc<NominalDecl>, &V)> {
+        self.0.iter().map(|(d, v)| (d, v))
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&Rc<NominalDecl>, &mut V)> {
+        self.0.iter_mut().map(|(d, v)| (&*d, v))
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.0.iter().map(|(_, v)| v)
+    }
+}
+
+impl<V: PartialEq> PartialEq for DeclMap<V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().all(|(d, v)| other.get(d) == Some(v))
+    }
+}
+
+impl<V, const N: usize> From<[(Rc<NominalDecl>, V); N]> for DeclMap<V> {
+    fn from(entries: [(Rc<NominalDecl>, V); N]) -> Self {
+        entries.into_iter().collect()
+    }
+}
+
+impl<V> FromIterator<(Rc<NominalDecl>, V)> for DeclMap<V> {
+    fn from_iter<I: IntoIterator<Item = (Rc<NominalDecl>, V)>>(entries: I) -> Self {
+        let mut map = DeclMap::default();
+        for (decl, value) in entries {
+            map.insert(decl, value);
+        }
+        map
+    }
+}
+
+impl<V> IntoIterator for DeclMap<V> {
+    type Item = (Rc<NominalDecl>, V);
+    type IntoIter = std::vec::IntoIter<(Rc<NominalDecl>, V)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a, V> IntoIterator for &'a DeclMap<V> {
+    type Item = (&'a Rc<NominalDecl>, &'a V);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (Rc<NominalDecl>, V)>,
+        fn(&'a (Rc<NominalDecl>, V)) -> (&'a Rc<NominalDecl>, &'a V),
+    >;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().map(|(d, v)| (d, v))
     }
 }
 
@@ -518,6 +716,9 @@ fn replace_params(ty: &mut Type, pol: bool, map: &HashMap<TypeParamId, (&Type, &
             for (arg, v) in args.iter_mut().zip(variances) {
                 replace_params(arg, v.polarity(pol), map);
             }
+            if let Some(instance) = decl.substituted(&mut |arg| replace_params(arg, pol, map)) {
+                *decl = instance;
+            }
         }
         Type::Split { input, output } => {
             replace_params(input, !pol, map);
@@ -543,6 +744,53 @@ mod tests {
 
     fn int() -> Type {
         Type::Base(BaseType::Int)
+    }
+
+    /// Two instances whose implicit arguments are equal types are one key of a [`DeclMap`],
+    /// though each argument's refinement was built on its own, and so prints differently.
+    #[test]
+    fn a_decl_map_finds_an_equal_instance() {
+        use crate::ccl::{BinOpKind, CompareKind, Expr, Lit, Name, Refinement};
+        let receipt = TypeParam::declared("Receipt");
+        let decl = NominalDecl::declared(
+            "Order".into(),
+            Vec::new(),
+            Span::new(FileId::ROOT, 0, 0),
+            false,
+        );
+        decl.set_implicit(vec![receipt.clone()]);
+        let positive = || {
+            let predicate = Expr::binop(
+                Expr::var(Name::elem()),
+                BinOpKind::Compare(CompareKind::Greater),
+                Expr::lit(Lit::Int(0)),
+            );
+            Type::refined_one(
+                int(),
+                Refinement {
+                    predicate: Rc::new(predicate),
+                },
+            )
+        };
+        let instance = |argument: Type| {
+            decl.substituted(&mut |arg| {
+                if *arg == Type::Param(receipt.clone()) {
+                    *arg = argument.clone();
+                }
+            })
+            .expect("the argument replaces the parameter")
+        };
+        let (a, b) = (instance(positive()), instance(positive()));
+        assert_eq!(a, b);
+        assert_ne!(
+            format!("{:?}", a.implicit_args()),
+            format!("{:?}", b.implicit_args())
+        );
+        let mut map = DeclMap::default();
+        map.insert(a, 1);
+        map.insert(Rc::clone(&b), 2);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&b), Some(&2));
     }
 
     /// The variance `define` reads off one constructor whose single parameter has the type

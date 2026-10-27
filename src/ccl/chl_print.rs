@@ -16,6 +16,8 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use smol_str::SmolStr;
+
 use crate::ccl::infer::solver::display::InferredPoly;
 use crate::ccl::ty::{FunKind, PolyType, TypeKind, TypeParamId};
 use crate::ccl::{BaseType, BinOpKind, Builtin, Expr, HistoryKind, Lit, Name, Type, TypedExprNode};
@@ -26,12 +28,33 @@ pub fn chl_type(ty: &Type) -> String {
     Printer::for_type(ty).ty(ty)
 }
 
+/// `ty` written in CHL as the module at `home` writes it: its own nominal types by their
+/// names alone.
+pub fn chl_type_in(ty: &Type, home: &[SmolStr]) -> String {
+    written_in(ty, Some(home))
+}
+
+fn written_in(ty: &Type, home: Option<&[SmolStr]>) -> String {
+    Printer {
+        home: home.map(<[SmolStr]>::to_vec),
+        ..Printer::for_type(ty)
+    }
+    .ty(ty)
+}
+
 /// An inferred polymorphic type written in CHL: its `Poly`, or its body alone when it
 /// has no parameters, with each join or meet the notation cannot write written as its
 /// operands, `A ∨ Int`.
 pub fn chl_inferred_poly(inferred: &InferredPoly) -> String {
+    chl_inferred_poly_in(inferred, None)
+}
+
+/// [`chl_inferred_poly`], written as the module at `home` writes it when there is one
+/// ([`chl_type_in`]).
+pub fn chl_inferred_poly_in(inferred: &InferredPoly, home: Option<&[SmolStr]>) -> String {
     let mut p = Printer {
-        joins: inferred.join_texts(chl_type),
+        joins: inferred.join_texts(|ty| written_in(ty, home)),
+        home: home.map(<[SmolStr]>::to_vec),
         ..Printer::for_type(&Type::Poly(std::rc::Rc::new(inferred.poly.clone())))
     };
     if inferred.poly.params.is_empty() {
@@ -57,6 +80,9 @@ struct Printer {
     /// The text of each parameter that stands for a join or meet
     /// ([`chl_inferred_poly`]).
     joins: Vec<(TypeParamId, String)>,
+    /// The path of the module the text is written in, whose own nominal types are written
+    /// by their names alone ([`chl_type_in`]).
+    home: Option<Vec<SmolStr>>,
 }
 
 /// Binding tightness of a CHL expression, loosest first.
@@ -226,10 +252,17 @@ impl Printer {
                 format!("Feed({})", self.ty(value))
             }
             Type::Poly(poly) => self.poly(poly),
-            Type::Nominal(decl, args) if args.is_empty() => decl.name.to_string(),
             Type::Nominal(decl, args) => {
+                let name = if self.home.as_deref() == Some(decl.module.as_slice()) {
+                    decl.name.to_string()
+                } else {
+                    decl.spelled()
+                };
+                if args.is_empty() {
+                    return name;
+                }
                 let args: Vec<String> = args.iter().map(|t| self.ty(t)).collect();
-                format!("{}({})", decl.name, args.join(", "))
+                format!("{name}({})", args.join(", "))
             }
             // No program writes one; this names both sides.
             Type::Split { input, output } => {

@@ -100,7 +100,7 @@ struct KeyView {
     history: BTreeMap<HistoryKind, (Box<KeyView>, Box<KeyView>)>,
     /// Nominal contributions, keyed by declaration so two nominal types at one
     /// position stay distinguishable. Each maps to its arguments in order.
-    nominal: BTreeMap<Rc<crate::ccl::nominal::NominalDecl>, Vec<KeyView>>,
+    nominal: crate::ccl::nominal::DeclMap<Vec<KeyView>>,
 }
 
 /// Structural equality, with `refinements` compared as a set.
@@ -176,12 +176,10 @@ impl KeyView {
             }
         }
         for (decl, args) in other.nominal {
-            match self.nominal.entry(decl) {
-                Entry::Vacant(e) => {
-                    e.insert(args);
-                }
-                Entry::Occupied(mut e) => {
-                    for (a0, a) in e.get_mut().iter_mut().zip(args) {
+            match self.nominal.get_mut(&decl) {
+                None => self.nominal.insert(decl, args),
+                Some(held) => {
+                    for (a0, a) in held.iter_mut().zip(args) {
                         a0.union(a);
                     }
                 }
@@ -215,7 +213,7 @@ impl KeyView {
             value.drop_covariant_refinements(at(Variance::Invariant));
             domain.drop_covariant_refinements(at(Variance::Invariant));
         }
-        for (decl, args) in &mut self.nominal {
+        for (decl, args) in self.nominal.iter_mut() {
             let mut args = args.iter_mut();
             for v in &decl.body().variances {
                 if *v == Variance::Bipolar {
@@ -605,7 +603,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             }
             let args = sides;
             KeyView {
-                nominal: BTreeMap::from([(decl.clone(), args)]),
+                nominal: crate::ccl::nominal::DeclMap::from([(decl.clone(), args)]),
                 ..Default::default()
             }
         }

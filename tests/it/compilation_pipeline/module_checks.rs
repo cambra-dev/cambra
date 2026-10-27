@@ -273,6 +273,54 @@ fn a_checked_module_prints_its_interface() {
     );
 }
 
+/// A public nominal type prints as its module declares it, with each type parameter's
+/// variance and the module's type parameters whose arguments tell its instances apart,
+/// and each public associated function prints with its contract.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_prints_its_nominal_types() {
+    let program = program(
+        indoc! {"
+            param Receipt
+            pub type Box(T):
+                boxed(T)
+                empty
+            pub type Price = Int
+            pub def Price::doubled(self) => Int:
+                self.extract() * 2
+            def Price::hidden(self) => Int:
+                1
+            pub type Order:
+                placed(r: Receipt, total: Price)
+            impl Box(T):
+                pub def or_else(self, d: T) => T:
+                    match self:
+                        case Box::boxed(v):
+                            v
+                        case Box::empty:
+                            d
+        "},
+        &[],
+    );
+    let interface = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(
+        interface,
+        indoc! {"
+            module main
+            param Receipt
+            pub type Box(T):  # covariant in T
+                boxed(T)
+                empty
+            pub type Price = Int
+            pub Price::doubled: Price => Int
+            pub type Order:  # one type per argument of Receipt
+                placed(r: Receipt, total: Price)
+            pub Box::or_else: forall (T) {Box(T), T} => T
+        "}
+    );
+}
+
 /// A type parameter with no kind written is one variable for the whole check, and a
 /// contract writes it as the parameter, in a member's type and in a generalized one's
 /// scheme alike.
@@ -304,8 +352,30 @@ fn a_contract_writes_a_parameter_with_no_kind_by_name() {
     );
 }
 
-/// A member declared after a statement that binds nothing, a loop or a feed, has
-/// its contract.
+/// A contract writes the module's own types by name, and another module's qualified by
+/// it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_contract_qualifies_only_another_modules_types() {
+    let program = program(
+        indoc! {"
+            import shop
+            pub type Price = Int
+            pub def convert(p: shop::Price) => Price:
+                Price::new(p.extract())
+        "},
+        &[("shop", "pub type Price = Int\n")],
+    );
+    let interface = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(
+        interface.contains("pub convert: shop::Price => Price\n"),
+        "{interface}"
+    );
+}
+
+/// A member declared after a statement that binds no member, a loop, a feed or an
+/// `impl` block, has its contract.
 #[rstest]
 #[case::a_loop(indoc! {"
     total := 0
@@ -316,6 +386,13 @@ fn a_contract_writes_a_parameter_with_no_kind_by_name() {
 #[case::a_feed(indoc! {"
     events = defer()
     events << 1
+    pub n = 1
+"})]
+#[case::an_impl_block(indoc! {"
+    type Price = Int
+    impl Price:
+        def doubled(self) => Int:
+            self.extract() * 2
     pub n = 1
 "})]
 #[timeout(Duration::from_secs(10))]
