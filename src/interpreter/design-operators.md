@@ -524,14 +524,16 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
   input produces only that part. Its answer is built from the input's, so it does not cut, and its
   operator test compares the answer with the whole answer cut to 𝑝 (`assert_conforms`). An operator
   that builds its answer from anything else cuts: accumulators held across pulls (`MapAggregate`),
-  arms already released (`UnionOperator`), or a cache read at a wider region (`FanOutSlot`, `Memo`).
+  arms already released (`UnionOperator`), or a cache read at a wider region (`Memo`, and `FanOutSlot`
+of a cyclic fan-out).
   An operator whose output keys are not its input's keys, such as `Converse`, pulls the input in
   full and cuts its own output. An operator that cannot restate 𝑝 for an input pulls the input in
   full and still cuts its output: pulling more is sound for a `get`, where a release that names
   more is not.
-- **Release between pulls.** The completeness contract compares a producer's consecutive answers,
-  and a pull of one projection states completeness over its keys only. A consumer that pulls two
-  projections of one producer releases the first before the second.
+- **Completeness between pulls.** The completeness contract compares a producer's answers inside
+  the region pulled, and a pull of one projection states completeness over its keys only, so a pull
+  of another region withdraws nothing it said of the first. The debug check keeps the last statement
+  of each region.
 - **Test double.** `ProjectionSpy` answers a fixed tile cut to the guard it is pulled with, and
   logs each projection and release it receives. An operator test pulls the operator over it and
   reads the log to see the guard the operator restated.
@@ -556,6 +558,7 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
 | `Uncurry` | Beneath standing levels the input is pulled at the projection. Pairing the whole tile reads the groups whose first component the projection admits, and the pairs are cut after. |
 | `Product` | Both sides are pulled at the projection, since they are aligned row for row. The outer side has no paired level, so a projection at or beneath it pulls both sides at the rows its paths run through (`Projection::above`), and the pairs are cut. |
 | `Converse` | Every level is restated (`Restates::Every`). Beneath standing levels the input is pulled at the standing keys the projection names (`Projection::above`), and the groups are cut to it. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
+| `FanOutSlot` | Pulls the shared input at its own projection and cuts its answer to it. A producer states completeness only for the region it returns, so slots at different regions each pull the one input at their own and a pull of one region retracts nothing it said of another (the debug check compares the last output inside the region pulled). A cyclic fan-out reads its input whole, because a sibling that re-enters mid-pull is answered from the cache of the last completed pull, which has to cover whatever region that sibling asks for. A projection beneath the outermost keys is read and cut as one of the outermost keys is. |
 
 ### Producer attribution and probes
 
