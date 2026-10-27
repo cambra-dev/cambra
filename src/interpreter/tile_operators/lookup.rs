@@ -719,7 +719,13 @@ impl TileProducer for LookupProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    /// The input is read whole, since each row's key is looked up in that row's collection, and
+    /// the answer is cut to the projection over the keys above the rows.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
         let mut tile = self.input.get(self.input.tiling().universal_guard());
         let Tiling::Scalar(out_extent) = self.tiling().values_at(self.level) else {
             unreachable!("`Lookup::new_at` puts one value at the level")
@@ -811,6 +817,7 @@ impl TileProducer for LookupProducer {
             answers.into_iter().flatten().collect(),
             &out_extent,
         ));
+        tile.restrict_to(&projection, self.tiling());
         tile
     }
 
