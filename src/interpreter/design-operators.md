@@ -494,6 +494,7 @@ of a restatement with no spelling.
 | `Filter` | The predicate and the input are pulled at the projection, since they share the keys of the level the mask names. |
 | `Restrict` | The predicate is pulled at the projection, since the restricted domain is the predicate's keys that pass. |
 | `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
+| `Uncurry` | Beneath standing levels the input is pulled at the projection. Pairing the whole tile reads the groups whose first component the projection admits, and the pairs are cut after. |
 
 ### Producer attribution and probes
 
