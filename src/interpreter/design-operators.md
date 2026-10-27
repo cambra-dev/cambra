@@ -498,6 +498,7 @@ of a restatement with no spelling.
 | `Product` | Both sides are pulled at the projection, since they are aligned row for row. |
 | `Converse` | Beneath standing levels the input is pulled at the projection. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
 | `FanOutSlot` | Pulls the shared input at the union of every slot's projection so far, which only grows, and cuts its own answer to the slot's projection. A shared producer states one completeness across its pulls, so slots at different regions cannot pull it at their own. A cyclic fan-out reads its input whole, because a sibling that re-enters mid-pull is answered from that pull's cache. |
+| `Memo` | Reads its input at the projection and caches what it read; a pull over a region it has read answers from the cache cut to the projection, and a region it has not read reaches the input however quiet the input has been. |
 
 ### Producer attribution and probes
 
