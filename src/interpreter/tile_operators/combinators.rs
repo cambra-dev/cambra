@@ -1739,9 +1739,10 @@ impl TileProducer for ProductProducer {
             *domain_predicate = complete;
         }
         tile.remove_guarded(self.obsolete_guard().clone());
-        if pulled != projection {
-            tile.restrict_to(&projection, self.tiling());
-        }
+        // The completeness intersected above is each side's, which a side states over the region
+        // it was pulled at and the pairing restates over the product's keys, so it is cut to the
+        // projection whether or not the sides were pulled at more.
+        tile.restrict_to(&projection, self.tiling());
         tile
     }
 

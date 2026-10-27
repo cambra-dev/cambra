@@ -1111,7 +1111,7 @@ pub trait TileProducer {
             // A guard that is not a projection is left to a producer that restates projections,
             // which panics on it in `get_impl`; one that is, bounds the answer.
             if let Ok(projection) = crate::interpreter::Projection::of(asked)
-                && let Err(outside) = result.within(&projection)
+                && let Err(outside) = result.within_over(&projection, self.tiling())
             {
                 panic!(
                     "{} answered a pull at {asked:?} with {result:?}, but {outside}",

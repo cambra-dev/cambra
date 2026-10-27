@@ -39,5 +39,6 @@ the key.
 and a key above where an admitted path passes through it. A statement beneath level 𝑛 is
 qualified by the paths kept (`within_paths`). A statement above level 𝑛 keeps the keys whose every
 path the predicate admits, which the arms of the projection's guard name above level 𝑛, and states
-the rest of what it said at level 𝑛, cut to the predicate. `Tile::within` checks the same paths.
+the rest of what it said at level 𝑛, cut to the predicate. `Tile::within` checks the same paths,
+and checks that every statement lies within what the cut leaves stated.
 

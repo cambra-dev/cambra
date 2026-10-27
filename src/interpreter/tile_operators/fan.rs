@@ -696,6 +696,10 @@ impl TileProducer for ZipProducer {
                 if let (1, Tile::DataFunction { domain, .. }) = (self.level.index(), &out) {
                     self.emitted = self.emitted.union(&Predicate::from_column_value(domain));
                 }
+                // The completeness intersected above is each arm's, which an arm restating fewer
+                // levels than the projection's states over the region it was pulled at, so it is
+                // cut to the projection.
+                out.restrict_to(&projection, self.tiling());
                 out
             }
             other => panic!("Zip: every input must be a function tile, got {other:?}"),
