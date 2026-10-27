@@ -244,7 +244,16 @@ impl TileProducer for ExtractAggregateProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    /// One extracted value has no keys to project: the projection is all of it or none.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        match projection_guard.projection(&self.name()) {
+            Projection::Everything => {}
+            Projection::Nothing => return self.tiling().empty_tile(),
+            Projection::Keys(_) => panic!(
+                "{} extracts one value, which has no keys to project: {projection_guard:?}",
+                self.name()
+            ),
+        }
         let input_result = self.input.get(self.input.tiling().universal_guard());
         let Tile::Aggregation {
             kind: _,
@@ -1301,5 +1310,60 @@ mod aggregate_projection_tests {
     fn a_key_projection_of_a_sum_is_rejected() {
         let (mut sum, _) = sum_of_finished_stream();
         sum.get(keys_between(0, 1));
+    }
+}
+
+#[cfg(test)]
+mod extract_aggregate_projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{GuardLog, ProjectionSpy, keys_between};
+    use crate::interpreter::{BaseType, Extent, Tile};
+
+    /// `sum(xs)` extracted once the aggregation is terminal: an accumulator holding `10`.
+    fn extract_of_finished_sum() -> (ExtractAggregateProducer, GuardLog) {
+        let accumulator = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let in_tiling = Tiling::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: Box::new(accumulator.clone()),
+        };
+        let finished = Tile::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+            terminal: ColumnValue::Bools(vec![true]),
+        };
+        let (input, pulled, _) = ProjectionSpy::new(finished, in_tiling);
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        (
+            ExtractAggregateProducer {
+                base: ProducerBase::unowned(ExtractAggregateProducer::alloc_id(), &tiling),
+                input: Box::new(input),
+                kind: AggregateKind::Sum,
+                only_terminal: true,
+            },
+            pulled,
+        )
+    }
+
+    #[test]
+    fn a_finished_sum_extracts_whole() {
+        let (mut extract, pulled) = extract_of_finished_sum();
+        let tile = extract.get(extract.tiling().universal_guard());
+        assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![10])));
+        assert!(pulled.borrow()[0].is_universal());
+    }
+
+    #[test]
+    fn an_extract_asked_for_nothing_reads_nothing() {
+        let (mut extract, pulled) = extract_of_finished_sum();
+        let tile = extract.get(extract.tiling().empty_guard());
+        assert_eq!(tile, extract.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "extracts one value")]
+    fn a_key_projection_of_an_extracted_value_is_rejected() {
+        let (mut extract, _) = extract_of_finished_sum();
+        extract.get(keys_between(0, 1));
     }
 }
