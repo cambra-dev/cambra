@@ -9,6 +9,7 @@ mod curry_level;
 mod guard;
 mod interval_sets;
 mod predicate;
+mod projection;
 mod tile;
 mod tiling_kind;
 
@@ -16,6 +17,7 @@ pub use curry_level::*;
 pub use guard::*;
 pub use interval_sets::*;
 pub use predicate::*;
+pub use projection::*;
 pub use tile::*;
 pub use tiling_kind::*;
 
