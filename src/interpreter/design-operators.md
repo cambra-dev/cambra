@@ -489,6 +489,7 @@ of a restatement with no spelling.
 | `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. |
 | `MakeRecord` | A record of values has no keys: the projection is the whole record or nothing, and a guard naming keys panics. |
 | `VariantWrap` | A payload stream is pulled at the projection. A payload that is itself a collection becomes one union column and is read whole. |
+| `VariantProject` | A union stream is pulled at the projection. A bare union has no keys of its own, so it is read whole and its positions are cut. |
 
 ### Producer attribution and probes
 
