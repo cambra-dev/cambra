@@ -552,6 +552,7 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
 | `VariantIs` | A union stream is pulled at the projection, since every key in is a key out. A bare union has no keys of its own, so it is read whole and its positions are cut. |
 | `Filter` | A predicate or input that is a collection is pulled at the projection, since they share the keys of the level the mask names. A side that is not a collection is read whole. With a collection predicate it takes a projection at any level down to the masked one (`Restates::Above`). The predicate holds no level beneath that one. With a function predicate, which masks the outermost keys, it takes a projection at any level (`Restates::Every`). |
 | `Restrict` | The predicate is pulled at the projection, since the restricted domain is the predicate's keys that pass. |
+| `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
 
 ### Producer attribution and probes
 
