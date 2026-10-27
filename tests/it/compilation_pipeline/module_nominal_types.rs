@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use cambra::interpreter::Value;
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use rstest_log::rstest;
 
 use super::helpers::*;
@@ -37,6 +37,23 @@ const SHOP: &str = indoc! {"
 fn store() -> String {
     format!("{SHOP}\nvisits := 0\n")
 }
+
+/// A module with a public type, its public method, and a private one.
+const SHOP_PRICE: &str = indoc! {"
+    pub type Price = Int
+    pub def Price::doubled(self) => Int:
+        self.extract() * 2
+    def Price::hidden(self) => Int:
+        1
+"};
+
+/// [`SHOP_PRICE`] with mutable state, so it is run and not imported.
+const STATEFUL_SHOP_PRICE: &str = indoc! {"
+    visits := 0
+    pub type Price = Int
+    pub def Price::doubled(self) => Int:
+        self.extract() * 2
+"};
 
 /// A type a module declares is used in that module, whether the module is imported or run.
 #[rstest]
@@ -198,6 +215,129 @@ fn a_use_name_names_another_modules_type(#[case] root: &str, #[case] expected: i
     check_program_scalar(
         &program(root, &[("shop", SHOP), ("store", &store)]),
         Value::Int(expected),
+    );
+}
+
+/// A module whose public `p` holds a `lib::Price`, reaching `lib` through `reach`: an
+/// `import lib` or a `run lib as l`.
+fn holder(reach: &str, qualifier: &str) -> String {
+    formatdoc! {"
+        {reach}
+        pub p = {qualifier}::Price::new(3)
+    "}
+}
+
+/// A method call finds the method of a value's type even where the calling module neither
+/// imports nor runs the type's module, as when another module's member holds the value.
+#[rstest]
+#[case::through_an_import(
+    indoc! {"
+        import mid
+        mid::p.doubled()
+    "},
+    "import lib",
+    "lib",
+    SHOP_PRICE
+)]
+#[case::through_a_run(
+    indoc! {"
+        run mid as m
+        m::p.doubled()
+    "},
+    "run lib as l",
+    "l",
+    STATEFUL_SHOP_PRICE
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_method_call_reaches_a_type_through_another_module(
+    #[case] root: &str,
+    #[case] reach: &str,
+    #[case] qualifier: &str,
+    #[case] lib: &str,
+) {
+    check_program_scalar(
+        &program(root, &[("mid", &holder(reach, qualifier)), ("lib", lib)]),
+        Value::Int(6),
+    );
+}
+
+/// The method a call finds through another module is the one of the instance the value has,
+/// whose run's argument the method's signature reads: an argument the run's statement
+/// writes, or one it takes from a parameter of the module that runs it.
+#[rstest]
+#[case::written(
+    "run mid as m\n",
+    indoc! {"
+        run lib(T=Int) as l
+        pub p = l::Box::new(1)
+    "}
+)]
+#[case::through_a_parameter(
+    "run mid(U=Int) as m\n",
+    indoc! {"
+        param U
+        run lib(T=U) as l
+        pub p = l::Box::new(1)
+    "}
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_method_call_through_another_module_takes_the_values_instance(
+    #[case] root: &str,
+    #[case] mid: &str,
+) {
+    // `lib` declares state, so it is run.
+    let lib = indoc! {"
+        param T
+        visits := 0
+        pub type Box = Int
+        pub def Box::wrap(self, x: T) => T:
+            x
+    "};
+    check_program_scalar(
+        &program(
+            &format!("{root}m::p.wrap(5)\n"),
+            &[("mid", mid), ("lib", lib)],
+        ),
+        Value::Int(5),
+    );
+}
+
+/// A method call above a `run` of the type's module takes a copy in scope at the call, not
+/// the run's, whose name is in scope only below its statement.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_method_call_above_a_run_takes_a_copy_in_scope() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                run mid as m
+                x = m::p.doubled()
+                run lib as l
+                x
+            "},
+            &[
+                ("mid", &holder("run lib as l", "l")),
+                ("lib", STATEFUL_SHOP_PRICE),
+            ],
+        ),
+        Value::Int(6),
+    );
+}
+
+#[rstest]
+#[case::private("hidden")]
+#[case::undeclared("nothing")]
+#[timeout(Duration::from_secs(10))]
+fn a_method_call_through_another_module_reaches_only_public_methods(#[case] method: &str) {
+    assert_refused(
+        &program(
+            &formatdoc! {"
+                import mid
+                mid::p.{method}()
+            "},
+            &[("mid", &holder("import lib", "lib")), ("lib", SHOP_PRICE)],
+        ),
+        &format!("no type this module declares or reaches has a method `{method}`"),
     );
 }
 

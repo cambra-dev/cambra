@@ -2853,7 +2853,15 @@ fn resolve_method<C: Typing>(
             }));
         }
     };
-    let Some(at) = candidates.iter().position(|c| c.decl == decl) else {
+    // The first candidate bound at the call. Failing that, the first one lowering found,
+    // which then reports itself unbound, as a module function called above its `def` does.
+    // A copy linking added is taken only where it is bound.
+    let in_scope = |c: &crate::ccl::MethodCandidate| matches!(&c.function.node, TypedExprNode::Var(name) if ctx.binds(name));
+    let Some(at) = candidates
+        .iter()
+        .position(|c| c.decl == decl && in_scope(c))
+        .or_else(|| candidates.iter().position(|c| c.decl == decl && !c.copy))
+    else {
         return Err(ctx.raise(unresolved(Some(decl.applied_to_params()))));
     };
     let chosen = candidates.swap_remove(at);
