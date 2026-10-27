@@ -6,6 +6,7 @@
 
 use super::{CycleStep, LoadError, LoadedModule, module_name};
 use crate::chl_parser::{FileId, ModulePath, SourceMap};
+use crate::util::cyclic_components;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The key modules are ordered by: the module path, and a root no module path
@@ -31,10 +32,7 @@ pub(super) fn cycles(modules: &[LoadedModule], sources: &SourceMap) -> Vec<LoadE
         .map(|m| m.edges.iter().map(|e| index[&e.target]).collect())
         .collect();
 
-    let mut components: Vec<Vec<usize>> = strongly_connected(&successors)
-        .into_iter()
-        .filter(|c| c.len() > 1 || successors[c[0]].contains(&c[0]))
-        .collect();
+    let mut components = cyclic_components(&successors);
     for component in &mut components {
         component.sort_by_key(|&i| key(sources, modules[i].file));
     }
@@ -124,69 +122,4 @@ pub(super) fn link_order(modules: &[LoadedModule], sources: &SourceMap) -> Vec<F
         "an acyclic module graph orders every module"
     );
     order
-}
-
-/// The strongly connected components of the graph `successors`, by Tarjan's
-/// algorithm.
-fn strongly_connected(successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
-    struct Tarjan<'a> {
-        successors: &'a [Vec<usize>],
-        index: Vec<Option<usize>>,
-        low: Vec<usize>,
-        on_stack: Vec<bool>,
-        stack: Vec<usize>,
-        next: usize,
-        components: Vec<Vec<usize>>,
-    }
-
-    impl Tarjan<'_> {
-        fn visit(&mut self, v: usize) {
-            self.index[v] = Some(self.next);
-            self.low[v] = self.next;
-            self.next += 1;
-            self.stack.push(v);
-            self.on_stack[v] = true;
-            for &w in &self.successors[v] {
-                match self.index[w] {
-                    None => {
-                        self.visit(w);
-                        self.low[v] = self.low[v].min(self.low[w]);
-                    }
-                    Some(w_index) if self.on_stack[w] => {
-                        self.low[v] = self.low[v].min(w_index);
-                    }
-                    Some(_) => {}
-                }
-            }
-            if Some(self.low[v]) == self.index[v] {
-                let mut component = Vec::new();
-                loop {
-                    let w = self.stack.pop().expect("v is on the stack");
-                    self.on_stack[w] = false;
-                    component.push(w);
-                    if w == v {
-                        break;
-                    }
-                }
-                self.components.push(component);
-            }
-        }
-    }
-
-    let n = successors.len();
-    let mut tarjan = Tarjan {
-        successors,
-        index: vec![None; n],
-        low: vec![0; n],
-        on_stack: vec![false; n],
-        stack: Vec::new(),
-        next: 0,
-        components: Vec::new(),
-    };
-    for v in 0..n {
-        if tarjan.index[v].is_none() {
-            tarjan.visit(v);
-        }
-    }
-    tarjan.components
 }
