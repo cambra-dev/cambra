@@ -875,6 +875,24 @@ fn several_generators_key_by_the_tuple_of_positions(#[case] source: &str, #[case
     out << [x * 10 + i for xs in [box([1, 2]), box([3])] for x in xs for i in [0, 1] if x > i]
 "#}, "[() -> [(_0: 0, _1: 0, _2: 0) -> 10, (_0: 0, _1: 1, _2: 0) -> 20, (_0: 0, _1: 1, _2: 1) -> 21, \
        (_0: 1, _1: 0, _2: 0) -> 30, (_0: 1, _1: 0, _2: 1) -> 31]]")]
+#[case::inside_a_comprehension_over_its_rows(indoc! {r#"
+    out = test_sink()
+    out << [[x for xs in xss for x in xs] for xss in [box([box([1, 2]), box([3])]), box([box([4])])]]
+"#}, "[() -> [[(_0: 0, _1: 0) -> 1, (_0: 0, _1: 1) -> 2, (_0: 1, _1: 0) -> 3], [(_0: 0, _1: 0) -> 4]]]")]
+#[case::summed_inside_a_comprehension_over_its_rows(indoc! {r#"
+    out = test_sink()
+    out << [sum([x for xs in xss for x in xs]) for xss in [box([box([1, 2]), box([3])]), box([box([4])])]]
+"#}, "[() -> [6, 4]]")]
+#[case::in_a_definition_applied_per_row(indoc! {r#"
+    def f(xss):
+        [x for xs in xss for x in xs]
+    out = test_sink()
+    out << [f(xss) for xss in [box([box([1, 2]), box([3])]), box([box([4])])]]
+"#}, "[() -> [[(_0: 0, _1: 0) -> 1, (_0: 0, _1: 1) -> 2, (_0: 1, _1: 0) -> 3], [(_0: 0, _1: 0) -> 4]]]")]
+#[case::inside_a_filtered_comprehension_over_its_rows(indoc! {r#"
+    out = test_sink()
+    out << [[x for xs in xss for x in xs] for xss in [box([box([1, 2]), box([3])]), box([box([4])])] if sum([1 for xs in xss]) > 1]
+"#}, "[() -> [[(_0: 0, _1: 0) -> 1, (_0: 0, _1: 1) -> 2, (_0: 1, _1: 0) -> 3]]]")]
 fn an_inner_generator_over_the_outer_element_keys_by_a_dependent_tuple(
     #[case] source: &str,
     #[case] expected: &str,
@@ -951,6 +969,19 @@ fn a_mismatch_between_dependent_tuples_names_no_minted_binder() {
     assert!(
         message.contains("hint: a tuple's width is part of its type"),
         "{message}"
+    );
+}
+
+/// The same flattening inside two comprehensions over its rows does not compile yet: each
+/// `xsss` holds one row, so its sum is erased to the collection over `0..1`, and `unbox` would
+/// narrow the keys a row of collections read at its key tiles as `UInt` to that bound. It must
+/// answer `[[[(_0: 0, _1: 0) -> 1, (_0: 0, _1: 1) -> 2, (_0: 1, _1: 0) -> 3]], [[(_0: 0, _1: 0) -> 4]]]`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn the_flattening_inside_two_comprehensions_over_its_rows_is_refused() {
+    check_compile_error(
+        "[[[x for xs in xss for x in xs] for xss in xsss] for xsss in [box([box([box([1, 2]), box([3])])]), box([box([box([4])])])]]",
+        "`unbox` narrowing keys tiled as UInt to its witness's bound 0..1 is not supported yet",
     );
 }
 
