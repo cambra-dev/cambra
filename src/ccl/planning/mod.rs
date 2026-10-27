@@ -375,15 +375,10 @@ pub(super) fn is_constant(expr: &Expr) -> bool {
 pub(super) fn replace_constant_domain_type(expr: &mut Expr, ty: &Type) {
     set_domain_ty(&mut expr.ty, ty);
     match &mut expr.node {
-        TypedExprNode::Apply { .. } => {
+        TypedExprNode::Apply { function, argument } => {
             let output_ty = expr.ty.clone();
-            let arg = if let TypedExprNode::Apply { function, argument } = &mut expr.node {
-                assert!(is_builtin(function, Builtin::Const));
-                argument.clone()
-            } else {
-                unreachable!()
-            };
-
+            assert!(is_builtin(function, Builtin::Const));
+            let arg = argument.clone();
             *expr = apply_primitive(*arg, Builtin::Const, output_ty)
         }
         TypedExprNode::Compose(elts) => {
@@ -410,13 +405,11 @@ pub(super) fn is_function_of_single_tuple_arm(expr: &Expr) -> Option<usize> {
                 if is_constant(elt) {
                     continue;
                 }
-                {
-                    let idx = is_function_of_single_tuple_arm(elt)?;
-                    if result.is_some_and(|x| x != idx) {
-                        return None;
-                    }
-                    result = Some(idx);
+                let idx = is_function_of_single_tuple_arm(elt)?;
+                if result.is_some_and(|x| x != idx) {
+                    return None;
                 }
+                result = Some(idx);
             }
             result
         }
@@ -441,42 +434,29 @@ pub(super) fn replace_tuple_project_with_id(expr: &mut Expr, ty: &Type) {
         TypedExprNode::Proj(ProjKey::Index(_)) => {
             *expr = id().with_ty(Type::fun(ty.clone(), ty.clone()))
         }
-        TypedExprNode::Compose(_) => {
+        TypedExprNode::Compose(elts) => {
             set_domain_ty(&mut expr.ty, ty);
-            if let TypedExprNode::Compose(elts) = &mut expr.node
-                && let Some(first) = elts.first_mut()
-            {
+            if let Some(first) = elts.first_mut() {
                 replace_tuple_project_with_id(first, ty);
             }
         }
-        TypedExprNode::Apply { .. } => {
+        TypedExprNode::Apply { function, argument } => {
             let mut output_ty = expr.ty.clone();
             set_domain_ty(&mut output_ty, ty);
-            let arg = if let TypedExprNode::Apply { function, argument } = &mut expr.node {
-                assert!(is_builtin(function, Builtin::Zip));
-                replace_tuple_project_with_id(argument, ty);
-                argument.clone()
-            } else {
-                unreachable!()
-            };
+            assert!(is_builtin(function, Builtin::Zip));
+            replace_tuple_project_with_id(argument, ty);
+            let arg = argument.clone();
             *expr = apply_primitive(*arg, Builtin::Zip, output_ty);
         }
-        TypedExprNode::Tuple(_) => {
-            if let Type::Tuple(elts) = &mut expr.ty {
-                elts.iter_mut().for_each(|elt| match elt {
-                    Type::Fun { domain, .. } => {
-                        **domain = ty.clone();
-                    }
-                    _ => panic!(),
-                });
+        TypedExprNode::Tuple(elts) => {
+            if let Type::Tuple(tys) = &mut expr.ty {
+                tys.iter_mut().for_each(|elt_ty| set_domain_ty(elt_ty, ty));
             }
-            if let TypedExprNode::Tuple(elts) = &mut expr.node {
-                for elt in elts.iter_mut() {
-                    if is_constant(elt) {
-                        replace_constant_domain_type(elt, ty);
-                    } else {
-                        replace_tuple_project_with_id(elt, ty);
-                    }
+            for elt in elts.iter_mut() {
+                if is_constant(elt) {
+                    replace_constant_domain_type(elt, ty);
+                } else {
+                    replace_tuple_project_with_id(elt, ty);
                 }
             }
         }

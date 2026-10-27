@@ -156,32 +156,26 @@ fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]
                 .expect("arm index not in arm_order");
             set_domain_ty(&mut expr.ty, new_domain_ty);
         }
-        TypedExprNode::Compose(_) => {
+        TypedExprNode::Compose(elts) => {
             set_domain_ty(&mut expr.ty, new_domain_ty);
-            if let TypedExprNode::Compose(elts) = &mut expr.node
-                && let Some(first) = elts.first_mut()
-            {
+            if let Some(first) = elts.first_mut() {
                 reindex_for_domain(first, new_domain_ty, arm_order);
             }
         }
-        TypedExprNode::Apply { .. } => {
+        TypedExprNode::Apply { function, argument } => {
             // Only zip applications appear at domain-accessing positions.
             let mut output_ty = expr.ty.clone();
             set_domain_ty(&mut output_ty, new_domain_ty);
-            let arg = if let TypedExprNode::Apply { function, argument } = &mut expr.node {
-                assert!(
-                    is_builtin(function, Builtin::Zip),
-                    "unexpected Apply at domain position: {:?}",
-                    function.node
-                );
-                reindex_for_domain(argument, new_domain_ty, arm_order);
-                argument.clone()
-            } else {
-                unreachable!()
-            };
+            assert!(
+                is_builtin(function, Builtin::Zip),
+                "unexpected Apply at domain position: {:?}",
+                function.node
+            );
+            reindex_for_domain(argument, new_domain_ty, arm_order);
+            let arg = argument.clone();
             *expr = apply_primitive(*arg, Builtin::Zip, output_ty);
         }
-        TypedExprNode::Tuple(_) => {
+        TypedExprNode::Tuple(elts) => {
             if let Type::Tuple(tys) = &mut expr.ty {
                 for ty in tys.iter_mut() {
                     if matches!(ty, Type::Fun { .. }) {
@@ -189,13 +183,11 @@ fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]
                     }
                 }
             }
-            if let TypedExprNode::Tuple(elts) = &mut expr.node {
-                for elt in elts.iter_mut() {
-                    if is_constant(elt) {
-                        replace_constant_domain_type(elt, new_domain_ty);
-                    } else {
-                        reindex_for_domain(elt, new_domain_ty, arm_order);
-                    }
+            for elt in elts.iter_mut() {
+                if is_constant(elt) {
+                    replace_constant_domain_type(elt, new_domain_ty);
+                } else {
+                    reindex_for_domain(elt, new_domain_ty, arm_order);
                 }
             }
         }
