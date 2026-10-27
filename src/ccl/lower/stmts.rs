@@ -631,9 +631,9 @@ pub(super) fn lower_assigned_value(
 
 /// Lower [`ChlExpr::Block`] through the terminal-statement path in the supplied scope.
 /// Scope determines whether `:=` introduces a local or writes an enclosing variable,
-/// including loop-carried writes inside a branch. Later,
-/// [`push_bindings_into_writing_cases`](crate::ccl::mut_elim::push_bindings_into_writing_cases)
-/// exposes branch writes to the statement-chain mutability transformations.
+/// including loop-carried writes inside a branch. Later, `mut_elim` merges the branches'
+/// writes into the value the block binds (`src/ccl/design/mutability.md`, "Loop-body
+/// bindings").
 /// See `src/ccl/design/lowering.md`, "`if` and `match` in value position".
 pub(super) fn lower_block_value(
     stmt: &Spanned<ChlStmt>,

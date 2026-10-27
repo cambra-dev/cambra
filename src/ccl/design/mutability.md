@@ -832,11 +832,18 @@ value of its type for a slot.
 
 A `let` bound to an `if` or a `match` whose branches write is walked the same way, and the value
 it binds merges as a variable does: `Case[𝑔ᵢ → 𝑣ᵢ]` over the values the branches end in, each
-taking its branch's bindings. Inside a writer body nothing pushes such a binding, or the statements
-after a statement `if`, into the branches (`mut_elim::push_writing_cases` and `flatten_spine`): a
-copy of the continuation per branch doubles the body at every `if`. Outside one, at the top level
-and in a function body, `push_binding_into_case` and `push_continuation_into_case` push them, since
-no writer walk merges the branches there.
+taking its branch's bindings. Nothing pushes such a binding, or the statements after a statement
+`if`, into the branches (`mut_elim::push_writing_cases` and `flatten_spine`): a copy of the
+continuation per branch doubles the body at every `if`.
+
+Outside a writer body, at the top level and in a function body, `mut_elim::rewrite` merges a
+writing `if` or `match` the same way, into one value (`merge_writing_case`). Each branch is rewritten
+into shadowing `let`s and ends in a tuple of the value it binds and what each variable a branch
+writes holds there; a binding of the value and a fresh binder of each variable read the tuple back,
+and the statements after the `Case` read those. A branch that feeds, defines, runs a loop or a
+transaction, or writes a key is not merged, since those statements have no reading in value
+position: `push_binding_into_case` and `push_continuation_into_case` push the continuation into
+its branches.
 
 A branch records its commit and fire paths relative to itself. A path `𝑝` leaving branch `𝑖` becomes
 `Case[π̂ᵢ → 𝑝; true → false]` (`mut_elim::conjoin_path`), with `𝑝` closed over the branch's

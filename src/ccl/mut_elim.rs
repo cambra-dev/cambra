@@ -411,7 +411,9 @@ fn hoist_writer_body(
         // rewrite. That pattern-match reads a `Let`'s bound expression directly and
         // so misses the shape where a binding sits between the `Let` and the `Case`
         // — a `match` whose scrutinee A-normalization named, for one.
-        TypedExprNode::Case { .. } if in_writer_body => Expr::let_in(binding, writer_body, body),
+        TypedExprNode::Case { .. } if in_writer_body || merges_in_place(&writer_body) => {
+            Expr::let_in(binding, writer_body, body)
+        }
         TypedExprNode::Case { .. } => push_binding_into_branches(&binding.name, writer_body, body),
         // A pure terminal value: bind it directly.
         _ => {
@@ -441,7 +443,8 @@ fn hoist_writer_body(
 /// into the continuation.
 ///
 /// **Not applied inside a writer body**, as [`push_continuation_into_case`] is not:
-/// [`WriterWalk`] merges the bound value there (`walk_value_case`).
+/// [`WriterWalk`] merges the bound value there (`walk_value_case`). Outside one it is
+/// applied only to a `Case` that does not merge in place ([`merges_in_place`]).
 ///
 /// The `Case` then takes the continuation's type. A continuation yielding
 /// nothing leaves it in effect position, which is where `WriterWalk` reads
@@ -449,7 +452,8 @@ fn hoist_writer_body(
 fn push_binding_into_case(e: &mut Expr) -> Option<Expr> {
     let applies = matches!(&e.node, TypedExprNode::Let { bound_expr, .. }
         if matches!(&bound_expr.node, TypedExprNode::Case { branches, .. }
-            if branches.iter().any(|b| spine_writes_mut(&b.body))));
+            if branches.iter().any(|b| spine_writes_mut(&b.body)))
+            && !merges_in_place(bound_expr));
     if applies {
         let let_id = e.node_id();
         let e = std::mem::take(e);
@@ -523,11 +527,13 @@ fn push_binding_into_branches(name: &Name, mut case: Expr, cont: Expr) -> Expr {
 ///
 /// **Not applied inside a writer body** — a for-loop body or a `with begin():` block —
 /// where this exact shape is what `WriterWalk` merges into one writer decision. The
-/// rewrite is for the positions no writer walks: the top level and a function body.
+/// rewrite is for the positions no writer walks, the top level and a function body, and
+/// there only for a `Case` that does not merge in place ([`merges_in_place`]).
 fn push_continuation_into_case(e: &mut Expr) -> Option<Expr> {
     let applies = matches!(&e.node, TypedExprNode::ExprStmt { expr: effect, .. }
         if matches!(&effect.node, TypedExprNode::Case { branches, .. }
-            if branches.iter().any(|b| spine_writes_mut(&b.body))));
+            if branches.iter().any(|b| spine_writes_mut(&b.body)))
+            && !merges_in_place(effect));
     if !applies {
         return None;
     }
@@ -694,8 +700,9 @@ fn push_writing_cases(mut expr: Expr, in_writer_body: bool) -> Expr {
 /// no `MutWrite` on its spine, so it is left undisturbed. After this pass the
 /// only `MutWrite`s in the tree are `ExprStmt` effects, so `rewrite` and
 /// `WriterWalk` never meet a mutable write in value position. The one exception is a
-/// `Let`-bound writing `Case` inside a writer body (`in_writer_body`, a for-loop body),
-/// which stays bound for `WriterWalk` to merge.
+/// `Let`-bound writing `Case`, which stays bound inside a writer body
+/// (`in_writer_body`, a for-loop body) for `WriterWalk` to merge, and outside one where
+/// it merges in place for `rewrite` ([`merges_in_place`]).
 fn flatten_spine(mut e: Expr, in_writer_body: bool) -> Expr {
     // As in `push_writing_cases`: a loop body is a writer body, whose `Let`-bound writing
     // `Case` the writer walk merges where it stands.
@@ -771,7 +778,8 @@ fn flatten_spine(mut e: Expr, in_writer_body: bool) -> Expr {
     // intermediate first — never for a pure `Let`.
     if let TypedExprNode::Let { bound_expr, .. } = &e.node
         && spine_writes_mut(bound_expr)
-        && !(in_writer_body && matches!(bound_expr.node, TypedExprNode::Case { .. }))
+        && !(matches!(bound_expr.node, TypedExprNode::Case { .. })
+            && (in_writer_body || merges_in_place(bound_expr)))
     {
         let let_id = e.node_id();
         let TypedExprNode::Let {
@@ -843,6 +851,41 @@ fn flatten_spine(mut e: Expr, in_writer_body: bool) -> Expr {
 
 fn rewrite(mut expr: Expr) -> Expr {
     let stmt_id = expr.node_id();
+    // A writing `if` or `match` no writer walks, bound by a `let` or in statement
+    // position, merges where it stands ([`merge_writing_case`]).
+    if let TypedExprNode::Let { bound_expr, .. } = &expr.node
+        && is_writing_case(bound_expr)
+        && merges_in_place(bound_expr)
+    {
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = expr.node
+        else {
+            unreachable!("matched as a `Let`")
+        };
+        let _g = provenance::enter(
+            stmt_id,
+            "letrec.merge_writing_case",
+            provenance::Nature::Machinery,
+        );
+        return merge_writing_case(Some(binding), *bound_expr, *body);
+    }
+    if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
+        && is_writing_case(effect)
+        && merges_in_place(effect)
+    {
+        let TypedExprNode::ExprStmt { expr: effect, body } = expr.node else {
+            unreachable!("matched as an `ExprStmt`")
+        };
+        let _g = provenance::enter(
+            stmt_id,
+            "letrec.merge_writing_case",
+            provenance::Nature::Machinery,
+        );
+        return merge_writing_case(None, *effect, *body);
+    }
     if let TypedExprNode::ExprStmt { expr: effect, body } = expr.node {
         let site = StmtSite::new(stmt_id, effect.node_id());
         if let TypedExprNode::For {
@@ -928,6 +971,119 @@ fn rewrite(mut expr: Expr) -> Expr {
     );
     expr.map_children(rewrite);
     expr
+}
+
+/// Whether a writing `Case` outside a writer body merges where it stands
+/// ([`merge_writing_case`]) rather than taking the statements after it into each branch
+/// ([`push_binding_into_case`], [`push_continuation_into_case`]). A branch that feeds,
+/// defines, runs a loop or a transaction, or writes a key keeps the push: the merge
+/// puts the branch in value position, where those statements have no reading.
+fn merges_in_place(case: &Expr) -> bool {
+    fn holds_a_statement_of_its_own(e: &Expr) -> bool {
+        matches!(
+            e.node,
+            TypedExprNode::Feed { .. }
+                | TypedExprNode::Define { .. }
+                | TypedExprNode::For { .. }
+                | TypedExprNode::Begin { .. }
+                | TypedExprNode::MutWrite { key: Some(_), .. }
+        ) || e.any_child(holds_a_statement_of_its_own)
+    }
+    !holds_a_statement_of_its_own(case)
+}
+
+/// `𝑡 = Case[𝑔ᵢ → 𝐵ᵢ] in rest`, or with `bound` `None` the statement `Case[𝑔ᵢ → 𝐵ᵢ];
+/// rest`, whose branches write the variables `𝑥₁ … 𝑥ₙ`, as one value: the `Case` whose
+/// branch `𝑖` is `𝐵ᵢ` rewritten to end in `(𝑣ᵢ, 𝑥₁, …, 𝑥ₙ)`, the value `𝐵ᵢ` ends in and
+/// what each variable holds there. `𝑡` and a fresh binder of each `𝑥ⱼ` read it back, and
+/// `rest` reads those, so it appears once however many branches the `Case` has.
+///
+/// The writer walk merges a writing `Case` the same way inside a writer body
+/// ([`WriterWalk`]); outside one, a write is a shadowing `let` ([`normalize_bare_write`]),
+/// and the branch is rewritten into those before its end is read.
+fn merge_writing_case(bound: Option<TypedBinding>, case: Expr, rest: Expr) -> Expr {
+    let value_tys = mut_var_value_tys([&case, &rest]);
+    let mut written = Vec::new();
+    collect_writes(&case, &value_tys, &mut written);
+    let mut slot_tys: Vec<Type> = bound.iter().map(|b| b.ty.clone()).collect();
+    slot_tys.extend(written.iter().map(|a| a.ty.clone()));
+    let tuple_ty = Type::Tuple(slot_tys);
+    let end = |value: Expr| {
+        let mut slots: Vec<Expr> = Vec::with_capacity(written.len() + 1);
+        if bound.is_some() {
+            slots.push(value);
+        }
+        slots.extend(written.iter().map(|a| tvar(&a.name, a.ty.clone())));
+        Expr::tuple(slots).with_ty(tuple_ty.clone())
+    };
+    let merged = rewrite(end_with(case, &end, &tuple_ty));
+    let merge = binding(Name::fresh("__merge"), tuple_ty.clone());
+    let mut rest = rest;
+    let mut reads: Vec<(TypedBinding, Expr)> = Vec::new();
+    if let Some(b) = bound {
+        let read = proj_of(&merge.name, &tuple_ty, 0, &b.ty);
+        reads.push((b, read));
+    }
+    let offset = reads.len();
+    for (j, a) in written.iter().enumerate() {
+        let fresh = Name::fresh_like(&a.name);
+        rename_uses(&mut rest, &a.name, &fresh);
+        let read = proj_of(&merge.name, &tuple_ty, offset + j, &a.ty);
+        reads.push((binding(fresh, a.ty.clone()), read));
+    }
+    let mut out = rewrite(rest);
+    for (b, read) in reads.into_iter().rev() {
+        out = Expr::let_in(b, read, out);
+    }
+    Expr::let_in(merge, merged, out)
+}
+
+/// `body` with the value it ends in, `𝑣`, replaced by `end(𝑣)` of type `ty`: past its
+/// statements and bindings, and into each branch of a writing `Case` it ends in (an `elif`).
+/// A branch of a statement `Case` ends in `unit`.
+fn end_with(body: Expr, end: &dyn Fn(Expr) -> Expr, ty: &Type) -> Expr {
+    let id = body.node_id;
+    match body.node {
+        TypedExprNode::ExprStmt { expr, body: rest } => {
+            Expr::expr_stmt_preserving(id, *expr, end_with(*rest, end, ty))
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body: rest,
+        } => Expr::let_in_preserving(id, binding, *bound_expr, end_with(*rest, end, ty)),
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body: rest,
+        } => Expr {
+            node: TypedExprNode::MutDecl {
+                binding,
+                init,
+                body: Box::new(end_with(*rest, end, ty)),
+            },
+            ty: ty.clone(),
+            ..body
+        },
+        TypedExprNode::Case {
+            scrutinee,
+            mut branches,
+        } if branches.iter().any(|b| contains_marker(&b.body)) => {
+            for br in branches.iter_mut() {
+                let taken = std::mem::take(&mut br.body);
+                br.body = end_with(taken, end, ty);
+            }
+            Expr {
+                node: TypedExprNode::Case {
+                    scrutinee,
+                    branches,
+                },
+                ty: ty.clone(),
+                ..body
+            }
+        }
+        node => end(Expr { node, ..body }),
+    }
 }
 
 /// Normalize a mutable write outside any loop — `ExprStmt(MutWrite(name, value),
