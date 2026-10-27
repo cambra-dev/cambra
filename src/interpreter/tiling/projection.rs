@@ -1,7 +1,9 @@
 //! The projection guards a producer restates: [`Projection`].
 //! See `src/interpreter/design-operators.md`, "Projection guards".
 
-use crate::interpreter::{CurryLevel, FunctionGuard, Predicate, Tile, TileGuard, Tiling, Value};
+use crate::interpreter::{
+    CurryLevel, Extent, FunctionGuard, Predicate, Tile, TileGuard, Tiling, Value,
+};
 
 /// The part of a producer's tile that a `get` asks for.
 ///
@@ -476,9 +478,28 @@ impl Tile {
     ///
     /// A producer answers a pull with a tile inside the projection, so a cell outside it is a
     /// producer that ignored the guard. Rows deleted but not yet compacted are released, so
-    /// they are not part of the answer. The check reads keys and cells and does not read the
-    /// completeness the tile states.
+    /// they are not part of the answer.
+    ///
+    /// The completeness the tile states is bounded the same way: at each level it lies within what
+    /// [`restrict_to`](Self::restrict_to) would leave stated there. A statement that a key outside
+    /// the projection is complete, or absent, is one the pull did not ask for, and a consumer that
+    /// merges answers would take it as settling a key it has not read.
     pub fn within(&self, projection: &Projection) -> Result<(), String> {
+        self.cells_within(projection)?;
+        self.statements_within(projection, None)
+    }
+
+    /// [`within`](Self::within) for a tile of a producer with `tiling`, whose outermost keys the
+    /// tiling bounds: a statement of the outermost level outside the projection lies outside it
+    /// only where it names a key of the tiling's domain. A union's domain carries its tags, so a
+    /// statement of the arms past them names no key.
+    pub fn within_over(&self, projection: &Projection, tiling: &Tiling) -> Result<(), String> {
+        self.cells_within(projection)?;
+        self.statements_within(projection, Some(tiling))
+    }
+
+    /// [`within`](Self::within) for the keys and cells the tile holds.
+    fn cells_within(&self, projection: &Projection) -> Result<(), String> {
         match projection {
             Projection::Everything => Ok(()),
             Projection::Nothing => {
@@ -534,6 +555,74 @@ impl Tile {
         }
     }
 
+    /// [`within`](Self::within) for the completeness the tile states, closing the outermost
+    /// level's over `tiling` where one is given ([`within_over`](Self::within_over)).
+    fn statements_within(
+        &self,
+        projection: &Projection,
+        tiling: Option<&Tiling>,
+    ) -> Result<(), String> {
+        let stated = self.stated_completeness();
+        let allowed = match projection {
+            Projection::Everything => return Ok(()),
+            Projection::Nothing => vec![Predicate::False; stated.len()],
+            Projection::Keys { level, keys } => {
+                let mut cut = self.clone();
+                cut.restrict_to_paths(*level, keys);
+                cut.stated_completeness()
+            }
+        };
+        debug_assert_eq!(
+            stated.len(),
+            allowed.len(),
+            "a restriction keeps every collection level of the tile"
+        );
+        let outside = stated
+            .iter()
+            .zip(&allowed)
+            .enumerate()
+            .filter(|(_, (stated, allowed))| !allowed.subsumes(stated))
+            .map(|(at, (stated, allowed))| (at, stated.minus(allowed)))
+            .find(|(at, outside)| match (at, tiling) {
+                (0, Some(tiling)) => names_a_key_of(outside, tiling),
+                _ => true,
+            });
+        match outside {
+            None => Ok(()),
+            Some((_, outside)) => Err(format!(
+                "it states {outside:?} complete, which the projection omits"
+            )),
+        }
+    }
+
+    /// The completeness each collection level of this tile states, outermost first and a record's
+    /// fields in name order.
+    fn stated_completeness(&self) -> Vec<Predicate> {
+        fn walk(tile: &Tile, out: &mut Vec<Predicate>) {
+            match tile {
+                Tile::DataFunction {
+                    domain_predicate,
+                    codomain,
+                    ..
+                } => {
+                    out.push(domain_predicate.clone());
+                    walk(codomain, out);
+                }
+                Tile::Record { fields, .. } => {
+                    let mut names: Vec<_> = fields.keys().collect();
+                    names.sort();
+                    for name in names {
+                        walk(&fields[name], out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
+        out
+    }
+
     /// How many collection levels this tile holds from its root down.
     fn levels_held(&self) -> usize {
         match self {
@@ -551,6 +640,17 @@ impl Tile {
             Projection::Nothing => *self = tiling.empty_tile(),
             Projection::Keys { level, keys } => self.restrict_to_paths(*level, keys),
         }
+    }
+}
+
+/// Whether `keys`, a region of the outermost keys of a producer with `tiling`, names a key its
+/// domain has: under a union domain, a key of one of the tags it carries.
+fn names_a_key_of(keys: &Predicate, tiling: &Tiling) -> bool {
+    match (keys, tiling.domain_extent()) {
+        (Predicate::Union { .. }, Some(Extent::Union(arms))) => arms
+            .keys()
+            .any(|tag| keys.under_tag(tag).is_none_or(|under| !under.is_false())),
+        _ => !keys.is_false(),
     }
 }
 
@@ -1241,7 +1341,7 @@ mod tests {
 
     #[test]
     fn a_tile_is_within_the_keys_it_holds_and_not_beyond() {
-        let tile = ints_by_position(&[10, 20, 30, 40], true);
+        let tile = ints_by_position(&[10, 20, 30, 40], false);
         let admitting = |first, last| Projection::admitting(positions(first, last));
         assert_eq!(tile.within(&admitting(0, 3)), Ok(()));
         assert_eq!(tile.within(&Projection::Everything), Ok(()));
@@ -1251,12 +1351,43 @@ mod tests {
             ints_tiling(4).empty_tile().within(&Projection::Nothing),
             Ok(())
         );
-        let mut released = ints_by_position(&[10, 20], true);
+        // Released rows are no part of the answer, so their cells lie within any projection. What
+        // the tile still states complete of them lies within a projection that names them only.
+        let mut released = ints_by_position(&[10, 20], false);
         released.remove_guarded(keys_between(0, 1));
-        assert_eq!(released.within(&Projection::Nothing), Ok(()));
-        assert_eq!(released.within(&admitting(5, 6)), Ok(()));
+        assert_eq!(released.within(&admitting(0, 1)), Ok(()));
+        assert!(released.within(&Projection::Nothing).is_err());
+        assert!(released.within(&admitting(5, 6)).is_err());
         let scalar = Tile::Scalar(ColumnValue::Ints(vec![1]));
         assert!(scalar.within(&admitting(0, 3)).is_err());
+    }
+
+    /// A tile whose cells lie within the projection still answers outside it where it states keys
+    /// beyond the projection complete: a key stated complete with no row is stated absent, which
+    /// the pull did not ask about.
+    #[test]
+    fn a_tile_states_completeness_only_within_the_projection() {
+        let admitting = |first, last| Projection::admitting(positions(first, last));
+        let mut one = ints_by_position(&[10, 20, 30], true);
+        assert!(
+            one.within(&admitting(1, 1)).unwrap_err().contains("omits"),
+            "its cells lie outside too"
+        );
+        one.restrict_to(&admitting(1, 1), &ints_tiling(3));
+        assert_eq!(one.within(&admitting(1, 1)), Ok(()));
+        // Only the completeness lies outside: no cells, and every key stated complete.
+        let mut closed = ints_tiling(3).empty_tile();
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut closed
+        else {
+            panic!("a collection's empty tile is a collection")
+        };
+        *domain_predicate = Predicate::True;
+        let outside = closed.within(&admitting(1, 1)).unwrap_err();
+        assert!(outside.contains("complete"), "{outside}");
+        assert!(closed.within(&Projection::Nothing).is_err());
+        assert_eq!(closed.within(&Projection::Everything), Ok(()));
     }
 
     /// A producer that restates no projection beneath its outermost keys is caught by the `get`

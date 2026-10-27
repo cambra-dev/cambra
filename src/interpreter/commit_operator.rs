@@ -3693,7 +3693,8 @@ impl TileProducer for StoreDenseReadProducer {
 
     impl_producer_base!();
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection_for(self);
         // Sample the store (consumer-driven; no producer-side drive-to-fixpoint) and
         // fold `key` at each position it has decided. The cycle advances one position
         // per pull, so a batch source converges over several pulls rather than in one
@@ -3714,8 +3715,12 @@ impl TileProducer for StoreDenseReadProducer {
         // store is fully decided, so the consumer re-pulls.
         let sg = self.store_producer.tiling().universal_guard();
         let store = self.store_producer.get(sg);
+        // The store is read whole, since a position's value folds the changelog below it, and
+        // the answer is cut to the pull's positions.
         if !self.enclosing.is_empty() {
-            return self.read_per_row(&store);
+            let mut out = self.read_per_row(&store);
+            out.restrict_to(&projection, self.tiling());
+            return out;
         }
         let Tile::Store { decided, .. } = &store else {
             unreachable!(
@@ -3779,7 +3784,9 @@ impl TileProducer for StoreDenseReadProducer {
         } else {
             Predicate::from_column_value(&positions)
         };
-        read_tile(positions, values, &self.value_extent, domain_predicate)
+        let mut out = read_tile(positions, values, &self.value_extent, domain_predicate);
+        out.restrict_to(&projection, self.tiling());
+        out
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {

@@ -543,8 +543,10 @@ input that does not restate the declared level.
   each region, and a pull at keys drops from it the rows released since.
 - **Check.** A debug build's `TileProducer::get` compares each answer with the projection it was
   asked for (`Tile::within`) and panics on a key the projection omits, on any cell where the
-  projection names nothing, and on a pull for keys that a non-collection answers. A producer that
-  answers whole fails the check at its first pull for keys.
+  projection names nothing, and on a pull for keys that a non-collection answers. It panics too on
+  completeness stated outside what `Tile::restrict_to` leaves stated, at any level: a key stated
+  complete with no row is stated absent, and an answer states absence only of keys the pull names. A
+  producer that answers whole fails the check at its first pull for keys.
 
 Each operator answers a projection as its row of this table states.
 
