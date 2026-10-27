@@ -67,14 +67,16 @@ set.
 ### The plan
 
 `plan_main` cuts the operator graph the way [docs/parallel-execution.md, "The pipeline
-plan"](../../docs/parallel-execution.md#the-pipeline-plan) describes, for one chain shape:
-`IterateExtent` over a finite range `[0, rows)`, then any number of `MapResult`s whose function
-operand is a `Constant`, into the breaker, which is the `main` sink or an `ExtractAggregate` over an
-`Aggregate` into it ([A fold as the breaker](#a-fold-as-the-breaker)). Every operator in the chain
-is streaming, so a worker's chain holds no state between morsels. A graph with any other node on the
-path, a source over anything but `[0, rows)`, or a sink besides `main` is refused with the reason,
-which the binary prints. The programs this admits are `[x + 1 for x in xs]` over a literal list and
-a `sum`, `max` or `min` of it; a source over a data-source domain is the next shape.
+plan"](../../docs/parallel-execution.md#the-pipeline-plan) describes, for one chain shape: an
+`IterateExtent`, then any number of `MapResult`s whose function operand is a `Constant`, into the
+breaker, which is the `main` sink or an `ExtractAggregate` over an `Aggregate` into it ([A fold as
+the breaker](#a-fold-as-the-breaker)). Every operator in the chain is streaming, so a worker's chain
+holds no state between morsels. A graph with any other node on the path or a sink besides `main` is
+refused with the reason, which the binary prints. `plan_main` checks the shape of the chain only.
+Which rows the source enumerates is the source's to say ([The dispatcher](#the-dispatcher)), so
+`run_main` refuses a source over anything but a finite range `[0, n)` when it asks the source for
+morsels. The programs this admits are `[x + 1 for x in xs]` over a literal list and a `sum`, `max`
+or `min` of it; a source over a data-source domain is the next shape.
 
 ### The pool
 
@@ -84,11 +86,11 @@ breakers"](../../docs/parallel-execution.md#thread-confined-chains-shared-breake
 operator is subscribed as many times as there are workers; nothing is cloned, because the chain is a
 tree of boxed operators each subscription walks afresh. A worker holds its chains in a vector
 indexed by `PipelineId`, which holds one entry, since the plan holds one pipeline. The threads are
-`std::thread::scope` threads over `run_worker`; the head runs on the calling thread inside the same
-scope, so the workers drain the dispatcher while the head fills it. For a collection the breaker's
-state is the collector, the sink: a `Mutex<Tile>` the workers merge into with `Tile::merge`, which
-calls the collection complete once every worker has returned, every package acknowledged after its
-rows were merged. For a fold it is the partials of [A fold as the breaker](#a-fold-as-the-breaker).
+`std::thread::scope` threads over `run_worker`, and the calling thread waits for the scope. For a
+collection the breaker's state is the collector, the sink: a `Mutex<Tile>` the workers merge into
+with `Tile::merge`, which calls the collection complete once every worker has returned, every
+package acknowledged after its rows were merged. For a fold it is the partials of [A fold as the
+breaker](#a-fold-as-the-breaker).
 
 The chains are lent to the workers and dropped after the scope, one at a time on the thread that
 subscribed them: a producer's drop detaches its probe with a lock that must not find the probe table
@@ -102,37 +104,52 @@ what keeps the chain's producers consistent with the completeness contract: a pr
 states a different interval complete, which it may do only where the previous one was released.
 
 The cells workers contend on take a blocking lock, `LockNow::lock_wait`: the probe table's
-`observe_named`, which every `get` calls, the collector, the fold's partials, and the dispatcher's
-state. Every other cell keeps the panic-on-contention lock, because a worker's chain is its own and
-never shares a cell with another worker's; the probe table's readers are on the thread that runs the
-inspector, which a parallel run refuses.
+`observe_named`, which every `get` calls, the collector, and the fold's partials. Every other cell
+keeps the panic-on-contention lock, because a worker's chain is its own and never shares a cell with
+another worker's; the probe table's readers are on the thread that runs the inspector, which a
+parallel run refuses.
 
 ### The dispatcher
 
 The dispatcher is the scheduler of [docs/parallel-execution.md, "The
-scheduler"](../../docs/parallel-execution.md#the-scheduler) for one pipeline: a
-`Mutex<DispatchState>` with a `Condvar`. The state is a `VecDeque` of `WorkPackage`s, each a
-`PipelineId` and the guard naming one morsel, and per pipeline whether it is closed and how many of
-its packages are taken and not acknowledged. One queue serves every pipeline because the plan holds
-one; the target gives each pipeline its own queue, so a worker can stay on its pipeline. It has six
+scheduler"](../../docs/parallel-execution.md#the-scheduler) for the pipelines of a plan. It holds
+one job per pipeline, a `MorselSource` with two atomics, and one `failed` flag. No lock guards it
+and no worker waits in it. A `WorkPackage` is a `PipelineId` and the guard naming one morsel. The
 calls:
 
-- `publish` queues a package behind every package already published.
-- `close` records that the pipeline's head publishes no more.
-- `next` answers the oldest queued package and counts it taken; with the queue empty it waits on
-  the `Condvar` while a pipeline is open, and answers `None` once every pipeline is closed.
-- `ack` counts a taken package back, once the breaker holds its rows and the morsel is released.
-- `is_done` says whether a pipeline is closed with none of its packages queued or taken.
+- `next` claims a morsel of `CAMBRA_MORSEL_ROWS` rows from the first pipeline whose source has one
+  and answers it as a package. It answers `None` once every source is exhausted or the dispatcher
+  failed.
+- `ack` counts a claimed morsel back, once the breaker holds its rows and the morsel is released.
+- `is_done` says whether a pipeline's source has answered `None` and every morsel it answered is
+  acknowledged.
 - `fail` makes every `next` answer `None` from then on.
 
-The pipeline's head is a `RangeHead` over `[0, rows)`: it cuts the range into morsels of
-`CAMBRA_MORSEL_ROWS` rows, publishes one package per morsel in order, and closes the pipeline.
-`IterateExtent`'s producer knows nothing of the dispatcher: each worker holds its own, and the head
-is the one object per pipeline that cuts the source.
+A worker pulls its morsel from the source; no structure holds morsels between the two. This is the
+dispatch of Leis et al. 2014, where the dispatcher carves the next range off a pipeline's input when
+a worker asks.
 
-A worker that panics fails the dispatcher on its way out (`FailOnUnwind`), and so does the head:
-`next` answers `None` from then on, the other workers return, and the scope re-raises the panic
-instead of waiting for a package nobody will publish.
+**The source cuts its own rows.** `TileOperator::morsel_source` answers an `Arc<dyn MorselSource>`
+for an operator that is a source and `None` for every other. `MorselSource::claim(rows)` answers the
+guard of the next morsel of at most `rows` rows, or `None`, which is final. `IterateExtent` over a
+finite range `[0, n)` answers a `RangeSource`: one `AtomicU64` cursor that `fetch_update` advances,
+so each position is in exactly one claimed morsel whichever threads claim, and the cursor never
+passes `n`. The claim orders nothing else: the cursor partitions positions, and the data a worker
+reads under a guard comes from its own chain. `IterateExtent`'s producer knows nothing of the
+dispatcher. `run_main` finds the source by walking the chain's inputs to the first operator that
+answers one, and refuses a chain with none or with several.
+
+**Done is a count.** A claim counts itself outstanding before it asks the source and takes the count
+back when the source answers `None`, so an exhausted source with nothing outstanding has no claim in
+flight. `ack` is the only other decrement.
+
+**`None` is final only while every pipeline's source exists.** A pipeline that exists only after
+another finishes, behind a breaker, or a source that receives rows over time, makes `None` mean
+"nothing now". The dispatcher is where a worker then waits, which needs a wake-up that a claim does
+not provide.
+
+A worker that panics fails the dispatcher on its way out (`FailOnUnwind`): `next` answers `None`
+from then on, the other workers stop claiming, and the scope re-raises the panic.
 
 ### Projection guards
 
@@ -185,18 +202,21 @@ rows with a morsel size that does not divide them equal the whole pull and are t
 collection and for `sum`, `max` and `min` over it, and the folds again over three rows, where a
 worker takes no package; one worker equals the whole pull; the plan reads a fold off the extract; a
 group-by is refused. The three producers each have a unit test of the interval they hand out and the
-release that follows (`map.rs`, `scalar.rs`, `iterate.rs`). The dispatcher's unit tests in
-`parallel.rs`: a range head publishes disjoint morsels covering its range and closes; an empty range
-publishes nothing and is done; a taken package keeps its pipeline from being done until it is
-acknowledged; a waiting worker wakes on a publish and on a close; a panicking worker releases the
-waiting ones.
+release that follows (`map.rs`, `scalar.rs`, `iterate.rs`). `iterate.rs` also tests `RangeSource`:
+its morsels are disjoint and end in `None`, a morsel holds at least one row, and a finite range from
+zero is the one extent that answers a source. The dispatcher's unit tests in `parallel.rs`: morsels
+are disjoint and cover the range; an empty range hands out nothing; a claimed morsel keeps its
+pipeline from being done until it is acknowledged; a failed dispatcher hands out nothing; a
+panicking worker stops the others claiming; eight workers claim every position of a range once.
+`source_of` finds the one source, and refuses a chain with none and a chain with two.
 
 ## Not yet implemented
 
 A breaker other than the sink and a fold into `main`, a source over a data-source domain, a pipeline
-plan over more than one pipeline, a dispatcher over more than one pipeline with heads that publish
-as rows arrive, and the sink pulls the scheduler loop queues. Before a data-source head lands, the
-`main` producer `compile_program` subscribes has to be owned by the pool: it registers a release
-record of `False` with the source, and a source agrees to reclaim only what every record releases,
-so an idle producer pins the source. Every program the plan refuses runs on the thread that compiled
-it, through `Scheduler::check_for_notifications` and the sink pulls it queues.
+plan over more than one pipeline, a source that receives rows over time (its claim needs a state
+between exhausted and nothing yet, and workers need a wake-up), and the sink pulls the scheduler
+loop queues. Before a source over a data-source domain lands, the `main` producer `compile_program`
+subscribes has to be owned by the pool: it registers a release record of `False` with the source,
+and a source agrees to reclaim only what every record releases, so an idle producer pins the source.
+Every program the plan refuses runs on the thread that compiled it, through
+`Scheduler::check_for_notifications` and the sink pulls it queues.

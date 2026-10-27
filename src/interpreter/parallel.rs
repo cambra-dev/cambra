@@ -2,12 +2,13 @@
 //! See `src/interpreter/design-parallel.md`, "The morsel prototype".
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fmt,
-    sync::{Condvar, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
-
-use intervalsets::{Bounding, Interval, IntervalSet};
 
 use crate::{
     ccl::{
@@ -16,9 +17,9 @@ use crate::{
         provenance::NodeId,
     },
     interpreter::{
-        Extent, FunctionGuard, LockNow, Predicate, Tile, TileGuard, Tiling, Value,
+        LockNow, Predicate, Tile, TileGuard, Tiling,
         operator_graph::{EdgeKind, EdgeRole, GraphNode, OperatorGraph},
-        tile_operators::{TileOperator, TileProducer},
+        tile_operators::{MorselSource, TileOperator, TileProducer},
     },
 };
 
@@ -70,12 +71,12 @@ impl fmt::Display for Unsupported {
     }
 }
 
-/// The pipeline shape the plan admits: `IterateExtent` over a finite range `[0, rows)`, then
-/// any number of `MapResult`s whose function operand is a `Constant`, into the breaker. Every
-/// operator in the chain is streaming, so a worker's chain holds no state between morsels.
+/// The pipeline shape the plan admits: any number of `MapResult`s whose function operand is a
+/// `Constant`, over an `IterateExtent`, into the breaker. Every operator in the chain is
+/// streaming, so a worker's chain holds no state between morsels. Which rows the source
+/// enumerates, and whether it can be cut into morsels, is the source's to say
+/// ([`TileOperator::morsel_source`]).
 pub struct MainPipeline {
-    /// The positions the source enumerates, `0..rows`.
-    pub rows: u64,
     /// What the chain ends in.
     pub breaker: Breaker,
 }
@@ -182,32 +183,8 @@ pub fn plan_main(graph: &OperatorGraph) -> Result<MainPipeline, Unsupported> {
             }
             Some(GraphNode::Operator {
                 kind: "IterateExtent",
-                tiling,
                 ..
-            }) => {
-                let Tiling::DataFunction {
-                    domain: Extent::UIntRange(set),
-                    ..
-                } = tiling
-                else {
-                    return Err(Unsupported(format!(
-                        "the source iterates `{tiling}`, and only a finite range is cut into \
-                         morsels"
-                    )));
-                };
-                return match set.intervals().as_slice() {
-                    // An empty literal is the range `[0, 0)`.
-                    [] => Ok(MainPipeline { rows: 0, breaker }),
-                    [one] if one.lval() == Some(&0) && one.rval().is_some() => Ok(MainPipeline {
-                        rows: one.rval().map_or(0, |last| last + 1),
-                        breaker,
-                    }),
-                    _ => Err(Unsupported(format!(
-                        "the source iterates `{tiling}`, and only a finite `[0, n)` is cut into \
-                         morsels"
-                    ))),
-                };
-            }
+            }) => return Ok(MainPipeline { breaker }),
             Some(GraphNode::Operator { kind, .. }) => {
                 return Err(Unsupported(format!(
                     "`{kind}` is not a streaming operator here"
@@ -223,12 +200,12 @@ pub fn plan_main(graph: &OperatorGraph) -> Result<MainPipeline, Unsupported> {
 /// Run `program`'s `main` output on `config.threads` workers and return what `main` holds,
 /// complete, or say why the program is not one the pool runs.
 ///
-/// Each worker owns one subscription of the chain under the breaker. The pipeline's head
-/// publishes one [`WorkPackage`] per morsel into the [`Dispatcher`] and closes the pipeline;
-/// each worker takes packages, pulls its chain at the package's guard, hands the tile to the
-/// breaker, releases the morsel once the breaker holds its rows, and acknowledges the package.
-/// A collection is merged into one shared tile, the sink; a fold is accumulated per worker and
-/// the partials are combined once every worker has returned: every package was acknowledged and
+/// Each worker owns one subscription of the chain under the breaker. The chain's source cuts
+/// its rows into morsels ([`TileOperator::morsel_source`]) that the [`Dispatcher`] hands to
+/// whichever worker asks; a worker pulls its chain at the morsel's guard, hands the tile to the
+/// breaker, releases the morsel once the breaker holds its rows, and acknowledges it. A
+/// collection is merged into one shared tile, the sink; a fold is accumulated per worker and
+/// the partials are combined once every worker has returned: every morsel was acknowledged and
 /// every fold worker has handed in its partial.
 pub fn run_main(
     ctx: &mut GlobalContext,
@@ -251,6 +228,7 @@ pub fn run_main(
                 "the plan saw an extract over a fold, and both reach through to the fold's input",
             ),
     };
+    let source = source_of(chain_op)?;
     let tiling = chain_op.tiling().clone();
     // One chain per pipeline per worker, indexed by `PipelineId`: the plan has one pipeline.
     let mut chains: Vec<Vec<Box<dyn TileProducer>>> = (0..config.threads.max(1))
@@ -258,12 +236,7 @@ pub fn run_main(
             vec![chain_op.subscribe(tiling.universal_guard(), Box::new(|| {}), ctx.scheduler())]
         })
         .collect();
-    let dispatcher = Dispatcher::new(1);
-    let head = RangeHead {
-        pipeline: MAIN_PIPELINE,
-        rows: pipeline.rows,
-        morsel_rows: config.morsel_rows.max(1),
-    };
+    let dispatcher = Dispatcher::new(vec![source], config.morsel_rows.max(1));
     let breaker = match &pipeline.breaker {
         Breaker::Collect => PoolBreaker::Collect {
             collector: Mutex::new(tiling.empty_tile()),
@@ -278,22 +251,44 @@ pub fn run_main(
     // a producer's drop detaches its probe with a lock that must not find the probe table
     // held by another worker's `get`.
     std::thread::scope(|scope| {
-        // Armed before the first spawn: a spawn that panics, or the head, ends the waits of the
-        // workers already running.
+        // Armed before the first spawn: a spawn that panics stops the workers already running
+        // from claiming further morsels.
         let _fail = FailOnUnwind(&dispatcher);
         for worker_chains in chains.iter_mut() {
             let (dispatcher, breaker) = (&dispatcher, &breaker);
             scope.spawn(move || run_worker(worker_chains, dispatcher, breaker));
         }
-        // The head runs on the calling thread while the workers drain the dispatcher.
-        head.run(&dispatcher);
     });
     drop(chains);
     debug_assert!(
         dispatcher.is_done(MAIN_PIPELINE),
-        "every worker returned, so the dispatcher drained a closed pipeline"
+        "every worker returned, so every morsel was claimed and acknowledged"
     );
     Ok(breaker.finish())
+}
+
+/// The one source under `chain` that cuts its rows into morsels, or why there is none.
+///
+/// A source is a leaf of the operator tree. The walk descends through each operator's inputs
+/// and stops at the first operator that answers [`TileOperator::morsel_source`].
+fn source_of(chain: &dyn TileOperator) -> Result<Arc<dyn MorselSource>, Unsupported> {
+    fn collect(op: &dyn TileOperator, found: &mut Vec<Arc<dyn MorselSource>>) {
+        match op.morsel_source() {
+            Some(source) => found.push(source),
+            None => op.visit_inputs(&mut |edge| collect(edge.target, found)),
+        }
+    }
+    let mut found = Vec::new();
+    collect(chain, &mut found);
+    match <[_; 1]>::try_from(found) {
+        Ok([source]) => Ok(source),
+        Err(found) if found.is_empty() => Err(Unsupported(
+            "the chain reads no source that is cut into morsels".into(),
+        )),
+        Err(_) => Err(Unsupported(
+            "the chain reads several sources, and a pipeline is cut at one".into(),
+        )),
+    }
 }
 
 /// The breaker's state while the workers run.
@@ -318,9 +313,9 @@ enum PoolBreaker {
 }
 
 impl PoolBreaker {
-    /// The answer once every worker has returned: complete, since the head published every row
-    /// of `[0, rows)`, every package was acknowledged after its rows reached the breaker, and
-    /// every fold worker has handed in its partial.
+    /// The answer once every worker has returned: complete, since the source answered every row
+    /// it has, every package was acknowledged after its rows reached the breaker, and every
+    /// fold worker has handed in its partial.
     fn finish(self) -> Tile {
         match self {
             PoolBreaker::Collect { collector } => {
@@ -420,140 +415,113 @@ struct WorkPackage {
     guard: TileGuard,
 }
 
-/// The guard naming the morsel `[first, last]` of a range's positions.
-fn morsel(first: u64, last: u64) -> TileGuard {
-    TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
-        IntervalSet::from(Interval::closed(Value::UInt(first), Value::UInt(last))),
-    )))
-}
-
-/// The queue of work packages the workers take from, and the record of which pipelines can
+/// What hands out the morsels of every pipeline of a plan, and records which pipelines can
 /// still produce one.
 ///
-/// A pipeline's head publishes packages and closes the pipeline once it will publish no more.
-/// A worker takes a package with [`next`](Self::next), which waits while the queue is empty and
-/// a pipeline is open, and acknowledges it with [`ack`](Self::ack) once the morsel is released.
-/// A pipeline is done when it is closed and none of its packages is queued or taken. See
+/// A worker claims a morsel from a pipeline's source with [`next`](Self::next) and acknowledges
+/// it with [`ack`](Self::ack) once the morsel is released. `next` never waits: a source either
+/// answers a morsel or has none left. A pipeline is done when its source has answered `None`
+/// and every morsel it answered is acknowledged. The dispatcher holds atomics and no lock. See
 /// `src/interpreter/design-parallel.md`, "The dispatcher".
 struct Dispatcher {
-    // shared-state-ok: the queue between a pipeline's head and the workers. What crosses it
-    // is a guard naming a morsel, never a tile: a worker produces the tile by pulling its own
-    // chain at the guard.
-    state: Mutex<DispatchState>,
-    /// Signalled when a package is published, a pipeline closes or a worker fails: each can
-    /// end a wait in `next`.
-    changed: Condvar,
-}
-
-/// What the [`Dispatcher`]'s lock guards.
-struct DispatchState {
-    queue: VecDeque<WorkPackage>,
     /// Per pipeline, by `PipelineId`.
-    pipelines: Vec<PipelineProgress>,
-    /// Set when a worker or the head panics: every `next` answers `None` from then on, so the
-    /// other workers return and the scope re-raises the panic instead of waiting for a package
-    /// that will not come.
-    failed: bool,
+    jobs: Vec<Job>,
+    /// Rows a morsel holds, which a worker claims at most.
+    morsel_rows: u64,
+    /// Set when a worker panics: every `next` answers `None` from then on, so the other
+    /// workers stop claiming morsels of a run whose result is discarded.
+    failed: AtomicBool,
 }
 
-/// One pipeline's standing in the [`Dispatcher`].
-struct PipelineProgress {
-    /// Whether the head will publish no more packages.
-    closed: bool,
-    /// Packages a worker has taken and not acknowledged.
-    taken: usize,
+/// One pipeline's source and its standing in the [`Dispatcher`].
+struct Job {
+    source: Arc<dyn MorselSource>,
+    /// Whether the source has answered `None`, which is final.
+    exhausted: AtomicBool,
+    /// Morsels claimed and not acknowledged, plus claims in flight.
+    outstanding: AtomicUsize,
 }
 
 impl Dispatcher {
-    /// A dispatcher over `pipelines` open pipelines with nothing queued.
-    fn new(pipelines: usize) -> Self {
-        let progress = (0..pipelines)
-            .map(|_| PipelineProgress {
-                closed: false,
-                taken: 0,
-            })
-            .collect();
+    /// A dispatcher over one pipeline per source, in order.
+    fn new(sources: Vec<Arc<dyn MorselSource>>, morsel_rows: u64) -> Self {
         Self {
-            state: Mutex::new(DispatchState {
-                queue: VecDeque::new(),
-                pipelines: progress,
-                failed: false,
-            }),
-            changed: Condvar::new(),
+            jobs: sources
+                .into_iter()
+                .map(|source| Job {
+                    source,
+                    exhausted: AtomicBool::new(false),
+                    outstanding: AtomicUsize::new(0),
+                })
+                .collect(),
+            morsel_rows,
+            failed: AtomicBool::new(false),
         }
     }
 
-    /// Queue `package` behind every package already published.
-    fn publish(&self, package: WorkPackage) {
-        let mut state = self.state.lock_wait();
-        debug_assert!(
-            !state.pipelines[package.pipeline.0].closed,
-            "a closed pipeline publishes no package"
-        );
-        state.queue.push_back(package);
-        self.changed.notify_one();
-    }
-
-    /// Record that `pipeline`'s head will publish no more packages.
-    fn close(&self, pipeline: PipelineId) {
-        self.state.lock_wait().pipelines[pipeline.0].closed = true;
-        self.changed.notify_all();
-    }
-
-    /// The oldest queued package, waiting while the queue is empty and a pipeline is open.
-    /// `None` once the queue is empty and every pipeline is closed, or once a worker failed.
+    /// The next morsel of the first pipeline that has one, or `None` once every pipeline's
+    /// source is exhausted or a worker failed.
+    ///
+    /// `None` is final because every pipeline's source exists from the start. A pipeline that
+    /// appears after another finishes, behind a breaker, makes `None` mean "nothing now", and
+    /// the dispatcher is where a worker would then wait.
     fn next(&self) -> Option<WorkPackage> {
-        let mut state = self.state.lock_wait();
-        loop {
-            if state.failed {
-                return None;
-            }
-            if let Some(package) = state.queue.pop_front() {
-                state.pipelines[package.pipeline.0].taken += 1;
-                return Some(package);
-            }
-            if state.pipelines.iter().all(|progress| progress.closed) {
-                return None;
-            }
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.failed.load(Ordering::Acquire) {
+            return None;
         }
+        for (index, job) in self.jobs.iter().enumerate() {
+            if job.exhausted.load(Ordering::Acquire) {
+                continue;
+            }
+            // Counted before the claim, so a thread that finds the source exhausted and no
+            // outstanding morsel knows no claim is in flight.
+            job.outstanding.fetch_add(1, Ordering::AcqRel);
+            match job.source.claim(self.morsel_rows) {
+                Some(guard) => {
+                    return Some(WorkPackage {
+                        pipeline: PipelineId(index),
+                        guard,
+                    });
+                }
+                None => {
+                    job.outstanding.fetch_sub(1, Ordering::AcqRel);
+                    job.exhausted.store(true, Ordering::Release);
+                }
+            }
+        }
+        None
     }
 
     /// Record that `package`'s morsel is in the breaker and released.
     fn ack(&self, package: WorkPackage) {
-        let mut state = self.state.lock_wait();
-        let progress = &mut state.pipelines[package.pipeline.0];
+        let before = self.jobs[package.pipeline.0]
+            .outstanding
+            .fetch_sub(1, Ordering::AcqRel);
         debug_assert!(
-            progress.taken > 0,
-            "a package is acknowledged once, after it was taken"
+            before > 0,
+            "a package is acknowledged once, after it was claimed"
         );
-        progress.taken -= 1;
     }
 
-    /// Whether `pipeline` is closed and none of its packages is queued or taken.
+    /// Whether `pipeline`'s source is exhausted and every morsel it answered is acknowledged.
     fn is_done(&self, pipeline: PipelineId) -> bool {
-        let state = self.state.lock_wait();
-        let progress = &state.pipelines[pipeline.0];
-        progress.closed
-            && progress.taken == 0
-            && !state
-                .queue
-                .iter()
-                .any(|package| package.pipeline.0 == pipeline.0)
+        let job = &self.jobs[pipeline.0];
+        // A claim counts itself before it asks the source, and the source's cursor orders its
+        // updates. A thread that read `exhausted` read it after the claim that ended the
+        // source, which the cursor ordered after every claim that answered a morsel, so it
+        // reads each of those claims' counts: an exhausted source with nothing outstanding has
+        // nothing in flight.
+        job.exhausted.load(Ordering::Acquire) && job.outstanding.load(Ordering::Acquire) == 0
     }
 
-    /// End every wait in `next`: a worker or the head panicked.
+    /// Stop every worker from claiming: a worker panicked.
     fn fail(&self) {
-        self.state.lock_wait().failed = true;
-        self.changed.notify_all();
+        self.failed.store(true, Ordering::Release);
     }
 }
 
-/// Fails the [`Dispatcher`] when the thread holding it unwinds, so no other worker waits for a
-/// package the panicking thread would have published or a pipeline it would have closed.
+/// Fails the [`Dispatcher`] when the thread holding it unwinds, so the other workers stop
+/// claiming morsels instead of finishing a run whose result the panic discards.
 struct FailOnUnwind<'a>(&'a Dispatcher);
 
 impl Drop for FailOnUnwind<'_> {
@@ -564,38 +532,17 @@ impl Drop for FailOnUnwind<'_> {
     }
 }
 
-/// The head of a pipeline over a finite range `[0, rows)`: it cuts the range into morsels of
-/// `morsel_rows` rows, publishes one package per morsel in order, and closes the pipeline.
-struct RangeHead {
-    pipeline: PipelineId,
-    rows: u64,
-    morsel_rows: u64,
-}
-
-impl RangeHead {
-    fn run(&self, dispatcher: &Dispatcher) {
-        let mut first = 0;
-        while first < self.rows {
-            let last = (first + self.morsel_rows).min(self.rows) - 1;
-            dispatcher.publish(WorkPackage {
-                pipeline: self.pipeline,
-                guard: morsel(first, last),
-            });
-            first = last + 1;
-        }
-        dispatcher.close(self.pipeline);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::interpreter::tile_operators::{IterateExtent, RangeSource, zip_arms_at};
+    use crate::interpreter::{BaseType, CurryLevel, Extent};
+    use crate::interpreter::{FunctionGuard, Value};
+    use intervalsets::Bounding;
 
     /// The `[first, last]` a package's guard names.
-    fn bounds(package: &WorkPackage) -> (u64, u64) {
-        let TileGuard::Function(FunctionGuard::Domain(Predicate::Intervals(set))) = &package.guard
-        else {
+    fn bounds(guard: &TileGuard) -> (u64, u64) {
+        let TileGuard::Function(FunctionGuard::Domain(Predicate::Intervals(set))) = guard else {
             panic!("a morsel is a domain interval");
         };
         let [interval] = set.intervals().as_slice() else {
@@ -608,117 +555,151 @@ mod tests {
         (value(interval.lval()), value(interval.rval()))
     }
 
+    fn dispatcher(rows: u64, morsel_rows: u64) -> Dispatcher {
+        Dispatcher::new(vec![Arc::new(RangeSource::new(rows))], morsel_rows)
+    }
+
     /// Everything a dispatcher hands out, in order, until it answers `None`.
     fn drain(dispatcher: &Dispatcher) -> Vec<(u64, u64)> {
         let mut taken = Vec::new();
         while let Some(package) = dispatcher.next() {
-            taken.push(bounds(&package));
+            taken.push(bounds(&package.guard));
             dispatcher.ack(package);
         }
         taken
     }
 
+    fn iterate(extent: Extent) -> Box<dyn TileOperator> {
+        Box::new(IterateExtent::new(extent))
+    }
+
     #[test]
-    fn a_range_head_publishes_disjoint_morsels_covering_the_range_and_closes() {
-        let dispatcher = Dispatcher::new(1);
-        RangeHead {
-            pipeline: MAIN_PIPELINE,
-            rows: 10,
-            morsel_rows: 4,
+    fn the_source_is_the_one_leaf_that_cuts_morsels() {
+        let source = source_of(&*iterate(Extent::uint_range(6))).expect("a finite range");
+        assert!(source.claim(4).is_some());
+    }
+
+    #[test]
+    fn a_chain_with_no_source_that_cuts_morsels_is_refused() {
+        let refused = source_of(&*iterate(Extent::Base(BaseType::Int)))
+            .err()
+            .expect("an unbounded extent has no morsels");
+        assert!(refused.to_string().contains("no source"), "{refused}");
+    }
+
+    #[test]
+    fn a_chain_with_two_sources_is_refused() {
+        let zipped = zip_arms_at(
+            vec![
+                iterate(Extent::uint_range(6)),
+                iterate(Extent::uint_range(6)),
+            ],
+            CurryLevel::new(1),
+        );
+        let refused = source_of(&*zipped)
+            .err()
+            .expect("a pipeline is cut at one source");
+        assert!(refused.to_string().contains("several sources"), "{refused}");
+    }
+
+    /// The first pipeline with a morsel answers, and the package names it.
+    #[test]
+    fn the_first_pipeline_with_a_morsel_answers() {
+        let dispatcher = Dispatcher::new(
+            vec![Arc::new(RangeSource::new(1)), Arc::new(RangeSource::new(5))],
+            4,
+        );
+        let mut answered = Vec::new();
+        while let Some(package) = dispatcher.next() {
+            answered.push((package.pipeline.0, bounds(&package.guard)));
+            dispatcher.ack(package);
         }
-        .run(&dispatcher);
+        assert_eq!(answered, [(0, (0, 0)), (1, (0, 3)), (1, (4, 4))]);
+        assert!(dispatcher.is_done(PipelineId(0)) && dispatcher.is_done(PipelineId(1)));
+    }
+
+    #[test]
+    fn a_range_to_the_largest_position_is_cut_without_overflow() {
+        let dispatcher = dispatcher(u64::MAX, u64::MAX);
+        let package = dispatcher.next().expect("the whole range is one morsel");
+        assert_eq!(bounds(&package.guard), (0, u64::MAX - 1));
+        dispatcher.ack(package);
+        assert!(dispatcher.next().is_none());
+    }
+
+    #[test]
+    fn morsels_are_disjoint_and_cover_the_range() {
+        let dispatcher = dispatcher(10, 4);
         assert_eq!(drain(&dispatcher), [(0, 3), (4, 7), (8, 9)]);
         assert!(dispatcher.is_done(MAIN_PIPELINE));
     }
 
     #[test]
-    fn an_empty_range_publishes_nothing_and_is_done() {
-        let dispatcher = Dispatcher::new(1);
-        RangeHead {
-            pipeline: MAIN_PIPELINE,
-            rows: 0,
-            morsel_rows: 4,
-        }
-        .run(&dispatcher);
+    fn an_empty_range_hands_out_nothing_and_is_done_once_asked() {
+        let dispatcher = dispatcher(0, 4);
+        assert!(
+            !dispatcher.is_done(MAIN_PIPELINE),
+            "a source is exhausted once it has said so"
+        );
         assert!(dispatcher.next().is_none());
         assert!(dispatcher.is_done(MAIN_PIPELINE));
     }
 
-    /// A taken package keeps the pipeline from being done until it is acknowledged.
+    /// A claimed morsel keeps the pipeline from being done until it is acknowledged, though the
+    /// source is exhausted.
     #[test]
-    fn a_taken_package_keeps_the_pipeline_open_until_acknowledged() {
-        let dispatcher = Dispatcher::new(1);
-        dispatcher.publish(WorkPackage {
-            pipeline: MAIN_PIPELINE,
-            guard: morsel(0, 0),
-        });
-        dispatcher.close(MAIN_PIPELINE);
-        assert!(
-            !dispatcher.is_done(MAIN_PIPELINE),
-            "a queued package keeps it open"
-        );
-        let package = dispatcher.next().expect("the published package");
+    fn a_claimed_morsel_keeps_the_pipeline_open_until_acknowledged() {
+        let dispatcher = dispatcher(1, 4);
+        let package = dispatcher.next().expect("the one morsel");
+        assert!(dispatcher.next().is_none());
         assert!(!dispatcher.is_done(MAIN_PIPELINE));
         dispatcher.ack(package);
         assert!(dispatcher.is_done(MAIN_PIPELINE));
     }
 
-    /// A worker waiting on an empty queue takes the next package once it is published, and
-    /// returns once the pipeline closes.
-    #[test]
-    fn a_waiting_worker_wakes_on_publish_and_on_close() {
-        let dispatcher = Dispatcher::new(1);
-        std::thread::scope(|scope| {
-            let worker = scope.spawn(|| drain(&dispatcher));
-            std::thread::sleep(Duration::from_millis(20));
-            assert!(
-                !worker.is_finished(),
-                "an open, empty queue keeps the worker waiting"
-            );
-            dispatcher.publish(WorkPackage {
-                pipeline: MAIN_PIPELINE,
-                guard: morsel(0, 1),
-            });
-            std::thread::sleep(Duration::from_millis(20));
-            assert!(
-                !worker.is_finished(),
-                "an open pipeline keeps the worker waiting"
-            );
-            dispatcher.close(MAIN_PIPELINE);
-            assert_eq!(worker.join().expect("the worker returns"), [(0, 1)]);
-        });
-    }
-
-    /// After a failure `next` answers `None`, whatever is still queued.
+    /// After a failure `next` answers `None`, whatever the source still holds.
     #[test]
     fn a_failed_dispatcher_hands_out_nothing() {
-        let dispatcher = Dispatcher::new(1);
-        dispatcher.publish(WorkPackage {
-            pipeline: MAIN_PIPELINE,
-            guard: morsel(0, 0),
-        });
+        let dispatcher = dispatcher(10, 4);
         dispatcher.fail();
         assert!(dispatcher.next().is_none());
     }
 
-    /// A panicking worker ends every other worker's wait, so the scope re-raises the panic
-    /// instead of waiting for a pipeline nobody will close.
+    /// A panicking worker stops the others from claiming, and the scope re-raises its panic.
     #[test]
-    fn a_panicking_worker_releases_the_waiting_ones() {
-        let dispatcher = Dispatcher::new(1);
+    fn a_panicking_worker_stops_the_others_claiming() {
+        let dispatcher = dispatcher(1000, 4);
         std::thread::scope(|scope| {
-            let waiting = scope.spawn(|| drain(&dispatcher));
-            std::thread::sleep(Duration::from_millis(20));
-            assert!(
-                !waiting.is_finished(),
-                "an open, empty queue keeps the worker waiting"
-            );
             let panicking = scope.spawn(|| {
                 let _fail = FailOnUnwind(&dispatcher);
                 panic!("a worker's chain panicked");
             });
             assert!(panicking.join().is_err());
-            assert_eq!(waiting.join().expect("the waiting worker returns"), []);
+            assert_eq!(drain(&dispatcher), []);
         });
+    }
+
+    /// Workers claiming at once split the range: every position is in exactly one morsel.
+    #[test]
+    fn concurrent_workers_claim_every_position_once() {
+        let (rows, workers) = (100_003, 8);
+        let dispatcher = dispatcher(rows, 7);
+        let mut morsels: Vec<(u64, u64)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| scope.spawn(|| drain(&dispatcher)))
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("a worker returns"))
+                .collect()
+        });
+        morsels.sort_unstable();
+        let mut next = 0;
+        for (first, last) in morsels {
+            assert_eq!(first, next, "morsels abut with no gap or overlap");
+            next = last + 1;
+        }
+        assert_eq!(next, rows);
+        assert!(dispatcher.is_done(MAIN_PIPELINE));
     }
 }

@@ -163,7 +163,6 @@ fn the_plan_reads_the_fold_off_the_extract() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
     let pipeline = plan_main(&compiled.operator_graph).expect("a fold is a breaker the pool runs");
-    assert_eq!(pipeline.rows, 3);
     let Breaker::Fold { kind, accumulator } = pipeline.breaker else {
         panic!("a fold, not the sink");
     };

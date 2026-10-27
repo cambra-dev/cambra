@@ -90,9 +90,6 @@ EXPECTED_EXCEPTIONS = [
     # `Arrivals`, the regions an input has notified since a `Memo` last took them; see its
     # type doc. The notification carries a region, which a one-bit flag cannot hold.
     ("src/interpreter/tile_operators/mod.rs", "shared cell of `Projection`"),
-    # The worker pool's dispatcher: the queue of work packages between a pipeline's head and
-    # the workers. A package names a morsel by its guard and carries no tile.
-    ("src/interpreter/parallel.rs", "cell of `DispatchState`"),
     # The worker pool's breakers: the collection every worker merges into, and each
     # worker's partial accumulator, handed in once; both answer `main` after every worker
     # has returned, and no operator reads either.

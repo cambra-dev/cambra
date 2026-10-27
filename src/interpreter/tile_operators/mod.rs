@@ -72,6 +72,18 @@ pub use reshape::*;
 pub use scalar::*;
 pub use union::*;
 
+/// A source's rows, handed to the workers of a pool as morsels.
+///
+/// A worker asks for a morsel when it needs one, so no queue holds morsels between a source
+/// and its workers. A morsel is named by a guard, never by its rows: the worker produces the
+/// tile by pulling its own chain at the guard.
+pub trait MorselSource: Send + Sync {
+    /// The guard naming the next morsel of at most `rows` rows, or `None` once every row has
+    /// been claimed. Each row is in exactly one claimed morsel, whichever threads claim.
+    /// `None` is final: a source that can still receive rows is not a `MorselSource` yet.
+    fn claim(&self, rows: u64) -> Option<TileGuard>;
+}
+
 /// Static descriptor of a computation node in the tile dataflow graph.
 ///
 /// An operator knows its output [`Tiling`] and can instantiate a live
@@ -125,6 +137,13 @@ pub trait TileOperator: Send + Sync {
     /// operator `None`, which `run_main` never consults because `plan_main` admits only those
     /// two above the chain (`src/interpreter/design-parallel.md`, "A fold as the breaker").
     fn pool_input(&mut self) -> Option<&mut dyn TileOperator> {
+        None
+    }
+
+    /// The rows this operator enumerates as morsels the workers of a pool claim, or `None` for
+    /// an operator that is not a source the pool cuts. `IterateExtent` over a finite range
+    /// answers one. See `src/interpreter/design-parallel.md`, "The dispatcher".
+    fn morsel_source(&self) -> Option<Arc<dyn MorselSource>> {
         None
     }
 

@@ -5,7 +5,13 @@ use intervalsets::{
     ops::{Difference, Intersection},
 };
 use smol_str::SmolStr;
-use std::{collections::HashMap, sync::Arc, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use super::*;
 use crate::ccl::TagMap;
@@ -49,6 +55,20 @@ impl TileOperator for IterateExtent {
     impl_operator_base!();
 
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+
+    /// A finite range `[0, n)` reads no source, so its rows are cut into morsels by position.
+    fn morsel_source(&self) -> Option<Arc<dyn MorselSource>> {
+        let Extent::UIntRange(set) = &self.extent else {
+            return None;
+        };
+        let rows = match set.intervals().as_slice() {
+            // An empty literal is the range `[0, 0)`.
+            [] => 0,
+            [one] if one.lval() == Some(&0) => one.rval()?.checked_add(1)?,
+            _ => return None,
+        };
+        Some(Arc::new(RangeSource::new(rows)))
+    }
 
     fn subscribe(
         &mut self,
@@ -112,6 +132,44 @@ release record outlives it",
             ),
         }
     });
+}
+
+/// The positions `[0, rows)` of an [`IterateExtent`], claimed as morsels by advancing one
+/// cursor.
+pub(crate) struct RangeSource {
+    rows: u64,
+    /// The first position not yet claimed. It only grows, to at most `rows`.
+    next: AtomicU64,
+}
+
+impl RangeSource {
+    pub(crate) fn new(rows: u64) -> Self {
+        Self {
+            rows,
+            next: AtomicU64::new(0),
+        }
+    }
+}
+
+impl MorselSource for RangeSource {
+    fn claim(&self, rows: u64) -> Option<TileGuard> {
+        let rows = rows.max(1);
+        // The cursor partitions the positions and nothing else, so no ordering is needed: the
+        // data a worker reads under the guard comes from its own chain.
+        let first = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |first| {
+                (first < self.rows).then(|| first.saturating_add(rows).min(self.rows))
+            })
+            .ok()?;
+        let last = first.saturating_add(rows).min(self.rows) - 1;
+        Some(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::intervals(IntervalSet::from(Interval::closed(
+                Value::UInt(first),
+                Value::UInt(last),
+            ))),
+        )))
+    }
 }
 
 /// Producer for [`IterateExtent`]: emits an identity function tile.
@@ -670,6 +728,71 @@ mod tests {
             }
             other => panic!("Unexpected predicate for record extent with base types: {other:?}"),
         }
+    }
+
+    /// The `[first, last]` a morsel's guard names.
+    fn bounds(guard: &TileGuard) -> (u64, u64) {
+        let TileGuard::Function(FunctionGuard::Domain(Predicate::Intervals(set))) = guard else {
+            panic!("a morsel is a domain interval, got {guard:?}");
+        };
+        let [interval] = set.intervals().as_slice() else {
+            panic!("a morsel is one interval, got {set:?}");
+        };
+        match (interval.lval(), interval.rval()) {
+            (Some(Value::UInt(first)), Some(Value::UInt(last))) => (*first, *last),
+            other => panic!("a closed range of positions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_range_source_claims_disjoint_morsels_and_then_none() {
+        let source = RangeSource::new(10);
+        let claimed: Vec<_> = std::iter::from_fn(|| source.claim(4))
+            .map(|guard| bounds(&guard))
+            .collect();
+        assert_eq!(claimed, [(0, 3), (4, 7), (8, 9)]);
+        assert!(source.claim(4).is_none(), "none is final");
+        assert!(source.claim(1).is_none(), "whatever size is asked");
+    }
+
+    #[test]
+    fn a_range_source_answers_a_morsel_of_at_least_one_row() {
+        let source = RangeSource::new(2);
+        assert_eq!(bounds(&source.claim(0).expect("a morsel")), (0, 0));
+        assert_eq!(bounds(&source.claim(u64::MAX).expect("a morsel")), (1, 1));
+        assert!(source.claim(u64::MAX).is_none());
+    }
+
+    #[test]
+    fn a_finite_range_from_zero_is_a_morsel_source_and_no_other_extent_is() {
+        let claimed = |extent: Extent| {
+            IterateExtent::new(extent)
+                .morsel_source()
+                .map(|source| std::iter::from_fn(|| source.claim(100)).count())
+        };
+        assert_eq!(claimed(Extent::uint_range(5)), Some(1));
+        assert_eq!(claimed(Extent::uint_range(0)), Some(0));
+        assert_eq!(
+            claimed(Extent::uint_range_interval(2, 5)),
+            None,
+            "starts above 0"
+        );
+        assert_eq!(claimed(Extent::Base(BaseType::Int)), None);
+        assert_eq!(
+            claimed(Extent::UIntRange(IntervalSet::from(Interval::closed(
+                0,
+                u64::MAX
+            )))),
+            None,
+            "a range to the largest position has no row count"
+        );
+        assert_eq!(
+            claimed(Extent::UIntRange(IntervalSet::from(Interval::open_closed(
+                0, 5
+            )))),
+            None,
+            "an open left bound starts above 0"
+        );
     }
 }
 
