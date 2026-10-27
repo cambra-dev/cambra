@@ -477,6 +477,10 @@ of a restatement with no spelling.
   logs each projection and release it receives. An operator test pulls the operator over it and
   reads the log to see the guard the operator restated.
 
+| Operator | Projection |
+| --- | --- |
+| `IterateExtent` | A finite range is cut to the admitted interval before it is rendered. Every other extent renders whole and is cut after. |
+
 ### Producer attribution and probes
 
 Each `subscribe` returns one producer attributed to the operator that constructs it.
