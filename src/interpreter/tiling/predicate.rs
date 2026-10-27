@@ -12,7 +12,7 @@ use intervalsets::{
     ops::{Complement, Difference, Intersection, Union},
 };
 
-use super::interval_sets::{HoldsValue, right_ends_ascend, single_interval_set};
+use super::interval_sets::{holds, right_ends_ascend, single_interval_set};
 use crate::{
     ccl::{BaseType, FieldKey, TagMap},
     interpreter::{
@@ -698,7 +698,7 @@ impl Predicate {
         match self {
             Predicate::True => true,
             Predicate::False => false,
-            Predicate::Intervals(s) => s.holds(value),
+            Predicate::Intervals(s) => holds(s, value),
             Predicate::Record(m) => match value {
                 Value::Record(fields) => m
                     .iter()
@@ -1065,6 +1065,12 @@ impl Predicate {
     /// not for a half-bounded one, so a complement's `(4, ∞)` reads as `[5, ∞)`. Then the
     /// empty set is [`Predicate::False`], a set covering its type is [`Predicate::True`],
     /// and intervals that meet, at a shared value or at adjacent discrete values, are merged.
+    ///
+    /// `set` holds no inverted interval, such as the `[5, 4]` that `Interval::open(4, 5)` is over
+    /// `UInt`. One stops `IntervalSet::new` merging the intervals around it, and the clamp drops
+    /// it but not what it left unmerged: `[4, 7], [5, 4], [6, 6]` comes out `[4, 7], [6, 6]`. That
+    /// set is not the canonical spelling of `[4, 7]`, and its right ends do not ascend, which
+    /// `canonical_runs` debug-asserts.
     pub(crate) fn intervals(set: IntervalSet<Value>) -> Predicate {
         let range = sample(&set).and_then(type_range);
         let set = match &range {
@@ -1484,7 +1490,7 @@ fn canonical_runs(set: IntervalSet<Value>) -> IntervalSet<Value> {
     }
     debug_assert!(
         right_ends_ascend(&merged),
-        "canonical_runs: the right ends ascend, which `HoldsValue::holds` searches by: {merged:?}"
+        "canonical_runs: the right ends ascend, which `holds` searches by: {merged:?}"
     );
     IntervalSet::new_unchecked(merged)
 }
@@ -1666,33 +1672,6 @@ mod tests {
                 .map(|(k, v)| (SmolStr::from(*k), v.clone()))
                 .collect(),
         )
-    }
-
-    /// `Predicate::intervals` drops the inverted `[5, 4]` that `Interval::open(4, 5)` builds over
-    /// `UInt`, so the right ends of its set ascend and `contains` finds the values of the interval
-    /// the inverted one sat in.
-    #[test]
-    fn an_inverted_interval_is_dropped_from_a_predicate() {
-        let u = Value::UInt;
-        let set = IntervalSet::new(vec![
-            Interval::closed(u(0), u(10)),
-            Interval::open(u(4), u(5)),
-            Interval::closed(u(12), u(14)),
-        ]);
-        let Predicate::Intervals(kept) = Predicate::intervals(set) else {
-            panic!("two disjoint runs stay an interval set");
-        };
-        assert_eq!(
-            kept.intervals(),
-            &[
-                Interval::closed(u(0), u(10)),
-                Interval::closed(u(12), u(14))
-            ]
-        );
-        let p = Predicate::Intervals(kept);
-        for (v, held) in [(3, true), (5, true), (10, true), (11, false), (13, true)] {
-            assert_eq!(p.contains(&u(v)), held, "{v}");
-        }
     }
 
     // ── Predicate::as_bool ────────────────────────────────────────────────────

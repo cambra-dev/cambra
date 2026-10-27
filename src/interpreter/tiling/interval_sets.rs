@@ -1,10 +1,10 @@
 //! Operations on [`IntervalSet`] that the `intervalsets` crate lacks:
 //!
 //! - [`HasDifference`]: whether one set holds a value that another does not.
-//! - [`HoldsValue`]: whether a set holds a value.
+//! - [`holds`]: whether a canonical set holds a value.
 //! - [`single_interval_set`]: a column of integers as one interval set.
 //!
-//! The crate's `Contains<T>` for a set scans every interval. [`HoldsValue::holds`] costs one
+//! The crate's `Contains<T>` for a set scans every interval. [`holds`] costs one
 //! binary search over the set's intervals and one interval's containment test.
 //!
 //! `intervalsets` computes `a ∖ b` as `a ∩ complement(b)`, which builds both sets before
@@ -43,37 +43,32 @@ impl<T: Domain> HasDifference for IntervalSet<T> {
     }
 }
 
-/// Whether `self` holds `value`.
+/// Whether `set` holds `value`.
 ///
-/// Equivalent to `Contains::contains(self, value)` under two conditions on the intervals of
-/// `self`:
+/// Defined on the canonical sets that [`Predicate::Intervals`](super::Predicate::Intervals)
+/// holds, which `canonical_runs` builds. On each of them the answer is
+/// `Contains::contains(set, value)`, which scans every interval. Two conditions on the intervals of `set` make it so:
 ///
 /// - They ascend by left end, as `IntervalSet::new` sorts them.
 /// - Each one ends at or after the end of the one before it (`right_ends_ascend`).
 ///
 /// A value above one right end is then above every earlier one, and the first interval whose right
 /// end does not fall below the value starts no later than any other interval that holds it. So
-/// the value lies in the union exactly when it lies in that interval. An inverted interval breaks
-/// the second condition: over a discrete domain `Interval::open(4, 5)` is `[5, 4]`, which holds
-/// nothing, and `IntervalSet::new` keeps it nested inside `[0, 10]`. A set built by
-/// `Predicate::intervals` meets both conditions, and `canonical_runs` asserts the second.
-pub trait HoldsValue<T> {
-    fn holds(&self, value: &T) -> bool;
-}
-
-impl<T: Domain> HoldsValue<T> for IntervalSet<T> {
-    fn holds(&self, value: &T) -> bool {
-        let intervals = self.intervals();
-        let at = intervals.partition_point(|y| {
-            y.right()
-                .is_some_and(|end| !end.contains(Side::Right, value))
-        });
-        intervals.get(at).is_some_and(|y| y.contains(value))
-    }
+/// the value lies in the union exactly when it lies in that interval. A set `IntervalSet::new`
+/// builds can break the second condition: over a discrete domain `Interval::open(4, 5)` is the
+/// inverted `[5, 4]`, which holds nothing, and `IntervalSet::new` keeps it nested inside
+/// `[0, 10]`. `canonical_runs` debug-asserts the second condition.
+pub(crate) fn holds<T: Domain>(set: &IntervalSet<T>, value: &T) -> bool {
+    let intervals = set.intervals();
+    let at = intervals.partition_point(|y| {
+        y.right()
+            .is_some_and(|end| !end.contains(Side::Right, value))
+    });
+    intervals.get(at).is_some_and(|y| y.contains(value))
 }
 
 /// Whether each interval ends at or after the end of the one before it, the order
-/// [`HoldsValue::holds`] searches by. Intervals with no right end form a suffix.
+/// [`holds`] searches by. Intervals with no right end form a suffix.
 pub(crate) fn right_ends_ascend<T: Domain>(intervals: &[Interval<T>]) -> bool {
     intervals
         .windows(2)
@@ -408,11 +403,11 @@ mod tests {
     /// crate's scan.
     fn assert_holds(set: &IntervalSet<Value>, held: &[Value], not_held: &[Value]) {
         for v in held {
-            assert!(set.holds(v), "{v:?} in {set:?}");
+            assert!(holds(set, v), "{v:?} in {set:?}");
             assert!(set.contains(v), "the crate's scan: {v:?} in {set:?}");
         }
         for v in not_held {
-            assert!(!set.holds(v), "{v:?} not in {set:?}");
+            assert!(!holds(set, v), "{v:?} not in {set:?}");
             assert!(!set.contains(v), "the crate's scan: {v:?} not in {set:?}");
         }
     }
@@ -590,14 +585,14 @@ mod tests {
         );
         assert_eq!(set.intervals().len(), 10_000);
         for v in 0..20_002 {
-            assert_eq!(set.holds(&u(v)), v % 2 == 0 && v < 20_000, "{v}");
+            assert_eq!(holds(&set, &u(v)), v % 2 == 0 && v < 20_000, "{v}");
         }
     }
 
     /// Over a discrete domain `Interval::open(4, 5)` is the inverted `[5, 4]`, which holds nothing
     /// and which `is_empty` does not recognize. Nested in `[0, 10]` it breaks the ascending right
-    /// ends `holds` relies on, and `holds` misses values the crate's scan finds. A set built by
-    /// `Predicate::intervals` has no such interval.
+    /// ends `holds` relies on, and `holds` misses values the crate's scan finds.
+    /// `Predicate::intervals` requires its input to hold none.
     #[test]
     fn an_inverted_interval_breaks_the_order_holds_relies_on() {
         let set = IntervalSet::new(vec![
@@ -606,8 +601,8 @@ mod tests {
             Interval::closed(u(12), u(14)),
         ]);
         assert_eq!(set.intervals().len(), 3, "the inverted interval is kept");
-        assert!(set.contains(&u(5)) && !set.holds(&u(5)));
-        assert!(set.contains(&u(10)) && !set.holds(&u(10)));
+        assert!(set.contains(&u(5)) && !holds(&set, &u(5)));
+        assert!(set.contains(&u(10)) && !holds(&set, &u(10)));
     }
 
     /// Intervals with no right end that overlap, which `canonical_runs` can leave as they are: the
@@ -634,9 +629,9 @@ mod tests {
             Interval::closed(u(0), u(10)),
         ]);
         assert!(right_ends_ascend(unsorted.intervals()));
-        assert!(unsorted.contains(&u(3)) && !unsorted.holds(&u(3)));
+        assert!(unsorted.contains(&u(3)) && !holds(&unsorted, &u(3)));
         let sorted = IntervalSet::new(unsorted.intervals().clone());
-        assert!(sorted.holds(&u(3)));
+        assert!(holds(&sorted, &u(3)));
     }
 
     /// Each pair passes or fails the order exactly where `holds` would answer differently from
@@ -692,7 +687,7 @@ mod tests {
             for _ in 0..20_000 {
                 let set = random_set(&mut rng, span, key);
                 for v in &domain {
-                    assert_eq!(set.holds(v), set.contains(v), "{key:?}: {v:?} in {set:?}");
+                    assert_eq!(holds(&set, v), set.contains(v), "{key:?}: {v:?} in {set:?}");
                 }
             }
         }
