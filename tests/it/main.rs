@@ -42,6 +42,7 @@ mod predicate_sharing_review;
 #[path = "../programs/mod.rs"]
 mod programs;
 mod reserve_port;
+mod subst_binders;
 mod subtype_transitivity_fuzz;
 mod test_layout;
 mod test_sink;
