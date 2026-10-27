@@ -476,8 +476,13 @@ impl TileProducer for MapDomainProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut tile = self.input.get(self.input.tiling().universal_guard());
+    /// Every level's keys stand, so the input is pulled at the projection.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let mut tile = self.input.get(projection.guard(self.input.tiling()));
         // The keys stand, so only the values at the level are replaced, in place.
         let Tile::DataFunction {
             domain, codomain, ..
@@ -3425,6 +3430,126 @@ mod restrict_projection_tests {
         let (mut restrict, pulled) = every_third();
         let nothing = restrict.tiling().empty_guard();
         assert_eq!(restrict.get(nothing), restrict.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+}
+
+/// `MapDomain` as a loop over a grouping reads it: the values of a collection are replaced by its
+/// keys, at the level the loop iterates, while the keys above stand. A worker pulls the groups
+/// it owns.
+#[cfg(test)]
+mod map_domain_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, ints_by_position, keys_between,
+    };
+    use bit_set::BitSet;
+
+    const ROWS: u64 = 6;
+
+    /// A stream of positions holding `0, 10, 20, …`, whose values are replaced by the positions.
+    fn keys_of_a_stream() -> (MapDomainProducer, GuardLog) {
+        let values: Vec<i64> = (0..ROWS as i64).map(|i| 10 * i).collect();
+        let tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let out = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::uint_range(ROWS)),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(ints_by_position(&values, true), tiling);
+        (
+            MapDomainProducer {
+                base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &out),
+                input: Box::new(input),
+                level: CurryLevel::OUTERMOST,
+            },
+            pulled,
+        )
+    }
+
+    #[test]
+    fn a_stream_keeps_its_morsel_and_takes_its_keys_as_values() {
+        let (mut keys, pulled) = keys_of_a_stream();
+        let morsel = keys.get(keys_between(1, 3));
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![1, 2, 3]));
+        assert_eq!(**codomain, Tile::Scalar(ColumnValue::UInts(vec![1, 2, 3])));
+        assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
+    }
+
+    /// The groups a `Converse` makes, each member listed by the key it stands at: the outer keys
+    /// are the groups, which the projection names, and the inner values become the inner keys.
+    fn members_of_groups() -> (MapDomainProducer, GuardLog) {
+        let groups = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2, 3]),
+            Box::new(Tile::grouped(
+                vec![0, 2, 3],
+                ColumnValue::UInts(vec![0, 2, 1, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 6, 7, 8]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let in_tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(4),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let out = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(Extent::uint_range(4), Tiling::Scalar(Extent::uint_range(4))),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(groups, in_tiling);
+        (
+            MapDomainProducer {
+                base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &out),
+                input: Box::new(input),
+                level: CurryLevel::new(1),
+            },
+            pulled,
+        )
+    }
+
+    fn groups_one_and_three() -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::Int(1)).union(&Predicate::point(Value::Int(3))),
+        ))
+    }
+
+    #[test]
+    fn a_projection_of_groups_reaches_the_groups() {
+        let (mut members, pulled) = members_of_groups();
+        let answer = members.get(groups_one_and_three());
+        let Tile::DataFunction { domain, .. } = &answer else {
+            panic!("a collection")
+        };
+        assert_eq!(*domain, ColumnValue::Ints(vec![1, 3]));
+        assert_eq!(*pulled.borrow(), [groups_one_and_three()]);
+    }
+
+    #[test]
+    fn the_projections_are_the_whole_pull_cut_to_them() {
+        assert_conforms(|| Box::new(keys_of_a_stream().0), keys_between(2, 4));
+        assert_conforms(|| Box::new(members_of_groups().0), groups_one_and_three());
+    }
+
+    #[test]
+    fn nothing_maps_nothing() {
+        let (mut keys, pulled) = keys_of_a_stream();
+        let nothing = keys.tiling().empty_guard();
+        assert_eq!(keys.get(nothing), keys.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
     }
 }
