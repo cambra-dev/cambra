@@ -391,8 +391,14 @@ impl TileProducer for MapExtractAggregateProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut output = self.input.get(self.input.tiling().universal_guard());
+    /// Every level keeps the input's keys and only the unfinished ones drop, so the input is
+    /// pulled at the projection, and the answer keeps its keys.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let mut output = self.input.get(projection.guard(self.input.tiling()));
         // Every level passes through; only what sits under the innermost changes, and the
         // non-terminal keys of that level go. Keeping the levels is what leaves a deeper
         // fold's grouping intact for the fold above it.
@@ -1501,6 +1507,130 @@ mod map_aggregate_projection_tests {
     fn the_morsels_together_are_the_whole_pull() {
         for guard in [keys_between(0, 3), keys_between(2, 5), keys_between(5, 5)] {
             assert_conforms(|| Box::new(sums_of_groups().0), guard);
+        }
+    }
+}
+
+#[cfg(test)]
+mod map_extract_aggregate_projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, keys_between,
+    };
+    use crate::interpreter::{BaseType, Extent, Tile};
+
+    const GROUPS: u64 = 4;
+
+    /// The per-group sums `[3, 3, 9, 6]` of a grouped fold, of which group 2 is still open,
+    /// extracted for the finished ones, with the pulls of the sums logged.
+    fn finished_sums() -> (MapExtractAggregateProducer, GuardLog) {
+        let int = || Extent::Base(BaseType::Int);
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(GROUPS),
+            Tiling::Aggregation {
+                kind: AggregateKind::Sum,
+                accumulator: Box::new(Tiling::Scalar(int())),
+            },
+        );
+        let sums = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2, 3]),
+            Box::new(Tile::Aggregation {
+                kind: AggregateKind::Sum,
+                accumulator: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 3, 9, 6]))),
+                terminal: ColumnValue::Bools(vec![true, true, false, true]),
+            }),
+            // Groups 0 and 1 are stated settled. Group 3 is terminal but not yet stated.
+            Predicate::at_or_below(Value::UInt(1)),
+            BitSet::new(),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(sums, in_tiling);
+        let out_tiling = Tiling::data_function(Extent::uint_range(GROUPS), Tiling::Scalar(int()));
+        (
+            MapExtractAggregateProducer {
+                base: ProducerBase::unowned(MapExtractAggregateProducer::alloc_id(), &out_tiling),
+                input: Box::new(input),
+                kind: AggregateKind::Sum,
+            },
+            pulled,
+        )
+    }
+
+    fn extracted(tile: &Tile) -> Vec<(Value, i64)> {
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("a collection, got {tile:?}")
+        };
+        let Tile::Scalar(ColumnValue::Ints(sums)) = &**codomain else {
+            panic!("integer sums, got {codomain:?}")
+        };
+        (0..domain.len())
+            .map(|i| (domain.index_at(i), sums[i]))
+            .collect()
+    }
+
+    /// A morsel pulls the sums at the morsel, and answers the finished groups in it: group 2 is
+    /// open, so it is not there yet.
+    #[test]
+    fn a_morsel_extracts_the_finished_groups_in_it() {
+        let (mut extract, pulled) = finished_sums();
+        let morsel = extract.get(keys_between(1, 2));
+        assert_eq!(extracted(&morsel), vec![(Value::UInt(1), 3)]);
+        assert_eq!(*pulled.borrow(), vec![keys_between(1, 2)]);
+    }
+
+    /// Group 2 is still open, so it is not emitted and the statement, the input's, does not
+    /// name it. Group 3 is finished and emitted though the input has not stated it settled. A
+    /// consumer releases what the tile holds and states complete, which does not reach group 2.
+    #[test]
+    fn an_open_group_is_not_emitted_stated_complete_or_released() {
+        let (mut extract, _) = finished_sums();
+        let tile = extract.get(extract.tiling().universal_guard());
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &tile
+        else {
+            panic!("a collection, got {tile:?}")
+        };
+        assert_eq!(*domain_predicate, Predicate::at_or_below(Value::UInt(1)));
+        assert_eq!(
+            extracted(&tile),
+            vec![
+                (Value::UInt(0), 3),
+                (Value::UInt(1), 3),
+                (Value::UInt(3), 6)
+            ]
+        );
+        extract.release(tile.to_guard());
+        let released = extract.input.obsolete_guard();
+        let TileGuard::Function(FunctionGuard::Domain(region)) = released else {
+            panic!("a key region, got {released:?}")
+        };
+        assert!(
+            region.intersect(&Predicate::exactly(&[Value::UInt(2)])) == Predicate::False,
+            "group 2 is still open: {region:?}"
+        );
+        for held in [0, 1, 3] {
+            assert!(
+                region.contains(&Value::UInt(held)),
+                "group {held} was emitted, so its release is forwarded: {region:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_asked_for_nothing_read_nothing() {
+        let (mut extract, pulled) = finished_sums();
+        let tile = extract.get(extract.tiling().empty_guard());
+        assert_eq!(tile, extract.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_morsels_together_are_the_whole_pull() {
+        for guard in [keys_between(0, 3), keys_between(2, 5), keys_between(5, 5)] {
+            assert_conforms(|| Box::new(finished_sums().0), guard);
         }
     }
 }
