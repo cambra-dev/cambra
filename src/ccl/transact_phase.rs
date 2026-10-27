@@ -651,11 +651,11 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     if txn_mut_vars.is_empty() && !contains_begin(&expr) {
         return Ok(expr);
     }
-    // A write inside a `Case` bound by a `Let` outside a writer body is off the
-    // statement spine, so its advance would be scoped to the branch and dropped.
-    // Push the binding into the branches first, the same normalization the letrec
-    // phase applies through `flatten_spine`. Inside a `with begin():` block the
-    // writer walk merges the `Case` instead.
+    // A write inside a `Case` bound by a `Let` is off the statement spine, so its
+    // advance would be scoped to the branch and dropped. The writer walk merges the
+    // `Case` inside a `with begin():` block, and the letrec phase merges it at the top
+    // level; the binding is pushed into the branches only where neither does, the
+    // same normalization the letrec phase applies through `flatten_spine`.
     let expr = crate::ccl::mut_elim::push_bindings_into_writing_cases(expr);
     // A statement whose effect is a `Let` hides that binding from the rest of
     // the spine, which is where this phase places the stores' `Transact`s that

@@ -6,7 +6,8 @@
 //! loop's writer takes a copy of the bindings it reads (`src/ccl/mut_elim.rs`'s
 //! `sink_prefix`). Inlining its value into each read instead costs a factor of
 //! two per binding on the chain `aₖ = aₖ₋₁ + aₖ₋₁`, whose every binding reads the
-//! one before it twice.
+//! one before it twice. Top-level code has no writer body, and the same holds for
+//! the value it merges a writing `if` into.
 //!
 //! Tree size is the probe rather than wall-clock: it is deterministic, so the
 //! guard is a hard bound instead of a timing threshold. The claim is the growth
@@ -193,6 +194,32 @@ fn a_chain_of_writing_if_values_in_a_writing_block_stays_linear() {
             "      ",
             "acc: Mut(Int, Txn) := 0\nfor i in [1, 2, 3]:\n    with begin():\n",
             "acc := acc + {last}\nawait_final(acc)\n",
+        )
+    });
+}
+
+#[test]
+fn a_chain_of_top_level_writing_ifs_stays_linear() {
+    // Outside a loop there is no writer walk: each `if` merges into one value whose
+    // fields the statements after it read.
+    assert_linear_in_chain_length("top-level writing `if`s", |d| {
+        format!(
+            "x := 1\ni = 3\n{}x\n",
+            "if i > 1:\n    x := x + x\nelse:\n    x := x + 1\n".repeat(d)
+        )
+    });
+}
+
+#[test]
+fn a_chain_of_top_level_writing_if_values_stays_linear() {
+    assert_linear_in_chain_length("top-level writing `if` values", |d| {
+        loop_with_chain_of(
+            "a0 = i + 1",
+            "a{k} = if i > 1:\n        acc += 1\n        a{p} + a{p}\n    else:\n        a{p}",
+            d,
+            "",
+            "acc := 0\ni = 3\n",
+            "acc += {last}\nacc\n",
         )
     });
 }
