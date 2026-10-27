@@ -549,6 +549,7 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
 | `MakeRecord` | A record of values has no keys: the projection is the whole record or nothing, and a guard naming keys panics. |
 | `VariantWrap` | A payload stream is pulled at the projection. A payload that is itself a collection becomes one union column and is read whole. A projection beneath the outermost keys is answered above the wrapped level (`Restates::Above`). |
 | `VariantProject` | A union stream is pulled at the projection. A bare union has no keys of its own, so it is read whole and its positions are cut. |
+| `VariantIs` | A union stream is pulled at the projection, since every key in is a key out. A bare union has no keys of its own, so it is read whole and its positions are cut. |
 
 ### Producer attribution and probes
 
