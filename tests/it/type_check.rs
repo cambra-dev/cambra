@@ -1234,6 +1234,42 @@ fn a_never_called_generic_function_is_accepted(#[case] defs: &str) {
     assert_eq!(infer_program(&dead_code(defs)), int_lit(1));
 }
 
+/// A live use that shares a specialization a dead definition minted keeps it in the
+/// program. `k(0)`'s clone walk checks the dead `f`, whose call `g(1)` mints `g`'s clone
+/// unreferenced; the trailing `g(1)` shares that clone, so the clone's binding is spliced.
+#[test]
+fn a_live_use_sharing_a_dead_definitions_specialization_splices_it() {
+    let code = indoc! {r#"
+        g = \x -> x + 1
+        def k(n):
+            def f(a):
+                g(1)
+            n
+        once = k(0)
+        g(1)
+    "#};
+    let mut lctx = LoweringContext::default();
+    let mut ictx = TypeInferenceContext::new();
+    let mut expr = lower_uniquified(&parse_module(code), &mut lctx);
+    infer(&mut expr, &mut ictx).expect("inference failed");
+    let mut bound = HashSet::new();
+    let mut e = &expr;
+    while let TypedExprNode::Let { binding, body, .. } = &e.node {
+        bound.insert(binding.name.clone());
+        e = body;
+    }
+    let TypedExprNode::Apply { function, .. } = &e.node else {
+        panic!("the program value is the call `g(1)`: {e:?}");
+    };
+    let TypedExprNode::Var(name) = &function.node else {
+        panic!("the call names `g`'s specialization: {function:?}");
+    };
+    assert!(
+        bound.contains(name),
+        "the specialization the live call shares is bound in the program"
+    );
+}
+
 /// A never-called definition that reads a *source* is checked against the source's
 /// element type, and accepted when it uses it consistently. The rejection case is
 /// the discriminating one: its live counterpart — same body, with `f(1)` appended —
