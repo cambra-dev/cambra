@@ -318,6 +318,36 @@ pub(super) fn lower_call(
             }
             Ok(Expr::builtin(Builtin::EmptyMap).with_ty(Type::map_of(Type::Hole, Type::Hole)))
         }
+        // `env_var("NAME")` reads the source of the environment variable `NAME`, which holds
+        // one element once the host fills it, and `Sole` makes that element a value. The
+        // name is a literal, so the variables a program reads are known when it compiles,
+        // and the host checks and fills each before the version starts
+        // (`SourceSinkRegistry::check_env_vars`).
+        Some(b @ SurfaceBuiltin::EnvVar) => {
+            if !b.arity().accepts(args.len()) {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    format!("`env_var` takes {}", b.arity()),
+                ));
+            }
+            let ChlExpr::Lit(ChlLit::String(var)) = &args[0].node else {
+                return Err(LoweringError::unsupported(
+                    args[0].span,
+                    "`env_var`'s argument is the variable's name, written as a string literal",
+                ));
+            };
+            let call = func.span.join(args[0].span);
+            // Reading a source is IO, which a module that is imported may not perform.
+            ctx.io_site.get_or_insert(call);
+            let source_name = ctx.env_var_source(var, call);
+            let sc = "lower.env_var";
+            let source = ctx.tag_machinery(
+                Expr::new(TypedExprNode::Source(source_name, Vec::new())),
+                call,
+                sc,
+            );
+            Ok(ctx.tag_machinery(Expr::aggregate(source, AggregateKind::Sole), call, sc))
+        }
         // An instance stands only before `::`, where the parser reads `summon(T)::f`
         // (`docs/chl-spec.md`, "Summoning an instance").
         Some(SurfaceBuiltin::Summon) => Err(LoweringError::unsupported(

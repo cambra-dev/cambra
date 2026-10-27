@@ -1087,6 +1087,7 @@ Where each part of a program stands after a swap:
 | A transaction writer's drive | Its writer's iteration input where the reload kept it, and `0` over a rebuilt one | Absolute item positions, released on the commit-ack |
 | A rebuilt store's commit tick | `0`, seeded from the carried value | Private and restartable |
 | A route, its listener, and the requests behind it | Where they were, while any version still binds a route on the port | `SourceSinkRegistry` |
+| An environment variable's source | Holding the value an earlier version read; a new reader reads it from position 0 | `SourceSinkRegistry`, `EnvVarSource` |
 
 Step 1 opens nothing. Rendering a difference runs with `Endpoints::Inherited`, so a route the
 registry does not hold is named rather than opened: the context is thrown away but a socket is not,
@@ -1174,6 +1175,21 @@ keyed by their source name, not by the response binding's name, which a new vers
 differently. Seeding the registry is also what lets `/diff` be answered about a running program:
 compiling the new version in a fresh `GlobalContext` would try to bind a port the running program
 holds and fail.
+
+### An environment variable is read once per process
+
+An `env_var("NAME")` call reads the source `__env:NAME` (`interpreter/env_var.rs`), which the
+registry holds once a version reading it is installed. Lowering creates the source empty when the
+registry does not hold it, so compiling reads no environment, and `/diff` reads none.
+`SourceSinkRegistry::check_env_vars` refuses a version that reads an unset variable whose source is
+empty, in the compile that precedes installing a version (step 2, `compile_to_opening`) and again in
+`compile_version`, which then fills each empty source (`fill_env_vars`). A version that reads a
+variable the registry holds binds the filled source and sees the value the earlier version read
+(`a_reload_reads_only_the_variables_it_adds`).
+
+The value is a constant, not a stream, so `EnvVarSource` never drops it and carries no release to
+new producers. A producer a reload adds reads the value from position 0, and a release records only
+that one producer has read it.
 
 ### A route a version stops serving is retired
 

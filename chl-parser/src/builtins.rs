@@ -32,6 +32,7 @@ pub enum SurfaceBuiltin {
     TestSink,
     Stdin,
     Summon,
+    EnvVar,
 }
 
 /// The number of arguments a [`SurfaceBuiltin`] call takes.
@@ -141,6 +142,9 @@ pub const SURFACE_BUILTINS: &[SurfaceBuiltinEntry] = {
         entry("test_sink", B::TestSink, Exact(0), SinkDeclaration),
         entry("stdin", B::Stdin, Exact(0), Source),
         entry("summon", B::Summon, Exact(1), Qualifier),
+        // Its argument is a string literal, the variable's name. A prelude stand-in for
+        // `std::env::var` until the std root is embedded.
+        entry("env_var", B::EnvVar, Exact(1), Function),
     ]
 };
 
@@ -199,7 +203,8 @@ mod tests {
             | B::HttpServe
             | B::TestSink
             | B::Stdin
-            | B::Summon => b,
+            | B::Summon
+            | B::EnvVar => b,
         };
         [
             B::Sum,
@@ -216,6 +221,7 @@ mod tests {
             B::TestSink,
             B::Stdin,
             B::Summon,
+            B::EnvVar,
         ]
         .into_iter()
         .map(every)

@@ -3874,10 +3874,26 @@ responses ([10. Sinks](#10-sinks)).
 |---|---|---|
 | `stdin()` | Process standard input | One element per line of UTF-8 text. |
 | `http_serve(port, method, path)` | HTTP server, a source and a sink | Returns a `(requests, responses)` 2-tuple. The requests source yields request bodies; the responses sink is a feed. Called only as the whole right-hand side of a top-level `=` (see below). |
+| `env_var(name)` | One environment variable of the process | Returns the variable's value, a `String`, rather than a stream (see below). |
 
 Additional sources may be pre-registered by the host embedding (testing,
 demos, etc.). `std::time` adds a clock read and an alarm source and sink
 ([7.5 Time [Decided]](#75-time-decided)).
+
+`env_var(name)` returns the value of the environment variable `name`:
+
+- `name` is a string literal. A program's variables are known when it compiles, and compiling
+  reads no environment.
+- Before a version starts, the host checks every variable the version reads. A version that
+  reads an unset variable, or one whose value is not UTF-8, is refused with an error at each call
+  that reads it, so a missing variable fails the deploy rather than a request.
+- A variable is read once per process. A reload that reads a variable an earlier version read sees
+  the value that version read, and reads a variable it adds when it is installed.
+- Reading a variable is IO, so a module that calls `env_var` is run, never imported
+  ([9.7 Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)).
+
+`env_var` stands in for `std::env::var` until the std root is embedded
+([9.16 The std root](#916-the-std-root)), as `http_serve` does for `std::http::serve`.
 
 `http_serve` opens its route when the program starts, so a call is the
 whole right-hand side of a `=` in the top-level block, and its three

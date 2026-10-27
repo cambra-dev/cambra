@@ -803,6 +803,9 @@ fn a_misused_import_argument_is_refused(#[case] root: &str, #[case] needle: &str
 #[case::a_source(indoc! {"
     pub xs = stdin()
 "}, "pub xs = stdin()")]
+#[case::an_environment_variable(indoc! {r#"
+    pub key = env_var("API_KEY")
+"#}, r#"env_var("API_KEY")"#)]
 #[timeout(Duration::from_secs(10))]
 fn importing_a_module_that_performs_io_is_refused(#[case] audit: &str, #[case] io: &str) {
     let errors = compile_errors(&program(

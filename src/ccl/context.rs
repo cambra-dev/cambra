@@ -40,7 +40,8 @@ use crate::{
         transact_phase, uniquify,
     },
     interpreter::{
-        Consumer, DataSink, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
+        Consumer, DataSink, DataSourceDomainExtentImpl, EnvLookup, EnvVarSource, Scheduler,
+        StdinDataSource,
         http_server::SharedHttpServer,
         operator_conversion::{
             ConversionError, OpConversionContext, OperatorMap, convert_outputs_to_operators,
@@ -745,6 +746,12 @@ pub struct SourceSinkRegistry {
     http_routes: HashMap<String, HttpRoute>,
     /// One listener per bound TCP port.
     shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
+    /// Every environment variable's source, by variable name. Each is also in
+    /// [`sources`](Self::sources). A variable is read once per process: a version that reads
+    /// one an earlier version read binds the same filled source.
+    env_var_sources: HashMap<String, Rc<RefCell<EnvVarSource>>>,
+    /// How the host reads an environment variable.
+    env: EnvLookup,
     /// Test sinks a test holds a handle on, by binding name.
     ///
     /// Registry state rather than per-pass state because a sink outlives a version, as a
@@ -768,6 +775,11 @@ impl SourceSinkRegistry {
                 .map(|(n, s)| (n.to_string(), s.clone())),
         );
         self.shared_servers.extend(lowering.take_servers());
+        self.env_var_sources.extend(
+            lowering
+                .env_var_sources()
+                .map(|(v, s)| (v.to_string(), s.clone())),
+        );
         for (name, route) in lowering.registered_routes() {
             // A route is only ever registered alongside the listener it was
             // opened on, and `take_servers` above has just moved every listener
@@ -874,6 +886,11 @@ impl SourceSinkRegistry {
                 .map(|(n, r)| (n.clone(), r.route.clone())),
             self.shared_servers.iter().map(|(p, s)| (*p, s.clone())),
         );
+        lowering.adopt_env_var_sources(
+            self.env_var_sources
+                .iter()
+                .map(|(v, s)| (v.clone(), s.clone())),
+        );
         #[cfg(any(test, feature = "test-helpers"))]
         lowering.adopt_test_sinks(self.test_sinks.iter().map(|(n, s)| (n.clone(), s.clone())));
         lowering
@@ -929,7 +946,61 @@ impl SourceSinkRegistry {
         self.shared_servers.extend(std::mem::take(
             &mut scratch.sources_and_sinks.shared_servers,
         ));
-        Ok(compiled?.expr)
+        let compiled = compiled?;
+        self.check_env_vars(&scratch.lowering)?;
+        Ok(compiled.expr)
+    }
+
+    /// Refuse a version that reads an environment variable the host does not have, with an
+    /// error at the calls that read it.
+    ///
+    /// Checks only the variables whose sources are empty: one an earlier version read is
+    /// filled, and is read once per process.
+    fn check_env_vars(&self, lowering: &LoweringContext) -> Result<(), Vec<CompileError>> {
+        let errors: Vec<CompileError> = lowering
+            .env_vars_this_pass()
+            .filter(|(var, source, _)| !source.borrow().is_filled() && self.env.get(var).is_none())
+            .map(|(var, _, calls)| {
+                let (first, rest) = calls
+                    .split_first()
+                    .expect("a variable this pass reads has a call that reads it");
+                let error = LoweringError::unsupported(
+                    *first,
+                    format!(
+                        "the environment variable `{var}` is unset or is not UTF-8, so this \
+                         version cannot start"
+                    ),
+                );
+                CompileError::Lower(
+                    rest.iter()
+                        .fold(error, |e, call| e.with_related(*call, "also read here")),
+                )
+            })
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Fill the source of every variable `lowering` reads that is still empty, from the
+    /// host's environment, refusing the version if one is missing.
+    ///
+    /// The one place a program's environment is read. Compiling reads none: lowering
+    /// creates each source empty.
+    fn fill_env_vars(&self, lowering: &LoweringContext) -> Result<(), Vec<CompileError>> {
+        self.check_env_vars(lowering)?;
+        for (var, source, _) in lowering.env_vars_this_pass() {
+            if !source.borrow().is_filled() {
+                let value = self
+                    .env
+                    .get(var)
+                    .unwrap_or_else(|| unreachable!("`check_env_vars` found `{var}`"));
+                source.borrow_mut().fill(value);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -966,6 +1037,12 @@ impl GlobalContext {
         let stdin = Rc::new(RefCell::new(StdinDataSource::new()));
         result.register_source(stdin);
         result
+    }
+
+    /// Read environment variables through `env` rather than from the process environment.
+    pub fn with_env(mut self, env: EnvLookup) -> Self {
+        self.sources_and_sinks.env = env;
+        self
     }
 
     /// A context around an already-seeded lowering registry, with every other
@@ -2834,6 +2911,7 @@ fn compile_version(
     // diff — must not act on a route the running program still serves.
     // Boxed before anything records a node: a `NodeId` is an address, and the
     // tree conversion walks is the tree `CompiledProgram::ast` keeps.
+    ctx.sources_and_sinks.fill_env_vars(&ctx.lowering)?;
     let join_planned = Box::new(join_planned);
     let routes = ctx.lowering.routes_bound_this_pass().clone();
     let still_bound: HashSet<String> = routes.union(bound_elsewhere).cloned().collect();

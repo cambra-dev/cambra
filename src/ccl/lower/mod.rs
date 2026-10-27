@@ -98,7 +98,7 @@ use crate::{
         Stmt as ChlStmt, VariantPayload as ChlVariantPayload,
     },
     interpreter::{
-        DataSink, DataSourceDomainExtentImpl,
+        DataSink, DataSourceDomainExtentImpl, EnvVarSource, env_var_source_name,
         http_server::{SharedHttpServer, UnopenedRoute, UnopenedRouteSink},
     },
 };
@@ -428,6 +428,17 @@ pub struct LoweringContext {
     /// What this pass may do with an `http_serve` naming a route the registry does
     /// not already hold.
     pub(super) endpoints: Endpoints,
+
+    /// The source of every environment variable this context knows, by variable name: one
+    /// the registry held when it seeded this context, already filled, and one an `env_var`
+    /// call of this pass created, empty until the host fills it
+    /// ([`EnvVarSource`]). Each is also in [`sources`](Self::sources), under
+    /// [`env_var_source_name`].
+    pub(super) env_var_sources: HashMap<String, Rc<RefCell<EnvVarSource>>>,
+
+    /// Every variable an `env_var` call of this pass names, with the span of each call: what
+    /// the host checks and fills before the version starts.
+    pub(super) env_vars_this_pass: BTreeMap<String, Vec<Span>>,
 
     /// Monotonic counter for minting unique synthetic names during lowering.
     /// Globally unique across nested scopes so inner binders cannot capture
@@ -783,6 +794,36 @@ impl LoweringContext {
         self.http_routes.iter().map(|(n, r)| (n.as_str(), r))
     }
 
+    /// The source `env_var(var)` reads, created empty if this context holds none, with
+    /// `call` recorded as a read of `var` in this pass. Creating it reads no environment.
+    pub(super) fn env_var_source(&mut self, var: &str, call: Span) -> String {
+        let name = env_var_source_name(var);
+        if !self.env_var_sources.contains_key(var) {
+            let source = Rc::new(RefCell::new(EnvVarSource::new(var)));
+            self.sources.insert(name.clone(), source.clone());
+            self.env_var_sources.insert(var.to_string(), source);
+        }
+        self.env_vars_this_pass
+            .entry(var.to_string())
+            .or_default()
+            .push(call);
+        name
+    }
+
+    /// Each variable this pass reads, with its source and the spans of its calls.
+    pub fn env_vars_this_pass(
+        &self,
+    ) -> impl Iterator<Item = (&str, &Rc<RefCell<EnvVarSource>>, &[Span])> {
+        self.env_vars_this_pass
+            .iter()
+            .map(|(var, calls)| (var.as_str(), &self.env_var_sources[var], calls.as_slice()))
+    }
+
+    /// Every environment variable's source this context holds, by variable name.
+    pub fn env_var_sources(&self) -> impl Iterator<Item = (&str, &Rc<RefCell<EnvVarSource>>)> {
+        self.env_var_sources.iter().map(|(v, s)| (v.as_str(), s))
+    }
+
     /// The routes this pass bound — every address the version being lowered
     /// serves. A route the registry holds and this set omits is one the version
     /// stopped serving.
@@ -820,6 +861,16 @@ impl LoweringContext {
         self.sources.extend(sources);
         self.http_routes.extend(routes);
         self.shared_servers.extend(servers);
+    }
+
+    /// Seed this context with the environment variables' sources a registry holds. Each is
+    /// already in the sources [`adopt_sources_and_sinks`](Self::adopt_sources_and_sinks)
+    /// seeds, under [`env_var_source_name`].
+    pub fn adopt_env_var_sources(
+        &mut self,
+        env_var_sources: impl IntoIterator<Item = (String, Rc<RefCell<EnvVarSource>>)>,
+    ) {
+        self.env_var_sources.extend(env_var_sources);
     }
 
     /// Seed this context with the test sinks a registry holds.

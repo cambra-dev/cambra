@@ -5,6 +5,7 @@
 
 mod binop;
 pub mod commit_operator;
+mod env_var;
 pub mod http_server;
 pub mod operator_conversion;
 pub mod operator_graph;
@@ -26,6 +27,7 @@ mod unary_op;
 pub mod value_probe;
 
 pub use binop::*;
+pub use env_var::*;
 pub use http_server::HttpServerDataSource;
 pub use scalar_expr::ScalarProgram;
 pub use scheduler::*;
