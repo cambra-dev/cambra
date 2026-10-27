@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use cambra::ccl::content_hash::content_hash;
 use cambra::ccl::{
-    BindingTransparency, Expr, Home, Lit, Refinement, SharedRun, Type, TypedBinding, TypedExpr,
+    BindingTransparency, Expr, Home, Lit, Refinement, SharedImport, Type, TypedBinding, TypedExpr,
     TypedExprNode, uniquify,
 };
 use cambra::chl_parser::ModulePath;
@@ -81,7 +81,7 @@ fn content_hash_covers_the_binder() {
 /// its seed is not top-level.
 #[test]
 fn a_top_level_mut_decl_is_minted_with_its_home() {
-    let catalog = Home::Shared(SharedRun {
+    let catalog = Home::Import(SharedImport {
         module: ModulePath::new(["catalog".into()]),
         arguments: Arc::new([]),
     });
