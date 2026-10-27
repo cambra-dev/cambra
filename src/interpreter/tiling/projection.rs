@@ -71,6 +71,16 @@ impl Projection {
         Projection::admitting(region(self).minus(&region(other)))
     }
 
+    /// The projection naming what either names: the region a memo has read or must read
+    /// again.
+    pub fn union(&self, other: &Projection) -> Projection {
+        match (self, other) {
+            (Projection::Everything, _) | (_, Projection::Everything) => Projection::Everything,
+            (Projection::Nothing, kept) | (kept, Projection::Nothing) => kept.clone(),
+            (Projection::Keys(a), Projection::Keys(b)) => Projection::admitting(a.union(b)),
+        }
+    }
+
     /// The projection naming the keys `keys` admits, normalized to
     /// [`Everything`](Self::Everything) or [`Nothing`](Self::Nothing) where it admits all or
     /// none.
@@ -256,6 +266,24 @@ mod tests {
         );
         assert_eq!(low.minus(&Projection::Everything), Projection::Nothing);
         assert_eq!(low.minus(&Projection::Nothing), low);
+    }
+
+    #[test]
+    fn a_union_names_the_region_a_memo_has_read_or_must_read_again() {
+        let (low, high) = (
+            Projection::Keys(positions(0, 2)),
+            Projection::Keys(positions(5, 7)),
+        );
+        assert_eq!(
+            low.union(&high),
+            Projection::Keys(positions(0, 2).union(&positions(5, 7)))
+        );
+        assert_eq!(low.union(&Projection::Nothing), low);
+        assert_eq!(
+            Projection::Nothing.union(&Projection::Nothing),
+            Projection::Nothing
+        );
+        assert_eq!(low.union(&Projection::Everything), Projection::Everything);
     }
 
     #[test]
