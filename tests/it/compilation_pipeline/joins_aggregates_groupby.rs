@@ -1418,13 +1418,16 @@ fn a_per_group_count_that_ignores_the_row() {
     );
 }
 
-/// A `groupby` over a comprehension of records bound to a name first does not compile: the
-/// post-lambda-elim type check rejects the collection domain of the grouping. The same
-/// comprehension written inline as the `groupby` source compiles, which the `groupby_source` row
-/// of `tests/it/generated_pairs.rs` holds for its `rec_comp` and `rec_filtered` fillers.
+/// A `groupby` over a comprehension of records bound to a name first does not compile.
+/// Planning does not rewrite the grouping into a `converse` index, so it iterates the key
+/// domain `{String | __elem ▷ ((rows ≫ (λ r → r.region)) ▷ collection_contains)}` directly, and
+/// op conversion rejects `collection_contains` taking an input operator. The same comprehension
+/// written inline as the `groupby` source compiles, which the `groupby_source` row of
+/// `tests/it/generated_pairs.rs` holds for its `rec_comp` and `rec_filtered` fillers.
 #[test]
 #[should_panic(
-    expected = "post-lambda-elim produced an invalid tree: [Type mismatch for collection domain"
+    expected = "Only higher-order combinators (map, const, zip) can take an input operator; \
+                found input for non-combinator collection_contains"
 )]
 fn a_groupby_over_a_bound_comprehension_of_records() {
     check_tile(
