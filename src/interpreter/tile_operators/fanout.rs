@@ -8,7 +8,7 @@ use super::*;
 use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{
-        Consumer, Position, Scheduler,
+        Consumer, Position, Projection, Scheduler,
         scheduler::{GatedConsumer, WakeupQueue, forwarding_consumer, shared_consumer},
     },
     pretty_graph::VizOptions,
@@ -755,15 +755,27 @@ impl TileProducer for FanOutProducer {
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        let shared_rc = self.shared();
+        // Reopened before the pull, as an operator's gate is (`TileProducer::get`), and so by
+        // a pull that reads nothing.
+        shared_rc.borrow().forwarded.take();
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let cyclic = shared_rc.borrow().reentrancy.is_some();
+        // A sibling that re-enters mid-pull is answered from the cache of the last completed
+        // pull, which has to cover whatever region that sibling asks for: a cyclic fan-out reads
+        // its input whole.
+        let projection_guard = match cyclic {
+            true => self.tiling().universal_guard(),
+            false => projection.guard(self.tiling()),
+        };
         // In cyclic mode, take the inner producer out during the pull so
         // sibling-slot re-entrance can detect re-entrance by finding
         // `producer == None` and serve from the cached tile.  In
         // non-cyclic mode, the producer stays in `shared` and we pull
         // through a regular borrow.
-        let shared_rc = self.shared();
-        // Reopened before the pull, as an operator's gate is (`TileProducer::get`).
-        shared_rc.borrow().forwarded.take();
-        let cyclic = shared_rc.borrow().reentrancy.is_some();
         let mut result = if cyclic {
             let producer_opt = shared_rc.borrow_mut().producer.take();
             if let Some(producer) = producer_opt {
@@ -820,6 +832,7 @@ impl TileProducer for FanOutProducer {
         let guard = shared_rc.borrow().release_guards[self.index()].clone();
         trace!("{} removing {guard:?} from {result:?}", self.name());
         result.remove_guarded(guard);
+        result.restrict_to(&projection, self.tiling());
         result
     }
 
@@ -1653,5 +1666,86 @@ mod tests {
             memo.upstream_drained,
             "the complete tile should have been released universally on the first pull"
         );
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::Scheduler;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpyOp, int_entries, ints_by_position, keys_between,
+    };
+    use crate::interpreter::{BaseType, Extent};
+
+    const ROWS: u64 = 8;
+
+    fn ints() -> Tiling {
+        Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
+    }
+
+    /// A fan-out over a stream of `0..ROWS`, with two slots subscribed, and the input's logs.
+    fn two_slots() -> (Box<dyn TileProducer>, Box<dyn TileProducer>, GuardLog) {
+        let values: Vec<i64> = (0..ROWS as i64).collect();
+        let (input, pulled, _) = ProjectionSpyOp::new(ints_by_position(&values, true), ints());
+        let fan = FanOut::new(Box::new(input));
+        let mut sched = Scheduler::new();
+        let first = fan
+            .slot()
+            .subscribe(ints().empty_guard(), Box::new(|| {}), &mut sched);
+        let second = fan
+            .slot()
+            .subscribe(ints().empty_guard(), Box::new(|| {}), &mut sched);
+        (first, second, pulled)
+    }
+
+    /// `xs ▷ map(c)` fans a stream into two consumers that each read their own morsels. Each
+    /// slot's answer is its own morsel, and the shared input is pulled at the region of the slot
+    /// that pulls it: a producer states completeness only for the region it returns, so a pull of
+    /// one region withdraws nothing it said of another.
+    #[test]
+    fn slots_read_their_own_morsels_through_one_input() {
+        let (mut first, mut second, pulled) = two_slots();
+
+        let one = first.get(keys_between(0, 3));
+        assert_eq!(int_entries(&one), vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+
+        let two = second.get(keys_between(4, 7));
+        assert_eq!(int_entries(&two), vec![(4, 4), (5, 5), (6, 6), (7, 7)]);
+
+        let pulled = pulled.borrow();
+        assert_eq!(pulled[0], keys_between(0, 3));
+        assert_eq!(
+            pulled[1],
+            keys_between(4, 7),
+            "the second pull is the second slot's morsel alone"
+        );
+    }
+
+    /// A slot pulled at `Nothing` before any other asks pulls nothing upstream, and the input
+    /// stays untouched until a slot wants a region.
+    #[test]
+    fn a_slot_that_asks_for_nothing_pulls_nothing() {
+        let (mut first, _second, pulled) = two_slots();
+        let tile = first.get(ints().empty_guard());
+        assert!(int_entries(&tile).is_empty());
+        assert!(pulled.borrow().is_empty());
+    }
+
+    /// A slot that asks for everything after another took a morsel gets everything, and the
+    /// morsel's slot is still answered at its own region afterwards.
+    #[test]
+    fn a_later_universal_pull_reads_everything_and_the_first_slot_keeps_its_region() {
+        let (mut first, mut second, pulled) = two_slots();
+        first.get(keys_between(0, 1));
+        let all = second.get(ints().universal_guard());
+        assert_eq!(int_entries(&all).len(), ROWS as usize);
+        assert_eq!(*pulled.borrow().last().unwrap(), ints().universal_guard());
+
+        let again = first.get(keys_between(0, 1));
+        assert_eq!(int_entries(&again), vec![(0, 0), (1, 1)]);
     }
 }
