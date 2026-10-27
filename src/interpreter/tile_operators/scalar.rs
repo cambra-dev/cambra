@@ -6,7 +6,8 @@ use crate::interpreter::UnionArm;
 use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{
-        BaseType, ColumnValue, Consumer, Extent, FunctionDef, Predicate, Scheduler, Value,
+        BaseType, ColumnValue, Consumer, Extent, FunctionDef, Predicate, Projection, Scheduler,
+        Value,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -347,8 +348,18 @@ impl TileProducer for VariantWrapProducer {
         visit("payload", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut tile = self.input.get(self.input.tiling().universal_guard());
+    /// A payload stream keeps its keys, so the input is pulled at the projection. A payload
+    /// that is itself a collection becomes one union column with no keys, so it is read whole.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let input_guard = match self.tiling().is_data_function() {
+            true => projection.guard(self.input.tiling()),
+            false => self.input.tiling().universal_guard(),
+        };
+        let mut tile = self.input.get(input_guard);
         // **A collection payload is a value only once it is whole.** The arm holds it as one
         // materialized cell, which cannot grow, so a row's cell is emitted once that row's
         // collection is complete and not before. At the outermost level the payload is one
@@ -1414,5 +1425,149 @@ mod projection_tests {
         let mut literal = list_literal();
         let nothing = literal.tiling().empty_guard();
         assert_eq!(literal.get(nothing), literal.tiling().empty_tile());
+    }
+}
+
+/// The variant operators as a `match` over a decision stream uses them: a payload stream is
+/// wrapped into a tagged stream (`commit(w)`), the tags are tested (`variant_is`), and each arm
+/// projects its payload back out (`variant_project`). A worker pulls each at one morsel.
+#[cfg(test)]
+mod variant_projection_tests {
+    use super::*;
+    use crate::ccl::TagMap;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, ints_by_position, keys_between,
+    };
+
+    const ROWS: u64 = 8;
+
+    fn commit() -> FieldKey {
+        FieldKey::Name("commit".into())
+    }
+
+    fn abort() -> FieldKey {
+        FieldKey::Name("abort".into())
+    }
+
+    /// ``{`commit{Int} | `abort}``, the decision a writer's body answers.
+    fn decision_extent() -> Extent {
+        Extent::Union(TagMap::from_arms(vec![
+            (commit(), Extent::Base(BaseType::Int)),
+            (abort(), Extent::Base(BaseType::Unit)),
+        ]))
+    }
+
+    fn decisions_tiling() -> Tiling {
+        Tiling::data_function(Extent::uint_range(ROWS), Tiling::Scalar(decision_extent()))
+    }
+
+    /// `commit(w) for w in ws`: a payload stream wrapped as the `commit` arm.
+    fn wrapped_payloads() -> (VariantWrapProducer, GuardLog) {
+        let payload_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let values: Vec<i64> = (0..ROWS as i64).map(|i| 10 * i).collect();
+        let (payloads, pulled, _) =
+            ProjectionSpy::new(ints_by_position(&values, true), payload_tiling);
+        (
+            VariantWrapProducer {
+                level: CurryLevel::new(1),
+                base: ProducerBase::unowned(VariantWrapProducer::alloc_id(), &decisions_tiling()),
+                input: Box::new(payloads),
+                tag: commit(),
+                variant_extents: TagMap::from_arms(vec![
+                    (commit(), Extent::Base(BaseType::Int)),
+                    (abort(), Extent::Base(BaseType::Unit)),
+                ]),
+            },
+            pulled,
+        )
+    }
+
+    fn keys(tile: &Tile) -> ColumnValue {
+        let Tile::DataFunction { domain, .. } = tile else {
+            panic!("a collection, got {tile:?}")
+        };
+        domain.clone()
+    }
+
+    /// Each row holds a collection, wrapped as one value once it is whole. Row 0's is complete
+    /// and row 1's is still open, so only row 0 is emitted: the arm holds a row's collection
+    /// as one cell that cannot grow. The statement is the input's, which does not name row 1.
+    #[test]
+    fn a_row_whose_collection_is_open_is_not_emitted_or_stated_complete() {
+        let tiling = |outer: u64| {
+            Tiling::data_function(
+                Extent::uint_range(outer),
+                Tiling::data_function(
+                    Extent::uint_range(4),
+                    Tiling::Scalar(Extent::Base(BaseType::Int)),
+                ),
+            )
+        };
+        let rows = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 2],
+                ColumnValue::UInts(vec![0, 1, 0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::exactly(&[Value::UInt(0)]),
+            BitSet::new(),
+        );
+        let (collections, _, _) = ProjectionSpy::new(rows, tiling(2));
+        let out_tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::Scalar(Extent::Union(TagMap::from_arms(vec![(
+                commit(),
+                Extent::Base(BaseType::Int),
+            )]))),
+        );
+        let mut wrap = VariantWrapProducer {
+            level: CurryLevel::new(1),
+            base: ProducerBase::unowned(VariantWrapProducer::alloc_id(), &out_tiling),
+            input: Box::new(collections),
+            tag: commit(),
+            variant_extents: TagMap::from_arms(vec![(commit(), Extent::Base(BaseType::Int))]),
+        };
+        let tile = wrap.get(out_tiling.universal_guard());
+        assert_eq!(keys(&tile), ColumnValue::UInts(vec![0]));
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &tile
+        else {
+            panic!("a collection, got {tile:?}")
+        };
+        assert!(
+            !domain_predicate.contains_path(&[Value::UInt(1)]),
+            "row 1 is withheld, so it is not complete: {domain_predicate:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_payload_stream_is_read_at_the_morsel() {
+        let (mut wrap, pulled) = wrapped_payloads();
+        let morsel = wrap.get(keys_between(2, 4));
+        assert_eq!(keys(&morsel), ColumnValue::UInts(vec![2, 3, 4]));
+        assert_eq!(*pulled.borrow(), [keys_between(2, 4)]);
+    }
+
+    #[test]
+    fn a_wrapped_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 1), keys_between(5, 40)] {
+            assert_conforms(|| Box::new(wrapped_payloads().0), guard);
+        }
+    }
+
+    #[test]
+    fn nothing_wraps_nothing() {
+        let (mut wrap, pulled) = wrapped_payloads();
+        let nothing = wrap.tiling().empty_guard();
+        assert_eq!(wrap.get(nothing), wrap.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 }
