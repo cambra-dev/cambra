@@ -149,6 +149,8 @@ past the `let` keeps the binder's name (`Typing::close_let_type`). Mutability el
 value each read took and makes every opaque `let` transparent
 ([A read is named while inference runs](mutability.md#a-read-is-named-while-inference-runs)).
 
+[dependent-types.md](dependent-types.md) maps the forms that bind inside a type.
+
 `well_scoped::assert_well_scoped` checks the rule in debug builds at every boundary `settle`
 checks, type parameters included, and `infer::debug_assert_no_free_witness` checks witnesses.
 
@@ -522,9 +524,12 @@ durable forms are:
 | `Base`, `UIntRange` | Scalar types and dense finite index domains. |
 | `Fun` | A function `𝐴 ⇒ 𝐵` or data collection `𝐴 ⤇ 𝐵`; an optional named binder scopes over the codomain. |
 | `Tuple`, `Record` | Positional and named products. A record's field names are `Label`s. |
+| `DepTuple` | A dependent tuple, each component's type reading the ones before it ([4.8](type-inference.md#48-dependent-tuples)). |
 | `Variant` | Tagged sum; source tags use `FieldKey::Name`, while anonymous positional sums use `FieldKey::Index`. `Openness` distinguishes a complete tag set from an open requirement. |
 | `Refinement` | A base type restricted by a nonempty set of predicates; construction flattens nested refinements. |
 | `DataSource`, `Txn` | An external source's nominal domain and the transaction sequencing domain. |
+| `Nominal` | An application of a `type` declaration to its type arguments ([nominal-types.md](nominal-types.md)). |
+| `Poly`, `Param` | A polymorphic type over type parameters, and a parameter ([type-parameters.md](type-parameters.md)). |
 | `WitnessRef` | Reference to a dependent-sum witness, inside the sum's own type; realization or erasure replaces it with a candidate. |
 | `WitnessProjection` | `σᵢ(𝑐)`, the `i`th witness of the sum the term `𝑐` holds: how a type outside the sum names it ([Projecting a sum's witness](collections.md#projecting-a-sums-witness)). |
 | `FamilyApp` | A generalized family applied to terms, `𝐷₁(𝑘)`: a type per value of the binders it is applied to ([Generalized types](type-parameters.md#generalized-types)). |

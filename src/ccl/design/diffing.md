@@ -202,7 +202,7 @@ declaration's identity, its module path and name, and its declaration's body: ea
 name and parameter types. Two versions that declare one name with different constructors
 therefore hash differently wherever a value of the type appears.
 
-A function contributes its `FunKind` discriminant. A kind variable additionally contributes its
+A function contributes its `FunKind` discriminant. A funkind variable additionally contributes its
 resolved kind, but not its allocation identity. Sum binders contribute their count, kinds and
 kind children; their IDs extend a witness environment over the domain and codomain. A
 `WitnessRef` found in that environment contributes its innermost-first position.

@@ -59,8 +59,8 @@ particular constraint that reports failure may depend on order. The explicit bou
 later graph traversal are part of how the solver handles this property, but the algorithm
 description alone does not establish it for all inputs.
 
-Function-kind variables are separate from ordinary type inference variables. When two
-function-kind variables meet, `constrain_fun_kind` records their relation on both variables.
+Funkind variables are separate from ordinary type inference variables. When two
+funkind variables meet, `constrain_fun_kind` records their relation on both variables.
 Resolution follows the lower and upper kind relations, avoids revisiting nodes, and joins the
 information encountered (`constrain_fun_kind` in `src/ccl/infer/solver/constrain.rs`;
 `FunKindVar::resolved` in `src/ccl/ty.rs`). Deferring this join matters: copying only the pins known
@@ -2014,6 +2014,10 @@ a non-function. Those cases do not prove that every emission path avoids cyclic 
 
 ## 4.5 Dependent refinements via Pi types
 
+[dependent-types.md](dependent-types.md) maps every dependent form, what binds it and how each is
+eliminated. This section specifies Pi types, how a stored type references a binder, and what happens
+to a type that leaves a binder's scope.
+
 A dependent function's result type can reference its argument. `Type::Fun` records an optional
 term binder in `name`; `(𝑘: 𝐾) ⇒ 𝑉` binds `𝑘` in `𝑉`, not in `𝐾`.
 For a grouping, the collection at key `𝑘` has a domain refined by
@@ -2124,6 +2128,46 @@ the variable that stands for the instance.
 composite at refinement leaves. `RefinementScope` then closes references against the functions
 enclosing that position. Identity transport preserves an unchanged predicate.
 
+#### Discharge is application
+
+A discharge-bearing bound represents applying a dependent type to a term argument. Its substitution
+domain accounts for names permitted in the stored type before that application is forced.
+`Subst::invert` does not invert a discharge; it accepts only injective rename mappings.
+
+Pi indices do not eliminate every name-based transport operation. Live bounds still name
+telescope entries, and the closure bridge still uses `Subst::aligned` and the restricted
+`licensed_correspondence_view` where appropriate. The cases and failure mode are specified under
+[Native bound edges and closure](#native-bound-edges-and-closure).
+
+#### A substitution reaching a variable suspends on it
+
+A substitution `σ` applied to an inference variable `𝛼` denotes `𝛼[σ]`: whatever `𝛼` resolves to,
+with `σ` applied. `Subst::apply_type` cannot compute that while `𝛼` is unresolved, so it returns a
+variable standing for it. The variable `𝛽` carries `𝛼` under `σ` as both its lower and its upper
+bound (`Bound::suspended_on`), so compaction applies `σ` to `𝛼`'s content as it walks to it, the
+way it applies an edge's substitution. `𝛽`'s telescope is `𝛼`'s with `σ`'s domain removed and the
+names `σ`'s range reads added, and it shares `𝛼`'s kind.
+
+A substitution whose binder half names no binder in `𝛼`'s telescope, and which has no witness half,
+leaves `𝛼` unchanged. `𝛼` resolves to types naming its telescope's binders and nothing else
+([The invariant](#the-invariant)), so the binder half acts on none of them. A telescope does not
+list witnesses, so a witness half always suspends. The bound keeps `σ` whole: other bounds have
+their witness half applied when they are stored (`Bound::with_subst`), and here that application is
+`𝛼[σ]` again.
+
+A substitution crossing into a refinement's predicate passes under the refinement's element binder,
+where every element reference it acts on or puts in place is one refinement further out
+([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).
+
+Compaction already applies a substitution to a variable met in a type's structure, by walking the
+variable's bounds under it. A variable met in a type slot of a term the type quotes is different.
+The slot is part of a refinement's predicate, which compaction forces whole
+(`Subst::force_refinement`), and coalescing resolves the slot later, on its own
+(`coalesce_type_predicates`). Without the suspension, `σ` misses what the slot resolves to. A
+dependent type quotes terms whose slots are such variables: a loop's source read at a position, a
+`let`'s definition, a key's projection. Discharging a loop variable into one leaves its slots
+naming the variable once they resolve.
+
 ### Dependent application and reconstruction
 
 `InferCtx::apply` creates a fresh expected binder with `Name::solver_arg`, a domain variable, and
@@ -2142,30 +2186,6 @@ argument constraint, and result discharge. For a dependent recorded function, `d
 opens indexed references at the argument and handles any remaining name-spelled references.
 Checking reconstructs this result instead of starting another inference pass.
 
-A lambda whose parameter occurs in the body's type but not its value can eliminate to the
-Pi-constant form `const(body) : (𝑥: 𝐷) ⇒ body.ty`, where the occurrence is in a refinement on a
-value. `lambda_elim` distinguishes value freedom with `is_free_in_value`; a dependency in a
-refinement still requires the Pi binder. The same situation can arise after pairing and currying
-introduce a parameter for a point-free body.
-
-A lambda eliminates to the Pi-constant form `const(body) : (𝑥: 𝐷) ⇒ body.ty` when its parameter
-occurs in `body.ty` and not in the body's value, and `body.ty` is not a data function whose domain
-reads the parameter. A refinement on a collection's domain is a filter, which determines which
-entries exist
-([A refinement on a collection's domain is data](#a-refinement-on-a-collections-domain-is-data)),
-so a parameter there varies the body as one free in the value does. Neither shape that carries
-such a filter takes the Pi-constant form:
-
-- The body is a lambda whose binder's type reads the parameter, as in
-  `λ r → λ i : {0..3 | 𝑝(r)} → 𝑒`. The nested-lambda rule lifts the refinement onto the pair it
-  forms.
-- A cast inside the body reads the parameter, under a node whose type does not, as in
-  `λ r → cast(λ i → 𝑒, {0..3 | 𝑝(r)} ⤇ Int) ▷ sum : Int`. `lambda_elim` rewrites the cast to
-  `λ i : {0..3 | 𝑝(r)} → 𝑒`, which reduces to the first shape.
-
-A cast that is a lambda's whole body is not rewritten. Its type is `body.ty`, so the cast arm binds
-the parameter there with a Pi, and `groupby`'s partition `λ k → cast(…)` keeps the shape planning's
-group-by recognizer reads.
 
 ### Scoped inference variables: a stored bound closes against a telescope
 
@@ -2292,6 +2312,121 @@ each element index the term reads free (`subst::shift_elems`):
 
 A function made from a predicate names its parameter where the predicate's types read the element
 (`fn_of_bare_predicate` in `src/ccl/planning/predicates.rs`).
+
+### Closing and opening stored binders
+
+A stored type spells a reference to a binder inside it as an index and one to a binder around it as
+a name ([A binder reference is stored in one of two
+forms](#a-binder-reference-is-stored-in-one-of-two-forms)). Construction and compaction close
+references; descent into a function, application and reading a stored predicate open them.
+
+#### Where the conversions run
+
+`PiWalk` implements closing and opening across mixed type and predicate-term structure.
+`close_pi_binder` closes occurrences of one named binder. `open_pi_binder` replaces references
+to the enclosing function with a `Mapping`, leaving references bound inside the codomain intact.
+
+**Construction closes.** `Type::pi`, `pi_kinded`, `pi_eliminated`, and `fun_like` close the
+codomain they construct. Rebuilds such as `emit_cast` and `emit_compose` also close dependent
+results. A codomain carried from another function must first be aligned with its new binder;
+`complete_annotation` does this before filling an annotation from an initializer.
+
+Two direct function constructions have different inputs. `emit_lambda` keeps the live in-solve
+codomain in named form; some of its refinements can still be hidden behind variables.
+`coalesce_compact_go` assembles a function from refinements already closed by compaction.
+Closing indiscriminately at the former site could mix indexed and named versions at one position.
+
+**Compaction and keying close their reads.** `compact_go` and `key_go` force bound substitutions
+and close each predicate under the enclosing `RefinementScope`. Deduplication happens while
+contributions merge, before a final function is assembled, so waiting until materialization is
+too late. `coalesce_type_predicates` closes rebuilt predicates again: resolving their interior
+type slots can expose named references from the live graph after the enclosing type was closed.
+
+**Descent opens.** The function constraint arm opens a closed codomain at its binder's name
+when the reader needs named references. During `LiveSolve`, it does so toward a side whose
+codomain contains inference variables; concrete closed pairs can compare index-to-index.
+`PostPass` derivation opens dependent codomains unconditionally because different passes may
+have produced different stored forms. Unconditionally opening concrete pairs during live solving
+could capture an unrelated free name matching a display spelling.
+
+`open_codomain` is the rebuild entry point used by composition adjacency, lambda elimination's
+application transformer, and the group-by recognizer. The recognizer needs a free key reference
+to match its equality predicate. A missing name on a function whose codomain references it
+is debug-asserted rather than treated as a valid anonymous dependency.
+
+Scope entry accompanies opening. `emit_compose`'s recursive chain walk enters preceding dependent
+function binders before checking following morphisms. Adjacent steps are coupled by that name, so
+a rewrite that splices a nested dependent chain into its enclosing one renames the nested chain's
+last step's binder to the chain's own: `simplify`'s compose flattening does
+(`flatten_compose_arm`). `normalize_annotation` extends the telescope
+for a named function's codomain. Variables minted under either traversal must admit the names the
+opened refinements contain.
+
+**Application opens at the argument.** Replacing Pi indices with an argument term uses the same
+opening walk as replacing them with a name. `discharge_codomain` supplies this operation to
+post-inference application checking. It is not an index-rebasing pass over an arbitrary type.
+
+**Reading a stored predicate as a term opens.** A predicate's subterms carry types, and a reader
+that compiles or checks the predicate builds new function types around them: lambda elimination
+wraps the predicate in `λ __elem → …`, and the checker rebuilds each subterm's type from its
+children. An index those subterm types hold, read in the stored form, lands under the crossings
+the new function types add, where it names another function. Planning's predicate compilation
+therefore runs on a codomain opened at its binder and closes the result
+(`subst::map_opened_codomain`), and the checker visits a type's children opened, with the binders
+they were opened at in scope (`subst::walk_children_opened`). A dependent tuple's components are
+opened at the names of the components before them. Closing leaves a name reference to a function
+inside the closed structure that binds the same name, since that function binds it.
+
+The checker types a predicate at the node whose type slot holds it (`check_slot_predicates`), so
+the predicate's free names resolve against the binders enclosing that node, and a refinement
+nested inside the predicate is typed under the predicate's own binders.
+
+#### Display opens what it descended through
+
+Type display tracks the enclosing function binders and renders Pi references with those names.
+For example, a grouped collection can display as:
+
+```text
+(k: Int) ⤇ ({0..3 | __elem ▷ xs ▷ key == k} ⤇ Int)
+```
+
+`PiRef` also carries a spelling hint for a reference displayed without its enclosing function,
+as in a domain fragment reported by an error. Equality, ordering, and hashing use only the index.
+Two equal references can have different hints and therefore print differently when detached.
+
+Display does not rewrite the stored type into named form. Later passes still construct closed
+functions through the same APIs; closing is not a one-time post-inference conversion.
+
+#### Freshening and `SpecKey`
+
+In a type shaped as `(k: ?K) ⤇ ((i: {?D | __elem ▷ f == #0}) ⤇ ?V)`, the `#0` in the
+inner domain refers to `k`: the inner binder is not in scope in its own domain.
+The same outer reference inside the inner codomain would have index 1.
+
+Freshening preserves these indices and function names while copying eligible inference variables.
+`freshen_refinement_predicate` freshens predicate type slots without renaming its term structure.
+Captured outer names remain names and continue to reference the definition's environment.
+This does not guarantee predicate allocation sharing; the
+[generic-instantiation exception](#one-known-exception-scoped-and-unfixed-generic-instantiation)
+remains.
+
+`SpecKey` closes references under the functions it walks and retains names outside that scope.
+Alpha-variant closed binders therefore need not split otherwise equal keys, while distinct captured
+binders can. Discharges are forced before predicates enter the key, so different arguments can
+remain distinguishable. These are contributions to the full
+[specialization key](#keying-a-specialization), not sufficient conditions for clone reuse alone.
+
+Specialization pins the fresh clone to the use's live instantiation, not merely its preliminary
+materialized type. Closed function sides can open into the clone's named telescope context as
+the relation reaches its variables. Indices themselves are copied unchanged until a binder
+crossing opens them at a name or an application opens them at an argument.
+
+### A type leaving a binder's scope
+
+A type written under a binder can name it, and a position outside the binder cannot. Each binder has
+its own exit: a `let` discharges its definition, a lambda's codomain drops what names its body's
+opaque binders, a contribution to a history is joined or keyed over the binders it crosses, and a
+chain reads each position as its input carried there.
 
 #### `let` binders and scope exit
 
@@ -2535,187 +2670,6 @@ operands were written with (`operation_type`). An application whose result reads
 states `apply`'s type the same way, over the pair of argument and function:
 `(𝑞 : (𝐴, (𝑘 : 𝐴) ⤇ 𝐶(𝑘))) ⇒ 𝐶(𝑞.0)`.
 
-#### Discharge is application
-
-A discharge-bearing bound represents applying a type family to a term argument. Its substitution
-domain accounts for names permitted in the stored type before that application is forced.
-`Subst::invert` does not invert a discharge; it accepts only injective rename mappings.
-
-Pi indices do not eliminate every name-based transport operation. Live bounds still name
-telescope entries, and the closure bridge still uses `Subst::aligned` and the restricted
-`licensed_correspondence_view` where appropriate. The cases and failure mode are specified under
-[Native bound edges and closure](#native-bound-edges-and-closure).
-
-#### A substitution reaching a variable suspends on it
-
-A substitution `σ` applied to an inference variable `𝛼` denotes `𝛼[σ]`: whatever `𝛼` resolves to,
-with `σ` applied. `Subst::apply_type` cannot compute that while `𝛼` is unresolved, so it returns a
-variable standing for it. The variable `𝛽` carries `𝛼` under `σ` as both its lower and its upper
-bound (`Bound::suspended_on`), so compaction applies `σ` to `𝛼`'s content as it walks to it, the
-way it applies an edge's substitution. `𝛽`'s telescope is `𝛼`'s with `σ`'s domain removed and the
-names `σ`'s range reads added, and it shares `𝛼`'s kind.
-
-A substitution whose binder half names no binder in `𝛼`'s telescope, and which has no witness half,
-leaves `𝛼` unchanged. `𝛼` resolves to types naming its telescope's binders and nothing else
-([The invariant](#the-invariant)), so the binder half acts on none of them. A telescope does not
-list witnesses, so a witness half always suspends. The bound keeps `σ` whole: other bounds have
-their witness half applied when they are stored (`Bound::with_subst`), and here that application is
-`𝛼[σ]` again.
-
-A substitution crossing into a refinement's predicate passes under the refinement's element binder,
-where every element reference it acts on or puts in place is one refinement further out
-([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).
-
-Compaction already applies a substitution to a variable met in a type's structure, by walking the
-variable's bounds under it. A variable met in a type slot of a term the type quotes is different.
-The slot is part of a refinement's predicate, which compaction forces whole
-(`Subst::force_refinement`), and coalescing resolves the slot later, on its own
-(`coalesce_type_predicates`). Without the suspension, `σ` misses what the slot resolves to. A
-dependent type quotes terms whose slots are such variables: a loop's source read at a position, a
-`let`'s definition, a key's projection. Discharging a loop variable into one leaves its slots
-naming the variable once they resolve.
-
-#### An elimination reads a sum through a term
-
-`unbox(𝑐)` is typed `(𝑐 : 𝐴) ⇒ 𝐴‹elim(𝑐)›`, `𝐴` a fresh variable stamped data. `elim(𝑐)` is a
-substitution component (`subst::Elim`): `𝐴`'s collection type with each binder `σᵢ` of its sum
-read as `σᵢ(𝑐)`, and the function plain. A plain collection is the sum over no binders, so the
-elimination leaves it unchanged. Which binders a sum has is its funkind's to say, so the type
-names none of them, and nothing is minted before the binders exist.
-
-`Elim::Top(𝑐)` waits for a function and acts on the outermost one it meets:
-
-- a settled sum: its binders are discharged to `σᵢ(𝑐)`, which opens the slot;
-- a function whose funkind is a variable `κ`: the elimination becomes `Elim::Kind(κ, 𝑐)` for the
-  function's parts, which discharges `κ`'s binders once its arity says which they are, and the
-  function is plain;
-- a variable: it suspends. The suspension has a data funkind of its own, because what an
-  elimination leaves is plain whatever the variable turns out to be;
-- anything else is not a collection and is unchanged.
-
-The component is separate from the witness half, so storing a bound does not force it, and it
-acts on type structure only: a quoted term's type slots are what the term says. A chain of
-substitutions keeps its eliminations in order, so a group read out of a sum read out of another
-eliminates both. The solver eliminates on entry to an edge (`eliminate_at`), and a variable arm
-relates an eliminated end's funkind as plain. Compaction applies the kind's binder correspondence
-before the elimination, so every spelling reaching the function is renamed onto the binders the
-elimination discharges (`eliminated_acc`).
-
-`Elim::Kind(κ, 𝑐)` also acts on a binder of a sum a kind edge relates to `κ`, at the same
-position, since such a binder's occurrences reach a part of the function before the
-correspondence renames them (`FunKindVar::binder_position`). A witness rename's target reaches the
-elimination as well: the component acts after the witness half.
-
-A bound recorded on a variable read through `𝑐` is about `𝑣‹elim(𝑐)›`, so its content can name
-`σᵢ(𝑐)`. The variable is a part of a function of kind `κ` and names that function's binders, never
-the witness one value carries. Rendering the bound in the holder's frame therefore reads `σᵢ(𝑐)`
-back as `κ`'s binder `σᵢ` (`Elim::ReadBack`, emitted by `Bound::render_subst` once `κ`'s arity is
-known). The record-time scope check reads it back the same way. An elimination and its read-back
-through one term compose to whichever acts later.
-
-The post-inference check types an `unbox` by its argument's settled sum instead
-([collections.md, "Typing"](collections.md#typing)).
-
-#### Where the conversions run
-
-`PiWalk` implements closing and opening across mixed type and predicate-term structure.
-`close_pi_binder` closes occurrences of one named binder. `open_pi_binder` replaces references
-to the enclosing function with a `Mapping`, leaving references bound inside the codomain intact.
-
-**Construction closes.** `Type::pi`, `pi_kinded`, `pi_eliminated`, and `fun_like` close the
-codomain they construct. Rebuilds such as `emit_cast` and `emit_compose` also close dependent
-results. A codomain carried from another function must first be aligned with its new binder;
-`complete_annotation` does this before filling an annotation from an initializer.
-
-Two direct function constructions have different inputs. `emit_lambda` keeps the live in-solve
-codomain in named form; some of its refinements can still be hidden behind variables.
-`coalesce_compact_go` assembles a function from refinements already closed by compaction.
-Closing indiscriminately at the former site could mix indexed and named versions at one position.
-
-**Compaction and keying close their reads.** `compact_go` and `key_go` force bound substitutions
-and close each predicate under the enclosing `RefinementScope`. Deduplication happens while
-contributions merge, before a final function is assembled, so waiting until materialization is
-too late. `coalesce_type_predicates` closes rebuilt predicates again: resolving their interior
-type slots can expose named references from the live graph after the enclosing type was closed.
-
-**Descent opens.** The function constraint arm opens a closed codomain at its binder's name
-when the reader needs named references. During `LiveSolve`, it does so toward a side whose
-codomain contains inference variables; concrete closed pairs can compare index-to-index.
-`PostPass` derivation opens dependent codomains unconditionally because different passes may
-have produced different stored forms. Unconditionally opening concrete pairs during live solving
-could capture an unrelated free name matching a display spelling.
-
-`open_codomain` is the rebuild entry point used by composition adjacency, lambda elimination's
-application transformer, and the group-by recognizer. The recognizer needs a free key reference
-to match its equality predicate. A missing name on a function whose codomain references it
-is debug-asserted rather than treated as a valid anonymous dependency.
-
-Scope entry accompanies opening. `emit_compose`'s recursive chain walk enters preceding dependent
-function binders before checking following morphisms. Adjacent steps are coupled by that name, so
-a rewrite that splices a nested dependent chain into its enclosing one renames the nested chain's
-last step's binder to the chain's own: `simplify`'s compose flattening does
-(`flatten_compose_arm`). `normalize_annotation` extends the telescope
-for a named function's codomain. Variables minted under either traversal must admit the names the
-opened refinements contain.
-
-**Application opens at the argument.** Replacing Pi indices with an argument term uses the same
-opening walk as replacing them with a name. `discharge_codomain` supplies this operation to
-post-inference application checking. It is not an index-rebasing pass over an arbitrary type.
-
-**Reading a stored predicate as a term opens.** A predicate's subterms carry types, and a reader
-that compiles or checks the predicate builds new function types around them: lambda elimination
-wraps the predicate in `λ __elem → …`, and the checker rebuilds each subterm's type from its
-children. An index those subterm types hold, read in the stored form, lands under the crossings
-the new function types add, where it names another function. Planning's predicate compilation
-therefore runs on a codomain opened at its binder and closes the result
-(`subst::map_opened_codomain`), and the checker visits a type's children opened, with the binders
-they were opened at in scope (`subst::walk_children_opened`). A dependent tuple's components are
-opened at the names of the components before them. Closing leaves a name reference to a function
-inside the closed structure that binds the same name, since that function binds it.
-
-The checker types a predicate at the node whose type slot holds it (`check_slot_predicates`), so
-the predicate's free names resolve against the binders enclosing that node, and a refinement
-nested inside the predicate is typed under the predicate's own binders.
-
-#### Display opens what it descended through
-
-Type display tracks the enclosing function binders and renders Pi references with those names.
-For example, a grouped collection can display as:
-
-```text
-(k: Int) ⤇ ({0..3 | __elem ▷ xs ▷ key == k} ⤇ Int)
-```
-
-`PiRef` also carries a spelling hint for a reference displayed without its enclosing function,
-as in a domain fragment reported by an error. Equality, ordering, and hashing use only the index.
-Two equal references can have different hints and therefore print differently when detached.
-
-Display does not rewrite the stored type into named form. Later passes still construct closed
-functions through the same APIs; closing is not a one-time post-inference conversion.
-
-#### Freshening and `SpecKey`
-
-In a type shaped as `(k: ?K) ⤇ ((i: {?D | __elem ▷ f == #0}) ⤇ ?V)`, the `#0` in the
-inner domain refers to `k`: the inner binder is not in scope in its own domain.
-The same outer reference inside the inner codomain would have index 1.
-
-Freshening preserves these indices and function names while copying eligible inference variables.
-`freshen_refinement_predicate` freshens predicate type slots without renaming its term structure.
-Captured outer names remain names and continue to reference the definition's environment.
-This does not guarantee predicate allocation sharing; the
-[generic-instantiation exception](#one-known-exception-scoped-and-unfixed-generic-instantiation)
-remains.
-
-`SpecKey` closes references under the functions it walks and retains names outside that scope.
-Alpha-variant closed binders therefore need not split otherwise equal keys, while distinct captured
-binders can. Discharges are forced before predicates enter the key, so different arguments can
-remain distinguishable. These are contributions to the full
-[specialization key](#keying-a-specialization), not sufficient conditions for clone reuse alone.
-
-Specialization pins the fresh clone to the use's live instantiation, not merely its preliminary
-materialized type. Closed function sides can open into the clone's named telescope context as
-the relation reaches its variables. Indices themselves are copied unchanged until a binder
-crossing opens them at a name or an application opens them at an argument.
 
 ### Predicate compilation after lambda elimination
 
@@ -2741,12 +2695,12 @@ recognizer ordering and the whole-tree contract pass must remain consistent with
 ## 4.6 Data vs compute functions
 
 `FunKind` distinguishes a data function, which represents a collection, from a compute function,
-which can be called. It also permits an unresolved kind variable that constraints can pin.
+which can be called. It also permits an unresolved funkind variable that constraints can pin.
 Concrete `Data` and `Compute` kinds are not interchangeable through subtyping.
 
 Lowering supplies kinds from constructs. Lists, comprehensions, groupings, and collection union
 are data functions. A lambda or `def` is a compute function, including a generator definition
-whose result is a collection. A function-valued parameter can carry a kind variable until its
+whose result is a collection. A function-valued parameter can carry a funkind variable until its
 argument determines the kind. Inference must preserve those declarations rather than infer kind
 solely from the domain's shape or a later consumer's intent.
 
@@ -3001,13 +2955,54 @@ in its keys ([Compiling a conditional collection](collections.md#compiling-a-con
 It is not a [`Cast`](ir.md#cast--explicit-refinement-acquisition), whose type is derived from its
 value's.
 
+### An elimination reads a sum through a term
+
+`unbox(𝑐)` is typed `(𝑐 : 𝐴) ⇒ 𝐴‹elim(𝑐)›`, `𝐴` a fresh variable stamped data. `elim(𝑐)` is a
+substitution component (`subst::Elim`): `𝐴`'s collection type with each binder `σᵢ` of its sum
+read as `σᵢ(𝑐)`, and the function plain. A plain collection is the sum over no binders, so the
+elimination leaves it unchanged. Which binders a sum has is its funkind's to say, so the type
+names none of them, and nothing is minted before the binders exist.
+
+`Elim::Top(𝑐)` waits for a function and acts on the outermost one it meets:
+
+- a settled sum: its binders are discharged to `σᵢ(𝑐)`, which opens the slot;
+- a function whose funkind is a variable `κ`: the elimination becomes `Elim::Kind(κ, 𝑐)` for the
+  function's parts, which discharges `κ`'s binders once its arity says which they are, and the
+  function is plain;
+- a variable: it suspends. The suspension has a data funkind of its own, because what an
+  elimination leaves is plain whatever the variable turns out to be;
+- anything else is not a collection and is unchanged.
+
+The component is separate from the witness half, so storing a bound does not force it, and it
+acts on type structure only: a quoted term's type slots are what the term says. A chain of
+substitutions keeps its eliminations in order, so a group read out of a sum read out of another
+eliminates both. The solver eliminates on entry to an edge (`eliminate_at`), and a variable arm
+relates an eliminated end's funkind as plain. Compaction applies the kind's binder correspondence
+before the elimination, so every spelling reaching the function is renamed onto the binders the
+elimination discharges (`eliminated_acc`).
+
+`Elim::Kind(κ, 𝑐)` also acts on a binder of a sum a kind edge relates to `κ`, at the same
+position, since such a binder's occurrences reach a part of the function before the
+correspondence renames them (`FunKindVar::binder_position`). A witness rename's target reaches the
+elimination as well: the component acts after the witness half.
+
+A bound recorded on a variable read through `𝑐` is about `𝑣‹elim(𝑐)›`, so its content can name
+`σᵢ(𝑐)`. The variable is a part of a function of kind `κ` and names that function's binders, never
+the witness one value carries. Rendering the bound in the holder's frame therefore reads `σᵢ(𝑐)`
+back as `κ`'s binder `σᵢ` (`Elim::ReadBack`, emitted by `Bound::render_subst` once `κ`'s arity is
+known). The record-time scope check reads it back the same way. An elimination and its read-back
+through one term compose to whichever acts later.
+
+The post-inference check types an `unbox` by its argument's settled sum instead
+([collections.md, "Typing"](collections.md#typing)).
+
 ### Subtyping for sums
 
 The function rule relates sums to sums. It has no implicit introduction or elimination
 between a sum and a plain data function. A mixed boxed/unboxed conditional therefore fails
 instead of silently boxing the plain arm or discarding the boxed arm's witness.
 
-A consumer can accept either form through a function-kind variable. This instantiates the
+A consumer can accept either form through a funkind variable. This instantiates the
 consumer's kind; it does not read a sum as a concrete plain function. See
 [Consuming a sum: pinning the consumer's kind](#consuming-a-sum-pinning-the-consumers-kind).
 
@@ -3043,7 +3038,7 @@ The Fun/Fun arm of `constrain_go` performs these operations:
 4. Check the domain and codomain using that substitution. The codomain also receives
    the ordinary Pi-binder alignment for named functions.
 
-Binder IDs are available for a kind variable once its arity is known, even though it states
+Binder IDs are available for a funkind variable once its arity is known, even though it states
 no candidate kind yet. Using only `sum_binders` for the correspondence would omit the
 consumer's IDs and compare unrelated domain spellings. The rule asserts that each kind
 supplies one ID per known position.
@@ -3053,7 +3048,7 @@ collection sums normally share a witness-independent codomain, the representatio
 enforce that restriction. Omitting the codomain rename would therefore make the rule depend
 on an unchecked invariant.
 
-A kind variable's candidate kind is derived during compaction, not checked prematurely at
+A funkind variable's candidate kind is derived during compaction, not checked prematurely at
 an edge. `var_binder_kind` first follows the collection's source positions where present;
 otherwise it joins lower contributions, falling back to a meet of upper contributions.
 The choice of lower versus upper list determines the operation at either occurrence
@@ -3171,14 +3166,14 @@ its [`KindPin`] and witness arity; this is kind instantiation, not subtyping fro
 to a concrete plain function.
 
 Lowering uses [`FunKind::fresh_data`] where the construct requires data, so a compute
-function is incompatible there. Relations between kind variables propagate requirements;
+function is incompatible there. Relations between funkind variables propagate requirements;
 [`FunKindVar::resolved`] detects conflicting pins across the related component.
 A comprehension records the source kinds it is built over so its result preserves their
 witness positions.
 
 #### A consumer's binders are a scope, not a name
 
-Each consumer kind variable allocates its own binder IDs when its arity becomes known.
+Each consumer funkind variable allocates its own binder IDs when its arity becomes known.
 An edge from a sum renames that sum's references into the consumer's scope. All bounds
 recorded through the edge retain the correspondence.
 
@@ -3191,7 +3186,7 @@ an incomplete candidate set.
 
 The compact function slot supplies the binders under which its domain and codomain
 materialize. It does not discover binder names by reading the final domain. Correspondences
-from related kind variables must therefore be applied before resolving those parts.
+from related funkind variables must therefore be applied before resolving those parts.
 [Materialization](#materialization) specifies the choice among merged IDs and the treatment
 of unbound references.
 
@@ -3207,7 +3202,7 @@ projection paths through products. Updating only the element binder's occurrence
 leave projection slots with stale witness names.
 
 A lookup on a sum emits the same application constraint as other lookups:
-`type(xs) <: (type(i) ⇒ ?r)`, with a kind variable on the demand. The codomain receives
+`type(xs) <: (type(i) ⇒ ?r)`, with a funkind variable on the demand. The codomain receives
 one covariant constraint. The index type and witness reference constrain the domain; any
 unresolved domain comparison must remain valid when the bounds materialize. See
 [Apply is one-way](#apply-is-one-way) and [Data domains are invariant](#data-domains-are-invariant).
@@ -3233,7 +3228,7 @@ candidate lists. Neither equal kinds nor unrelated allocation order establishes 
 ### How a sum flows through the solver
 
 Emission instantiates `box` with fresh variables and witness IDs. Its result can initially
-be `Σ (σ : [?d]). σ ⤇ ?v`. Consumer kind variables acquire binder IDs through their
+be `Σ (σ : [?d]). σ ⤇ ?v`. Consumer funkind variables acquire binder IDs through their
 relations to sums.
 
 Compaction stores both sums and plain functions in the `fun` slot. [`CompactFun::binders`]
@@ -3343,10 +3338,10 @@ for the extent of the assertion.
 
 ### Implementation limits
 
-- Function-kind variables have no generalization level. `freshen_kind_var` copies them
+- Funkind variables have no generalization level. `freshen_kind_var` copies them
   unconditionally, unlike type variables at or below a scheme's cutoff. It copies the
   data stamp, both bound lists and source-kind relations, with fresh binder IDs. A free
-  kind variable therefore does not have the same sharing rule as a free type variable.
+  funkind variable therefore does not have the same sharing rule as a free type variable.
 - Enumerated membership has no disjunctive constraint representation. Unresolved candidate
   equality is limited to matching expressions; property-kind requirements and subtype
   bounds can still be recorded. This does not impose a groundness precondition on joins.
@@ -3378,6 +3373,237 @@ as a specialized singleton. `a_udf_call_arm_joins_through_the_bound_graph` and
 `a_lambda_param_use_falls_back_to_the_param_slot` cover these paths. The general
 materialization procedure remains owned by
 [Coalescing](#coalescing-from-bounds-to-types).
+
+---
+
+## 4.8 Dependent tuples
+
+A dependent tuple `(𝑎 : 𝐴) × 𝐷(𝑎)` is the type of pairs whose second component ranges over a
+type chosen by the first component's value. It is the domain a nested collection has when read
+as one collection: uncurrying the family `(𝑎 : 𝐴) ⇒ (𝐷(𝑎) ⤇ 𝑉)` gives
+`((𝑎 : 𝐴) × 𝐷(𝑎)) ⤇ 𝑉`, and the two are isomorphic only with the dependent tuple on the
+uncurried side. Where `𝐷` does not depend on `𝑎` it is the product `(𝐴, 𝐷)`, and the
+isomorphism is the `curry` and `uncurry` pair the IR already has. The Pi type of
+[4.5](#45-dependent-refinements-via-pi-types) is the curried half; the dependent tuple is the
+uncurried half.
+
+A dependent tuple differs from a sum of [4.7](#47-dependent-sums): a sum's witness is a type
+fixed per collection, while a dependent tuple's first component is a value and each value has its
+own fiber.
+
+### Where a dependent tuple is born
+
+`lambda_elim`'s nested-lambda rule packs two binders into one, so `λ 𝑎 : 𝐴 → λ 𝑏 : 𝐷(𝑎) → body`
+becomes `curry(λ 𝑝 : (𝑎 : 𝐴) × 𝐷(𝑎) → body)` when the inner binder's type still reads `𝑎` after
+the rule lifts the inner binder's filters onto the pair. What still reads it is a membership
+refinement: a group-by under a loop whose key reads the loop's binder has keys
+`{𝐾 | 𝑘 ∈ 𝑀(𝑎)}`. A pair whose second component reads nothing of the first is the `Tuple` it
+always was.
+
+A program cannot write a dependent tuple. Inference introduces one through `uncurry(𝑛)`, which
+flattens a comprehension over several generators ([ir.md, "Several
+generators"](ir.md#several-generators)). Its scheme keys the flattened collection by
+`(𝑘₁ : 𝛼₁) × … × 𝛼ₙ`, each `𝛼ᵢ` a variable standing under `𝑘₁ … 𝑘ᵢ₋₁`, so a generator whose source
+reads an outer element, as in `[x for xs in xss for x in xs]`, keys the result by a tuple whose
+component reads the outer key. The scheme builds the `DepTuple` whether or not a component reads
+an earlier one; compaction collapses it to the plain tuple where none does. The value `𝜈` stands
+under every key binder too, and the result reads it through the flattened tuple's projections,
+`(𝑝 : (𝑘₁ : 𝛼₁) × …) ⤇ 𝜈[𝑘ᵢ ↦ 𝑝.𝑖]`, which emission puts in at each use
+(`schemes::uncurried_value_at_its_tuple`). `channelize` keys a feed under nested loops by a
+dependent tuple when an inner loop's keys depend on an outer loop's value
+([A history's value may depend on its position](#a-historys-value-may-depend-on-its-position)).
+
+### Representation
+
+`Type::DepTuple(Vec<(Option<Name>, Type)>)` is a telescope: each component is a binder in the
+shape of a `Fun`'s, whose scope is the components after it. The name slot is an opening address
+and a display spelling, as `Fun::name` is; it is not part of the type's identity.
+
+A reference to an earlier component is a `Name::PiBound`, and its index counts crossings into a
+binder's scope, of which a function's codomain and the components after a tuple component are
+the two kinds. This widens
+[A binder reference is stored in one of two forms](#a-binder-reference-is-stored-in-one-of-two-forms),
+where an index counts function codomains alone. A reference from component `𝑘` to component `𝑗`
+is index `𝑘 − 1 − 𝑗`, and a reference to a function around the tuple adds `𝑘`. The index of a
+reference in a curried family is the same as in its uncurried domain: in
+`(𝑖 : 𝐴) ⇒ ((𝑗 : 𝐵(𝑖)) ⇒ (𝐶(𝑖, 𝑗) ⤇ 𝑉))`, `𝐶` reaches `𝑗` at 0 and `𝑖` at 1, and in
+`(𝑖 : 𝐴) × (𝑗 : 𝐵(𝑖)) × 𝐶(𝑖, 𝑗)` component 2 does too.
+Uncurrying copies the domains along the chain unchanged.
+
+A telescope displays as `(𝑖 : 𝐴) × (𝑗 : 𝐵(𝑖)) × 𝐶(𝑖, 𝑗)`, one tuple of three components. A
+component that is itself a dependent tuple displays in parentheses,
+`(𝑝 : (𝑎 : 𝐴) × 𝐵(𝑎)) × 𝐶(𝑝.0, 𝑝.1)`, and is a different type.
+
+`Type::dep_tuple` closes the components' references to earlier components' names and returns the
+`Type::Tuple` of the components when none references an earlier one, so a tuple has one spelling.
+A plain tuple's components cross no binder, so the collapse lowers component `𝑘`'s references to
+binders around the tuple by `𝑘` (`subst::tuple_of_components`): uncurrying
+`(𝑥 : Int) ⇒ ((𝑖 : Int) ⇒ {Int | 𝑥})` copies `{Int | #1}` into component 1, and the plain tuple holds
+`{Int | #0}`.
+Nested tuples are not flattened: `(𝐴, (𝐵, 𝐶))` and `(𝐴, 𝐵, 𝐶)` are different types, because a
+key's `.1` is a pair in one and a `𝐵` in the other.
+
+The closing and opening walk (`subst::PiWalk`) walks component `𝑘` at `𝑘` crossings below the
+tuple. Code that only recurses through a tuple treats `DepTuple` as it treats `Tuple`.
+
+### Projection
+
+`𝑝.𝑘` has component `𝑘`'s type opened at `𝑝.0‥𝑝.𝑘−1`, outermost first (`Type::component_type`).
+Opening the outermost binder changes no distance to a binder inside it, and the binders around the
+tuple are already open wherever the tuple is held, so no index shifts. In
+`λ 𝑝 : (𝑎 : Int) × {Int | __elem ∈ keys(𝑎)} → …`, the term `𝑝.1` has type
+`{Int | __elem ∈ keys(𝑝.0)}`. Check mode's projection rule (`emit_proj`) requires a projection's
+codomain to be that type, read with the projection's own binder as `𝑝`.
+
+The nested-lambda rule types `.1` out of the pair it builds as `(𝑝 : 𝑇) ⇒ 𝐷(𝑝.0)`, with the
+pair's own binder as the projection's, as every morphism eliminated from `λ 𝑝 → …` binds it. The
+projection applied to `𝑝` discharges `𝑝` at itself, which `subst::discharge_codomain` answers by
+opening the codomain at the name.
+
+### Flattening
+
+`flatten_domain` reshapes keys, `((𝑖, 𝑗), 𝑘)` into `(𝑖, 𝑗, 𝑘)`. Its type rule takes
+`(𝑝 : (𝑎 : 𝐴) × 𝐵(𝑎)) × 𝐶(𝑝.0, 𝑝.1)` to `(𝑎 : 𝐴) × (𝑏 : 𝐵(𝑎)) × 𝐶(𝑎, 𝑏)`, rewriting `𝐶`'s reads
+of `𝑝.0` and `𝑝.1` into references to the new components. The reshaping is an operation in the
+types as at run time. A feed under several loops takes its flat key (`docs/chl-spec.md`, "8.4
+Feeds are the second form of mutability") from one `uncurry(𝑛)` over its levels instead
+(`feed_nest::flatten_nested_contribution`), as a comprehension over several generators does
+([ir.md, "Several generators"](ir.md#several-generators)).
+
+### Subtyping
+
+Two dependent tuples of one length relate component by component (`constrain_go`). During
+inference a component reads the ones before it by name, as a codomain reads its function's
+binder, so each side's names are aligned onto the other's for the components after them, and a
+side closed to indices opens at its names where the other side holds variables. Compaction keeps
+a dependent tuple in a slot of its own (`CompactType::dep_tuple`), component `𝑘` compacted under
+the binders of the `𝑘` components before it. A plain tuple's components close their references to
+binders around the tuple `𝑘` less deep, so the two slots do not merge, and a position meeting both
+names two shapes. Materialization builds the tuple with `Type::dep_tuple`, which collapses it to
+the plain tuple where no component reads an earlier one. As a collection's domain it is
+invariant, like every domain.
+
+### A refinement on a collection's domain is data
+
+A refinement on a value records a fact about a value already fixed. A refinement on a
+collection's domain decides which entries exist. A body that holds a collection whose domain reads
+a lambda's parameter varies with the parameter, so the body is not constant in it, and the lambda
+belongs to the nested-lambda rule rather than to the Pi-constant form
+([A parameter only the type reads: the Pi-constant form](optimization.md#a-parameter-only-the-type-reads-the-pi-constant-form)). `λ 𝑖 → λ 𝑘 : {Int | 𝑘 ∈ keys(𝑖)} → …`, a
+group-by whose key reads `𝑖`, has such a parameter, as does a comprehension filtered by the
+enclosing binder, `λ 𝑟 → λ 𝑣 : {Int | 𝑣 > 𝑟} → …`.
+
+The collection may sit below the body's own domain. Under `λ 𝑖`, the rows of
+`(𝑗 : 𝐽) ⤇ ({𝐾 | 𝑝(𝑖, 𝑗)} ⤇ 𝑉)` have domains that read `𝑖`, so the rows' entries differ for each
+`𝑖` while the outer domain `𝐽` does not read it. The collections a body holds are its rows, the
+components of a tuple, record or variant, and a history's function.
+
+A compute function's type cannot say whether a collection in its result is one it builds or one
+it takes and returns: the group `λ 𝑔 : 𝐺(𝑘) → (𝑔, 1)` returns its argument, and a loop's writer
+builds the row it feeds. Its term can. A filter defines a collection's domain, as a cast's target
+or, once an enclosing elimination has rewritten the cast, as a refinement on a comprehension's
+binder, so a body that holds one reading the parameter varies with it, inside a compute function
+as anywhere else. A comprehension's binder ranges over the keys of the source it applies it to,
+so the refinements that source's domain carries are restated there rather than built, and only
+the ones beyond them count. A compute lambda's binder type is what it takes, and does not count.
+
+A domain that reads a binder of the body's own type does not vary the body. A group's domain reads
+the group's key, `(𝑘 : 𝐾) ⤇ ({𝐼 | key(𝑒) == 𝑘} ⤇ 𝑉)`, and that family is the Pi-constant
+type the group-by recognizer plans. A collection the body takes as an argument does not vary the
+body either: `sum` over a collection whose domain reads the parameter is the same `sum` for every
+value of it.
+
+### A group-by whose key reads an enclosing binder
+
+The group-by recognizer (`src/ccl/planning/groupby.rs`) buckets a partition
+`{𝐼 | key(𝑒) == 𝑘}` with one `converse`, which needs `key` closed. A key that reads an
+enclosing binder partitions differently for each value of the binder, so lambda elimination reads
+the partition as a filter on the group's elements that reads the enclosing binder, and the
+nested-lambda rule lifts it onto the pair, where planning applies it once per pair. A partition
+that reads the enclosing binder only as the comparand `𝑘` stays the Pi-constant group-by.
+
+### One binder for one value
+
+Two binders that denote one value give every type that reads either two spellings, and types
+compare structurally, so the two spellings disagree.
+
+A lambda applied to a term becomes, after lambda elimination, a pairing `⟨id, 𝑔⟩ ≫ ℎ` whose pair
+`𝑥 = (𝑎, 𝑔(𝑎))` is bound by the dependent projection that starts `ℎ`. The types after the
+projection read `𝑥`. Product β removes the pairing with the projection, so it rewrites `𝑥.0` to
+`𝑎` and `𝑥.1` to `𝑎 ▷ 𝑔` in those types, and declines where the pairing names no binder for `𝑎`
+(`docs/operational-semantics/lowering.md`, "Simplifying expressions").
+
+### Lifting a filter onto the pair
+
+The nested-lambda rule writes a lifted filter over the pair's element, `𝑎 ↦ __elem.0`. A
+refinement nested in the filter's subterm types reads it as `__elem^1.0`, one refinement out
+([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).
+A filter reading `𝑎` where the pair is otherwise not dependent is not lifted: it stays on the
+second component, which makes the pair the dependent tuple `(𝑎 : 𝐴) × {𝐾 | 𝑝(𝑎, ·)}`. Planning
+applies it as `filter_values` over the pair of `𝑎` and the keys (`planning/correlated.rs`,
+`emit_component_filter`). Keys that read `𝑎`, a boxed row's `σ₁(𝑎)`, keep that pair the dependent
+tuple `(𝑎 : 𝐴) × 𝐾(𝑎)`.
+
+### Iterating a dependent tuple
+
+A curried site over a dependent tuple, `curry(𝑔)` with `𝑔 : ((𝑥 : 𝑋) × 𝐷(𝑥)) ⤇ 𝑉`, has no one
+key collection every row shares. Planning writes it `(𝐹, 𝑔) ▷ curry_over`, where
+`𝐹 : (𝑥 : 𝑋) ⇒ (𝐷(𝑥) ⤇ 𝐷(𝑥))` gives each row its keys (`src/ccl/planning/correlated.rs`,
+`keys_family`), and op-conversion pairs each row with its own keys through `strength_over`
+(`src/interpreter/design-operators.md`, "A correlated inner comprehension"). A collection every
+row shares is `𝐹 = const(𝐾)`.
+
+A membership component `{𝐾 | 𝑘 ∈ 𝑀(𝑥)}` has the image of `𝑀(𝑥)` as its keys, so `𝐹` is
+`(λ 𝑥 → 𝑀(𝑥)) ≫ converse ≫ map_domain`, with `𝑀(𝑥)` written in the indexed form a
+comprehension reaches lambda elimination in, `λ 𝑟 → 𝑟 ▷ 𝑠 ▷ 𝑓` for the chain `𝑠 ≫ 𝑓`. The
+first morphism binds `𝑥`, whether or not its codomain reads it, since the keys `map_domain` yields
+are stated at `𝑥`. A witness projection through the row, `σᵢ(𝑡(𝑥))`, has the row's own keys
+([A `for` loop over a sum](collections.md#a-for-loop-over-a-sum)). A second component of any other
+shape, and a tuple of more than two components under one `curry`, are refused.
+
+A domain whose keys are a dependent tuple is enumerated as a family too, where an iteration site
+ranges over it, as a filtered flattening does (`iterate::domain_keys`). The first component's
+keys, composed with the family `𝐹`, flatten with `uncurry(2)` and take their keys as their values
+by `map_domain`. A tuple of more components is the tuple of all but the last, as one component,
+and the last read at that prefix's projections; the pairs this enumerates splice back into one
+tuple through `[0] ▷ flatten_domain`.
+
+A site over a plain pair whose element is read out of a collection the enclosing value carries,
+`(.1, .0 ≫ 𝑝) ▷ zip ≫ apply` for projections `𝑝`, takes that collection's keys per row as well: `𝐹`
+is `𝑝 ≫ map_domain`, the identity's where `𝑝` is empty (`row_collection`). The collection's domain
+is a generalized parameter, bare or a family's application (`Type::generalized_param`), which
+differs per row, so it is matched with the projection's type instantiated at the site's input. A
+body that reads no element names no collection, and the site's own type does: its inner domain, a
+generalized parameter, is the domain of a collection the enclosing value holds, which
+`collection_typed_at` finds through the enclosing value's tuple components. A site whose inner
+domain is a generalized parameter that no such collection has is refused, since enumerating the
+parameter's bound would look each row up at keys it lacks.
+
+### At run time
+
+A dependent tuple's extent bounds its keys component by component (`extent_of`), as a plain
+tuple's does: a component that reads an earlier one does so in which keys it holds, and its bound
+is its kind's. Which keys exist is the data's, so the tuple's entries are a family of collections
+rather than one collection, and planning rewrites a site that ranges over one into a site over
+that family before any operator is built
+([Iterating a dependent tuple](#iterating-a-dependent-tuple)). A
+nested `Tile::DataFunction` already keeps a separate run of keys per row, and `Converse` and
+`MapDomain` act beneath standing levels, each row's collection on its own, which is how a key
+family runs per row.
+
+### Open
+
+- A row typed by a sum and reached through a loop has its own domain as its fiber. The fiber may
+  be the key type refined by membership in that row, with a check-mode rule that a key in
+  `dom(𝑐)` indexes `𝑐`.
+- A dependent tuple as the witness of a `SubtypesOf` kind needs a membership check against the
+  kind's tuple of key types.
+- The projection rule where the projected tuple is a refinement's own element, as in a lifted
+  filter. A nested refinement reads that element as `__elem^1`
+  ([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).
+- A pairing `⟨id, 𝑔⟩ ≫ ℎ` that reaches a type check without product β removing it compares a
+  product against the dependent tuple `ℎ` takes. Typing the pairing at that dependent tuple and
+  comparing types up to projections out of a pairing would accept it.
 
 ---
 
@@ -3866,237 +4092,6 @@ terms it builds, which read it from the `PlanningCtx`, since a term such as `con
 
 ---
 
-## 4.8 Dependent tuples
-
-A dependent tuple `(𝑎 : 𝐴) × 𝐷(𝑎)` is the type of pairs whose second component ranges over a
-type chosen by the first component's value. It is the domain a nested collection has when read
-as one collection: uncurrying the family `(𝑎 : 𝐴) ⇒ (𝐷(𝑎) ⤇ 𝑉)` gives
-`((𝑎 : 𝐴) × 𝐷(𝑎)) ⤇ 𝑉`, and the two are isomorphic only with the dependent tuple on the
-uncurried side. Where `𝐷` does not depend on `𝑎` it is the product `(𝐴, 𝐷)`, and the
-isomorphism is the `curry` and `uncurry` pair the IR already has. The Pi type of
-[4.5](#45-dependent-refinements-via-pi-types) is the curried half; the dependent tuple is the
-uncurried half.
-
-A dependent tuple differs from a sum of [4.7](#47-dependent-sums): a sum's witness is a type
-fixed per collection, while a dependent tuple's first component is a value and each value has its
-own fiber.
-
-### Where a dependent tuple is born
-
-`lambda_elim`'s nested-lambda rule packs two binders into one, so `λ 𝑎 : 𝐴 → λ 𝑏 : 𝐷(𝑎) → body`
-becomes `curry(λ 𝑝 : (𝑎 : 𝐴) × 𝐷(𝑎) → body)` when the inner binder's type still reads `𝑎` after
-the rule lifts the inner binder's filters onto the pair. What still reads it is a membership
-refinement: a group-by under a loop whose key reads the loop's binder has keys
-`{𝐾 | 𝑘 ∈ 𝑀(𝑎)}`. A pair whose second component reads nothing of the first is the `Tuple` it
-always was.
-
-A program cannot write a dependent tuple. Inference introduces one through `uncurry(𝑛)`, which
-flattens a comprehension over several generators ([ir.md, "Several
-generators"](ir.md#several-generators)). Its scheme keys the flattened collection by
-`(𝑘₁ : 𝛼₁) × … × 𝛼ₙ`, each `𝛼ᵢ` a variable standing under `𝑘₁ … 𝑘ᵢ₋₁`, so a generator whose source
-reads an outer element, as in `[x for xs in xss for x in xs]`, keys the result by a tuple whose
-component reads the outer key. The scheme builds the `DepTuple` whether or not a component reads
-an earlier one; compaction collapses it to the plain tuple where none does. The value `𝜈` stands
-under every key binder too, and the result reads it through the flattened tuple's projections,
-`(𝑝 : (𝑘₁ : 𝛼₁) × …) ⤇ 𝜈[𝑘ᵢ ↦ 𝑝.𝑖]`, which emission puts in at each use
-(`schemes::uncurried_value_at_its_tuple`). `channelize` keys a feed under nested loops by a
-dependent tuple when an inner loop's keys depend on an outer loop's value
-([A history's value may depend on its position](#a-historys-value-may-depend-on-its-position)).
-
-### Representation
-
-`Type::DepTuple(Vec<(Option<Name>, Type)>)` is a telescope: each component is a binder in the
-shape of a `Fun`'s, whose scope is the components after it. The name slot is an opening address
-and a display spelling, as `Fun::name` is; it is not part of the type's identity.
-
-A reference to an earlier component is a `Name::PiBound`, and its index counts crossings into a
-binder's scope, of which a function's codomain and the components after a tuple component are
-the two kinds. This widens
-[A binder reference is stored in one of two forms](#a-binder-reference-is-stored-in-one-of-two-forms),
-where an index counts function codomains alone. A reference from component `𝑘` to component `𝑗`
-is index `𝑘 − 1 − 𝑗`, and a reference to a function around the tuple adds `𝑘`. The index of a
-reference in a curried family is the same as in its uncurried domain: in
-`(𝑖 : 𝐴) ⇒ ((𝑗 : 𝐵(𝑖)) ⇒ (𝐶(𝑖, 𝑗) ⤇ 𝑉))`, `𝐶` reaches `𝑗` at 0 and `𝑖` at 1, and in
-`(𝑖 : 𝐴) × (𝑗 : 𝐵(𝑖)) × 𝐶(𝑖, 𝑗)` component 2 does too.
-Uncurrying copies the domains along the chain unchanged.
-
-A telescope displays as `(𝑖 : 𝐴) × (𝑗 : 𝐵(𝑖)) × 𝐶(𝑖, 𝑗)`, one tuple of three components. A
-component that is itself a dependent tuple displays in parentheses,
-`(𝑝 : (𝑎 : 𝐴) × 𝐵(𝑎)) × 𝐶(𝑝.0, 𝑝.1)`, and is a different type.
-
-`Type::dep_tuple` closes the components' references to earlier components' names and returns the
-`Type::Tuple` of the components when none references an earlier one, so a tuple has one spelling.
-A plain tuple's components cross no binder, so the collapse lowers component `𝑘`'s references to
-binders around the tuple by `𝑘` (`subst::tuple_of_components`): uncurrying
-`(𝑥 : Int) ⇒ ((𝑖 : Int) ⇒ {Int | 𝑥})` copies `{Int | #1}` into component 1, and the plain tuple holds
-`{Int | #0}`.
-Nested tuples are not flattened: `(𝐴, (𝐵, 𝐶))` and `(𝐴, 𝐵, 𝐶)` are different types, because a
-key's `.1` is a pair in one and a `𝐵` in the other.
-
-The closing and opening walk (`subst::PiWalk`) walks component `𝑘` at `𝑘` crossings below the
-tuple. Code that only recurses through a tuple treats `DepTuple` as it treats `Tuple`.
-
-### Projection
-
-`𝑝.𝑘` has component `𝑘`'s type opened at `𝑝.0‥𝑝.𝑘−1`, outermost first (`Type::component_type`).
-Opening the outermost binder changes no distance to a binder inside it, and the binders around the
-tuple are already open wherever the tuple is held, so no index shifts. In
-`λ 𝑝 : (𝑎 : Int) × {Int | __elem ∈ keys(𝑎)} → …`, the term `𝑝.1` has type
-`{Int | __elem ∈ keys(𝑝.0)}`. Check mode's projection rule (`emit_proj`) requires a projection's
-codomain to be that type, read with the projection's own binder as `𝑝`.
-
-The nested-lambda rule types `.1` out of the pair it builds as `(𝑝 : 𝑇) ⇒ 𝐷(𝑝.0)`, with the
-pair's own binder as the projection's, as every morphism eliminated from `λ 𝑝 → …` binds it. The
-projection applied to `𝑝` discharges `𝑝` at itself, which `subst::discharge_codomain` answers by
-opening the codomain at the name.
-
-### Flattening
-
-`flatten_domain` reshapes keys, `((𝑖, 𝑗), 𝑘)` into `(𝑖, 𝑗, 𝑘)`. Its type rule takes
-`(𝑝 : (𝑎 : 𝐴) × 𝐵(𝑎)) × 𝐶(𝑝.0, 𝑝.1)` to `(𝑎 : 𝐴) × (𝑏 : 𝐵(𝑎)) × 𝐶(𝑎, 𝑏)`, rewriting `𝐶`'s reads
-of `𝑝.0` and `𝑝.1` into references to the new components. The reshaping is an operation in the
-types as at run time. A feed under several loops takes its flat key (`docs/chl-spec.md`, "8.4
-Feeds are the second form of mutability") from one `uncurry(𝑛)` over its levels instead
-(`feed_nest::flatten_nested_contribution`), as a comprehension over several generators does
-([ir.md, "Several generators"](ir.md#several-generators)).
-
-### Subtyping
-
-Two dependent tuples of one length relate component by component (`constrain_go`). During
-inference a component reads the ones before it by name, as a codomain reads its function's
-binder, so each side's names are aligned onto the other's for the components after them, and a
-side closed to indices opens at its names where the other side holds variables. Compaction keeps
-a dependent tuple in a slot of its own (`CompactType::dep_tuple`), component `𝑘` compacted under
-the binders of the `𝑘` components before it. A plain tuple's components close their references to
-binders around the tuple `𝑘` less deep, so the two slots do not merge, and a position meeting both
-names two shapes. Materialization builds the tuple with `Type::dep_tuple`, which collapses it to
-the plain tuple where no component reads an earlier one. As a collection's domain it is
-invariant, like every domain.
-
-### A refinement on a collection's domain is data
-
-A refinement on a value records a fact about a value already fixed. A refinement on a
-collection's domain decides which entries exist. A body that holds a collection whose domain reads
-a lambda's parameter varies with the parameter, so the body is not constant in it, and the lambda
-belongs to the nested-lambda rule rather than to the Pi-constant form of
-[4.5](#dependent-application-and-reconstruction). `λ 𝑖 → λ 𝑘 : {Int | 𝑘 ∈ keys(𝑖)} → …`, a
-group-by whose key reads `𝑖`, has such a parameter, as does a comprehension filtered by the
-enclosing binder, `λ 𝑟 → λ 𝑣 : {Int | 𝑣 > 𝑟} → …`.
-
-The collection may sit below the body's own domain. Under `λ 𝑖`, the rows of
-`(𝑗 : 𝐽) ⤇ ({𝐾 | 𝑝(𝑖, 𝑗)} ⤇ 𝑉)` have domains that read `𝑖`, so the rows' entries differ for each
-`𝑖` while the outer domain `𝐽` does not read it. The collections a body holds are its rows, the
-components of a tuple, record or variant, and a history's function.
-
-A compute function's type cannot say whether a collection in its result is one it builds or one
-it takes and returns: the group `λ 𝑔 : 𝐺(𝑘) → (𝑔, 1)` returns its argument, and a loop's writer
-builds the row it feeds. Its term can. A filter defines a collection's domain, as a cast's target
-or, once an enclosing elimination has rewritten the cast, as a refinement on a comprehension's
-binder, so a body that holds one reading the parameter varies with it, inside a compute function
-as anywhere else. A comprehension's binder ranges over the keys of the source it applies it to,
-so the refinements that source's domain carries are restated there rather than built, and only
-the ones beyond them count. A compute lambda's binder type is what it takes, and does not count.
-
-A domain that reads a binder of the body's own type does not vary the body. A group's domain reads
-the group's key, `(𝑘 : 𝐾) ⤇ ({𝐼 | key(𝑒) == 𝑘} ⤇ 𝑉)`, and that family is the Pi-constant
-type the group-by recognizer plans. A collection the body takes as an argument does not vary the
-body either: `sum` over a collection whose domain reads the parameter is the same `sum` for every
-value of it.
-
-### A group-by whose key reads an enclosing binder
-
-The group-by recognizer (`src/ccl/planning/groupby.rs`) buckets a partition
-`{𝐼 | key(𝑒) == 𝑘}` with one `converse`, which needs `key` closed. A key that reads an
-enclosing binder partitions differently for each value of the binder, so lambda elimination reads
-the partition as a filter on the group's elements that reads the enclosing binder, and the
-nested-lambda rule lifts it onto the pair, where planning applies it once per pair. A partition
-that reads the enclosing binder only as the comparand `𝑘` stays the Pi-constant group-by.
-
-### One binder for one value
-
-Two binders that denote one value give every type that reads either two spellings, and types
-compare structurally, so the two spellings disagree.
-
-A lambda applied to a term becomes, after lambda elimination, a pairing `⟨id, 𝑔⟩ ≫ ℎ` whose pair
-`𝑥 = (𝑎, 𝑔(𝑎))` is bound by the dependent projection that starts `ℎ`. The types after the
-projection read `𝑥`. Product β removes the pairing with the projection, so it rewrites `𝑥.0` to
-`𝑎` and `𝑥.1` to `𝑎 ▷ 𝑔` in those types, and declines where the pairing names no binder for `𝑎`
-(`docs/operational-semantics/lowering.md`, "Simplifying expressions").
-
-### Lifting a filter onto the pair
-
-The nested-lambda rule writes a lifted filter over the pair's element, `𝑎 ↦ __elem.0`. A
-refinement nested in the filter's subterm types reads it as `__elem^1.0`, one refinement out
-([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).
-A filter reading `𝑎` where the pair is otherwise not dependent is not lifted: it stays on the
-second component, which makes the pair the dependent tuple `(𝑎 : 𝐴) × {𝐾 | 𝑝(𝑎, ·)}`. Planning
-applies it as `filter_values` over the pair of `𝑎` and the keys (`planning/correlated.rs`,
-`emit_component_filter`). Keys that read `𝑎`, a boxed row's `σ₁(𝑎)`, keep that pair the dependent
-tuple `(𝑎 : 𝐴) × 𝐾(𝑎)`.
-
-### Iterating a dependent tuple
-
-A curried site over a dependent tuple, `curry(𝑔)` with `𝑔 : ((𝑥 : 𝑋) × 𝐷(𝑥)) ⤇ 𝑉`, has no one
-key collection every row shares. Planning writes it `(𝐹, 𝑔) ▷ curry_over`, where
-`𝐹 : (𝑥 : 𝑋) ⇒ (𝐷(𝑥) ⤇ 𝐷(𝑥))` gives each row its keys (`src/ccl/planning/correlated.rs`,
-`keys_family`), and op-conversion pairs each row with its own keys through `strength_over`
-(`src/interpreter/design-operators.md`, "A correlated inner comprehension"). A collection every
-row shares is `𝐹 = const(𝐾)`.
-
-A membership component `{𝐾 | 𝑘 ∈ 𝑀(𝑥)}` has the image of `𝑀(𝑥)` as its keys, so `𝐹` is
-`(λ 𝑥 → 𝑀(𝑥)) ≫ converse ≫ map_domain`, with `𝑀(𝑥)` written in the indexed form a
-comprehension reaches lambda elimination in, `λ 𝑟 → 𝑟 ▷ 𝑠 ▷ 𝑓` for the chain `𝑠 ≫ 𝑓`. The
-first morphism binds `𝑥`, whether or not its codomain reads it, since the keys `map_domain` yields
-are stated at `𝑥`. A witness projection through the row, `σᵢ(𝑡(𝑥))`, has the row's own keys
-([A `for` loop over a sum](collections.md#a-for-loop-over-a-sum)). A second component of any other
-shape, and a tuple of more than two components under one `curry`, are refused.
-
-A domain whose keys are a dependent tuple is enumerated as a family too, where an iteration site
-ranges over it, as a filtered flattening does (`iterate::domain_keys`). The first component's
-keys, composed with the family `𝐹`, flatten with `uncurry(2)` and take their keys as their values
-by `map_domain`. A tuple of more components is the tuple of all but the last, as one component,
-and the last read at that prefix's projections; the pairs this enumerates splice back into one
-tuple through `[0] ▷ flatten_domain`.
-
-A site over a plain pair whose element is read out of a collection the enclosing value carries,
-`(.1, .0 ≫ 𝑝) ▷ zip ≫ apply` for projections `𝑝`, takes that collection's keys per row as well: `𝐹`
-is `𝑝 ≫ map_domain`, the identity's where `𝑝` is empty (`row_collection`). The collection's domain
-is a generalized parameter, bare or a family's application (`Type::generalized_param`), which
-differs per row, so it is matched with the projection's type instantiated at the site's input. A
-body that reads no element names no collection, and the site's own type does: its inner domain, a
-generalized parameter, is the domain of a collection the enclosing value holds, which
-`collection_typed_at` finds through the enclosing value's tuple components. A site whose inner
-domain is a generalized parameter that no such collection has is refused, since enumerating the
-parameter's bound would look each row up at keys it lacks.
-
-### At run time
-
-A dependent tuple's extent bounds its keys component by component (`extent_of`), as a plain
-tuple's does: a component that reads an earlier one does so in which keys it holds, and its bound
-is its kind's. Which keys exist is the data's, so the tuple's entries are a family of collections
-rather than one collection, and planning rewrites a site that ranges over one into a site over
-that family before any operator is built
-([Iterating a dependent tuple](#iterating-a-dependent-tuple)). A
-nested `Tile::DataFunction` already keeps a separate run of keys per row, and `Converse` and
-`MapDomain` act beneath standing levels, each row's collection on its own, which is how a key
-family runs per row.
-
-### Open
-
-- A row typed by a sum and reached through a loop has its own domain as its fiber. The fiber may
-  be the key type refined by membership in that row, with a check-mode rule that a key in
-  `dom(𝑐)` indexes `𝑐`.
-- A dependent tuple as the witness of a `SubtypesOf` kind needs a membership check against the
-  kind's tuple of key types.
-- The projection rule where the projected tuple is a refinement's own element, as in a lifted
-  filter. A nested refinement reads that element as `__elem^1`
-  ([A refinement's element is referenced by index](#a-refinements-element-is-referenced-by-index)).
-- A pairing `⟨id, 𝑔⟩ ≫ ℎ` that reaches a type check without product β removing it compares a
-  product against the dependent tuple `ℎ` takes. Typing the pairing at that dependent tuple and
-  comparing types up to projections out of a pairing would accept it.
-
----
-
 ## 5. CCL-specific inference rules
 
 The rules in `infer/emit.rs` describe each CCL node's structural typing. They run in both
@@ -4405,6 +4400,11 @@ These definitions summarize the linked contracts rather than restating their alg
 | Let binding resolution | Resolve a binding and its uses, specializing generalized uses independently. See [Let-polymorphism](#31-let-polymorphism-is-freshening-instantiation). |
 | `InferArena` | Owns inference variables for one run and clears bounds on drop to break reference cycles. See [Variable lifetime](#32-the-inferarena-who-owns-inference-variables). |
 | Pi type | A function type binding a term name in its codomain. See [Dependent refinements](#45-dependent-refinements-via-pi-types). |
+| Dependent tuple | A tuple whose components read the ones before it. See [Dependent tuples](#48-dependent-tuples). |
+| Telescope | The term binders an inference variable may name. See [The invariant](#the-invariant). |
+| Suspension | A variable standing for an unresolved variable under a substitution. See [A substitution reaching a variable suspends on it](#a-substitution-reaching-a-variable-suspends-on-it). |
+| Elimination | Reading a sum through a term, as `unbox` does. See [An elimination reads a sum through a term](#an-elimination-reads-a-sum-through-a-term). |
+| Type kind / funkind | What a witness ranges over (`TypeKind`), and a function's data or compute kind carrying its witnesses (`FunKind`). See [Type kinds](#type-kinds) and [Data vs compute functions](#46-data-vs-compute-functions). |
 | Dependent sum | A data function binding type witnesses for its domain. See [Dependent sums](#47-dependent-sums). |
 | `Subst` / discharge / rename | Substitution over term and witness references; discharge supplies a value/type, while rename aligns binders. See [Substitution](#substitution-and-bound-transport). |
 | Correspondence | Binder alignment supplied by the relation's caller or derived at a function edge. See [Substitution](#substitution-and-bound-transport) and [The Σ rule](#the-σ-rule). |
