@@ -238,8 +238,11 @@ struct MapResultProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     function: Box<dyn TileProducer>,
-    /// Whether each of the input's values is its own key: a one-level stream such as an
-    /// iteration's positions, which the function is then looked up at.
+    /// Whether the data is one level whose values are its keys: the input's
+    /// `result_correlation` is the empty path, as an `IterateExtent`'s is, and its values hold
+    /// no level. Then a `Domain` guard on the data names the keys the function operand is
+    /// looked up at, so the guard reaches the operand and so does the release
+    /// (`src/interpreter/design-parallel.md`, "Projection guards").
     values_are_keys: bool,
     /// The level the arguments stand at.
     level: CurryLevel,
@@ -1301,7 +1304,9 @@ impl TileProducer for MapResultWithSourceProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, ReleaseSpy, TestTileProducer,
+    };
     use bit_set::BitSet;
 
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
@@ -1351,6 +1356,74 @@ mod tests {
             level: CurryLevel::new(1),
         };
         (producer, released, in_tiling)
+    }
+
+    /// `pos ↦ pos` over `0..4` applied to a table over the same keys, as a morsel pipeline's
+    /// first `MapResult` is, with the forwarding switched by `values_are_keys`.
+    fn identity_applied_to_a_table(
+        values_are_keys: bool,
+    ) -> (MapResultProducer, GuardLog, GuardLog) {
+        let keys = Extent::Base(BaseType::UInt);
+        let in_tiling = Tiling::data_function(keys.clone(), Tiling::Scalar(keys.clone()));
+        let fn_tiling =
+            Tiling::data_function(keys.clone(), Tiling::Scalar(Extent::Base(BaseType::Int)));
+        let (function, pulled, released) = ProjectionSpy::new(
+            Tile::data_function(
+                ColumnValue::from_uints(vec![0, 1, 2, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 12, 13]))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            fn_tiling.clone(),
+        );
+        let (input, _, _) = ProjectionSpy::new(
+            Tile::data_function(
+                ColumnValue::from_uints(vec![0, 1, 2, 3]),
+                Box::new(Tile::Scalar(ColumnValue::from_uints(vec![0, 1, 2, 3]))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            in_tiling.clone(),
+        );
+        let producer = MapResultProducer {
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &fn_tiling),
+            input: Box::new(input),
+            function: Box::new(function),
+            values_are_keys,
+            level: CurryLevel::new(1),
+        };
+        (producer, pulled, released)
+    }
+
+    /// When the data's values are its keys, a `Domain` guard on the data is the guard the
+    /// function is pulled at, and a `Domain` release reaches the function.
+    #[test]
+    fn a_domain_guard_reaches_the_function_when_the_data_values_are_its_keys() {
+        let (mut producer, pulled, released) = identity_applied_to_a_table(true);
+        let morsel = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+            Value::UInt(1),
+        )));
+        producer.get(morsel.clone());
+        assert_eq!(pulled.lock_now().as_slice(), std::slice::from_ref(&morsel));
+        producer.release(morsel.clone());
+        assert_eq!(released.lock_now().as_slice(), &[morsel]);
+    }
+
+    /// Otherwise the function is pulled whole and released only with the whole output.
+    #[test]
+    fn a_domain_guard_stops_at_the_data_when_its_values_are_not_its_keys() {
+        let (mut producer, pulled, released) = identity_applied_to_a_table(false);
+        let morsel = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+            Value::UInt(1),
+        )));
+        producer.get(morsel.clone());
+        assert!(
+            pulled.lock_now().iter().all(TileGuard::is_universal),
+            "{:?}",
+            pulled.lock_now()
+        );
+        producer.release(morsel);
+        assert!(released.lock_now().is_empty(), "{:?}", released.lock_now());
     }
 
     /// The function operand is re-read on **every** pull, so it can only be

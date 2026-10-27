@@ -8,6 +8,7 @@ pub mod commit_operator;
 pub mod http_server;
 pub mod operator_conversion;
 pub mod operator_graph;
+pub mod parallel;
 mod producer_releases;
 mod scalar_expr;
 mod scheduler;

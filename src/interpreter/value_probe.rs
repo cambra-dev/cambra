@@ -102,7 +102,7 @@ impl ProbeSlot {
         tile: &Tile,
         obsolete: &TileGuard,
     ) {
-        if let Some(table) = self.0.lock_now().as_mut() {
+        if let Some(table) = self.0.lock_wait().as_mut() {
             table.observe_named(node_id, producer_id, name, tile, obsolete);
         }
     }

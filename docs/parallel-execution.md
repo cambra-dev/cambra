@@ -22,11 +22,10 @@ the database literature are marked as such. The thread-safe handles are implemen
    with `Tile::merge` is the semantics' own rule, not a new one. The breakers are where a merge law
    beyond `⊕` is needed, and that law is the content of the per-operator state model below.
 3. **The projection guard is the morsel.** `TileProducer::get` already takes a projection guard
-   (`design-operators.md`, "The producer protocol"), but every stateless producer binds it as
-   `_projection_guard` and pulls its input at the universal guard. Making stateless producers
-   honor a `Domain` interval guard, restated across levels the way `through_shared_levels` already
-   restates releases, is the enabling change: a worker then pulls one row range of a source through
-   a chain without touching the other workers' ranges, and no second protocol is needed.
+   (`design-operators.md`, "The producer protocol"), and every tile operator restates a `Domain`
+   interval guard for its inputs (`design-operators.md`, "Projection guards"), across levels the
+   way `through_shared_levels` restates releases. A worker then pulls one row range of a source
+   through a chain without touching the other workers' ranges, and no second protocol is needed.
 4. **Partitioning stays out of the guard algebra.** Range partitions are spellable as
    `Predicate::Intervals`; hash partitions are not, and `design-operators.md`, "Guard operations
    are exact" forbids an approximate spelling. Hash partitioning is needed only inside a breaker,
@@ -44,13 +43,14 @@ the database literature are marked as such. The thread-safe handles are implemen
    are `Send`; the handles are `Arc<Mutex<_>>`, `Arc<RwLock<_>>` and atomics
    (`src/interpreter/design-parallel.md`, "Thread-safe handles"). A CCL `Type` is not `Send`, so
    nothing a thread holds stores one.
-7. **A head hands out morsels through a cursor, and the scheduler is a data structure the
-   execution threads pull from.** A source's cursor is the complement of its released predicate;
-   a materialized output's is its unclaimed rows. A worker stays on one pipeline while it has
-   work; a source or a memo offers rows as they arrive, and a partitioned breaker offers its
-   output only when a round's merge has run. A ring of immutable segments at each head, with
-   reference-counted tiles and per-segment reclaim, is an optional refinement
-   ([Optional: a ring of segments at each head](#optional-a-ring-of-segments-at-each-head)).
+7. **A head publishes work packages into a dispatcher, and the execution threads take them from
+   it.** A work package is a pipeline and a morsel guard, never a tile. A source's head publishes
+   each arrival once, as ranges past what it has published, and a materialized output's head
+   publishes its rows; the released predicate governs reclaim, not publication. A worker stays on
+   one pipeline while it has work. A partitioned breaker's head publishes only when a round's merge
+   has run. A ring of immutable segments at each head, with
+   reference-counted tiles and per-segment reclaim, is an optional refinement ([Optional: a ring of
+   segments at each head](#optional-a-ring-of-segments-at-each-head)).
 8. **Recommended shape: thread-confined producer chains per worker, shared state only at the
    breakers.** The chain between two breakers is instantiated once per worker (the protocol already
    permits several subscriptions to one operator through `FanOut` slots), and the breaker is the
@@ -203,7 +203,8 @@ Three programs from `tests/programs`, read off the plans in `planning/join.rs` a
 
 Task parallelism is then: run every pipeline whose delta source has something new, each on its
 own worker, with the breakers as the synchronization points. The notification graph already says
-which pipelines are runnable: a gate set on a breaker's consumer is a runnable pipeline below it.
+which pipelines have work: a gate set on a breaker's consumer is a pipeline below it whose head has
+something to publish.
 
 ## Designs
 
@@ -224,16 +225,15 @@ the graph the inspector reads").
 
 ### The morsel
 
-A morsel is a contiguous row range of the pipeline head, claimed from the head's cursor and
+A morsel is a contiguous row range of the pipeline head, published by the head as a work package and
 named to the chain by a `Domain` interval guard over the range's key bounds at the level the head
-cuts. A source's cursor is the complement of its released predicate; a materialized output's
-cursor is the rows no worker has claimed. A claim advances the cursor by one range, under a short
-lock or as a compare-and-swap on a row index, and the guard is read off the keys at the range's
-ends, which needs the head's domain column sorted at that level. For a flat source it is a range
-of `UIntRange` positions or of source keys. For a pipeline under a standing level (a per-group
-body, a nested loop's rows) the range holds whole enclosing rows and its guard is a qualified
-predicate, because `group_at`, `regroup_beneath` and `per_group` already cut tiles at row
-boundaries.
+cuts. A source's head publishes each arrival once, as ranges past what it has published; a
+materialized output's head publishes its rows. The released predicate governs what the source
+reclaims, not what the head publishes. The guard is read off the keys at the range's ends, which
+needs the head's domain column sorted at that level. For a flat source it is a range of `UIntRange`
+positions or of source keys. For a pipeline under a standing level (a per-group body, a nested
+loop's rows) the range holds whole enclosing rows and its guard is a qualified predicate, because
+`group_at`, `regroup_beneath` and `per_group` already cut tiles at row boundaries.
 
 Size follows the literature (Leis et al., "Morsel-Driven Parallelism", SIGMOD 2014): a few
 thousand to a hundred thousand rows, so one morsel's columns through a chain stay in L2, and small
@@ -284,29 +284,35 @@ predicate union.
 
 ### The scheduler
 
-The scheduler is a data structure, not a thread. `N` execution threads, one per core, pull work
-from it; nothing dispatches to them. Its content is the set of runnable pipelines, each with its
-head's cursor.
+The scheduler is a data structure, not a thread: the dispatcher. `N` execution threads, one per
+core, take work from it; nothing dispatches to them. Its content is, per pipeline, a queue of work
+packages, each a morsel guard, whether the pipeline's head is closed, and how many of its packages
+are taken and not acknowledged; a worker asking for the next package is answered from the pipeline
+it is on while that pipeline has one. A head publishes packages and closes its pipeline
+once it will publish no more; a pipeline is done when it is closed and none of its packages is
+queued or taken. A package carries a guard and never a tile, because the tile is what a worker
+produces by pulling its own chain, and data crosses between operators only through `get`.
 
-**A worker's loop.** Claim the next morsel from the current pipeline's cursor, run the chain on
-it, hand the result to the breaker, release, repeat. A worker leaves its pipeline only when the
-head has no unclaimed rows. The affinity is what keeps the chain's producers, the rows it reads
-and the breaker partial it writes in one cache; moving between pipelines per morsel would evict
-all three. When it moves, it prefers a pipeline whose breaker partial it already holds, then one
-whose head's rows sit on its socket.
+**A worker's loop.** Take the next package, pull the package's pipeline at its guard, hand the
+result to the breaker, release, acknowledge, repeat. A worker leaves its pipeline only when the
+dispatcher holds no package of it. The affinity is what keeps the chain's producers, the rows it
+reads and the breaker partial it writes in one cache; moving between pipelines per morsel would
+evict all three. When it moves, it prefers a pipeline whose breaker partial it already holds, then
+one whose head's rows sit on its socket.
 
 **Partial and whole offering.** A head offers work in one of two ways, by what it is:
 
-- A source or a `Memo` offers rows as they arrive. The scheduler lap's poll appends the arrivals
-  to the source's buffer and marks the pipeline runnable; a memo appends as its own input lands.
-  Work is available before the head is done, which is what lets a pipeline run while its source
-  is live.
+- A source or a `Memo` offers rows as they arrive. The scheduler lap's poll appends the arrivals to
+  the source's buffer and the head publishes them; a memo's head publishes as its own input lands.
+  Work is available before the head is done, which is what lets a pipeline run while its source is
+  live.
 - A breaker that builds partitioned state, `Converse` and `MapAggregate`, offers nothing until a
-  round completes. A round closes when the upstream pipeline has no unclaimed rows and every
-  claimed morsel has been absorbed; the breaker then runs its merge as tasks on the same workers,
-  appends the merged output to its output, and
-  marks the downstream pipeline runnable. Until then the downstream pipeline is not runnable,
-  since a partition cannot be read while its finalize writes it.
+  round completes. A round closes when the upstream pipeline has no queued package, every taken
+  package has been acknowledged, and every worker holding a partial of the round has handed it in:
+  an acknowledgement says the rows are in a worker's partial, not in the shared list. The breaker
+  then runs its merge as tasks on the same workers, appends the merged output to its output, and
+  the downstream head publishes it. Until then the downstream head publishes nothing, since a
+  partition cannot be read while its finalize writes it.
 - A blocking breaker (`ExtractFinal`, `ExtractAggregate`) offers its one value at terminal and
   nothing before.
 
@@ -320,22 +326,25 @@ row that arrives after that belongs to the next round, so a round closes even wh
 keeps delivering.
 
 **Backpressure.** A head whose producer outruns its readers grows without bound. Each head
-carries a limit on unclaimed rows; a source poll stops appending to a head at its limit and the
+carries a limit on queued packages; a source poll stops appending to a head at its limit and the
 arrivals stay in the source's own buffer, and a breaker's round waits to publish into a full
 output. The limit is per head because the retention it governs is per head, and a limit of a few
 morsels per worker keeps the producer one morsel ahead of the readers without holding more.
 
-**Notification.** The notification contract's wake becomes "mark the pipeline runnable". A
-`GatedConsumer`'s gate, one wake per pull, becomes one runnable mark per round or per arrival,
-cleared when a worker claims; the `WakeupQueue` is the runnable set. A sink is pulled by
-whichever worker reaches a runnable pipeline that ends in it, once per lap, as today.
+**Notification.** The notification contract's wake becomes "a head publishes". A
+`GatedConsumer`'s gate, one wake per pull, becomes one publication per round or per arrival, and
+the dispatcher's queues take the `WakeupQueue`'s place. A sink is pulled by whichever worker takes a
+package of a pipeline that ends in it, once per lap, as today.
 
-**No shared write on the hot path.** The words several threads write are the head's cursor and
-the runnable mark per pipeline, each one compare-and-swap. A breaker's thread-local partial is
-written by one worker; a merged table is written by the one worker or task that owns it; a
-head's rows are written by its producer before they are offered and never after. Locks remain
-only at the places the per-breaker models name: the release-guard union on a `Memo` or `FanOut`,
-and `CommitEngine::attempt`.
+**Shared writes per morsel.** The dispatcher's lock is taken three times per morsel: once by the
+head to publish, and twice by the worker, to take and to acknowledge. A `Mutex` with a `Condvar`
+holds the dispatcher's state first. `crossbeam-deque`'s `Injector` with a `Worker` and `Stealer`
+per thread is the candidate lock-free queue (a conjecture, unmeasured); it has no parking wait, no
+closed state and no taken count, so those stay beside it. A breaker's thread-local partial is
+written by one worker; a merged table is written by the one worker or task that owns it; a head's
+rows are written by its producer before they are published and never after. The other locks are
+at the places the per-breaker models name: the release-guard union on a `Memo` or `FanOut`, and
+`CommitEngine::attempt`.
 
 ### Per-breaker state models
 
@@ -403,7 +412,7 @@ instead: each row's inversion is independent.
 
 Phase one of both `MapAggregate` and `Converse` is a thread-local multimap or hash table that no
 other thread reads, and phase two is one merging worker, or one owner per hash range or
-partition, so neither needs a lock or a lock-free structure beyond the head's cursor. The one
+partition, so neither needs a lock or a lock-free structure beyond the dispatcher. The one
 shared object is the list of partials a round combines, appended once per worker per round.
 `Converse` offers its output to the scheduler only when a round's finalize has run
 ([The scheduler](#the-scheduler)): a group whose members sit in several unmerged partials is not
@@ -438,15 +447,15 @@ bodies concurrently. The induction store has one writer per store and is sequent
 positions; its parallelism is across the leaves of `Engines`, one task per enclosing row of a
 nested `Transact`, which is embarrassingly parallel because no row reads another's store.
 
-**`IterateExtent` and the source buffer.** The source hands out morsels as row ranges from its
-cursor; a worker's `IterateExtent` instance renders one range. Release per worker is the range's
-interval, unioned into the source's per-producer released predicate (`ProducerReleases`), which
-`Predicate::Intervals` keeps exact for ranges released out of order. `UIntStreamBuffer` keeps a
-`Vec<SmolStr>` with a `start_idx`; compaction after release stays a prefix trim, so the buffer
-trims to the lowest unreleased position across workers, and a slow morsel holds the prefix. That
-is the same retention rule the fan's intersection imposes today. The optional ring makes the trim
-per segment
-([Optional: a ring of segments at each head](#optional-a-ring-of-segments-at-each-head)).
+**`IterateExtent` and the source buffer.** The source's head publishes morsels as row ranges; a
+worker's `IterateExtent` instance renders the range of the package it took. Release per worker is
+the range's interval, unioned into the source's per-producer released predicate
+(`ProducerReleases`), which `Predicate::Intervals` keeps exact for ranges released out of order.
+`UIntStreamBuffer` keeps a `Vec<SmolStr>` with a `start_idx`; compaction after release stays a
+prefix trim, so the buffer trims to the lowest unreleased position across workers, and a slow morsel
+holds the prefix. That is the same retention rule the fan's intersection imposes today. The optional
+ring makes the trim per segment ([Optional: a ring of segments at each
+head](#optional-a-ring-of-segments-at-each-head)).
 
 **Sinks.** One lock per sink around `data`; or, since a sink is pulled once per pass by one
 worker, keep it thread-confined and leave it.
@@ -575,7 +584,7 @@ short; stealing from the front of another worker's queue rather than the back ke
 ### Optional: a ring of segments at each head
 
 Everything above runs with the heads as they are: a source buffer that trims a released prefix,
-a memo cache and a breaker output held as owned tiles, and a cursor per head handing out row
+a memo cache and a breaker output held as owned tiles, and a head per pipeline publishing row
 ranges. The ring below is a refinement of the heads, not a precondition. It buys two things: a
 tile handed to a worker that references rows instead of copying them, and reclamation at a fixed
 granularity with no guard arithmetic on shared state. It changes `Tile`'s ownership of its
@@ -608,23 +617,21 @@ producer may retain released data, and may not return it, which the per-segment 
 handed-out view enforces without a copy. A finer reclaim, freeing rows inside a segment, would
 need a mutable segment and would cost the sharing above; it is not done.
 
-**A segment is a morsel.** Each segment carries a claim word, and the head's cursor becomes that
-word: a worker claims a segment with one compare-and-swap, with no cursor arithmetic and no guard
-algebra at claim time. The guard that flows down the chain is read off the claimed segment's key
-bounds.
+**A segment is a work package.** The head publishes one package per segment, and the guard that
+flows down the chain is read off the segment's key bounds, with no guard algebra at publication.
 
-**What the ring shares.** No predicate arithmetic runs on shared state. A projection pull reads
-the ring's tail index (an acquire load; the list is append-only with one producer), the claimed
-segment's key bounds (written once at publish), the segment's rows (immutable) and, for a head
-whose keys can stay open after publication, a per-segment completeness word the producer advances
-and a worker reads with one atomic load. The subtraction of released data uses the worker's own
-`obsolete_guard` in its thread-confined `ProducerBase`. Release crosses threads as a per-reader
-"released through segment `k`" counter, one atomic store per morsel; the compaction walk takes
-the minimum over readers, and a partial release inside a segment does not advance it. Where a
-consumer needs the head's whole completeness statement as a `Predicate`, the producer builds it
-and swaps an `Arc` (read-copy-update); readers load it without waiting. The locks that remain are
-off the per-morsel path: the release-guard union on a `Memo` or `FanOut` across its readers,
-taken once per morsel at release, and `CommitEngine::attempt`.
+**What the ring shares.** No predicate arithmetic runs on shared state. A projection pull reads the
+ring's tail index (an acquire load; the list is append-only with one producer), the taken segment's
+key bounds (written once at publish), the segment's rows (immutable) and, for a head whose keys can
+stay open after publication, a per-segment completeness word the producer advances and a worker
+reads with one atomic load. The subtraction of released data uses the worker's own `obsolete_guard`
+in its thread-confined `ProducerBase`. Release crosses threads as a per-reader "released through
+segment `k`" counter, one atomic store per morsel; the compaction walk takes the minimum over
+readers, and a partial release inside a segment does not advance it. Where a consumer needs the
+head's whole completeness statement as a `Predicate`, the producer builds it and swaps an `Arc`
+(read-copy-update); readers load it without waiting. The locks that remain are the dispatcher's,
+three per morsel, the release-guard union on a `Memo` or `FanOut` across its readers, taken once per
+morsel at release, and `CommitEngine::attempt`.
 
 ### The contracts under threads
 
@@ -648,12 +655,12 @@ taken once per morsel at release, and `CommitEngine::attempt`.
 
 ### Failures, probes and output order
 
-- **A panic in a worker fails the run.** Today a panic unwinds the one thread and the process
-  ends. A worker's panic is caught at the task boundary, recorded on the scheduler, and every
-  other worker stops at its next claim; the run then fails with that panic's message. The debug
-  checks (`completeness_violation`, the released-data check, `validate_tile` on merge) run inside
-  workers and fail the run the same way, so a morsel overlap or a withdrawn completion is reported
-  rather than merged.
+- **A panic in a worker fails the run.** Today a panic unwinds the one thread and the process ends.
+  A worker's panic is caught at the task boundary, recorded on the scheduler, and every other worker
+  stops when it next asks the dispatcher for a package; the run then fails with that panic's
+  message. The debug checks (`completeness_violation`, the released-data check, `validate_tile` on
+  merge) run inside workers and fail the run the same way, so a morsel overlap or a withdrawn
+  completion is reported rather than merged.
 - **Probes.** `ProducerBase::probes` writes an observation on every `get` while the inspector is
   attached. Under workers each producer writes from its own thread, so the probe table is either
   one per worker, merged when a frame is published, or behind a lock taken only while a client is
@@ -756,8 +763,10 @@ Ordered so that each step is measurable on its own and none is undone by the nex
 2. **Honor the projection guard in streaming producers.** Every `_projection_guard` becomes a
    restated pull of the input. Test: pulling a chain at two disjoint guards and merging equals
    pulling it at the universal guard. This is the morsel mechanism, exercised single-threaded.
-   In the same step, give `UIntStreamBuffer` a cursor that serves a `Domain` interval, which is
-   the first head that hands out morsels.
+   Landed for every tile operator (`src/interpreter/design-operators.md`, "Projection guards"),
+   and the morsel pipeline cuts a finite `IterateExtent` range and a collection `Constant`
+   (`src/interpreter/design-parallel.md`, "Projection guards"). The `UIntStreamBuffer` is not
+   yet cut by interval.
 3. **The pipeline plan and a chain per worker.** The pass over `OperatorGraph` that classifies
    breakers and emits pipelines, and the cloning of a streaming producer chain per worker,
    exercised single-threaded with two chains over disjoint guards into one breaker.
@@ -765,8 +774,10 @@ Ordered so that each step is measurable on its own and none is undone by the nex
    no per-pull sort). Measurable on `groupby_rollup` scaled up, with the flamegraph tooling in
    `~/.claude/projects/-Users-leon-dev-cambra/viz/`. This is the serial cost that would otherwise
    be parallelized as-is.
-5. **A worker pool and the first breaker.** `Aggregate` over a source: `N` workers each pull a
-   morsel range through their own chain and fold into a per-worker partial; the extract combines.
+5. **A worker pool and the first breaker.** The pool, the dispatcher with a range head, and the sink
+   as the breaker landed for `[x + 1 for x in xs]` over a literal list
+   (`src/interpreter/design-parallel.md`, "The morsel prototype"). Next: `Aggregate` over a source,
+   with `N` workers each folding their morsels into a per-worker partial and the extract combining.
    Measures the chain's scaling with no exchange.
 6. **The grouped fold.** The planning rewrite that fuses `converse(c ≫ key) ≫ map(c ≫ v) ≫
    map_aggregate(kind)` into one fold over `pos ↦ (key, v)`, with thread-local tables and the
@@ -782,6 +793,12 @@ Ordered so that each step is measurable on its own and none is undone by the nex
     or guard arithmetic on release as a cost worth the change to `Tile`'s ownership.
 
 ## Open questions
+
+- What an acknowledgement means once a breaker keeps per-worker partials across rounds: rows
+  absorbed into the breaker's shared state, or a per-worker hand-in step the round waits for. A
+  wait on taken packages, or a head waiting on a full queue, also needs a notify `ack` does not
+  issue today, and a `Condvar` of its own apart from the workers'.
+
 
 - Whether to keep `get` as the only data path once a breaker has an `absorb` entry for upstream
   workers, or to admit a push edge into the protocol. The CLAUDE.md invariant is that data crosses

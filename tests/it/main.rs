@@ -34,6 +34,7 @@ mod inference_variants;
 mod inspector_goldens;
 mod live_keys_readers;
 mod loop_body_binding_cost;
+mod parallel;
 mod predicate_sharing;
 mod predicate_sharing_review;
 // The gallery stays at `tests/programs/`: its `program.cambra` paths are read at run time

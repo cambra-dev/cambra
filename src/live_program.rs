@@ -581,6 +581,13 @@ impl LiveProgram {
         Some((branch.version, &branch.program))
     }
 
+    /// The compiled program behind branch `name`, mutably: what subscribes further chains of
+    /// its `main` output.
+    pub fn program_mut(&mut self, name: &str) -> Option<&mut CompiledProgram> {
+        let at = self.index_of(name).ok()?;
+        Some(&mut self.branches[at].program)
+    }
+
     /// Branch `name`'s `main` output's producer, for a driver to pull.
     pub fn main_producer_mut(&mut self, name: &str) -> Option<&mut Box<dyn TileProducer>> {
         let at = self.index_of(name).ok()?;

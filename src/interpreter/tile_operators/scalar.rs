@@ -1028,6 +1028,48 @@ mod tests {
 
     /// ``VariantProject(`commit)`` narrows to the tag-0 sub-domain (positions 0, 2)
     /// and reads back the arm-0 inner column `[10, 30]`.
+    /// A collection constant pulled at an interval hands out those keys and calls only them
+    /// complete; once they are released, a pull at the next interval states that one.
+    #[test]
+    fn a_collection_constant_hands_out_the_admitted_interval() {
+        use bit_set::BitSet;
+        let keys = Extent::Base(BaseType::UInt);
+        let tiling = Tiling::data_function(keys, Tiling::Scalar(Extent::Base(BaseType::Int)));
+        let table = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2, 3]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 12, 13]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let mut op = Constant::collection(table, tiling.clone());
+        let mut sched = Scheduler::new();
+        let mut producer = op.subscribe(tiling.universal_guard(), Box::new(|| {}), &mut sched);
+        let interval = |first: u64, last: u64| {
+            let at_or_below = |v: u64| Predicate::at_or_below(Value::UInt(v));
+            TileGuard::Function(FunctionGuard::Domain(match first {
+                0 => at_or_below(last),
+                _ => at_or_below(last).minus(&at_or_below(first - 1)),
+            }))
+        };
+        let keys_of = |tile: &Tile| match tile {
+            Tile::DataFunction { domain, .. } => domain.clone(),
+            other => panic!("a collection, got {other:?}"),
+        };
+        let first = producer.get(interval(0, 1));
+        assert_eq!(keys_of(&first), ColumnValue::from_uints(vec![0, 1]));
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &first
+        else {
+            unreachable!()
+        };
+        assert!(domain_predicate.contains(&Value::UInt(1)));
+        assert!(!domain_predicate.contains(&Value::UInt(2)));
+        producer.release(interval(0, 1));
+        let second = producer.get(interval(2, 3));
+        assert_eq!(keys_of(&second), ColumnValue::from_uints(vec![2, 3]));
+    }
+
     #[test]
     fn variant_project_commit_arm() {
         let scrut = Box::new(commit_abort_scrutinee());
