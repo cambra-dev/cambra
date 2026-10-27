@@ -115,25 +115,20 @@ impl UnionOperator {
             );
             codomains[0].clone()
         } else {
-            // Differing arms get merged into one column, so each must fit in one:
-            // a `Scalar`, or a `Record` of them — a compound mutable variable's arms are
-            // the latter and disagree on *layout* (a constructed tuple arrives as
-            // a record of columns, the carried snapshot as one column of record
-            // values), which `flat_merge` reconciles by rebuilding the column at
-            // the declared tiling. A function-tiled arm is what must not pass:
-            // flattening it would declare a scalar column of *functions*, which no
-            // producer can emit. Rejected here, where the shape is known.
+            // Arms whose tilings differ merge into one column at the declared codomain, so
+            // each must fit in one: `Tiling::is_scalar`, a `Scalar` or a `Record` of such
+            // tilings at any depth. A record that `MakeRecord` or a `Zip` builds arrives as a
+            // record of tiles, and a literal list, the map an element-wise chain fuses into,
+            // or a compound mutable variable's carried value as one column of records.
+            // `flat_merge` and `UnionProducer::get_impl` rebuild each arm as one column,
+            // keeping its own record fields. An arm holding a level, an `Aggregation` or a
+            // `Store` has no column to go in, so it is rejected here, where the shape is known.
             for t in &codomains {
-                match t {
-                    Tiling::Scalar(_) => {}
-                    Tiling::Record(fields)
-                        if fields.values().all(|f| matches!(f, Tiling::Scalar(_))) => {}
-                    other => panic!(
-                        "UnionOperator: arms with differing codomains merge into one \
-                         column, so each must be a `Scalar` or a `Record` of them; \
-                         got {other}"
-                    ),
-                }
+                assert!(
+                    t.is_scalar(),
+                    "UnionOperator: arms with differing codomains merge into one column, so \
+                     each must be a `Scalar` or a `Record` of them at any depth; got {t}"
+                );
             }
             Tiling::Scalar(declared_codomain)
         };
@@ -832,11 +827,10 @@ mod tests {
         );
     }
 
-    /// Differing arms merge into one *column*, which is also the only codomain
-    /// shape `UnionProducer` can build. A non-`Scalar` arm is therefore rejected
-    /// here rather than declared as a scalar column of functions — a tile the
-    /// producer cannot emit, and which would have failed at the first `get`
-    /// instead of at graph construction where the shape is known.
+    /// Differing arms merge into one column, which is also the only codomain shape
+    /// `UnionProducer` can build. An arm holding a level is rejected at construction. Declaring
+    /// it a scalar column of functions would describe a tile the producer cannot emit, and the
+    /// program would fail at the first `get`.
     #[test]
     #[should_panic(expected = "arms with differing codomains merge into one column")]
     fn differing_non_scalar_codomains_are_rejected_at_construction() {
@@ -848,6 +842,119 @@ mod tests {
             vec![function_with_codomain(Extent::Base(BaseType::Int)), nested],
             Extent::Base(BaseType::Int),
         );
+    }
+
+    /// `{a: Int, n: {c: Int, d: Int}}`, a record holding a record.
+    fn nested_record() -> Extent {
+        let int = || Extent::Base(BaseType::Int);
+        let inner = Extent::record(HashMap::from([("c".into(), int()), ("d".into(), int())]));
+        Extent::record(HashMap::from([("a".into(), int()), ("n".into(), inner)]))
+    }
+
+    /// The tiling of [`nested_record`] as a record of tiles, field by field.
+    fn nested_record_of_tiles() -> Tiling {
+        let int = || Tiling::Scalar(Extent::Base(BaseType::Int));
+        Tiling::Record(HashMap::from([
+            ("a".into(), int()),
+            (
+                "n".into(),
+                Tiling::Record(HashMap::from([("c".into(), int()), ("d".into(), int())])),
+            ),
+        ]))
+    }
+
+    /// A nested record arrives as a record of tiles from `MakeRecord` or a `Zip`, and as one
+    /// column of records from a literal list or a fused element-wise map. The two layouts hold
+    /// the same values, so the union takes both and declares one column of records.
+    #[test]
+    fn arms_that_lay_out_a_nested_record_differently_merge_into_one_column() {
+        let tiles = Box::new(TilingOnly(Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            nested_record_of_tiles(),
+        ))) as Box<dyn TileOperator>;
+        let op = UnionOperator::new(
+            vec![function_with_codomain(nested_record()), tiles],
+            nested_record(),
+        );
+        assert_eq!(union_codomain(&op), Tiling::Scalar(nested_record()));
+    }
+
+    /// A record holding a level at any depth has no column to go in, so an arm that is one is
+    /// rejected at construction, as a bare level is.
+    #[test]
+    #[should_panic(expected = "arms with differing codomains merge into one column")]
+    fn a_record_holding_a_level_at_any_depth_is_rejected_at_construction() {
+        let int = || Tiling::Scalar(Extent::Base(BaseType::Int));
+        let holding = Tiling::Record(HashMap::from([
+            ("a".into(), int()),
+            (
+                "n".into(),
+                Tiling::Record(HashMap::from([("c".into(), int_function_tiling())])),
+            ),
+        ]));
+        let arm = Box::new(TilingOnly(Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            holding,
+        ))) as Box<dyn TileOperator>;
+        let _ = UnionOperator::new(
+            vec![function_with_codomain(nested_record()), arm],
+            nested_record(),
+        );
+    }
+
+    /// The values of the two layouts merge into one column of records, in key order.
+    #[test]
+    fn flat_merge_restates_a_nested_record_of_tiles_as_a_column() {
+        let ints = |v: &[i64]| ColumnValue::Ints(v.to_vec());
+        let column = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::Scalar(ColumnValue::Records(HashMap::from([
+                ("a".into(), ints(&[1])),
+                (
+                    "n".into(),
+                    ColumnValue::Records(HashMap::from([
+                        ("c".into(), ints(&[2])),
+                        ("d".into(), ints(&[3])),
+                    ])),
+                ),
+            ])))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let tiles = Tile::data_function(
+            ColumnValue::from_uints(vec![1]),
+            Box::new(Tile::record(HashMap::from([
+                ("a".into(), Tile::Scalar(ints(&[4]))),
+                (
+                    "n".into(),
+                    Tile::record(HashMap::from([
+                        ("c".into(), Tile::Scalar(ints(&[5]))),
+                        ("d".into(), Tile::Scalar(ints(&[6]))),
+                    ])),
+                ),
+            ]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let out = flat_merge(
+            vec![tiles, column],
+            &Extent::uint_range(2),
+            &Tiling::Scalar(nested_record()),
+        );
+        let Tile::DataFunction { codomain, .. } = out else {
+            panic!("flat merge yields a Function");
+        };
+        let want = ColumnValue::Records(HashMap::from([
+            ("a".into(), ints(&[1, 4])),
+            (
+                "n".into(),
+                ColumnValue::Records(HashMap::from([
+                    ("c".into(), ints(&[2, 5])),
+                    ("d".into(), ints(&[3, 6])),
+                ])),
+            ),
+        ]));
+        assert_eq!(*codomain, Tile::Scalar(want));
     }
 
     // ── flat_merge: the arms' domains must partition, not overlap ─────────────
