@@ -490,14 +490,15 @@ fn a_bare_groupby_tail_is_driven() {
 // across instead of rebuilding the type as a bare combinator `⇒`.
 #[case(
     "[sum(x) for x in groupby([1,2,3,4], \\y -> y // 2)]",
-    // The final `sum`'s domain is the honest present-key domain — the key type refined
-    // by membership in what this group-by's key morphism produces, rather than the old
-    // imprecise total `Int` (see `src/ccl/design/collections.md`, "`groupby`'s exact
-    // type"). It rides this type annotation only; it is never executed (the group-by
-    // is realized as `converse`), and the compiled tile below is unchanged. The
+    // The sum over each group fuses with the grouping into one fold over the rows
+    // (`src/ccl/planning/grouped_fold.rs`). The result's domain is the honest present-key
+    // domain — the key type refined by membership in what this group-by's key morphism
+    // produces, rather than the old imprecise total `Int` (see
+    // `src/ccl/design/collections.md`, "`groupby`'s exact type"). It rides this type
+    // annotation only; it is never executed, and the compiled tile below is unchanged. The
     // morphism inside it stays **pointful** — planning point-frees the predicates it
     // reifies into a `Restrict`, and this one it never reaches.
-    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:({Int | __elem ▷ (([1, 2, 3, 4] ≫ (λ y : Int → y // 2)) ▷ collection_contains)} ⤇ Int)",
+    "(iterate ≫ ([1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div, [1, 2, 3, 4]) ▷ zip) ▷ group_fold(sum):({Int | __elem ▷ (([1, 2, 3, 4] ≫ (λ y : Int → y // 2)) ▷ collection_contains)} ⤇ Int)",
     Tile::data_function(ColumnValue::Ints(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))), Predicate::True, BitSet::new()))]
 #[case(
     "[x + y for x in [1,2,3] for y in [2,3,4,5] if x == y]",
@@ -724,6 +725,125 @@ fn test_grouping_built_once(#[case] code: &str) {
         ccl.matches("converse").count(),
         1,
         "the grouping should be bucketized once however many uses it has; got:\n{ccl}"
+    );
+}
+
+/// A fold over each group of a group-by plans as one fold over the rows, `group_fold`, with no
+/// `converse`: the key chain's head is an `iterate` (a literal's positions) or the grouped
+/// collection itself (a let-bound one), and a step after the aggregate stays after the fold. See
+/// `src/ccl/planning/grouped_fold.rs`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::over_positions(
+    "[max(g) for g in groupby([x + 1 for x in [1, 2, 3, 4, 5]], \\x -> x // 2)]",
+    "group_fold(max)",
+    Tile::data_function(ColumnValue::Ints(vec![1, 2, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 5, 6]))), Predicate::True, BitSet::new())
+)]
+#[case::over_the_collection(
+    indoc! {r#"
+        sales = [(region="west", amount=100), (region="east", amount=50), (region="west", amount=200)]
+        [sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]
+    "#},
+    "(sales ≫ (.region, .amount) ▷ zip) ▷ group_fold(sum)",
+    Tile::data_function(ColumnValue::Strings(vec!["east".into(), "west".into()]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![50, 300]))), Predicate::True, BitSet::new())
+)]
+// A map literal groups its pairs by key and keeps each group's sole pair, then projects the
+// value: a step after the fold, which stays after it.
+#[case::with_a_step_after(
+    indoc! {r#"
+        m = map([("a", 1), ("b", 2)])
+        [q for q in m]
+    "#},
+    "group_fold(sole) ≫ .1",
+    Tile::data_function(ColumnValue::Strings(vec!["a".into(), "b".into()]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))), Predicate::True, BitSet::new())
+)]
+// The pairs' values are computed tuples, which a `zip` holds as a record of columns.
+#[case::of_computed_tuples(
+    indoc! {r#"
+        m = map([(x, x * 2) for x in [1, 2, 3]])
+        [q for q in m]
+    "#},
+    "group_fold(sole)",
+    Tile::data_function(ColumnValue::Ints(vec![1, 2, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 4, 6]))), Predicate::True, BitSet::new())
+)]
+// The head is an `iterate` narrowed by a `restrict`.
+#[case::over_a_filtered_collection(
+    "[sum(g) for g in groupby([x for x in [1, 2, 3, 4, 5] if x > 2], \\x -> x // 5)]",
+    "group_fold(sum)",
+    Tile::data_function(ColumnValue::Ints(vec![0, 1]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 5]))), Predicate::True, BitSet::new())
+)]
+#[case::over_no_rows(
+    "[sum(g) for g in groupby([x for x in [1, 2] if x > 5], \\x -> x)]",
+    "group_fold(sum)",
+    Tile::data_function(ColumnValue::Ints(vec![]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))), Predicate::True, BitSet::new())
+)]
+fn a_fold_over_each_group_is_one_fold_over_the_rows(
+    #[case] code: &str,
+    #[case] fused: &str,
+    #[case] expected: Tile,
+) {
+    use cambra::ccl::symbolic::symbolic;
+
+    let mut ctx = GlobalContext::default();
+    let (expr, result) = run_pipeline_with_ctx(&mut ctx, code);
+    let ccl = symbolic(&expr);
+    assert!(ccl.contains(fused), "expected `{fused}` in:\n{ccl}");
+    assert!(
+        !ccl.contains("converse"),
+        "no group is materialized:\n{ccl}"
+    );
+    assert_eq!(
+        sort_function_by_domain(result),
+        sort_function_by_domain(expected)
+    );
+}
+
+/// A map literal read in a loop body is a grouping looked up per row: the fold fuses with the
+/// lookup kept before it. The loop's keys still come from a `converse` through `map_domain`,
+/// which reads no group's members. The unfused chain panics in `MapResult` here.
+#[test]
+fn a_fold_looked_up_in_a_loop_body_fuses() {
+    use cambra::ccl::symbolic::symbolic;
+
+    let code = indoc! {r#"
+        acc := 0
+        for i in [1, 2]:
+            for q in map(["a" -> 1, "b" -> 2]):
+                acc := acc + q
+        acc
+    "#};
+    let mut ctx = GlobalContext::default();
+    let (expr, result) = run_pipeline_with_ctx(&mut ctx, code);
+    let ccl = symbolic(&expr);
+    assert!(
+        ccl.contains("▷ group_fold(sole) ≫ .1"),
+        "the map literal fuses:\n{ccl}"
+    );
+    assert_eq!(result, Tile::Scalar(ColumnValue::Ints(vec![6])));
+}
+
+/// A group-by whose fold reads a filtered group keeps its `converse`: the filter drops members
+/// but keeps the group, which a fold over the rows does not see.
+#[test]
+fn a_filtered_group_keeps_its_groups() {
+    use cambra::ccl::symbolic::symbolic;
+
+    let code = "[sum([x for x in g if x > 4]) for g in groupby([1, 5, 2, 6], \\x -> x // 4)]";
+    let mut ctx = GlobalContext::default();
+    let (expr, result) = run_pipeline_with_ctx(&mut ctx, code);
+    let ccl = symbolic(&expr);
+    assert!(
+        ccl.contains("converse") && !ccl.contains("group_fold"),
+        "the filtered fold stays on the groups:\n{ccl}"
+    );
+    assert_eq!(
+        sort_function_by_domain(result),
+        sort_function_by_domain(Tile::data_function(
+            ColumnValue::Ints(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 11]))),
+            Predicate::True,
+            BitSet::new()
+        ))
     );
 }
 

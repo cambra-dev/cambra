@@ -8,7 +8,7 @@ use crate::interpreter::nest_levels;
 use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::AggregateKind,
-    interpreter::{ColumnValue, Consumer, Scheduler, Value},
+    interpreter::{ColumnValue, Consumer, Scheduler, Value, tuple_field},
 };
 
 /// Reduces a `DataFunction` input to a single scalar via an aggregation operation.
@@ -810,6 +810,250 @@ impl TileProducer for MapAggregateProducer {
     }
 }
 
+/// Folds each value of a collection of pairs `𝐼 ⤇ (𝐾, 𝑉)` into the group its key names,
+/// producing `𝐾 ⤇ Aggregation(𝑊)`, which a [`MapExtractAggregate`] reads as it reads a
+/// [`MapAggregate`]'s output.
+///
+/// It is `Converse` followed by `MapAggregate` with no member held: one accumulator per key,
+/// and each input row released once it is folded. Planning mints it for a fold over the
+/// groups of a group-by (`src/ccl/design/optimization.md`, "Grouped folds").
+pub struct GroupedFold {
+    /// Output tiling: `DataFunction { domain: 𝐾, codomain: Aggregation { kind, accumulator } }`.
+    base: OperatorBase,
+    /// The pairs, one level whose values are records of fields `_0` (the key) and `_1` (the
+    /// value).
+    input: Box<dyn TileOperator>,
+    /// The aggregation operation.
+    kind: AggregateKind,
+}
+
+impl GroupedFold {
+    /// A grouped fold of `input`'s pairs with `kind`, or why `input` holds no pairs it folds:
+    /// a collection whose values are pairs that fit in one column each (`Tiling::is_scalar`),
+    /// the value one `kind` folds.
+    pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Result<Self, String> {
+        // A pair tiles as one record column or, as a `zip` builds it, as a record of columns;
+        // either way its extent is the record of the two halves.
+        let pair = match input.tiling() {
+            Tiling::DataFunction { codomain, .. } if codomain.is_scalar() => {
+                match codomain.extent() {
+                    Extent::Record(fields) if fields.len() == 2 => fields
+                        .get(&tuple_field(0))
+                        .cloned()
+                        .zip(fields.get(&tuple_field(1)).cloned()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((key, value)) = pair else {
+            return Err(format!(
+                "a grouped fold reads a collection of pairs held in columns, got {}",
+                input.tiling()
+            ));
+        };
+        let accumulator = kind
+            .output_tiling(&Tiling::Scalar(value.clone()))
+            .ok_or_else(|| format!("cannot apply {kind:?} to values {value}"))?;
+        let tiling = Tiling::DataFunction {
+            domain: key,
+            codomain: Box::new(Tiling::Aggregation {
+                kind,
+                accumulator: Box::new(accumulator),
+            }),
+        };
+        Ok(Self {
+            base: OperatorBase::new(tiling),
+            input,
+            kind,
+        })
+    }
+}
+
+impl TileOperator for GroupedFold {
+    impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("input", &*self.input));
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let input =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        let (extents, accumulator) = folded_shape(self.tiling());
+        let keys = extents
+            .into_iter()
+            .next()
+            .expect("a grouped fold has one level");
+        Box::new(GroupedFoldProducer {
+            base: ProducerBase::new(
+                GroupedFoldProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
+            input,
+            groups: GroupedAccumulators::new(self.kind, accumulator, keys),
+        })
+    }
+}
+
+/// One accumulator per key of a grouped fold, and the rows folded into them.
+pub(crate) struct GroupedAccumulators {
+    kind: AggregateKind,
+    /// The accumulator's tiling, which seeds a key's accumulator.
+    accumulator: Tiling,
+    /// The keys' extent, which the rendered domain column is built at.
+    keys: Extent,
+    /// One accumulator per key folded into.
+    by_key: HashMap<Value, Tile>,
+}
+
+impl GroupedAccumulators {
+    pub(crate) fn new(kind: AggregateKind, accumulator: Tiling, keys: Extent) -> Self {
+        Self {
+            kind,
+            accumulator,
+            keys,
+            by_key: HashMap::new(),
+        }
+    }
+
+    /// Fold each row of `pairs`, a column of `(key, value)` records in either layout
+    /// [`GroupedFold::new`] admits, into its key's accumulator, except a row whose key `skip`
+    /// names.
+    pub(crate) fn fold(&mut self, pairs: Tile, skip: &dyn Fn(&Value) -> bool) {
+        let Some(ColumnValue::Records(mut fields)) = try_scalar_tile_to_column_value(pairs) else {
+            panic!("a grouped fold reads pairs held in columns")
+        };
+        let (Some(keys), Some(values)) = (
+            fields.remove(&tuple_field(0)),
+            fields.remove(&tuple_field(1)),
+        ) else {
+            panic!("a pair has fields `_0` and `_1`")
+        };
+        let mut groups: HashMap<Value, Vec<usize>> = HashMap::new();
+        for row in 0..keys.len() {
+            groups.entry(keys.index_at(row)).or_default().push(row);
+        }
+        for (key, rows) in groups {
+            if skip(&key) {
+                continue;
+            }
+            let column = values.select_indices(rows.iter().copied(), rows.len());
+            let acc = self
+                .by_key
+                .entry(key)
+                .or_insert_with(|| self.kind.initial_accumulator(&self.accumulator));
+            self.kind
+                .accumulate(acc, &Tile::Scalar(column), 0, rows.len());
+        }
+    }
+
+    /// Keep the accumulators whose key `keep` names.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&Value) -> bool) {
+        self.by_key.retain(|key, _| keep(key));
+    }
+
+    /// The cells the accumulators and their keys hold.
+    fn cell_count(&self) -> usize {
+        self.by_key.values().map(|acc| 1 + acc.cell_count()).sum()
+    }
+
+    /// The groups as `𝐾 ⤇ Aggregation`, sorted by key, every group terminal and the domain
+    /// stated decided where `complete`.
+    pub(crate) fn render(&self, complete: bool) -> Tile {
+        let mut entries: Vec<(&Value, &Tile)> = self.by_key.iter().collect();
+        // Sorted so the keys come out in one order whatever the hash order.
+        entries.sort_by(|a, b| compare_paths(std::slice::from_ref(a.0), std::slice::from_ref(b.0)));
+        let mut accumulator = self.accumulator.empty_at_no_rows();
+        for (_, acc) in &entries {
+            accumulator.merge_rows((*acc).clone());
+        }
+        let domain = ColumnValue::from_values(
+            entries.iter().map(|(key, _)| (*key).clone()).collect(),
+            &self.keys,
+        );
+        Tile::data_function(
+            domain,
+            Box::new(Tile::Aggregation {
+                kind: self.kind,
+                accumulator: Box::new(accumulator),
+                terminal: ColumnValue::Bools(vec![complete; entries.len()]),
+            }),
+            if complete {
+                Predicate::True
+            } else {
+                Predicate::False
+            },
+            BitSet::new(),
+        )
+    }
+}
+
+/// Producer for [`GroupedFold`].
+struct GroupedFoldProducer {
+    base: ProducerBase,
+    input: Box<dyn TileProducer>,
+    /// The accumulators of the keys not released.
+    groups: GroupedAccumulators,
+}
+
+impl TileProducer for GroupedFoldProducer {
+    fn state_info(&self) -> ProducerStateInfo {
+        ProducerStateInfo::holding(self.groups.cell_count())
+    }
+
+    impl_producer_base!();
+
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let mut input_tile = self.input.get(self.input.tiling().universal_guard());
+        trace!("{} received {input_tile:?}", self.name());
+        let received = input_tile.to_guard();
+        input_tile.compact();
+        let Tile::DataFunction { codomain, .. } = input_tile else {
+            panic!("a grouped fold reads a collection, got {input_tile:?}")
+        };
+        // A row arriving for a released group is dropped: the consumer has let the group go,
+        // and folding it would put the key back.
+        let released = &self.base.obsolete_guard;
+        self.groups.fold(*codomain, &|key| {
+            released.covers_path(std::slice::from_ref(key))
+        });
+        // Every row received is now in an accumulator, so the input may reclaim it.
+        self.input.release(received);
+        // Every row is folded once the input's release is universal, which is the test
+        // `Aggregate` makes: each delivery is released as it is folded, so what the input has
+        // released is what has been folded, and the release covers a row only once it is
+        // decided.
+        self.groups
+            .render(self.input.obsolete_guard().is_universal())
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        if obsolete_guard.is_universal() {
+            self.groups.retain(|_| false);
+            self.input.release(self.input.tiling().universal_guard());
+            return;
+        }
+        // The input's rows were released as they were folded, so a released group holds
+        // nothing upstream: dropping its accumulator is the whole release. A guard naming
+        // part of a group's aggregation releases no accumulator, as in `MapAggregate`.
+        self.groups
+            .retain(|key| !obsolete_guard.covers_path(std::slice::from_ref(key)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,6 +1398,237 @@ mod tests {
             domain_predicate.contains_path(&[Value::UInt(0), Value::UInt(0)]),
             "the input settles (0, 0) at this level, and the output says nothing: \
              {domain_predicate:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod grouped_fold_tests {
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+    use super::*;
+    use crate::interpreter::{BaseType, Extent, Predicate, Tile};
+
+    /// A producer answering `tiles` in turn, one per pull, and recording each release.
+    struct Script {
+        base: ProducerBase,
+        tiles: VecDeque<Tile>,
+        released: Rc<RefCell<Vec<TileGuard>>>,
+    }
+
+    impl TileProducer for Script {
+        impl_producer_base!();
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            self.tiles
+                .pop_front()
+                .unwrap_or_else(|| self.tiling().empty_tile())
+        }
+
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            self.released.borrow_mut().push(obsolete_guard);
+        }
+    }
+
+    fn pair_tiling() -> Tiling {
+        Tiling::DataFunction {
+            domain: Extent::uint_range(8),
+            codomain: Box::new(Tiling::Record(HashMap::from([
+                (
+                    tuple_field(0),
+                    Tiling::Scalar(Extent::Base(BaseType::String)),
+                ),
+                (tuple_field(1), Tiling::Scalar(Extent::Base(BaseType::Int))),
+            ]))),
+        }
+    }
+
+    /// The pairs `(key, value)` at `positions`, stating `predicate` over the positions.
+    fn pairs(positions: Vec<u64>, rows: &[(&str, i64)], predicate: Predicate) -> Tile {
+        Tile::data_function(
+            ColumnValue::from_uints(positions),
+            Box::new(Tile::Record {
+                fields: HashMap::from([
+                    (
+                        tuple_field(0),
+                        Tile::Scalar(ColumnValue::Strings(
+                            rows.iter().map(|(key, _)| (*key).into()).collect(),
+                        )),
+                    ),
+                    (
+                        tuple_field(1),
+                        Tile::Scalar(ColumnValue::Ints(
+                            rows.iter().map(|(_, value)| *value).collect(),
+                        )),
+                    ),
+                ]),
+                absent: HashMap::new(),
+            }),
+            predicate,
+            BitSet::new(),
+        )
+    }
+
+    /// A summing [`GroupedFoldProducer`] over `tiles`, and the releases its input receives.
+    fn summing(tiles: Vec<Tile>) -> (GroupedFoldProducer, Rc<RefCell<Vec<TileGuard>>>) {
+        let released = Rc::new(RefCell::new(Vec::new()));
+        let input = Script {
+            base: ProducerBase::unowned(Script::alloc_id(), &pair_tiling()),
+            tiles: tiles.into(),
+            released: released.clone(),
+        };
+        let accumulator = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::DataFunction {
+            domain: Extent::Base(BaseType::String),
+            codomain: Box::new(Tiling::Aggregation {
+                kind: AggregateKind::Sum,
+                accumulator: Box::new(accumulator.clone()),
+            }),
+        };
+        let producer = GroupedFoldProducer {
+            base: ProducerBase::unowned(GroupedFoldProducer::alloc_id(), &tiling),
+            input: Box::new(input),
+            groups: GroupedAccumulators::new(
+                AggregateKind::Sum,
+                accumulator,
+                Extent::Base(BaseType::String),
+            ),
+        };
+        (producer, released)
+    }
+
+    /// The output's keys, sums and terminal flags.
+    fn groups(tile: &Tile) -> (Vec<Value>, Vec<i64>, Vec<bool>) {
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("a collection, got {tile:?}")
+        };
+        let Tile::Aggregation {
+            accumulator,
+            terminal: ColumnValue::Bools(terminal),
+            ..
+        } = codomain.as_ref()
+        else {
+            panic!("aggregations, got {tile:?}")
+        };
+        let Tile::Scalar(ColumnValue::Ints(sums)) = accumulator.as_ref() else {
+            panic!("integer sums, got {tile:?}")
+        };
+        let keys = (0..domain.len()).map(|row| domain.index_at(row)).collect();
+        (keys, sums.clone(), terminal.clone())
+    }
+
+    fn key(name: &str) -> Value {
+        Value::String(name.into())
+    }
+
+    /// Rows fold under their keys as they arrive, each delivery is released once folded, and
+    /// the groups settle once the input's release covers its whole domain.
+    #[test]
+    fn rows_fold_under_their_keys_and_settle_with_the_input() {
+        let (mut fold, released) = summing(vec![
+            pairs(vec![0, 1], &[("a", 1), ("b", 2)], Predicate::False),
+            pairs(vec![2], &[("a", 3)], Predicate::True),
+        ]);
+        let guard = fold.tiling().universal_guard();
+        let first = fold.get(guard.clone());
+        assert_eq!(
+            groups(&first),
+            (vec![key("a"), key("b")], vec![1, 2], vec![false, false]),
+            "no group settles while rows of any key can still arrive"
+        );
+        assert_eq!(released.borrow().len(), 1, "the first delivery is released");
+        let second = fold.get(guard);
+        assert_eq!(
+            groups(&second),
+            (vec![key("a"), key("b")], vec![4, 2], vec![true, true])
+        );
+        assert!(
+            fold.input.obsolete_guard().is_universal(),
+            "every delivery is released, so the whole domain is"
+        );
+    }
+
+    /// A pair held as one record column, its value itself a tuple, folds as a record of
+    /// columns does: `Sole` keeps each key's one tuple.
+    #[test]
+    fn pairs_in_one_record_column_fold_alike() {
+        let tuple = |a: i64, b: i64| {
+            Value::Record(
+                [
+                    (tuple_field(0), Value::Int(a)),
+                    (tuple_field(1), Value::Int(b)),
+                ]
+                .into_iter()
+                .collect(),
+            )
+        };
+        let value_extent = Extent::Record(HashMap::from([
+            (tuple_field(0), Extent::Base(BaseType::Int)),
+            (tuple_field(1), Extent::Base(BaseType::Int)),
+        ]));
+        let pair_extent = Extent::Record(HashMap::from([
+            (tuple_field(0), Extent::Base(BaseType::String)),
+            (tuple_field(1), value_extent.clone()),
+        ]));
+        let pair = |k: &str, v: Value| {
+            Value::Record(
+                [(tuple_field(0), key(k)), (tuple_field(1), v)]
+                    .into_iter()
+                    .collect(),
+            )
+        };
+        let pairs = Tile::Scalar(ColumnValue::from_values(
+            vec![pair("a", tuple(1, 2)), pair("b", tuple(3, 4))],
+            &pair_extent,
+        ));
+        let mut groups = GroupedAccumulators::new(
+            AggregateKind::Sole,
+            Tiling::Scalar(value_extent.clone()),
+            Extent::Base(BaseType::String),
+        );
+        groups.fold(pairs, &|_| false);
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = groups.render(true)
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(domain, ColumnValue::Strings(vec!["a".into(), "b".into()]));
+        let Tile::Aggregation { accumulator, .. } = *codomain else {
+            panic!("aggregations")
+        };
+        assert_eq!(
+            *accumulator,
+            Tile::Scalar(ColumnValue::from_values(
+                vec![tuple(1, 2), tuple(3, 4)],
+                &value_extent
+            ))
+        );
+    }
+
+    /// A released group is dropped, and a row arriving for it later is not folded back in.
+    #[test]
+    fn a_released_group_stays_released() {
+        let (mut fold, released) = summing(vec![
+            pairs(vec![0, 1], &[("a", 1), ("b", 2)], Predicate::False),
+            pairs(vec![2, 3], &[("a", 5), ("b", 7)], Predicate::False),
+        ]);
+        let guard = fold.tiling().universal_guard();
+        fold.get(guard.clone());
+        fold.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(key("a")),
+        )));
+        assert_eq!(
+            groups(&fold.get(guard)),
+            (vec![key("b")], vec![9], vec![false])
+        );
+        fold.release(fold.tiling().universal_guard());
+        assert!(
+            released.borrow().iter().any(TileGuard::is_universal),
+            "a universal release reaches the input, which may still hold rows"
         );
     }
 }

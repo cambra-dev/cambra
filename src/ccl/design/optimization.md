@@ -266,7 +266,8 @@ engine during operator conversion. `planning::run` then performs these rewrites 
 7. Insert `map(filter_values(𝑞))` for supported refinements on inner, per-group collections, and
    refuse a narrowing none materializes (`reject_unmaterialized_narrowings`).
 8. Simplify the planned expression again.
-9. Prune projections: push the leaves each source's chain reads into the source.
+9. Fuse each fold over the groups of a group-by into one fold over the rows (`group_fold`).
+10. Prune projections: push the leaves each source's chain reads into the source.
 
 Constant folding evaluates supported operations through the runtime's `src/scalar_ops.rs` kernel
 on one-element columns. `src/ccl/planning/const_fold.rs` defines which expressions are excluded;
@@ -344,6 +345,41 @@ groups them with `converse`, and maps the value function over each group. The gr
 the key-dependent refined domain, so a later aggregate sees only its members. If the
 pointful shape does not match, the site retains ordinary iteration and restriction.
 
+### Grouped folds
+
+`fuse_grouped_folds` (`ccl/planning/grouped_fold.rs`) rewrites a fold over each group of a
+group-by into one fold over the rows. The chain the keyed-aggregate rewrite and a per-group
+aggregate produce together, `𝑘 ▷ converse ≫ 𝑐 ▷ map ≫ 𝑣₂ ▷ map ≫ … ≫ 𝑎`, becomes
+`(𝐻 ≫ (𝐾, 𝑉) ▷ zip) ▷ group_fold(𝑎)`, where the key chain `𝑘` is `𝐻 ≫ 𝐾`. `𝑉` reads a row's
+value from what `𝐻` yields at it:
+
+- `𝐻` is an `iterate`, with or without `restrict`s, and yields the row's position: `𝑉` is
+  `𝑐 ≫ 𝑣₂ ≫ … ≫ 𝑣ₙ`. `𝐾` and `𝑐` start with the same lookup, and `𝑐`'s later steps keep every
+  key, so a row has a key exactly where it has a value and no group the `converse` made is lost.
+- `𝐻` is `𝑐`, a let-bound collection, and yields the row's element: `𝑉` is `𝑣₂ ≫ … ≫ 𝑣ₙ`.
+
+`group_fold(𝑎)` compiles to a `GroupedFold` read by a `MapExtractAggregate`, so no group's members
+are held. What precedes the `converse` in its composition looks each group up by key, and what
+follows `𝑎` applies to each group's result: a map literal plans as `… ≫ sole ≫ .1`. Both stay
+around the fold. The rewrite declines:
+
+- any other head, or an `iterate` head whose key chain and `𝑐` do not start with one lookup;
+- a step that does not keep the group's keys (`preserves_domain`). A `filter_values` from a
+  per-group filter is one: it keeps a group whose members it drops, which a fold over the rows
+  never sees;
+- a key or value whose type is not a base type, a variant of such payloads, or a tuple or
+  record of such, the types `GroupedFold` holds in columns;
+- a per-group step around the aggregate, such as `min(𝑔) * 10`, which planning emits as a `zip`
+  around `min` rather than as a step after it.
+
+Every fold in a composition fuses, one after another.
+
+A grouping bound to a name and read by several folds keeps its `converse`: each fold's chain
+starts at the name, not at the `converse`.
+
+`group_fold` has no inference scheme. The post-planning check holds its stamped type to the rule
+`(𝐼 ⤇ (𝐾, 𝑉)) ⇒ (𝐾′ ⤇ 𝑊)` (`check_group_fold` in `src/ccl/infer/check.rs`).
+
 ### Iteration-Site Marking (`insert_iterate_markers`)
 
 `insert_iterate_markers` visits positions that operator conversion compiles with no
@@ -400,11 +436,12 @@ term like any other.
 
 Planning runs one list of phases, `PlanningPhase`: conditional realization, group-by recognition,
 correlated filters, `simplify`, correlated pairing, constant folding, the iteration walk, predicate
-compilation (`compile_refinement_predicates`), per-group filters, and a last `simplify`. The
-program runs every phase (`run`). A term lifted into the tree during one of them runs, where it is
-lifted, the phases the tree ran before it, since those phases do not rewrite inside a predicate
-while the term sits in one; the tree runs every later phase on it. Whether the lifting phase also
-runs at the lift depends on the order its walk rewrites in (`PlanningPhase::reaches_its_lifts`):
+compilation (`compile_refinement_predicates`), per-group filters, a last `simplify`, and
+grouped-fold fusion. The program runs every phase (`run`). A term lifted into the tree during one
+of them runs, where it is lifted, the phases the tree ran before it, since those phases do not
+rewrite inside a predicate while the term sits in one; the tree runs every later phase on it.
+Whether the lifting phase also runs at the lift depends on the order its walk rewrites in
+(`PlanningPhase::reaches_its_lifts`):
 
 - A top-down phase rewrites a node and then descends into what it built, so its own walk reaches
   the term. Realization's gates, a group-by key, a correlated pair's filter, and a dependent

@@ -373,6 +373,11 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Atom, format!("variant_wrap(`{tag})"))
         }
 
+        TypedExprNode::Builtin(Builtin::GroupFold(kind)) => (
+            Precedence::Atom,
+            format!("group_fold({})", Builtin::for_aggregate(*kind).name()),
+        ),
+
         TypedExprNode::Builtin(Builtin::VariantIs(tag)) => {
             (Precedence::Atom, format!("variant_is(`{tag})"))
         }

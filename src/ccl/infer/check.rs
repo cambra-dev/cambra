@@ -15,8 +15,8 @@ use crate::ccl::provenance;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, BindingTransparency, Builtin, Expr, FieldKey, Level, Name, Refinement, RefinementSet,
-    Type, TypedBinding, TypedExpr, TypedExprNode,
+    AggregateKind, BaseType, BindingTransparency, Builtin, Expr, FieldKey, Level, Name, Refinement,
+    RefinementSet, Type, TypedBinding, TypedExpr, TypedExprNode,
 };
 
 use super::emit::{
@@ -790,6 +790,13 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             expr.ty.clone()
         }
 
+        // `group_fold` is minted by planning with the type of the chain it replaces, so
+        // nothing resolved it: its rule is checked rather than trusted.
+        TypedExprNode::Builtin(Builtin::GroupFold(kind)) => {
+            check_group_fold(*kind, &expr.ty, &label, ctx);
+            expr.ty.clone()
+        }
+
         // Leaves whose type carries the full load and was resolved during
         // inference — trust the recorded type (matching the old typecheck,
         // which left these unchecked).
@@ -1094,6 +1101,62 @@ fn check_strength_over(ty: &Type, label: &str, ctx: &mut CheckCtx) {
     let _ = ctx.require_sub(&recorded, &expected, &at);
 }
 
+/// The rule for [`Builtin::GroupFold`]: `(𝐼 ⤇ (𝐾, 𝑉)) ⇒ (𝐾′ ⤇ 𝑊)`, where both arrows are data
+/// functions, the pairs' keys 𝐾 lie in the base of the result's keys 𝐾′, and 𝑊 is what the aggregate makes of a collection of 𝑉, as its
+/// scheme states: `Int` for `sum`, `unit` for `drain`, and a supertype of 𝑉 for the others.
+/// Recorded into `ctx.errors`, as `require_sub` records.
+fn check_group_fold(kind: AggregateKind, ty: &Type, label: &str, ctx: &mut CheckCtx) {
+    let parts = (|| {
+        let (collection, groups) = (ty.domain()?, ty.codomain()?);
+        if !collection.is_collection() || !groups.is_collection() {
+            return None;
+        }
+        let pairs = collection.codomain()?;
+        let Type::Tuple(pair) = pairs.peel_refinements() else {
+            return None;
+        };
+        let [key, value] = pair.as_slice() else {
+            return None;
+        };
+        Some((
+            key.clone(),
+            value.clone(),
+            groups.domain()?,
+            groups.codomain()?,
+        ))
+    })();
+    let Some((key, value, groups, folded)) = parts else {
+        let error = ctx.raise(InferError::TypeMismatch {
+            found: Box::new(ty.clone()),
+            expected: None,
+            ctx: format!("{label}: group_fold takes a collection of pairs to a collection"),
+        });
+        ctx.errors.push(error);
+        return;
+    };
+    let at = || format!("{label}: group_fold({kind:?}) folds each pair's value under its key");
+    // The pairs' keys lie in the result's key base. The result's keys are refined by
+    // membership in the key chain's image, which the pairs' key type (a literal's singleton,
+    // say) states no relation to that the solver can prove, so that refinement is left out.
+    let _ = ctx.require_sub(&key, &strip_refinements(&groups), &at);
+    let int = Type::Base(BaseType::Int);
+    let unit = Type::Base(BaseType::Unit);
+    match kind {
+        AggregateKind::Sum => {
+            let _ = ctx.require_sub(&value, &int, &at);
+            let _ = ctx.require_sub(&int, &folded, &at);
+            let _ = ctx.require_sub(&folded, &int, &at);
+        }
+        AggregateKind::Drain => {
+            let _ = ctx.require_sub(&unit, &folded, &at);
+            let _ = ctx.require_sub(&folded, &unit, &at);
+        }
+        AggregateKind::Max | AggregateKind::Min | AggregateKind::Sole => {
+            let _ = ctx.require_sub(&value, &folded, &at);
+        }
+    }
+}
+
 /// Run the post-inference structural type-check over `expr`.
 ///
 /// Drives the shared per-node typing rules in Check mode over a throwaway
@@ -1316,6 +1379,92 @@ mod tests {
         assert!(
             !errors_for(collection.clone()).is_empty(),
             "a result holding the values alone is reported"
+        );
+    }
+
+    #[test]
+    fn group_fold_is_checked_against_its_pairs() {
+        let (int, string) = (Type::Base(BaseType::Int), Type::Base(BaseType::String));
+        let pairs = |key: &Type, value: &Type| {
+            Type::data_fun(
+                Type::UIntRange(4),
+                Type::Tuple(vec![key.clone(), value.clone()]),
+            )
+        };
+        let errors_for = |kind: AggregateKind, pairs: Type, result: Type| {
+            let mut node =
+                Expr::builtin(Builtin::GroupFold(kind)).with_ty(Type::fun(pairs, result));
+            let mut ctx = CheckCtx::new(node.node_id());
+            let _ = check_node(&mut node, &mut ctx);
+            ctx.errors
+        };
+        let sums = Type::data_fun(string.clone(), int.clone());
+        let right = errors_for(AggregateKind::Sum, pairs(&string, &int), sums.clone());
+        assert!(
+            right.is_empty(),
+            "the stamped type is the rule's: {right:?}"
+        );
+        assert!(
+            !errors_for(AggregateKind::Sum, pairs(&int, &int), sums.clone()).is_empty(),
+            "groups keyed by a base the pairs' keys do not have are reported"
+        );
+        assert!(
+            !errors_for(AggregateKind::Sum, pairs(&string, &string), sums).is_empty(),
+            "a sum of values that are not integers is reported"
+        );
+        assert!(
+            !errors_for(
+                AggregateKind::Max,
+                pairs(&string, &int),
+                Type::data_fun(string.clone(), string.clone())
+            )
+            .is_empty(),
+            "a maximum of another type than its values is reported"
+        );
+        let unit = Type::Base(BaseType::Unit);
+        for (kind, value, folded) in [
+            (AggregateKind::Min, &int, &int),
+            (AggregateKind::Sole, &string, &string),
+            (AggregateKind::Drain, &string, &unit),
+        ] {
+            let found = errors_for(
+                kind,
+                pairs(&string, value),
+                Type::data_fun(string.clone(), folded.clone()),
+            );
+            assert!(found.is_empty(), "{kind:?}: {found:?}");
+        }
+        assert!(
+            !errors_for(
+                AggregateKind::Drain,
+                pairs(&string, &int),
+                Type::data_fun(string.clone(), int.clone())
+            )
+            .is_empty(),
+            "a drain that answers a value is reported"
+        );
+        let always = Rc::new(TypedExpr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool)));
+        let refined_key = Type::refined_one(string.clone(), Refinement::born(always));
+        let refined = errors_for(
+            AggregateKind::Sum,
+            pairs(&refined_key, &int),
+            Type::data_fun(string.clone(), int.clone()),
+        );
+        assert!(
+            refined.is_empty(),
+            "a refined key lies in its base: {refined:?}"
+        );
+        assert!(
+            !errors_for(
+                AggregateKind::Sum,
+                Type::fun(
+                    Type::UIntRange(4),
+                    Type::Tuple(vec![string.clone(), int.clone()])
+                ),
+                Type::data_fun(string.clone(), int.clone())
+            )
+            .is_empty(),
+            "pairs that are not a collection are reported"
         );
     }
 }

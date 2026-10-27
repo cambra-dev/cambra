@@ -41,6 +41,7 @@ mod conditionals;
 mod const_fold;
 mod correlated;
 mod groupby;
+mod grouped_fold;
 mod iterate;
 mod join;
 mod loops;
@@ -180,10 +181,15 @@ pub(super) enum PlanningPhase {
     /// `Apply(_, Iterate)` or `Apply(_, Restrict)` marker, so only the cleanups and the
     /// reduction of a marker-free subtree fire here.
     Cleanup,
+    /// Fuse each fold over the groups of a group-by into one fold over the rows
+    /// ([`grouped_fold::fuse_grouped_folds`]). It runs after the cleanup `simplify`, which
+    /// flattens the chain it matches, and after the per-group filters, whose
+    /// `filter_values` it declines to fuse. Bottom-up.
+    FuseGroupedFolds,
 }
 
 impl PlanningPhase {
-    const ALL: [PlanningPhase; 10] = [
+    const ALL: [PlanningPhase; 11] = [
         PlanningPhase::RealizeConditionals,
         PlanningPhase::RecognizeGroupBy,
         PlanningPhase::EmitCorrelatedFilters,
@@ -194,6 +200,7 @@ impl PlanningPhase {
         PlanningPhase::CompilePredicates,
         PlanningPhase::InsertPerGroupFilters,
         PlanningPhase::Cleanup,
+        PlanningPhase::FuseGroupedFolds,
     ];
 
     /// Whether this phase's walk of the tree reaches a term it lifts into the tree. A
@@ -213,7 +220,10 @@ impl PlanningPhase {
             PlanningPhase::Simplify
             | PlanningPhase::FoldConstants
             | PlanningPhase::CompilePredicates
-            | PlanningPhase::Cleanup => unreachable!("planning's `{self:?}` lifts no term"),
+            | PlanningPhase::Cleanup
+            | PlanningPhase::FuseGroupedFolds => {
+                unreachable!("planning's `{self:?}` lifts no term")
+            }
         }
     }
 }
@@ -280,6 +290,7 @@ fn run_phases(
                 correlated::emit_correlated_filters(&mut term, witnesses)?
             }
             PlanningPhase::Simplify | PlanningPhase::Cleanup => term = simplify(term),
+            PlanningPhase::FuseGroupedFolds => grouped_fold::fuse_grouped_folds(&mut term),
             PlanningPhase::PairCorrelatedSites => {
                 correlated::pair_correlated_sites(&mut term, witnesses)?
             }

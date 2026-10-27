@@ -960,7 +960,7 @@ fn narrows_domain_irrecoverably(expr: &Expr) -> bool {
 /// functions of the key that hold at every key the collection has;
 /// [`builtin_preserves_domain`] decides every builtin, with no wildcard, so a new builtin needs
 /// a decision here.
-fn preserves_domain(expr: &Expr) -> bool {
+pub(crate) fn preserves_domain(expr: &Expr) -> bool {
     match &expr.node {
         TypedExprNode::Compose(steps) => steps.iter().all(preserves_domain),
         TypedExprNode::Tuple(items) => items.iter().all(preserves_domain),
@@ -1010,6 +1010,7 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         | Builtin::MapDomain
         | Builtin::Compose
         | Builtin::Converse
+        | Builtin::GroupFold(_)
         | Builtin::Uncurry
         | Builtin::Restrict
         | Builtin::Iterate

@@ -42,8 +42,8 @@ use crate::{
         scalar_expr,
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
-            Filter, FlattenTupleDomain, IterateExtent, MakeRecord, MapAggregate, MapDomain,
-            MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
+            Filter, FlattenTupleDomain, GroupedFold, IterateExtent, MakeRecord, MapAggregate,
+            MapDomain, MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
             MapResultWithSource, Memo, PermuteRecordDomain, Product, Restrict, SelectField,
             TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap,
             zip_arms_at, zip_arms_named_at,
@@ -2876,6 +2876,20 @@ fn convert_impl_inner(
                 }
                 b if let Some(op) = builtin_to_unaryop(b.clone()) => {
                     apply_unaryop(input, op, ctx.level())
+                }
+                // `group_fold(𝑎)` is applied to the collection of pairs it folds, which the
+                // generic `Apply` arm converts as a root, so the pairs arrive one level deep.
+                // Planning mints it only applied to a root (`planning/grouped_fold.rs`).
+                Builtin::GroupFold(kind) => {
+                    if ctx.level() != CurryLevel::new(1) {
+                        return Err(ConversionError::Unsupported(format!(
+                            "group_fold under enclosing levels, at {:?}",
+                            ctx.level()
+                        )));
+                    }
+                    let fold =
+                        GroupedFold::new(input, *kind).map_err(ConversionError::Unsupported)?;
+                    Ok(Box::new(MapExtractAggregate::new(Box::new(fold), *kind)))
                 }
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
                 b if let Some(kind) = b.as_aggregate() => Ok(Box::new(MapExtractAggregate::new(

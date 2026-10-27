@@ -1316,6 +1316,7 @@ fn test_incremental_aggregates() {
         (Value::UInt(1), Value::Int(20)),
     ]);
 
+    ctx.scheduler().check_for_notifications();
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
         result,
@@ -1331,6 +1332,7 @@ fn test_incremental_aggregates() {
         (Value::UInt(2), Value::Int(10)),
         (Value::UInt(3), Value::Int(30)),
     ]);
+    ctx.scheduler().check_for_notifications();
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
         result,
@@ -1346,6 +1348,7 @@ fn test_incremental_aggregates() {
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
 
+    ctx.scheduler().check_for_notifications();
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
         sort_function_by_domain(result),

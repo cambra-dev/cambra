@@ -399,6 +399,16 @@ pub enum Builtin {
     Compose,
     /// `converse : (A → K) → (K → (A → A))` — group-by-key combinator.
     Converse,
+    /// `group_fold(𝑎) : (𝐼 ⤇ (𝐾, 𝑉)) ⇒ (𝐾′ ⤇ 𝑊)` — fold each value into the group its key
+    /// names with the aggregate 𝑎, 𝐾′ being the keys present and 𝑊 what 𝑎 makes of a
+    /// collection of 𝑉. It is `converse ≫ map ≫ 𝑎` with no member held between the steps:
+    /// planning rewrites `𝑘 ▷ converse ≫ 𝑐 ▷ map ≫ … ≫ 𝑎` to it (`src/ccl/design/optimization.md`,
+    /// "Grouped folds").
+    ///
+    /// **Born in planning**, and so carries no scheme: the rewrite stamps its type, which is
+    /// the type of the chain it replaces. Op-conversion compiles the application to a
+    /// `GroupedFold` read by a `MapExtractAggregate`.
+    GroupFold(AggregateKind),
     /// `uncurry : (A → (B → C)) → ((A, B) → C)`.
     Uncurry,
     /// `restrict : (D ⤇ Bool) ⇒ (D ⤇ T) ⇒ ({d: D | p(d)} ⤇ T)` —
@@ -851,6 +861,9 @@ impl Builtin {
             Self::MapDomain => "map_domain",
             Self::Compose => "compose",
             Self::Converse => "converse",
+            // The aggregate is rendered by `symbolic` (a `&'static str` cannot carry it); this
+            // bare name is the fallback for other callers.
+            Self::GroupFold(_) => "group_fold",
             Self::Uncurry => "uncurry",
             Self::Restrict => "restrict",
             Self::Iterate => "iterate",
@@ -963,6 +976,7 @@ impl Builtin {
             || matches!(
                 self,
                 Self::Converse
+                    | Self::GroupFold(_)
                     | Self::MapDomain
                     | Self::Uncurry
                     | Self::PermuteDomain

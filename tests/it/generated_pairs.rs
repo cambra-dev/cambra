@@ -54,9 +54,6 @@ use panic_message::panic_message;
 const BROKEN: &[(&str, &str, &str)] = &[
     ("function_body", "rows_sum", "CompilerPanics"),
     ("generator_yield", "rows_sum", "CompilerPanics"),
-    ("groupby_tuple_key", "rec_comp", "CompilerPanics"),
-    ("groupby_tuple_key", "rec_filtered", "CompilerPanics"),
-    ("groupby_tuple_key", "rec_list", "CompilerPanics"),
     (
         "loop_source_in_loop",
         "binder_filtered_comp[i]",
@@ -73,8 +70,8 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ),
     ("nested_mut_source", "dup_union", "CompilerRejects"),
     ("nested_mut_source", "generator_coll", "CompilerPanics"),
-    ("nested_mut_source", "map_arrow", "CompilerPanics"),
-    ("nested_mut_source", "map_lit", "CompilerPanics"),
+    ("nested_mut_source", "map_arrow", "InterpreterGap"),
+    ("nested_mut_source", "map_lit", "InterpreterGap"),
     ("nested_mut_source", "union", "CompilerRejects"),
     ("record_in_list", "comp_sum", "CompilerRejects"),
     ("record_in_list", "filtered_sum", "CompilerRejects"),
