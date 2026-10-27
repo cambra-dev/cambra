@@ -5,7 +5,9 @@ use bit_set::BitSet;
 
 use super::*;
 use crate::interpreter::operator_graph::{value, value_at};
-use crate::interpreter::{Consumer, RowIndex, Scheduler, Value, shared_consumer, tuple_field};
+use crate::interpreter::{
+    Consumer, Projection, RowIndex, Scheduler, Value, shared_consumer, tuple_field,
+};
 
 /// Pairs its operands at `level`, producing a collection carrying the levels standing above it
 /// whose values are a record of what each operand holds there.
@@ -218,8 +220,13 @@ impl TileProducer for RecordWrapProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut tile = self.input.get(self.input.tiling().universal_guard());
+    /// Wrapping keeps the input's keys, so the input is pulled at the projection.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let mut tile = self.input.get(projection.guard(self.input.tiling()));
         assert!(
             tile.is_data_function(),
             "RecordWrap: the input must be a function tile, got {tile:?}"
@@ -1699,5 +1706,83 @@ mod tests {
                 log.borrow()
             );
         }
+    }
+}
+
+/// How the operators of this module are pulled in the shapes they are built for: a record
+/// literal over a stream (`(a: x for x in xs)`), a pair of streams zipped by key, and a field
+/// read out of a record stream.
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, ints_by_position, keys_between,
+    };
+    use crate::interpreter::{BaseType, Extent};
+
+    const ROWS: u64 = 8;
+
+    fn ints() -> Tiling {
+        Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
+    }
+
+    fn stream(offset: i64) -> (ProjectionSpy, GuardLog) {
+        let values: Vec<i64> = (0..ROWS as i64).map(|i| i + offset).collect();
+        let (spy, pulled, _) = ProjectionSpy::new(ints_by_position(&values, true), ints());
+        (spy, pulled)
+    }
+
+    /// `(a: x for x in xs)`: one field over a stream.
+    fn wrapped() -> (RecordWrapProducer, GuardLog) {
+        let (input, pulled) = stream(0);
+        let out = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Record(
+                [(
+                    SmolStr::new("a"),
+                    Tiling::Scalar(Extent::Base(BaseType::Int)),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        (
+            RecordWrapProducer {
+                base: ProducerBase::unowned(RecordWrapProducer::alloc_id(), &out),
+                name: SmolStr::new("a"),
+                level: CurryLevel::new(1),
+                input: Box::new(input),
+            },
+            pulled,
+        )
+    }
+
+    #[test]
+    fn a_wrapped_stream_pulls_its_input_at_the_morsel() {
+        let (mut wrap, pulled) = wrapped();
+        let morsel = wrap.get(keys_between(2, 4));
+        let Tile::DataFunction { domain, .. } = &morsel else {
+            panic!("a collection")
+        };
+        assert_eq!(domain.len(), 3);
+        assert_eq!(*pulled.borrow(), [keys_between(2, 4)]);
+    }
+
+    #[test]
+    fn a_wrapped_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 2), keys_between(6, 20)] {
+            assert_conforms(|| Box::new(wrapped().0), guard);
+        }
+    }
+
+    #[test]
+    fn nothing_wraps_nothing() {
+        let (mut wrap, pulled) = wrapped();
+        let nothing = wrap.tiling().empty_guard();
+        assert_eq!(wrap.get(nothing), wrap.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 }
