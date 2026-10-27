@@ -1113,7 +1113,9 @@ pub enum TilePathStep {
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
-    use super::{InspectNode, ProducerBase, Tile, TileGuard, TileProducer, Tiling, VizOptions};
+    use super::{
+        InspectNode, ProducerBase, Tile, TileGuard, TileOperator, TileProducer, Tiling, VizOptions,
+    };
     use crate::interpreter::{ColumnValue, FunctionGuard, Predicate, Value};
     use bit_set::BitSet;
     use intervalsets::{Interval, IntervalSet};
@@ -1253,6 +1255,53 @@ pub(crate) mod test_helpers {
 
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
             self.released.borrow_mut().push(obsolete_guard);
+        }
+    }
+
+    /// An operator over a fixed tile whose producers are [`ProjectionSpy`]s sharing one pair of
+    /// logs, so a test can build a fan-out or a memo over it and read what reaches the input.
+    pub(crate) struct ProjectionSpyOp {
+        tile: Tile,
+        tiling: Tiling,
+        pulled: GuardLog,
+        released: GuardLog,
+    }
+
+    impl ProjectionSpyOp {
+        pub(crate) fn new(tile: Tile, tiling: Tiling) -> (Self, GuardLog, GuardLog) {
+            let (pulled, released) = (GuardLog::default(), GuardLog::default());
+            (
+                Self {
+                    tile,
+                    tiling,
+                    pulled: pulled.clone(),
+                    released: released.clone(),
+                },
+                pulled,
+                released,
+            )
+        }
+    }
+
+    impl TileOperator for ProjectionSpyOp {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(super::InputEdgeSpec<'_>)) {}
+
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            mut consumer: Box<dyn super::Consumer>,
+            _scheduler: &mut super::Scheduler,
+        ) -> Box<dyn TileProducer> {
+            consumer.notify();
+            let (mut spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
+            spy.pulled = self.pulled.clone();
+            spy.released = self.released.clone();
+            Box::new(spy)
         }
     }
 
