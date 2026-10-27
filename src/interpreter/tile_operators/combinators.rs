@@ -1152,9 +1152,17 @@ impl TileProducer for RestrictProducer {
         visit("predicate", &*self.predicate);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let pred_guard = self.predicate.tiling().universal_guard();
-        let pred_result = self.predicate.get(pred_guard);
+    /// A restricted domain is the predicate's keys that pass, so the predicate is pulled at the
+    /// projection.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let pred_result = self
+            .predicate
+            .get(projection.guard(self.predicate.tiling()));
+
         match pred_result {
             Tile::DataFunction {
                 row_starts,
@@ -3336,5 +3344,87 @@ mod filter_projection_tests {
         let nothing = filter.tiling().empty_guard();
         assert_eq!(filter.get(nothing), filter.tiling().empty_tile());
         assert!(input_pulled.borrow().is_empty() && predicate_pulled.borrow().is_empty());
+    }
+}
+
+/// `Restrict` as the head of a filtered iteration uses it: `iterate ▷ (p ▷ restrict)` keeps the
+/// positions a predicate stream passes, and a worker pulls the predicate at one morsel.
+#[cfg(test)]
+mod restrict_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, keys_between,
+    };
+    use bit_set::BitSet;
+
+    const ROWS: u64 = 8;
+
+    /// The positions whose predicate answer is true: every third position.
+    fn every_third() -> (RestrictProducer, GuardLog) {
+        let answers = Tile::data_function(
+            ColumnValue::UInts((0..ROWS).collect()),
+            Box::new(Tile::Scalar(ColumnValue::Bools(
+                (0..ROWS).map(|i| i % 3 == 0).collect(),
+            ))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let pred_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Bool)),
+        );
+        let out = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::uint_range(ROWS)),
+        );
+        let (predicate, pulled, _) = ProjectionSpy::new(answers, pred_tiling);
+        (
+            RestrictProducer {
+                base: ProducerBase::unowned(RestrictProducer::alloc_id(), &out),
+                predicate: Box::new(predicate),
+            },
+            pulled,
+        )
+    }
+
+    /// The keys a consumer sees: those the tile does not mark deleted.
+    fn live_keys(tile: &Tile) -> Vec<u64> {
+        let Tile::DataFunction {
+            domain: ColumnValue::UInts(keys),
+            deleted,
+            ..
+        } = tile
+        else {
+            panic!("a collection of positions, got {tile:?}")
+        };
+        keys.iter()
+            .enumerate()
+            .filter(|(row, _)| !deleted.contains(*row))
+            .map(|(_, key)| *key)
+            .collect()
+    }
+
+    #[test]
+    fn a_restricted_morsel_keeps_the_passing_positions_and_pulls_the_predicate_at_it() {
+        let (mut restrict, pulled) = every_third();
+        let morsel = restrict.get(keys_between(2, 7));
+        assert_eq!(live_keys(&morsel), [3, 6]);
+        assert_eq!(*pulled.borrow(), [keys_between(2, 7)]);
+    }
+
+    #[test]
+    fn a_restricted_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 3), keys_between(4, 30)] {
+            assert_conforms(|| Box::new(every_third().0), guard);
+        }
+    }
+
+    #[test]
+    fn nothing_restricts_nothing() {
+        let (mut restrict, pulled) = every_third();
+        let nothing = restrict.tiling().empty_guard();
+        assert_eq!(restrict.get(nothing), restrict.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 }
