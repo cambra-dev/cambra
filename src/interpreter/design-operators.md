@@ -474,12 +474,13 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
   producer asked for part of its keys says nothing about the rest.
 - **The input.** An operator whose outermost keys are its input's forwards 𝑝 to the input, so the
   input produces only that part. Its answer is built from the input's, so it does not cut, and its
-  operator test compares the answer with the whole answer cut to 𝑝. An operator that builds its
-  answer from anything else cuts: accumulators held across pulls (`MapAggregate`), arms already
-  released (`UnionOperator`), or a cache read at a wider region (`FanOutSlot`, `Memo`). An operator
-  whose output keys are not its input's keys, such as `Converse`, pulls the input in full and cuts
-  its own output. An operator that cannot restate 𝑝 for an input pulls the input in full and still
-  cuts its output: pulling more is sound for a `get`, where a release that names more is not.
+  operator test compares the answer with the whole answer cut to 𝑝 (`assert_conforms`). An operator
+  that builds its answer from anything else cuts: accumulators held across pulls (`MapAggregate`),
+  arms already released (`UnionOperator`), or a cache read at a wider region (`FanOutSlot`, `Memo`).
+  An operator whose output keys are not its input's keys, such as `Converse`, pulls the input in
+  full and cuts its own output. An operator that cannot restate 𝑝 for an input pulls the input in
+  full and still cuts its output: pulling more is sound for a `get`, where a release that names
+  more is not.
 - **Release between pulls.** The completeness contract compares a producer's consecutive answers,
   and a pull of one projection states completeness over its keys only. A consumer that pulls two
   projections of one producer releases the first before the second.
@@ -491,6 +492,7 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
 | --- | --- |
 | `IterateExtent` | A finite range is cut to the admitted interval before it is rendered. Every other extent renders whole and is cut after. |
 | `Constant` | A collection constant answers the admitted keys. A scalar constant answers the whole value or nothing. |
+| `MapResult` | A keyed input is pulled at the projection; a scalar input is a key looked up in the function, has no keys to project, and is read whole. A function operand that is a collection is pulled at the projection too where the input's values are its keys, the arguments stand at the first level, and the operand is a data function; its keys are released with the data's. Any other function operand is read whole. Beneath the outermost keys the input is pulled at a projection above the level the function applies at (`Restates::Above`), and the function operand is read whole. |
 
 ### Producer attribution and probes
 
