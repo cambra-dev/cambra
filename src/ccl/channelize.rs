@@ -879,31 +879,8 @@ pub fn run(expr: Expr) -> Result<Expr, Located<DeferError>> {
 /// per-instantiation, freshened at `specialize_use`), so channel recording
 /// and lift-alias entries key on it, never on the term name.
 fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
-    match ty.peel_refinements() {
-        Type::History {
-            domain,
-            history_kind: HistoryKind::Append,
-            ..
-        } => match domain.peel_refinements() {
-            Type::ChanDom(n, l) => Some((n.clone(), *l)),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// the channel domain carried by an assembled channel's
-/// type — the domain of its constructed `Fun`, or, for an alias channel that
-/// is itself a defer read (`x <<= y` leaves `Var(y) : feed(…)`), the read's
-/// handle domain (a `ChanDom` closed later by [`close_chan_domains`]).
-fn channel_domain_of(ty: &Type) -> Option<Type> {
-    match ty.peel_refinements() {
-        Type::Fun { domain, .. } => Some((**domain).clone()),
-        Type::History {
-            domain,
-            history_kind: HistoryKind::Append,
-            ..
-        } => Some((**domain).clone()),
+    match ty.as_feed()?.0.peel_refinements() {
+        Type::ChanDom(n, l) => Some((n.clone(), *l)),
         _ => None,
     }
 }
@@ -1800,7 +1777,7 @@ fn channelize_cluster(
             // A non-function channel type records no domain; any consumer
             // still holding its `ChanDom` surfaces at the debug residue
             // assert / strict wall.
-            if let Some(dom) = channel_domain_of(&ch.ty) {
+            if let Some(dom) = ch.ty.read_view().domain() {
                 if let Some(k) = ch.ty.fun_kind() {
                     ctx.channel_kinds.push((key.clone(), k.clone()));
                 }
