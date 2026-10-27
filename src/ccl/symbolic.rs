@@ -13,7 +13,7 @@
 use crate::ccl::module_type::AliasType;
 use crate::ccl::{
     ArithmeticKind, BinOpKind, BindingTransparency, Branch, Builtin, Expr, Lit, LogicKind, Type,
-    TypedExprNode, UnaryOpKind, source_projection_label,
+    TypedExprNode, UnaryOpKind, ccl_utils::is_trivially_true_predicate, source_projection_label,
 };
 
 // ---------------------------------------------------------------------------
@@ -413,7 +413,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             // useful structure in marker noise.  The full `pred ▷ iterate`
             // form still renders normally when the predicate is non-trivial.
             if matches!(function.node, TypedExprNode::Builtin(Builtin::Iterate))
-                && is_trivially_true_arg(argument)
+                && is_trivially_true_predicate(argument)
             {
                 return (Precedence::Atom, "iterate".to_string());
             }
@@ -775,18 +775,6 @@ fn fmt_nary(
 /// as outer `▷`), which would otherwise silently re-associate.
 fn fmt_apply_func(func: &Expr, opts: &SymbolicOpts) -> String {
     fmt(func, Precedence::Apply.next_highest(), opts)
-}
-
-/// Returns `true` if `arg` is the trivially-true predicate `Apply(Lit(true), Const)`
-/// — the canonical predicate planning emits at unrefined iteration sites.  Detection
-/// here lets [`fmt_inner`] render `Apply(true_pred, Iterate)` as a bare `iterate`
-/// atom rather than the verbose `true ▷ const ▷ iterate` form.
-fn is_trivially_true_arg(arg: &Expr) -> bool {
-    let TypedExprNode::Apply { argument, function } = &arg.node else {
-        return false;
-    };
-    matches!(&function.node, TypedExprNode::Builtin(Builtin::Const))
-        && matches!(&argument.node, TypedExprNode::Lit(Lit::Bool(true)))
 }
 
 /// Render a [`Lit`] as its CCL symbolic form.
