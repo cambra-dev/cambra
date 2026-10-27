@@ -814,10 +814,9 @@ impl Subst {
                 // Domain refinements ride the param's *type* (a
                 // `Type::Refinement`); `apply_binder_types` rewrites that slot
                 // below, under the unrestricted substitution.
-                let (param_name, inner) = self.under_binder(&param.name, body);
+                let inner = self.under_binder(&param.name, body);
                 let body = Box::new(inner.apply_expr(body));
-                let mut param = param.clone();
-                param.name = param_name;
+                let param = param.clone();
                 Lambda { param, body }
             }
 
@@ -825,10 +824,9 @@ impl Subst {
             // outer scope — same discipline as `Lambda`.
             For { target, iter, body } => {
                 let iter = Box::new(self.apply_expr(iter));
-                let (target_name, inner) = self.under_binder(&target.name, body);
+                let inner = self.under_binder(&target.name, body);
                 let body = Box::new(inner.apply_expr(body));
-                let mut target = target.clone();
-                target.name = target_name;
+                let target = target.clone();
                 For { target, iter, body }
             }
 
@@ -838,12 +836,10 @@ impl Subst {
                 body,
             } => {
                 let bound_expr = Box::new(self.apply_expr(bound_expr));
-                let (bind_name, inner) = self.under_binder(&binding.name, body);
+                let inner = self.under_binder(&binding.name, body);
                 let body = Box::new(inner.apply_expr(body));
-                let mut binding = binding.clone();
-                binding.name = bind_name;
                 Let {
-                    binding,
+                    binding: binding.clone(),
                     bound_expr,
                     body,
                 }
@@ -1326,26 +1322,26 @@ impl Subst {
         }
     }
 
-    /// Restrict this substitution so it does not act on `binder`. Returns the
-    /// binder name to install and the substitution to use inside its scope.
+    /// Restrict this substitution so it does not act on `binder`, returning the
+    /// substitution to use inside its scope.
     ///
     /// Capture cannot happen: under the Barendregt convention nothing free in
     /// a substitution's range can collide with a binder bound inside the
     /// target term (binder uids are minted once at lowering; copies preserve
     /// them, so a range name and an inner binder are the same `Name` only if
     /// they are the same binder — and a binder's scope cannot nest inside
-    /// itself). The α-rename fallback is therefore asserted unreachable,
-    /// which is also what deletes the same-discharge-twice determinism
-    /// hazard: no fresh names are minted on any equality-mediated path.
-    fn under_binder(&self, binder: &Name, body: &TypedExpr) -> (Binder, Subst) {
+    /// itself). Capture is therefore asserted rather than α-renamed, so no
+    /// fresh names are minted on any equality-mediated path and the same
+    /// discharge applied twice yields the same term.
+    fn under_binder(&self, binder: &Name, body: &TypedExpr) -> Subst {
         let restricted = self.shadow(binder);
         // If no substituted binder occurs free in the body, the substitution
         // is inert there — return the identity so the body is left untouched.
         if !restricted.binders.keys().any(|k| is_free(k, body)) {
-            return (binder.clone(), Subst::id());
+            return Subst::id();
         }
         restricted.assert_no_capture(binder);
-        (binder.clone(), restricted)
+        restricted
     }
 
     /// Refuse a rewrite of `r` that would capture: the substitution acts on `r`'s predicate
@@ -1568,9 +1564,9 @@ impl Subst {
                 codomain,
             } => {
                 let domain = Box::new(self.apply_type(domain));
-                let (b2, inner) = self.under_binder_ty(b, codomain);
+                let inner = self.under_binder_ty(b, codomain);
                 Type::Fun {
-                    name: Some(b2),
+                    name: Some(b.clone()),
                     fun_kind: self.apply_fun_kind(fun_kind),
                     domain,
                     codomain: Box::new(inner),
@@ -1677,12 +1673,11 @@ impl Subst {
 
     /// `Fun`-codomain analogue of [`under_binder`](Self::under_binder):
     /// shadow the Pi binder in `codomain`. Capture is asserted unreachable
-    /// for the same reason (see `under_binder`); this is what retires the
-    /// spurious α-renames PR #233 observed at this site.
-    fn under_binder_ty(&self, binder: &Name, codomain: &Type) -> (Binder, Type) {
+    /// for the same reason (see `under_binder`).
+    fn under_binder_ty(&self, binder: &Name, codomain: &Type) -> Type {
         let restricted = self.shadow(binder);
         restricted.assert_no_capture(binder);
-        (binder.clone(), restricted.apply_type(codomain))
+        restricted.apply_type(codomain)
     }
 }
 
@@ -2718,7 +2713,7 @@ mod capture_assert_probe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement};
+    use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement, TypedBinding};
 
     fn var(s: &str) -> TypedExpr {
         TypedExpr::var(s)
@@ -3134,6 +3129,74 @@ mod tests {
             "the binder slot stays the composition's own; got `{}`",
             out.ty
         );
+    }
+
+    // A substitution crossing a binder leaves the binder's name as it is: under the Barendregt
+    // convention `Subst` never α-renames (`src/ccl/design/ir.md`, "Structured names and
+    // α-uniquification (Barendregt convention)").
+
+    /// `[k ↦ j]`, live in each expression body below, so each term crossing takes the
+    /// restricted path rather than the inert one; a `Fun` crossing has no inert path.
+    fn live_rename() -> Subst {
+        Subst::rename("k", "j")
+    }
+
+    /// What `live_rename` makes of each body: the occurrence `k` retargeted to `j`.
+    fn renamed() -> TypedExprNode {
+        TypedExprNode::Var(Name::raw("j"))
+    }
+
+    #[test]
+    fn a_lambda_keeps_its_param_name() {
+        let e = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("k"));
+        let TypedExprNode::Lambda { param, body } = live_rename().apply_expr(&e).node else {
+            panic!("expected a lambda");
+        };
+        assert_eq!(param.name, Name::raw("x"));
+        assert_eq!(body.node, renamed());
+    }
+
+    #[test]
+    fn a_for_keeps_its_target_name() {
+        let e = TypedExpr::new(TypedExprNode::For {
+            target: TypedBinding::new_unannotated("y"),
+            iter: Box::new(TypedExpr::var("xs")),
+            body: Box::new(TypedExpr::var("k")),
+        });
+        let TypedExprNode::For { target, body, .. } = live_rename().apply_expr(&e).node else {
+            panic!("expected a for");
+        };
+        assert_eq!(target.name, Name::raw("y"));
+        assert_eq!(body.node, renamed());
+    }
+
+    #[test]
+    fn a_let_keeps_its_binding_name() {
+        let e = TypedExpr::let_in(
+            TypedBinding::new_unannotated("z"),
+            TypedExpr::var("k"),
+            TypedExpr::var("k"),
+        );
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = live_rename().apply_expr(&e).node
+        else {
+            panic!("expected a let");
+        };
+        assert_eq!(binding.name, Name::raw("z"));
+        assert_eq!(bound_expr.node, renamed());
+        assert_eq!(body.node, renamed());
+    }
+
+    #[test]
+    fn a_pi_keeps_its_binder_name() {
+        let t = Type::pi("b", Type::Hole, Type::Hole);
+        let Type::Fun { name, .. } = live_rename().apply_type(&t) else {
+            panic!("expected a function type");
+        };
+        assert_eq!(name, Some(Name::raw("b")));
     }
 }
 
