@@ -17,6 +17,7 @@ load the modules ([Tests](#tests)).
 | Module | File | Used by | Holds |
 | -- | -- | -- | -- |
 | `std::time` | [src/std/time.cambra](src/std/time.cambra) | `import std::time` | `Instant`, `Duration`, `now()`, `alarms`, durations, and conversions to integer counts and Unix time |
+| `std::env` | [src/std/env.cambra](src/std/env.cambra) | `import std::env` | `var`, the environment variables a program names, read by the host |
 
 - **A module that declares state or performs IO is run; every other module is imported.** Importing
   asserts that a module declares no mutable variable or feed and opens no source
