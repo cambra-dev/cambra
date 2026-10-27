@@ -1114,6 +1114,147 @@ pub enum TilePathStep {
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::{InspectNode, ProducerBase, Tile, TileGuard, TileProducer, Tiling, VizOptions};
+    use crate::interpreter::{ColumnValue, FunctionGuard, Predicate, Value};
+    use bit_set::BitSet;
+    use intervalsets::{Interval, IntervalSet};
+
+    /// The projection guard naming the keys `[first, last]` of the outermost collection.
+    pub(crate) fn keys_between(first: u64, last: u64) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
+            IntervalSet::from(Interval::closed(Value::UInt(first), Value::UInt(last))),
+        )))
+    }
+
+    /// `values` as a collection of integers keyed by position `0..`, stating `complete` of its
+    /// whole domain or only of the positions it holds.
+    pub(crate) fn ints_by_position(values: &[i64], complete: bool) -> Tile {
+        let domain_predicate = match (complete, values.len()) {
+            (true, _) => Predicate::True,
+            (false, 0) => Predicate::False,
+            (false, n) => Predicate::at_or_below(Value::UInt(n as u64 - 1)),
+        };
+        Tile::data_function(
+            ColumnValue::UInts((0..values.len() as u64).collect()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(values.to_vec()))),
+            domain_predicate,
+            BitSet::new(),
+        )
+    }
+
+    /// The `(position, value)` entries of a collection of integers keyed by position, in key
+    /// order, whatever order the tile holds them in. A row the tile marks deleted is not an
+    /// entry, as it is to a consumer.
+    pub(crate) fn int_entries(tile: &Tile) -> Vec<(u64, i64)> {
+        let Tile::DataFunction {
+            domain,
+            codomain,
+            deleted,
+            ..
+        } = tile
+        else {
+            panic!("a collection, got {tile:?}");
+        };
+        let (ColumnValue::UInts(keys), Tile::Scalar(ColumnValue::Ints(values))) =
+            (domain, codomain.as_ref())
+        else {
+            panic!("positions to integers, got {tile:?}");
+        };
+        let mut entries: Vec<(u64, i64)> = keys
+            .iter()
+            .copied()
+            .zip(values.iter().copied())
+            .enumerate()
+            .filter(|(row, _)| !deleted.contains(*row))
+            .map(|(_, entry)| entry)
+            .collect();
+        entries.sort_unstable();
+        entries
+    }
+
+    /// Assert that a producer answers a projection as the whole of its answer cut to it. `make`
+    /// builds the same producer twice: one is pulled at `guard`, the other at the universal
+    /// guard, and the second's tile is cut to `guard` and compared. Both are compacted and
+    /// ordered by key where the keys are scalars, since a producer may order its rows as it likes.
+    pub(crate) fn assert_conforms(make: impl Fn() -> Box<dyn TileProducer>, guard: TileGuard) {
+        let normal = |mut tile: Tile| {
+            tile.compact();
+            // Pairs and other record keys keep the order the producer gave them.
+            match &tile {
+                Tile::DataFunction {
+                    domain: ColumnValue::Records(_),
+                    ..
+                } => tile,
+                _ => crate::interpreter::sort_function_by_domain(tile),
+            }
+        };
+        let mut projected = make();
+        let answer = normal(projected.get(guard.clone()));
+        let mut whole = make();
+        let mut expected = whole.get(whole.tiling().universal_guard());
+        expected.restrict_to(&guard.projection("assert_conforms"), whole.tiling());
+        assert_eq!(
+            answer,
+            normal(expected),
+            "a pull at {guard:?} is the whole answer cut to it"
+        );
+    }
+
+    /// A [`TileProducer`] that **conforms to projection**: it answers a fixed tile minus what
+    /// has been released, cut to the projection guard it is pulled with. It logs every
+    /// projection and every release it receives, which is how a test sees the guard an
+    /// operator restated for its input.
+    ///
+    /// Pull it after releasing, never over a region already pulled and kept: the double is
+    /// itself held to the completeness contract.
+    pub(crate) struct ProjectionSpy {
+        pub(crate) base: ProducerBase,
+        pub(crate) tile: Tile,
+        pub(crate) pulled: GuardLog,
+        pub(crate) released: GuardLog,
+    }
+
+    /// The two logs of a [`ProjectionSpy`]: the projection guards it was pulled with, and the
+    /// guards released to it.
+    pub(crate) type GuardLog = std::rc::Rc<std::cell::RefCell<Vec<TileGuard>>>;
+
+    impl ProjectionSpy {
+        pub(crate) fn new(tile: Tile, tiling: Tiling) -> (Self, GuardLog, GuardLog) {
+            let pulled = GuardLog::default();
+            let released = GuardLog::default();
+            (
+                Self {
+                    base: ProducerBase::unowned(Self::alloc_id(), &tiling),
+                    tile,
+                    pulled: pulled.clone(),
+                    released: released.clone(),
+                },
+                pulled,
+                released,
+            )
+        }
+    }
+
+    impl TileProducer for ProjectionSpy {
+        impl_producer_base!();
+
+        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+            node
+        }
+
+        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+            self.pulled.borrow_mut().push(projection_guard.clone());
+            let mut tile = self.tile.clone();
+            tile.remove_guarded(self.obsolete_guard().clone());
+            tile.compact();
+            let projection = projection_guard.projection("ProjectionSpy");
+            tile.restrict_to(&projection, self.tiling());
+            tile
+        }
+
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            self.released.borrow_mut().push(obsolete_guard);
+        }
+    }
 
     /// A test helper TileProducer that returns a pre-determined tile.
     /// Useful for testing TileOperators by injecting tiles directly.
@@ -1259,7 +1400,7 @@ pub(crate) mod test_helpers {
             "a_record_field",
             &last,
             &result,
-            &TileGuard::Function(super::FunctionGuard::Domain(Predicate::False)),
+            &TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
         )
         .expect("an addition beneath a complete key is reported");
         assert!(
