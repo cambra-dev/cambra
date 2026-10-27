@@ -9,10 +9,10 @@ use bit_set::BitSet;
 use intervalsets::{
     Bounding, Interval, IntervalSet, MaybeEmpty, Side,
     numeric::Domain,
-    ops::{Complement, Contains, Difference, Intersection, Union},
+    ops::{Complement, Difference, Intersection, Union},
 };
 
-use super::interval_sets::single_interval_set;
+use super::interval_sets::{holds, right_ends_ascend, single_interval_set};
 use crate::{
     ccl::{BaseType, FieldKey, TagMap},
     interpreter::{
@@ -698,7 +698,7 @@ impl Predicate {
         match self {
             Predicate::True => true,
             Predicate::False => false,
-            Predicate::Intervals(s) => s.contains(value),
+            Predicate::Intervals(s) => holds(s, value),
             Predicate::Record(m) => match value {
                 Value::Record(fields) => m
                     .iter()
@@ -1065,6 +1065,12 @@ impl Predicate {
     /// not for a half-bounded one, so a complement's `(4, ∞)` reads as `[5, ∞)`. Then the
     /// empty set is [`Predicate::False`], a set covering its type is [`Predicate::True`],
     /// and intervals that meet, at a shared value or at adjacent discrete values, are merged.
+    ///
+    /// `set` holds no inverted interval, such as the `[5, 4]` that `Interval::open(4, 5)` is over
+    /// `UInt`. One stops `IntervalSet::new` merging the intervals around it, and the clamp drops
+    /// it but not what it left unmerged: `[4, 7], [5, 4], [6, 6]` comes out `[4, 7], [6, 6]`. That
+    /// set is not the canonical spelling of `[4, 7]`, and its right ends do not ascend, which
+    /// `canonical_runs` debug-asserts.
     pub(crate) fn intervals(set: IntervalSet<Value>) -> Predicate {
         let range = sample(&set).and_then(type_range);
         let set = match &range {
@@ -1471,16 +1477,20 @@ where
 /// `𝑥` has no predecessor to make them adjacent. Together they are `(-∞, 𝑦]`. Where the shared
 /// value is open on both sides it belongs to neither, which is a real gap and stays.
 fn canonical_runs(set: IntervalSet<Value>) -> IntervalSet<Value> {
-    let (merged, ordered) = normalize_and_join(set);
-    if ordered {
-        return IntervalSet::new_unchecked(merged);
+    let (mut merged, ordered) = normalize_and_join(set);
+    if !ordered {
+        // The crate's `intersection` with the type's range turns two equal half-bounded
+        // intervals into two equal finite ones. `IntervalSet::new` sorts and merges them.
+        let ordered;
+        (merged, ordered) = normalize_and_join(IntervalSet::new(merged));
+        debug_assert!(
+            ordered,
+            "canonical_runs: intervals of a set built by `IntervalSet::new` are sorted and disjoint: {merged:?}"
+        );
     }
-    // The crate's `intersection` with the type's range turns two equal half-bounded intervals into
-    // two equal finite ones. `IntervalSet::new` sorts and merges them.
-    let (merged, ordered) = normalize_and_join(IntervalSet::new(merged));
     debug_assert!(
-        ordered,
-        "canonical_runs: intervals of a set built by `IntervalSet::new` are sorted and disjoint: {merged:?}"
+        right_ends_ascend(&merged),
+        "canonical_runs: the right ends ascend, which `holds` searches by: {merged:?}"
     );
     IntervalSet::new_unchecked(merged)
 }

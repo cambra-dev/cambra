@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use intervalsets::ops::Contains;
 use log::trace;
 
 use crate::{
@@ -209,7 +208,7 @@ fn key_matches_predicate(key: &Value, predicate: &Predicate) -> bool {
     match predicate {
         Predicate::True => true,
         Predicate::False => false,
-        Predicate::Intervals(intervals) => intervals.contains(key),
+        Predicate::Intervals(_) => predicate.contains(key),
         _ => panic!("Unsupported predicate type in TestDataSource release: {predicate:?}"),
     }
 }
