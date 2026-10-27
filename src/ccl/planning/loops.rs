@@ -151,12 +151,7 @@ fn is_txn_group(bindings: &[(TypedBinding, Expr)]) -> bool {
 
 /// Whether the subtree mentions builtin `b`.
 fn uses_builtin(e: &Expr, b: &Builtin) -> bool {
-    if matches!(&e.node, TypedExprNode::Builtin(x) if x == b) {
-        return true;
-    }
-    let mut found = false;
-    e.walk_children(|c| found = found || uses_builtin(c, b));
-    found
+    matches!(&e.node, TypedExprNode::Builtin(x) if x == b) || e.any_child(|c| uses_builtin(c, b))
 }
 
 /// Flatten an acyclic channel group to plain `let`s, dependencies bound before
