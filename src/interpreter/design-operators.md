@@ -497,6 +497,7 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
 | `MapResultWithSource` | The input is pulled at the projection, so a morsel reads only its own keys from the source. |
 | `RecordWrap` | The input is pulled at the projection, which beneath the outermost keys is one above the wrapped level (`Restates::Above`). |
 | `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. |
+| `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. A projection beneath the outermost keys is answered above the record's level (`Restates::Above`). |
 
 ### Producer attribution and probes
 
