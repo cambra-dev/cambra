@@ -4371,6 +4371,8 @@ fn eq_term_modulo_ty_slots_go(
                 kind: k2,
             },
         ) => k1 == k2 && eq_term_modulo_ty_slots_go(i1, i2, pairs),
+        // `bound_expr`, `init` or `iter` sits outside the binder's scope; the binder scopes
+        // over `body`.
         (
             N::Let {
                 binding: bd1,
@@ -4382,43 +4384,33 @@ fn eq_term_modulo_ty_slots_go(
                 bound_expr: e2,
                 body: b2,
             },
-        ) => {
-            // The definiens sits outside the binder, the body inside it.
-            eq_term_modulo_ty_slots_go(e1, e2, pairs)
-                && eq_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])
-        }
-        (
+        )
+        | (
             N::MutDecl {
                 binding: bd1,
-                init: i1,
+                init: e1,
                 body: b1,
             },
             N::MutDecl {
                 binding: bd2,
-                init: i2,
+                init: e2,
                 body: b2,
             },
-            // A mutable variable introduction binds exactly as a `let` does: the seed sits
-            // outside the binder, the body inside it.
-        ) => {
-            eq_term_modulo_ty_slots_go(i1, i2, pairs)
-                && eq_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])
-        }
-        (
+        )
+        | (
             N::For {
-                target: t1,
-                iter: it1,
+                target: bd1,
+                iter: e1,
                 body: b1,
             },
             N::For {
-                target: t2,
-                iter: it2,
+                target: bd2,
+                iter: e2,
                 body: b2,
             },
-            // The source is evaluated outside the loop; the target is bound over the body.
         ) => {
-            eq_term_modulo_ty_slots_go(it1, it2, pairs)
-                && eq_under_binder(pairs, &t1.name, &t2.name, &[(b1, b2)])
+            eq_term_modulo_ty_slots_go(e1, e2, pairs)
+                && eq_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])
         }
         (
             N::MutWrite {

@@ -591,13 +591,12 @@ fn hash_payload<'a>(
             }
         }
 
-        N::Lambda { param, .. } => hash_binding(param, env, wenv, free, fold, h),
-        N::Let { binding, .. } => hash_binding(binding, env, wenv, free, fold, h),
-        // A mutable variable introduction binds exactly as a `let` does — the
-        // history `Mut(V, D)` rides the binder's `ty`, so hashing the binding
+        // A `MutDecl`'s history `Mut(V, D)` rides its binder's `ty`, so hashing the binding
         // covers the declaration's whole type-level content.
-        N::MutDecl { binding, .. } => hash_binding(binding, env, wenv, free, fold, h),
-        N::For { target, .. } => hash_binding(target, env, wenv, free, fold, h),
+        N::Lambda { param: b, .. }
+        | N::Let { binding: b, .. }
+        | N::MutDecl { binding: b, .. }
+        | N::For { target: b, .. } => hash_binding(b, env, wenv, free, fold, h),
         N::LetRec { bindings, .. } | N::DefGroup { bindings, .. } => {
             bindings.len().hash(h);
             for (b, _) in bindings {
