@@ -507,6 +507,7 @@ of a restatement with no spelling.
 | `Aggregate` | Admits `Everything` and `Nothing`: the accumulator has no keys, and the input is read whole whatever the consumer asks. A key projection panics. |
 | `ExtractAggregate` | Admits `Everything` and `Nothing`: one extracted value has no keys. A key projection panics. |
 | `MapAggregate` | Pulls the input at the projection and cuts the answer to it: the answer is built from every accumulator held, including those of keys pulled earlier, and each group beneath a key is whole. |
+| `MapExtractAggregate` | Pulls the input at the projection. The answer keeps the input's keys, and only unfinished groups drop. |
 
 ### Producer attribution and probes
 
