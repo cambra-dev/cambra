@@ -475,6 +475,10 @@ of a cyclic fan-out).
   the region pulled, and a pull of one projection states completeness over its keys only, so a pull
   of another region withdraws nothing it said of the first. The debug check keeps the last statement
   of each region.
+- **Check.** A debug build's `TileProducer::get` compares each answer with the projection it was
+  asked for (`Tile::within`) and panics on a key the projection omits, on any cell where the
+  projection names nothing, and on a pull for keys that a non-collection answers. A producer that
+  has not restated projections answers whole and fails the check on the first pull for keys.
 - **Test double.** `ProjectionSpy` answers a fixed tile cut to the guard it is pulled with, and
   logs each projection and release it receives. An operator test pulls the operator over it and
   reads the log to see the guard the operator restated.
