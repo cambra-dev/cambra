@@ -86,6 +86,24 @@ impl Projection {
         }
     }
 
+    /// The keys above `level` that this projection names, for an operator whose input lacks
+    /// `level`: itself where it names keys above `level`, and otherwise the keys of the level just
+    /// above that its paths run through, or everything where `level` is the outermost.
+    ///
+    /// The operator pulls its input there and cuts its answer to this projection after; pulling
+    /// more is sound for a `get`.
+    pub fn above(&self, level: CurryLevel) -> Projection {
+        match self {
+            Projection::Keys { level: own, keys } if *own >= level => match level.enclosing() {
+                None => Projection::Everything,
+                Some(enclosing) => {
+                    Projection::keys_at(enclosing, through_at(keys, *own, enclosing))
+                }
+            },
+            other => other.clone(),
+        }
+    }
+
     /// The level whose keys this projection names, `None` for everything and nothing.
     pub fn level(&self) -> Option<CurryLevel> {
         match self {
@@ -723,6 +741,27 @@ mod tests {
                 "({k}, {j}) is stated complete again"
             );
         }
+    }
+
+    /// An operator that keeps the keys above its level pulls its input, for a projection of
+    /// paths at or beneath that level, at the rows above it the paths run through, and at the
+    /// projection itself otherwise.
+    #[test]
+    fn a_projection_beneath_an_operator_s_level_is_pulled_at_the_rows_above_it() {
+        let paths =
+            level_one(under(key(0), positions(1, 2)).union(&under(key(1), Predicate::True)));
+        let rows = paths.above(CurryLevel::new(1));
+        let both = Projection::admitting(positions(0, 1));
+        assert_eq!(
+            (rows.minus(&both), both.minus(&rows)),
+            (Projection::Nothing, Projection::Nothing),
+            "rows 0 and 1, which the paths run through: {rows:?}"
+        );
+        assert_eq!(paths.above(CurryLevel::new(2)), paths);
+        assert_eq!(paths.above(CurryLevel::OUTERMOST), Projection::Everything);
+        let keys = Projection::admitting(key(0));
+        assert_eq!(keys.above(CurryLevel::new(1)), keys);
+        assert_eq!(keys.above(CurryLevel::OUTERMOST), Projection::Everything);
     }
 
     /// Every key beneath an outermost key reads as that key, so a producer restating the

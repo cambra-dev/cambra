@@ -554,6 +554,7 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
 | `Restrict` | The predicate is pulled at the projection, since the restricted domain is the predicate's keys that pass. |
 | `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
 | `Uncurry` | Beneath standing levels the input is pulled at the projection. Pairing the whole tile reads the groups whose first component the projection admits, and the pairs are cut after. |
+| `Product` | Both sides are pulled at the projection, since they are aligned row for row. The outer side has no paired level, so a projection at or beneath it pulls both sides at the rows its paths run through (`Projection::above`), and the pairs are cut. |
 
 ### Producer attribution and probes
 
