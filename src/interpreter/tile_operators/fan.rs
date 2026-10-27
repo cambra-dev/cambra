@@ -827,52 +827,57 @@ pub struct SelectField {
     name: SmolStr,
 }
 
-/// What a selector of field `name` releases of the product `tiling`, given its consumer's
-/// release `guard` of that field: `guard` on the field, and every other field whole.
-///
-/// **A selector's subscription reads one field**, so nothing beneath it needs the others.
-/// A sibling selector reads the product through the [`FanOut`] a shared product sits
-/// behind, which forwards only the meet of its readers' releases, so a field reaches the
-/// product released only where every reader has released it. The meet of two such releases
-/// beneath a level names one field's cells under some rows, which a keyless field's guard
-/// states by the rows above it ([`TileGuard::Scalar`]).
-///
-/// A guard naming keys of a level above the record names every field at those keys, and it
-/// passes through as those keys.
+/// Restate a selector's release at field `name` in the product `tiling`.
+/// Enclosing keys release those records whole. Unused collection fields remain available at
+/// later rows: a zip needs their presence to retain each record. Unused keyless fields can be
+/// released whole because a zip represents their missing cells. A bare product has no enclosing
+/// rows, so its unused fields are released whole.
 fn guard_at_field(tiling: &Tiling, name: &str, guard: TileGuard) -> TileGuard {
-    match tiling {
-        Tiling::DataFunction { codomain, .. } => match guard {
-            g if g.is_universal() => tiling.universal_guard(),
-            TileGuard::Function(FunctionGuard::Codomain(inner)) => TileGuard::Function(
-                FunctionGuard::Codomain(Box::new(guard_at_field(codomain, name, *inner))),
-            ),
-            TileGuard::Or(arms) => TileGuard::flatten_or(
-                arms.into_iter()
-                    .map(|arm| guard_at_field(tiling, name, arm))
-                    .collect(),
-            ),
-            keys @ TileGuard::Function(FunctionGuard::Domain(_)) => {
-                let field = select_field_tiling(codomain, name).empty_guard();
-                TileGuard::flatten_or(vec![
-                    keys,
-                    TileGuard::Function(FunctionGuard::Codomain(Box::new(guard_at_field(
-                        codomain, name, field,
-                    )))),
-                ])
+    fn at_field(tiling: &Tiling, name: &str, guard: TileGuard, under_keys: bool) -> TileGuard {
+        match tiling {
+            Tiling::DataFunction { codomain, .. } => match guard {
+                g if g.is_universal() => tiling.universal_guard(),
+                TileGuard::Function(FunctionGuard::Codomain(inner)) => TileGuard::Function(
+                    FunctionGuard::Codomain(Box::new(at_field(codomain, name, *inner, true))),
+                ),
+                TileGuard::Or(arms) => TileGuard::flatten_or(
+                    arms.into_iter()
+                        .map(|arm| at_field(tiling, name, arm, under_keys))
+                        .collect(),
+                ),
+                keys @ TileGuard::Function(FunctionGuard::Domain(_)) => {
+                    let field = select_field_tiling(codomain, name).empty_guard();
+                    TileGuard::flatten_or(vec![
+                        keys,
+                        TileGuard::Function(FunctionGuard::Codomain(Box::new(at_field(
+                            codomain, name, field, true,
+                        )))),
+                    ])
+                }
+                other => unreachable!("a collection's guard is a function guard, got {other:?}"),
+            },
+            Tiling::Record(fields) => {
+                let release_unused = !under_keys || guard.is_universal();
+                TileGuard::Record(
+                    fields
+                        .iter()
+                        .map(|(field, tiling)| {
+                            let released = if field == name {
+                                guard.clone()
+                            } else if release_unused || !tiling.holds_a_level() {
+                                tiling.universal_guard()
+                            } else {
+                                tiling.empty_guard()
+                            };
+                            (field.clone(), released)
+                        })
+                        .collect(),
+                )
             }
-            other => unreachable!("a collection's guard is a function guard, got {other:?}"),
-        },
-        Tiling::Record(fields) => TileGuard::Record(
-            fields
-                .iter()
-                .map(|(field, t)| match field == name {
-                    true => (field.clone(), guard.clone()),
-                    false => (field.clone(), t.universal_guard()),
-                })
-                .collect(),
-        ),
-        other => unreachable!("SelectField's input holds a record, got {other}"),
+            other => unreachable!("SelectField's input holds a record, got {other}"),
+        }
     }
+    at_field(tiling, name, guard, false)
 }
 
 /// Replace the record at a chain's deepest values with its `name` field, keeping the levels.
@@ -955,11 +960,13 @@ impl TileOperator for SelectField {
 
 /// Producer for [`SelectField`].
 ///
-/// **A pull reads the whole product.** A narrowed pull is unsound through a cumulative
-/// cache: [`Memo`] merges what a pull returned and answers later pulls from it without going
-/// below, so a pull naming one field would record a partial answer as the whole one, and a
-/// sibling selector would read a field never fetched. A release names this field's part and
-/// every other field whole ([`guard_at_field`]).
+/// **A pull reads every field of the product.** A pull that names one field is unsound through
+/// a cumulative cache: [`Memo`] merges what a pull returned and answers later pulls from it
+/// without going below, so a pull naming one field would record a partial answer as the
+/// whole one, and a sibling selector would read a field never fetched. A pull may name keys
+/// of the stream the field sits under, since a key brings every field of its record. A
+/// release names this field's part; enclosing keys release their whole records
+/// ([`guard_at_field`]).
 struct SelectFieldProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
@@ -981,8 +988,19 @@ impl TileProducer for SelectFieldProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut tile = self.input.get(self.input.tiling().universal_guard());
+    /// A stream of records keeps its keys under the field, so the input is pulled at the
+    /// projection. A product of collections has no projection guard of its own: it is pulled
+    /// whole, and the field cut after.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let input_guard = match self.input.tiling().is_data_function() {
+            true => projection.guard(self.input.tiling()),
+            false => self.input.tiling().universal_guard(),
+        };
+        let mut tile = self.input.get(input_guard);
         // A row holding no cell of this field gave that cell back to this reader's release
         // (`Tile::Record`'s `absent`), and the field is the whole value here, so the row
         // leaves with it. The record gathers its other fields' cells along.
@@ -1023,6 +1041,7 @@ impl TileProducer for SelectFieldProducer {
             let at_field = self.at_field(dropped);
             self.input.release(at_field);
         }
+        tile.restrict_to(&projection, self.tiling());
         tile
     }
 
@@ -1341,10 +1360,10 @@ mod tests {
         );
     }
 
-    /// A consumer finishing rows of one field releases those rows whole, and every other
-    /// field everywhere: nothing beneath the selector reads the others ([`guard_at_field`]).
+    /// Finishing one row releases that record, including its unused collection field, and
+    /// leaves the other rows available for the next morsel.
     #[test]
-    fn select_field_releases_finished_rows_and_every_other_field() {
+    fn small_morsels_release_only_the_selected_records_rows() {
         let input_tiling = record_under_a_level();
         let (spy, log) = ReleaseSpy::new(
             Tile::Scalar(ColumnValue::Ints(vec![])),
@@ -1355,28 +1374,49 @@ mod tests {
             base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &output_tiling),
             input: Box::new(spy),
             name: "a".into(),
-            input_tiling: input_tiling.clone(),
+            input_tiling,
         };
         let rows = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
             0,
         ))));
         producer.release(rows.clone());
+        assert_eq!(*log.borrow(), vec![rows]);
+    }
 
-        let Tiling::DataFunction { codomain, .. } = &input_tiling else {
-            unreachable!("built as a collection")
-        };
-        let Tiling::Record(fields) = &**codomain else {
-            unreachable!("built over a record")
-        };
-        let other_fields = TileGuard::Function(FunctionGuard::Codomain(Box::new(
-            TileGuard::Record(HashMap::from([
-                ("a".into(), TileGuard::Scalar(Predicate::False)),
-                ("xs".into(), fields["xs"].universal_guard()),
+    #[test]
+    fn small_morsels_keep_unused_collections_while_record_cells_are_live() {
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let selected = Tiling::Record(HashMap::from([
+            ("x".into(), scalar.clone()),
+            ("y".into(), scalar.clone()),
+        ]));
+        let sibling = Tiling::data_function(Extent::uint_range(2), scalar.clone());
+        let input = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::Record(HashMap::from([
+                ("a".into(), selected),
+                ("xs".into(), sibling.clone()),
+                ("q".into(), scalar),
             ])),
-        )));
+        );
+        let cells = TileGuard::Record(HashMap::from([
+            ("x".into(), TileGuard::Scalar(Predicate::True)),
+            ("y".into(), TileGuard::Scalar(Predicate::False)),
+        ]));
+        let released = guard_at_field(
+            &input,
+            "a",
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(cells.clone()))),
+        );
         assert_eq!(
-            *log.borrow(),
-            vec![TileGuard::flatten_or(vec![rows, other_fields])],
+            released,
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(
+                HashMap::from([
+                    ("a".into(), cells),
+                    ("xs".into(), sibling.empty_guard()),
+                    ("q".into(), TileGuard::Scalar(Predicate::True)),
+                ])
+            ))))
         );
     }
 
@@ -1721,7 +1761,7 @@ mod tests {
 mod projection_tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{
-        GuardLog, ProjectionSpy, assert_conforms, ints_by_position, keys_between,
+        GuardLog, ProjectionSpy, assert_conforms, int_entries, ints_by_position, keys_between,
     };
     use crate::interpreter::{BaseType, Extent};
 
@@ -1781,6 +1821,105 @@ mod projection_tests {
         for guard in [keys_between(0, 2), keys_between(6, 20)] {
             assert_conforms(|| Box::new(wrapped().0), guard);
         }
+    }
+
+    /// `[r.amount for r in rows]`: a field read out of a stream of records.
+    fn amounts_of_records() -> (SelectFieldProducer, GuardLog) {
+        let rows = Tile::data_function(
+            ColumnValue::UInts((0..ROWS).collect()),
+            Box::new(Tile::record(HashMap::from([
+                (
+                    SmolStr::new("amount"),
+                    Tile::Scalar(ColumnValue::Ints(
+                        (0..ROWS as i64).map(|i| 100 + i).collect(),
+                    )),
+                ),
+                (
+                    SmolStr::new("qty"),
+                    Tile::Scalar(ColumnValue::Ints((0..ROWS as i64).collect())),
+                ),
+            ]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Record(
+                ["amount", "qty"]
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            SmolStr::new(name),
+                            Tiling::Scalar(Extent::Base(BaseType::Int)),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(rows, in_tiling.clone());
+        (
+            SelectFieldProducer {
+                base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
+                input: Box::new(input),
+                name: SmolStr::new("amount"),
+                input_tiling: in_tiling,
+            },
+            pulled,
+        )
+    }
+
+    #[test]
+    fn a_field_of_a_record_stream_is_read_at_the_morsel() {
+        let (mut select, pulled) = amounts_of_records();
+        let morsel = select.get(keys_between(1, 3));
+        assert_eq!(int_entries(&morsel), [(1, 101), (2, 102), (3, 103)]);
+        assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
+    }
+
+    #[test]
+    fn a_field_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 1), keys_between(6, 20)] {
+            assert_conforms(|| Box::new(amounts_of_records().0), guard);
+        }
+    }
+
+    /// A product of two collections, as a `Let` or a record of comprehensions makes it, has no
+    /// projection guard of its own: the field is read whole from the product and cut after.
+    #[test]
+    fn a_field_of_a_product_is_pulled_whole_and_cut() {
+        let product_tiling = Tiling::Record(
+            ["a", "b"]
+                .into_iter()
+                .map(|name| (SmolStr::new(name), ints()))
+                .collect(),
+        );
+        let make = || {
+            let product = Tile::record(HashMap::from([
+                (
+                    SmolStr::new("a"),
+                    ints_by_position(&(0..ROWS as i64).collect::<Vec<_>>(), true),
+                ),
+                (
+                    SmolStr::new("b"),
+                    ints_by_position(&(100..100 + ROWS as i64).collect::<Vec<_>>(), true),
+                ),
+            ]));
+            let (input, pulled, _) = ProjectionSpy::new(product, product_tiling.clone());
+            (
+                SelectFieldProducer {
+                    base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
+                    input: Box::new(input),
+                    name: SmolStr::new("a"),
+                    input_tiling: product_tiling.clone(),
+                },
+                pulled,
+            )
+        };
+        let (mut select, pulled) = make();
+        let morsel = select.get(keys_between(2, 3));
+        assert_eq!(int_entries(&morsel), [(2, 2), (3, 3)]);
+        assert_eq!(*pulled.borrow(), [product_tiling.universal_guard()]);
+        assert_conforms(|| Box::new(make().0), keys_between(2, 3));
     }
 
     #[test]

@@ -545,7 +545,7 @@ Each operator answers a projection as its row of this table states.
 | `MapResultToConst` | The input is pulled at the projection. The constant is read whole, since every row reads all of it. A projection beneath the outermost keys is answered above the constant's level (`Restates::Above`), and one at or beneath it panics. |
 | `MapResultWithSource` | The input is pulled at the projection, at any level (`Restates::Every`), so a morsel reads only its own keys from the source. |
 | `RecordWrap` | The input is pulled at the projection, which beneath the outermost keys is one above the wrapped level (`Restates::Above`). |
-| `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. |
+| `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. Releasing enclosing keys releases those records only; partial cell releases retain collection-valued sibling fields for later rows, while unused keyless fields can be released whole. A bare product releases unused fields whole. |
 | `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. A projection beneath the outermost keys is answered above the record's level (`Restates::Above`). |
 | `MakeRecord` | A record of values has no keys: the projection is the whole record or nothing, and a guard naming keys panics. |
 | `VariantWrap` | A payload stream is pulled at the projection. A payload that is itself a collection becomes one union column and is read whole. A projection beneath the outermost keys is answered above the wrapped level (`Restates::Above`). |
