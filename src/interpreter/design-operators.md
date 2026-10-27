@@ -544,6 +544,7 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
 | `MapResultToConst` | The input is pulled at the projection. The constant is read whole, since every row reads all of it. A projection beneath the outermost keys is answered above the constant's level (`Restates::Above`), and one at or beneath it panics. |
 | `MapResultWithSource` | The input is pulled at the projection, at any level (`Restates::Every`), so a morsel reads only its own keys from the source. |
 | `RecordWrap` | The input is pulled at the projection, which beneath the outermost keys is one above the wrapped level (`Restates::Above`). |
+| `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. |
 
 ### Producer attribution and probes
 
