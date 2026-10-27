@@ -24,7 +24,7 @@ log <<= [e for e in events if e.ok and not e.skip or True]
 
 def bump(n: {Int where _ >= 0}, flag: Bool, hole: _) => Int:
     if n == 0 or n != 1:
-        return n ** 2 // 3
+        return n ** 2 // 1_000
     elif n <= 4 and n > 5 or n < 6:
         return n ^+ 1
     else:

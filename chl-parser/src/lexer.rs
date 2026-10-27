@@ -254,8 +254,11 @@ pub enum Token {
     At,
 
     // -- Literals ---------------------------------------------------------
-    /// Decimal integer literal. `_` digit separators are not supported.
-    #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
+    /// Decimal integer literal, with optional `_` digit separators: `1_000_000`.
+    /// The regex takes every digit and `_` after the first digit, so a malformed
+    /// run (`1_`, `1__0`) is one invalid token rather than an integer followed by
+    /// an identifier.
+    #[regex(r"[0-9][0-9_]*", |lex| parse_int(lex.slice()))]
     Int(i64),
 
     /// String literal in either double-quoted (`"…"`) or single-quoted
@@ -610,6 +613,16 @@ fn push_comment(
     if run_start < end {
         out.push((HighlightClass::Comment, Span::new(file, run_start, end)));
     }
+}
+
+/// The value of an integer literal's text, or `None` for a malformed one: a
+/// separator `_` stands between two digits (`docs/chl-spec.md`, "1.7 Literals"),
+/// as in Python (PEP 515) and Go, and the value fits an `i64`.
+fn parse_int(text: &str) -> Option<i64> {
+    if text.ends_with('_') || text.contains("__") {
+        return None;
+    }
+    text.replace('_', "").parse().ok()
 }
 
 /// The words an editor marks inside a comment as [`HighlightClass::Todo`].
@@ -1636,6 +1649,32 @@ mod tests {
     #[test]
     fn just_a_literal() {
         assert_eq!(tokens("42"), vec![Token::Int(42), Token::Newline]);
+    }
+
+    #[test]
+    fn digit_separators_join_one_integer() {
+        assert_eq!(
+            tokens("1_000_000"),
+            vec![Token::Int(1_000_000), Token::Newline]
+        );
+        assert_eq!(tokens("1_2_3"), vec![Token::Int(123), Token::Newline]);
+    }
+
+    /// A separator stands between two digits. A malformed run of digits and
+    /// separators is one invalid token covering the run, not an integer
+    /// followed by an identifier: in `1_a` the run is `1_`.
+    #[test]
+    fn a_misplaced_digit_separator_is_one_invalid_token() {
+        let file = FileId::ROOT;
+        for (source, end) in [("1_", 2), ("1__0", 4), ("1_a", 2)] {
+            assert_eq!(
+                errors(source),
+                vec![LexError::InvalidToken {
+                    span: Span::new(file, 0, end)
+                }],
+                "{source}"
+            );
+        }
     }
 
     #[test]

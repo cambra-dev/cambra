@@ -214,7 +214,7 @@
     },
     "number": {
       "name": "constant.numeric.integer.decimal.cambra",
-      "match": "\\b[0-9]+\\b"
+      "match": "\\b[0-9]+(?:_[0-9]+)*\\b"
     },
     "lambda": {
       "name": "storage.type.function.lambda.cambra",

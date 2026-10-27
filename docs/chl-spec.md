@@ -183,7 +183,7 @@ clause, which ends a `def` signature or a polymorphic type
 
 | Form | Token | Notes |
 |---|---|---|
-| `0`, `42`, `1234` | `Int(i64)` | Decimal only; no `_` separators, no hex/bin/oct, no negation in the token (`-3` is `UnaryOp(Neg, 3)`). |
+| `0`, `42`, `1_000_000` | `Int(i64)` | Decimal only; no hex/bin/oct, no negation in the token (`-3` is `UnaryOp(Neg, 3)`). A `_` digit separator stands between two digits and does not change the value, as in Python and Go: `1_000` is `1000`. A misplaced separator (`1_`, `1__0`) makes the run of digits and separators one invalid token ([11.1 Lex errors](#111-lex-errors)). |
 | `"hello\n"`, `'world'` | `String` | Double- or single-quoted. Escapes: `\n \t \r \\ \" \' \0`. Unknown escapes are preserved verbatim (the `\` is kept). A literal closes on the line it opens on: a raw newline before the closing quote is the lex error `UnterminatedString` ([11.1 Lex errors](#111-lex-errors)), so there are no multi-line strings. No triple-quoted `"""..."""`, no f-strings, no raw `r"..."`. |
 | `True`, `False` | `Bool` | |
 
