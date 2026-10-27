@@ -917,7 +917,8 @@ pub trait TileProducer {
     /// the result.
     /// Tiling conformance is asserted in every build; release, structural and completeness
     /// checks require debug assertions. Probe observations occur after those checks.
-    /// Projection is the implementation's responsibility.
+    /// A debug build also checks that the answer holds only what the projection guard names
+    /// ([`Tile::within`]); an operator that forwards the projection to its input answers inside it because the input does, and any other cuts its own answer.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
         // Cleared before the pull, so a notification arriving while it runs passes: the
@@ -926,6 +927,7 @@ pub trait TileProducer {
             gate.take();
         }
         self.base_mut().pulls += 1;
+        let asked = cfg!(debug_assertions).then(|| projection_guard.clone());
         let mut result = self.get_impl(projection_guard);
         // Released scalar cells are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
@@ -948,6 +950,18 @@ pub trait TileProducer {
             self.tiling()
         );
         debug_assert!(validate_tile(&result), "Invalid tile: {result:?}");
+        if let Some(asked) = &asked {
+            // A guard that is not a projection is left to a producer that restates projections,
+            // which panics on it in `get_impl`; one that is, bounds the answer.
+            if let Ok(projection) = crate::interpreter::Projection::of(asked)
+                && let Err(outside) = result.within(&projection)
+            {
+                panic!(
+                    "{} answered a pull at {asked:?} with {result:?}, but {outside}",
+                    self.name()
+                );
+            }
+        }
         if cfg!(debug_assertions) {
             if let Some(last) = &self.base().last_output
                 && let Some(violation) =
