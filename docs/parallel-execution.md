@@ -290,9 +290,14 @@ The scheduler is a data structure, not a thread: the dispatcher. `N` execution t
 core, take work from it; nothing dispatches to them. Its content is, per pipeline, the pipeline's
 morsel source, whether that source is exhausted, and how many claimed morsels are not acknowledged;
 a worker asking for the next package is answered from the pipeline it is on while that pipeline's
-source has one. A source answers `None` once it has no more rows, and a pipeline is done when its
-source is exhausted and no claimed morsel is outstanding. A package carries a guard and never a
-tile, because the tile is what a worker produces by pulling its own chain, and data crosses between
+source has one. A source answers `None` once it has no more rows. A pipeline is done when its source
+is exhausted, no claimed morsel is outstanding, and every worker that claimed from it has left it,
+handing in the state it holds for it. The worker that completes the pipeline runs the breaker's
+combine and starts the pipelines waiting on it; a pipeline's source is built then, since a pipeline
+behind a breaker reads what the breaker produced. A worker with nothing claimable parks until a
+pipeline finishes. A pipeline with its dependencies is the event, and a partitioned merge is a pipeline over the
+partitions. A package carries a guard and never a tile,
+because the tile is what a worker produces by pulling its own chain, and data crosses between
 operators only through `get`.
 
 **A worker's loop.** Claim the next package, pull the package's pipeline at its guard, hand the
@@ -798,10 +803,9 @@ Ordered so that each step is measurable on its own and none is undone by the nex
 
 ## Open questions
 
-- What an acknowledgement means once a breaker keeps per-worker partials across rounds: rows
-  absorbed into the breaker's shared state, or a per-worker hand-in step the round waits for. A
-  round that waits on outstanding morsels also needs a wake that `ack` does not issue today, and a
-  `Condvar` of its own apart from the workers'.
+- Whether a round that keeps per-worker partials across rounds can use the pipeline's leave as its
+  hand-in, which finishes a pipeline once every worker has left it, or needs a hand-in per round
+  while the pipeline stays open.
 - How a live source's claim names "nothing yet" beside "exhausted", and which of the source, the
   dispatcher and the scheduler lap wakes a parked worker.
 

@@ -112,18 +112,18 @@ parallel run refuses.
 ### The dispatcher
 
 The dispatcher is the scheduler of [docs/parallel-execution.md, "The
-scheduler"](../../docs/parallel-execution.md#the-scheduler) for the pipelines of a plan. It holds
-one job per pipeline, a `MorselSource` with two atomics, and one `failed` flag. No lock guards it
-and no worker waits in it. A `WorkPackage` is a `PipelineId` and the guard naming one morsel. The
-calls:
+scheduler"](../../docs/parallel-execution.md#the-scheduler) for the pipelines of a plan. A plan
+gives it one `PipelineSpec` per pipeline: the pipelines it follows, a function that builds its
+`MorselSource`, and an optional `finalize`. A `WorkPackage` is a `PipelineId` and the guard naming
+one morsel. The morsel path takes no lock. The only lock parks idle workers. The calls:
 
-- `next` claims a morsel of `CAMBRA_MORSEL_ROWS` rows from the first pipeline whose source has one
-  and answers it as a package. It answers `None` once every source is exhausted or the dispatcher
-  failed.
+- `next(prefer)` claims a morsel of `CAMBRA_MORSEL_ROWS` rows from a started pipeline, trying
+  `prefer` first, and answers `Next::Package`. It answers `Next::Wait` when no started pipeline has
+  a morsel and some pipeline has not finished, and `Next::Done` once every pipeline has finished or
+  the dispatcher failed.
 - `ack` counts a claimed morsel back, once the breaker holds its rows and the morsel is released.
-- `is_done` says whether a pipeline's source has answered `None` and every morsel it answered is
-  acknowledged.
-- `fail` makes every `next` answer `None` from then on.
+- `serve(worker)` is one worker's loop over those calls ([A worker's turn](#a-workers-turn)).
+- `fail` makes every `next` answer `Done` from then on.
 
 A worker pulls its morsel from the source; no structure holds morsels between the two. This is the
 dispatch of Leis et al. 2014, where the dispatcher carves the next range off a pipeline's input when
@@ -134,22 +134,47 @@ for an operator that is a source and `None` for every other. `MorselSource::clai
 guard of the next morsel of at most `rows` rows, or `None`, which is final. `IterateExtent` over a
 finite range `[0, n)` answers a `RangeSource`: one `AtomicU64` cursor that `fetch_update` advances,
 so each position is in exactly one claimed morsel whichever threads claim, and the cursor never
-passes `n`. The claim orders nothing else: the cursor partitions positions, and the data a worker
-reads under a guard comes from its own chain. `IterateExtent`'s producer knows nothing of the
-dispatcher. `run_main` finds the source by walking the chain's inputs to the first operator that
-answers one, and refuses a chain with none or with several.
+passes `n`. The update is acquire-release, because a claim that answers `None` must happen after
+every claim that answered a morsel (the finish rule below relies on it). The data a worker reads
+under a guard comes from its own chain. `IterateExtent`'s producer knows nothing of the dispatcher.
+`run_main` finds the source by walking the chain's inputs to the first operator that answers one,
+and refuses a chain with none or with several.
 
-**Done is a count.** A claim counts itself outstanding before it asks the source and takes the count
-back when the source answers `None`, so an exhausted source with nothing outstanding has no claim in
-flight. `ack` is the only other decrement.
+**A pipeline finishes when three counts agree.** Its source has answered `None`, no claimed morsel
+is outstanding, and no worker is still attached. A claim counts itself outstanding before it asks
+the source and takes the count back when the source answers `None`. A worker attaches when it
+receives its first package of the pipeline and leaves once the source is exhausted, handing in what
+it holds for the pipeline through `PoolWorker::leave`. The worker that completes the pipeline, by
+its last `ack`, its `None` claim or its leaving, runs `finalize` and finishes it. Nothing is
+outstanding and no worker is attached only after every claim that answered a morsel was
+acknowledged: a claim attaches before it acknowledges.
 
-**`None` is final only while every pipeline's source exists.** A pipeline that exists only after
-another finishes, behind a breaker, or a source that receives rows over time, makes `None` mean
-"nothing now". The dispatcher is where a worker then waits, which needs a wake-up that a claim does
-not provide.
+**A pipeline starts when the pipelines it follows have finished.** Finishing a pipeline decrements
+the wait count of each pipeline behind it, and the one that reaches zero builds its source. The
+source is built then because a pipeline behind a breaker reads what the breaker produced. A plan
+lists a pipeline after every pipeline it follows, so the dependencies form no cycle, and the
+dispatcher refuses a plan that does not.
 
-A worker that panics fails the dispatcher on its way out (`FailOnUnwind`): `next` answers `None`
-from then on, the other workers stop claiming, and the scope re-raises the panic.
+**Idle workers park.** A worker that finds nothing claimable reads the dispatcher's epoch before it
+looks, and parks until the epoch moves. The epoch moves when a pipeline's source is exhausted, when
+a pipeline finishes and when the dispatcher fails. The thread that moves it takes the idle lock
+before it notifies, so a worker between its check and its wait is not missed. Exhaustion moves it
+because a worker parked while attached has to wake and leave before the pipeline can finish.
+
+**A worker stays on its pipeline.** `next` tries the pipeline the worker last claimed from first,
+which keeps its chain, the rows it reads and its partial in one cache. A worker moves when that
+pipeline has no morsel.
+
+A worker that panics fails the dispatcher on its way out (`FailOnUnwind`): `next` answers `Done`
+from then on, parked workers wake, the other workers stop claiming, and the scope re-raises the
+panic.
+
+#### A worker's turn
+
+`Dispatcher::serve` runs one worker until every pipeline has finished. Each pass leaves the
+pipelines whose source is exhausted, asks `next`, and runs the package through `PoolWorker::work`,
+which pulls the chain, hands the tile to the breaker and releases the morsel, before `ack`. The
+plan's one pipeline is served by `MainWorker`; a test double records what it ran and left.
 
 ### Projection guards
 
@@ -205,18 +230,25 @@ group-by is refused. The three producers each have a unit test of the interval t
 release that follows (`map.rs`, `scalar.rs`, `iterate.rs`). `iterate.rs` also tests `RangeSource`:
 its morsels are disjoint and end in `None`, a morsel holds at least one row, and a finite range from
 zero is the one extent that answers a source. The dispatcher's unit tests in `parallel.rs`: morsels
-are disjoint and cover the range; an empty range hands out nothing; a claimed morsel keeps its
-pipeline from being done until it is acknowledged; a failed dispatcher hands out nothing; a
-panicking worker stops the others claiming; eight workers claim every position of a range once.
-`source_of` finds the one source, and refuses a chain with none and a chain with two.
+are disjoint and cover the range; an empty range finishes its pipeline when first asked; a claimed
+morsel keeps its pipeline open until it is acknowledged; a failed dispatcher hands out nothing; a
+panicking worker stops the others claiming; a pipeline waits for the one it follows, an empty
+pipeline starts the ones behind it, and a pipeline behind two starts after both; a dependency on a
+later pipeline is refused; a worker stays on its pipeline; eight workers over a chain of two
+pipelines claim every position of each once, start each pipeline once and leave each pipeline they
+claimed from; an idle worker parks while another holds a morsel and wakes when the pipeline
+finishes; a failure wakes a parked worker. `source_of` finds the one source, and refuses a chain
+with none and a chain with two.
 
 ## Not yet implemented
 
 A breaker other than the sink and a fold into `main`, a source over a data-source domain, a pipeline
-plan over more than one pipeline, a source that receives rows over time (its claim needs a state
-between exhausted and nothing yet, and workers need a wake-up), and the sink pulls the scheduler
-loop queues. Before a source over a data-source domain lands, the `main` producer `compile_program`
-subscribes has to be owned by the pool: it registers a release record of `False` with the source,
-and a source agrees to reclaim only what every record releases, so an idle producer pins the source.
-Every program the plan refuses runs on the thread that compiled it, through
-`Scheduler::check_for_notifications` and the sink pulls it queues.
+plan over more than one pipeline (the dispatcher runs dependent pipelines, and `plan_main` cuts
+one), the operator that serves a breaker's output to the pipeline behind it, a source that receives
+rows over time (its claim needs a state between exhausted and nothing yet, and a way to hand a
+morsel back), and the sink pulls the scheduler loop queues. Before a source over a data-source
+domain lands, the `main` producer `compile_program` subscribes has to be owned by the pool: it
+registers a release record of `False` with the source, and a source agrees to reclaim only what
+every record releases, so an idle producer pins the source. Every program the plan refuses runs on
+the thread that compiled it, through `Scheduler::check_for_notifications` and the sink pulls it
+queues.

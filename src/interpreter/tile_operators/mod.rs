@@ -81,6 +81,11 @@ pub trait MorselSource: Send + Sync {
     /// The guard naming the next morsel of at most `rows` rows, or `None` once every row has
     /// been claimed. Each row is in exactly one claimed morsel, whichever threads claim.
     /// `None` is final: a source that can still receive rows is not a `MorselSource` yet.
+    ///
+    /// A claim that answers `None` happens after every claim that answered a morsel: the
+    /// dispatcher finishes a pipeline once it has seen the `None` and no outstanding morsel, and
+    /// reads that count only because of this order. A source whose claims are updates of one
+    /// atomic gets it from acquire-release updates.
     fn claim(&self, rows: u64) -> Option<TileGuard>;
 }
 

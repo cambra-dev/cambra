@@ -154,11 +154,12 @@ impl RangeSource {
 impl MorselSource for RangeSource {
     fn claim(&self, rows: u64) -> Option<TileGuard> {
         let rows = rows.max(1);
-        // The cursor partitions the positions and nothing else, so no ordering is needed: the
-        // data a worker reads under the guard comes from its own chain.
+        // Acquire-release, as `MorselSource::claim` requires: the update that answers `None`
+        // reads the update that answered the last morsel. The data a worker reads under a
+        // guard comes from its own chain.
         let first = self
             .next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |first| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |first| {
                 (first < self.rows).then(|| first.saturating_add(rows).min(self.rows))
             })
             .ok()?;

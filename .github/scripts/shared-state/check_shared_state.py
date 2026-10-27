@@ -95,6 +95,12 @@ EXPECTED_EXCEPTIONS = [
     # has returned, and no operator reads either.
     ("src/interpreter/parallel.rs", "cell of `Tile`"),
     ("src/interpreter/parallel.rs", "cell of `Vec<Tile>`"),
+    # The worker pool's dispatcher, twice. A pipeline's source cannot be built before the
+    # pipelines it follows finish, so it is set once, later, and read by every worker; it answers
+    # guards that name morsels and holds no tile. The idle lock guards nothing: a worker with
+    # nothing to claim parks on its condition variable, which needs a mutex to pair with.
+    ("src/interpreter/parallel.rs", "cell of `Arc<dyn MorselSource>`"),
+    ("src/interpreter/parallel.rs", "cell of `()`"),
     # The operator-graph recorder, twice: the `thread_local!` and the cell inside
     # it each match the ambient-state shape. Necessary because `OperatorBase::new`
     # runs inside operator constructors, which take no context parameter; what
