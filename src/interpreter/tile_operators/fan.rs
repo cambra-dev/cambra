@@ -310,7 +310,12 @@ impl TileProducer for ZipProducer {
         }
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    /// The arms share the pair's keys, so each arm is pulled at the projection.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
         // Cost note: the presence-intersection path below runs
         // unconditionally on every pull — N predicate intersections, N
         // `to_remove` minuses, and one `remove_guarded` per input.  Non-
@@ -328,7 +333,7 @@ impl TileProducer for ZipProducer {
             .inputs
             .iter_mut()
             .map(|i| {
-                let mut tile = i.get(i.tiling().universal_guard());
+                let mut tile = i.get(projection.guard(i.tiling()));
                 let dropped = tile.deleted_keys_guard();
                 // Presence is read off the key columns, so a key an arm has dropped is gone
                 // from them first.
@@ -1888,6 +1893,94 @@ mod projection_tests {
         assert_eq!(int_entries(&morsel), [(2, 2), (3, 3)]);
         assert_eq!(*pulled.borrow(), [product_tiling.universal_guard()]);
         assert_conforms(|| Box::new(make().0), keys_between(2, 3));
+    }
+
+    /// `[(x, y) for ...]`: two arms over the same positions, the second holding only what has
+    /// been delivered of `delivered` positions.
+    fn pair(delivered: usize) -> (ZipProducer, GuardLog, GuardLog) {
+        let (a, a_pulled) = stream(0);
+        let values: Vec<i64> = (0..delivered as i64).map(|i| 100 + i).collect();
+        let (b, b_pulled, _) =
+            ProjectionSpy::new(ints_by_position(&values, delivered as u64 == ROWS), ints());
+        let out = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Record(
+                [0, 1]
+                    .into_iter()
+                    .map(|i| (tuple_field(i), Tiling::Scalar(Extent::Base(BaseType::Int))))
+                    .collect(),
+            ),
+        );
+        (
+            ZipProducer {
+                base: ProducerBase::unowned(ZipProducer::alloc_id(), &out),
+                names: vec![tuple_field(0), tuple_field(1)],
+                inputs: vec![Box::new(a), Box::new(b)],
+                level: CurryLevel::new(1),
+            },
+            a_pulled,
+            b_pulled,
+        )
+    }
+
+    /// Both arms are pulled at the morsel, so neither reads the other's rows.
+    #[test]
+    fn a_pair_of_streams_pulls_each_arm_at_the_morsel() {
+        let (mut zip, a_pulled, b_pulled) = pair(ROWS as usize);
+        let morsel = zip.get(keys_between(2, 4));
+        let Tile::DataFunction {
+            domain,
+            domain_predicate,
+            ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(domain.len(), 3);
+        let TileGuard::Function(FunctionGuard::Domain(stated)) = keys_between(2, 4) else {
+            unreachable!("a morsel is a domain guard")
+        };
+        assert_eq!(*domain_predicate, stated);
+        assert_eq!(*a_pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(*b_pulled.borrow(), [keys_between(2, 4)]);
+    }
+
+    /// An arm that has delivered less pairs only the keys both hold, and the pair is complete
+    /// only where both arms are: the morsel past the slower arm is not stated complete.
+    #[test]
+    fn a_morsel_past_a_lagging_arm_pairs_the_common_keys_and_states_them_complete() {
+        let (mut zip, _, _) = pair(4);
+        let morsel = zip.get(keys_between(2, 6));
+        let Tile::DataFunction {
+            domain,
+            domain_predicate,
+            ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![2, 3]));
+        let TileGuard::Function(FunctionGuard::Domain(stated)) = keys_between(2, 3) else {
+            unreachable!("a morsel is a domain guard")
+        };
+        assert_eq!(*domain_predicate, stated);
+    }
+
+    #[test]
+    fn a_paired_morsel_is_the_whole_pull_cut_to_it() {
+        for delivered in [ROWS as usize, 5] {
+            for guard in [keys_between(0, 2), keys_between(3, 20)] {
+                assert_conforms(|| Box::new(pair(delivered).0), guard);
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_pairs_nothing() {
+        let (mut zip, a_pulled, b_pulled) = pair(ROWS as usize);
+        let nothing = zip.tiling().empty_guard();
+        assert_eq!(zip.get(nothing), zip.tiling().empty_tile());
+        assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
     }
 
     #[test]
