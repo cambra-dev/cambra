@@ -606,8 +606,12 @@ struct VariantProjectProducer {
 
 impl VariantProjectProducer {
     /// The payloads of the scrutinee's rows carrying the tag.
-    fn project(&mut self) -> Tile {
-        let tile = self.input.get(self.input.tiling().universal_guard());
+    fn project(&mut self, projection: &Projection) -> Tile {
+        let input_guard = match self.input.tiling().is_data_function() {
+            true => projection.guard(self.input.tiling()),
+            false => self.input.tiling().universal_guard(),
+        };
+        let tile = self.input.get(input_guard);
         // Under standing levels the projection runs one enclosing row at a time: its keys
         // are the rows it keeps, and which rows those are is a fact about one group.
         if let (Some(level), Some(empty)) = (self.level, self.empty_level.as_ref())
@@ -631,14 +635,22 @@ impl TileProducer for VariantProjectProducer {
         visit("scrutinee", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut out = self.project();
+    /// A union stream keeps its keys at the rows carrying the tag, so the scrutinee is pulled at
+    /// the projection. A bare union has implicit positions for keys, so it is read whole and
+    /// the positions cut after.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let mut out = self.project(&projection);
         // Part of a payload released names no part of the scrutinee, so the scrutinee keeps
         // the row and the payload is projected again on the next pull (`release_impl`);
         // what the consumer let go is taken back out here.
         if !self.base.obsolete_guard.is_empty() {
             out.remove_guarded(self.base.obsolete_guard.clone());
         }
+        out.restrict_to(&projection, self.tiling());
         out
     }
 
@@ -652,12 +664,13 @@ impl TileProducer for VariantProjectProducer {
         // did not carry does not take it from the arm that did.
         //
         // A bare `Scalar(Union)` scrutinee has no domain column — `get_impl` supplies the
-        // positions themselves — so it takes no domain guard and falls to the whole-tile
-        // case below.
-        if let TileGuard::Function(FunctionGuard::Domain(_)) = &obsolete_guard
-            && matches!(self.input.tiling(), Tiling::DataFunction { .. })
-        {
-            self.input.release(obsolete_guard);
+        // positions themselves — so the scrutinee takes no domain guard. The positions a
+        // consumer released are cut from the answer by the producer's own obsolete guard, and
+        // the scrutinee is released whole by the whole-tile case below.
+        if let TileGuard::Function(FunctionGuard::Domain(_)) = &obsolete_guard {
+            if matches!(self.input.tiling(), Tiling::DataFunction { .. }) {
+                self.input.release(obsolete_guard);
+            }
             return;
         }
         // Beneath standing levels the keys are the scrutinee's too, down to its values; the
@@ -1561,6 +1574,154 @@ mod variant_projection_tests {
         for guard in [keys_between(0, 1), keys_between(5, 40)] {
             assert_conforms(|| Box::new(wrapped_payloads().0), guard);
         }
+    }
+
+    /// The decisions `commit(0), abort, commit(20), abort, …`: even positions commit their
+    /// position times ten, odd positions abort.
+    fn decisions() -> Tile {
+        let commits: Vec<usize> = (0..ROWS as usize).step_by(2).collect();
+        let aborts: Vec<usize> = (1..ROWS as usize).step_by(2).collect();
+        let payloads: Vec<i64> = commits.iter().map(|row| 10 * *row as i64).collect();
+        Tile::data_function(
+            ColumnValue::UInts((0..ROWS).collect()),
+            Box::new(Tile::Scalar(ColumnValue::Union(TagMap::from_arms(vec![
+                (
+                    commit(),
+                    UnionArm::new(commits, ColumnValue::Ints(payloads)),
+                ),
+                (
+                    abort(),
+                    UnionArm::new(aborts.clone(), ColumnValue::Units(aborts.len())),
+                ),
+            ])))),
+            Predicate::True,
+            BitSet::new(),
+        )
+    }
+
+    /// One arm of `match d { commit(w) → …; abort → … }`: the payload of the rows carrying
+    /// `tag`, read from the decision stream.
+    fn arm(tag: FieldKey, payload: Extent) -> (VariantProjectProducer, GuardLog) {
+        let out = Tiling::data_function(Extent::uint_range(ROWS), Tiling::Scalar(payload.clone()));
+        let (scrutinee, pulled, _) = ProjectionSpy::new(decisions(), decisions_tiling());
+        (
+            VariantProjectProducer {
+                base: ProducerBase::unowned(VariantProjectProducer::alloc_id(), &out),
+                input: Box::new(scrutinee),
+                tag,
+                payload_extent: payload,
+                level: CurryLevel::innermost_of(&out),
+                empty_level: None,
+            },
+            pulled,
+        )
+    }
+
+    fn commit_arm() -> (VariantProjectProducer, GuardLog) {
+        arm(commit(), Extent::Base(BaseType::Int))
+    }
+
+    fn abort_arm() -> (VariantProjectProducer, GuardLog) {
+        arm(abort(), Extent::Base(BaseType::Unit))
+    }
+
+    #[test]
+    fn an_arm_reads_its_rows_of_the_morsel_from_the_decision_stream() {
+        let (mut commits, pulled) = commit_arm();
+        let morsel = commits.get(keys_between(2, 5));
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![2, 4]));
+        assert_eq!(**codomain, Tile::Scalar(ColumnValue::Ints(vec![20, 40])));
+        assert_eq!(*pulled.borrow(), [keys_between(2, 5)]);
+    }
+
+    /// The tags partition the stream, so the arms of one `match` pulled at one morsel hold
+    /// disjoint keys that together are the morsel's.
+    #[test]
+    fn the_arms_of_a_match_partition_the_morsel() {
+        let morsel = |mut arm: VariantProjectProducer| -> Vec<u64> {
+            let Tile::DataFunction {
+                domain: ColumnValue::UInts(keys),
+                ..
+            } = arm.get(keys_between(2, 5))
+            else {
+                panic!("a collection of positions")
+            };
+            keys
+        };
+        let (mut held, mut other) = (morsel(commit_arm().0), morsel(abort_arm().0));
+        held.append(&mut other);
+        held.sort_unstable();
+        assert_eq!(held, [2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn an_arm_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 3), keys_between(6, 30)] {
+            assert_conforms(|| Box::new(commit_arm().0), guard.clone());
+            assert_conforms(|| Box::new(abort_arm().0), guard);
+        }
+    }
+
+    /// A scrutinee with no keys of its own, a bare union value, supplies positions for them:
+    /// it has no guard to receive, so it is read whole and the positions are cut after.
+    #[test]
+    fn a_bare_union_is_read_whole_and_its_positions_cut() {
+        let bare_tiling = Tiling::Scalar(decision_extent());
+        let make = || {
+            let Tile::DataFunction { codomain, .. } = decisions() else {
+                unreachable!("decisions are a stream")
+            };
+            let out = Tiling::data_function(
+                Extent::uint_range(ROWS),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            );
+            let (scrutinee, pulled, _) = ProjectionSpy::new(*codomain, bare_tiling.clone());
+            (
+                VariantProjectProducer {
+                    base: ProducerBase::unowned(VariantProjectProducer::alloc_id(), &out),
+                    input: Box::new(scrutinee),
+                    tag: commit(),
+                    payload_extent: Extent::Base(BaseType::Int),
+                    level: CurryLevel::innermost_of(&out),
+                    empty_level: None,
+                },
+                pulled,
+            )
+        };
+        let (mut commits, pulled) = make();
+        let morsel = commits.get(keys_between(1, 4));
+        let Tile::DataFunction { domain, .. } = &morsel else {
+            panic!("a collection")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![2, 4]));
+        assert_eq!(*pulled.borrow(), [bare_tiling.universal_guard()]);
+        assert_conforms(|| Box::new(make().0), keys_between(1, 4));
+
+        // The consumer releases a morsel before the next. The scrutinee has no keys to take the
+        // release, and the released positions stay out of the answer.
+        commits.release(keys_between(1, 4));
+        let next = commits.get(keys_between(5, 7));
+        let Tile::DataFunction { domain, .. } = &next else {
+            panic!("a collection")
+        };
+        assert!(
+            (0..domain.len()).all(|i| matches!(domain.index_at(i), Value::UInt(key) if key >= 5)),
+            "only the second morsel's positions: {domain:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_projects_nothing() {
+        let (mut commits, pulled) = commit_arm();
+        let nothing = commits.tiling().empty_guard();
+        assert_eq!(commits.get(nothing), commits.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 
     #[test]
