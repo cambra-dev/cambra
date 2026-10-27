@@ -447,6 +447,36 @@ without delivering it is a debug assertion failure, except during unwinding; the
 buffered but no consumer has been woken. [The notification contract](#the-notification-contract)
 specifies forwarding and reentrancy.
 
+### Projection guards
+
+A projection guard names the part of a producer's tile that a `get` asks for. The producer
+returns that part and nothing outside it, and states completeness only for that part.
+
+A producer restates three shapes (`Projection`): everything, nothing, and `Domain(𝑝)` over the keys
+of the outermost collection. A guard that names a path or steps into a codomain is a release's
+shape. A producer that receives one as a projection panics with the guard
+(`TileGuard::projection`), as [Guard operations are exact](#guard-operations-are-exact) requires
+of a restatement with no spelling.
+
+- **The answer.** `Tile::restrict_to_keys` keeps the outermost keys 𝑝 admits, each with the value
+  under it, and intersects the tile's `domain_predicate` with 𝑝. A group is whole under its key. A
+  producer asked for part of its keys says nothing about the rest.
+- **The input.** An operator whose outermost keys are its input's forwards 𝑝 to the input, so the
+  input produces only that part. Its answer is built from the input's, so it does not cut, and its
+  operator test compares the answer with the whole answer cut to 𝑝 (`assert_conforms`). An operator
+  that builds its answer from anything else cuts: accumulators held across pulls (`MapAggregate`),
+  arms already released (`UnionOperator`), or a cache read at a wider region (`FanOutSlot`, `Memo`).
+  An operator whose output keys are not its input's keys, such as `Converse`, pulls the input in
+  full and cuts its own output. An operator that cannot restate 𝑝 for an input pulls the input in
+  full and still cuts its output: pulling more is sound for a `get`, where a release that names
+  more is not.
+- **Release between pulls.** The completeness contract compares a producer's consecutive answers,
+  and a pull of one projection states completeness over its keys only. A consumer that pulls two
+  projections of one producer releases the first before the second.
+- **Test double.** `ProjectionSpy` answers a fixed tile cut to the guard it is pulled with, and
+  logs each projection and release it receives. An operator test pulls the operator over it and
+  reads the log to see the guard the operator restated.
+
 ### Producer attribution and probes
 
 Each `subscribe` returns one producer attributed to the operator that constructs it.
