@@ -570,6 +570,31 @@ fn permute_record_domain_sends_everything_for_a_later_region() {
     );
 }
 
+fn flatten_tuple_domain() -> Built {
+    let outer = Extent::Record(
+        [(crate::interpreter::tuple_field(0), two_keys())]
+            .into_iter()
+            .collect(),
+    );
+    let (input, consumer) = feed(Tiling::data_function(outer, Tiling::Scalar(int())));
+    let op = FlattenTupleDomain::new(input, vec![0]);
+    (Box::new(op), vec![consumer])
+}
+
+/// The keys are re-keyed, so a region of the input's keys names none of the output's.
+#[test]
+fn flatten_tuple_domain_sends_everything_for_a_region_of_its_input() {
+    assert_widens(&flatten_tuple_domain, 0);
+}
+
+#[test]
+fn flatten_tuple_domain_sends_everything_for_a_later_region() {
+    assert_eq!(
+        received(&flatten_tuple_domain, 0, &another_region()),
+        [Projection::Everything]
+    );
+}
+
 fn make_record() -> Built {
     let (a, first) = feed(ints());
     let (b, second) = feed(ints());
