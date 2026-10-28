@@ -1322,8 +1322,11 @@ impl CompiledProgram {
 
 /// Compiler stages used for stopping, snapshot capture and rewrite tags.
 ///
-/// Declaration order is pipeline order. Range queries such as
-/// `ProvenanceTable::deaths` rely on it; insert new stages where they run.
+/// Each tag's runs lie within one pane pair. A tag may run more than once inside that pair:
+/// `MutRead` names reads before inference and resolves them after inference. Declaration order
+/// therefore does not order every run. Phase-range queries such as `ProvenanceTable::deaths`
+/// select exact pipeline intervals only at pane-pair granularity. A run across a pane boundary
+/// needs a distinct tag, as `AsOfRead` does from `Transact`.
 /// Unlike `SyntheticKind`, which classifies binder roles, this enum identifies
 /// compilation stages. Not every stage necessarily writes a provenance row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
@@ -1869,9 +1872,8 @@ struct Frontend {
 
 /// Capture `phase`'s output if asked for, and say whether the run stops here.
 ///
-/// The one place a phase boundary is expressed, so "capture a pane" and "stop
-/// for a diff" are the same event at the same position. The stop test is `>=`
-/// over [`Phase`]'s declaration order, which is pipeline order.
+/// Capture and stopping use the same output boundary. The stop test is `>=` over [`Phase`]'s
+/// declaration order; repeated recording runs under a tag do not each create a boundary here.
 fn at_phase_output(
     phase: Phase,
     expr: &Expr,
@@ -2486,22 +2488,11 @@ fn run_passes(
         return Ok(expr);
     }
 
-    // Driver-capture audit span: post-inference pane in, and out at the **last
-    // instrumented pane**, which is now the last pane — `join-planned`, covering
-    // inline, transact, mut_elim, channelize, the as-of-read rewrite, lambda
-    // elimination and planning.
-    //
-    // The endpoint is chosen rather than inherited. An audit measures what the
-    // recordings explain, so a span running past the last instrumented phase
-    // reports every node the uninstrumented tail mints as a defect — a number
-    // that cannot reach zero however correct the recording is, which makes the
-    // audit read as a broken gate instead of a measurement. Every phase that
-    // rewrites expression nodes now records, so the span reaches the end of the
-    // pipeline; operator conversion is past it and has no node identity to
-    // record against.
+    // The full named audit measures expression-tree provenance from inference through planning.
+    // Operator conversion records operator identities but belongs to a separate gated pane pair,
+    // not this expression-tree audit.
     let audit = ProvenanceAudit::start("full", "post-inference..join-planned", &expr);
-    // A narrower audit span over just the mutability phases (inline, transact,
-    // mut_elim), which is where the fate-prediction question lives.
+    // The letrec audit covers inlining, transaction lowering, and induction lowering.
     let audit_letrec = ProvenanceAudit::start("letrec", "post-inference..post-letrec", &expr);
 
     expr = recorded(capture_provenance, Phase::Inline, || {
@@ -2567,8 +2558,7 @@ fn run_passes(
     // hoisted to an ordinary feed of the loop's history for channelize to route.
     // The tree still carries Defer/Feed here, so the check is the relaxed
     // pre-channelize one.
-    // An audit span over `mut_elim` alone — the phase whose fate prediction driver
-    // capture is meant to delete.
+    // The mutelim audit isolates induction lowering between its input and output trees.
     let audit_mutelim = ProvenanceAudit::start("mutelim", "post-transact..post-letrec", &expr);
     let phase_out = recorded(capture_provenance, Phase::Letrec, || mut_elim::run(expr));
     audit_mutelim.finish(&phase_out);

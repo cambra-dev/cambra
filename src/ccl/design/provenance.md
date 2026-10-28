@@ -58,9 +58,11 @@ The explicit preserving operations and diagnostic-only exceptions are specified 
 diagnostic throwaways use this sentinel without recording a birth. It must not persist in the
 main tree; the boundary check asserts that condition in debug/test builds.
 
-`Phase` identifies the compiler stage in a row's `via` field. Its declaration order is pipeline
-order, which phase-range queries use. A phase identifies where a rewrite runs, not the module
-containing its implementation: `AsOfRead`, for example, is implemented in `transact_phase`.
+`Phase` identifies the compiler stage in a row's `via` field. Each tag's runs lie within one pane
+pair, but a tag can run on both sides of another tag within that pair: `MutRead` runs before and
+after inference. Declaration-order range queries describe exact pipeline intervals only at
+pane-pair granularity. A rewrite crossing a pane boundary needs a distinct tag; `AsOfRead` is
+separate from `Transact` even though both are implemented in `transact_phase`.
 `PANES` in `src/ccl/panes.rs` assigns phases to snapshot intervals.
 
 ### Walking the ids
