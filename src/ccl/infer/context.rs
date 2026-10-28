@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::effects::{
-    Capability, Effect, EffectVar, Effects, Filter, Item, Repr, Requirement,
+    Bound as CapabilityBound, Capability, Effect, EffectVar, Effects, Filter, Item, Repr,
+    Requirement,
 };
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::display::{poly_for_display, scheme_obligations};
@@ -143,6 +144,15 @@ pub(super) struct InferCtx {
     effect_frames: Vec<EffectFrame>,
     /// Where each mutable variable and feed in scope is bound, for the capability that names it.
     effect_binders: HashMap<Name, EffectBinder>,
+    /// Each statement emitted, with the variable collecting what it causes.
+    effect_statements: Vec<(NodeId, Rc<EffectVar>)>,
+    /// The `ExprStmt` of each expression statement the program writes, the statements an
+    /// inert one is refused among.
+    pub(super) expression_statements: HashSet<NodeId>,
+    /// Each public function of the module, with its effects and its `let`.
+    effect_public: Vec<(Name, Rc<EffectVar>, NodeId)>,
+    /// The variable of every call site ([`InferCtx::call_effects`]).
+    effect_calls: HashSet<crate::ccl::effects::EffectVarId>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
     /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
     /// polymorphic `let` additionally stashes its typed definition subtree so
@@ -329,12 +339,25 @@ impl DeferredMethod {
 /// A [`DefGroup`](crate::ccl::TypedExprNode::DefGroup) under emission: what its members are
 /// emitted at, wherever a reference first needs one (`src/ccl/design/nominal-types.md`,
 /// "Associated functions").
+/// What a module's public functions do to the variables of its top level
+/// ([`InferCtx::exported_effects`]).
+#[derive(Default)]
+pub(super) struct ExportedEffects {
+    /// A public function naming an induction variable, with its `let` and the capability.
+    pub(super) escaping: Vec<(NodeId, Name, Capability)>,
+    /// An append to a private feed, which the top level then causes too.
+    pub(super) appends: Vec<Capability>,
+}
+
 /// A function body, or the module's top level, under emission: the variable collecting
 /// what it requires and causes.
 struct EffectFrame {
     var: Rc<EffectVar>,
     /// How many function bodies enclose this one, 0 for the top level.
     depth: u32,
+    /// A statement's frame, which keeps the capabilities naming the enclosing function's own
+    /// variables: a statement that writes one does something.
+    keeps_own: bool,
     /// How many `with begin():` bodies inside this function enclose the emission.
     transactions: u32,
 }
@@ -345,7 +368,7 @@ impl EffectFrame {
     fn filter(&self) -> Filter {
         Filter {
             when_data: None,
-            below: Some(self.depth),
+            below: (!self.keeps_own).then_some(self.depth),
             discharges: if self.transactions > 0 {
                 [Requirement::Transaction].into_iter().collect()
             } else {
@@ -524,9 +547,14 @@ impl InferCtx {
             effect_frames: vec![EffectFrame {
                 var: EffectVar::fresh(0),
                 depth: 0,
+                keeps_own: false,
                 transactions: 0,
             }],
             effect_binders: HashMap::new(),
+            effect_statements: Vec::new(),
+            expression_statements: HashSet::new(),
+            effect_calls: HashSet::new(),
+            effect_public: Vec::new(),
         }
     }
 
@@ -602,10 +630,55 @@ impl InferCtx {
         }
     }
 
+    /// What public functions do to the variables of their module's top level, which other
+    /// modules then do by calling them (`docs/chl-spec.md`, "Discharging requirements and
+    /// effects"): each one naming an induction variable, which `docs/chl-spec.md`, "9.10
+    /// Induction variables stay in their module", keeps in its module, and each append to a
+    /// private feed, which makes the feed the run's.
+    pub(super) fn exported_effects(&self) -> ExportedEffects {
+        let mut out = ExportedEffects::default();
+        for (name, var, node) in &self.effect_public {
+            for capability in var.resolved() {
+                if capability.bound != CapabilityBound::At(0) {
+                    continue;
+                }
+                match &capability.item {
+                    Item::Causes(Effect::Append(_)) => out.appends.push(capability),
+                    _ => out.escaping.push((*node, name.clone(), capability)),
+                }
+            }
+        }
+        out
+    }
+
+    /// The statements emitted that cause nothing and so do nothing
+    /// (`docs/chl-spec.md`, "4.9 Expression statement").
+    ///
+    /// A statement in a polymorphic definition can call a function that only each use of the
+    /// definition determines: a parameter's. That call's variable has nothing flowing into it
+    /// at the definition, where each use fills a copy of its own, so a statement reaching one
+    /// may do something and is not reported.
+    pub(super) fn inert_statements(&self) -> Vec<NodeId> {
+        let undetermined = |v: &EffectVar| {
+            self.effect_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
+        };
+        self.effect_statements
+            .iter()
+            .filter(|(_, var)| {
+                crate::ccl::effects::set_of(&var.resolved())
+                    .causes
+                    .is_empty()
+                    && !var.reaches(&undetermined)
+            })
+            .map(|(node, _)| *node)
+            .collect()
+    }
+
     /// The effects a call site expects of its callee: a fresh variable whose capabilities flow
     /// into the enclosing function body's, through the body's filter.
     fn call_effects(&mut self) -> Effects {
         let call = EffectVar::fresh(self.level);
+        self.effect_calls.insert(call.uid);
         let frame = self.effect_frame();
         frame.var.flows_from(&call, frame.filter());
         Effects::var(call)
@@ -2096,6 +2169,7 @@ impl Typing for InferCtx {
         self.effect_frames.push(EffectFrame {
             var: Rc::clone(&var),
             depth,
+            keeps_own: false,
             transactions: 0,
         });
         let r = f(self);
@@ -2124,9 +2198,6 @@ impl Typing for InferCtx {
 
     fn record_effect(&mut self, item: Item, name: Option<&Name>) {
         let binder = name.and_then(|n| self.effect_binders.get(n).copied());
-        if binder.is_some_and(|b| b.parameter) {
-            return;
-        }
         // A transactional variable belongs to the run, so a read or a write of one is the run's
         // capability, which names no variable (`docs/chl-spec.md`, "Discharging requirements
         // and effects").
@@ -2141,7 +2212,11 @@ impl Typing for InferCtx {
         };
         let capability = Capability {
             item,
-            bound_at: binder.filter(|b| !b.escapes).map(|b| b.depth),
+            bound: match binder {
+                Some(b) if b.parameter => CapabilityBound::Parameter,
+                Some(b) if !b.escapes => CapabilityBound::At(b.depth),
+                _ => CapabilityBound::Escaping,
+            },
         };
         let frame = self.effect_frame();
         if frame.filter().admits(&capability) {
@@ -2165,6 +2240,37 @@ impl Typing for InferCtx {
                 self.record_effect(Item::Requires(Requirement::Transaction), None);
             }
             self.record_effect(Item::Requires(Requirement::Read(name.clone())), Some(name));
+        }
+    }
+
+    fn statement<R>(&mut self, node: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
+        if !self.expression_statements.contains(&node) {
+            return f(self);
+        }
+        let outer = self.effect_frame();
+        let frame = EffectFrame {
+            var: EffectVar::fresh(self.level),
+            depth: outer.depth,
+            keeps_own: true,
+            transactions: outer.transactions,
+        };
+        let var = Rc::clone(&frame.var);
+        self.effect_frames.push(frame);
+        let r = f(self);
+        self.effect_frames.pop();
+        let outer = self.effect_frame();
+        outer.var.flows_from(&var, outer.filter());
+        self.effect_statements.push((node, var));
+        r
+    }
+
+    fn note_binding(&mut self, name: &Name, ty: &Type, node: NodeId) {
+        if self.effect_frame().depth == 0
+            && self.public.contains(name)
+            && let Type::Fun { effects, .. } = ty.peel_refinements()
+            && let Repr::Var(v) = effects.repr()
+        {
+            self.effect_public.push((name.clone(), Rc::clone(v), node));
         }
     }
 
@@ -2540,7 +2646,6 @@ mod tests {
     use super::*;
     use crate::ccl::Name;
     use crate::ccl::infer::typing::Typing;
-    use crate::ccl::provenance::NodeId;
 
     /// A variable minted inside `scoped` carries the binder in its telescope,
     /// and one minted outside does not. This is the threading end to end

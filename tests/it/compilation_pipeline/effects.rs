@@ -172,6 +172,58 @@ fn a_contract_states_what_the_function_causes(
     assert_eq!(clauses_of(code, member), expected);
 }
 
+/// An expression statement before its block's last statement is evaluated only for what it
+/// causes, so one that causes nothing is refused (`docs/chl-spec.md`, "4.9 Expression
+/// statement").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_pure_call("def f(x):\n    x + 1\nf(3)\n2\n")]
+#[case::arithmetic("x = 1\nx + 1\n2\n")]
+fn an_expression_statement_that_causes_nothing_is_refused(#[case] root: &str) {
+    let errors = super::modules::compile_errors(&program(root, &[]));
+    assert!(
+        errors.contains("this statement causes nothing and its value is discarded"),
+        "{errors}"
+    );
+}
+
+/// A statement calling a function parameter does what the function each use passes does,
+/// which the definition does not know, so the definition does not refuse it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_statement_calling_a_parameter_is_kept() {
+    super::helpers::check_program_scalar(
+        &program(
+            indoc! {"
+                def each(f, x):
+                    f(x)
+                    x
+                each(\\y -> y + 1, 2)
+            "},
+            &[],
+        ),
+        cambra::interpreter::Value::Int(2),
+    );
+}
+
+/// A public function whose type names an induction variable of its module would let another
+/// module read or write it (`docs/chl-spec.md`, "9.10 Induction variables stay in their
+/// module").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_read("pub def current(n: Int):\n    cnt + n\n", "has `Read(cnt)`")]
+#[case::a_write(
+    "def bump(c: Mut(Int)):\n    c += 1\npub def tick(n: Int):\n    bump(cnt)\n    n\n",
+    "has `Write(cnt)`"
+)]
+fn a_public_function_naming_an_induction_variable_is_refused(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
+    let errors = errors_of(&format!("cnt := 0\nfor x in [1, 2]:\n    cnt += x\n{code}"));
+    assert!(errors.contains(needle), "{errors}");
+}
+
 /// A transactional variable belongs to the run, so it is declared at a module's top level
 /// (`docs/chl-spec.md`, "Discharging requirements and effects").
 #[rstest]
