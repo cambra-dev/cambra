@@ -123,6 +123,20 @@ pub(crate) fn int_stream(entries: &[(u64, i64)], complete: Predicate) -> Tile {
     )
 }
 
+/// A stream keyed by position holding the positions `entries`, complete over `complete`.
+pub(crate) fn positions_stream(entries: &[(u64, u64)], complete: Predicate) -> Tile {
+    let mut sorted = entries.to_vec();
+    sorted.sort();
+    Tile::data_function(
+        ColumnValue::UInts(sorted.iter().map(|(key, _)| *key).collect()),
+        Box::new(Tile::Scalar(ColumnValue::UInts(
+            sorted.iter().map(|(_, value)| *value).collect(),
+        ))),
+        complete,
+        BitSet::new(),
+    )
+}
+
 /// The tiling of [`int_stream`].
 pub(crate) fn int_stream_tiling() -> Tiling {
     Tiling::data_function(
@@ -146,6 +160,8 @@ pub(crate) enum Expect {
     Narrower,
     /// The region is exactly what the input notified.
     Exact,
+    /// The region is `Everything`: the operator reads this input whole.
+    Widens,
 }
 
 /// One step of a script: input `input` moves to its next state and notifies `changed`.
@@ -207,16 +223,16 @@ pub(crate) fn assert_notification_sound(
     build: &dyn Fn(Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator>,
     feeds: &[(Tiling, Vec<Tile>)],
     steps: &[Step],
-    expect: Expect,
+    expect: &[Expect],
 ) {
     let (mut operator, handles) = instantiate(build, feeds);
     let (log, regions) = RegionLog::new(true);
     let guard = operator.tiling().universal_guard();
-    let mut producer = operator.subscribe(guard.clone(), Box::new(log), &mut Scheduler::new());
-    // Inputs that notify when they are subscribed, and the first pull, open the gate.
-    producer.get(guard);
+    let mut producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    // Inputs may notify when they are subscribed.
     regions.lock_now().clear();
     let mut at = vec![0; feeds.len()];
+    let mut pulled_region = Projection::Nothing;
     for (n, step) in steps.iter().enumerate() {
         let before = answer(build, feeds, &at, &Projection::Everything);
         at[step.input] += 1;
@@ -242,19 +258,32 @@ pub(crate) fn assert_notification_sound(
             normal(after_outside),
             "step {n}: the answer changed outside the notified region {notified:?}"
         );
-        // A pull at nothing states nothing, and the check outside it has covered the step.
-        if notified != Projection::Nothing {
-            let pulled = normal(producer.get(notified.guard(&tiling)));
+        // The pulls only grow, because a pull of less over what was already pulled and kept would
+        // withdraw what the first one stated complete. A pull at nothing states nothing, and the
+        // check outside the region has covered the step.
+        pulled_region = pulled_region.union(&notified);
+        if pulled_region != Projection::Nothing {
+            let pulled = normal(producer.get(pulled_region.guard(&tiling)));
             let mut expected = after;
-            expected.restrict_to(&notified, &tiling);
+            expected.restrict_to(&pulled_region, &tiling);
             assert_eq!(
                 pulled,
                 normal(expected),
-                "step {n}: a pull at the notified region {notified:?} differs from the whole answer cut to it"
+                "step {n}: a pull at the regions notified so far, {pulled_region:?}, differs from \
+                 the whole answer cut to them"
             );
         }
-        match expect {
+        // A step that changes nothing sends no notification to hold to a variant.
+        if step.changed == Projection::Nothing {
+            continue;
+        }
+        match expect[step.input] {
             Expect::Sound => {}
+            Expect::Widens => assert_eq!(
+                notified,
+                Projection::Everything,
+                "step {n}: the operator did not widen"
+            ),
             Expect::Narrower => assert_ne!(
                 notified,
                 Projection::Everything,
@@ -309,6 +338,8 @@ pub(crate) fn assert_release_sound(
 pub(crate) enum Values {
     Ints,
     Bools,
+    /// Positions in `0..12`, the keys of a table the stream's values are looked up in.
+    Positions,
 }
 
 /// A stream keyed by position holding the booleans `entries`, complete over `complete`.
@@ -348,65 +379,125 @@ pub(crate) enum Growth {
     CompletenessAndEmpty,
 }
 
-/// The tiles an input answers at successive states and the steps that reach them, for a stream
-/// of `values` over the positions `0..12` that grows as `growth` says. The same `seed` makes the
-/// same script. A step that adds keys notifies exactly those keys, one that only widens
-/// completeness notifies everything, and one that changes nothing notifies nothing.
+/// A generated stream: the keys it holds, and whether it is complete.
+struct Stream {
+    values: Values,
+    /// Keys are drawn from the positions `0..12` that are `residue` modulo `modulus`, so that
+    /// the arms of a flat union hold disjoint keys. `None` draws from all of them.
+    key_class: Option<(u64, u64)>,
+    present: Vec<(u64, i64)>,
+    complete: Predicate,
+}
+
+impl Stream {
+    fn new(values: Values, key_class: Option<(u64, u64)>) -> Self {
+        Self {
+            values,
+            key_class,
+            present: Vec::new(),
+            complete: Predicate::False,
+        }
+    }
+
+    fn tile(&self) -> Tile {
+        match self.values {
+            Values::Ints => int_stream(&self.present, self.complete.clone()),
+            Values::Positions => {
+                let mut sorted = self.present.clone();
+                sorted.sort();
+                Tile::data_function(
+                    ColumnValue::UInts(sorted.iter().map(|(key, _)| *key).collect()),
+                    Box::new(Tile::Scalar(ColumnValue::UInts(
+                        sorted.iter().map(|(_, value)| *value as u64 % 12).collect(),
+                    ))),
+                    self.complete.clone(),
+                    BitSet::new(),
+                )
+            }
+            Values::Bools => bool_stream(
+                &self
+                    .present
+                    .iter()
+                    .map(|(key, value)| (*key, value % 2 == 0))
+                    .collect::<Vec<_>>(),
+                self.complete.clone(),
+            ),
+        }
+    }
+
+    /// The stream after one step of `growth`, and the region the step notifies: the keys it
+    /// added, everything where it only widened completeness, and nothing where it changed
+    /// nothing.
+    fn advance(&mut self, rng: &mut Rng, growth: Growth) -> Projection {
+        let action = match growth {
+            Growth::OneAtATime => 1,
+            Growth::Bursts => 1 + rng.next() % 4,
+            Growth::CompletenessAndEmpty => rng.next() % 4,
+        };
+        let draws = match growth {
+            Growth::CompletenessAndEmpty => (action == 1) as u64,
+            _ => action,
+        };
+        let mut added = Vec::new();
+        for _ in 0..draws {
+            // A complete stream gains no key.
+            if self.complete == Predicate::True {
+                break;
+            }
+            let key = rng.next() % 12;
+            let in_class = self
+                .key_class
+                .is_none_or(|(modulus, residue)| key % modulus == residue);
+            if in_class && self.present.iter().all(|(k, _)| *k != key) {
+                self.present.push((key, (rng.next() % 100) as i64));
+                added.push(key);
+            }
+        }
+        if !added.is_empty() {
+            keys_region(&added)
+        } else if matches!(growth, Growth::CompletenessAndEmpty) && action == 2 {
+            self.complete = Predicate::True;
+            Projection::Everything
+        } else {
+            Projection::Nothing
+        }
+    }
+}
+
+/// The tiles each of several inputs answers at successive states, and the steps that reach them:
+/// each step moves one input, chosen by the generator, by one step of `growth`. The same `seed`
+/// makes the same script. An input's states are indexed by how many steps have moved it.
+pub(crate) fn grow_many(
+    seed: u64,
+    shapes: &[(Values, Option<(u64, u64)>)],
+    steps: usize,
+    growth: Growth,
+) -> (Vec<Vec<Tile>>, Vec<Step>) {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut streams: Vec<Stream> = shapes
+        .iter()
+        .map(|(values, class)| Stream::new(*values, *class))
+        .collect();
+    let mut tiles: Vec<Vec<Tile>> = streams.iter().map(|stream| vec![stream.tile()]).collect();
+    let mut script = Vec::new();
+    for _ in 0..steps {
+        let input = (rng.next() % streams.len() as u64) as usize;
+        let changed = streams[input].advance(&mut rng, growth);
+        tiles[input].push(streams[input].tile());
+        script.push(Step { input, changed });
+    }
+    (tiles, script)
+}
+
+/// [`grow_many`] for one input.
 pub(crate) fn grow(
     seed: u64,
     steps: usize,
     growth: Growth,
     values: Values,
 ) -> (Vec<Tile>, Vec<Step>) {
-    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-    let mut present: Vec<(u64, i64)> = Vec::new();
-    let mut complete = Predicate::False;
-    let tile = |present: &[(u64, i64)], complete: &Predicate| match values {
-        Values::Ints => int_stream(present, complete.clone()),
-        Values::Bools => bool_stream(
-            &present
-                .iter()
-                .map(|(k, v)| (*k, v % 2 == 0))
-                .collect::<Vec<_>>(),
-            complete.clone(),
-        ),
-    };
-    let mut tiles = vec![tile(&present, &complete)];
-    let mut script = Vec::new();
-    for _ in 0..steps {
-        let action = match growth {
-            Growth::OneAtATime => 1,
-            Growth::Bursts => 1 + rng.next() % 4,
-            Growth::CompletenessAndEmpty => rng.next() % 4,
-        };
-        let mut added = Vec::new();
-        // A complete stream gains no key.
-        let all_present = present.len() >= 12 || complete == Predicate::True;
-        for _ in 0..match growth {
-            Growth::CompletenessAndEmpty => (action == 1) as u64,
-            _ => action,
-        } {
-            if all_present {
-                break;
-            }
-            let key = rng.next() % 12;
-            if present.iter().all(|(k, _)| *k != key) {
-                present.push((key, (rng.next() % 100) as i64));
-                added.push(key);
-            }
-        }
-        let changed = if !added.is_empty() {
-            keys_region(&added)
-        } else if matches!(growth, Growth::CompletenessAndEmpty) && action == 2 {
-            complete = Predicate::True;
-            Projection::Everything
-        } else {
-            Projection::Nothing
-        };
-        tiles.push(tile(&present, &complete));
-        script.push(Step { input: 0, changed });
-    }
-    (tiles, script)
+    let (mut tiles, script) = grow_many(seed, &[(values, None)], steps, growth);
+    (tiles.remove(0), script)
 }
 
 #[cfg(test)]
@@ -539,26 +630,26 @@ mod tests {
                 CurryLevel::new(1),
             ))
         };
-        assert_notification_sound(&build, &growth(), &growth_steps(), Expect::Exact);
+        assert_notification_sound(&build, &growth(), &growth_steps(), &[Expect::Exact]);
     }
 
     #[test]
     #[should_panic(expected = "changed outside the notified region")]
     fn an_operator_that_swallows_a_change_is_caught() {
         let build = probe(Notify::Swallowed, Release::Honest);
-        assert_notification_sound(&build, &growth(), &growth_steps(), Expect::Sound);
+        assert_notification_sound(&build, &growth(), &growth_steps(), &[Expect::Sound]);
     }
 
     #[test]
     fn a_widening_operator_is_sound_and_fails_the_narrower_variant() {
         let build = probe(Notify::Widened, Release::Honest);
-        assert_notification_sound(&build, &growth(), &growth_steps(), Expect::Sound);
+        assert_notification_sound(&build, &growth(), &growth_steps(), &[Expect::Sound]);
         let caught = std::panic::catch_unwind(|| {
-            assert_notification_sound(&build, &growth(), &growth_steps(), Expect::Narrower)
+            assert_notification_sound(&build, &growth(), &growth_steps(), &[Expect::Narrower])
         });
         assert!(caught.is_err(), "Narrower accepted a widening operator");
         let caught = std::panic::catch_unwind(|| {
-            assert_notification_sound(&build, &growth(), &growth_steps(), Expect::Exact)
+            assert_notification_sound(&build, &growth(), &growth_steps(), &[Expect::Exact])
         });
         assert!(caught.is_err(), "Exact accepted a widening operator");
     }
