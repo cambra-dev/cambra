@@ -2814,14 +2814,10 @@ fn txn_writer_called_inside_block_rejected() {
     );
 }
 
-/// PR-2 registry leak (same class as PR-1's mutable-registry leak): a
-/// `Mut(_, Txn)` mutable variable declared *inside* a `def` body must not leak into the
-/// transactional registry and falsely gate a like-spelled top-level local. The
-/// def-body scope snapshots and restores *both* mutable variable registries, so `v`
-/// outside `f` is an ordinary local (assignable, readable).
+/// A transactional variable belongs to the run, so one declared in a `def` body is refused.
 #[test]
-fn txn_mut_var_in_def_body_does_not_leak_to_outer_local() {
-    check_scalar(
+fn txn_mut_var_in_def_body_is_refused() {
+    check_compile_error(
         indoc! {r#"
             def f(x):
                 v: Mut(Int, Txn) := 0
@@ -2829,7 +2825,7 @@ fn txn_mut_var_in_def_body_does_not_leak_to_outer_local() {
             v = 5
             v
         "#},
-        cambra::interpreter::Value::Int(5),
+        "is a transactional mutable variable, which belongs to the run",
     );
 }
 

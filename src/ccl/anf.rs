@@ -252,6 +252,13 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
 /// hoisted further outward — except when `e` is an `Apply`, handled by
 /// [`normalize_apply_spine`] for the reason in the module docs.
 fn normalize(e: Expr, muts: &Muts) -> Expr {
+    // One stack frame per node over the whole tree; grow on demand, as the other
+    // pass-level walks do.
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || normalize_inner(e, muts))
+}
+
+/// The body of [`normalize`].
+fn normalize_inner(e: Expr, muts: &Muts) -> Expr {
     let id = e.node_id();
     // Lowering pre-stamps some nodes' `ty`/`user_annotation` before inference
     // runs (e.g. a `for`-loop's `Compose` carries a `Type::data_fun(Hole, Hole)`

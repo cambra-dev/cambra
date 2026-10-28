@@ -1145,6 +1145,11 @@ pub enum Type {
         domain: Box<Type>,
         /// The result type. Covariant position; may reference `name`.
         codomain: Box<Type>,
+        /// What a call reads from its context and contributes besides its result
+        /// (`docs/chl-spec.md`, "6.9 Capabilities \[Decided\]"). A
+        /// data function's are [`Effects::none`](crate::ccl::effects::Effects::none).
+        /// A rebuild copies them from the type it replaces, as it copies `fun_kind`.
+        effects: crate::ccl::effects::Effects,
     },
     /// An ordered product type with unnamed fields (tuple). Its width is part of the
     /// type: two tuples relate only at equal width (`docs/chl-spec.md`, "Tuple width").
@@ -2220,6 +2225,7 @@ impl Type {
             fun_kind: FunKind::Data(Some(Rc::new(vec![witness]))),
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 
@@ -2247,6 +2253,7 @@ impl Type {
             fun_kind: FunKind::Data(slot),
             domain,
             codomain,
+            effects,
         } = body
         else {
             unreachable!("a sum's body is a data function, got a non-data shape")
@@ -2263,6 +2270,7 @@ impl Type {
                 fun_kind: FunKind::Data(slot),
                 domain,
                 codomain,
+                effects: effects.clone(),
             };
         }
         // The new binder goes outermost; the body's occurrences already name it.
@@ -2275,6 +2283,7 @@ impl Type {
             fun_kind: FunKind::Data(Some(Rc::new(ws))),
             domain,
             codomain,
+            effects: effects.clone(),
         }
     }
 
@@ -2571,6 +2580,7 @@ fn fmt_type(
             fun_kind,
             domain,
             codomain,
+            effects,
         } => {
             // A sum renders as its binder prefixes then the function they bind over. The
             // binder is written, and its **id is not**: rendering the id would make
@@ -2588,8 +2598,8 @@ fn fmt_type(
             let cod = at(codomain, Some(&inner));
             let dom = at(domain, binders);
             match name {
-                Some(x) => write!(f, "(({x}: {dom}) {} {cod})", fun_kind.arrow()),
-                None => write!(f, "({dom} {} {cod})", fun_kind.arrow()),
+                Some(x) => write!(f, "(({x}: {dom}) {} {cod}{effects})", fun_kind.arrow()),
+                None => write!(f, "({dom} {} {cod}{effects})", fun_kind.arrow()),
             }
         }
         Type::Tuple(ts) => {
@@ -2729,18 +2739,24 @@ fn fmt_type(
                     other => format!("{}: {other}", p.param.spelling),
                 })
                 .collect();
+            // A function body's effects join the trait requirements after the codomain.
+            let (body, effects) = match &poly.body {
+                Type::Fun { effects, .. } => (
+                    poly.body
+                        .clone()
+                        .with_effects(crate::ccl::effects::Effects::none()),
+                    effects.clone(),
+                ),
+                body => (body.clone(), crate::ccl::effects::Effects::none()),
+            };
+            let requires = poly.requires_text(|t| at(t, binders).to_string());
             write!(
                 f,
-                "forall ({}) {}",
+                "forall ({}) {}{}",
                 params.join(", "),
-                at(&poly.body, binders)
-            )?;
-            let requires = poly.requires_text(|t| at(t, binders).to_string());
-            if requires.is_empty() {
-                Ok(())
-            } else {
-                write!(f, " requires {}", requires.join(", "))
-            }
+                at(&body, binders),
+                crate::ccl::effects::clauses(requires, &effects)
+            )
         }
         Type::Txn => write!(f, "Txn"),
         Type::History {
@@ -2902,6 +2918,30 @@ impl Type {
         Type::Record(fields)
     }
 
+    /// This function type with `effects` in place of its own.
+    ///
+    /// # Panics
+    ///
+    /// When `self` is not a function type.
+    pub fn with_effects(self, effects: crate::ccl::effects::Effects) -> Self {
+        match self {
+            Type::Fun {
+                name,
+                fun_kind,
+                domain,
+                codomain,
+                ..
+            } => Type::Fun {
+                name,
+                fun_kind,
+                domain,
+                codomain,
+                effects,
+            },
+            other => panic!("`with_effects` takes a function type, got {other}"),
+        }
+    }
+
     /// Helper for creating a non-dependent **compute** function type
     /// (`name: None`, `kind: Compute`).
     pub fn fun(domain: Self, codomain: Self) -> Self {
@@ -2910,6 +2950,7 @@ impl Type {
             fun_kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 
@@ -2977,6 +3018,7 @@ impl Type {
             fun_kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 
@@ -3091,6 +3133,7 @@ impl Type {
             fun_kind: FunKind::fresh_var(),
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 
@@ -3102,6 +3145,7 @@ impl Type {
             fun_kind: FunKind::Data(None),
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 
@@ -3113,6 +3157,7 @@ impl Type {
             fun_kind: FunKind::fresh_data(),
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 
@@ -3157,7 +3202,12 @@ impl Type {
     /// `WitnessRef` outside its binder means nothing at all.
     pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
         match exemplar {
-            Type::Fun { name, fun_kind, .. } => {
+            Type::Fun {
+                name,
+                fun_kind,
+                effects,
+                ..
+            } => {
                 // The exemplar's kind is copied as it stands, variable included: a
                 // variable *is* the kind at that position, and reading what the solver has
                 // recorded on it would make a rebuild depend on when it ran.
@@ -3174,6 +3224,7 @@ impl Type {
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(domain),
                     codomain: Box::new(codomain),
+                    effects: effects.clone(),
                 }
             }
             Type::History {
@@ -3282,6 +3333,7 @@ impl Type {
                 fun_kind: FunKind::Data(Some(ws)),
                 domain,
                 codomain,
+                effects,
             } => Type::Fun {
                 name: name.clone(),
                 fun_kind: FunKind::Data(Some(Rc::new(
@@ -3296,6 +3348,7 @@ impl Type {
                 ))),
                 domain: Box::new(domain.rename_witnesses(renaming)),
                 codomain: Box::new(codomain.rename_witnesses(renaming)),
+                effects: effects.clone(),
             },
             other => {
                 let mut out = other.clone();
@@ -3663,6 +3716,7 @@ impl Type {
                     fun_kind: FunKind::Data(Some(ws)),
                     domain,
                     codomain,
+                    effects,
                 } => {
                     // The slot is a telescope: binder 𝑖's kind is canonicalized under
                     // binders 0‥𝑖−1, the domain and codomain under all of them.
@@ -3691,6 +3745,7 @@ impl Type {
                         ))),
                         domain: Box::new(domain),
                         codomain: Box::new(codomain),
+                        effects: effects.clone(),
                     }
                 }
                 other => {
@@ -3774,6 +3829,7 @@ impl Type {
                 },
                 domain: Box::new(domain.without_pi_names()),
                 codomain: Box::new(codomain.without_pi_names()),
+                effects: crate::ccl::effects::Effects::none(),
             },
             Type::BoundedHole(t) => Type::BoundedHole(Box::new(t.without_pi_names())),
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| t.without_pi_names()).collect()),
@@ -5959,6 +6015,7 @@ mod tests {
                 },
             )),
             codomain: Box::new(Type::Hole),
+            effects: crate::ccl::effects::Effects::none(),
         };
         let cast = TypedExpr::cast(TypedExpr::var("xs"), target);
         let _ = Refinement::born(Rc::new(cast));
@@ -6598,6 +6655,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::fun(Type::Base(BaseType::Int), refined)),
+            effects: crate::ccl::effects::Effects::none(),
         };
         assert_eq!(ty.to_string(), "((k: Int) ⇒ (Int ⇒ {Int | k}))");
     }

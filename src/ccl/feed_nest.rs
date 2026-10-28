@@ -64,6 +64,7 @@ pub(crate) fn contribution_lambda(
             fun_kind,
             domain: Box::new(param.ty.clone()),
             codomain: Box::new(codomain),
+            effects: crate::ccl::effects::Effects::none(),
         }
     };
     Expr::lambda(&param.name, param.ty.clone(), body).with_ty(ty)
@@ -153,6 +154,7 @@ fn outer_levels(ty: &Type) -> Levels {
         name: outer_name,
         domain: outer,
         codomain: inner,
+        ..
     } = ty.peel_refinements()
     else {
         unreachable!("a contribution has a collection level per loop it was fed under")
@@ -163,6 +165,7 @@ fn outer_levels(ty: &Type) -> Levels {
         name: inner_name,
         domain: keys,
         codomain: elem,
+        ..
     } = inner.peel_refinements()
     else {
         unreachable!("a contribution has a collection level per loop it was fed under")

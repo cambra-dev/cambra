@@ -236,6 +236,7 @@ pub(crate) fn fn_of_bare_predicate(
                 fun_kind,
                 domain: domain.clone(),
                 codomain: codomain.clone(),
+                effects: crate::ccl::effects::Effects::none(),
             };
             lam.with_ty(restated)
         }

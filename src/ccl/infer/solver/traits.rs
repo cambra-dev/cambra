@@ -438,6 +438,7 @@ impl CompilerTraits {
                         fun_kind: crate::ccl::ty::FunKind::data_hole(),
                         domain: Box::new(Type::Hole),
                         codomain: Box::new(Type::Hole),
+                        effects: crate::ccl::effects::Effects::none(),
                     },
                 )],
                 functions: vec![TraitFunction {

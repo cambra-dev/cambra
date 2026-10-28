@@ -379,6 +379,7 @@ fn encode(
             fun_kind: src_kind,
             domain: Box::new(iter_dom.clone().unwrap_or(Type::Hole)),
             codomain: Box::new(Type::Hole),
+            effects: crate::ccl::effects::Effects::none(),
         });
         let indexed_source = Expr::apply(idx_arg, source);
         let per_elem = per_element_lambda(binding, body_expr);
@@ -430,6 +431,7 @@ fn encode(
                 fun_kind: result_kind.clone(),
                 domain: Box::new(Type::Hole),
                 codomain: Box::new(Type::Hole),
+                effects: crate::ccl::effects::Effects::none(),
             });
         let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole, result_kind);
         at_id(make_cast(unrefined_lambda, target_ty), comprehension_id)
@@ -447,6 +449,7 @@ fn encode(
                 fun_kind: result_kind,
                 domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
                 codomain: Box::new(Type::Hole),
+                effects: crate::ccl::effects::Effects::none(),
             });
         at_id(lambda, comprehension_id)
     }

@@ -527,6 +527,9 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             domain,
             codomain,
             fun_kind,
+            // Effects choose no clone: two uses that differ only in what they cause run one
+            // body.
+            effects: _,
         } => {
             // The domain is contravariant — the flip that makes the dual read
             // follow an argument's *lower* bounds.
@@ -1008,6 +1011,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::fresh_var(),
             domain: Box::new(int()),
             codomain: Box::new(int()),
+            effects: crate::ccl::effects::Effects::none(),
         };
         assert_eq!(
             spec_key(&unresolved()),
@@ -1156,6 +1160,7 @@ mod refinement_closing_tests {
                 Type::Base(crate::ccl::BaseType::Int),
                 Refinement::born(dep_pred(binder)),
             )),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 
@@ -1199,7 +1204,9 @@ mod refinement_closing_tests {
                     Type::Base(crate::ccl::BaseType::Int),
                     Refinement::born(dep_pred(referenced)),
                 )),
+                effects: crate::ccl::effects::Effects::none(),
             }),
+            effects: crate::ccl::effects::Effects::none(),
         };
         assert_ne!(
             spec_key(&nested("y")),

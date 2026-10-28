@@ -150,26 +150,14 @@ about to constrain is a handle position.
   off the head of the spine — and lowering resolves the operand by name as it does a write
   target, so the mention never becomes a value position at all.
 
-A lambda's result is not dereffed, which is where rule 2 catches a function
-returning a `Mut`, and dereffing would silently accept the escape by turning it into a
-read.
-
-That check reads what the body **denotes**, not what its root node is stamped with, and
-the difference is load-bearing. A **statement's continuation** and a **mutable variable
-introduction's body** report their continuation's *value* — they emit it as a value
-operand — so a program ending in a read of its accumulator has that accumulator's value
-rather than a handle. Their coalesce-time lifted type derefs for the same reason
-(`solve.rs`): a lift that copied the continuation's type verbatim would re-stamp the node
-with the handle the read looked through, leaving the node's recorded type
-contradicting the rule that typed it. A **`Let` body** is the one tail that does not
-deref: a `Let` owns nothing — it cannot even bind a mutable variable — so it reports whatever its
-body reports, handle included, which is what leaves rule 2 an escape to catch. The same
-deref would hide an escape one line away from the boundary: reading the
-type alone, `λ 𝑐 → (𝑐 += 1; 𝑐)` looks like it returns an `Int` while `λ 𝑐 → 𝑐` returns the
-handle. So the escape check walks the tails to the term that actually produces the value.
-Every tail is walked, the mutable variable introduction included — a mutable variable does not escape its
-own introduction either, so returning one declared inside the function is the same escape
-as returning a parameter.
+A lambda's result reads, as every tail does: a **statement's continuation**, a **mutable
+variable introduction's body** and a **`Let` body** each report their continuation's *value* —
+they emit it as a value operand — so a function ending in a mention of a mutable variable
+returns that variable's value (`docs/chl-spec.md`, "8.3 Reads"), and no `Mut` leaves a
+function. A program ending in a read of its accumulator has that accumulator's value for the
+same reason. Their coalesce-time lifted types deref too (`solve.rs`): a lift that copied the
+continuation's type verbatim would re-stamp the node with the handle the read looked through,
+leaving the node's recorded type contradicting the rule that typed it.
 
 **Neither direction is a subtyping fact**, and the symmetry is the point: `Mut(𝑉) <: 𝑉`
 would put a mutable variable *below* its value and `𝑉 <: Mut(𝑉, 𝐷)` would put it *above*, while
@@ -263,7 +251,7 @@ variable: `[z for z in xs if z > acc]` types over `{… | z > __anf}`.
 
 Outside those terms, four positions keep the read as lowering built it, in both passes, each because
 a later pass reads the term there: an application's function and argument (the three handle
-positions above), a block's terminal expression (the tail rules, and rule 2's escape check), and the
+positions above), a block's terminal expression (the tail rules), and the
 value of a feed (`rewrite_as_of_reads`). The module docs carry the per-position detail.
 
 ## Surface language
