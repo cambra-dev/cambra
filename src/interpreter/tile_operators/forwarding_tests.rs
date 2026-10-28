@@ -148,6 +148,22 @@ fn nested() -> Tiling {
     Tiling::data_function(Extent::uint_range(8), ints())
 }
 
+fn map_aggregate() -> Built {
+    let (input, consumer) = feed(nested());
+    let op = MapAggregate::new(input, crate::ccl::AggregateKind::Sum);
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn map_aggregate_forwards_its_inputs_outermost_region() {
+    assert_keeps(&map_aggregate, 0);
+}
+
+#[test]
+fn map_aggregate_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&map_aggregate, 0);
+}
+
 fn memo() -> Built {
     let (input, consumer) = feed(ints());
     (Box::new(Memo::new(input)), vec![consumer])
