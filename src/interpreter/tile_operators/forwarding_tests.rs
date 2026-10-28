@@ -83,6 +83,21 @@ fn record_wrap_carries_no_region_between_notifications() {
     assert_keeps_without_state(&record_wrap, 0);
 }
 
+fn map_domain() -> Built {
+    let (input, consumer) = feed(ints());
+    (Box::new(MapDomain::new(input)), vec![consumer])
+}
+
+#[test]
+fn map_domain_forwards_its_inputs_region() {
+    assert_keeps(&map_domain, 0);
+}
+
+#[test]
+fn map_domain_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&map_domain, 0);
+}
+
 fn bools() -> Tiling {
     Tiling::data_function(
         Extent::uint_range(8),
