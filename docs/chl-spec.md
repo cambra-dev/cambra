@@ -2186,8 +2186,6 @@ Generator functions have a separate rule for bare `return`, specified under
 
 ### 4.9 Expression statement
 
-**[Decided]** — the rules of this section.
-
 A final expression statement supplies its block's value. A nonterminal expression statement is
 evaluated only for what it causes
 ([6.9 Capabilities](#69-capabilities)), so one that causes

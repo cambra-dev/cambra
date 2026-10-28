@@ -2118,6 +2118,9 @@ fn run_frontend(
         gate_leaks(&leaks, "lowering");
         projection
     };
+    // The expression statements the program writes are inference's to read.
+    ctx.inference_ctx().expression_statements =
+        crate::ccl::lower::expression_statements(&lowering_projection);
 
     debug!("Lowered (pre-channelize):\n{}", symbolic(&expr));
 
@@ -2817,6 +2820,8 @@ pub fn check_program(
         gate_leaks(&leaks, "lowering");
         projection
     };
+    ctx.inference_ctx().expression_statements =
+        crate::ccl::lower::expression_statements(&projection);
     for (_name, source) in ctx.lowering_ctx().take_sources() {
         let name = source.borrow().get_id().to_string();
         let output_type = source.borrow().output_type();
@@ -3027,6 +3032,13 @@ fn run_passes(
         CheckMode::Full,
         &instances,
     )?;
+
+    // An expression statement that causes nothing, reported once the checks that diagnose
+    // a statement more precisely have run (`docs/chl-spec.md`, "4.9 Expression statement").
+    let inert = std::mem::take(&mut ctx.inference_ctx().inert);
+    if !inert.is_empty() {
+        return Err(blame.infer(inert, &expr));
+    }
 
     // Give each named read its position back, now that inference has run and no
     // refinement needs a binder to mention (`crate::ccl::mut_read::unbind`).

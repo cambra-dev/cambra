@@ -707,15 +707,13 @@ fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities) {
             for r in &set.requires {
                 v1.record(ScopedCapability {
                     item: Capability::Requires(r.clone()),
-                    bound_at: None,
-                    parameter: false,
+                    bound: crate::ccl::capabilities::Bound::Escaping,
                 });
             }
             for e in &set.causes {
                 v1.record(ScopedCapability {
                     item: Capability::Causes(e.clone()),
-                    bound_at: None,
-                    parameter: false,
+                    bound: crate::ccl::capabilities::Bound::Escaping,
                 });
             }
         }

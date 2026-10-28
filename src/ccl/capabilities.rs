@@ -428,18 +428,27 @@ pub enum Capability {
     Causes(Effect),
 }
 
-/// A [`Capability`] with the depth of the function whose body binds the variable it names: the
-/// number of function bodies around the binder, `0` at a module's top level. `None` for an
-/// item that names no variable, and for one naming a variable no scope's end discharges, a
-/// transactional mutable variable bound by its run.
+/// A [`Capability`] with where the variable it names is bound, which decides the function bodies
+/// it leaves.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScopedCapability {
     pub item: Capability,
-    pub bound_at: Option<u32>,
-    /// Whether it names a parameter, whose history is its argument's: what a function does to
-    /// its parameter is what each call does to the argument, which the call records, so it
-    /// reaches no function's type.
-    pub parameter: bool,
+    pub bound: Bound,
+}
+
+/// Where the variable a [`ScopedCapability`] names is bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Bound {
+    /// Nowhere a scope's end discharges: the capability names no variable, or names a public feed,
+    /// which belongs to the run.
+    Escaping,
+    /// In the body of the function this many function bodies deep, `0` at a module's top
+    /// level.
+    At(u32),
+    /// As a parameter. A parameter's history is its argument's, so the call records what is
+    /// done to it, and the capability leaves no function body: only the statement doing it holds it
+    /// (`docs/chl-spec.md`, "Discharging requirements and effects").
+    Parameter,
 }
 
 /// What an edge into a [`CapabilityVar`] lets through
@@ -474,10 +483,10 @@ impl Filter {
         {
             return false;
         }
-        match (self.below, capability.bound_at) {
-            (Some(_), _) if capability.parameter => false,
-            (Some(below), Some(at)) => at < below,
-            _ => true,
+        match (self.below, capability.bound) {
+            (None, _) | (Some(_), Bound::Escaping) => true,
+            (Some(below), Bound::At(at)) => at < below,
+            (Some(_), Bound::Parameter) => false,
         }
     }
 }
@@ -627,6 +636,27 @@ impl CapabilityVar {
         out
     }
 
+    /// Whether `pred` holds of this variable or of any variable flowing into it.
+    pub fn reaches(&self, pred: &dyn Fn(&CapabilityVar) -> bool) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<Rc<CapabilityVar>> =
+            self.incoming().into_iter().map(|(v, _)| v).collect();
+        if pred(self) {
+            return true;
+        }
+        seen.insert(self.uid);
+        while let Some(v) = stack.pop() {
+            if !seen.insert(v.uid) {
+                continue;
+            }
+            if pred(&v) {
+                return true;
+            }
+            stack.extend(v.incoming().into_iter().map(|(w, _)| w));
+        }
+        false
+    }
+
     /// The capabilities recorded on this variable itself, without what flows in.
     #[expect(
         clippy::mutable_key_type,
@@ -731,8 +761,7 @@ impl Capabilities {
             .chain(set.causes.iter().map(|e| Capability::Causes(e.clone())))
             .map(|item| ScopedCapability {
                 item,
-                bound_at: None,
-                parameter: false,
+                bound: Bound::Escaping,
             })
             .collect()
     }

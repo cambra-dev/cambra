@@ -1475,6 +1475,26 @@ impl LoweringContext {
     }
 }
 
+/// The rewrite label of the `ExprStmt` an expression statement lowers to, one the program
+/// writes before its block's last statement, which inference refuses when it causes nothing
+/// (`docs/chl-spec.md`, "4.9 Expression statement"). A statement lowering builds for a loop,
+/// an `if` or a `match` is not one. Every copy of the statement keeps its label, so the
+/// statements of each run and shared import of a module are found by it
+/// ([`expression_statements`]).
+pub(crate) const EXPRESSION_STATEMENT: RewriteLabel = "lower.expression_statement";
+
+/// The `ExprStmt` of each expression statement in the trees `projection` attributes
+/// ([`EXPRESSION_STATEMENT`]).
+pub(crate) fn expression_statements(
+    projection: &crate::ccl::provenance::SourceProjection,
+) -> HashSet<crate::ccl::provenance::NodeId> {
+    projection
+        .iter()
+        .filter(|(_, attribution)| attribution.rewritten.label == EXPRESSION_STATEMENT)
+        .map(|(&id, _)| id)
+        .collect()
+}
+
 /// Prefix for synthetic parameter names representing the tupled domain of a
 /// multi-arg lambda. Each multi-arg lambda's name is this prefix followed by
 /// a unique id (see [`LoweringContext::fresh_tuple_arg`]).
