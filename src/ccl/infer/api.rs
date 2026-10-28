@@ -2078,6 +2078,7 @@ pub fn check_module(
     ctx: &mut TypeInferenceContext,
     params: &[super::ModuleCheckParam],
     reported: &HashSet<Name>,
+    public: &HashSet<Name>,
 ) -> ModuleCheckResult {
     // The arena tears down every variable the check mints, as for `infer`.
     let mut arena = InferArena::new();
@@ -2088,12 +2089,14 @@ pub fn check_module(
         &ctx.instances,
         params,
         reported,
+        public,
         true,
     );
-    let Some((_, schemes, opened)) = outcome.typed else {
+    let Some((_, schemes, opened, top_level)) = outcome.typed else {
         return ModuleCheckResult {
             before: outcome.before,
             contracts: HashMap::new(),
+            top_level: None,
             has_typed_tree: false,
             errors: outcome.errors,
             recovered: outcome.recovered,
@@ -2128,9 +2131,12 @@ pub fn check_module(
             contracts.insert(binding.name.clone(), Contract::Type(ty));
         }
     }
+    // A top level with statements left out says nothing of what the module requires and causes.
+    let complete = outcome.recovered.is_empty() && !super::holds_stand_in(&outcome.before);
     ModuleCheckResult {
-        before: outcome.before,
         contracts,
+        top_level: complete.then_some(top_level),
+        before: outcome.before,
         has_typed_tree: true,
         errors: outcome.errors,
         recovered: outcome.recovered,
@@ -2142,6 +2148,9 @@ pub struct ModuleCheckResult {
     pub(crate) before: Expr,
     /// Contracts established by surviving definitions or complete declarations.
     pub contracts: HashMap<Name, Contract>,
+    /// What the module's top level requires and causes, less what its scopes discharge, where
+    /// the check leaves a typed tree.
+    pub top_level: Option<crate::ccl::capabilities::CapabilitySet>,
     /// Errors from the module and every recovery run.
     pub errors: Vec<LocatedInferError>,
     pub(crate) has_typed_tree: bool,

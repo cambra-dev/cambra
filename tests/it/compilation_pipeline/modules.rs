@@ -1933,7 +1933,7 @@ fn a_partial_module_argument_keeps_known_entries_and_stands_in_for_unknown_ones(
     "};
     let root = indoc! {r#"
         import lib
-        run client(m=lib) as c
+        import client(m=lib) as c
         c::value + "s"
     "#};
     let errors = compile_errors(&program(root, &[("lib", library), ("client", &client)]));

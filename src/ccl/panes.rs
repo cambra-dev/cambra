@@ -1140,17 +1140,25 @@ mod tests {
     /// A type a `use` item brings in resolves to the name its declaration writes in the
     /// module that declares it, through an import's `use` clause and a run's, for an alias
     /// and a nominal type alike, and under a name `as` gives it
-    /// (`src/ccl/design/lowering.md`, "Names lowering resolves").
+    /// (`src/ccl/design/lowering.md`, "Names lowering resolves"). The module a run runs holds
+    /// a transactional variable, which makes it runnable.
     #[rstest::rstest]
-    #[case::an_import("import shop use Item, Shape", "Item", "Shape")]
-    #[case::a_run("run shop as sh use Item, Shape", "Item", "Shape")]
-    #[case::renamed("import shop use Item as Entry, Shape as Form", "Entry", "Form")]
+    #[case::an_import("import shop use Item, Shape", "Item", "Shape", "")]
+    #[case::a_run(
+        "run shop as sh use Item, Shape",
+        "Item",
+        "Shape",
+        "visits: Mut(Int, Txn) := 0"
+    )]
+    #[case::renamed("import shop use Item as Entry, Shape as Form", "Entry", "Form", "")]
     fn a_type_a_use_item_brings_in_resolves_into_its_module(
         #[case] clause: &str,
         #[case] item: &str,
         #[case] shape: &str,
+        #[case] state: &str,
     ) {
-        let shop = indoc! {"
+        let shop = formatdoc! {"
+            {state}
             pub Item = Int
             pub type Shape:
                 circle(Int)
@@ -1172,7 +1180,7 @@ mod tests {
                 module: None,
                 text: root.clone(),
             },
-            &mut InMemory::default().with("shop", shop),
+            &mut InMemory::default().with("shop", &shop),
         );
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});

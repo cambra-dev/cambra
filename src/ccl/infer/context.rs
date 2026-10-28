@@ -144,6 +144,8 @@ pub(super) struct InferCtx {
     /// The nodes under emission, innermost last: each one's capability variable, which its
     /// `capabilities` slot holds until coalesce resolves it.
     node_capabilities: Vec<NodeCapabilities>,
+    /// The capability variable of the tree's root, once it has been emitted.
+    root_capabilities: Option<Rc<CapabilityVar>>,
     /// Where each mutable variable and feed in scope is bound, for the capability that names it.
     capability_binders: HashMap<Name, CapabilityBinder>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
@@ -216,6 +218,10 @@ pub(super) struct InferCtx {
     /// scheme each was bound at, written as an annotation would state it
     /// ([`Typing::note_scheme`]).
     pub(super) reported: HashSet<Name>,
+    /// The public members of the module under check, bound at its top level. A public feed
+    /// is appended to by other modules, so no scope's end discharges an append to it
+    /// (`docs/chl-spec.md`, "Discharging requirements and effects").
+    pub(super) public: HashSet<Name>,
     pub(super) schemes_noted: Vec<(Name, crate::ccl::infer::solver::display::InferredPoly)>,
     /// Where the demand of the edges being drawn was stated, when it is not the node
     /// under emission: a type parameter's bound or a requirement, written in a `Poly`
@@ -400,6 +406,9 @@ struct CapabilityBinder {
     /// A transactional mutable variable: reading or writing it requires `Transaction`, and its
     /// capabilities are `ReadTxn` and `WriteTxn`.
     transactional: bool,
+    /// No scope's end discharges what is done to it: a public feed or a declared transactional
+    /// variable, which belong to the run.
+    escapes: bool,
 }
 
 pub(super) struct OpenGroup {
@@ -544,6 +553,7 @@ impl InferCtx {
             shared_holes: RefCell::new(HashMap::new()),
             opened_params: Vec::new(),
             reported: HashSet::new(),
+            public: HashSet::new(),
             schemes_noted: Vec::new(),
             demand_at: None,
             value_at: None,
@@ -572,8 +582,28 @@ impl InferCtx {
             selected_methods: Rc::default(),
             capability_frames: vec![CapabilityFrame { depth: 0 }],
             node_capabilities: Vec::new(),
+            root_capabilities: None,
             capability_binders: HashMap::new(),
         }
+    }
+
+    /// What the module's top level requires and causes, less what its scopes discharge
+    /// (`docs/chl-spec.md`, "Shareable modules").
+    pub(super) fn top_level_capabilities(&self) -> crate::ccl::capabilities::CapabilitySet {
+        let root = self
+            .root_capabilities
+            .as_ref()
+            .expect("the tree's root is emitted before its top level's effects are read");
+        // The top level's frame keeps out what names a variable the top level binds, as a
+        // function body's frame does what its body binds.
+        let filter = CapabilityFrame { depth: 0 }.filter();
+        crate::ccl::capabilities::set_of(
+            &root
+                .resolved()
+                .into_iter()
+                .filter(|c| filter.admits(c))
+                .collect(),
+        )
     }
 
     fn capability_frame(&self) -> &CapabilityFrame {
@@ -607,7 +637,11 @@ impl InferCtx {
             .node_capabilities
             .pop()
             .expect("a node under emission entered its effects");
-        if let Some(parent) = self.node_capabilities.last_mut() {
+        let Some(parent) = self.node_capabilities.last_mut() else {
+            self.root_capabilities = Some(node.var);
+            return;
+        };
+        {
             match parent.inflow {
                 Inflow::All => parent.var.flows_from(&node.var, Filter::default()),
                 Inflow::DischargesTransaction => parent.var.flows_from(
@@ -643,7 +677,7 @@ impl InferCtx {
         // included, stays out of the function's type at the frame's filter.
         ScopedCapability {
             item,
-            bound_at: binder.map(|b| b.depth),
+            bound_at: binder.filter(|b| !b.escapes).map(|b| b.depth),
             parameter: binder.is_some_and(|b| b.parameter),
         }
     }
@@ -671,14 +705,27 @@ impl InferCtx {
                 "lowering refuses `{name}`, a transactional variable declared below a module's \
                  top level"
             );
+            let public_feed = declares
+                && depth == 0
+                && matches!(history_kind, crate::ccl::ty::HistoryKind::Append)
+                && self.public.contains(name);
             self.capability_binders.insert(
                 name.clone(),
                 CapabilityBinder {
                     depth,
                     parameter: !declares,
                     transactional,
+                    escapes: public_feed || (declares && transactional),
                 },
             );
+            // Other modules append to a public feed, so declaring one is an output of the
+            // top level's, as declaring a transactional variable writes it.
+            if public_feed {
+                self.record_capability(
+                    Capability::Causes(Effect::Append(name.clone())),
+                    Some(name),
+                );
+            }
         }
     }
 
@@ -2605,7 +2652,6 @@ impl Typing for InferCtx {
             .push(exit);
         self.scopes.push_scope();
         self.scopes.bind(binding.name.clone(), entry);
-        self.bind_capability_name(&binding.name, &binding.ty, true);
         let r = self.under_binder(&binding.name, f);
         self.scopes.pop_scope();
         r

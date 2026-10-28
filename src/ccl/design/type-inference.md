@@ -4458,8 +4458,8 @@ depth 0.
 recorded through. A `Mut` handle cannot travel, so for a `Mut` that name is always the variable.
 A feed handle is a value, so it can be reached through an unannotated parameter, an alias or a
 projection, and the capability then names that instead: passing `out` to an unannotated
-parameter `o` records `Append(o)`, an alias `log: Feed(_) = out` is a declared variable that its
-function's scope discharges, and `q = (out, v).0` records `Append(q)`. A parameter annotated
+parameter `o` records `Append(o)`, an alias `log: Feed(_) = out` records `Append(log)`, and
+`q = (out, v).0` records `Append(q)`. A parameter annotated
 `Feed(V)` is a parameter, so a call passing `out` to it records `Append(out)`. The mutability
 redesign decides how a feed travels; `a_feed_reached_through_another_name` in
 `tests/it/compilation_pipeline/capabilities.rs` pins the current output.

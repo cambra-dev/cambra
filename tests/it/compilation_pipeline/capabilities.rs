@@ -228,8 +228,8 @@ fn a_function_type_with_clauses_is_parenthesized(#[case] code: &str, #[case] lin
 /// A feed reached through a second name is not tracked: a capability is keyed by the name it is
 /// recorded through, and a feed handle, unlike a `Mut` one, is a value that travels
 /// (`src/ccl/design/type-inference.md`, "4.9 Capabilities"). These pin the current output, which
-/// names the parameter, the alias's scope discharging it, and the projection, where each
-/// should be `Append(out)`; the mutability redesign decides how a feed travels.
+/// names the parameter, the alias and the projection, where each should be `Append(out)`; the
+/// mutability redesign decides how a feed travels.
 #[rstest]
 #[case::an_unannotated_parameter(
     indoc! {"
@@ -248,7 +248,7 @@ fn a_function_type_with_clauses_is_parenthesized(#[case] code: &str, #[case] lin
             log << v
     "},
     "via_alias",
-    ""
+    "causes Append(log)"
 )]
 #[case::a_projection(
     indoc! {"

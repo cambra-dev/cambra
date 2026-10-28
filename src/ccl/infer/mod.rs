@@ -714,9 +714,18 @@ pub(crate) fn run(
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
 ) -> Result<Type, Vec<LocatedInferError>> {
-    let outcome = run_with_params(arena, expr, sources, instances, &[], &HashSet::new(), false);
+    let outcome = run_with_params(
+        arena,
+        expr,
+        sources,
+        instances,
+        &[],
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+    );
     match outcome.typed {
-        Some((ty, _, _)) if outcome.errors.is_empty() => Ok(ty),
+        Some((ty, ..)) if outcome.errors.is_empty() => Ok(ty),
         _ => Err(outcome.errors),
     }
 }
@@ -732,7 +741,12 @@ pub(crate) type OpenedVars = HashMap<crate::ccl::InferVarId, Rc<crate::ccl::ty::
 pub(crate) struct RunOutcome {
     /// The tree before emission, at the identities earlier errors can still name.
     pub before: Expr,
-    pub typed: Option<(Type, NotedSchemes, OpenedVars)>,
+    pub typed: Option<(
+        Type,
+        NotedSchemes,
+        OpenedVars,
+        crate::ccl::capabilities::CapabilitySet,
+    )>,
     pub errors: Vec<LocatedInferError>,
     pub recovered: HashMap<NodeId, StandIn>,
     pub unavailable: HashSet<Name>,
@@ -758,6 +772,10 @@ pub(crate) struct RunOutcome {
 /// and the last successful run supplies partial contracts. Its tree replaces `expr`, while
 /// errors from earlier runs remain reported. A failed function retains its declared
 /// parameters and result for checking its callers.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the module check's inputs, each read by every run, and the recovery switch"
+)]
 pub(crate) fn run_with_params(
     arena: &mut InferArena,
     expr: &mut Expr,
@@ -765,6 +783,7 @@ pub(crate) fn run_with_params(
     instances: &Rc<solver::traits::InstanceTable>,
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
+    public: &HashSet<Name>,
     recover_all: bool,
 ) -> RunOutcome {
     // Emission rewrites the tree it types, so a run that starts over needs it as it was: a
@@ -779,7 +798,7 @@ pub(crate) fn run_with_params(
     let RunFailure {
         mut errors,
         mut recovered,
-    } = match run_once(expr, sources, instances, params, reported) {
+    } = match run_once(expr, sources, instances, params, reported, public) {
         Ok(typed) => {
             return RunOutcome {
                 before: pristine,
@@ -823,7 +842,7 @@ pub(crate) fn run_with_params(
         if recover_all {
             unavailable = unavailable_contracts(&rest);
         }
-        let failure = match run_once(&mut rest, sources, instances, params, reported) {
+        let failure = match run_once(&mut rest, sources, instances, params, reported, public) {
             Ok(found) => {
                 typed = Some(found);
                 if recover_all {
@@ -1153,7 +1172,16 @@ fn run_once(
     instances: &Rc<solver::traits::InstanceTable>,
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
-) -> Result<(Type, NotedSchemes, OpenedVars), RunFailure> {
+    public: &HashSet<Name>,
+) -> Result<
+    (
+        Type,
+        NotedSchemes,
+        OpenedVars,
+        crate::ccl::capabilities::CapabilitySet,
+    ),
+    RunFailure,
+> {
     let failed = |errors| RunFailure {
         errors,
         recovered: Vec::new(),
@@ -1175,6 +1203,7 @@ fn run_once(
         .open_module_params(params)
         .map_err(|e| failed(vec![e]))?;
     sub_ctx.reported = reported.clone();
+    sub_ctx.public = public.clone();
 
     // Pass 1: emit constraints. The high-value variants
     // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.
@@ -1352,7 +1381,8 @@ fn run_once(
     // validator does not traverse for witness references. This additional walk is debug-only.
     #[cfg(debug_assertions)]
     debug_assert_no_free_witness(expr, "post-inference");
-    Ok((expr.ty.clone(), sub_ctx.schemes_noted, opened))
+    let top_level = sub_ctx.top_level_capabilities();
+    Ok((expr.ty.clone(), sub_ctx.schemes_noted, opened, top_level))
 }
 
 use crate::ccl::Expr;
