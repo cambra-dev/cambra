@@ -631,15 +631,38 @@ An output change discovered during a pull must wake readers that may still hold 
 result. That wake is deferred through `WakeupQueue`, not delivered synchronously inside
 `get`: a feedback path could re-enter a producer while its `RefCell` is borrowed.
 
-A notification carries no payload. `GatedConsumer` forwards at most one notification between
-pulls. `shared_consumer` constructs it with `Notified::clear()`, so the first notification
-passes, including one sent during `subscribe`. Forwarding sets the flag; `ProducerBase::sharing`
-holds the `Gate` token that clears it before each pull. `Notified::flag()` instead starts set
-to permit an initial input read, and `Notified::Always` is used when no flag intercepts input
-notifications. A `Notified::Flag` is set by notification and cleared by `take()`.
-`FanOutShared::forwarded` tracks forwarding to fan-out slots. Clearing does not depend on
-whether the pull reads the notifying input. Without this suppression, a change can reach a sink
-once per path through the graph, and cyclic notification paths can continue indefinitely.
+A notification carries the region of the notifying producer's outermost keys that changed:
+`Consumer::notify(arrived: &Projection)`. A producer that cannot name the region sends `Everything`, and
+none sends `Nothing`. A closure consumer ignores the region. A consumer that pulls on notification
+has no use for it, since its pull reads whatever arrived. A consumer that does not pull acts on the
+region instead.
+
+A component that merges notifications to one consumer unites their regions with
+`Projection::union` and narrows none. A gate drops the notification it suppresses, and its region
+with it: a consumer that pulls reads the change in its next pull, and a consumer that needs every
+region must not sit behind a gate.
+
+**Forwarding.** An operator keeps an input's keys, forwarding its region unchanged, only if its row
+of the "Projection guards" table pulls that input at the projection and the input's keys are the
+operator's own output keys: a region of changed input keys is then a region of possibly changed
+output keys, and a changed completeness statement at a key is a change at that key. An operator that
+re-keys, or reads an input whole, sends `Everything` for that input, since it cannot say which of
+its own keys changed. `MapResult`'s function operand is pulled at the projection where the input's
+values are its keys, and still widens: its keys are the values looked up, not the result's keys. A
+producer with no keys of its own notifies `Everything` whatever it is read through. Where a row
+depends on the input's shape, the operator decides from its tiling when it subscribes, as its
+`get_impl` does when it pulls.
+
+`GatedConsumer` forwards at most one notification between pulls to a consumer that pulls.
+`shared_consumer` constructs it with `Notified::clear()`, so the first notification passes,
+including one sent during `subscribe`. Forwarding sets the flag; `ProducerBase::sharing` holds the
+`Gate` token that clears it before each pull. A notification behind a closed gate is not delivered,
+and the consumer's next pull reads the change. `Notified::flag()` instead starts set to permit an
+initial input read, and `Notified::Always` is used when no flag intercepts input notifications. A
+`Notified::Flag` is set by notification and cleared by `take()`. `FanOutShared::forwarded` tracks
+forwarding to fan-out slots. Clearing does not depend on whether the pull reads the notifying input.
+Without this suppression, a change can reach a sink once per path through the graph, and cyclic
+notification paths can continue indefinitely.
 
 `forwarding_consumer` delivers through the gate when its consumer can be borrowed. On reentry,
 it drops the notification if the gate is set: no pull has occurred since forwarding. Otherwise
