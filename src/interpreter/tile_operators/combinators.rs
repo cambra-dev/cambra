@@ -1176,9 +1176,10 @@ impl TileOperator for Restrict {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // The restricted domain is the predicate's keys that pass, so a region of them is a region of the result's.
         let predicate_producer = self.predicate.subscribe(
             self.predicate.tiling().universal_guard(),
-            widening(consumer),
+            consumer,
             scheduler,
         );
         Box::new(RestrictProducer {
