@@ -73,6 +73,9 @@ impl TileOperator for Converse {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // Beneath standing levels the input's outermost keys are the result's; inverting the
+        // outermost collection re-keys.
+        let keeps_keys = self.level != CurryLevel::OUTERMOST;
         Box::new(ConverseProducer {
             base: ProducerBase::new(
                 ConverseProducer::alloc_id(),
@@ -82,7 +85,7 @@ impl TileOperator for Converse {
             ),
             input: self.input.subscribe(
                 self.tiling().universal_guard(),
-                widening(consumer),
+                consumer_keeping_keys_if(keeps_keys, consumer),
                 scheduler,
             ),
             held: Vec::new(),
@@ -3210,7 +3213,6 @@ mod tests {
 #[cfg(test)]
 mod filter_projection_tests {
     use super::*;
-
     use crate::interpreter::BaseType;
     use crate::interpreter::tile_operators::test_helpers::{
         GuardLog, ProjectionSpy, assert_conforms, int_entries, ints_by_position, keys_between,
