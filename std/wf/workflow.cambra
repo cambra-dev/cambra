@@ -1,0 +1,280 @@
+# One workflow: its run table, the functions that start and end runs, the two limits that end runs
+# nobody ends, and, for a child workflow, its parent link.
+#
+# The module declares state, so a program runs it: each `run std::wf::workflow(…)` is one workflow
+# (docs/chl-spec.md, "9.9 Running"). Its functions run in the caller's transaction, so `start`
+# and the caller's own per-run writes commit together.
+#
+# Example:
+#
+#     import std::wf
+#
+#     run std::wf::workflow(State=BillWorkflowState, timeout=…, stale_after=…) as bills
+#
+#     def chase(bill) causes wf::WorkflowCancellationException(_):
+#         contact = lookup_contact::send_request(bill_id=bill.state.bill_id)
+#         …
+#
+#     bills::for_each(chase)    # `chase` completes its bill's run
+#
+# Status: proposed, not in the spec (docs/libs/workflow_library.md, "Runs"). `[proposed]` marks
+# each construct the compiler lacks.
+
+import std::http
+import std::time
+import std::wf
+import std::wf::detached
+
+# [proposed] `State` inferred from the states passed to `start`, and `PState` from `parent`'s type
+# members (docs/chl-spec.md, "9.4 Parameters": inferred from the other arguments); and the
+# requirement `wf::WorkflowState(State)` on a type parameter, which that section leaves Open.
+param State
+param PState
+# Both limits are required: a workflow that keeps runs forever writes `never.
+param timeout: {`after{time::Duration} | `never}
+param stale_after: {`after{time::Duration} | `never}
+param parent: wf::Workflow(PState) = detached
+param child_lifecycle: wf::ChildLifecycle = `dependent
+# The address of the cancel route, or `none to serve none.
+param control: {`serve{port: String, path: String} | `none} = `none
+
+# This run's id type. Each run of this module declares its own, so two workflows' ids are distinct
+# types even when their state types are equal.
+# [proposed] a nominal type declared in a run module is distinct per run, as docs/chl-spec.md,
+# "9.7 Importing asserts no IO and no state", says of `eu_inv::InStock`; and a constructor only
+# this module may call (docs/chl-spec.md, "6.8 Nominal types and methods [Decided]" and
+# "9.5 Visibility", make methods and members private, not constructors).
+pub type RunId = {value: String}
+PRunId = parent::RunId
+
+# Everything the library keeps about one run. `wake` is the run's pending wake in `wakes`, or
+# `none once the run has ended or when both limits are `never. A row stays after its run ends, so a
+# second `start` answers `existing; how long ended rows are kept is open.
+type Run = {
+    state: State,
+    parent: Option(PRunId),
+    status: wf::RunState,
+    started_at: time::Instant,
+    last_activity: time::Instant,
+    wake: Option(time::Instant),
+}
+runs: Mut(Map(RunId, Run), Txn) := empty_map()
+
+# One pending wake per run.
+run std::time::timer(Key=RunId) as wakes
+
+# `started` holds one element per running run, keyed by its id; `ended` one element per end. Each
+# is written in the transaction that starts or ends the run. `ended` triggers cleanup only: whether
+# a run is live is read from `live`.
+# [proposed] a public feed of a run (docs/chl-spec.md, "9.9 Running"), and keyed feeds; and
+# `started` holding each running run for a loop that a reload adds, such as a body or a schedule
+# (docs/libs/workflow_library.md, "What a loop added by a reload reads").
+pub started = defer()   # Feed(RunId, wf::Started(RunId, State))
+pub ended = defer()     # Feed(wf::Ended(RunId))
+
+# What `start` did: started the run, found an existing run (live or ended), or refused because the
+# parent run is not live.
+pub StartResult = {`started{id: RunId} | `existing{id: RunId, status: wf::RunState}
+                   | `parent_not_live{id: RunId}}
+
+# Returns the id of the run for `state`: for a child run, its parent's id, `/`, and the state's
+# `get_run_id()`, so two parents' children with equal states are two runs. It does not check that
+# the run exists.
+# [proposed] a value parameter with a default in a `def`.
+pub def id(state: State, parent_run: Option(PRunId) = `none) => RunId:
+    match parent_run:
+        case `some(p):
+            RunId(value=parent::id_string(p) + "/" + state.get_run_id())
+        case `none:
+            RunId(value=state.get_run_id())
+
+# Returns the id as text.
+pub def id_string(i: RunId) => String:
+    i.value
+
+# Starts the run for `state` unless the workflow holds it already. A run with a parent starts only
+# while its parent is live, and records it. A child workflow's run started with no parent, such as
+# from the child's own route, ends only on its own.
+# [proposed] `requires Transaction` (docs/chl-spec.md, "8.7 Direction [Decided]: transactions as
+# contextual parameters").
+pub def start(state: State, parent_run: Option(PRunId) = `none) => StartResult requires Transaction:
+    i = id(state, parent_run)
+    if i in runs:
+        `existing(id=i, status=runs[i].status)
+    elif not parent_live(parent_run):
+        `parent_not_live(id=i)
+    else:
+        now = time::now()
+        runs[i] := arm(i, (state=state, parent=parent_run, status=wf::`running,
+                           started_at=now, last_activity=now, wake=`none))
+        started[i] << (id=i, state=state, at=now)
+        `started(id=i)
+
+# Returns the run's state, live or ended, or `none for a run the workflow does not hold.
+pub def get(i: RunId) => Option(State) requires Transaction:
+    if i in runs:
+        `some(runs[i].state)
+    else:
+        `none
+
+# Returns the run's status, or `none for a run the workflow does not hold.
+pub def status(i: RunId) => Option(wf::RunState) requires Transaction:
+    if i in runs:
+        `some(runs[i].status)
+    else:
+        `none
+
+# Whether the run is running and, for a dependent child, its parent is live, so a check sees a
+# parent's end as soon as it commits.
+pub def live(i: RunId) => Bool requires Transaction:
+    if i not in runs:
+        False
+    else:
+        match runs[i].status:
+            case wf::`running:
+                child_lifecycle == `independent or parent_live(runs[i].parent)
+            case _:
+                False
+
+# Returns the live runs of this workflow whose parent run is `p`, oldest first. Two child workflows
+# of one parent never see each other's runs.
+# [proposed] a `Txn` map scan inside a transaction.
+pub def live_children(p: PRunId) => List(RunId) requires Transaction:
+    sorted([i for i -> r in runs if r.parent == `some(p) and live(i)],
+           by=(i) => runs[i].started_at)
+
+# Ends the run `completed. Ending a run that has ended changes nothing: a cancelled run stays
+# cancelled.
+pub def complete(i: RunId) requires Transaction:
+    end(i, wf::`completed(time::now()))
+
+# Ends the run `cancelled with `reason`, as `complete` does.
+pub def cancel(i: RunId, reason: String) requires Transaction:
+    end(i, wf::`cancelled(at=time::now(), reason=reason))
+
+# Records activity on a live run, which postpones its `stale_after`; a dependent child's activity
+# is its parent's too. It leaves the run's wake where it is: the wake finds the run within its limit
+# and registers the next, so the wake moves once per `stale_after`, not per call.
+pub def touch(i: RunId) requires Transaction:
+    if live(i):
+        runs[i] := (runs[i] with last_activity=time::now())
+        if child_lifecycle == `dependent:
+            match runs[i].parent:
+                case `some(p):
+                    parent::touch(p)
+                case `none:
+                    pass
+
+def parent_live(p: Option(PRunId)) => Bool requires Transaction:
+    match p:
+        case `some(pid):
+            parent::live(pid)
+        case `none:
+            True
+
+def end(i: RunId, state: wf::RunState) requires Transaction:
+    if i in runs and runs[i].status == wf::`running:
+        runs[i] := (runs[i] with status=state, wake=`none)
+        wakes::cancel(i)
+        ended << (id=i, state=state)
+
+def limit_due(limit: {`after{time::Duration} | `never}, since: time::Instant) => Option(time::Instant):
+    match limit:
+        case `after(d):
+            `some(since + d)
+        case `never:
+            `none
+
+def passed(due: Option(time::Instant), now: time::Instant) => Bool:
+    match due:
+        case `some(t):
+            t <= now
+        case `none:
+            False
+
+def earliest(a: Option(time::Instant), b: Option(time::Instant)) => Option(time::Instant):
+    match (a, b):
+        case (`some(x), `some(y)):
+            `some(min(x, y))
+        case (`some(x), `none):
+            `some(x)
+        case (`none, y):
+            y
+
+# Registers the run's next wake, the earlier of its two limits' due times, and returns the row with
+# `wake` set to it. A reload that changes a limit applies at the run's next wake, which may be
+# after a shortened limit has passed.
+def arm(i: RunId, r: Run) => Run requires Transaction:
+    w = earliest(limit_due(timeout, r.started_at), limit_due(stale_after, r.last_activity))
+    match w:
+        case `some(t):
+            wakes::register(i, t)
+        case `none:
+            wakes::cancel(i)
+    (r with wake=w)
+
+# A run whose `started_at + timeout` passes ends `timed_out; one with no activity for `stale_after`
+# ends `stale. The transaction reads the run and decides: a wake that is not the row's pending one
+# does nothing, and a run within both limits registers its next wake.
+for t in wakes::fired:
+    with begin():
+        i = t.key
+        if live(i) and runs[i].wake == `some(t.at):
+            r = runs[i]
+            now = time::now()
+            if passed(limit_due(timeout, r.started_at), now):
+                end(i, wf::`timed_out(now))
+            elif passed(limit_due(stale_after, r.last_activity), now):
+                end(i, wf::`stale(at=now, idle_since=r.last_activity))
+            else:
+                runs[i] := arm(i, r)
+
+# A dependent child run ends `cancelled when its parent ends, by any cause. `live` already reads the
+# parent; this loop records the child's end and emits its `ended`, which its effects clean up on.
+# [proposed] a `for` over a `Txn` map inside a transaction.
+for e in parent::ended:
+    with begin():
+        if child_lifecycle == `dependent:
+            for i -> r in runs if r.parent == `some(e.id):
+                end(i, wf::`cancelled(at=time::now(), reason="parent ended"))
+
+# The cancel route: `POST {path}` with `{run, reason}` cancels the run whose id is `run`, and
+# replies with its status, `none for a run the workflow does not hold. The request names the run by
+# its id as text, so an operator needs none of the state's fields; only this module turns the text
+# into a `RunId`. Keyed by the client's idempotency key, so a resent request is one request
+# (docs/libs/workflow_library.md, "The cancel route").
+# [proposed] an `http::serve` address passed as a parameter (docs/chl-spec.md, "9.16 The std
+# root", Planned), a route served only when a parameter selects it, and typed request rows on
+# `http::serve`.
+match control:
+    case `serve(c):
+        cancel_reqs, cancel_resps = http::serve(c.port, "POST", c.path)
+        # r: {run, reason}
+        for r in wf::keyed(cancel_reqs, by=(r) => r.headers["Idempotency-Key"]):
+            with begin():
+                i = RunId(value=r.run)
+                cancel(i, r.reason)
+                cancel_resps << (run=r.run, status=status(i))
+    case `none:
+        pass
+
+# Runs `body` once per live run, as a loop over `started` that catches
+# `wf::WorkflowCancellationException`.
+#
+# - Every `send_request` in `body` is keyed by the run.
+# - `for_each` does not complete the run and discards `body`'s value; `body` completes the run
+#   inside a `match` on the last result it waits for.
+# - Each `for_each` call is one body, and the first body to complete a run ends it for every body.
+# - `body` causes no other exception: one left unhandled is a compile error at the `for_each` call.
+#
+# A run resumes after a crash or a reload at the step whose outcome is pending
+# (docs/libs/workflow_library.md, "Bodies").
+# [proposed] a function whose body is a loop over a feed, inlined into the module that calls it; a
+# function-typed parameter with a `causes` clause; `try`/`except`; and the split at `send_request`.
+pub def for_each(Out, body: wf::Started(RunId, State) => Out
+                 causes wf::WorkflowCancellationException(_)):
+    for i -> s in started:
+        try:
+            body(s)
+        except wf::WorkflowCancellationException:
+            pass

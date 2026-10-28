@@ -17,6 +17,11 @@ A module's path is its file's path under this directory, with `std` in place of 
 | `std::time` | [time.cambra](time.cambra) | `import std::time` | `Instant`, `Duration`, `now()`, durations, and conversions to integer counts and Unix time |
 | `std::time::timer` | [time/timer.cambra](time/timer.cambra) | `run std::time::timer(Key=K) as t` | Keyed one-shot timers: `register`, `cancel`, `pending`, `fired` |
 | `std::retry` | [retry.cambra](retry.cambra) | `import std::retry` | Retry policy: reply classification, backoff, deadlines, `transient_http_retry` |
+| `std::wf` | [wf.cambra](wf.cambra) | `import std::wf` | The workflow library's shared types, traits and client contract ([workflow_library.md](../docs/libs/workflow_library.md)) |
+| `std::wf::workflow` | [wf/workflow.cambra](wf/workflow.cambra) | `run std::wf::workflow(…) as w` | A workflow's run table, limits and `for_each` |
+| `std::wf::effect` | [wf/effect.cambra](wf/effect.cambra) | `run std::wf::effect(…) as e` | Calls to a remote, once per key: `send_request`, retries, cancellation |
+| `std::wf::schedule` | [wf/schedule.cambra](wf/schedule.cambra) | `run std::wf::schedule(…) as s` | A child workflow with one run per parent run per slot |
+| `std::wf::detached` | [wf/detached.cambra](wf/detached.cambra) | imported by `std::wf::workflow` | The default parent: a workflow with no runs |
 
 - **A module that declares state or performs IO is run; every other module is imported.** Importing
   asserts that a module declares no mutable variable or feed and opens no source

@@ -1,0 +1,155 @@
+# v4 of the bill reminder's versions: retire v3's resend loop, and rename its label
+# (docs/libs/workflow_library.md, "Example: the bill reminder's versions"). Does not compile;
+# `[proposed]` marks what the compiler lacks.
+#
+# Reloaded over a running v3, once every SMS v2's body broke has been resent. The resend loop held
+# no state of its own: each resend it fed is a call of `send_sms`, which carries over with the
+# effect's run, and a resend still in flight settles as any call does. So the retirement is one
+# reload that loads nothing. A failure after v4 is not resent, and a resend that fails is still
+# reported. Reloading v3 again would resend no failure twice: each resent failure was resolved.
+
+run std::env as env
+import lib         # lib.cambra beside this file: the providers' request and reply types
+import std::retry
+import std::http   # sketched in stdlib/http.cambra
+import std::time
+import std::wf
+
+BillId = String
+
+# [proposed] declared traits, and `impl` of a library trait for a user type.
+type Bill = {bill_id: BillId}
+
+impl wf::WorkflowState(Bill):
+    def get_run_id(self) => String:
+        "bill-" + self.bill_id
+
+# A bill is chased for at most a year, and ends `stale after 30 days in which no effect sent or
+# settled a call for it. An operator cancels one bill's run through the workflow's cancel route.
+run std::wf::workflow(State=Bill, timeout=`after(time::days(365)),
+                      stale_after=`after(time::days(30)),
+                      control=`serve(port="8080", path="/bills/cancel"))
+    as bills
+
+# One run per bill per day, the first when the bill is tracked. `replace: a day still sending when
+# the next comes due is cancelled, so a bill never has two reminders in flight, and after downtime
+# it gets one reminder, not one per missed day.
+run std::wf::schedule(parent=bills, every=time::days(1), on_due=`replace) as daily
+
+# Tracking a bill starts its run; paying it completes the run, which cancels its days. Each route is
+# keyed by the client's idempotency key, so a resent request is one request.
+# [proposed] typed request rows on `http::serve`.
+track_reqs, track_resps = http::serve("8080", "POST", "/bills")
+paid_reqs, paid_resps = http::serve("8080", "POST", "/bills/paid")
+
+for r in wf::keyed(track_reqs, by=(r) => r.headers["Idempotency-Key"]):   # r: {bill_id}
+    with begin():
+        bills::start(Bill(bill_id=r.bill_id))
+        track_resps << (bill_id=r.bill_id)
+
+for r in wf::keyed(paid_reqs, by=(r) => r.headers["Idempotency-Key"]):    # r: {bill_id}
+    with begin():
+        bills::complete(bills::id(Bill(bill_id=r.bill_id)))
+        paid_resps << (bill_id=r.bill_id)
+
+# Customer lookup is out of scope: the addresses are derived from the bill id.
+def contact(bill_id: BillId) => {email: String, phone: String}:
+    (email=bill_id + "@example.com", phone="+1555" + bill_id)
+
+email_chat = lib::openai_chat(base_url=env::var("OPENAI_BASE_URL"),
+                              api_key=env::var("OPENAI_API_KEY"), model="gpt-5-mini")
+mailman_client = lib::resend(base_url=env::var("RESEND_BASE_URL"),
+                             api_key=env::var("RESEND_API_KEY"),
+                             from="Bills <bills@example.com>",
+                             key_prefix=env::var("DEPLOYMENT") + "/send_email")
+
+run std::wf::effect(workflow=daily, client=email_chat,
+                    config=wf::config(retry::default_retry()))
+    as compose_email
+run std::wf::effect(workflow=daily, client=mailman_client,
+                    config=wf::config(retry::default_retry()))
+    as send_email
+
+# A day is done once its email is sent. A failed call leaves the day running until the next day
+# replaces it.
+# [proposed] `causes` syntax for effects and exceptions.
+def email_for_day(day) causes wf::WorkflowCancellationException(_):
+    match compose_email::send_request(lib::prompt="bill-reminder-email"):
+        case `err(f):
+            pass
+        case `ok(composed):
+            match send_email::send_request(lib::to=contact(day.state.parent.bill_id).email,
+                                           lib::subject="Your bill is due",
+                                           lib::text=composed.lib::text):
+                case `err(f):
+                    pass
+                case `ok(_):
+                    with begin():
+                        daily::complete(day.id)
+
+daily::for_each(email_for_day)
+
+# One run per bill every other day. Its effects belong to it, so each SMS slot composes and sends
+# once, under a key of its own, apart from the day's email. `latest, not `replace: a slot whose SMS
+# failed stays running, holding its failure on `send_sms::failed`, so a later version can retry it.
+run std::wf::schedule(parent=bills, every=time::days(2), on_due=`latest) as every_other_day
+
+sms_chat = lib::openai_chat(base_url=env::var("OPENAI_BASE_URL"),
+                            api_key=env::var("OPENAI_API_KEY"), model="gpt-5-mini")
+sms_client = lib::twilio(base_url=env::var("TWILIO_BASE_URL"),
+                         account_sid=env::var("TWILIO_ACCOUNT_SID"),
+                         auth_token=env::var("TWILIO_AUTH_TOKEN"), from="+15550100000")
+
+run std::wf::effect(workflow=every_other_day, client=sms_chat,
+                    config=wf::config(retry::default_retry()))
+    as compose_sms
+run std::wf::effect(workflow=every_other_day, client=sms_client,
+                    config=wf::config(retry::default_retry()))
+    as send_sms
+
+def sms_body(text: String) => String:
+    truncate(text, 1600)  # [proposed] string slicing
+
+# A slot is done once its SMS is sent.
+def sms_for_slot(slot) causes wf::WorkflowCancellationException(_):
+    match compose_sms::send_request(lib::prompt="bill-reminder-sms"):
+        case `err(f):
+            pass
+        case `ok(composed):
+            match send_sms::send_request(lib::to=contact(slot.state.parent.bill_id).phone,
+                                         lib::body=sms_body(composed.lib::text)):
+                case `err(f):
+                    pass
+                case `ok(_):
+                    with begin():
+                        every_other_day::complete(slot.id)
+
+every_other_day::for_each(sms_for_slot)
+
+# v3's `sms_fixed`, renamed to say what the label marks now that nothing fixes a body. The keys of
+# the calls v3 made carry the old name, so the label is renamed from it: a resend still in flight at
+# this reload completes its slot, and a resend that fails is reported, as under v3.
+# [proposed] `@RenamedFrom` on a call-site label (docs/chl-spec.md, "1.9 Decorators", lists the
+# declarations it decorates: a run, a type and a constructor).
+@RenamedFrom(sms_fixed)
+sms_resent = wf::label("sms_resent")
+
+# Failures that need a person: each is reported once.
+pub ops_alerts = defer()   # Feed({bill_id, reason, last})
+
+# A resend that succeeds completes its slot's run, as the body does for a first send.
+for k -> sent in send_sms::responses if k.has_label(sms_resent):
+    with begin():
+        every_other_day::complete(k.run)
+
+# A resend that failed again needs a person: it is reported once, and resolved.
+# [proposed] `send_sms::failed` holding the failures from before this reload
+# (docs/libs/workflow_library.md, "What a loop added by a reload reads").
+for k -> f in send_sms::failed if k.has_label(sms_resent):
+    with begin():
+        match every_other_day::get(k.run):
+            case `some(s):
+                ops_alerts << (bill_id=s.parent.bill_id, reason=f.reason, last=f.last)
+            case `none:
+                pass
+        send_sms::resolve(k)

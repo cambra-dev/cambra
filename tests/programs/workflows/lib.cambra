@@ -1,0 +1,139 @@
+# The bill reminder's providers: their request and reply types, and one client constructor each
+# (OpenAI chat, Resend email, Twilio SMS), each returning a `wf::ClientCtor`
+# (docs/libs/workflow_library.md, "Effects").
+#
+# No client here retries, keeps state across writes, or has a cancel operation, so
+# each reads nothing from its `cancels_feed`. Each request times out within 60 s, so
+# `retry::default_retry`'s 5-minute `deadline` outlasts every client's time to a final reply. Each
+# takes its base URL, so a test can point every client at a local stub.
+#
+# Does not compile. `...` is elided code: each client's mapping between its rows and
+# `http::http_client`'s, and JSON and form encoding, which have no design. `http::http_client` is
+# assumed keyed, like `wf::Client`.
+# [proposed] a nested `def` whose parameter is a type, returned as a value.
+
+import std::http
+import std::retry
+import std::time
+import std::wf
+
+# OpenAI Chat Completions.
+pub Chat = {prompt: String}
+pub Composed = {text: String}
+
+# Resend.
+pub Email = {to: String, subject: String, text: String}
+pub Emailed = {id: String}
+
+# Twilio Messages. `to` is an E.164 number.
+pub Sms = {to: String, body: String}
+pub Sent = {sid: String}
+
+# `POST {base_url}/v1/chat/completions`, bearer auth; the reply text is
+# `choices[0].message.content`. OpenAI has no idempotency header, so a resend after a timeout can
+# compose twice.
+pub def openai_chat(base_url: String, api_key: String,
+                    model: String) => wf::ClientCtor(Chat, http::Outcome(Composed), Composed):
+    def build(CK: Type) => wf::Client(wf::Attempt(CK), Chat, http::Outcome(Composed)):
+        writes_feed = defer()
+        http_writes, http_replies = http::http_client(wf::Attempt(CK), (
+            http::base_url=base_url,
+            http::headers={"Authorization": "Bearer " + api_key,
+                           "Content-Type": "application/json"},
+            http::timeout=time::seconds(60),
+        ))
+        ...
+        wf::Client(writes_feed=writes_feed, cancels_feed=defer(), replies=...)
+    (build=build, retry_logic=retry::transient_http_retry, cancel_logic=http_cancel_logic)
+
+# `POST {base_url}/emails`, bearer auth. Resend answers a request with a repeated
+# `Idempotency-Key` and payload from its record for 24 h, without sending again. Whether that
+# record includes failures is undocumented; Stripe's includes every response once execution began.
+#
+# The header is built from `key_prefix`, the call's key and the attempt's generation
+# (`wf::Attempt`; docs/libs/workflow_library.md, "Retry"): a retry after a timeout keeps the key,
+# and a retry after an answered failure gets a new one.
+#
+# Resend keeps one key space per account, and call keys are not unique across effects, so each
+# constructor value passed to an effect takes a `key_prefix` no other effect on the account uses,
+# such as the effect's run name and the deployment. Without one, Resend takes a second effect's
+# email for a retry of the first's and does not send it.
+pub def resend(base_url: String, api_key: String, from: String,
+               key_prefix: String) => wf::ClientCtor(Email, http::Outcome(Emailed), Emailed):
+    def build(CK: Type) => wf::Client(wf::Attempt(CK), Email, http::Outcome(Emailed)):
+        writes_feed = defer()
+        replies = defer()
+        http_writes, http_replies = http::http_client(wf::Attempt(CK), (
+            http::base_url=base_url,
+            http::headers={"Authorization": "Bearer " + api_key,
+                           "Content-Type": "application/json"},
+            http::timeout=time::seconds(30),
+        ))
+
+        for a -> e in writes_feed:
+            http_writes[a] << (http::method="POST", http::path="/emails",
+                               http::headers={"Idempotency-Key":
+                                              remote_key(key_prefix, a.key, a.generation)},
+                               http::body=email_json(from, e))
+
+        for a -> reply in http_replies:
+            replies[a] << decode_emailed(reply)
+
+        wf::Client(writes_feed=writes_feed, cancels_feed=defer(), replies=replies)
+    (build=build, retry_logic=resend_retry, cancel_logic=http_cancel_logic)
+
+# Resend's classification: `retry::transient_http_retry`, except that a 409
+# `concurrent_idempotent_requests`, which Resend's docs call safe to retry later, is unanswered: the
+# first request under the key is still in flight, so the retry keeps the key.
+pub def resend_retry(o: http::Outcome(Emailed)) => retry::RetryState(Emailed):
+    match o:
+        case http::`status(r):
+            if r.http::status == 409 and resend_error(r) == "concurrent_idempotent_requests":
+                retry::`retriable(answered=False)
+            else:
+                retry::transient_http_retry(o)
+        case _:
+            retry::transient_http_retry(o)
+
+# Returns Resend's error name from a failed reply's body,
+# `{"name": "concurrent_idempotent_requests", …}`.
+def resend_error(r: http::Response) => String:
+    ...
+
+# An example remote key, within Resend's limit of 256 characters.
+# [proposed] `string(k)` of a call key, and `sha256`.
+def remote_key(prefix: String, k, generation: Int) => String:
+    sha256(prefix + "|" + string(k)) + "#" + string(generation)
+
+# `POST {base_url}/2010-04-01/Accounts/{account_sid}/Messages.json`, HTTP Basic auth,
+# form-encoded. Twilio has no idempotency header. It answers a body over 1,600 characters with
+# 400, error 21617, which `retry::transient_http_retry` fails without retrying.
+pub def twilio(base_url: String, account_sid: String, auth_token: String,
+               from: String) => wf::ClientCtor(Sms, http::Outcome(Sent), Sent):
+    def build(CK: Type) => wf::Client(wf::Attempt(CK), Sms, http::Outcome(Sent)):
+        writes_feed = defer()
+        http_writes, http_replies = http::http_client(wf::Attempt(CK), (
+            http::base_url=base_url + "/2010-04-01/Accounts/" + account_sid,
+            http::headers={"Authorization": "Basic " + base64(account_sid + ":" + auth_token),
+                           "Content-Type": "application/x-www-form-urlencoded"},
+            http::timeout=time::seconds(30),
+        ))
+        ...
+        wf::Client(writes_feed=writes_feed, cancels_feed=defer(), replies=...)
+    (build=build, retry_logic=retry::transient_http_retry, cancel_logic=http_cancel_logic)
+
+# Returns Twilio's error code from a failed reply's body, `{"code": 21617, …}`.
+pub def twilio_error(r: http::Response) => Int:
+    ...
+
+# The `cancel_logic` of a client with no cancel operation: the reply to a cancelled attempt is the
+# attempt's own reply. A success was performed, an unanswered attempt may have been, and an
+# answered failure was not.
+def http_cancel_logic(Ok, o: http::Outcome(Ok)) => wf::CancelOutcome:
+    match o:
+        case http::`ok(_):
+            wf::`performed
+        case http::`status(_):
+            wf::`not_performed
+        case _:
+            wf::`unknown

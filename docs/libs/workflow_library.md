@@ -3,7 +3,7 @@
 An aspirational Cambra library of the primitives for workflow-shaped programs: long-running runs,
 calls to remote systems that happen once per key, timers, and changes to the program while runs
 are in flight. The library is in the std root, [std/](../../std/README.md), and the programs written
-against it are in `tests/programs/workflows/`. None of it
+against it are in [tests/programs/workflows/](../../tests/programs/workflows/README.md). None of it
 compiles; `[proposed]` marks each construct Cambra main lacks where the code uses it.
 
 Unmarked text describes what that code implements. The rest carries a status marker, as
@@ -43,7 +43,7 @@ Each workflow concept is one construct of the library:
 One run of `bills` is one bill. One run of the child workflow `reminders` is one bill's reminder
 for one day. The effects belong to `reminders`, so each day's reminder looks up a contact, composes
 a message and sends it once, and the body completes the day's run once the message is sent.
-`bill-reminder.cambra` is the full program.
+[bill-reminder.cambra](../../tests/programs/workflows/bill-reminder.cambra) is the full program.
 
 ```
 type BillWorkflowState = {bill_id: BillId}
@@ -240,7 +240,7 @@ per-run state for runs nobody ends, such as a bill never paid.
   activity, finds the run within its limit, and registers the next one, so a run's wake moves once
   per `stale_after` rather than once per call.
 
-The limit check, simplified from `std/wf/workflow.cambra`:
+The limit check, simplified from [std/wf/workflow.cambra](../../std/wf/workflow.cambra):
 
 ```
 for t in wakes::fired:                         # one pending timer per run
@@ -825,6 +825,18 @@ effect, B's pending outputs are discarded rather than mistyped, and the run stal
 Checking it at all needs typing across versions (the running version against the loaded one), which
 is not planned.
 
+### Example: the bill reminder's versions
+
+Four versions of a bill reminder, each reloaded over the one before, take a running program through
+several of the flows below:
+
+| Version | Change | At the reload |
+| -- | -- | -- |
+| [v1](../../tests/programs/workflows/bill-reminder-v1.cambra) | Emails each bill daily | Starts from no prior state |
+| [v2](../../tests/programs/workflows/bill-reminder-v2.cambra) | Adds an SMS every other day, whose body has a bug: Twilio refuses one over 1,600 characters | Every bill v1 is chasing gets its first SMS slot at the takeover |
+| [v3](../../tests/programs/workflows/bill-reminder-v3.cambra) | Fixes the SMS body, and resends each SMS v2's body broke under the label `sms_fixed` | The new loop reads the failures held on `send_sms::failed` |
+| [v4](../../tests/programs/workflows/bill-reminder-v4.cambra) | Retires the resend loop, and renames `sms_fixed` to `sms_resent` with `@RenamedFrom` | Loads nothing; a resend still in flight keeps its key |
+
 ### Developer flows
 
 What a developer does with a workflow program over its life, and how each is done:
@@ -842,7 +854,6 @@ What a developer does with a workflow program over its life, and how each is don
 | **Act on one run without a deploy** | The workflow's cancel route, or a keyed route of the program's own that calls `cancel(id, reason)` ([The cancel route](#the-cancel-route)). From that commit on, no effect sends for the run, and its dependent child runs end with it ([How a run ends](#how-a-run-ends)) |
 | **Query runs in flight** | A branch whose version adds a read-only output over the workflow's state, read and then deleted, with main not reloaded. The branch keeps main's operators where its version agrees and forks only the variables its version changes ([A branch is created by branch-and-reload](../../src/ccl/design/program-evolution.md#a-branch-is-created-by-branch-and-reload)). Until branches isolate their effects, the query branch also runs every effect main runs |
 | **Isolate a branch** | Not designed: a branch's effects would reach a sandbox until it is promoted. Every branch reads every element of a shared source and runs its own writes ([Every branch reads every element](../../src/ccl/design/program-evolution.md#every-branch-reads-every-element)) |
-
 
 ## Open
 

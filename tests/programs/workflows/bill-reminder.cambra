@@ -1,0 +1,123 @@
+# The bill reminder as a workflow body that calls effects as functions, `send_request(…)`, with
+# exceptions for cancellation (docs/libs/workflow_library.md, "Example: the bill reminder"). Does
+# not compile; `[proposed]` marks what the compiler lacks.
+
+run std::env as env
+import lib         # lib.cambra beside this file: the providers' request and reply types
+import std::retry
+import std::http   # sketched in stdlib/http.cambra
+import std::time
+import std::wf
+
+BillId = String
+
+# --- Workflows ----------------------------------------------------------------
+
+# A bill's workflow state. `wf::WorkflowState` derives the run id from it, so the same bill always
+# names the same run.
+# [proposed] declared traits, and `impl` of a library trait for a user type.
+type BillWorkflowState = {bill_id: BillId}
+
+impl wf::WorkflowState(BillWorkflowState):
+    def get_run_id(self) => String:
+        "bill-" + self.bill_id
+
+# An operator cancels one bill's run through the workflow's cancel route.
+run std::wf::workflow(State=BillWorkflowState, timeout=`after(time::days(365)),
+                      stale_after=`after(time::days(30)),
+                      control=`serve(port="8080", path="/bills/cancel"))
+    as bills
+
+# A child workflow with one run per bill per day; the run id is the bill's run id and the day's
+# slot. `dependent: a bill's end (paid, cancelled, timed out, stale) cancels its reminder runs, and
+# so every effect below stops for the bill.
+run std::wf::schedule(parent=bills, every=time::days(1), on_due=`replace, child_lifecycle=`dependent)
+    as reminders
+
+# Tracking a bill starts its run; paying it completes the run, which cancels its reminders. Each
+# route is keyed by the client's idempotency key, so a resent request is one request
+# (`wf::KeyedSource`).
+# [proposed] typed request rows on `http::serve`.
+track_reqs, track_resps = http::serve("8080", "POST", "/bills")
+paid_reqs, paid_resps = http::serve("8080", "POST", "/bills/paid")
+
+for r in wf::keyed(track_reqs, by=(r) => r.headers["Idempotency-Key"]):   # r: {bill_id}
+    with begin():
+        bills::start(BillWorkflowState(bill_id=r.bill_id))
+        track_resps << (bill_id=r.bill_id)
+
+for r in wf::keyed(paid_reqs, by=(r) => r.headers["Idempotency-Key"]):    # r: {bill_id}
+    with begin():
+        bills::complete(bills::id(BillWorkflowState(bill_id=r.bill_id)))
+        paid_resps << (bill_id=r.bill_id)
+
+# --- Clients and effects ------------------------------------------------------
+
+# Each value is a client constructor (`wf::ClientCtor`), from which each effect builds its own
+# client. A Resend constructor's `key_prefix` keeps its effect's remote keys apart from every other
+# effect's on the account (`lib::resend`).
+cms_contact_info_client = ...   # a contact lookup client, not in lib.cambra
+email_chat = lib::openai_chat(base_url=env::var("OPENAI_BASE_URL"),
+                              api_key=env::var("OPENAI_API_KEY"), model="gpt-5-mini")
+sms_chat = lib::openai_chat(base_url=env::var("OPENAI_BASE_URL"),
+                            api_key=env::var("OPENAI_API_KEY"), model="gpt-5-mini")
+mailman_client = lib::resend(base_url=env::var("RESEND_BASE_URL"),
+                             api_key=env::var("RESEND_API_KEY"), from="Bills <bills@example.com>",
+                             key_prefix=env::var("DEPLOYMENT") + "/send_email")
+sms_client = lib::twilio(base_url=env::var("TWILIO_BASE_URL"),
+                         account_sid=env::var("TWILIO_ACCOUNT_SID"),
+                         auth_token=env::var("TWILIO_AUTH_TOKEN"), from="+15550100000")
+
+run std::wf::effect(workflow=reminders, client=cms_contact_info_client, ...) as lookup_contact_info
+run std::wf::effect(workflow=reminders, client=email_chat,
+                    config=wf::config(retry::default_retry()))
+    as compose_email
+run std::wf::effect(workflow=reminders, client=sms_chat,
+                    config=wf::config(retry::default_retry()))
+    as compose_sms
+run std::wf::effect(workflow=reminders, client=mailman_client,
+                    config=wf::config(retry::default_retry()))
+    as send_email
+run std::wf::effect(workflow=reminders, client=sms_client,
+                    config=wf::config(retry::default_retry()))
+    as send_sms
+
+
+# --- Workflow logic -----------------------------------------------------------
+# `for_each` is the loop over the live runs, with `wf::WorkflowCancellationException` caught
+# (`std::wf::workflow`).
+reminders::for_each(send_for_reminder)
+
+# [proposed] `causes` syntax for effects and exceptions
+def send_for_reminder(rem) causes wf::WorkflowCancellationException(_):
+    # Open: if users can handle cancellation exceptions, is there a SIGKILL equivalent?
+    #
+    # `result` is the send's result, or the failure of the call that stopped the branch before
+    # the send.
+    # [proposed] a sum of the two sends' `Result` types, and `_` in a mutable variable's type.
+    # result: Result(lib::Sent | lib::Emailed, _) := `err(`not_sent)
+    result = match lookup_contact_info::send_request(bill_id=rem.state.parent.bill_id, ...):
+        case `err(f):
+            `err(f)
+        case `ok(contact):
+            if contact.prefer_sms:
+                match compose_sms::send_request(lib::prompt="bill-reminder-sms", ...):
+                    case `err(f):
+                        `err(f)
+                    case `ok(sms_body):
+                        send_sms::send_request(lib::body=sms_body.lib::text, ...)
+            else:
+                match compose_email::send_request(lib::prompt="bill-reminder-email", ...):
+                    case `err(f):
+                        `err(f)
+                    case `ok(email_body):
+                        send_email::send_request(lib::text=email_body.lib::text, ...)
+    # The `match` reads the send's result, so the run completes after the send settles.
+    match result:
+        case `ok(_):
+            with begin():
+                reminders::complete(rem.id)
+        case `err(f):
+            pass    # the run stays live until a later slot replaces it or a limit ends it
+
+

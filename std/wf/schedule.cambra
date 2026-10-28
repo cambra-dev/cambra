@@ -1,0 +1,116 @@
+# A child workflow with one run per parent run per slot: every `every`, each live parent run's next
+# slot comes due, and the schedule starts a run whose state is `wf::Slot(PState)`.
+#
+# The module declares state, so a program runs it (docs/chl-spec.md, "9.9 Running"). It re-exports
+# its slot workflow's members, so it is a `wf::Workflow` that effects take as their workflow.
+#
+# Example, a body that reads its parent's state as `rem.state.parent`:
+#
+#     import std::time
+#     import std::wf
+#
+#     run std::wf::schedule(parent=bills, every=time::days(1), on_due=`replace) as reminders
+#
+#     def send_for_reminder(rem) causes wf::WorkflowCancellationException(_):
+#         contact = lookup_contact_info::send_request(bill_id=rem.state.parent.bill_id)
+#         …
+#
+#     reminders::for_each(send_for_reminder)
+#
+# Status: proposed, not in the spec (docs/libs/workflow_library.md, "Schedules").
+# `[proposed]` marks each construct the compiler lacks.
+
+import std::time
+import std::wf
+
+# [proposed] the requirement `wf::WorkflowState(PState)` on a type parameter, which
+# docs/chl-spec.md, "9.4 Parameters", leaves Open.
+param PState
+param parent: wf::Workflow(PState)
+param every: time::Duration
+param on_due: wf::OnDue = `latest
+param child_lifecycle: wf::ChildLifecycle = `dependent
+# Limits on each slot's run, which otherwise ends by `complete or with its parent.
+param timeout: {`after{time::Duration} | `never} = `never
+param stale_after: {`after{time::Duration} | `never} = `never
+
+# The slot runs, whose members are re-exported below.
+# [proposed] re-exporting a run's members by `pub name = run::name` (docs/chl-spec.md, "9.3 Runs").
+run std::wf::workflow(State=wf::Slot(PState), parent=parent, child_lifecycle=child_lifecycle,
+                      timeout=timeout, stale_after=stale_after)
+    as runs
+
+pub RunId = runs::RunId
+pub id = runs::id
+pub id_string = runs::id_string
+pub started = runs::started
+pub ended = runs::ended
+pub get = runs::get
+pub status = runs::status
+pub live = runs::live
+pub touch = runs::touch
+pub complete = runs::complete
+pub cancel = runs::cancel
+pub for_each = runs::for_each
+
+PRunId = parent::RunId
+
+# Each parent run's pending slot, read only inside transactions. A wake acts only if it is still
+# the pending slot.
+next: Mut(Map(PRunId, time::Instant), Txn) := empty_map()
+
+# One pending wake per parent run, at its pending slot.
+# TODO spread the first slots of the parent runs live at the takeover over a window: they all come
+# due at once, a burst the size of the parent's run table.
+run std::time::timer(Key=PRunId) as wakes
+
+# A reload that rebuilds this loop reads every live parent run again; `next` already holds a slot
+# for each, so it starts no second chain.
+# [proposed] `parent::started` holding each running parent run for a loop that a reload adds, so a
+# schedule added by a reload reaches the parent runs started before it
+# (docs/libs/workflow_library.md, "What a loop added by a reload reads").
+for s in parent::started:
+    with begin():
+        if s.id not in next:
+            now = time::now()
+            # TODO initial firing should be configurable instead of now
+            next[s.id] := now
+            wakes::register(s.id, now)
+
+# `on_due`, when the slots from `t.at` to `latest` are due for parent run `p`:
+#
+# - `all: start a run for every due slot, and leave earlier runs running.
+# - `latest: start a run for `latest only, and leave earlier runs running.
+# - `replace: start a run for `latest only, and cancel `p`'s earlier runs still running.
+# - `skip: start a run for `latest only if `p` has no run still running.
+#
+# A schedule whose runs end only with their parent uses `all or `latest
+# (docs/libs/workflow_library.md, "Schedules"). A parent run that has ended stops its chain.
+# [proposed] `Duration` division, and a `for` over a list inside a transaction.
+for t in wakes::fired:
+    with begin():
+        p = t.key
+        if parent::live(p) and p in next and next[p] == t.at:
+            latest = t.at + every * ((time::now() - t.at) // every)
+            match parent::get(p):
+                case `some(ps):
+                    match on_due:
+                        case `all:
+                            for slot in range(t.at, latest + every, every):
+                                runs::start(wf::Slot(parent=ps, slot=slot), parent_run=`some(p))
+                        case `latest:
+                            runs::start(wf::Slot(parent=ps, slot=latest), parent_run=`some(p))
+                        case `replace:
+                            for c in runs::live_children(p):
+                                runs::cancel(c, "replaced by a later slot")
+                            runs::start(wf::Slot(parent=ps, slot=latest), parent_run=`some(p))
+                        case `skip:
+                            if runs::live_children(p) == []:
+                                runs::start(wf::Slot(parent=ps, slot=latest), parent_run=`some(p))
+                case `none:
+                    pass
+            next[p] := latest + every
+            wakes::register(p, latest + every)
+        elif not parent::live(p) and p in next:
+            del next[p]
+            wakes::cancel(p)
