@@ -194,7 +194,7 @@ impl HttpRoute {
             .parse()
             .map_err(|_| format!("http_serve port must be a u16, got {port:?}"))?;
         Ok(HttpRoute {
-            source_name: http_requests_source_name(port, method, path),
+            source_name: http_requests_source_name(port_u16, method, path),
             address: RouteAddress::Fixed {
                 port: port_u16,
                 method: method.to_string(),

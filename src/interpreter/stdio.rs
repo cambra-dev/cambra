@@ -1,6 +1,6 @@
 use std::{
     io::BufRead,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
 };
 
@@ -21,35 +21,52 @@ pub struct StdinDataSource {
     /// Shared buffer, indexing, and predicate bookkeeping.
     buf: UIntStreamBuffer,
 
-    /// Lines arriving from the background reader thread.  `None` signals EOF.
-    receiver: Receiver<Option<SmolStr>>,
+    /// Lines from the background reader thread, then the end of file or the error that stopped
+    /// it.
+    receiver: Receiver<StdinMessage>,
+}
+
+/// What the stdin reader thread sends.
+enum StdinMessage {
+    Line(SmolStr),
+    /// Stdin reached end of file, and the reader has returned.
+    Eof,
+    /// Reading stdin failed, and the reader has returned.
+    Failed(String),
+}
+
+/// Send each line of `reader` to `sender`, then [`StdinMessage::Eof`] or [`StdinMessage::Failed`].
+///
+/// A read error is sent rather than panicked on. A panic would end this thread alone, and the
+/// source would find the channel closed with neither an end of file nor an error to report.
+fn read_lines(mut reader: impl BufRead, sender: Sender<StdinMessage>) {
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) => {
+                let _ = sender.send(StdinMessage::Eof);
+                return;
+            }
+            Ok(_) => {
+                let line = SmolStr::new(buf.trim_end_matches(['\n', '\r']));
+                if sender.send(StdinMessage::Line(line)).is_err() {
+                    // The source was dropped, so nothing reads further lines.
+                    return;
+                }
+            }
+            Err(err) => {
+                let _ = sender.send(StdinMessage::Failed(err.to_string()));
+                return;
+            }
+        }
+    }
 }
 
 impl StdinDataSource {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(std::io::stdin());
-            let mut buf = String::new();
-            loop {
-                buf.clear();
-                match reader.read_line(&mut buf) {
-                    Ok(0) => {
-                        // EOF — signal the main thread and stop.
-                        let _ = sender.send(None);
-                        return;
-                    }
-                    Ok(_) => {
-                        let line = SmolStr::new(buf.trim_end_matches(['\n', '\r']));
-                        if sender.send(Some(line)).is_err() {
-                            // Receiver was dropped (source closed); stop reading.
-                            return;
-                        }
-                    }
-                    Err(err) => panic!("Error reading from stdin: {err}"),
-                }
-            }
-        });
+        thread::spawn(move || read_lines(std::io::BufReader::new(std::io::stdin()), sender));
         Self {
             buf: UIntStreamBuffer::new(),
             receiver,
@@ -76,25 +93,35 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         Some(self.buf.retained_window())
     }
 
-    /// Drains any lines that the background reader thread has buffered.
+    /// Drains the lines the background reader thread has buffered, and never blocks.
     ///
-    /// Returns `true` if at least one new line (or EOF) was received, which
-    /// tells the scheduler to re-notify consumers.  Never blocks.
+    /// Returns `true` if at least one line or the end of file arrived, which tells the scheduler
+    /// to notify consumers. Panics on the error that stopped the reader: the stream can neither
+    /// continue nor be called complete.
     fn check_for_new_data(&mut self) -> bool {
+        // The reader returns after sending the end of file, which closes the channel.
+        if self.buf.eof_reached {
+            return false;
+        }
         let mut got_data = false;
         loop {
             match self.receiver.try_recv() {
-                Ok(Some(line)) => {
+                Ok(StdinMessage::Line(line)) => {
                     self.add(line);
                     got_data = true;
                 }
-                Ok(None) => {
+                Ok(StdinMessage::Eof) => {
                     debug!("EOF reached on stdin");
                     self.buf.eof_reached = true;
                     got_data = true;
                     break;
                 }
-                Err(_) => break,
+                Ok(StdinMessage::Failed(err)) => panic!("Error reading from stdin: {err}"),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => unreachable!(
+                    "the stdin reader returns only after sending the end of file or an error, \
+                     or once this source is dropped"
+                ),
             }
         }
         got_data
@@ -148,10 +175,27 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
 
 #[cfg(test)]
 mod tests {
+    use std::{io::Cursor, sync::mpsc};
+
     use crate::interpreter::{
-        ColumnValue, DataSourceDomainExtentImpl, Value, stdio::StdinDataSource, tiling::Predicate,
+        ColumnValue, DataSourceDomainExtentImpl, Value,
+        stdio::{StdinDataSource, StdinMessage, read_lines},
+        stream_buffer::UIntStreamBuffer,
+        tiling::Predicate,
     };
     use test_log::test;
+
+    /// A source reading the channel `messages` were sent on, with no reader thread on stdin.
+    fn source_reading(messages: Vec<StdinMessage>) -> StdinDataSource {
+        let (sender, receiver) = mpsc::channel();
+        for message in messages {
+            sender.send(message).unwrap();
+        }
+        StdinDataSource {
+            buf: UIntStreamBuffer::new(),
+            receiver,
+        }
+    }
 
     /// `Predicate::False` means nothing is obsolete: all indices in `start_idx..ready_size`.
     #[test]
@@ -366,6 +410,57 @@ mod tests {
         assert_ne!(
             pred_after_first, pred_after_second,
             "Predicate should be updated to OR with the new release"
+        );
+    }
+
+    /// The reader sends each line, then the error that stopped it, and nothing after.
+    #[test]
+    fn a_read_error_is_sent_and_ends_the_reader() {
+        let (sender, receiver) = mpsc::channel();
+        read_lines(Cursor::new(b"ok\n\xff\nnever\n".to_vec()), sender);
+        let sent: Vec<StdinMessage> = receiver.iter().collect();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [StdinMessage::Line(line), StdinMessage::Failed(_)] if line == "ok"
+            ),
+            "the line before the invalid UTF-8, then the error",
+        );
+    }
+
+    /// The reader sends each line, then the end of file.
+    #[test]
+    fn the_reader_ends_with_the_end_of_file() {
+        let (sender, receiver) = mpsc::channel();
+        read_lines(Cursor::new(b"a\n".to_vec()), sender);
+        let sent: Vec<StdinMessage> = receiver.iter().collect();
+        assert!(
+            matches!(sent.as_slice(), [StdinMessage::Line(line), StdinMessage::Eof] if line == "a"),
+            "the line, then the end of file",
+        );
+    }
+
+    /// A poll that reads the reader's error panics rather than leaving the stream open.
+    #[test]
+    #[should_panic(expected = "Error reading from stdin: stream did not contain valid UTF-8")]
+    fn a_read_error_panics_the_poll() {
+        let mut source = source_reading(vec![
+            StdinMessage::Line("ok".into()),
+            StdinMessage::Failed("stream did not contain valid UTF-8".into()),
+        ]);
+        source.check_for_new_data();
+    }
+
+    /// The end of file completes the stream once. A poll after it reads nothing, though the
+    /// reader has returned and the channel has no sender.
+    #[test]
+    fn a_poll_after_the_end_of_file_reads_nothing() {
+        let mut source = source_reading(vec![StdinMessage::Line("a".into()), StdinMessage::Eof]);
+        assert!(source.check_for_new_data(), "the line and the end of file");
+        assert_eq!(source.get_yield_predicate(), Predicate::True);
+        assert!(
+            !source.check_for_new_data(),
+            "nothing follows the end of file"
         );
     }
 }

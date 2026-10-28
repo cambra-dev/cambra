@@ -1282,6 +1282,32 @@ fn a_port_a_refused_version_adds_is_released() {
     );
 }
 
+/// A version that spells its port differently keeps the routes it serves and what they hold.
+///
+/// A route is keyed by its port as a number, so `"0…"` names the route the running version serves
+/// and the reload inherits it rather than registering a second route at its address.
+#[test]
+fn a_version_that_respells_its_port_keeps_its_routes() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("guestbook", port));
+
+    let before = exchange(&mut ctx, move || vec![http_post(port, "/sign", "alice")]);
+    assert_eq!(before, vec!["alice\n"]);
+
+    let respelled =
+        source("guestbook", port).replace(&format!("\"{port}\""), &format!("\"0{port}\""));
+    assert_ne!(
+        respelled,
+        source("guestbook", port),
+        "the fixture names its port"
+    );
+    live.reload_text(&mut ctx, MAIN_BRANCH, &respelled, &no_main)
+        .expect("`0…` names the port the running version serves");
+
+    let after = exchange(&mut ctx, move || vec![http_post(port, "/sign", "bob")]);
+    assert_eq!(after, vec!["alice\nbob\n"]);
+}
+
 // ── `@LoadFrom(x)`: seeding a variable from the value the predecessor held ───
 
 /// A version that retires a variable and seeds a new one from the value it held
