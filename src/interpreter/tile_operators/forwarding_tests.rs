@@ -959,3 +959,31 @@ fn a_memo_and_a_fan_out_slot_pass_a_region_of_fields_on() {
         std::slice::from_ref(&everything)
     );
 }
+
+/// A product's region names the field it changed in: the selected field's region is the result's,
+/// a region of another field sends nothing, and any other region is everything.
+#[test]
+fn select_field_over_a_product_takes_its_fields_region() {
+    let product = || {
+        select_field(Tiling::Record(
+            [(SmolStr::new("a"), ints()), (SmolStr::new("b"), ints())]
+                .into_iter()
+                .collect(),
+        ))
+    };
+    assert_eq!(received(&product, 0, &field("a", region())), [region()]);
+    assert_eq!(
+        received(&product, 0, &field("b", region())),
+        Vec::<Projection>::new()
+    );
+    assert_eq!(
+        received(&product, 0, &Projection::Everything),
+        [Projection::Everything]
+    );
+    assert_eq!(received(&product, 0, &region()), [Projection::Everything]);
+    let both = Projection::fields([
+        (SmolStr::new("a"), another_region()),
+        (SmolStr::new("b"), region()),
+    ]);
+    assert_eq!(received(&product, 0, &both), [another_region()]);
+}

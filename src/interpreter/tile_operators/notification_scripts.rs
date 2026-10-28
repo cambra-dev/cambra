@@ -943,3 +943,81 @@ fn map_result_with_source_notifies_exactly_what_its_keys_changed_over_growth() {
         assert_notification_sound(&build, &feeds, &script, &[Expect::Exact]);
     }
 }
+
+/// `SelectField("_0")` over `MakeRecord(a, b)`, directly and through a memo and a fan-out's slot.
+fn select_over_make_record(
+    through: Through,
+) -> impl Fn(Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    move |inputs| {
+        let record: Box<dyn TileOperator> = Box::new(MakeRecord::new(inputs));
+        let record: Box<dyn TileOperator> = match through {
+            Through::Nothing => record,
+            Through::Memo => Box::new(Memo::new(record)),
+            Through::FanOutSlot => FanOut::new(record).slot(),
+        };
+        Box::new(SelectField::new(record, "_0"))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Through {
+    Nothing,
+    Memo,
+    FanOutSlot,
+}
+
+/// A change to the field that is selected arrives as that field's region, and a change to the
+/// other field wakes nothing.
+fn check_product_routing(through: Through) {
+    let shapes = [(Values::Ints, None), (Values::Ints, None)];
+    check_many(
+        &select_over_make_record(through),
+        &shapes,
+        &[Expect::Exact, Expect::Silent],
+    );
+}
+
+#[test]
+fn select_field_over_make_record_notifies_the_selected_fields_region_only() {
+    check_product_routing(Through::Nothing);
+}
+
+#[test]
+fn select_field_over_a_memo_of_make_record_notifies_the_selected_fields_region_only() {
+    check_product_routing(Through::Memo);
+}
+
+#[test]
+fn select_field_over_a_fan_out_of_make_record_notifies_the_selected_fields_region_only() {
+    check_product_routing(Through::FanOutSlot);
+}
+
+/// The other field changes first and nothing pulls, then the selected field changes.
+#[test]
+fn a_change_to_the_selected_field_after_one_to_the_other_still_notifies() {
+    let none = Predicate::False;
+    let a = vec![
+        int_stream(&[], none.clone()),
+        int_stream(&[(2, 20)], none.clone()),
+    ];
+    let b = vec![
+        int_stream(&[], none.clone()),
+        int_stream(&[(7, 70)], none.clone()),
+    ];
+    let feeds = [
+        (stream_tiling(Values::Ints), a),
+        (stream_tiling(Values::Ints), b),
+    ];
+    let steps = [(1, keys_region(&[7])), (0, keys_region(&[2]))]
+        .into_iter()
+        .map(|(input, changed)| Step { input, changed })
+        .collect::<Vec<_>>();
+    for through in [Through::Nothing, Through::Memo, Through::FanOutSlot] {
+        assert_notification_sound(
+            &select_over_make_record(through),
+            &feeds,
+            &steps,
+            &[Expect::Exact, Expect::Silent],
+        );
+    }
+}

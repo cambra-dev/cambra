@@ -666,11 +666,12 @@ The projection table ([Projection guards](#projection-guards)), the release rule
 contract](#the-notification-contract)) each state a fact about 𝑅. Keeping keys is the identity
 translation, and widening is the top element, `Everything`.
 
-**Not implemented.** The exact translations are missing: the field-select of `SelectField` and the
-rename of `PermuteRecordDomain` widen on notification. A region payload is path-qualified like a
-guard (`TileGuard::Record`) in the intended form, and `Projection`, which names the outermost keys
-only, is the first step toward it. A product widens today because its notification cannot say which
-field changed.
+**Not implemented.** A region payload is path-qualified like a guard (`TileGuard::Record`) for a
+product: `MakeRecord` notifies `Projection::Fields`, and `SelectField` over a product, `Memo` and
+`FanOutSlot` act on one. Every other operator that keeps keys widens a region of fields. The rename
+of `PermuteRecordDomain` and the re-keying of `FlattenTupleDomain` are exact translations that are
+missing: they widen. A field's region names the outermost keys of the field, and a region of the
+groups beneath them is not spelled.
 
 ## The notification contract
 
@@ -708,7 +709,7 @@ depends on the input's shape, the operator decides from its tiling when it subsc
 | `MapResultToConst` | the constant | widens | Every row reads all of it. |
 | `MapResultWithSource` | the input | keeps | Pulled at the projection, so its keys are the output's. |
 | `RecordWrap`, `MapDomain`, `Restrict` | the input, the predicate | keeps | Pulled at the projection; a restricted domain is the predicate's keys that pass. |
-| `SelectField` | the input | keeps for a stream of records, widens for a product of collections | The product is read whole and the field cut. |
+| `SelectField` | the input | keeps for a stream of records, selects its field's region for a product of collections | The product is read whole and the field cut. A region of fields places a change in a field: the selected field's region is the result's, and a region of another field only sends no notification. Any other region of a product is `Everything`. |
 | `VariantWrap` | the payload | keeps where the result is a collection (applied at level 1 or beyond), widens at level 0 | The values at the level become one union column, which has no keys of its own at level 0. |
 | `VariantProject`, `VariantIs` | the input | keeps for a stream, widens for a bare union | A bare union has no keys of its own. |
 | `Zip`, `Product` | every arm, both sides | keeps | Pulled at the projection and aligned row for row. |

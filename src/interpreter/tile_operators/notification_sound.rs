@@ -164,6 +164,8 @@ pub(crate) enum Expect {
     Widens,
     /// The region is the one the input notified, as the region of this field of a record.
     Routed(&'static str),
+    /// No notification arrives: the operator's output has nothing of this input in it.
+    Silent,
 }
 
 /// One step of a script: input `input` moves to its next state and notifies `changed`.
@@ -306,6 +308,11 @@ pub(crate) fn assert_notification_sound(
                 notified,
                 Projection::fields([(SmolStr::new(name), step.changed.clone())]),
                 "step {n}: the operator did not route the region to its field"
+            ),
+            Expect::Silent => assert_eq!(
+                notified,
+                Projection::Nothing,
+                "step {n}: the operator woke its consumer for a change it does not read"
             ),
             Expect::Widens => assert_eq!(
                 notified,

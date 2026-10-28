@@ -958,11 +958,15 @@ impl TileOperator for SelectField {
         // An intent may only widen on its way upstream, so the input is asked for all of
         // it. [`guard_at_field`] narrows, which is sound for a release and not here.
         let input_tiling = self.input.tiling().clone();
-        let input_producer = self.input.subscribe(
-            input_tiling.universal_guard(),
-            consumer_keeping_keys_if(keeps_keys, consumer),
-            scheduler,
-        );
+        // A product's region names the field it changed in: a change to another field wakes
+        // nothing.
+        let consumer = match keeps_keys {
+            true => keys_only(consumer),
+            false => selecting_field(SmolStr::new(&self.name), consumer),
+        };
+        let input_producer =
+            self.input
+                .subscribe(input_tiling.universal_guard(), consumer, scheduler);
         Box::new(SelectFieldProducer {
             base: ProducerBase::new(
                 SelectFieldProducer::alloc_id(),

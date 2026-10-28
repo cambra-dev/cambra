@@ -168,6 +168,35 @@ pub fn forwarding_consumer_passing_regions(
     })
 }
 
+/// `consumer` behind a consumer for the record the operator selects the field `name` of: it
+/// forwards a region of that field, sends nothing for a region of other fields only, and sends
+/// `Everything` for any other region.
+pub fn selecting_field(name: SmolStr, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+    Box::new(SelectingField { name, consumer })
+}
+
+struct SelectingField {
+    name: SmolStr,
+    consumer: Box<dyn Consumer>,
+}
+
+impl Consumer for SelectingField {
+    fn notify(&mut self, arrived: &Projection) {
+        match arrived {
+            Projection::Fields(fields) => {
+                if let Some(region) = fields.get(&self.name) {
+                    self.consumer.notify(region);
+                }
+            }
+            _ => self.consumer.notify(&Projection::Everything),
+        }
+    }
+
+    fn region_driven(&self) -> bool {
+        self.consumer.region_driven()
+    }
+}
+
 /// [`forwarding_consumer`] for the input that is the field `name` of the record the operator
 /// makes of its inputs, whose fields are `names`: its region is forwarded as the region of that
 /// field.
@@ -1013,6 +1042,21 @@ mod tests {
         assert_eq!(passes(&[keys(1, 4), fields.clone()]), 2);
         assert_eq!(passes(&[fields.clone(), keys(1, 4)]), 2);
         assert_eq!(passes(&[keys(1, 4), fields.clone(), keys(1, 4)]), 3);
+    }
+
+    /// The gate holds what it passed, not what was delivered: a consumer behind it that drops a
+    /// region still closes the gate to that region, and the next pull opens it.
+    #[test]
+    fn a_region_the_consumer_behind_the_gate_drops_still_closes_the_gate_to_it() {
+        let (log, regions) = RegionLog::new(false);
+        let (gated, gate) = shared_consumer(selecting_field(SmolStr::new("a"), Box::new(log)));
+        let other = Projection::fields([(SmolStr::new("b"), keys(1, 2))]);
+        let wanted = Projection::fields([(SmolStr::new("a"), keys(1, 2))]);
+        gated.notify(&other);
+        gated.notify(&other);
+        gated.notify(&wanted);
+        assert_eq!(*regions.lock_now(), [keys(1, 2)]);
+        assert!(gate.0.take());
     }
 
     /// A forwarder that keeps keys passes each region on as it is, `Everything` included, and

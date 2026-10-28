@@ -35,7 +35,7 @@ use crate::{
     interpreter::{
         ColumnValue, Consumer, Extent, Gate, GatedConsumer, Projection, Scheduler, Value,
         forwarding_consumer, forwarding_consumer_into_field, forwarding_consumer_keeping_keys,
-        keys_only, validate_tile, widening,
+        keys_only, selecting_field, validate_tile, widening,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
