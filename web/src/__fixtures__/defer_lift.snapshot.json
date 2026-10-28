@@ -217,7 +217,7 @@
           "rewritten": {
             "via": "Lower",
             "nature": "machinery",
-            "label": "lower.stmt_seq"
+            "label": "lower.expression_statement"
           },
           "type": "_",
           "children": [
