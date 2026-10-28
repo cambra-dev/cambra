@@ -195,6 +195,21 @@ pub(crate) fn subscribe_forwarding(
     )
 }
 
+/// The consumer an operator passes an input: `consumer` itself where the operator's outermost keys
+/// are the input's, so that the input's region reaches the operator's consumer as it is, and a
+/// widening consumer where the operator re-keys or reads the input whole. The rule is the
+/// operator's row of the projection table (`src/interpreter/design-operators.md`, "Projection
+/// guards"): an input is kept iff the row pulls it at the projection.
+pub(crate) fn consumer_keeping_keys_if(
+    keeps_keys: bool,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    match keeps_keys {
+        true => consumer,
+        false => widening(consumer),
+    }
+}
+
 /// [`subscribe_forwarding`] for an input whose outermost keys are the operator's: the input's
 /// region reaches the operator's consumer as it is.
 pub(crate) fn subscribe_forwarding_keeping_keys(

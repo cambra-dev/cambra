@@ -937,12 +937,14 @@ impl TileOperator for SelectField {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // A stream of records is pulled at the projection; a product of collections is read whole.
+        let keeps_keys = self.input.tiling().is_data_function();
         // An intent may only widen on its way upstream, so the input is asked for all of
         // it. [`guard_at_field`] narrows, which is sound for a release and not here.
         let input_tiling = self.input.tiling().clone();
         let input_producer = self.input.subscribe(
             input_tiling.universal_guard(),
-            widening(consumer),
+            consumer_keeping_keys_if(keeps_keys, consumer),
             scheduler,
         );
         Box::new(SelectFieldProducer {
