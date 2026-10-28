@@ -138,6 +138,25 @@ pub struct ModuleCheck {
     pub arguments: Vec<InferredArgument>,
     /// What the module declares.
     pub interface: Rc<Interface>,
+    /// The module's own `import` and `run` statements, each with the file it names.
+    pub statements: Vec<ModuleStatement>,
+    /// The statement binding a sink at the module's top level, if one does: an output
+    /// outside the program, which its top level causes (`docs/chl-spec.md`, "Output outside
+    /// the program").
+    pub binds_sink: Option<Span>,
+}
+
+/// One `import` or `run` statement of a module, with the file it names.
+#[derive(Debug, Clone)]
+pub struct ModuleStatement {
+    pub span: Span,
+    pub target: FileId,
+    pub runs: bool,
+    /// Whether every argument is one an import may pass: a constant, an import name, or a
+    /// type written over imports. A run passing anything else, a run or a parameter, gives
+    /// the module state an import cannot share, so it is run whatever its top level does
+    /// (`docs/chl-spec.md`, "Shareable modules \[Decided\]").
+    pub importable_arguments: bool,
 }
 
 /// A value argument for a parameter its module leaves unannotated
@@ -323,7 +342,74 @@ impl<'a> ProgramLowering<'a> {
             inferred_parameters: lowered.interface.inferred_parameters().cloned().collect(),
             arguments: self.inferred_arguments(file, &lowered.chain),
             interface: Rc::clone(&lowered.interface),
+            statements: self.statements(file),
+            binds_sink: self.program.ast(file).and_then(sink_site),
         })
+    }
+
+    /// The `import` and `run` statements of the module in `file`, each with the file it names.
+    pub(super) fn statements(&self, file: FileId) -> Vec<ModuleStatement> {
+        let Some(ast) = self.program.ast(file) else {
+            return Vec::new();
+        };
+        // The names an import's argument may write, and the names of the module's own that
+        // it may not: its runs, its parameters and the types it declares.
+        let mut import_names = HashSet::new();
+        let mut own = HashSet::new();
+        for stmt in &ast.body {
+            let stmt = match &stmt.node {
+                ChlStmt::Pub { stmt, .. } => &stmt.node,
+                other => other,
+            };
+            match stmt {
+                ChlStmt::Import { path, alias, .. } => {
+                    if let Some(module) = path.to_path() {
+                        import_names.insert(bound_name(&module, alias.as_ref()));
+                    }
+                }
+                ChlStmt::Run { path, alias, .. } => {
+                    if let Some(module) = path.to_path() {
+                        own.insert(bound_name(&module, alias.as_ref()));
+                    }
+                }
+                ChlStmt::Param { name, .. } => {
+                    own.insert(name.node.clone());
+                }
+                _ => {}
+            }
+        }
+        own.extend(
+            top_level_aliases(&ast.body)
+                .into_iter()
+                .chain(top_level_nominal_types(&ast.body))
+                .map(|declared| declared.name),
+        );
+        let importable = |arg: &KeywordArg| {
+            if chl_parser::ast::is_type_name(&arg.name.node) {
+                let mut names = HashSet::new();
+                mentioned_names(&arg.value.node, &mut names);
+                return names.is_disjoint(&own);
+            }
+            constant(&arg.value.node).is_some()
+                || matches!(&arg.value.node, ChlExpr::Name(name) if import_names.contains(name))
+        };
+        ast.body
+            .iter()
+            .filter_map(|stmt| {
+                let (path, runs, args) = match &stmt.node {
+                    ChlStmt::Import { path, args, .. } => (path, false, args),
+                    ChlStmt::Run { path, args, .. } => (path, true, args),
+                    _ => return None,
+                };
+                let target = self.program.file_of(&path.to_path()?)?;
+                Some(ModuleStatement {
+                    span: stmt.span,
+                    target,
+                    runs,
+                    importable_arguments: args.iter().all(importable),
+                })
+            })
+            .collect()
     }
 
     /// Each value argument the module in `file`, lowered to `chain`, passes to

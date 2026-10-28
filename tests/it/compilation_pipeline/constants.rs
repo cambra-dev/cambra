@@ -15,8 +15,19 @@ use super::helpers::*;
 use super::modules::{compile_errors, program, report_count};
 
 /// A module whose type reaches its `const` parameter through a refinement, and whose other
-/// type reaches it through a method.
+/// type reaches it through a method. It holds state, so it is run.
 const SHOP: &str = indoc! {"
+    const param max_rate: Int
+    limit = max_rate * 2
+    pub type Capped = {Int where _ <= limit}
+    pub type Tag = Int
+    pub def Tag::rate(self) => Int:
+        max_rate
+    visits: Mut(Int, Txn) := 0
+"};
+
+/// [`SHOP`] without its state, so it is imported.
+const LIBRARY: &str = indoc! {"
     const param max_rate: Int
     limit = max_rate * 2
     pub type Capped = {Int where _ <= limit}
@@ -30,6 +41,7 @@ const MID: &str = indoc! {"
     const param r: Int
     run shop(max_rate=r + 1) as s
     pub t = s::Tag::new(1)
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A binding whose definition is built from literals, constants, operators and the fields of
@@ -239,8 +251,8 @@ fn a_declaration_refuses_what_its_constant_refuses(
 )]
 #[case::import(
     indoc! {"
-        import shop(max_rate=5)
-        shop::Capped::new(3).extract()
+        import library(max_rate=5)
+        library::Capped::new(3).extract()
     "},
     3
 )]
@@ -270,7 +282,14 @@ fn a_declaration_refuses_what_its_constant_refuses(
 #[timeout(Duration::from_secs(10))]
 fn a_run_gives_its_constant_a_value(#[case] root: &str, #[case] expected: i64) {
     check_program_scalar(
-        &program(root, &[("shop", SHOP), ("cfg", "pub rate = 5\n")]),
+        &program(
+            root,
+            &[
+                ("shop", SHOP),
+                ("library", LIBRARY),
+                ("cfg", "pub rate = 5\n"),
+            ],
+        ),
         Value::Int(expected),
     );
 }
@@ -347,23 +366,23 @@ fn runs_with_one_value_reach_one_type(
 #[rstest]
 #[case::refinement(
     indoc! {"
-        import shop(max_rate=5) as eu
-        import shop(max_rate=6) as us
+        import library(max_rate=5) as eu
+        import library(max_rate=6) as us
         def f(c: eu::Capped) => Int:
             c.extract()
         f(us::Capped::new(3))
     "},
-    "expected shop(max_rate=5)::Capped, found shop(max_rate=6)::Capped"
+    "expected library(max_rate=5)::Capped, found library(max_rate=6)::Capped"
 )]
 #[case::method(
     indoc! {"
-        import shop(max_rate=5) as eu
-        import shop(max_rate=6) as us
+        import library(max_rate=5) as eu
+        import library(max_rate=6) as us
         def f(t: eu::Tag) => Int:
             t.rate()
         f(us::Tag::new(1))
     "},
-    "expected shop(max_rate=5)::Tag, found shop(max_rate=6)::Tag"
+    "expected library(max_rate=5)::Tag, found library(max_rate=6)::Tag"
 )]
 #[case::through_a_run(
     indoc! {"
@@ -377,7 +396,10 @@ fn runs_with_one_value_reach_one_type(
 )]
 #[timeout(Duration::from_secs(10))]
 fn copies_with_different_values_reach_different_types(#[case] root: &str, #[case] needle: &str) {
-    let errors = compile_errors(&program(root, &[("shop", SHOP), ("mid", MID)]));
+    let errors = compile_errors(&program(
+        root,
+        &[("shop", SHOP), ("library", LIBRARY), ("mid", MID)],
+    ));
     assert!(errors.contains(needle), "{errors}");
 }
 
@@ -416,6 +438,7 @@ const CALC: &str = indoc! {"
     const param d: Int
     pub q = 10 // d if d != 0 else 0
     pub big = d != 0 and 10 // d > 1
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A run's value decides a condition or a boolean operation, which leaves the other operand
@@ -448,6 +471,7 @@ const TIERS: &str = indoc! {"
     const param m: Int
     lim = 10 if m > 3 else 1
     pub type T = {Int where _ <= lim}
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A declaration's refinement reads a ternary over a `const` parameter, which takes the arm
@@ -570,11 +594,24 @@ const ORDERS: &str = indoc! {"
                 a.extract()
 "};
 
+/// [`ORDERS`] with state, so it is run.
+const ORDERS_RUN: &str = indoc! {"
+    const param max_order: Int
+    pub type Amount = {Int where _ <= max_order}
+    pub type Order:
+        placed(Amount)
+    pub def total(o: Order) => Int:
+        match o:
+            case Order::placed(a):
+                a.extract()
+    visits: Mut(Int, Txn) := 0
+"};
+
 /// A type that reaches a `const` parameter through another type takes each run's value for
 /// that type too, both where it is built and where a pattern reads the other type back.
 #[rstest]
 #[case::run(indoc! {"
-    run orders(max_order=100) as s
+    run ledger(max_order=100) as s
     s::total(s::Order::placed(s::Amount::new(5)))
 "})]
 #[case::import(indoc! {"
@@ -583,7 +620,10 @@ const ORDERS: &str = indoc! {"
 "})]
 #[timeout(Duration::from_secs(10))]
 fn a_type_reaches_a_constant_through_another_type(#[case] root: &str) {
-    check_program_scalar(&program(root, &[("orders", ORDERS)]), Value::Int(5));
+    check_program_scalar(
+        &program(root, &[("orders", ORDERS), ("ledger", ORDERS_RUN)]),
+        Value::Int(5),
+    );
 }
 
 /// An argument or a default that has no value at the arguments a run of its module gives it is

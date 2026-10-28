@@ -616,6 +616,11 @@ pub struct LoweringContext {
     /// The check tree of each module other than the root, which the compile
     /// infers before the linked program ([`modules::ModuleCheck`]).
     pub(crate) module_checks: Vec<modules::ModuleCheck>,
+    /// The root's `import` and `run` statements. Its check is usually the linked program's
+    /// inference rather than a module check, so they are kept here for the rule that decides
+    /// whether a module is imported or run (`docs/chl-spec.md`, "Shareable modules
+    /// \[Decided\]").
+    pub(crate) root_statements: Vec<modules::ModuleStatement>,
     /// Where each run of the linked program is brought in
     /// ([`modules::RunSites`]).
     pub(crate) run_sites: modules::RunSites,

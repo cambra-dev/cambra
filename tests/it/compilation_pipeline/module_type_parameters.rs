@@ -19,12 +19,20 @@ const BOX: &str = indoc! {"
     pub held: T = x
     pub def get(d: T) => T:
         d
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A module of a value and a type alias over its type parameter.
 const HOLDER: &str = indoc! {"
     param T
     pub Pair = {first: T, second: T}
+"};
+
+/// [`HOLDER`] with state, so it is run.
+const PAIRS: &str = indoc! {"
+    param T
+    pub Pair = {first: T, second: T}
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A module of a value of its type parameter's type.
@@ -39,6 +47,7 @@ const ADDER: &str = indoc! {"
     param T
     param x: T
     pub y = x + 1
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A module whose second type parameter defaults to a type over its first.
@@ -57,6 +66,7 @@ const NEST: &str = indoc! {"
     param y: U
     run box(T={a: U}, x=(a=y)) as b
     pub out = b::held
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// Each run of a module takes its own type arguments, in its run's types and
@@ -112,7 +122,7 @@ const NEST: &str = indoc! {"
 )]
 #[case::a_type_member(
     indoc! {"
-        run holder(T=Int) as h
+        run pairs(T=Int) as h
         x: h::Pair = (h::first=1, h::second=2)
         x.h::second
     "},
@@ -120,7 +130,7 @@ const NEST: &str = indoc! {"
 )]
 #[case::a_used_type_member(
     indoc! {"
-        run holder(T=Int) as h use Pair
+        run pairs(T=Int) as h use Pair
         x: Pair = (h::first=1, h::second=2)
         x.h::second
     "},
@@ -162,13 +172,14 @@ fn a_run_takes_its_type_arguments(#[case] root: &str, #[case] expected: Value) {
             &[
                 ("box", BOX),
                 ("holder", HOLDER),
+                ("pairs", PAIRS),
                 ("adder", ADDER),
                 ("keyed", KEYED),
                 ("nest", NEST),
                 (
                     "shop",
                     indoc! {"
-                        run holder(T=Int) as h
+                        run pairs(T=Int) as h
                         pub k = h
                     "},
                 ),
@@ -363,11 +374,11 @@ fn imports_at_one_type_written_two_ways_reach_one_shared_import() {
 )]
 #[case::a_type_member_of_the_wrong_type(
     indoc! {r#"
-        run holder(T=Int) as h
+        run pairs(T=Int) as h
         x: h::Pair = (h::first=1, h::second="a")
         1
     "#},
-    "annotated as {holder::first: Int, holder::second: Int}"
+    "annotated as {pairs::first: Int, pairs::second: Int}"
 )]
 #[case::an_argument_its_uses_do_not_fit(
     indoc! {r#"
@@ -447,6 +458,7 @@ fn a_misused_type_parameter_is_refused(#[case] root: &str, #[case] needle: &str)
             &[
                 ("box", BOX),
                 ("holder", HOLDER),
+                ("pairs", PAIRS),
                 ("adder", ADDER),
                 (
                     "below",

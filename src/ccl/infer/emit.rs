@@ -1877,7 +1877,15 @@ pub(super) fn emit_let<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let (scheme, defined) = emit_let_definition(binding, bound_expr, ctx)?;
-    let body_ty = ctx.scoped_let(binding, scheme, |ctx| ctx.subexpr(body))?;
+    // A `defer()` declares the feed the `let` binds. Any other `let` of a feed names one
+    // declared elsewhere, a parameter's or another module's, which is not this scope's.
+    let declares_feed = matches!(bound_expr.node, TypedExprNode::Defer);
+    let body_ty = ctx.scoped_let(binding, scheme, |ctx| {
+        if declares_feed {
+            ctx.declare_mutable(&binding.name, &binding.ty);
+        }
+        ctx.subexpr(body)
+    })?;
     // A failed definition has no definiens to discharge: the program is already
     // rejected, and the RHS it would substitute did not type.
     if !defined {

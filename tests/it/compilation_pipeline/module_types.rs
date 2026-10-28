@@ -21,6 +21,17 @@ const COUNTER: &str = indoc! {"
     hidden = 1
 "};
 
+/// [`COUNTER`] with state, so it is run.
+const STORE: &str = indoc! {"
+    pub count = 3
+    pub def bump(x):
+        x + 1
+    pub def id(x):
+        x
+    hidden = 1
+    visits: Mut(Int, Txn) := 0
+"};
+
 /// A module that uses a generic member of the module it takes at two types.
 const GENERIC: &str = indoc! {"
     param counter: Module{id: forall (T) T => T}
@@ -62,25 +73,26 @@ const LOGGER: &str = indoc! {"
 
 /// A module that returns a run it declares, by binding it to a member.
 const HOLDER: &str = indoc! {"
-    run counter as c
+    run store as c
     pub k = c
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A parameter of Module type reaches the members of the module its argument
 /// names: a run, an import, its default, or a member bound to a run.
 #[rstest]
 #[case::a_run(indoc! {"
-    run counter as c
+    run store as c
     run shop(counter=c) as s
     s::total
 "}, 4)]
 #[case::an_import(indoc! {"
     import counter
-    run shop(counter=counter) as s
+    import shop(counter=counter) as s
     s::total
 "}, 4)]
 #[case::through_an_imported_alias(indoc! {"
-    run counter as c
+    run store as c
     run tally(counter=c) as t
     t::total
 "}, 6)]
@@ -107,7 +119,7 @@ const HOLDER: &str = indoc! {"
     shop::total
 "}, 4)]
 #[case::passed_on(indoc! {"
-    run counter as c
+    run store as c
     run relay(counter=c) as r
     r::out
 "}, 4)]
@@ -147,14 +159,14 @@ const HOLDER: &str = indoc! {"
 "}, 3)]
 #[case::a_binding_of_a_parameter_returned(
     indoc! {"
-        run counter as c
+        run store as c
         run relayed(counter=c) as r
         r::k::count
     "},
     3
 )]
 #[case::a_generic_member(indoc! {"
-    run counter as c
+    run store as c
     run generic(counter=c) as g
     g::v
 "}, 4)]
@@ -182,6 +194,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
             root,
             &[
                 ("counter", COUNTER),
+                ("store", STORE),
                 ("shop", SHOP),
                 ("tally", TALLY),
                 ("api", "pub Counter = Module{count: Int}\n"),
@@ -220,7 +233,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 #[rstest]
 #[case::a_member_its_type_does_not_name(
     indoc! {"
-        run counter as c
+        run store as c
         run narrow(counter=c) as n
         1
     "},
@@ -228,23 +241,23 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 )]
 #[case::a_missing_member(
     indoc! {"
-        run counter as c
+        run store as c
         run wide(counter=c) as w
         1
     "},
-    "this module does not fit the parameter's Module type: module `counter` has no member `other`"
+    "this module does not fit the parameter's Module type: module `store` has no member `other`"
 )]
 #[case::a_private_member(
     indoc! {"
-        run counter as c
+        run store as c
         run peek(counter=c) as p
         1
     "},
-    "this module does not fit the parameter's Module type: `hidden` is private to module `counter`"
+    "this module does not fit the parameter's Module type: `hidden` is private to module `store`"
 )]
 #[case::a_member_of_another_type(
     indoc! {"
-        run counter as c
+        run store as c
         run mistyped(counter=c) as m
         m::v
     "},
@@ -259,7 +272,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 )]
 #[case::a_module_for_a_value(
     indoc! {"
-        run counter as c
+        run store as c
         run valued(n=c) as v
         1
     "},
@@ -290,7 +303,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 )]
 #[case::a_run_to_an_import(
     indoc! {"
-        run counter as c
+        run store as c
         import shop(counter=c)
         1
     "},
@@ -312,12 +325,12 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
     "`C` is a Module type"
 )]
 #[case::a_module_as_a_value(indoc! {"
-    run counter as c
+    run store as c
     c
 "}, "`c` names a module")]
 #[case::a_txn_entry(
     indoc! {"
-        run counter as c
+        run store as c
         run stocked(counter=c) as s
         1
     "},
@@ -341,16 +354,16 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 )]
 #[case::a_missing_module_member(
     indoc! {"
-        run counter as c
+        run store as c
         run nested(shop=c) as n
         1
     "},
-    "this module does not fit the parameter's Module type: module `counter` has no member `k` bound \
-     to a module"
+    "this module does not fit the parameter's Module type: module `store` has no member `k` bound to \
+     a module"
 )]
 #[case::a_forwarded_parameter_reaching_more(
     indoc! {"
-        run counter as c
+        run store as c
         run narrow_relay(counter=c) as r
         1
     "},
@@ -359,7 +372,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 )]
 #[case::a_binding_of_a_parameter(
     indoc! {"
-        run counter as c
+        run store as c
         run rebound(counter=c) as r
         1
     "},
@@ -367,7 +380,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 )]
 #[case::a_returned_binding_of_a_parameter(
     indoc! {"
-        run counter as c
+        run store as c
         run relayed(counter=c) as r
         r::k::bump(1)
     "},
@@ -383,7 +396,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 )]
 #[case::a_use_name_of_a_parameters_narrowed_member(
     indoc! {"
-        run counter as c
+        run store as c
         run relayed(counter=c) as r use k
         k::bump(1)
     "},
@@ -422,7 +435,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 )]
 #[case::a_binding_in_a_function(
     indoc! {"
-        run counter as c
+        run store as c
         def f(x):
             k = c
             k::count + x
@@ -439,7 +452,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 )]
 #[case::a_binder_named_like_the_parameter(
     indoc! {"
-        run counter as c
+        run store as c
         run shadow(counter=c) as s
         1
     "},
@@ -463,7 +476,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 )]
 #[case::a_label_through_a_parameter(
     indoc! {"
-        run counter as c
+        run store as c
         run labelled(counter=c) as l
         1
     "},
@@ -471,7 +484,7 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
 )]
 #[case::a_binding_used_above_it(
     indoc! {"
-        run counter as c
+        run store as c
         x = k::count
         k = c
         x
@@ -485,6 +498,7 @@ fn a_misused_module_type_is_refused(#[case] root: &str, #[case] needle: &str) {
             root,
             &[
                 ("counter", COUNTER),
+                ("store", STORE),
                 ("shop", SHOP),
                 (
                     "narrow",
@@ -583,6 +597,7 @@ fn a_misused_module_type_is_refused(#[case] root: &str, #[case] needle: &str) {
                     indoc! {"
                         pub def id(x):
                             x + 1
+                        visits: Mut(Int, Txn) := 0
                     "},
                 ),
                 (
@@ -611,17 +626,17 @@ fn a_misused_module_type_is_refused(#[case] root: &str, #[case] needle: &str) {
 #[rstest]
 #[case::a_value_member(indoc! {"
     x = c::count
-    run counter as c
+    run store as c
     x
 "})]
 #[case::a_module(indoc! {"
     k = c
-    run counter as c
+    run store as c
     k::count
 "})]
 #[timeout(Duration::from_secs(10))]
 fn a_path_above_its_qualifier_is_reported_once(#[case] root: &str) {
-    let errors = compile_errors(&program(root, &[("counter", COUNTER)]));
+    let errors = compile_errors(&program(root, &[("counter", COUNTER), ("store", STORE)]));
     assert!(
         errors.contains("the run `c` is declared below this use"),
         "{errors}"
@@ -636,12 +651,12 @@ fn a_path_above_its_qualifier_is_reported_once(#[case] root: &str) {
 fn a_binder_taking_a_bound_members_name_is_reported_once() {
     let errors = compile_errors(&program(
         indoc! {"
-            run counter as c
+            run store as c
             k = c
             k = 1
             k
         "},
-        &[("counter", COUNTER)],
+        &[("counter", COUNTER), ("store", STORE)],
     ));
     assert!(
         errors.contains("`k` is a member bound to a module, so no binder in its module takes it"),
@@ -690,6 +705,7 @@ fn an_import_passing_a_module_reaches_one_shared_import_per_argument() {
         "},
         &[
             ("counter", COUNTER),
+            ("store", STORE),
             ("shop", SHOP),
             (
                 "both",
@@ -717,12 +733,22 @@ const POSITIVE: &str = indoc! {"
         c
 "};
 
+/// [`POSITIVE`] with state, so it is run.
+const POSITIVES: &str = indoc! {"
+    pub Count = {Int where _ > 0}
+    pub start: Count = 3
+    pub def keep(c: Count) => Count:
+        c
+    visits: Mut(Int, Txn) := 0
+"};
+
 /// A module whose type member is `Int`, a value of it, and a function over it.
 const INTS: &str = indoc! {"
     pub Count = Int
     pub start: Count = 0
     pub def keep(c: Count) => Count:
         c
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A module that knows its parameter's `Count` only through a bound, so it
@@ -747,17 +773,17 @@ const PAIR: &str = indoc! {"
 /// (`docs/chl-spec.md`, "9.8 Module types").
 #[rstest]
 #[case::a_bounded_member(indoc! {"
-    run positive as p
+    run positives as p
     run bounded(n=p) as b
     b::v
 "}, 3)]
 #[case::a_kinded_member(indoc! {"
-    run positive as p
+    run positives as p
     run kinded(n=p) as k
     k::v
 "}, 3)]
 #[case::a_subtypes_of_kind(indoc! {"
-    run positive as p
+    run positives as p
     run subtyped(n=p) as k
     k::v
 "}, 3)]
@@ -772,7 +798,7 @@ const PAIR: &str = indoc! {"
     bounded::v
 "}, 3)]
 #[case::a_parameter_passed_on(indoc! {"
-    run positive as p
+    run positives as p
     run relay(n=p) as r
     r::v
 "}, 3)]
@@ -782,14 +808,14 @@ const PAIR: &str = indoc! {"
     x::v
 "}, 3)]
 #[case::a_nested_entry_beside_a_run_of_its_module(indoc! {"
-    run positive as p
+    run positives as p
     run outer as o
     run nested(n=o) as x
     x::v + p::keep(p::start)
 "}, 6)]
 #[case::two_runs_of_a_module_with_a_refinement(indoc! {"
-    run positive as a
-    run positive as b
+    run positives as a
+    run positives as b
     x: a::Count = a::keep(a::start)
     y: b::Count = b::keep(b::start)
     x + y
@@ -806,7 +832,7 @@ const PAIR: &str = indoc! {"
 #[case::two_parameters_of_one_module_type(
     indoc! {"
         run ints as i
-        run positive as p
+        run positives as p
         run pair(a=i, b=p) as q
         q::w
     "},
@@ -822,6 +848,7 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
             root,
             &[
                 ("positive", POSITIVE),
+                ("positives", POSITIVES),
                 ("ints", INTS),
                 ("bounded", BOUNDED),
                 (
@@ -857,7 +884,7 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
                 (
                     "outer",
                     indoc! {"
-                        run positive as p
+                        run positives as p
                         pub inner = p
                     "},
                 ),
@@ -877,7 +904,7 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
 #[rstest]
 #[case::a_value_of_an_abstract_member(
     indoc! {"
-        run positive as p
+        run positives as p
         run zero(n=p) as z
         1
     "},
@@ -885,7 +912,7 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
 )]
 #[case::an_exact_member_the_arguments_is_not(
     indoc! {"
-        run positive as p
+        run positives as p
         run exact_only(n=p) as e
         1
     "},
@@ -901,7 +928,7 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
 )]
 #[case::two_parameters_members(
     indoc! {"
-        run positive as p
+        run positives as p
         run crossed(a=p, b=p) as c
         1
     "},
@@ -909,7 +936,7 @@ fn a_module_typed_parameter_takes_its_arguments_type_members(
 )]
 #[case::an_exact_member_the_argument_does_not_fit(
     indoc! {"
-        run positive as p
+        run positives as p
         run exact(n=p) as e
         1
     "},
@@ -962,6 +989,7 @@ fn a_misused_type_member_is_refused(#[case] root: &str, #[case] needle: &str) {
             root,
             &[
                 ("positive", POSITIVE),
+                ("positives", POSITIVES),
                 ("bounded", BOUNDED),
                 (
                     "plain",
