@@ -148,6 +148,37 @@ fn nested() -> Tiling {
     Tiling::data_function(Extent::uint_range(8), ints())
 }
 
+fn memo() -> Built {
+    let (input, consumer) = feed(ints());
+    (Box::new(Memo::new(input)), vec![consumer])
+}
+
+#[test]
+fn a_memo_forwards_its_inputs_region() {
+    assert_keeps(&memo, 0);
+}
+
+#[test]
+fn a_memo_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&memo, 0);
+}
+
+/// A region that changes at the bottom of `feed → MapDomain → RecordWrap → Memo` reaches the
+/// chain's consumer as it was named: each operator on the way keeps keys.
+#[test]
+fn a_region_crosses_a_chain_of_operators_that_keep_keys() {
+    let chain = || {
+        let (input, consumer) = feed(ints());
+        let domain = MapDomain::new(input);
+        let wrapped = RecordWrap::new_at(SmolStr::new("a"), Box::new(domain), CurryLevel::new(1));
+        (
+            Box::new(Memo::new(Box::new(wrapped))) as Box<dyn TileOperator>,
+            vec![consumer],
+        )
+    };
+    assert_keeps(&chain, 0);
+}
+
 fn zip() -> Built {
     let (a, first) = feed(ints());
     let (b, second) = feed(ints());
