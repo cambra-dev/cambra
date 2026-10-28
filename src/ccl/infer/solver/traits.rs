@@ -2771,8 +2771,9 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
 /// distinct base ceilings have no common value under them. Either way the requirement
 /// cannot be satisfied, and one of the two is what the lattice would have reported.
 ///
-/// Bases only. A non-base bound (a product, a variant, a function) arrives at the
-/// obligation through `deliver`, which narrows or rejects on it there ([`Offered`]).
+/// Bases only. A non-base lower bound reaches the obligation through `deliver`, which
+/// narrows by it or rejects it ([`Offered`]); this function does not read a non-base upper
+/// bound.
 fn conflicting_base(var: &Rc<InferVar>, required: &BaseType) -> Option<BaseType> {
     let bounds = var.bounds.borrow();
     bounds
@@ -2991,9 +2992,10 @@ pub enum OperandFailure {
 
 /// What a bound contribution tells a trait about the position it landed on.
 ///
-/// `Unknown` is a position not determined yet and narrows nothing; `NotABase` is
-/// determined, at a type no base or nominal head names, and is rejected unless a candidate
-/// takes any type there.
+/// `Unknown` narrows nothing. At an operand position, a `Product`, `NotABase` or `Param`
+/// contribution where a candidate takes any type ([`InstanceHead::Any`]) keeps those
+/// candidates and the assumptions stating that type (`TraitObligation::narrow_to_variables`).
+/// An argument position is narrowed by `TraitObligation::narrow_arg` instead.
 pub enum Offered<'a> {
     /// A base leaf, with refinements peeled — the fact narrowing consumes.
     Base(&'a BaseType),
@@ -3003,9 +3005,7 @@ pub enum Offered<'a> {
     Unknown,
     /// A determined **product** — a tuple or a record.
     ///
-    /// No head names one. Where a candidate takes any type at the position
-    /// ([`InstanceHead::Any`]), `deliver` narrows to those candidates
-    /// (`TraitObligation::narrow_to_variables`). Otherwise
+    /// At an operand position where no candidate takes any type,
     /// `TraitObligation::narrow_product` answers it by an assumption stating that product or
     /// by the product rule of a [structural](Trait::is_structural) trait, and rejects it in
     /// every other case.
@@ -3016,9 +3016,7 @@ pub enum Offered<'a> {
     /// A determined type that is neither a base leaf, a product nor a nominal type — a
     /// variant or a function.
     ///
-    /// No head names one. Where a candidate takes any type at the position
-    /// ([`InstanceHead::Any`]), `deliver` narrows to those candidates
-    /// (`TraitObligation::narrow_to_variables`); otherwise the requirement fails here
+    /// At an operand position where no candidate takes any type, the requirement fails here
     /// (`TraitObligation::reject`) rather than going unresolved.
     NotABase,
     /// A type parameter, inside the definition that declares it. It supports what
