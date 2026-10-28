@@ -63,7 +63,11 @@ interpreter/
 
 ## Per-port server sharing
 
-One `tiny_http::Server` is bound per TCP port, shared by all `http_serve` routes on that port.  `SharedHttpServer::mut_var(method, path)` adds a route and returns an `mpsc::Receiver` channel.  The background dispatcher reads each incoming request, looks up the route in the `RouteMap`, and either delivers the request body to the matching channel or returns 404.
+One `tiny_http::Server` is bound per TCP port, shared by all `http_serve` routes on that port.
+`SharedHttpServer::register(method, path)` adds a route and returns the `mpsc::Receiver` of the
+route's channel. The dispatcher thread reads each incoming request and looks up the route in the
+routing table (`RouteTable`). It sends a request for a registered route to that route's channel as
+`RouteMessage::Request`, and answers any other request 404.
 
 Duplicate `(port, method, path)` registrations are rejected with a `LoweringError` at compile time.
 
@@ -91,6 +95,30 @@ Multiple `http_serve` calls each produce an independent `Source`/`Defer` pair an
 
 ## Shutdown and completion
 
-`SinkConsumer` detects terminal tiles via `Tile::is_terminal()` and fires `DoneNotifier::signal()`.  `SinksHandle::done` fires once all consumers have signalled.  For long-lived HTTP servers the underlying `HttpServerDataSource` never reaches EOF, so `done` never fires; the scheduler loop in `main.rs` runs until the process is killed.
+`SinkConsumer` detects terminal tiles via `Tile::is_terminal()` and fires `DoneNotifier::signal()`.
+`SinksHandle::done` fires once all consumers have signalled. An `HttpServerDataSource` never reaches
+the end of its stream, so for a program that serves HTTP `done` never fires, and the scheduler loop
+in `main.rs` runs until the process is killed.
 
-There is currently no graceful-shutdown mechanism for `SharedHttpServer`.
+Dropping a `SharedHttpServer` releases its port. `Drop` sets `releasing` and unblocks the dispatcher
+thread, which returns without sending its routes anything, and the listener closes with it. The
+registry drops the handle only once no route remains on the port (`release_unrouted_ports`, see
+[A route a version stops serving is retired](../ccl/design/program-evolution.md#a-route-a-version-stops-serving-is-retired))
+or with its whole context, so no source reads the channels.
+
+A poll that reads either of two states from a route's channel panics, because no request reaches the
+route again:
+
+- `RouteMessage::Failed`. The dispatcher sends it when `recv` returns an error without `releasing`
+  set, which is tiny_http's accept thread exiting on its first `accept` error and closing the
+  listener. `ReportPanic` sends it when the dispatcher thread panics. The routing table records the
+  failure, and `register` sends it to a route registered afterwards.
+- A channel with no sender. The routing table holds the sender until the route is unregistered, and
+  retirement forgets the route's source in the step that unregisters it, so a poll that finds none
+  is polling a source the scheduler should no longer hold.
+
+> **Open: one `accept` error ends the process.** tiny_http 0.12 treats every `accept` error as
+> fatal, and the poll that reads the failure panics, which takes every port, every branch and the
+> control port with it. Running out of file descriptors (EMFILE, ENFILE) under connection load is
+> the confirmed trigger. Keeping the port would take rebinding after a failure, or an accept loop
+> that retries the errors `accept(2)` documents as transient; tiny_http 0.12 exposes neither.

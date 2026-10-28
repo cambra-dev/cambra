@@ -82,7 +82,7 @@ JUSTIFICATION = re.compile(r"//\s*shared-state-ok:\s*\S")
 EXPECTED_EXCEPTIONS = [
     ("src/interpreter/http_server.rs", "ambient mutable state"),
     ("src/interpreter/http_server.rs", "cell of `HashMap<u64, tiny_http::Request>`"),
-    ("src/interpreter/http_server.rs", "shared cell of `HashMap<(String, String), RouteSender>`"),
+    ("src/interpreter/http_server.rs", "shared cell of `RouteTable`"),
     # The test sink's accumulator: a sink is a terminal consumer at the I/O boundary,
     # and `DataSink::process` takes `&self`.
     ("src/interpreter/test_sink.rs", "cell of `Option<Tile>`"),
