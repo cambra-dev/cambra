@@ -90,6 +90,21 @@ fn bools() -> Tiling {
     )
 }
 
+fn restrict() -> Built {
+    let (predicate, consumer) = feed(bools());
+    (Box::new(Restrict::new(predicate)), vec![consumer])
+}
+
+#[test]
+fn restrict_forwards_its_predicates_region() {
+    assert_keeps(&restrict, 0);
+}
+
+#[test]
+fn restrict_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&restrict, 0);
+}
+
 fn map_result_with_source() -> Built {
     use crate::interpreter::TestDataSource;
     use std::{cell::RefCell, rc::Rc};
