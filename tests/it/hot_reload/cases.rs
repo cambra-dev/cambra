@@ -3730,7 +3730,7 @@ fn a_filtered_fold_resumes_at_a_position_of_the_collection_it_filters() {
 
 /// A fold over a *different* fixed collection folds it from its first element.
 ///
-/// `[0, 2]` is the extent of `["y", "z"]` and of `["p", "q"]` alike, so the extent
+/// `0..3` is the extent of `["y", "z"]` and of `["p", "q"]` alike, so the extent
 /// alone would have the second fold resume at the first's frontier and skip both
 /// its elements. What rules that out is that the two collections are two nodes:
 /// the iteration is rebuilt and offers every position. The value carries the way

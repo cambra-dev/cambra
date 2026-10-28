@@ -81,7 +81,7 @@ fn a_bound_collection_keeps_its_map_domain() {
     assert_eq!(
         term,
         indoc! {"
-            let xs : ([0, 2] ⤇ Int) = iterate ≫ [1, 2, 3]
+            let xs : (0..3 ⤇ Int) = iterate ≫ [1, 2, 3]
             in iterate ≫ [1, 2] ≫ xs ▷ map_domain ▷ const ▷ strength_over ≫ ((.1 ≫ xs, .0) ▷ zip ≫ add) ▷ map ≫ sum"}
         .trim_end()
     );

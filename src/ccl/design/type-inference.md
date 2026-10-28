@@ -681,7 +681,7 @@ short: that answer is computed again on each path that meets it. Each upper boun
 The second kind covers every join. A conditional's branches, a list literal's elements and a
 polymorphic call's arguments each record their types as lower bounds on one variable. The recursion
 covers nesting. Take a list literal whose element variable `𝜀` has the lower bound `(𝛼, Int)`, and
-whose type `[0, 0] ⤇ 𝜀` is a lower bound of a conditional's `𝑅` beside `[0, 0] ⤇ (Bool, Int)`:
+whose type `0..1 ⤇ 𝜀` is a lower bound of a conditional's `𝑅` beside `0..1 ⤇ (Bool, Int)`:
 
 - `𝛼` occurs in `𝜀`'s lower bound at tuple position `0`. `𝜀`'s own reading there is `𝛼` alone, so
   the answer is the type of `𝜀`'s position, read at `0`.
@@ -2028,11 +2028,11 @@ so a parameter there varies the body as one free in the value does. Neither shap
 such a filter takes the Pi-constant form:
 
 - The body is a lambda whose binder's type reads the parameter, as in
-  `λ r → λ i : {[0, 2] | 𝑝(r)} → 𝑒`. The nested-lambda rule lifts the refinement onto the pair it
+  `λ r → λ i : {0..3 | 𝑝(r)} → 𝑒`. The nested-lambda rule lifts the refinement onto the pair it
   forms.
 - A cast inside the body reads the parameter, under a node whose type does not, as in
-  `λ r → cast(λ i → 𝑒, {[0, 2] | 𝑝(r)} ⤇ Int) ▷ sum : Int`. `lambda_elim` rewrites the cast to
-  `λ i : {[0, 2] | 𝑝(r)} → 𝑒`, which reduces to the first shape.
+  `λ r → cast(λ i → 𝑒, {0..3 | 𝑝(r)} ⤇ Int) ▷ sum : Int`. `lambda_elim` rewrites the cast to
+  `λ i : {0..3 | 𝑝(r)} → 𝑒`, which reduces to the first shape.
 
 A cast that is a lambda's whole body is not rewritten. Its type is `body.ty`, so the cast arm binds
 the parameter there with a Pi, and `groupby`'s partition `λ k → cast(…)` keeps the shape planning's
@@ -2298,7 +2298,7 @@ Type display tracks the enclosing function binders and renders Pi references wit
 For example, a grouped collection can display as:
 
 ```text
-(k: Int) ⤇ ({[0, 2] | __elem ▷ xs ▷ key == k} ⤇ Int)
+(k: Int) ⤇ ({0..3 | __elem ▷ xs ▷ key == k} ⤇ Int)
 ```
 
 `PiRef` also carries a spelling hint for a reference displayed without its enclosing function,
@@ -2670,7 +2670,7 @@ on unresolved shapes. Deferred property checks are specified in
 ### The domain join needs `box`
 
 Plain data functions over distinct domains have no common collection type. A contravariant
-meet that reduced `[0, 1] ⤇ Int` and `[0, 2] ⤇ Int` to the shorter domain would
+meet that reduced `0..2 ⤇ Int` and `0..3 ⤇ Int` to the shorter domain would
 discard a row. Inference reports `CoalesceError::DomainJoinConflict` instead.
 
 Boxing each arm permits a join of sums. For domains `𝐷ₓ` and `𝐷ᵧ`, the result can

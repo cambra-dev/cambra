@@ -2169,17 +2169,17 @@ mod tests {
 
     // ---- `try_map_domain_of_iteration` ------------------------------------------------
 
-    /// The positions `[0, 3)`, the domain every collection below ranges over.
+    /// The positions `0..3`, the domain every collection below ranges over.
     fn positions() -> Type {
         Type::UIntRange(3)
     }
 
-    /// `iterate`, the identity collection on the positions: `[0, 3) ⤇ [0, 3)`.
+    /// `iterate`, the identity collection on the positions: `0..3 ⤇ 0..3`.
     fn iteration() -> Expr {
         make_iterate(trivially_true_predicate(positions()))
     }
 
-    /// A morphism out of the positions standing in for a list literal, `[0, 3) ⇒ Int`.
+    /// A morphism out of the positions standing in for a list literal, `0..3 ⇒ Int`.
     fn values_by_position(name: &str) -> Expr {
         var(name).with_ty(fun_ty(positions(), int_ty()))
     }
@@ -2252,7 +2252,7 @@ mod tests {
     }
 
     /// A collection that is not iteration-led has no known relation between values and keys.
-    /// This one has the identity's type, `[0, 3) ⤇ [0, 3)`, and could hold the permutation
+    /// This one has the identity's type, `0..3 ⤇ 0..3`, and could hold the permutation
     /// `[2, 0, 1]`, whose `map_domain` is `[0, 1, 2]` and not itself: only the iteration check
     /// keeps it.
     #[test]

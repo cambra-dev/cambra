@@ -950,8 +950,8 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
 /// and lambda elimination's check that a node keeps its type rejects the pair:
 ///
 /// ```text
-/// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > (let __anf = [1, 2] in __iter_record ▷ __anf)} ⤇ Int)
-/// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)} ⤇ Int)
+/// (__iter_record: 0..2) ⤇ ({0..3 | … v > (let __anf = [1, 2] in __iter_record ▷ __anf)} ⤇ Int)
+/// (__iter_record: 0..2) ⤇ ({0..3 | … v > __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)} ⤇ Int)
 /// ```
 ///
 /// That check is `debug_assertions`-gated. Without it the tree reaches the post-lambda-elim

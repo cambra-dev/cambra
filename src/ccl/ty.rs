@@ -1034,10 +1034,10 @@ impl SharedHoleMint {
 pub enum Type {
     /// A primitive base type.
     Base(BaseType),
-    /// A finite index range `[0, n)`, used as the domain of list types.
+    /// The finite index range `0..n`, used as the domain of list types.
     ///
     /// [`OpConversionContext::extent_of`](crate::interpreter::operator_conversion::OpConversionContext::extent_of)
-    /// maps it to the extent `[0, n)`.
+    /// maps it to the extent `0..n`.
     UIntRange(u64),
     /// A function type. When `name` is `None` it is the ordinary
     /// non-dependent function type `domain ⇒ codomain`. When `name` is `Some(x)` it
@@ -1889,7 +1889,7 @@ pub enum TypeKind {
     /// single range either: the down-set of a large range would admit *sparse*
     /// subsets, whereas membership here is exactly "is a `Type::UIntRange`", i.e. a
     /// dense prefix. That distinction is load-bearing — it is what stops a
-    /// *filtered* range `{[0, k) | p}` (a `Refinement`, not a `UIntRange`) passing
+    /// *filtered* range `{0..k | p}` (a `Refinement`, not a `UIntRange`) passing
     /// as a `List`, which would supply a length witness for a domain that has holes.
     UIntRanges,
     /// Every type **below** a given one — the kind a `Map(K, V)`'s witness is summed
@@ -2334,7 +2334,7 @@ fn show_binders() -> bool {
 
 // This rendering IS the inspector wire format for types — the serde impl above
 // `collect_str`s it, and the golden fixtures pin it byte-exactly on every
-// `type` field. Changing any notation here (`⇒`, `[0, N]`, `Mut(…)`, the
+// `type` field. Changing any notation here (`⇒`, `0..n`, `Mut(…)`, the
 // singleton spelling, braces) is a deliberate corpus-wide re-bless: rerun
 // web/scripts/regen-fixtures.sh and commit the classified diff.
 /// Renders through [`fmt_type`] with no enclosing function: a self-contained
@@ -2384,15 +2384,12 @@ fn fmt_type(
     }
     match ty {
         Type::Base(b) => write!(f, "{}", b.keyword()),
-        // `n == 0` means an empty range (e.g. the domain of `[]`); render
-        // it as `∅` instead of computing `n - 1` and underflowing.
         Type::BoundedHole(t) => write!(f, "<:{}", at(t, binders)),
         // The mirror of `BoundedHole`'s `<:𝑇`. Rendered by identity like
         // `Infer`'s `?N`, never by reading `lowers`, which may be cyclic or
         // mutably borrowed.
         Type::BarrierVar(var) => write!(f, ":>{}", var.uid),
-        Type::UIntRange(0) => write!(f, "∅"),
-        Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
+        Type::UIntRange(n) => write!(f, "0..{n}"),
         // The rendered symbol reflects the resolved `kind`: `⇒` for a compute
         // capability (and an unresolved kind var), `⤇` for a data collection
         // (see `FunKind::function`), making the collection/capability distinction
@@ -2625,7 +2622,7 @@ fn singleton_value(ty: &Type) -> Option<&TypedExpr> {
 }
 
 impl Type {
-    /// The index range `[0, len)` of an in-memory sequence of `len` rows.
+    /// The index range `0..len` of an in-memory sequence of `len` rows.
     pub fn index_range(len: usize) -> Self {
         Type::UIntRange(crate::interpreter::uint_of_row(len))
     }
@@ -3239,8 +3236,8 @@ impl Type {
     /// *type*-witness whose kind is every index range ([`TypeKind::UIntRanges`]), so
     /// the length is the witness **domain** rather than a separate scalar value, and
     /// `len` is a property of that domain. An `Array` reaches it as `box(arr)`, whose
-    /// one-candidate sum `Σ (𝐷 ∈ {[0, k)}). 𝐷 ⤇ elem` is contained by plain type-kind
-    /// containment: `{[0, k)} ⊆ UIntRanges`. The `box` is not optional — without it there
+    /// one-candidate sum `Σ (𝐷 ∈ {0..k}). 𝐷 ⤇ elem` is contained by plain type-kind
+    /// containment: `{0..k} ⊆ UIntRanges`. The `box` is not optional — without it there
     /// is no edge at all (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
     ///
     /// There is no `{𝑖 | 𝑖 < 𝑛}` domain refinement: the *kind* already
@@ -5216,6 +5213,19 @@ impl From<Refinement> for RefinementSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uint_range_display_uses_exclusive_length() {
+        for n in [0, 1, 4, u64::MAX] {
+            let ty = Type::UIntRange(n);
+            assert_eq!(ty.to_string(), format!("0..{n}"));
+            assert_eq!(serde_json::to_value(&ty).unwrap(), format!("0..{n}"));
+        }
+        assert_eq!(
+            Type::data_fun(Type::UIntRange(0), Type::Base(BaseType::Int)).to_string(),
+            "(0..0 ⤇ Int)"
+        );
+    }
 
     /// **A rebuilt predicate equals itself, `Realize` included.** Refinement equality is
     /// structural precisely so a predicate re-minted by planning compares equal to the one

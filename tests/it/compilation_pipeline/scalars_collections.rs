@@ -55,7 +55,7 @@ fn test_type_annotation_forms(#[case] code: &str, #[case] expected: Value) {
 #[case("x: List(_) = box([1, 2, 3])\nx", make_int_list(&[1, 2, 3]))]
 // The element type can also be spelled concretely: `List(Int)`.
 #[case("x: List(Int) = box([1, 2, 3])\nx", make_int_list(&[1, 2, 3]))]
-// `Array(n, T)` = `[0, n) ⤇ T`: a static index range, so the length rides the
+// `Array(n, T)` = `0..n ⤇ T`: a static index range, so the length rides the
 // domain (`UIntRange(3)`) rather than being inferred.
 #[case(r"
 x: Array(3, Int) = [1, 2, 3]

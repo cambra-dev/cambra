@@ -93,7 +93,7 @@ use super::panic_message::panic_message;
         c = True
         b = box([1]) if c else box([])
     "},
-    "Box(Array(1, {Int where _ == 1}) | Array(0, {Int where _ == 1}))"
+    "Box(Array(0, {Int where _ == 1}) | Array(1, {Int where _ == 1}))"
 )]
 #[case::list("b: List(Int) = box([1, 2])", "List(Int)")]
 #[case::map(

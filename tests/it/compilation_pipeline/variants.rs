@@ -1938,7 +1938,7 @@ fn test_the_spec_match_in_a_loop_example(#[case] code: &str, #[case] expected: V
 
 /// A variant whose payload is a **collection** is one variant value, the collection held
 /// whole in its arm, which the variant's type says: `` `some(xs) `` is a
-/// `` {`some{[0, 1] ⤇ Int}} ``, not a collection of `` `some `` values. The `match` reopens
+/// `` {`some{0..2 ⤇ Int}} ``, not a collection of `` `some `` values. The `match` reopens
 /// the payload as the collection it was.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
