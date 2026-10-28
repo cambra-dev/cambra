@@ -83,6 +83,13 @@ fn record_wrap_carries_no_region_between_notifications() {
     assert_keeps_without_state(&record_wrap, 0);
 }
 
+fn bools() -> Tiling {
+    Tiling::data_function(
+        Extent::uint_range(8),
+        Tiling::Scalar(Extent::Base(BaseType::Bool)),
+    )
+}
+
 fn map_result_with_source() -> Built {
     use crate::interpreter::TestDataSource;
     use std::{cell::RefCell, rc::Rc};
@@ -146,6 +153,34 @@ fn assert_widens(build: &dyn Fn() -> Built, notified: usize) {
             "{sent:?}"
         );
     }
+}
+
+fn filter(predicate: Tiling) -> Built {
+    let (input, data) = feed(ints());
+    let (predicate, mask) = feed(predicate);
+    let op = Filter::new_at(input, predicate, CurryLevel::OUTERMOST);
+    (Box::new(op), vec![data, mask])
+}
+
+#[test]
+fn filter_forwards_the_region_of_each_collection_side() {
+    for side in [0, 1] {
+        assert_keeps(&|| filter(bools()), side);
+    }
+    assert_keeps_without_state(&|| filter(bools()), 1);
+}
+
+/// A predicate that is one function value is read whole.
+#[test]
+fn filter_sends_everything_for_a_function_valued_predicate() {
+    let function = || {
+        filter(Tiling::Scalar(Extent::Function {
+            domain: Box::new(int()),
+            codomain: Box::new(Extent::Base(BaseType::Bool)),
+        }))
+    };
+    assert_widens(&function, 1);
+    assert_keeps(&function, 0);
 }
 
 fn map_result_to_const(level: CurryLevel) -> Built {
