@@ -183,23 +183,33 @@ for that checked tree, not for every intermediate tree built within the phase.
 
 ## Name occurrences
 
-**Planned.** Each binder, and each name a `Feed`, `Define` or `MutWrite` holds, carries a `NodeId`
-of its own, an `Occurrence`, recorded at the span of the name as the source writes it. Provenance
-mints, copies, enumerates, folds and gates an occurrence as it does an expression node's id, so a
-`NodeId` names an expression node or an occurrence. Nothing in provenance reads which of the two an
-id names.
+**Planned.** Each name the source writes that a term holds in a field rather than as a node carries
+a `NodeId` of its own, an `Occurrence`, recorded at the span of the name as the source writes it. A
+binder's annotation carries one too, recorded at the span of the type expression it writes.
+Provenance mints, copies, enumerates, folds and gates an occurrence as it does an expression node's
+id, so a `NodeId` names an expression node or an occurrence. Nothing in provenance reads which of
+the two an id names.
 
-A name appears in the IR in four ways, and only the first two carry an `Occurrence`:
+A name appears in a term in seven ways, and the first four carry an `Occurrence`:
 
 | Kind | Example | Held in | Its id |
 |---|---|---|---|
 | **binding occurrence**: the name a binder introduces | `p` in `def f(p)`, `g` in `g = 10` | `TypedBinding.occurrence` | an `Occurrence` |
 | **applied occurrence held as a field**: a use of a binder bound elsewhere, written where the IR holds a name rather than a node | `out` in `out << v` | the `name_occurrence` of a `Feed`, `Define` or `MutWrite` | an `Occurrence` |
-| applied occurrence held as a node | `g` in `p + g` | a `Var` | the `Var`'s own `NodeId` |
+| **label occurrence**: a record field label or a variant tag a term writes | `x` in `(x=1, y=2)`, `ok` in `` `ok(1) `` | a `Record` entry's `label_occurrence`, a `VariantCtor`'s `tag_occurrence` | an `Occurrence` |
+| **head occurrence**: the tag or constructor a `match` arm matches | `ok` in `` case `ok(v) ``, `rect` in `case Shape::rect(w, h)` | `Pattern.head_occurrence` | an `Occurrence` |
+| applied occurrence held as a node | `g` in `p + g`, `Shape::rect` in `Shape::rect(1, 2)` | a `Var` | the `Var`'s own `NodeId` |
+| field or method name | `x` in `p.x`, `m` in `v.m(a)` | a `Proj` or `Method`, tagged at the name | the node's own `NodeId` |
 | substituted parameter or field: a use of a name lowering binds to no binder | `q` in `def f(p, q): q`, `w` in `case Shape::rect(w, h): w` | a projection tagged `lower.param_proj` | the projection's own `NodeId` |
 
-In this doc, "an occurrence" means a binding occurrence or an applied occurrence held as a field,
-and a rule that covers only one of them names it.
+The **annotation occurrence** is the fifth kind of `Occurrence`: `String` in `x: String = 5`, held
+in `Annotation.occurrence` inside `TypedBinding.user_annotation`. In this doc, "an occurrence" means
+any of the five, and a rule that covers fewer names them.
+
+A name written in a type has no place in a term: `Shape` in `s: Shape`, an alias, a type
+parameter, a `use` item and a module path. Lowering resolves each one and erases it, so no pass
+after lowering holds it. Lowering records what it resolved in a table outside provenance
+([Names lowering resolves](lowering.md#names-lowering-resolves)).
 
 Occurrences are in the fold so that a binder is reachable in every pane, not only where lowering
 built it. Passes copy binders: monomorphization's specializations, the comprehension phase's
@@ -215,8 +225,8 @@ program leaves no tree, so it leaves no occurrences, and nothing that reads them
 program.
 
 Narrowing the binding node's span to the name does not give a binder a position of its own. That
-span is the extent of what the node computes, and diagnostics read it that way: `x: String = g`
-reports its annotation mismatch across the whole statement.
+span is the extent of what the node computes, and a diagnostic about the statement reads it that
+way.
 
 ### The occurrence field
 
@@ -225,11 +235,25 @@ pub struct TypedBinding {
     pub name: Name,
     pub occurrence: Occurrence,
     pub ty: Type,
-    pub user_annotation: Option<Type>,
+    pub user_annotation: Option<Annotation>,
     pub transparency: BindingTransparency,
 }
 
+pub struct Annotation {
+    pub ty: Type,
+    pub occurrence: Occurrence,
+}
+
+pub struct RecordEntry {
+    pub label: Label,
+    pub label_occurrence: Occurrence,
+    pub value: TypedExpr,
+}
+
 Feed { name: Name, name_occurrence: Occurrence, value: Box<TypedExpr> }   // likewise Define and MutWrite
+Record(Vec<RecordEntry>)
+VariantCtor { tag: Label, tag_occurrence: Occurrence, payload: Box<TypedExpr> }
+Pattern { head: PatternHead, head_occurrence: Occurrence, binding: TypedBinding, empty_payload: bool }
 ```
 
 `Occurrence` wraps a `NodeId` and gives it the two properties [Node identity](#node-identity) gives
@@ -250,10 +274,11 @@ A binder's identity stays its `Name`'s `Uid`. The occurrence records where the b
 and what it descends from. One `Uid` has several occurrences wherever a pass copies a binder, and
 each copy resolves to the written name through `parents`.
 
-Fields that hold a name but bind nothing get no occurrence: a `TransactKey` and a writer's
-footprint, which are labels; `Run.name` and a run's arguments; `LetType.name`, which `uniquify`
-removes; `Method.name`; a pattern head's constructor; and the names inside types (`Type::Fun`'s
-parameter name, a Σ witness).
+Fields that hold a name the source does not write in that place get no occurrence: a
+`TransactKey` and a writer's footprint, which are labels the compiler builds; `Run.name` and a
+run's arguments, which linking replaces; `LetType.name`, which `uniquify` removes; and the names
+inside a `Type` (`Type::Fun`'s parameter name, a Σ witness, a record or variant
+type's labels).
 
 A multi-parameter function's parameters and the fields of a constructor pattern in a `match` arm
 bind nothing either. `uncurry_params` and `bind_parameters` substitute a projection for each use of
@@ -262,12 +287,42 @@ parameter or field declares, and keep the channel
 [ir.md](ir.md#source-locations-on-substituted-parameter-projections) describes. A constructor's
 fields in a one-field arm and in `N::c(a, b) = v` are binders, and get binding occurrences.
 
+### Labels, pattern heads and annotations
+
+A record literal's labels, a variant constructor's tag and a pattern's head are written once in the
+source and held once in the term, so each gets an occurrence beside it. A label occurrence records
+at the label's name, without its qualifier: `price` in `catalog::price=25`. A tag's occurrence
+records at the tag's name, without its backtick, as the parser's `tag_span` gives it. A head
+occurrence records at the tag's name for a `PatternHead::Tag`, and at the constructor's name for a
+`PatternHead::Constructor`: `rect` in `case Shape::rect(w, h)`. The `Shape` segment is a type name,
+which lowering resolves ([Names lowering resolves](lowering.md#names-lowering-resolves)).
+
+A field access `p.x` lowers to `p ▷ .x`, and the `Proj` is a node, so it needs no occurrence.
+Lowering tags the `Proj` at the span of `x`, not of `p.x`, and the `Apply` at the span of `p.x`. A
+method call `v.m(a)` tags its `Method` node at `m` the same way. A field name resolves to no
+definition, as a label does: the `x` of `Pt = {x: Int, y: Int}` is a label inside a `Type`, which
+holds no occurrence.
+
+A binder's annotation is a type expression, not a name, and its occurrence locates that expression:
+`String` in `x: String = 5`, `{n: Int}` in `z: {n: Int} = y`. The occurrence sits in `Annotation`
+beside the `Type`, so inference's clearing of a reconciled annotation drops the occurrence with it.
+An annotation occurrence therefore lives from lowering to inference, and `pre-inference` is the
+one pane that holds it. Inference reports `AnnotationMismatch` and `PolyAnnotationMismatch` at the
+annotation's occurrence, so `x: String = 5` underlines `String`. Every other diagnostic about a
+binder keeps blaming its binding node.
+
+A structural label has no declaration: two records that write `price` share the label without
+either declaring it. A label occurrence therefore resolves to no definition, and a consumer reads it
+for the label's type in a pane and for the other occurrences of the same `Label`. A head
+occurrence for a constructor resolves to the constructor's declaration, `NominalCtor.span`, which
+the pattern's `PatternHead::Constructor` reaches through its `decl`.
+
 ### Minting and recording occurrences
 
 | Where | What the occurrence gets |
 |---|---|
 | Lowering, a binder the source writes | A `LoweringStep::Leaf` at the name's span, labelled `lower.image`. The binder helpers (`let_bind*`, `lambda`, `for_loop`, `mut_decl`, `AssignmentBindings`, `PrefixStmt::Bind`) take the name with its span in place of a `String`. |
-| Lowering, an applied occurrence | A `LoweringStep::Leaf` at the name's span, labelled `lower.image`. |
+| Lowering, an applied occurrence, a label, a tag, a pattern head or an annotation | A `LoweringStep::Leaf` at the span the source writes it at, labelled `lower.image`. |
 | Lowering, a binder the source does not write | A `tag_machinery` leaf at the span its node is tagged with: `__arg_tuple_N`, `__result_N`, the group-by and set binders, `OUTPUT_BINDER`, a constructor's argument, an absent payload. |
 | `uniquify` | Nothing new. It renames binders in place, so every occurrence survives, and mints none. |
 | A copy of a subtree | A fresh id and a copy row, from `Occurrence::clone`. `subst`'s transport, monomorphization and inlining need no change. |
@@ -305,11 +360,13 @@ binder records at its name like any other binder the source writes.
 ### Walking the ids with occurrences
 
 Every walk that enumerates the ids of a tree reaches its occurrences, through one enumeration.
-`TypedExpr::for_each_own_id` yields the node's id, the occurrence of each binder `walk_binders`
-reaches, and the `name_occurrence` of a `Feed`, `Define` or `MutWrite`. It is an exhaustive match,
-so a binding form added to the IR fails to compile until it is covered. A tree-level walk built on
-it descends through `walk_children` and, when asked, through `walk_type_slots` into refinement
-predicates, which can hold binders: the group-by key predicate holds `λ x → x`.
+`TypedExpr::for_each_own_id` yields the node's id, the occurrence and the annotation's occurrence of
+each binder `walk_binders` reaches, the `name_occurrence` of a `Feed`, `Define` or `MutWrite`, the
+`label_occurrence` of each `Record` entry, a `VariantCtor`'s `tag_occurrence`, and each `Pattern`'s
+`head_occurrence`. It is an exhaustive match, so a binding form added to the IR fails to compile
+until it is covered. A tree-level walk built on it descends through `walk_children` and, when
+asked, through `walk_type_slots` into refinement predicates, which can hold binders: the group-by
+key predicate holds `λ x → x`.
 
 | Walk | Route |
 |---|---|
@@ -317,7 +374,7 @@ predicates, which can hold binders: the group-by key predicate holds `λ x → x
 | `collect_main_tree_ids`, `duplicate_node_ids`, the placeholder check in `assert_unique_node_ids` | The tree-level walk, without predicates. |
 | `predicate_id_collisions`, `uniquify`'s `distinct_predicate_terms` | `for_each_own_id` within each term, under their own `Rc` dedup. |
 | `uniquify::collect_node_ids` | The tree-level walk, keeping its `LetType` skip. |
-| `enclosing`, `context.rs`'s fallback for `traced` | `for_each_own_id` per node, so an occurrence's enclosing node is the node that holds it. Diagnostics keep blaming the binding node, and a blamed occurrence resolves to it here. |
+| `enclosing`, `context.rs`'s fallback for `traced` | `for_each_own_id` per node, so an occurrence's enclosing node is the node that holds it. A blamed occurrence resolves through the projection first, so an annotation mismatch reports at the annotation. |
 | `copied_nodes` (monomorphization's pairing of a clone with its definition) | The two nodes' `for_each_own_id` sequences, zipped. |
 | `build_node_table` | Ships each occurrence as an entry of the pane's node table, a child of the node that holds it ([An occurrence on the wire](../../inspector_model/design.md#an-occurrence-on-the-wire)). |
 
@@ -339,9 +396,17 @@ mint. At every retained pane, each occurrence whose name has a source spelling r
 pane's projection to a span whose text is that spelling. A name's source spelling is
 `Name::source_spelling`, read through the source `Name` that a `SyntheticKind::Mono` carries. A name
 with no source spelling, such as the `__result_N` a loop's `feed` names, is not checked. An
-associated `def`'s binder is `N::f` while the source writes `f`, so the check compares the part
-after `N::`. A binder minted under a recording where it should have copied its source binder's
-occurrence resolves to the recording node's span, and the check reports it.
+associated `def`'s binder and a constructor's binder are `N::f` while the source writes `f`, so the
+check compares the part after `N::`. A binder minted under a recording where it should have copied
+its source binder's occurrence resolves to the recording node's span, and the check reports it.
+
+A label occurrence and a tag's occurrence compare the `Label`'s name, and a head occurrence the
+tag's name or the constructor's name. An annotation occurrence has no spelling to compare: lowering
+substitutes an alias by the type it names, so `Annotation.ty` does not render as the text the source
+wrote. At `pre-inference`, the one pane that holds annotation occurrences, each one's row must have
+`via` `Lower`: lowering minted it, and no pass between lowering and inference copies or rebuilds an
+annotated binder. A re-mint under a later recording carries that recording's phase, and the check
+reports it.
 
 The inspector reads occurrences for go-to-definition and for a binder's type in each pane
 ([An occurrence on the wire](../../inspector_model/design.md#an-occurrence-on-the-wire),

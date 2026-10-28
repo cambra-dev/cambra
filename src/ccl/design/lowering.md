@@ -326,6 +326,49 @@ checked; nested block lowering stops at the first alias error. The declaration s
 block-entry pass that lowers an annotation, including `pre_register_txn_decls`. This order lets a
 transactional `Mut(Cents, Txn)` declaration resolve `Cents` before transaction registration.
 
+## Names lowering resolves
+
+**Planned.** Lowering returns, beside the tree, a `ResolvedNames` table with one row per name it
+resolves in a type or a module path. Those names have no place in a term. Lowering substitutes an
+alias by the type it names, turns a nominal type's name into a `Type::Nominal` and a type
+parameter into a `Type::Param`, and turns a qualifier into the module it reaches, so no pass after
+lowering holds the name. A row is the use's span, the name as written there, and the target the
+name resolves to.
+
+| A use of | Resolves to | Lowering finds it through |
+|---|---|---|
+| a type alias: `Item` in `def f(i: Item)` | the alias's name in `Item = {price: Int}` | `LoweringContext::type_alias`, through the `DeclaredAlias`'s `name_span` |
+| a type parameter: `T` in `def first(T, a: T, b: T) => T` | the `T` that heads the parameter list | `type_alias`, which holds a type parameter as a `DeclaredAlias` whose `name_span` is the parameter's |
+| a nominal type: `Shape` in `s: Shape`, in `Shape::rect(1, 2)` and in `case Shape::rect(w, h)` | `NominalDecl.span`, the name the declaration binds | `LoweringContext::nominal_type` |
+| a module qualifier: `catalog` in `catalog::price`, each segment of a `use` path | the module's file | `ModuleScope.qualifiers`, whose `Qualifier.file` names it |
+| a `use` item that names a value: `f` in `use m::f` | the member's binder | `Reached::Value` |
+| a `use` item that names a type | the alias or nominal declaration, as for a use of either | `Reached::Type`, `Reached::Nominal` |
+| a type a `use` item brought in: `T` in `x: T` after `use m::T` | `T`'s declaration in `m`, the `use` item's own target | `type_alias`, through the `name_span` `Reached::Type` carries, or `nominal_type`, through `used_nominal`'s `NominalDecl.span` |
+
+`DeclaredAlias` gains a `name_span`, the span of the name its declaration binds: the left-hand side
+of an alias statement, a type parameter, or, for a `use` type name, the alias's name in the module
+that declares it. `Reached::Type` gains that span beside the type, so an import's and a run's `use`
+type names both resolve into the declaring module, as their nominal counterparts do. A `use` type
+name whose module has errors names no type and has no row.
+
+A target is a `Span` for a declaration lowering locates directly, or the `Uid` of a value member's
+binder. A module's target is the empty span at the start of its file. A `Uid` target resolves
+through the binder's binding occurrence, as a use of the binder does
+([provenance.md](provenance.md#name-occurrences)). A span names its file, so a target in another
+module's file resolves there. A name with no declaration in any source has no row: `Int`
+and the other built-in types, and the compiler-provided `Option`, whose `NominalDecl.span` is empty.
+
+The table is an output of lowering, not of provenance. No pass after lowering reads or rewrites the
+names it records, so a row needs no `NodeId` and no copy rule. It describes the program lowering
+saw, which is the program the `pre-inference` pane holds, and like the tree it exists only when
+lowering succeeds. A `Type` cannot carry the ids instead: it derives `Clone`, `Eq` and `Hash`, keys
+the solver's constraint cache, and is cloned by the solver, substitution, monomorphization and
+planning outside any recording ([provenance.md](provenance.md#the-occurrence-field)).
+
+`every_resolved_name_spans_its_spelling`, over the pipeline corpus, checks that the text at each
+row's use span is the name the row records, and that a span target's text is that name too, except
+for a module's empty span.
+
 ## `pass` statements
 
 `contributing_stmts` removes `pass` at each block entry, before the last value-producing
