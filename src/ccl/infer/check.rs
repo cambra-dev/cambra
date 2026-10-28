@@ -910,7 +910,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, None, ctx)?,
 
-        TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
+        TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, node_id, ctx)?,
 
         TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
         TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, &recorded_ty, ctx)?,

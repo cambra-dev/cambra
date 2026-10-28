@@ -616,6 +616,11 @@ pub struct LoweringContext {
     /// The check tree of each module other than the root, which the compile
     /// infers before the linked program ([`modules::ModuleCheck`]).
     pub(crate) module_checks: Vec<modules::ModuleCheck>,
+    /// The `ExprStmt` of each expression statement a program writes before its block's last
+    /// statement, which inference refuses when it causes nothing (`docs/chl-spec.md`, "4.9
+    /// Expression statement"). A statement lowering builds for a loop, an `if` or a `match`
+    /// is not one.
+    pub(crate) expression_statements: HashSet<crate::ccl::provenance::NodeId>,
     /// The root's `import` and `run` statements. Its check is usually the linked program's
     /// inference rather than a module check, so they are kept here for the rule that decides
     /// whether a module is imported or run (`docs/chl-spec.md`, "Shareable modules

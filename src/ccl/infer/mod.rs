@@ -552,7 +552,8 @@ pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
-) -> Result<Type, Vec<LocatedInferError>> {
+    statements: &HashSet<crate::ccl::provenance::NodeId>,
+) -> Result<(Type, Vec<LocatedInferError>), Vec<LocatedInferError>> {
     run_with_params(
         expr,
         sources,
@@ -560,8 +561,9 @@ pub(crate) fn run(
         &[],
         &HashSet::new(),
         &HashSet::new(),
+        statements,
     )
-    .map(|(ty, ..)| ty)
+    .map(|inferred| (inferred.ty, inferred.inert))
 }
 
 /// The scheme each generalized binding a module check reports was bound at.
@@ -582,15 +584,8 @@ pub(crate) fn run_with_params(
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
     public: &HashSet<Name>,
-) -> Result<
-    (
-        Type,
-        NotedSchemes,
-        OpenedVars,
-        crate::ccl::effects::EffectSet,
-    ),
-    Vec<LocatedInferError>,
-> {
+    statements: &HashSet<crate::ccl::provenance::NodeId>,
+) -> Result<Inferred, Vec<LocatedInferError>> {
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
         let pre = InferCtx::new(HashMap::new(), expr.node_id());
@@ -607,6 +602,7 @@ pub(crate) fn run_with_params(
     let opened = sub_ctx.open_module_params(params).map_err(|e| vec![e])?;
     sub_ctx.reported = reported.clone();
     sub_ctx.public = public.clone();
+    sub_ctx.expression_statements = statements.clone();
 
     // Pass 1: emit constraints. The high-value variants
     // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.
@@ -756,8 +752,60 @@ pub(crate) fn run_with_params(
     // validator does not traverse for witness references. This additional walk is debug-only.
     #[cfg(debug_assertions)]
     debug_assert_no_free_witness(expr, "post-inference");
-    let top_level = sub_ctx.top_level_effects();
-    Ok((expr.ty.clone(), sub_ctx.schemes_noted, opened, top_level))
+    // An expression statement does something only by what it causes.
+    let inert: Vec<LocatedInferError> = sub_ctx
+        .inert_statements()
+        .into_iter()
+        .map(|node| LocatedInferError::new(InferError::InertStatement, node))
+        .collect();
+    // A public function's type naming a variable its module keeps is a type the module's
+    // interface cannot state, so it fails inference outright.
+    let exported = sub_ctx.exported_effects();
+    let escaping: Vec<LocatedInferError> = exported
+        .escaping
+        .into_iter()
+        .map(|(node, name, label)| {
+            let item = match &label.item {
+                crate::ccl::effects::Item::Requires(r) => r.to_string(),
+                crate::ccl::effects::Item::Causes(e) => e.to_string(),
+            };
+            LocatedInferError::new(
+                InferError::VariablePastItsScope {
+                    member: name.base().to_string(),
+                    item,
+                },
+                node,
+            )
+        })
+        .collect();
+    if !escaping.is_empty() {
+        return Err(escaping);
+    }
+    // A private feed a public function appends to is appended to by other modules, so it is
+    // the run's, as a public feed is.
+    let mut top_level = sub_ctx.top_level_effects();
+    top_level = top_level.union(&crate::ccl::effects::set_of(
+        &exported.appends.into_iter().collect(),
+    ));
+    Ok(Inferred {
+        ty: expr.ty.clone(),
+        schemes: sub_ctx.schemes_noted,
+        opened,
+        top_level,
+        inert,
+    })
+}
+
+/// What [`run_with_params`] infers of a tree.
+pub(crate) struct Inferred {
+    pub(crate) ty: Type,
+    pub(crate) schemes: NotedSchemes,
+    pub(crate) opened: OpenedVars,
+    /// What the tree's top level requires and causes, less what its scopes discharge.
+    pub(crate) top_level: crate::ccl::effects::EffectSet,
+    /// The expression statements that cause nothing, each an error the caller reports once
+    /// the checks that diagnose a statement more precisely have run.
+    pub(crate) inert: Vec<LocatedInferError>,
 }
 
 use crate::ccl::Expr;

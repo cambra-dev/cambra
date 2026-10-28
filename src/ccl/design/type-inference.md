@@ -3553,8 +3553,9 @@ whose body it is. Labels are recorded on the innermost frame:
 
 A value read is a mention whose handle becomes its value (`read_value` in `emit.rs`). A mention
 passed by reference, or to `await_final`, stays a handle and reads nothing. A parameter's history
-is its argument's, so a label naming a parameter is not recorded. A
-`MutDecl` binder is declared, not a parameter (`Typing::declare_mutable`).
+is its argument's, so a label naming a parameter is `Bound::Parameter`, which no function body's
+filter admits: only a statement's frame, below, keeps one. A `MutDecl` binder is
+declared, not a parameter (`Typing::declare_mutable`).
 
 **A frame's filter keeps what is the function's own out of its type.** An edge or label entering a
 frame passes when the variable it names is bound outside the frame's body: its depth is below the
@@ -3586,6 +3587,22 @@ variable above the scheme's cutoff with its labels and the edges into it
 **Materialization.** Compaction resolves each function position's effects (`CompactFun::effects`).
 A merge takes the union at a positive position and the intersection at a negative one. Coalesce
 writes the set into a compute function's type as `Known`.
+
+**Statements.** An expression statement a program writes before its block's last statement gets a
+frame of its own, which keeps every label, the enclosing function's own variables' included, and
+flows into the enclosing frame through that frame's filter (`Typing::statement`; lowering records
+the statements in `LoweringContext::expression_statements`). A parameter's label is `Bound::Parameter`:
+it reaches the statement's frame and no function body's. A statement whose frame causes nothing is
+inert (`InferError::InertStatement`), unless it reaches a call variable with nothing flowing into
+it, the call of a function a polymorphic definition takes as a parameter, which only each use
+determines (`InferCtx::inert_statements`). Inference returns the inert statements, and the compile
+reports them after the `Mut` discipline checks, which diagnose a wrongly passed argument more
+precisely.
+
+**Public functions.** A public function's effects naming an induction variable of the top level,
+`Bound::At(0)`, are an error at its `let` (`InferError::VariablePastItsScope`). An append to a
+private feed instead joins the top level's effects, since other modules append to the feed through
+the function (`InferCtx::exported_effects`).
 
 **Erasure.** The checks after inference read the materialized effects. Once they have run,
 `effects::erase` sets every function type's effects to none, and every later pass builds function

@@ -303,7 +303,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             emit_compose(elts, &recorded_ty, stamped.as_ref(), ctx)?
         }
 
-        TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
+        TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, node_id, ctx)?,
 
         TypedExprNode::Defer => emit_defer(ctx),
         // A value known only by its type, which the `let` binding it states.
@@ -1527,11 +1527,12 @@ pub(super) fn emit_record<C: Typing>(
 pub(super) fn emit_expr_stmt<C: Typing>(
     e: &mut Expr,
     body: &mut Expr,
+    statement: NodeId,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     // A failed statement is recovered from: its value is discarded either way.
     let reads_before = ctx.poisoned_reads();
-    if let Err(error) = ctx.subexpr(e) {
+    if let Err(error) = ctx.statement(statement, |ctx| ctx.subexpr(e)) {
         ctx.recover(error, reads_before)?;
     }
     emit_value_read(body, ctx)
@@ -1877,6 +1878,7 @@ pub(super) fn emit_let<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let (scheme, defined) = emit_let_definition(binding, bound_expr, ctx)?;
+    ctx.note_binding(&binding.name, &bound_expr.ty, bound_expr.node_id());
     // A `defer()` declares the feed the `let` binds. Any other `let` of a feed names one
     // declared elsewhere, a parameter's or another module's, which is not this scope's.
     let declares_feed = matches!(bound_expr.node, TypedExprNode::Defer);
