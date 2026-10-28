@@ -457,6 +457,7 @@ impl TileOperator for MapDomain {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // Every level's keys stand.
         Box::new(MapDomainProducer {
             base: ProducerBase::new(
                 MapDomainProducer::alloc_id(),
@@ -464,11 +465,9 @@ impl TileOperator for MapDomain {
                 &self.base,
                 scheduler,
             ),
-            input: self.input.subscribe(
-                self.tiling().universal_guard(),
-                widening(consumer),
-                scheduler,
-            ),
+            input: self
+                .input
+                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
             level: self.level,
         })
     }
