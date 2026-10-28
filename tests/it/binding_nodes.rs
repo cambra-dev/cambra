@@ -107,3 +107,21 @@ fn a_top_level_mut_decl_is_minted_with_its_home() {
     assert_eq!(at_home("f"), Some(catalog));
     assert_eq!(at_home("b"), None);
 }
+
+/// Both child walkers visit each node's `bound_expr`, `init` or `iter` before its `body`.
+#[test]
+fn child_walkers_visit_the_expression_outside_the_binder_first() {
+    let is_value = |e: &TypedExpr| matches!(e.node, TypedExprNode::Lit(Lit::Int(1)));
+    let is_body = |e: &TypedExpr| matches!(&e.node, TypedExprNode::Var(v) if v.base() == "x");
+    for (kind, mut node) in ["Let", "MutDecl", "For"]
+        .into_iter()
+        .zip(single_binder_nodes(1, None))
+    {
+        let mut children = Vec::new();
+        node.walk_children(|c| children.push((is_value(c), is_body(c))));
+        let mut children_mut = Vec::new();
+        node.walk_children_mut(|c| children_mut.push((is_value(c), is_body(c))));
+        assert_eq!(children, [(true, false), (false, true)], "{kind}");
+        assert_eq!(children_mut, children, "{kind}");
+    }
+}
