@@ -546,6 +546,7 @@ impl Notified {
     /// Whether a notification of `region` would be suppressed now, without recording anything: for
     /// a gate, a notification has passed since the last pull and its region is inside what
     /// passed. `Always` covers every region, and a flag covers any while it is set.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn covers(&self, region: &Projection) -> bool {
         match self {
             Self::Always => true,
@@ -559,6 +560,7 @@ impl Notified {
     }
 
     /// Whether the flag is set, without clearing it. `Always` reads set.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn is_set(&self) -> bool {
         match self {
             Self::Always => true,

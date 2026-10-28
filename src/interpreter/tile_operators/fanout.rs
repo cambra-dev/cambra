@@ -189,8 +189,9 @@ fn retain_flagged<T>(v: &mut Vec<T>, keep: &[bool]) {
 }
 
 /// The consumer a fan-out installs on its input: it forwards the input's region to every live
-/// slot's consumer. A notification whose region is inside what already passed since the last pull is
-/// dropped, which a slot consumer that pulls does not need, since its pull reads whatever arrived.
+/// slot's consumer. A notification whose region is inside what already passed since the last
+/// pull is dropped, which a slot consumer that pulls does not need, since its pull reads whatever
+/// arrived.
 struct FanOutInput {
     shared: Weak<Mutex<FanOutShared>>,
 }

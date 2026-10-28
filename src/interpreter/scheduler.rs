@@ -298,11 +298,12 @@ impl Consumer for Forwarding {
         };
         let region = &region;
         // Absorbing the notification of a consumer that never pulls into one in progress would
-        // leave its region to a notification that may never return to it, so the forwarder waits for the cell. The notification graph of a region-driven
-        // chain is acyclic, so a cascade does not reach one cell twice, and a cell downstream of a
-        // region-driven consumer is itself region-driven, so a thread that holds one such cell
-        // waits only for cells further along. That orders the cells' locks and nothing else: the
-        // thread that notifies must hold no lock that the cascade takes
+        // leave its region to a notification that may never return to it, so the forwarder
+        // waits for the cell. The notification graph of a region-driven chain is acyclic, so a
+        // cascade does not reach one cell twice, and a cell downstream of a region-driven
+        // consumer is itself region-driven, so a thread that holds one such cell waits only for
+        // cells further along. That orders the cells' locks and nothing else: the thread that
+        // notifies must hold no lock that the cascade takes
         // (`src/interpreter/design-operators.md`, "The notification contract").
         if *region_driven {
             shared.lock_wait().notify(region);
@@ -840,10 +841,10 @@ mod tests {
         Projection::of(&keys_between(first, last)).expect("keys name a projection")
     }
 
-    /// A consumer that pulls is not notified of a region inside what passed since its last pull, and the closed gate delivers
-    /// no region after it.
+    /// A consumer that pulls is not notified of a region inside what passed since its last pull,
+    /// and a pull opens the gate again.
     #[test]
-    fn a_closed_gate_passes_one_notification_to_a_consumer_that_pulls() {
+    fn a_closed_gate_suppresses_a_region_inside_what_passed_for_a_consumer_that_pulls() {
         let (log, regions) = RegionLog::new(false);
         let (gated, gate) = shared_consumer(Box::new(log));
         gated.notify(&keys(0, 3));
@@ -1344,7 +1345,8 @@ mod tests {
             scheduler.check_for_notifications();
             gate.0.take();
         }
-        assert_eq!(log.lock_now().len(), 2, "{:?}", log.lock_now());
+        let heard = log.lock_now().clone();
+        assert_eq!(heard.len(), 2, "{heard:?}");
         assert!(scheduler.wakeups.is_empty());
     }
 
