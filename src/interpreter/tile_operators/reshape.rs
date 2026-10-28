@@ -73,7 +73,9 @@ impl TileOperator for PermuteRecordDomain {
                 &self.base,
                 scheduler,
             ),
-            input: self.input.subscribe(intent_guard, consumer, scheduler),
+            input: self
+                .input
+                .subscribe(intent_guard, widening(consumer), scheduler),
             permutation: self.permutation.clone(),
         })
     }
@@ -438,9 +440,11 @@ impl TileOperator for FlattenTupleDomain {
                 &self.base,
                 scheduler,
             ),
-            input: self
-                .input
-                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+            input: self.input.subscribe(
+                self.tiling().universal_guard(),
+                widening(consumer),
+                scheduler,
+            ),
             field_map: self.field_map.clone(),
         })
     }
