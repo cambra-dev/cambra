@@ -288,20 +288,10 @@ fn binop(op: BinOpKind, a: &Lit, b: &Lit) -> Result<Lit, NoValue> {
         NoValue(format!(
             "`{} {} {}` has no value",
             ConstTerm::Lit(a.clone()),
-            symbol(op),
+            op.chl_sym(),
             ConstTerm::Lit(b.clone())
         ))
     })
-}
-
-/// How CHL spells `op`: [`BinOpKind::sym`], except xor, which CHL writes `^`, and string
-/// concatenation, which it writes `+`.
-fn symbol(op: BinOpKind) -> &'static str {
-    match op {
-        BinOpKind::Concat => "+",
-        BinOpKind::BoolLogic(LogicKind::Xor) => "^",
-        _ => op.sym(),
-    }
 }
 
 /// As CHL writes the term: `30`, `"us"`, `(a=1, b=2)`, `r + 1`.
@@ -346,7 +336,7 @@ impl fmt::Display for ConstTerm {
                 }
                 write!(f, ")")
             }
-            ConstTerm::BinOp(op, l, r) => write!(f, "({l} {} {r})", symbol(*op)),
+            ConstTerm::BinOp(op, l, r) => write!(f, "({l} {} {r})", op.chl_sym()),
             ConstTerm::Neg(t) => write!(f, "-{t}"),
             ConstTerm::Not(t) => write!(f, "not {t}"),
             ConstTerm::If(c, t, e) => write!(f, "({t} if {c} else {e})"),
