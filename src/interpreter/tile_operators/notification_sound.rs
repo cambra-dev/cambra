@@ -221,7 +221,11 @@ pub(crate) fn assert_notification_sound(
         let before = answer(build, feeds, &at, &Projection::Everything);
         at[step.input] += 1;
         handles[step.input].advance_to(at[step.input]);
-        handles[step.input].notify(&step.changed);
+        // A step that changes nothing sends no notification, which a consumer does not expect
+        // to be empty.
+        if step.changed != Projection::Nothing {
+            handles[step.input].notify(&step.changed);
+        }
         let notified = regions
             .lock_now()
             .drain(..)
@@ -238,14 +242,17 @@ pub(crate) fn assert_notification_sound(
             normal(after_outside),
             "step {n}: the answer changed outside the notified region {notified:?}"
         );
-        let pulled = normal(producer.get(notified.guard(&tiling)));
-        let mut expected = after;
-        expected.restrict_to(&notified, &tiling);
-        assert_eq!(
-            pulled,
-            normal(expected),
-            "step {n}: a pull at the notified region {notified:?} differs from the whole answer cut to it"
-        );
+        // A pull at nothing states nothing, and the check outside it has covered the step.
+        if notified != Projection::Nothing {
+            let pulled = normal(producer.get(notified.guard(&tiling)));
+            let mut expected = after;
+            expected.restrict_to(&notified, &tiling);
+            assert_eq!(
+                pulled,
+                normal(expected),
+                "step {n}: a pull at the notified region {notified:?} differs from the whole answer cut to it"
+            );
+        }
         match expect {
             Expect::Sound => {}
             Expect::Narrower => assert_ne!(
@@ -295,6 +302,111 @@ pub(crate) fn assert_release_sound(
         normal(whole),
         "the rest differs from a fresh pull of the rest after the region was released"
     );
+}
+
+/// The values a generated stream holds.
+#[derive(Clone, Copy)]
+pub(crate) enum Values {
+    Ints,
+    Bools,
+}
+
+/// A stream keyed by position holding the booleans `entries`, complete over `complete`.
+pub(crate) fn bool_stream(entries: &[(u64, bool)], complete: Predicate) -> Tile {
+    let mut sorted = entries.to_vec();
+    sorted.sort();
+    Tile::data_function(
+        ColumnValue::UInts(sorted.iter().map(|(key, _)| *key).collect()),
+        Box::new(Tile::Scalar(ColumnValue::Bools(
+            sorted.iter().map(|(_, value)| *value).collect(),
+        ))),
+        complete,
+        BitSet::new(),
+    )
+}
+
+/// A deterministic generator: xorshift64, so a failing script reruns from its seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+/// How a generated script grows its stream.
+#[derive(Clone, Copy)]
+pub(crate) enum Growth {
+    /// One key per step, in any order.
+    OneAtATime,
+    /// Up to four keys per step.
+    Bursts,
+    /// Steps that only widen completeness or change nothing, among steps that add a key.
+    CompletenessAndEmpty,
+}
+
+/// The tiles an input answers at successive states and the steps that reach them, for a stream
+/// of `values` over the positions `0..12` that grows as `growth` says. The same `seed` makes the
+/// same script. A step that adds keys notifies exactly those keys, one that only widens
+/// completeness notifies everything, and one that changes nothing notifies nothing.
+pub(crate) fn grow(
+    seed: u64,
+    steps: usize,
+    growth: Growth,
+    values: Values,
+) -> (Vec<Tile>, Vec<Step>) {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut present: Vec<(u64, i64)> = Vec::new();
+    let mut complete = Predicate::False;
+    let tile = |present: &[(u64, i64)], complete: &Predicate| match values {
+        Values::Ints => int_stream(present, complete.clone()),
+        Values::Bools => bool_stream(
+            &present
+                .iter()
+                .map(|(k, v)| (*k, v % 2 == 0))
+                .collect::<Vec<_>>(),
+            complete.clone(),
+        ),
+    };
+    let mut tiles = vec![tile(&present, &complete)];
+    let mut script = Vec::new();
+    for _ in 0..steps {
+        let action = match growth {
+            Growth::OneAtATime => 1,
+            Growth::Bursts => 1 + rng.next() % 4,
+            Growth::CompletenessAndEmpty => rng.next() % 4,
+        };
+        let mut added = Vec::new();
+        // A complete stream gains no key.
+        let all_present = present.len() >= 12 || complete == Predicate::True;
+        for _ in 0..match growth {
+            Growth::CompletenessAndEmpty => (action == 1) as u64,
+            _ => action,
+        } {
+            if all_present {
+                break;
+            }
+            let key = rng.next() % 12;
+            if present.iter().all(|(k, _)| *k != key) {
+                present.push((key, (rng.next() % 100) as i64));
+                added.push(key);
+            }
+        }
+        let changed = if !added.is_empty() {
+            keys_region(&added)
+        } else if matches!(growth, Growth::CompletenessAndEmpty) && action == 2 {
+            complete = Predicate::True;
+            Projection::Everything
+        } else {
+            Projection::Nothing
+        };
+        tiles.push(tile(&present, &complete));
+        script.push(Step { input: 0, changed });
+    }
+    (tiles, script)
 }
 
 #[cfg(test)]

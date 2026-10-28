@@ -55,6 +55,8 @@ mod iterate;
 mod lookup;
 mod map;
 #[cfg(test)]
+mod notification_scripts;
+#[cfg(test)]
 mod notification_sound;
 mod reshape;
 mod scalar;
