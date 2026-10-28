@@ -247,7 +247,7 @@ intersection cannot read.
 ### Lowering requirements
 
 `lower_requirements` resolves each requirement against the trait table: the name
-(`Trait::from_surface_name`), the operand count, and each associated type by name
+(`Trait::compiler_named`), the operand count, and each associated type by name
 (`Assoc::from_surface_name`). Refinements are stripped from every operand, since an instance row
 matches a base whatever its refinements.
 
