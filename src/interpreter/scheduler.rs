@@ -1318,6 +1318,76 @@ mod tests {
         assert!(scheduler.wakeups.is_empty());
     }
 
+    /// A notifier writes data and notifies the gate twice in a row; a puller wakes when a
+    /// notification passed, takes the gate and then reads. The second notification arrives as
+    /// the pull of the first begins, so the gate passes it or the pull reads what it announced.
+    /// A gate that dropped it after the pull began leaves the second write unread, and the
+    /// notifier waits for it until the test gives up.
+    #[test]
+    fn a_notification_sent_while_a_pull_begins_is_never_lost() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        const PAIRS: usize = 3_000;
+        let gate = Notified::clear();
+        let data = AtomicUsize::new(0);
+        let seen = AtomicUsize::new(0);
+        let wake = AtomicBool::new(false);
+        let finished = AtomicBool::new(false);
+        let lost = AtomicBool::new(false);
+        let pulls_begun = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                'pairs: for pair in 0..PAIRS {
+                    for write in [2 * pair + 1, 2 * pair + 2] {
+                        // The second notification waits for the pull of the first to begin.
+                        while write % 2 == 0 && pulls_begun.load(Ordering::SeqCst) <= pair {
+                            std::hint::spin_loop();
+                        }
+                        data.store(write, Ordering::SeqCst);
+                        if gate.mark_news_of(&Projection::Everything) {
+                            wake.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while seen.load(Ordering::SeqCst) < 2 * pair + 2 {
+                        if Instant::now() > deadline {
+                            lost.store(true, Ordering::SeqCst);
+                            break 'pairs;
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+                finished.store(true, Ordering::SeqCst);
+            });
+            scope.spawn(|| {
+                while !finished.load(Ordering::SeqCst) && !lost.load(Ordering::SeqCst) {
+                    if wake.swap(false, Ordering::SeqCst) {
+                        pulls_begun.fetch_add(1, Ordering::SeqCst);
+                        gate.take();
+                        seen.store(data.load(Ordering::SeqCst), Ordering::SeqCst);
+                    }
+                    std::hint::spin_loop();
+                }
+            });
+        });
+        assert!(
+            !lost.load(Ordering::SeqCst),
+            "a notification sent as a pull began was dropped"
+        );
+    }
+
+    /// After a pull resets the gate, a region outside what passed before it passes, and one inside
+    /// what passed since is suppressed.
+    #[test]
+    fn a_pull_leaves_the_gate_holding_nothing() {
+        let gate = Notified::clear();
+        assert!(gate.mark_news_of(&keys(1, 4)));
+        assert!(gate.take());
+        assert!(gate.mark_news_of(&keys(6, 6)));
+        assert!(gate.mark_news_of(&keys(2, 3)));
+        assert!(!gate.mark_news_of(&keys(6, 6)));
+    }
+
     /// A pull that answers what the last one did but queues a wakeup is not quiescence: the
     /// wakeup is delivered by the next lap, and the producer it wakes answers anew.
     #[test]

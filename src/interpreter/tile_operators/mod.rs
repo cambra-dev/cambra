@@ -514,20 +514,25 @@ impl Notified {
     }
 
     /// Read and clear. `Always` reads set and stays set. A gate also forgets the region it held.
+    ///
+    /// A gate's pull begins here, and a notification that arrives after it began passes. The
+    /// order is what makes that so: the lock is taken first, and `everything` is cleared before
+    /// `set`, so a lock-free reader that still sees `everything` read it before the pull began,
+    /// and a notification that comes later finds it clear and waits on the lock, which is
+    /// released only after the region is reset, and then sees `set` clear and passes. `Release`
+    /// stores pair with the `Acquire` loads in [`Self::mark_news_of`]; the lock orders the rest.
     pub fn take(&self) -> bool {
         match self {
             Self::Always => true,
             Self::Flag(c) => c.swap(false, Ordering::AcqRel),
             Self::Gate(gate) => {
+                let mut passed = gate
+                    .passed
+                    .lock()
+                    .expect("a gate's region is never poisoned");
+                gate.everything.store(false, Ordering::Release);
                 let was_set = gate.set.swap(false, Ordering::AcqRel);
-                if was_set {
-                    let mut passed = gate
-                        .passed
-                        .lock()
-                        .expect("a gate's region is never poisoned");
-                    *passed = Projection::Nothing;
-                    gate.everything.store(false, Ordering::Release);
-                }
+                *passed = Projection::Nothing;
                 was_set
             }
         }
