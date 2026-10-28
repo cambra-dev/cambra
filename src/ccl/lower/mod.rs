@@ -588,7 +588,7 @@ pub struct LoweringContext {
     /// [`begin_module`](Self::begin_module).
     pub(super) module: modules::ModuleScope,
     /// Where the module being lowered performs IO, if it does: the first call to
-    /// a registered source (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state").
+    /// a registered source (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module").
     pub(super) io_site: Option<Span>,
     /// Each reference to a name a run's `use` clause binds, by its node, with
     /// where it is written ([`Self::reference`]).
@@ -1683,7 +1683,7 @@ enum Lowered {
 
 /// Where `module`, an imported module, binds a sink: the first statement that
 /// declares one, which makes importing it an error (`docs/chl-spec.md`, "9.7
-/// Importing asserts no IO and no state"). Reading a source is the other IO a
+/// Importing asserts a shareable module"). Reading a source is the other IO a
 /// module can perform, and lowering records it ([`LoweringContext::io_site`]).
 pub fn sink_site(module: &ChlModule) -> Option<Span> {
     module.body.iter().find_map(|stmt| {
@@ -1703,7 +1703,7 @@ pub fn sink_site(module: &ChlModule) -> Option<Span> {
 /// The first statement at `module`'s top level that declares or writes mutable
 /// state: a mutable variable, a write to one, a loaded declaration, a feed
 /// declaration, or a feed's definition. Such a module is run and not
-/// imported (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state"): a
+/// imported (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module"): a
 /// feed at an import's module would collect what every importer feeds it.
 pub fn state_site(module: &ChlModule) -> Option<Span> {
     module.body.iter().find_map(|stmt| {
@@ -1922,7 +1922,7 @@ fn use_name_members(
 
 /// One error per top-level statement an imported module may not hold: a `run`,
 /// since the import would reach the run's state (`docs/chl-spec.md`, "9.7
-/// Importing asserts no IO and no state"), an expression statement, and,
+/// Importing asserts a shareable module"), an expression statement, and,
 /// not supported yet, anything but a value binding, a `def`, a type alias, an
 /// `import`, `pass`, a nominal type, or an `impl` block.
 pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<LoweringError> {

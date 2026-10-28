@@ -16,8 +16,8 @@ and the operational semantics in [docs/operational-semantics/](operational-seman
 CHL today **looks** like Python, but it is not Python. Several Python
 tokens are re-purposed (`<<`, `<<=`, `&`, `|`, `^`), one is new (`++`),
 and Python features that don't fit the dataflow model (mutable identity,
-exceptions, classes, true division, etc.) are absent. Where CHL diverges
-from Python, this document states the divergence explicitly.
+exception handlers looked up at run time, classes, true division, etc.) are
+absent.
 
 The Python resemblance itself is transitional: CHL is **converging away
 from Python-compatible surface syntax** toward its own syntax, designed
@@ -173,10 +173,12 @@ clause, which ends a `def` signature or a polymorphic type
 ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)).
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
-> `rec` (recursive binding — §4.3, **[Decided]**), `given` (the
-> transactions-as-contextual-parameters layer — §8.7, **[Decided]**),
-> and `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
-> surface, **[Open]** as to what `static` demands). Avoid taking these names for other purposes.
+> `rec` (recursive binding — §4.3, **[Decided]**),
+> `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
+> surface, **[Open]** as to what `static` demands), and `causes`, `only`, `nothing`, `raise`,
+> `try` and `except` (effects and exceptions —
+> [6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided), **[Decided]**).
+> Avoid taking these names for other purposes.
 > (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `type`, `impl`, `trait` and
 > the module keywords are **already** lexed — the first two carry today's transactions and
 > mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a refinement's
@@ -316,7 +318,7 @@ exactly like any nested block (§4). (The parser's root AST node is
 named `Module`, after Python's `ast.Module`.)
 
 > **Direction [Decided].** A source file is a **module**. Importing one
-> asserts that it performs no IO and reaches the shared import of its arguments;
+> asserts that it is shareable (§9.7) and reaches the shared import of its arguments;
 > running one creates a run of its own. The engine runs one root module. Modules are
 > specified in [9. Modules](#9-modules), whose statements (`import`, `run`, `param`,
 > and `pub` on a member) extend this grammar ([2.2 Statements](#22-statements)).
@@ -436,17 +438,16 @@ begin():`, §8.2, `[Decided]`); any other context is rejected. `with` does
 `decl_stmt` declares a feed with no value, `h: Feed(V)`
 ([Declaring a feed](#declaring-a-feed)); every other binding takes a value.
 
-> **Direction.** Planned statement forms, not in today's grammar:
-> `rec x = e` recursive bindings (**[Decided]**, §4.3), and
-> out-of-line collection definition through a subscript target,
-> `c[i] = v` (**[Tentative]**, §6.3 — this would relax the
-> no-subscript-target rule above). A `type` declaration, a `def` whose name is
-> qualified by a type (`def Price::discounted(…)`), and `@RenamedFrom` on either a
-> `type` or one of its constructors are **[Decided]**, with their grammar in
-> [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided).
-> (`mut_assign_stmt` and `with_stmt`
-> above are already implemented — §4.3, §8; they are in the grammar, not
-> this list.)
+> **Direction.** Planned statement forms, not in today's grammar: `rec x = e` recursive bindings
+> (**[Decided]**, §4.3), and out-of-line collection definition through a subscript target,
+> `c[i] = v` (**[Tentative]**, §6.3 — this would relax the no-subscript-target rule above). A
+> `causes` clause on a `def`, and the `raise` and `try`/`except` statements, are **[Decided]**, with
+> their grammar in [6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided). A
+> `type` declaration, a `def` whose name is qualified by a type (`def Price::discounted(…)`), and
+> `@RenamedFrom` on either a `type` or one of its constructors are **[Decided]**, with their grammar
+> in [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided).
+> (`mut_assign_stmt` and `with_stmt` above are already implemented — §4.3, §8; they are in the
+> grammar, not this list.)
 
 The module statements `import_stmt`, `run_stmt`, `param_stmt`, `renamed_from_stmt`, `discard_stmt`
 and `pub_stmt` parse, with the productions of [9. Modules](#9-modules), and so does `const` before a
@@ -653,43 +654,55 @@ payload's whenever the payload has any, and the tag's when it does not.
 ## 3. Expression semantics
 
 Each CHL expression denotes a value; some expression forms additionally
-perform an **effect** when evaluated. The effecting forms:
+perform an **effect** when evaluated. An effect is an output: a write to a
+mutable variable, a contribution to a feed, a commit, an output outside the
+program, or an exception
+([6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided)).
+The effecting forms:
 
 - **Feed `<<`** (§3.7) appends its right-hand side to a feed.
-- **`yield`** (§3.13) appends its operand to the collection the
-  enclosing generator function returns.
 - **A call to an effecting function** — one that writes a `Mut(…)`
   parameter (pass-by-reference, §6.2) or writes a transactional mutable variable
   inside a `with begin():` block (§8) — performs that function's writes.
-  A function's effects are always visible in its signature (a `Mut(…)`
-  parameter, or a write to a `Txn` variable in its body); there are **no
-  implicit-effect functions**, so an inert expression statement (§4.9)
-  stays detectable and rejected. Effects becoming part of a function's
-  type is **[Tentative]**
-  ([6.9 Effects in function types [Tentative]](#69-effects-in-function-types-tentative)).
+  A function's effects are always visible in its type: today they are read
+  off its `Mut(…)` parameters and the `Txn` writes in its body, and
+  **[Decided]** its `causes` clause states them, written or inferred. There
+  are **no implicit-effect functions**, so an inert expression statement
+  (§4.9) stays detectable and rejected.
+- **[Decided]** — **`raise`**, a call that may raise, and an output outside
+  the program, such as binding a sink
+  ([6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided)).
+
+`yield` (§3.13) is not an effect in this sense: it adds its operand to the
+collection the enclosing generator function returns, which is that
+function's result.
 
 Mutation of a *variable* is a property of statements, not expressions:
 `x := e` (§4.3, §8.1) writes a mutable variable, and loop accumulation
 (§4.6) and transactions (§8.2) are the statement contexts that give those
 writes their sequencing. A bare *reference* to a mutable variable is a
-pure read — a dereference of its current value; the effect is carried by
-the `:=` write and the effecting call, never by the read.
+read — a dereference of its current value. It causes nothing; the effect
+is carried by the `:=` write and the effecting call, never by the read.
 
-Every other expression form is *pure*: it depends only on its inputs and
-has no observable effect. A pure expression is safe to evaluate zero,
-one, or many times, and it is only over pure sub-expressions that the
-freedoms below (unordered collections, unspecified evaluation order)
-apply. Ordering *between* effects is not free-for-all: it is governed by
+Every other expression form is *pure*: it causes nothing, and its value
+depends only on its inputs. What it requires does not make it impure: a
+read of a mutable variable requires `Read(x)` or `Transaction`, and a
+reading requires `Ext`, but each has one value at each position
+([6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided)).
+A pure expression is safe to evaluate zero, one, or many times, and it is
+only over pure sub-expressions that the freedoms below (unordered
+collections, unspecified evaluation order) apply. Ordering *between*
+effects is not free-for-all: it is governed by
 the dependency-edge model of §8.5 — effects are ordered exactly by the
 data dependencies among them, and unordered (freely interleaved)
 otherwise.
 
-> **Direction [Decided].** The `requires Transaction` / `given` / `summon`
-> contextual-parameter layer (§8.7) adds a *second* way for a call to be
-> effecting — a function that manifests a transaction from context rather
-> than through a `Mut(…)` parameter. That layer is not yet implemented;
-> the `Mut(…)`-parameter and `with begin():` effecting-call forms above
-> are.
+> **Direction [Decided].** The `requires Transaction` contextual
+> requirement (§8.7) adds a *second* way for a call to be effecting — a
+> function that reads or writes a transactional mutable variable in the
+> block it is called in, rather than through a `Mut(…)` parameter. It is
+> not yet implemented; the `Mut(…)`-parameter and `with begin():`
+> effecting-call forms above are.
 
 ### Collections are unordered
 
@@ -700,51 +713,62 @@ elements. Two collections with the same elements (with the same
 multiplicities) are indistinguishable.
 
 The consequence at the operational level: a `for` loop's iterations
-may run in **any order, including in parallel**. A program has no way
-to rely on iteration order — the denotation is the same bag whichever
-order the implementation picks.
+may run in **any order, including in parallel**, unless they interact
+([Ordered loops](#ordered-loops)).
 
-Regardless of ordering, collections are all indexed by some type.
-This type is generally not visible to users, but can be used to impose
-ordering or to match up data between coupled source/sink pairs like
+Every collection is indexed by some type, the type of its **positions**: a list's positions are its
+indices, a set's and a map's are its keys, and a comprehension result's are its generators'
+([3.12 Comprehensions](#312-comprehensions)). Positions are generally not visible to users. They
+fix the order of an ordered loop, and they match up data between coupled source/sink pairs like
 `http_serve`.
 
-The single way to introduce inter-iteration ordering is a
-**loop-carried accumulator** (§4.6): a `:=` write to an outer-scope name
-inside a `for` body creates a data dependency from one iteration to
-the next, forcing those iterations to run sequentially in the order
-the dependency requires. No other construct sequences iterations.
+The single way to introduce inter-iteration ordering is an **ordered loop**: one whose iterations
+interact through a loop-carried accumulator (§4.6) or an exception escaping its body. It runs in
+its source's position order ([Ordered loops](#ordered-loops)). No other construct sequences
+iterations.
 
 Lists do retain an integer-indexed *addressing* structure (a list is
 a finite function from `0..n` to values, so `xs[i]` is well-defined
-— §3.9); but the order of *iteration* over a list is not the order of
-its indices, and a comprehension over `xs` does not promise any order
-on its output.
+— §3.9). A list's indices are its positions, so an ordered loop over a list runs in index order.
 
-> **Direction [Tentative].** The target model is more nuanced than
-> "all collections are bags". In the collections model (§6.3), `List`
-> and `Array` are *ordered* — their positional structure is part of
-> the value, not just an addressing convention — while `Set`, `Map`,
-> and `Collection` are unordered. Order-dependent operations over the
-> unordered types are expected too, with the ordering supplied
-> explicitly as a **given** instance (the contextual-parameter
-> mechanism of §8) rather than baked into the type. This nuance is
-> recorded here only (2026-07-07, no brainstorm writeup yet); today's
-> compiler treats every collection as a bag, exactly as this section
-> describes.
+### Ordered loops
 
-### Accumulator iteration order is not yet defined [Open]
+A loop is **ordered** when its iterations interact: its body causes `Write(x)` for a mutable
+variable `x` bound outside the loop, an accumulator update made directly or by a call (§4.6), or a
+`Raise(E)` that escapes the body ([Exceptions](#exceptions)). A comprehension whose element,
+generator or guard may raise is ordered the same way. Appends, reads and commits order nothing:
+appends commute, a read of an accumulator is sequenced by the writes it reads, and a `with
+begin():` block commits by the event that triggers it
+([8.5 Ordering and concurrency](#85-ordering-and-concurrency)). The iterations of every other loop
+are unordered.
 
-A loop-carried accumulator sequences its loop's iterations "in the order the dependency
-requires" ([4.6 `for` — iteration](#46-for--iteration)), and an accumulator whose update does
-not commute (`last := v`) makes the result depend on that order. This document does not say
-what the order is. The compiler runs a list's iterations in index order, but over a keyed
-collection, such as a `Map` or a `groupby` result, no order is implied, so two equal maps could
-give different results. Whether the order is the keys' order, an ordering supplied as a given
-(the direction above), or a refusal of non-commuting accumulation over an unordered collection
-is **[Open]**. The compiler refuses an accumulating loop whose source is not indexed by
-iteration position (``a `mut` loop's source must be indexed by iteration position``), so the
-question does not arise in a program it accepts.
+An ordered loop runs its iterations one after another, in its source's **position order**:
+
+| Source | Positions | Order |
+| --- | --- | --- |
+| `List(T)`, `Array(n, T)` | its indices | ascending |
+| `Set(K)`, `Map(K, V)`, `FullMap(K, V)`, a `groupby` result | its keys, of type `K` | `K`'s order |
+| a comprehension result | the tuples of its generators' positions ([3.12 Comprehensions](#312-comprehensions)) | lexicographic, the first-written generator's position first |
+| a source | its arrivals | arrival order |
+
+**The positions must be orderable.** An ordered loop requires `Orderable(P, P)` of its source's
+position type `P`. A loop walks the collection its source's `Iterable` instance returns
+([4.6 `for` — iteration](#46-for--iteration)), so a source of a nominal type has that collection's
+positions. A loop over `Map(K, V)` that accumulates is accepted
+where `K` is orderable and rejected otherwise, and a polymorphic `def` running an ordered loop over
+a parameter requires `Orderable` of the parameter's positions in its type. A loop is ordered by
+what its body causes, not by what its writes compute: `total += x` over a set whose elements have
+no order is rejected although `+` commutes.
+
+**A concatenation has no order between its parts.** `a ++ b` holds each part's positions tagged
+with its part, and nothing about a union puts one part first, so an ordered loop over a
+concatenation is rejected. So is one over a feed fed from more than one `<<`, which is the
+concatenation of what each `<<` contributes. **[Open]** — how a program states the order such a
+loop runs in.
+
+The order is a fact about the source, not about the run, so two equal collections give an ordered
+loop the same result. A position decides it, not an element: `last := v` over a map ends at the
+value of the map's greatest key. A write to a variable bound outside two nested loops orders both.
 
 ### Evaluation order is unspecified
 
@@ -753,12 +777,13 @@ expression has no observable effect, so the order in which the
 sub-expressions of a compound expression evaluate is **not specified** by
 this document. Argument evaluation order in a call, operand order in a
 binary operator, the relative order of two independent feeds in the same
-loop body — none of these are sequenced. The append effects (`<<`,
+loop body — none of these are sequenced unless they interact through effects (below). The append effects (`<<`,
 `yield`) contribute to bag-valued feeds and generator results and commute, so
 they too impose no order among themselves beyond data dependencies. The
 one place order *is* observable — effecting calls and transactional
-writes — is governed by the dependency-edge model of §8.5, not by source
-position.
+writes — is governed by the dependency-edge model of §8.5, in which source
+position decides only which way an edge points between two pieces of one
+evaluation that interact.
 
 The only constraints on execution order are **data dependencies**:
 if expression `A` produces a value that expression `B` consumes,
@@ -771,6 +796,9 @@ introduce such dependencies are:
   `for` loop along the accumulator's update chain,
 - short-circuit `and` / `or` (§3.5) and ternary `if`/`else` (§3.6),
   which select which sub-expressions contribute to the result,
+- written order within one evaluation, between statements, arguments or operands that
+  interact through effects ([8.5 Ordering and concurrency](#85-ordering-and-concurrency)): one
+  writes a variable the other reads or writes, or one may raise and the other causes something,
 - sink contracts (e.g. `http_serve`'s response-paired-with-request
   rule — §7.3), which fix ordering at the boundary between the
   program and the outside world.
@@ -1140,19 +1168,16 @@ A *zero-argument* call is valid only against a name registered as a
 or as the context of `with begin():` (§8.2). A zero-argument call against
 any other name is a compile-time error.
 
-> **Direction [Decided] — a zero-argument call is an effect.** Terms are pure and immutable, so a
-> function of no argument is a constant and is written as a value. A zero-argument call remains
-> only where something other than a value is produced: a source read or a transaction
-> (`begin()`). `empty_map()` becomes the values `Map::empty` and `Set::empty`
-> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), and an
-> associated function that declares no parameters, `def Price::zero():`, is an error that says to
-> bind a value instead ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
->
-> A method call is not a zero-argument call: `o.is_none()` passes `o` as `self`, so the function
-> takes one argument. Two gaps remain, both **[Open]**. A value is bound by `=`, whose right side is
-> an expression, an `if` chain or a `match` ([4.3 Assignment forms](#43-assignment-forms)), so a
-> constant that needs an indented block of statements has no spelling. And an associated value of a
-> declared type, such as `Price::zero`, has none either.
+> **Direction [Decided] — a function may declare no parameters.** A call of one passes no
+> arguments: `f()` applies `f` to the unit, the product of no components. `def zero() => Int:`,
+> `\ -> 3`, an associated function `def Price::zero() => Price:` and a trait's `def one() => S`
+> each take the unit. A pure function of no parameters returns one value at every call. One that
+> requires or causes something returns what its effects give at each call
+> ([6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided)): `time::now()`
+> takes a reading at each position and call path
+> ([Inputs from outside the program](#inputs-from-outside-the-program)). `empty_map()` becomes the
+> values `Map::empty` and `Set::empty`
+> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)).
 
 ### 3.9 Subscript and attribute access
 
@@ -1371,9 +1396,13 @@ filtered by each `if` guard. Concretely, for a comprehension with
 clauses `for x₁ in xs₁ ⟨guards…⟩ for x₂ in xs₂ ⟨guards…⟩ … for xₙ in
 xsₙ ⟨guards…⟩`, the result contains one `element` value for each tuple
 `(x₁, …, xₙ) ∈ xs₁ × xs₂ × … × xsₙ` such that every interspersed `if`
-guard holds. The output is **unordered** (§3) — like any CHL
-collection, it is a bag, and downstream consumers must not rely on
-the order in which the tuples were enumerated.
+guard holds.
+
+The result's **positions** are those of the tuples it is taken over: the tuple `(p₁, …, pₙ)` of
+the position `pᵢ` of each `xᵢ` in `xsᵢ`, or `p₁` alone for one `for` clause. A guard drops a
+position and leaves the others as they are. The output's elements are a bag (§3), and downstream
+consumers must not rely on the order in which the tuples were enumerated. An ordered loop over the
+result runs in the lexicographic order of its positions ([Ordered loops](#ordered-loops)).
 
 A guard depending only on outer iteration variables (e.g. `if c(x₁)`
 sitting between `for x₁` and `for x₂`) acts as a *prune* on the outer
@@ -1595,8 +1624,19 @@ statements whose last statement yields a value — i.e. one of:
   above (the branch's value is the function's result for that case).
 
 A function value captures the values of free names in its surrounding
-scope at definition time (lexical capture). Captured names are
-read-only: a function cannot mutate a name from an outer scope.
+scope at definition time (lexical capture). A captured mutable variable is
+the exception: a call reads it at the call's own position in its history.
+
+```python
+cnt := 10
+def f(x):
+    cnt + x
+cnt := 20
+f(0)          # 20
+```
+
+Captured names are read-only: a function cannot mutate a name from an outer
+scope.
 Recursion through self-reference is **[Planned]**; for now each
 function must be definable without referring to its own name.
 
@@ -1909,7 +1949,8 @@ including every comprehension result ([3.12 Comprehensions](#312-comprehensions)
 `Elements`, so it yields its values. A nominal type yields what its module's instance returns. A
 polymorphic `def` that iterates a parameter carries the requirement in its type: `def f(c): for x in
 c: …` requires `Iterable(C)` of its parameter's type `C`, so each call iterates its argument by the
-argument's own instance.
+argument's own instance. An
+ordered loop requires `Orderable` of its source's positions ([Ordered loops](#ordered-loops)).
 
 > **Direction [Decided] — the element is chosen per collection type.** `Set`, `Map` and `FullMap`
 > are nominal builtins
@@ -1925,11 +1966,9 @@ argument's own instance.
 > the form to write once it lands. Design:
 > [collections.md, "Operations: how the trait layer dispatches [Planned]"](../src/ccl/design/collections.md#operations-how-the-trait-layer-dispatches-planned).
 
-**Iterations are unordered and may run in parallel** (§3): unless the
-body introduces a data dependency from one iteration to the next, the
-implementation is free to evaluate the iterations in any order and
-concurrently. The single way to sequence iterations is a loop-carried
-accumulator (below).
+**Iterations are unordered and may run in parallel** (§3) unless the loop is ordered: a
+loop-carried accumulator (below), or an exception escaping the body, sequences them in the
+source's position order ([Ordered loops](#ordered-loops)).
 
 A bare `for` loop in a non-generator context is an **effect
 statement**: its purpose is to feed values into feeds as it
@@ -1951,8 +1990,8 @@ generator's implicit result collection.
 introduced *before* the loop — a pre-loop `:=`, a function argument, or
 any binding from an enclosing frame — is an **accumulator update**, not a
 per-iteration shadow. It introduces an inter-iteration data dependency
-that **forces the loop to run sequentially** in the order the dependency
-requires:
+that **forces the loop to run sequentially**, in its source's position order
+([Ordered loops](#ordered-loops)):
 
 - Before the loop, the name has its outer value.
 - At each iteration, the body computes a new value from the
@@ -2125,11 +2164,14 @@ Generator functions have a separate rule for bare `return`, specified under
 
 ### 4.9 Expression statement
 
-A final expression statement supplies its block's value. A nonterminal expression statement
-must have a permitted effect: a feed (`target << value`) or a function call that writes a
-`Mut(…)` parameter or transactional mutable variable. An inert nonterminal expression is
-rejected. Function effects must be visible in their types; there are no implicit-effect
-functions. See [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
+A final expression statement supplies its block's value. A nonterminal expression statement is
+evaluated only for what it causes
+([6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided)), so one that causes
+nothing is inert and is rejected. A statement that writes a variable, appends to a feed, commits a
+transaction, causes `Emit` or may raise an exception is not inert. What it requires does not count:
+a call that only reads the clock is inert. In a polymorphic `def`, a statement calling a function
+parameter causes whatever that function does, which each use decides, so the definition does not
+reject it. See [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
 
 **[Decided]** Contextual transaction parameters add calls that obtain their transaction from
 context rather than a `Mut(…)` argument; its contract is specified under
@@ -3107,10 +3149,14 @@ associated functions, so whatever name it takes is unavailable to every type dec
 - **A value identifies its constructor by name.** A value is held as the name of its constructor
   and that constructor's arguments. The name, and not the constructor's position in the
   declaration, identifies the constructor, so reordering a declaration's lines changes nothing.
+- **A value names its declaration.** A value of a declared nominal type carries the declaration its
+  constructor belongs to, as the version of the program that built it defines it, and compares in
+  that declaration's order ([Equality and order](#equality-and-order)).
 - **[Open] — erasure after inference.** The first implementation keeps a declared nominal type
   until operator conversion, which reads a value's shape off its constructors' parameter types, and
-  erases the nominal builtins once inference has resolved their operations. A nominal type kept
-  past inference could bound the data it holds, which is why erasure is not decided.
+  erases the nominal builtins once inference has resolved their operations. Whether a value keeps
+  the whole type, its arguments included, past inference, which could bound the data it holds, is
+  not decided.
 
 #### Associated functions and methods
 
@@ -3166,8 +3212,9 @@ method it means, and the method as an unapplied value has no other spelling.
   single-constructor form share one namespace.** Two entries of one type with one name are an error
   naming both sites. Two types in one module may each have a `discounted`.
 - **An associated function declares at least one value parameter.** `def Price::zero():` is an
-  error: a function of no argument is a constant ([3.8 Function calls](#38-function-calls)). An
-  associated value has no spelling and is **[Open]**.
+  error. **[Decided]** — an associated function may declare no parameters: `def Price::zero() =>
+  Price:` is called `Price::zero()` ([3.8 Function calls](#38-function-calls)). A constructor that
+  declares no parameters is a value instead, written without parentheses.
 - **An associated function reaches nothing a run gives its module.** Every run of a module shares a
   type that reaches none of the module's parameters
   ([Nominal type identity](#nominal-type-identity)), so each run's copy of the type's functions must
@@ -3249,24 +3296,303 @@ read from an instance, `summon(Area(_))::area(s)`
   method and a trait's function may share a name, and two traits may declare functions of one
   name: `c.area()`, `summon(Area(_))::area(c)` and `summon(Surface(_))::area(c)` are three calls.
 
-### 6.9 Effects in function types [Tentative]
+### 6.9 Effects and requirements [Decided]
 
-A function's type includes its **effects**. An effect is one of:
+A function's type states what a call reads from its context, in its **`requires` clause**, and what
+the call contributes besides its result, in its **`causes` clause**. A requirement is an input that
+the context supplies. An effect is an output. Trait requirements
+([Trait requirements](#trait-requirements)) are implemented, and the rest of this section is
+**[Decided]**. The effecting forms that are implemented
+([3. Expression semantics](#3-expression-semantics)) are the `Write` and `Append` effects below,
+read off a function's body rather than stated in its type.
 
-- IO, through a source or a sink ([7. Built-in functions and
-  sources](#7-built-in-functions-and-sources));
-- mutation of state provided from outside the function, through a `Mut(…)` parameter or a
-  captured mutable variable ([8. Mutability, transactions, and
-  feeds](#8-mutability-transactions-and-feeds)).
+| Requirement | Supplied by | Required by |
+| --- | --- | --- |
+| a trait instance | the instance that the call's types pick ([Summoning an instance](#summoning-an-instance)) | an operator, a `summon`, a trait's function, an ordered loop ([Ordered loops](#ordered-loops)) |
+| `Transaction` | a `with begin():` block, for its body ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)) | a read or a write of a transactional mutable variable |
+| `Ext` | the run, at every position ([Inputs from outside the program](#inputs-from-outside-the-program)) | opening a source, a reading |
+| `Read(x)` | the scope binding `x`, to every call inside it | a read of the induction variable `x` |
 
-Today's effecting calls ([3. Expression semantics](#3-expression-semantics)) carry the
-mutation effect, read off a `Mut(…)` parameter or a `Txn` write in the body. Under this
-direction the function's type states it. Everything else about effects is **[Open]**: how an
-effect is written in a function type, how effects compose and are inferred, and whether a feed
-write is an effect of its own.
+| Effect | Caused by |
+| --- | --- |
+| `Write(x)` | a write to the mutable variable `x`: `x := e`, a compound assignment, passing `x` to a `Mut` parameter, or a call to a function that writes `x` |
+| `Append(f)` | a contribution to the feed `f`: `f << e`, `f <<= e`, passing `f` to a `Feed` parameter, or a call to a function that appends to `f` |
+| `Commit` | a `with begin():` block ([8.2 Transactions: `with begin():`](#82-transactions-with-begin)) |
+| `Emit` | an output outside the program ([Output outside the program](#output-outside-the-program)) |
+| `Raise(E)` | `raise e` with `e` of type `E` ([Exceptions](#exceptions)) |
 
-**[Open] — crash handling.** What a program does when an effect fails at run time, and in
-particular whether the dataflow downstream of the failure pauses, is undecided.
+`yield` is not an effect: what a generator function yields is its result
+([3.13 `yield`](#313-yield)).
+
+**Every requirement and every effect is a trait.** A requirement's instance is what its context
+supplies, as the first table states. `Transaction`, `Ext` and `Read` are built-in traits that differ
+from a declared one only in where their instances come from. An effect is a built-in trait with no
+instances. The five above are every effect there is, and a program declares no effect of its own:
+`Raise` takes a type, so each type a program raises gives one more effect, such as
+`Raise(Negative)`. Only a built-in trait takes a term parameter, as `Read`, `Write` and `Append`
+take a variable; a declared trait's operands are types ([Declaring a trait](#declaring-a-trait)).
+
+**A clause is a type.** A trait applied to its operands is a type, so each requirement and each
+effect is one, and an effect is a type with no values. A `causes` clause is the join of its effects
+in the subtype order. A `requires` clause is the meet of its requirements, since the context
+supplies an instance of each. Two built-in types bound them:
+
+- `Effect` is above every effect and every join of effects. `causes nothing` is the least of them.
+- `Context` is the requirement that every context meets, and every requirement and every meet of
+  requirements is below it. `requires nothing` is `Context`.
+
+The families are closed, so no other type is below `Effect` or `Context`. A variable standing for a
+clause is a type variable with one of them as its bound ([Kinds and bounds](#kinds-and-bounds)).
+
+An expression requires and causes what its parts and the calls it makes require and cause. A
+block, a function body and a module's top level require and cause what their statements do, less
+what they discharge ([Discharging requirements and effects](#discharging-requirements-and-effects)).
+
+#### Writing requirements and effects
+
+```ebnf
+def_stmt        ::= "def" ident "(" [ params ] ")" [ "=>" expression ]
+                    [ requires_clause ] [ causes_clause ] ":" block
+fun_type        ::= expression "=>" expression [ requires_clause ] [ causes_clause ]
+requires_clause ::= "requires" ( "nothing" | [ "only" ] requirement ( "," requirement )* )
+causes_clause   ::= "causes" ( "nothing" | [ "only" ] effect ( "," effect )* )
+requirement     ::= … | "Transaction" | "Ext" | "Read" "(" variable ")" | Ident | "_"
+effect          ::= "Write" "(" variable ")" | "Append" "(" variable ")"
+                 |  "Commit" | "Emit" | "Raise" "(" expression ")" | Ident | "_"
+variable        ::= ( ident "::" )* ident
+```
+
+`requirement`'s other alternatives are those of [Trait requirements](#trait-requirements). A
+capitalized name standing alone in a clause, other than the built-in `Transaction`, `Ext`, `Commit`
+and `Emit`, is a type variable or an associated type. One in a `causes` clause is bounded by
+`Effect` or a type below it, and one in a `requires` clause by `Context` or a type below it
+([Kinds and bounds](#kinds-and-bounds), [Effects in traits](#effects-in-traits)). Any other is an
+error, so a raised type is written `Raise(NotFound)`, never `NotFound` alone.
+
+- **An omitted clause in a `def` is inferred.** `def total(xs): …` requires and causes what its
+  body does.
+- **A written clause in a `def` is a lower bound.** `def lookup(k) causes Raise(NotFound):` states
+  that a call may raise `NotFound`, and inference adds the rest of what the body causes. A call sees
+  every written requirement and effect whether the body has it or not, so a library may state an
+  effect its body does not cause yet.
+- **`only` makes a clause an upper bound.** Under `causes only Write(stock), Raise(NotFound)`, an
+  effect the body causes beyond those listed is an error at the line that causes it, with a
+  secondary label at the clause. `nothing` is the empty upper bound:
+  `def norm(v) requires nothing causes nothing:`.
+- **A trait requirement on a type parameter is always written.** A type parameter is opaque
+  ([Type parameters](#type-parameters)), so inference adds no requirement on one, whether the
+  clause is a lower or an upper bound ([Trait requirements](#trait-requirements)).
+- **A written type's clauses are exact.** A function type `A => B` with no clause requires nothing
+  and causes nothing, in an annotation, a parameter's type, a Module type's entry and a trait's
+  signature alike. `_` in a clause stands for what inference supplies, as it does in a type:
+  `A => B causes _`.
+- **A clause in a parameter's type ends at the next parameter.** Each item of a clause begins with
+  a capitalized name or `_`, so in `def apply(f: Int => Int causes E, xs)` the comma before the
+  lowercase `xs` ends the clause and `xs` is the next parameter.
+- **A hole that a `def`'s body leaves open is a variable.** In
+  `def apply_all(f: Int => Int causes _, xs): [f(x) for x in xs]` nothing fixes the hole, so
+  `apply_all` has type
+  `forall (E <: Effect) {Int => Int causes E, List(Int)} => List(Int) causes E`, as a type that a
+  body leaves open makes a `def` polymorphic ([6.10 Polymorphic types](#610-polymorphic-types)). A
+  variable is written where an upper bound relates two positions:
+  `def apply_all(E <: Effect, f: Int => Int causes E, xs) causes only E`.
+- **A function type that requires and causes less is a subtype.** A `requires` clause is an input
+  and a `causes` clause an output, so `A => B requires R₁ causes E₁` is a subtype of
+  `A => B requires R₂ causes E₂` when `R₂ <: R₁` and `E₁ <: E₂`. A meet is below another when it has
+  each of the other's requirements, and a join is below another when each of its effects is below
+  one of the other's, as `Raise(Int@2)` is below `Raise(Int)` ([Exceptions](#exceptions)).
+- **A monomorphic function type requires only context requirements.** A function value's trait
+  requirements are resolved where it is made, so its type's `requires` names only `Transaction`,
+  `Ext`, `Read(x)` and type variables bounded by `Context`. A polymorphic type has one clause after
+  its function type's codomain, holding its trait requirements and its context requirements
+  together ([Polymorphic type annotations](#polymorphic-type-annotations)).
+- **An arrow takes the clauses written after its codomain.** `=>` groups to the right, so in
+  `A => B => C causes E` the clause is `B => C`'s, and `A => (B => C) causes E` gives it to the
+  outer arrow.
+- **A diagnostic and `cambra check` print each clause in full,** inferred parts included
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
+
+#### Discharging requirements and effects
+
+| Construct | Discharges |
+| --- | --- |
+| `with begin():` | `Transaction`, in its body |
+| `try` with `except T` | each `Raise(S)` with `S` a subtype of `T`, in its `try` block |
+| the end of a scope | `Write(x)`, `Append(x)` and `Read(x)` for a variable `x` it binds, under the rules below |
+| the run | `Ext`, at a module's top level |
+
+- **A scope ends the history of each variable it binds.** A scope is a `def` body, a loop body, a
+  block, or a module's top level. At its end, `Write(x)`, `Append(x)` and `Read(x)` for each `x`
+  the scope binds are dropped: every write to `x` stands inside the scope, so nothing outside it
+  observes one, and every call inside the scope has a position in `x`'s history to read at.
+- **Some state belongs to the run, and its effects are never dropped.** A transactional mutable
+  variable is bound by the run: its history grows as transactions commit after the top level has
+  run. A feed is the run's when other modules may append to it: a public feed, or a private one
+  that a public function appends to. No scope's end drops `Write`, `Append` or `Read` of either.
+- **A `Mut` or `Feed` parameter's writes are the caller's.** A call passing `a` to a `Mut` parameter
+  causes `Write(a)`, and one passing `a` to a `Feed` parameter causes `Append(a)`, whether or not
+  the callee writes it. The callee's writes to its own `Mut` or `Feed` parameter are not in its
+  type, since the parameter's type states them.
+- **Nothing that outlives a scope names a variable whose history the scope ends.** A function value
+  or a public member whose type causes `Write(x)` or `Append(x)`, or requires `Read(x)`, for such
+  an `x` is an error at its definition. At a module's top level this rule is
+  [9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module).
+- **A contract names a transactional mutable variable by its run**, whether the variable is private
+  or not, as a type may mention a private member ([9.13 Private-in-public](#913-private-in-public)).
+  A module that calls `inv::reserve` sees `causes Write(inv::stock)`, and the `stock` of two runs
+  gives two effects, `Write(inv::stock)` and `Write(eu_inv::stock)`.
+- **`Commit` and `Emit` are never discharged.** A `with begin():` block whose body causes `Commit`
+  is a nested transaction ([8.2 Transactions: `with begin():`](#82-transactions-with-begin)).
+- **A function value's requirements are supplied at each call.** A lambda that requires
+  `Transaction` reads the transaction of the block it is called in, not the block it was made in.
+
+#### Inputs from outside the program
+
+`Ext` is the requirement of every input from outside the program:
+
+- **Opening a source requires `Ext`** ([7.3 Sources](#73-sources)). The source's elements are
+  values, so a function that reads a captured source requires nothing further.
+- **A reading requires `Ext`.** A reading is a call whose value comes from outside the program:
+  the clock (`time::now()`, [7.5 Time [Decided]](#75-time-decided)), a random value, or the reply
+  to a call made outside the program. A reading is an intrinsic, such as `__now`, which a program
+  reaches through the std function that calls it ([9.16 The std root](#916-the-std-root)).
+
+The run supplies `Ext` at every position, and no construct in a module supplies it. A top level
+that requires it is therefore run, not imported
+([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)), and no
+constant reads one
+([9.19 Constants](#919-constants)). `Ext` has no parts: no construct supplies one kind of input
+without the others.
+
+The **position** of an evaluation is the run's start at the top level, extended by one iteration
+for each loop around the evaluation. A **call path** is the sequence of call sites, outermost first,
+through which an evaluation reaches an operation. Every call, a call of a function value included,
+is resolved when the program is compiled, so each call path is fixed.
+
+- **A reading has one value at each position and call path.** Two calls at one position may return
+  different values, two clock readings included, and one call evaluated again at its position
+  returns its value again. Every reading is keyed this way: the clock, a random value and the reply
+  to a call made outside the program differ only in where the value comes from.
+- **The run records each reading** the first time its key is evaluated and returns the recorded
+  value at every later evaluation, so a retried transaction reads what the first evaluation read.
+- **A reading belongs to its version of the program.** A reload may take a reading again. A program
+  that needs a reading kept holds it in a mutable variable, whose value a reload keeps
+  ([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)):
+  `t: Mut(time::Instant) := time::now()` keeps its instant across reloads, and `t = time::now()`
+  may read the clock again. A reading survives a crash as the state holding it does
+  ([8.8 `@LoadFrom`](#88-loadfrom)).
+
+#### Output outside the program
+
+`Emit` is the effect of every output outside the program. A **sink** is an operation that hands data
+out: binding a feed to a sink, as `http_serve` binds its responses ([7.3 Sources](#73-sources)), or
+calling a sink function, which takes a collection and writes it out. Each causes `Emit`. A call that
+sends a request out and returns the reply causes `Emit` and requires `Ext`.
+
+No construct discharges `Emit`. An output inside a `with begin():` block is sent only if the block
+commits
+([8.4 Feeds are the second form of mutability](#84-feeds-are-the-second-form-of-mutability)).
+
+#### Exceptions
+
+```ebnf
+raise_stmt  ::= "raise" expression
+try_stmt    ::= "try" ":" block ( "except" expression [ "as" ident ] ":" block )+
+```
+
+An **exception** is a value a `raise` raises, of any type. Its type is the parameter of the
+`Raise` effect it causes, so `Raise(Negative)` and `Raise(Timeout)` are two effects:
+
+```python
+type Negative = {qty: Int}
+
+def checked(qty):
+    if qty < 0:
+        raise Negative::new((qty=qty))
+    qty
+
+def checked_or_zero(qty):
+    try:
+        checked(qty)
+    except Negative:
+        0
+```
+
+- **`raise e` causes `Raise(E)`,** where `E` is the type of `e`, so `raise 2` causes
+  `Raise(Int@2)`. `raise` is a statement.
+- **`Raise` is covariant.** An exception is an output, so a function that may raise an `Int@2` may
+  raise an `Int`: `Raise(Int@2)` is a subtype of `Raise(Int)`
+  ([Writing requirements and effects](#writing-requirements-and-effects)).
+- **A path that raises contributes no value.** An `if` arm, a `match` arm or a branch of a function
+  body that raises is left out of the join
+  ([Joining the types of several values](#joining-the-types-of-several-values)).
+- **An exception ends its path.** The statements after a statement that raises run only on the path
+  where it did not raise. The statements before it are unaffected, and their outputs stand.
+- **Within an expression, the first exception in written order escapes.** An argument or operand
+  that causes anything is evaluated only where none of the arguments or operands written before it
+  raised, so in `f(a) + g(b)`, where both calls may raise, `g(b)` runs only if `f(a)` did not raise.
+  This is the written order of one evaluation ([8.5 Ordering and
+  concurrency](#85-ordering-and-concurrency)), which leaves an operand that causes nothing
+  unordered.
+- **A call causes each `Raise(E)` its callee causes** and does not catch.
+- **An exception is an output.** An expression that may raise raises whether its value is used or
+  not, and a statement whose only effect is an exception is not inert
+  ([4.9 Expression statement](#49-expression-statement)).
+- **`try` catches by type.** `except T` catches each `Raise(S)` its `try` block causes with `S` a
+  subtype of `T`. Where the block raises such an exception, the first clause catching it runs, with
+  the exception bound to the name after `as` at type `T`, and its value is the statement's. The
+  statement causes what its `try` block causes, less what its clauses catch, and what its clauses'
+  blocks cause. In value position its type is the join of its blocks' values, as an `if`'s is. A
+  clause that catches nothing its `try` block causes is an error.
+- **Catching is decided by type, not by value.** `except {Int where _ > 0}` catches `raise 2`,
+  whose type is `Int@2`, and not `raise n` with `n: Int`, whatever value `n` holds.
+- **An exception escaping a `with begin():` block aborts the transaction.** None of the block's
+  writes commits and no output inside it is sent, and the exception continues outward. An exception
+  caught inside the block does not abort it.
+- **An exception escaping an iteration orders the iterations.** A `for` loop, or a comprehension
+  whose element or condition may raise, raises the exception of its first raising iteration in
+  position order, and nothing after that iteration takes effect. This is a dependency from one
+  iteration to the next, as an accumulator's is ([4.6 `for` — iteration](#46-for--iteration)). The
+  loop is ordered, so its source's positions must be orderable
+  ([Ordered loops](#ordered-loops)); over positions with no order, the loop or comprehension catches
+  inside its body.
+- **No exception escapes the program.** An exception that a module's top level causes is an error
+  at the statement it escapes from, with a secondary label at the `raise`.
+- **Catching is resolved when the program is compiled.** A function that causes `Raise(E)` returns
+  its result or an `E`, and each caller passes the `E` on or catches it. No handler is looked up at
+  run time ([8.7 Direction [Decided]: transactions as contextual
+  parameters](#87-direction-decided-transactions-as-contextual-parameters)).
+
+**[Open] — partial operations.** Whether division by zero, a missing key or an out-of-range index
+raises an exception is part of
+[Partiality is not yet defined [Open]](#partiality-is-not-yet-defined-open).
+
+**[Open] — crash handling.** What a program does when an operation outside it fails at run time,
+and in particular whether the dataflow downstream of the failure pauses, is undecided.
+
+#### Effects in traits
+
+- **A trait's signature is a written type.** A `def` line in a trait with no clause requires
+  nothing beyond its trait requirements and causes nothing.
+- **The signature is every instance's contract.** An instance's function writes no clause of its
+  own, its body causes nothing beyond what the signature states, and every call of it, through a
+  summon, a method call or a requirement, sees the signature
+  ([Declaring an instance](#declaring-an-instance)).
+- **A trait's signature names no variable.** An instance may be declared in another module than
+  the trait, so `Write(x)`, `Append(f)` and `Read(x)` in a signature are errors; what an instance's
+  functions do to its module's state is an associated type's.
+- **An associated type lets instances differ.** `Name <: Effect` in a trait declares an associated
+  type that a `causes` clause names, and `Name <: Context` one that a `requires` clause names:
+
+  ```python
+  trait Sink(T):
+      Writes <: Effect
+      def put(t: T, v: String) causes Writes
+  ```
+
+  An instance writes no definition of such a type: it is what the instance's functions cause, or
+  require, beyond what their signatures list otherwise. Under `requires s: Sink(T)`, `s::Writes` is
+  the type of the instance each call passes, and a call of `s::put` causes it.
 
 ### 6.10 Polymorphic types
 
@@ -3361,6 +3687,11 @@ in the kind `K`:
 - `Type` is every type. `T` alone is `T: Type`.
 - `SubtypesOf(U)` is every subtype of `U`, `U` included. `T <: U`, the **bound** form, is
   `T: SubtypesOf(U)`.
+
+**[Decided]** A clause of
+[6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided) is a type, so a
+variable standing for one is a type variable with the bound form: `E <: Effect` ranges over `causes`
+clauses and `R <: Context` over `requires` clauses.
 
 Any other kind, such as a listing `T: [Int, String]`, is **[Open]** and an error. A type written as
 a kind, as in `T: Int`, is an error.
@@ -3474,6 +3805,9 @@ instance ([Equality and order](#equality-and-order)).
   parameter is an error unless a requirement or the parameter's bound covers it. Where both do, the
   requirement decides: `x + y` under `T <: Int` and `requires a: Addable(T, T), a::Output <: T` is
   an `a::Output`, which is a `T`.
+- **[Decided]** — the context requirements `Transaction` and `Ext`, a written clause as a lower
+  bound, and `only` and `nothing`, are specified in
+  [Writing requirements and effects](#writing-requirements-and-effects).
 - **Each call satisfies each requirement at its own instantiation,** and passes the instance that
   satisfies it. A call that does not is rejected at the call. A secondary label at the requirement
   is **[Decided]**.
@@ -3573,15 +3907,17 @@ def total(S, s: S) => Int requires a: Area(S):
 trait_stmt  ::= "trait" Ident "(" Ident ( "," Ident )* [ "," ] ")" [ requires_clause ] ":"
                 NEWLINE INDENT trait_item+ DEDENT
 trait_item  ::= Ident [ "<:" expression ] NEWLINE
-             |  "def" ident "(" params ")" "=>" expression [ requires_clause ] NEWLINE
+             |  "def" ident "(" params ")" "=>" expression [ requires_clause ]
+                [ causes_clause ] NEWLINE
 ```
 
 A `trait` declaration binds a capitalized name to a new trait over its **operands**, the types it
 names in parentheses: one instance type for each list of operand types. Its body declares
-**associated types**, each a capitalized name alone, `Elem`, and **functions**, each a `def` line
-with a signature and no body. Every instance defines each associated type and holds each function at
-its own operands. An associated type is an alias the instance defines, not a nominal type, so no
-`type` keyword introduces it.
+**associated types**, each a capitalized name, alone, `Elem`, or bounded, `Size <: Int`, and
+**functions**, each a `def` line with a signature and no body. Every instance holds each function
+at its own operands and defines each associated type, except one bounded by `Effect` or `Context`,
+which stands for a clause its functions decide ([Effects in traits](#effects-in-traits)). An associated type is
+an alias the instance defines, not a nominal type, so no `type` keyword introduces it.
 
 ```python
 trait Area(S):
@@ -3601,12 +3937,16 @@ trait Scales(V, F):
 - **A signature states every type.** Each parameter is annotated and the result is written. The
   operands and associated types are types in every signature. A function may declare type
   parameters of its own, as `tag` declares `R`, and a `requires` clause; each call opens the
-  parameters at its own types and satisfies the clause there.
+  parameters at its own types and satisfies the clause there. **[Decided]** A signature is a
+  written type, so one without a `causes` clause causes nothing, and an associated type
+  `Name <: Effect` lets instances cause different effects
+  ([Effects in traits](#effects-in-traits)).
 - **A trait's function is no method.** No parameter of one is named `self`, in the trait or in an
   instance, and a call reads it from an instance: `summon(Scales(_, _))::scale_vec(2, v)`, not
   `2.scale_vec(v)` ([Associated functions and methods](#associated-functions-and-methods)).
-- **A function declares at least one parameter.** A function of no argument is a constant
-  ([3.8 Function calls](#38-function-calls)), and a trait's constant has no spelling.
+- **A function declares at least one parameter.** **[Decided]** — a function may declare no
+  parameters, and a call reads it from an instance like any trait function:
+  `summon(One(Circle))::one()` ([3.8 Function calls](#38-function-calls)).
 - **Neither the trait's name nor a type's reaches a function.** `Area::area(c)` is an error, and
   `Circle::area(c)` names only a function `Circle` declares
   ([Summoning an instance](#summoning-an-instance)).
@@ -3703,7 +4043,10 @@ impl forall (T) Area(Two(T)) requires a: Area(T):
 - **The block defines each of the trait's functions, and nothing else.** A `def` in it is the
   trait's function at the instance's types. A parameter it leaves unannotated, its result, its own
   type parameters and its `requires` clause are the trait's there, and one it writes must be the
-  trait's. A `def` names no type of its own, and `pub` does not mark one.
+  trait's. **[Decided]** It writes no `causes` clause and no context requirement: it requires and
+  causes what the trait's signature states, and its body causes nothing beyond that
+  ([Effects in traits](#effects-in-traits)). A `def` names no type of its own, and `pub` does not
+  mark one.
 - **No two instances of a trait accept one type.** Two instances overlap when some types match both
   heads, as `Two(T)` and `Two(Int)` do, and `Duo(Int, B)` and `Duo(A, String)`; the second is an
   error. `Two(Int)` and `Two(String)` do not overlap, and a summon picks between them by the types
@@ -3863,6 +4206,10 @@ pick: forall (T) {T, T} => T = first
   and `pick: Pick = first` uses it as a whole annotation
   ([6.7 Type-alias statements](#67-type-alias-statements)). Such an alias inside another type is
   the nested case above.
+- **[Decided]** — **A polymorphic function type has one `requires` clause,** after its codomain,
+  holding the trait requirements on the types it quantifies and the context requirements of a
+  call: `forall (T) {T, T} => T requires Orderable(T, T), Transaction causes Emit`
+  ([Writing requirements and effects](#writing-requirements-and-effects)).
 - **It is never a type constructor.** `forall (T) V` does not denote a function from types to
   types. A parameterised alias, if added, is written in the head form `Pair(T) = {T, T}`
   ([6.7 Type-alias statements](#67-type-alias-statements)).
@@ -3978,6 +4325,11 @@ responses ([10. Sinks](#10-sinks)).
 Additional sources may be pre-registered by the host embedding (testing,
 demos, etc.). `std::time` adds a clock read and an alarm source and sink
 ([7.5 Time [Decided]](#75-time-decided)).
+
+**[Decided]** Opening a source requires `Ext`, and binding a sink causes `Emit`
+([Inputs from outside the program](#inputs-from-outside-the-program),
+[Output outside the program](#output-outside-the-program)). A reading, such as the clock, is an
+intrinsic a std module calls ([9.16 The std root](#916-the-std-root)).
 
 `http_serve` opens its route when the program starts, so a call is the
 whole right-hand side of a `=` in the top-level block, and its three
@@ -4135,16 +4487,17 @@ position in the commit order ([6. Types (informal sketch)](#6-types-informal-ske
 - **Each evaluation of a call reads the clock.** A call is evaluated once per iteration of each
   enclosing loop. Two calls can return different readings, including two calls in one transaction.
   A binding holds one reading: in `t = time::now()`, every use of `t` is the same instant.
-- **A call at a module's top level reads the clock once, when the program starts.** A reload keeps
-  the reading of a binding it keeps. A binding the reload adds or changes reads the clock when the
-  new version starts.
+- **A call at a module's top level reads the clock once, when the program starts.** A reload may
+  read the clock again. A mutable variable holding a reading keeps it across reloads
+  ([Inputs from outside the program](#inputs-from-outside-the-program)).
 - **A reading orders nothing.** A reading is not an event and creates no dependency edge
   ([8.5 Ordering and concurrency](#85-ordering-and-concurrency)). Commit order never consults a
   reading, so a transaction that commits after another can hold an earlier reading.
-- **A call is IO.** The compiler represents a call as a read of a clock source at the call's
-  position, not as an expression it may merge or duplicate. A module whose top-level evaluation
-  calls `time::now()`, directly or through a function, performs IO and is run
-  ([9.7 Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)).
+- **A call requires `Ext`.** It is a reading
+  ([Inputs from outside the program](#inputs-from-outside-the-program)), not an expression the
+  compiler may merge or duplicate. A module whose top level calls `time::now()`, directly or
+  through a function, requires `Ext` and is run
+  ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
 
 #### `time::alarms()`
 
@@ -4302,9 +4655,17 @@ for req in incr_reqs:
 - Writes to a `Txn`-domain mutable variable are legal **only** inside a `with
   begin():` block; a write outside one is rejected (§8.3), as is a write
   reached through a transactional-writer function *called* inside a block
-  (a disguised nested transaction).
+  (a disguised nested transaction). **[Decided]** — a function the block
+  calls may write one too: it requires `Transaction` for the write, and the
+  block supplies it (§8.7). Only a call of a function that runs a block of its
+  own is a nested transaction.
 - **Nested transactions are rejected** — a block commits as one unit, so a
   `with` inside it has no coherent meaning.
+- **[Decided]** A block causes `Commit`, and its body supplies `Transaction` to what it calls. A
+  body that causes `Commit`, directly or through a call, is the nested transaction above
+  ([Discharging requirements and effects](#discharging-requirements-and-effects)). An exception
+  that escapes the block aborts it: none of its writes commits and no output inside it is sent
+  ([Exceptions](#exceptions)).
 - **Branch guards and tag dispatch.** A block may carry `if`/`elif`/`else`
   guards, more than one of them, and `match` dispatch. Each branch's
   writes are scoped to its own path and the transaction commits on the
@@ -4348,8 +4709,11 @@ around `reserve` + `quote` + the feed).
 - **Trailing induction read** — after a `for` loop, a bare reference to an
   induction accumulator is its final value (or the pre-loop value if the
   source was empty). The loop has ended, so "latest" is unambiguous.
-- **A `Txn` mutable variable is read only inside a `with begin():` block.** A
-  bare read outside one is an error, and stays one: the block is what pins a
+- **A `Txn` mutable variable is read only inside a `with begin():` block.**
+  **[Decided]** — or in a function the block calls, which requires
+  `Transaction` for it
+  ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)).
+  A bare read that no block encloses is an error, and stays one: the block is what pins a
   **snapshot-consistent** view, so that several mutable variable reads in one
   block see one commit snapshot. A read that wants no snapshot has the two terms
   below instead — an as-of read fed out of a block, or `await_final`.
@@ -4389,8 +4753,8 @@ observable:
 A mutable program's meaning is an *ordering story* — which effect happens
 before which. CHL states that story as a single principle:
 
-**Execution is maximally concurrent; nothing is ordered by its position in
-the source text. The only ordering is the transitive closure of dependency
+**Execution is maximally concurrent; source position orders nothing by
+itself. The only ordering is the transitive closure of dependency
 edges, and every edge originates at an _event_.** Two pieces of logic are
 ordered exactly when a chain of dependency edges connects them, and freely
 interleaved (or parallel) otherwise. The events:
@@ -4406,6 +4770,17 @@ interleaved (or parallel) otherwise. The events:
   piece produces, the read depends on the write — read-your-writes in a
   block, a commit decision reading a snapshot, a reply consuming its own
   commit record.
+
+  Within one evaluation — the top level's, a block's, an iteration's or a call's — written order
+  decides which way such an edge points. Its statements, and the arguments and operands of each
+  expression in it, take effect in the order they are written wherever two of them interact: a
+  read sees the writes written before it and none written after it, a later write leaves what an
+  earlier read saw unchanged, and whatever is written after a piece that raised runs only where it
+  did not raise ([Exceptions](#exceptions)). Two pieces that cannot change each other's values or
+  outputs, in either order, are unordered: appends to a feed commute, two reads commute, and a
+  reading is keyed by its call path rather than by when it is taken
+  ([Inputs from outside the program](#inputs-from-outside-the-program)). Commits are ordered by
+  the consequences below, not by where a block is written.
 - **`await_final`.** The **completion event** of a transactional mutable variable
   (§8.6): it is available only once every writer of the mutable variable has
   drained, and everything downstream depends on that completion.
@@ -4497,6 +4872,13 @@ for r in reqs2:
 An **induction** accumulator may likewise be seeded from an await
 (`x := await_final(pool)`): a different recurrence, so there is no cycle.
 
+**[Decided]** — **the rules hold across modules.** `await_final(x)` requires nothing: its value is
+one value for the whole run, the same wherever it is evaluated
+([6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided)). A writer of `x` is
+any statement that causes `Write(x)`, a call of another module's function included, so the await
+waits for every writer of `x` in the program. A writer that depends on `await_final(x)`, directly
+or through another module's public value, is the cycle above and an error at the write.
+
 One restriction unrelated to cycles: `await_final` may not appear inside a `with
 begin():` block, which reads its mutable variables bare as a snapshot; awaiting
 there would wait on the history that block extends.
@@ -4520,38 +4902,42 @@ or every transaction denies, the await is `x`'s initializer.
 
 The implemented model above passes a transaction *implicitly by block
 scope* (`with begin():` establishes it; `Mut(…, Txn)` mutable variables are the
-shared state). A **[Decided]** further direction adds an explicit
-contextual-parameter mechanism modeled on Scala 3's `given`/`using`/`summon`,
-so a transaction can be threaded into a called function without a `Mut`
+shared state). A **[Decided]** further direction makes the transaction a
+contextual requirement, so a transaction reaches a called function without a `Mut`
 parameter:
 
 - `def put(…) requires Transaction:` — the function declares it needs a
-  transaction from context.
-- `given txn` — injects an existing transaction into the context.
-- `summon(Transaction)` — the contextual transaction, the instance a `with begin():` block
-  installs ([Summoning an instance](#summoning-an-instance)).
+  transaction from context. A function reading or writing a transactional
+  mutable variable outside a block of its own requires one whether or not it
+  says so, and a call of it that no block encloses is an error.
+- **A transaction is never a value.** No construct names the transaction a block supplies or
+  passes it elsewhere: the block's body, and every call in it, is where it acts. **[Planned]** — a
+  std function that requires `Transaction` answers the transaction's own data, such as its time,
+  so a called function reads it without a parameter threading it there.
 
 Supporting decisions (same source):
 
-- **Discharged by the typeclass/given solver, *not* algebraic effects.**
+- **Discharged by the requirement solver, *not* algebraic effects.**
   Cambra compiles to static dataflow; handler-based effects make control
   flow non-local and data flow handler-dependent — exactly what the
   dataflow compiler cannot see through. `requires Transaction` is ordinary
   dictionary passing, resolved by the same solver that will serve general
   typeclasses.
-- **Locally-scoped givens, not global coherence.** A fresh transaction is
+- **Locally-scoped transactions, not global coherence.** A fresh transaction is
   minted per `with begin():` block; many exist over a program's life.
-- **Domains as a type index.** `Transaction(dom)`, created with
-  `with dom.begin()`, restores per-domain coherence while allowing fresh
-  transactions across scopes. Start with one global domain and make `dom`
-  itself a given, so the common case omits it.
-- **Commit/abort are data operations on a time-region**, not control
-  effects: block exit merges the region forward (commit), `abort()` drops
-  it (rollback) — a structured early-exit, not exception unwinding.
+- **[Open] — domains.** Every transaction is the one global domain's. A domain index,
+  `Transaction(dom)` created with `with dom.begin()`, would partition the state into domains each
+  serializable on its own, for scale; nothing needs one yet.
+- **A commit is a data operation on a time-region**, not a control effect:
+  block exit merges the region forward. A transaction that should not commit
+  is written with a guard, the deny idiom of
+  [8.2 Transactions: `with begin():`](#82-transactions-with-begin), or ends
+  with an exception that escapes the block, which drops the region
+  ([Exceptions](#exceptions)). There is no `abort()`.
 - **Terminology:** type `Transaction`; variable abbreviation `txn` (never
-  `tx`, which collides with "transmit"); operations `begin()` / `abort()`.
-- **Implicit *parameters* only — never implicit conversions**; given
-  visibility stays explicit and resolution inspectable (hence `summon`).
+  `tx`, which collides with "transmit"); operation `begin()`.
+- **Implicit *parameters* only — never implicit conversions**; where a requirement is
+  discharged stays inspectable.
 - **One `requires` clause.** `Transaction` and trait requirements share it:
   `requires Transaction, Orderable(T, T)`
   ([Trait requirements](#trait-requirements)).
@@ -4685,10 +5071,11 @@ deletes no state.
 
 A **module** is one `.cambra` file. A module is used in one of two ways:
 
-- **Importing** it brings its public members into scope. Importing asserts that the module performs
-  no IO and declares no mutable state. Its members exist once for each distinct set of arguments its
-  imports pass, however many modules import it with those arguments ([9.7 Importing asserts no IO
-  and no state](#97-importing-asserts-no-io-and-no-state)).
+- **Importing** it brings its public members into scope. Importing asserts that the module is
+  shareable: its top level reads nothing from outside the program, and leaves behind no output and
+  no state another module could reach. Its members exist once for each distinct set of arguments
+  its imports pass, however many modules import it with those arguments
+  ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
 - **Running** it performs its top-level computation, public and private: its state, its sources and
   sinks, and its loops. A module may be run any number of times, each run with its own name, its own
   arguments, and its own state.
@@ -4711,9 +5098,9 @@ members ([9.8 Module types](#98-module-types)).
   module that declares it and a **run path** from the root: `eu`, or `eu::inv` for a run `eu`
   declares.
 - **Shared import.** The one evaluation of an imported module's top level at one set of arguments,
-  whose members every import passing those arguments reaches. It holds no state, and it is named
-  by the module path with those arguments, `shop(Receipt=stripe::Receipt)`
-  ([9.7 Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)).
+  whose members every import passing those arguments reaches. Any state it holds ends with its top
+  level, and it is named by the module path with those arguments, `shop(Receipt=stripe::Receipt)`
+  ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
 - **Member.** A binding at a module's top level. Bindings inside a `def`, a loop, or a block are
   **locals**.
 - **Public member.** A member declared with `pub`. Every other member is private to its module.
@@ -4722,8 +5109,9 @@ members ([9.8 Module types](#98-module-types)).
 - **Module type.** The structural type of a module's public members, `Module{…}`
   ([9.8 Module types](#98-module-types)).
 - **Module interface.** What checking records about a module for the modules that use it: its
-  public members' contracts, its parameters, and whether it performs IO or declares mutable state
-  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
+  public members' contracts, its parameters, and whether it is shareable
+  ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module),
+  [9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
 
 ### 9.2 Imports
 
@@ -4743,9 +5131,9 @@ module_path ::= ident ("::" ident)*
   ([9.15 Module files](#915-module-files)). A `use` alias keeps the case of the member it names,
   `T as U` or `f as g`. Both rules follow from a capitalized name being a type
   ([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)).
-- An import reaches every public member of the module's shared import. Importing a module that
-  performs IO or declares mutable state is an error ([9.7 Importing asserts no IO and no
-  state](#97-importing-asserts-no-io-and-no-state)).
+- An import reaches every public member of the module's shared import. Importing a module that is
+  not shareable is an error
+  ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
 - An import passes arguments to the module's parameters as a run does
   ([9.4 Parameters](#94-parameters)): keyword-only, one for each parameter without a default. Every
   argument is a constant, so two imports of one module with equal arguments reach one shared import,
@@ -4756,8 +5144,8 @@ module_path ::= ident ("::" ident)*
   ([9.8 Module types](#98-module-types)). **[Decided]** It may be any constant
   ([9.19 Constants](#919-constants)), and two arguments with one value reach one
   shared import. A run
-  name may not: a shared import stands outside every run, and an import reaches no state ([9.7
-  Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)).
+  name may not: a shared import stands outside every run, and an import reaches no run's state
+  ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
 - An `import` stands at a module's top level. One inside a `def`, a loop, or a block is an error.
 - There is no wildcard `use`. Adding a public member to a module never changes what an importer's
   names mean.
@@ -4970,32 +5358,34 @@ access](#39-subscript-and-attribute-access)). With `import shop::cart`, `run sho
   statement down, as the run name is. A local may shadow either. A member of the module with the
   same spelling is an error naming both sites.
 
-### 9.7 Importing asserts no IO and no state
+### 9.7 Importing asserts a shareable module
 
-Importing a module asserts that the module performs no IO and declares no mutable state. A module
-performs IO when it opens a source or binds a sink, or when it runs a module that performs IO. It
-declares mutable state when its top level introduces a mutable variable, writes one, loads one with
-`@LoadFrom`, declares a feed ([8.4 Feeds are the second form of
-mutability](#84-feeds-are-the-second-form-of-mutability)), or defines a feed with `<<=`
-([4.4 Define statement `<<=`](#44-define-statement-)), or when it runs a module that declares
-mutable state. Importing
-either kind of module is an error at the `import`, with a secondary label at the IO site or the
-state. Such a module is run instead. The check is per module: a module that serves a route or holds
-state is run, whatever else it exports.
+**[Decided]** — the rules of this section. Today a module is imported only when it performs no IO
+and declares no mutable state: its top level opens no source, binds no sink, introduces, writes or
+loads (`@LoadFrom`) no mutable variable, declares or defines no feed, and runs no module that does
+any of these. The rules of this section differ in two cases: a module whose only state is induction
+variables, private feeds and loaded declarations is imported, where today it is run, and a module
+that performs no IO and declares no state cannot be run.
 
-State therefore belongs to runs. Every piece of state has a run that a `run` statement names, so the
-source says which modules reach it: the module that runs it, and the modules that run is handed to.
-An imported module declares no run, since the import would reach the run's state. A module that
-runs another is itself run.
+Importing a module asserts that it is **shareable**: its top level reads nothing from outside
+the program, and leaves behind no output and no state another module could reach
+([Shareable modules [Decided]](#shareable-modules-decided)).
+
+State that outlives a top level therefore belongs to runs. Every transactional mutable variable,
+and every feed other modules append to, has a run that a `run` statement names, so the source says
+which modules reach it: the module that runs it, and the modules that run is handed to. An imported
+module declares no run, since the import would reach the run's state. A module that runs another is
+itself run.
 
 An imported module's top level is evaluated once for each distinct set of arguments, however many
 modules import it with those arguments, because its members are values it computes. That evaluation
 is the module's **shared import** at those arguments. Every import passing them reaches the same
 members. Its run path is the module path with its arguments, so it never collides with a run a
-`run` statement names.
+`run` statement names. Its induction variables and private feeds are its own: their histories end
+with its top level, so no other module reaches them.
 
 ```python
-# inventory.cambra: declares state, so it is run and not imported
+# inventory.cambra: declares a transactional variable, so it is run and not imported
 stock: Mut(Map(String, Int), Txn) := Map::empty
 pub def reserve(sku, qty) requires Transaction:
     …
@@ -5005,6 +5395,41 @@ pub InStock = {String where _ in stock.keys()}   # intended; not supported today
 `InStock` is intended and not supported today, in one file as across modules: the compiler cannot
 name a mutable map's key set in a type. `run inventory as inv` and `run inventory as eu_inv` are two
 runs, each with its own `stock`, and `inv::InStock` is a different type from `eu_inv::InStock`.
+
+#### Shareable modules [Decided]
+
+A module is **shareable** when its top level, less what its scopes discharge, requires nothing but
+trait instances and causes nothing
+([6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided)). An import shares
+one evaluation among every import passing its arguments, so what decides is the module with its
+arguments: a statement naming a shareable module, whose arguments are each one an import may pass
+([9.2 Imports](#92-imports)), is an `import`, and any other is a `run`. Importing a module that is
+not shareable is an error at the `import`, naming what its top level requires or causes. Running a
+shareable module with arguments an import could pass is an error at the `run`. A run passed as an
+argument carries its state into the module it is passed to, which an import cannot share, so
+`run shop(counter=c)` with a run `c` is legal whatever `shop`'s top level does. The check is per
+module: a module that serves a route or holds a run's state is run, whatever else it exports.
+
+- **A top level that opens a source or takes a reading requires `Ext`,** and one that binds a sink
+  causes `Emit`. Its module is run.
+- **A transactional mutable variable makes its module a run.** Its declaration writes it, and the
+  top level's end does not discharge `Write` of a variable bound by the run.
+- **So does a public feed.** Other modules append to it, so declaring it causes `Append`, which
+  the top level's end does not discharge.
+- **An induction variable and a private feed do not.** Each one's history ends with the top level,
+  so its writes are discharged there, and a module whose only state is induction variables and
+  private feeds is shareable when nothing else makes it a run. A public function that reads or
+  writes an induction variable names it past its scope, which is an error
+  ([9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
+  A public function that appends to a private feed makes the feed the run's, as a public feed is,
+  since appends commute and have no order to lose across modules.
+- **`@LoadFrom` is outside this model.** A loaded declaration
+  ([8.8 `@LoadFrom`](#88-loadfrom)) binds a plain value the version it replaces carried across the
+  reload, which its top level neither requires nor causes, so a load makes no module a run.
+- **A `run` statement requires and causes what its module's top level does,** so a module that runs
+  another is run.
+- **A top level from which an exception escapes is an error,** imported or run
+  ([Exceptions](#exceptions)).
 
 ### 9.8 Module types
 
@@ -5067,8 +5492,8 @@ Each run performs its module's top level, with its parameters bound to its argum
 - Its own runs run with it, and their run paths extend its own.
 
 Runs share state only by being passed: a module passes one run to others as an argument. A shared
-import holds no state ([9.7 Importing asserts no IO and no
-state](#97-importing-asserts-no-io-and-no-state)):
+import holds no state that outlives its top level
+([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)):
 
 ```python
 run audit
@@ -5296,7 +5721,9 @@ with the type `Count` names.
   ([9.19 Constants](#919-constants)).
   **[Planned]** — and which public functions may be called in a constant.
 - **Imports are read through contracts.** A module sees each member another module exports through
-  its contract, and whether the module performs IO or declares mutable state.
+  its contract, and whether the module is shareable
+  ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
+  **[Decided]** A function's contract includes its `requires` and `causes` clauses.
 - **A public member's contract is its type.** An exactly annotated member's contract is the
   annotation, checked against the body, and a module using the member reads no body. An unannotated
   member's contract is its inferred type, refinements and all, and a `<:` member's is its inferred
@@ -5376,6 +5803,11 @@ a `const param` and each run serves its own.
 The prelude (`sum`, `max`, `groupby`, `stdin`, `box`, `begin`, …) stays unqualified and in
 scope in every module.
 
+An **intrinsic** is a builtin whose name begins with `__`, such as `__now`. Every intrinsic exists
+in every program, but only a std module names one: a user module that names one is refused, as a
+module path segment beginning with `__` is ([9.15 Module files](#915-module-files)). A program
+reaches an intrinsic through the std function that calls it, as `time::now()` calls `__now()`.
+
 **[Decided]** — `Option` is a `type` declared in a std module, and is in the prelude
 ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Builtin
 operations that answer an `Option`, the lookup `c[k]` and the unwrap `e!`
@@ -5398,8 +5830,10 @@ script-shaped root therefore needs an output sink, which [10. Sinks](#10-sinks) 
 A reload replaces the source of every module, the root's included, and the running program carries
 its state across ([8.8 `@LoadFrom`](#88-loadfrom)):
 
-- **State belongs to runs.** Each run's state is its own, and a shared import holds none
-  ([9.7 Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)). A reload
+- **State belongs to runs.** Each run's state is its own. A reload carries nothing for a shared
+  import: its top level reads nothing from outside the program, so the new version evaluates it
+  again ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)), and
+  its loaded declarations pair by its run path as a run's do. A reload
   pairs the runs of the two versions by run path. A run the new version adds starts from its
   declared initial values. A run present in both takes over its state, whether its module's source,
   its arguments, or both changed.
@@ -5506,11 +5940,14 @@ pub type Capped = {Int where _ <= limit}
   ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). `const` before any
   other statement is an error.
 - **[Planned]** **A function may be called in a constant when its body reads only its own
-  parameters, constants, and functions that may be.** Functions carry no marker. The check follows
-  a `def` through its body and every function that body calls, and reads an imported function
-  through its module's interface, which records whether each public function may be
-  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). A call to one that may
-  not is an error naming the binding, source, feed or mutable variable its body reads.
+  parameters, constants, and functions that may be, and it requires nothing and causes nothing**
+  ([6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided)). Requiring and
+  causing nothing is not enough alone: a function that captures a value the run computes is not
+  one. Functions carry no marker. The check
+  follows a `def` through its body and every function that body calls, and reads an imported
+  function through its module's interface, which records whether each public function may be ([9.14
+  Checking a module on its own](#914-checking-a-module-on-its-own)). A call to one that may not is
+  an error naming the binding, source, feed or mutable variable its body reads.
 - **A read of a constant is known to be the constant**, in a module checked alone too, where a
   `const` parameter has no value yet. There `Capped::new(max_rate)` meets
   `{Int where _ <= max_rate}`, and in a module that writes `run shop(max_rate=r + 1) as a`, a value
@@ -5555,6 +5992,11 @@ the whole of what the program produces: the value of its trailing expression
 is discarded.
 
 Sinks may observe the indices of collections passed to them if needed.
+
+**[Decided]** A sink is any operation that hands data out of the program: binding a feed to a sink,
+or calling a sink function that takes a collection and writes it out. Feeds are one way to build the
+collection, not the only one. Each causes `Emit`
+([Output outside the program](#output-outside-the-program)).
 
 ## 11. Errors and recovery
 

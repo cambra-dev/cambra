@@ -287,7 +287,7 @@ pub(super) const RUN_MODULE: &str = "an import name or a run name";
 pub(super) const IMPORT_MODULE: &str = "an import name";
 
 /// What makes a module one that is run and not imported (`docs/chl-spec.md`,
-/// "9.7 Importing asserts no IO and no state").
+/// "9.7 Importing asserts a shareable module").
 #[derive(Debug, Clone, Copy)]
 pub enum Unimportable {
     /// The module performs IO here: it opens a source or binds a sink.

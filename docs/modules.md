@@ -922,7 +922,7 @@ the [Implementation stack](#implementation-stack).
   `{String where _ in stock.keys()}` over `stock: Mut(Map(String, Int), Txn)`, names a key set that
   changes with each commit. The compiler cannot name a mutable map's key set in a type today, in one
   file or several. Needed for a per-run type such as `InStock` ([chl-spec.md, "9.7 Importing
-  asserts no IO and no state"](chl-spec.md#97-importing-asserts-no-io-and-no-state)).
+  asserts a shareable module"](chl-spec.md#97-importing-asserts-a-shareable-module)).
 - **Constants where an import resolves.** A link-time constant is a `const` parameter or a binding
   whose definition is a constant ([chl-spec.md, "9.19 Constants"](chl-spec.md#919-constants)), and
   linking gives each run's `const` parameters their values ([Runs](#runs)). An import's arguments

@@ -20,7 +20,7 @@ load the modules ([Tests](#tests)).
 
 - **A module that declares state or performs IO is run; every other module is imported.** Importing
   asserts that a module declares no mutable variable or feed and opens no source
-  ([9.7 Importing asserts no IO and no state](../docs/chl-spec.md#97-importing-asserts-no-io-and-no-state)).
+  ([9.7 Importing asserts a shareable module](../docs/chl-spec.md#97-importing-asserts-a-shareable-module)).
   A function that performs IO when called, such as `time::now()` or `time::alarms()`, leaves its
   module importable: the IO belongs to the module whose evaluation calls it.
 - **One concept per module, named by a noun:** `time`, `http`. A module's members read qualified,
@@ -83,7 +83,7 @@ no hedges. The repo's
 [prose rules](../CLAUDE.md#prose-style-specifications-not-blog-posts) apply in full.
 
 - **Cite the spec by heading**: the path, then the heading's exact text in double quotes,
-  `docs/chl-spec.md, "9.7 Importing asserts no IO and no state"`, never a section number alone.
+  `docs/chl-spec.md, "9.7 Importing asserts a shareable module"`, never a section number alone.
   `./ci.sh doc_refs` checks it in full-line comments; a citation in a comment trailing code is not
   read.
 - **Use the spec's names.** A std concept the spec already names takes that name. A name the spec
