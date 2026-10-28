@@ -244,3 +244,32 @@ fn variant_wrap_at_the_outermost_level_sends_everything() {
         0,
     );
 }
+
+fn union_extent() -> Extent {
+    Extent::Union(crate::ccl::TagMap::from_arms(vec![(
+        crate::ccl::FieldKey::Index(0),
+        int(),
+    )]))
+}
+
+fn union_stream() -> Tiling {
+    Tiling::data_function(Extent::uint_range(8), Tiling::Scalar(union_extent()))
+}
+
+fn variant_project(input: Tiling) -> Built {
+    let (input, consumer) = feed(input);
+    let op = VariantProject::new(input, crate::ccl::FieldKey::Index(0), int());
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn variant_project_forwards_the_region_of_a_stream() {
+    assert_keeps(&|| variant_project(union_stream()), 0);
+    assert_keeps_without_state(&|| variant_project(union_stream()), 0);
+}
+
+/// A bare union has no keys of its own.
+#[test]
+fn variant_project_over_a_bare_union_sends_everything() {
+    assert_widens(&|| variant_project(Tiling::Scalar(union_extent())), 0);
+}
