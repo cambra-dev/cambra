@@ -1972,8 +1972,11 @@ fn run_frontend(
 
     // Drain sink bindings before taking sources.
     let sink_bindings = ctx.lowering_ctx().take_sink_bindings();
-    // The instances the program declares are inference's to read.
+    // The instances the program declares are inference's to read, and so are the expression
+    // statements it writes.
     ctx.inference_ctx().instances = Rc::new(ctx.lowering_ctx().take_instances());
+    ctx.inference_ctx().expression_statements =
+        std::mem::take(&mut ctx.lowering_ctx().expression_statements);
 
     // Check identity before keying attribution by NodeId: duplicate live IDs
     // would collapse separate nodes' entries. Both boundary assertions are
@@ -2374,6 +2377,8 @@ pub fn check_program(
     }
     let lowering_session = LoweringSession::install();
     let lowered = lower_for_check(program, ctx.lowering_ctx());
+    ctx.inference_ctx().expression_statements =
+        std::mem::take(&mut ctx.lowering_ctx().expression_statements);
     errors.extend(lowered.into_iter().map(CompileError::Lower));
     let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
     if !errors.is_empty() {
@@ -2563,6 +2568,13 @@ fn run_passes(
     // (compiler-bug backstops), these are user errors: aliasing or nesting a
     // mutable reference.
     check_mut_rules(&expr, &blame)?;
+
+    // An expression statement that causes nothing, reported once the checks that diagnose
+    // a statement more precisely have run (`docs/chl-spec.md`, "4.9 Expression statement").
+    let inert = std::mem::take(&mut ctx.inference_ctx().inert);
+    if !inert.is_empty() {
+        return Err(blame.infer(inert, &expr));
+    }
 
     // The last check that reads effects has run, so they are erased: every pass after this
     // one builds function types that state none.

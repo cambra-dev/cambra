@@ -310,7 +310,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             emit_compose(elts, &recorded_ty, node_id, stamped.as_ref(), ctx)?
         }
 
-        TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
+        TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, node_id, ctx)?,
 
         TypedExprNode::Defer => emit_defer(ctx),
         // A value known only by its type, which the `let` binding it states.
@@ -1542,11 +1542,12 @@ pub(super) fn emit_record<C: Typing>(
 pub(super) fn emit_expr_stmt<C: Typing>(
     e: &mut Expr,
     body: &mut Expr,
+    statement: NodeId,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     // A failed statement is recovered from: its value is discarded either way.
     let reads_before = ctx.poisoned_reads();
-    if let Err(error) = ctx.subexpr(e) {
+    if let Err(error) = ctx.statement(statement, |ctx| ctx.subexpr(e)) {
         ctx.recover(error, reads_before)?;
     }
     // The continuation's value is passed along: a mutable variable reads, and a feed stays
@@ -1988,6 +1989,7 @@ pub(super) fn emit_let<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     let recoveries_before = ctx.recoveries();
     let (scheme, defined) = emit_let_definition(binding, bound_expr, Some(body), ctx)?;
+    ctx.note_binding(&binding.name, &bound_expr.ty, bound_expr.node_id());
     // A right-hand side holding a statement recovered from has untyped nodes, so, like one
     // that did not type, it has no value to discharge.
     let defined = defined && ctx.recoveries() == recoveries_before;
