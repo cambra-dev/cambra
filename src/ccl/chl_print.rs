@@ -292,15 +292,24 @@ impl Printer {
                 },
             })
             .collect();
-        let body = self.ty(&poly.body);
+        // A function body's capabilities join the trait requirements after the codomain.
+        let (body, capabilities) = match &poly.body {
+            Type::Fun { capabilities, .. } => (
+                poly.body
+                    .clone()
+                    .with_capabilities(crate::ccl::capabilities::Capabilities::none()),
+                capabilities.clone(),
+            ),
+            body => (body.clone(), crate::ccl::capabilities::Capabilities::none()),
+        };
+        let body = self.ty(&body);
         let mut requires = family_bounds;
         requires.extend(poly.requires_text(|t| self.ty(t)));
-        let mut text = format!("forall ({}) {body}", params.join(", "));
-        if !requires.is_empty() {
-            text.push_str(" requires ");
-            text.push_str(&requires.join(", "));
-        }
-        text
+        format!(
+            "forall ({}) {body}{}",
+            params.join(", "),
+            crate::ccl::capabilities::clauses(requires, &capabilities)
+        )
     }
 
     fn ty(&mut self, ty: &Type) -> String {
@@ -389,7 +398,11 @@ impl Printer {
                 fun_kind,
                 domain,
                 codomain,
-            } => self.fun(name.as_ref(), fun_kind, domain, codomain),
+                capabilities,
+            } => format!(
+                "{}{capabilities}",
+                self.fun(name.as_ref(), fun_kind, domain, codomain)
+            ),
             Type::History {
                 function,
                 history_kind,
@@ -572,6 +585,7 @@ impl Printer {
                         fun_kind: FunKind::Data(None),
                         domain: Box::new(candidate.clone()),
                         codomain: Box::new(values),
+                        capabilities: crate::ccl::capabilities::Capabilities::none(),
                     };
                     self.ty(&alternative)
                 })

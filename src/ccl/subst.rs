@@ -2373,6 +2373,9 @@ impl Subst {
                 fun_kind,
                 domain,
                 codomain,
+                // A capability names a variable bound outside the function, never a term
+                // this substitution maps (`src/ccl/design/type-inference.md`, "Capability variables").
+                capabilities: _,
             } => {
                 // A witness binder is a *type*-level binder, so a term substitution has
                 // no name to map here — only the kinds' type children need rewriting.
@@ -2390,6 +2393,9 @@ impl Subst {
                 fun_kind,
                 domain,
                 codomain,
+                // A capability names a variable bound outside the function, never a term
+                // this substitution maps (`src/ccl/design/type-inference.md`, "Capability variables").
+                capabilities: _,
             } => {
                 for w in fun_kind.witnesses_mut() {
                     for t in w.types_mut() {
@@ -2742,12 +2748,14 @@ impl Subst {
                         name,
                         domain,
                         codomain,
+                        capabilities,
                         ..
                     } => Type::Fun {
                         name,
                         fun_kind: FunKind::Data(None),
                         domain,
                         codomain,
+                        capabilities,
                     },
                     other => other,
                 }
@@ -2827,11 +2835,13 @@ impl Subst {
                 fun_kind,
                 domain,
                 codomain,
+                capabilities,
             } => Type::Fun {
                 name: None,
                 fun_kind: self.apply_fun_kind(fun_kind),
                 domain: Box::new(self.apply_domain(fun_kind, domain)),
                 codomain: Box::new(self.apply_type(codomain)),
+                capabilities: capabilities.clone(),
             },
 
             Type::Fun {
@@ -2839,6 +2849,7 @@ impl Subst {
                 fun_kind,
                 domain,
                 codomain,
+                capabilities,
             } => {
                 let domain = Box::new(self.apply_domain(fun_kind, domain));
                 let inner = self.under_binder_ty(b, codomain);
@@ -2847,6 +2858,7 @@ impl Subst {
                     fun_kind: self.apply_fun_kind(fun_kind),
                     domain,
                     codomain: Box::new(inner),
+                    capabilities: capabilities.clone(),
                 }
             }
 
@@ -3498,6 +3510,9 @@ pub fn walk_children_opened<'t>(
             fun_kind,
             domain,
             codomain,
+            // A capability names a variable bound outside the function, never its own binder,
+            // so the binder's substitution reaches no capability.
+            capabilities: _,
         } => {
             for w in fun_kind.witnesses() {
                 for t in w.types() {
@@ -3959,6 +3974,7 @@ impl<'a> PiWalk<'a> {
                 fun_kind,
                 domain,
                 codomain,
+                ..
             } => {
                 // A binder scopes over its codomain only: the domain stays at
                 // the enclosing depth, the codomain is one crossing deeper. A name
@@ -4891,6 +4907,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::infer()),
             codomain: Box::new(refined(gt(var("i"), var("k")))),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let out = Subst::discharge("k", int(5)).apply_type(&ty);
         let Type::Fun { codomain, .. } = &out else {
@@ -5237,6 +5254,7 @@ mod tests {
             ])),
             fun_kind: FunKind::Data(Some(Rc::new(vec![w0, w1]))),
             codomain: Box::new(int.clone()),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let c = Rc::new(var("c"));
         let projection = |i| Type::WitnessProjection(WitnessProjection::new(Rc::clone(&c), i));
@@ -5247,6 +5265,7 @@ mod tests {
                 fun_kind: FunKind::Data(None),
                 domain: Box::new(Type::Tuple(vec![projection(0), projection(1)])),
                 codomain: Box::new(int),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             }
         );
     }
@@ -5622,6 +5641,7 @@ mod locally_nameless_tests {
                 fun_kind: crate::ccl::FunKind::Compute,
                 domain: Box::new(int()),
                 codomain: Box::new(refined(TypedExpr::var(x.clone()))),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             },
         );
         let Type::Fun {

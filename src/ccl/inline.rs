@@ -1877,6 +1877,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -1895,7 +1896,9 @@ mod tests {
                 fun_kind: FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             }),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -1913,12 +1916,14 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let ty = Type::Fun {
             name: None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::refined_one(inner_fun, refinement)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -1933,6 +1938,7 @@ mod tests {
             fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(!should_inline(&ty));
     }
@@ -1947,6 +1953,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -1962,6 +1969,7 @@ mod tests {
                 Type::Base(BaseType::Int),
             ])),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -1978,6 +1986,7 @@ mod tests {
                 Type::Base(BaseType::Int),
             ])),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -2262,6 +2271,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 

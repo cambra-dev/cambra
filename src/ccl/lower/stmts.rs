@@ -3028,6 +3028,7 @@ pub(super) fn lower_trait_type(
     Ok(crate::ccl::ty::TraitRequirement {
         trait_,
         args,
+        terms: Vec::new(),
         assoc: Vec::new(),
         at: Some(span),
     })
@@ -3055,6 +3056,7 @@ fn holes_to_params(
             fun_kind: fun_kind @ crate::ccl::FunKind::Var(k),
             domain,
             codomain,
+            capabilities,
         } = ty
             && k.is_hole()
             && matches!(**domain, Type::Hole)
@@ -3064,6 +3066,7 @@ fn holes_to_params(
                 fun_kind: fun_kind.clone(),
                 domain: domain.clone(),
                 codomain: Box::new(go(codomain, fresh, bounded)),
+                capabilities: capabilities.clone(),
             };
         }
         if matches!(ty, Type::Hole) {
@@ -3301,6 +3304,7 @@ fn expand_requirement(
             out.push(Rc::new(crate::ccl::ty::TraitRequirement {
                 trait_,
                 args: args.iter().map(Type::canonical).collect(),
+                terms: Vec::new(),
                 assoc,
                 at: Some(span),
             }));
@@ -3332,6 +3336,7 @@ fn expand_requirement(
     out.push(Rc::new(crate::ccl::ty::TraitRequirement {
         trait_,
         args,
+        terms: Vec::new(),
         assoc,
         at: Some(span),
     }));
@@ -3647,6 +3652,7 @@ pub(super) fn lower_type_expr_or_poly(
                 fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             })
         }
         ChlExpr::TypeBinder { name, .. } => Err(LoweringError::unsupported(
@@ -4912,6 +4918,7 @@ fn lower_type_application(
                     fun_kind: crate::ccl::FunKind::Data(None),
                     domain: Box::new(key.clone()),
                     codomain: Box::new(value),
+                    capabilities: crate::ccl::capabilities::Capabilities::none(),
                 });
             }
             // A family parameter passed on is the family it applies, read at the key.

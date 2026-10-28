@@ -1184,8 +1184,9 @@ mod tests {
     // Lambda with function type annotation
     #[case(
         Expr::lambda(
-            "x", Occurrence::mint(),
-            Type::Fun { name: None, fun_kind: crate::ccl::ty::FunKind::Compute, domain: Box::new(Type::Base(BaseType::Int)), codomain: Box::new(Type::Base(BaseType::Bool)) },
+            "x",
+            Occurrence::mint(),
+            Type::Fun { name: None, fun_kind: crate::ccl::ty::FunKind::Compute, domain: Box::new(Type::Base(BaseType::Int)), codomain: Box::new(Type::Base(BaseType::Bool)) , capabilities: crate::ccl::capabilities::Capabilities::none() },
             Expr::var("x"),
         ),
         "λ x : (Int ⇒ Bool) → x"

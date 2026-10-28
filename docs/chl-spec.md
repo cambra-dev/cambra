@@ -661,8 +661,8 @@ The effecting forms:
 - **A call to an effecting function** — one that writes a `Mut(…)` parameter (pass-by-reference,
   §6.2) or writes a transactional mutable variable in a `with begin():` block of its own or in the
   block that calls it (§8, §8.7, **[Decided]**) — performs that function's writes. A function's
-  effects are always visible in its type: its `causes` clause states them, written or inferred
-  (**[Decided]**). There are **no
+  effects are always visible in its type: its `causes` clause states them, inferred, or
+  written (**[Decided]**). There are **no
   implicit-effect functions**, so an inert expression statement (§4.9) stays detectable and
   rejected.
 - **`raise`** (**[Decided]**), a call that may raise, and an output outside the program, such
@@ -3481,7 +3481,16 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 ### 6.9 Capabilities
 
-**[Decided]** — the rules of this section.
+**[Decided]** — written clauses, clause variables and tops ([Writing requirements and
+effects](#writing-requirements-and-effects)); effects in traits ([Effects in
+traits](#effects-in-traits)); refusing a function that outlives a variable it names, and a nested
+transaction, by their capabilities; `Transaction` in a function a block calls ([8.7 Transactions as
+contextual parameters](#87-transactions-as-contextual-parameters)); readings ([Inputs from outside
+the program](#inputs-from-outside-the-program)); exceptions ([Exceptions](#exceptions)); naming
+another module's public transactional variable, `WriteTxn(inv::stock)`; sink functions and calls
+made outside the program ([Output outside the program](#output-outside-the-program)); and keeping
+readings across a reload and a restart ([Inputs from outside the
+program](#inputs-from-outside-the-program)). The rest of this section is implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what
 the call contributes besides its result, in its **`causes` clause**. A requirement is an input that
@@ -5171,7 +5180,7 @@ for req in withdraw_reqs:
 - **Trailing induction read** — after a `for` loop, a bare reference to an
   induction accumulator is its final value (or the pre-loop value if the
   source was empty). The loop has ended, so "latest" is unambiguous.
-- **A function's result** (**[Decided]**) — a bare reference as a function's last statement
+- **A function's result** — a bare reference as a function's last statement
   is a read: the function returns the variable's value where its body ends,
   never the variable, which no function returns (§8.1).
   `def total(xs): s := 0; for x in xs: s += x; s` returns the sum, and
@@ -6215,7 +6224,7 @@ Count`, not with the type `Count` names.
 - **Imports are read through contracts.** A module sees each member another module exports through
   its contract, and whether the module is shareable
   ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
-  A function's contract includes its `requires` and `causes` clauses (**[Decided]**).
+  A function's contract includes its `requires` and `causes` clauses.
 - **A public member's contract is its type.** An exactly annotated member's contract is the
   annotation, checked against the body, and a module using the member reads no body. An unannotated
   member's contract is its inferred type, refinements and all, and a `<:` member's is its inferred

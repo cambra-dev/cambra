@@ -2924,6 +2924,10 @@ fn run_passes(
         &instances,
     )?;
 
+    // The last check that reads capabilities has run, so they are erased: every pass after this
+    // one builds function types that state none.
+    crate::ccl::capabilities::erase(&mut expr);
+
     // Give each named read its position back, now that inference has run and no
     // refinement needs a binder to mention (`crate::ccl::mut_read::unbind`).
     // Before the pane below, so one phase sits on one side of it; before
@@ -3988,11 +3992,13 @@ Error: lowering error
         x
         "#}, "x += 2", 0)]
     #[case::mut_rule_1(indoc::indoc! {r#"
-        def g(n):
-            z := n
-            z
-        g(5)
-        "#}, "g(5)", 0)]
+        def bump(c: Mut(Int)):
+            c += 1
+        x := 0
+        y := 1
+        bump(x if True else y)
+        x
+        "#}, "x if True else y", 0)]
     // An undetermined type is reported at the innermost node holding it, the first read of `x`.
     #[case::ambiguous_program(indoc::indoc! {r#"
         f = \x -> [x, x]

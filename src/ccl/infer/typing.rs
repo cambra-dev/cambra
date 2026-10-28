@@ -48,8 +48,8 @@ pub(super) enum MethodCallsEnd {
 /// The written argument an A-normalization temp names, before reading mutable variables.
 #[derive(Clone)]
 pub(super) enum TempNames {
-    /// A source variable, at its own type rather than the type of its read value.
-    Variable(Type),
+    /// A source variable, by name and at its own type rather than the type of its read value.
+    Variable(Name, Type),
     /// A computed expression, which supplies no variable to pass by reference.
     Computed,
 }
@@ -345,6 +345,70 @@ pub(super) trait Typing {
         Self: Sized,
     {
         self.scoped(name, ty, f)
+    }
+
+    /// Run `f` as a function body, and answer the capabilities its function type states
+    /// (`src/ccl/design/type-inference.md`, "Capability variables"). Emit collects them on a
+    /// fresh variable. Check reads them off `recorded`, the type inference wrote.
+    fn function_body<R>(
+        &mut self,
+        recorded: &Type,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, crate::ccl::capabilities::Capabilities)
+    where
+        Self: Sized,
+    {
+        let capabilities = match recorded {
+            Type::Fun { capabilities, .. } => capabilities.clone(),
+            _ => crate::ccl::capabilities::Capabilities::none(),
+        };
+        (f(self), capabilities)
+    }
+
+    /// The capabilities of the composition of `parts`, a chain whose own type is `recorded`.
+    /// Emit collects the parts' on a fresh variable, settled by the chain's kind as a
+    /// function body's are; Check reads them off `recorded`.
+    fn composed_capabilities(
+        &mut self,
+        recorded: &Type,
+        _parts: &[Type],
+    ) -> crate::ccl::capabilities::Capabilities {
+        match recorded {
+            Type::Fun { capabilities, .. } => capabilities.clone(),
+            _ => crate::ccl::capabilities::Capabilities::none(),
+        }
+    }
+
+    /// Record that the enclosing function body requires or causes `item`, which names
+    /// the variable `name` where it names one. Emit records it on the body's effect
+    /// variable; Check reads capabilities off the recorded types and records nothing.
+    fn record_capability(
+        &mut self,
+        _item: crate::ccl::capabilities::Capability,
+        _name: Option<&Name>,
+    ) {
+    }
+
+    /// Record that writing `name` requires `Transaction`, when it is a transactional
+    /// mutable variable. Check records nothing.
+    fn record_transactional_access(&mut self, _name: &Name) {}
+
+    /// Record what reading the mutable variable `name` as a value requires: a position in
+    /// its history, `Read(name)`, and `Transaction` too for a transactional one. Check records
+    /// nothing.
+    fn record_read(&mut self, _name: &Name) {}
+
+    /// Record that `name`, just bound at `ty`, is a mutable variable its scope declares
+    /// rather than a parameter, whose history would be its argument's.
+    fn declare_mutable(&mut self, _name: &Name, _ty: &Type) {}
+
+    /// Run `f` as the body of a `with begin():` block, which supplies `Transaction` to
+    /// what it calls.
+    fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized,
+    {
+        f(self)
     }
 
     /// Emit/check a `let` RHS. Emit bumps the polymorphism level so RHS-local

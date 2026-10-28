@@ -1503,6 +1503,7 @@ pub(crate) fn chain_type(elts: &[Expr], fun_kind: crate::ccl::ty::FunKind) -> Ty
             fun_kind,
             domain: Box::new(head_domain),
             codomain: Box::new(last_codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         },
     )
 }
@@ -1519,6 +1520,7 @@ pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
         fun_kind,
         domain,
         codomain,
+        capabilities,
     } = head.ty.peel_refinements().clone()
     else {
         panic!("a view reads a collection, got {}", head.ty)
@@ -1535,6 +1537,7 @@ pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: codomain.clone(),
+        capabilities: capabilities.clone(),
     };
     let value = crate::ccl::subst::open_codomain(&named, &codomain);
     let mut body =
@@ -1559,6 +1562,7 @@ pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
             fun_kind,
             domain: domain.clone(),
             codomain: Box::new(body.ty.clone()),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     };
     Expr::lambda(position, Occurrence::mint(), *domain, body).with_ty(ty)
@@ -1664,6 +1668,7 @@ pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> 
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: codomain.clone(),
+        capabilities: crate::ccl::capabilities::Capabilities::none(),
     };
     let item = crate::ccl::subst::open_codomain(&named, &codomain);
     let read = Expr::apply(
@@ -1821,6 +1826,7 @@ fn without_unread_binder(stated: Type, elts: &[Expr]) -> Type {
         fun_kind,
         domain,
         codomain,
+        capabilities,
     } = &stated
     else {
         return stated;
@@ -1838,6 +1844,7 @@ fn without_unread_binder(stated: Type, elts: &[Expr]) -> Type {
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: codomain.clone(),
+        capabilities: capabilities.clone(),
     }
 }
 
@@ -1899,11 +1906,13 @@ pub(crate) fn read_at_position(
                     fun_kind,
                     domain,
                     codomain,
+                    capabilities,
                 } => Type::Fun {
                     name: Some(b.refreshed()),
                     fun_kind,
                     domain,
                     codomain,
+                    capabilities,
                 },
                 other => other,
             };
@@ -2292,6 +2301,7 @@ pub fn refined_data_fun(
             Refinement::born(Rc::new(predicate)),
         )),
         codomain: Box::new(codomain),
+        capabilities: crate::ccl::capabilities::Capabilities::none(),
     }
 }
 

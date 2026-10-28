@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::traits::{TraitObligation, TraitObligationId};
+use crate::ccl::capabilities::{Capabilities, CapabilityVar, CapabilityVarId, Repr};
 use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::TraitRequirement;
@@ -223,6 +224,10 @@ pub struct FreshenCache {
     /// `DomainJoinConflict`. Freshening mints one `κ'` per original `κ` (bounds
     /// copied so def-intrinsic forcing survives), consistently within a copy.
     pub fun_kind_vars: HashMap<FunKindVarId, Rc<FunKindVar>>,
+    /// Original quantified capability variable → its fresh replacement, so the capabilities of
+    /// two uses of one generalized function are collected apart
+    /// (`src/ccl/design/type-inference.md`, "Polymorphism and materialization").
+    pub capability_vars: HashMap<CapabilityVarId, Rc<CapabilityVar>>,
     /// Original kind-variable binder → the copy's binder at the same position.
     ///
     /// A kind variable's binders are quantified with it: they are the scope its edges
@@ -366,6 +371,33 @@ fn freshen_fun_kind(
 /// Caching by `uid` is what keeps repeated occurrences of one `κ` in a single
 /// copy identified; the copy decouples *this* instantiation's pin from the
 /// definition's and from every sibling instantiation's.
+/// A copy of the capability variable `v` and of every variable above `lim` flowing into it, each
+/// with its capabilities and edges; one at or below `lim` is shared, as a type variable is.
+fn freshen_capability_var(
+    lim: Level,
+    v: &Rc<CapabilityVar>,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Rc<CapabilityVar> {
+    if v.level() <= lim {
+        return Rc::clone(v);
+    }
+    if let Some(f) = cache.capability_vars.get(&v.uid) {
+        return Rc::clone(f);
+    }
+    let f = CapabilityVar::fresh(target.level_of(v.level()));
+    // Cached before the edges are copied, so a cycle reaches the copy.
+    cache.capability_vars.insert(v.uid, Rc::clone(&f));
+    for capability in v.own() {
+        f.record(capability);
+    }
+    for (source, filter) in v.incoming() {
+        let source = freshen_capability_var(lim, &source, target, cache);
+        f.flows_from(&source, filter);
+    }
+    f
+}
+
 fn freshen_kind_var(
     kv: &Rc<FunKindVar>,
     lim: Level,
@@ -681,6 +713,7 @@ pub fn freshen_above(
             fun_kind,
             domain: d,
             codomain: c,
+            capabilities,
         } => {
             // An operator scheme's binder names are the template's, like its witnesses, so
             // each instantiation names its own: two `box`es binding one name would put one
@@ -725,6 +758,12 @@ pub fn freshen_above(
                 fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
+                capabilities: match capabilities.repr() {
+                    Repr::Var(v) => {
+                        Capabilities::var(freshen_capability_var(lim, v, target, cache))
+                    }
+                    Repr::Known(_) => capabilities.clone(),
+                },
             };
             // The parts of a function whose kind may bind witnesses sit under those binders.
             if let Type::Fun {
@@ -1506,6 +1545,7 @@ mod tests {
             fun_kind: FunKind::Var(Rc::clone(&kv)),
             domain: Box::new(Type::Infer(InferVar::fresh(5))),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: Capabilities::none(),
         };
         let mut cache = FreshenCache::new();
         let fresh = freshen_above(0, &f, FreshenLevel::At(1), &mut cache);
@@ -1565,6 +1605,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(refined_domain),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            capabilities: Capabilities::none(),
         };
         assert_eq!(
             type_level(&ty),

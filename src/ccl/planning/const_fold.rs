@@ -335,6 +335,7 @@ fn gate_operand_at(
                 fun_kind: fun_kind.clone(),
                 domain: domain.clone(),
                 codomain: Box::new(logic.ty.codomain()?),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             },
         };
         // A kept literal is typed by its own refinement (`Bool@false`) and is re-stamped with

@@ -137,7 +137,10 @@ fn generalized_bodies(ty: &Type) -> Type {
 /// as the name `b`.
 fn codomain_opened_as(fun: &Type, codomain: &Type, b: &crate::ccl::Name) -> Type {
     let Type::Fun {
-        fun_kind, domain, ..
+        fun_kind,
+        domain,
+        capabilities,
+        ..
     } = fun.peel_refinements()
     else {
         unreachable!("only a function has a codomain")
@@ -147,6 +150,7 @@ fn codomain_opened_as(fun: &Type, codomain: &Type, b: &crate::ccl::Name) -> Type
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: Box::new(codomain.clone()),
+        capabilities: capabilities.clone(),
     };
     crate::ccl::subst::open_codomain(&renamed, codomain)
 }
@@ -159,11 +163,13 @@ pub(crate) fn opened_deep(ty: &Type) -> Type {
             fun_kind,
             domain,
             codomain,
+            capabilities,
         } => Type::Fun {
             name: Some(b.clone()),
             fun_kind: fun_kind.clone(),
             domain: Box::new(opened_deep(domain)),
             codomain: Box::new(opened_deep(&crate::ccl::subst::open_codomain(ty, codomain))),
+            capabilities: capabilities.clone(),
         },
         // A family's body reads its binders by their names.
         Type::Family { binders, body } if binders.iter().all(|(n, _)| n.is_some()) => {
@@ -210,6 +216,7 @@ pub(crate) fn closed_deep(ty: &Type) -> Type {
             fun_kind,
             domain,
             codomain,
+            ..
         } => Type::pi_kinded(
             b.clone(),
             closed_deep(domain),
@@ -288,6 +295,7 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
                 fun_kind,
                 domain,
                 codomain,
+                capabilities,
             },
             sup_fun @ Type::Fun {
                 name: sup_name,
@@ -312,6 +320,7 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
                             fun_kind: fun_kind.clone(),
                             domain,
                             codomain: Box::new(aligned),
+                            capabilities: capabilities.clone(),
                         }
                     } else {
                         Type::pi_kinded(b, *domain, aligned, fun_kind.clone())
@@ -322,6 +331,7 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
                     fun_kind: fun_kind.clone(),
                     domain,
                     codomain: Box::new(align_sub(codomain, sc)),
+                    capabilities: capabilities.clone(),
                 },
             }
         }
@@ -808,6 +818,7 @@ fn walk(
             fun_kind: fun_kind.clone(),
             domain: Box::new(argument.ty.clone()),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         function.ty = match &e.ty {
             Type::Poly(p) if p.is_generalized() => {
@@ -1007,6 +1018,7 @@ fn renamed_apart(
             fun_kind,
             domain,
             codomain,
+            ..
         } if free.contains(b) => {
             let fresh = match renames.iter().find(|(_, original)| original == b) {
                 Some((fresh, _)) => fresh.clone(),
@@ -1044,6 +1056,7 @@ fn restored_names(ty: &Type, renames: &[(crate::ccl::Name, crate::ccl::Name)]) -
             fun_kind,
             domain,
             codomain,
+            capabilities,
         } => {
             let name = match renames.iter().find(|(fresh, _)| fresh == b) {
                 Some((_, original))
@@ -1058,6 +1071,7 @@ fn restored_names(ty: &Type, renames: &[(crate::ccl::Name, crate::ccl::Name)]) -
                 fun_kind: fun_kind.clone(),
                 domain: Box::new(restored_names(domain, renames)),
                 codomain: Box::new(restored_names(codomain, renames)),
+                capabilities: capabilities.clone(),
             }
         }
         _ => {
@@ -1085,6 +1099,7 @@ fn generalized_go(
         fun_kind,
         domain,
         codomain,
+        capabilities,
     } = ty.peel_refinements()
     else {
         // A component that is a compute function is generalized on its own; a collection is its
@@ -1131,6 +1146,7 @@ fn generalized_go(
             fun_kind: fun_kind.clone(),
             domain: domain.clone(),
             codomain: Box::new(codomain),
+            capabilities: capabilities.clone(),
         };
         return Ok(match inner {
             Type::Poly(p)
@@ -1572,6 +1588,7 @@ fn drop_facts_naming(
                 fun_kind,
                 domain,
                 codomain,
+                capabilities,
             } => Type::Fun {
                 name: name.clone(),
                 fun_kind: fun_kind.clone(),
@@ -1583,6 +1600,7 @@ fn drop_facts_naming(
                     whole,
                 )?),
                 codomain: Box::new(go(codomain, false, out_of_scope, at, whole)?),
+                capabilities: capabilities.clone(),
             },
             _ => {
                 let mut out = ty.clone();

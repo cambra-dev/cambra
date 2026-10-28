@@ -406,6 +406,7 @@ fn strength_over_ty(f: &Expr, fun_kind: &FunKind) -> Type {
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: Box::new(strengthened),
+        capabilities: crate::ccl::capabilities::Capabilities::none(),
     }
 }
 
@@ -577,6 +578,7 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
                         (Some(x.clone()), *b.clone()),
                         (None, second),
                     ])),
+                    capabilities: crate::ccl::capabilities::Capabilities::none(),
                 };
             }
             let codomain = Type::Tuple(vec![*b.clone(), *c.clone()]);
@@ -594,6 +596,7 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
                     fun_kind: fun_kind.clone(),
                     domain: a.clone(),
                     codomain: Box::new(codomain),
+                    capabilities: crate::ccl::capabilities::Capabilities::none(),
                 },
             }
         }
@@ -799,6 +802,7 @@ fn arm_compose(
         fun_kind: fun_kind.clone(),
         domain: Box::new(dom),
         codomain: Box::new(cod),
+        capabilities: crate::ccl::capabilities::Capabilities::none(),
     })
 }
 
@@ -1038,6 +1042,7 @@ fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
             fun_kind,
             domain,
             codomain,
+            ..
         } => {
             let data = match fun_kind {
                 FunKind::Data(..) => true,
@@ -1228,6 +1233,7 @@ fn eta_expanded(v: Expr) -> Expr {
         fun_kind,
         domain: Box::new(domain),
         codomain: Box::new(codomain),
+        capabilities: crate::ccl::capabilities::Capabilities::none(),
     })
 }
 
@@ -1732,6 +1738,8 @@ fn elim_lambda_impl(
                                         fun_kind: fun_kind.clone(),
                                         domain: pair_domain.clone(),
                                         codomain: Box::new(chain.clone()),
+                                        capabilities: crate::ccl::capabilities::Capabilities::none(
+                                        ),
                                     },
                                 };
                                 (compose_ty, step)
@@ -2981,6 +2989,7 @@ mod tests {
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(int.clone()),
                     codomain: Box::new(int.clone()),
+                    capabilities: crate::ccl::capabilities::Capabilities::none(),
                 },
             );
             let out = run(lambda).expect("elimination succeeds");
@@ -3020,6 +3029,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(a),
             codomain: Box::new(b),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 

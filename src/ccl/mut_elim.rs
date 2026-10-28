@@ -1984,6 +1984,7 @@ fn feed_each(defer: Name, collection: Expr, site: Option<Rc<crate::ccl::site::Si
             fun_kind: fun_kind.clone(),
             domain: domain.clone(),
             codomain: codomain.clone(),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         },
         other => panic!("a fed collection is a function, got {other}"),
     };

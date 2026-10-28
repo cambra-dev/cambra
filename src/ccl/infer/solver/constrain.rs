@@ -14,6 +14,7 @@
 // hazard therefore doesn't apply here.
 #![allow(clippy::mutable_key_type)]
 
+use crate::ccl::capabilities::{Capabilities, Capability, Filter, Repr, ScopedCapability};
 use crate::ccl::nominal::{Variance, sides};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -703,6 +704,33 @@ fn kind_edge_subst(own: &Subst, far: &Type, far_subst: &Subst) -> Subst {
 /// A concrete pair is the one thing settled at the edge, since neither side can learn
 /// anything later: two kinds that denote different points of the lattice have no common
 /// function, whichever side is which.
+/// Capabilities are covariant: a function that does less stands where one that may do more is
+/// expected, so what the left side's capabilities hold flows into the right side's
+/// (`src/ccl/design/type-inference.md`, "Capability variables").
+///
+/// A known set on the right is a ceiling only where a written clause states it, and no
+/// clause is written yet, so a known right side records nothing.
+fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities) {
+    match (e0.repr(), e1.repr()) {
+        (Repr::Var(v0), Repr::Var(v1)) => v1.flows_from(v0, Filter::default()),
+        (Repr::Known(set), Repr::Var(v1)) => {
+            for r in &set.requires {
+                v1.record(ScopedCapability {
+                    item: Capability::Requires(r.clone()),
+                    bound_at: None,
+                });
+            }
+            for e in &set.causes {
+                v1.record(ScopedCapability {
+                    item: Capability::Causes(e.clone()),
+                    bound_at: None,
+                });
+            }
+        }
+        (_, Repr::Known(_)) => {}
+    }
+}
+
 fn constrain_fun_kind(
     k0: &FunKind,
     k1: &FunKind,
@@ -1437,6 +1465,7 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
             fun_kind,
             domain,
             codomain,
+            capabilities,
         } => {
             let parts = match fun_kind {
                 FunKind::Data(Some(ws)) => rest.discharged_through(ws, &term),
@@ -1450,6 +1479,7 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
                     fun_kind: FunKind::Data(None),
                     domain: domain.clone(),
                     codomain: codomain.clone(),
+                    capabilities: capabilities.clone(),
                 },
                 parts,
             ))
@@ -1588,18 +1618,21 @@ fn constrain_go_impl(
                 fun_kind: k0,
                 domain: d0,
                 codomain: c0,
+                capabilities: e0,
             },
             Type::Fun {
                 name: n1,
                 fun_kind: k1,
                 domain: d1,
                 codomain: c1,
+                capabilities: e1,
             },
         ) => {
             // The kind edge (see [`constrain_fun_kind`]): recorded, not answered. What the two
             // kinds turn out to be, and how their binders correspond, is read once the kind
             // graph is closed.
             constrain_fun_kind(k0, k1, lhs, rhs, sl, sr)?;
+            constrain_capabilities(e0, e1);
             // **Binders correspond by position across this edge.** A sum's binders are its
             // kind's positions, so position `i` of one side is position `i` of the other,
             // and the edge carries that correspondence in its own substitution — the Σ
@@ -2195,6 +2228,7 @@ fn constrain_go_impl(
         // the new upper by bridging the holder gap and composing **forward**
         // onto the two content sides.
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level() => {
+            crate::ccl::capabilities::lower_capability_levels(rhs, lv.level());
             let lows = {
                 let bound =
                     Bound::edge(sl.clone(), rhs.clone(), sr.clone()).with_origin(cache.origins.1);
@@ -2296,6 +2330,7 @@ fn constrain_go_impl(
         // inverse, and a non-invertible discharge degraded to `id` twice over.
         // Here the forward morphism is read directly off the edge.
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level() => {
+            crate::ccl::capabilities::lower_capability_levels(lhs, rv.level());
             let ups = {
                 let bound =
                     Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
@@ -2743,6 +2778,7 @@ fn escaping_param(ty: &Type, target_level: Level) -> Option<Rc<crate::ccl::ty::T
 /// constrain_subtype solver's level-mismatch branches).
 pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCache) -> Type {
     if type_level(ty) <= target_level {
+        crate::ccl::capabilities::lower_capability_levels(ty, target_level);
         return ty.clone();
     }
     match ty {
@@ -2855,7 +2891,17 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             fun_kind,
             domain: d,
             codomain: c,
+            capabilities,
         } => Type::Fun {
+            // A capability variable crossing to a shallower level is no longer local to the
+            // scope it was minted in, so it moves rather than being copied: an instantiation
+            // of the deeper scope's scheme then shares it.
+            capabilities: {
+                if let Repr::Var(v) = capabilities.repr() {
+                    v.lower_level(target_level);
+                }
+                capabilities.clone()
+            },
             name: name.clone(),
             // A sum's **candidates** are an invariant position, so they cross a level
             // boundary through two-way proxies rather than the polar one-way
@@ -2942,6 +2988,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 fun_kind,
                 domain,
                 codomain,
+                capabilities,
             } = function.as_ref()
             else {
                 unreachable!("a history's function is an unrefined function, got {function}")
@@ -2952,6 +2999,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(extrude_invariant(domain, target_level, cache)),
                     codomain: Box::new(extrude_invariant(codomain, target_level, cache)),
+                    capabilities: capabilities.clone(),
                 },
                 *history_kind,
             )
@@ -5198,6 +5246,7 @@ mod tests {
             fun_kind,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(prim(BaseType::Int)),
+            capabilities: Capabilities::none(),
         }
     }
 
@@ -5411,6 +5460,7 @@ mod tests {
             fun_kind: FunKind::Var(Rc::clone(&v)),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(prim(BaseType::Int)),
+            capabilities: Capabilities::none(),
         };
         let mut cache = ConstrainCache::new();
         constrain_subtype(

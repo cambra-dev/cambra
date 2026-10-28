@@ -1070,6 +1070,7 @@ fn base_keys(
                 fun_kind: crate::ccl::FunKind::Data(None),
                 domain: Box::new(first.clone()),
                 codomain,
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             };
             let nested = typed_compose(vec![outer, family]).with_ty(nested_ty);
             let p = Name::fresh("__keys");

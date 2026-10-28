@@ -124,8 +124,8 @@
 //!
 //! **A block's terminal expression, when it is a bare reference.** A tail is
 //! read for what it denotes rather than for what it is stamped with: a statement
-//! chain's tail and a mutable variable introduction's deref, a lambda's does
-//! not, and rule 2 catches a function returning a `Mut` at that difference.
+//! chain's tail, a mutable variable introduction's, a `Let`'s and a lambda's all
+//! deref, so a function returns a mutable variable's value.
 //! A named read answers the check with a value whatever the tail is. Nothing is
 //! lost, a bare reference carrying no refinement for a mutable variable to reach.
 //!
@@ -1028,6 +1028,7 @@ fn hidden(ty: &Type, out_of_scope: &dyn Fn(&Name) -> bool) -> Type {
             fun_kind,
             domain,
             codomain,
+            ..
         } if fun_kind.resolved().is_data()
             && matches!(&**domain, Type::Refinement(_, rs) if rs.iter().any(reads)) =>
         {
@@ -1208,8 +1209,8 @@ mod tests {
         assert!(!s.contains("__read"), "no binder is minted: {s}");
     }
 
-    /// A block's terminal read stays a bare reference — the position rule 2 and
-    /// the tail rules read.
+    /// A block's terminal read stays a bare reference — the position the tail rules
+    /// read.
     #[test]
     fn a_terminal_read_is_left_alone() {
         let x = Name::fresh("x");

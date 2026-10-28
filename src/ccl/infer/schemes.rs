@@ -211,6 +211,7 @@ impl OperatorSchemes {
                     fun_kind: crate::ccl::FunKind::Data(None),
                     domain: Box::new(delta.clone()),
                     codomain: Box::new(epsilon.clone()),
+                    capabilities: crate::ccl::capabilities::Capabilities::none(),
                 },
                 Type::sum_over(
                     crate::ccl::ty::TypeKind::Enumerated(vec![delta]),
@@ -478,6 +479,7 @@ pub(super) fn uncurried_value_at_its_tuple(
         fun_kind,
         domain: argument,
         codomain,
+        capabilities,
     } = instantiated
     else {
         unreachable!("uncurry's scheme is a function")
@@ -522,7 +524,9 @@ pub(super) fn uncurried_value_at_its_tuple(
             fun_kind: result_kind,
             domain: tuple,
             codomain: Box::new(read),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }),
+        capabilities,
     }
 }
 
@@ -565,6 +569,7 @@ fn uncurry_scheme(n: usize) -> PolyScheme {
             fun_kind: crate::ccl::FunKind::Data(None),
             domain: Box::new(key.clone()),
             codomain: Box::new(inner),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         });
     let components = names.into_iter().map(Some).zip(keys).collect();
     PolyScheme::poly(

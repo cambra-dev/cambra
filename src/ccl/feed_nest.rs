@@ -119,6 +119,7 @@ fn opened_levels(ty: &Type, levels: usize) -> (Vec<(Option<Name>, Type)>, Type) 
             name,
             domain,
             codomain,
+            ..
         } = &level
         else {
             unreachable!("a contribution has a collection level per loop it was fed under")

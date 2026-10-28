@@ -4404,6 +4404,92 @@ terms it builds, which read it from the `PlanningCtx`, since a term such as `con
 
 ---
 
+## 4.9 Capabilities
+
+A `Type::Fun` carries what a call reads from its context and what it contributes besides its
+result, its `requires` and `causes` clauses
+([chl-spec.md, "6.9 Capabilities"](../../../docs/chl-spec.md#69-capabilities)).
+The `capabilities` slot holds a `Capabilities` (`src/ccl/capabilities.rs`): `Known` for a set a type states, and
+`Var` for one inference is still collecting. A data function's is always the empty set.
+
+A requirement in a capability set is a `TraitRequirement` of one of the compiler's context traits
+(`Requirement` in `capabilities.rs`): `Transaction`, `ObserveWorld`, `ReadTxn` or `Read`.
+`TraitDecl::supplied_by` names where a trait's instance comes from: a `with begin():` block for
+`Transaction`, the run for `ObserveWorld` and `ReadTxn`, the scope binding the variable for
+`Read`, and instance search for every other trait. `Read` and `ReadTxn` take a term parameter, the
+variable whose history the read stands in (`TraitDecl::term_params`, `TraitRequirement::terms`). A
+context trait is over no types.
+
+### Capability variables
+
+A `CapabilityVar` holds **capabilities** and **edges**. A capability is one requirement or effect, with
+the depth of the function body that binds the variable it names: the number of function bodies
+around the binder, 0 at the top level, and none for a capability naming no variable. An edge from 𝑢 into 𝑣 says that what 𝑢 holds, through the edge's
+filter, 𝑣 holds too. `CapabilityVar::resolved` is the fixpoint over the edges reaching a variable.
+
+Emission keeps a stack of frames, one for the module's top level and one for each function body
+under emission (`InferCtx::capability_frames`). A frame's variable is the capabilities of the function
+whose body it is. Capabilities are recorded on the innermost frame:
+
+| Node | Capability |
+| --- | --- |
+| `MutWrite` of 𝑥 | `Write(𝑥)`, or `WriteTxn(𝑥)` and `Transaction` when 𝑥 is transactional |
+| `Feed` or `Define` into 𝑓 | `Append(𝑓)` |
+| `Begin` | `RunTransaction`; its body's frame discharges `Transaction` |
+| `Source` | `ObserveWorld` |
+| a value read of a transactional variable 𝑥 | `ReadTxn(𝑥)` and `Transaction` |
+| a value read of an induction variable 𝑥 | `Read(𝑥)` |
+| an `Apply` passing 𝑎 to a `Mut` parameter | `Write(𝑎)`, or `WriteTxn(𝑎)` when 𝑎 is transactional |
+| an `Apply` passing a feed 𝑎 to a `Feed` parameter | `Append(𝑎)` |
+
+A value read is a mention whose handle becomes its value (`read_value` in `emit.rs`). A mention
+passed by reference, or to `await_final`, stays a handle and reads nothing. A parameter's history
+is its argument's, so a capability naming a parameter is not recorded. A
+`MutDecl` binder is declared, not a parameter (`Typing::declare_mutable`). `InferCtx::record_capability`
+records a read or a write of a declared transactional variable as `ReadTxn(𝑥)` or `WriteTxn(𝑥)`,
+which belong to the run, so no scope discharges them; a `Mut` parameter's is its argument's, which
+the call records.
+Declaring a transactional variable in a function body is refused
+(`InferError::TransactionalOutsideTopLevel`).
+
+**A frame's filter keeps what is the function's own out of its type.** An edge or capability
+entering a frame passes when the variable it names is bound outside the frame's body: its depth is
+below the frame's. Inside a `Begin` body the filter also drops `Transaction`. A capability naming no
+variable always passes. `Read(𝑥)` is filtered as `Write(𝑥)` is: inside the scope binding 𝑥, every
+call has a position in its history.
+
+**A call relates the callee's capabilities to the caller's.** `InferCtx::apply` puts a fresh call
+variable on the expected function type and an edge from it into the innermost frame. The
+`Fun`/`Fun` arm of `constrain_go` relates capabilities covariantly: an edge from the left side's
+variable into the right side's, or the left side's known capabilities recorded on the right side's
+variable. A known set on the right records nothing.
+
+**A collection runs where it is built.** A lambda, a `Compose` chain or a `Cast` whose kind is data
+denotes a collection, and its body runs where the collection is built, so its capabilities flow into
+the enclosing frame as a call's do (`InferCtx::settle_by_kind`). One whose kind is still a variable
+gets the edge with a condition, `Filter::when_data`, which holds once the kind resolves to data. A
+compute function's capabilities stay in its type. A chain's and a cast's capabilities are the union of
+their parts' (`Typing::composed_capabilities`). The kind is the lowering stamp where the node carries
+one, as `emit_node` applies it.
+
+### Polymorphism and materialization
+
+**Levels.** A capability variable is minted at the emission level. `type_level` leaves capabilities out,
+since a capability variable decides nothing about whether a definition is polymorphic. A type
+becoming a bound of a variable at a shallower level lowers its capability variables to that level
+(`lower_capability_levels`, at bound recording and at extrusion). Instantiation copies an effect
+variable above the scheme's cutoff with its capabilities and the edges into it
+(`freshen_capability_var`), so two uses of one polymorphic function collect their capabilities apart.
+
+**Materialization.** Compaction resolves each function position's capabilities (`CompactFun::capabilities`).
+A merge takes the union at a positive position and the intersection at a negative one. Coalesce
+writes the set into a compute function's type as `Known`.
+
+### Erasure
+
+The checks after inference read the materialized capabilities. Once they have run, `capabilities::erase` sets
+every function type's capabilities to none, and every later pass builds function types that state none.
+
 ## 5. CCL-specific inference rules
 
 The rules in `infer/emit.rs` describe each CCL node's structural typing. They run in both

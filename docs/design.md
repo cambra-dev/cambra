@@ -170,7 +170,7 @@ pipeline; individual pass contracts belong to the linked design documents.
 | Name mutable reads | `mut_read::run` gives mutable reads immutable names that refinements can reference. |
 | Lower comprehensions | `comprehension::run` lowers each comprehension to its `cast`/`λ`/`▷` encoding. |
 | Bind opaque outputs | `opaque_output::run` binds the body of each lambda that binds an opaque variable to `__output` under a barrier-variable annotation. |
-| Infer | Infer types, specialize uses and validate the typed tree; see [type inference](../src/ccl/design/type-inference.md). Each module's check tree is inferred first, alone, and a failed check stops the compile; see [checking a module on its own](modules.md#checking-a-module-on-its-own). Read naming is undone before the post-inference pane. |
+| Infer | Infer types, specialize uses and validate the typed tree; see [type inference](../src/ccl/design/type-inference.md). Each module's check tree is inferred first, alone, and a failed check stops the compile; see [checking a module on its own](modules.md#checking-a-module-on-its-own). Capability annotations are erased and read naming is undone before the post-inference pane. |
 | Inline | Inline capability bindings and beta-reduce calls; see [inlining](../src/ccl/design/optimization.md#inlining-pass-cclinliners). |
 | Eliminate transactions | `transact_phase::run` constructs transaction histories after keyed-write desugaring and value-type views. |
 | Eliminate induction mutation | `mut_elim::run` constructs induction histories. |
@@ -232,7 +232,7 @@ The connections between the layers above and the capabilities Cambra claims:
 | Aggregates | `sum`, `max`, `min` implemented; `count`/`avg`/`len` **[Planned]** |
 | Refinement typing | Machinery implemented (internal); surface syntax **[Decided]** |
 | Feed channels | `Feed(_)` declarations, `Feed(_)` parameters and `http_serve` implemented |
-| Function requirements and effects (`requires` / `causes`) | **[Decided]** |
+| Function requirements and effects (`requires` / `causes`) | Inferred and printed; written clauses and exceptions **[Decided]** |
 | `rec` fixpoint bindings | **[Decided]** |
 | Collections-as-functions model | **[Decided]** — one representation (the data function `D ⤇ V`), five surface kinds; `Array`/`List`/`Collection` types implemented, `Map`/`Set` types and the operation layer landing (see [src/ccl/design/collections.md](../src/ccl/design/collections.md)) |
 | `match` / `case` | Tag dispatch implemented; deeper patterns **[Tentative]** |

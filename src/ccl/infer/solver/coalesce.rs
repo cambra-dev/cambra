@@ -315,11 +315,13 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
                     fun_kind,
                     domain,
                     codomain,
+                    capabilities,
                 } if !crate::ccl::subst::codomain_depends_on(b, codomain) => Type::Fun {
                     name: None,
                     fun_kind: fun_kind.clone(),
                     domain: domain.clone(),
                     codomain: codomain.clone(),
+                    capabilities: capabilities.clone(),
                 },
                 other => other.clone(),
             };
@@ -764,6 +766,9 @@ fn coalesce_compact_go(
                     fun_kind: crate::ccl::ty::FunKind::Compute,
                     domain: Box::new(sole.clone()),
                     codomain: Box::new(c),
+                    capabilities: crate::ccl::capabilities::Capabilities::known(
+                        (*cf.capabilities).clone(),
+                    ),
                 });
             }
             KindPin::Data | KindPin::Plain | KindPin::Sum(_) => {
@@ -800,6 +805,7 @@ fn coalesce_compact_go(
                     },
                     domain: Box::new(domains[0].clone()),
                     codomain: Box::new(c),
+                    capabilities: crate::ccl::capabilities::Capabilities::none(),
                 });
             }
         }
@@ -820,6 +826,7 @@ fn coalesce_compact_go(
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(coalesce_compact_go(&history.domain, polarity, scope)?),
             codomain: Box::new(value),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         shapes.push(Type::history_over(function, history.kind));
     }
@@ -986,6 +993,7 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
                 binders: Vec::new(),
                 // A feed's read view is a collection: a data function.
                 kind: super::compact::KindPin::Data,
+                capabilities: Default::default(),
                 // A read view is over its channel domain, not over an index of its own.
                 domains_disagree: false,
                 domain,
@@ -1211,7 +1219,8 @@ mod tests {
                 name: None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
-                codomain: Box::new(Type::Base(BaseType::Bool))
+                codomain: Box::new(Type::Base(BaseType::Bool)),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             }
         );
     }
@@ -1225,6 +1234,7 @@ mod tests {
             term: CompactType {
                 fun: Some(CompactFun {
                     binders: Vec::new(),
+                    capabilities: Default::default(),
                     name: None,
                     kind: KindPin::Data,
                     domains_disagree: false,
@@ -1244,6 +1254,7 @@ mod tests {
                 fun_kind: crate::ccl::ty::FunKind::Data(None),
                 domain: Box::new(Type::UIntRange(2)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             }
         );
     }
@@ -1260,6 +1271,7 @@ mod tests {
             term: CompactType {
                 fun: Some(CompactFun {
                     binders: Vec::new(),
+                    capabilities: Default::default(),
                     name: None,
                     kind: KindPin::Plain,
                     domains_disagree: true,
@@ -1296,6 +1308,7 @@ mod tests {
             term: CompactType {
                 fun: Some(CompactFun {
                     binders: Vec::new(),
+                    capabilities: Default::default(),
                     name: None,
                     kind: KindPin::Conflict,
                     domains_disagree: false,

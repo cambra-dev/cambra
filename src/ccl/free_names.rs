@@ -308,6 +308,7 @@ impl<'m> Walk<'m> {
                 fun_kind,
                 domain,
                 codomain,
+                capabilities: _,
             } => {
                 // A witness binder binds no term name.
                 for w in fun_kind.witnesses() {

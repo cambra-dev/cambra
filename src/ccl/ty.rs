@@ -1267,6 +1267,11 @@ pub enum Type {
         domain: Box<Type>,
         /// The result type. Covariant position; may reference `name`.
         codomain: Box<Type>,
+        /// What a call reads from its context and contributes besides its result
+        /// (`docs/chl-spec.md`, "6.9 Capabilities"). A
+        /// data function's are [`Capabilities::none`](crate::ccl::capabilities::Capabilities::none).
+        /// A rebuild copies them from the type it replaces, as it copies `fun_kind`.
+        capabilities: crate::ccl::capabilities::Capabilities,
     },
     /// An ordered product type with unnamed fields (tuple). Its width is part of the
     /// type: two tuples relate only at equal width (`docs/chl-spec.md`, "Tuple width").
@@ -1799,6 +1804,8 @@ pub struct TraitRequirement {
     pub trait_: crate::ccl::infer::solver::traits::Trait,
     /// One per operand position.
     pub args: Vec<Type>,
+    /// One per term parameter of the trait: the variable `x` in `Read(x)`.
+    pub terms: Vec<crate::ccl::Name>,
     /// The associated types the clause names. One it leaves unnamed is absent, and
     /// leaves that position open.
     pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
@@ -1809,7 +1816,10 @@ pub struct TraitRequirement {
 
 impl PartialEq for TraitRequirement {
     fn eq(&self, other: &Self) -> bool {
-        self.trait_ == other.trait_ && self.args == other.args && self.assoc == other.assoc
+        self.trait_ == other.trait_
+            && self.args == other.args
+            && self.terms == other.terms
+            && self.assoc == other.assoc
     }
 }
 impl Eq for TraitRequirement {}
@@ -1817,6 +1827,7 @@ impl std::hash::Hash for TraitRequirement {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.trait_.hash(state);
         self.args.hash(state);
+        self.terms.hash(state);
         self.assoc.hash(state);
     }
 }
@@ -1827,6 +1838,7 @@ impl TraitRequirement {
         TraitRequirement {
             trait_: self.trait_.clone(),
             args: self.args.iter().map(&mut f).collect(),
+            terms: self.terms.clone(),
             assoc: self.assoc.iter().map(|(n, t)| (n.clone(), f(t))).collect(),
             at: self.at,
         }
@@ -2469,6 +2481,7 @@ impl Type {
             fun_kind: FunKind::Data(Some(Rc::new(vec![witness]))),
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -2496,6 +2509,7 @@ impl Type {
             fun_kind: FunKind::Data(slot),
             domain,
             codomain,
+            capabilities,
         } = body
         else {
             unreachable!("a sum's body is a data function, got a non-data shape")
@@ -2512,6 +2526,7 @@ impl Type {
                 fun_kind: FunKind::Data(slot),
                 domain,
                 codomain,
+                capabilities: capabilities.clone(),
             };
         }
         // The new binder goes outermost; the body's occurrences already name it.
@@ -2524,6 +2539,7 @@ impl Type {
             fun_kind: FunKind::Data(Some(Rc::new(ws))),
             domain,
             codomain,
+            capabilities: capabilities.clone(),
         }
     }
 
@@ -2828,6 +2844,7 @@ fn fmt_type(
             fun_kind,
             domain,
             codomain,
+            capabilities,
         } => {
             // A sum renders as its binder prefixes then the function they bind over. The
             // binder is written, and its **id is not**: rendering the id would make
@@ -2845,8 +2862,8 @@ fn fmt_type(
             let cod = at(codomain, Some(&inner));
             let dom = at(domain, binders);
             match name {
-                Some(x) => write!(f, "(({x}: {dom}) {} {cod})", fun_kind.arrow()),
-                None => write!(f, "({dom} {} {cod})", fun_kind.arrow()),
+                Some(x) => write!(f, "(({x}: {dom}) {} {cod}{capabilities})", fun_kind.arrow()),
+                None => write!(f, "({dom} {} {cod}{capabilities})", fun_kind.arrow()),
             }
         }
         Type::Tuple(ts) => {
@@ -3030,18 +3047,24 @@ fn fmt_type(
                     }
                 })
                 .collect();
+            // A function body's capabilities join the trait requirements after the codomain.
+            let (body, capabilities) = match &poly.body {
+                Type::Fun { capabilities, .. } => (
+                    poly.body
+                        .clone()
+                        .with_capabilities(crate::ccl::capabilities::Capabilities::none()),
+                    capabilities.clone(),
+                ),
+                body => (body.clone(), crate::ccl::capabilities::Capabilities::none()),
+            };
+            let requires = poly.requires_text(|t| at(t, binders).to_string());
             write!(
                 f,
-                "forall ({}) {}",
+                "forall ({}) {}{}",
                 params.join(", "),
-                at(&poly.body, binders)
-            )?;
-            let requires = poly.requires_text(|t| at(t, binders).to_string());
-            if requires.is_empty() {
-                Ok(())
-            } else {
-                write!(f, " requires {}", requires.join(", "))
-            }
+                at(&body, binders),
+                crate::ccl::capabilities::clauses(requires, &capabilities)
+            )
         }
         Type::Txn => write!(f, "Txn"),
         Type::History {
@@ -3221,6 +3244,30 @@ impl Type {
         Type::Record(fields)
     }
 
+    /// This function type with `capabilities` in place of its own.
+    ///
+    /// # Panics
+    ///
+    /// When `self` is not a function type.
+    pub fn with_capabilities(self, capabilities: crate::ccl::capabilities::Capabilities) -> Self {
+        match self {
+            Type::Fun {
+                name,
+                fun_kind,
+                domain,
+                codomain,
+                ..
+            } => Type::Fun {
+                name,
+                fun_kind,
+                domain,
+                codomain,
+                capabilities,
+            },
+            other => panic!("`with_effects` takes a function type, got {other}"),
+        }
+    }
+
     /// Helper for creating a non-dependent **compute** function type
     /// (`name: None`, `kind: Compute`).
     pub fn fun(domain: Self, codomain: Self) -> Self {
@@ -3229,6 +3276,7 @@ impl Type {
             fun_kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -3296,6 +3344,7 @@ impl Type {
             fun_kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -3322,6 +3371,7 @@ impl Type {
                 fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             }
         }
     }
@@ -3433,6 +3483,7 @@ impl Type {
             fun_kind: FunKind::Data(None),
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -3448,6 +3499,7 @@ impl Type {
             fun_kind,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         }
     }
 
@@ -3492,7 +3544,12 @@ impl Type {
     /// `WitnessRef` outside its binder means nothing at all.
     pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
         match exemplar {
-            Type::Fun { name, fun_kind, .. } => {
+            Type::Fun {
+                name,
+                fun_kind,
+                capabilities,
+                ..
+            } => {
                 // The exemplar's kind is copied as it stands, variable included: a
                 // variable *is* the kind at that position, and reading what the solver has
                 // recorded on it would make a rebuild depend on when it ran.
@@ -3509,6 +3566,7 @@ impl Type {
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(domain),
                     codomain: Box::new(codomain),
+                    capabilities: capabilities.clone(),
                 }
             }
             Type::History {
@@ -3617,6 +3675,7 @@ impl Type {
                 fun_kind: FunKind::Data(Some(ws)),
                 domain,
                 codomain,
+                capabilities,
             } => Type::Fun {
                 name: name.clone(),
                 fun_kind: FunKind::Data(Some(Rc::new(
@@ -3631,6 +3690,7 @@ impl Type {
                 ))),
                 domain: Box::new(domain.rename_witnesses(renaming)),
                 codomain: Box::new(codomain.rename_witnesses(renaming)),
+                capabilities: capabilities.clone(),
             },
             other => {
                 let mut out = other.clone();
@@ -4002,6 +4062,7 @@ impl Type {
                     fun_kind: FunKind::Data(Some(ws)),
                     domain,
                     codomain,
+                    capabilities,
                 } => {
                     // The slot is a telescope: binder 𝑖's kind is canonicalized under
                     // binders 0‥𝑖−1, the domain and codomain under all of them.
@@ -4030,6 +4091,7 @@ impl Type {
                         ))),
                         domain: Box::new(domain),
                         codomain: Box::new(codomain),
+                        capabilities: capabilities.clone(),
                     }
                 }
                 other => {
@@ -4113,6 +4175,7 @@ impl Type {
                 },
                 domain: Box::new(domain.without_pi_names()),
                 codomain: Box::new(codomain.without_pi_names()),
+                capabilities: crate::ccl::capabilities::Capabilities::none(),
             },
             Type::BoundedHole(t) => Type::BoundedHole(Box::new(t.without_pi_names())),
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| t.without_pi_names()).collect()),
@@ -6549,6 +6612,7 @@ mod tests {
                 },
             )),
             codomain: Box::new(Type::Hole),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         let cast = TypedExpr::cast(TypedExpr::var("xs"), target);
         let _ = Refinement::born(Rc::new(cast));
@@ -7171,6 +7235,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::fun(Type::Base(BaseType::Int), refined)),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert_eq!(ty.to_string(), "((k: Int) ⇒ (Int ⇒ {Int | k}))");
     }

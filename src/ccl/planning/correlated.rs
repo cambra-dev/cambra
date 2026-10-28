@@ -682,6 +682,7 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
         fun_kind,
         domain,
         codomain,
+        ..
     } = crate::ccl::generalize::opened(&g.ty)
     else {
         return Ok(false);
@@ -710,6 +711,7 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
         fun_kind,
         domain: Box::new(pair_ty.clone()),
         codomain: codomain.clone().into(),
+        capabilities: crate::ccl::capabilities::Capabilities::none(),
     };
     let mut chain = std::mem::replace(g, Expr::builtin(Builtin::Id));
     for predicate in predicates {
@@ -728,6 +730,7 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
             fun_kind: crate::ccl::FunKind::Compute,
             domain: Box::new(pair_ty.clone()),
             codomain: Box::new(codomain.clone()),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         });
     }
     *g = chain;
@@ -841,6 +844,7 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
             fun_kind: crate::ccl::FunKind::Compute,
             domain: Box::new(product.clone()),
             codomain: codomain.clone(),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
         });
         kept = Type::fun(product.clone(), product.clone());
     }

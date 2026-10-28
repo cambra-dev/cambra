@@ -19,6 +19,7 @@
 
 mod helpers;
 
+mod capabilities;
 mod chl_types;
 mod comprehensions;
 mod conditionals;
