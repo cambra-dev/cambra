@@ -39,7 +39,7 @@ fn another_region() -> Projection {
 /// operator of its own.
 fn received(build: &dyn Fn() -> Built, notified: usize, region: &Projection) -> Vec<Projection> {
     let (mut operator, inputs) = build();
-    let (log, regions) = RegionLog::new();
+    let (log, regions) = RegionLog::new(true);
     let guard = operator.tiling().universal_guard();
     let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
     // Some inputs notify when they are subscribed.
@@ -738,7 +738,7 @@ macro_rules! fan_out_with_two_slots {
             let mut logs = Vec::new();
             let mut producers = Vec::new();
             for _ in 0..2 {
-                let (log, regions) = RegionLog::new();
+                let (log, regions) = RegionLog::new(true);
                 let mut slot = fan.slot();
                 let guard = slot.tiling().universal_guard();
                 producers.push(slot.subscribe(guard, Box::new(log), &mut scheduler));

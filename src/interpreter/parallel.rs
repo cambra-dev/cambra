@@ -17,9 +17,9 @@ use crate::{
         provenance::NodeId,
     },
     interpreter::{
-        LockNow, Predicate, Tile, TileGuard, Tiling,
+        Consumer, LockNow, Predicate, Projection, Scheduler, Tile, TileGuard, Tiling,
         operator_graph::{EdgeKind, EdgeRole, GraphNode, OperatorGraph},
-        tile_operators::{MorselSource, TileOperator, TileProducer},
+        tile_operators::{Claim, MorselSource, TileOperator, TileProducer},
     },
 };
 
@@ -229,24 +229,9 @@ pub fn run_main(
             ),
     };
     let source = source_of(chain_op)?;
-    let tiling = chain_op.tiling().clone();
-    // One chain per pipeline per worker, indexed by `PipelineId`: the plan has one pipeline.
-    let mut chains: Vec<Vec<Box<dyn TileProducer>>> = (0..config.threads.max(1))
-        .map(|_| {
-            vec![chain_op.subscribe(tiling.universal_guard(), Box::new(|| {}), ctx.scheduler())]
-        })
-        .collect();
-    let dispatcher = Dispatcher::new(
-        vec![PipelineSpec {
-            after: Vec::new(),
-            source: Box::new(move || source.clone()),
-            finalize: None,
-        }],
-        config.morsel_rows.max(1),
-    );
     let breaker = match &pipeline.breaker {
         Breaker::Collect => PoolBreaker::Collect {
-            collector: Mutex::new(tiling.empty_tile()),
+            collector: Mutex::new(chain_op.tiling().empty_tile()),
         },
         Breaker::Fold { kind, accumulator } => PoolBreaker::Fold {
             kind: *kind,
@@ -254,6 +239,66 @@ pub fn run_main(
             partials: Mutex::new(Vec::new()),
         },
     };
+    Ok(run_pipeline(
+        ctx.scheduler(),
+        chain_op,
+        source,
+        breaker,
+        config,
+        None,
+    ))
+}
+
+/// The thread that delivers a live source's arrivals while the workers run: called once, on a
+/// thread of its own, with the handle that publishes a region to the pipeline's source. It stands
+/// in for the thread that reads the source's input. It publishes nothing once it returns, so
+/// `run_pipeline` closes the pipeline's source then.
+type DeliveringThread<'a> = Box<dyn FnOnce(PipelineHandle) + Send + 'a>;
+
+/// Run the plan's one pipeline: `config.threads` workers each pull their own subscription of
+/// `chain_op` at the morsels `source` hands out and feed `breaker`. The result is what the
+/// breaker holds once every morsel is acknowledged and every worker has left.
+///
+/// With a `delivery` the pipeline's head is notified through a [`PipelineConsumer`]: an arrival
+/// a notification carries is published to `source` and wakes a parked worker. When `delivery`
+/// returns, `run_pipeline` closes the source, and the pipeline finishes once the workers have
+/// claimed everything.
+fn run_pipeline(
+    scheduler: &mut Scheduler,
+    chain_op: &mut dyn TileOperator,
+    source: Arc<dyn MorselSource>,
+    breaker: PoolBreaker,
+    config: &Config,
+    delivery: Option<DeliveringThread<'_>>,
+) -> Tile {
+    let tiling = chain_op.tiling().clone();
+    let dispatcher = Arc::new(Dispatcher::new(
+        vec![PipelineSpec {
+            after: Vec::new(),
+            source: Box::new(move || source.clone()),
+            finalize: None,
+        }],
+        config.morsel_rows.max(1),
+    ));
+    let handle = PipelineHandle {
+        dispatcher: dispatcher.clone(),
+        pipeline: PipelineId(0),
+    };
+    // One chain per pipeline per worker, indexed by `PipelineId`: the plan has one pipeline.
+    // Notifications reach the dispatcher through the first worker's chain. Every chain's
+    // source registration is notified of the same region, and one consumer publishes it: a
+    // second would publish what the source has already claimed. The path from the source to
+    // that consumer is region-driven and acyclic (`plan_main` admits no shared node or
+    // recurrence), so no consumer on it drops or widens the region.
+    let mut chains: Vec<Vec<Box<dyn TileProducer>>> = (0..config.threads.max(1))
+        .map(|worker| {
+            let head: Box<dyn Consumer> = match (&delivery, worker) {
+                (Some(_), 0) => Box::new(PipelineConsumer(handle.clone())),
+                _ => Box::new(|| {}),
+            };
+            vec![chain_op.subscribe(tiling.universal_guard(), head, scheduler)]
+        })
+        .collect();
     // The chains are lent to the workers and dropped here, after the scope, one at a time:
     // a producer's drop detaches its probe with a lock that must not find the probe table
     // held by another worker's `get`.
@@ -261,6 +306,14 @@ pub fn run_main(
         // Armed before the first spawn: a spawn that panics stops the workers already running
         // from claiming further morsels.
         let _fail = FailOnUnwind(&dispatcher);
+        if let Some(delivery) = delivery {
+            let (dispatcher, handle) = (&dispatcher, handle.clone());
+            scope.spawn(move || {
+                let _fail = FailOnUnwind(dispatcher);
+                delivery(handle.clone());
+                handle.close();
+            });
+        }
         for worker_chains in chains.iter_mut() {
             let (dispatcher, breaker) = (&dispatcher, &breaker);
             scope.spawn(move || run_worker(worker_chains, dispatcher, breaker));
@@ -271,7 +324,45 @@ pub fn run_main(
         dispatcher.all_done(),
         "every worker returned, so every pipeline finished"
     );
-    Ok(breaker.finish())
+    breaker.finish()
+}
+
+/// What delivers to one pipeline of a [`Dispatcher`]: a region of arrived keys, and the end of
+/// arrivals.
+#[derive(Clone)]
+struct PipelineHandle {
+    dispatcher: Arc<Dispatcher>,
+    pipeline: PipelineId,
+}
+
+impl PipelineHandle {
+    /// The keys `arrived` can be claimed.
+    fn publish(&self, arrived: &Projection) {
+        self.dispatcher.publish(self.pipeline, arrived);
+    }
+
+    /// No further key will arrive.
+    fn close(&self) {
+        self.dispatcher.close(self.pipeline);
+    }
+}
+
+/// The consumer at the head of a pipeline: a notification publishes the region it carries to the
+/// pipeline's source and never pulls, which is what `region_driven` says.
+struct PipelineConsumer(PipelineHandle);
+
+impl Consumer for PipelineConsumer {
+    fn notify(&mut self, arrived: &Projection) {
+        debug_assert!(
+            *arrived != Projection::Nothing,
+            "no producer notifies of an empty region"
+        );
+        self.0.publish(arrived);
+    }
+
+    fn region_driven(&self) -> bool {
+        true
+    }
 }
 
 /// The one source under `chain` that cuts its rows into morsels, or why there is none.
@@ -460,7 +551,8 @@ struct PipelineSpec {
 enum Next {
     /// A morsel to run.
     Package(WorkPackage),
-    /// Nothing is claimable now, and a pipeline that finishes or starts may change that.
+    /// Nothing is claimable now, and a publish, a close, or a pipeline that finishes or starts may
+    /// change that.
     Wait,
     /// Every pipeline has finished, or the dispatcher failed.
     Done,
@@ -480,10 +572,11 @@ trait PoolWorker {
 ///
 /// A worker claims a morsel from a pipeline's source with [`next`](Self::next) and acknowledges
 /// it with [`ack`](Self::ack) once the morsel is released. A pipeline finishes when its source
-/// has answered `None`, every morsel it answered is acknowledged, and every worker that claimed
-/// from it has left it. The worker that completes it runs its `finalize` and starts the pipelines
-/// waiting on it. The morsel path takes no lock: the only lock parks idle workers. See
-/// `src/interpreter/design-parallel.md`, "The dispatcher".
+/// has answered `Exhausted`, every morsel it answered is acknowledged, and every worker that
+/// claimed from it has left it. The worker that completes it runs its `finalize` and starts the
+/// pipelines waiting on it. A finite source's morsel path takes no lock; a live source's takes
+/// its own state lock. The lock that parks idle workers is the only one the dispatcher itself
+/// takes on the claim path. See `src/interpreter/design-parallel.md`, "The dispatcher".
 struct Dispatcher {
     /// Per pipeline, by `PipelineId`.
     jobs: Vec<Job>,
@@ -494,11 +587,19 @@ struct Dispatcher {
     /// Set when a worker panics: every `next` answers `Done` from then on, so the other
     /// workers stop claiming morsels of a run whose result is discarded.
     failed: AtomicBool,
-    /// Counts the events that can end a wait: a pipeline finishing, and a failure.
+    /// Counts the events that can end a wait: a pipeline finishing or exhausting its source, a
+    /// publish, a close and a failure.
     epoch: AtomicU64,
     // shared-state-ok: parks idle workers and guards no data; `wake_idle` and `park` state how.
     idle: Mutex<()>,
     wake: Condvar,
+}
+
+/// What reached a pipeline before it started: the union of the regions published to it, and
+/// whether it was closed.
+struct Early {
+    region: Projection,
+    closed: bool,
 }
 
 /// One pipeline's standing in the [`Dispatcher`].
@@ -512,7 +613,12 @@ struct Job {
     // shared-state-ok: the pipeline's source, set once when it starts and read by every worker
     // that claims. It answers guards that name morsels and holds no tile.
     source: OnceLock<Arc<dyn MorselSource>>,
-    /// Whether the source has answered `None`, which is final.
+    /// What was published to the pipeline before its source was built. `start` hands it to the
+    /// source.
+    // shared-state-ok: a region and a flag, written by whichever thread delivers an arrival and
+    // read once by the thread that starts the pipeline. It holds no tile.
+    early: Mutex<Early>,
+    /// Whether the source has answered `Exhausted`, which is final.
     exhausted: AtomicBool,
     finished: AtomicBool,
     /// Morsels claimed and not acknowledged, plus claims in flight.
@@ -545,6 +651,10 @@ impl Dispatcher {
                 finalize: spec.finalize,
                 dependents,
                 source: OnceLock::new(),
+                early: Mutex::new(Early {
+                    region: Projection::Nothing,
+                    closed: false,
+                }),
                 exhausted: AtomicBool::new(false),
                 finished: AtomicBool::new(false),
                 outstanding: AtomicUsize::new(0),
@@ -568,11 +678,65 @@ impl Dispatcher {
         dispatcher
     }
 
-    /// Build the pipeline's source, which makes its morsels claimable.
+    /// Build the pipeline's source, which makes its morsels claimable, and hand it what reached
+    /// the pipeline before it started.
+    ///
+    /// The early state stays locked until the source is set, so a publish either lands in it
+    /// before the source reads it or finds the source set.
     fn start(&self, index: usize) {
         let job = &self.jobs[index];
+        let early = job.early.lock_wait();
         let source = (job.build)();
+        source.publish(&early.region);
+        if early.closed {
+            source.close();
+        }
         assert!(job.source.set(source).is_ok(), "a pipeline starts once");
+    }
+
+    /// The keys `arrived` have been added to the pipeline's source: unite the region into what
+    /// the source can hand out, and wake the workers parked for want of a morsel.
+    ///
+    /// The caller has written the rows and made their positions ready before it calls, and holds
+    /// no lock this call takes: the pipeline's early state, the source's state, the lock the
+    /// source's ready-positions function reads, and the lock that parks idle workers. The source
+    /// takes the region under its own lock, and the epoch moves after that, so a worker that finds
+    /// no morsel in its claim read the epoch before the move and its park returns at once.
+    fn publish(&self, pipeline: PipelineId, arrived: &Projection) {
+        let job = &self.jobs[pipeline.0];
+        debug_assert!(
+            !job.finished.load(Ordering::Acquire),
+            "a pipeline is published to before it finishes"
+        );
+        {
+            let mut early = job.early.lock_wait();
+            match job.source.get() {
+                Some(source) => {
+                    drop(early);
+                    source.publish(arrived);
+                }
+                None => early.region = early.region.union(arrived),
+            }
+        }
+        self.wake_idle();
+    }
+
+    /// No row will be added to the pipeline's source, which makes its claim `Exhausted` once
+    /// every published row is claimed. It follows the last publish, and a second call changes
+    /// nothing.
+    fn close(&self, pipeline: PipelineId) {
+        let job = &self.jobs[pipeline.0];
+        {
+            let mut early = job.early.lock_wait();
+            match job.source.get() {
+                Some(source) => {
+                    drop(early);
+                    source.close();
+                }
+                None => early.closed = true,
+            }
+        }
+        self.wake_idle();
     }
 
     /// The next morsel of a started pipeline that has one, trying `prefer` first: a worker
@@ -597,13 +761,18 @@ impl Dispatcher {
                 // outstanding morsel knows no claim is in flight.
                 job.outstanding.fetch_add(1, Ordering::AcqRel);
                 match source.claim(self.morsel_rows) {
-                    Some(guard) => {
+                    Claim::Morsel(guard) => {
                         return Next::Package(WorkPackage {
                             pipeline: PipelineId(index),
                             guard,
                         });
                     }
-                    None => {
+                    // A row may still arrive: the pipeline stays open, and a publish or a close
+                    // wakes the worker that parks on it.
+                    Claim::Idle => {
+                        job.outstanding.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    Claim::Exhausted => {
                         job.outstanding.fetch_sub(1, Ordering::AcqRel);
                         // A worker parked while attached to this pipeline has to leave it
                         // before it can finish, so the exhaustion wakes it.
@@ -751,10 +920,13 @@ impl Drop for FailOnUnwind<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::tile_operators::{IterateExtent, RangeSource, zip_arms_at};
+    use crate::interpreter::tile_operators::{
+        IterateExtent, LiveSource, RangeSource, union_of, zip_arms_at,
+    };
     use crate::interpreter::{BaseType, CurryLevel, Extent};
     use crate::interpreter::{FunctionGuard, Value};
     use intervalsets::Bounding;
+    use intervalsets::{Interval, IntervalSet};
     use std::collections::BTreeSet;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -1044,6 +1216,235 @@ mod tests {
         }
     }
 
+    /// The positions that have ready at a live source, which the test advances.
+    type Ready = Arc<Mutex<IntervalSet<u64>>>;
+
+    /// A live source over the positions that have ready, as a pipeline's source.
+    fn live_source() -> (Arc<LiveSource>, Ready) {
+        let ready: Ready = Arc::new(Mutex::new(IntervalSet::from(Interval::<u64>::empty())));
+        let read = ready.clone();
+        let source = Arc::new(LiveSource::new(move || read.lock_wait().clone()));
+        (source, ready)
+    }
+
+    /// `count` positions arrive after the ones that did and are published to `pipeline`, as the
+    /// delivering thread does: the rows first, then the region.
+    fn arrive(dispatcher: &Dispatcher, pipeline: PipelineId, ready: &Ready, count: u64) {
+        let first = {
+            let mut set = ready.lock_wait();
+            let first = set
+                .intervals()
+                .last()
+                .and_then(|last| last.rval().copied())
+                .map_or(0, |last| last + 1);
+            *set = union_of(
+                &set,
+                &IntervalSet::from(Interval::closed(first, first + count - 1)),
+            );
+            first
+        };
+        let region = TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
+            IntervalSet::from(Interval::closed(
+                Value::UInt(first),
+                Value::UInt(first + count - 1),
+            )),
+        )));
+        dispatcher.publish(pipeline, &Projection::of(&region).expect("keys"));
+    }
+
+    fn live_dispatcher(source: &Arc<LiveSource>, morsel_rows: u64) -> Dispatcher {
+        let source: Arc<dyn MorselSource> = source.clone();
+        Dispatcher::new(
+            vec![PipelineSpec {
+                after: Vec::new(),
+                source: Box::new(move || source.clone()),
+                finalize: None,
+            }],
+            morsel_rows,
+        )
+    }
+
+    /// A pipeline over a live source answers `Wait` while nothing is published, hands out each
+    /// arrival once it is published, and finishes when the source is closed and drained.
+    #[test]
+    fn a_live_pipeline_hands_out_arrivals_and_finishes_when_closed() {
+        let (source, rows) = live_source();
+        let dispatcher = live_dispatcher(&source, 4);
+        assert!(matches!(dispatcher.next(None), Next::Wait));
+        arrive(&dispatcher, MAIN_PIPELINE, &rows, 6);
+        let first = package(dispatcher.next(None));
+        assert_eq!(bounds(&first.guard), (0, 3));
+        let second = package(dispatcher.next(None));
+        assert_eq!(bounds(&second.guard), (4, 5));
+        assert!(
+            matches!(dispatcher.next(None), Next::Wait),
+            "open and drained"
+        );
+        dispatcher.ack(first);
+        dispatcher.ack(second);
+        assert!(
+            !dispatcher.is_done(MAIN_PIPELINE),
+            "an arrival may still come"
+        );
+        dispatcher.close(MAIN_PIPELINE);
+        assert!(matches!(dispatcher.next(None), Next::Done));
+        assert!(dispatcher.is_done(MAIN_PIPELINE));
+    }
+
+    /// A dispatcher whose second pipeline, over `source`, starts once the first, a finite one,
+    /// has finished.
+    fn live_behind_another(source: &Arc<LiveSource>, morsel_rows: u64) -> Dispatcher {
+        let live: Arc<dyn MorselSource> = source.clone();
+        Dispatcher::new(
+            vec![
+                PipelineSpec {
+                    after: Vec::new(),
+                    source: Box::new(|| Arc::new(RangeSource::new(1))),
+                    finalize: None,
+                },
+                PipelineSpec {
+                    after: vec![PipelineId(0)],
+                    source: Box::new(move || live.clone()),
+                    finalize: None,
+                },
+            ],
+            morsel_rows,
+        )
+    }
+
+    /// The morsels of the live pipeline that `serve` ran.
+    fn live_morsels(dispatcher: &Dispatcher) -> Vec<(u64, u64)> {
+        let mut worker = Recorder::default();
+        dispatcher.serve(&mut worker);
+        worker
+            .morsels
+            .iter()
+            .filter(|(p, _)| *p == 1)
+            .map(|(_, b)| *b)
+            .collect()
+    }
+
+    /// Regions published to a pipeline that has not started are united, and the source claims
+    /// the union.
+    #[test]
+    fn regions_published_before_the_pipeline_starts_are_united() {
+        let (source, ready) = live_source();
+        let dispatcher = live_behind_another(&source, 8);
+        arrive(&dispatcher, PipelineId(1), &ready, 2);
+        arrive(&dispatcher, PipelineId(1), &ready, 3);
+        dispatcher.close(PipelineId(1));
+        assert_eq!(live_morsels(&dispatcher), [(0, 4)]);
+    }
+
+    /// An `Everything` published before the pipeline starts is resolved when the source is built,
+    /// to the positions ready then.
+    #[test]
+    fn an_everything_published_before_the_pipeline_starts_covers_what_is_ready_by_then() {
+        let (source, ready) = live_source();
+        let dispatcher = live_behind_another(&source, 8);
+        *ready.lock_wait() = IntervalSet::from(Interval::closed(0, 3));
+        dispatcher.publish(PipelineId(1), &Projection::Everything);
+        *ready.lock_wait() = IntervalSet::from(Interval::closed(0, 5));
+        dispatcher.close(PipelineId(1));
+        assert_eq!(live_morsels(&dispatcher), [(0, 5)]);
+    }
+
+    /// Poll `condition` until it holds, failing after ten seconds.
+    fn wait_until(condition: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the condition held in time"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// A worker with nothing to claim wakes when a region is published, runs it while the source
+    /// is open, and returns once the source is closed.
+    #[test]
+    fn a_parked_worker_wakes_on_a_publish_and_on_a_close() {
+        let (source, rows) = live_source();
+        let dispatcher = live_dispatcher(&source, 4);
+        std::thread::scope(|scope| {
+            // A failed wait fails the dispatcher, which wakes the parked worker, so the scope
+            // joins it instead of hanging.
+            let _fail = FailOnUnwind(&dispatcher);
+            let worker = scope.spawn(|| {
+                let mut worker = Recorder::default();
+                dispatcher.serve(&mut worker);
+                worker
+            });
+            let claimed = |count: u64| {
+                let source = source.clone();
+                move || {
+                    source
+                        .claimed()
+                        .intervals()
+                        .iter()
+                        .map(|i| i.rval().map_or(0, |r| r + 1))
+                        .max()
+                        .unwrap_or(0)
+                        >= count
+                }
+            };
+            arrive(&dispatcher, MAIN_PIPELINE, &rows, 3);
+            wait_until(claimed(3));
+            assert!(
+                !worker.is_finished(),
+                "the source is open, so the worker waits"
+            );
+            arrive(&dispatcher, MAIN_PIPELINE, &rows, 2);
+            wait_until(claimed(5));
+            assert!(!worker.is_finished(), "the source is still open");
+            dispatcher.close(MAIN_PIPELINE);
+            let worker = worker
+                .join()
+                .expect("the worker returns once the source is closed");
+            let ran: Vec<_> = worker.morsels.iter().map(|(_, b)| *b).collect();
+            assert_eq!(ran, [(0, 2), (3, 4)]);
+            assert_eq!(worker.left, [0], "it left the pipeline before it finished");
+            assert!(dispatcher.all_done());
+        });
+    }
+
+    /// What reaches a pipeline before it starts is kept for its source: an arrival published to
+    /// a pipeline behind another is claimed once the first finishes.
+    #[test]
+    fn a_region_published_before_the_pipeline_starts_is_kept() {
+        let (source, rows) = live_source();
+        let live: Arc<dyn MorselSource> = source.clone();
+        let dispatcher = Dispatcher::new(
+            vec![
+                PipelineSpec {
+                    after: Vec::new(),
+                    source: Box::new(|| Arc::new(RangeSource::new(2))),
+                    finalize: None,
+                },
+                PipelineSpec {
+                    after: vec![PipelineId(0)],
+                    source: Box::new(move || live.clone()),
+                    finalize: None,
+                },
+            ],
+            4,
+        );
+        let behind = PipelineId(1);
+        arrive(&dispatcher, behind, &rows, 3);
+        dispatcher.close(behind);
+        let mut worker = Recorder::default();
+        dispatcher.serve(&mut worker);
+        let behind_ran: Vec<_> = worker
+            .morsels
+            .iter()
+            .filter(|(p, _)| *p == 1)
+            .map(|(_, b)| *b)
+            .collect();
+        assert_eq!(behind_ran, [(0, 2)]);
+        assert!(dispatcher.all_done());
+    }
+
     /// A worker with nothing to claim parks while another holds a morsel of the pipeline it
     /// waits on, and the finish that morsel allows wakes it to run the next pipeline.
     #[test]
@@ -1257,7 +1658,7 @@ mod tests {
     #[test]
     fn the_source_is_the_one_leaf_that_cuts_morsels() {
         let source = source_of(&*iterate(Extent::uint_range(6))).expect("a finite range");
-        assert!(source.claim(4).is_some());
+        assert!(source.claim(4).morsel().is_some());
     }
 
     #[test]

@@ -635,12 +635,11 @@ A notification carries the region of the notifying producer's outermost keys tha
 `Consumer::notify(arrived: &Projection)`. A producer that cannot name the region sends `Everything`, and
 none sends `Nothing`. A closure consumer ignores the region. A consumer that pulls on notification
 has no use for it, since its pull reads whatever arrived. A consumer that does not pull acts on the
-region instead.
+region instead: a pipeline's dispatcher takes the work it hands out from it ([The
+scheduler](../../docs/parallel-execution.md#the-scheduler)).
 
-A component that merges notifications to one consumer unites their regions with
-`Projection::union` and narrows none. A gate drops the notification it suppresses, and its region
-with it: a consumer that pulls reads the change in its next pull, and a consumer that needs every
-region must not sit behind a gate.
+Notifications to one consumer coalesce by `Projection::union`. A region widens until its consumer
+is notified and is neither narrowed nor dropped on the way.
 
 **Forwarding.** An operator keeps an input's keys, forwarding its region unchanged, only if its row
 of the "Projection guards" table pulls that input at the projection and the input's keys are the
@@ -689,6 +688,26 @@ initial input read. A
 forwarding to fan-out slots. Clearing does not depend on whether the pull reads the notifying input.
 Without this suppression, a change can reach a sink once per path through the graph, and cyclic
 notification paths can continue indefinitely.
+
+A consumer that never pulls (`Consumer::region_driven`) has no gate. No pull is owed to its
+notifications, so a gate it sat behind would pass one notification and hold the rest until a pull
+of the producer behind it, which a worker owes only to a claimed morsel. Its gate is
+`Notified::Always`, so no region waits behind one, and `forwarding_consumer` waits for the
+consumer's cell where it would drop or defer, because a dropped notification loses its region.
+
+**Region-driven chains.** A region reaches a region-driven consumer intact only if every consumer
+between the notifying producer and it reports `region_driven`, and the notification graph between
+them is acyclic. The first makes each gate on the path `Notified::Always` and each forwarder wait
+rather than drop. A closure and a sink's consumer report `false` and ignore the region, and a
+fan-out's input consumer reports `false` and drops a second notification between pulls, with its
+region. Acyclicity makes the wait safe: a cell is not reached twice along one cascade, and a cell
+downstream of a region-driven consumer is itself region-driven, so no forwarder waits for a cell its
+own cascade holds. It orders the cells' locks only. The thread that notifies also holds no lock that
+the cascade takes, so that a forwarder's wait is not for a lock the notifier itself holds: for the
+worker pool that is the dispatcher's lock on what reached a pipeline before it started, the live
+source's state lock, the lock the source's ready-positions function reads, and the lock that parks
+idle workers. The worker pool's plan admits only chains for which both hold ([The
+scheduler](../../docs/parallel-execution.md#the-scheduler)).
 
 `forwarding_consumer` delivers through the gate when its consumer can be locked. On reentry,
 it drops the notification if the gate is set: no pull has occurred since forwarding. Otherwise

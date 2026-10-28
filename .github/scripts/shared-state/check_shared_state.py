@@ -101,6 +101,13 @@ EXPECTED_EXCEPTIONS = [
     # nothing to claim parks on its condition variable, which needs a mutex to pair with.
     ("src/interpreter/parallel.rs", "cell of `Arc<dyn MorselSource>`"),
     ("src/interpreter/parallel.rs", "cell of `()`"),
+    # A live source's arrivals, twice: the positions published and not claimed, and what reached a
+    # pipeline before its source was built. Both are interval sets of positions, which have no
+    # atomic form, and both name morsels without holding a tile. The source's lock orders every
+    # claim, which the dispatcher's finish rule relies on; the early state's lock orders a publish
+    # against the start of the pipeline.
+    ("src/interpreter/parallel.rs", "cell of `Early`"),
+    ("src/interpreter/tile_operators/iterate.rs", "cell of `LiveState`"),
     # The operator-graph recorder, twice: the `thread_local!` and the cell inside
     # it each match the ambient-state shape. Necessary because `OperatorBase::new`
     # runs inside operator constructors, which take no context parameter; what

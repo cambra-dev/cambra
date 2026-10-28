@@ -130,23 +130,25 @@ dispatch of Leis et al. 2014, where the dispatcher carves the next range off a p
 a worker asks.
 
 **The source cuts its own rows.** `TileOperator::morsel_source` answers an `Arc<dyn MorselSource>`
-for an operator that is a source and `None` for every other. `MorselSource::claim(rows)` answers the
-guard of the next morsel of at most `rows` rows, or `None`, which is final. `IterateExtent` over a
+for an operator that is a source and `None` for every other. `MorselSource::claim(rows)` answers a
+`Claim`: `Morsel` with the guard of the next morsel of at most `rows` rows, `Idle` (nothing is
+claimable now and a row may still arrive) or `Exhausted`, which is final. `IterateExtent` over a
 finite range `[0, n)` answers a `RangeSource`: one `AtomicU64` cursor that `fetch_update` advances,
 so each position is in exactly one claimed morsel whichever threads claim, and the cursor never
-passes `n`. The update is acquire-release, because a claim that answers `None` must happen after
-every claim that answered a morsel (the finish rule below relies on it). The data a worker reads
-under a guard comes from its own chain. `IterateExtent`'s producer knows nothing of the dispatcher.
-`run_main` finds the source by walking the chain's inputs to the first operator that answers one,
-and refuses a chain with none or with several.
+passes `n`. The update is acquire-release, because a claim that answers `Exhausted` must happen
+after every claim that answered a morsel (the finish rule below relies on it). A finite source holds
+every row from the start, so its `publish` and `close` do nothing and it never answers `Idle`. The
+data a worker reads under a guard comes from its own chain. `IterateExtent`'s producer knows nothing
+of the dispatcher. `run_main` finds the source by walking the chain's inputs to the first operator
+that answers one, and refuses a chain with none or with several.
 
-**A pipeline finishes when three counts agree.** Its source has answered `None`, no claimed morsel
-is outstanding, and no worker is still attached. A claim counts itself outstanding before it asks
-the source and takes the count back when the source answers `None`. A worker attaches when it
-receives its first package of the pipeline and leaves once the source is exhausted, handing in what
-it holds for the pipeline through `PoolWorker::leave`. The worker that completes the pipeline, by
-its last `ack`, its `None` claim or its leaving, runs `finalize` and finishes it. Nothing is
-outstanding and no worker is attached only after every claim that answered a morsel was
+**A pipeline finishes when three counts agree.** Its source has answered `Exhausted`, no claimed
+morsel is outstanding, and no worker is still attached. A claim counts itself outstanding before it
+asks the source and takes the count back when the source answers `Idle` or `Exhausted`. A worker
+attaches when it receives its first package of the pipeline and leaves once the source is exhausted,
+handing in what it holds for the pipeline through `PoolWorker::leave`. The worker that completes the
+pipeline, by its last `ack`, its `Exhausted` claim or its leaving, runs `finalize` and finishes it.
+Nothing is outstanding and no worker is attached only after every claim that answered a morsel was
 acknowledged: a claim attaches before it acknowledges.
 
 **A pipeline starts when the pipelines it follows have finished.** Finishing a pipeline decrements
@@ -160,6 +162,51 @@ looks, and parks until the epoch moves. The epoch moves when a pipeline's source
 a pipeline finishes and when the dispatcher fails. The thread that moves it takes the idle lock
 before it notifies, so a worker between its check and its wait is not missed. Exhaustion moves it
 because a worker parked while attached has to wake and leave before the pipeline can finish.
+
+**A live source's arrivals are published to it.** `LiveSource` is the source of positions that
+receive rows, in any order. It holds the positions published and not claimed (`pending`) and the
+positions claimed, as interval sets under one lock, and reads the source's yield predicate, `ready`,
+an interval set of the positions whose rows are ready to read. The yield predicate is the region
+ready to read. It is not a tile's `domain_predicate`, which says that no further key arrives in a
+region: a position outside `ready` may arrive later, and one inside it has. `publish` names a region
+of `ready`, and `Everything` names `ready` itself. A `Keys` region lies within `ready`, since the
+rows and their positions in the yield predicate are visible before the region is published, and
+`publish` asserts it in release builds as well. The source unites the region, less what was claimed,
+into `pending`, so a region published twice is claimed once and a position that is not ready is
+never claimed. `UInt` is discrete, so a region built from open bounds holds closed ones, and the
+conversion to positions is exact. Nothing is published after `close`. `claim(rows)` cuts the lowest
+`rows` pending positions into a morsel, or answers `Idle` while the source is open and `Exhausted`
+once `close` was called and `pending` is empty. One lock orders every claim, so an `Exhausted`
+follows every morsel.
+
+`Dispatcher::publish(pipeline, region)` and `close(pipeline)` reach a pipeline's source and move the
+epoch. A pipeline that has not started has no source yet, so they keep the region and the close in
+the pipeline's `Early` state, which `start` hands to the source it builds. The delivering thread
+holds no lock these calls take: `Early`'s, the source's state, the one `ready` reads, and `idle`.
+`start` holds that state's lock until the source is set, so a publish either lands in it first or
+finds the source set.
+
+A `PipelineHandle` is a dispatcher and a pipeline, and `PipelineConsumer` is a `region_driven`
+consumer over it: the consumer subscribed at the head of the first worker's chain. A notification
+that reaches it publishes its region. Every other worker's chain subscribes a closure, and the
+source registers every chain's consumer, so one arrival notifies all of them. Only the first chain
+publishes, and the source takes a region it has already claimed once: the duplicates that remain are
+an `Everything` that covers published rows and a region that reaches the head along two paths of a
+diamond. The path from the source to the `PipelineConsumer` is region-driven and acyclic
+([Region-carrying notifications](#region-carrying-notifications)), which `plan_main` guarantees by
+admitting only `MapResult`s over a `Constant` function operand and refusing a shared node
+(`FanOutSlot`) or a deferred edge. `run_pipeline` is the body of `run_main` for a plan with one
+pipeline: it takes the breaker and the source, and with a `DeliveringThread` runs a thread that
+stands in for the one that reads the source's input and receives the handle. It closes the source
+when that thread returns, which can publish nothing more.
+
+**Rows are written before their region is published, and the region before the epoch moves.** The
+delivering thread writes the rows under their store's lock, publishes the region under the source's
+lock, then moves the epoch. A worker that claims a morsel locks the source after the publish, and
+the lock it takes on the store when it pulls follows the delivering thread's, so the rows are
+visible to it. A worker reads the epoch before it claims. One that found `Idle` read the epoch
+before the publish moved it, so its park returns at once, and one that read it after found the
+region.
 
 **A worker stays on its pipeline.** `next` tries the pipeline the worker last claimed from first,
 which keeps its chain, the rows it reads and its partial in one cache. A worker moves when that
@@ -175,6 +222,40 @@ panic.
 pipelines whose source is exhausted, asks `next`, and runs the package through `PoolWorker::work`,
 which pulls the chain, hands the tile to the breaker and releases the morsel, before `ack`. The
 plan's one pipeline is served by `MainWorker`; a test double records what it ran and left.
+
+### Region-carrying notifications
+
+`Consumer::notify(arrived: &Projection)` names the region of the notifying producer's outermost
+keys that changed ([the notification contract](design-operators.md#the-notification-contract)). The
+region is the work a pipeline's dispatcher hands out, so it must reach the pipeline's head intact
+or widened, never narrowed or lost.
+
+- **Default.** An operator keeps an input's keys, forwarding its region unchanged, when its row of
+  the projection table pulls that input at the projection, and widens every other input, which
+  forwards `Everything`. [The notification-contract
+  table](design-operators.md#the-notification-contract) says which, per operator and input. There
+  are four ways to keep keys: `consumer_keeping_keys_if` (or the bare consumer, for an operator
+  with one input), `subscribe_forwarding_keeping_keys` and `subscribe_forwarding_keeping_keys_if`
+  (an operator with several inputs behind one gate), and `forwarding_consumer_keeping_keys`
+  (`Memo`). A region reaches a consumer unwidened only through operators that keep keys.
+- **No gate for a region-driven consumer.** `Consumer::region_driven` says a consumer acts on the
+  region and never pulls. `shared_consumer` gives such a consumer a gate of `Notified::Always`, so
+  no region waits behind one: no pull is owed to its notifications, and a closed gate would pass one
+  and hold the rest. A consumer that pulls keeps no region, since its pull reads whatever arrived.
+  The wrappers (`widening`, `Gated`, `FlaggingConsumer`, `Forwarding`) report the flag of the
+  consumer they wrap, and `Gated` asserts that a region-driven consumer's gate is `Always`.
+  `forwarding_consumer` waits for the cell of a region-driven consumer with `lock_wait`, where the
+  drop or the deferral that serves a consumer that pulls would lose the region.
+- **The invariant.** Every consumer between the notifying producer and a region-driven consumer
+  reports `region_driven`, and the notification graph between them is acyclic. A closure and a
+  sink's consumer ignore the region, and a fan-out's input consumer drops a second notification, so
+  a chain with one between its source and the pool's head loses regions. The pool's plan refuses
+  such a chain. Acyclicity makes the wait of `forwarding_consumer` safe: a cascade does not reach
+  one cell twice, and a cell downstream of a region-driven consumer is itself region-driven. It
+  orders the cells' locks only. The thread that notifies holds no lock the cascade takes (the
+  dispatcher's lock on what reached a pipeline before it started, the source's state lock, the lock
+  its ready-positions function reads, and the lock that parks idle workers).
+- **Closures.** A closure consumer ignores the region, and the scheduler's drains send `Everything`.
 
 ### Projection guards
 
@@ -228,13 +309,13 @@ collection and for `sum`, `max` and `min` over it, and the folds again over thre
 worker takes no package; one worker equals the whole pull; the plan reads a fold off the extract; a
 group-by is refused. The three producers each have a unit test of the interval they hand out and the
 release that follows (`map.rs`, `scalar.rs`, `iterate.rs`). `iterate.rs` also tests `RangeSource`:
-its morsels are disjoint and end in `None`, a morsel holds at least one row, and a finite range from
-zero is the one extent that answers a source. The dispatcher's unit tests in `parallel.rs`: morsels
-are disjoint and cover the range; an empty range finishes its pipeline when first asked; a claimed
-morsel keeps its pipeline open until it is acknowledged; a failed dispatcher hands out nothing; a
-panicking worker stops the others claiming; a pipeline waits for the one it follows, an empty
-pipeline starts the ones behind it, and a pipeline behind two starts after both; a dependency on a
-later pipeline is refused; a worker stays on its pipeline; eight workers over a chain of two
+its morsels are disjoint and end in `Exhausted`, a morsel holds at least one row, and a finite range
+from zero is the one extent that answers a source. The dispatcher's unit tests in `parallel.rs`:
+morsels are disjoint and cover the range; an empty range finishes its pipeline when first asked; a
+claimed morsel keeps its pipeline open until it is acknowledged; a failed dispatcher hands out
+nothing; a panicking worker stops the others claiming; a pipeline waits for the one it follows, an
+empty pipeline starts the ones behind it, and a pipeline behind two starts after both; a dependency
+on a later pipeline is refused; a worker stays on its pipeline; eight workers over a chain of two
 pipelines claim every position of each once, start each pipeline once and leave each pipeline they
 claimed from; an idle worker parks while another holds a morsel and wakes when the pipeline
 finishes; a failure wakes a parked worker. `source_of` finds the one source, and refuses a chain
@@ -244,11 +325,11 @@ with none and a chain with two.
 
 A breaker other than the sink and a fold into `main`, a source over a data-source domain, a pipeline
 plan over more than one pipeline (the dispatcher runs dependent pipelines, and `plan_main` cuts
-one), the operator that serves a breaker's output to the pipeline behind it, a source that receives
-rows over time (its claim needs a state between exhausted and nothing yet, and a way to hand a
-morsel back), and the sink pulls the scheduler loop queues. Before a source over a data-source
-domain lands, the `main` producer `compile_program` subscribes has to be owned by the pool: it
-registers a release record of `False` with the source, and a source agrees to reclaim only what
-every record releases, so an idle producer pins the source. Every program the plan refuses runs on
-the thread that compiled it, through `Scheduler::check_for_notifications` and the sink pulls it
-queues.
+one), the operator that serves a breaker's output to the pipeline behind it, a way to hand a morsel
+back, and the sink pulls the scheduler loop queues. A live source exists as `LiveSource`, and
+nothing outside tests publishes to it: `IterateExtent` over a data-source domain answers no
+`morsel_source`. Before a source over a data-source domain lands, the `main` producer
+`compile_program` subscribes has to be owned by the pool: it registers a release record of `False`
+with the source, and a source agrees to reclaim only what every record releases, so an idle producer
+pins the source. Every program the plan refuses runs on the thread that compiled it, through
+`Scheduler::check_for_notifications` and the sink pulls it queues.

@@ -2194,36 +2194,25 @@ mod projection_tests {
         use crate::interpreter::tile_operators::test_helpers::{
             NotifyingOp, RegionLog, notify_input,
         };
+        let (table_tile, table_tiling) = table();
+        let positions = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::uint_range(ROWS)),
+        );
+        let (input, input_consumer) = NotifyingOp::new(stream((0..ROWS).collect()).0, positions);
+        let (function, function_consumer) = NotifyingOp::new(table_tile, table_tiling);
+        let mut map = MapResult::new_at(Box::new(input), Box::new(function), CurryLevel::new(1));
+        let (log, regions) = RegionLog::new(true);
+        let _producer = map.subscribe(
+            map.tiling().universal_guard(),
+            Box::new(log),
+            &mut Scheduler::new(),
+        );
+
         let morsel = Projection::of(&keys_between(2, 4)).expect("keys");
-        // One consumer notifies once between pulls, so each operand gets a subscription.
-        let notified = |through_input: bool| {
-            let (table_tile, table_tiling) = table();
-            let positions = Tiling::data_function(
-                Extent::uint_range(ROWS),
-                Tiling::Scalar(Extent::uint_range(ROWS)),
-            );
-            let (input, input_consumer) =
-                NotifyingOp::new(stream((0..ROWS).collect()).0, positions);
-            let (function, function_consumer) = NotifyingOp::new(table_tile, table_tiling);
-            let mut map =
-                MapResult::new_at(Box::new(input), Box::new(function), CurryLevel::new(1));
-            let (log, regions) = RegionLog::new();
-            let _producer = map.subscribe(
-                map.tiling().universal_guard(),
-                Box::new(log),
-                &mut Scheduler::new(),
-            );
-            let operand = if through_input {
-                &input_consumer
-            } else {
-                &function_consumer
-            };
-            notify_input(operand, &morsel);
-            let seen = regions.lock_now();
-            seen.clone()
-        };
-        assert_eq!(notified(true), std::slice::from_ref(&morsel));
-        assert_eq!(notified(false), [Projection::Everything]);
+        notify_input(&input_consumer, &morsel);
+        notify_input(&function_consumer, &morsel);
+        assert_eq!(*regions.lock_now(), [morsel, Projection::Everything]);
     }
 
     /// Applied to a whole collection at the outermost level, the function's keys are the
@@ -2247,17 +2236,15 @@ mod projection_tests {
                 codomain: Box::new(Extent::Base(BaseType::Int)),
             },
         );
-        // A constant notifies its consumer when it is subscribed, which closes the gate, so a
-        // stand-in of its tiling that does not notify takes its place.
-        let function_tiling = function.tiling().clone();
-        let (function, _) = NotifyingOp::new(function_tiling.empty_tile(), function_tiling);
         let mut map = MapResult::new_at(Box::new(input), Box::new(function), CurryLevel::OUTERMOST);
-        let (log, regions) = RegionLog::new();
+        let (log, regions) = RegionLog::new(true);
         let _producer = map.subscribe(
             map.tiling().universal_guard(),
             Box::new(log),
             &mut Scheduler::new(),
         );
+        // A constant notifies its consumer when it is subscribed.
+        regions.lock_now().clear();
         notify_input(
             &input_consumer,
             &Projection::of(&keys_between(2, 4)).expect("keys"),
@@ -2278,7 +2265,7 @@ mod projection_tests {
             NotifyingOp::new(Tile::Scalar(ColumnValue::single(Value::UInt(3))), scalar);
         let (function, _) = NotifyingOp::new(table_tile, table_tiling);
         let mut map = MapResult::new_at(Box::new(input), Box::new(function), CurryLevel::OUTERMOST);
-        let (log, regions) = RegionLog::new();
+        let (log, regions) = RegionLog::new(true);
         let _producer = map.subscribe(
             map.tiling().universal_guard(),
             Box::new(log),

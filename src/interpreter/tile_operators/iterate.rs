@@ -2,7 +2,7 @@ use crate::interpreter::LockNow;
 use bit_set::BitSet;
 use intervalsets::{
     Bounding, Interval, IntervalSet,
-    ops::{Difference, Intersection},
+    ops::{Difference, Intersection, Union},
 };
 use smol_str::SmolStr;
 use std::{
@@ -16,8 +16,8 @@ use std::{
 use super::*;
 use crate::ccl::TagMap;
 use crate::interpreter::{
-    BaseType, ColumnValue, Consumer, Extent, NotifyOrSubscribeResult, Projection, Scheduler,
-    SharedConsumer, UnionArm, Value, scheduler::shared_consumer,
+    BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult,
+    Projection, Scheduler, SharedConsumer, UnionArm, Value, scheduler::shared_consumer,
 };
 
 /// Produces a function tile whose domain and codomain both equal `extent`.
@@ -45,8 +45,21 @@ impl IterateExtent {
         consumer: SharedConsumer,
         scheduler: &mut Scheduler,
     ) {
+        // The outermost keys of the extent are a source's keys when the extent is that source's
+        // domain, or a restriction of it; inside a record or a union they are not.
+        fn outermost_source(
+            extent: &Extent,
+        ) -> Option<&Arc<Mutex<dyn DataSourceDomainExtentImpl>>> {
+            match extent {
+                Extent::DataSourceDomain(source) => Some(source),
+                Extent::Restricted { base, .. } => outermost_source(base),
+                _ => None,
+            }
+        }
+        let outermost = outermost_source(extent);
         extent.for_each_source(&mut |source| {
-            scheduler.add_source_handle(source.clone(), Arc::downgrade(&consumer));
+            let outermost_keys = outermost.is_some_and(|keys| Arc::ptr_eq(keys, source));
+            scheduler.add_source_handle(source.clone(), Arc::downgrade(&consumer), outermost_keys);
         });
     }
 }
@@ -152,24 +165,155 @@ impl RangeSource {
 }
 
 impl MorselSource for RangeSource {
-    fn claim(&self, rows: u64) -> Option<TileGuard> {
+    fn claim(&self, rows: u64) -> Claim {
         let rows = rows.max(1);
-        // Acquire-release, as `MorselSource::claim` requires: the update that answers `None`
-        // reads the update that answered the last morsel. The data a worker reads under a
-        // guard comes from its own chain.
-        let first = self
+        // Acquire-release, as `MorselSource::claim` requires: the update that answers
+        // `Exhausted` reads the update that answered the last morsel. The data a worker reads
+        // under a guard comes from its own chain.
+        let Ok(first) = self
             .next
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |first| {
                 (first < self.rows).then(|| first.saturating_add(rows).min(self.rows))
             })
-            .ok()?;
+        else {
+            return Claim::Exhausted;
+        };
         let last = first.saturating_add(rows).min(self.rows) - 1;
-        Some(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::intervals(IntervalSet::from(Interval::closed(
-                Value::UInt(first),
-                Value::UInt(last),
-            ))),
-        )))
+        Claim::Morsel(positions(first, last))
+    }
+}
+
+/// The guard naming the positions `[first, last]` of the outermost collection.
+fn positions(first: u64, last: u64) -> TileGuard {
+    TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
+        IntervalSet::from(Interval::closed(Value::UInt(first), Value::UInt(last))),
+    )))
+}
+
+/// The positions of a source that receives rows, claimed as morsels from the region published so
+/// far. Nothing publishes to a live source outside tests yet.
+///
+/// The source's yield predicate, `ready`, is the set of positions whose rows are ready to read. It
+/// is not a tile's `domain_predicate`, which says no further key arrives in a region: positions may
+/// arrive in any order, and a position outside `ready` may arrive later. A publish names a region of
+/// the positions in `ready`, which `Everything` is resolved to, and the source adds it to `pending`,
+/// less what was claimed before, so a region published twice is claimed once and a position that has
+/// not arrived is never claimed. A claim cuts the lowest `rows` pending positions. Both sets live
+/// under one lock, which makes the claims a total order: the claim that answers `Exhausted` follows
+/// every claim that answered a morsel.
+pub struct LiveSource {
+    // shared-state-ok: the positions published and claimed, which name morsels and hold no
+    // tile. One lock orders every claim, which the finish rule of the dispatcher relies on.
+    state: Mutex<LiveState>,
+    /// The yield predicate, read when a region is published.
+    ready: Box<dyn Fn() -> IntervalSet<u64> + Send + Sync>,
+}
+
+struct LiveState {
+    /// Published and not claimed.
+    pending: IntervalSet<u64>,
+    /// Claimed.
+    claimed: IntervalSet<u64>,
+    closed: bool,
+}
+
+/// `a ∪ b`, which [`IntervalSet::union`] has no interval to start from when both are empty.
+pub(crate) fn union_of(a: &IntervalSet<u64>, b: &IntervalSet<u64>) -> IntervalSet<u64> {
+    match (a.intervals().is_empty(), b.intervals().is_empty()) {
+        (true, _) => b.clone(),
+        (_, true) => a.clone(),
+        _ => a.union(b),
+    }
+}
+
+impl LiveSource {
+    /// A source whose rows are the positions `ready()` names: a set that only grows as rows are
+    /// appended, in any order. `Everything` published to the source means every position in
+    /// `ready`, not every position of the source's extent. The thread that appends a row writes it
+    /// and adds its position to `ready`, then publishes the region that names it, and `close`
+    /// follows the last publish. That thread holds no lock that `ready` takes while it publishes,
+    /// since `publish` calls `ready` and the cascade that reached `publish` may hold others.
+    pub fn new(ready: impl Fn() -> IntervalSet<u64> + Send + Sync + 'static) -> Self {
+        Self {
+            state: Mutex::new(LiveState {
+                pending: IntervalSet::from(Interval::<u64>::empty()),
+                claimed: IntervalSet::from(Interval::<u64>::empty()),
+                closed: false,
+            }),
+            ready: Box::new(ready),
+        }
+    }
+
+    /// The positions claimed so far.
+    #[cfg(test)]
+    pub fn claimed(&self) -> IntervalSet<u64> {
+        self.state.lock_wait().claimed.clone()
+    }
+}
+
+impl MorselSource for LiveSource {
+    fn claim(&self, rows: u64) -> Claim {
+        let rows = rows.max(1);
+        let mut state = self.state.lock_wait();
+        let Some(first) = state.pending.intervals().first().cloned() else {
+            return if state.closed {
+                Claim::Exhausted
+            } else {
+                Claim::Idle
+            };
+        };
+        let (start, end) = (
+            first
+                .lval()
+                .copied()
+                .expect("a published position is bounded"),
+            first
+                .rval()
+                .copied()
+                .expect("a published position is bounded"),
+        );
+        let last = end.min(start.saturating_add(rows - 1));
+        let morsel = IntervalSet::from(Interval::closed(start, last));
+        debug_assert!(
+            state.claimed.intersection(&morsel).intervals().is_empty(),
+            "a morsel is disjoint from the positions claimed before it"
+        );
+        state.pending = state.pending.difference(&morsel);
+        state.claimed = union_of(&state.claimed, &morsel);
+        Claim::Morsel(positions(start, last))
+    }
+
+    fn publish(&self, arrived: &Projection) {
+        let ready = (self.ready)();
+        let region = match arrived {
+            Projection::Nothing => return,
+            Projection::Everything => ready,
+            Projection::Keys(Predicate::Intervals(intervals)) => {
+                // `UInt` is a discrete type, so the intervals of a region hold closed bounds
+                // whatever bounds built them, and `predicate_intervals_to_u64` reads them exactly.
+                let keys = predicate_intervals_to_u64(intervals);
+                assert!(
+                    keys.difference(&ready).intervals().is_empty(),
+                    "the rows of {keys:?} are ready before their region is published, and \
+                     {ready:?} is ready"
+                );
+                keys
+            }
+            Projection::Keys(keys) => {
+                panic!("a live source is published as intervals of positions, got {keys:?}")
+            }
+        };
+        let mut state = self.state.lock_wait();
+        let unclaimed = region.difference(&state.claimed);
+        debug_assert!(
+            !state.closed || unclaimed.intervals().is_empty(),
+            "a closed source is published to only what was claimed already"
+        );
+        state.pending = union_of(&state.pending, &unclaimed);
+    }
+
+    fn close(&self) {
+        self.state.lock_wait().closed = true;
     }
 }
 
@@ -748,20 +892,178 @@ mod tests {
     #[test]
     fn a_range_source_claims_disjoint_morsels_and_then_none() {
         let source = RangeSource::new(10);
-        let claimed: Vec<_> = std::iter::from_fn(|| source.claim(4))
+        let claimed: Vec<_> = std::iter::from_fn(|| source.claim(4).morsel())
             .map(|guard| bounds(&guard))
             .collect();
         assert_eq!(claimed, [(0, 3), (4, 7), (8, 9)]);
-        assert!(source.claim(4).is_none(), "none is final");
-        assert!(source.claim(1).is_none(), "whatever size is asked");
+        assert!(
+            matches!(source.claim(4), Claim::Exhausted),
+            "exhausted is final"
+        );
+        assert!(
+            matches!(source.claim(1), Claim::Exhausted),
+            "whatever size is asked"
+        );
+    }
+
+    /// The positions that have ready at a live source, which the test advances.
+    type Ready = Arc<Mutex<IntervalSet<u64>>>;
+
+    fn live(ready: &Ready) -> LiveSource {
+        let ready = ready.clone();
+        LiveSource::new(move || ready.lock_wait().clone())
+    }
+
+    /// The positions `[first, last]` arrive: their rows are written, then the region is published.
+    fn arrive_at(ready: &Ready, source: &LiveSource, first: u64, last: u64) {
+        {
+            let mut set = ready.lock_wait();
+            *set = union_of(&set, &IntervalSet::from(Interval::closed(first, last)));
+        }
+        source.publish(&Projection::of(&positions(first, last)).expect("keys"));
+    }
+
+    /// `rows` further positions arrive after the ones that did, in order.
+    fn arrive(ready: &Ready, source: &LiveSource, rows: u64) -> (u64, u64) {
+        let first = ready
+            .lock_wait()
+            .intervals()
+            .last()
+            .and_then(|last| last.rval().copied())
+            .map_or(0, |last| last + 1);
+        arrive_at(ready, source, first, first + rows - 1);
+        (first, first + rows - 1)
+    }
+
+    fn nothing_arrived() -> Ready {
+        Arc::new(Mutex::new(IntervalSet::from(Interval::<u64>::empty())))
+    }
+
+    /// A live source hands out only what was published, in morsels of at most the asked size,
+    /// and is `Idle` while open with nothing pending.
+    #[test]
+    fn a_live_source_claims_only_what_was_published() {
+        let ready = nothing_arrived();
+        let source = live(&ready);
+        assert!(matches!(source.claim(4), Claim::Idle));
+        arrive(&ready, &source, 6);
+        assert_eq!(bounds(&source.claim(4).morsel().expect("a morsel")), (0, 3));
+        assert_eq!(bounds(&source.claim(4).morsel().expect("a morsel")), (4, 5));
+        assert!(
+            matches!(source.claim(4), Claim::Idle),
+            "open, nothing pending"
+        );
+        arrive(&ready, &source, 2);
+        assert_eq!(bounds(&source.claim(4).morsel().expect("a morsel")), (6, 7));
+    }
+
+    /// A region published twice is claimed once, as an `Everything` that covers rows already
+    /// published publishes them again.
+    #[test]
+    fn a_region_published_twice_is_claimed_once() {
+        let ready = nothing_arrived();
+        let source = live(&ready);
+        let (first, last) = arrive(&ready, &source, 4);
+        assert_eq!(bounds(&source.claim(8).morsel().expect("a morsel")), (0, 3));
+        source.publish(&Projection::of(&positions(first, last)).expect("keys"));
+        source.publish(&Projection::Everything);
+        assert!(matches!(source.claim(8), Claim::Idle));
+        assert_eq!(source.claimed(), IntervalSet::from(Interval::closed(0, 3)));
+    }
+
+    /// `Everything` names the positions that have ready, and no others.
+    #[test]
+    fn everything_is_cut_to_the_positions_that_have_arrived() {
+        let ready = nothing_arrived();
+        let source = live(&ready);
+        arrive(&ready, &source, 3);
+        source.publish(&Projection::Everything);
+        assert_eq!(bounds(&source.claim(8).morsel().expect("a morsel")), (0, 2));
+        assert!(matches!(source.claim(8), Claim::Idle));
+        arrive(&ready, &source, 2);
+        source.publish(&Projection::Everything);
+        assert_eq!(bounds(&source.claim(8).morsel().expect("a morsel")), (3, 4));
+    }
+
+    /// Positions arrive in any order: a region that arrives ahead of an earlier one is claimed
+    /// first, the earlier one is not claimable until it arrives, and an `Everything` sent while
+    /// it is missing claims nothing from it. A row count cannot say this.
+    #[test]
+    fn a_region_that_arrives_ahead_of_an_earlier_one_is_claimed_first() {
+        let ready = nothing_arrived();
+        let source = live(&ready);
+        arrive_at(&ready, &source, 4, 7);
+        assert_eq!(bounds(&source.claim(8).morsel().expect("a morsel")), (4, 7));
+        source.publish(&Projection::Everything);
+        assert!(
+            matches!(source.claim(8), Claim::Idle),
+            "[0, 3] has not ready"
+        );
+        assert_eq!(source.claimed(), IntervalSet::from(Interval::closed(4, 7)));
+
+        arrive_at(&ready, &source, 0, 3);
+        source.publish(&Projection::Everything);
+        assert_eq!(bounds(&source.claim(8).morsel().expect("a morsel")), (0, 3));
+        assert!(matches!(source.claim(8), Claim::Idle), "each row once");
+        assert_eq!(source.claimed(), IntervalSet::from(Interval::closed(0, 7)));
+    }
+
+    /// A region whose positions are not ready is a bug in the publisher, and release builds
+    /// refuse it too.
+    #[test]
+    #[should_panic(expected = "are ready before their region is published")]
+    fn a_region_outside_the_ready_positions_is_refused() {
+        let ready = nothing_arrived();
+        let source = live(&ready);
+        arrive_at(&ready, &source, 0, 3);
+        source.publish(&Projection::of(&positions(2, 6)).expect("keys"));
+    }
+
+    /// `UInt` is discrete, so a region built from open bounds, or by `Projection::minus`, names
+    /// exactly the closed positions it contains.
+    #[test]
+    fn a_region_with_open_bounds_names_the_positions_it_contains() {
+        let ready = nothing_arrived();
+        let source = live(&ready);
+        *ready.lock_wait() = IntervalSet::from(Interval::closed(0, 9));
+        let open = Projection::Keys(Predicate::intervals(IntervalSet::from(Interval::open(
+            Value::UInt(3),
+            Value::UInt(7),
+        ))));
+        let minus = Projection::of(&positions(0, 9))
+            .expect("keys")
+            .minus(&Projection::of(&positions(3, 5)).expect("keys"));
+        source.publish(&open);
+        assert_eq!(bounds(&source.claim(8).morsel().expect("a morsel")), (4, 6));
+        assert!(matches!(source.claim(8), Claim::Idle));
+        // `[0, 9]` less `[3, 5]` is `[0, 2] ∪ [6, 9]`, and 6 was claimed above.
+        source.publish(&minus);
+        assert_eq!(bounds(&source.claim(8).morsel().expect("a morsel")), (0, 2));
+        assert_eq!(bounds(&source.claim(8).morsel().expect("a morsel")), (7, 9));
+    }
+
+    /// A closed source is exhausted only once its published rows are claimed.
+    #[test]
+    fn a_closed_live_source_is_exhausted_after_its_published_rows() {
+        let ready = nothing_arrived();
+        let source = live(&ready);
+        arrive(&ready, &source, 3);
+        source.close();
+        assert_eq!(bounds(&source.claim(2).morsel().expect("a morsel")), (0, 1));
+        assert_eq!(bounds(&source.claim(2).morsel().expect("a morsel")), (2, 2));
+        assert!(matches!(source.claim(2), Claim::Exhausted));
+        assert!(matches!(source.claim(2), Claim::Exhausted), "and stays so");
     }
 
     #[test]
     fn a_range_source_answers_a_morsel_of_at_least_one_row() {
         let source = RangeSource::new(2);
-        assert_eq!(bounds(&source.claim(0).expect("a morsel")), (0, 0));
-        assert_eq!(bounds(&source.claim(u64::MAX).expect("a morsel")), (1, 1));
-        assert!(source.claim(u64::MAX).is_none());
+        assert_eq!(bounds(&source.claim(0).morsel().expect("a morsel")), (0, 0));
+        assert_eq!(
+            bounds(&source.claim(u64::MAX).morsel().expect("a morsel")),
+            (1, 1)
+        );
+        assert!(matches!(source.claim(u64::MAX), Claim::Exhausted));
     }
 
     #[test]
@@ -769,7 +1071,7 @@ mod tests {
         let claimed = |extent: Extent| {
             IterateExtent::new(extent)
                 .morsel_source()
-                .map(|source| std::iter::from_fn(|| source.claim(100)).count())
+                .map(|source| std::iter::from_fn(|| source.claim(100).morsel()).count())
         };
         assert_eq!(claimed(Extent::uint_range(5)), Some(1));
         assert_eq!(claimed(Extent::uint_range(0)), Some(0));
@@ -895,7 +1197,7 @@ mod projection_tests {
         );
     }
 
-    /// The head of a program over a live source. A morsel is cut from what has arrived, and the
+    /// The head of a program over a live source. A morsel is cut from what has ready, and the
     /// head says nothing about positions that may still arrive in the morsel.
     #[test]
     fn a_live_source_head_is_complete_only_over_what_has_arrived() {
@@ -923,7 +1225,7 @@ mod projection_tests {
         assert_eq!(completeness(&inside), between(1, 2));
         head.release(keys_between(1, 2));
 
-        // Positions 5 to 9 have not arrived, so the morsel is complete over 3 and 4 only.
+        // Positions 5 to 9 have not ready, so the morsel is complete over 3 and 4 only.
         let straddling = head.get(keys_between(3, 9));
         assert_eq!(positions(&straddling), [3, 4]);
         assert_eq!(completeness(&straddling), between(3, 4));

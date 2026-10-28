@@ -14,6 +14,7 @@ use cambra::{
         parallel::{Breaker, Config, plan_main, run_main},
     },
 };
+use indoc::indoc;
 
 /// `[x + 1 for x in [0, 1, …, rows - 1]]`: a finite source, two streaming maps, `main`.
 fn program(rows: u64) -> String {
@@ -196,6 +197,28 @@ fn a_program_with_another_breaker_is_not_a_morsel_pipeline() {
         .expect("a group-by has breakers the pool does not run");
     assert!(
         refused.to_string().contains("is not a streaming operator"),
+        "{refused}"
+    );
+}
+
+/// A chain that reads a shared node would notify the pool through a fan-out, whose input consumer
+/// drops a second notification between pulls, so the plan refuses it.
+#[test]
+fn a_chain_that_reads_a_shared_node_is_not_a_morsel_pipeline() {
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(indoc! {"
+        xs = [x + 1 for x in [1, 2, 3, 4]]
+        [a * 2 for a in xs]
+    "});
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
+    let refused = plan_main(&compiled.operator_graph)
+        .err()
+        .expect("a shared chain is not a streaming pipeline");
+    assert!(
+        refused
+            .to_string()
+            .contains("`FanOutSlot` is not a streaming operator"),
         "{refused}"
     );
 }

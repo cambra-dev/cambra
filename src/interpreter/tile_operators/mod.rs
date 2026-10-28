@@ -78,15 +78,51 @@ pub use union::*;
 /// and its workers. A morsel is named by a guard, never by its rows: the worker produces the
 /// tile by pulling its own chain at the guard.
 pub trait MorselSource: Send + Sync {
-    /// The guard naming the next morsel of at most `rows` rows, or `None` once every row has
-    /// been claimed. Each row is in exactly one claimed morsel, whichever threads claim.
-    /// `None` is final: a source that can still receive rows is not a `MorselSource` yet.
+    /// The next morsel of at most `rows` rows. Each row is in exactly one claimed morsel,
+    /// whichever threads claim.
     ///
-    /// A claim that answers `None` happens after every claim that answered a morsel: the
-    /// dispatcher finishes a pipeline once it has seen the `None` and no outstanding morsel, and
-    /// reads that count only because of this order. A source whose claims are updates of one
-    /// atomic gets it from acquire-release updates.
-    fn claim(&self, rows: u64) -> Option<TileGuard>;
+    /// [`Claim::Exhausted`] is final. A claim that answers it happens after every claim that
+    /// answered a morsel: the dispatcher finishes a pipeline once it has seen `Exhausted` and no
+    /// outstanding morsel, and reads that count only because of this order. A source whose
+    /// claims are updates of one atomic gets it from acquire-release updates, and one whose
+    /// claims take a lock gets it from the lock.
+    fn claim(&self, rows: u64) -> Claim;
+
+    /// The keys `arrived` have been added to the source, and their rows are readable. `Everything`
+    /// means every key that is ready to read, not every key of the source's extent: keys may
+    /// arrive in any order, and a key that is not ready is not claimable. The caller wrote the
+    /// rows and made their keys part of the source's yield predicate, the region ready to read,
+    /// before it publishes the region, and publishes nothing after [`close`](Self::close). It
+    /// holds no lock that the cascade of a notification takes, nor one the source takes. The yield
+    /// predicate is not a tile's `domain_predicate`, which says that no further key arrives in a
+    /// region. A source that holds every row from the start ignores it.
+    fn publish(&self, _arrived: &Projection) {}
+
+    /// No row will be added, and no region will be published after this call. Once every
+    /// published row is claimed, `claim` answers [`Claim::Exhausted`]. A source that holds every
+    /// row from the start ignores it.
+    fn close(&self) {}
+}
+
+/// The answer to [`MorselSource::claim`].
+pub enum Claim {
+    /// The guard naming the morsel.
+    Morsel(TileGuard),
+    /// Nothing is claimable now, and a row may still arrive.
+    Idle,
+    /// Every row has been claimed and no row will arrive.
+    Exhausted,
+}
+
+#[cfg(test)]
+impl Claim {
+    /// The morsel, or `None` for `Idle` and `Exhausted`.
+    pub fn morsel(self) -> Option<TileGuard> {
+        match self {
+            Claim::Morsel(guard) => Some(guard),
+            Claim::Idle | Claim::Exhausted => None,
+        }
+    }
 }
 
 /// Static descriptor of a computation node in the tile dataflow graph.
@@ -354,7 +390,9 @@ pub(crate) use impl_operator_base;
 #[derive(Clone)]
 pub enum Notified {
     /// The input's notification does not reach this producer, so every pull reads —
-    /// what an operator whose `subscribe` installs no flag gets.
+    /// what an operator whose `subscribe` installs no flag gets. It is also the gate of a
+    /// region-driven consumer, which no pull would reopen and which a closed gate would
+    /// deprive of its regions.
     Always,
     /// Set when the input notifies, cleared by a pull.
     // shared-state-ok: see the type doc.
@@ -425,6 +463,10 @@ impl Consumer for FlaggingConsumer {
         self.flag.mark();
         self.downstream.notify(arrived);
     }
+
+    fn region_driven(&self) -> bool {
+        self.downstream.region_driven()
+    }
 }
 
 /// The regions an input has notified since they were last taken.
@@ -475,6 +517,10 @@ impl Consumer for RecordingConsumer {
         *held = held.union(arrived);
         drop(held);
         self.downstream.notify(arrived);
+    }
+
+    fn region_driven(&self) -> bool {
+        self.downstream.region_driven()
     }
 }
 
@@ -1589,17 +1635,20 @@ pub(crate) mod test_helpers {
         }
     }
 
-    /// A consumer that logs the region of each notification it receives.
+    /// A consumer that logs the region of each notification it receives. `driven` is its
+    /// [`Consumer::region_driven`].
     pub(crate) struct RegionLog {
         regions: Arc<Mutex<Vec<Projection>>>,
+        driven: bool,
     }
 
     impl RegionLog {
-        pub(crate) fn new() -> (Self, Arc<Mutex<Vec<Projection>>>) {
+        pub(crate) fn new(driven: bool) -> (Self, Arc<Mutex<Vec<Projection>>>) {
             let regions = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
                     regions: regions.clone(),
+                    driven,
                 },
                 regions,
             )
@@ -1609,6 +1658,25 @@ pub(crate) mod test_helpers {
     impl super::Consumer for RegionLog {
         fn notify(&mut self, arrived: &Projection) {
             self.regions.lock_now().push(arrived.clone());
+        }
+
+        fn region_driven(&self) -> bool {
+            self.driven
+        }
+    }
+
+    /// A consumer that acts on the region and never pulls is not gated, so the consumer that
+    /// records the region before it says what the consumer behind it says.
+    #[test]
+    fn a_recording_consumer_is_region_driven_as_its_downstream_is() {
+        let arrivals = super::Arrivals::new();
+        for driven in [true, false] {
+            let (log, _) = RegionLog::new(driven);
+            assert_eq!(
+                arrivals.consumer(Box::new(log)).region_driven(),
+                driven,
+                "downstream driven: {driven}"
+            );
         }
     }
 

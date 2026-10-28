@@ -309,11 +309,11 @@ one whose head's rows sit on its socket.
 
 **Partial and whole offering.** A head offers work in one of two ways, by what it is:
 
-- A source or a `Memo` offers rows as they arrive. The scheduler lap's poll appends the arrivals to
-  the source's buffer and the source's claim answers them; a memo's claim answers as its own input
+- A source or a `Memo` offers rows as they arrive. The arrival's notification publishes its region
+  to the source and the source's claim answers it; a memo's claim answers as its own input
   lands. Work is available before the head is done, which is what lets a pipeline run while its
-  source is live. Such a claim has a state between exhausted and nothing yet, which `None`, final,
-  does not name.
+  source is live. Such a claim has a state between exhausted and nothing yet (`Idle`), which
+  `Exhausted`, final, does not name.
 - A breaker that builds partitioned state, `Converse` and `MapAggregate`, offers nothing until a
   round completes. A round closes when the upstream pipeline's source has no morsel left for the
   round, every claimed morsel has been acknowledged, and every worker holding a partial of the round
@@ -338,17 +338,43 @@ buffer until a worker asks and no queue grows. A breaker's round produces its ou
 asked, so a round that outruns its readers waits to append to an output holding more than a few
 morsels per worker.
 
-**Notification.** The notification contract's wake becomes "a source has rows to claim". A
-`GatedConsumer`'s gate, one wake per pull, becomes one wake per round or per arrival. A worker whose
-claim finds nothing yet parks, and an arrival or a completed round wakes it, which takes the
-`WakeupQueue`'s place. A sink is pulled by whichever worker takes a package of a pipeline that ends
-in it, once per lap, as today.
+**Notification.** A notification carries the region that changed ([the notification
+contract](../src/interpreter/design-operators.md#the-notification-contract)). A pipeline's head
+consumer is a `PipelineConsumer`, which hands the region to the pipeline's source
+(`MorselSource::publish`) and moves the dispatcher's epoch. A source keeps a pending region, the
+keys published and not yet claimed, and a yield predicate, the keys whose rows are ready to read,
+which is not a tile's `domain_predicate`: keys arrive in any order, `Everything` published to a live
+source means everything that has arrived, and a key that has not arrived is not claimable. A claim
+cuts at most one morsel of `CAMBRA_MORSEL_ROWS` keys from it, lowest keys first, and removes them. A
+region already claimed is dropped when it is published again, so an `Everything` that covers rows
+already published, or a region that reaches the head along two paths of a diamond, publishes once.
+The claim answers a morsel, `Idle` (nothing pending, the source open) or `Exhausted` (the source
+closed, nothing pending). `Idle` leaves the pipeline unfinished and the worker parks; a publish or a
+close wakes it, which takes the `WakeupQueue`'s place for a pooled pipeline. A sink is pulled by
+whichever worker takes a package of a pipeline that ends in it, once per lap, as today.
+
+The delivering thread, the thread that reads the source's input, runs the notification cascade,
+and nothing in it pulls: the cascade ends in a union and an epoch move. A worker reads the epoch
+before it looks for a morsel and parks only while the epoch is unchanged. The delivering thread
+writes the rows, then publishes the region under the source's lock, then moves the epoch, so a
+worker that misses the region in its claim read the epoch before the move, and its park returns at
+once. The delivering thread holds no lock the cascade takes: the dispatcher's lock on what reached
+a pipeline before it started, the source's state lock, the lock its ready-positions function reads,
+and the lock that parks idle workers.
+
+Only the first worker's chain carries the `PipelineConsumer`; every other chain's head consumer
+ignores the region. The chain's notification path from the source to that consumer satisfies one
+invariant: every consumer on it reports `region_driven`, and the path is acyclic. A closure or a
+sink's consumer on the path ignores the region, and a fan-out's input consumer drops a second
+notification, so the plan refuses a chain with a shared operator or a recurrence. A consumer that
+only sends `Everything` loses nothing: a live source resolves it to every ready position less what
+was claimed.
 
 **Shared writes per morsel.** A claim on a finite source is one atomic update of its cursor, and the
 dispatcher counts a morsel outstanding before the claim and back at the acknowledgement, two atomic
-updates. No lock is taken on a finite source's morsel path. A live source's claim reads the arrivals
-under the source's lock, a buffer read and a predicate union. Idle workers park on a `Condvar`
-taken only when nothing is claimable. A per-worker deque with stealing (`crossbeam-deque`) is the
+updates. No lock is taken on a finite source's morsel path. A live source's claim takes the lock of
+its pending region, a predicate cut and difference. Idle workers park on a `Condvar` taken only when
+nothing is claimable. A per-worker deque with stealing (`crossbeam-deque`) is the
 extension for socket affinity, a conjecture until measured. A breaker's thread-local partial is
 written by one worker; a merged table is written by the one worker or task that owns it; a head's
 rows are written by its producer before they are claimable and never after. The other locks are at
@@ -806,10 +832,6 @@ Ordered so that each step is measurable on its own and none is undone by the nex
 - Whether a round that keeps per-worker partials across rounds can use the pipeline's leave as its
   hand-in, which finishes a pipeline once every worker has left it, or needs a hand-in per round
   while the pipeline stays open.
-- How a live source's claim names "nothing yet" beside "exhausted", and which of the source, the
-  dispatcher and the scheduler lap wakes a parked worker.
-
-
 - Whether to keep `get` as the only data path once a breaker has an `absorb` entry for upstream
   workers, or to admit a push edge into the protocol. The CLAUDE.md invariant is that data crosses
   only as tiles through `get`; a breaker's absorb takes a tile and returns nothing, which keeps

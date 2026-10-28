@@ -60,6 +60,12 @@ pub trait Consumer: Send {
     /// Notify the consumer that the keys `arrived` changed, and that it should pull again if it
     /// reads this producer.
     fn notify(&mut self, arrived: &Projection);
+
+    /// Whether the consumer acts on the region and never pulls. A notification path that ends
+    /// in such a consumer is not gated, because nothing reopens a gate it sits behind.
+    fn region_driven(&self) -> bool {
+        false
+    }
 }
 
 /// Blanket implementation: Arc<Mutex<C>> implements Consumer when C does.
@@ -68,6 +74,10 @@ pub trait Consumer: Send {
 impl<C: Consumer> Consumer for Arc<Mutex<C>> {
     fn notify(&mut self, arrived: &Projection) {
         self.lock_now().notify(arrived)
+    }
+
+    fn region_driven(&self) -> bool {
+        self.lock_now().region_driven()
     }
 }
 

@@ -28,6 +28,8 @@ pub type SharedConsumer = Arc<Mutex<dyn Consumer>>;
 pub struct GatedConsumer {
     shared: SharedConsumer,
     gate: Notified,
+    /// Whether the consumer behind the gate never pulls, so the gate is [`Notified::Always`].
+    region_driven: bool,
 }
 
 /// The gate of an operator's [`GatedConsumer`], for the operator's producer to take into its
@@ -46,6 +48,10 @@ pub struct Gate(pub(crate) Notified);
 struct Gated {
     admit: Notified,
     consumer: Box<dyn Consumer>,
+    /// Whether `consumer` never pulls. Such a consumer has no gate, `admit` being
+    /// [`Notified::Always`], so no region waits behind one: a consumer that pulls reads whatever
+    /// arrived in its pull, and a region-driven one is notified of each.
+    region_driven: bool,
 }
 
 impl Consumer for Gated {
@@ -54,20 +60,42 @@ impl Consumer for Gated {
             *arrived != Projection::Nothing,
             "no producer notifies of an empty region"
         );
+        debug_assert!(
+            !self.region_driven || matches!(self.admit, Notified::Always),
+            "a region-driven consumer has no gate, or a closed one would hold its regions back"
+        );
         if self.admit.mark_news() {
             self.consumer.notify(arrived);
         }
     }
+
+    fn region_driven(&self) -> bool {
+        self.region_driven
+    }
 }
 
 impl GatedConsumer {
-    /// `consumer` behind `gate`, which the operator's producer must clear on every pull.
-    pub fn new(consumer: Box<dyn Consumer>, gate: Notified) -> Self {
+    /// `consumer` behind `gate`, which the operator's producer must clear on every pull. A
+    /// consumer that never pulls gets no gate to clear, so `gate` is replaced by
+    /// [`Notified::Always`] for it. Private: [`shared_consumer`] builds the gate and hands its
+    /// token to the caller, so no caller holds a clone the forwarder never reads.
+    fn new(consumer: Box<dyn Consumer>, gate: Notified) -> Self {
+        let region_driven = consumer.region_driven();
+        let gate = if region_driven {
+            Notified::Always
+        } else {
+            gate
+        };
         let shared: SharedConsumer = Arc::new(Mutex::new(Gated {
             admit: gate.clone(),
             consumer,
+            region_driven,
         }));
-        Self { shared, gate }
+        Self {
+            shared,
+            gate,
+            region_driven,
+        }
     }
 
     /// The handle a wakeup queue holds or a producer re-arms.
@@ -88,8 +116,9 @@ impl GatedConsumer {
 /// operator's producer takes the [`Gate`] into its base
 /// ([`ProducerBase::sharing`](crate::interpreter::tile_operators::ProducerBase::sharing)).
 pub fn shared_consumer(consumer: Box<dyn Consumer>) -> (GatedConsumer, Gate) {
-    let gate = Notified::clear();
-    (GatedConsumer::new(consumer, gate.clone()), Gate(gate))
+    let gated = GatedConsumer::new(consumer, Notified::clear());
+    let gate = Gate(gated.gate.clone());
+    (gated, gate)
 }
 
 /// A fresh `Box<dyn Consumer>` forwarding to `shared` — what `subscribe` wants for
@@ -128,7 +157,7 @@ pub fn forwarding_consumer_keeping_keys(
 ///
 /// An operator passes this to its input in place of its own consumer unless its outermost keys
 /// are its input's: the input's region names the input's keys, which say nothing of the
-/// operator's own.
+/// operator's own. The wrapper is as region-driven as `consumer`.
 pub fn widening(consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
     Box::new(Widening(consumer))
 }
@@ -138,6 +167,10 @@ struct Widening(Box<dyn Consumer>);
 impl Consumer for Widening {
     fn notify(&mut self, _arrived: &Projection) {
         self.0.notify(&Projection::Everything);
+    }
+
+    fn region_driven(&self) -> bool {
+        self.0.region_driven()
     }
 }
 
@@ -150,13 +183,28 @@ struct Forwarding {
 
 impl Consumer for Forwarding {
     fn notify(&mut self, arrived: &Projection) {
-        let GatedConsumer { shared, gate } = &self.gated;
+        let GatedConsumer {
+            shared,
+            gate,
+            region_driven,
+        } = &self.gated;
         let everything = Projection::Everything;
         let region = if self.keeps_keys {
             arrived
         } else {
             &everything
         };
+        // Dropping or deferring the notification of a consumer that never pulls would lose its
+        // region, so the forwarder waits for the cell. The notification graph of a region-driven
+        // chain is acyclic, so a cascade does not reach one cell twice, and a cell downstream of a
+        // region-driven consumer is itself region-driven, so a thread that holds one such cell
+        // waits only for cells further along. That orders the cells' locks and nothing else: the
+        // thread that notifies must hold no lock that the cascade takes
+        // (`src/interpreter/design-operators.md`, "The notification contract").
+        if *region_driven {
+            shared.lock_wait().notify(region);
+            return;
+        }
         // A notification that re-enters a consumer already being notified is deferred to
         // the next drain of the wakeup queue. A recurrence's notification graph is cyclic,
         // and nesting closes a cycle through *two* inputs of one operator: the inner store
@@ -177,6 +225,10 @@ impl Consumer for Forwarding {
             None if gate.is_set() => {}
             None => self.wakeups.request(shared.clone()),
         }
+    }
+
+    fn region_driven(&self) -> bool {
+        self.gated.region_driven
     }
 }
 
@@ -227,9 +279,16 @@ pub struct Scheduler {
     sink_pulls: WakeupQueue,
 }
 
+/// A consumer registered for a source, and whether the outermost keys of what it wakes are the
+/// source's keys.
+struct SourceConsumer {
+    consumer: Weak<Mutex<dyn Consumer>>,
+    outermost_keys: bool,
+}
+
 type SourceHandle = (
     Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
-    Vec<Weak<Mutex<dyn Consumer>>>,
+    Vec<SourceConsumer>,
 );
 
 impl Scheduler {
@@ -307,11 +366,21 @@ impl Scheduler {
     /// their registrations, while an operator carried across the replacement
     /// keeps waking as before. A strong registration would instead keep every
     /// operator any version ever subscribed alive and being notified.
+    ///
+    /// `outermost_keys` says that the outermost keys of what the consumer wakes are the source's
+    /// keys, as an `IterateExtent` over the source's domain has. A consumer registered for a source
+    /// inside a record or a union is woken with `Everything` when only keys are named
+    /// ([`Scheduler::notify_source_consumers`]).
     pub fn add_source_handle(
         &mut self,
         handle: Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
         consumer: Weak<Mutex<dyn Consumer>>,
+        outermost_keys: bool,
     ) {
+        let consumer = SourceConsumer {
+            consumer,
+            outermost_keys,
+        };
         let id = handle.lock_now().get_id().to_string();
         if let Some(entry) = self.source_handles.get_mut(&id) {
             assert!(
@@ -351,6 +420,38 @@ other's subscribers",
         self.sink_pulls.clone()
     }
 
+    /// Notify the consumers registered for the source named `source` that the keys `arrived`
+    /// have changed, without polling it, and say whether a consumer was notified. `arrived` names
+    /// the keys whose rows or readiness changed. A consumer whose outermost keys are not the
+    /// source's, because the source sits inside a record or a union in its extent, is woken with
+    /// `Everything`: the source's keys say nothing of its own.
+    ///
+    /// This is the hook for a thread that writes a source's rows and knows which keys it wrote,
+    /// where `deliver` can say only that something changed. It is `pub`, and nothing calls it
+    /// outside tests yet: no source reports its own arrival regions. The caller has written the
+    /// rows and made their keys ready before it notifies, and holds no lock the cascade takes: the
+    /// live source's state lock, the source's `Mutex`, the pool dispatcher's locks and the lock
+    /// that parks idle workers. The source's `check_for_new_data` is not consulted, so a pending
+    /// report of the same arrival is still delivered by the next poll, as `Everything`.
+    pub fn notify_source_consumers(&mut self, source: &str, arrived: &Projection) -> bool {
+        let Some((_, consumers)) = self.source_handles.get_mut(source) else {
+            return false;
+        };
+        consumers.retain(|c| c.consumer.strong_count() > 0);
+        let woken: Vec<(SharedConsumer, bool)> = consumers
+            .iter()
+            .filter_map(|c| Some((c.consumer.upgrade()?, c.outermost_keys)))
+            .collect();
+        for (consumer, outermost_keys) in &woken {
+            let region = match outermost_keys {
+                true => arrived,
+                false => &Projection::Everything,
+            };
+            consumer.lock_now().notify(region);
+        }
+        !woken.is_empty()
+    }
+
     /// Pull what each source has received into its buffer, and return the
     /// consumers to wake, without waking them.
     ///
@@ -363,9 +464,9 @@ other's subscribers",
         for (source, consumers) in self.source_handles.values_mut() {
             // Prune first, so a source whose every subscriber is gone stops
             // accumulating dead registrations across program reloads.
-            consumers.retain(|c| c.strong_count() > 0);
+            consumers.retain(|c| c.consumer.strong_count() > 0);
             if source.lock_now().check_for_new_data() {
-                woken.extend(consumers.iter().filter_map(Weak::upgrade));
+                woken.extend(consumers.iter().filter_map(|c| c.consumer.upgrade()));
             }
         }
         Delivery(woken)
@@ -550,7 +651,7 @@ mod tests {
     /// no region after it.
     #[test]
     fn a_closed_gate_passes_one_notification_to_a_consumer_that_pulls() {
-        let (log, regions) = RegionLog::new();
+        let (log, regions) = RegionLog::new(false);
         let (gated, gate) = shared_consumer(Box::new(log));
         gated.notify(&keys(0, 3));
         gated.notify(&keys(10, 12));
@@ -560,14 +661,27 @@ mod tests {
         assert_eq!(*regions.lock_now(), [keys(0, 3), keys(30, 31)]);
     }
 
+    /// A consumer that never pulls has no gate to reopen, so every notification reaches it, whole
+    /// and in order, through the forwarder of an operator's input.
+    #[test]
+    fn a_consumer_that_never_pulls_is_not_gated() {
+        let (log, regions) = RegionLog::new(true);
+        let (gated, _gate) = shared_consumer(Box::new(log));
+        let mut input = forwarding_consumer_keeping_keys(&gated, &WakeupQueue::default());
+        assert!(input.region_driven());
+        for region in [keys(0, 3), keys(4, 7), keys(8, 9)] {
+            input.notify(&region);
+        }
+        assert_eq!(*regions.lock_now(), [keys(0, 3), keys(4, 7), keys(8, 9)]);
+    }
+
     /// A forwarder sends `Everything` unless its operator's keys are its input's.
     #[test]
     fn a_forwarder_sends_everything_unless_it_keeps_keys() {
-        let (log, regions) = RegionLog::new();
-        let (gated, gate) = shared_consumer(Box::new(log));
+        let (log, regions) = RegionLog::new(true);
+        let (gated, _gate) = shared_consumer(Box::new(log));
         let wakeups = WakeupQueue::default();
         forwarding_consumer(&gated, &wakeups).notify(&keys(2, 4));
-        assert!(gate.0.take());
         forwarding_consumer_keeping_keys(&gated, &wakeups).notify(&keys(2, 4));
         assert_eq!(*regions.lock_now(), [Projection::Everything, keys(2, 4)]);
     }
@@ -586,7 +700,7 @@ mod tests {
     /// `widening` sends `Everything` whatever region it is notified of.
     #[test]
     fn widening_sends_everything_for_any_region() {
-        let (log, regions) = RegionLog::new();
+        let (log, regions) = RegionLog::new(true);
         let mut consumer = widening(Box::new(log));
         consumer.notify(&keys(2, 4));
         consumer.notify(&Projection::Everything);
@@ -600,7 +714,7 @@ mod tests {
     /// carries nothing from one notification to the next.
     #[test]
     fn a_keeping_forwarder_passes_each_region_unchanged() {
-        let (log, regions) = RegionLog::new();
+        let (log, regions) = RegionLog::new(true);
         let (gated, gate) = shared_consumer(Box::new(log));
         let mut input = forwarding_consumer_keeping_keys(&gated, &WakeupQueue::default());
         let sent = [keys(2, 4), Projection::Everything, keys(6, 7)];
@@ -825,7 +939,11 @@ mod tests {
         let count_c = count.clone();
         let consumer: SharedConsumer = Arc::new(Mutex::new(move || *count_c.lock_now() += 1));
         let mut scheduler = Scheduler::new();
-        scheduler.add_source_handle(Arc::new(Mutex::new(source)), Arc::downgrade(&consumer));
+        scheduler.add_source_handle(
+            Arc::new(Mutex::new(source)),
+            Arc::downgrade(&consumer),
+            true,
+        );
         (scheduler, count, consumer)
     }
 
