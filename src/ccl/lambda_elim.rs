@@ -346,6 +346,7 @@ fn strength_over_ty(f: &Expr, fun_kind: &FunKind) -> Type {
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: Box::new(strengthened),
+        effects: crate::ccl::effects::Effects::none(),
     }
 }
 
@@ -581,6 +582,7 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
                     fun_kind: fun_kind.clone(),
                     domain: a.clone(),
                     codomain: Box::new(codomain),
+                    effects: crate::ccl::effects::Effects::none(),
                 },
             }
         }
@@ -786,6 +788,7 @@ fn arm_compose(
         fun_kind: fun_kind.clone(),
         domain: Box::new(dom),
         codomain: Box::new(cod),
+        effects: crate::ccl::effects::Effects::none(),
     })
 }
 
@@ -1168,6 +1171,7 @@ fn elim_lambda_impl(
             fun_kind: fun_kind.clone(),
             domain: Box::new(param_ty.clone()),
             codomain: Box::new(body_ty.clone()),
+            effects: crate::ccl::effects::Effects::none(),
         }
     };
     assert_ne!(Type::Hole, result_ty);
@@ -1561,6 +1565,7 @@ fn elim_lambda_impl(
                                         fun_kind: fun_kind.clone(),
                                         domain: pair_domain.clone(),
                                         codomain: Box::new(chain.clone()),
+                                        effects: crate::ccl::effects::Effects::none(),
                                     },
                                 };
                                 (compose_ty, step)
@@ -1917,6 +1922,7 @@ fn elim_lambda_impl(
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(param_ty.clone()),
                     codomain: Box::new(value_ty),
+                    effects: crate::ccl::effects::Effects::none(),
                 })),
             }
         }
@@ -2166,6 +2172,7 @@ fn elim_lambda_impl(
                     fun_kind: fun_kind.clone(),
                     domain: Box::new(param_ty.clone()),
                     codomain: Box::new(value_ty),
+                    effects: crate::ccl::effects::Effects::none(),
                 })),
             }
         }
@@ -2739,6 +2746,7 @@ mod tests {
                 fun_kind: fun_kind.clone(),
                 domain: Box::new(int.clone()),
                 codomain: Box::new(int.clone()),
+                effects: crate::ccl::effects::Effects::none(),
             });
             let out = run(lambda).expect("elimination succeeds");
             let Type::Fun { fun_kind: got, .. } = &out.ty else {
@@ -2777,6 +2785,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(a),
             codomain: Box::new(b),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 

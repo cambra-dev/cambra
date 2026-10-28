@@ -457,8 +457,8 @@ fn a_def_with_a_mut_parameter_is_written_uncurried() {
         interface,
         indoc! {"
             module main
-            pub draw: {Mut(Int, Txn), Int} => {}
-            pub reset: Mut(Int, Txn) => {}
+            pub draw: {Mut(Int, Txn), Int} => {} causes Commit
+            pub reset: Mut(Int, Txn) => {} causes Commit
         "}
     );
 }

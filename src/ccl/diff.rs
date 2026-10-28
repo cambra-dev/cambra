@@ -2456,6 +2456,7 @@ mod tests {
                     }),
                 )),
                 codomain: Box::new(Type::Base(BaseType::Int)),
+                effects: crate::ccl::effects::Effects::none(),
             },
         });
         // The cast goes away; its predicate term survives as a sibling.
@@ -2517,6 +2518,7 @@ mod tests {
                         }),
                     )),
                     codomain: Box::new(Type::Base(BaseType::Int)),
+                    effects: crate::ccl::effects::Effects::none(),
                 },
             })
         };

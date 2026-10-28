@@ -972,6 +972,7 @@ fn erase_chan_domains_in_type(
             fun_kind: fun_kind.unwrap_or(FunKind::Data(None)),
             domain: Box::new(domain),
             codomain: Box::new(value),
+            effects: crate::ccl::effects::Effects::none(),
         };
         erase_chan_domains_in_type(ty, map, kinds);
         return true;
@@ -3478,6 +3479,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::refined_one(Type::Hole, refinement)),
             codomain: Box::new(Type::Hole),
+            effects: crate::ccl::effects::Effects::none(),
         });
         let mut free: HashSet<Name> = HashSet::new();
         collect_free_vars(&typed, &mut free);

@@ -153,6 +153,7 @@ pub fn fun(d: Type, c: Type) -> Type {
         fun_kind: crate::ccl::ty::FunKind::Compute,
         domain: Box::new(d),
         codomain: Box::new(c),
+        effects: crate::ccl::effects::Effects::none(),
     }
 }
 

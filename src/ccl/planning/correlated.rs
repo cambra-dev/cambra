@@ -472,6 +472,7 @@ fn emit_pair_filter(g: &mut Expr, witnesses: &mut Witnesses) -> Result<bool, Str
         fun_kind,
         domain: Box::new(pair_ty.clone()),
         codomain: codomain.clone().into(),
+        effects: crate::ccl::effects::Effects::none(),
     };
     let mut chain = std::mem::replace(g, Expr::builtin(Builtin::Id));
     for predicate in predicates {

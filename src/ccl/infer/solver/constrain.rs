@@ -14,6 +14,7 @@
 // hazard therefore doesn't apply here.
 #![allow(clippy::mutable_key_type)]
 
+use crate::ccl::effects::{Effects, Filter, Item, Label, Repr};
 use crate::ccl::nominal::{Variance, sides};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -608,6 +609,33 @@ fn witness_instantiation(
 /// A concrete pair is the one thing settled at the edge, since neither side can learn
 /// anything later: two kinds that denote different points of the lattice have no common
 /// function, whichever side is which.
+/// Effects are covariant: a function that does less stands where one that may do more is
+/// expected, so what the left side's effects hold flows into the right side's
+/// (`src/ccl/design/type-inference.md`, "Effect variables").
+///
+/// A known set on the right is a ceiling only where a written clause states it, and no
+/// clause is written yet, so a known right side records nothing.
+fn constrain_effects(e0: &Effects, e1: &Effects) {
+    match (e0.repr(), e1.repr()) {
+        (Repr::Var(v0), Repr::Var(v1)) => v1.flows_from(v0, Filter::default()),
+        (Repr::Known(set), Repr::Var(v1)) => {
+            for r in &set.requires {
+                v1.record(Label {
+                    item: Item::Requires(r.clone()),
+                    bound_at: None,
+                });
+            }
+            for e in &set.causes {
+                v1.record(Label {
+                    item: Item::Causes(e.clone()),
+                    bound_at: None,
+                });
+            }
+        }
+        (_, Repr::Known(_)) => {}
+    }
+}
+
 fn constrain_fun_kind(
     k0: &FunKind,
     k1: &FunKind,
@@ -1133,18 +1161,21 @@ fn constrain_go_impl(
                 fun_kind: k0,
                 domain: d0,
                 codomain: c0,
+                effects: e0,
             },
             Type::Fun {
                 name: n1,
                 fun_kind: k1,
                 domain: d1,
                 codomain: c1,
+                effects: e1,
             },
         ) => {
             // The kind edge (see [`constrain_fun_kind`]): recorded, not answered. What the two
             // kinds turn out to be, and how their binders correspond, is read once the kind
             // graph is closed.
             constrain_fun_kind(k0, k1, lhs, rhs)?;
+            constrain_effects(e0, e1);
             // **Binders correspond by position across this edge.** A sum's binders are its
             // kind's positions, so position `i` of one side is position `i` of the other,
             // and the edge carries that correspondence in its own substitution — the Σ
@@ -1599,6 +1630,7 @@ fn constrain_go_impl(
         // the new upper by bridging the holder gap and composing **forward**
         // onto the two content sides.
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level() => {
+            crate::ccl::effects::lower_effect_levels(rhs, lv.level());
             let lows = {
                 let bound =
                     Bound::edge(sl.clone(), rhs.clone(), sr.clone()).with_origin(cache.origins.1);
@@ -1673,6 +1705,7 @@ fn constrain_go_impl(
         // inverse, and a non-invertible discharge degraded to `id` twice over.
         // Here the forward morphism is read directly off the edge.
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level() => {
+            crate::ccl::effects::lower_effect_levels(lhs, rv.level());
             let ups = {
                 let bound =
                     Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
@@ -1806,6 +1839,7 @@ fn constrain_go_impl(
                 fun_kind: FunKind::Data(None),
                 domain: domain.clone(),
                 codomain: value.clone(),
+                effects: Effects::none(),
             };
             constrain_go(&chan, rhs, sl, sr, cache, scope)
         }
@@ -1829,6 +1863,7 @@ fn constrain_go_impl(
                 fun_kind: FunKind::Data(None),
                 domain: domain.clone(),
                 codomain: value.clone(),
+                effects: Effects::none(),
             };
             constrain_go(lhs, &chan, sl, sr, cache, scope)
         }
@@ -2050,6 +2085,7 @@ fn escaping_param(ty: &Type, target_level: Level) -> Option<Rc<crate::ccl::ty::T
 /// constrain_subtype solver's level-mismatch branches).
 pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCache) -> Type {
     if type_level(ty) <= target_level {
+        crate::ccl::effects::lower_effect_levels(ty, target_level);
         return ty.clone();
     }
     match ty {
@@ -2148,7 +2184,17 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             fun_kind,
             domain: d,
             codomain: c,
+            effects,
         } => Type::Fun {
+            // An effect variable crossing to a shallower level is no longer local to the
+            // scope it was minted in, so it moves rather than being copied: an instantiation
+            // of the deeper scope's scheme then shares it.
+            effects: {
+                if let Repr::Var(v) = effects.repr() {
+                    v.lower_level(target_level);
+                }
+                effects.clone()
+            },
             name: name.clone(),
             // A sum's **candidates** are an invariant position, so they cross a level
             // boundary through two-way proxies rather than the polar one-way
@@ -4251,6 +4297,7 @@ mod tests {
             fun_kind,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(prim(BaseType::Int)),
+            effects: Effects::none(),
         }
     }
 
@@ -4464,6 +4511,7 @@ mod tests {
             fun_kind: FunKind::Var(Rc::clone(&v)),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(prim(BaseType::Int)),
+            effects: Effects::none(),
         };
         let mut cache = ConstrainCache::new();
         constrain_subtype(

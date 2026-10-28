@@ -248,6 +248,65 @@ pub(super) trait Typing {
     where
         Self: Sized;
 
+    /// Run `f` as a function body, and answer the effects its function type states
+    /// (`src/ccl/design/type-inference.md`, "Effect variables"). Emit collects them on a
+    /// fresh variable. Check reads them off `recorded`, the type inference wrote.
+    fn function_body<R>(
+        &mut self,
+        recorded: &Type,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, crate::ccl::effects::Effects)
+    where
+        Self: Sized,
+    {
+        let effects = match recorded {
+            Type::Fun { effects, .. } => effects.clone(),
+            _ => crate::ccl::effects::Effects::none(),
+        };
+        (f(self), effects)
+    }
+
+    /// The effects of the composition of `parts`, a chain whose own type is `recorded`.
+    /// Emit collects the parts' on a fresh variable, settled by the chain's kind as a
+    /// function body's are; Check reads them off `recorded`.
+    fn composed_effects(
+        &mut self,
+        recorded: &Type,
+        _parts: &[Type],
+    ) -> crate::ccl::effects::Effects {
+        match recorded {
+            Type::Fun { effects, .. } => effects.clone(),
+            _ => crate::ccl::effects::Effects::none(),
+        }
+    }
+
+    /// Record that the enclosing function body requires or causes `item`, which names
+    /// the variable `name` where it names one. Emit records it on the body's effect
+    /// variable; Check reads effects off the recorded types and records nothing.
+    fn record_effect(&mut self, _item: crate::ccl::effects::Item, _name: Option<&Name>) {}
+
+    /// Record that writing `name` requires `Transaction`, when it is a transactional
+    /// mutable variable. Check records nothing.
+    fn record_transactional_access(&mut self, _name: &Name) {}
+
+    /// Record what reading the mutable variable `name` as a value requires: `Transaction`
+    /// for a transactional one, and a position in its history, `Read(name)`, for an
+    /// induction variable. Check records nothing.
+    fn record_read(&mut self, _name: &Name) {}
+
+    /// Record that `name`, just bound at `ty`, is a mutable variable its scope declares
+    /// rather than a parameter, whose history would be its argument's.
+    fn declare_mutable(&mut self, _name: &Name, _ty: &Type) {}
+
+    /// Run `f` as the body of a `with begin():` block, which supplies `Transaction` to
+    /// what it calls.
+    fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized,
+    {
+        f(self)
+    }
+
     /// Emit/check a `let` RHS. Emit bumps the polymorphism level so RHS-local
     /// variables become generalizable at the binding site; Check (which trusts
     /// recorded types) runs `f` unchanged.

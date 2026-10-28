@@ -462,12 +462,14 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                 fun_kind: k1,
                 domain: d1,
                 codomain: c1,
+                effects: e1,
             },
             Type::Fun {
                 name: n2,
                 fun_kind: k2,
                 domain: d2,
                 codomain: c2,
+                effects: e2,
             },
         ) => {
             // Two sums agree iff their binders' type kinds agree pairwise, binder by binder
@@ -492,6 +494,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                 });
             slots_agree
                 && n1 == n2
+                && e1 == e2
                 && types_agree_modulo_unread(d1, d2, refinements)
                 && types_agree_modulo_unread(c1, c2, refinements)
         }
@@ -2047,6 +2050,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                     fun_kind: first_kind.clone(),
                     domain: Box::new((**first_dom).clone()),
                     codomain: Box::new((**last_cod).clone()),
+                    effects: crate::ccl::effects::Effects::none(),
                 };
             }
         }
@@ -3999,6 +4003,59 @@ mod tests {
             "the two identical `Int` uses share one specialization"
         );
         assert_eq!(used_names.len(), 2);
+    }
+
+    /// `x : history := 10 in λ y → body`, inferred, as the type its lambda has.
+    fn lambda_over_a_mutable_variable(history: Type, body: TypedExpr) -> Type {
+        let lambda = TypedExpr::lambda("y", Type::Hole, body);
+        let mut e = TypedExpr::mut_decl("x", history, lit_int(10), lambda);
+        run_inference(&mut e).expect("a lambda over a mutable variable type-checks")
+    }
+
+    fn lambda_over_a_transactional_variable(body: TypedExpr) -> Type {
+        lambda_over_a_mutable_variable(Type::mutable(Type::Txn, Type::Base(BaseType::Int)), body)
+    }
+
+    /// Reading an induction variable bound outside the function requires a position in its
+    /// history (`src/ccl/design/type-inference.md`, "Effect variables").
+    #[test]
+    fn an_induction_read_requires_a_position_in_its_history() {
+        let ty = lambda_over_a_mutable_variable(
+            Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
+            TypedExpr::binop(
+                TypedExpr::var("x"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                TypedExpr::var("y"),
+            ),
+        );
+        let Type::Fun { effects, .. } = &ty else {
+            panic!("a lambda has a function type, got {ty}");
+        };
+        assert_eq!(effects.to_string(), " requires Read(x)");
+    }
+
+    /// Reading a transactional variable requires a transaction, and a `with begin():` body
+    /// supplies one (`src/ccl/design/type-inference.md`, "Effect variables").
+    #[test]
+    fn a_transactional_read_requires_a_transaction_outside_a_block() {
+        let read = || {
+            TypedExpr::binop(
+                TypedExpr::var("x"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                TypedExpr::var("y"),
+            )
+        };
+        let outside = lambda_over_a_transactional_variable(read());
+        let inside = lambda_over_a_transactional_variable(TypedExpr::begin(TypedExpr::mut_write(
+            "x",
+            read(),
+        )));
+        let clauses = |ty: &Type| match ty {
+            Type::Fun { effects, .. } => effects.to_string(),
+            other => panic!("a lambda has a function type, got {other}"),
+        };
+        assert_eq!(clauses(&outside), " requires Transaction");
+        assert_eq!(clauses(&inside), " causes Write(x), Commit");
     }
 
     /// Typechecking a dead definition must not resurrect it, and must not

@@ -2452,6 +2452,10 @@ fn run_passes(
     // mutable reference.
     check_mut_rules(&expr, &blame)?;
 
+    // The last check that reads effects has run, so they are erased: every pass after this
+    // one builds function types that state none.
+    crate::ccl::effects::erase(&mut expr);
+
     // Give each named read its position back, now that inference has run and no
     // refinement needs a binder to mention (`crate::ccl::mut_read::unbind`).
     // Before the pane below, so one phase sits on one side of it; before

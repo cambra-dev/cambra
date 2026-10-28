@@ -839,7 +839,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             _ => expr.ty.clone(),
         },
 
-        TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, ctx)?,
+        TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, None, ctx)?,
 
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
         // **The assertion is trusted**, which is the whole difference from `Cast`. The
@@ -908,7 +908,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             payload,
         } => emit_nominal_ctor(decl, ctor, payload, ctx)?,
 
-        TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, ctx)?,
+        TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, None, ctx)?,
 
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 

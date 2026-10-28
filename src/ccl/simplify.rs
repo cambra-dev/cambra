@@ -1127,6 +1127,7 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
                     fun_kind: mint_kind.clone(),
                     domain: Box::new(dom),
                     codomain: Box::new(cod),
+                    effects: crate::ccl::effects::Effects::none(),
                 },
                 _ => Type::Hole,
             };
@@ -1320,6 +1321,7 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
                         fun_kind: mint_kind.clone(),
                         domain: Box::new(a.clone()),
                         codomain: Box::new(a),
+                        effects: crate::ccl::effects::Effects::none(),
                     })
                     .unwrap_or(Type::Hole);
             let id_node = id().with_ty(id_ty);
@@ -1361,6 +1363,7 @@ fn try_partial_lookup(expr: &mut Expr) -> bool {
                 fun_kind: mint_kind.clone(),
                 domain: Box::new(key_ty),
                 codomain: Box::new(option_ty),
+                effects: crate::ccl::effects::Effects::none(),
             };
             // `curry(lookup?) : ((𝐶, 𝐾) ⇒ Option(𝑉)) ⇒ (𝐶 ⇒ (𝐾 ⇒ Option(𝑉)))`, applied at
             // the collection to leave the morphism the keys compose into.
@@ -1574,6 +1577,7 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
                     fun_kind: mint_kind.clone(),
                     domain: Box::new(dom.as_ref().clone()),
                     codomain: Box::new(cod.as_ref().clone()),
+                    effects: crate::ccl::effects::Effects::none(),
                 },
                 _ => Type::Hole,
             };
@@ -1767,6 +1771,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(a),
             codomain: Box::new(b),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 
@@ -1789,6 +1794,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: fun_tys.first().unwrap().0.clone(),
             codomain: fun_tys.last().unwrap().1.clone(),
+            effects: crate::ccl::effects::Effects::none(),
         };
         Expr::compose(elts).with_ty(ty)
     }
@@ -2554,6 +2560,7 @@ mod tests {
             fun_kind: FunKind::Data(None),
             domain: Box::new(domain),
             codomain: Box::new(Type::data_fun(b_ty.clone(), c2_ty.clone())),
+            effects: crate::ccl::effects::Effects::none(),
         };
 
         // 𝑓 absent: the bare `.0` arm.

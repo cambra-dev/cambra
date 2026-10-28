@@ -3521,6 +3521,76 @@ family runs per row.
 
 ---
 
+## 4.9 Effects
+
+A `Type::Fun` carries what a call reads from its context and what it contributes besides its
+result, its `requires` and `causes` clauses
+([chl-spec.md, "6.9 Effects and requirements [Decided]"](../../../docs/chl-spec.md#69-effects-and-requirements-decided)).
+The `effects` slot holds an `Effects` (`src/ccl/effects.rs`): `Known` for a set a type states, and
+`Var` for one inference is still collecting. A data function's is always the empty set.
+
+### Effect variables
+
+An `EffectVar` holds **labels** and **edges**. A label is one requirement or effect, with the
+depth of the function body that binds the variable it names: the number of function bodies around
+the binder, 0 at the top level, and none for a label naming no variable or a transactional mutable
+variable. An edge from 𝑢 into 𝑣 says that what 𝑢 holds, through the edge's filter, 𝑣 holds too.
+`EffectVar::resolved` is the fixpoint over the edges reaching a variable.
+
+Emission keeps a stack of frames, one for the module's top level and one for each function body
+under emission (`InferCtx::effect_frames`). A frame's variable is the effects of the function
+whose body it is. Labels are recorded on the innermost frame:
+
+| Node | Label |
+| --- | --- |
+| `MutWrite` of 𝑥 | `Write(𝑥)`, and `Transaction` when 𝑥 is transactional |
+| `Feed` or `Define` into 𝑓 | `Append(𝑓)` |
+| `Begin` | `Commit`; its body's frame discharges `Transaction` |
+| `Source` | `Ext` |
+| a value read of a transactional variable 𝑥 | `Transaction` |
+| a value read of an induction variable 𝑥 | `Read(𝑥)` |
+| an `Apply` passing 𝑎 to a `Mut` parameter | `Write(𝑎)` |
+
+A value read is a mention whose handle becomes its value (`read_value` in `emit.rs`). A mention
+passed by reference, or to `await_final`, stays a handle and reads nothing. A parameter's history
+is its argument's, so a label naming a parameter is not recorded. A
+`MutDecl` binder is declared, not a parameter (`Typing::declare_mutable`).
+
+**A frame's filter keeps what is the function's own out of its type.** An edge or label entering a
+frame passes when the variable it names is bound outside the frame's body: its depth is below the
+frame's. Inside a `Begin` body the filter also drops `Transaction`. A label naming no variable
+always passes. `Read(𝑥)` is filtered as `Write(𝑥)` is: inside the scope binding 𝑥, every call
+has a position in its history.
+
+**A call relates the callee's effects to the caller's.** `InferCtx::apply` puts a fresh call
+variable on the expected function type and an edge from it into the innermost frame. The
+`Fun`/`Fun` arm of `constrain_go` relates effects covariantly: an edge from the left side's
+variable into the right side's, or the left side's known labels recorded on the right side's
+variable. A known set on the right records nothing.
+
+**A collection runs where it is built.** A lambda, a `Compose` chain or a `Cast` whose kind is data
+denotes a collection, and its body runs where the collection is built, so its labels flow into the
+enclosing frame as a call's do (`InferCtx::settle_by_kind`). One whose kind is still a variable
+gets the edge with a condition, `Filter::when_data`, which holds once the kind resolves to data. A
+compute function's labels stay in its type. A chain's and a cast's effects are the union of their
+parts' (`Typing::composed_effects`). The kind is the lowering stamp where the node carries one, as
+`emit_node` applies it.
+
+**Levels.** An effect variable is minted at the emission level. `type_level` leaves effects out,
+since an effect variable decides nothing about whether a definition is polymorphic. A type
+becoming a bound of a variable at a shallower level lowers its effect variables to that level
+(`lower_effect_levels`, at bound recording and at extrusion). Instantiation copies an effect
+variable above the scheme's cutoff with its labels and the edges into it
+(`freshen_effect_var`), so two uses of one polymorphic function collect their effects apart.
+
+**Materialization.** Compaction resolves each function position's effects (`CompactFun::effects`).
+A merge takes the union at a positive position and the intersection at a negative one. Coalesce
+writes the set into a compute function's type as `Known`.
+
+**Erasure.** The checks after inference read the materialized effects. Once they have run,
+`effects::erase` sets every function type's effects to none, and every later pass builds function
+types that state none.
+
 ## 5. CCL-specific inference rules
 
 The rules in `infer/emit.rs` describe each CCL node's structural typing. They run in both

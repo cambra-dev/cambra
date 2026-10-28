@@ -395,12 +395,15 @@ fn encode(
                             fun_kind,
                             domain,
                             codomain,
+                            // A comprehension's source is a collection, whose effects are none.
+                            effects: _,
                         }),
                     ) if matches!(*domain, Type::Hole) => source.with_user_annotation(Type::Fun {
                         name,
                         fun_kind,
                         domain: Box::new(shared.clone()),
                         codomain,
+                        effects: crate::ccl::effects::Effects::none(),
                     }),
                     _ => source,
                 }
@@ -419,6 +422,7 @@ fn encode(
                     fun_kind: src_kind,
                     domain: Box::new(src_dom),
                     codomain: Box::new(Type::Hole),
+                    effects: crate::ccl::effects::Effects::none(),
                 })
             }
         };
@@ -472,6 +476,7 @@ fn encode(
                 fun_kind: result_kind.clone(),
                 domain: Box::new(Type::Hole),
                 codomain: Box::new(Type::Hole),
+                effects: crate::ccl::effects::Effects::none(),
             });
         let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole, result_kind);
         at_id(make_cast(unrefined_lambda, target_ty), comprehension_id)
@@ -489,6 +494,7 @@ fn encode(
                 fun_kind: result_kind,
                 domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
                 codomain: Box::new(Type::Hole),
+                effects: crate::ccl::effects::Effects::none(),
             });
         at_id(lambda, comprehension_id)
     }

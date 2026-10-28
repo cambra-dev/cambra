@@ -794,6 +794,7 @@ pub fn typed_compose(elts: Vec<Expr>) -> Expr {
         fun_kind,
         domain: Box::new(d_ty),
         codomain: Box::new(c_ty),
+        effects: crate::ccl::effects::Effects::none(),
     })
 }
 
@@ -1154,6 +1155,7 @@ pub fn refined_data_fun(
             Refinement::born(Rc::new(predicate)),
         )),
         codomain: Box::new(codomain),
+        effects: crate::ccl::effects::Effects::none(),
     }
 }
 

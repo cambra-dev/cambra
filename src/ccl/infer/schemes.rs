@@ -215,6 +215,7 @@ impl OperatorSchemes {
                     fun_kind: crate::ccl::FunKind::Data(None),
                     domain: Box::new(delta.clone()),
                     codomain: Box::new(epsilon.clone()),
+                    effects: crate::ccl::effects::Effects::none(),
                 },
                 Type::sum_over(
                     crate::ccl::ty::TypeKind::Enumerated(vec![delta]),

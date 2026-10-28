@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::traits::{TraitObligation, TraitObligationId};
+use crate::ccl::effects::{EffectVar, EffectVarId, Effects, Repr};
 use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::TraitRequirement;
@@ -201,6 +202,10 @@ pub struct FreshenCache {
     /// `DomainJoinConflict`. Freshening mints one `κ'` per original `κ` (bounds
     /// copied so def-intrinsic forcing survives), consistently within a copy.
     pub fun_kind_vars: HashMap<FunKindVarId, Rc<FunKindVar>>,
+    /// Original quantified effect variable → its fresh replacement, so the effects of
+    /// two uses of one generalized function are collected apart
+    /// (`src/ccl/design/type-inference.md`, "Effect variables").
+    pub effect_vars: HashMap<EffectVarId, Rc<EffectVar>>,
     /// Original kind-variable binder → the copy's binder at the same position.
     ///
     /// A kind variable's binders are quantified with it: they are the scope its edges
@@ -308,6 +313,33 @@ fn freshen_fun_kind(fun_kind: &FunKind, cache: &mut FreshenCache) -> FunKind {
 /// Caching by `uid` is what keeps repeated occurrences of one `κ` in a single
 /// copy identified; the copy decouples *this* instantiation's pin from the
 /// definition's and from every sibling instantiation's.
+/// A copy of the effect variable `v` and of every variable above `lim` flowing into it, each
+/// with its labels and edges; one at or below `lim` is shared, as a type variable is.
+fn freshen_effect_var(
+    lim: Level,
+    v: &Rc<EffectVar>,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Rc<EffectVar> {
+    if v.level() <= lim {
+        return Rc::clone(v);
+    }
+    if let Some(f) = cache.effect_vars.get(&v.uid) {
+        return Rc::clone(f);
+    }
+    let f = EffectVar::fresh(target.level_of(v.level()));
+    // Cached before the edges are copied, so a cycle reaches the copy.
+    cache.effect_vars.insert(v.uid, Rc::clone(&f));
+    for label in v.own() {
+        f.record(label);
+    }
+    for (source, filter) in v.incoming() {
+        let source = freshen_effect_var(lim, &source, target, cache);
+        f.flows_from(&source, filter);
+    }
+    f
+}
+
 fn freshen_kind_var(kv: &Rc<FunKindVar>, cache: &mut FreshenCache) -> Rc<FunKindVar> {
     if let Some(f) = cache.fun_kind_vars.get(&kv.uid) {
         return f.clone();
@@ -470,6 +502,7 @@ pub fn freshen_above(
             fun_kind,
             domain: d,
             codomain: c,
+            effects,
         } => {
             let out = Type::Fun {
                 name: name.clone(),
@@ -487,6 +520,10 @@ pub fn freshen_above(
                 },
                 domain: Box::new(freshen_above(lim, d, target, cache)),
                 codomain: Box::new(freshen_above(lim, c, target, cache)),
+                effects: match effects.repr() {
+                    Repr::Var(v) => Effects::var(freshen_effect_var(lim, v, target, cache)),
+                    Repr::Known(_) => effects.clone(),
+                },
             };
             // A scheme binds its witnesses, so each instantiation owes itself its own —
             // `box`'s scheme is one sum, and sharing its binders would make every `box`
@@ -1200,6 +1237,7 @@ mod tests {
             fun_kind: FunKind::Var(Rc::clone(&kv)),
             domain: Box::new(Type::Infer(InferVar::fresh(5))),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: Effects::none(),
         };
         let mut cache = FreshenCache::new();
         let fresh = freshen_above(0, &f, FreshenLevel::At(1), &mut cache);
@@ -1259,6 +1297,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(refined_domain),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: Effects::none(),
         };
         assert_eq!(
             type_level(&ty),
