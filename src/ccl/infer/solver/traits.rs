@@ -876,7 +876,7 @@ impl fmt::Display for InstanceHead {
 ///
 /// The compiler's and a module's are the same data. A compiler instance's head names base
 /// types, except `Equatable`'s for `Option(T)`; a module's,
-/// `impl Container(Bag(T), Elem=T) requires …:`, is built by lowering.
+/// `instance Container(Bag(T)) requires …:`, is built by lowering.
 #[derive(Debug)]
 pub struct TraitInstance {
     /// The head's type variables, `T` in `Bag(T)`, declared ([`TypeParam::declared`]).
@@ -906,7 +906,7 @@ pub struct TraitInstance {
 pub struct DeclaredAt {
     /// The path of the module that declares it: empty for the program's root module.
     pub module: Vec<SmolStr>,
-    /// The instance's head as its `impl` writes it, `Area(Circle)`.
+    /// The instance's head as its `instance` writes it, `Area(Circle)`.
     pub head: String,
     /// The instance's head.
     pub span: Span,
@@ -1026,7 +1026,7 @@ impl TraitInstance {
 /// How an instance implements one of its trait's functions.
 #[derive(Debug, Clone)]
 pub enum Implementation {
-    /// The function an instance's `def` binds, where its `impl` stands.
+    /// The function an instance's `def` binds, where its `instance` stands.
     Binding(Name),
     /// A compiler instance's primitive operation.
     Primitive(InstanceBody),

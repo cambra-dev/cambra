@@ -445,8 +445,7 @@ A trait is a member of its module, and its declaration records the module's path
 it declares, a compiler trait, one a `use` name reaches (`Reached::Trait`), or a public one of the
 module a qualifier names (`Qualifier::reach_trait`), as in `shapes::Area(S)`
 (`LoweringContext::resolve_trait`). A summon, a requirement and an instance's head name a trait the
-same way. An `impl` block whose head is written through a qualifier is an instance
-(`LoweringContext::is_instance_block`).
+same way, and an `impl` head naming one is refused (`LoweringContext::names_a_trait`).
 
 Every module declares its instances before its statements lower, the root's as any other's
 (`declare_module_instances`). The instance table is the program's: `begin_module` clears the

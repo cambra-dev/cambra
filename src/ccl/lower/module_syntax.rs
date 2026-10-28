@@ -265,7 +265,7 @@ impl Refusals {
                 self.expr(context);
                 self.stmts(body);
             }
-            ChlStmt::Impl(block) => {
+            ChlStmt::Impl(block) | ChlStmt::Instance(block) => {
                 for arg in &block.args {
                     self.expr(arg);
                 }

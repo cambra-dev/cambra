@@ -349,12 +349,12 @@ whose element misuses its binder fails at the binder's slot rather than at the a
 
 #### A definition group is emitted in the order its references need
 
-A `DefGroup`, an `impl` block's functions, means the `let`s that bind each function after the
-functions it calls, and which those are is decided as the calls are emitted: a method call names
-its function only once its receiver is typed. So `emit_def_group` binds each member as a `let`'s
-definition, at the group's position, in a scope it opens for the group, and a reference to a member
-not yet bound emits that member first (`emit_group_member_for`, from the `Var` rule), wherever the
-reference stands. That emission runs as if the enclosing member's had not begun
+A `DefGroup`, an `impl` or `instance` block's functions, means the `let`s that bind each function
+after the functions it calls, and which those are is decided as the calls are emitted: a method call
+names its function only once its receiver is typed. So `emit_def_group` binds each member as a
+`let`'s definition, at the group's position, in a scope it opens for the group, and a reference to a
+member not yet bound emits that member first (`emit_group_member_for`, from the `Var` rule),
+wherever the reference stands. That emission runs as if the enclosing member's had not begun
 (`InferCtx::at_group`): the scopes it opened are set aside, and the level, telescope, open `Poly`
 parameters and assumptions are the group's. Each member is then bound before the members that name
 it, is generalized as a `let` is, and its uses instantiate its scheme, so the members are
@@ -3341,13 +3341,13 @@ termination proofs for logic programs (Bezem's recurrent programs; De Schreye an
 
 - **Size, with traits unordered** (GHC's Paterson conditions): each condition has fewer
   constructors and variables than the head, and no variable more often. It refuses
-  `impl forall (F) Scales(Vec2, F) requires Multipliable(Int, F)`, whose condition has the head's
-  size, and `requires Equatable(T, T)` under a head that names `T` once.
+  `instance forall (F) Scales(Vec2, F) requires Multipliable(Int, F)`, whose condition has the
+  head's size, and `requires Equatable(T, T)` under a head that names `T` once.
 - **Size within cycles of the instance graph**: only a condition whose instance can reach its own
   again shrinks. Whether it can depends on instances its module need not see. With traits `P` and
   `Q` and a type `Pair` in one module,
-  `impl forall (X, Y) P(Pair(Wa(X), Y)) requires Q(Pair(Y, Wa(X)))` in `Wa`'s module and
-  `impl forall (U, V) Q(Pair(Wb(U), V)) requires P(Pair(V, Wb(U)))` in `Wb`'s resolve
+  `instance forall (X, Y) P(Pair(Wa(X), Y)) requires Q(Pair(Y, Wa(X)))` in `Wa`'s module and
+  `instance forall (U, V) Q(Pair(Wb(U), V)) requires P(Pair(V, Wb(U)))` in `Wb`'s resolve
   `P(Pair(Wa(𝑎), Wb(𝑏)))` back to itself, and only a module importing both sees the cycle.
 - **A check along each chain as it resolves**, refusing a condition whose types embed an earlier
   one's, as Scala's implicit divergence check does and as calls of an instance's function are
@@ -3582,7 +3582,7 @@ included, for a name.
   (`matching_instance`). The slots are type slots, so a generalized definition's specialization
   clone freshens them with the rest of the clone, and each clone chooses its own instance. A walk
   whose types are dropped chooses nothing. No `TraitFn` survives inference.
-  - An instance's functions are `def`s, which lowering binds where the `impl` stands, each
+  - An instance's functions are `def`s, which lowering binds where the `instance` stands, each
     under a name the instance records. Before anything reads the node, `use_instance_function`
     makes it a use of that name with the node's own type, the signature at the call's types, and
     the use then specializes as any use of a generalized definition does, pinned against that type

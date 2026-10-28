@@ -634,7 +634,7 @@ fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
         orders,
     };
     for stmt in body {
-        let Stmt::Impl(block) = &stmt.node else {
+        let Stmt::Instance(block) = &stmt.node else {
             continue;
         };
         let trait_ = block.ty.node.to_string();
@@ -673,9 +673,9 @@ fn instance_names(requires: &[Spanned<chl_parser::ast::Requirement>]) -> Scope {
         .collect()
 }
 
-/// The prefix the functions of the instance `impl T(…)` at `at` are bound under.
+/// The prefix the functions of the instance `instance T(…)` at `at` are bound under.
 fn instance_prefix(trait_: &str, at: usize) -> String {
-    format!("impl {trait_}@{at}")
+    format!("instance {trait_}@{at}")
 }
 
 /// A loop over a collection not keyed by position, whose iteration order is not defined
@@ -1546,7 +1546,7 @@ impl Interp {
 
             // An instance binds each `def` under its own prefix, which dispatch names. Its
             // functions read the requirements its trait names and those the block names.
-            Stmt::Impl(block)
+            Stmt::Instance(block)
                 if self
                     .traits
                     .functions
@@ -1566,7 +1566,7 @@ impl Interp {
                         name, params, body, ..
                     } = &def.node
                     else {
-                        return err("an instance's `impl` block holds `def`s");
+                        return err("an `instance` block holds `def`s");
                     };
                     let mut env = self.captured_scopes();
                     env.push(names.clone());
@@ -1582,6 +1582,10 @@ impl Interp {
                 }
                 Ok(None)
             }
+
+            // An instance of a trait that declares no function, `Equatable` or `Orderable`,
+            // binds nothing: values compare by value.
+            Stmt::Instance(_) => Ok(None),
 
             // `impl N:` binds each `def` as `def N::f` does.
             Stmt::Impl(block) => {
@@ -3625,13 +3629,13 @@ mod tests {
                 def name(a: A) => Int
             trait Both(A) requires l: Left(A), r: Right(A):
                 def sum(a: A) => Int
-            impl Left(M):
+            instance Left(M):
                 def name(a):
                     1
-            impl Right(M):
+            instance Right(M):
                 def name(a):
                     2
-            impl Both(M):
+            instance Both(M):
                 def sum(a):
                     10 * l::name(a) + r::name(a)
             def twice(A, a: A) => Int requires b: Both(A):
@@ -3647,10 +3651,10 @@ mod tests {
                 def name(a: A) => Int
             trait Both(A) requires l: Left(A):
                 def sum(a: A) => Int
-            impl Left(M):
+            instance Left(M):
                 def name(a):
                     1
-            impl Both(M):
+            instance Both(M):
                 def sum(a):
                     l::name(a)
             def f(A, a: A) => Int requires b: Both(A):
@@ -3680,20 +3684,20 @@ mod tests {
                 def area(s: S) => Int
             trait Join(A, B):
                 def join(a: A, other: B) => Int
-            impl Area(Circle):
+            instance Area(Circle):
                 def area(s):
                     Circle::circle(r) = s
                     3 * r
-            impl Join(Circle, Int):
+            instance Join(Circle, Int):
                 def join(a, other):
                     Circle::circle(r) = a
                     r + other
-            impl Join(Circle, String):
+            instance Join(Circle, String):
                 def join(a, other):
                     0
             trait Sized(C):
                 def size(c: C) => Int
-            impl forall (T) Sized(Bag(T)):
+            instance forall (T) Sized(Bag(T)):
                 def size(c):
                     Bag::bag(xs) = c
                     sum([1 for x in xs]) + 100
@@ -3725,12 +3729,12 @@ mod tests {
             trait Area(S):
                 def area(s: S) => Int
                 def twice(s: S) => Int
-            impl Area(Circle):
+            instance Area(Circle):
                 def area(s):
                     s.extract()
                 def twice(s):
                     2 * summon(Area(_))::area(s)
-            impl forall (T) Area(One(T)) requires Area(T):
+            instance forall (T) Area(One(T)) requires Area(T):
                 def area(s):
                     summon(Area(_))::twice(s) - summon(Area(_))::area(s.extract()) + 1
                 def twice(s):
@@ -3752,19 +3756,19 @@ mod tests {
                 bag(xs: List(T))
             trait Describe(C):
                 def code(c: C) => Int
-            impl Describe(Two(Int)):
+            instance Describe(Two(Int)):
                 def code(c):
                     1
-            impl Describe(Two(String)):
+            instance Describe(Two(String)):
                 def code(c):
                     2
-            impl forall (T) Describe(Two(Two(T))):
+            instance forall (T) Describe(Two(Two(T))):
                 def code(c):
                     3
-            impl Describe(Bag(Int)):
+            instance Describe(Bag(Int)):
                 def code(c):
                     4
-            impl Describe(Bag(Bool)):
+            instance Describe(Bag(Bool)):
                 def code(c):
                     5
             out << (
@@ -3787,7 +3791,7 @@ mod tests {
             trait Scales(V, F):
                 def scale(v: V, f: F) => V
                 def times(f: F, v: V) => V
-            impl forall (F) Scales(Vec2, F) requires r: Multipliable(Int, F), r::Output <: Int:
+            instance forall (F) Scales(Vec2, F) requires r: Multipliable(Int, F), r::Output <: Int:
                 def scale(v, f):
                     Vec2::new((v.extract().0 * f, v.extract().1 * f))
                 def times(f, v):
@@ -3804,16 +3808,16 @@ mod tests {
         let v = out(indoc! {r#"
             out = test_sink()
             type Money = Int
-            impl Addable(Money, Money):
+            instance Addable(Money, Money):
                 Output = Money
                 def add(x, other):
                     Money::new(x.extract() + other.extract())
-            impl Negatable(Money):
+            instance Negatable(Money):
                 Output = Money
                 def neg(x):
                     Money::new(0 - x.extract())
-            impl Equatable(Money, Money)
-            impl Orderable(Money, Money)
+            instance Equatable(Money, Money)
+            instance Orderable(Money, Money)
             m = Money::new(1) + Money::new(2)
             out << (m.extract(), (-m).extract(), m == Money::new(3), m < Money::new(2), max([m, Money::new(9)]).extract())
         "#});
@@ -3832,10 +3836,10 @@ mod tests {
             type Person = {age: Int, name: String}
             type Version:
                 version(major: Int, minor: Int)
-            impl Equatable(Person, Person)
-            impl Orderable(Person, Person)
-            impl Equatable(Version, Version)
-            impl Orderable(Version, Version)
+            instance Equatable(Person, Person)
+            instance Orderable(Person, Person)
+            instance Equatable(Version, Version)
+            instance Orderable(Version, Version)
             a = Person::new((age=3, name="b"))
             b = Person::new((age=4, name="a"))
             out << (a < b, max([a, b]).extract().name, Version::version(1, 9) < Version::version(2, 0), (1, 2) < (1, 3))
@@ -3856,10 +3860,10 @@ mod tests {
             type Square = Int
             trait Area(S):
                 def area(s: S) => Int
-            impl Area(Circle):
+            instance Area(Circle):
                 def area(s):
                     1
-            impl Area(Square):
+            instance Area(Square):
                 def area(s):
                     2
             out << (summon(Area(_))::area(Circle::new(2)), summon(Area(_))::area(Square::new(3)))
@@ -3918,7 +3922,7 @@ mod tests {
         let v = out(indoc! {r#"
             out = test_sink()
             type Bag = List(Int)
-            impl Iterable(Bag):
+            instance Iterable(Bag):
                 Elements = List(Int)
                 def elements(b):
                     b.extract()

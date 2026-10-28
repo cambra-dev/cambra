@@ -1,4 +1,4 @@
-//! Lowering of traits: a module's `trait` declarations and `impl Trait(…)` instances, and
+//! Lowering of traits: a module's `trait` declarations and `instance Trait(…)` instances, and
 //! the functions read from an instance, `summon(Area(_))::area` and `a::area` under
 //! `requires a: Area(S)` (`docs/chl-spec.md`, "Summoning an instance";
 //! `src/ccl/design/type-inference.md`, "Trait functions").
@@ -7,7 +7,7 @@
 //! which inference types by the trait's signature and coalescing replaces with the function
 //! of the instance its operands match.
 //! A declared trait becomes a [`TraitDecl`], and a declared instance a row of the program's
-//! [`InstanceTable`]. An instance's `def`s lower where its `impl` block stands, each bound
+//! [`InstanceTable`]. An instance's `def`s lower where its `instance` block stands, each bound
 //! to the name its row records, and each completed from its trait's signature at the
 //! instance's types.
 
@@ -176,7 +176,7 @@ pub(super) fn apply_to_arguments(
     Ok(Expr::apply(argument, function))
 }
 
-/// What lowering keeps of an instance a module declares, for its `impl` block's `def`s,
+/// What lowering keeps of an instance a module declares, for its `instance` block's `def`s,
 /// which lower where the block stands.
 pub(crate) struct InstanceBlock {
     /// The block's statement.
@@ -676,8 +676,8 @@ fn mentions_refinement(ty: &Type) -> bool {
     found
 }
 
-/// Declare the instance each `impl` among the module's top-level `stmts` whose head names a
-/// trait declares, checking it against its trait and the instances before it
+/// Declare the instance each `instance` block among the module's top-level `stmts`
+/// declares, checking it against its trait and the instances before it
 /// (`docs/chl-spec.md`, "Declaring an instance").
 pub(super) fn declare_instances(
     stmts: &[Spanned<ChlStmt>],
@@ -685,14 +685,43 @@ pub(super) fn declare_instances(
 ) -> Vec<LoweringError> {
     let mut errors = Vec::new();
     for stmt in stmts {
-        let ChlStmt::Impl(block) = &stmt.node else {
+        let ChlStmt::Instance(block) = &stmt.node else {
             continue;
         };
         let trait_ = match ctx.block_trait(block) {
             Ok(Some(trait_)) => trait_,
-            Ok(None) => continue,
+            Ok(None) => {
+                errors.push(LoweringError::unsupported(
+                    block.ty.span,
+                    format!(
+                        "`instance {}` names no trait; an instance is of a trait the module \
+                         declares, reaches, or the compiler's, and a type's own block is written \
+                         `impl`",
+                        block.ty.node
+                    ),
+                ));
+                continue;
+            }
             Err(e) => {
-                errors.push(e);
+                // A qualified head naming a type of its module is the type's own block, as
+                // an unqualified one is above.
+                let names_a_type = !block.qualifier.is_empty()
+                    && ctx
+                        .qualifier_path(&block.qualifier, block.ty.span)
+                        .is_ok_and(|at| at.declares_nominal(&block.ty.node));
+                errors.push(if names_a_type {
+                    LoweringError::unsupported(
+                        block.ty.span,
+                        format!(
+                            "module `{}` declares no trait `{}`; a type's own block is written \
+                             `impl`",
+                            crate::ccl::names::QualifiedName::of_segments(&block.qualifier),
+                            block.ty.node
+                        ),
+                    )
+                } else {
+                    e
+                });
                 continue;
             }
         };
@@ -776,7 +805,7 @@ fn declare_instance(
         return Err(LoweringError::unsupported(
             block.ty.span,
             format!(
-                "`{trait_}` is over {} type{}, and `impl {written}` names {}",
+                "`{trait_}` is over {} type{}, and `instance {written}` names {}",
                 trait_.arity(),
                 if trait_.arity() == 1 { "" } else { "s" },
                 block.args.len()
@@ -792,7 +821,7 @@ fn declare_instance(
         if variables.iter().any(|(n, _)| *n == v.node) {
             return Err(LoweringError::unsupported(
                 v.span,
-                format!("`{}` is declared twice in `impl forall (…)`", v.node),
+                format!("`{}` is declared twice in `instance forall (…)`", v.node),
             ));
         }
         variables.push((v.node.clone(), TypeParam::declared(v.node.clone())));
@@ -810,7 +839,7 @@ fn declare_instance(
         return Err(LoweringError::unsupported(
             block.ty.span,
             format!(
-                "`impl {}` names no nominal type; an instance is for a type the module \
+                "`instance {}` names no nominal type; an instance is for a type the module \
                  declares, so one of its operands names one",
                 head_spelling(&trait_, &operands)
             ),
@@ -835,7 +864,7 @@ fn declare_instance(
             return Err(LoweringError::unsupported(
                 block.ty.span,
                 format!(
-                    "`impl {}` names no type this module declares; an instance is declared in \
+                    "`instance {}` names no type this module declares; an instance is declared in \
                      its trait's module or in the module of a type its head names, and {whose}",
                     head_spelling(&trait_, &operands)
                 ),
@@ -850,7 +879,7 @@ fn declare_instance(
             return Err(LoweringError::unsupported(
                 arg.span,
                 format!(
-                    "`impl {}` has a type variable as a whole operand, which only an instance \
+                    "`instance {}` has a type variable as a whole operand, which only an instance \
                      in its trait's module may, and {whose}; write an instance for each type",
                     head_spelling(&trait_, &operands)
                 ),
@@ -865,7 +894,7 @@ fn declare_instance(
         return Err(LoweringError::unsupported(
             block.args.get(1).map_or(block.ty.span, |a| a.span),
             format!(
-                "`impl {}` takes an exponent that is not `Int`; a `**`'s exponent is a \
+                "`instance {}` takes an exponent that is not `Int`; a `**`'s exponent is a \
                  non-negative `Int` whichever instance answers it",
                 head_spelling(&trait_, &operands)
             ),
@@ -882,7 +911,7 @@ fn declare_instance(
             return Err(LoweringError::unsupported(
                 v.span,
                 format!(
-                    "type variable `{}` appears in no operand of `impl {}`, so no call's types \
+                    "type variable `{}` appears in no operand of `instance {}`, so no call's types \
                      determine it",
                     v.node,
                     head_spelling(&trait_, &operands)
@@ -909,7 +938,7 @@ fn declare_instance(
         if assoc.iter().any(|(n, _)| *n == name) {
             return Err(LoweringError::unsupported(
                 a.name_span,
-                format!("`{}` is defined twice in `impl {written}`", a.name),
+                format!("`{}` is defined twice in `instance {written}`", a.name),
             ));
         }
         let mut ty = lower_type_expr(&a.value, ctx)?;
@@ -918,7 +947,7 @@ fn declare_instance(
             return Err(LoweringError::internal(
                 a.value.span,
                 format!(
-                    "a refinement in the associated type `{}` of `impl {written}` is not \
+                    "a refinement in the associated type `{}` of `instance {written}` is not \
                      supported yet",
                     a.name
                 ),
@@ -931,7 +960,7 @@ fn declare_instance(
             return Err(LoweringError::unsupported(
                 a.value.span,
                 format!(
-                    "`Elements = {ty}` in `impl {}` is a nominal type, and an `Elements` that \
+                    "`Elements = {ty}` in `instance {}` is a nominal type, and an `Elements` that \
                      is not a structural collection is not supported yet",
                     head_spelling(&trait_, &operands)
                 ),
@@ -966,7 +995,7 @@ fn declare_instance(
                 String::new()
             } else {
                 format!(
-                    ", which is `{name} <: {bound}` in `impl {}`",
+                    ", which is `{name} <: {bound}` in `instance {}`",
                     head_spelling(&trait_, &operands)
                 )
             };
@@ -988,7 +1017,7 @@ fn declare_instance(
         return Err(LoweringError::unsupported(
             block.ty.span,
             format!(
-                "`impl {}` does not define `{missing}`; an instance's block defines each \
+                "`instance {}` does not define `{missing}`; an instance's block defines each \
                  associated type its trait declares, `{missing} = T`",
                 head_spelling(&trait_, &operands)
             ),
@@ -1007,7 +1036,7 @@ fn declare_instance(
             r.at.unwrap_or(block.ty.span),
             format!(
                 "`{name}` names a requirement of `{trait_}`, which the functions of \
-                 `impl {head}` read by that name; name this one otherwise"
+                 `instance {head}` read by that name; name this one otherwise"
             ),
         ));
     }
@@ -1023,7 +1052,7 @@ fn declare_instance(
             return Err(LoweringError::unsupported(
                 block.ty.span,
                 format!(
-                    "`impl {head}` needs `{needed}`, which `{trait_}` requires of every \
+                    "`instance {head}` needs `{needed}`, which `{trait_}` requires of every \
                      instance; declare that instance above this one, or require it with \
                      `requires`"
                 ),
@@ -1038,7 +1067,7 @@ fn declare_instance(
         let error = LoweringError::unsupported(
             block.ty.span,
             format!(
-                "`impl {head}` overlaps another instance of `{trait_}`; a trait has one \
+                "`instance {head}` overlaps another instance of `{trait_}`; a trait has one \
                  instance for a type"
             ),
         );
@@ -1057,17 +1086,17 @@ fn declare_instance(
                     def.span,
                     format!(
                         "an instance's functions are its trait's, so `pub` does not mark one \
-                         in `impl {head}`"
+                         in `instance {head}`"
                     ),
                 ));
             }
-            _ => unreachable!("the parser builds an `impl` block of `def`s"),
+            _ => unreachable!("the parser builds an `instance` block of `def`s"),
         };
         if let Some(other) = owner {
             return Err(LoweringError::unsupported(
                 other.span,
                 format!(
-                    "a `def` in `impl {head}` defines a function of `{trait_}` and names no \
+                    "a `def` in `instance {head}` defines a function of `{trait_}` and names no \
                      type of its own; write `def {fname}(…)`"
                 ),
             ));
@@ -1075,13 +1104,15 @@ fn declare_instance(
         if trait_.function(fname).is_none() {
             return Err(LoweringError::unsupported(
                 fspan,
-                format!("`{trait_}` declares no function `{fname}` for `impl {head}` to define"),
+                format!(
+                    "`{trait_}` declares no function `{fname}` for `instance {head}` to define"
+                ),
             ));
         }
         if functions.iter().any(|(n, _)| n == fname) {
             return Err(LoweringError::unsupported(
                 fspan,
-                format!("`impl {head}` defines `{fname}` twice"),
+                format!("`instance {head}` defines `{fname}` twice"),
             ));
         }
         functions.push((
@@ -1097,7 +1128,7 @@ fn declare_instance(
         return Err(LoweringError::unsupported(
             block.ty.span,
             format!(
-                "`impl {head}` does not define `{}`, which `{trait_}` declares",
+                "`instance {head}` does not define `{}`, which `{trait_}` declares",
                 missing.name
             ),
         ));
@@ -1196,7 +1227,7 @@ fn check_conditions_end(
         return Err(LoweringError::unsupported(
             r.at.unwrap_or(block.ty.span),
             format!(
-                "`impl {head}` requires `{condition}`, which is {} the head; {why}, so resolving \
+                "`instance {head}` requires `{condition}`, which is {} the head; {why}, so resolving \
                  an instance's conditions ends",
                 if deeper {
                     "deeper than"
@@ -1276,7 +1307,7 @@ fn check_comparison_instance(
     };
     if one != other {
         return refuse(format!(
-            "`impl {head}` relates two different types; a comparison is by value, so an \
+            "`instance {head}` relates two different types; a comparison is by value, so an \
              instance of `{trait_}` names one type twice"
         ));
     }
@@ -1287,7 +1318,7 @@ fn check_comparison_instance(
     let orderable = *trait_ == Trait::orderable();
     if orderable && ctors.len() != 1 {
         return refuse(format!(
-            "`impl {head}`: `{}` has {} constructors, which have no order; only a type with \
+            "`instance {head}`: `{}` has {} constructors, which have no order; only a type with \
              one constructor is orderable",
             decl.name,
             ctors.len()
@@ -1304,14 +1335,14 @@ fn check_comparison_instance(
         );
         if orderable && !ctor.payload_order().is_ordered() {
             return refuse(format!(
-                "`impl {head}`: `{}::{}`'s argument holds a record its declaration does not \
+                "`instance {head}`: `{}::{}`'s argument holds a record its declaration does not \
                  write, whose fields have no order; write the record in `{}`'s declaration",
                 decl.name, ctor.name, decl.name
             ));
         }
         if !compares_as_written(trait_, &payload, &ctor.payload_order(), requires, instances) {
             return refuse(format!(
-                "`impl {head}`: `{}::{}`'s argument is `{}`, which is not `{trait_}`; a \
+                "`instance {head}`: `{}::{}`'s argument is `{}`, which is not `{trait_}`; a \
                  nominal type compares by its constructor's argument",
                 decl.name,
                 ctor.name,
@@ -1360,7 +1391,7 @@ fn instance_pattern(
         LoweringError::unsupported(
             arg.span,
             format!(
-                "`impl {head}` names a type that is not a type variable, a base type or a \
+                "`instance {head}` names a type that is not a type variable, a base type or a \
                  nominal type; an instance's head is built from those"
             ),
         )
@@ -1371,7 +1402,7 @@ fn instance_pattern(
             LoweringError::unsupported(
                 span,
                 format!(
-                    "`{}` names no nominal type; `impl {head}` names a type variable, a base \
+                    "`{}` names no nominal type; `instance {head}` names a type variable, a base \
                      type or a nominal type at each operand",
                     crate::ccl::names::QualifiedName::of(q)
                 ),
@@ -1413,7 +1444,7 @@ fn instance_pattern(
                 arg.span,
                 format!(
                     "`{name}` is no type; a type variable of an instance is declared before its \
-                     head, `impl forall ({name}) {head}`"
+                     head, `instance forall ({name}) {head}`"
                 ),
             ));
         }
@@ -1436,7 +1467,7 @@ fn applied_pattern(
         return Err(LoweringError::unsupported(
             arg.span,
             format!(
-                "`{}` takes {} type parameter{}, and `impl {head}` applies it to {}",
+                "`{}` takes {} type parameter{}, and `instance {head}` applies it to {}",
                 decl.name,
                 decl.params.len(),
                 if decl.params.len() == 1 { "" } else { "s" },
@@ -1461,7 +1492,7 @@ fn signature_alias(i: usize) -> String {
 /// annotation.
 type InstanceDef = (Name, Expr, Option<Type>);
 
-/// Lower the `def`s of an instance's `impl` block where it stands: each a binding, under
+/// Lower the `def`s of an `instance` block where it stands: each a binding, under
 /// the name the instance's row records, wrapped around `body`. The functions reach each
 /// other in any order, as a type's own `impl` block's do: inference binds each after the
 /// functions of this instance its calls are answered by (`TypedExprNode::DefGroup`).
@@ -1797,17 +1828,15 @@ impl LoweringContext {
         }
     }
 
-    /// The trait an `impl` block's head names, or `None` for a type's own block: one whose
-    /// head names a trait by its name, or names one through a module, which is a trait or
-    /// an error.
+    /// The trait an `instance` block's head names, or `None` where it names none by its name:
+    /// a name written through a module names a trait or is an error.
     pub(super) fn block_trait(&self, block: &ImplBlock) -> Result<Option<Trait>, LoweringError> {
         self.resolve_trait(&block.qualifier, &block.ty, block.ty.span)
     }
 
-    /// Whether an `impl` block is an instance of a trait rather than a type's own block: its
-    /// head names a trait, or names something through a module, which only a trait's may.
-    pub(super) fn is_instance_block(&self, block: &ImplBlock) -> bool {
-        !block.qualifier.is_empty() || self.trait_named(&block.ty.node).is_some()
+    /// Whether an `impl` block's head names a trait, which a type's own block may not.
+    pub(super) fn names_a_trait(&self, block: &ImplBlock) -> bool {
+        self.block_trait(block).is_ok_and(|t| t.is_some())
     }
 
     /// The trait a qualified name's qualifier ends at, `Area` in `Area::area` and in

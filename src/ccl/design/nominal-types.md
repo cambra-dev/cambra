@@ -335,13 +335,14 @@ type twice and that every constructor's argument compares by value under its `re
 a written order. The instance goes in the program's `InstanceTable` with the others, which every
 check after inference reads.
 
-Lowering declares a module's traits after its types and before their associated functions, and
-its instances after those (`lower::traits`). An instance's `def`s lower where its `impl` stands,
-each completed from the trait's signature at the instance's types: a missing annotation becomes the
-trait's type there, and one the `def` writes is compared with it. Each body reads the
+Lowering declares a module's traits after its types and before their associated functions, and its
+instances after those (`lower::traits`). An instance's `def`s lower where its `instance` statement
+stands, each completed from the trait's signature at the instance's types: a missing annotation
+becomes the trait's type there, and one the `def` writes is compared with it. Each body reads the
 requirements the trait's clause names, at the instance's types, and those the block's clause names
 (`lower_instance_def`). The block's functions are a `DefGroup`, bound so that each follows the ones
-of its instance it calls ([type-inference.md, "Trait functions"](type-inference.md#trait-functions)).
+of its instance it calls
+([type-inference.md, "Trait functions"](type-inference.md#trait-functions)).
 
 ---
 

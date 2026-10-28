@@ -971,12 +971,10 @@ pub(super) fn lower_middle_stmt(
         }
         // An associated function, `def N::f`, or an `impl` block of them: bindings at the
         // statement's position, as a module function's is (`nominal::lower_associated_def`).
-        ChlStmt::Impl(block) if !is_top_level && ctx.is_instance_block(block) => {
-            Err(LoweringError::unsupported(
-                stmt.span,
-                "an instance is declared at a module's top level",
-            ))
-        }
+        ChlStmt::Instance(_) if !is_top_level => Err(LoweringError::unsupported(
+            stmt.span,
+            "an instance is declared at a module's top level",
+        )),
         ChlStmt::FunctionDef { owner: Some(_), .. } | ChlStmt::Impl(_) if !is_top_level => {
             Err(LoweringError::unsupported(
                 stmt.span,
@@ -985,9 +983,7 @@ pub(super) fn lower_middle_stmt(
         }
         // An instance's functions: bindings at the block's position, as a module function's
         // is (`traits::lower_instance`).
-        ChlStmt::Impl(block) if ctx.is_instance_block(block) => {
-            traits::lower_instance(block, stmt.span, body, ctx)
-        }
+        ChlStmt::Instance(block) => traits::lower_instance(block, stmt.span, body, ctx),
         ChlStmt::FunctionDef { owner: Some(_), .. } | ChlStmt::Impl(_) => {
             let mut lowered = Vec::new();
             for def in nominal::associated_defs(stmt, ctx)? {
@@ -2131,7 +2127,7 @@ pub(super) fn lower_requirements(
             binder.span,
             format!(
                 "`{}` names a requirement's instance, which only the `requires` clause of a \
-                 `def`, a `trait` or an `impl` does",
+                 `def`, a `trait` or an `instance` does",
                 binder.node
             ),
         ));
@@ -2357,7 +2353,7 @@ fn lower_requirement_item(
                 return Err(LoweringError::internal(
                     req.span,
                     "a bound on an associated type in this `requires` clause is not supported \
-                     yet; only a `def`'s or an `impl`'s clause bounds one",
+                     yet; only a `def`'s or an `instance`'s clause bounds one",
                 ));
             };
             let Some((_, Type::Param(param))) = r.assoc.iter().find(|(n, _)| *n == assoc) else {
@@ -2823,7 +2819,7 @@ pub(super) fn lower_type_expr_or_poly(
                         annotation.span,
                         format!(
                             "`{}::{member}` is an associated type of a requirement whose clause \
-                             gives it no type parameter; only a `def`'s or an `impl`'s \
+                             gives it no type parameter; only a `def`'s or an `instance`'s \
                              `requires` clause names one yet",
                             q.qualifier[0].node
                         ),

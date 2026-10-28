@@ -293,11 +293,12 @@ A trait's associated type may carry a bound (`TraitDecl::assoc_bounds`), `Size <
 other associated types, and a bound naming the type it bounds is refused where the trait is
 declared. The bound holds in three places:
 
-- **An instance.** An `impl`'s choice of the type must be below the bound, with the instance's
-  operands and other choices substituted into it, as far as their forms decide (`may_be_below`
-  in `lower/traits.rs`): a function where the bound is one, its domain compared by its kind's
-  variance (a compute domain contravariantly, a data domain both ways), the base or nominal type
-  the bound is. A refined bound has no instance yet, since a choice carries no refinement.
+- **An instance.** An `instance`'s choice of the type must be below the bound, with the
+  instance's operands and other choices substituted into it, as far as their forms decide
+  (`may_be_below` in `lower/traits.rs`): a function where the bound is one, its domain compared by
+  its kind's variance (a compute domain contravariantly, a data domain both ways), the base or
+  nominal type the bound is. A refined bound has no instance yet, since a choice carries no
+  refinement.
 - **An obligation.** `require_trait_obligation` bounds each associated position it mints by the
   trait's bound at the obligation's own operand and associated variables. Each function layer of
   the bound gets a binder of its own first (`name_function_binders`), so a dependent collection

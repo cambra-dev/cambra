@@ -2245,10 +2245,10 @@ fn an_instance_function_recursing_through_a_deeply_nested_value() {
             type Two(T) = {T, T}
             trait Area(S):
                 def area(s: S) => Int
-            impl Area(Circle):
+            instance Area(Circle):
                 def area(s):
                     s.extract()
-            impl forall (T) Area(Two(T)) requires Area(T):
+            instance forall (T) Area(Two(T)) requires Area(T):
                 def area(s):
                     summon(Area(_))::area(s.extract().0) + summon(Area(_))::area(s.extract().1)
             c0 = Circle::new(1)

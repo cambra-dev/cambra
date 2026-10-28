@@ -466,7 +466,7 @@ pub enum InferError {
         receiver: Option<Type>,
     },
     /// A trait function's call whose instance a module declares below it: the instance's
-    /// functions are in scope after its `impl`, as a `def` is after its own
+    /// functions are in scope after its `instance`, as a `def` is after its own
     /// (`docs/chl-spec.md`, "Declaring an instance").
     InstanceAfterUse {
         /// The trait function called, `Area::area`.
@@ -508,9 +508,9 @@ pub enum InferError {
         /// The same, for the specialization it is inside.
         within: Vec<(smol_str::SmolStr, Type)>,
     },
-    /// Functions of an `impl` block that reach themselves through the calls their
-    /// definitions make: each calls the next, and the last the first (`docs/chl-spec.md`,
-    /// "Associated functions and methods").
+    /// Functions of an `impl` or `instance` block that reach themselves through the calls
+    /// their definitions make: each calls the next, and the last the first
+    /// (`docs/chl-spec.md`, "Associated functions and methods").
     DefinitionCycle {
         /// The functions, each calling the next.
         names: Vec<String>,
@@ -1269,8 +1269,8 @@ impl std::fmt::Debug for InferError {
             }
             InferError::InstanceAfterUse { function, instance } => write!(
                 f,
-                "this call of `{function}` is answered by `impl {instance}`, which is declared \
-                 below it; an instance's functions are in scope after its `impl`, so declare \
+                "this call of `{function}` is answered by `instance {instance}`, which is declared \
+                 below it; an instance's functions are in scope after its `instance`, so declare \
                  the instance above the call, or above the definition the call is in"
             ),
             InferError::InstanceOfAnotherModule {
@@ -1281,7 +1281,7 @@ impl std::fmt::Debug for InferError {
             } => write!(
                 f,
                 "this call of `{function}`, in a definition {definition_module} declares, is \
-                 answered by `impl {instance}`, which {instance_module} declares; a use of a \
+                 answered by `instance {instance}`, which {instance_module} declares; a use of a \
                  definition passes it the instances its module reaches, and which instances of \
                  a module importing it a use may pass is not decided yet"
             ),

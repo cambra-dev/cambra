@@ -18,17 +18,17 @@ const SHAPES: &str = indoc! {"
     pub trait Area(S):
         def area(s: S) => Int
     pub type Circle = Int
-    impl Area(Circle):
+    instance Area(Circle):
         def area(s):
             3 * s.extract() * s.extract()
     pub def twice(S, s: S) => Int requires a: Area(S):
         a::area(s) + a::area(s)
     pub type Money = Int
-    impl Addable(Money, Money):
+    instance Addable(Money, Money):
         Output = Money
         def add(a, b):
             Money::new(a.extract() + b.extract())
-    impl Equatable(Money, Money)
+    instance Equatable(Money, Money)
 "};
 
 /// [`SHAPES`] with mutable state, so it is run and not imported.
@@ -69,7 +69,7 @@ fn stateful_shapes() -> String {
     indoc! {"
         import shapes
         type Square = Int
-        impl shapes::Area(Square):
+        instance shapes::Area(Square):
             def area(s):
                 s.extract() * s.extract()
         def total(S, s: S) => Int requires shapes::Area(S):
@@ -103,7 +103,7 @@ fn stateful_shapes() -> String {
     indoc! {"
         run shapes as s
         type Square = Int
-        impl s::Area(Square):
+        instance s::Area(Square):
             def area(q):
                 q.extract()
         summon(s::Area(_))::area(Square::new(5))
@@ -234,6 +234,28 @@ fn two_runs_share_an_instance() {
     "})],
     "no instance of `Area` accepts"
 )]
+#[case::impl_naming_another_module_s_type(
+    indoc! {"
+        import shapes
+        impl shapes::Circle:
+            def f(self) => Int:
+                1
+        1
+    "},
+    &[("shapes", SHAPES)],
+    "`impl shapes::Circle` names a type through a module"
+)]
+#[case::instance_naming_another_module_s_type(
+    indoc! {"
+        import shapes
+        instance shapes::Circle:
+            def area(s):
+                1
+        1
+    "},
+    &[("shapes", SHAPES)],
+    "module `shapes` declares no trait `Circle`; a type's own block is written `impl`"
+)]
 #[case::a_trait_the_module_does_not_declare(
     indoc! {"
         import shapes
@@ -245,13 +267,13 @@ fn two_runs_share_an_instance() {
 #[case::an_instance_in_neither_the_trait_s_nor_the_type_s_module(
     indoc! {"
         import shapes
-        impl shapes::Area(shapes::Circle):
+        instance shapes::Area(shapes::Circle):
             def area(s):
                 0
         1
     "},
     &[("shapes", SHAPES)],
-    "`impl Area(shapes::Circle)` names no type this module declares; an instance is declared \
+    "`instance Area(shapes::Circle)` names no type this module declares; an instance is declared \
      in its trait's module or in the module of a type its head names, and `Area` is module \
      `shapes`'s"
 )]
@@ -259,7 +281,7 @@ fn two_runs_share_an_instance() {
     indoc! {"
         import scales
         type Mine = Int
-        impl forall (F) scales::Scales(Mine, F):
+        instance forall (F) scales::Scales(Mine, F):
             def scale(a, b):
                 1
         1
@@ -274,7 +296,7 @@ fn two_runs_share_an_instance() {
     indoc! {"
         import scales
         type Mine = Int
-        impl scales::Scales(scales::Vec2, Mine):
+        instance scales::Scales(scales::Vec2, Mine):
             def scale(a, b):
                 2
         1
@@ -283,11 +305,24 @@ fn two_runs_share_an_instance() {
         pub trait Scales(A, B):
             def scale(a: A, b: B) => Int
         pub type Vec2 = Int
-        impl forall (F) Scales(Vec2, F):
+        instance forall (F) Scales(Vec2, F):
             def scale(a, b):
                 1
     "})],
     "overlaps another instance of `Scales`"
+)]
+#[case::an_impl_block_naming_its_trait(
+    indoc! {"
+        import shapes
+        type Square = Int
+        impl shapes::Area(Square):
+            def area(s):
+                1
+        1
+    "},
+    &[("shapes", SHAPES)],
+    "`impl shapes::Area` names a trait; an instance of a trait is written \
+     `instance shapes::Area(…)`"
 )]
 #[case::a_trait_function_read_from_the_trait(
     indoc! {"
@@ -319,7 +354,7 @@ fn two_runs_share_an_instance() {
         trait Hidden(T):
             def h(t: T) => Int
         pub type W = Int
-        impl Hidden(W):
+        instance Hidden(W):
             def h(t):
                 1
         pub trait Shown(T):
@@ -336,7 +371,7 @@ fn two_runs_share_an_instance() {
         trait Area(S):
             def area(s: S) => Int
         type Circle = Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 1
         pub def total(S, s: S) => Int requires Area(S):
@@ -353,7 +388,7 @@ fn two_runs_share_an_instance() {
         trait Area(S):
             def area(s: S) => Int
         type Circle = Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 1
         pub def total(s):
@@ -371,11 +406,11 @@ fn two_runs_share_an_instance() {
             def area(s: S) => Int
         pub type Circle = Int
         count := 5
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 count
     "})],
-    "the function `area` of `impl Area(lib::Circle)` reads `count`, a mutable variable of its \
+    "the function `area` of `instance Area(lib::Circle)` reads `count`, a mutable variable of its \
      module"
 )]
 #[timeout(Duration::from_secs(10))]
@@ -396,7 +431,7 @@ fn a_trait_across_modules_refuses(
     indoc! {"
         import shapes use Area
         type Square = Int
-        impl Area(Square):
+        instance Area(Square):
             def area(s):
                 s.extract()
         shapes::twice(Square::new(5))
@@ -407,7 +442,7 @@ fn a_trait_across_modules_refuses(
     indoc! {"
         run shapes as s
         type Square = Int
-        impl s::Area(Square):
+        instance s::Area(Square):
             def area(q):
                 7
         s::twice(Square::new(5))
@@ -422,7 +457,7 @@ fn a_definition_of_another_module_does_not_reach_the_importer_s_instance(
     assert_refused(
         &program(root, &[("shapes", &shapes)]),
         "this call of `Area::area`, in a definition module `shapes` declares, is answered by \
-         `impl Area(Square)`, which the root module declares",
+         `instance Area(Square)`, which the root module declares",
     );
 }
 
@@ -442,7 +477,7 @@ fn an_instance_in_a_module_with_a_type_parameter(
         pub trait Area(S):
             def area(s: S) => Int
         {circle}
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 7
     "};
@@ -471,7 +506,7 @@ fn an_instance_function_reading_a_const_parameter() {
         pub trait Area(S):
             def area(s: S) => Int
         pub type Circle = Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 n
     "};
@@ -505,7 +540,7 @@ fn an_instance_function_calling_a_run_s_type_taking_a_parameter() {
         pub trait Sized(S):
             def size(s: S) => Int
         pub type Sq = Int
-        impl Sized(Sq):
+        instance Sized(Sq):
             def size(s):
                 l::C::new(1).get()
     "};
@@ -533,8 +568,8 @@ fn a_checked_module_prints_its_traits() {
             trait Private(P):
                 def p(x: P) => Int
             pub type Bag = Int
-            impl Equatable(Bag, Bag)
-            impl Container(Bag):
+            instance Equatable(Bag, Bag)
+            instance Container(Bag):
                 Elem = Int
                 def first(c):
                     c.extract()
