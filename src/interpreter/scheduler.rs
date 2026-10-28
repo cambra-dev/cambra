@@ -59,6 +59,10 @@ struct Gated {
     /// [`Notified::Always`], so no region waits behind one: a consumer that pulls reads whatever
     /// arrived in its pull, and a region-driven one is notified of each.
     region_driven: bool,
+    /// The thread that notified a consumer that pulls first. Such a cell is notified from one
+    /// thread only, the scheduler's, which is what lets the notification in progress deliver a
+    /// region that re-entered it: a region left by another thread could miss that delivery.
+    owner: Option<std::thread::ThreadId>,
 }
 
 impl Consumer for Gated {
@@ -71,6 +75,14 @@ impl Consumer for Gated {
             !self.region_driven || matches!(self.admit, Notified::Always),
             "a region-driven consumer has no gate, or a closed one would hold its regions back"
         );
+        if !self.region_driven {
+            let here = std::thread::current().id();
+            debug_assert_eq!(
+                *self.owner.get_or_insert(here),
+                here,
+                "a cell whose consumer pulls was notified from two threads"
+            );
+        }
         // A notification that re-enters this consumer while it is being notified cannot be
         // delivered inside the first, so the forwarder leaves its region with the gate
         // ([`Notified::defer`]) and the notification in progress delivers it when it returns,
@@ -124,6 +136,7 @@ impl GatedConsumer {
             admit: gate.clone(),
             consumer,
             region_driven,
+            owner: None,
         }));
         Self {
             shared,
@@ -341,17 +354,7 @@ impl Consumer for Forwarding {
         // queued and no pull is needed.
         match shared.try_lock_now() {
             Some(mut consumer) => consumer.notify(region),
-            None => {
-                gate.defer(region);
-                // The cell may have been released since, by a notification that had already
-                // looked for what was pending: deliver it here, through the gate.
-                if let Some(mut consumer) = shared.try_lock_now() {
-                    let pending = gate.take_pending();
-                    if pending != Projection::Nothing {
-                        consumer.notify(&pending);
-                    }
-                }
-            }
+            None => gate.defer(region),
         }
     }
 
@@ -1464,6 +1467,29 @@ mod tests {
             names,
         ));
         input_a.notify(&keys(1, 2));
+    }
+
+    /// A cell whose consumer pulls is notified from one thread: the notification in progress
+    /// delivers a region that re-entered it, which a region left by another thread could miss.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_cell_whose_consumer_pulls_notified_from_two_threads_is_caught() {
+        let (shared, _gate) = shared_consumer(Box::new(|| {}));
+        shared.notify(&keys(1, 2));
+        let other = shared.clone();
+        let outcome = std::thread::spawn(move || other.notify(&keys(5, 6))).join();
+        assert!(
+            outcome.is_err(),
+            "the second thread's notification was accepted"
+        );
+    }
+
+    /// The same cell, notified from its one thread any number of times, is fine.
+    #[test]
+    fn a_cell_whose_consumer_pulls_notified_from_one_thread_is_fine() {
+        let (shared, _gate) = shared_consumer(Box::new(|| {}));
+        shared.notify(&keys(1, 2));
+        shared.notify(&keys(5, 6));
     }
 
     /// A pull that answers what the last one did but queues a wakeup is not quiescence: the
