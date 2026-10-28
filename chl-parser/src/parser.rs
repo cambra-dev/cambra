@@ -12,11 +12,13 @@ use smol_str::SmolStr;
 use crate::ast::{
     AnnotationMode, ArmPattern, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp,
     CmpOp, CompClause, Comprehension, Constructor, ConstructorParam, ConstructorPattern,
-    DiscardHead, EntryForm, Expr, FileId, IfBranch, ImplBlock, KeywordArg, KindAnnotation, Lit,
-    MatchArm, MatchPattern, Module, ModuleTypeEntry, Param, PayloadPattern, QualifiedName,
-    RecordField, Requirement, Span, Spanned, Stmt, TypeAnnotation, TypeDecl, TypeDeclBody,
-    TypeParam, UnaryOp, UseItem, VariantPayload, WrittenPath, is_type_name,
+    DiscardHead, EntryForm, Expr, FileId, FunctionSignature, IfBranch, ImplBlock, KeywordArg,
+    KindAnnotation, Lit, MatchArm, MatchPattern, Module, ModuleTypeEntry, Param, PayloadPattern,
+    QualifiedName, RecordField, Requirement, Span, Spanned, Stmt, TraitDecl, TraitItem, TraitType,
+    TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem, VariantPayload,
+    WrittenPath, is_type_name,
 };
+use crate::builtins::SurfaceBuiltin;
 use crate::lexer::{self, Token};
 use crate::module_path::segment_error;
 
@@ -118,6 +120,29 @@ where
             };
             Spanned::new(e.span(), node)
         });
+
+        // `summon(T)::f`, a function of the instance of the trait type `T`
+        // (`docs/chl-spec.md`, "Summoning an instance"). An instance stands only before
+        // `::`, so `summon(T)` alone is a call of a function named `summon`.
+        let summon = select! { Token::Ident(s) if s == SurfaceBuiltin::Summon.spelling() => () }
+            .ignore_then(
+                trait_type(expr.clone()).delimited_by(just(Token::LParen), just(Token::RParen)),
+            )
+            .then_ignore(just(Token::ColonColon))
+            .then(
+                select! { Token::Ident(s) => s }
+                    .labelled("function name")
+                    .map_with(|s, e| Spanned::new(e.span(), s)),
+            )
+            .map_with(|(trait_type, function), e| {
+                Spanned::new(
+                    e.span(),
+                    Expr::Summon {
+                        trait_type: Box::new(trait_type),
+                        function,
+                    },
+                )
+            });
 
         // ---- One-line `match` (bracketed positions only) --------------
         //
@@ -588,6 +613,7 @@ where
             paren_group,
             brace_type,
             module_type,
+            summon,
             name,
         ))
         .labelled("expression")
@@ -1816,6 +1842,7 @@ where
             .ignore_then(def_name)
             .then(
                 param
+                    .clone()
                     .separated_by(just(Token::Comma))
                     .allow_trailing()
                     .collect::<Vec<_>>()
@@ -1843,9 +1870,13 @@ where
                 },
             );
 
-        // ---- impl N(P…): ( [pub] def … )+ -------------------------------
-        // (`docs/chl-spec.md`, "Associated functions and methods")
-        let impl_item = just(Token::Pub)
+        // ---- impl N(P…): ( [pub] def … | A = T )+ ----------------------
+        // (`docs/chl-spec.md`, "Associated functions and methods" and "Declaring an instance")
+        enum ImplItem {
+            Def(Box<Spanned<Stmt>>),
+            Assoc(AssocArg),
+        }
+        let impl_def = just(Token::Pub)
             .map_with(|_, e| e.span())
             .or_not()
             .then(def_stmt.clone())
@@ -1859,18 +1890,52 @@ where
                     },
                 ),
             });
+        // An instance defines an associated type its trait declares as a type alias is
+        // written, `Elem = T`.
+        let impl_assoc = select! { Token::Ident(s) => s }
+            .map_with(|s, e| (s, e.span()))
+            .then_ignore(just(Token::Eq))
+            .then(expr.clone())
+            .then_ignore(just(Token::Newline))
+            .map(|((name, name_span), value)| AssocArg {
+                name,
+                name_span,
+                value,
+            });
+        let impl_item = choice((
+            impl_def.map(|d| ImplItem::Def(Box::new(d))),
+            impl_assoc.map(ImplItem::Assoc),
+        ));
+        // The head is a type applied to its parameters, or a trait applied to the types an
+        // instance is for, spelled as a requirement is: lowering tells them apart by what
+        // the name names.
+        // An instance's type variables are declared before its head, `impl forall (T)
+        // Area(Two(T))`; each is a capitalized name.
+        let instance_vars = just(Token::Forall).ignore_then(
+            binder
+                .validate(|name, _, emitter| {
+                    if !is_type_name(&name.node) {
+                        emitter.emit(Rich::custom(
+                            name.span,
+                            format!(
+                                "type variable `{}` begins with a lowercase letter; it names \
+                                 a type, so it is capitalized",
+                                name.node
+                            ),
+                        ));
+                    }
+                    name
+                })
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        );
         let impl_stmt = just(Token::Impl)
-            .ignore_then(binder)
-            .then(
-                binder
-                    .separated_by(just(Token::Comma))
-                    .at_least(1)
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen))
-                    .or_not()
-                    .map(Option::unwrap_or_default),
-            )
+            .ignore_then(instance_vars.or_not())
+            .then(trait_type(expr.clone()))
+            .then(requires_clause(expr.clone()).or_not())
             .then_ignore(just(Token::Colon))
             .then_ignore(just(Token::Newline))
             .then_ignore(just(Token::Indent).labelled("indented `def`s"))
@@ -1882,8 +1947,117 @@ where
                     .collect::<Vec<_>>(),
             )
             .then_ignore(just(Token::Dedent))
-            .map_with(|((ty, params), defs), e| {
-                Spanned::new(e.span(), Stmt::Impl(ImplBlock { ty, params, defs }))
+            .map_with(|(((vars, head), requires), items), e| {
+                let TraitType {
+                    name,
+                    name_span,
+                    args,
+                } = head.node;
+                let mut defs = Vec::new();
+                let mut assoc = Vec::new();
+                for item in items {
+                    match item {
+                        ImplItem::Def(def) => defs.push(*def),
+                        ImplItem::Assoc(a) => assoc.push(a),
+                    }
+                }
+                Spanned::new(
+                    e.span(),
+                    Stmt::Impl(ImplBlock {
+                        vars: vars.unwrap_or_default(),
+                        ty: Spanned::new(name_span, name),
+                        args,
+                        assoc,
+                        requires: requires.unwrap_or_default(),
+                        defs,
+                    }),
+                )
+            });
+
+        // ---- trait T(P…): ( type A | def f(…) => R requires … )+ -------
+        // (`docs/chl-spec.md`, "Declaring a trait")
+        let fn_signature = just(Token::Def)
+            .ignore_then(
+                select! { Token::Ident(s) => s }
+                    .labelled("function name")
+                    .map_with(|s, e| Spanned::new(e.span(), s)),
+            )
+            .then(
+                param
+                    .separated_by(just(Token::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .try_map(|items, _| split_params(items))
+                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+            )
+            .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
+            .then(requires_clause(expr.clone()).or_not())
+            .map_with(|(((name, (type_params, params)), output), requires), e| {
+                TraitItem::Function(Box::new(Spanned::new(
+                    e.span(),
+                    FunctionSignature {
+                        name,
+                        type_params,
+                        params,
+                        output,
+                        requires: requires.unwrap_or_default(),
+                    },
+                )))
+            });
+        // An associated type is its capitalized name alone: it is a type the instance defines,
+        // as an alias, not a nominal type a `type` declaration introduces.
+        let trait_item = choice((binder.map(TraitItem::AssocType), fn_signature))
+            .then_ignore(just(Token::Newline));
+        let trait_stmt = just(Token::Trait)
+            .ignore_then(binder)
+            .then(
+                binder
+                    .separated_by(just(Token::Comma))
+                    .at_least(1)
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+            )
+            .then(requires_clause(expr.clone()).or_not())
+            .then_ignore(just(Token::Colon))
+            .then_ignore(just(Token::Newline))
+            .then_ignore(just(Token::Indent).labelled("indented associated types and signatures"))
+            .then(
+                trait_item
+                    .then_ignore(just(Token::Newline).repeated())
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(Token::Dedent))
+            .validate(|(((name, params), requires), items), e, emitter| {
+                let heads = std::iter::once((&name, "trait name"))
+                    .chain(params.iter().map(|p| (p, "trait operand")))
+                    .chain(items.iter().filter_map(|i| match i {
+                        TraitItem::AssocType(a) => Some((a, "associated type")),
+                        TraitItem::Function(_) => None,
+                    }));
+                for (head, what) in heads {
+                    if !is_type_name(&head.node) {
+                        emitter.emit(Rich::custom(
+                            head.span,
+                            format!(
+                                "{what} `{}` begins with a lowercase letter; it names a type, \
+                                 so it is capitalized",
+                                head.node
+                            ),
+                        ));
+                    }
+                }
+                Spanned::new(
+                    e.span(),
+                    Stmt::TraitDecl(TraitDecl {
+                        name,
+                        params,
+                        requires: requires.unwrap_or_default(),
+                        items,
+                    }),
+                )
             });
 
         // ---- simple statements (must end at NEWLINE) ----------------
@@ -2059,6 +2233,7 @@ where
             def_stmt,
             type_stmt,
             impl_stmt,
+            trait_stmt,
             decorated_stmt,
             pub_stmt,
             const_stmt,
@@ -2120,6 +2295,7 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
         | Stmt::MutAssign { .. }
         | Stmt::FunctionDef { .. }
         | Stmt::TypeDecl(_)
+        | Stmt::TraitDecl(_)
         | Stmt::Error => return None,
         Stmt::Import { .. } => {
             "`pub` is refused on an `import`: a module exports only what it declares"
@@ -2239,8 +2415,8 @@ where
 }
 
 /// `requires R₀, R₁, …`, the clause that ends a `def` signature or a polymorphic
-/// type. A requirement is a name, optionally applied to its operand types and then
-/// its associated types by name: `Addable(A, B, Output=O)`.
+/// type. A requirement is a trait type, `Addable(A, B)`, optionally naming its instance,
+/// `a: Addable(A, B)`, or a bound on a named instance's associated type, `a::Output <: T`.
 ///
 /// Spec: `docs/chl-spec.md`, "Trait requirements".
 fn requires_clause<'src, I, E>(
@@ -2250,67 +2426,81 @@ where
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
 {
-    enum Arg {
-        Operand(Spanned<Expr>),
-        Assoc(AssocArg),
-    }
-    let ident = select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span()));
-    let assoc =
-        ident
-            .then_ignore(just(Token::Eq))
-            .then(expr.clone())
-            .map(|((name, name_span), value)| {
-                Arg::Assoc(AssocArg {
-                    name,
-                    name_span,
-                    value,
-                })
-            });
-    let args = choice((assoc, expr.map(Arg::Operand)))
-        .separated_by(just(Token::Comma))
-        .allow_trailing()
-        .collect::<Vec<_>>()
-        .delimited_by(just(Token::LParen), just(Token::RParen));
-    let requirement = ident
-        .labelled("requirement")
-        .then(args.or_not())
-        .try_map_with(|((name, name_span), args), e| {
-            let mut operands = Vec::new();
-            let mut assocs: Vec<AssocArg> = Vec::new();
-            for arg in args.unwrap_or_default() {
-                match arg {
-                    Arg::Operand(operand) => {
-                        if let Some(first) = assocs.first() {
-                            return Err(Rich::custom(
-                                operand.span,
-                                format!(
-                                    "an operand follows `{}=`; a requirement's associated \
-                                     types come after its operands",
-                                    first.name
-                                ),
-                            ));
-                        }
-                        operands.push(operand);
-                    }
-                    Arg::Assoc(arg) => assocs.push(arg),
-                }
-            }
-            Ok(Spanned::new(
-                e.span(),
-                Requirement {
-                    name,
-                    name_span,
-                    args: operands,
-                    assoc: assocs,
-                },
-            ))
-        });
     just(Token::Requires).ignore_then(
-        requirement
+        requirement(expr)
             .separated_by(just(Token::Comma))
             .at_least(1)
             .collect::<Vec<_>>(),
     )
+}
+
+/// One requirement: a trait type, `Addable(A, B)`, and before it the name the requirement
+/// binds its instance to, if it names one; or a bound, `a::Output <: T`.
+fn requirement<'src, I, E>(
+    expr: E,
+) -> impl Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    // `requires Transaction:` ends a signature with the `:` a binder would take, so the bare
+    // trait type is the alternative, not an optional binder before it.
+    let ident = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
+    let binder = ident.then_ignore(just(Token::Colon));
+    // `a::Output <: T`: a bound on an associated type of the instance a requirement names.
+    let bound = ident
+        .then_ignore(just(Token::ColonColon))
+        .then(ident)
+        .then_ignore(just(Token::LtColon))
+        .then(expr.clone())
+        .map(|((instance, member), bound)| Requirement::Bound {
+            instance,
+            member,
+            bound,
+        });
+    choice((
+        bound,
+        binder
+            .then(trait_type(expr.clone()))
+            .map(|(b, ty)| Requirement::Trait {
+                binder: Some(b),
+                ty: ty.node,
+            }),
+        trait_type(expr).map(|ty| Requirement::Trait {
+            binder: None,
+            ty: ty.node,
+        }),
+    ))
+    .map_with(|r, e| Spanned::new(e.span(), r))
+}
+
+/// A trait type, `Addable(A, B)`: a name, optionally applied to its operand types. An
+/// instance's head and a summon's argument have this shape (`docs/chl-spec.md`, "Declaring an
+/// instance" and "Summoning an instance").
+fn trait_type<'src, I, E>(expr: E) -> impl Parser<'src, I, Spanned<TraitType>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    let args = expr
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LParen), just(Token::RParen));
+    select! { Token::Ident(s) => s }
+        .map_with(|s, e| (s, e.span()))
+        .labelled("requirement")
+        .then(args.or_not())
+        .map_with(|((name, name_span), args), e| {
+            Spanned::new(
+                e.span(),
+                TraitType {
+                    name,
+                    name_span,
+                    args: args.unwrap_or_default(),
+                },
+            )
+        })
 }
 
 /// Split a parameter list into its type parameters, the capitalized names, and its
@@ -2820,9 +3010,86 @@ mod tests {
             panic!("expected an impl block, got {:?}", m.body[1].node)
         };
         assert_eq!(block.ty.node, "Option");
-        assert_eq!(block.params.len(), 1);
+        assert_eq!(block.args.len(), 1);
         assert_eq!(block.defs.len(), 2);
         assert!(matches!(block.defs[1].node, Stmt::Pub { .. }));
+    }
+
+    /// A trait declares a `requires` clause, associated types and bodiless signatures; an
+    /// instance declares its type variables with `forall`, its head is spelled as a trait type
+    /// with a `requires` clause, and its block defines the associated types. Either clause may
+    /// name its requirements.
+    #[test]
+    fn trait_declaration_and_instance_head() {
+        let m = parse_mod(indoc! {"
+            trait Container(C) requires e: Equatable(C, C):
+                Elem
+                def first(c: C, otherwise: Elem) => Elem
+                def tag(R, c: C, label: R) => {R, Elem} requires Equatable(R, R)
+            impl forall (T) Container(Two(T)) requires c: Container(T):
+                Elem = T
+                def first(c, otherwise):
+                    otherwise
+        "})
+        .into_result()
+        .expect("parses");
+        let Stmt::TraitDecl(decl) = &m.body[0].node else {
+            panic!("expected a trait declaration, got {:?}", m.body[0].node)
+        };
+        assert_eq!(decl.name.node, "Container");
+        assert_eq!(decl.params.len(), 1);
+        assert_eq!(requirement_binder(&decl.requires[0].node), Some("e"));
+        let [
+            TraitItem::AssocType(elem),
+            TraitItem::Function(first),
+            TraitItem::Function(tag),
+        ] = decl.items.as_slice()
+        else {
+            panic!("expected `Elem` and two signatures, got {:?}", decl.items)
+        };
+        assert_eq!(elem.node, "Elem");
+        assert_eq!(first.node.params.len(), 2);
+        assert_eq!(tag.node.type_params.len(), 1);
+        assert_eq!(tag.node.requires.len(), 1);
+        let Stmt::Impl(block) = &m.body[1].node else {
+            panic!("expected an impl block, got {:?}", m.body[1].node)
+        };
+        assert_eq!(block.ty.node, "Container");
+        assert_eq!(block.vars.len(), 1);
+        assert_eq!(block.args.len(), 1);
+        assert_eq!(block.assoc.len(), 1);
+        assert_eq!(block.assoc[0].name.as_str(), "Elem");
+        assert_eq!(block.defs.len(), 1);
+        assert_eq!(requirement_binder(&block.requires[0].node), Some("c"));
+    }
+
+    /// The name a trait requirement binds its instance to.
+    fn requirement_binder(r: &Requirement) -> Option<&str> {
+        match r {
+            Requirement::Trait { binder, .. } => binder.as_ref().map(|b| b.node.as_str()),
+            Requirement::Bound { .. } => panic!("expected a trait requirement, got {r:?}"),
+        }
+    }
+
+    /// The trait type a trait requirement states.
+    fn requirement_trait(r: &Requirement) -> &TraitType {
+        match r {
+            Requirement::Trait { ty, .. } => ty,
+            Requirement::Bound { .. } => panic!("expected a trait requirement, got {r:?}"),
+        }
+    }
+
+    /// A trait's associated type is a type, so it is capitalized.
+    #[test]
+    fn a_lowercase_associated_type_is_refused() {
+        let result = parse_mod("trait T(C):\n    elem\n");
+        let errors = result.into_result().expect_err("refused");
+        assert!(
+            errors.iter().any(|e| e
+                .to_string()
+                .contains("associated type `elem` begins with a lowercase")),
+            "{errors:?}"
+        );
     }
 
     /// `pub` stands on each `def` in an `impl` block, not on the block.
@@ -4302,22 +4569,76 @@ mod tests {
     #[test]
     fn def_requires_clause_follows_the_result() {
         let m = parse_m(indoc! {"
-            def add(A, B, O, a: A, b: B) => O requires Addable(A, B, Output=O), Transaction:
+            def add(A, B, O, a: A, b: B) => O requires s: Addable(A, B), s::Output <: O, Transaction:
                 a + b
         "});
         let (type_params, params, requires) = def_signature(&m);
         assert_eq!(type_params.len(), 3);
         assert_eq!(params.len(), 2);
-        assert_eq!(requires.len(), 2);
-        let addable = &requires[0].node;
+        assert_eq!(requires.len(), 3);
+        assert_eq!(requirement_binder(&requires[0].node), Some("s"));
+        let addable = requirement_trait(&requires[0].node);
         assert_eq!(addable.name.as_str(), "Addable");
         assert_eq!(addable.args.len(), 2);
-        assert_eq!(addable.assoc.len(), 1);
-        assert_eq!(addable.assoc[0].name.as_str(), "Output");
-        assert!(matches!(&addable.assoc[0].value.node, Expr::Name(n) if n == "O"));
-        let transaction = &requires[1].node;
+        let Requirement::Bound {
+            instance,
+            member,
+            bound,
+        } = &requires[1].node
+        else {
+            panic!("expected a bound, got {:?}", requires[1].node)
+        };
+        assert_eq!(
+            (instance.node.as_str(), member.node.as_str()),
+            ("s", "Output")
+        );
+        assert!(matches!(&bound.node, Expr::Name(n) if n == "O"));
+        let transaction = requirement_trait(&requires[2].node);
         assert_eq!(transaction.name.as_str(), "Transaction");
-        assert!(transaction.args.is_empty() && transaction.assoc.is_empty());
+        assert!(transaction.args.is_empty());
+    }
+
+    /// A requirement may bind its instance to a name, beside one that binds none.
+    #[test]
+    fn a_requirement_names_its_instance() {
+        let m = parse_m(indoc! {"
+            def total(S, s: S) => Int requires a: Area(S), Transaction:
+                a::area(s)
+        "});
+        let (_, _, requires) = def_signature(&m);
+        let binders: Vec<Option<&str>> = requires
+            .iter()
+            .map(|r| requirement_binder(&r.node))
+            .collect();
+        assert_eq!(binders, [Some("a"), None]);
+        assert_eq!(requirement_trait(&requires[0].node).name.as_str(), "Area");
+    }
+
+    /// `summon(T)::f` reads a function from an instance, and a call applies it; `summon(T)`
+    /// without `::` is a call of a function named `summon`.
+    #[test]
+    fn summon_reads_a_function_from_an_instance() {
+        let e = parse_e("summon(Area(_))::area(c)");
+        let Expr::Call { func, args } = &e.node else {
+            panic!("expected a call, got {:?}", e.node)
+        };
+        assert_eq!(args.len(), 1);
+        let Expr::Summon {
+            trait_type,
+            function,
+        } = &func.node
+        else {
+            panic!("expected a summon, got {:?}", func.node)
+        };
+        assert_eq!(trait_type.node.name.as_str(), "Area");
+        assert_eq!(trait_type.node.args.len(), 1);
+        assert_eq!(function.node.as_str(), "area");
+        let bare = parse_e("summon(Area(_))");
+        assert!(
+            matches!(&bare.node, Expr::Call { func, .. } if matches!(&func.node, Expr::Name(n) if n == "summon")),
+            "{:?}",
+            bare.node
+        );
     }
 
     /// Without a result annotation the clause follows the parameter list.
@@ -4343,15 +4664,6 @@ mod tests {
                 x
         "});
         assert!(msg.contains("type parameters come first"), "{msg}");
-    }
-
-    #[test]
-    fn an_operand_after_an_associated_type_is_rejected() {
-        let msg = custom_error(indoc! {"
-            def f(A, a: A) requires Addable(A, Output=A, A):
-                a
-        "});
-        assert!(msg.contains("come after its operands"), "{msg}");
     }
 
     /// The `)` closing the binder list ends the last kind, and the `requires` clause

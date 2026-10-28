@@ -139,6 +139,7 @@ match  case
 pass
 where
 forall requires
+type   impl   trait
 import use    as     pub    run    param  const  this
 ```
 
@@ -161,6 +162,10 @@ reserved for future use.
 
 `match` and `case` introduce tag dispatch over a variant (§4.10).
 
+`type` declares a nominal type, `impl` its associated functions or an instance of a trait, and
+`trait` a trait ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided),
+[Declaring a trait](#declaring-a-trait)).
+
 `forall` begins a polymorphic type (**[Planned]**,
 [Polymorphic type annotations](#polymorphic-type-annotations)). `requires` begins a `requires`
 clause, which ends a `def` signature or a polymorphic type
@@ -168,17 +173,16 @@ clause, which ends a `def` signature or a polymorphic type
 ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)).
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
-> `rec` (recursive binding — §4.3, **[Decided]**), `given` and `summon` (the
-> transactions-as-contextual-parameters layer — §8.7, **[Decided]**), `type` and `impl` (nominal
-> types and their associated functions, **[Decided]**,
-> [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
+> `rec` (recursive binding — §4.3, **[Decided]**), `given` (the
+> transactions-as-contextual-parameters layer — §8.7, **[Decided]**),
 > and `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
 > surface, **[Open]** as to what `static` demands). Avoid taking these names for other purposes.
-> (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires` and the module keywords are
-> **already** lexed — the first two carry today's transactions and mutation, §8, `match`/`case`
-> carry tag dispatch, §4.10, `where` separates a refinement's predicate, §6.4, and `forall` and
-> `requires` begin a polymorphic type and a `requires` clause, §6.10 — so they are not in this
-> list.)
+> (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `type`, `impl`, `trait` and
+> the module keywords are **already** lexed — the first two carry today's transactions and
+> mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a refinement's
+> predicate, §6.4, `forall` and `requires` begin a polymorphic type and a `requires` clause, §6.10,
+> and `type`, `impl` and `trait` declare nominal types, their functions and traits, §6.8 and
+> §6.10 — so they are not in this list.)
 
 ### 1.7 Literals
 
@@ -206,10 +210,11 @@ surface level.
 `::` separates a qualifier from the name it qualifies: a module or a run from its member
 (`cart::total`, [9.6 Qualified references](#96-qualified-references)), a module from its label or
 tag (`r.mod2::f1`, `` mod2::`some ``, [9.12 Field labels and tags belong to a
-module](#912-field-labels-and-tags-belong-to-a-module)), and a nominal type from its method
+module](#912-field-labels-and-tags-belong-to-a-module)), a nominal type from its method
 (`Price::discounted`, [6.8 Nominal types and methods
-[Decided]](#68-nominal-types-and-methods-decided)). A qualified name parses wherever a name does,
-and lowering refuses it until modules are implemented.
+[Decided]](#68-nominal-types-and-methods-decided)), and an instance of a trait from its function
+(`a::area`, `summon(Area(_))::area`, [Summoning an instance](#summoning-an-instance)). A qualified
+name parses wherever a name does.
 
 > **Direction [Decided].** Postfix `!` joins the set. It unwraps an `Option` proven not to be
 > `Option::none` ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
@@ -462,7 +467,7 @@ noted:
 | 15 | `*` `//` | multiplicative |
 | 16 | unary `-` | prefix |
 | 17 | `**` | exponentiation; *right*-associative. It **straddles** the unary `-` at 16 rather than sitting under it — see below |
-| 18 | postfix: `f(args)`, `x[i]`, `x.attr`, `x.0` | left-fold. The method call `x.m(args)` ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)) and the unwrap `e!` ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)) join this level (**[Decided]**) |
+| 18 | postfix: `f(args)`, `x[i]`, `x.attr`, `x.0`, `summon(T)::f` | left-fold. The method call `x.m(args)` ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)) and the unwrap `e!` ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)) join this level (**[Decided]**) |
 | 19 | atom | literal, name, `(...)`, `[...]`, `{...}`, comprehension |
 
 `**` binds tighter than the unary `-` on its left and looser than the one on
@@ -1107,10 +1112,8 @@ so presence is stated by a term predicate over it rather than by a subtype namin
 `is_none` is a method of `Option` declared with it, and the predicate calls it because a nominal
 type has no `==`. A lookup into a `Set` has the same type at `Option(unit)`. A lookup into an
 `Array(n, T)` states presence as `i < n`, and a `FullMap` lookup's result is
-`{Option(V) where not _.is_none()}` for every key. A `List(T)` lookup states presence through
-its length, `{Option(T) where _.is_none() == not (i < len(xs))}`
-([Trait requirements](#trait-requirements)); an index drawn from iterating `xs` lies in its index
-range, so it establishes `i < len(xs)`.
+`{Option(V) where not _.is_none()}` for every key. **[Open]** — the predicate a `List(T)` lookup
+states presence by. An index drawn from iterating `xs` is present.
 
 `c[k]!` is accepted exactly where the refinement on `c[k]` entails `not _.is_none()`: under an
 `in` guard, for a key drawn from iterating `c`, or for a `FullMap`. Failure to establish presence
@@ -2570,9 +2573,6 @@ of a constructor into an unboxed term.
 - Membership `in` tests the items iteration yields, so a map's keys are tested through
   `m.keys()` ([Membership expressions](#membership-expressions-decided)). A true key-membership
   guard refines the key for proven access.
-- `len(c)` answers the size of a collection's domain, through the built-in `HasLen` trait
-  ([Trait requirements](#trait-requirements)). A `List` lookup states presence as
-  `i < len(xs)` ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
 - Maps iterate entries, sets keys, and arrays/lists/collections values. The methods
   `m.keys()`, `m.values()` and `m.items()` of a `Map` or `FullMap`, and `s.keys()` of a `Set`,
   expose lazy collection views. Numeric `sum(m)` rejects entries; `sum(m.values())` requests
@@ -2591,9 +2591,10 @@ compiler provides, so `Set(K)` and `Map(K, unit)` are distinct types. Nothing re
 three to a structural collection type: none widens to `Collection`, and the methods `keys`,
 `values` and `items` are the written route. `FullMap` has every operation `Map` has, and differs
 only in how it is built and in its lookup's refinement. The operations of all three are built in:
-lookup, iteration, `len`, the methods `keys`, `values` and `items` (`keys` alone for a `Set`), and
-the re-keying constructors `set([…])` and `map([…])`. Membership `in` is not one of them: it
-comes from the `Iterable` instance ([Membership expressions](#membership-expressions-decided)). The representation is
+lookup, iteration, the methods `keys`, `values` and `items` (`keys` alone for a `Set`), and the
+re-keying constructors `set([…])` and `map([…])`. Membership `in` is not one of them: it comes from
+the `Iterable` instance ([Membership expressions](#membership-expressions-decided)). The
+representation is
 [Telling `Set` and `Map` apart](../src/ccl/design/collections.md#telling-set-and-map-apart-decided).
 
 A builtin differs from a declared nominal type in five ways:
@@ -2606,9 +2607,9 @@ A builtin differs from a declared nominal type in five ways:
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
 - **A type family as a parameter.** `FullMap(K, V)`'s `V` may depend on the key, as a group-by's
   groups do. A declared type's parameter takes a type.
-- **Trait instances.** All three satisfy `Iterable` and `HasLen` through instances the compiler
-  provides ([Trait requirements](#trait-requirements)). Which traits a declared type satisfies is
-  **[Open]**.
+- **Trait instances.** All three satisfy `Iterable` through instances the compiler provides
+  ([Trait requirements](#trait-requirements)). A declared type satisfies the traits its module
+  declares instances of ([Declaring an instance](#declaring-an-instance)).
 - **Stated variances.** A declared type's variance is read off its constructors' parameter types,
   and a builtin has none to read, so each is stated. `Set(K)` is covariant in `K`, and `Map(K, V)`
   in both `K` and `V`: a map over keys below `K` is a map over keys below any supertype of `K`.
@@ -3000,13 +3001,14 @@ associated functions, so whatever name it takes is unavailable to every type dec
   ([4.3.1 Destructuring patterns](#431-destructuring-patterns)), `extract`, and the type's own
   functions are the only ways in. A nominal value has no fields: `p.amount` is an error, and
   `p.extract().amount` is the projection.
-- **[Open] — which traits a declared nominal type satisfies.** None is inherited from the
+- **A declared nominal type satisfies the traits its module declares instances of**
+  ([Declaring an instance](#declaring-an-instance)), and no other. None is inherited from the
   constructors' parameter types: `type Price = {Int where _ >= 0}` is not `Addable` because `Int`
-  is. The direction is opt-in derivation, as with Rust's `#[derive]`, where the declaration names
-  each trait it takes from its constructors. Until then a declared nominal type satisfies no trait,
-  so `==`, ordering and arithmetic are errors on its values, and one is not a key of a `Set`, a
-  `Map` or a `groupby`. The nominal builtins `Set`, `Map` and `FullMap` satisfy the built-in
-  instances of `Iterable` and `HasLen`, which the compiler provides.
+  is. An instance of an operator's trait, which would give `==`, ordering and arithmetic on a
+  nominal type's values and make one a key of a `Set`, a `Map` or a `groupby`, is **[Planned]**;
+  until then those are errors on its values. Deriving an instance from the constructors, as with
+  Rust's `#[derive]`, is **[Open]**. The nominal builtins `Set`, `Map` and `FullMap` satisfy the
+  built-in instances of `Iterable`, which the compiler provides.
 - **The type of a nominal value is fixed by the expression that produced it.** Every producer of a
   value names the same nominal type, so a method and a trait requirement resolve the same way
   wherever the value flows.
@@ -3116,8 +3118,8 @@ impl Option(T):
   ([Type parameters](#type-parameters)), with `self` of type `Option(T)` unannotated. A `def` may
   add type parameters of its own.
 - **The block names a type of its own module.** `impl shop::Price:` from another module is the
-  spelling an extension would take, and is **[Open]** with extensions. Whether an `impl` block also
-  declares trait instances, as `impl HasLen(Bag(T)):`, is **[Open]** with instance declarations.
+  spelling an extension would take, and is **[Open]** with extensions. An `impl` block whose head
+  names a trait declares an instance of it ([Declaring an instance](#declaring-an-instance)).
 
 **Methods and fields are separate namespaces, and the parentheses decide which is meant.**
 `r.f(args)` is a method call, and `r.f` is a field and never a method. A nominal value has no
@@ -3147,14 +3149,13 @@ that asks for an annotation on `x`. What precedes a call is the program text bef
 clauses of each comprehension the call stands in, which bind the names its element reads
 ([3.12 Comprehensions](#312-comprehensions)): in `[p.cents() for p in prices]`, the type of
 `prices` determines the type of `p`. A polymorphic `def` therefore calls no method on a value whose
-type is one of its type parameters. An operation that works across types is a trait
-requirement instead, as iteration is ([4.6 `for` — iteration](#46-for--iteration)).
+type is one of its type parameters. An operation that works across types is a trait's function,
+read from an instance, `summon(Area(_))::area(s)`
+([Summoning an instance](#summoning-an-instance)).
 
-> **Direction [Planned] — trait methods.** Method-call syntax extends to an operation a trait
-> requires: `xs.len()` resolves through `HasLen` ([Trait requirements](#trait-requirements)) as
-> `len(xs)` does. The receiver's type then need not be nominal, and a polymorphic `def` may call a
-> trait method on a value whose type is a type parameter, through the requirement the call places.
-> The rule above then covers only a type's own associated functions.
+- **A trait's functions are not methods.** `x.m()` names only a method of `x`'s type, so a type's
+  method and a trait's function may share a name, and two traits may declare functions of one
+  name: `c.area()`, `summon(Area(_))::area(c)` and `summon(Surface(_))::area(c)` are three calls.
 
 ### 6.9 Effects in function types [Tentative]
 
@@ -3294,12 +3295,18 @@ With `a: {at: Int}` and a `{Int, {at: Int}}` result instead, `pair.1` is `{at: I
 
 ```ebnf
 requires_clause ::= "requires" requirement ( "," requirement )*
-requirement     ::= Ident [ "(" req_arg ( "," req_arg )* ")" ]
-req_arg         ::= expression | Ident "=" expression
+requirement     ::= [ ident ":" ] trait_type | ident "::" Ident "<:" expression
+trait_type      ::= trait_name [ "(" expression ( "," expression )* ")" ]
+trait_name      ::= ( ident "::" )* Ident   (* a qualified name is [Decided] *)
 ```
 
-A **trait** is a named requirement on a list of types. Each operator places one on its operand
-types. The traits are built in:
+A **trait** is a type whose values are **instances**. `Area(Circle)` is the type of an instance that
+gives `Circle` the functions `Area` declares, and a trait with operands is a family of such types,
+one for each list of operand types. A **requirement** in a definition's `requires` clause is a
+parameter of such a type that no call writes: each call passes the instance its types pick
+([Summoning an instance](#summoning-an-instance)). Each operator places a requirement on its
+operand types. A module declares traits of its own ([Declaring a trait](#declaring-a-trait)), and a
+requirement names one as it names these, which are built in:
 
 | Trait | Required by | Operands | Associated type | Satisfied by |
 | --- | --- | --- | --- | --- |
@@ -3317,46 +3324,309 @@ two operands of one listed type, and a tuple or record satisfies `Equatable` onl
 product ([3.4 Comparisons](#34-comparisons)). A listed instance's `Output` is its operand type, so
 the sum of two `Int`s is an `Int`.
 
-- **An associated type is written by name after the operands.** `requires Addable(A, B, Output=O)`
-  states that `A` and `B` are `Addable` and that `O` is their `Output`. Omitting `Output=…` leaves
-  it unnamed.
+- **A named requirement binds its instance.** In `def total(S, s: S) => Int requires a: Area(S)`,
+  `a` is the instance each call passes, and `a::area(s)` calls its `area`
+  ([Summoning an instance](#summoning-an-instance)). A requirement without a name passes an
+  instance too, which the body reaches with `summon`.
+- **A named requirement's associated types are types.** Under `requires a: Addable(A, B)`,
+  `a::Output` is `Addable`'s `Output` at `A` and `B`, the type of `a + b`, and the signature and
+  the body may write it: `def add(A, B, x: A, y: B) => a::Output requires a: Addable(A, B)`. Each
+  call's types decide it.
+- **A clause bounds an associated type it names.** `a::Output <: T`, written in the clause after
+  the requirement that names `a`, states that the instance's `Output` is below `T`, so `a + b`
+  under `requires a: Addable(T, T), a::Output <: T` is a `T`. A call whose instance's `Output` is
+  not below `T` is rejected at the call. A bound no instance's associated type meets is an error
+  at the bound.
 - **A requirement's arguments are any types.** `Equatable` reads a product componentwise, as `==`
   does ([3.4 Comparisons](#34-comparisons)), so `requires Equatable({T, U}, {T, U})` also states
-  `Equatable(T, T)` and `Equatable(U, U)`.
+  `Equatable(T, T)` and `Equatable(U, U)`. `requires Describe(Two(T))` states `Describe` of the
+  nominal type `Two(T)`, which a definition needs where the instances are at particular arguments,
+  as `impl Describe(Two(Int))` is ([Declaring an instance](#declaring-an-instance)).
 - **A requirement no instance can satisfy is an error at the requirement.**
   `requires Orderable(List(T), List(T))` is rejected where it is written: no `List` is `Orderable`,
   so no call could satisfy it.
-- **A requirement on base types alone states nothing about a parameter.** It must be satisfiable,
-  and it has no other effect; naming a type parameter as its associated type is an error.
+- **A requirement on types without type parameters states nothing about a parameter.** It must be
+  satisfiable, and it has no other effect than the associated types it names.
 - **One clause holds every requirement.** `Transaction`
   ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters))
   is written in the same clause: `requires Transaction, Orderable(T, T)` (**[Planned]**).
 - **The body uses only what the clause states.** An operator whose operand type involves a type
   parameter is an error unless a requirement or the parameter's bound covers it. Where both do, the
-  requirement decides: `a + b` under `T <: Int` and `requires Addable(T, T, Output=T)` is a `T`.
-- **Each call satisfies each requirement at its own instantiation.** A call that does not is
-  rejected at the call. A secondary label at the requirement is **[Decided]**.
-- Declaring a trait or an instance is **[Open]**.
+  requirement decides: `x + y` under `T <: Int` and `requires a: Addable(T, T), a::Output <: T` is
+  an `a::Output`, which is a `T`.
+- **Each call satisfies each requirement at its own instantiation,** and passes the instance that
+  satisfies it. A call that does not is rejected at the call. A secondary label at the requirement
+  is **[Decided]**.
 
-> **Direction [Decided] — collection traits.** Two more traits are built in, with instances the
+> **Direction [Decided] — collection traits.** One more trait is built in, with instances the
 > compiler provides for the collection types
 > ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)):
 >
 > | Trait | Required by | Operands | Associated type | Satisfied by |
 > | --- | --- | --- | --- | --- |
 > | `Iterable` | `for`-in, a comprehension's `for` clause, `in`, `not in` | 1 | `Item` | `Array`, `List`, `Collection`, `Set`, `Map`, `FullMap`, and every comprehension result |
-> | `HasLen` | `len` | 1 | none | `Array`, `List`, `Collection`, `Set`, `Map`, `FullMap` |
 >
-> `Iterable`'s `Item` is what [4.6 `for` — iteration](#46-for--iteration) binds. `len` is the
-> operation `HasLen` requires, as `+` is the operation `Addable` requires: the builtin
-> `len : forall (C) C => UInt requires HasLen(C)`, called as `len(c)`, places `HasLen(C)` on its
-> argument's type. Each instance answers the size of the collection's domain: `n` for an
-> `Array(n, T)`, the length of a `List`'s index range, the count of keys of a `Set`, `Map` or
-> `FullMap`, and the count of positions of a `Collection`. A `FullMap`'s key type is finite
-> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), so
-> `len(g)` counts a group-by's groups. `len` is a function, not a method: `List` is structural, so
-> `xs.len()` has no type to resolve against until trait methods
-> ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+> `Iterable`'s `Item` is what [4.6 `for` — iteration](#46-for--iteration) binds.
+
+#### Summoning an instance
+
+```ebnf
+summon_expr ::= "summon" "(" trait_type ")"
+member      ::= ( summon_expr | ident ) "::" ident
+```
+
+`summon(T)` is the instance of the trait type `T` that is visible where it is written, and `i::f` is
+the function `f` of the instance `i`:
+
+```python
+c = Circle::new(2)
+summon(Area(Circle))::area(c)    # 12
+summon(Area(_))::area(c)         # the hole is inferred: the instance of `Area(Circle)`
+
+def total(S, s: S) => Int requires a: Area(S):
+    a::area(s)
+```
+
+- **A trait's functions are read from an instance.** No name reaches one through its trait:
+  `Area::area(c)` is an error. `i::f` without arguments is the function as a value.
+- **A hole in `T` is inferred,** as a hole in an annotation is. `summon(Area(_))::area(c)` finds
+  `Area(Circle)` from the type of `c`.
+- **The visible instances** are the requirements of the definitions a `summon` stands in, named or
+  not, and every instance the program declares ([Declaring an instance](#declaring-an-instance)).
+  Each call passes a requirement the instance the program declares for the call's types, so the
+  visible instances that answer one `T` are one instance. **[Open]** — which instance a summon
+  names where visible instances differ, as one installed in a scope would, and a scope that
+  requires that no instance of a trait is visible.
+- **A summon places its requirement on the definition it stands in,** as an operator places its
+  trait's, whether the clause states it or not: `def total(s): summon(Area(_))::area(s)` requires
+  `Area(S)` of its parameter's type `S`.
+- **Which instance a summon names is decided when the program is compiled,** at each
+  specialization of the definitions it stands in, so a call of an instance's function runs a
+  function the compiler knows. What is decided is which instance a summon stands for, not a value:
+  an instance installed in a scope may hold a value only the running program has, as a
+  transaction does
+  ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)).
+- **An instance stands only before `::`.** `summon(T)` and a requirement's name are qualifiers.
+  Binding an instance to a name, passing one to a function, and holding one in data are
+  **[Open]**.
+- **A requirement's name is a qualifier in the body.** `a::f` reads the instance `a` where a
+  requirement binds `a`, which shadows a module of that name there, and `a::Elem` its associated
+  type ([Trait requirements](#trait-requirements)). Reading an associated type through
+  `summon(T)` is **[Open]**.
+
+> **Direction [Decided] — an instance is a module.** A trait is a nominal Module type
+> ([9.8 Module types](#98-module-types)) whose operands are fixed type members, and an instance is
+> a module with no state whose members are its functions, read with `::` as a module's members are.
+> A generic instance, `impl forall (T) Area(Two(T)) requires a: Area(T)`, is a module that takes
+> types and instances as arguments. Its instance at particular arguments is shared, as an import
+> with particular arguments reaches one shared run ([9.2 Imports](#92-imports)), rather than made
+> afresh for each use, as a run is. `requires Transaction`
+> ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters))
+> is a requirement of this kind, whose instance a `with begin():` block installs for its body
+> rather than for the whole program. **[Open]**: passing an instance at a call explicitly, and
+> installing an existing module as an instance of a trait.
+
+#### Declaring a trait
+
+```ebnf
+trait_stmt  ::= "trait" Ident "(" Ident ( "," Ident )* [ "," ] ")" [ requires_clause ] ":"
+                NEWLINE INDENT trait_item+ DEDENT
+trait_item  ::= Ident NEWLINE
+             |  "def" ident "(" params ")" "=>" expression [ requires_clause ] NEWLINE
+```
+
+A `trait` declaration binds a capitalized name to a new trait over its **operands**, the types it
+names in parentheses: one instance type for each list of operand types. Its body declares
+**associated types**, each a capitalized name alone, `Elem`, and **functions**, each a `def` line
+with a signature and no body. Every instance defines each associated type and holds each function at
+its own operands. An associated type is an alias the instance defines, not a nominal type, so no
+`type` keyword introduces it.
+
+```python
+trait Area(S):
+    def area(s: S) => Int
+    def scaled(s: S, k: Int) => S
+
+trait Container(C):
+    Elem
+    def first(c: C, otherwise: Elem) => Elem
+    def tag(R, c: C, label: R) => {R, Elem}
+
+trait Scales(V, F):
+    def scale(v: V, f: F) => V
+    def scale_vec(f: F, v: V) => V
+```
+
+- **A signature states every type.** Each parameter is annotated and the result is written. The
+  operands and associated types are types in every signature. A function may declare type
+  parameters of its own, as `tag` declares `R`, and a `requires` clause; each call opens the
+  parameters at its own types and satisfies the clause there.
+- **A trait's function is no method.** No parameter of one is named `self`, in the trait or in an
+  instance, and a call reads it from an instance: `summon(Scales(_, _))::scale_vec(2, v)`, not
+  `2.scale_vec(v)` ([Associated functions and methods](#associated-functions-and-methods)).
+- **A function declares at least one parameter.** A function of no argument is a constant
+  ([3.8 Function calls](#38-function-calls)), and a trait's constant has no spelling.
+- **Neither the trait's name nor a type's reaches a function.** `Area::area(c)` is an error, and
+  `Circle::area(c)` names only a function `Circle` declares
+  ([Summoning an instance](#summoning-an-instance)).
+- **[Open] — default functions.** A trait function with a body, which an instance that leaves it
+  out would take, is not part of the language: every instance defines each of its trait's
+  functions.
+- **A trait's names are types.** The trait's name, its operands and its associated types are
+  capitalized, and none is a type the module declares or a built-in name. A trait is declared at a
+  module's top level, and its signatures name the traits declared above it.
+- **A requirement names a declared trait as it names a built-in one.** `requires Area(S)` states
+  that `S` has an instance of `Area`, and under `requires c: Container(C)`, `c::Elem` is the `Elem`
+  of `C`'s ([Trait requirements](#trait-requirements)).
+- **[Open] — an associated type the trait defines.** `Elem = Int` in a trait, which every instance
+  would take, is not part of the language, as a default function is not: every instance defines
+  each of its trait's associated types.
+- **A trait may require traits of its types.** `trait Ranked(A, B) requires s: Same(A, B):` states
+  that every instance of `Ranked` is at types `Same` holds of: an instance whose types `Same` does
+  not hold of, by the instances declared above it and its own `requires` clause, is an error. Each
+  instance's functions see that instance of `Same`, as `s::same` here.
+- **A requirement is not transitive.** `requires r: Ranked(T, T)` states nothing of `Same(T, T)`:
+  under it, `summon(Same(T, T))` and `r::s` are errors, and a definition that calls `Same`'s
+  functions requires `Same(T, T)` as well. An instance shows only its own trait's functions, so two
+  traits a trait requires may declare functions of one name.
+
+#### Declaring an instance
+
+```ebnf
+impl_stmt   ::= "impl" [ "forall" "(" Ident ( "," Ident )* [ "," ] ")" ]
+                trait_name "(" expression ( "," expression )* ")" [ requires_clause ] ":"
+                NEWLINE INDENT impl_item+ DEDENT
+impl_item   ::= Ident "=" expression NEWLINE | def_stmt
+```
+
+An `impl` block whose head names a trait declares an **instance** of it and installs it for the
+whole program: the types it is for, a definition of each of the trait's associated types, and a
+definition of each of the trait's functions.
+
+```python
+type Circle = Int
+type Two(T) = {T, T}
+
+impl Area(Circle):
+    def area(s) => Int:
+        3 * s.extract() * s.extract()
+    def scaled(s, k):
+        Circle::new(s.extract() * k)
+
+impl forall (T) Container(Two(T)):
+    Elem = T
+    def first(c, otherwise):
+        c.extract().0
+    def tag(c, label):
+        (label, c.extract().0)
+
+impl forall (T) Area(Two(T)) requires a: Area(T):
+    def area(s):
+        a::area(s.extract().0) + a::area(s.extract().1)
+    def scaled(s, k):
+        Two::new((a::scaled(s.extract().0, k), a::scaled(s.extract().1, k)))
+```
+
+- **An instance is for a nominal type.** Each operand of the head is a **pattern**: a type
+  variable, a base type, or a nominal type applied to patterns in turn, as in `Two(T)`, `Two(Int)`
+  and `Duo(Two(Int), B)`. At least one operand is a nominal type, and the instance is declared in
+  its trait's module or in the module of a nominal type its head names
+  ([Traits and instances across modules [Decided]](#traits-and-instances-across-modules-decided)).
+- **`forall` declares the head's type variables.** `impl forall (T) Area(Two(T))` declares `T`; a
+  capitalized name in the head that names no type and is not declared is an error. A type variable
+  stands for any type, one type wherever the head names it, appears in an operand, and is a type
+  parameter of every function in the block. A variable standing as a whole operand, `F` in
+  `impl forall (F) Scales(Vec2, F)`, accepts any type there.
+- **The block defines every associated type,** once each, as a type alias is written, `Elem = T`,
+  over the head's variables. The head names only the operands, as a requirement does.
+- **A `requires` clause makes the instance conditional.**
+  `impl forall (T) Area(Two(T)) requires a: Area(T)` answers `Area(Two(X))` only where `Area(X)`
+  holds, and its functions reach the instance that holds it as `a`.
+- **Resolving an instance's conditions ends.** A type's depth is how deeply it nests, a type
+  variable counting 0: `Int` and `T` have depth 0, `Two(T)` 1, `Two(Two(T))` 2. Each condition is
+  no deeper than the head: its depth is at most the head's, and each type variable stands in it no
+  deeper than at its deepest place in the head. A condition on the instance's own trait, or on a
+  trait not declared before it, is shallower: both comparisons are strict.
+  `impl forall (T) Area(Two(T)) requires Area(T)` is accepted, and `requires Area(Two(T))` is an
+  error. A variable may stand in a condition more often than in the head, as `T` does in
+  `impl forall (T) Same(Two(T)) requires Equatable(T, T)`. The compiler's traits are declared
+  before a module's, a module's traits in the order it writes them, and an imported module's
+  before the importing module's; traits of two modules neither of which imports the other are not
+  ordered. A chain of conditions therefore either names an earlier trait or a shallower type at
+  each step that keeps its trait or names a later one, so it ends.
+- **The block defines each of the trait's functions, and nothing else.** A `def` in it is the
+  trait's function at the instance's types. A parameter it leaves unannotated, its result, its own
+  type parameters and its `requires` clause are the trait's there, and one it writes must be the
+  trait's. A `def` names no type of its own, and `pub` does not mark one.
+- **No two instances of a trait accept one type.** Two instances overlap when some types match both
+  heads, as `Two(T)` and `Two(Int)` do, and `Duo(Int, B)` and `Duo(A, String)`; the second is an
+  error. `Two(Int)` and `Two(String)` do not overlap, and a summon picks between them by the types
+  it is resolved at. This rule, and the one on which module may declare an instance
+  ([Traits and instances across modules [Decided]](#traits-and-instances-across-modules-decided)), are rules of
+  installing an instance for the whole program.
+- **An instance is visible after its `impl`,** as a `def`'s name is after the `def`. Within a
+  module, a summon answered by an instance declared below it is an error, and so is a summon inside
+  a generic definition declared above the instance that a use answers with it. Within the block, a
+  function may call another of the instance's in either order, and two that call each other at the
+  instance's types are an error. A call another instance answers, at other types, is no call of
+  this block's functions, whichever way the two call each other.
+- **An instance's function may call its own instance at other types, where the chain of calls
+  can end.** `Area(Two(T))`'s `area` calls `area` at `T`, so at `Two(Two(Circle))` it calls
+  `Area(Two(Circle))`'s, which calls `Area(Circle)`'s, and the chain ends however deep the type it
+  starts at. A call reaching an instance's function, inside that function at some types, is an
+  error when each of those types is **inside** the call's type at its place, as when `area` calls
+  `area` at `Two(Two(T))`: `T` is inside `Two(T)`, so the chain need not end. The types compared
+  are the ones a call gives the head's variables and the function's own type parameters, so
+  `tag(R, s: S, label: R)` calling `tag` at `T` with `R` doubled to `{R, R}`, from `One(T)` and
+  `R`, is accepted: `One(T)` is inside no `T`.
+- **A type is inside another when deleting parts of the other gives it:** replacing a type by one
+  of the types it is built from, or dropping components of a tuple, fields of a record or arms of a
+  variant. `Int` and `{Int, String}` are inside `{Int, Two(String)}`, and `{String, Int}` is not.
+  Refinements and the bounds of ranges are set aside. No infinite sequence of types avoids an
+  earlier one inside a later one, so every chain the rule accepts ends.
+- **A summon names the instance its types pick.** Each summon, and each use of a generic
+  definition that summons, is resolved at its own types to the one visible instance that accepts
+  them, and a call reads its function from that instance. An instance is declared at a module's
+  top level.
+- An instance of an operator's trait is **[Planned]**. Each operator trait gains a function its
+  operator calls, `add` for `+`, so that `impl Addable(Money, Money)` with `Output = Money` in its
+  block defines `+` on `Money`.
+
+#### Traits and instances across modules [Decided]
+
+A trait is a member of its module ([9. Modules [Decided]](#9-modules-decided)), and an instance
+belongs to the whole program.
+
+- **`pub trait` exports a trait** with its functions and associated types, and `pub` is refused on
+  a trait's `def`. Another module names it qualified, as `shapes::Area` in a `requires` clause, in
+  `summon(shapes::Area(_))` and in an instance's head `impl shapes::Area(Circle):`, or by its own
+  name after `use shapes::{Area}`.
+- **An instance holds wherever its trait and its types can be named.** `impl` takes no `pub`, and
+  no import selects instances: a module sees every instance its imports declare, directly or
+  through other imports. A key of a `Set`, a join's equality and each summon therefore mean the
+  same in every module.
+- **An instance is declared in its trait's module or in the module of a nominal type its head
+  names.** A module that can name the trait and the type imports the module declaring the
+  instance, directly or through other imports. The compiler's traits and `Option` belong to no
+  module, so a module declares an instance of a compiler trait only for a type it declares, and an
+  instance for `Option` only of a trait it declares.
+- **Outside its trait's module, no operand of an instance's head is a type variable.**
+  `impl forall (T) shapes::Area(Two(T))` may stand in `Two`'s module, and
+  `impl forall (F) Scales(Vec2, F)` only in `Scales`'s. Two modules that do not import each other
+  then cannot declare overlapping instances, so an overlap is an error in the module declaring the
+  second instance, which a module checked on its own reports
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
+- **A public member's contract names only public traits.** A `pub` definition whose stated or
+  inferred `requires` clause names a private trait is an error, and so is a `pub trait` whose
+  signatures or `requires` clause name a private type or trait.
+- **[Open] — a summon answered by an instance of another module.** A generic definition, an
+  instance's function included, may be used at a type whose instance a module importing the
+  definition's declares: `app`'s `impl Area(Square)` answering the requirement of a library's
+  `def total(S, s: S) => Int requires a: Area(S)`. Which such instances a use may pass is open;
+  the scoping rule of [Declaring an instance](#declaring-an-instance) orders one module's
+  declarations.
+- **[Open] — a trait as a member of a Module type.** A Module type names no trait, so a module
+  reaches the traits of a module it takes as an argument only through an import.
 
 #### Polymorphic type annotations
 
@@ -3395,10 +3665,10 @@ pick: forall (T) {T, T} => T = first
 - **A diagnostic prints an inferred polymorphic type in this notation.** A mismatch against a
   polymorphic annotation prints the right-hand side's type with each variable it quantifies as a
   parameter, `A`, `B`, … in order of first appearance, and each trait it requires of them as a
-  requirement. `def inc(a): a + 1` prints as
-  `forall (A) A => Int requires Addable(A, Int, Output=Int)`. A part of the type the notation cannot
-  write, such as a parameter joined with another type, is marked in the printed type (`A ∨ Int`),
-  not dropped.
+  requirement, named where it has an associated type and that type bounded by what it is.
+  `def inc(a): a + 1` prints as `forall (A) A => Int requires r: Addable(A, Int), r::Output <: Int`.
+  A part of the type the notation cannot write, such as a parameter joined with another type, is
+  marked in the printed type (`A ∨ Int`), not dropped.
 
 #### A use that checks compiles
 
@@ -3448,8 +3718,9 @@ The north-star programs additionally assume non-aggregate built-ins —
 > nominal type ([6.8 Nominal types and methods
 > [Decided]](#68-nominal-types-and-methods-decided)). `Set`, `Map` and
 > `FullMap` are nominal, so `catalog.keys()` resolves; `List` and
-> `Collection` are structural, so `orders.filter(…)` on one waits on the
-> planned trait methods, open with the combinators themselves.
+> `Collection` are structural, so `orders.filter(…)` on one names no
+> method, and a trait's function is read from an instance
+> ([Summoning an instance](#summoning-an-instance)).
 
 ### 7.2 `groupby`
 
@@ -3955,7 +4226,8 @@ parameter:
 - `def put(…) requires Transaction:` — the function declares it needs a
   transaction from context.
 - `given txn` — injects an existing transaction into the context.
-- `summon(Transaction)` — manifests the contextual transaction as a value.
+- `summon(Transaction)` — the contextual transaction, the instance a `with begin():` block
+  installs ([Summoning an instance](#summoning-an-instance)).
 
 Supporting decisions (same source):
 
@@ -4273,9 +4545,13 @@ param payments: Module{charge: {amount: Int} => Receipt}
   ([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
   `Receipt=stripe::Receipt` therefore passes when `stripe::Receipt` is a record whose `id` is the
   bounding module's label.
-- **[Open] — a bound a nominal type can meet.** The direction is a trait requirement on the
-  parameter, such as a method `id(self) => String`, which resolves on the argument's own type
-  rather than on labels. It waits on declared traits ([Trait requirements](#trait-requirements)).
+- **[Decided] — a trait requirement is a bound a nominal type meets.** `param Receipt requires
+  Identified(Receipt)` takes any type with an instance of `Identified`, checked at the `run` or
+  `import` against the instances the argument's module sees. Inside the module, `Receipt` stays
+  opaque and has `Identified`'s functions, as a type parameter under a `requires`
+  clause does ([Trait requirements](#trait-requirements)). The clause follows a `<:` bound where
+  there is one, and may name the module's other type parameters, as
+  `requires Convert(Receipt, Price)` does.
 - A value parameter is an immutable value, annotated with its type. A value parameter written
   without an annotation is an error, so each module states what its arguments are, if only as `_`.
   Its type is its annotation, with each `_` in it inferred from the module's uses the way a function
@@ -4444,18 +4720,20 @@ param payments: Module{Receipt <: {id: String}, charge: {amount: Int} => Receipt
 | feed | `name: Feed(T)` |
 | `Txn` mutable variable | **[Planned]** `name: Mut(V, Txn)` |
 | member bound to a module, `pub audit = a` | `name: Module{…}`, the Module type of the module it is bound to |
-| type alias | `Name = T` for an exact type, `Name <: T` for one known through a bound, or `Name: K` for one known through its kind |
+| type alias | `Name = T` for an exact type, `Name <: T` for one known through a bound, or `Name: K` for one known through its kind, any of them followed by a `requires` clause on it (**[Decided]**) |
 | nominal type | `Name = T`, where `T` is the nominal type |
 | private member | none |
 
-A capitalized entry is a type member. Its `<:` is the bounded form of a type parameter
-([9.4 Parameters](#94-parameters)), and it is the one place `<:` appears inside a type literal
-([Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)). `Name: K`
-states its kind, as `T: K` does for a type parameter, so `Name: Type` is any type
+A capitalized entry is a type member. Its `<:` and its `requires` clause are the bounds of a type
+parameter ([9.4 Parameters](#94-parameters)), and the entry is the one place `<:` appears inside a
+type literal ([Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
+`Name: K` states its kind, as `T: K` does for a type parameter, so `Name: Type` is any type
 ([Kinds and bounds](#kinds-and-bounds)). A module reaching a type member through a Module type
 knows what its entry states and nothing more. Through `Name = T` it can build values of the member,
 and through `Name <: T` or `Name: K` it cannot. A type member is in scope in the entries after it,
 which is how `charge` above returns a `Receipt`.
+**[Decided]** `Module{Receipt requires Identified(Receipt), charge: {amount: Int} => Receipt}` is met by a run
+whose `Receipt` has an instance of `Identified`.
 
 `Module{…}` 𝐴 is a subtype of `Module{…}` 𝐵 when 𝐴 has every member 𝐵 names. A value member's type
 in 𝐴 is a subtype of its type in 𝐵, a `Mut` member's type is equal, since `Mut` is invariant, and a

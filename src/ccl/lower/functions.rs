@@ -417,65 +417,93 @@ pub(super) fn lower_def(
     }
     let aliases = ctx.snapshot_type_aliases();
     let scoped = ctx.type_params_in_scope.len();
-    let result = declare_type_params(type_params, ctx).and_then(|declared| {
-        let requires = lower_requirements(requires, ctx)?;
-        let func = lower_function_body(fn_span, params, output, body, ctx)?;
-        // Every type parameter is determined by a call's arguments: it appears in a
-        // value parameter's annotation, or it is the associated type of a requirement
-        // whose operands are determined (`docs/chl-spec.md`, "Type parameters").
-        let mut mentioned = parameter_annotation_params(&func);
-        loop {
-            let before = mentioned.len();
-            for r in &requires {
-                // An operand can be a product; every parameter in it has to be known.
-                let mut in_operands = HashSet::new();
-                for a in &r.args {
-                    collect_params(a, &mut in_operands);
-                }
-                let operands_known = in_operands.is_subset(&mentioned);
-                if operands_known {
-                    for (_, t) in &r.assoc {
-                        if let Type::Param(param) = t {
-                            mentioned.insert(param.id);
-                        }
-                    }
-                }
-            }
-            if mentioned.len() == before {
-                break;
-            }
-        }
-        if let Some((tp, _)) = type_params
-            .iter()
-            .zip(&declared)
-            .find(|(_, d)| !mentioned.contains(&d.param.id))
-        {
-            return Err(LoweringError::unsupported(
-                tp.name_span,
-                format!(
-                    "type parameter `{}` appears in no parameter's annotation, so no call's \
-                     arguments determine it",
-                    tp.name
-                ),
-            ));
-        }
-        let poly = Type::Poly(Rc::new(crate::ccl::ty::PolyType {
-            params: declared,
-            requires,
-            body: Type::Hole,
-        }));
-        Ok((func, Some(poly)))
+    let in_scope = ctx.named_requirements.len();
+    let result = declare_type_params(type_params, ctx).and_then(|mut declared| {
+        let (requires, named) = lower_named_requirements(requires, Some(&mut declared), ctx)?;
+        ctx.named_requirements.extend(named);
+        let spans: Vec<Option<Span>> = type_params.iter().map(|tp| Some(tp.name_span)).collect();
+        lower_def_declared(
+            fn_span, declared, &spans, params, output, requires, body, ctx,
+        )
     });
+    ctx.named_requirements.truncate(in_scope);
     ctx.type_params_in_scope.truncate(scoped);
     ctx.restore_type_aliases(aliases);
     result
+}
+
+/// [`lower_def`] over type parameters the caller has declared in the current alias scope,
+/// and requirements it has lowered: an instance's `def`, whose type parameters are its
+/// head's variables and whose requirements may be its trait's. `spans` locates each of
+/// `declared` for a diagnostic, and is `None` for one a call determines otherwise, as a trait
+/// function's call determines an instance's variables by its trait's operands.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lower_def_declared(
+    fn_span: Span,
+    declared: Vec<crate::ccl::ty::PolyParam>,
+    spans: &[Option<Span>],
+    params: &[Param],
+    output: Option<&Spanned<ChlExpr>>,
+    requires: Vec<Rc<crate::ccl::ty::TraitRequirement>>,
+    body: &[Spanned<ChlStmt>],
+    ctx: &mut LoweringContext,
+) -> Result<(Expr, Option<Type>), LoweringError> {
+    let func = lower_function_body(fn_span, params, output, body, ctx)?;
+    if declared.is_empty() && requires.is_empty() {
+        return Ok((func, None));
+    }
+    // Every type parameter is determined by a call's arguments: it appears in a
+    // value parameter's annotation, or it is the associated type of a requirement
+    // whose operands are determined (`docs/chl-spec.md`, "Type parameters").
+    let mut mentioned = parameter_annotation_params(&func);
+    loop {
+        let before = mentioned.len();
+        for r in &requires {
+            // An operand can be a product; every parameter in it has to be known.
+            let mut in_operands = HashSet::new();
+            for a in &r.args {
+                collect_params(a, &mut in_operands);
+            }
+            let operands_known = in_operands.is_subset(&mentioned);
+            if operands_known {
+                for (_, t) in &r.assoc {
+                    if let Type::Param(param) = t {
+                        mentioned.insert(param.id);
+                    }
+                }
+            }
+        }
+        if mentioned.len() == before {
+            break;
+        }
+    }
+    if let Some((Some(span), d)) = spans
+        .iter()
+        .zip(&declared)
+        .find(|(span, d)| span.is_some() && !mentioned.contains(&d.param.id))
+    {
+        return Err(LoweringError::unsupported(
+            *span,
+            format!(
+                "type parameter `{}` appears in no parameter's annotation, so no call's \
+                 arguments determine it",
+                d.param.spelling
+            ),
+        ));
+    }
+    let poly = Type::Poly(Rc::new(crate::ccl::ty::PolyType {
+        params: declared,
+        requires,
+        body: Type::Hole,
+    }));
+    Ok((func, Some(poly)))
 }
 
 /// The type parameters the annotations on `func`'s parameters name: the binders of
 /// the lambda chain `uncurry_params` builds, one lambda for an uncurried definition
 /// and one per parameter for a `Mut`-parameter one.
 /// Every type parameter `ty` names, into `out`.
-fn collect_params(ty: &Type, out: &mut HashSet<crate::ccl::ty::TypeParamId>) {
+pub(super) fn collect_params(ty: &Type, out: &mut HashSet<crate::ccl::ty::TypeParamId>) {
     if let Type::Param(param) = ty {
         out.insert(param.id);
     }

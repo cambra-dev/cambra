@@ -1470,8 +1470,8 @@ pub struct PolyType {
     pub body: Type,
 }
 
-/// A trait requirement: `Addable(A, B, Output=O)` in a `requires` clause
-/// (`docs/chl-spec.md`, "Trait requirements").
+/// A trait requirement: `Addable(A, B)` in a `requires` clause, with the types its
+/// associated types stand for (`docs/chl-spec.md`, "Trait requirements").
 ///
 /// One type serves every reading of a requirement. In a lowered [`PolyType`] its
 /// operands are base types, declared type parameters, and products against a type
@@ -1517,7 +1517,7 @@ impl TraitRequirement {
         TraitRequirement {
             trait_: self.trait_.clone(),
             args: self.args.iter().map(&mut f).collect(),
-            assoc: self.assoc.iter().map(|(n, t)| (*n, f(t))).collect(),
+            assoc: self.assoc.iter().map(|(n, t)| (n.clone(), f(t))).collect(),
             at: self.at,
         }
     }
@@ -1527,22 +1527,111 @@ impl TraitRequirement {
         self.assoc.iter().find(|(n, _)| n == name).map(|(_, t)| t)
     }
 
-    /// Whether an operand is one of the type parameters `params`.
+    /// Whether an operand names one of the type parameters `params`, at its root or inside a
+    /// nominal type, as `Describe(Two(T))` names `T`.
     pub fn mentions_any(&self, params: &[TypeParamId]) -> bool {
         self.args
             .iter()
-            .any(|t| matches!(t, Type::Param(p) if params.contains(&p.id)))
+            .any(|t| params_at_or_below(t).any(|p| params.contains(&p)))
     }
 
-    /// Whether an operand is a type parameter other than `params`.
+    /// Whether an operand names a type parameter other than `params`, at its root or inside a
+    /// nominal type.
     pub fn mentions_other_than(&self, params: &[TypeParamId]) -> bool {
         self.args
             .iter()
-            .any(|t| matches!(t, Type::Param(p) if !params.contains(&p.id)))
+            .any(|t| params_at_or_below(t).any(|p| !params.contains(&p)))
     }
 }
 
+/// The type parameters `ty` is, or a nominal type in it is applied to, through any depth of
+/// nominal types.
+fn params_at_or_below(ty: &Type) -> impl Iterator<Item = TypeParamId> {
+    fn go(ty: &Type, out: &mut Vec<TypeParamId>) {
+        match ty {
+            Type::Param(p) => out.push(p.id),
+            Type::Nominal(_, args) => args.iter().for_each(|a| go(a, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    go(ty, &mut out);
+    out.into_iter()
+}
+
 impl PolyType {
+    /// Whether `param` stands for an associated type of a requirement the clause names,
+    /// `a::Output` under `requires a: Addable(T, T)`: a parameter of this `Poly` that some
+    /// requirement associates, spelled through the requirement's name. A `requires` clause
+    /// writes its bound, and the parameter list leaves it out.
+    pub fn is_member(&self, param: &TypeParam) -> bool {
+        param.spelling.contains("::")
+            && self.requires.iter().any(|r| {
+                r.assoc
+                    .iter()
+                    .any(|(_, t)| matches!(t, Type::Param(p) if p.id == param.id))
+            })
+    }
+
+    /// The `requires` clause as CHL writes it, each type written by `write`: each requirement
+    /// at its operands, named where it has associated types, then a bound on each associated
+    /// type, `a: Addable(T, T), a::Output <: T`. One standing for a member parameter is
+    /// bounded as that parameter is, and unbounded writes nothing; any other is bounded by
+    /// the type it is. A requirement with associated types and no member parameter, as an
+    /// inferred one, is named `r`, numbered apart from the clause's other names.
+    pub fn requires_text(&self, mut write: impl FnMut(&Type) -> String) -> Vec<String> {
+        let member_binder = |r: &TraitRequirement| {
+            r.assoc.iter().find_map(|(_, t)| match t {
+                Type::Param(p) if self.is_member(p) => p
+                    .spelling
+                    .split_once("::")
+                    .map(|(binder, _)| binder.to_string()),
+                _ => None,
+            })
+        };
+        let taken: Vec<String> = self
+            .requires
+            .iter()
+            .filter_map(|r| member_binder(r))
+            .collect();
+        let mut minted = 0usize;
+        let mut fresh = || loop {
+            let name = if minted == 0 {
+                "r".to_string()
+            } else {
+                format!("r{minted}")
+            };
+            minted += 1;
+            if !taken.contains(&name) {
+                return name;
+            }
+        };
+        let mut items = Vec::new();
+        for r in &self.requires {
+            let args: Vec<String> = r.args.iter().map(&mut write).collect();
+            let binder = member_binder(r).or_else(|| (!r.assoc.is_empty()).then(&mut fresh));
+            items.push(match &binder {
+                Some(b) => format!("{b}: {}({})", r.trait_, args.join(", ")),
+                None => format!("{}({})", r.trait_, args.join(", ")),
+            });
+            let Some(binder) = binder else { continue };
+            for (n, t) in &r.assoc {
+                let bound = match t {
+                    Type::Param(p) if self.is_member(p) => self
+                        .params
+                        .iter()
+                        .find(|d| d.param.id == p.id)
+                        .and_then(|d| d.bound().cloned()),
+                    other => Some(other.clone()),
+                };
+                if let Some(bound) = bound {
+                    items.push(format!("{binder}::{n} <: {}", write(&bound)));
+                }
+            }
+        }
+        items
+    }
+
     /// Every type this `Poly` holds: each kind's in declaration order, each
     /// requirement's operands and associated types, then the body.
     pub fn types(&self) -> impl Iterator<Item = &Type> {
@@ -2460,6 +2549,7 @@ fn fmt_type(
             let params: Vec<String> = poly
                 .params
                 .iter()
+                .filter(|p| !poly.is_member(&p.param))
                 .map(|p| match &p.kind {
                     TypeKind::Type => p.param.spelling.to_string(),
                     TypeKind::SubtypesOf(bound) => {
@@ -2474,20 +2564,7 @@ fn fmt_type(
                 params.join(", "),
                 at(&poly.body, binders)
             )?;
-            let requires: Vec<String> = poly
-                .requires
-                .iter()
-                .map(|r| {
-                    let mut args: Vec<String> =
-                        r.args.iter().map(|t| at(t, binders).to_string()).collect();
-                    args.extend(
-                        r.assoc
-                            .iter()
-                            .map(|(n, t)| format!("{n}={}", at(t, binders))),
-                    );
-                    format!("{}({})", r.trait_, args.join(", "))
-                })
-                .collect();
+            let requires = poly.requires_text(|t| at(t, binders).to_string());
             if requires.is_empty() {
                 Ok(())
             } else {
@@ -4252,6 +4329,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::VariantCtor { .. }
         | N::NominalCtor { .. }
         | N::Method { .. }
+        | N::TraitFn { .. }
         | N::For { .. }
         | N::MutDecl { .. }
         | N::MutWrite { .. }
@@ -4297,6 +4375,18 @@ fn eq_term_modulo_ty_slots_go(
         (N::Lit(x), N::Lit(y)) => x == y,
         (N::Var(x), N::Var(y)) => paired_refs_match(pairs, x, y),
         (N::Builtin(x), N::Builtin(y)) => x == y,
+        (
+            N::TraitFn {
+                trait_: t1,
+                function: f1,
+                ..
+            },
+            N::TraitFn {
+                trait_: t2,
+                function: f2,
+                ..
+            },
+        ) => t1 == t2 && f1 == f2,
         (N::Proj(x), N::Proj(y)) => x == y,
         (N::Source(x, p), N::Source(y, q)) => x == y && p == q,
         // A `LoadFrom` name is not a reference to a binder the compared term introduces:
@@ -4637,6 +4727,12 @@ fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
         TypedExprNode::Method { name, args, .. } => {
             name.hash(state);
             args.hash(state);
+        }
+        TypedExprNode::TraitFn {
+            trait_, function, ..
+        } => {
+            trait_.hash(state);
+            function.hash(state);
         }
         TypedExprNode::Proj(ProjKey::Index(i)) => i.hash(state),
         TypedExprNode::Proj(ProjKey::Field(f)) => f.hash(state),

@@ -14,7 +14,7 @@ syn case match
 
 syn keyword cambraBoolean True False
 syn keyword cambraKeywordControl if elif else for in return yield match case pass with
-syn keyword cambraKeywordOther def where and or not forall requires type impl import use as pub run param const this
+syn keyword cambraKeywordOther def where and or not forall requires type impl trait import use as pub run param const this
 
 " Ordinary operators. Among matches starting at one column, Vim prefers the one
 " defined last, so the mutation, feed and define operators below win over the
@@ -27,7 +27,7 @@ syn match cambraFeed "<<=\="
 
 " A match rather than a keyword: a keyword outranks every match, and
 " `cambraFunction` below has to win over a builtin name after `def`.
-syn match cambraBuiltin "\<\%(sum\|max\|min\|groupby\|set\|map\|box\|empty_map\|await_final\|defer\|begin\|http_serve\|test_sink\|stdin\)\>"
+syn match cambraBuiltin "\<\%(sum\|max\|min\|groupby\|set\|map\|box\|empty_map\|await_final\|defer\|begin\|http_serve\|test_sink\|stdin\|summon\)\>"
 
 syn match cambraLambda "\\"
 syn match cambraNumber "\<\d\+\%(_\d\+\)*\>"

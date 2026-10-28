@@ -119,6 +119,7 @@ mod sinks;
 mod stmts;
 #[cfg(any(test, feature = "test-helpers"))]
 mod test_sink;
+mod traits;
 mod transactions;
 
 /// The names a type alias may not rebind, re-exported so the test that pins the
@@ -497,6 +498,32 @@ pub struct LoweringContext {
     /// The associated functions the module declares, recorded before anything lowers so a
     /// method call anywhere names every type declaring its method.
     pub(super) associated_functions: Vec<nominal::AssociatedFunction>,
+
+    /// The traits the module declares (`docs/chl-spec.md`, "Declaring a trait"), declared
+    /// before anything lowers so a call anywhere names them. Declared only at the top level,
+    /// so never snapshotted.
+    pub(super) traits: Vec<crate::ccl::infer::solver::traits::Trait>,
+
+    /// The instances the module declares, of its traits and of the compiler's, which
+    /// inference reads every obligation's candidates from ([`take_instances`]).
+    ///
+    /// [`take_instances`]: Self::take_instances
+    pub(super) instances: crate::ccl::infer::solver::traits::InstanceTable,
+
+    /// Whether the module's instances are declared, which a requirement is checked against.
+    pub(super) instances_declared: bool,
+
+    /// The requirements lowered before the module's instances are declared, on its traits,
+    /// their signatures and its instances' heads, which are checked against those instances
+    /// once they are ([`stmts::check_pending_requirements`]).
+    pub(super) pending_requirements: Vec<PendingRequirement>,
+
+    /// What each instance's `impl` block needs to lower its `def`s where it stands.
+    pub(super) instance_blocks: Vec<traits::InstanceBlock>,
+
+    /// The requirements the `requires` clauses around the expression being lowered name,
+    /// innermost last, which `a::f` reads (`docs/chl-spec.md`, "Summoning an instance").
+    pub(super) named_requirements: Vec<NamedRequirement>,
 
     /// The members of compiler-provided declarations the module names, by binding name: the
     /// ones a qualified reference names, and the candidates of a method call of their name
@@ -1264,7 +1291,25 @@ fn lower_expr_inner(
             Ok(ctx.reference(Name::raw(name), expr.span))
         }
         ChlExpr::Qualified(q) if nominal::names_a_type_member(q) => {
-            nominal::lower_member(q, expr.span, ctx)
+            if let Some(trait_) = ctx.trait_named(&q.qualifier[0].node) {
+                Err(traits::refuse_trait_member(&trait_, q, expr.span))
+            } else {
+                nominal::lower_member(q, expr.span, ctx)
+            }
+        }
+        // `a::f` reads the instance a requirement names, which shadows a module of that name.
+        ChlExpr::Qualified(q) if traits::reads_named_requirement(q, ctx) => {
+            let instance = traits::named_requirement(q, ctx)?;
+            traits::lower_instance_member(&instance, &q.name, ctx)
+        }
+        ChlExpr::Summon {
+            trait_type,
+            function,
+        } => {
+            // The instance `summon(T)` names is the requirement it places, at the types `T`
+            // writes, a hole where it writes `_`.
+            let instance = lower_trait_type(&trait_type.node, trait_type.span, ctx)?;
+            traits::lower_instance_member(&instance, function, ctx)
         }
         // A member of another module lowers to the binder its module's chain
         // minted for it (`modules`).

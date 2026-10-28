@@ -23,7 +23,7 @@ use crate::chl_parser::ast::{
     ArmPattern, AssignTarget, CompClause, Comprehension, ConstructorPattern, DiscardHead,
     Expr as ChlExpr, IfBranch, KindAnnotation, MatchArm, Module as ChlModule, Param,
     PayloadPattern, QualifiedName, RecordField, Requirement, Span, Spanned, Stmt as ChlStmt,
-    TypeAnnotation, TypeDeclBody, TypeParam, VariantPayload, is_type_name,
+    TraitItem, TraitType, TypeAnnotation, TypeDeclBody, TypeParam, VariantPayload, is_type_name,
 };
 use smol_str::SmolStr;
 
@@ -264,11 +264,30 @@ impl Refusals {
                 self.expr(context);
                 self.stmts(body);
             }
-            // A block's `def`s stand at the block's own depth, so `pub` marks one at a
-            // module's top level (`docs/chl-spec.md`, "Associated functions and methods").
             ChlStmt::Impl(block) => {
+                for arg in &block.args {
+                    self.expr(arg);
+                }
+                for assoc in &block.assoc {
+                    self.expr(&assoc.value);
+                }
+                self.requires(&block.requires);
+                // A block's `def`s stand at the block's own depth, so `pub` marks one at a
+                // module's top level (`docs/chl-spec.md`, "Associated functions and methods").
                 for def in &block.defs {
                     self.stmt(def);
+                }
+            }
+            ChlStmt::TraitDecl(decl) => {
+                for item in &decl.items {
+                    if let TraitItem::Function(sig) = item {
+                        self.type_params(&sig.node.type_params);
+                        self.params(&sig.node.params);
+                        if let Some(output) = &sig.node.output {
+                            self.expr(output);
+                        }
+                        self.requires(&sig.node.requires);
+                    }
                 }
             }
             ChlStmt::TypeDecl(decl) => match &decl.body {
@@ -325,12 +344,16 @@ impl Refusals {
 
     fn requires(&mut self, requires: &[Spanned<Requirement>]) {
         for requirement in requires {
-            for arg in &requirement.node.args {
-                self.expr(arg);
+            match &requirement.node {
+                Requirement::Trait { ty, .. } => self.trait_type(ty),
+                Requirement::Bound { bound, .. } => self.expr(bound),
             }
-            for assoc in &requirement.node.assoc {
-                self.expr(&assoc.value);
-            }
+        }
+    }
+
+    fn trait_type(&mut self, ty: &TraitType) {
+        for arg in &ty.args {
+            self.expr(arg);
         }
     }
 
@@ -423,6 +446,7 @@ impl Refusals {
                 }
             }
             ChlExpr::Qualified(q) => self.qualified(q, expr.span),
+            ChlExpr::Summon { trait_type, .. } => self.trait_type(&trait_type.node),
             ChlExpr::Attribute {
                 target,
                 attr,

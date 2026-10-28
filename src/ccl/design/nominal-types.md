@@ -318,16 +318,26 @@ and display walks follow the same layout and polarities.
 
 ### Traits
 
-A nominal type offers no trait (`traits::offered`), so `==`, ordering and arithmetic on a nominal
-value are rejected where the operator is applied.
+A nominal type offers its declaration as its head (`traits::offered`), which only a declared
+instance accepts ([type-inference.md, "What the tables hold"](type-inference.md#what-the-tables-hold)).
+No operator trait has a declared instance, so `==`, ordering and arithmetic on a nominal value are
+rejected where the operator is applied.
+
+Lowering declares a module's traits after its types and before their associated functions, and
+its instances after those (`lower::traits`). An instance's `def`s lower where its `impl` stands,
+each completed from the trait's signature at the instance's types: a missing annotation becomes the
+trait's type there, and one the `def` writes is compared with it. Each body reads the
+requirements the trait's clause names, at the instance's types, and those the block's clause names
+(`lower_instance_def`). The block's functions are a `DefGroup`, bound so that each follows the ones
+of its instance it calls ([type-inference.md, "Trait functions"](type-inference.md#trait-functions)).
 
 ---
 
 ## After inference
 
 A nominal type is concrete, and stays in every type slot to operator conversion. A nominal value is
-opaque to the passes after inference: it has no fields and satisfies no trait, so it is never a
-key, a domain, or an operator's operand, and those passes move it without reading its shape. The
+opaque to the passes after inference: it has no fields, and no operator trait accepts it, so it is
+never a key, a domain, or an operator's operand, and those passes move it without reading its shape. The
 shape is read where a value is built or taken apart, through `Type::structure`, which answers a
 nominal type's **representation** and every other type itself:
 

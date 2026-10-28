@@ -576,6 +576,12 @@ fn hash_payload<'a>(
             name.hash(h);
             args.hash(h);
         }
+        N::TraitFn {
+            trait_, function, ..
+        } => {
+            trait_.hash(h);
+            function.hash(h);
+        }
         // Field *names* are folded together with their values in `hash_rel`,
         // which is what keeps `(a: 1, b: 2)` distinct from `(a: 2, b: 1)` under
         // the order-insensitive fold. An [`Fold::Own`] fold has no children to

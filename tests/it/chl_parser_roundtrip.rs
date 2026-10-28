@@ -282,7 +282,7 @@ fn requires_clauses_and_type_parameters() {
             b if a < b else a
     "});
     must_parse_module(indoc! {"
-        def add(A, B, O, a: A, b: B) => O requires Addable(A, B, Output=O):
+        def add(A, B, O, a: A, b: B) => O requires r: Addable(A, B), r::Output <: O:
             a + b
     "});
     must_parse_module("bigger: forall (T <: {at: Int}) {T, T} => T = larger");

@@ -47,7 +47,23 @@ pub(super) fn lower_call(
     let name = match &func.node {
         ChlExpr::Name(id) => id.as_str(),
         ChlExpr::Qualified(q) if nominal::names_a_type_member(q) => {
+            if let Some(trait_) = ctx.trait_named(&q.qualifier[0].node) {
+                return Err(traits::refuse_trait_member(&trait_, q, func.span));
+            }
             return nominal::lower_member_call(q, func.span, args, ctx);
+        }
+        ChlExpr::Qualified(q) if traits::reads_named_requirement(q, ctx) => {
+            let instance = traits::named_requirement(q, ctx)?;
+            return traits::lower_instance_member_call(&instance, &q.name, func.span, args, ctx);
+        }
+        ChlExpr::Summon {
+            trait_type,
+            function,
+        } => {
+            // The instance `summon(T)` names is the requirement it places, at the types `T`
+            // writes, a hole where it writes `_`.
+            let instance = lower_trait_type(&trait_type.node, trait_type.span, ctx)?;
+            return traits::lower_instance_member_call(&instance, function, func.span, args, ctx);
         }
         // A member of another module is a named callee
         // (`docs/chl-spec.md`, "9.6 Qualified references").
@@ -311,6 +327,13 @@ pub(super) fn lower_call(
             }
             Ok(Expr::new(TypedExprNode::Defer))
         }
+        // An instance stands only before `::`, where the parser reads `summon(T)::f`
+        // (`docs/chl-spec.md`, "Summoning an instance").
+        Some(SurfaceBuiltin::Summon) => Err(LoweringError::unsupported(
+            func.span,
+            "`summon(T)` is an instance, which stands only before `::`: read a function from \
+             it, as `summon(T)::f`",
+        )),
         // A transaction marker or a sink declaration is recognized by the statement that
         // holds it, and a source by its registration rather than by this table. Called
         // anywhere else, each of these lowers as an ordinary call.
@@ -1155,8 +1178,8 @@ mod tests {
     }
 
     /// The table's kind column holds lowering's recognizers: called in expression position at
-    /// its table arity, exactly the `Function` rows lower in their own arm of `lower_call`, and
-    /// every other row takes the fallthrough. With every spelling registered as a source, the
+    /// its table arity, exactly the `Function` rows lower in their own arm of `lower_call` and
+    /// the `Qualifier` row is refused there, and every other row takes the fallthrough. With every spelling registered as a source, the
     /// fallthrough is observable as a `source(…)` node, because it consults the registry before
     /// anything else.
     #[test]
@@ -1179,7 +1202,10 @@ mod tests {
                 .is_ok_and(|ccl| symbolic(&ccl) == format!("source({})", row.spelling));
             assert_eq!(
                 fell_through,
-                row.kind != SurfaceBuiltinKind::Function,
+                !matches!(
+                    row.kind,
+                    SurfaceBuiltinKind::Function | SurfaceBuiltinKind::Qualifier
+                ),
                 "`{}` is a {:?} row",
                 row.spelling,
                 row.kind

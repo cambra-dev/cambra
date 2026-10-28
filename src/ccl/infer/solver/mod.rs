@@ -45,6 +45,7 @@ pub mod barrier;
 pub mod coalesce;
 pub mod compact;
 pub mod constrain;
+pub(crate) mod containment;
 pub mod display;
 pub mod scheme;
 pub mod simplify_type;

@@ -58,3 +58,12 @@ type Price = Int
 impl Price:
     def doubled(self) => Price:
         Price::new(self.extract() * 2)
+
+trait Sized(S):
+    def size(s: S) => Int
+
+impl Sized(Price):
+    def size(s):
+        s.extract()
+
+n = summon(Sized(_))::size(Price::new(3))

@@ -225,6 +225,7 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
         | TypedExprNode::Defer
         | TypedExprNode::Abstract
         | TypedExprNode::Builtin(_)
+        | TypedExprNode::TraitFn { .. }
         | TypedExprNode::Lambda { .. } => true,
         // An unresolved method stands for one of its candidate references, each an atom,
         // and inference resolves it only where it is an application's function.
@@ -325,7 +326,8 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
         | TypedExprNode::Proj(_)
         | TypedExprNode::Defer
         | TypedExprNode::Abstract
-        | TypedExprNode::Builtin(_) => e,
+        | TypedExprNode::Builtin(_)
+        | TypedExprNode::TraitFn { .. } => e,
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
 

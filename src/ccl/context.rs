@@ -1965,6 +1965,8 @@ fn run_frontend(
 
     // Drain sink bindings before taking sources.
     let sink_bindings = ctx.lowering_ctx().take_sink_bindings();
+    // The instances the program declares are inference's to read.
+    ctx.inference_ctx().instances = Rc::new(ctx.lowering_ctx().take_instances());
 
     // Check identity before keying attribution by NodeId: duplicate live IDs
     // would collapse separate nodes' entries. Both boundary assertions are

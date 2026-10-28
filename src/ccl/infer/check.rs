@@ -290,6 +290,14 @@ impl Typing for CheckCtx {
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError> {
+        // A declared trait is required only by a trait function's call and by a `requires`
+        // clause, and inference replaces the one and monomorphizes the other away.
+        if !trait_.is_compiler() {
+            unreachable!(
+                "the declared trait `{}` is required after inference",
+                trait_.name()
+            )
+        }
         // No obligation is created here, for two independent reasons. Types are
         // already concrete, so there is nothing to discharge incrementally; and Check
         // runs outside any `InferArena`, so an obligation's variable⇄obligation cycle
@@ -763,6 +771,9 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         }
         TypedExprNode::Method { .. } => {
             unreachable!("a Method reached the check; inference resolves every method")
+        }
+        TypedExprNode::TraitFn { .. } => {
+            unreachable!("a TraitFn reached the check; coalescing chooses every instance")
         }
         // Verify the **base**, trust the refinement. A literal's singleton predicate
         // (`{Int | __elem == 5}`) is a resolved predicate like any other, and by the
