@@ -6,8 +6,9 @@
 use smol_str::SmolStr;
 
 use super::notification_sound::{
-    Expect, FeedOp, Growth, Step, Values, assert_notification_sound, assert_release_sound, grow,
-    grow_many, int_stream, int_stream_tiling, keys_region, positions_stream,
+    Expect, FeedOp, Growth, Step, Values, assert_notification_sound,
+    assert_notifications_survive_the_gates, assert_release_sound, grow, grow_many, int_stream,
+    int_stream_tiling, keys_region, positions_stream,
 };
 use super::test_helpers::RegionLog;
 use super::*;
@@ -1019,5 +1020,56 @@ fn a_change_to_the_selected_field_after_one_to_the_other_still_notifies() {
             &steps,
             &[Expect::Exact, Expect::Silent],
         );
+    }
+}
+
+/// Behind the gates of a consumer that pulls, with no pull between the steps, the consumer hears
+/// every change: a gate that passed the region of one field must still pass the region of the
+/// other. `MakeRecord` is selected from directly, through a memo and through a fan-out's slot.
+#[test]
+fn a_consumer_that_pulls_hears_every_field_of_a_record_behind_the_gates() {
+    let shapes = [(Values::Ints, None), (Values::Ints, None)];
+    for through in [Through::Nothing, Through::Memo, Through::FanOutSlot] {
+        for (seed, steps, growth) in [
+            (1, 8, Growth::OneAtATime),
+            (2, 6, Growth::Bursts),
+            (3, 10, Growth::CompletenessAndEmpty),
+            (4, 8, Growth::OneAtATime),
+        ] {
+            let (tiles, script) = grow_many(seed, &shapes, steps, growth);
+            let feeds: Vec<(Tiling, Vec<Tile>)> = shapes
+                .iter()
+                .zip(tiles)
+                .map(|((values, _), tiles)| (stream_tiling(*values), tiles))
+                .collect();
+            assert_notifications_survive_the_gates(
+                &select_over_make_record(through),
+                &feeds,
+                &script,
+            );
+        }
+    }
+}
+
+/// The same behind the gates for the other operators whose gate matters: the ones that share one
+/// consumer between several inputs and the memo.
+#[test]
+fn a_consumer_that_pulls_hears_every_change_to_every_input_behind_the_gates() {
+    let two = [(Values::Ints, None), (Values::Ints, None)];
+    let operators: Vec<Box<Build>> = vec![
+        Box::new(make_record),
+        Box::new(zip),
+        Box::new(|inputs| Box::new(Memo::new(make_record(inputs)))),
+    ];
+    for build in &operators {
+        for (seed, steps, growth) in [(5, 10, Growth::OneAtATime), (6, 8, Growth::Bursts)] {
+            let (tiles, script) = grow_many(seed, &two, steps, growth);
+            let feeds: Vec<(Tiling, Vec<Tile>)> = two
+                .iter()
+                .zip(tiles)
+                .map(|((values, _), tiles)| (stream_tiling(*values), tiles))
+                .collect();
+            assert_notifications_survive_the_gates(&**build, &feeds, &script);
+        }
     }
 }

@@ -332,6 +332,48 @@ pub(crate) fn assert_notification_sound(
     }
 }
 
+/// Run `steps` with no pull between them, behind the gates of an operator whose consumer pulls,
+/// and hold what its consumer was notified of to the answers: outside the union of the regions it
+/// received, the whole answer after every step equals the whole answer before the first.
+///
+/// [`assert_notification_sound`] gives the operator a consumer that never pulls, which leaves
+/// every gate open; this is the check of a gate that closes, and of a region it must not lose
+/// behind one it passed.
+pub(crate) fn assert_notifications_survive_the_gates(
+    build: &dyn Fn(Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator>,
+    feeds: &[(Tiling, Vec<Tile>)],
+    steps: &[Step],
+) {
+    let (mut operator, handles) = instantiate(build, feeds);
+    let (log, regions) = RegionLog::new(false);
+    let guard = operator.tiling().universal_guard();
+    let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    regions.lock_now().clear();
+    let mut at = vec![0; feeds.len()];
+    let before = answer(build, feeds, &at, &Projection::Everything);
+    for step in steps {
+        at[step.input] += 1;
+        handles[step.input].advance_to(at[step.input]);
+        if step.changed != Projection::Nothing {
+            handles[step.input].notify(&step.changed);
+        }
+    }
+    let received = regions
+        .lock_now()
+        .drain(..)
+        .fold(Projection::Nothing, |all, region| all.union(&region));
+    let after = answer(build, feeds, &at, &Projection::Everything);
+    let tiling = operator.tiling().clone();
+    let (mut before_outside, mut after_outside) = (before, after);
+    cut(&mut before_outside, &tiling, &received, true);
+    cut(&mut after_outside, &tiling, &received, true);
+    assert_eq!(
+        normal(before_outside),
+        normal(after_outside),
+        "the answer changed outside {received:?}, which is all the consumer behind the gates heard"
+    );
+}
+
 /// Cut `tile`, an answer of `tiling`, to `region`, or to what `region` leaves out where
 /// `complement`. A region of fields cuts a record field by field, and a field it omits is left
 /// whole in the complement.
