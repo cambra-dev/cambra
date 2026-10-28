@@ -121,13 +121,15 @@ fn distinct_predicate_terms(expr: &Expr) -> Vec<Vec<crate::ccl::provenance::Node
         t.walk_children(|c| from_ty(c, acc, seen));
     }
     fn from_expr(e: &Expr, acc: &mut HashMap<usize, Vec<NodeId>>, seen: &mut HashSet<usize>) {
-        from_ty(&e.ty, acc, seen);
-        if let Some(a) = &e.user_annotation {
-            from_ty(a, acc, seen);
+        // Uniquify removes a `LetType`, so a predicate only its type holds, that of an
+        // alias with no use, exists before the pass and not after. The predicates of
+        // a used alias ride its uses, and count there.
+        if let TypedExprNode::LetType { body, .. } = &e.node {
+            return from_expr(body, acc, seen);
         }
-        if let TypedExprNode::Cast { target, .. } = &e.node {
-            from_ty(target, acc, seen);
-        }
+        // Every type slot, including a binder's: uniquify rebuilds the predicates on
+        // a binder's type and annotation too (`binding_tys`).
+        e.walk_type_slots(|t| from_ty(t, acc, seen));
         e.walk_children(|c| from_expr(c, acc, seen));
     }
     let mut acc = HashMap::new();
@@ -641,9 +643,10 @@ fn for_each_predicate(ty: &Type, f: &mut impl FnMut(&Refinement)) {
 }
 
 /// Collect the sorted multiset of every node's [`NodeId`] reachable from
-/// `expr`, mirroring the exact set of nodes [`Uniquifier::expr`] visits —
-/// the main expression tree *and* the [`TypedExpr`]s living inside type-borne
-/// refinement predicates (which uniquify rebuilds in place). Sorting makes the
+/// `expr`, covering every node [`Uniquifier::expr`] visits — the main
+/// expression tree *and* the [`TypedExpr`]s living inside the refinement
+/// predicates of every slot [`TypedExpr::walk_type_slots`] reaches (which
+/// uniquify rebuilds in place). Sorting makes the
 /// result order-independent so the before/after comparison checks set identity
 /// with 1:1 multiplicity, not traversal order.
 ///
@@ -679,15 +682,10 @@ fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
             return from_expr(body, out);
         }
         out.push(e.node_id());
-        from_ty(&e.ty, out);
-        if let Some(ann) = &e.user_annotation {
-            from_ty(ann, out);
-        }
-        // `Cast`'s target is a type slot `walk_children` skips; its refinement
-        // predicate is an anchor uniquify rebuilds, so walk it explicitly.
-        if let TypedExprNode::Cast { target, .. } = &e.node {
-            from_ty(target, out);
-        }
+        // Every type slot, including a binder's: uniquify rebuilds the predicates
+        // on a binder's type and annotation too (`binding_tys`). A slot it does
+        // not rebuild keeps its ids, so it counts alike on both sides.
+        e.walk_type_slots(|t| from_ty(t, out));
         e.walk_children(|c| from_expr(c, out));
     }
 
@@ -965,6 +963,52 @@ mod tests {
             root_id,
             "the root Let's NodeId is unchanged across the rename"
         );
+    }
+
+    // Both of `run_in`'s checks reach the predicate on a binder's annotation, a slot
+    // uniquify rebuilds through `binding_tys`. Without the preservation check, an id
+    // dropped or re-minted there goes unnoticed; without the 1:1 check, an original
+    // surviving there beside its rebuild does.
+    #[test]
+    fn id_walks_reach_binder_annotation_predicates() {
+        use crate::ccl::provenance::NodeId;
+        use std::collections::HashSet;
+
+        fn ids_of(e: &Expr, out: &mut Vec<NodeId>) {
+            out.push(e.node_id());
+            e.walk_children(|c| ids_of(c, out));
+        }
+        fn binder_predicate_ids(e: &Expr, out: &mut Vec<NodeId>) {
+            e.walk_binders(|b| {
+                for r in b.user_annotation.iter().flat_map(Type::refinements) {
+                    ids_of(&r.predicate, out);
+                }
+            });
+            e.walk_children(|c| binder_predicate_ids(c, out));
+        }
+
+        let expr = lower_only("x: {Int where _ > 0} = 5\nx\n");
+        let mut predicate_ids = Vec::new();
+        binder_predicate_ids(&expr, &mut predicate_ids);
+        assert!(
+            !predicate_ids.is_empty(),
+            "the annotation lowers onto the binder"
+        );
+        let collected: HashSet<NodeId> = collect_node_ids(&expr).into_iter().collect();
+        for id in &predicate_ids {
+            assert!(
+                collected.contains(id),
+                "{id:?}, inside the binder's annotation, is missing from collect_node_ids"
+            );
+        }
+        #[cfg(debug_assertions)]
+        {
+            predicate_ids.sort_unstable();
+            assert!(
+                distinct_predicate_terms(&expr).contains(&predicate_ids),
+                "the binder annotation's predicate is missing from distinct_predicate_terms"
+            );
+        }
     }
 
     #[test]

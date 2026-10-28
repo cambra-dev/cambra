@@ -632,8 +632,9 @@ fn derived_from(
 /// The nodes enclosing `node` in `tree`, outermost first, or `None` if `tree`
 /// does not contain it.
 ///
-/// A refinement predicate in a type slot (the node's own type, its annotation, a
-/// binder's type) counts as enclosed by the node carrying the slot: inference
+/// A refinement predicate in a type slot (any slot `walk_type_slots` reaches: the
+/// node's own type, its annotation, a binder's, a `Cast` target, a `Transact`'s
+/// domain) counts as enclosed by the node carrying the slot: inference
 /// raises errors inside annotations, and the node holding the annotation is the
 /// one the source shows. Iterative, since a tree is as deep as its program is
 /// long. Runs only on an error path.
@@ -659,16 +660,7 @@ fn enclosing(tree: &Expr, node: NodeId) -> Option<Vec<NodeId>> {
         }
         let mut children: Vec<&Expr> = Vec::new();
         e.walk_children(|c| children.push(c));
-        predicates(&e.ty, &mut children);
-        if let Some(ann) = &e.user_annotation {
-            predicates(ann, &mut children);
-        }
-        e.walk_binders(|b| {
-            predicates(&b.ty, &mut children);
-            if let Some(ann) = &b.user_annotation {
-                predicates(ann, &mut children);
-            }
-        });
+        e.walk_type_slots(|t| predicates(t, &mut children));
         for c in children {
             // A predicate shared by `Rc` across slots is reached once.
             if c.node_id() != tree.node_id() && !parents.contains_key(&c.node_id()) {
@@ -3284,25 +3276,21 @@ Error: lowering error
         assert_eq!(unrecorded, expected, "without recording");
     }
 
-    /// Without recording, an error inference raises at a node it
-    /// minted itself, outside the final tree, traces to no
-    /// span. `compile_program` resolves it through the table, to the
-    /// element `x`; [`compile_to`] has no table, the node is in
-    /// neither projection, and no node encloses it in the
-    /// tree. `Blame::span` therefore panics in a debug build and
-    /// answers the whole root file in a release build.
+    /// Without recording, an error inference raises at a node it minted
+    /// resolves to the node enclosing it in the tree. `compile_program`
+    /// resolves that node through the provenance table, to the element `x`.
+    /// [`compile_to`] has no table and the node is in neither projection, so
+    /// `enclosing` finds the comprehension, whose type slot holds the filter's
+    /// predicate.
     ///
-    /// The failing node is minted by inference, not by the
-    /// comprehension phase, and the compiler before that phase
-    /// existed fails the same way.
+    /// Inference mints the failing node, not the comprehension phase.
     ///
     /// TODO: give inference's mints a projection that is always on,
     /// as the comprehension phase's have (`design/provenance.md`,
     /// "The derivation log"), and pin the element's span here
     /// instead.
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "traces to no source span"))]
-    fn an_inference_minted_blame_node_has_no_span_without_recording() {
+    fn an_inference_minted_blame_node_falls_back_to_its_enclosing_node_without_recording() {
         let code = "xs = [1, 2]\n[x for x in xs if x > \"a\"]\n";
         let program = LoadedProgram::test(code);
         let errs = GlobalContext::default()
@@ -3313,7 +3301,12 @@ Error: lowering error
             .iter()
             .find_map(CompileError::span)
             .unwrap_or_else(|| panic!("expected a spanned error, got: {errs:?}"));
-        assert_eq!(span, Span::new(program.sources().root(), 0, code.len()));
+        let comprehension = "[x for x in xs if x > \"a\"]";
+        let start = code.find(comprehension).unwrap();
+        assert_eq!(
+            span,
+            Span::new(program.sources().root(), start, start + comprehension.len())
+        );
     }
 
     /// Every rejection a pass after lowering raises points at the source of what
@@ -3703,6 +3696,48 @@ x = (1 +)
         assert!(
             parse_count >= 1,
             "expected at least 1 parse error: {errs:?}"
+        );
+    }
+
+    /// `enclosing` finds the node carrying a type slot for an id inside that slot's
+    /// predicate, for every slot `walk_type_slots` reaches: here a `Cast` target and
+    /// a `Transact`'s domain, neither of which is a node's own type or annotation.
+    #[test]
+    fn enclosing_reaches_predicates_in_every_type_slot() {
+        use crate::ccl::{BaseType, Lit, Refinement};
+        fn refined() -> (Type, NodeId) {
+            let predicate = Expr::lit(Lit::Bool(true));
+            let id = predicate.node_id();
+            let ty = Type::refined_one(
+                Type::Base(BaseType::Int),
+                Refinement::born(Rc::new(predicate)),
+            );
+            (ty, id)
+        }
+
+        let (target, in_target) = refined();
+        let cast = Expr::cast(Expr::lit(Lit::Int(5)), target);
+        let root = Expr::let_bind("x", Expr::lit(Lit::Int(1)), cast);
+        let TypedExprNode::Let { body, .. } = &root.node else {
+            unreachable!()
+        };
+        assert_eq!(
+            enclosing(&root, in_target),
+            Some(vec![root.node_id(), body.node_id()]),
+            "a predicate in a `Cast` target is enclosed by the `Cast`"
+        );
+
+        let (domain, in_domain) = refined();
+        let txn = Expr::new(TypedExprNode::Transact {
+            keys: Vec::new(),
+            writers: Vec::new(),
+            domain,
+            parameter: None,
+        });
+        assert_eq!(
+            enclosing(&txn, in_domain),
+            Some(vec![txn.node_id()]),
+            "a predicate in a `Transact`'s domain is enclosed by the `Transact`"
         );
     }
 }
