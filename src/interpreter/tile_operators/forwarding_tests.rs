@@ -180,3 +180,37 @@ fn map_result_to_const_sends_everything_for_its_constant() {
 fn map_result_to_const_at_the_outermost_level_sends_everything_for_its_inputs_region() {
     assert_widens(&|| map_result_to_const(CurryLevel::OUTERMOST), 0);
 }
+
+fn select_field(input: Tiling) -> Built {
+    let (input, consumer) = feed(input);
+    (Box::new(SelectField::new(input, "a")), vec![consumer])
+}
+
+fn a_stream_of_records() -> Built {
+    select_field(Tiling::data_function(
+        Extent::uint_range(8),
+        Tiling::Record(
+            [(SmolStr::new("a"), Tiling::Scalar(int()))]
+                .into_iter()
+                .collect(),
+        ),
+    ))
+}
+
+#[test]
+fn select_field_forwards_the_region_of_a_stream_of_records() {
+    assert_keeps(&a_stream_of_records, 0);
+    assert_keeps_without_state(&a_stream_of_records, 0);
+}
+
+/// A product of collections is read whole and its field cut, so a region of one collection's keys
+/// is not a region of the field's.
+#[test]
+fn select_field_over_a_product_of_collections_sends_everything() {
+    let product = || {
+        select_field(Tiling::Record(
+            [(SmolStr::new("a"), ints())].into_iter().collect(),
+        ))
+    };
+    assert_widens(&product, 0);
+}
