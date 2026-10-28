@@ -28,8 +28,9 @@ code are not checked. A link whose *text* wraps across the hard-wrapped prose is
 still found (see "Wrapped references" below).
 
 **B. Prose → doc section (the quoted-title citation).** Every `<name>.md`
-mentioned in a Rust *comment* (string literals are excluded) must resolve to a
-doc that exists, matched by unique path-suffix so `ir.md`, `design/ir.md`, and
+mentioned in a Rust *comment* (string literals are excluded) or in a full-line
+CHL `#` comment in a `.cambra` file (a comment trailing code is not read) must
+resolve to a doc that exists, matched by unique path-suffix so `ir.md`, `design/ir.md`, and
 the full path all resolve to the same file (an ambiguous suffix is an error —
 write a longer path). Any **section title quoted immediately after** the
 reference must exist as a heading in that doc.
