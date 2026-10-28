@@ -853,9 +853,14 @@ impl TileOperator for VariantIs {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input = self
-            .input
-            .subscribe(intent_guard, widening(consumer), scheduler);
+        // The scrutinee is pulled at the projection, so a region of its keys is a region of the
+        // result's.
+        let keeps_keys = self.input.tiling().is_data_function();
+        let input = self.input.subscribe(
+            intent_guard,
+            consumer_keeping_keys_if(keeps_keys, consumer),
+            scheduler,
+        );
         Box::new(VariantIsProducer {
             base: ProducerBase::new(
                 VariantIsProducer::alloc_id(),
