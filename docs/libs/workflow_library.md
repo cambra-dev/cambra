@@ -855,6 +855,69 @@ What a developer does with a workflow program over its life, and how each is don
 | **Query runs in flight** | A branch whose version adds a read-only output over the workflow's state, read and then deleted, with main not reloaded. The branch keeps main's operators where its version agrees and forks only the variables its version changes ([A branch is created by branch-and-reload](../../src/ccl/design/program-evolution.md#a-branch-is-created-by-branch-and-reload)). Until branches isolate their effects, the query branch also runs every effect main runs |
 | **Isolate a branch** | Not designed: a branch's effects would reach a sandbox until it is promoted. Every branch reads every element of a shared source and runs its own writes ([Every branch reads every element](../../src/ccl/design/program-evolution.md#every-branch-reads-every-element)) |
 
+## Data-configured sources
+
+Module runs are fixed in source ([9.3 Runs](../chl-spec.md#93-runs),
+[9.4 Parameters](../chl-spec.md#94-parameters)), and a run's sources open when the run starts
+([9.9 Running](../chl-spec.md#99-running)), but a durable workflow often needs a source chosen by
+data: a topic per tenant, a listener per registered port. Workflow runs are already data, so a
+program can start a run per configuration and cancel each one. The library lacks a source per
+runtime value.
+
+**[Proposed]** — [dynamic_sources.cambra](../../tests/programs/workflows/dynamic_sources.cambra)
+sketches one answer. An operator POSTs `(topic, message_type)`; the program subscribes that Kafka
+topic through the handler module for the type, which decodes its records and adds them to
+per-customer totals shared by every type. A DELETE cancels the topic's run, and the run's end
+unsubscribes the topic.
+
+- **A std source whose connections follow a `Txn` map.** A run of `kafka::consumers` consumes
+  every topic in its `subscriptions` map. Rows are added and deleted at run time, so the run graph
+  stays static while the set of connections is data. A handler hands the consumer its subscriptions
+  by writing that run's public `Txn` variable ([9.9 Running](../chl-spec.md#99-running), Planned).
+- **Each opening of a topic is a workflow run.** A run of `topics` per opening, with run id
+  `<topic>#<generation>`, gives each subscription the library's cancel and stale limit. The routes
+  only start and cancel runs, as the bill reminder's routes do.
+- **A `for_each` body subscribes the run's topic.** `topics::for_each(subscribe)` picks the handler
+  once per run, by the topic's type, and subscribes in its own transaction. A body whose run ended
+  before that transaction commits subscribes nothing, because the run's cleanup may already have
+  run.
+- **One handler module per message type, each with its own consumer.** Each type has its own
+  offsets, retention and backlog, so a slow handler holds back only its own topics. A handler's
+  record loop stays a plain loop: a body runs once per run, and a run receives many records.
+- **A record is applied once.** Records are a keyed source, keyed by topic, partition and offset.
+  The offsets are the consumer run's own `Txn` state, advanced in the transaction that applies the
+  record, and a reload pairs them by run path.
+- **Shared state is a run passed as an argument.** Every handler takes the `ledger` run as a
+  Module-typed parameter and adds to its totals in the handler's own transaction.
+
+Two other shapes were considered; the file's header compares all three:
+
+| Shape | Cost |
+| -- | -- |
+| One consumer and one loop decoding every topic by a per-topic type map | One handler body for every type, and a record slow to apply holds back every topic's retention, as one slow branch holds a source's retention for every other ([Routes across branches](../../src/ccl/design/program-evolution.md#routes-across-branches)) |
+| One consumer and a router loop writing each record's bytes to a handler module's public feed | Each record passes through one more feed between the consumer and its handler, and every type shares one consumer's offsets and backlog. The right shape when the type is known only per record (a schema registry) |
+
+The chosen shape costs a module, a `run` and a Kafka connection per message type.
+
+Writing the sketch in the current model showed three consequences of the design:
+
+| Observation | Consequence |
+| -- | -- |
+| An ended run's row stays, so an ended run never restarts | Reopening a closed topic starts a run of the next generation: the state is `{topic, generation, message_type}`, and the run id is `<topic>#<generation>`. The open route keeps each topic's latest state and starts a new generation only when the current one is not live |
+| `id(state)` takes the whole state | The routes keep each topic's latest state to name its run, and each handler keeps the run that owns each of its topics, because a record carries only a topic name |
+| Rows owned by a run are deleted by hand | A body sees its run's end only when an effect call raises `wf::WorkflowCancellationException`, and the subscribing body calls no effect, so the program unsubscribes in a loop over `ended`. A handler unsubscribes only while the ending run still owns the topic. A `wf` hook that runs per ended run, or a body step that waits for the run's end, would replace the loop |
+
+A reopened topic starts at its latest offset, because reading from the earliest would apply the
+previous generations' records to the totals a second time; records produced while the topic was
+closed are skipped. The subscription row carries the generation, and the consumer drops a topic's
+offsets when the generation changes. A reopening's body can subscribe before the previous
+opening's cleanup deletes its row, so it overwrites that row instead of adding one, and without the
+generation the consumer would continue from the old offsets.
+
+**[Open]** — whether a std source taking its connection set as a `Txn` map is the primitive for
+Kafka, HTTP listeners, timers and the rest; how such a source bounds its open connections; and
+whether two runs may share a topic.
+
 ## Open
 
 Each question below is **[Open]**.
@@ -917,13 +980,6 @@ account gains $200. Every client that resends can hit this, because it resends o
 for a reply, which is after its first request committed. So keeping a key until its element is
 released never prevents a duplicate. The key has to outlive the client's resends, which the program
 cannot observe, so it needs a declared retention, as Stripe keeps a key for 24 h.
-
-### Data-configured sources
-
-A durable workflow often needs a source chosen by data: a topic per tenant, a listener per
-registered port. Module runs are fixed in source ([9.3 Runs](../chl-spec.md#93-runs)), and a run's
-sources open when the run starts ([9.9 Running](../chl-spec.md#99-running)), so the library has no
-source per runtime value.
 
 ### What a loop added by a reload reads
 

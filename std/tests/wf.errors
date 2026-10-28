@@ -192,9 +192,9 @@ Error: parse error
      │        ╰── invalid assignment target
 ─────╯
 Error: parse error
-    ╭─[<std>/wf/workflow.cambra:84:53]
+    ╭─[<std>/wf/workflow.cambra:86:53]
     │
- 84 │ pub def id(state: State, parent_run: Option(PRunId) = `none) => RunId:
+ 86 │ pub def id(state: State, parent_run: Option(PRunId) = `none) => RunId:
     │     ───────────────────────┬────────────────┬────── ┬  
     │                            ╰─────────────────────────── while parsing statement
     │                                             │       │  
@@ -203,9 +203,9 @@ Error: parse error
     │                                                     ╰── found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', or ','
 ────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:100:56]
+     ╭─[<std>/wf/workflow.cambra:102:56]
      │
- 100 │ pub def start(state: State, parent_run: Option(PRunId) = `none) => StartResult requires Transaction:
+ 102 │ pub def start(state: State, parent_run: Option(PRunId) = `none) => StartResult requires Transaction:
      │     ─────────────────────────┬─────────────────┬────── ┬  
      │                              ╰──────────────────────────── while parsing statement
      │                                                │       │  
@@ -214,9 +214,9 @@ Error: parse error
      │                                                        ╰── found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', or ','
 ─────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:115:10]
+     ╭─[<std>/wf/workflow.cambra:117:10]
      │
- 115 │     if i in runs:
+ 117 │     if i in runs:
      │     ──┬┬ ─┬  
      │       ╰────── while parsing statement
      │        │  │  
@@ -225,9 +225,9 @@ Error: parse error
      │           ╰── found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
 ─────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:122:10]
+     ╭─[<std>/wf/workflow.cambra:124:10]
      │
- 122 │     if i in runs:
+ 124 │     if i in runs:
      │     ──┬┬ ─┬  
      │       ╰────── while parsing statement
      │        │  │  
@@ -236,9 +236,9 @@ Error: parse error
      │           ╰── found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
 ─────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:130:10]
+     ╭─[<std>/wf/workflow.cambra:132:10]
      │
- 130 │     if i not in runs:
+ 132 │     if i not in runs:
      │     ──┬┬ ─┬─  
      │       ╰─────── while parsing statement
      │        │  │   
@@ -247,10 +247,10 @@ Error: parse error
      │           ╰─── found 'not', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
 ─────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:144:14]
+     ╭─[<std>/wf/workflow.cambra:146:14]
      │
- 143 │ ╭─▶     sorted([i for i -> r in runs if r.parent == `some(p) and live(i)],
- 144 │ ├─▶            by=(i) => runs[i].started_at)
+ 145 │ ╭─▶     sorted([i for i -> r in runs if r.parent == `some(p) and live(i)],
+ 146 │ ├─▶            by=(i) => runs[i].started_at)
      │ │              ─┬┬                             
      │ │               ╰────────────────────────────── while parsing expression
      │ │                │                             
@@ -259,9 +259,9 @@ Error: parse error
      │                  ╰───────────────────────────── found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
 ─────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:160:29]
+     ╭─[<std>/wf/workflow.cambra:162:29]
      │
- 160 │         runs[i] := (runs[i] with last_activity=time::now())
+ 162 │         runs[i] := (runs[i] with last_activity=time::now())
      │         ───────────────┬──────┬──┬─────────────────────────  
      │                        ╰───────────────────────────────────── while parsing expression
      │                               │  │                           
@@ -270,9 +270,9 @@ Error: parse error
      │                                  ╰─────────────────────────── while parsing statement
 ─────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:176:10]
+     ╭─[<std>/wf/workflow.cambra:178:10]
      │
- 176 │     if i in runs and runs[i].status == wf::`running:
+ 178 │     if i in runs and runs[i].status == wf::`running:
      │     ──┬┬ ─┬  
      │       ╰────── while parsing statement
      │        │  │  
@@ -281,19 +281,19 @@ Error: parse error
      │           ╰── found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
 ─────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:197:14]
+     ╭─[<std>/wf/workflow.cambra:199:14]
      │
- 196 │ ╭─▶     match (a, b):
- 197 │ ├─▶         case (`some(x), `some(y)):
+ 198 │ ╭─▶     match (a, b):
+ 199 │ ├─▶         case (`some(x), `some(y)):
      │ │                ┬                       
      │ ╰──────────────────────────────────────── while parsing statement
      │                  │                       
      │                  ╰─────────────────────── found '(', expected 'this', '`', or something else
 ─────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:214:8]
+     ╭─[<std>/wf/workflow.cambra:216:8]
      │
- 214 │     (r with wake=w)
+ 216 │     (r with wake=w)
      │     ─────┬─┬───────  
      │          ╰─────────── found 'with', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', 'for', '<<', '^+', '->', '=>', '**', '=', ')', ',', or '::'
      │            │         
@@ -302,9 +302,9 @@ Error: parse error
      │            ╰───────── while parsing expression
 ─────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:238:58]
+     ╭─[<std>/wf/workflow.cambra:240:58]
      │
- 238 │             for i -> r in runs if r.parent == `some(e.id):
+ 240 │             for i -> r in runs if r.parent == `some(e.id):
      │             ──────────────────────┬──────┬───────────────┬  
      │                                   ╰───────────────────────── while parsing statement
      │                                          │               │  
@@ -313,9 +313,9 @@ Error: parse error
      │                                                          ╰── found ':', expected binary operator, comparison operator, boolean operator, postfix operation, 'else', '^+', or '**'
 ─────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:253:43]
+     ╭─[<std>/wf/workflow.cambra:255:43]
      │
- 253 │         for r in wf::keyed(cancel_reqs, by=(r) => r.headers["Idempotency-Key"]):
+ 255 │         for r in wf::keyed(cancel_reqs, by=(r) => r.headers["Idempotency-Key"]):
      │         ─────────────────┬───────────────┬┬  
      │                          ╰─────────────────── while parsing statement
      │                                          ││  
@@ -324,14 +324,14 @@ Error: parse error
      │                                           ╰── found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
 ─────╯
 Error: parse error
-     ╭─[<std>/wf/workflow.cambra:275:18]
+     ╭─[<std>/wf/workflow.cambra:282:18]
      │
- 274 │ pub def for_each(Out, body: wf::Started(RunId, State) => Out
+ 281 │ pub def for_each(Out, body: wf::Started(RunId, State) => Out
      │     ────────────────────────────┬─────────────────────────┬─  
      │                                 ╰───────────────────────────── while parsing statement
      │                                                           │   
      │                                                           ╰─── while parsing expression
- 275 │                  causes wf::WorkflowCancellationException(_)):
+ 282 │                  causes wf::WorkflowCancellationException(_)):
      │                  ───┬──  
      │                     ╰──── found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
 ─────╯

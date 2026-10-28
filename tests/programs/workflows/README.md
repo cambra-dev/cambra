@@ -58,3 +58,4 @@ instant, which is a burst of calls the size of the bill table. Two ways spread i
 | `bill-reminder-v1.cambra` … `bill-reminder-v4.cambra` | The bill reminder's versions, each reloaded over the one before |
 | `lib.cambra` | The bill reminder's providers: request and reply types, and a client constructor each for OpenAI, Resend and Twilio |
 | `stdlib/http.cambra` | `http::http_client`, a sketch of the outbound half of `std::http` |
+| `dynamic_sources.cambra` | Sources opened per runtime value: Kafka subscriptions as a `Txn` map, owned by workflow runs (`workflow_library.md`, "Data-configured sources") |

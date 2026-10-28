@@ -827,6 +827,132 @@ folds:
   81-82
   86-88 comment
   93-98 comment
+== tests/programs/workflows/dynamic_sources.cambra
+diagnostics:
+  86:8-86:10 found '::', expected '(', or ':'
+    86:1-86:8 while parsing statement
+  92:16-92:17 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    92:5-92:16 while parsing statement
+    92:11-92:16 while parsing expression
+  101:45-101:53 found 'requires', expected binary operator, comparison operator, boolean operator, postfix operation, 'where', 'if', '<<', '^+', '->', '=>', '**', '}', or ','
+    100:5-101:44 while parsing statement
+    101:42-101:44 while parsing expression
+  168:14-168:16 found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ':', or '::'
+    168:5-168:13 while parsing statement
+    168:8-168:13 while parsing expression
+  217:1-217:5 found 'indent', expected statement, or 'newline'
+  244:33-244:34 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    244:1-244:33 while parsing statement
+    244:31-244:33 while parsing expression
+  257:34-257:35 found '=', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '**', ')', ',', or '::'
+    257:1-257:34 while parsing statement
+    257:32-257:34 while parsing expression
+  272:18-272:24 found 'identifier', expected 'requires', '=>', or ':'
+    272:1-272:17 while parsing statement
+symbols:
+  module std::wf 35:1-35:15 (name 35:8-35:15)
+  variable brokers 38:1-38:22 (name 38:7-38:14)
+  variable Start 40:1-40:34 (name 40:5-40:10)
+  variable Subscription 41:1-41:51 (name 41:5-41:17)
+  variable Offset 42:1-42:58 (name 42:5-42:11)
+  variable Record 46:1-46:84 (name 46:5-46:11)
+  variable subscriptions 56:1-56:70 (name 56:5-56:18)
+  variable offsets 63:1-63:76 (name 63:1-63:8)
+  variable records 70:1-70:65 (name 70:5-70:12)
+  module std::wf 78:1-78:15 (name 78:8-78:15)
+  variable MessageType 80:1-80:49 (name 80:5-80:16)
+  function opening 91:1-92:61 (name 91:9-91:16)
+  variable Delta 95:1-95:61 (name 95:5-95:10)
+  module shared 111:1-111:14 (name 111:8-111:14)
+  variable totals 113:1-113:60 (name 113:1-113:7)
+  variable report 117:1-117:21 (name 117:5-117:11)
+  function add 120:1-126:44 (name 120:9-120:12)
+  module std::json 139:1-139:17 (name 139:8-139:17)
+  module shared 140:1-140:14 (name 140:8-140:14)
+  module std::wf 141:1-141:15 (name 141:8-141:15)
+  variable brokers 143:1-143:22 (name 143:7-143:14)
+  variable topics 144:1-144:42 (name 144:7-144:13)
+  variable ledger 145:1-145:29 (name 145:7-145:13)
+  variable Order 147:1-147:40 (name 147:1-147:6)
+  module ingress 149:1-149:54 (name 149:47-149:54)
+  variable owners 153:1-153:60 (name 153:1-153:7)
+  function subscribe 160:1-163:92 (name 160:9-160:18)
+  function unsubscribe 167:1-170:42 (name 167:9-167:20)
+  variable undecodable 174:1-174:26 (name 174:5-174:16)
+  module std::env 206:1-206:16 (name 206:8-206:16)
+  module std::http 207:1-207:17 (name 207:8-207:17)
+  module shared 208:1-208:14 (name 208:8-208:14)
+  module std::time 209:1-209:17 (name 209:8-209:17)
+  module std::wf 210:1-210:15 (name 210:8-210:15)
+  module std::wf::workflow 216:1-216:94 (name 216:5-216:22)
+  module ledger 219:1-219:21 (name 219:15-219:21)
+  module orders 223:1-223:86 (name 223:80-223:86)
+  module refunds 224:1-224:88 (name 224:81-224:88)
+  module shipments 225:1-225:92 (name 225:83-225:92)
+  variable current 229:1-229:61 (name 229:1-229:8)
+  variable open_reqs 237:1-237:63 (name 237:1-237:10)
+  variable open_resps 237:1-237:63 (name 237:12-237:22)
+  variable close_reqs 238:1-238:75 (name 238:1-238:11)
+  variable close_resps 238:1-238:75 (name 238:13-238:24)
+  function unsubscribe 284:1-291:55 (name 284:5-284:16)
+folds:
+  1-20 comment
+  22-24 comment
+  26-33 comment
+  44-45 comment
+  48-55 comment
+  58-62 comment
+  65-69 comment
+  72-74 comment
+  82-83 comment
+  91-92
+  97-99 comment
+  100-101
+  104-106 comment
+  108-109 comment
+  115-116 comment
+  120-126
+  122-124
+  128-130 comment
+  132-136 comment
+  151-152 comment
+  155-159 comment
+  160-163
+  165-166 comment
+  167-170
+  172-173 comment
+  176-180 comment
+  181-197
+  182-197
+  183-197
+  184-195
+  185-195
+  187-195
+  188-191
+  189-191
+  192-195
+  193-195
+  196-197
+  199-201 comment
+  203-204 comment
+  214-215 comment
+  221-222 comment
+  227-228 comment
+  233-236 comment
+  240-243 comment
+  265-266 comment
+  269-271 comment
+  284-291
+  285-291
+  286-287
+  288-289
+  290-291
+  293-296 comment
+  297-303
+  298-303
+  299-303
+  300-301
+  302-303
 == tests/programs/workflows/lib.cambra
 diagnostics:
   41:27-42:63 `{…}` is type syntax: a record type `{field: T}` or a tuple type `{T, U}`; a map is written `[k -> v]`
