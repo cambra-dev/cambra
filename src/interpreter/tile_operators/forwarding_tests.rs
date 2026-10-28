@@ -291,3 +291,25 @@ fn variant_is_forwards_the_region_of_a_stream() {
 fn variant_is_over_a_bare_union_sends_everything() {
     assert_widens(&|| variant_is(Tiling::Scalar(union_extent())), 0);
 }
+
+fn make_record() -> Built {
+    let (a, first) = feed(ints());
+    let (b, second) = feed(ints());
+    let op = MakeRecord::new(vec![a, b]);
+    (Box::new(op), vec![first, second])
+}
+
+/// A record of values has no keys of its own.
+#[test]
+fn make_record_sends_everything_for_a_region_of_either_field() {
+    assert_widens(&make_record, 0);
+    assert_widens(&make_record, 1);
+}
+
+#[test]
+fn make_record_sends_everything_for_a_later_region() {
+    assert_eq!(
+        received(&make_record, 1, &another_region()),
+        [Projection::Everything]
+    );
+}
