@@ -118,9 +118,11 @@ impl TileOperator for ExtractFinal {
         // no-op notifier because its readiness only matters at the moment
         // we discover an empty source — by then we're already in `get_impl`
         // and will pull it directly.
-        let source_producer =
-            self.source
-                .subscribe(self.source.tiling().universal_guard(), consumer, scheduler);
+        let source_producer = self.source.subscribe(
+            self.source.tiling().universal_guard(),
+            widening(consumer),
+            scheduler,
+        );
         let default_producer = self
             .default
             .as_mut()
