@@ -653,9 +653,6 @@ producer with no keys of its own notifies `Everything` whatever it is read throu
 depends on the input's shape, the operator decides from its tiling when it subscribes, as its
 `get_impl` does when it pulls.
 
-The table states the rule each operator ends with. A row that keeps takes effect in the commit that
-keeps that operator's keys; until then the operator widens.
-
 | Operator | Input | Notification | Reason |
 | --- | --- | --- | --- |
 | `MapResult` | the input | keeps if applied one level in to a collection, else widens | A keyed input is pulled at the projection; applied at the outermost level or to a scalar, the function's keys are the result's. |
