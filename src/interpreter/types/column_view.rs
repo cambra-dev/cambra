@@ -9,8 +9,8 @@ use super::ColumnValue;
 /// A column of `Int`, `UInt`, `String` or `Bool` values, borrowed from a [`ColumnValue`] or
 /// built from a literal.
 ///
-/// The element-wise operations read their operands as column views, so an operand that is a
-/// region of the input, or one literal repeated, is read in place and never copied into a column.
+/// Kernel dispatch and allocation rules are in `src/interpreter/design-operators.md`,
+/// "Column views".
 #[derive(Debug, Clone, Copy)]
 pub enum ColumnView<'a> {
     Ints(View<'a, i64>),
@@ -61,8 +61,8 @@ impl<'a> ColumnView<'a> {
 }
 
 impl ColumnValue {
-    /// This column as a view, or `None` for a column that is not of a base type: a record, a union
-    /// or another composite, and a `Units` column, which stores no values.
+    /// Borrow an `Int`, `UInt`, `String`, or `Bool` column. Other variants, including `Units`,
+    /// return `None`.
     pub fn view(&self) -> Option<ColumnView<'_>> {
         match self {
             ColumnValue::Ints(v) => Some(ColumnView::Ints(View::Slice(v))),

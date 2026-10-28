@@ -1,26 +1,8 @@
-//! One element-wise function of a column, built from a chain of element-wise operations and
-//! applied as [`FunctionDef::Scalar`](super::FunctionDef).
+//! Recognize element-wise chains and evaluate them as [`FunctionDef::Scalar`](super::FunctionDef).
 //!
-//! A `zip` of arms over one input converts to `Memo`, `FanOut`, one map per arm, a `Zip` and a
-//! map over the pair. When every arm is element-wise, the whole chain is a function of the one
-//! input column. [`fuse_prefix`] recognizes such a chain and [`ScalarProgram::eval`] computes it
-//! without an operator or an intermediate pair per arm.
-//!
-//! A [`ScalarProgram`] is a straight-line program over slots: instruction 𝑖 names slot 𝑖, and
-//! its operands name earlier slots. A value that two operations read is one slot, computed once.
-//! Every `Input` reads a column of a base type and every `Const` is a value of one, and no
-//! operation reads a record: [`fuse_prefix`] takes a comparison of two records apart into a
-//! comparison per field. The last instruction is the result: an operation, or, for a chain that
-//! ends in a `zip`, a `Record` of the columns its fields name, so a product is built only as the
-//! result, one column of records.
-//!
-//! `eval` works through the input in blocks of [`BLOCK_ROWS`] rows. An `Input` or a `Const` is
-//! read in place, as a region of the input or one value repeated. An operation writes one
-//! block-sized column into a slot of its own, which later blocks reuse, so the intermediates of a
-//! chain are a few kilobytes each, allocated once per `eval`, and each kernel runs over columns
-//! that are still in cache. The last instruction appends to the result instead: an operation by its
-//! kernel, and a `Record` by copying each field's block from the slot, input region or constant
-//! the field names.
+//! [`fuse_prefix`] builds the program; [`ScalarProgram::eval`] applies it to a column. The program
+//! format and evaluation rules are in `src/interpreter/design-operators.md`, "Scalar programs".
+//! Conversion eligibility is in `src/ccl/design/optimization.md`, "Element-wise chains".
 
 use std::collections::HashMap;
 use std::mem::replace;
@@ -60,17 +42,17 @@ enum Instr {
     Record(Vec<(SmolStr, Slot)>),
 }
 
-/// A function of one column, as a straight-line program over slots.
+/// A straight-line program whose operands refer to earlier instruction slots.
 ///
-/// The last instruction is the result. Every instruction is an operand of a later one or the
-/// result, so equal functions have equal programs.
+/// The last instruction produces the result. Structural equality compares instruction sequences;
+/// it does not establish equivalence between different expressions for the same function.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScalarProgram {
     instrs: Vec<Instr>,
 }
 
-/// Rows evaluated at a time: 8 KiB per column of 64-bit values, so an instruction's operands
-/// and result stay in L1.
+/// Rows per block, chosen to keep a kernel's operands and result in L1. Each full 64-bit column
+/// occupies 8 KiB, so two operands and a result occupy 24 KiB.
 const BLOCK_ROWS: usize = 1024;
 
 /// The column of `input` that `path` reads.
@@ -96,18 +78,11 @@ fn const_view(value: &Value, len: usize) -> ColumnView<'_> {
     }
 }
 
-/// The columns of an evaluation, one per instruction, kept from block to block.
-///
-/// An operation writes its block into its own slot, so a slot's buffer is allocated while the
-/// first block is evaluated and reused for every later one, instead of each block allocating a
-/// column per operation. An `Input` or a `Const` writes no slot: its block is read in place as a
-/// [`ColumnView`], a region of the input or one value repeated.
+/// Per-evaluation buffers reused across blocks. Inputs and constants are borrowed views.
 struct Scratch<'a> {
     input: &'a ColumnValue,
-    /// The slot of an operation is `Units(0)` until its instruction first writes it; no
-    /// operation's result is a `Units` column, so the marker is unambiguous. The slot of an
-    /// `Input`, a `Const` or a `Record` stays unwritten, and so does the last instruction's, which
-    /// runs into the result ([`Scratch::block`]).
+    /// `Units(0)` marks unwritten slots; no operation produces that column variant. Inputs,
+    /// constants, records, and the last instruction never write a scratch slot.
     slots: Vec<ColumnValue>,
     /// The current block: the rows `start..start + len` of the input.
     start: usize,
@@ -139,13 +114,9 @@ impl<'a> Scratch<'a> {
         }
     }
 
-    /// Run `program` over the rows `start..start + len` and append the block's result to `out`,
-    /// the result column of [`ScalarProgram::empty_output`], with room for the whole input
-    /// reserved.
-    ///
-    /// Every operation but the last runs into its own slot. No instruction reads the last one, so
-    /// it runs into `out`: an operation by its kernel, with no slot of its own, and a `Record` by
-    /// copying each field's block from the slot, input region or constant the field names.
+    /// Append the result for `start..start + len` to `out`, prepared by
+    /// [`ScalarProgram::empty_output`]. No instruction reads the last slot, so its result can be
+    /// appended directly without a scratch buffer.
     fn block(&mut self, program: &ScalarProgram, start: usize, len: usize, out: &mut ColumnValue) {
         self.start = start;
         self.len = len;
@@ -156,9 +127,7 @@ impl<'a> Scratch<'a> {
         self.run(program, last, out);
     }
 
-    /// Run instruction `slot` into its own slot, if it is an operation. An `Input`, a `Const` or a
-    /// `Record` writes no slot: [`Scratch::view`] reads the first two in place, and
-    /// [`Scratch::run`] appends a record field by field.
+    /// Evaluate an operation into its scratch buffer. Other instructions have no scratch output.
     fn run_into_slot(&mut self, program: &ScalarProgram, slot: usize) {
         let instr = &program.instrs[slot];
         if !matches!(instr, Instr::Bin(..) | Instr::Un(..)) {
@@ -187,10 +156,8 @@ impl<'a> Scratch<'a> {
         }
     }
 
-    /// Append the block of operation or `Record` `slot` to `out`, a column of its type. An
-    /// operation runs its kernel over its operands' blocks. A `Record` appends each field: a field
-    /// that is itself a `Record` the same way, since a `Record` writes no slot, and any other field
-    /// by copying its block from the slot, input region or constant it names.
+    /// Append an operation or record's current block to `out`, which must have its result type.
+    /// Nested records are built recursively because they have no scratch columns.
     fn run(&self, program: &ScalarProgram, slot: usize, out: &mut ColumnValue) {
         match &program.instrs[slot] {
             Instr::Un(op, a) => apply_unaryop_views(*op, &self.view(program, *a as usize), out),
@@ -230,10 +197,10 @@ fn take(slot: &mut ColumnValue) -> ColumnValue {
 }
 
 impl ScalarProgram {
-    /// Evaluate over `input`, the column of the values the function is applied to.
+    /// Return one result row per input row, evaluating in blocks of [`BLOCK_ROWS`].
     ///
-    /// The result is built block by block, with room for all of it reserved at the first block,
-    /// so peak memory is the input, the result, and one block's slots.
+    /// Reserve the output for all input rows before evaluation. Intermediate operations retain
+    /// only one block each; inputs and constants are read through borrowed views.
     pub fn eval(&self, input: &ColumnValue) -> ColumnValue {
         let len = input.len();
         let mut scratch = Scratch::new(input, self);
@@ -284,9 +251,8 @@ impl ScalarProgram {
         empties.pop().expect("a program has a last instruction")
     }
 
-    /// Whether the last instruction is an operation or a `Record`, every `Record` is the last
-    /// instruction or a field of a later `Record`, and no operation reads one, so that a record is
-    /// built only into the result.
+    /// Check that records are used only to construct the result, never as operation operands.
+    /// The last instruction must be an operation or a record, not a borrowed input or constant.
     fn records_build_only_the_result(&self) -> bool {
         let is_record = |slot: &Slot| matches!(self.instrs[*slot as usize], Instr::Record(_));
         let last = self.instrs.len() - 1;
@@ -353,8 +319,8 @@ pub struct Fused {
     pub consumed: usize,
 }
 
-/// The value a chain element is applied to, while the chain is being read. A `zip` is tracked
-/// structurally and is a slot only where an operation needs its column.
+/// A value during recognition. Products retain their fields without emitting record instructions;
+/// operations read individual fields, and [`Parser::output`] materializes result records.
 #[derive(Clone)]
 enum Val {
     /// The chain's input, or a field path into it, not yet read into a slot, with the extent of
@@ -389,15 +355,15 @@ impl Parser {
         (self.instrs.len() - 1) as Slot
     }
 
-    /// Remove every instruction from `len` on, and the reads they made, returning the parser to
-    /// the state it had when it held `len` instructions.
+    /// Discard instructions from `len` onward and their cached input reads. Keep the operation
+    /// count: probing an output must not undo the count accumulated by [`Parser::step`].
     fn truncate(&mut self, len: usize) {
         self.instrs.truncate(len);
         self.reads.retain(|_, slot| (*slot as usize) < len);
     }
 
-    /// The column a value stands for, read into a slot: a computed column, a path of the input, or
-    /// a base value. A product and a record have none.
+    /// Return a scalar slot, emitting an input or constant instruction when needed. Records and
+    /// tuples have no scalar slot. Repeated reads of one input path share an instruction.
     fn column(&mut self, v: &Val) -> Option<(Slot, Extent)> {
         match v {
             Val::Slot(slot, extent) => Some((*slot, extent.clone())),
@@ -503,9 +469,8 @@ impl Parser {
         }
     }
 
-    /// A field of the chain's input. A projection of a product built in the chain is not read, and
-    /// ends the prefix: `simplify` reduces `⟨f, g⟩ ≫ .0` before conversion, and not a projection of
-    /// a record or of a wider tuple.
+    /// Extend an input field path. Projections of computed products are not recognized here;
+    /// any such projection left after simplification ends the prefix.
     fn project(v: Val, key: &ProjKey) -> Option<Val> {
         let Val::Read(mut path, extent) = v else {
             return None;
@@ -577,14 +542,9 @@ impl Parser {
         }
     }
 
-    /// What a chain ending at `v` yields. A projection of the input is nothing to compute,
-    /// whatever its path: the projection's own conversion takes the field without copying it, and
-    /// the prefix ends at an operation or a product, so an `Input` is emitted only for an
-    /// operation or a field that reads it. A constant has no root for the same reason, since
-    /// `simplify` has already reduced `f ≫ c ▷ const`. A product is one column of records.
-    ///
-    /// The root is the last instruction, with its extent. An operation's value is the instruction
-    /// its element emitted last, and a product's `Record` is emitted after its fields'.
+    /// Return the final instruction and result extent, emitting result records if needed.
+    /// Input paths and constants are not eligible results on their own: their ordinary conversion
+    /// does not require a scalar program.
     fn root_of(&mut self, v: &Val) -> Option<(Slot, Extent)> {
         match v {
             Val::Slot(slot, extent) => {
@@ -658,18 +618,12 @@ fn is_plain(extent: &Extent) -> bool {
     }
 }
 
-/// The longest prefix of `chain` that is a pointwise function of its input, as one program.
-/// `input` is the extent of the values the chain is applied to.
+/// Return the longest prefix accepted by the scalar recognizer, or `None` if none is eligible.
+/// `input` is the extent of each input value.
 ///
-/// The recognizer reads the identity, projections, closed constants, binary and unary
-/// operations, and `zip`s of such chains. The prefix ends before the first other element: an
-/// aggregate, a lookup, a conditional, a store read, or a constant that is not closed has a
-/// domain or a value outside the input column. A chosen prefix ends at an operation, or at a
-/// `zip`, whose result is one column of records (`Parser::root_of`), and reads at least two
-/// operations (`Parser::ops`). A `zip` counts as two, so a prefix that ends at a `zip` meets the
-/// count, `(x, x)` and the one-field `(a=x)` included. A binary operation takes its operands from
-/// a `zip`, so `x + 1` meets it too. A lone unary operation (`neg`, `not`) keeps its own
-/// conversion, since it is one operator either way.
+/// An eligible prefix ends at an operation or product and meets [`Parser::ops`]'s minimum count
+/// of two. See `src/ccl/design/optimization.md`, "Element-wise chains", for supported forms and
+/// conversion boundaries.
 pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
     if !is_plain(input) {
         return None;
@@ -689,9 +643,8 @@ pub fn fuse_prefix(chain: &[Expr], input: &Extent) -> Option<Fused> {
         };
         cur = next;
         if parser.ops >= 2 {
-            // The output of a product emits its `Record`s and reads its fields' `Input`s and
-            // `Const`s into slots, none of which the rest of the chain reads: they are removed
-            // here and emitted again once the prefix is chosen.
+            // Probing a product output emits instructions that later elements must not read.
+            // Discard them now and rebuild the output only for the chosen prefix.
             let len = parser.instrs.len();
             if parser.root_of(&cur).is_some() {
                 best = Some((k + 1, len, cur.clone()));
