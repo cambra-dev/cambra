@@ -213,7 +213,7 @@ The connections between the layers above and the capabilities Cambra claims:
 | Streaming sources and sinks (`stdin`, `http_serve`) | Implemented |
 | Generator functions | Implemented (single-`for` bodies; general shapes **[Planned]**) |
 | `:=` mutation and loop accumulators (induction histories) | Implemented |
-| Transactions: `with begin():` over `Mut(V, Txn)` variables | Implemented (single deny-guard conditionals only; handle form and `abort()` still landing) |
+| Transactions: `with begin():` over `Mut(V, Txn)` variables | Implemented (single deny-guard conditionals only); naming a transaction, `with txn = begin():`, **[Decided]** |
 | Aggregates | `sum`, `max`, `min` implemented; `count`/`avg`/`len` **[Planned]** |
 | Refinement typing | Machinery implemented (internal); surface syntax **[Decided]** |
 | Feed channels | `Feed(_)` declarations, `Feed(_)` parameters and `http_serve` implemented |

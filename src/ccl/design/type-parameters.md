@@ -306,7 +306,7 @@ parameters join its head's variables (`TraitInstance::params`), with their bound
 
 Any other requirement is refused at the requirement, since no use could satisfy it. `Transaction`
 is refused until
-[chl-spec.md, "8.7 Direction [Decided]: transactions as contextual parameters"](../../../docs/chl-spec.md#87-direction-decided-transactions-as-contextual-parameters)
+[chl-spec.md, "8.7 Transactions as contextual parameters"](../../../docs/chl-spec.md#87-transactions-as-contextual-parameters)
 is implemented. For the check that every parameter is determined, a member parameter of a
 requirement whose operands are determined counts as determined, and so does a parameter a hole in
 a member's bound became.

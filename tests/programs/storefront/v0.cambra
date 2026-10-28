@@ -102,7 +102,7 @@ for req in order_reqs:
                         qty = req.body.qty,
                         price = price,
                         discount = item.price * req.body.qty - price,
-                        time = txn.current_time(),
+                        time = txn::now(),
                     )
                     http.ok(str(price))
                 else:
@@ -113,7 +113,7 @@ for req in order_reqs:
 # Revenue per SKU, as of this request's own transaction time.
 for req in stats_reqs:
     with txn = begin():
-        paid = orders.filter(\o -> o.time < txn.current_time())
+        paid = orders.filter(\o -> o.time < txn::now())
         revenue = [key -> sum([o.price for o in g])
             for key -> g in groupby(paid, \o -> o.sku)]
 

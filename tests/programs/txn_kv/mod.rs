@@ -7,12 +7,12 @@
 //!
 //! `/stats` contrasts the two idioms: the store uses transactional *mutation*,
 //! while the write count is a *declarative aggregate* over the request stream
-//! (`count(set_reqs.restrict(\r -> r.time < txn.current_time()))`) — no mutable
+//! (`count(set_reqs.restrict(\r -> r.time < txn::now()))`) — no mutable
 //! counter, no shared state to race on.
 //!
-//! `requires Transaction` makes the transaction a contextual parameter
-//! (resolved by the typeclass/given solver, not an effect); a transaction
-//! commits on normal block exit, `abort()` rolls it back.
+//! `requires Transaction` makes the transaction a contextual requirement,
+//! which the block calling `put` supplies; a transaction commits on normal
+//! block exit, and one that should not write is written with a guard.
 //!
 //! This merges two former standalone examples: `kv_store` (a KV store served
 //! by concurrent HTTP handlers is only correct if its state is transactional)
@@ -22,7 +22,7 @@
 //! arms on their `case` lines included (`docs/chl-spec.md`, "An arm on its
 //! `case` line"), so the first error is the loader finding no `http` module in
 //! the std root for `import std::http`.  Behind it: `requires Transaction`
-//! (refused by lowering), `with begin()` / `abort()`, map-index assignment,
+//! (refused by lowering), `with begin()`, map-index assignment,
 //! structured requests, and `restrict` / `count`.  This pins the loading error,
 //! and that no parse error precedes it.
 

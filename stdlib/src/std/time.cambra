@@ -2,7 +2,7 @@
 # integer counts, and alarms that deliver a row once the clock reaches its instant.
 #
 # `std::time` declares no state and opens no source, so a module imports it
-# (docs/chl-spec.md, "9.7 Importing asserts no IO and no state"). A call of `alarms` opens a
+# (docs/chl-spec.md, "9.7 Importing asserts a shareable module"). A call of `alarms` opens a
 # source in the calling module, so the IO belongs to the caller.
 #
 # An `Instant` is a point on the UTC timeline. Instants read by different processes, before and
@@ -65,8 +65,9 @@ pub type Duration = Int
 # - A reading orders nothing, and commit order never consults one: a transaction that commits after
 #   another can hold an earlier reading. Both rules describe this clock, whose readings carry no
 #   order; a clock whose readings the commit engine places in commit order would order them.
-# - A call is IO. A module whose top-level evaluation calls `now()` is run, not imported
-#   (docs/chl-spec.md, "9.7 Importing asserts no IO and no state").
+# - A call requires `ObserveWorld` (docs/chl-spec.md, "Inputs from outside the program"), so a module
+#   whose top level calls `now()` is run, not imported
+#   (docs/chl-spec.md, "9.7 Importing asserts a shareable module").
 #
 # [proposed] a call the compiler represents as a read of a clock source at the call's position
 # (docs/chl-spec.md, "7.5 Time [Decided]"); a zero-argument call of a std builtin, where a `def`
